@@ -1,6 +1,8 @@
 # SFTP over the kaijutsu VFS
 
-*Design note — no code yet. Status: proposed 2026-06-25.*
+*Design note. Status: proposed 2026-06-25. The `generation` prerequisite is
+**landed** (commits `70a589ea` / `7f38ff2b` / `f542c944`); the SSH-surface work
+below is **not started**. Next step: the RPC-named migration (slice 0).*
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
 client (sshfs, `sftp`, Nautilus, an editor's remote-FS plugin) can read and
@@ -9,8 +11,11 @@ memory scratch at `/tmp` — through the same SSH server that already carries th
 Cap'n Proto RPC channel.
 
 This is plumbing, not new architecture. The VFS is already SFTP-shaped; the
-work is an SSH subsystem handler, an adapter, and one genuine design decision
-about how an SFTP session reaches a capability verdict.
+work is a channel-dispatch scaffold on the SSH session-channel surface, an SFTP
+adapter, and one genuine design decision about how an SFTP session reaches a
+capability verdict. That scaffold is shared with two siblings — a cleaner
+**named RPC** (today it's positional) and a future **debug kaish** shell — so
+this doc covers the whole surface, not SFTP alone.
 
 ## Why this is mostly already done
 
@@ -37,15 +42,75 @@ about how an SFTP session reaches a capability verdict.
 ## The gap
 
 `ConnectionHandler` (`crates/kaijutsu-server/src/ssh.rs:632`) implements only
-`channel_open_session`, `auth_publickey`, and `channel_close`. There is **no**
-`channel_open_subsystem_request` — that is the `subsystem sftp` entry point, and
-it is the one structural thing missing. Today channel index 1 gets the RPC
-handler thread; indices 0 and 2 are accepted but inert.
+`channel_open_session`, `auth_publickey`, and `channel_close`. The russh 0.61.1
+`Handler` trait already exposes the methods we'd need —
+`subsystem_request(channel: ChannelId, name: &str, session)` (the `subsystem
+sftp` entry point), plus `shell_request` / `exec_request` / `pty_request` /
+`data` for a future debug shell — but **none are implemented**. That handler
+method is the one structural thing missing.
 
 No SFTP crate is in the tree. `russh-sftp` is the natural fit; the one thing to
 verify up front is its compatibility with the pinned russh version, since that
 pairing has historically been version-sensitive. The alternative is parsing
 `SSH_FXP_*` packets by hand over the channel stream — more code, no upside.
+
+## The SSH session-channel surface (and why RPC migrates first)
+
+SFTP doesn't land in isolation — it's the second tenant of the SSH
+session-channel surface, and the first tenant is set up in a way that's worth
+fixing on the way in.
+
+**RPC today is positional, not named.** The client opens three plain session
+channels in a fixed order — `control`, `rpc`, `events`
+(`crates/kaijutsu-client/src/ssh.rs:235–248`) — and the server identifies the
+RPC channel purely by **ordinal**: `channel_open_session` counts opens and only
+channel index 1 gets the Cap'n Proto handler thread
+(`crates/kaijutsu-server/src/ssh.rs:686`). There is no subsystem name, nothing
+discoverable on the wire. Worse, `control` and `events` are **dead weight** —
+`retain_ssh_channels` just stashes them in an `Arc` to hold them open
+(`crates/kaijutsu-client/src/rpc.rs:101`); they're never read or written. The
+real event stream flows as capnp *over the single RPC channel*
+(`subscriptions.rs`). So two of the three channels exist only to pad the ordinal
+scheme.
+
+**The structural change SFTP needs is exactly the change RPC-named needs.** To
+dispatch a channel by subsystem name, the server must *not* consume it via
+`into_stream()` at open time (as it does now for index 1); it must **stash** the
+`Channel<Msg>` in a per-connection `HashMap<ChannelId, Channel<Msg>>` and drain
+it when the matching `*_request` arrives. That retention-and-dispatch scaffold
+is shared by every named channel — RPC, SFTP, and a debug shell are all just
+`match name` arms over it.
+
+So the sequence is **RPC-named first**, because it builds and proves that
+scaffold on the path we exercise constantly (regressions surface immediately),
+after which SFTP is one more match arm plus the adapter — not a new architecture.
+
+**RPC-named migration — sized (small/moderate, ~one focused session):**
+- *Server (~40–60 lines, mostly relocation):* add the `HashMap<ChannelId,
+  Channel<Msg>>` field; stash in `channel_open_session` instead of streaming
+  index 1; delete the ordinal `channel_index == 1` logic; implement
+  `subsystem_request` — on `"kaijutsu-rpc"` drain the channel, `into_stream()`,
+  spawn the existing `run_rpc` thread block (`ssh.rs:715–745` moves here
+  verbatim), and signal `session.channel_success(channel)`. Unknown name →
+  `channel_failure`.
+- *Client (~3 lines + a deletion):* after opening the one channel, call
+  `rpc.request_subsystem(true, "kaijutsu-rpc")` before `into_stream()`
+  (russh `channels/mod.rs:249`); delete `control`/`events`,
+  `retain_ssh_channels`, and the two `SshChannels` fields (~30 lines of dead
+  code gone).
+- *Risks (minor):* relocating the `LocalSet`/thread spawn from open-time to
+  subsystem-time is safe (`subsystem_request` fires after `channel_open_session`
+  for the same channel); **must** signal `channel_success` or a `want_reply:
+  true` client hangs; it's a **breaking client↔server wire change** — monorepo +
+  early dev means a flag-day cutover, no compat shim. Verify the e2e live-eval
+  harness reconnects.
+
+The same surface later hosts a **debug kaish** (`shell_request` for interactive
+`ssh kernel-host`, or a named `subsystem "kaish"`): retain the channel the same
+way, wire its stream to an `EmbeddedKaish` bound to the authenticated principal
++ a context, capability-gated to operator/admin. Skip `pty_request` /
+`window_change_request` for a line-oriented shell; add them for a full TTY. It
+reuses the same binding decision SFTP raises (settle it once for both).
 
 ## Principal threading — the load-bearing decision
 
@@ -217,10 +282,16 @@ above — so the handle guard and the cache now share one primitive.
 
 ## Implementation slices
 
-1. **Subsystem dispatch (~50 lines).** Add `channel_open_subsystem_request` to
-   `ConnectionHandler`; on `name == "sftp"`, spawn an SFTP task with the
-   channel stream + the authenticated `Principal`, mirroring the RPC-thread
-   spawn. Reject the subsystem if `identity` is `None`.
+0. **RPC → named subsystem + channel-retention scaffold (~one session).** Build
+   the `HashMap<ChannelId, Channel<Msg>>` retention + `subsystem_request`
+   dispatch (see "The SSH session-channel surface" above), migrate RPC to
+   `"kaijutsu-rpc"`, drop the dead `control`/`events` channels. This is the
+   shared scaffold; doing it first de-risks everything below on a path we
+   already exercise. Flag-day client↔server cutover.
+1. **SFTP subsystem dispatch (~1 match arm).** With the scaffold in place,
+   `subsystem_request` gains a `name == "sftp"` arm that spawns the SFTP task
+   with the channel stream + the authenticated `Principal`. Reject if `identity`
+   is `None`.
 2. **Adapter (budget ~1,000+ lines, not 200–300).** The first estimate was
    naïve. Bridging onto `VfsOps` also means:
    - `SSH_FXP_REALPATH` and `.`/`..` canonicalization — and getting it right
@@ -246,8 +317,10 @@ above — so the handle guard and the cache now share one primitive.
    e2e live-eval harness does.
 
 **Dependency order:** the mtime/generation rework is **done** (see the
-prerequisite section); next is dispatch + adapter + binding; limits and the
-TOCTOU guard are not optional polish.
+prerequisite section). Next is slice 0 (RPC-named + retention scaffold), then
+the SFTP arm + adapter + binding; limits and the TOCTOU guard are not optional
+polish. A debug-kaish `shell`/`subsystem` is a later tenant of the same
+scaffold.
 
 ## File references
 
@@ -255,7 +328,11 @@ TOCTOU guard are not optional polish.
 - `crates/kaijutsu-kernel/src/vfs/mount.rs` — `MountTable` routing
 - `crates/kaijutsu-kernel/src/runtime/mount_backend.rs:293` — CRDT write-through
 - `crates/kaijutsu-server/src/ssh.rs:632` — `ConnectionHandler` (subsystem gap)
+- `crates/kaijutsu-server/src/ssh.rs:686` — ordinal `channel_index == 1` RPC selection (to be replaced)
 - `crates/kaijutsu-server/src/ssh.rs:696` — RPC per-connection thread pattern
+- `crates/kaijutsu-client/src/ssh.rs:235` — client opens control/rpc/events in order
+- `crates/kaijutsu-client/src/rpc.rs:101` — `retain_ssh_channels` holds the dead control/events channels
+- russh 0.61.1 `server/mod.rs:633` (`subsystem_request`) / `channels/mod.rs:249` (`request_subsystem`)
 - `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (`RcWrite`, `ConfigWrite`)
 - `crates/kaijutsu-kernel/src/file_tools/guard.rs:71` — `context_allows_rc_write`
 - `crates/kaijutsu-types/src/principal.rs:16` — `Principal`

@@ -30,6 +30,11 @@ use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
 use crate::rpc::{ConnectionState, ServerRegistry, WorldImpl};
 
+/// SSH subsystem name for SFTP — the protocol-standard "sftp" every stock
+/// client requests. A second named tenant of the channel-dispatch scaffold
+/// alongside [`SSH_RPC_SUBSYSTEM`].
+const SSH_SFTP_SUBSYSTEM: &str = "sftp";
+
 /// Source for the SSH host key.
 #[derive(Clone)]
 pub enum KeySource {
@@ -808,6 +813,24 @@ impl server::Handler for ConnectionHandler {
                     // Spawn failed; `chan` was consumed, drop closes it.
                     session.channel_failure(channel)?;
                 }
+                Ok(())
+            }
+            SSH_SFTP_SUBSYSTEM => {
+                log::info!(
+                    "Binding channel {} to {} for {} ({})",
+                    channel,
+                    SSH_SFTP_SUBSYSTEM,
+                    principal.username,
+                    principal.display_name,
+                );
+                // SFTP handler futures are `Send`, so unlike the capnp RPC path
+                // this runs on the server's ambient runtime — no dedicated
+                // thread. `run` spawns the per-connection processing loop and
+                // returns; the loop owns the channel stream until EOF.
+                let vfs = self.registry.kernel.kernel.vfs().clone();
+                let session_handler = crate::sftp::SftpSession::new(principal, vfs);
+                russh_sftp::server::run(chan.into_stream(), session_handler).await;
+                session.channel_success(channel)?;
                 Ok(())
             }
             other => {
