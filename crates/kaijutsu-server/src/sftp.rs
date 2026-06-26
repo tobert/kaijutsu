@@ -402,10 +402,10 @@ impl Handler for SftpSession {
         let wants_write =
             pflags.intersects(OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::CREATE | OpenFlags::TRUNCATE);
 
-        if wants_write {
-            if let Some(denied) = privileged_write_denied(&path) {
-                return Err(denied);
-            }
+        if wants_write
+            && let Some(denied) = privileged_write_denied(&path)
+        {
+            return Err(denied);
         }
 
         // Probe current state once. Rejecting a directory open happens *before*
