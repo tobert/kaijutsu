@@ -115,8 +115,8 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
     };
 
     let mut ssh_client = kaijutsu_client::SshClient::new(config);
-    let channels = ssh_client.connect().await.expect("SSH connect failed");
-    RpcClient::new(channels.rpc.into_stream())
+    let rpc_channel = ssh_client.connect().await.expect("SSH connect failed");
+    RpcClient::new(rpc_channel.into_stream())
         .await
         .expect("RPC client init failed")
 }

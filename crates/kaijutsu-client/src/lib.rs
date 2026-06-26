@@ -30,7 +30,7 @@ pub use rpc::{
     ToolResult, ToolSchema, VersionSnapshot,
 };
 pub use document_store::{DocumentEntry, DocumentStore};
-pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
+pub use ssh::{KeySource, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};
@@ -42,13 +42,9 @@ pub use synced_input::SyncedInput;
 /// Must be called within a `tokio::task::LocalSet` context.
 pub async fn connect_ssh(config: SshConfig) -> Result<RpcClient, ConnectError> {
     let mut ssh = SshClient::new(config);
-    let channels = ssh.connect().await?;
-    // Retain control/events channels — dropping them sends SSH_MSG_CHANNEL_CLOSE
-    let control = channels.control;
-    let events = channels.events;
-    let rpc_stream = channels.rpc.into_stream();
+    let rpc_channel = ssh.connect().await?;
+    let rpc_stream = rpc_channel.into_stream();
     let mut client = RpcClient::new(rpc_stream).await?;
-    client.retain_ssh_channels(control, events);
     // Retain the SSH session handle for clean disconnect and keepalive.
     // Without this, the Handle<ClientHandler> is dropped and no
     // SSH_MSG_DISCONNECT can be sent for graceful shutdown.

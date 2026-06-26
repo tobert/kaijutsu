@@ -10,6 +10,49 @@ Newest work first within each area; dates are when the work landed.
 
 ---
 
+## SSH transport & RPC surface (design: `docs/sftp.md`)
+
+### RPC migrates from channel-ordinal to a named SSH subsystem (landed 2026-06-26)
+
+Slice 0 of the SSH-surface renovation in `docs/sftp.md`. The Cap'n Proto RPC
+transport used to ride a **positional** channel scheme: the client opened three
+session channels in a fixed order (control / rpc / events) and the server keyed
+the RPC handler purely by **ordinal** — only channel index 1 got the capnp
+handler thread. `control` and `events` were dead weight, retained client-side in
+an `Arc` only to hold the connection open; the real event stream already flows
+as capnp *over the single RPC channel*. So two of three channels existed only to
+pad the ordinal.
+
+Now the client opens **one** channel and calls `request_subsystem(true,
+"kaijutsu-rpc")` before `into_stream()`. The server stashes every opened channel
+in a per-connection `HashMap<ChannelId, Channel<Msg>>` at `channel_open_session`
+time and implements `subsystem_request`, which drains the map and dispatches by
+name: `kaijutsu-rpc` spawns the existing RPC thread (extracted into a
+`ConnectionHandler::spawn_rpc_thread` helper); an unknown name gets
+`channel_failure` + `close`. Every exit path acks (`channel_success` or
+`channel_failure`) because the client requests with `want_reply` — a silent
+return would hang it. `channel_close` also drops the channel from the pending
+map. The subsystem name lives in one shared const, `kaijutsu_types::
+SSH_RPC_SUBSYSTEM`. Client-side, `SshChannels` and `retain_ssh_channels` are
+gone; `connect()` now delegates to a generalized `connect_subsystem(name)` seam
+(the same seam a future kaijutsu-native subsystem — e.g. debug-kaish — requests
+through) and returns the one bound channel.
+
+This is the **shared retention-and-dispatch scaffold** the rest of the plan
+needs: SFTP and a debug-kaish shell become additional `match name` arms over the
+same pending-channel map. Doing RPC-named *first* proves the scaffold on the path
+we exercise constantly — the full SSH e2e suite (24 `rpc_integration` tests incl.
+subscriptions, 7 `reconnect_fsm`, 3 `editor_wire`, 8 `peer_e2e`) stayed green,
+and a new `test_unknown_subsystem_is_not_bound_to_rpc` guards against any
+ordinal-style "attach RPC to any channel" fallback. **Breaking wire change**, no
+compat shim — a flag-day cutover (early dev, single user): kernel + app + MCP all
+rebuilt together. A deepseek review via kaibo confirmed the refactor correct;
+its two notes (a misleading `connect_subsystem` doc comment — `want_reply` makes
+the *server* ack, it doesn't fail the client call early; and a defensive
+`pending_channels.remove` on the unreachable unauthenticated path) were folded in.
+
+---
+
 ## VFS & filesystem
 
 ### `FileAttr.generation` — coherence stamp split from display mtime (landed 2026-06-25)

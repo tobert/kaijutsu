@@ -4,6 +4,7 @@
 //! Public key authentication with user identity from SQLite.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use kaijutsu_types::Principal;
+use kaijutsu_types::{Principal, SSH_RPC_SUBSYSTEM};
 
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
@@ -361,8 +362,10 @@ struct ConnectionHandler {
     identity: Option<Principal>,
     /// Shared kernel and MCP pool (created at server startup)
     registry: Arc<ServerRegistry>,
-    /// Channel index counter — only channel 1 (RPC) gets a handler thread
-    channel_count: u32,
+    /// Channels opened but not yet bound to a subsystem. `channel_open_session`
+    /// stashes each one here; `subsystem_request` drains it and dispatches by
+    /// name (`kaijutsu-rpc` today; SFTP and a debug shell later).
+    pending_channels: HashMap<ChannelId, Channel<Msg>>,
     /// Shared counter of active connections (decremented on drop).
     active_connections: Arc<AtomicUsize>,
     /// Maximum allowed concurrent connections.
@@ -386,11 +389,77 @@ impl ConnectionHandler {
             allow_anonymous,
             identity: None,
             registry,
-            channel_count: 0,
+            pending_channels: HashMap::new(),
             active_connections,
             max_connections,
             counted: false,
         }
+    }
+
+    /// Spawn the Cap'n Proto RPC handler for a channel on its own OS thread.
+    ///
+    /// capnp-rpc needs a current-thread runtime + `LocalSet`, so each RPC
+    /// channel gets a dedicated thread. Returns `true` if the thread was
+    /// spawned; the caller turns that into the SSH subsystem ack.
+    ///
+    /// Named so wedged threads show up identifiably in `ps -T` / `top -H`. We
+    /// don't keep the `JoinHandle`: a wedged current_thread runtime can't be
+    /// killed from outside safely. We rely on the per-task watchdog in
+    /// `run_rpc` for diagnosability and the `conn_cancel` + per-callback
+    /// timeouts inside `rpc.rs` to prevent the wedge in the first place. A
+    /// panic on the RPC thread is logged but does not take down the server —
+    /// the default panic hook plus this `catch_unwind` boundary contain damage
+    /// to that one connection.
+    fn spawn_rpc_thread(&self, channel: Channel<Msg>, principal: Principal) -> bool {
+        let stream = channel.into_stream();
+        let registry = self.registry.clone();
+        let username_for_thread = principal.username.clone();
+        let session_label = format!(
+            "kjutsu-rpc-{}-{:?}",
+            principal.username,
+            self.peer_addr.as_ref().map(|a| a.port()).unwrap_or(0),
+        );
+
+        let builder = std::thread::Builder::new().name(session_label.clone());
+        if let Err(e) = builder.spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!(
+                        "Failed to build tokio runtime for {}: {}",
+                        username_for_thread, e,
+                    );
+                    return;
+                }
+            };
+            let local = tokio::task::LocalSet::new();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local.block_on(&rt, async move {
+                    run_rpc(stream, principal, registry).await;
+                });
+            }));
+            if let Err(panic) = result {
+                let msg = panic.downcast_ref::<&'static str>().copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic payload>");
+                log::error!(
+                    "RPC thread for {} panicked: {}",
+                    username_for_thread,
+                    msg,
+                );
+            }
+        }) {
+            log::error!(
+                "Failed to spawn RPC thread {}: {}",
+                session_label, e,
+            );
+            return false;
+        }
+
+        true
     }
 }
 
@@ -669,89 +738,94 @@ impl server::Handler for ConnectionHandler {
             );
         }
 
-        let channel_index = self.channel_count;
-        self.channel_count += 1;
-
+        // Stash the channel inert. It carries no traffic until the client
+        // names a subsystem via `subsystem_request`, which drains the map and
+        // dispatches by name. This retention-and-dispatch scaffold is shared by
+        // every named tenant of the session-channel surface (RPC today; SFTP
+        // and a debug shell later).
+        let channel_id = channel.id();
         log::info!(
-            "Channel {} (index {}) opened for {} ({})",
-            channel.id(),
-            channel_index,
+            "Channel {} opened for {} ({}), awaiting subsystem request",
+            channel_id,
             principal.username,
-            principal.display_name
+            principal.display_name,
         );
-
-        // Only channel 1 (RPC) gets a handler thread. Channels 0 (control)
-        // and 2 (events) are accepted but don't need their own RPC system —
-        // they're retained by the client to keep the SSH connection alive.
-        if channel_index != 1 {
-            log::debug!(
-                "Channel {} (index {}) accepted without RPC handler",
-                channel.id(),
-                channel_index,
-            );
-            // Channel is kept alive by the SSH session; no thread needed.
-            return Ok(true);
-        }
-
-        let stream = channel.into_stream();
-        let registry = self.registry.clone();
-        let username_for_thread = principal.username.clone();
-        let session_label = format!(
-            "kjutsu-rpc-{}-{:?}",
-            principal.username,
-            self.peer_addr.as_ref().map(|a| a.port()).unwrap_or(0),
-        );
-
-        // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet).
-        //
-        // Named so wedged threads show up identifiably in `ps -T` / `top -H`.
-        // We don't keep the JoinHandle: a wedged current_thread runtime can't
-        // be killed from outside safely. We rely on the per-task watchdog in
-        // `run_rpc` for diagnosability and the conn_cancel + per-callback
-        // timeouts inside `rpc.rs` to prevent the wedge in the first place.
-        // A panic on the RPC thread is logged but does not take down the
-        // server — the default panic hook plus this catch_unwind boundary
-        // contain damage to that one connection.
-        let builder = std::thread::Builder::new().name(session_label.clone());
-        if let Err(e) = builder.spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!(
-                        "Failed to build tokio runtime for {}: {}",
-                        username_for_thread, e,
-                    );
-                    return;
-                }
-            };
-            let local = tokio::task::LocalSet::new();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                local.block_on(&rt, async move {
-                    run_rpc(stream, principal, registry).await;
-                });
-            }));
-            if let Err(panic) = result {
-                let msg = panic.downcast_ref::<&'static str>().copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("<non-string panic payload>");
-                log::error!(
-                    "RPC thread for {} panicked: {}",
-                    username_for_thread,
-                    msg,
-                );
-            }
-        }) {
-            log::error!(
-                "Failed to spawn RPC thread {}: {}",
-                session_label, e,
-            );
-            return Ok(false);
-        }
+        self.pending_channels.insert(channel_id, channel);
 
         Ok(true)
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Every exit path must ack with channel_success or channel_failure:
+        // the client requests with want_reply, so a silent return hangs it.
+        let principal = match &self.identity {
+            Some(id) => id.clone(),
+            None => {
+                log::warn!(
+                    "Subsystem request {:?} on unauthenticated channel {}",
+                    name,
+                    channel,
+                );
+                // Unreachable in practice (auth precedes channel_open_session),
+                // but drop any stashed channel so this path can't leak one.
+                self.pending_channels.remove(&channel);
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
+
+        let chan = match self.pending_channels.remove(&channel) {
+            Some(chan) => chan,
+            None => {
+                log::warn!(
+                    "Subsystem request {:?} for unknown channel {} from {}",
+                    name,
+                    channel,
+                    principal.username,
+                );
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
+
+        match name {
+            SSH_RPC_SUBSYSTEM => {
+                log::info!(
+                    "Binding channel {} to {} for {} ({})",
+                    channel,
+                    SSH_RPC_SUBSYSTEM,
+                    principal.username,
+                    principal.display_name,
+                );
+                if self.spawn_rpc_thread(chan, principal) {
+                    session.channel_success(channel)?;
+                } else {
+                    // Spawn failed; `chan` was consumed, drop closes it.
+                    session.channel_failure(channel)?;
+                }
+                Ok(())
+            }
+            other => {
+                log::warn!(
+                    "Unknown subsystem {:?} requested by {} on channel {}",
+                    other,
+                    principal.username,
+                    channel,
+                );
+                // Refuse the request, then close the channel so the client sees
+                // prompt closure rather than an idle channel lingering to the
+                // inactivity timeout. (channel_failure alone leaves it open per
+                // the SSH spec.) `chan` drops here too.
+                session.channel_failure(channel)?;
+                session.close(channel)?;
+                Ok(())
+            }
+        }
     }
 
     async fn auth_publickey(
@@ -920,6 +994,9 @@ impl server::Handler for ConnectionHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Drop any still-unbound channel so a client that opens then closes
+        // without naming a subsystem doesn't leak an entry.
+        self.pending_channels.remove(&channel);
         log::debug!("Channel {} closed", channel);
         Ok(())
     }

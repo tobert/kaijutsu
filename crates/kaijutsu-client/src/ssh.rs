@@ -5,10 +5,9 @@
 //! - Key file (loads from disk, optional passphrase)
 //! - In-memory key (for testing with ephemeral keys)
 //!
-//! The connection provides channels for:
-//! - Channel 0: control (version negotiation, keepalive)
-//! - Channel 1: rpc (Cap'n Proto request/response)
-//! - Channel 2: events (server-pushed subscription streams)
+//! The connection opens a single session channel and binds it to the
+//! `kaijutsu-rpc` subsystem (`SSH_RPC_SUBSYSTEM`); Cap'n Proto then carries
+//! both request/response and server-pushed subscription streams over it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +16,8 @@ use russh::client::{self, Config, Handle};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::{Channel, Disconnect};
+
+use kaijutsu_types::SSH_RPC_SUBSYSTEM;
 
 use crate::constants::{
     DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SSH_INACTIVITY_TIMEOUT, SSH_KEEPALIVE_INTERVAL,
@@ -170,13 +171,6 @@ impl client::Handler for ClientHandler {
     }
 }
 
-/// Channel handles for the three kaijutsu channels
-pub struct SshChannels {
-    pub control: Channel<client::Msg>,
-    pub rpc: Channel<client::Msg>,
-    pub events: Channel<client::Msg>,
-}
-
 /// SSH client wrapper
 pub struct SshClient {
     config: SshConfig,
@@ -191,8 +185,32 @@ impl SshClient {
         }
     }
 
-    /// Connect to the server using the configured key source
-    pub async fn connect(&mut self) -> Result<SshChannels, SshError> {
+    /// Connect to the server and bind a channel to the Cap'n Proto RPC
+    /// subsystem. Convenience wrapper over [`connect_subsystem`] with
+    /// `SSH_RPC_SUBSYSTEM`.
+    ///
+    /// [`connect_subsystem`]: Self::connect_subsystem
+    pub async fn connect(&mut self) -> Result<Channel<client::Msg>, SshError> {
+        self.connect_subsystem(SSH_RPC_SUBSYSTEM).await
+    }
+
+    /// Connect, authenticate, then open one session channel and bind it to the
+    /// named SSH subsystem, returning the bound channel ready for
+    /// `into_stream()`.
+    ///
+    /// The server stashes each channel at open and only attaches a handler once
+    /// it sees the named subsystem request, so the request must precede any
+    /// streaming. `want_reply=true` doesn't surface as an error on this call
+    /// (russh returns `Ok` once the request is sent) — it obliges the *server*
+    /// to explicitly accept (`channel_success`) or refuse (`channel_failure` +
+    /// close). On refusal the server closes the channel, so the first message
+    /// over the returned channel fails fast instead of hanging on a handler that
+    /// will never exist. This is the seam every kaijutsu-native subsystem tenant
+    /// requests through.
+    pub async fn connect_subsystem(
+        &mut self,
+        subsystem: &str,
+    ) -> Result<Channel<client::Msg>, SshError> {
         let config = Config {
             inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
             keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
@@ -231,30 +249,20 @@ impl SshClient {
             }
         }
 
-        // Open three session channels
-        let control = session
+        let channel = session
             .channel_open_session()
             .await
-            .map_err(|e| SshError::ChannelFailed(format!("control: {}", e)))?;
+            .map_err(|e| SshError::ChannelFailed(format!("channel open: {}", e)))?;
 
-        let rpc = session
-            .channel_open_session()
+        channel
+            .request_subsystem(true, subsystem)
             .await
-            .map_err(|e| SshError::ChannelFailed(format!("rpc: {}", e)))?;
+            .map_err(|e| SshError::ChannelFailed(format!("subsystem {}: {}", subsystem, e)))?;
 
-        let events = session
-            .channel_open_session()
-            .await
-            .map_err(|e| SshError::ChannelFailed(format!("events: {}", e)))?;
-
-        log::info!("Opened control, rpc, and events channels");
+        log::info!("Opened channel and requested {} subsystem", subsystem);
         self.session = Some(session);
 
-        Ok(SshChannels {
-            control,
-            rpc,
-            events,
-        })
+        Ok(channel)
     }
 
     /// Authenticate using SSH agent

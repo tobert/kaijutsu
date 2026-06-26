@@ -17,6 +17,50 @@ fn test_whoami() {
     });
 }
 
+/// The server dispatches the RPC handler by subsystem name, not by channel
+/// ordinal. A channel that requests an unknown subsystem must never be bound to
+/// RPC — so an RPC call over it must fail (or never be answered), never succeed.
+/// This is the regression guard for the named-subsystem migration: if dispatch
+/// silently fell back to "attach RPC to any channel", whoami would succeed here.
+#[test]
+fn test_unknown_subsystem_is_not_bound_to_rpc() {
+    run_local(async {
+        let addr = start_server().await;
+
+        let config = kaijutsu_client::SshConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            username: "test_user".to_string(),
+            key_source: kaijutsu_client::KeySource::ephemeral(),
+            insecure: true,
+        };
+        let mut ssh = kaijutsu_client::SshClient::new(config);
+
+        // Auth succeeds and the channel opens, but the server must refuse to
+        // bind an unknown subsystem — no Cap'n Proto handler is attached.
+        let channel = ssh
+            .connect_subsystem("definitely-not-a-real-subsystem")
+            .await
+            .expect("channel open + subsystem request should still send");
+        let client = kaijutsu_client::RpcClient::new(channel.into_stream())
+            .await
+            .expect("rpc client init over the raw stream");
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.whoami()).await;
+
+        match result {
+            Ok(Ok(_)) => {
+                panic!("whoami succeeded — server wrongly bound an unknown subsystem to RPC")
+            }
+            // Channel refused/closed → RPC fails fast. Correct.
+            Ok(Err(_)) => {}
+            // No handler ever answered → also correct: nothing was bound.
+            Err(_elapsed) => {}
+        }
+    });
+}
+
 #[test]
 fn test_list_kernels_shows_shared_kernel() {
     run_local(async {

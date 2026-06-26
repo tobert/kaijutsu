@@ -61,6 +61,12 @@ pub mod track;
 // Re-export kaish output types for structured tool results.
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};
 
+/// SSH subsystem name the client requests to bind a session channel to the
+/// Cap'n Proto RPC handler. One source of truth for both `kaijutsu-client`
+/// (which requests it) and `kaijutsu-server` (which dispatches on it). Siblings
+/// like SFTP and a debug shell will join this namespace.
+pub const SSH_RPC_SUBSYSTEM: &str = "kaijutsu-rpc";
+
 // Re-export primary types at crate root for convenience.
 pub use block::{
     BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockMetadata,

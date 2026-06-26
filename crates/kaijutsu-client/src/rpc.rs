@@ -46,10 +46,6 @@ pub struct RpcClient {
     /// This closes the underlying stream, causing the server to detect
     /// the disconnect and stop its FlowBus bridge task.
     _rpc_guard: RpcSystemGuard,
-    /// Retained SSH channels to prevent SSH_MSG_CHANNEL_CLOSE on drop.
-    /// These are unused but must stay alive for the connection's lifetime.
-    #[allow(dead_code)]
-    retained_channels: Option<std::sync::Arc<(russh::Channel<Msg>, russh::Channel<Msg>)>>,
     /// Retained SSH session for clean disconnect and keepalive.
     /// Without this, no SSH_MSG_DISCONNECT can be sent on shutdown.
     #[allow(dead_code)]
@@ -92,18 +88,8 @@ impl RpcClient {
         Ok(Self {
             world,
             _rpc_guard: rpc_guard,
-            retained_channels: None,
             ssh_session: None,
         })
-    }
-
-    /// Retain SSH channels to prevent them from being dropped (which closes them).
-    pub fn retain_ssh_channels(
-        &mut self,
-        control: russh::Channel<Msg>,
-        events: russh::Channel<Msg>,
-    ) {
-        self.retained_channels = Some(std::sync::Arc::new((control, events)));
     }
 
     /// Retain the SSH session handle for clean disconnect and keepalive.
