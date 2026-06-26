@@ -109,6 +109,9 @@ pub struct SftpSession {
     /// and the forthcoming capability binding (slice 3); reads/writes act as
     /// this `who` once the binding lands.
     principal: Principal,
+    /// Opaque per-session id, stamped on every operation span so a whole sshfs
+    /// session's traces correlate by `sftp.session` in telemetry.
+    session_id: String,
     vfs: Arc<MountTable>,
     handles: HashMap<String, HandleEntry>,
     next_handle: u64,
@@ -118,6 +121,7 @@ impl SftpSession {
     pub fn new(principal: Principal, vfs: Arc<MountTable>) -> Self {
         Self {
             principal,
+            session_id: uuid::Uuid::now_v7().to_string(),
             vfs,
             handles: HashMap::new(),
             next_handle: 0,
@@ -303,6 +307,12 @@ impl Handler for SftpSession {
         StatusReply::new(StatusCode::OpUnsupported)
     }
 
+    #[tracing::instrument(
+        name = "sftp.init",
+        level = "info",
+        skip_all,
+        fields(sftp.session = %self.session_id, sftp.user = %self.principal.username)
+    )]
     async fn init(
         &mut self,
         _version: u32,
@@ -322,6 +332,7 @@ impl Handler for SftpSession {
         })
     }
 
+    #[tracing::instrument(name = "sftp.realpath", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let resolved = canonicalize(&path);
         log::debug!(
@@ -336,6 +347,7 @@ impl Handler for SftpSession {
         })
     }
 
+    #[tracing::instrument(name = "sftp.stat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         // STAT follows symlinks to the final target.
         let path = canonicalize(&path);
@@ -346,6 +358,7 @@ impl Handler for SftpSession {
         })
     }
 
+    #[tracing::instrument(name = "sftp.lstat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         // LSTAT does not follow the final symlink; getattr is lstat-shaped.
         let path = canonicalize(&path);
@@ -356,6 +369,7 @@ impl Handler for SftpSession {
         })
     }
 
+    #[tracing::instrument(name = "sftp.fstat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.handle = %handle))]
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let path = match self.handles.get(&handle) {
             Some(HandleEntry::File(f)) => f.path.clone(),
@@ -369,6 +383,12 @@ impl Handler for SftpSession {
         })
     }
 
+    #[tracing::instrument(
+        name = "sftp.opendir",
+        level = "debug",
+        skip_all,
+        fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path)
+    )]
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         if let Some(denied) = self.handle_capacity_denied() {
             return Err(denied);
@@ -386,6 +406,17 @@ impl Handler for SftpSession {
         Ok(Handle { id, handle })
     }
 
+    #[tracing::instrument(
+        name = "sftp.readdir",
+        level = "debug",
+        skip_all,
+        fields(
+            sftp.session = %self.session_id,
+            sftp.user = %self.principal.username,
+            sftp.handle = %handle,
+            sftp.entries = tracing::field::Empty,
+        )
+    )]
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
         // Phase 1: under the handle borrow, carve out this chunk and advance the
         // cursor. We can't hold the &mut borrow across the getattr awaits below.
@@ -426,9 +457,22 @@ impl Handler for SftpSession {
             };
             files.push(dir_file(entry, &attr));
         }
+        tracing::Span::current().record("sftp.entries", files.len());
         Ok(Name { id, files })
     }
 
+    #[tracing::instrument(
+        name = "sftp.open",
+        level = "info",
+        skip_all,
+        fields(
+            sftp.session = %self.session_id,
+            sftp.user = %self.principal.username,
+            sftp.path = %filename,
+            sftp.write = tracing::field::Empty,
+            sftp.created = tracing::field::Empty,
+        )
+    )]
     async fn open(
         &mut self,
         id: u32,
@@ -445,6 +489,7 @@ impl Handler for SftpSession {
         // handle), so it counts as a write open alongside WRITE/CREATE/TRUNCATE.
         let wants_write =
             pflags.intersects(OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::CREATE | OpenFlags::TRUNCATE);
+        tracing::Span::current().record("sftp.write", wants_write);
 
         if wants_write
             && let Some(denied) = privileged_write_denied(&path)
@@ -482,6 +527,7 @@ impl Handler for SftpSession {
                             .with_message("no such file"));
                     }
                     let mode = perm_from_attrs(&attrs, 0o644);
+                    tracing::Span::current().record("sftp.created", true);
                     self.vfs.create(&path, mode).await.map_err(reply)?.generation
                 }
             }
@@ -508,6 +554,19 @@ impl Handler for SftpSession {
         Ok(Handle { id, handle })
     }
 
+    #[tracing::instrument(
+        name = "sftp.write",
+        level = "debug",
+        skip_all,
+        fields(
+            sftp.session = %self.session_id,
+            sftp.user = %self.principal.username,
+            sftp.handle = %handle,
+            sftp.offset = offset,
+            sftp.bytes = data.len(),
+            sftp.append = tracing::field::Empty,
+        )
+    )]
     async fn write(
         &mut self,
         id: u32,
@@ -525,6 +584,7 @@ impl Handler for SftpSession {
             }
             _ => return Err(StatusReply::new(StatusCode::Failure).with_message("bad file handle")),
         };
+        tracing::Span::current().record("sftp.append", append);
 
         // TOCTOU guard: SFTP clients expect a handle to pin the *file object*,
         // not the path string. `VfsOps` cannot pin an inode, so we re-verify the
@@ -563,6 +623,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.mkdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn mkdir(
         &mut self,
         id: u32,
@@ -578,6 +639,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.rmdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         let path = canonicalize(&path);
         if let Some(denied) = privileged_write_denied(&path) {
@@ -587,6 +649,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.remove", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %filename))]
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         let path = canonicalize(&filename);
         if let Some(denied) = privileged_write_denied(&path) {
@@ -596,6 +659,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.rename", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.from = %oldpath, sftp.to = %newpath))]
     async fn rename(
         &mut self,
         id: u32,
@@ -619,6 +683,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.setstat", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn setstat(
         &mut self,
         id: u32,
@@ -636,6 +701,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.fsetstat", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.handle = %handle))]
     async fn fsetstat(
         &mut self,
         id: u32,
@@ -686,6 +752,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.symlink", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.link = %linkpath, sftp.target = %targetpath))]
     async fn symlink(
         &mut self,
         id: u32,
@@ -705,6 +772,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.readlink", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let path = canonicalize(&path);
         let target = self.vfs.readlink(&path).await.map_err(reply)?;
@@ -714,6 +782,20 @@ impl Handler for SftpSession {
         })
     }
 
+    #[tracing::instrument(
+        name = "sftp.read",
+        level = "debug",
+        skip_all,
+        fields(
+            sftp.session = %self.session_id,
+            sftp.user = %self.principal.username,
+            sftp.handle = %handle,
+            sftp.offset = offset,
+            sftp.req_len = len,
+            sftp.bytes = tracing::field::Empty,
+            sftp.eof = tracing::field::Empty,
+        )
+    )]
     async fn read(
         &mut self,
         id: u32,
@@ -735,11 +817,14 @@ impl Handler for SftpSession {
         if data.is_empty() {
             // No bytes at this offset == end of file. The explicit Eof is what
             // tells the client to stop reading; omitting it hangs the transfer.
+            tracing::Span::current().record("sftp.eof", true);
             return Err(StatusReply::new(StatusCode::Eof));
         }
+        tracing::Span::current().record("sftp.bytes", data.len());
         Ok(Data { id, data })
     }
 
+    #[tracing::instrument(name = "sftp.close", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.handle = %handle))]
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         if self.handles.remove(&handle).is_none() {
             return Err(StatusReply::new(StatusCode::Failure).with_message("bad handle"));
@@ -747,6 +832,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
+    #[tracing::instrument(name = "sftp.extended", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.request = %request))]
     async fn extended(
         &mut self,
         id: u32,
