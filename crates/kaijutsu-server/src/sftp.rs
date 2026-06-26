@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use kaijutsu_kernel::{DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps};
+use kaijutsu_kernel::{
+    DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
+};
 use kaijutsu_types::Principal;
 
 use russh_sftp::extensions::{
@@ -39,6 +41,13 @@ use russh_sftp::server::{Handler, StatusReply};
 /// overwrite-on-exists rename; russh-sftp has no constant for it.
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
+/// Cap on a single `READ`'s byte count, so a client can't ask us to allocate
+/// (and frame) an unbounded buffer. 256 KiB matches common SFTP read windows.
+const MAX_READ_LEN: u32 = 256 * 1024;
+
+/// Symlink-follow hop limit for `STAT` (loop protection).
+const MAX_SYMLINK_HOPS: usize = 16;
+
 /// Wire payload of `posix-rename@openssh.com`: two SSH strings, same layout as
 /// [`HardlinkExtension`]. Defined locally because russh-sftp ships no struct for
 /// this extension.
@@ -53,7 +62,7 @@ struct PosixRenameExtension {
 /// write path (later slice).
 struct OpenFile {
     path: PathBuf,
-    #[allow(dead_code)] // recorded for symmetry; reads aren't access-checked
+    /// Whether this handle permits reads (gates `read`).
     read: bool,
     /// Whether this handle was opened for writing (gates `write`/`fsetstat`).
     write: bool,
@@ -107,6 +116,29 @@ impl SftpSession {
         let key = format!("h{id}");
         self.handles.insert(key.clone(), entry);
         key
+    }
+
+    /// Resolve a path to its final target, following symlinks — SFTP `STAT`
+    /// semantics, bounded by [`MAX_SYMLINK_HOPS`]. `VfsOps::getattr` is
+    /// lstat-shaped (it does not follow the final link), so `STAT` must walk the
+    /// chain explicitly; `LSTAT` uses `getattr` directly.
+    async fn getattr_following(&self, path: &Path) -> VfsResult<FileAttr> {
+        let mut cur = path.to_path_buf();
+        for _ in 0..MAX_SYMLINK_HOPS {
+            let attr = self.vfs.getattr(&cur).await?;
+            if !attr.is_symlink() {
+                return Ok(attr);
+            }
+            let target = self.vfs.readlink(&cur).await?;
+            cur = if target.is_absolute() {
+                canonicalize(&target.to_string_lossy())
+            } else {
+                // A relative target resolves against the link's parent.
+                let parent = cur.parent().unwrap_or(Path::new("/"));
+                canonicalize(&parent.join(&target).to_string_lossy())
+            };
+        }
+        Err(VfsError::TooManySymlinks)
     }
 }
 
@@ -280,8 +312,9 @@ impl Handler for SftpSession {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        // STAT follows symlinks to the final target.
         let path = canonicalize(&path);
-        let attr = self.vfs.getattr(&path).await.map_err(reply)?;
+        let attr = self.getattr_following(&path).await.map_err(reply)?;
         Ok(Attrs {
             id,
             attrs: to_attributes(&attr),
@@ -289,9 +322,13 @@ impl Handler for SftpSession {
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        // VfsOps::getattr is lstat-shaped (it does not follow the final
-        // symlink for type reporting); reuse it for both.
-        self.stat(id, path).await
+        // LSTAT does not follow the final symlink; getattr is lstat-shaped.
+        let path = canonicalize(&path);
+        let attr = self.vfs.getattr(&path).await.map_err(reply)?;
+        Ok(Attrs {
+            id,
+            attrs: to_attributes(&attr),
+        })
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
@@ -369,30 +406,51 @@ impl Handler for SftpSession {
             if let Some(denied) = privileged_write_denied(&path) {
                 return Err(denied);
             }
-            let exists = self.vfs.exists(&path).await;
-            if exists {
-                // O_EXCL: CREATE|EXCLUDE must fail if the file already exists.
-                if pflags.contains(OpenFlags::CREATE) && pflags.contains(OpenFlags::EXCLUDE) {
-                    return Err(StatusReply::new(StatusCode::Failure)
-                        .with_message("file already exists"));
+        }
+
+        // Probe current state once. Rejecting a directory open happens *before*
+        // any mutation — truncating or creating over a directory is nonsense
+        // and could error or corrupt the backend mid-op.
+        let existing = self.vfs.getattr(&path).await.ok();
+        if let Some(attr) = &existing
+            && attr.is_dir()
+        {
+            return Err(StatusReply::new(StatusCode::Failure).with_message("is a directory"));
+        }
+
+        let generation = if wants_write {
+            match &existing {
+                Some(_) => {
+                    // O_EXCL: CREATE|EXCLUDE must fail if the file already exists.
+                    if pflags.contains(OpenFlags::CREATE) && pflags.contains(OpenFlags::EXCLUDE) {
+                        return Err(StatusReply::new(StatusCode::Failure)
+                            .with_message("file already exists"));
+                    }
+                    if pflags.contains(OpenFlags::TRUNCATE) {
+                        self.vfs.truncate(&path, 0).await.map_err(reply)?;
+                    }
+                    // Re-read: truncate advanced the generation.
+                    self.vfs.getattr(&path).await.map_err(reply)?.generation
                 }
-                if pflags.contains(OpenFlags::TRUNCATE) {
-                    self.vfs.truncate(&path, 0).await.map_err(reply)?;
+                None => {
+                    if !pflags.contains(OpenFlags::CREATE) {
+                        return Err(StatusReply::new(StatusCode::NoSuchFile)
+                            .with_message("no such file"));
+                    }
+                    let mode = perm_from_attrs(&attrs, 0o644);
+                    self.vfs.create(&path, mode).await.map_err(reply)?.generation
                 }
-            } else {
-                if !pflags.contains(OpenFlags::CREATE) {
+            }
+        } else {
+            // Read-only open: the file must already exist.
+            match existing {
+                Some(attr) => attr.generation,
+                None => {
                     return Err(StatusReply::new(StatusCode::NoSuchFile)
                         .with_message("no such file"));
                 }
-                let mode = perm_from_attrs(&attrs, 0o644);
-                self.vfs.create(&path, mode).await.map_err(reply)?;
             }
-        }
-
-        let attr = self.vfs.getattr(&path).await.map_err(reply)?;
-        if attr.is_dir() {
-            return Err(StatusReply::new(StatusCode::Failure).with_message("is a directory"));
-        }
+        };
 
         let handle = self.alloc_handle(HandleEntry::File(OpenFile {
             // A pure-read open still records read access; a write open may also
@@ -401,7 +459,7 @@ impl Handler for SftpSession {
             write: wants_write,
             append: pflags.contains(OpenFlags::APPEND),
             path,
-            generation: attr.generation,
+            generation,
         }));
         Ok(Handle { id, handle })
     }
@@ -507,8 +565,12 @@ impl Handler for SftpSession {
         {
             return Err(denied);
         }
-        // Plain SFTPv3 RENAME (overwrite-on-exists is the posix-rename@openssh
-        // extension, a later slice). Delegates to the backend's rename semantics.
+        // Base SFTPv3 RENAME must FAIL if the destination exists — overwrite is
+        // the posix-rename@openssh.com extension's job (handled in `extended`).
+        // Don't rely on backend rename semantics for this.
+        if self.vfs.exists(&to).await {
+            return Err(StatusReply::new(StatusCode::Failure).with_message("destination exists"));
+        }
         self.vfs.rename(&from, &to).await.map_err(reply)?;
         Ok(ok_status(id))
     }
@@ -616,9 +678,15 @@ impl Handler for SftpSession {
         len: u32,
     ) -> Result<Data, Self::Error> {
         let path = match self.handles.get(&handle) {
-            Some(HandleEntry::File(f)) => f.path.clone(),
+            Some(HandleEntry::File(f)) if f.read => f.path.clone(),
+            Some(HandleEntry::File(_)) => {
+                return Err(StatusReply::new(StatusCode::PermissionDenied)
+                    .with_message("handle not open for reading"));
+            }
             _ => return Err(StatusReply::new(StatusCode::Failure).with_message("bad file handle")),
         };
+        // Cap the request so a client can't make us allocate an unbounded buffer.
+        let len = len.min(MAX_READ_LEN);
         let data = self.vfs.read(&path, offset, len).await.map_err(reply)?;
         if data.is_empty() {
             // No bytes at this offset == end of file. The explicit Eof is what
@@ -888,6 +956,64 @@ mod tests {
         // the existing target); /a.txt is gone.
         assert_eq!(vfs.read_all(Path::new("/b.txt")).await.unwrap(), b"aaa");
         assert!(!vfs.exists(Path::new("/a.txt")).await);
+    }
+
+    #[tokio::test]
+    async fn stat_follows_symlink_but_lstat_does_not() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/target.txt"), b"hi").await.unwrap();
+        vfs.symlink(Path::new("/link"), Path::new("/target.txt"))
+            .await
+            .unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs);
+        // LSTAT reports the link itself.
+        let l = Handler::lstat(&mut s, 1, "/link".into()).await.unwrap();
+        assert!(l.attrs.is_symlink());
+        // STAT follows to the regular-file target.
+        let st = Handler::stat(&mut s, 2, "/link".into()).await.unwrap();
+        assert!(st.attrs.is_regular());
+        assert!(!st.attrs.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn base_rename_refuses_existing_destination() {
+        // SFTPv3 RENAME must fail on an existing target; overwrite is
+        // posix-rename's job.
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/a.txt"), b"a").await.unwrap();
+        vfs.write_all(Path::new("/b.txt"), b"b").await.unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let err = Handler::rename(&mut s, 1, "/a.txt".into(), "/b.txt".into())
+            .await
+            .expect_err("base rename must refuse an existing destination");
+        assert_eq!(err.status_code, StatusCode::Failure);
+        assert!(vfs.exists(Path::new("/a.txt")).await);
+        assert_eq!(vfs.read_all(Path::new("/b.txt")).await.unwrap(), b"b");
+    }
+
+    #[tokio::test]
+    async fn read_on_write_only_handle_is_refused() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        let mut s = SftpSession::new(Principal::system(), vfs);
+        // WRITE|CREATE without READ.
+        let h = Handler::open(
+            &mut s,
+            1,
+            "/w.txt".into(),
+            OpenFlags::WRITE | OpenFlags::CREATE,
+            FileAttributes::empty(),
+        )
+        .await
+        .unwrap();
+        let err = Handler::read(&mut s, 2, h.handle, 0, 16)
+            .await
+            .expect_err("write-only handle must refuse read");
+        assert_eq!(err.status_code, StatusCode::PermissionDenied);
     }
 
     #[tokio::test]
