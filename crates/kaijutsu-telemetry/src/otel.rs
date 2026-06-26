@@ -308,13 +308,16 @@ impl ShouldSample for KaijutsuSampler {
 /// `list_contexts`. The `rpc` family stays a bare prefix on purpose so it
 /// covers `rpc`, `rpc.request`, and `rpc_client.*` alike.
 fn sampling_rate(name: &str) -> f64 {
-    if name.starts_with("gen_ai.")
+    if name == "sftp.read" || name == "sftp.write" || name == "sftp.readdir" {
+        0.1 // 10% — the per-block data / per-chunk listing path can be high-volume
+    } else if name.starts_with("gen_ai.")
         || name.starts_with("llm.")
         || name.starts_with("engine.")
         || name.starts_with("tool.")
         || name.starts_with("drift.")
+        || name.starts_with("sftp.")
     {
-        1.0 // 100% — high-value, low-volume namespaces
+        1.0 // 100% — high-value, low-volume namespaces (sftp control/metadata ops)
     } else if name.starts_with("rpc") {
         0.1 // 10% — rpc, rpc.request, rpc_client.* (high-volume Cap'n Proto)
     } else if name.starts_with("sync") {
