@@ -48,6 +48,16 @@ const MAX_READ_LEN: u32 = 256 * 1024;
 /// Symlink-follow hop limit for `STAT` (loop protection).
 const MAX_SYMLINK_HOPS: usize = 16;
 
+/// Directory entries returned per `READDIR` reply. Bounds the `Name` packet size
+/// (a single all-entries reply would exceed the SSH channel max packet for a
+/// large directory and disconnect the client) and the per-call `getattr` cost.
+const READDIR_CHUNK: usize = 64;
+
+/// Cap on simultaneously-open handles per session, so a client that opens
+/// without closing can't exhaust memory. (A coarse stopgap until the slice-4
+/// limits work; per-session because the handle map is per-session.)
+const MAX_OPEN_HANDLES: usize = 1024;
+
 /// Wire payload of `posix-rename@openssh.com`: two SSH strings, same layout as
 /// [`HardlinkExtension`]. Defined locally because russh-sftp ships no struct for
 /// this extension.
@@ -74,13 +84,18 @@ struct OpenFile {
     generation: u64,
 }
 
-/// An open directory handle. `readdir` drains `entries` in one shot, then
-/// signals `Eof` on the next call (the SFTP `READDIR` loop convention).
+/// An open directory handle. `readdir` emits the listing in bounded chunks
+/// (one `getattr` per entry, on demand), then signals `Eof` — never one giant
+/// `Name` packet that would blow the SSH channel's max-packet limit and
+/// disconnect the client. The lightweight `DirEntry` list is held; the heavy
+/// per-entry `File`/attrs are built a chunk at a time.
 struct OpenDir {
-    #[allow(dead_code)] // retained for diagnostics / future paging
     path: PathBuf,
-    files: Vec<File>,
-    sent: bool,
+    entries: Vec<DirEntry>,
+    cursor: usize,
+    /// Synthetic `.`/`..` are emitted once, in the first chunk (sshfs expects
+    /// them even when the backend's `readdir` omits them).
+    dots_sent: bool,
 }
 
 enum HandleEntry {
@@ -106,6 +121,16 @@ impl SftpSession {
             vfs,
             handles: HashMap::new(),
             next_handle: 0,
+        }
+    }
+
+    /// Fail loud if this session is at its open-handle ceiling, so a client
+    /// that opens without closing can't exhaust memory.
+    fn handle_capacity_denied(&self) -> Option<StatusReply> {
+        if self.handles.len() >= MAX_OPEN_HANDLES {
+            Some(StatusReply::new(StatusCode::Failure).with_message("too many open handles"))
+        } else {
+            None
         }
     }
 
@@ -345,47 +370,63 @@ impl Handler for SftpSession {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-        let path = canonicalize(&path);
-        let entries = self.vfs.readdir(&path).await.map_err(reply)?;
-
-        // Resolve each entry's attributes for a useful longname. A getattr that
-        // fails (race, dangling symlink) degrades to a typed stub rather than
-        // dropping the entry.
-        let mut files = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            let child = path.join(&entry.name);
-            let attr = match self.vfs.getattr(&child).await {
-                Ok(a) => a,
-                Err(e) => {
-                    log::debug!("sftp opendir getattr {} failed: {e}", child.display());
-                    stub_attr(entry.kind)
-                }
-            };
-            files.push(dir_file(entry, &attr));
+        if let Some(denied) = self.handle_capacity_denied() {
+            return Err(denied);
         }
-
+        let path = canonicalize(&path);
+        // Hold only the lightweight DirEntry list; per-entry attrs are resolved
+        // chunk-by-chunk in readdir, not all up front.
+        let entries = self.vfs.readdir(&path).await.map_err(reply)?;
         let handle = self.alloc_handle(HandleEntry::Dir(OpenDir {
             path,
-            files,
-            sent: false,
+            entries,
+            cursor: 0,
+            dots_sent: false,
         }));
         Ok(Handle { id, handle })
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        match self.handles.get_mut(&handle) {
+        // Phase 1: under the handle borrow, carve out this chunk and advance the
+        // cursor. We can't hold the &mut borrow across the getattr awaits below.
+        let (dir_path, batch, include_dots) = match self.handles.get_mut(&handle) {
             Some(HandleEntry::Dir(dir)) => {
-                if dir.sent {
+                let include_dots = !dir.dots_sent;
+                dir.dots_sent = true;
+                let start = dir.cursor;
+                let end = (start + READDIR_CHUNK).min(dir.entries.len());
+                let batch = dir.entries[start..end].to_vec();
+                dir.cursor = end;
+                // Nothing left to emit (and dots already sent on a prior call).
+                if batch.is_empty() && !include_dots {
                     return Err(StatusReply::new(StatusCode::Eof));
                 }
-                dir.sent = true;
-                Ok(Name {
-                    id,
-                    files: std::mem::take(&mut dir.files),
-                })
+                (dir.path.clone(), batch, include_dots)
             }
-            _ => Err(StatusReply::new(StatusCode::Failure).with_message("bad dir handle")),
+            _ => {
+                return Err(StatusReply::new(StatusCode::Failure).with_message("bad dir handle"));
+            }
+        };
+
+        // Phase 2: build File entries, one getattr per entry (on demand).
+        let mut files = Vec::with_capacity(batch.len() + 2);
+        if include_dots {
+            let dir_attrs = to_attributes(&FileAttr::directory(0o755));
+            files.push(File::new(".".to_string(), dir_attrs.clone()));
+            files.push(File::new("..".to_string(), dir_attrs));
         }
+        for entry in &batch {
+            let child = dir_path.join(&entry.name);
+            let attr = match self.vfs.getattr(&child).await {
+                Ok(a) => a,
+                Err(e) => {
+                    log::debug!("sftp readdir getattr {} failed: {e}", child.display());
+                    stub_attr(entry.kind)
+                }
+            };
+            files.push(dir_file(entry, &attr));
+        }
+        Ok(Name { id, files })
     }
 
     async fn open(
@@ -395,6 +436,9 @@ impl Handler for SftpSession {
         pflags: OpenFlags,
         attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        if let Some(denied) = self.handle_capacity_denied() {
+            return Err(denied);
+        }
         let path = canonicalize(&filename);
 
         // APPEND implies write access (a client may WRITE on a READ|APPEND
@@ -956,6 +1000,48 @@ mod tests {
         // the existing target); /a.txt is gone.
         assert_eq!(vfs.read_all(Path::new("/b.txt")).await.unwrap(), b"aaa");
         assert!(!vfs.exists(Path::new("/a.txt")).await);
+    }
+
+    #[tokio::test]
+    async fn readdir_injects_dot_and_dotdot_then_eofs() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/only.txt"), b"x").await.unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs);
+        let h = Handler::opendir(&mut s, 1, "/".into()).await.expect("opendir");
+
+        let first = Handler::readdir(&mut s, 2, h.handle.clone())
+            .await
+            .expect("first chunk");
+        let names: Vec<&str> = first.files.iter().map(|f| f.filename.as_str()).collect();
+        assert!(names.contains(&"."), "first chunk carries .");
+        assert!(names.contains(&".."), "first chunk carries ..");
+        assert!(names.contains(&"only.txt"));
+
+        // Everything fit in one chunk; the next call signals Eof.
+        let err = Handler::readdir(&mut s, 3, h.handle)
+            .await
+            .expect_err("second call is Eof");
+        assert_eq!(err.status_code, StatusCode::Eof);
+    }
+
+    #[tokio::test]
+    async fn open_is_refused_past_the_handle_cap() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/f.txt"), b"x").await.unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs);
+        for i in 0..MAX_OPEN_HANDLES {
+            Handler::open(&mut s, i as u32, "/f.txt".into(), OpenFlags::READ, FileAttributes::empty())
+                .await
+                .expect("open under the cap");
+        }
+        let err = Handler::open(&mut s, 9999, "/f.txt".into(), OpenFlags::READ, FileAttributes::empty())
+            .await
+            .expect_err("open past the cap must be refused");
+        assert_eq!(err.status_code, StatusCode::Failure);
     }
 
     #[tokio::test]

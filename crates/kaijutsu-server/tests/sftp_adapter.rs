@@ -74,6 +74,28 @@ async fn read_dir_lists_seeded_entries() {
 }
 
 #[tokio::test]
+async fn read_dir_pages_a_large_directory() {
+    // More entries than one READDIR chunk (64), so the client must loop
+    // READDIR until Eof and the server must page rather than send one giant
+    // Name packet. Confirms the full listing arrives intact.
+    let vfs = Arc::new(MountTable::new());
+    vfs.mount("/", MemoryBackend::new()).await;
+    vfs.mkdir(std::path::Path::new("/big"), 0o755).await.unwrap();
+    for i in 0..130 {
+        vfs.write_all(std::path::Path::new(&format!("/big/f{i:03}.txt")), b"x")
+            .await
+            .unwrap();
+    }
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
+    let client = ClientSession::new(client_io).await.expect("handshake");
+
+    let count = client.read_dir("/big").await.expect("read_dir /big").count();
+    assert_eq!(count, 130, "all entries should page through to the client");
+}
+
+#[tokio::test]
 async fn read_returns_file_contents() {
     let client = fixture().await;
     let body = client.read("/hello.txt").await.expect("read hello.txt");
