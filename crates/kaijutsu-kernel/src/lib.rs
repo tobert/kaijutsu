@@ -45,11 +45,7 @@ pub use block_store::DocumentKind;
 pub use block_store::{
     BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store,
 };
-pub use block_tools::{
-    AbcBlockEngine, BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine,
-    BlockReadEngine, BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, EditOp,
-    ImgBlockEngine, ImgBlockFromPathEngine, KernelSearchEngine, SvgBlockEngine,
-};
+
 pub use config_seed::DEFAULT_SYSTEM_PROMPT;
 pub use control::ConsentMode;
 pub use kaijutsu_types::DocKind;
@@ -110,9 +106,7 @@ pub use drift::{
     build_distillation_prompt,
     shared_drift_router,
 };
-pub use file_tools::{
-    EditEngine, FileDocumentCache, GlobEngine, GrepEngine, ReadEngine, WhoamiEngine, WriteEngine,
-};
+pub use file_tools::FileDocumentCache;
 
 // Non-MCP flow buses (block / config / input-doc). The MCP-specific buses
 // (Resource / Progress / Logging / Elicitation) were removed in Phase 1 M5

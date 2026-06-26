@@ -42,40 +42,8 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
-pub mod batch;
-pub mod content_engines;
-pub mod cursor;
-pub mod engines;
 pub mod error;
 pub mod translate;
-
-// Re-export content-type block engines
-pub use content_engines::{AbcBlockEngine, ImgBlockEngine, ImgBlockFromPathEngine, SvgBlockEngine};
-
-// Re-export engine types
-pub use engines::{
-    BlockAppendEngine,
-    // Parameter types
-    BlockAppendParams,
-    BlockCreateEngine,
-    BlockCreateParams,
-    BlockEditEngine,
-    BlockEditParams,
-    BlockListEngine,
-    BlockListParams,
-    BlockReadEngine,
-    BlockReadParams,
-    BlockSearchEngine,
-    BlockSearchParams,
-    BlockSpliceEngine,
-    BlockSpliceParams,
-    BlockStatusEngine,
-    BlockStatusParams,
-    EditOp,
-    KernelSearchEngine,
-    KernelSearchMatch,
-    KernelSearchParams,
-};
 
 // Re-export error types
 pub use error::{EditError, Result};
@@ -86,12 +54,6 @@ pub use translate::{
     line_to_byte_offset, validate_expected_text,
 };
 
-// Re-export batching utilities
-pub use batch::{AppendBatcher, BatchConfig, BatcherStats};
-
-// Re-export cursor tracking
-pub use cursor::{CursorEvent, CursorPosition, CursorTracker};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,7 +61,6 @@ mod tests {
     #[test]
     fn test_module_exports() {
         // Ensure all exports are accessible
-        let _ = std::any::type_name::<BlockEditEngine>();
         let _ = std::any::type_name::<EditError>();
     }
 }

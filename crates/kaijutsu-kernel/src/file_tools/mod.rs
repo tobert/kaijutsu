@@ -31,23 +31,11 @@
 //! ```
 
 pub mod cache;
-pub mod edit;
-pub mod glob;
-pub mod grep;
 pub mod guard;
 pub mod hashline;
 pub mod path;
-pub mod read;
 pub mod vfs_walker;
-pub mod whoami;
-pub mod write;
 
 pub use cache::{CacheReadError, FileDocumentCache};
-pub use edit::EditEngine;
-pub use glob::GlobEngine;
-pub use grep::GrepEngine;
 pub use guard::WorkspaceGuard;
-pub use read::ReadEngine;
 pub use vfs_walker::VfsWalkerAdapter;
-pub use whoami::WhoamiEngine;
-pub use write::WriteEngine;

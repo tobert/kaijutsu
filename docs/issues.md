@@ -1298,6 +1298,15 @@ candidates, not commitments.
   mid-session mode. gemini `enter_plan_mode`/`exit_plan_mode` flips to read-only with
   a visible reason. A lightweight plan-mode token (vs the heavier fork) for
   single-session exploration constraint, surfaced to the harness via a `KjResult` variant.
+- **Socket hook vs. Hook Table alignment.** The legacy MCP socket hook (for session mirroring) has drifted from core structures, causing silent data loss
+  (e.g., `agent_id` vs `principal_id` mismatch, obsolete `tool_response` key, fragile PID-based socket discovery). Details in
+  [mcp-hook-alignment.md](file:///home/atobey/src/kaijutsu/docs/mcp-hook-alignment.md).
+- **Silent fallbacks in tool/binding lookup.** [Kernel::list_tool_defs_via_broker](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L465) maps lookup errors
+  to empty vectors, silently stripping the LLM of tools. [dispatch_tool_via_broker_with_cancel](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L336) defaults to empty bindings on lookup
+  failure, causing confusing `ToolNotFound` errors rather than propagating the underlying DB/resolver error.
+- **Latency overhead on visible tool scans.** [list_visible_tools](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/broker.rs#L1081) is called on **every single tool dispatch** to refresh naming resolutions, causing lock contention
+  on `self.instances` and `self.bindings` and extra async hops. These resolutions should be cached per context and invalidated only when bindings change.
+- **Contradictory hook persistence documentation.** [BuiltinBindingsServer](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/servers/bindings_builtin.rs#L64) claims hooks are "in-memory only" when they are actually eagerly hydrated and written to SQLite in `broker.rs`.
 
 ### Safety, sandboxing & policy
 

@@ -1,7 +1,6 @@
-//! Adapters between MCP broker types and the internal engine call shape.
+//! Adapters between MCP broker types and the internal call shape.
 //!
-//! Virtual MCP servers hold engine structs (e.g. `BlockCreateEngine`) and
-//! delegate to their inherent `execute(params_json, &ExecContext)` methods.
+//! Virtual MCP servers inline their execution logic directly.
 //! This module bridges `CallContext` → `ExecContext` (adding the `cwd`
 //! default) and `ExecResult` → `KernelToolResult` (collapsing onto the D-28
 //! `is_error` channel).
