@@ -39,6 +39,9 @@ struct OpenFile {
     read: bool,
     /// Whether this handle was opened for writing (gates `write`/`fsetstat`).
     write: bool,
+    /// APPEND mode: every write is forced to the current end-of-file, ignoring
+    /// the client-supplied offset (SFTPv3 `SSH_FXF_APPEND`).
+    append: bool,
     /// Content `generation` last observed through this handle — the TOCTOU
     /// re-verify anchor, captured at open and refreshed after each write.
     generation: u64,
@@ -150,7 +153,10 @@ fn reply(err: VfsError) -> StatusReply {
 /// wired through the shared guard in a later slice. Everything else is governed
 /// by the mount's own `read_only()` flag, which `VfsOps` already enforces.
 fn privileged_write_denied(path: &Path) -> Option<StatusReply> {
-    if path.starts_with("/etc/rc") || path.starts_with("/etc/config") {
+    let s = path.to_string_lossy();
+    let gated = |root: &str| s == root || s.starts_with(&format!("{root}/"));
+    // Component-boundary match so `/etc/rcfoo` is NOT mistaken for `/etc/rc`.
+    if gated("/etc/rc") || gated("/etc/config") {
         Some(StatusCode::PermissionDenied.with_message(
             "SFTP writes to /etc/rc and /etc/config are not yet capability-gated; refused",
         ))
@@ -356,6 +362,7 @@ impl Handler for SftpSession {
             // be readable (the client set READ alongside WRITE).
             read: pflags.contains(OpenFlags::READ) || !wants_write,
             write: wants_write,
+            append: pflags.contains(OpenFlags::APPEND),
             path,
             generation: attr.generation,
         }));
@@ -371,8 +378,8 @@ impl Handler for SftpSession {
     ) -> Result<Status, Self::Error> {
         // Pull the path + the generation we last observed through this handle,
         // without holding the handle-map borrow across the VFS awaits.
-        let (path, expected) = match self.handles.get(&handle) {
-            Some(HandleEntry::File(f)) if f.write => (f.path.clone(), f.generation),
+        let (path, expected, append) = match self.handles.get(&handle) {
+            Some(HandleEntry::File(f)) if f.write => (f.path.clone(), f.generation, f.append),
             Some(HandleEntry::File(_)) => {
                 return Err(StatusReply::new(StatusCode::PermissionDenied)
                     .with_message("handle not open for writing"));
@@ -385,17 +392,31 @@ impl Handler for SftpSession {
         // content `generation` captured at open (and refreshed after each of our
         // own writes). A mismatch means the file was replaced underneath us
         // (rename-replace) — refuse rather than silently writing the wrong file.
-        let current = self.vfs.getattr(&path).await.map_err(reply)?.generation;
-        if current != expected {
+        // One getattr serves both the guard and the append offset.
+        let attr = self.vfs.getattr(&path).await.map_err(reply)?;
+        if attr.generation != expected {
             return Err(StatusReply::new(StatusCode::Failure).with_message(
                 "file changed underneath the open handle (possible rename-replace); write refused",
             ));
         }
 
-        self.vfs.write(&path, offset, &data).await.map_err(reply)?;
+        // APPEND forces the write to the current end-of-file, ignoring the
+        // client-supplied offset (SSH_FXF_APPEND).
+        let write_offset = if append { attr.size } else { offset };
+        self.vfs
+            .write(&path, write_offset, &data)
+            .await
+            .map_err(reply)?;
 
         // Our own write advanced the generation; refresh the anchor so the next
         // write on this handle compares against the right value.
+        //
+        // There is a narrow window between this write and the getattr below: a
+        // concurrent unlink+create at the same path by another principal would
+        // refresh the anchor to the replacement's generation and mask it. The
+        // per-session sequential packet loop makes this exceedingly unlikely,
+        // and the consequence is writing to the path the client explicitly
+        // opened — acceptable in a shared-trust kernel.
         let new_gen = self.vfs.getattr(&path).await.map_err(reply)?.generation;
         if let Some(HandleEntry::File(f)) = self.handles.get_mut(&handle) {
             f.generation = new_gen;
@@ -478,18 +499,47 @@ impl Handler for SftpSession {
         handle: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let path = match self.handles.get(&handle) {
-            Some(HandleEntry::File(f)) => f.path.clone(),
-            Some(HandleEntry::Dir(d)) => d.path.clone(),
+        // fsetstat mutates; it must honor the same write-open gate and TOCTOU
+        // guard as `write` (a setattr(size=…) truncates). A read-only handle
+        // must not be a back door to truncation. Directory handles carry no
+        // generation, so they skip the guard (a dir setstat is metadata-only).
+        let (path, expected) = match self.handles.get(&handle) {
+            Some(HandleEntry::File(f)) if f.write => (f.path.clone(), Some(f.generation)),
+            Some(HandleEntry::File(_)) => {
+                return Err(StatusReply::new(StatusCode::PermissionDenied)
+                    .with_message("handle not open for writing"));
+            }
+            Some(HandleEntry::Dir(d)) => (d.path.clone(), None),
             None => return Err(StatusReply::new(StatusCode::Failure).with_message("bad handle")),
         };
         if let Some(denied) = privileged_write_denied(&path) {
             return Err(denied);
         }
+
+        if let Some(expected) = expected {
+            let current = self.vfs.getattr(&path).await.map_err(reply)?.generation;
+            if current != expected {
+                return Err(StatusReply::new(StatusCode::Failure).with_message(
+                    "file changed underneath the open handle (possible rename-replace); setstat refused",
+                ));
+            }
+        }
+
+        let size_changed = attrs.size.is_some();
         self.vfs
             .setattr(&path, set_attr_from(&attrs))
             .await
             .map_err(reply)?;
+
+        // A size change is a content mutation that advances generation; refresh
+        // the anchor. A pure mtime/perm setstat does not bump it, so leave the
+        // anchor untouched there (re-reading would be a needless getattr).
+        if size_changed && expected.is_some() {
+            let new_gen = self.vfs.getattr(&path).await.map_err(reply)?.generation;
+            if let Some(HandleEntry::File(f)) = self.handles.get_mut(&handle) {
+                f.generation = new_gen;
+            }
+        }
         Ok(ok_status(id))
     }
 
@@ -632,6 +682,66 @@ mod tests {
         Handler::close(&mut s, 4, h.handle).await.expect("close");
 
         assert_eq!(vfs.read_all(Path::new("/g.txt")).await.unwrap(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn append_writes_at_end_ignoring_offset() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/log.txt"), b"start").await.unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let h = Handler::open(
+            &mut s,
+            1,
+            "/log.txt".into(),
+            OpenFlags::WRITE | OpenFlags::APPEND,
+            FileAttributes::empty(),
+        )
+        .await
+        .expect("open append");
+
+        // The client sends offset 0, but APPEND forces the write to EOF.
+        Handler::write(&mut s, 2, h.handle, 0, b"-more".to_vec())
+            .await
+            .expect("append write");
+        assert_eq!(
+            vfs.read_all(Path::new("/log.txt")).await.unwrap(),
+            b"start-more"
+        );
+    }
+
+    #[tokio::test]
+    async fn fsetstat_on_read_handle_is_refused() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/ro.txt"), b"keepme").await.unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let h = Handler::open(&mut s, 1, "/ro.txt".into(), OpenFlags::READ, FileAttributes::empty())
+            .await
+            .expect("open read-only");
+
+        // A size=0 fsetstat would truncate — it must be refused on a read handle.
+        let mut attrs = FileAttributes::empty();
+        attrs.size = Some(0);
+        let err = Handler::fsetstat(&mut s, 2, h.handle, attrs)
+            .await
+            .expect_err("read-only handle must not truncate");
+        assert_eq!(err.status_code, StatusCode::PermissionDenied);
+        assert_eq!(vfs.read_all(Path::new("/ro.txt")).await.unwrap(), b"keepme");
+    }
+
+    #[test]
+    fn privileged_deny_matches_on_component_boundary() {
+        assert!(privileged_write_denied(Path::new("/etc/rc")).is_some());
+        assert!(privileged_write_denied(Path::new("/etc/rc/coder/S10.kai")).is_some());
+        assert!(privileged_write_denied(Path::new("/etc/config")).is_some());
+        assert!(privileged_write_denied(Path::new("/etc/config/models")).is_some());
+        // Not gated: a sibling whose name merely starts with the gated prefix.
+        assert!(privileged_write_denied(Path::new("/etc/rcfoo")).is_none());
+        assert!(privileged_write_denied(Path::new("/etc/configuration")).is_none());
+        assert!(privileged_write_denied(Path::new("/tmp/x")).is_none());
     }
 
     #[test]
