@@ -1,5 +1,36 @@
 # 会術 Kaijutsu
 
+## Developer Notes from Amy 2026-06-26
+
+Kaijutsu started as a "more serious" version of an [SSH MUD](https://github.com/tobert/sshwarma)
+that nerdsniped me as I built out an equipment system for models. That led to having rooms have
+tools in them too. The system felt cool but then I had to face the context problem: how do I
+bound context for each model? How should I compact for them? Could it be customized by role, room,
+and other dimensions?
+
+I was also working on variations of [hootenanny](https://github.com/tobert/hootenanny)
+which was a big pile of ideas and experiments while I learned about music models, real-time
+sound, and a few other things. I've retired it. I learned a lot but it was time to start over.
+
+Kaijutsu is a maximal project, where I spend my leisure coding time building something
+ambitious and occasionally whimsical. Which is to say, it's turned into an operating
+system that lives in a process. It has its own shell, coreutils, and default
+assumptions around concurrent change by multiple agents and users, making it more like
+a shared game world than a typical developer tool. Also unlike developer tools, contexts
+can have a beat, and features exist for sliding window contexts with KV cache optimizations.
+
+As I write this developer note, it's been about 6 months since the project started with "what
+if my agent had a bevy frontend and its own shell" has turned into kaish maturing rapidly as
+part of [kaibo](https://github.com/tobert/kaibo). In a lot of ways kaibo is a more pragmatic
+take on a lot of what I've explored in kaijutsu so far.
+
+The curious are welcome to give it a try, but I wouldn't call this ready for consumption yet.
+The idea blender is still whirring and only the fast and the foolish should put their hands in
+at this point. If that's your jam, welcome, find me on Bluesky as @renice.bsky.social
+or open an issue on Github.
+
+## Introduction
+
 Kaijutsu is an AI agent system built around context forking and drifting, with some
 experimental features for agentic music production. The core is the kaijutsu kernel,
 which offers CRDT-based editing primitives to help users and multiple agents work
