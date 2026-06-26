@@ -4,9 +4,9 @@
 //!
 //! ```text
 //!     ┌──────┐
-//!     │ Idle │  (initial; first command kicks off Connecting)
+//!     │ Idle │  (transient bootstrap; dials immediately on start)
 //!     └──┬───┘
-//!        │ first cmd
+//!        │ eager
 //!        ▼
 //! ┌──────────────────────────┐
 //! │ Connecting { attempt }   │ ◄──┐
@@ -140,7 +140,9 @@ pub enum CallError {
 /// Why the actor declined to serve a call. Returned inside `CallError::NotReady`.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum NotReadyReason {
-    /// No command has triggered the first Connecting transition yet.
+    /// Actor hasn't left its transient bootstrap yet. With eager connect the
+    /// actor dials on start and never rests here, so a caller should not
+    /// normally observe this; it remains for completeness of the mapping.
     #[error("idle")]
     Idle,
     /// Handshake in progress.
@@ -165,6 +167,9 @@ pub enum NotReadyReason {
 
 /// Internal FSM state. Private — observers use `ConnectionStatus` instead.
 enum ActorState {
+    /// Transient bootstrap state. The run loop dials immediately (eager
+    /// connect), so the actor never rests here; it also serves as the
+    /// placeholder `finish_closing` swaps in before computing the next state.
     Idle,
     Connecting {
         attempt: u32,
@@ -1892,20 +1897,20 @@ impl RpcActor {
 
             match &self.state {
                 ActorState::Idle => {
-                    tokio::select! {
-                        cmd = self.rx.recv() => {
-                            let Some(envelope) = cmd else {
-                                // mpsc closed — shutdown.
-                                self.start_closing(CloseCause::Shutdown);
-                                continue;
-                            };
-                            // First command kicks off Connecting. Reject the
-                            // command (caller retries) so we don't queue it
-                            // through a handshake that could take 25 seconds.
-                            self.reject_not_ready(envelope.command);
-                            self.start_connecting(1);
-                        }
-                    }
+                    // Eager connect: the actor dials the moment it starts
+                    // running rather than waiting for a first command to kick
+                    // it. A client should reach for the connection as soon as
+                    // it can — that gives the user an early connected/failed
+                    // signal, and a command arriving after startup usually
+                    // finds us already Connected instead of eating a
+                    // sacrificial NotReady("idle") round-trip. This is
+                    // asynchronous: `start_connecting` spawns the handshake
+                    // task and returns; commands that race the handshake are
+                    // handled by the `Connecting` arm (rejected as
+                    // NotReady(Connecting), or served once Connected). Shutdown
+                    // (mpsc closed) is likewise observed there. Idle is now a
+                    // transient bootstrap state the actor never rests in.
+                    self.start_connecting(1);
                 }
 
                 ActorState::Cooldown { until, .. } => {

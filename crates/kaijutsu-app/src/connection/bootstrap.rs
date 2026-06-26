@@ -119,7 +119,8 @@ fn bootstrap_thread(
                             );
 
                             // spawn_actor creates the actor in this LocalSet.
-                            // It will auto-connect on first command (lazy connect).
+                            // It dials eagerly the moment it starts running, so
+                            // the connection is in flight before any command.
                             //
                             // The kernel_id passed in is advisory — the FSM
                             // re-binds and learns the server-authoritative

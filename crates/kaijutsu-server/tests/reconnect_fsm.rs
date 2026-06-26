@@ -17,7 +17,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio::task::{JoinHandle, LocalSet};
 
 use kaijutsu_client::{
-    ActorHandle, CallError, ConnectionStatus, KeySource, NotReadyReason, ServerEvent, SshConfig,
+    ActorHandle, CallError, ConnectionStatus, KeySource, ServerEvent, SshConfig,
     SyncState, SyncedDocument, spawn_actor,
 };
 use kaijutsu_crdt::{ContextId, PrincipalId};
@@ -175,34 +175,32 @@ async fn whoami_with_retry(
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
 
-/// The first command issued to an Idle actor returns `NotReady(Idle)` and
-/// triggers the transition to `Connecting`. The new typed error is the
-/// contract that callers depend on; this nails it down.
+/// Eager connect: a freshly spawned actor dials on its own, with no command to
+/// kick it. This nails down the contract — the actor reaches `Connected`
+/// without any caller traffic, so the first real call doesn't eat a sacrificial
+/// `NotReady(Idle)`. (Under the old lazy scheme this test would hang in Idle.)
 #[test]
-fn first_call_rejected_with_idle_then_actor_connects() {
+fn actor_connects_eagerly_without_a_command() {
     run_local(async {
         let server = start_server_on(None).await;
-        let actor = spawn_test_actor(server.addr, "test-first-call");
+        // Subscribe to status BEFORE the actor task gets a chance to run (the
+        // LocalSet only advances when we await), so we can't miss a transition.
+        let actor = spawn_test_actor(server.addr, "test-eager-connect");
 
-        // The first call hits the FSM in Idle and gets NotReady(Idle).
-        let first = actor.whoami().await;
-        assert!(
-            matches!(
-                first,
-                Err(CallError::NotReady(NotReadyReason::Idle))
-                    | Err(CallError::NotReady(NotReadyReason::Connecting { .. }))
-            ),
-            "first call should be NotReady, got {:?}",
-            first
-        );
+        // No command is ever sent here — the actor must reach Connected on its
+        // own. If eager connect regressed to lazy, this wait would time out.
+        wait_for_status(
+            &actor,
+            "Connected",
+            Duration::from_secs(5),
+            |s| matches!(s, ConnectionStatus::Connected { .. }),
+        )
+        .await;
 
-        // Subsequent calls should succeed once Connected.
-        let id = whoami_with_retry(&actor, Duration::from_secs(5))
-            .await
-            .expect("should connect within 5s");
+        // And the first call now succeeds straight away — no kick needed.
         // Anonymous-mode auto-registration may rename the user on collision;
-        // the load-bearing assertion is that we GOT an identity, not its
-        // exact form.
+        // the load-bearing assertion is that we GOT an identity.
+        let id = actor.whoami().await.expect("whoami after eager connect");
         assert!(!id.username.is_empty(), "username should be non-empty");
     });
 }

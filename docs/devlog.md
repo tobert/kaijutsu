@@ -12,6 +12,34 @@ Newest work first within each area; dates are when the work landed.
 
 ## SSH transport & RPC surface (design: `docs/sftp.md`)
 
+### Client actor connects eagerly, not on first command (landed 2026-06-26)
+
+Surfaced while flag-day-reconnecting the MCP during the named-subsystem cutover
+(below): the first call after any cold start returned `not ready: idle`, and you
+had to call twice. That was by design — the client RPC actor
+(`kaijutsu-client/src/actor.rs`) was a *lazy*-connect FSM: it rested in `Idle`
+and only dialed when the first command arrived, deliberately rejecting that
+command (`NotReady(Idle)`) rather than blocking the caller for up to ~25s through
+the SSH+capnp handshake. Reasonable for a retry-loop poller, but the MCP/app tool
+surface doesn't absorb the kick, so the `NotReady` leaked to the human/agent as a
+visible first-call failure on every reconnect.
+
+Amy's steer: a client should reach for the connection as soon as it can — the
+early connected/failed signal is worth more than the apparent efficiency of
+deferring, and it shouldn't sit in a state that bounces commands. So the `Idle`
+arm now calls `start_connecting(1)` immediately instead of waiting for a command;
+`Idle` becomes a transient bootstrap the actor never rests in. The change is
+surgical because the post-disconnect path *already* self-reconnected
+(`finish_closing` → `Cooldown` → timer → `Connecting`); only cold start waited on
+a command. Commands that race the handshake are still handled by the `Connecting`
+arm (`NotReady(Connecting)`, or served once `Connected`), and shutdown (mpsc
+closed) is observed there too — so nothing regressed. The e2e contract test was
+rewritten from `first_call_rejected_with_idle_then_actor_connects` to
+`actor_connects_eagerly_without_a_command`: it waits for `Connected` with **no
+command sent**, which hangs→times-out on the old lazy code. Live-validated over
+MCP — the first `whoami` after reconnect now reaches the kernel instead of being
+bounced.
+
 ### RPC migrates from channel-ordinal to a named SSH subsystem (landed 2026-06-26)
 
 Slice 0 of the SSH-surface renovation in `docs/sftp.md`. The Cap'n Proto RPC
