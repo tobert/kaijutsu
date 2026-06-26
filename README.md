@@ -64,6 +64,13 @@ cargo versions soon.
 # First time: add your SSH key
 cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --nick amy
 
+# ...or bulk-import an existing authorized_keys file
+cargo run -p kaijutsu-server -- import ~/.ssh/authorized_keys
+
+# Check what's registered
+cargo run -p kaijutsu-server -- list-users
+cargo run -p kaijutsu-server -- list-keys amy
+
 # Terminal 1: Server
 cargo run -p kaijutsu-server
 
