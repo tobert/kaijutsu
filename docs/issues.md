@@ -65,6 +65,13 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Architecture & System Design
 
+- **SSH shell subsystem (`kaijutsu-shell`):** give an `ssh` user an interactive kaish
+  with `kj` that starts in a lobby and attaches into contexts (VFS reflows on switch).
+  Design + wiring captured in [`ssh-shell.md`](ssh-shell.md). Start after the SFTP
+  read-path work settles (shared subsystem plumbing). Open decisions noted there:
+  per-principal home vs shared lobby anchor (copy the `lost+found` `ensure_*` pattern —
+  *not* the global-singleton `scratch` context), and whether `Send`-ness lets it run
+  SFTP-style or needs the RPC dedicated-thread treatment.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
