@@ -6,6 +6,35 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## SFTP over the VFS (slices 1–3 landed 2026-06-26; follow-ups)
+
+Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
+the `"sftp"` arm in `ssh.rs`). Two DeepSeek reviews + a Gemini Pro batch
+whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
+
+- **Slice 3 — capability binding (next).** Replace the stopgap
+  `privileged_write_denied` (lexical `/etc/rc`+`/etc/config` deny) with a real
+  loadout binding routed through the shared `context_allows_rc_write` guard.
+  Path-based context routing is the preferred option (`docs/sftp.md` → "Three
+  options"). **This also fixes the altitude bug the Gemini review flagged:** the
+  lexical deny sits *above* symlink resolution, so a symlink resolving into the
+  gated tree would slip past it (not a live bypass today — symlinks don't cross
+  mount backends and host `/` is read-only — but the gate belongs below
+  resolution).
+- **Slice 4 — adapter limits.** Rate-limiting + traversal-depth/size caps to
+  survive an editor-indexer crawl (the access-pattern-shift DoS in
+  `docs/sftp.md` → Security posture). The open-handle cap (1024/session) is a
+  coarse down-payment; also need true streaming `readdir` — `VfsOps::readdir`
+  loads the whole entry list, so only the heavy per-entry `File` build is chunked
+  today, not the `DirEntry` fetch.
+- **TOCTOU atomicity refactor.** The write/fsetstat generation guard has a
+  narrow post-write race (re-getattr after our own write can adopt a concurrent
+  replacement's generation). The clean fix is making `VfsOps::write`/`setattr`
+  return the new `FileAttr` atomically — a kernel-wide change worth doing before
+  slice 4.
+- **Runner-verify** with a stock `sftp`/sshfs client through the real server
+  (kernel rebuild+restart; capnp schema unchanged, but it's a new subsystem).
+
 ## Instrument reframing & RC stances (follow-ups from the 2026-06-22 pass)
 
 The pass that reframed kaijutsu as an instrument, rewrote the rc create-stances,
