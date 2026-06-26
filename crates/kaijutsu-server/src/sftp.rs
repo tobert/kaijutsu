@@ -22,13 +22,31 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kaijutsu_kernel::{DirEntry, FileAttr, FileType, MountTable, SetAttr, VfsError, VfsOps};
+use bytes::Bytes;
+use kaijutsu_kernel::{DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps};
 use kaijutsu_types::Principal;
 
+use russh_sftp::extensions::{
+    self, FsyncExtension, HardlinkExtension, Statvfs, StatvfsExtension,
+};
 use russh_sftp::protocol::{
-    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
+    Attrs, Data, ExtendedReply, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status,
+    StatusCode, Version,
 };
 use russh_sftp::server::{Handler, StatusReply};
+
+/// `posix-rename@openssh.com` is the OpenSSH extension sshfs uses for an
+/// overwrite-on-exists rename; russh-sftp has no constant for it.
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
+
+/// Wire payload of `posix-rename@openssh.com`: two SSH strings, same layout as
+/// [`HardlinkExtension`]. Defined locally because russh-sftp ships no struct for
+/// this extension.
+#[derive(serde::Deserialize)]
+struct PosixRenameExtension {
+    oldpath: String,
+    newpath: String,
+}
 
 /// An open file handle: the resolved path plus the access flags. The
 /// `generation` captured at open is the TOCTOU re-verify anchor used by the
@@ -226,6 +244,25 @@ impl Handler for SftpSession {
 
     fn unimplemented(&self) -> Self::Error {
         StatusReply::new(StatusCode::OpUnsupported)
+    }
+
+    async fn init(
+        &mut self,
+        _version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
+        // Advertise the OpenSSH extensions stock clients depend on. sshfs in
+        // particular *refuses to write* without `statvfs@openssh.com` and uses
+        // `posix-rename@openssh.com` for atomic overwrite-renames.
+        let mut ext = HashMap::new();
+        ext.insert(extensions::STATVFS.to_string(), "2".to_string());
+        ext.insert(POSIX_RENAME.to_string(), "1".to_string());
+        ext.insert(extensions::HARDLINK.to_string(), "1".to_string());
+        ext.insert(extensions::FSYNC.to_string(), "1".to_string());
+        Ok(Version {
+            version: russh_sftp::protocol::VERSION,
+            extensions: ext,
+        })
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
@@ -597,6 +634,99 @@ impl Handler for SftpSession {
         }
         Ok(ok_status(id))
     }
+
+    async fn extended(
+        &mut self,
+        id: u32,
+        request: String,
+        data: Vec<u8>,
+    ) -> Result<Packet, Self::Error> {
+        match request.as_str() {
+            // Overwrite-on-exists rename. Plain SFTPv3 RENAME fails if the
+            // target exists; sshfs needs this for atomic replace.
+            POSIX_RENAME => {
+                let ext: PosixRenameExtension = decode_ext(data)?;
+                let from = canonicalize(&ext.oldpath);
+                let to = canonicalize(&ext.newpath);
+                if let Some(denied) =
+                    privileged_write_denied(&from).or_else(|| privileged_write_denied(&to))
+                {
+                    return Err(denied);
+                }
+                // Best-effort overwrite: remove an existing destination first,
+                // then rename. (A future slice can make this atomic in the VFS.)
+                if self.vfs.exists(&to).await {
+                    self.vfs.unlink(&to).await.map_err(reply)?;
+                }
+                self.vfs.rename(&from, &to).await.map_err(reply)?;
+                Ok(Packet::Status(ok_status(id)))
+            }
+            extensions::HARDLINK => {
+                let ext: HardlinkExtension = decode_ext(data)?;
+                let old = canonicalize(&ext.oldpath);
+                let new = canonicalize(&ext.newpath);
+                if let Some(denied) = privileged_write_denied(&new) {
+                    return Err(denied);
+                }
+                self.vfs.link(&old, &new).await.map_err(reply)?;
+                Ok(Packet::Status(ok_status(id)))
+            }
+            // Every vfs.write is synchronous write-through, so there is nothing
+            // buffered to flush — fsync is a success no-op. We still validate the
+            // handle so a bad handle fails loud.
+            extensions::FSYNC => {
+                let ext: FsyncExtension = decode_ext(data)?;
+                if !self.handles.contains_key(&ext.handle) {
+                    return Err(StatusReply::new(StatusCode::Failure).with_message("bad handle"));
+                }
+                Ok(Packet::Status(ok_status(id)))
+            }
+            extensions::STATVFS => {
+                let ext: StatvfsExtension = decode_ext(data)?;
+                let path = canonicalize(&ext.path);
+                // Path must resolve, but statfs itself is filesystem-wide.
+                self.vfs.getattr(&path).await.map_err(reply)?;
+                let stat = self.vfs.statfs().await.map_err(reply)?;
+                let bytes = russh_sftp::ser::to_bytes(&to_statvfs(&stat, self.vfs.read_only()))
+                    .map_err(|e| {
+                        StatusReply::new(StatusCode::Failure)
+                            .with_message(format!("statvfs encode: {e}"))
+                    })?;
+                Ok(Packet::ExtendedReply(ExtendedReply {
+                    id,
+                    data: bytes.to_vec(),
+                }))
+            }
+            other => Err(StatusReply::new(StatusCode::OpUnsupported)
+                .with_message(format!("unsupported extension: {other}"))),
+        }
+    }
+}
+
+/// Deserialize an extension's SSH-wire payload, failing loud as a `BadMessage`
+/// rather than a generic failure (a malformed extension is a protocol error).
+fn decode_ext<T: serde::de::DeserializeOwned>(data: Vec<u8>) -> Result<T, StatusReply> {
+    russh_sftp::de::from_bytes(&mut Bytes::from(data)).map_err(|e| {
+        StatusReply::new(StatusCode::BadMessage).with_message(format!("bad extension payload: {e}"))
+    })
+}
+
+/// Map kernel [`StatFs`] onto the `statvfs@openssh.com` reply struct.
+fn to_statvfs(stat: &StatFs, read_only: bool) -> Statvfs {
+    const ST_RDONLY: u64 = 0x1;
+    Statvfs {
+        block_size: stat.bsize as u64,
+        fragment_size: stat.frsize as u64,
+        blocks: stat.blocks,
+        blocks_free: stat.bfree,
+        blocks_avail: stat.bavail,
+        inodes: stat.files,
+        inodes_free: stat.ffree,
+        inodes_avail: stat.ffree,
+        fs_id: 0,
+        flags: if read_only { ST_RDONLY } else { 0 },
+        name_max: stat.namelen as u64,
+    }
 }
 
 /// A typed-but-empty attribute stub for a directory entry whose `getattr`
@@ -730,6 +860,65 @@ mod tests {
             .expect_err("read-only handle must not truncate");
         assert_eq!(err.status_code, StatusCode::PermissionDenied);
         assert_eq!(vfs.read_all(Path::new("/ro.txt")).await.unwrap(), b"keepme");
+    }
+
+    #[tokio::test]
+    async fn posix_rename_overwrites_existing_target() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/a.txt"), b"aaa").await.unwrap();
+        vfs.write_all(Path::new("/b.txt"), b"bbb").await.unwrap();
+
+        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        // posix-rename payload has the same two-SSH-string wire shape as
+        // HardlinkExtension, so reuse its serializer to build the bytes.
+        let payload: Vec<u8> = HardlinkExtension {
+            oldpath: "/a.txt".into(),
+            newpath: "/b.txt".into(),
+        }
+        .try_into()
+        .unwrap();
+
+        let packet = Handler::extended(&mut s, 1, POSIX_RENAME.into(), payload)
+            .await
+            .expect("posix-rename over existing target");
+        assert!(matches!(packet, Packet::Status(_)));
+
+        // /b.txt now holds /a.txt's content (plain RENAME would have failed on
+        // the existing target); /a.txt is gone.
+        assert_eq!(vfs.read_all(Path::new("/b.txt")).await.unwrap(), b"aaa");
+        assert!(!vfs.exists(Path::new("/a.txt")).await);
+    }
+
+    #[tokio::test]
+    async fn unknown_extension_is_op_unsupported() {
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        let mut s = SftpSession::new(Principal::system(), vfs);
+        let err = Handler::extended(&mut s, 1, "made-up@example.com".into(), vec![])
+            .await
+            .expect_err("unknown extension");
+        assert_eq!(err.status_code, StatusCode::OpUnsupported);
+    }
+
+    #[tokio::test]
+    async fn hardlink_surfaces_backend_unsupported_cleanly() {
+        // MemoryBackend has no hard links; the extension must surface that as a
+        // clean status, not a panic.
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", MemoryBackend::new()).await;
+        vfs.write_all(Path::new("/src.txt"), b"x").await.unwrap();
+        let mut s = SftpSession::new(Principal::system(), vfs);
+        let payload: Vec<u8> = HardlinkExtension {
+            oldpath: "/src.txt".into(),
+            newpath: "/link.txt".into(),
+        }
+        .try_into()
+        .unwrap();
+        let err = Handler::extended(&mut s, 1, extensions::HARDLINK.into(), payload)
+            .await
+            .expect_err("memory backend has no hard links");
+        assert_eq!(err.status_code, StatusCode::Failure);
     }
 
     #[test]

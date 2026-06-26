@@ -19,6 +19,7 @@ tokio-util.workspace = true
 futures.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
+bytes = "1"
 log.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true

@@ -171,6 +171,21 @@ async fn setstat_resizes_via_truncate() {
 }
 
 #[tokio::test]
+async fn statvfs_extension_reports_filesystem_stats() {
+    // The client only enables fs_info() if the server advertised
+    // statvfs@openssh.com in the VERSION exchange — so this exercises both the
+    // init advertisement and the extended() statvfs reply end to end.
+    let client = fixture().await;
+    let info = client
+        .fs_info("/")
+        .await
+        .expect("statvfs call")
+        .expect("server advertised statvfs@openssh.com");
+    assert!(info.block_size > 0, "block_size should be populated");
+    assert!(info.blocks > 0, "blocks should be populated");
+}
+
+#[tokio::test]
 async fn writes_to_etc_rc_are_refused() {
     // Until the SFTP session carries a capability binding (slice 3), a write to
     // the capability-gated trees fails loud rather than bypassing the gate.
