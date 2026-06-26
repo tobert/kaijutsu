@@ -91,10 +91,14 @@ impl SftpSession {
 /// Lexically canonicalize a client-supplied path into an absolute path rooted
 /// at `/`, the root of the global VFS tree.
 ///
-/// This is the directory-traversal guard: it resolves `.` and `..` *without*
-/// string surgery that could escape the mount boundary. `..` past the root is
-/// clamped (a pop on an empty stack is a no-op), and a relative path is treated
-/// as relative to `/`. `realpath(".")` therefore resolves to `/`.
+/// This is **lexical** normalization — defense-in-depth, not the real escape
+/// guard. It resolves `.` and `..` *without* string surgery, clamping `..` at
+/// the root (a pop on an empty stack is a no-op) and treating a relative path
+/// as relative to `/`, so `realpath(".")` resolves to `/`. Its job is to hand
+/// `MountTable` a clean absolute path that routes to the right mount; the
+/// authoritative escape check (symlinks resolved, `starts_with(root)`) lives in
+/// the backends (`LocalBackend::resolve`, `ConfigCrdtFs::resolve`), which a
+/// lexical normalizer structurally cannot replace.
 fn canonicalize(raw: &str) -> PathBuf {
     let mut out: Vec<std::ffi::OsString> = Vec::new();
     for comp in Path::new(raw).components() {
@@ -228,7 +232,10 @@ impl Handler for SftpSession {
             let child = path.join(&entry.name);
             let attr = match self.vfs.getattr(&child).await {
                 Ok(a) => a,
-                Err(_) => stub_attr(entry.kind),
+                Err(e) => {
+                    log::debug!("sftp opendir getattr {} failed: {e}", child.display());
+                    stub_attr(entry.kind)
+                }
             };
             files.push(dir_file(entry, &attr));
         }
@@ -266,9 +273,13 @@ impl Handler for SftpSession {
     ) -> Result<Handle, Self::Error> {
         let path = canonicalize(&filename);
 
-        // Write path lands in the next slice; for now a write/create/truncate
-        // open fails loud rather than silently dropping data.
-        if pflags.intersects(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE) {
+        // Write path lands in the next slice; for now any open that could
+        // mutate fails loud rather than silently dropping data. APPEND implies
+        // write access (a client may WRITE on a READ|APPEND handle), so it is
+        // in the rejection set alongside WRITE/CREATE/TRUNCATE.
+        if pflags.intersects(
+            OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        ) {
             return Err(StatusReply::new(StatusCode::OpUnsupported)
                 .with_message("sftp write not yet implemented"));
         }
