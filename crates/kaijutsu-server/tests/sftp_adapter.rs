@@ -14,6 +14,17 @@ use kaijutsu_server::sftp::SftpSession;
 use kaijutsu_types::Principal;
 
 use russh_sftp::client::SftpSession as ClientSession;
+use tokio::io::AsyncWriteExt;
+
+/// Create-or-truncate `path` and write `data`, then close the handle. The
+/// high-level `SftpSession::write` helper opens WRITE-only (no CREATE), so it
+/// can't create a new file against a spec-correct server — this drives the
+/// `create()` (CREATE|TRUNCATE|WRITE) + `File` AsyncWrite path instead.
+async fn put(client: &ClientSession, path: &str, data: &[u8]) {
+    let mut file = client.create(path).await.expect("create for write");
+    file.write_all(data).await.expect("write_all");
+    file.shutdown().await.expect("close handle");
+}
 
 /// Build a `MountTable` with an in-memory backend at `/`, seeded with a file
 /// and a nested directory, plus a connected SFTP client speaking to the
@@ -102,17 +113,84 @@ async fn missing_file_is_no_such_file() {
 }
 
 #[tokio::test]
-async fn write_is_not_yet_supported() {
-    // Slice boundary: opening for write fails loud (no silent data loss) until
-    // the write path lands. Flip this assertion when that slice ships.
+async fn write_creates_and_overwrites() {
     let client = fixture().await;
-    let err = client
-        .write("/hello.txt", b"clobber")
+
+    // Create a new file.
+    put(&client, "/fresh.txt", b"first body").await;
+    assert_eq!(
+        client.read("/fresh.txt").await.expect("read back"),
+        b"first body"
+    );
+
+    // Overwrite an existing file (create+truncate+write); truncate means no
+    // stale tail from the longer original survives.
+    put(&client, "/hello.txt", b"replaced").await;
+    assert_eq!(
+        client.read("/hello.txt").await.expect("read back"),
+        b"replaced"
+    );
+}
+
+#[tokio::test]
+async fn mkdir_remove_rename_round_trip() {
+    let client = fixture().await;
+
+    client.create_dir("/newdir").await.expect("mkdir /newdir");
+    assert!(client.metadata("/newdir").await.expect("stat").is_dir());
+
+    put(&client, "/newdir/a.txt", b"aaa").await;
+    client
+        .rename("/newdir/a.txt", "/newdir/b.txt")
         .await
-        .expect_err("write should be rejected this slice");
+        .expect("rename");
+    assert_eq!(
+        client.read("/newdir/b.txt").await.expect("read renamed"),
+        b"aaa"
+    );
+
+    client
+        .remove_file("/newdir/b.txt")
+        .await
+        .expect("remove file");
+    client.remove_dir("/newdir").await.expect("rmdir");
+    assert!(!client.try_exists("/newdir").await.expect("exists check"));
+}
+
+#[tokio::test]
+async fn setstat_resizes_via_truncate() {
+    let client = fixture().await;
+    let mut meta = russh_sftp::protocol::FileAttributes::empty();
+    meta.size = Some(4);
+    client
+        .set_metadata("/hello.txt", meta)
+        .await
+        .expect("setstat size");
+    let body = client.read("/hello.txt").await.expect("read truncated");
+    assert_eq!(body, b"hell");
+}
+
+#[tokio::test]
+async fn writes_to_etc_rc_are_refused() {
+    // Until the SFTP session carries a capability binding (slice 3), a write to
+    // the capability-gated trees fails loud rather than bypassing the gate.
+    let vfs = Arc::new(MountTable::new());
+    vfs.mount("/", MemoryBackend::new()).await;
+    vfs.mkdir(std::path::Path::new("/etc"), 0o755).await.unwrap();
+    vfs.mkdir(std::path::Path::new("/etc/rc"), 0o755).await.unwrap();
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
+    let client = ClientSession::new(client_io).await.expect("handshake");
+
+    // `File` isn't `Debug`, so match rather than `expect_err`.
+    let err = match client.create("/etc/rc/evil.kai").await {
+        Ok(_) => panic!("etc/rc create must be refused"),
+        Err(e) => e,
+    };
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("unsupported") || msg.contains("not yet implemented"),
-        "unexpected write error: {msg}"
+        msg.contains("permission") || msg.contains("capability-gated"),
+        "unexpected etc/rc error: {msg}"
     );
 }
