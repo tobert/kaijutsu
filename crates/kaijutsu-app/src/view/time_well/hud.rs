@@ -71,10 +71,11 @@ const HUD_DEPTH: f32 = 100.0;
 /// fit in `hud_transform` keeps each panel's outer edge exactly this far in, so
 /// a small value hugs the screen edge.
 const HUD_MARGIN: f32 = 0.02;
-/// Extra downward drop (fraction of half-height) for the E/W corner panels so
-/// their top edge clears the app's persistent top status bar. N is center-top
-/// and clears the bar's left/right labels on its own.
-const HUD_EW_TOP_DROP: f32 = 0.15;
+/// Fallback top-drop (fraction of the frustum half-height) used before UI layout
+/// has produced a real dock/window size. ~0.15 matches a 40px dock in a
+/// ~540px-tall window; [`dock_top_drop`] derives the live value from the actual
+/// dock vs window height so the clearance stays correct at any resolution.
+const HUD_TOP_DROP_FALLBACK: f32 = 0.15;
 /// Texture-space font size + inner padding for the readout text.
 const HUD_FONT_SIZE: f32 = 27.0;
 /// North's context-name (first line) is rendered this much larger than the body.
@@ -136,28 +137,54 @@ fn hud_shape(slot: HudSlot) -> Vec4 {
 /// depth `depth` the frustum half-extents are `half_h = depth·tan(fov_y/2)` and
 /// `half_w = half_h·aspect`; the anchor sits `margin` (fraction of the half-extent)
 /// inboard of the edge, on the plane `z = -depth` (camera looks down local -Z).
-/// N anchors top-center; **E/W anchor to the top corners** (they share N's top
-/// row and grow downward — `hud_transform` fits the panel in from the anchor).
-pub fn hud_slot_offset(slot: HudSlot, fov_y: f32, aspect: f32, depth: f32, margin: f32) -> Vec3 {
+/// All three top-anchored panels (N center-top, **E/W top corners**) share one
+/// dropped top row — `top_drop` (fraction of the half-height, from
+/// [`dock_top_drop`]) lowers that row so the panels clear the persistent top dock,
+/// whose right side now carries sparklines that reach toward N at narrow widths.
+pub fn hud_slot_offset(
+    slot: HudSlot,
+    fov_y: f32,
+    aspect: f32,
+    depth: f32,
+    margin: f32,
+    top_drop: f32,
+) -> Vec3 {
     let half_h = depth * (fov_y * 0.5).tan();
     let half_w = half_h * aspect;
     let inset = 1.0 - margin;
+    // Top-anchored panels share this row, dropped below the dock band.
+    let top = inset - top_drop;
     match slot {
-        HudSlot::North => Vec3::new(0.0, half_h * inset, -depth),
+        HudSlot::North => Vec3::new(0.0, half_h * top, -depth),
         HudSlot::South => Vec3::new(0.0, -half_h * inset, -depth),
-        HudSlot::East => Vec3::new(half_w * inset, half_h * (inset - HUD_EW_TOP_DROP), -depth),
-        HudSlot::West => Vec3::new(-half_w * inset, half_h * (inset - HUD_EW_TOP_DROP), -depth),
+        HudSlot::East => Vec3::new(half_w * inset, half_h * top, -depth),
+        HudSlot::West => Vec3::new(-half_w * inset, half_h * top, -depth),
+    }
+}
+
+/// Top-edge inset (fraction of the frustum half-height) needed to clear the
+/// persistent top dock. The dock lays out in fixed pixels while the HUD is
+/// frustum-proportional, so a fixed fraction would over/under-shoot as the window
+/// scales; deriving from the dock's real pixel height keeps the clearance exact at
+/// every resolution. The window's full height maps to `2·half_h`, so a `dock_h`-px
+/// band is `2·dock_h/window_h` of the half-height. Falls back to
+/// [`HUD_TOP_DROP_FALLBACK`] before layout has produced sizes.
+fn dock_top_drop(window_h: f32, dock_h: f32) -> f32 {
+    if window_h > 0.0 && dock_h > 0.0 {
+        2.0 * dock_h / window_h
+    } else {
+        HUD_TOP_DROP_FALLBACK
     }
 }
 
 /// Full child-local transform for a slot: edge offset + a scale that sizes the
 /// shared unit quad to [`hud_quad_size`]. Recomputed on spawn and every frame
 /// ([`position_well_hud`]) so the HUD stays edge-locked across window resizes.
-fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32) -> Transform {
+fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32, top_drop: f32) -> Transform {
     let half_h = HUD_DEPTH * (fov_y * 0.5).tan();
     let half_w = half_h * aspect;
     let size = hud_quad_size(slot, half_w, half_h);
-    let anchor = hud_slot_offset(slot, fov_y, aspect, HUD_DEPTH, HUD_MARGIN);
+    let anchor = hud_slot_offset(slot, fov_y, aspect, HUD_DEPTH, HUD_MARGIN, top_drop);
     // Fit the panel fully inside from its edge/corner anchor: pull horizontally
     // toward center by half-width (a center-anchored panel like N stays at x=0 —
     // note `f32::signum(0.0)` is 1.0, so guard the zero case) and always down
@@ -189,12 +216,15 @@ pub fn spawn_well_hud(
     mut materials: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     camera: Query<(Entity, &Projection), With<Camera3d>>,
+    windows: Query<&Window>,
+    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
 ) {
     let Ok((cam_entity, projection)) = camera.single() else {
         warn!("well HUD: no Camera3d to parent panels to");
         return;
     };
     let (fov_y, aspect) = read_perspective(projection);
+    let top_drop = top_drop_from(&windows, &dock);
 
     // Shared unit quad; per-panel size rides on Transform.scale.
     let quad = meshes.add(Rectangle::new(1.0, 1.0));
@@ -216,7 +246,7 @@ pub fn spawn_well_hud(
                 HudText::default(),
                 Mesh3d(quad.clone()),
                 MeshMaterial3d(material),
-                hud_transform(slot, fov_y, aspect),
+                hud_transform(slot, fov_y, aspect, top_drop),
                 Visibility::Inherited,
                 panel,
                 Name::new("WellHudPanel"),
@@ -236,15 +266,29 @@ pub fn despawn_well_hud(mut commands: Commands, hud: Query<Entity, With<WellHud>
 /// (cheap — four `Vec3`s) so the HUD tracks window-aspect/FOV changes.
 pub fn position_well_hud(
     camera: Query<&Projection, With<Camera3d>>,
+    windows: Query<&Window>,
+    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
     mut panels: Query<(&HudSlot, &mut Transform), With<WellHud>>,
 ) {
     let Ok(projection) = camera.single() else {
         return;
     };
     let (fov_y, aspect) = read_perspective(projection);
+    let top_drop = top_drop_from(&windows, &dock);
     for (slot, mut tf) in panels.iter_mut() {
-        *tf = hud_transform(*slot, fov_y, aspect);
+        *tf = hud_transform(*slot, fov_y, aspect, top_drop);
     }
+}
+
+/// Read the live window + dock heights and turn them into a [`dock_top_drop`]
+/// fraction. Shared by spawn and per-frame positioning so both agree.
+fn top_drop_from(
+    windows: &Query<&Window>,
+    dock: &Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
+) -> f32 {
+    let window_h = windows.single().map(|w| w.height()).unwrap_or(0.0);
+    let dock_h = dock.single().map(|c| c.size().y).unwrap_or(0.0);
+    dock_top_drop(window_h, dock_h)
 }
 
 /// Refresh the four readouts from the current selection. Recomputes the formatted
@@ -543,64 +587,84 @@ mod tests {
 
     #[test]
     fn slots_sit_on_their_edges() {
-        let (fov, aspect, m) = (FRAC_PI_4, 16.0 / 9.0, 0.16);
-        let n = hud_slot_offset(HudSlot::North, fov, aspect, D, m);
-        let s = hud_slot_offset(HudSlot::South, fov, aspect, D, m);
-        let e = hud_slot_offset(HudSlot::East, fov, aspect, D, m);
-        let w = hud_slot_offset(HudSlot::West, fov, aspect, D, m);
+        let (fov, aspect, m, drop) = (FRAC_PI_4, 16.0 / 9.0, 0.16, 0.15);
+        let n = hud_slot_offset(HudSlot::North, fov, aspect, D, m, drop);
+        let s = hud_slot_offset(HudSlot::South, fov, aspect, D, m, drop);
+        let e = hud_slot_offset(HudSlot::East, fov, aspect, D, m, drop);
+        let w = hud_slot_offset(HudSlot::West, fov, aspect, D, m, drop);
         assert!(n.y > 0.0, "north is above center");
         assert!(s.y < 0.0, "south is below center");
         assert!(e.x > 0.0, "east is right of center");
         assert!(w.x < 0.0, "west is left of center");
-        // N centered horizontally; E/W anchor to the top corners but drop a bit
-        // below N's row to clear the top status bar.
+        // N centered horizontally; E/W anchor to the top corners. All three
+        // top-anchored panels share one dock-cleared row.
         assert_eq!(n.x, 0.0);
         assert_eq!(s.x, 0.0);
-        assert!(e.y < n.y, "east drops below the top row to clear the bar");
-        assert!(e.y > 0.0, "but is still in the upper half");
+        assert_eq!(e.y, n.y, "east shares north's dropped top row");
         assert_eq!(e.y, w.y, "east/west share the dropped top row");
+        assert!(e.y > 0.0, "but the row is still in the upper half");
         assert_eq!(e.x, -w.x, "east/west are symmetric");
     }
 
     #[test]
     fn all_slots_share_one_plane() {
-        let (fov, aspect, m) = (FRAC_PI_4, 1.5, 0.1);
-        let z = hud_slot_offset(HudSlot::North, fov, aspect, D, m).z;
+        let (fov, aspect, m, drop) = (FRAC_PI_4, 1.5, 0.1, 0.1);
+        let z = hud_slot_offset(HudSlot::North, fov, aspect, D, m, drop).z;
         assert_eq!(z, -D, "panels sit at -depth in front of the camera");
         for slot in HudSlot::ALL {
-            assert_eq!(hud_slot_offset(slot, fov, aspect, D, m).z, z, "shared plane");
+            assert_eq!(hud_slot_offset(slot, fov, aspect, D, m, drop).z, z, "shared plane");
         }
     }
 
     #[test]
     fn wider_aspect_pushes_sides_out_but_not_top() {
-        let (fov, m) = (FRAC_PI_4, 0.12);
-        let narrow = hud_slot_offset(HudSlot::East, fov, 1.0, D, m).x;
-        let wide = hud_slot_offset(HudSlot::East, fov, 2.0, D, m).x;
+        let (fov, m, drop) = (FRAC_PI_4, 0.12, 0.15);
+        let narrow = hud_slot_offset(HudSlot::East, fov, 1.0, D, m, drop).x;
+        let wide = hud_slot_offset(HudSlot::East, fov, 2.0, D, m, drop).x;
         assert!(wide > narrow, "east moves further right as aspect widens");
         // North's vertical placement is aspect-independent.
-        let n1 = hud_slot_offset(HudSlot::North, fov, 1.0, D, m).y;
-        let n2 = hud_slot_offset(HudSlot::North, fov, 2.0, D, m).y;
+        let n1 = hud_slot_offset(HudSlot::North, fov, 1.0, D, m, drop).y;
+        let n2 = hud_slot_offset(HudSlot::North, fov, 2.0, D, m, drop).y;
         assert_eq!(n1, n2, "north.y does not depend on aspect");
     }
 
     #[test]
     fn depth_scales_extents_linearly() {
-        let (fov, aspect, m) = (FRAC_PI_4, 1.6, 0.1);
-        let near = hud_slot_offset(HudSlot::North, fov, aspect, D, m);
-        let far = hud_slot_offset(HudSlot::North, fov, aspect, 2.0 * D, m);
+        let (fov, aspect, m, drop) = (FRAC_PI_4, 1.6, 0.1, 0.1);
+        let near = hud_slot_offset(HudSlot::North, fov, aspect, D, m, drop);
+        let far = hud_slot_offset(HudSlot::North, fov, aspect, 2.0 * D, m, drop);
         assert!((far.y - 2.0 * near.y).abs() < 1e-3, "doubling depth doubles half-height");
         assert!((far.z - 2.0 * near.z).abs() < 1e-3, "and the in-front distance");
     }
 
     #[test]
-    fn margin_zero_lands_on_the_frustum_edge() {
+    fn margin_and_drop_zero_lands_on_the_frustum_edge() {
         let (fov, aspect) = (FRAC_PI_4, 1.6);
         let half_h = D * (fov * 0.5).tan();
-        let on_edge = hud_slot_offset(HudSlot::North, fov, aspect, D, 0.0).y;
-        assert!((on_edge - half_h).abs() < 1e-3, "margin 0 → center on the edge");
+        let on_edge = hud_slot_offset(HudSlot::North, fov, aspect, D, 0.0, 0.0).y;
+        assert!((on_edge - half_h).abs() < 1e-3, "margin 0 + drop 0 → center on the edge");
         // A positive margin pulls it inboard (smaller |y|).
-        let inboard = hud_slot_offset(HudSlot::North, fov, aspect, D, 0.2).y;
+        let inboard = hud_slot_offset(HudSlot::North, fov, aspect, D, 0.2, 0.0).y;
         assert!(inboard < on_edge, "margin pulls the panel inboard");
+    }
+
+    #[test]
+    fn positive_top_drop_lowers_the_top_row() {
+        let (fov, aspect, m) = (FRAC_PI_4, 1.6, 0.02);
+        let no_drop = hud_slot_offset(HudSlot::North, fov, aspect, D, m, 0.0).y;
+        let dropped = hud_slot_offset(HudSlot::North, fov, aspect, D, m, 0.15).y;
+        assert!(dropped < no_drop, "a top-drop lowers north below the frustum top");
+    }
+
+    #[test]
+    fn dock_top_drop_scales_with_resolution() {
+        // A 40px dock is a larger fraction of a short window than a tall one.
+        let small = dock_top_drop(540.0, 40.0);
+        let large = dock_top_drop(1080.0, 40.0);
+        assert!((small - 2.0 * 40.0 / 540.0).abs() < 1e-6, "exact fraction of half-height");
+        assert!(large < small, "taller window → smaller fractional drop");
+        // Falls back before layout has produced real sizes.
+        assert_eq!(dock_top_drop(0.0, 40.0), HUD_TOP_DROP_FALLBACK);
+        assert_eq!(dock_top_drop(540.0, 0.0), HUD_TOP_DROP_FALLBACK);
     }
 }
