@@ -145,16 +145,35 @@ impl KjDispatcher {
                   sid: SessionId,
                   tools: &mut kaish_kernel::ToolRegistry| {
                 if let Some(d) = dispatcher {
+                    // The opener captured for this materialized shell: who's
+                    // running it + the context they're in. `vi` records it on the
+                    // session (so `fg` re-foregrounds for this principal and
+                    // `:r !cmd` shells out in this context); `fg` resolves the
+                    // caller by principal. Built here because the kaish `ToolCtx`
+                    // carries no kaijutsu principal/context to recover at exec time.
+                    let opener = Some(crate::editor::EditorOpener {
+                        principal,
+                        context_id,
+                        session_id: sid,
+                    });
                     // `vi`/`edit`: the ergonomic front doors onto the kernel's
                     // editor surface, sharing `Kernel::editor_open` with `kj editor`
                     // (docs/vi.md). Registered before `kj` is consumed by the move.
-                    tools.register(crate::runtime::vi_builtin::ViBuiltin::new(d.clone(), "vi"));
+                    tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
+                        d.clone(),
+                        "vi",
+                        opener,
+                    ));
                     tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
                         d.clone(),
                         "edit",
+                        opener,
                     ));
                     // `fg` — job-control resume of an editor suspended with Ctrl+Z.
-                    tools.register(crate::runtime::vi_builtin::FgBuiltin::new(d.clone()));
+                    tools.register(crate::runtime::vi_builtin::FgBuiltin::new(
+                        d.clone(),
+                        Some(principal),
+                    ));
                     tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
                         d,
                         scm,

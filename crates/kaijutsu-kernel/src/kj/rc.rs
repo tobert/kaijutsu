@@ -447,10 +447,15 @@ impl KjDispatcher {
         // and `kj editor open` route through, and signal the submitter's app
         // windows to pop a renderer (`open_editor`). A headless driver
         // (`kj editor keys …`) with no app still gets a real session.
+        let opener = caller.context_id.map(|context_id| crate::editor::EditorOpener {
+            principal: caller.principal_id,
+            context_id,
+            session_id: caller.session_id,
+        });
         let Some(content) = content else {
             return match self
                 .kernel()
-                .editor_open_signaled(path, self.block_store(), Some(caller.principal_id))
+                .editor_open_signaled(path, self.block_store(), opener)
                 .await
             {
                 Ok((id, st)) => KjResult::ok_with_data(

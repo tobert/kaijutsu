@@ -30,7 +30,7 @@
 //! is the whole point. See `docs/vi.md` ("Path resolution").
 
 use kaijutsu_crdt::{BlockId, ContextId};
-use kaijutsu_types::PrincipalId;
+use kaijutsu_types::{PrincipalId, SessionId};
 
 use crate::block_store::SharedBlockStore;
 use crate::config_doc::{config_context_id, first_block_id};
@@ -200,6 +200,24 @@ impl EditorState {
     }
 }
 
+/// Who opened a session, and the shell context they opened from — captured at
+/// the front door (`vi`/`edit`, `kj editor`, `kj rc edit`) and recorded on the
+/// session. Two consumers:
+///
+/// - **`fg`** re-foregrounds the caller's most-recent session by `principal`.
+/// - **`:r !cmd`** materializes a kaish in `(principal, context_id, session_id)`
+///   so the command runs in the *opener's* working context and capability
+///   allow-set — not the edited block's context.
+///
+/// `None` for a headless open (a test driver, the wire `editorOpen` handler):
+/// nobody to foreground, and `:r !cmd` then fails loud rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorOpener {
+    pub principal: PrincipalId,
+    pub context_id: ContextId,
+    pub session_id: SessionId,
+}
+
 /// One open editor: a pure [`EditorCore`] bound to the CRDT block that owns the
 /// text, plus the rollback checkpoint.
 struct EditorSession {
@@ -218,10 +236,11 @@ struct EditorSession {
     /// `EditorCore` strips modalkit's line terminator, so the terminator lives
     /// here; edits mirror as diffs (never touching it) and `ZQ` re-applies it.
     terminator: String,
-    /// The principal that opened the session — the submitter whose app windows
-    /// `open_editor` signals. `fg` uses it to find the caller's suspended editor
-    /// to re-foreground. `None` for a headless open (test / no `ExecContext`).
-    opener: Option<PrincipalId>,
+    /// Who opened the session + the context they opened from ([`EditorOpener`]).
+    /// `fg` finds the caller's suspended editor by `principal`; `:r !cmd` runs in
+    /// the opener's `(principal, context_id, session_id)`. `None` for a headless
+    /// open (test / wire `editorOpen` — no caller to capture).
+    opener: Option<EditorOpener>,
 }
 
 /// The kernel's registry of open editor sessions.
@@ -249,7 +268,7 @@ impl EditorSessions {
         path: &str,
         target: EditorTarget,
         blocks: &SharedBlockStore,
-        opener: Option<PrincipalId>,
+        opener: Option<EditorOpener>,
     ) -> Result<(EditorSessionId, EditorState), String> {
         let raw = block_text(blocks, &target)?;
         let mut core = EditorCore::new(&raw);
@@ -284,9 +303,16 @@ impl EditorSessions {
     ) -> Option<(EditorSessionId, String)> {
         self.sessions
             .iter()
-            .filter(|(_, s)| s.opener == Some(principal))
+            .filter(|(_, s)| s.opener.map(|o| o.principal) == Some(principal))
             .max_by_key(|(id, _)| id.0)
             .map(|(id, s)| (*id, s.path.clone()))
+    }
+
+    /// The opener (`principal` + originating context) recorded for `id`, if any.
+    /// `:r !cmd` reads this to materialize a shell in the opener's context; a
+    /// `None` (headless open) makes `:r !cmd` fail loud rather than guess.
+    pub fn session_opener(&self, id: EditorSessionId) -> Option<EditorOpener> {
+        self.sessions.get(&id).and_then(|s| s.opener)
     }
 
     /// The most-recently-opened session of *any* opener — `fg`'s shared-trust
@@ -1155,9 +1181,17 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let me = PrincipalId::system();
         let other = PrincipalId::beat();
+        // `fg` keys on the opener's principal; context/session are irrelevant here.
+        let as_opener = |p: PrincipalId| {
+            Some(EditorOpener {
+                principal: p,
+                context_id: ContextId::new(),
+                session_id: SessionId::new(),
+            })
+        };
 
-        let (_a, _) = sessions.open(RC_PATH, target, &blocks, Some(me)).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks, Some(me)).unwrap();
+        let (_a, _) = sessions.open(RC_PATH, target, &blocks, as_opener(me)).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, as_opener(me)).unwrap();
 
         assert_eq!(
             sessions.latest_session_for(me).map(|(id, _)| id),

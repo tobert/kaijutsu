@@ -85,9 +85,16 @@ impl KjDispatcher {
 
         let kernel = self.kernel();
         let blocks = self.block_store();
+        // Record the opener (principal + context) so `fg` and `:r !cmd` work;
+        // a caller with no joined context degrades to a headless-style open.
+        let opener = caller.context_id.map(|context_id| crate::editor::EditorOpener {
+            principal: caller.principal_id,
+            context_id,
+            session_id: caller.session_id,
+        });
         match parsed.command {
             EditorCommand::Open { path } => match kernel
-                .editor_open_signaled(&path, blocks, Some(caller.principal_id))
+                .editor_open_signaled(&path, blocks, opener)
                 .await
             {
                 Ok((id, st)) => KjResult::ok_with_data(

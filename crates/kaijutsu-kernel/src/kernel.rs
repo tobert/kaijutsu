@@ -861,14 +861,15 @@ impl Kernel {
         self.editor_open_as(path, blocks, None).await
     }
 
-    /// Open an editor recording the `opener` principal on the session, so `fg`
-    /// can later re-foreground it for that principal. The signaled front doors
-    /// (`vi`/`edit`, `kj editor`, `kj rc edit`) pass the submitter here.
+    /// Open an editor recording the [`EditorOpener`](crate::editor::EditorOpener)
+    /// on the session, so `fg` can re-foreground it for that principal and
+    /// `:r !cmd` can shell out in the opener's context. The signaled front doors
+    /// (`vi`/`edit`, `kj editor`, `kj rc edit`) pass the caller here.
     pub async fn editor_open_as(
         &self,
         path: &str,
         blocks: &crate::block_store::SharedBlockStore,
-        opener: Option<kaijutsu_types::PrincipalId>,
+        opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         let file_cache = self.file_cache(blocks);
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
@@ -896,7 +897,7 @@ impl Kernel {
         // fulfilled below: the async fetch happens *outside* the lock, so the
         // `!Send` `EditorCore` never crosses an await (the `SendSessions`
         // invariant); only the fetched `String` does.
-        let (path, outcome, io, io_cursor) = {
+        let (path, outcome, io, io_cursor, io_opener) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
             let outcome = sessions.0.keys(id, keys, blocks)?;
@@ -909,13 +910,16 @@ impl Kernel {
             // it while the fetch awaits can't make the read land at the wrong
             // place (the "wandering cursor" race) — insert happens at this offset.
             let io_cursor = io.as_ref().and_then(|_| sessions.0.session_cursor(id));
-            (path, outcome, io, io_cursor)
+            // The opener context, captured at submit too — `:r !cmd` shells out
+            // in it (the caller's context/capabilities, not the edited block's).
+            let io_opener = io.as_ref().and_then(|_| sessions.0.session_opener(id));
+            (path, outcome, io, io_cursor, io_opener)
         };
 
         // Fulfill a `:r` read: fetch the content, then splice it at the cursor
         // captured above (not the live cursor, which may have moved).
         if let Some(io) = io {
-            let content = self.fetch_editor_io(io, blocks).await?;
+            let content = self.fetch_editor_io(io, io_opener, blocks).await?;
             let at = io_cursor.unwrap_or(0);
             let state = {
                 let mut sessions = self.editor_sessions.lock();
@@ -950,22 +954,59 @@ impl Kernel {
 
     /// Fetch the content for a `:r` read intent. `:r <file>` reads through the
     /// shared `FileDocumentCache` (the same source the editor and file tools
-    /// use). `:r !cmd` (shell-read) is **not yet implemented** — it needs the
-    /// opener's context threaded onto the session + a kernel kaish-exec helper
-    /// (`kj_dispatcher.materialize_context_kaish`); fail loud meanwhile, pointing
-    /// at the shell (Ctrl+Z) which already does this.
+    /// use). `:r !cmd` materializes a per-context kaish in the *opener's*
+    /// `(principal, context_id, session_id)` — the same `materialize_context_kaish`
+    /// the model shell and rc lifecycle use — and splices the command's stdout.
+    /// Running in the opener's context means the command sees their cwd and
+    /// capability allow-set, not the edited block's context. Fails loud (never a
+    /// silent empty splice) when there's no opener, no dispatcher, or the command
+    /// fails.
     async fn fetch_editor_io(
         &self,
         io: kaijutsu_editor::EditorIo,
+        opener: Option<crate::editor::EditorOpener>,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<String, String> {
         match io {
             kaijutsu_editor::EditorIo::ReadFile(path) => {
                 self.file_cache(blocks).read_content(&path).await
             }
-            kaijutsu_editor::EditorIo::ReadShell(cmd) => Err(format!(
-                "editor: ':r !{cmd}' is not yet implemented — use Ctrl+Z to the shell"
-            )),
+            kaijutsu_editor::EditorIo::ReadShell(cmd) => {
+                // No opener (a headless driver / wire open) → no context to run
+                // in. Fail loud pointing at the interactive shell, as before.
+                let opener = opener.ok_or_else(|| {
+                    format!(
+                        "editor: ':r !{cmd}' needs an opener context — open via \
+                         vi/edit, or use Ctrl+Z to the shell"
+                    )
+                })?;
+                let dispatcher = self.broker.kj_dispatcher().await.ok_or_else(|| {
+                    "editor: ':r !cmd' unavailable — kj dispatcher not wired".to_string()
+                })?;
+                let kaish = dispatcher
+                    .materialize_context_kaish(
+                        "editor-read",
+                        opener.principal,
+                        opener.context_id,
+                        opener.session_id,
+                        dispatcher.semantic_index(),
+                        dispatcher.block_source(),
+                    )
+                    .await
+                    .map_err(|e| format!("editor: ':r !{cmd}' materialize shell: {e}"))?;
+                let result = kaish
+                    .execute_with_options(&cmd, kaish_kernel::ExecuteOptions::default())
+                    .await
+                    .map_err(|e| format!("editor: ':r !{cmd}' failed: {e}"))?;
+                if result.code != 0 {
+                    return Err(format!(
+                        "editor: ':r !{cmd}' exited {}: {}",
+                        result.code,
+                        result.err.trim()
+                    ));
+                }
+                Ok(result.text_out().into_owned())
+            }
         }
     }
 
@@ -1382,11 +1423,13 @@ impl Kernel {
         &self,
         path: &str,
         blocks: &crate::block_store::SharedBlockStore,
-        submitter: Option<kaijutsu_types::PrincipalId>,
+        opener: Option<crate::editor::EditorOpener>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
-        // Record the opener so `fg` (and a future `:r !cmd`) can find the
-        // submitter's session later.
-        let (id, state) = self.editor_open_as(path, blocks, submitter).await?;
+        // Record the full opener so `fg` and `:r !cmd` can find the caller's
+        // session + context later; the open_editor signal fans only to their
+        // app windows, so it needs just the principal.
+        let submitter = opener.map(|o| o.principal);
+        let (id, state) = self.editor_open_as(path, blocks, opener).await?;
         self.signal_open_editor(id, path, &state, submitter).await;
         Ok((id, state))
     }
@@ -1403,10 +1446,12 @@ impl Kernel {
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         let (id, path, state) = {
             let mut sessions = self.editor_sessions.lock();
-            // Prefer the caller's own most-recent session; fall back to the
-            // most-recent editor of any opener (shared-trust single-user — and a
-            // safety net while the opener isn't captured on every front-door
-            // path, e.g. the external-MCP shell).
+            // Prefer the caller's own most-recent session — now that the opener
+            // is captured at construction on every materialized-shell front door,
+            // this is the normal path. The most-recent-of-any fallback remains a
+            // shared-trust safety net for a caller with no recorded session (a
+            // headless / context-less open) — single-user "the editor" is
+            // unambiguous; precise multi-user targeting is a later refinement.
             let found = submitter
                 .and_then(|p| sessions.0.latest_session_for(p))
                 .or_else(|| sessions.0.latest_session_any());
@@ -1715,7 +1760,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::runtime::config_crdt_fs::ConfigCrdtFs;
         use crate::vfs::VfsOps as _;
-        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_crdt::{ContextId, PrincipalId};
         use std::path::Path;
 
         let kernel = Kernel::new_ephemeral("test").await;
@@ -1743,7 +1788,15 @@ mod tests {
         assert!(kernel.resume_editor(None).await.is_err(), "...regardless of principal");
 
         // Open as `me` (records the opener), then resume finds it by principal.
-        let (id, _) = kernel.editor_open_as(path, &blocks, Some(me)).await.unwrap();
+        let me_opener = crate::editor::EditorOpener {
+            principal: me,
+            context_id: ContextId::new(),
+            session_id: kaijutsu_types::SessionId::new(),
+        };
+        let (id, _) = kernel
+            .editor_open_as(path, &blocks, Some(me_opener))
+            .await
+            .unwrap();
         let (resumed_id, st) = kernel.resume_editor(Some(me)).await.unwrap();
         assert_eq!(resumed_id, id, "fg foregrounds the principal's session");
         assert_eq!(st.text, "hello");
@@ -1756,9 +1809,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editor_colon_r_shell_fails_loud_for_now() {
-        // `:r !cmd` isn't wired yet (needs a kernel kaish-exec helper + opener
-        // context) — it must fail loud, never silently no-op.
+    async fn editor_colon_r_shell_runs_in_the_opener_context() {
+        // `:r !cmd` materializes a kaish in the *opener's* context and splices the
+        // command's stdout at the cursor. Wire the dispatcher into the broker (the
+        // production shape — `set_self_arc` + `broker().set_kj_dispatcher`) so
+        // `fetch_editor_io` can reach it.
+        use crate::kj::test_helpers::{
+            install_rc_script_file, register_context, test_dispatcher_crdt_rc,
+        };
+        use kaijutsu_crdt::PrincipalId;
+        use kaijutsu_types::SessionId;
+
+        let d = Arc::new(test_dispatcher_crdt_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let kernel = d.kernel();
+        let blocks = d.block_store();
+
+        let path = "/etc/rc/vitest/create/S00-foo.kai";
+        install_rc_script_file(&d, path, "hello").await;
+
+        // A real registered context for `:r !cmd` to run in.
+        let principal = PrincipalId::system();
+        let context_id = register_context(&d, Some("vi-r"), None, principal);
+        let opener = crate::editor::EditorOpener {
+            principal,
+            context_id,
+            session_id: SessionId::new(),
+        };
+
+        let (id, _) = kernel
+            .editor_open_as(path, blocks, Some(opener))
+            .await
+            .unwrap();
+        // `:r !echo hi` splices the command's stdout at the cursor (buffer top).
+        let state = kernel
+            .editor_keys(id, ":r !echo hi<CR>", blocks)
+            .await
+            .unwrap();
+        assert!(
+            state.text.contains("hi"),
+            "':r !echo' must splice command stdout: {:?}",
+            state.text
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_colon_r_shell_without_opener_fails_loud() {
+        // A headless open (no opener) has no context to shell out in — `:r !cmd`
+        // must fail loud pointing at the interactive shell, never silently no-op.
         use crate::block_store::shared_block_store_with_db;
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
@@ -1782,6 +1881,7 @@ mod tests {
         let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
         kernel.set_file_cache(cache);
 
+        // `editor_open` records no opener.
         let (id, _) = kernel
             .editor_open("/etc/rc/coder/create/S00.kai", &blocks)
             .await
@@ -1790,7 +1890,7 @@ mod tests {
             .editor_keys(id, ":r !date<CR>", &blocks)
             .await
             .unwrap_err();
-        assert!(err.contains("not yet implemented"), "got: {err}");
+        assert!(err.contains("needs an opener context"), "got: {err}");
     }
 
     #[tokio::test]

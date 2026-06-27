@@ -21,21 +21,35 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ast::Value, Tool};
 
-use crate::execution::ExecContext;
+use kaijutsu_types::PrincipalId;
+
+use crate::editor::EditorOpener;
 use crate::kj::KjDispatcher;
 
 /// kaish builtin that opens an editor session via `Kernel::editor_open`.
 ///
 /// Registered once per user-facing name (`vi`, `edit`) so both resolve to the
 /// same behaviour; `name` is the registry key this instance answers to.
+///
+/// The `opener` (caller principal + context) is captured at **construction**,
+/// not via a `ToolCtx` downcast: the kaish interpreter hands builtins the kaish
+/// `ExecContext`, which carries no kaijutsu principal/context, so a downcast to
+/// our `ExecContext` always missed. `materialize_context_kaish` builds a fresh
+/// instance per invocation with the live `(principal, context_id, session_id)`,
+/// so each `ViBuiltin` already knows who opened it (mirrors `KjBuiltin`).
 pub struct ViBuiltin {
     dispatcher: Arc<KjDispatcher>,
     name: &'static str,
+    opener: Option<EditorOpener>,
 }
 
 impl ViBuiltin {
-    pub fn new(dispatcher: Arc<KjDispatcher>, name: &'static str) -> Self {
-        Self { dispatcher, name }
+    pub fn new(dispatcher: Arc<KjDispatcher>, name: &'static str, opener: Option<EditorOpener>) -> Self {
+        Self {
+            dispatcher,
+            name,
+            opener,
+        }
     }
 }
 
@@ -60,7 +74,7 @@ impl Tool for ViBuiltin {
         )
     }
 
-    async fn execute(&self, args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
+    async fn execute(&self, args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
         let path = match args.positional.first() {
             Some(Value::String(s)) => s.clone(),
             Some(other) => format!("{other:?}"),
@@ -72,20 +86,15 @@ impl Tool for ViBuiltin {
             }
         };
 
-        // The submitter is the execution's principal — `open_editor` fans the
-        // renderer signal to *their* app windows. Downcast through the trait's
-        // escape hatch (the kj builtin does the same); absent off the kernel
-        // ExecContext (a portable test surface), fall back to the app nick.
-        let submitter = ctx
-            .as_any_mut()
-            .downcast_mut::<ExecContext>()
-            .map(|ec| ec.principal_id);
-
+        // The opener (captured at construction) is who `open_editor` fans the
+        // renderer signal to, and whose context `:r !cmd` shells out in. A
+        // headless instance (no opener) still opens a real session — it just
+        // pops no window and can't `:r !cmd`.
         let blocks = self.dispatcher.block_store();
         match self
             .dispatcher
             .kernel()
-            .editor_open_signaled(&path, blocks, submitter)
+            .editor_open_signaled(&path, blocks, self.opener)
             .await
         {
             Ok((id, st)) => {
@@ -111,11 +120,15 @@ impl Tool for ViBuiltin {
 /// app pops back to the editor via the same path a fresh `vi` uses.
 pub struct FgBuiltin {
     dispatcher: Arc<KjDispatcher>,
+    /// The principal running `fg` (captured at construction, like [`ViBuiltin`]'s
+    /// opener — the kaish `ToolCtx` carries no kaijutsu principal). `resume_editor`
+    /// prefers this principal's most-recent session. `None` for a headless build.
+    caller: Option<PrincipalId>,
 }
 
 impl FgBuiltin {
-    pub fn new(dispatcher: Arc<KjDispatcher>) -> Self {
-        Self { dispatcher }
+    pub fn new(dispatcher: Arc<KjDispatcher>, caller: Option<PrincipalId>) -> Self {
+        Self { dispatcher, caller }
     }
 }
 
@@ -133,15 +146,10 @@ impl Tool for FgBuiltin {
         .example("Return to vi after peeking at the shell", "fg")
     }
 
-    async fn execute(&self, _args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
-        // Same submitter resolution as `vi`: the signal fans to this principal's
-        // app windows. A headless caller (no `ExecContext`) has no window to pop.
-        let submitter = ctx
-            .as_any_mut()
-            .downcast_mut::<ExecContext>()
-            .map(|ec| ec.principal_id);
-
-        match self.dispatcher.kernel().resume_editor(submitter).await {
+    async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
+        // The caller (captured at construction) is whose suspended editor we
+        // re-foreground; the signal fans to their app windows.
+        match self.dispatcher.kernel().resume_editor(self.caller).await {
             Ok((id, st)) => {
                 let session = id.as_u64();
                 let mut result = ExecResult::success(format!("resuming editor session {session}"));
@@ -176,10 +184,15 @@ mod tests {
 
         let configure_tools =
             move |_scm: SessionContextMap,
-                  _sid: SessionId,
+                  sid: SessionId,
                   tools: &mut kaish_kernel::ToolRegistry| {
-                tools.register(ViBuiltin::new(dispatcher.clone(), "vi"));
-                tools.register(ViBuiltin::new(dispatcher.clone(), "edit"));
+                let opener = Some(EditorOpener {
+                    principal: PrincipalId::system(),
+                    context_id: ctx,
+                    session_id: sid,
+                });
+                tools.register(ViBuiltin::new(dispatcher.clone(), "vi", opener));
+                tools.register(ViBuiltin::new(dispatcher.clone(), "edit", opener));
             };
 
         EmbeddedKaish::with_identity(
