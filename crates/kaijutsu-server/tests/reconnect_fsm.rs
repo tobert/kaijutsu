@@ -205,6 +205,64 @@ fn actor_connects_eagerly_without_a_command() {
     });
 }
 
+/// Status is *level* state, not just an edge stream. An observer that arrives
+/// after the actor already reached `Connected` must still be able to read
+/// "we're connected" — because a healthy Connected actor is silent (it only
+/// broadcasts on transitions). This is the bug behind the app showing
+/// "Disconnected" while live data flowed: both app-side status subscribers
+/// (the bootstrap gate and the UI poll) subscribe a frame or more after the
+/// actor began its eager dial, so on a fast local handshake the one-shot
+/// `Connected` broadcast is gone before they listen, and `broadcast` never
+/// replays. `current_status()` / `watch_status()` close the gap by exposing
+/// the latest value, readable at any time.
+#[test]
+fn late_observer_reads_connected_as_level() {
+    run_local(async {
+        let server = start_server_on(None).await;
+        let actor = spawn_test_actor(server.addr, "test-late-observer");
+
+        // Get the actor solidly into Connected. A successful whoami means the
+        // handshake completed; from here the actor sits silently in Connected.
+        let id = whoami_with_retry(&actor, Duration::from_secs(5))
+            .await
+            .expect("initial whoami");
+        assert!(!id.username.is_empty());
+
+        // A *fresh* broadcast subscriber models the late app subscriber: it
+        // missed the one-shot Connected and gets nothing (no replay). This is
+        // the trap that hung the bootstrap task's `recv()` loop forever.
+        let mut late_broadcast = actor.subscribe_status();
+        assert!(
+            matches!(
+                late_broadcast.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a late broadcast subscriber must NOT replay the Connected edge"
+        );
+
+        // The level-readable status, by contrast, reports the truth right away.
+        assert!(
+            matches!(actor.current_status(), ConnectionStatus::Connected { .. }),
+            "current_status() must read Connected for a late observer, got {:?}",
+            actor.current_status()
+        );
+
+        // And `watch_status().wait_for(..)` — what the bootstrap gate now uses —
+        // returns immediately because it checks the current value first.
+        let mut watch = actor.watch_status();
+        let observed = tokio::time::timeout(
+            Duration::from_secs(1),
+            watch.wait_for(|s| matches!(s, ConnectionStatus::Connected { .. })),
+        )
+        .await
+        .expect("wait_for must not block when already Connected")
+        .expect("watch sender alive");
+        assert!(matches!(&*observed, ConnectionStatus::Connected { .. }));
+
+        server.stop().await;
+    });
+}
+
 /// The big one: client connects, server dies, server comes back, client
 /// reconnects via the FSM, and the next call succeeds. This is the failure
 /// mode the rewrite exists to fix.

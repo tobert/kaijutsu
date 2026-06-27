@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
@@ -180,6 +180,10 @@ enum ActorState {
     },
     Closing {
         cause: CloseCause,
+        /// The reconnect attempt count carried in from the state we left, so
+        /// `finish_closing` can compute the next backoff. 0 when we closed
+        /// from a healthy `Connected` (the next reconnect is attempt 1).
+        attempt: u32,
     },
     Cooldown {
         next_attempt: u32,
@@ -666,6 +670,13 @@ pub struct ActorHandle {
     tx: mpsc::Sender<ChannelCmd>,
     event_tx: broadcast::Sender<ServerEvent>,
     status_tx: broadcast::Sender<ConnectionStatus>,
+    /// Level-readable mirror of `status_tx`. The broadcast carries the
+    /// transition *stream* (every Idle→Connecting→Connected edge), but a
+    /// late subscriber misses edges that already fired and a healthy
+    /// Connected actor is silent. This watch always holds the latest value,
+    /// so a caller can read "are we connected?" without racing the one-shot
+    /// broadcast. See [`Self::current_status`] / [`Self::watch_status`].
+    status_watch_rx: watch::Receiver<ConnectionStatus>,
 }
 
 impl ActorHandle {
@@ -691,6 +702,32 @@ impl ActorHandle {
 
     pub fn subscribe_status(&self) -> broadcast::Receiver<ConnectionStatus> {
         self.status_tx.subscribe()
+    }
+
+    /// The current connection status as a *level* (the latest value), readable
+    /// at any time without racing the one-shot transition broadcast. A caller
+    /// that comes up after the actor already reached `Connected` still reads
+    /// `Connected` here — unlike [`Self::subscribe_status`], which only
+    /// delivers transitions that happen after the subscription.
+    ///
+    /// Because this mirrors only the *latest* value, rapid back-to-back
+    /// transitions can coalesce (e.g. the transient `Closing` before `Cooldown`
+    /// may never be observed here). For the full transition stream — e.g. to
+    /// drive UI through every state — use [`Self::subscribe_status`].
+    pub fn current_status(&self) -> ConnectionStatus {
+        self.status_watch_rx.borrow().clone()
+    }
+
+    /// A `watch` receiver for connection status. `watch_status().wait_for(..)`
+    /// checks the current value *before* awaiting a change, so a level
+    /// condition like "reached Connected" cannot be missed by a late
+    /// subscriber. Use this (not `subscribe_status`) to gate on a state.
+    ///
+    /// Latest-value semantics apply (see [`Self::current_status`]): intermediate
+    /// transitions can coalesce, so don't use this to count or observe every
+    /// edge — use [`Self::subscribe_status`] for the full stream.
+    pub fn watch_status(&self) -> watch::Receiver<ConnectionStatus> {
+        self.status_watch_rx.clone()
     }
 
     // ── Drift ────────────────────────────────────────────────────────────
@@ -1424,11 +1461,16 @@ struct RpcActor {
     rx: mpsc::Receiver<ChannelCmd>,
     /// Outbound: server events.
     event_tx: broadcast::Sender<ServerEvent>,
-    /// Outbound: connection status.
+    /// Outbound: connection status (transition stream).
     status_tx: broadcast::Sender<ConnectionStatus>,
+    /// Outbound: connection status (latest-value mirror). Sent alongside
+    /// `status_tx` so observers can read the current level without racing the
+    /// broadcast's one-shot edges.
+    status_watch_tx: watch::Sender<ConnectionStatus>,
 }
 
 impl RpcActor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: SshConfig,
         context_id: Option<ContextId>,
@@ -1437,6 +1479,7 @@ impl RpcActor {
         rx: mpsc::Receiver<ChannelCmd>,
         event_tx: broadcast::Sender<ServerEvent>,
         status_tx: broadcast::Sender<ConnectionStatus>,
+        status_watch_tx: watch::Sender<ConnectionStatus>,
     ) -> Self {
         let (close_tx, close_rx) = mpsc::channel(1);
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
@@ -1459,6 +1502,7 @@ impl RpcActor {
             rx,
             event_tx,
             status_tx,
+            status_watch_tx,
         }
     }
 
@@ -1474,7 +1518,7 @@ impl RpcActor {
                 context_id: self.joined_context_id,
                 since_ms: since.elapsed().as_millis() as u64,
             },
-            ActorState::Closing { cause } => ConnectionStatus::Closing {
+            ActorState::Closing { cause, .. } => ConnectionStatus::Closing {
                 cause: cause.to_error_string(),
             },
             ActorState::Cooldown {
@@ -1495,6 +1539,9 @@ impl RpcActor {
                 reason: reason.clone(),
             },
         };
+        // Latest-value mirror first so a watcher woken by the broadcast (or a
+        // reader racing this call) can't observe a stale level.
+        let _ = self.status_watch_tx.send(status.clone());
         let _ = self.status_tx.send(status);
     }
 
@@ -1599,8 +1646,18 @@ impl RpcActor {
     /// Transition to `Closing` from any state where a connection might be live.
     fn start_closing(&mut self, cause: CloseCause) {
         log::warn!("Actor closing connection: {}", cause.to_error_string());
+        // Carry the attempt count from the state we're leaving so the next
+        // backoff climbs instead of resetting. `Connected` carries 0 (a fresh
+        // drop → next reconnect is attempt 1); a mid-handshake close keeps the
+        // in-flight attempt; a cooldown close keeps the pending one.
+        let attempt = match &self.state {
+            ActorState::Connecting { attempt, .. } => *attempt,
+            ActorState::Cooldown { next_attempt, .. } => *next_attempt,
+            _ => 0,
+        };
         self.state = ActorState::Closing {
             cause: cause.clone(),
+            attempt,
         };
         // Drop the live connection (this aborts the RpcSystem via
         // RpcSystemGuard and closes the SSH channels).
@@ -1620,7 +1677,8 @@ impl RpcActor {
 
     /// Transition out of `Closing` to either `Cooldown` or `Terminal`.
     fn finish_closing(&mut self) {
-        let ActorState::Closing { cause } = std::mem::replace(&mut self.state, ActorState::Idle)
+        let ActorState::Closing { cause, attempt } =
+            std::mem::replace(&mut self.state, ActorState::Idle)
         else {
             // Defensive — we should only reach finish_closing from Closing.
             log::error!("finish_closing called from non-Closing state");
@@ -1635,12 +1693,10 @@ impl RpcActor {
             return;
         }
 
-        // Compute backoff. The current attempt count carries over.
-        let attempt_so_far = match &self.state {
-            ActorState::Connecting { attempt, .. } => *attempt,
-            _ => 0,
-        };
-        let next_attempt = attempt_so_far.saturating_add(1).max(1);
+        // Compute backoff. The attempt count carries over from the state we
+        // closed from (captured in `start_closing`); `self.state` is now the
+        // Idle placeholder, so we must use the carried value, not re-read it.
+        let next_attempt = attempt.saturating_add(1).max(1);
         let backoff = backoff_for_attempt(next_attempt);
         let until = Instant::now() + backoff;
         log::info!(
@@ -2713,6 +2769,9 @@ pub fn spawn_actor(
     let (tx, rx) = mpsc::channel::<ChannelCmd>(CHANNEL_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
     let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
+    // Seed the level mirror with Idle — the state the actor starts in, before
+    // `run()` issues its first `broadcast_state`.
+    let (status_watch_tx, status_watch_rx) = watch::channel(ConnectionStatus::Idle);
 
     let actor = RpcActor::new(
         config,
@@ -2722,6 +2781,7 @@ pub fn spawn_actor(
         rx,
         event_tx.clone(),
         status_tx.clone(),
+        status_watch_tx,
     );
     tokio::task::spawn_local(actor.run());
 
@@ -2729,6 +2789,7 @@ pub fn spawn_actor(
         tx,
         event_tx,
         status_tx,
+        status_watch_rx,
     }
 }
 

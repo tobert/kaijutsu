@@ -382,11 +382,16 @@ fn poll_bootstrap_results(
                 );
 
                 // The reconnect FSM rejects the first call to a fresh actor
-                // with NotReady(Idle) and starts connecting in the
-                // background. We subscribe to status first so we don't race
-                // past the Connected event, kick the actor with a throwaway
-                // call, then wait for the FSM to surface Connected (or
-                // Terminal) before issuing the real bootstrap calls.
+                // with NotReady(Idle) and starts connecting in the background.
+                // We kick it with a throwaway call, then wait for the FSM to
+                // surface Connected (or Terminal) before issuing the real
+                // bootstrap calls. The wait reads the *level* (watch_status),
+                // not the one-shot transition broadcast: this task is spawned a
+                // frame or more after the actor began its eager dial, so on a
+                // fast local handshake the Connected edge can fire before we get
+                // here — and `broadcast` never replays it, which used to hang
+                // this loop forever (whoami/peer/theme/list_contexts never ran,
+                // and the UI sat on "Disconnected" while drift-poll data flowed).
                 let h = handle.clone();
                 let tx = result_channel.sender();
                 let inv_tx = invocation_channel.tx.clone();
@@ -394,27 +399,37 @@ fn poll_bootstrap_results(
                 let cc_key = client_id.current_context_key();
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
-                        let mut status_rx = h.subscribe_status();
+                        let mut status_rx = h.watch_status();
                         // Kick the FSM out of Idle. NotReady is expected.
                         let _ = h.whoami().await;
 
-                        // Wait until the actor reaches Connected — or
-                        // Terminal, in which case bootstrap is over.
-                        loop {
-                            match status_rx.recv().await {
-                                Ok(kaijutsu_client::ConnectionStatus::Connected { .. }) => {
-                                    break;
-                                }
-                                Ok(kaijutsu_client::ConnectionStatus::Terminal { reason }) => {
+                        // Wait until the actor reaches Connected — or Terminal,
+                        // in which case bootstrap is over. `wait_for` checks the
+                        // current value before awaiting a change, so a Connected
+                        // that already landed is observed immediately (no
+                        // missed-edge hang).
+                        match status_rx
+                            .wait_for(|s| {
+                                matches!(
+                                    s,
+                                    kaijutsu_client::ConnectionStatus::Connected { .. }
+                                        | kaijutsu_client::ConnectionStatus::Terminal { .. }
+                                )
+                            })
+                            .await
+                        {
+                            Ok(status) => {
+                                if let kaijutsu_client::ConnectionStatus::Terminal { reason } =
+                                    &*status
+                                {
                                     log::warn!("Bootstrap aborted: actor terminal: {reason}");
                                     return;
                                 }
-                                Ok(_) => continue,
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    log::warn!("Bootstrap aborted: status channel closed");
-                                    return;
-                                }
+                                // Drop the watch borrow before the awaits below.
+                            }
+                            Err(_) => {
+                                log::warn!("Bootstrap aborted: status watch closed");
+                                return;
                             }
                         }
 
@@ -626,14 +641,27 @@ fn poll_connection_status(
 ) {
     let Some(actor) = actor else { return };
 
-    // Re-subscribe when actor changes
+    let mut received_any = false;
+
+    // Re-subscribe when actor changes, and seed the UI from the current
+    // *level*. The broadcast below only delivers transitions that happen after
+    // we subscribe, and the one-shot Connected may already have fired (the
+    // RpcActor resource is inserted via a deferred command, so this poll
+    // subscribes a frame late). Without the seed, a healthy-but-silent
+    // Connected actor would leave the indicator stuck on its prior value.
     if actor.is_changed() {
         *receiver = Some(actor.handle.subscribe_status());
+        events.write(ConnectionStatusMessage(actor.handle.current_status()));
+        received_any = true;
     }
 
-    let Some(rx) = receiver.as_mut() else { return };
+    let Some(rx) = receiver.as_mut() else {
+        if received_any {
+            let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+        }
+        return;
+    };
 
-    let mut received_any = false;
     loop {
         match rx.try_recv() {
             Ok(status) => {
@@ -745,10 +773,14 @@ fn update_connection_state(
             RpcResultMessage::IdentityReceived(identity) => {
                 state.identity = Some(identity.clone());
                 // If we got identity, the connection succeeded — mark connected.
-                // This is critical because the broadcast ConnectionStatus::Connected
-                // event fires before poll_connection_status subscribes (deferred
-                // command race: RpcActor is inserted via commands.insert_resource
-                // which is deferred, so the subscription happens a frame too late).
+                // This was the original workaround for the deferred-subscription
+                // race (the one-shot ConnectionStatus::Connected fired before
+                // poll_connection_status subscribed a frame late). That race is
+                // now closed at the source: poll_connection_status seeds from
+                // current_status() on (re)subscribe, so it sets `connected`
+                // before this message arrives. Kept as a harmless belt-and-
+                // suspenders backup — the `!state.connected` guard no-ops it
+                // once the seed already worked.
                 if !state.connected {
                     log::info!("Connection established (from IdentityReceived)");
                     state.connected = true;
