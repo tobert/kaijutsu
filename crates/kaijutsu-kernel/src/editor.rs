@@ -50,69 +50,70 @@ pub struct EditorTarget {
     pub block_id: BlockId,
 }
 
-/// Whether `path` names content the config backends own as a CRDT document
-/// (`/etc/rc` scripts or `/etc/config` TOMLs). These bind directly to their
-/// owning block rather than through the file-doc cache.
+/// Cheap prefix test for whether `path` is in the rc/config trees.
 ///
-/// Prefix-based for pass 1; the sharp edge (this should be the mount table's
-/// answer, "what owns this path?") is noted in `docs/vi.md`.
+/// **This is NOT the editor's ownership decision** — that is
+/// [`resolve_editor_target`], which asks the mount table ([`MountTable::owner_of`]
+/// + [`VfsOps::owns_config_docs`](crate::vfs::VfsOps::owns_config_docs)) so the
+/// editor and the VFS can't drift on what owns a path. This prefix check survives
+/// only as the **synchronous** guard for `Kernel::invalidate_config_file_cache`,
+/// a cache-coherence optimization on the sync editor-quit path where an `async`
+/// mount-table query would cascade. Tracked in `docs/issues.md`.
 pub fn config_owned(path: &str) -> bool {
     matches!(path, "/etc/rc" | "/etc/config")
         || path.starts_with("/etc/rc/")
         || path.starts_with("/etc/config/")
 }
 
-/// The CRDT config mount root that owns `path` (caller guarantees
-/// [`config_owned`]). Used to follow rc/config symlinks the same way the
-/// `ConfigCrdtFs` mount does — see `resolve_editor_target`.
-fn config_root(path: &str) -> &'static str {
-    if path == "/etc/config" || path.starts_with("/etc/config/") {
-        "/etc/config"
-    } else {
-        "/etc/rc"
-    }
-}
-
 /// Resolve `path` to the `(context, block)` of the CRDT document that owns its
-/// text. Fails loud (no silent empty/placeholder) when a config path names a
-/// document that does not exist — an editor must not open on a phantom block.
+/// text. The mount table answers "what owns this path?": a backend that
+/// [`owns_config_docs`](crate::vfs::VfsOps::owns_config_docs) (the rc/config
+/// `ConfigCrdtFs`) binds straight to its block; anything else goes through the
+/// file-doc cache. Fails loud (no silent empty/placeholder) when a config path
+/// names a document that does not exist — an editor must not open on a phantom
+/// block.
 pub async fn resolve_editor_target(
     path: &str,
     blocks: &SharedBlockStore,
     file_cache: &FileDocumentCache,
+    mounts: &crate::vfs::MountTable,
 ) -> Result<EditorTarget, String> {
-    if config_owned(path) {
-        // Follow any rc/config symlink to its terminal document FIRST, exactly as
-        // the read/exec path (`ConfigCrdtFs`) does. Without this the editor binds
-        // the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
-        // composition) while reads resolve to the target — so saved edits land on
-        // a block nothing else reads (docs/issues.md). Resolving here makes the
-        // editor and the executor agree on one block.
-        let fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(
-            blocks.clone(),
-            config_root(path),
-        );
-        let resolved = fs
-            .resolve_canonical(path)
-            .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
-        let context_id = config_context_id(&resolved);
-        let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
-            format!("open editor: config document '{path}' does not exist (nothing to edit)")
-        })?;
-        Ok(EditorTarget {
-            context_id,
-            block_id,
-        })
-    } else {
-        let (context_id, block_id) = file_cache
-            .get_or_load(path)
-            .await
-            .map_err(|e| format!("open editor: cannot open '{path}': {e}"))?;
-        Ok(EditorTarget {
-            context_id,
-            block_id,
-        })
+    // Ask the VFS which backend owns this path. The config-doc backends answer
+    // for themselves — no hardcoded `/etc/rc` prefix to drift from the mounts.
+    if let Some((mount_root, fs)) = mounts.owner_of(std::path::Path::new(path)).await {
+        if fs.owns_config_docs() {
+            // Follow any rc/config symlink to its terminal document FIRST, exactly
+            // as the read/exec path (`ConfigCrdtFs`) does. Without this the editor
+            // binds the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
+            // composition) while reads resolve to the target — so saved edits land
+            // on a block nothing else reads (docs/issues.md). Resolving here makes
+            // the editor and the executor agree on one block. A fresh
+            // `ConfigCrdtFs` at the mount root does the lexical walk (it is
+            // stateless — blocks + root); `resolve_canonical` is not on `VfsOps`.
+            let root = mount_root.to_string_lossy().into_owned();
+            let config_fs =
+                crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), root);
+            let resolved = config_fs
+                .resolve_canonical(path)
+                .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
+            let context_id = config_context_id(&resolved);
+            let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
+                format!("open editor: config document '{path}' does not exist (nothing to edit)")
+            })?;
+            return Ok(EditorTarget {
+                context_id,
+                block_id,
+            });
+        }
     }
+    let (context_id, block_id) = file_cache
+        .get_or_load(path)
+        .await
+        .map_err(|e| format!("open editor: cannot open '{path}': {e}"))?;
+    Ok(EditorTarget {
+        context_id,
+        block_id,
+    })
 }
 
 // ============================================================================
@@ -611,6 +612,15 @@ mod tests {
         shared_block_store_with_db(db, ws_id, creator)
     }
 
+    /// A mount table with the rc `ConfigCrdtFs` mounted at `/etc/rc` — the
+    /// production shape the resolver queries to decide config-ownership.
+    async fn mounts_with_rc(blocks: &SharedBlockStore) -> Arc<crate::vfs::MountTable> {
+        let mt = crate::vfs::MountTable::new();
+        mt.mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .await;
+        Arc::new(mt)
+    }
+
     #[test]
     fn config_owned_covers_rc_and_config_trees_only() {
         assert!(config_owned("/etc/rc"));
@@ -633,13 +643,13 @@ mod tests {
             .await
             .unwrap();
 
-        // A bare FileDocumentCache is never consulted for a config path; the
-        // resolver must answer from the ConfigCrdtFs owner instead.
-        let file_cache =
-            FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
+        // The mount table owns the answer: it routes the path to the rc
+        // ConfigCrdtFs (config-owned), so the file cache is never consulted.
+        let mounts = mounts_with_rc(&blocks).await;
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
 
         let full = "/etc/rc/coder/create/S00-stance.kai";
-        let target = resolve_editor_target(full, &blocks, &file_cache)
+        let target = resolve_editor_target(full, &blocks, &file_cache, &mounts)
             .await
             .expect("rc path resolves to its owning block");
 
@@ -676,11 +686,11 @@ mod tests {
         .await
         .unwrap();
 
-        let file_cache =
-            FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
+        let mounts = mounts_with_rc(&blocks).await;
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
 
         let link_path = "/etc/rc/coder/create/S10-binding.kai";
-        let target = resolve_editor_target(link_path, &blocks, &file_cache)
+        let target = resolve_editor_target(link_path, &blocks, &file_cache, &mounts)
             .await
             .expect("symlinked rc path resolves to its target block");
 
@@ -706,13 +716,15 @@ mod tests {
     #[tokio::test]
     async fn missing_config_doc_fails_loud_not_empty() {
         let blocks = blocks_with_db();
-        let file_cache =
-            FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
+        let mounts = mounts_with_rc(&blocks).await;
+        let file_cache = FileDocumentCache::new(blocks.clone(), mounts.clone());
 
-        // No document was ever seeded at this path.
-        let err = resolve_editor_target("/etc/rc/nope/create/S00.kai", &blocks, &file_cache)
-            .await
-            .expect_err("a phantom config doc must error, not open an empty editor");
+        // No document was ever seeded at this path, but the mount table still
+        // routes it to the config backend → fail loud (not a file-cache miss).
+        let err =
+            resolve_editor_target("/etc/rc/nope/create/S00.kai", &blocks, &file_cache, &mounts)
+                .await
+                .expect_err("a phantom config doc must error, not open an empty editor");
         assert!(
             err.contains("does not exist"),
             "fail-loud message, got: {err}"
@@ -746,8 +758,16 @@ mod session_tests {
         rc.write_all(Path::new("coder/create/S00.kai"), initial)
             .await
             .unwrap();
-        let fc = FileDocumentCache::new(blocks.clone(), Arc::new(MountTable::new()));
-        let target = resolve_editor_target(RC_PATH, &blocks, &fc).await.unwrap();
+        let mounts = Arc::new({
+            let mt = MountTable::new();
+            mt.mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+                .await;
+            mt
+        });
+        let fc = FileDocumentCache::new(blocks.clone(), mounts.clone());
+        let target = resolve_editor_target(RC_PATH, &blocks, &fc, &mounts)
+            .await
+            .unwrap();
         (blocks, target)
     }
 

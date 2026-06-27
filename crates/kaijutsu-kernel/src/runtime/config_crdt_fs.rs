@@ -712,6 +712,10 @@ impl VfsOps for ConfigCrdtFs {
         false
     }
 
+    fn owns_config_docs(&self) -> bool {
+        true
+    }
+
     async fn statfs(&self) -> VfsResult<StatFs> {
         Ok(StatFs::default())
     }

@@ -155,10 +155,13 @@ impl MountTable {
         }
     }
 
-    /// Find the mount point for a given path.
-    ///
-    /// Returns the mount and the path relative to that mount.
-    async fn find_mount(&self, path: &Path) -> VfsResult<(Arc<dyn VfsOps>, PathBuf)> {
+    /// The mount point owning `path` (longest-prefix match) paired with its
+    /// backend — the "what owns this path?" question. `None` when nothing is
+    /// mounted over `path`. Used by the editor resolver to decide config-owned
+    /// (bind straight to the CRDT block) vs. an ordinary file, and to recover the
+    /// config mount root without a hardcoded prefix — see
+    /// [`VfsOps::owns_config_docs`].
+    pub async fn owner_of(&self, path: &Path) -> Option<(PathBuf, Arc<dyn VfsOps>)> {
         let path_str = path.to_string_lossy();
         let normalized = if path_str.starts_with('/') {
             path.to_path_buf()
@@ -194,26 +197,37 @@ impl MountTable {
             }
         }
 
-        match best_match {
-            Some((mount_path, fs)) => {
-                // Calculate relative path
-                let mount_str = mount_path.to_string_lossy();
-                let normalized_str = normalized.to_string_lossy();
+        best_match.map(|(mount_path, fs)| (mount_path.clone(), Arc::clone(fs)))
+    }
 
-                let relative = if mount_str == "/" {
-                    normalized_str.trim_start_matches('/').to_string()
-                } else {
-                    normalized_str
-                        .strip_prefix(mount_str.as_ref())
-                        .unwrap_or("")
-                        .trim_start_matches('/')
-                        .to_string()
-                };
+    /// Find the mount point for a given path.
+    ///
+    /// Returns the mount and the path relative to that mount.
+    async fn find_mount(&self, path: &Path) -> VfsResult<(Arc<dyn VfsOps>, PathBuf)> {
+        let (mount_path, fs) = self
+            .owner_of(path)
+            .await
+            .ok_or_else(|| VfsError::no_mount_point(path.display().to_string()))?;
 
-                Ok((Arc::clone(fs), PathBuf::from(relative)))
-            }
-            None => Err(VfsError::no_mount_point(path.display().to_string())),
-        }
+        // Calculate the path relative to the matched mount.
+        let path_str = path.to_string_lossy();
+        let normalized = if path_str.starts_with('/') {
+            path.to_string_lossy().into_owned()
+        } else {
+            format!("/{}", path_str)
+        };
+        let mount_str = mount_path.to_string_lossy();
+        let relative = if mount_str == "/" {
+            normalized.trim_start_matches('/').to_string()
+        } else {
+            normalized
+                .strip_prefix(mount_str.as_ref())
+                .unwrap_or("")
+                .trim_start_matches('/')
+                .to_string()
+        };
+
+        Ok((fs, PathBuf::from(relative)))
     }
 
     /// List the root directory, synthesizing entries from mount points.

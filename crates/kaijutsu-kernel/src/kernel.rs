@@ -872,8 +872,10 @@ impl Kernel {
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         let file_cache = self.file_cache(blocks);
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
-        // `!Send` `EditorCore` never coexists with an await.
-        let target = crate::editor::resolve_editor_target(path, blocks, &file_cache).await?;
+        // `!Send` `EditorCore` never coexists with an await. The mount table is
+        // the authority on what owns the path (config-doc backend vs. file).
+        let target =
+            crate::editor::resolve_editor_target(path, blocks, &file_cache, self.vfs()).await?;
         self.editor_sessions.lock().0.open(path, target, blocks, opener)
     }
 
@@ -1564,6 +1566,11 @@ mod tests {
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
+        // Mount it so the resolver's mount-table query routes the path to the
+        // config backend (same blocks, so it finds the seeded block).
+        kernel
+            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .await;
         let path = "/etc/rc/coder/create/S00.kai";
 
         // Open → type → state reflects, all through the kernel surface.
