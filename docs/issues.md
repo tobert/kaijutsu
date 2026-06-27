@@ -6,34 +6,109 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## SFTP over the VFS (slices 1–3 landed 2026-06-26; follow-ups)
+## SFTP over the VFS (slices 0–2 + extensions + tracing landed 2026-06-26; slice 3+ open)
 
 Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
 the `"sftp"` arm in `ssh.rs`). Two DeepSeek reviews + a Gemini Pro batch
 whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
 
-- **Slice 3 — capability binding (next).** Replace the stopgap
-  `privileged_write_denied` (lexical `/etc/rc`+`/etc/config` deny) with a real
-  loadout binding routed through the shared `context_allows_rc_write` guard.
-  Path-based context routing is the preferred option (`docs/sftp.md` → "Three
-  options"). **This also fixes the altitude bug the Gemini review flagged:** the
-  lexical deny sits *above* symlink resolution, so a symlink resolving into the
-  gated tree would slip past it (not a live bypass today — symlinks don't cross
-  mount backends and host `/` is read-only — but the gate belongs below
-  resolution).
+- **Slice 3 — capability binding (consumer of `/v/session`).** Prereq = the `/v`
+  surfaces below (own work, `docs/slash-v.md`). SFTP's part: register each
+  connection as a session, intercept `symlink`/`readlink` on
+  `/v/session/self/bound` to set the per-connection arm (sliding TTL ~15m), route
+  privileged writes through the bound `context_id` to the shared
+  `context_allows_rc_write` guard, deny-with-message otherwise. Replaces the
+  stopgap `privileged_write_denied` (lexical `/etc/rc`+`/etc/config` deny).
+  **Also fixes the altitude bug the Gemini review flagged:** the lexical deny sits
+  *above* symlink resolution, so a symlink resolving into the gated tree would
+  slip past it (not a live bypass today — symlinks don't cross mount backends and
+  host `/` is read-only — but the gate belongs below resolution).
+  **Re-verified 2026-06-27** (gpal batch raised it again): `LocalBackend::resolve`
+  canonicalizes *and* re-clamps with `canonical.starts_with(canonical_root)`
+  (`vfs/backends/local.rs:102-113`), so a symlink escaping its backend root is
+  rejected `path_escapes_root`; gated paths (`/etc/rc`, `/etc/config`) are a
+  separate `ConfigCrdtFs` mount reached by VFS prefix, not OS-symlink-reachable
+  from another backend. Confirmed not-a-bypass — the altitude fix is hygiene, not
+  a live hole.
 - **Slice 4 — adapter limits.** Rate-limiting + traversal-depth/size caps to
   survive an editor-indexer crawl (the access-pattern-shift DoS in
   `docs/sftp.md` → Security posture). The open-handle cap (1024/session) is a
   coarse down-payment; also need true streaming `readdir` — `VfsOps::readdir`
   loads the whole entry list, so only the heavy per-entry `File` build is chunked
-  today, not the `DirEntry` fetch.
-- **TOCTOU atomicity refactor.** The write/fsetstat generation guard has a
-  narrow post-write race (re-getattr after our own write can adopt a concurrent
-  replacement's generation). The clean fix is making `VfsOps::write`/`setattr`
-  return the new `FileAttr` atomically — a kernel-wide change worth doing before
-  slice 4.
+  today, not the `DirEntry` fetch. **The retained-list angle (gpal batch
+  2026-06-27):** `opendir` (`sftp.rs:392`) eagerly materializes the *entire*
+  `readdir` `Vec<DirEntry>` into the session handle map at open; an editor indexer
+  crawling `/v/ctx` holds many such lists open at once, so the OOM vector is the
+  sum of retained `DirEntry` lists across open dir handles, not just one page's
+  `File` build. The real fix is paginating `VfsOps::readdir`
+  (`readdir(path, offset, limit)`) so the handle holds a cursor, not the list.
+- **TOCTOU atomicity refactor.** The write/fsetstat generation guard
+  (`sftp.rs:595-608`) has two non-atomic facets. (a) The post-write re-getattr can
+  adopt a concurrent replacement's generation. (b) **Concurrent-appender lost
+  update** (gpal batch 2026-06-27, verified): `getattr` → generation-check →
+  `attr.size` → `write` spans separate `.await`s with no CAS, and APPEND offset is
+  `attr.size`. The guard catches rename-replace (its job) but *not* two appenders —
+  both read gen=N, both pass, both write at the same offset, one clobbers the
+  other. **Scope = cross-session** (two SSH connections to the same path); a single
+  client's pipelined writes are serialized by the handler's `&mut self`, so this is
+  not intra-session. Returning the new `FileAttr` atomically from
+  `VfsOps::write`/`setattr` closes (a); (b) also needs an atomic-append primitive
+  or per-path write serialization. Kernel-wide change, worth doing before slice 4.
 - **Runner-verify** with a stock `sftp`/sshfs client through the real server
   (kernel rebuild+restart; capnp schema unchanged, but it's a new subsystem).
+
+## `/v/ctx` + `/v/session` virtual surfaces (design `docs/slash-v.md`; lands ahead of SFTP slice 3)
+
+Two sysfs-style read-mostly `VfsBackend`s under the existing `/v` namespace
+(joins `/v/docs`, `/v/input`, `/v/blobs`). Every surface (app/kaish/file-tools/
+SFTP) sees them. Self-contained — no SFTP dependency — and unblocks the SFTP
+capability binding (which becomes a consumer of `/v/session`). Slices:
+
+- **V0 — `content_len` on `BlockHeader` (prerequisite, not `/v`-specific).** Block
+  byte size isn't stored, so a naive `getattr` would materialize the whole CRDT
+  body (a 5 MB tool result re-allocated for `ls -l`). Add an additive `content_len`
+  field (`kaijutsu-types/src/block.rs:134`), set on write/merge → O(1) size. CBOR
+  schema bump is additive/fail-loud. Slice V1 depends on it.
+- **V1 — `/v/ctx` read-only backend.** Contexts + CRDT block logs:
+  `/v/ctx/by-id/<id>/blocks/by-id/<key>/{role,kind,status,content,json,...}` with
+  **flat kind-conditional** attrs (tool-call: `tool_name`/`tool_input`/
+  `tool_use_id`; tool-result: `exit_code`/`is_error`/`call->`) — *not* nested
+  `tool/`·`error/` dirs (locked 2026-06-26) + `by-time/NNNN` symlink view
+  (stable-id-primary; never iterate `BlockId` order as timeline — use
+  `block_ids_ordered()`). Contexts from `list_all_contexts()` (`kernel_db.rs:1680`);
+  blocks from each **per-context** store in `documents: DashMap<ContextId,
+  DocumentEntry>` (`block_store.rs:182`) — no global filter. `generation` ←
+  `DocumentEntry::version()` (`block_store.rs:153`, bumps on local write + remote
+  merge), not a bespoke map. Scalar files + opt-in `json`; relationships as
+  symlinks; `0`/`1` booleans. `EROFS` writes; size from `content_len`; `read_all`
+  override (sizing gotcha). No shard (paged readdir + `/v` being a deliberate
+  destination handle scale); `live/<label>` (KernelDb-unique, short-id fallback)·
+  `by-type/`·`by-lineage/` (from `context_edges`) are convenience views. Testable
+  via `kaish ls /v/ctx`.
+  - ⚠️ **Deferred optimization (slice 1 ships naive):** `block_ids_ordered()`
+    (`block_store.rs:199`) re-sorts the whole context per call and caches nothing,
+    so `ls -l .../by-time/` is O(N²·log N) (one `readdir` + N `readlink`s = N+1
+    sorts). Fix later: backend cache of the ordered `Vec<BlockId>` keyed on
+    `DocumentEntry::version()`. Known-slow on large contexts until then.
+- **V2 — `/v/session` read-only backend.** View over a live participant registry
+  (generalize `PeerRegistry` to carry session *kind* — `PeerInfo` has no such field
+  today, `peers.rs:50`; app/MCP already registered). `self` resolved per-surface at
+  adapter altitude. `bound` renders the session's current context — for app/MCP
+  that's KV `client.current_context` (set via `context switch`). `/proc`-style
+  ephemeral; reconnect-flicker visible (see peer-reattach tech-debt).
+- **V3 — writable `bound`.** `set_bound(session, context_id)` + route privileged
+  writes through the shared `context_allows_rc_write` guard. The guard already keys
+  on `ctx.context_id` (`guard.rs:71`) — `guard.rs`/`binding.rs` unchanged. The real
+  work is the SFTP **consumer** side: `SftpSession` (`sftp.rs:107`, holds only
+  `Principal`) gains a guard handle + `bound_context_id`, and the lexical
+  `privileged_write_denied` (`sftp.rs:234`) is replaced by a real guard call in
+  every write handler; the `ln -s` symlink is only the setter. Join point with
+  SFTP slice 3 (setter + sliding TTL + fail-loud deny). App/MCP keep `context switch`.
+
+Locked 2026-06-26: `live/<label>` keying; flat kind-conditional block attrs;
+`content_len` on `BlockHeader`; `generation` ← `DocumentEntry::version()`; slice 1
+naive (ordered-id cache deferred, above). Open: huge-`content` range-read vs cap;
+slice-3 sliding-TTL storage home (`PeerInfo` carries no expiry today).
 
 ## Instrument reframing & RC stances (follow-ups from the 2026-06-22 pass)
 
@@ -1010,6 +1085,48 @@ cache eviction — e.g. `kj rc reset lib/S20` then `cat coder/S20` (coder→lib)
 editing `coder/S20` then `cat lib/S20`. Cosmetic (cat path only), self-heals on
 LRU/TTL. A full fix needs alias-aware invalidation (forward-resolve the written
 path to its terminal *and* reverse-scan symlinks that point at it) — deferred.
+
+## VFS / cache: coherency + consistency + test-coverage audit (2026-06-27)
+
+External reviewers (the gpal/Gemini batches especially) keep poking at the cache
+layer and finding *plausible* coherency holes that mostly turn out narrower than
+claimed once checked against the wiring — but the recurring near-misses say the
+substrate deserves a systematic pass rather than per-claim firefighting. The trigger
+this round: SFTP rides `Arc<MountTable>` directly (`sftp.rs:115`, from
+`kernel.vfs()`), while the `FileDocumentCache` write-through lives one layer up in
+`MountBackend` (`runtime/mount_backend.rs:43-49`), which SFTP never traverses. Not
+the "silent divergence" the review claimed (CRDT mounts still hit `ConfigCrdtFs`
+in-table; the generation/mtime staleness reload exists precisely to catch
+bypassing writers — that's how host `vim` stays coherent) — but the two-layer split
+is real and under-tested.
+
+Scope a deliberate audit covering three axes:
+
+- **Cache coherency.** Enumerate every `FileDocumentCache` consumer and every path
+  that *bypasses* it (SFTP via `MountTable`, app renderer, `ConfigCrdtFs` execution
+  reads, kaish/MCP file tools via `MountBackend`). For each: does the generation/
+  mtime staleness reload actually fire? Map the **dirty-cache-wins** windows (an
+  in-flight cached edit shadows an external/SFTP write until flush) and the
+  byte-offset-write vs document-level `WriteMode` impedance (SFTP `write(path,
+  offset, data)` onto a UTF-8 CRDT doc). Fold in the residual cross-alias staleness
+  above — it's the same family.
+- **Code consistency (async-correctness).** `LocalBackend` mixes `tokio::fs` and
+  blocking `std::fs` on the async worker: `write`/`read`/`truncate` use `tokio::fs`
+  (offloaded, fine), but `create` (`local.rs:290`), `mkdir` (`:307`), and
+  critically `resolve()` — called on *every* op, doing synchronous
+  `canonicalize()` at `:80,93,105` — block the runtime thread. Under a slow/stalled
+  host FS those starve the ambient tokio pool, which is exactly the path the
+  "ssh-in-when-the-app-is-down" fallback depends on (the gpal `spawn_blocking`
+  note, verified — but mis-aimed at `write`; the offenders are `resolve`/`create`/
+  `mkdir`). Fix: route the blocking calls through `spawn_blocking` or `tokio::fs`.
+- **Test coverage.** We lack concurrent multi-writer VFS tests (the kind that would
+  have surfaced the SFTP concurrent-append lost-update directly), cross-layer
+  coherence round-trips (SFTP write → kaish `cat` sees it; kaish edit → SFTP read
+  sees it), and staleness-reload tests per backend. Build these as the audit's
+  exit criteria, not an afterthought.
+
+Not urgent, but a good forcing function alongside the SFTP/shell sidequest, which
+is the consumer that stresses all three axes at once.
 
 ## kaijutsu-mcp — invoke_peer double-encodes object params (found 2026-06-23)
 
