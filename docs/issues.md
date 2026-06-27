@@ -292,24 +292,36 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
   multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
 - **Vi editor command mode — `:` dialect (Slice 3, `docs/vi.md` → *Command mode*).**
-  Steps 1+2 **shipped** (`ff9efb36` core verbs `:w/:q/:wq/:q!/:x/:w!`; `e9bec018`
-  `:s`/`:%s`/`:N,Ms`) — both runner-verified. Design notes that held: surface stays
-  kernel-owned (app forwards every key); the dialect is its own thing (Rust-regex
-  `:s`, not vim BRE); intent pattern (`CommandRequest`/`take_commands`), **not**
-  modalkit's command machine (its default set lacks `:wq`/`:x` and its commands
-  don't compose). Remaining:
-  - **Step 3 — `:r <file>` / `:r !cmd` + Ctrl+Z-suspend / `fg`-resume.** **`:!`
-    dropped** (2026-06-25): it needed nested editor sessions + a return stack; the
-    shell is already a keystroke away, so use the Unix job-control metaphor instead
-    — Ctrl+Z suspends vi to the shell (local app intercept = also the hung-kernel
-    escape hatch), `fg` (kaish builtin re-fires `open_editor`) resumes it. `:r`
-    makes `Kernel::editor_keys` **async** (first VFS/kaish I/O intent); `EditorCore`
-    gains `EditorIo::{ReadFile,ReadShell}` + `take_io()` + `insert_at_cursor`.
-    Insert at cursor, fail-loud on missing file / denied shell.
+  Steps 1+2+3 **shipped** (core verbs `:w/:q/:wq/:q!/:x/:w!`; `:s`/`:%s`/`:N,Ms`;
+  `:r <file>`/`:r !cmd`; Ctrl+Z-suspend / `fg`-resume). Design notes that held:
+  surface stays kernel-owned (app forwards every key); the dialect is its own
+  thing (Rust-regex `:s`, not vim BRE); intent pattern
+  (`CommandRequest`/`take_commands`), **not** modalkit's command machine.
+  **Slice-3 polish landed 2026-06-27** (headless green, **runner-verify pending** —
+  capnp `@6` ⇒ kernel+app rebuild+restart, eyeball `:r !cmd` splice, a bad `:cmd`
+  showing E492 on the strip, and `fg` from a second window):
+  - **`:r !cmd`** now shells out in the **opener's** context (was fail-loud-deferred).
+  - **Opener capture fixed** — `EditorOpener { principal, context_id, session_id }`
+    captured at builtin construction (the old `ToolCtx`→kaijutsu-`ExecContext`
+    downcast was a type mismatch that *always* failed, so `fg` only ever hit the
+    most-recent-of-any fallback). `fg` now targets the caller's own session.
+  - **Bad `:cmd` / bad `:s`** report on `EditorState.message` (vim E492) and keep
+    the session open, instead of erroring `editor_keys`.
+  - **`:w!` == `:w`** (decided 2026-06-27) — `force` reserved for a future
+    changed-under-us guard (concurrent-writer detection), not a permission gate.
   - **Step 4 — `:e <path>`** (rebind the session to another block) — deferred.
   - Related separate thread: the Ctrl+Z shell may become a **shadow context**
     (blocks excluded from the conversation until drifted) — simplify-by-construction,
     its own design pass; `project_shadow_context_shell` memory.
+- **Vi editor — residual `config_owned` prefix on the cache-invalidation path.**
+  `resolve_editor_target` now decides config-ownership via the mount table
+  (`MountTable::owner_of` + `VfsOps::owns_config_docs`, 2026-06-27), but
+  `Kernel::invalidate_config_file_cache` still uses the hardcoded `config_owned`
+  prefix check. It's the **sync** guard on the sync `editor_quit` path; routing it
+  through the async mount-table query would cascade `editor_quit` (+ its wire
+  handlers) to async. Unify when that path is reworked, or add a sync
+  mount-ownership lookup. Low stakes (cache-coherence optimization), but it's a
+  second source of truth for config-ownership.
 - **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.

@@ -416,8 +416,10 @@ impl EditorSessions {
         let mut saved_state = None;
         for cmd in commands {
             match cmd {
-                // `force` (`:w!`) is reserved for a future read-only/permission
-                // gate; rc/config has none today, so a forced write == a write.
+                // `:w!` == `:w` today. `force` is reserved for the planned
+                // changed-under-us guard: once a plain `:w` refuses when the block
+                // moved since open (a concurrent writer), `:w!` overrides it. No
+                // such detection yet, so a forced write is just a write.
                 CommandRequest::Write { force: _ } => {
                     saved_state = Some(self.save(id)?);
                 }

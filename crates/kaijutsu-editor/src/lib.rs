@@ -70,8 +70,10 @@ pub enum CloseRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandRequest {
     /// `:w` / `:w!` — checkpoint (save) the buffer; **stay open**. `force` (`!`)
-    /// is recorded for a future read-only / permission gate (rc/config has none
-    /// today), so it is presently a no-op distinction.
+    /// is recorded but presently a no-op distinction: `:w!` == `:w`. The intended
+    /// future use is an overwrite-the-overwrite override — once the kernel detects
+    /// the block changed under us since open (a concurrent writer), a plain `:w`
+    /// refuses and `:w!` forces (vim's "file has changed since editing started").
     Write { force: bool },
     /// `:q` / `:q!` — quit. `force` (`!`) discards changes since the last
     /// checkpoint; without it a *dirty* buffer must refuse (vim's "No write

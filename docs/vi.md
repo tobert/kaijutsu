@@ -643,9 +643,9 @@ contract as buffer/cursor today, no app mode tracking).
      SUBSTITUTED/` rendered in the app; `:q!` restored the block.
    - **Deferred:** bare `:s` (repeat-last) errors for now; `.`/`$` ranges;
      `&`/`~` repeat; substitute undo granularity.
-3. ✅ **`:r <file>` + Ctrl+Z/`fg` SHIPPED + runner-verified (2026-06-25).**
-   `:r !cmd` fail-loud-deferred (needs the opener-context capture). **`:!`
-   dropped** — see "Step 3 design" below.
+3. ✅ **`:r <file>` + Ctrl+Z/`fg` SHIPPED + runner-verified (2026-06-25);
+   `:r !cmd` SHIPPED (2026-06-27, headless green, runner-verify pending).**
+   **`:!` dropped** — see "Step 3 design" below.
 4. `:e` if/when wanted.
 
 ### Step 3 design — `:r` + Ctrl+Z/`fg` (locked 2026-06-25; `:!` dropped)
@@ -662,10 +662,15 @@ back. (`:%!filter` buffer-through-command is also out of scope; the shell filter
 
 **What ships:**
 
-1. **`:r <file>`** ✅ SHIPPED (2026-06-25); **`:r !cmd`** fail-loud-deferred
-   (needs a kernel kaish-exec helper via `kj_dispatcher.materialize_context_kaish`
-   + the opener's context threaded onto the session — `:r !cmd` errors clearly
-   meanwhile, pointing at Ctrl+Z). `:r <file>` reads via `FileDocumentCache::
+1. **`:r <file>`** ✅ SHIPPED (2026-06-25); **`:r !cmd`** ✅ SHIPPED (2026-06-27,
+   headless green, runner-verify pending). `:r !cmd` materializes a kaish in the
+   **opener's** `(principal, context_id, session_id)` via
+   `broker.kj_dispatcher().materialize_context_kaish` (the same helper the model
+   shell + rc lifecycle use) and splices the command's stdout at the cursor —
+   running in the opener's working context / capability allow-set, not the edited
+   block's context. Fails loud on no opener (headless open), no dispatcher, or a
+   nonzero exit. The opener is captured at construction on every front door (see
+   "Opener capture" below). `:r <file>` reads via `FileDocumentCache::
    read_content` and splices **at the cursor**. The one real cost paid: these are
    the first **async** intents, so **`Kernel::editor_keys` is now `async`**:
    sync-lock { apply_keys, mirror, `take_io`/`take_close`/`take_commands` } →
@@ -699,14 +704,20 @@ back. (`:%!filter` buffer-through-command is also out of scope; the shell filter
      caller's most-recent session (job-control) and **re-fires the existing
      `open_editor` signal** → the app re-enters `Screen::Editor`. No new wire.
      Nothing open → `fg: no editor session` (mirrors bash).
-   - **Opener capture / fallback:** the session records its opener principal
-     (`editor_open_as`), but the opener isn't captured on the external-MCP shell
-     path (the `vi` builtin's `ExecContext` downcast doesn't reach there — the
-     *same* gap `:r !cmd` must close: thread the opener context onto the session).
-     So `resume_editor` **prefers** the caller's session and **falls back** to the
-     most-recent editor of any opener — correct for the shared-trust single-user
-     instrument, a multi-user refinement later. Runner-verified: `vi` → Ctrl+Z
-     (→ shell) → `fg` (→ editor) end to end.
+   - **Opener capture — ✅ FIXED (2026-06-27).** The session records a full
+     `EditorOpener { principal, context_id, session_id }`. The previous code
+     downcast the kaish `ToolCtx` to *kaijutsu's* `ExecContext` (a different type
+     from the kaish `ExecContext` the interpreter actually passes), so the
+     downcast **always failed** and the opener was never captured — `fg` always
+     hit the most-recent-of-any fallback. Fixed by capturing the opener at
+     **construction** (`ViBuiltin::new`/`FgBuiltin::new` get it from
+     `materialize_context_kaish`'s live `(principal, context_id, session_id)`,
+     mirroring `KjBuiltin`), not via a downcast. `resume_editor` now resolves the
+     caller's own session as the normal path; the most-recent-of-any fallback
+     remains a shared-trust safety net (a headless / context-less open). The same
+     captured context is what `:r !cmd` shells out in. Runner-verify pending
+     (capnp `@6` ⇒ kernel+app rebuild). Earlier `vi`→Ctrl+Z→`fg` runner-verified
+     2026-06-25; the precision fix is headless-green.
 
 **Related (separate thread, NOT part of this):** the Ctrl+Z shell may later become
 a **shadow context** whose blocks are excluded from the agent's conversation until
@@ -726,9 +737,18 @@ working feature, but all of it blocks calling it finished**:
   vi.md (risk #4) says the editor doesn't need it (the app sends *keys*, the
   kernel writes via `block_store.edit_text`). If one lands anyway, either find it
   a second consumer or pull it.
-- **The path-resolution prefix check** (`config_owned` in `editor.rs`) is a
-  hardcoded `/etc/rc` + `/etc/config` test; it should become a mount-table
-  question ("what owns this path?"). Noted at the resolver.
+- **The path-resolution prefix check — ✅ FIXED (2026-06-27).**
+  `resolve_editor_target` now asks the mount table ("what owns this path?"):
+  `MountTable::owner_of(path)` + `VfsOps::owns_config_docs()` (the config-doc
+  backends answer for themselves; `ConfigCrdtFs` returns `true`). No hardcoded
+  `/etc/rc` prefix in the binding decision, so the editor and the VFS can't drift
+  on ownership. **Behavior change:** a config path is config-owned only when its
+  backend is actually *mounted* (more correct — you can't edit an unmounted
+  tree). **Residual (deferred):** `config_owned` survives as the **synchronous**
+  prefix guard for `Kernel::invalidate_config_file_cache` (a cache-coherence
+  optimization on the *sync* `editor_quit` path — an async mount-table query there
+  would cascade into the sync editor methods + wire handlers). Tracked in
+  `docs/issues.md`.
 - **Peer addressing** is pass-1 single-nick (`APP_PEER_NICK`); generalize to the
   submitting peer (risk #3) before multi-user.
 - **Any optimistic-mirror / latency hack** in the app renderer (if we add one)
@@ -754,14 +774,23 @@ working feature, but all of it blocks calling it finished**:
   our minimal modalkit setup (inert no-op). Wiring real `.` repeat needs
   modalkit's last-edit-sequence machinery; revisit when the `:`/search surface
   is built.
-- **`:w!` force is a no-op (Slice 3).** `CommandRequest::Write{force}` carries
-  the bang, but rc/config has no read-only/permission gate to override, so a
-  forced write == a write today. Wire `force` to a real gate when one exists.
-- **Bad `:cmd` errors the RPC instead of the `:` line (Slice 3).** An unknown
-  command makes `editor_keys` return `Err` (fail-loud, which the front door
-  surfaces). vim shows "E492: Not an editor command" on the `:` line and stays
-  put. Render the error on the strip (an `EditorState` message field) when the
-  `:`-line surface grows — for now, fail-loud is the right default.
+- **`:w!` is a synonym for `:w` (decided 2026-06-27).** `CommandRequest::Write
+  {force}` carries the bang but it's a no-op distinction today. We're *not*
+  wiring it to a permission gate; the intended future use is a
+  **changed-under-us guard** — when the kernel detects the block moved since open
+  (a concurrent writer), a plain `:w` refuses and `:w!` overrides (vim's "file
+  has changed since editing started"). Until that detection exists, `:w!` == `:w`.
+  The `force` field stays so the grammar is ready.
+- **Bad `:cmd` reports on the `:` line — ✅ FIXED (2026-06-27).** An unknown
+  command (or a bad `:s` regex — both arrive on the same `take_commands()`
+  `Some(Err)` channel) now sets `EditorState.message` (vim's E492) and keeps the
+  session open, instead of erroring `editor_keys` out from under the renderer.
+  Wire: capnp `EditorState.message @6`; the app strip draws it (command_line
+  takes precedence while typing, message after a bad submit). The message is
+  transient — it clears on the next keystroke batch. Specs:
+  `unknown_colon_command_reports_on_the_status_line`,
+  `bad_substitute_pattern_reports_on_the_status_line_and_leaves_block_clean`, and
+  the `editor_wire` e2e `unknown_colon_command_reports_on_the_status_line_over_the_wire`.
 
 ### Command surface the e2e covers (verified)
 
