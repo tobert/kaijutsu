@@ -2779,6 +2779,9 @@ pub struct EditorState {
     /// The `:`-line a renderer draws while command mode is active (`":wq"`);
     /// `None` when the bar is unfocused. (docs/vi.md → Command mode.)
     pub command_line: Option<String>,
+    /// A transient status/error line (vim `E492`), e.g. an unknown `:command` or
+    /// a bad `:s` regex; `None` when there's nothing to report. Drawn read-only.
+    pub message: Option<String>,
 }
 
 /// Parse a capnp `EditorState` reader into the client struct. Shared by the
@@ -2788,6 +2791,7 @@ pub(crate) fn parse_editor_state(
 ) -> Result<EditorState, RpcError> {
     let mode = r.get_mode()?.to_string()?;
     let command_line = r.get_command_line()?.to_string()?;
+    let message = r.get_message()?.to_string()?;
     Ok(EditorState {
         session: r.get_session(),
         text: r.get_text()?.to_string()?,
@@ -2798,6 +2802,11 @@ pub(crate) fn parse_editor_state(
             None
         } else {
             Some(command_line)
+        },
+        message: if message.is_empty() {
+            None
+        } else {
+            Some(message)
         },
     })
 }

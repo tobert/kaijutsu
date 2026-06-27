@@ -366,6 +366,7 @@ struct EditorState {
   mode @3 :Text;         # vim mode label; "" = none/normal
   dirty @4 :Bool;        # buffer differs from the last open/save checkpoint
   commandLine @5 :Text;  # the ":"-line while command mode is active (":wq"); "" = bar unfocused
+  message @6 :Text;      # transient status/error line (vim E492); "" = none
 }
 
 # Callback for receiving editor-session state pushes (the in-app vi editor).

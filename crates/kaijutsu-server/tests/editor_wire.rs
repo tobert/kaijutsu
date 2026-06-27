@@ -268,6 +268,36 @@ fn colon_substitute_edits_the_block_over_the_wire() {
 }
 
 #[test]
+fn unknown_colon_command_reports_on_the_status_line_over_the_wire() {
+    // Slice 3 polish: an unknown `:command` must NOT error the `editorKeys` call
+    // (which the renderer would surface as a hard failure / popped editor) — it
+    // returns a normal state carrying the vim-E492 message, session still open.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+
+        let after = kernel
+            .editor_keys(session, ":frobnicate<CR>")
+            .await
+            .expect("a bad command does not error the RPC");
+        let msg = after.message.expect("a status message rode the wire");
+        assert!(msg.contains("Not an editor command"), "got: {msg}");
+        assert_eq!(after.text, opened.text, "the buffer is untouched");
+
+        // The session is still alive: editorState answers and the message has
+        // cleared (it's transient, set only on the offending submit's push).
+        let polled = kernel.editor_state(session).await.unwrap();
+        assert_eq!(polled.message, None, "the status message is transient");
+
+        kernel.editor_keys(session, ":q!<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn colon_r_reads_a_file_into_the_buffer_over_the_wire() {
     // Slice 3: `:r <file>` fetches content (VFS) inside the now-async editor_keys
     // and splices it at the cursor. Read the editor's own seeded file into itself

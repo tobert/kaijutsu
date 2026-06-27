@@ -153,7 +153,15 @@ pub fn build_editor_surface(
     let text = &view.state.text;
     let cursor_byte = char_to_byte(text, view.state.cursor as usize);
     let kind = mode_kind(view.state.mode.as_deref());
-    let cmdline = &view.state.command_line;
+    // The bottom strip shows the in-progress `:`-line while typing, else a
+    // transient status/error message (vim E492) after a bad `:`-submit. The
+    // command line takes precedence — you're actively typing it.
+    let cmdline = view
+        .state
+        .command_line
+        .as_ref()
+        .or(view.state.message.as_ref())
+        .cloned();
 
     let size_changed =
         (rtt.built_width - width).abs() > 1.0 || (rtt.built_height - height).abs() > 1.0;
@@ -191,7 +199,8 @@ pub fn build_editor_surface(
         // The `:`-command strip (Slice 3): laid out with the same mono font and
         // appended to the same glyph buffer near the page bottom — so the editor
         // draws its command line read-only, no second surface, no mode tracking.
-        if let Some(cl) = cmdline {
+        // Also carries the status/error message (vim E492) after a bad submit.
+        if let Some(cl) = &cmdline {
             let strip_layout = font.layout(cl, &style, VelloTextAlign::Left, Some(content_width));
             for line in strip_layout.lines() {
                 for item in line.items() {

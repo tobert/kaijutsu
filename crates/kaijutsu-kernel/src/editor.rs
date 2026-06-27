@@ -175,6 +175,11 @@ pub struct EditorState {
     /// `Some(":wq")` mid-type, `None` when the bar is unfocused. The kernel owns
     /// the bar (modalkit); the renderer draws this read-only, tracking no mode.
     pub command_line: Option<String>,
+    /// A transient status/error line (vim's `E492`-area message), e.g. an unknown
+    /// `:command` or a bad `:s` regex. `Some` right after the offending submit,
+    /// cleared on the next keystroke batch. The session stays open — a bad
+    /// `:`-line reports here instead of erroring the whole `editor_keys` call.
+    pub message: Option<String>,
 }
 
 impl EditorState {
@@ -190,6 +195,7 @@ impl EditorState {
             "mode": self.mode,
             "dirty": self.dirty,
             "command_line": self.command_line,
+            "message": self.message,
         })
     }
 }
@@ -347,10 +353,22 @@ impl EditorSessions {
             return Ok(KeysOutcome::Closed(final_state));
         }
 
-        // A submitted `:`-line (`:w`/`:wq`/`:q!`/…). An unknown command fails
-        // loud (vim's "Not an editor command"); a parsed batch runs in order.
+        // A submitted `:`-line (`:w`/`:wq`/`:q!`/…). A parsed batch runs in
+        // order; an unknown command or a bad `:s` regex (both arrive as
+        // `Some(Err)`) reports vim-style on the status line and keeps the session
+        // open — never errors the whole `editor_keys` call out from under the
+        // renderer (the front door would otherwise surface it as a hard failure).
         if let Some(parsed) = commands {
-            return self.run_commands(id, parsed?, blocks);
+            match parsed {
+                Ok(cmds) => return self.run_commands(id, cmds, blocks),
+                Err(msg) => {
+                    let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+                    let saved = session.saved_content.clone();
+                    let mut state = state_of(&mut session.core, &saved);
+                    state.message = Some(msg);
+                    return Ok(KeysOutcome::Updated(state));
+                }
+            }
         }
 
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
@@ -570,6 +588,9 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
         mode,
         dirty,
         command_line,
+        // A fresh state carries no status message; the command path sets one only
+        // when a `:`-line errored, and it clears on the next keystroke batch.
+        message: None,
     }
 }
 
@@ -1018,14 +1039,35 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn unknown_colon_command_fails_loud() {
+    async fn unknown_colon_command_reports_on_the_status_line() {
+        // vim's E492: an unknown `:command` shows on the status line and the
+        // session stays put — it does NOT error `editor_keys` (which the front
+        // door would surface as a hard failure, popping the editor).
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let err = sessions.keys(id, ":frobnicate<CR>", &blocks).unwrap_err();
-        assert!(err.contains("Not an editor command"), "got: {err}");
+        let outcome = sessions.keys(id, ":frobnicate<CR>", &blocks).unwrap();
+        assert!(
+            matches!(outcome, KeysOutcome::Updated(_)),
+            "a bad command keeps the session open"
+        );
+        let msg = outcome
+            .state()
+            .message
+            .as_deref()
+            .expect("a status message is set");
+        assert!(msg.contains("Not an editor command"), "got: {msg}");
         assert!(sessions.is_open(id), "a bad command leaves the session open");
+        // The buffer is untouched (the bad command edited nothing).
+        assert_eq!(block_text(&blocks, &target).unwrap(), "hello");
+
+        // The message clears on the next keystroke batch (vim-ish transience).
+        let outcome = sessions.keys(id, "l", &blocks).unwrap();
+        assert!(
+            outcome.state().message.is_none(),
+            "the status message clears on the next keystroke"
+        );
     }
 
     #[tokio::test]
@@ -1070,13 +1112,21 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn bad_substitute_pattern_fails_loud_and_leaves_block_clean() {
+    async fn bad_substitute_pattern_reports_on_the_status_line_and_leaves_block_clean() {
+        // A bad `:s` regex arrives on the same `Some(Err)` channel as an unknown
+        // command, so it too reports on the status line and keeps the session
+        // open — the block is left untouched, no silent edit.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let err = sessions.keys(id, ":s/[/x/<CR>", &blocks).unwrap_err();
-        assert!(err.contains("invalid :s pattern"), "got: {err}");
+        let outcome = sessions.keys(id, ":s/[/x/<CR>", &blocks).unwrap();
+        let msg = outcome
+            .state()
+            .message
+            .as_deref()
+            .expect("a status message is set");
+        assert!(msg.contains("invalid :s pattern"), "got: {msg}");
         assert_eq!(block_text(&blocks, &target).unwrap(), "hello", "no edit on a bad pattern");
         assert!(sessions.is_open(id), "a bad :s leaves the session open");
     }

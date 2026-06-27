@@ -110,6 +110,9 @@ fn dispatch_peer_action(
                     mode: p.mode,
                     dirty: p.dirty,
                     command_line: p.command_line,
+                    // An open carries no status message — it's set only when a
+                    // later `:`-line errors (arriving via the editor push).
+                    message: None,
                 },
             });
 
