@@ -149,20 +149,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   SFTP-style or needs the RPC dedicated-thread treatment.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
-- **`context_type` is a bare `String` (newtype, not enum — 2026-06-28).** The
-  field is duplicated across ~6 struct defs (`kernel_db::ContextRow`, `kj/rc.rs`,
-  `kaijutsu-client` rpc+actor, `kaijutsu-mcp::models`, the time-well card) and
-  crosses SQLite (`context_type TEXT … DEFAULT 'default'`), capnp, and rc-path
-  resolution. Behavioral branching is shallow — only 3 sites compare the value
-  (`rpc.rs:1672` create-arm, `kj/context.rs:628` track derivation,
-  `transport.rs:268` `kj transport arm`) — but bare `== "musician"` literals are
-  easy to typo and scatter. Do NOT make it a closed `enum`: `context_type` names
-  an **rc-bucket directory** (`/etc/rc/<type>/<verb>/`), so the set is deliberately
-  open (a new mode = new rc scripts, no Rust change — see `project_rc_lifecycle`).
-  The fit is a serde-transparent **newtype** `ContextType(String)` in
-  `kaijutsu-types` with associated consts (`ContextType::MUSICIAN`) + predicates
-  (`.is_musician()`): one documented home for the known buckets, the literals
-  vanish, the set stays open, and the wire/DB are unchanged. Low priority.
+- **`context_type` stringly-typed — prefer the feature-decomposition over a
+  newtype (direction: `docs/chameleon.md` → "context_type is an rc bundle of
+  features", 2026-06-28).** `context_type` is a bare `String` duplicated across
+  ~6 struct defs (`kernel_db::ContextRow`, `kj/rc.rs`, `kaijutsu-client` rpc+actor,
+  `kaijutsu-mcp::models`, the time-well card), crossing SQLite, capnp, and rc-path
+  resolution. Only 3 sites branch on `"musician"` (`rpc.rs:1672` create-arm,
+  `kj/context.rs:628` track derivation, `transport.rs:268` `kj transport arm`) —
+  and the beat *runtime* already keys off "armed", not the name. The **preferred**
+  fix is not a newtype but to move the create-time arm into the musician's
+  `create/` rc (via `kj transport arm`) and replace the arm gate with a property
+  ("has a track lane" / opt-in), deleting the 3 string sites and letting new
+  context_types (`funkMusician`, …) be pure rc — see the chameleon decision for
+  the full trajectory + the two related axes (decouple-Act-from-ABC, per-type
+  `BeatPolicy`). A serde-transparent `ContextType(String)` newtype with consts is
+  the *shallow* alternative if the decomposition stalls — but don't do both; the
+  decomposition leaves ≤1 comparison, not worth a newtype. Do NOT make it a closed
+  `enum`: `context_type` names an open **rc-bucket directory** (`project_rc_lifecycle`).
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
 - **Context-type tool policy (unified governance):** The `kj` surface is now
   capability-gated — escalation-relevant verbs check the caller's loadout via
@@ -820,6 +823,9 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   malformed-quarantine (just shipped, beat.rs:850 `set_excluded`) and the
   header-carry follow-up below both become per-content-type validator behavior,
   not ABC special cases. Keep ABC as the first registered validator/deriver.
+  This is one axis of the broader **`context_type` feature-decomposition**
+  (`docs/chameleon.md` → "context_type is an rc bundle of features"): *what
+  artifact* a player produces, separate from *whether* it has a beat.
 - **Header-carry for headerless player output (robustness).** A windowed player
   naturally emits a bare continuation body (no `X:`/`K:` header) once it has a
   full tune in its context; the schedule-time validator then rejects it. Today
@@ -853,7 +859,9 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   fixed in `BeatPolicy::musician_default()`. Make the cadence a settable knob
   (rc-declared and/or a `kj transport` arg), persisted per context. Fine to do
   later. (Until then, a high BPM via `kj transport tempo` shrinks the wall-clock
-  per OODA turn for testing — 128 beats @ 1000 BPM ≈ 7.7 s.)
+  per OODA turn for testing — 128 beats @ 1000 BPM ≈ 7.7 s.) Per-type `BeatPolicy`
+  defaults are an axis of the **`context_type` feature-decomposition**
+  (`docs/chameleon.md`): a `funkMusician` shouldn't be stuck on `musician_default()`.
 - **`kj transport meter` inbound verb (Chameleon batch 1, F2):** add
   `kj transport meter <beats_per_phrase>` with a `--bars N --beats-per-bar M`
   convenience that multiplies to beats *at the edge* → new

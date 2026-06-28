@@ -135,6 +135,58 @@ band owns time — the transport (拍子木) does.
     fork-lineage). The thin fork's only jobs are lean-player spawn, song
     structure, and rc-refresh.
 
+- **`context_type` is an rc bundle of features, not a Rust enum — the beat is a
+  capability a context_type *consumes*, not a name the kernel matches
+  (direction set 2026-06-28).** The trigger: `kj transport arm` (the manual
+  restart-recovery verb, shipped 2026-06-28) gates on `context_type == "musician"`,
+  and a survey asked how deep that string goes. Answer: **the beat *runtime* is
+  already feature-decomposed — it keys off "armed", not the name.** `on_turn_completed`
+  (the OODA Act that crystallizes a turn's ABC into a cell) gates on
+  `self.armed.get(&ctx)` + `ooda_armed` (`beat.rs:842`); so do `fire_due` and
+  transport play/pause. Once a context is **armed**, nothing downstream asks "is
+  it a musician?". The literal `"musician"` survives only at the three create-time
+  **entry gates** that decide a context *becomes* armed and *gets a lane*:
+  `rpc.rs:1672` (send `BeatCommand::Arm`), `context.rs:628` (derive the track from
+  the label), and `transport.rs:268` (the arm verb's refusal). Everything else a
+  "musician" *is* already lives in the open layers:
+
+  | Feature of a "musician" | Where it lives |
+  |---|---|
+  | tool-free, drive-only loadout | rc binding (`musician/create/S10-binding.kai`) — the capability allow-set |
+  | ABC-output stance primer | rc `.md` → system slot (`S15-abc-primer.md`) |
+  | hydration window policy | rc-driven (`kj context hydrate --window`) |
+  | OODA Act crystallizes turn→cell | gated on **armed** (structural, `beat.rs:842`) |
+  | beat participation + track lane | the **only** Rust-string-hardcoded bit (the 3 gates above) |
+
+  So `context_type` is *already* "the name of an rc bundle that composes
+  features" — the rc lifecycle + capability allow-set + the `armed` flag **are**
+  the feature-decomposition system; only the beat *entry gate* is still keyed on
+  the literal name. The trajectory (consistent with **"Players are rc programs"**
+  above — even arming is rc, not Rust):
+  - **`kj transport arm` is the rc-callable arm primitive.** It already derives
+    the track from the label and picks the policy (persisted, else
+    `musician_default()`), so it does everything `rpc.rs:1672` does. Move the
+    create-time arm **out of Rust into the musician's `create/` rc** (an
+    `S20-arm.kai` that calls `kj transport arm`). The `rpc.rs:1672` and
+    `context.rs:628` string checks then **delete**.
+  - **The remaining gate becomes a property, not a name.** `transport.rs:268`'s
+    `== "musician"` becomes "does this label yield a track lane?" — or, in
+    shared-trust kaijutsu (capabilities are ergonomic nudges, not security),
+    *nothing*: **arming is the opt-in.** Anything you arm is a beat participant.
+  - **New context_types are pure rc, zero Rust.** `funkMusician` = an rc bundle
+    whose `create/` calls arm + a funk stance + (later) its own tempo;
+    `lyricist_in_time_with_music` = arm + a lyricist stance + reads `$HEARD`.
+    No kernel edit, no enum variant.
+
+  Two open issues are the *other axes* of the same decomposition: **"Decouple the
+  OODA Act from ABC"** (content-type-keyed validation/derivation — *what artifact*
+  a player produces, separate from *whether* it has a beat) and **"Cadence
+  settable per context"** (per-type `BeatPolicy` defaults so a funk player isn't
+  stuck on `musician_default()`). Corollary: this makes the *shallow* fix — a
+  `ContextType(String)` newtype to centralize the literals (issues.md → Architecture)
+  — nearly moot; if the create-arm moves to rc, ≤1 string comparison remains, not
+  worth a newtype. Prefer the decomposition over the newtype; don't do both.
+
 ## Timeline gap analysis (vs. hyoushigi as landed)
 
 The temporal substrate is ready; the timeline is a **solo instrument**. One
