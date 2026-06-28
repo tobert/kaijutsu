@@ -457,6 +457,17 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Control Plane & Navigation (kj)
 
+- **Latch confirmation nonce is emitted on stderr (prose-only) — make it
+  machine-readable.** Found 2026-06-28 trying to script a batch `kj context
+  remove`. The latch is an explicit two-step *machine* protocol: the first call
+  returns a nonce you must capture and pass back via `--confirm`. But the nonce
+  is buried in human-prose **stderr** ("To confirm, run: … --confirm <nonce>",
+  exit 2), so any automation must `2>&1` and regex-scrape it — a footgun (cost us
+  a failed batch loop; nothing wrong with kaish, the prompt just wasn't on
+  stdout). Fix: surface the nonce in the result's structured `data` field
+  (`data.confirm_nonce`, per the kj structured-data convention) so a caller reads
+  it structurally. Applies to every latched verb (`context remove/archive/retag/
+  move`, …) — they share the latch helper, so it's one change at the source.
 - **Workspace path mount points:** `kj workspace add --mount <target>` was
   documented + parsed but silently ignored (no backing storage) — removed during
   the clap migration so it now fails loud. To implement: add a `mount` column to
@@ -960,20 +971,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     the durable log + CAS, carry the tick) is the fix; until then a page-turn
     restarts the timeline. Pairs with the windowed-notation pull primitive below
     (carrying recent notation into the child).
-    **⚠️ The gap is worse than "music restarts" — `rotate --every 1` is a fork
-    bomb (confirmed live 2026-06-28 runner-verify).** The rotate horizon is
-    `phrase % every == 0`. With the tick reset, a freshly-forked child seeds its
-    playhead at tick 0 → phrase 0, and `0 % every == 0` is true for ANY `every`,
-    so the child rotates immediately on its first beat — spawning another child
-    that does the same. A `--every 1` test self-forked ~15 musicians in ~30s and
-    only a server restart (armed map clears on cold start) stopped it; one-by-one
-    `kj transport stop` lost the race because children spawned faster than the
-    stop pass. Two independent guards, either of which defuses it: (a) carry the
-    tick (the continuity fix above — a child resumes mid-phrase, not at phrase 0);
-    and/or (b) a minimum phrase-age before a context may rotate (don't rotate on
-    the same phrase you were born into). Want **both** — (b) is a cheap safety
-    rail that should land regardless of (a). Until then, treat `kj transport
-    rotate --every 1` as unsafe on a live kernel.
+    Runner-verified live 2026-06-28: a played musician forks a labelless child
+    on the parent's track, tempo + `$ROTATE_EVERY` inherited, lineage is a clean
+    LINEAR chain (verified via `kj context list --tree`) — song form, exactly as
+    designed. (Birth-rotation is already guarded: `beat_count` is post-increment
+    so the earliest rotate is phrase 1, never phrase 0 — `beat.rs process_one`;
+    rotation is driven by `beat_count` which resets on arm, INDEPENDENT of the
+    playhead tick reset above. An earlier note here mis-diagnosed a "phrase-0
+    fork bomb" — retracted; no such bug.)
+    **Operational gap — no clean way to STOP a live rotate chain.** `rotate
+    --every N` keeps turning the page every N phrases until something stops the
+    current tip, and the child inherits the cadence by design, so the song
+    out-runs a `kj transport stop` driven off a stale context list (each stop
+    races the advancing tip). The reliable halt was a full server restart (armed
+    map clears on cold start). Worth an affordance: a "stop/disarm the whole
+    rotating lineage" verb, or `rotate off` that also clears the inherited cadence
+    so the in-flight child doesn't re-arm it. Until then, to stop a song stop its
+    live tip (`kj context list --tree` to find it) or restart the kernel.
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed
