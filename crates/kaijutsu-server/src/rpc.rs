@@ -1666,40 +1666,12 @@ async fn create_context_inner(
         log::warn!("rc create lifecycle for {}: {e}", context_id.short());
     }
 
-    // Arm the beat for context types that own one (musician). A musician's
-    // playhead can't block, so the beat scheduler drives it; coders are never
-    // armed. Absent a scheduler (embedded/test) this is a no-op.
-    if context_type == "musician" {
-        let label = label.unwrap_or("");
-        // Derive the musician's lane from its label: strict constructor first,
-        // then lossy-but-loud slugify. An empty slug HARD-ERRORS creation rather
-        // than silently sharing a default lane (two musicians would collide).
-        let track = match kaijutsu_types::TrackId::new(label)
-            .ok()
-            .or_else(|| kaijutsu_types::TrackId::slugify(label))
-        {
-            Some(t) => t,
-            None => {
-                return Err(capnp::Error::failed(format!(
-                    "musician label {label:?} does not yield a valid track id \
-                     (slug is empty) — refusing to create with a silent shared lane"
-                )));
-            }
-        };
-        let armed = state.kernel.send_beat_command(
-            kaijutsu_kernel::hyoushigi::BeatCommand::Arm {
-                context_id,
-                policy: kaijutsu_kernel::hyoushigi::BeatPolicy::musician_default(),
-                track,
-            },
-        );
-        if !armed {
-            log::warn!(
-                "musician {} created but no beat scheduler is wired — it will not beat",
-                context_id.short()
-            );
-        }
-    }
+    // The beat arm now lives in the musician's `create/` rc (run above via
+    // run_rc_lifecycle), not a Rust `context_type == "musician"` branch here —
+    // this used to duplicate the same arm logic the `kj context create` builtin
+    // carried. A context_type is a beat participant exactly when its `create/` rc
+    // calls `kj transport arm`, so new beat-bearing roles (funkMusician, …) need
+    // no kernel edit. See `docs/chameleon.md`, "context_type is an rc bundle".
 
     Ok(())
 }

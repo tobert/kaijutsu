@@ -36,13 +36,15 @@ pub(crate) struct TransportArgs {
 
 #[derive(Subcommand, Debug)]
 enum TransportCommand {
-    /// Re-arm a musician's beat after a kernel restart. The scheduler's armed
-    /// map starts empty on cold start, so a restart silently stops every
-    /// musician's beat (auto-arm fires only on context *create*); this is the
-    /// manual recovery. Arms **stopped** + OODA-armed (no surprise token spend —
-    /// `kj transport play` starts the clock). The policy + lane come from the
-    /// persisted `beat_state` (the real tempo/cadence), falling back to the
-    /// musician default + label-derived lane for a never-persisted musician.
+    /// Arm a context's beat — both the manual restart-recovery (the scheduler's
+    /// armed map starts empty on cold start, so a restart stops every beat) and
+    /// the create-time entry the musician's `create/` rc calls. Arming IS the
+    /// opt-in: a context becomes a beat participant by being armed, not by a
+    /// hardcoded type name (so `funkMusician`/`lyricist…` are pure rc). Arms
+    /// **stopped** + OODA-armed (no surprise token spend — `kj transport play`
+    /// starts the clock). Policy + lane come from the persisted `beat_state`
+    /// (real tempo/cadence on a re-arm), else the musician default + a lane
+    /// derived from the label; an unsluggable label is refused (no shared lane).
     Arm {
         /// Target context: . (default) | <label> | <hex prefix>
         #[arg(long)]
@@ -257,24 +259,9 @@ impl KjDispatcher {
     /// non-musician context: there is nothing meaningful to arm.
     fn beat_arm_payload(&self, ctx: ContextId) -> Result<(BeatPolicy, TrackId), String> {
         let db = self.kernel_db().lock();
-        // Verify the context is a musician FIRST, regardless of whether a
-        // beat_state row exists. A context whose type was changed away from
-        // musician still carries its stale beat_state; arming it would start a
-        // beat on a non-musician. The type gate is the authority, not the row.
-        let row = db
-            .get_context(ctx)
-            .map_err(|e| format!("kj transport arm: {e}"))?
-            .ok_or_else(|| format!("kj transport arm: context {} not found", short_hex(ctx)))?;
-        if row.context_type != "musician" {
-            return Err(format!(
-                "kj transport arm: context {} is a '{}', not a musician — nothing to arm",
-                short_hex(ctx),
-                row.context_type
-            ));
-        }
-
         // Prefer the persisted policy + lane (the real tempo/cadence a restart
-        // should restore).
+        // should restore). A type-changed context still uses its persisted row —
+        // arming is an explicit opt-in, so its last-known policy is what's wanted.
         if let Some(state) = db
             .get_beat_state(ctx)
             .map_err(|e| format!("kj transport arm: reading beat state: {e}"))?
@@ -293,17 +280,26 @@ impl KjDispatcher {
             return Ok((policy, track));
         }
 
-        // No persisted state — derive the lane from the label + musician default.
+        // No persisted state — derive the lane from the context label + musician
+        // default. Arming is the opt-in: a context is a beat participant exactly
+        // by *being armed* (typically from its `create/` rc — musician,
+        // funkMusician, …), NOT by a hardcoded `context_type == "musician"` name.
+        // The one hard requirement is a real lane: an empty/unsluggable label is
+        // refused so two players can't collide on a silent shared lane (the
+        // original footgun). `docs/chameleon.md`, "context_type is an rc bundle".
+        let row = db
+            .get_context(ctx)
+            .map_err(|e| format!("kj transport arm: {e}"))?
+            .ok_or_else(|| format!("kj transport arm: context {} not found", short_hex(ctx)))?;
         let label = row.label.unwrap_or_default();
-        // Mirror the create path's lane derivation: strict first, then lossy-but-
-        // loud slugify; an empty slug is a hard error (never a silent shared lane).
         let track = TrackId::new(label.as_str())
             .ok()
             .or_else(|| TrackId::slugify(&label))
             .ok_or_else(|| {
                 format!(
-                    "kj transport arm: musician label {label:?} yields no valid track id \
-                     (slug is empty)"
+                    "kj transport arm: context {} label {label:?} yields no valid track \
+                     lane (a beat participant needs a lane)",
+                    short_hex(ctx)
                 )
             })?;
         Ok((BeatPolicy::musician_default(), track))
@@ -353,7 +349,6 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("bass"), None, principal);
-        d.kernel_db().lock().update_context_type(ctx, "musician").unwrap();
         d.kernel_db()
             .lock()
             .upsert_beat_state(
@@ -385,17 +380,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_arm_falls_back_to_default_for_unpersisted_musician() {
-        // A musician with no persisted beat_state (created before persistence, or
-        // a failed create-time write) re-arms on the musician default + a lane
-        // derived from its label — never silently un-armed.
+    async fn transport_arm_falls_back_to_default_when_unpersisted() {
+        // No persisted beat_state → re-arm on the musician default + a lane
+        // derived from the label. The context_type is irrelevant — arming is the
+        // opt-in, so any context with a sluggable label gets a beat (this is what
+        // lets funkMusician/lyricist be pure rc, no hardcoded type name).
         use kaijutsu_types::TrackId;
 
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("Lead Synth"), None, principal);
-        // register_context stamps "default"; make it a musician so the fallback applies.
-        d.kernel_db().lock().update_context_type(ctx, "musician").unwrap();
         let c = caller_with_context(ctx);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
@@ -417,20 +411,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_arm_refuses_non_musician_without_state() {
-        // Arming a non-musician with no persisted beat_state has nothing to arm —
-        // refuse loudly rather than send a meaningless Arm.
+    async fn transport_arm_refuses_when_no_track_lane() {
+        // The one hard gate that survives: a context whose label yields no track
+        // lane can't be armed (it would collide on a silent shared lane). Refuse
+        // loudly rather than send a lane-less Arm.
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("coder-ctx"), None, principal); // "default" type
+        let ctx = register_context(&d, None, None, principal); // no label → no lane
         let c = caller_with_context(ctx);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
 
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
-        assert!(!result.is_ok(), "arming a non-musician should fail");
+        assert!(!result.is_ok(), "arming a context with no track lane should fail");
         assert!(
-            result.message().contains("not a musician"),
+            result.message().contains("no valid track lane"),
             "error should explain why: {}",
             result.message()
         );
@@ -438,16 +433,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_arm_refuses_former_musician_with_stale_state() {
-        // A context that WAS a musician (so it carries a stale beat_state row) but
-        // whose type was changed away must still be refused — the type gate is the
-        // authority, not the persisted row. Guards the short-circuit DeepSeek flagged.
+    async fn transport_arm_uses_persisted_row_regardless_of_type() {
+        // A type-changed context still carries (and uses) its persisted beat_state
+        // — arming is an explicit opt-in, so the last-known policy/lane is what's
+        // wanted, not a refusal. (Replaces the former type-gate refusal: the gate
+        // is now "has a lane", not "is a musician".)
         use crate::kernel_db::PersistedBeatState;
+        use kaijutsu_types::TrackId;
 
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("bass"), None, principal);
-        d.kernel_db().lock().update_context_type(ctx, "musician").unwrap();
+        let ctx = register_context(&d, Some("bass"), None, principal); // "default" type
         d.kernel_db()
             .lock()
             .upsert_beat_state(
@@ -460,20 +456,19 @@ mod tests {
                 },
             )
             .unwrap();
-        // Type changed away from musician — the row is now stale.
-        d.kernel_db().lock().update_context_type(ctx, "default").unwrap();
         let c = caller_with_context(ctx);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
 
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
-        assert!(!result.is_ok(), "arming a former musician should still fail");
-        assert!(
-            result.message().contains("not a musician"),
-            "the type gate refuses despite a persisted row: {}",
-            result.message()
-        );
-        assert!(rx.try_recv().is_err(), "no Arm command sent on refusal");
+        assert!(result.is_ok(), "arm with a persisted row should succeed: {}", result.message());
+        match rx.try_recv().expect("an Arm should be sent") {
+            BeatCommand::Arm { policy, track, .. } => {
+                assert_eq!(policy.period, Duration::from_millis(250), "uses the persisted policy");
+                assert_eq!(track, TrackId::new("bass").unwrap());
+            }
+            other => panic!("expected Arm, got {other:?}"),
+        }
     }
 
     #[tokio::test]

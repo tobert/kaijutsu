@@ -149,23 +149,22 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   SFTP-style or needs the RPC dedicated-thread treatment.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
-- **`context_type` stringly-typed — prefer the feature-decomposition over a
-  newtype (direction: `docs/chameleon.md` → "context_type is an rc bundle of
-  features", 2026-06-28).** `context_type` is a bare `String` duplicated across
-  ~6 struct defs (`kernel_db::ContextRow`, `kj/rc.rs`, `kaijutsu-client` rpc+actor,
+- **`context_type` stringly-typed — beat-decomposition done; newtype declined
+  (`docs/chameleon.md` → "context_type is an rc bundle of features", 2026-06-28).**
+  `context_type` is a bare `String` duplicated across ~6 struct defs
+  (`kernel_db::ContextRow`, `kj/rc.rs`, `kaijutsu-client` rpc+actor,
   `kaijutsu-mcp::models`, the time-well card), crossing SQLite, capnp, and rc-path
-  resolution. Only 3 sites branch on `"musician"` (`rpc.rs:1672` create-arm,
-  `kj/context.rs:628` track derivation, `transport.rs:268` `kj transport arm`) —
-  and the beat *runtime* already keys off "armed", not the name. The **preferred**
-  fix is not a newtype but to move the create-time arm into the musician's
-  `create/` rc (via `kj transport arm`) and replace the arm gate with a property
-  ("has a track lane" / opt-in), deleting the 3 string sites and letting new
-  context_types (`funkMusician`, …) be pure rc — see the chameleon decision for
-  the full trajectory + the two related axes (decouple-Act-from-ABC, per-type
-  `BeatPolicy`). A serde-transparent `ContextType(String)` newtype with consts is
-  the *shallow* alternative if the decomposition stalls — but don't do both; the
-  decomposition leaves ≤1 comparison, not worth a newtype. Do NOT make it a closed
-  `enum`: `context_type` names an open **rc-bucket directory** (`project_rc_lifecycle`).
+  resolution. The **beat** coupling — the 3 `== "musician"` sites that gated arming
+  — is **resolved 2026-06-28**: the create-arm moved into `musician/create/
+  S20-arm.kai` (deleting the duplicated Rust arm in both `rpc.rs` and
+  `kj/context.rs`), and `kj transport arm`'s gate is now "has a track lane", not a
+  type name. Zero beat-related string checks remain, so the `ContextType(String)`
+  newtype is **not worth doing** (declined, not deferred). Remaining `"musician"`
+  literals are inert (rc-path strings, test fixtures, the `seed_scripts` assertion).
+  The live follow-ons are the *other axes* (decouple-Act-from-ABC; per-type
+  `BeatPolicy` so `funkMusician` isn't stuck on `musician_default()`), tracked under
+  Hyoushigi. Do NOT make `context_type` a closed `enum`: it names an open
+  **rc-bucket directory** (`project_rc_lifecycle`).
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
 - **Context-type tool policy (unified governance):** The `kj` surface is now
   capability-gated — escalation-relevant verbs check the caller's loadout via

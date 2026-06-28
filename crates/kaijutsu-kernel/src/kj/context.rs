@@ -622,25 +622,12 @@ impl KjDispatcher {
         // /etc/rc/default/<verb>/.
         let context_type = cfg.type_spec.take().unwrap_or_else(|| "default".to_string());
 
-        // For musicians, derive the beat lane (track) from the label up front,
-        // so a label that yields no valid track id fails BEFORE we create an
-        // orphan context. The arm itself happens after the rc lifecycle (below).
-        let musician_track = if context_type == "musician" {
-            match kaijutsu_types::TrackId::new(label)
-                .ok()
-                .or_else(|| kaijutsu_types::TrackId::slugify(label))
-            {
-                Some(t) => Some(t),
-                None => {
-                    return KjResult::Err(format!(
-                        "kj context create: musician label {label:?} yields no valid \
-                         track id (slug is empty) — refusing a silent shared lane"
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+        // The beat is no longer a Rust special-case here: arming a musician is an
+        // rc step (`musician/create/S20-arm.kai` runs `kj transport arm`), so a
+        // context_type is a beat participant exactly when its `create/` rc arms it
+        // — no `context_type == "musician"` branch, and new beat-bearing roles
+        // (funkMusician, …) need no kernel edit. `docs/chameleon.md`,
+        // "context_type is an rc bundle of features".
 
         // Validate + resolve the rest before any mutation so a typo'd
         // --model/--consent/--env can't leave an orphan context behind.
@@ -724,26 +711,8 @@ impl KjDispatcher {
             tracing::warn!("rc create lifecycle: {e}");
         }
 
-        // Arm the beat for musician contexts so the scheduler drives the
-        // playhead. This mirrors the capnp `CreateContext` path
-        // (`create_context_inner` in kaijutsu-server/src/rpc.rs) — without it, a
-        // musician created via `kj` (the path the Chameleon player-spawn rc
-        // uses) is never armed: `kj transport play` is ignored ("play on
-        // un-armed context") and the OODA Act never crystallizes. Absent a
-        // scheduler (embedded/test) `send_beat_command` returns false → no-op.
-        if let Some(track) = musician_track {
-            let armed = self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Arm {
-                context_id: new_id,
-                policy: crate::hyoushigi::BeatPolicy::musician_default(),
-                track,
-            });
-            if !armed {
-                tracing::warn!(
-                    "musician {} created but no beat scheduler is wired — it will not beat",
-                    new_id.short()
-                );
-            }
-        }
+        // The beat arm now lives in the musician's `create/` rc (run above), not
+        // here — see the note at the top of this fn and `docs/chameleon.md`.
 
         let mut msg = format!("created context '{}' ({})", label, new_id.short());
         if !config_changes.is_empty() {
@@ -2335,11 +2304,13 @@ mod tests {
         // A musician created via `kj` MUST arm the beat scheduler. The OODA Act
         // (ABC→cell→MIDI) never fires for an un-armed context and
         // `kj transport play` is silently ignored ("play on un-armed context").
-        // Regression: the arm lived only in the capnp CreateContext path
-        // (`create_context_inner`), so `kj`-spawned players — the Chameleon
-        // player-spawn path — were created but never beat. A non-musician must
-        // NOT arm.
-        let d = test_dispatcher().await;
+        // The arm is now driven by the musician's `create/` rc
+        // (`S20-arm.kai` → `kj transport arm`), NOT a Rust `== "musician"` branch
+        // — so this exercises the rc end-to-end: `set_self_arc` is required for
+        // `kj`-inside-rc to resolve (else the rc kaish falls back to bare kaish
+        // and the arm command never fires). A non-musician runs no arm rc.
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
 

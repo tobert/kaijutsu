@@ -383,6 +383,42 @@ DB round-trip + corruption-loud + clear; scheduler write-through (arm + tempo);
 verb (persisted / default-fallback / non-musician-refusal). Memory:
 `project_chameleon`, `project_composer_transport`.
 
+## context_type decomposition — the beat moved from Rust to rc (2026-06-28)
+
+Immediately after shipping `kj transport arm`, Amy asked how deep the
+`context_type == "musician"` strings ran — and whether the real answer was to
+break musician-ness into features a context_type *consumes* rather than a name
+the kernel matches. The survey (written up in `docs/chameleon.md`) found the beat
+*runtime* was already decomposed — `on_turn_completed` and friends key off
+"armed", not the name — and the literal survived only at the create-time arm
+gates. Two of those were *duplicated* Rust blocks: `create_context_inner`
+(`rpc.rs`) and the `kj context create` builtin (`context.rs`) each carried the
+same `if context_type == "musician" { derive lane; send Arm }`.
+
+`kj transport arm` was the missing rc-callable primitive, so we executed the
+decomposition: a new `musician/create/S20-arm.kai` runs `kj transport arm`, and
+both Rust arm sites deleted — one rc script replaces the duplicated pair, and the
+two create-time string checks are gone. The arm verb's own gate dropped
+`== "musician"` for "does the label yield a track lane?" — arming is the opt-in
+(shared-trust: capabilities are nudges, not security), and a type-changed context
+still re-arms from its persisted row. Net effect: a context_type is a beat
+participant exactly when its `create/` rc arms it, so `funkMusician` /
+`lyricist_in_time_with_music` are now pure rc bundles with no kernel edit — and
+the `ContextType(String)` newtype became moot (zero beat-related string checks
+left), so we declined it rather than deferring.
+
+Two integration subtleties worth recording. (1) rc `.kai` scripts run
+**privileged** (`materialize_context_kaish_rc`), so the rc `kj transport arm`
+clears the Transport cap gate under the musician's narrowed loadout. (2)
+`test_dispatcher` doesn't call `set_self_arc`, so `kj`-inside-rc falls back to
+bare kaish and silently no-ops — which is why the existing musician-create test
+passed for the *wrong* reason (it was testing the Rust arm, not the rc). Rewiring
+that test to `Arc::new(test_dispatcher()).set_self_arc()` turned it into a real
+end-to-end check: create musician → rc runs → `BeatCommand::Arm` fires. One honest
+behavior change: arming with no beat scheduler wired now surfaces a LOUD rc Error
+block instead of a quiet `log::warn` (embedded/test only; the server always wires
+a scheduler). Memory: `project_chameleon`, `project_rc_lifecycle`.
+
 ## Chameleon / musician — first loop reached MIDI (2026-06-13, `da59499`)
 
 The musician (né composer) transport + OODA loop reached its headline: the first

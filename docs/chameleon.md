@@ -163,29 +163,34 @@ band owns time — the transport (拍子木) does.
   the feature-decomposition system; only the beat *entry gate* is still keyed on
   the literal name. The trajectory (consistent with **"Players are rc programs"**
   above — even arming is rc, not Rust):
-  - **`kj transport arm` is the rc-callable arm primitive.** It already derives
-    the track from the label and picks the policy (persisted, else
-    `musician_default()`), so it does everything `rpc.rs:1672` does. Move the
-    create-time arm **out of Rust into the musician's `create/` rc** (an
-    `S20-arm.kai` that calls `kj transport arm`). The `rpc.rs:1672` and
-    `context.rs:628` string checks then **delete**.
-  - **The remaining gate becomes a property, not a name.** `transport.rs:268`'s
-    `== "musician"` becomes "does this label yield a track lane?" — or, in
-    shared-trust kaijutsu (capabilities are ergonomic nudges, not security),
-    *nothing*: **arming is the opt-in.** Anything you arm is a beat participant.
-  - **New context_types are pure rc, zero Rust.** `funkMusician` = an rc bundle
-    whose `create/` calls arm + a funk stance + (later) its own tempo;
-    `lyricist_in_time_with_music` = arm + a lyricist stance + reads `$HEARD`.
-    No kernel edit, no enum variant.
+  - **✅ SHIPPED 2026-06-28 — arming moved from Rust to rc.** `kj transport arm`
+    (the rc-callable primitive) now runs from `musician/create/S20-arm.kai`; it
+    derives the lane from the label and picks the policy (persisted, else
+    `musician_default()`). Both Rust arm sites — `rpc.rs` create_context_inner
+    **and** the `context.rs` `kj context create` builtin (which *duplicated* the
+    same logic) — deleted; one rc script replaces the pair. The two create-time
+    `== "musician"` string checks are **gone**.
+  - **✅ SHIPPED — the arm gate is a property, not a name.** `kj transport arm`
+    no longer checks `context_type == "musician"`; it arms any context whose
+    label yields a valid track lane (else refuses, so no silent shared lane).
+    Arming IS the opt-in — shared-trust (capabilities are ergonomic nudges, not
+    security). A type-changed context still re-arms from its persisted row.
+  - **✅ ENABLED — new context_types are pure rc, zero Rust.** `funkMusician` /
+    `lyricist_in_time_with_music` become rc bundles whose `create/` calls
+    `kj transport arm` + a flavored stance (+ later their own tempo). Building
+    those specific roles is future work, but the kernel no longer stands in the
+    way — no `== "<name>"` branch, no enum variant. (Caveat: arming reports a
+    LOUD rc Error block when no beat scheduler is wired — embedded/test only;
+    the server always wires one. More honest than the old silent `log::warn`.)
 
   Two open issues are the *other axes* of the same decomposition: **"Decouple the
   OODA Act from ABC"** (content-type-keyed validation/derivation — *what artifact*
   a player produces, separate from *whether* it has a beat) and **"Cadence
   settable per context"** (per-type `BeatPolicy` defaults so a funk player isn't
-  stuck on `musician_default()`). Corollary: this makes the *shallow* fix — a
-  `ContextType(String)` newtype to centralize the literals (issues.md → Architecture)
-  — nearly moot; if the create-arm moves to rc, ≤1 string comparison remains, not
-  worth a newtype. Prefer the decomposition over the newtype; don't do both.
+  stuck on `musician_default()`). Corollary, now realized: the *shallow* fix — a
+  `ContextType(String)` newtype to centralize the literals — is moot for the beat;
+  the create-arm move left **zero** beat-related string checks. Prefer the
+  decomposition over the newtype; don't do both.
 
 ## Timeline gap analysis (vs. hyoushigi as landed)
 

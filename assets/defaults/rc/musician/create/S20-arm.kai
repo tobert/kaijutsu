@@ -1,0 +1,18 @@
+# musician: arm the beat at create — the entry into the hyoushigi transport.
+#
+# This is the ONLY thing that makes a context a beat participant: being armed.
+# It used to be a Rust special-case keyed on `context_type == "musician"` (in
+# BOTH create paths — the `kj context create` builtin and the capnp
+# create_context_inner), which meant a new beat-bearing role couldn't exist
+# without editing the kernel. Now arming is an rc step, so a context_type is a
+# beat participant exactly when its `create/` rc arms it — `funkMusician`,
+# `lyricist_in_time_with_music`, etc. are pure rc bundles, no kernel edit.
+# See docs/chameleon.md, "context_type is an rc bundle of features".
+#
+# `kj transport arm` (no --context) targets THIS new context. It derives the
+# beat lane (track) from the label, arms stopped + OODA-armed (no surprise token
+# spend — `kj transport play` starts the clock), and seeds the playhead from the
+# block log's max tick. An empty/unsluggable label fails LOUD here (an rc Error
+# block) rather than arming onto a silent shared lane. Runs privileged in the
+# create lifecycle, so it clears the Transport gate under the narrowed loadout.
+kj transport arm
