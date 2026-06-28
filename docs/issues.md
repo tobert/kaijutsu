@@ -960,6 +960,20 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     the durable log + CAS, carry the tick) is the fix; until then a page-turn
     restarts the timeline. Pairs with the windowed-notation pull primitive below
     (carrying recent notation into the child).
+    **⚠️ The gap is worse than "music restarts" — `rotate --every 1` is a fork
+    bomb (confirmed live 2026-06-28 runner-verify).** The rotate horizon is
+    `phrase % every == 0`. With the tick reset, a freshly-forked child seeds its
+    playhead at tick 0 → phrase 0, and `0 % every == 0` is true for ANY `every`,
+    so the child rotates immediately on its first beat — spawning another child
+    that does the same. A `--every 1` test self-forked ~15 musicians in ~30s and
+    only a server restart (armed map clears on cold start) stopped it; one-by-one
+    `kj transport stop` lost the race because children spawned faster than the
+    stop pass. Two independent guards, either of which defuses it: (a) carry the
+    tick (the continuity fix above — a child resumes mid-phrase, not at phrase 0);
+    and/or (b) a minimum phrase-age before a context may rotate (don't rotate on
+    the same phrase you were born into). Want **both** — (b) is a cheap safety
+    rail that should land regardless of (a). Until then, treat `kj transport
+    rotate --every 1` as unsafe on a live kernel.
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed
