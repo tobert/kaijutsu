@@ -799,6 +799,19 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Hyoushigi / Musician
 
+- **`kj transport play` reports `"playing"` on an un-armed context (silent
+  no-op).** Surfaced during the rotate runner-verify 2026-06-28: `kj transport
+  play --context <mcp-context-never-armed>` prints `transport: playing
+  '<id>'` and exits 0, even though the scheduler has nothing armed for that
+  context and silently drops the `BeatCommand::Play`. The kj verb sends the
+  command and unconditionally formats success (`transport.rs` `Play =>
+  (BeatCommand::Play(ctx), "playing".into())`) without consulting the scheduler's
+  armed map. Against the crash-over-silent-fallback stance this should either (a)
+  refuse play on a context with no `beat_state`/scheduler entry with a loud
+  "context not armed — `kj transport arm` first", or (b) have the scheduler
+  ack/nack so the verb can report the truth. Made the create-rc-arm verification
+  harder (play-success is not proof of arm; had to read the `beat_state` row to
+  confirm). Low urgency, but it's a genuine lie in the transport surface.
 - **Musician `kj` loadout — tool-free (2026-06-13).** `musician` seeds
   `assets/defaults/rc/musician/create/S10-binding.kai` granting only `drive`:
   no `builtin.*` tool instances, no `facade:shell`/`submit_input`, no

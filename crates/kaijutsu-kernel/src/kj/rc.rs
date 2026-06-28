@@ -45,7 +45,7 @@ enum RcCommand {
         /// Filter by context_type
         #[arg(long = "type")]
         type_filter: Option<String>,
-        /// Filter by verb (create|fork|attach|drift|tick)
+        /// Filter by verb (create|fork|attach|drift|tick|rotate)
         #[arg(long = "verb")]
         verb_filter: Option<String>,
     },
@@ -83,15 +83,21 @@ enum RcCommand {
     },
 }
 
-/// Canonical rc path format. `attach` is a reserved verb — scripts install fine
-/// but lifecycle dispatch is a no-op until that hook is wired (tracked in
+/// Canonical rc path format. The verb alternation is built from
+/// [`crate::kj::lifecycle::RC_VERBS`] — the single source shared with the firing
+/// gate — so the validator can never reject a verb the scheduler fires (the
+/// rotate regression). `attach` is a reserved verb: scripts install fine but
+/// lifecycle dispatch is a no-op until that hook is wired (tracked in
 /// `docs/issues.md`). `tick` is the beat verb (fired by the beat scheduler on a
-/// context's OODA cadence).
-const RC_PATH_PATTERN: &str = r"^/etc/rc/([a-z][a-z0-9_-]*)/(create|fork|attach|drift|tick)/(S\d{1,3})-([a-z][a-z0-9_-]*)\.(kai|md)$";
+/// context's OODA cadence); `rotate` is the page-turn verb.
+fn rc_path_pattern() -> String {
+    let verbs = crate::kj::lifecycle::RC_VERBS.join("|");
+    format!(r"^/etc/rc/([a-z][a-z0-9_-]*)/({verbs})/(S\d{{1,3}})-([a-z][a-z0-9_-]*)\.(kai|md)$")
+}
 
 fn rc_path_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(RC_PATH_PATTERN).expect("rc path regex compiles"))
+    RE.get_or_init(|| Regex::new(&rc_path_pattern()).expect("rc path regex compiles"))
 }
 
 /// Parsed components of a canonical rc path.
@@ -107,14 +113,15 @@ pub struct RcPathParts {
 ///
 /// Format: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`. Type and
 /// name are lowercase identifiers (`[a-z][a-z0-9_-]*`); sort_key matches
-/// `S\d{1,3}`. Verbs: create, fork, attach, drift, tick.
+/// `S\d{1,3}`. Valid verbs are [`crate::kj::lifecycle::RC_VERBS`].
 pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
     let caps = rc_path_regex().captures(path).ok_or_else(|| {
+        let verbs = crate::kj::lifecycle::RC_VERBS.join(", ");
         format!(
             "invalid rc path: '{path}'\n\
              expected /etc/rc/<context_type>/<verb>/SXX-name.{{kai,md}}\n\
              - context_type and name must be lowercase ([a-z][a-z0-9_-]*)\n\
-             - verb must be one of: create, fork, attach, drift, tick\n\
+             - verb must be one of: {verbs}\n\
              - sort_key must be S followed by 1-3 digits (e.g. S00, S05, S100)\n\
              - extension must be 'kai' or 'md'"
         )
@@ -597,6 +604,28 @@ mod tests {
         // no-op them until those hooks land.
         assert!(parse_rc_path("/etc/rc/test/attach/S00-foo.md").is_ok());
         assert!(parse_rc_path("/etc/rc/test/drift/S00-foo.kai").is_ok());
+    }
+
+    /// The path validator and the firing gate share one verb list
+    /// (`lifecycle::RC_VERBS`). Every canonical verb MUST parse — a verb the
+    /// scheduler fires but `parse_rc_path` rejects is a migration trap (the
+    /// rotate regression: `kj rc reset` refused a path the beat scheduler runs).
+    /// This fails the moment a verb is added to one source but not the other.
+    #[test]
+    fn every_canonical_verb_parses() {
+        for verb in crate::kj::lifecycle::RC_VERBS {
+            let path = format!("/etc/rc/musician/{verb}/S10-x.kai");
+            let parts = parse_rc_path(&path)
+                .unwrap_or_else(|e| panic!("canonical verb {verb} must parse ({path}): {e}"));
+            assert_eq!(&parts.verb, verb, "round-trip verb for {path}");
+        }
+    }
+
+    /// The page-turn verb specifically — the one that regressed. `kj rc
+    /// reset`/`edit` on the shipped rotate script must validate.
+    #[test]
+    fn rotate_path_validates() {
+        assert!(parse_rc_path("/etc/rc/musician/rotate/S10-rotate.kai").is_ok());
     }
 
     /// `kj rc show <path>` round-trips content from an earlier `kj rc add`

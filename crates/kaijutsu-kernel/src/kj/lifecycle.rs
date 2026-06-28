@@ -94,11 +94,23 @@ pub const VERB_TICK: &str = "tick";
 /// (`docs/chameleon.md`).
 pub const VERB_ROTATE: &str = "rotate";
 
+/// The canonical set of rc lifecycle verbs — the single source of truth for
+/// both the firing gate ([`verb_is_wired`]) and the path validator
+/// (`parse_rc_path`'s regex in `kj::rc`). They MUST agree: a verb the scheduler
+/// fires but the management surface rejects is a latent migration trap — exactly
+/// the rotate regression where `kj rc reset`/`edit` refused a path the beat
+/// scheduler runs. Derive both from here so they can't drift again.
+pub const RC_VERBS: &[&str] = &[
+    VERB_CREATE,
+    VERB_FORK,
+    VERB_ATTACH,
+    VERB_DRIFT,
+    VERB_TICK,
+    VERB_ROTATE,
+];
+
 fn verb_is_wired(verb: &str) -> bool {
-    matches!(
-        verb,
-        VERB_CREATE | VERB_FORK | VERB_DRIFT | VERB_ATTACH | VERB_TICK | VERB_ROTATE
-    )
+    RC_VERBS.contains(&verb)
 }
 
 impl KjDispatcher {
