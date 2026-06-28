@@ -433,6 +433,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_rc_forks_arms_and_plays_the_child_on_the_parent_track() {
+        // End-to-end page-turn: the `rotate` lifecycle (musician/rotate/S10-rotate.kai)
+        // forks a thin child, switches the rc shell to it, and arms + re-rotates +
+        // plays it — on the PARENT's track (via the fork's beat_state copy), since a
+        // spawn-fork has no label of its own. set_self_arc is required for kj-in-rc.
+        use crate::kernel_db::PersistedBeatState;
+        use kaijutsu_types::TrackId;
+        use std::collections::HashMap;
+
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        // The `spawn` factory preset the rotate rc forks with is seeded at server
+        // startup; test_dispatcher doesn't, so seed it here.
+        crate::seed_presets::ensure_factory_presets(
+            &mut d.kernel_db().lock(),
+            PrincipalId::new(),
+        )
+        .unwrap();
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("bass"), None, principal);
+        d.kernel_db().lock().update_context_type(parent, "musician").unwrap();
+        // The scheduler would have persisted this on arm; seed it so the fork copies it.
+        d.kernel_db()
+            .lock()
+            .upsert_beat_state(
+                parent,
+                &PersistedBeatState {
+                    period_ms: 500,
+                    beats_per_phrase: 16,
+                    ooda_every: 128,
+                    track: "bass".to_string(),
+                },
+            )
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        // Fire the rotate lifecycle exactly as the beat scheduler's fire_rotate
+        // does, seeding $ROTATE_EVERY (the scheduler sets it only when rotating).
+        let caller = caller_with_context(parent);
+        let mut vars = HashMap::new();
+        vars.insert("ROTATE_EVERY".to_string(), "4".to_string());
+        d.run_rc_lifecycle_with_vars("rotate", parent, None, None, None, &vars, &caller)
+            .await
+            .expect("rotate lifecycle runs");
+
+        // The page-turn emits, in order, three commands — all for the forked CHILD
+        // (the rc `--switch`ed onto it), never the retired parent.
+        let arm = rx.try_recv().expect("rotate arms the child");
+        let (child, track) = match arm {
+            BeatCommand::Arm { context_id, track, .. } => (context_id, track),
+            other => panic!("expected Arm first, got {other:?}"),
+        };
+        assert_ne!(child, parent, "the child is a NEW context, not the parent");
+        assert_eq!(track, TrackId::new("bass").unwrap(), "child keeps the parent's lane");
+
+        match rx.try_recv().expect("rotate re-establishes the cadence") {
+            BeatCommand::SetRotate { context_id, every_phrases } => {
+                assert_eq!(context_id, child, "cadence set on the child");
+                assert_eq!(every_phrases, Some(4), "the song keeps turning at the same cadence");
+            }
+            other => panic!("expected SetRotate, got {other:?}"),
+        }
+        match rx.try_recv().expect("rotate plays the child") {
+            BeatCommand::Play(id) => assert_eq!(id, child, "the child's clock starts (seamless continuation)"),
+            other => panic!("expected Play, got {other:?}"),
+        }
+
+        // The child really is a fork of the parent.
+        let forked_from = d.kernel_db().lock().get_context(child).unwrap().unwrap().forked_from;
+        assert_eq!(forked_from, Some(parent), "child is forked from the parent");
+    }
+
+    #[tokio::test]
     async fn transport_arm_uses_persisted_row_regardless_of_type() {
         // A type-changed context still carries (and uses) its persisted beat_state
         // — arming is an explicit opt-in, so the last-known policy/lane is what's

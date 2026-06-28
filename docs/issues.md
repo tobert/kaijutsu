@@ -926,14 +926,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   - **Lock now (small):** `musician/fork/S30-hydrate.kai` (rebuild + re-mark)
     and confirm a musician fork is thin. `kj transport ooda on|off --context`
     already exists, so transport-follow (arm child / disarm parent) is pure rc.
-  - **Rotate action rc (unwritten):** the scheduler-side detach-at-horizon
-    trigger is built — `BeatCommand::SetRotate{ctx, every_phrases}` +
-    `kj transport rotate --every N | off`; at a phrase horizon (`phrase % N == 0`)
-    `fire_due` `stop`s the parent synchronously (no further ticks) and fires the
-    `rotate` rc lifecycle. Still unwritten: the rotate ACTION itself, a
-    `musician/rotate/*.kai` that forks `--preset spawn` + arms the child. Race-free
-    when it lands (the parent is already stopped). (The ordering race that forced
-    the trigger into Rust rather than pure rc is closed by this synchronous stop.)
+  - **Rotate action rc — ✅ SHIPPED 2026-06-28.** The scheduler trigger was already
+    built (`SetRotate` + `kj transport rotate`; at the horizon `fire_due` `stop`s the
+    parent synchronously and fires the `rotate` lifecycle). Now the ACTION exists:
+    `VERB_ROTATE` wired into `verb_is_wired`, and `musician/rotate/S10-rotate.kai` =
+    `kj fork --preset spawn --switch && kj transport arm && kj transport rotate
+    --every $ROTATE_EVERY && kj transport play`. Three enablers landed with it: (1)
+    **fork copies `beat_state`** (`insert_forked_context`), so the thin (labelless)
+    child re-arms on the PARENT's track — the lane is the durable fork-lineage
+    identity, not a label-derived slug; (2) **`$ROTATE_EVERY`** seeded into the
+    transport vars when rotating, so the child re-establishes the cadence and the
+    song keeps turning; (3) the arm-is-rc decomposition gave `kj transport arm` as
+    the rc-callable primitive. `--switch` moves the rc shell onto the child so the
+    bare transport calls target it (no id capture). End-to-end test:
+    `rotate_rc_forks_arms_and_plays_the_child_on_the_parent_track`.
+    **Remaining gap — tick continuity (still unbuilt):** a spawn-fork has no
+    committed blocks, so the child's `arm` seeds the playhead from `max_tick`=0 —
+    musical time RESETS in the child instead of continuing the parent's tick. The
+    chameleon rotation tick-continuity invariant (retire old committed history to
+    the durable log + CAS, carry the tick) is the fix; until then a page-turn
+    restarts the timeline. Pairs with the windowed-notation pull primitive below
+    (carrying recent notation into the child).
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed

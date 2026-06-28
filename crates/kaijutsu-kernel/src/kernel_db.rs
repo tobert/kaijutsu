@@ -1440,6 +1440,12 @@ impl KernelDb {
         let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
         let binding = self.get_context_binding(source)?;
+        // Beat state travels with the fork so a forked musician keeps the PARENT's
+        // track (lane) + policy, not a label-derived one — the lane is the durable
+        // identity that persists across a fork-lineage (the rotation page-turn:
+        // `docs/chameleon.md`). A thin spawn-fork has no label, so without this the
+        // child has no lane to arm on. `None` for a non-musician parent (no-op).
+        let beat_state = self.get_beat_state(source)?;
 
         let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
         let doc = DocumentRow {
@@ -1470,6 +1476,9 @@ impl KernelDb {
         }
         if let Some(binding) = binding {
             Self::write_binding(&tx, row.context_id, &binding)?;
+        }
+        if let Some(state) = beat_state {
+            Self::write_beat_state(&tx, row.context_id, &state)?;
         }
         tx.commit()?;
         Ok(())
@@ -3177,7 +3186,18 @@ impl KernelDb {
         context_id: ContextId,
         state: &PersistedBeatState,
     ) -> KernelDbResult<()> {
-        self.conn.execute(
+        Self::write_beat_state(&self.conn, context_id, state)
+    }
+
+    /// Upsert beat state against `conn` (a `&Connection` or a `&Transaction` via
+    /// deref). Shared by `upsert_beat_state` and the transactional fork copy
+    /// ([`insert_forked_context`](Self::insert_forked_context)). Does NOT commit.
+    fn write_beat_state(
+        conn: &Connection,
+        context_id: ContextId,
+        state: &PersistedBeatState,
+    ) -> KernelDbResult<()> {
+        conn.execute(
             "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(context_id) DO UPDATE SET
@@ -5555,6 +5575,51 @@ mod tests {
         assert!(
             db.get_beat_state(ctx.context_id).unwrap().is_none(),
             "cleared beat state reverts to never-armed"
+        );
+    }
+
+    #[test]
+    fn beat_state_travels_with_a_fork() {
+        // A forked musician must keep the PARENT's track + policy (the lane is the
+        // durable identity across a fork-lineage — the rotation page-turn). A thin
+        // spawn-fork has no label, so without this copy the child has no lane to
+        // arm on.
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let parent = make_context_row(Some("bass"));
+        insert_context_with_doc(&db, &parent, ws_id);
+        let state = beat_state(250, 12, 96, "bass");
+        db.upsert_beat_state(parent.context_id, &state).unwrap();
+
+        // Fork: a labelless thin child (spawn shape).
+        let mut child = make_context_row(None);
+        child.forked_from = Some(parent.context_id);
+        db.insert_forked_context(&child, ws_id, parent.context_id)
+            .unwrap();
+
+        assert_eq!(
+            db.get_beat_state(child.context_id).unwrap(),
+            Some(state),
+            "the child inherits the parent's track + policy via the fork"
+        );
+    }
+
+    #[test]
+    fn fork_of_a_non_musician_copies_no_beat_state() {
+        // A non-musician parent has no beat_state; the fork copy is a clean no-op.
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let parent = make_context_row(Some("coder"));
+        insert_context_with_doc(&db, &parent, ws_id);
+
+        let mut child = make_context_row(Some("coder-child"));
+        child.forked_from = Some(parent.context_id);
+        db.insert_forked_context(&child, ws_id, parent.context_id)
+            .unwrap();
+
+        assert!(
+            db.get_beat_state(child.context_id).unwrap().is_none(),
+            "no parent beat_state → none copied (forks of non-musicians are unaffected)"
         );
     }
 

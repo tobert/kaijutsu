@@ -123,6 +123,13 @@ band owns time — the transport (拍子木) does.
   - **Fork-lineage IS song form.** Each thin fork is a section/movement; the
     page-turn is the player **self-`kj fork --preset spawn`-ing on a horizon**. The
     time-well's fork-lineage-down grammar draws the performance natively.
+    *✅ Rotate action shipped 2026-06-28* (`musician/rotate/S10-rotate.kai`): the
+    scheduler stops the parent at the horizon and fires the `rotate` rc, which forks
+    a spawn child, `--switch`es onto it, and arms+re-rotates+plays it on the
+    PARENT's track (fork now copies `beat_state`, so the lane survives the
+    page-turn). Remaining gap: **tick continuity** — the thin child's playhead
+    seeds from `max_tick`=0, so musical time resets across the turn until the
+    retire-history-and-carry-tick invariant is built (issues.md).
   - **Producer edits are horizon-latched.** Scripts snapshot at instantiation
     (updates don't leak into a live context), so a producer's rc edit lands at
     the player's *next* page-turn — musically right (direction changes on a

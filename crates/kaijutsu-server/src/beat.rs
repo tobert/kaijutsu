@@ -773,6 +773,14 @@ impl BeatScheduler {
             .map(|blocks| heard_json(&blocks, playhead, window))
             .unwrap_or_else(|_| "[]".to_string());
         vars.insert("HEARD".to_string(), heard);
+        // $ROTATE_EVERY: the rotate cadence in phrases, when this context rotates.
+        // The page-turn rc re-establishes the same cadence on the child it spawns
+        // (the scheduler's `rotate_every_phrases` is per-BeatState and does NOT
+        // travel with the fork — re-arm starts un-rotating, like stopped/ooda),
+        // so the song keeps turning. Absent when the context doesn't rotate.
+        if let Some(n) = st.rotate_every_phrases {
+            vars.insert("ROTATE_EVERY".to_string(), n.to_string());
+        }
         vars
     }
 

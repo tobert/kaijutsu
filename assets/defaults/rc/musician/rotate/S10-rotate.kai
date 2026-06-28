@@ -1,0 +1,26 @@
+# musician: the page-turn — self-fork on a phrase horizon (song form).
+#
+# Fired by the beat scheduler when this context hits its rotate horizon
+# (`phrase % rotate_every == 0`, set via `kj transport rotate --every N`). The
+# scheduler has ALREADY stopped THIS context synchronously, in the same beat
+# that decided to rotate, so nothing here can race a stray parent tick — the
+# parent is off the clock before this script runs (`docs/chameleon.md`, the
+# page-turn; the horizon decision is Rust precisely to make this race-free).
+#
+# Each thin fork is a section/movement; fork-lineage IS song form, drawn
+# natively by the time-well's fork-lineage-down grammar.
+#
+# `--preset spawn` is the thin fork (keeps ~nothing); the child's `musician/fork/`
+# rc re-establishes setup (hydration re-mark). `--switch` moves THIS rc shell's
+# current context to the child, so the bare `kj transport` calls below target the
+# child, not the retired parent — no id capture needed. The child inherits the
+# parent's beat_state (track + tempo) by fork copy, so `arm` re-arms it on the
+# SAME lane (the track is the durable identity that outlives any one player;
+# UseLastGood / $HEARD stay continuous), NOT a label-derived one — which matters
+# because a spawn-fork has no label to derive from.
+#
+# Chained with `&&`: if the fork fails (no switch), we must NOT fall through and
+# arm/play the parent the scheduler just stopped. Re-arm the same rotate cadence
+# (`$ROTATE_EVERY`, seeded by the scheduler only when rotating) so the song keeps
+# turning, then start the child's clock to continue the performance seamlessly.
+kj fork --preset spawn --switch && kj transport arm && kj transport rotate --every $ROTATE_EVERY && kj transport play

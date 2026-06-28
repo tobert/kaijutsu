@@ -419,6 +419,39 @@ behavior change: arming with no beat scheduler wired now surfaces a LOUD rc Erro
 block instead of a quiet `log::warn` (embedded/test only; the server always wires
 a scheduler). Memory: `project_chameleon`, `project_rc_lifecycle`.
 
+## Rotate action — the page-turn lands (2026-06-28)
+
+With `kj transport arm` now an rc-callable primitive, the long-deferred rotate
+ACTION became writable. The scheduler trigger was already built (at a phrase
+horizon it stops the parent synchronously and fires the `rotate` lifecycle); what
+was missing was the lifecycle being *wired* (`rotate` wasn't in `verb_is_wired`,
+so it silently no-op'd) and the rc script itself. Both landed:
+`musician/rotate/S10-rotate.kai` = `kj fork --preset spawn --switch && kj transport
+arm && kj transport rotate --every $ROTATE_EVERY && kj transport play`. The
+`--switch` moves the rc shell onto the freshly-forked child so the bare transport
+calls target it — no context-id capture in shell. Chained with `&&` so a failed
+fork can't fall through and re-arm the parent the scheduler just stopped.
+
+Two enablers fell out of writing it. (1) A spawn-fork is *labelless*, and a
+forked player must keep the parent's **track** anyway (the lane is the durable
+identity across a fork-lineage — UseLastGood/$HEARD are per-track). So fork now
+copies `beat_state` parent→child (`insert_forked_context`, alongside the
+binding/env copy); the child's `kj transport arm` finds the inherited row and
+re-arms on the parent's exact lane + policy, not a label slug. (2) The scheduler's
+`rotate_every_phrases` is a runtime BeatState field that doesn't travel with the
+fork (re-arm starts un-rotating, like stopped/ooda), so the song would turn once
+and stop — fixed by seeding `$ROTATE_EVERY` into the transport vars when rotating,
+which the rc replays onto the child.
+
+The end-to-end test fires the `rotate` lifecycle and asserts the three child
+commands in order (Arm on the parent's track, SetRotate at the same cadence, Play)
+plus that the child is a real fork. Honest remaining gap, recorded in issues.md:
+**tick continuity** — a thin child has no committed blocks, so its playhead seeds
+from `max_tick`=0 and musical time *resets* across the page-turn. The fix is the
+chameleon retire-history-and-carry-tick invariant, still unbuilt; until then the
+page-turn restarts the timeline. Memory: `project_chameleon`,
+`project_rc_lifecycle`.
+
 ## Chameleon / musician — first loop reached MIDI (2026-06-13, `da59499`)
 
 The musician (né composer) transport + OODA loop reached its headline: the first

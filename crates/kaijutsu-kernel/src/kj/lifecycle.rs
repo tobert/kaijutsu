@@ -87,9 +87,18 @@ pub const VERB_DRIFT: &str = "drift";
 /// hook — typically `kj drive` to request the next OODA turn. Materialized the
 /// same throwaway-kaish way the other verbs are; no new runtime.
 pub const VERB_TICK: &str = "tick";
+/// The page-turn verb: fired by the beat scheduler when a context hits its rotate
+/// horizon (`phrase % rotate_every == 0`). The scheduler has ALREADY stopped the
+/// parent synchronously, so the rotate scripts (`kj fork --preset spawn` + arm +
+/// play the child) run race-free — fork-lineage becomes song form
+/// (`docs/chameleon.md`).
+pub const VERB_ROTATE: &str = "rotate";
 
 fn verb_is_wired(verb: &str) -> bool {
-    matches!(verb, VERB_CREATE | VERB_FORK | VERB_DRIFT | VERB_ATTACH | VERB_TICK)
+    matches!(
+        verb,
+        VERB_CREATE | VERB_FORK | VERB_DRIFT | VERB_ATTACH | VERB_TICK | VERB_ROTATE
+    )
 }
 
 impl KjDispatcher {
