@@ -149,6 +149,20 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   SFTP-style or needs the RPC dedicated-thread treatment.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
+- **`context_type` is a bare `String` (newtype, not enum — 2026-06-28).** The
+  field is duplicated across ~6 struct defs (`kernel_db::ContextRow`, `kj/rc.rs`,
+  `kaijutsu-client` rpc+actor, `kaijutsu-mcp::models`, the time-well card) and
+  crosses SQLite (`context_type TEXT … DEFAULT 'default'`), capnp, and rc-path
+  resolution. Behavioral branching is shallow — only 3 sites compare the value
+  (`rpc.rs:1672` create-arm, `kj/context.rs:628` track derivation,
+  `transport.rs:268` `kj transport arm`) — but bare `== "musician"` literals are
+  easy to typo and scatter. Do NOT make it a closed `enum`: `context_type` names
+  an **rc-bucket directory** (`/etc/rc/<type>/<verb>/`), so the set is deliberately
+  open (a new mode = new rc scripts, no Rust change — see `project_rc_lifecycle`).
+  The fit is a serde-transparent **newtype** `ContextType(String)` in
+  `kaijutsu-types` with associated consts (`ContextType::MUSICIAN`) + predicates
+  (`.is_musician()`): one documented home for the known buckets, the literals
+  vanish, the set stays open, and the wire/DB are unchanged. Low priority.
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
 - **Context-type tool policy (unified governance):** The `kj` surface is now
   capability-gated — escalation-relevant verbs check the caller's loadout via
