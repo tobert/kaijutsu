@@ -335,6 +335,38 @@ impl BeatScheduler {
                 materialize_failures: 0,
                 failure_water: 0,
             });
+        // Mirror the (possibly new) policy + lane to the DB so a kernel restart can
+        // re-arm this musician with its real values via `kj transport arm`.
+        self.persist_state(context_id);
+    }
+
+    /// Mirror a context's live policy + lane into the `beat_state` table — the
+    /// durable copy a `kj transport arm` reads to recover the musician after a
+    /// kernel restart (the scheduler's `armed` map starts empty on cold start).
+    /// Called on every policy mutation (arm, tempo) so the row never drifts behind
+    /// the live `BeatState`.
+    ///
+    /// A db-less store (embedded / unit test) has nowhere to persist — a clean
+    /// no-op. A db-backed store whose write FAILS is loud (`log::error!`), never
+    /// silent: the live beat is unaffected, but the restart-recovery copy is now
+    /// stale, and a musician silently re-arming to the default tempo after a crash
+    /// is exactly the kind of silent fallback this project rejects.
+    fn persist_state(&self, context_id: ContextId) {
+        let Some(st) = self.armed.get(&context_id) else {
+            return;
+        };
+        let Some(db) = self.documents.db() else {
+            return; // db-less store (embedded/test): nothing to persist to.
+        };
+        let state = kaijutsu_kernel::kernel_db::PersistedBeatState {
+            period_ms: st.policy.period.as_millis() as u64,
+            beats_per_phrase: st.policy.beats_per_phrase,
+            ooda_every: st.policy.ooda_every,
+            track: st.track.as_str().to_string(),
+        };
+        if let Err(e) = db.lock().upsert_beat_state(context_id, &state) {
+            log::error!("beat: failed to persist beat state for {context_id}: {e}");
+        }
     }
 
     /// Start (or resume) the clock. Pushes a heap entry one period out; the
@@ -370,8 +402,17 @@ impl BeatScheduler {
 
     /// Set the beat period (tempo). Takes effect on the next re-arm.
     pub fn set_tempo(&mut self, context_id: ContextId, period: Duration) {
-        if let Some(st) = self.armed.get_mut(&context_id) {
-            st.policy.period = period;
+        let updated = match self.armed.get_mut(&context_id) {
+            Some(st) => {
+                st.policy.period = period;
+                true
+            }
+            None => false,
+        };
+        // Persist the new tempo so a restart re-arm carries it (not the default).
+        // Outside the `get_mut` borrow so `persist_state(&self)` can re-read.
+        if updated {
+            self.persist_state(context_id);
         }
     }
 
@@ -1930,6 +1971,101 @@ mod tests {
             playhead_after_rearm,
             Tick::new(big_t + 1),
             "re-arm of a live timeline never re-seeds (or_insert_with is a no-op)"
+        );
+    }
+
+    /// Build a db-backed block store + the context row its `beat_state` FKs to, so
+    /// the scheduler's persistence write-through has somewhere to land. Returns the
+    /// shared DB handle (to read `beat_state` back) and the context id.
+    async fn db_backed_kernel_and_docs() -> (
+        Arc<Kernel>,
+        SharedBlockStore,
+        kaijutsu_kernel::block_store::DbHandle,
+        ContextId,
+    ) {
+        use kaijutsu_kernel::block_store::shared_block_store_with_db;
+        use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
+        use kaijutsu_types::{ConsentMode, ContextState};
+
+        let kernel = Arc::new(Kernel::new_ephemeral("test").await);
+        let db: kaijutsu_kernel::block_store::DbHandle =
+            Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let principal = PrincipalId::new();
+        let ctx = ContextId::new();
+        let ws_id = {
+            let g = db.lock();
+            let ws = g.get_or_create_default_workspace(principal).unwrap();
+            // beat_state FKs to contexts(context_id): the row must exist first.
+            g.insert_context_with_document(
+                &ContextRow {
+                    context_id: ctx,
+                    label: Some("bass".to_string()),
+                    provider: None,
+                    model: None,
+                    system_prompt: None,
+                    consent_mode: ConsentMode::default(),
+                    context_state: ContextState::Live,
+                    context_type: "musician".to_string(),
+                    created_at: 0,
+                    created_by: principal,
+                    forked_from: None,
+                    fork_kind: None,
+                    archived_at: None,
+                    workspace_id: None,
+                    preset_id: None,
+                    concluded_at: None,
+                },
+                ws,
+            )
+            .unwrap();
+            ws
+        };
+        let documents = shared_block_store_with_db(db.clone(), ws_id, principal);
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        (kernel, documents, db, ctx)
+    }
+
+    /// Arm and tempo-change write the live policy + lane through to `beat_state`,
+    /// so a kernel restart can re-arm the musician with its real values instead of
+    /// `BeatPolicy::musician_default()`. This is the durable half of "re-arm is
+    /// possible after a cold start" — the read half is `kj transport arm`.
+    #[tokio::test]
+    async fn arm_and_tempo_persist_beat_state() {
+        use kaijutsu_kernel::kernel_db::PersistedBeatState;
+
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let mut sched = BeatScheduler::new(kernel, documents);
+
+        // Arm with a non-default policy on the `bass` lane.
+        let policy = BeatPolicy { period: Duration::from_millis(500), beats_per_phrase: 12, ooda_every: 96 };
+        let track = TrackId::new("bass").unwrap();
+        sched.arm(ctx, policy, track.clone());
+
+        assert_eq!(
+            db.lock().get_beat_state(ctx).unwrap(),
+            Some(PersistedBeatState {
+                period_ms: 500,
+                beats_per_phrase: 12,
+                ooda_every: 96,
+                track: "bass".to_string(),
+            }),
+            "arm mirrors the policy + lane into beat_state for restart re-arm"
+        );
+
+        // A tempo change to 240 BPM (250 ms) updates the persisted period in place,
+        // leaving the rest of the policy intact.
+        sched.set_tempo(ctx, Duration::from_millis(250));
+        assert_eq!(
+            db.lock().get_beat_state(ctx).unwrap(),
+            Some(PersistedBeatState {
+                period_ms: 250,
+                beats_per_phrase: 12,
+                ooda_every: 96,
+                track: "bass".to_string(),
+            }),
+            "set_tempo write-through updates the persisted period, not the whole row"
         );
     }
 

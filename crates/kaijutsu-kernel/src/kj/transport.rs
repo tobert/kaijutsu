@@ -13,12 +13,14 @@
 //! explicit user command, so it reports the failure rather than silently
 //! no-opping.
 
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
-use kaijutsu_types::ContentType;
+use kaijutsu_types::{ContentType, ContextId, TrackId};
 
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
-use crate::hyoushigi::BeatCommand;
+use crate::hyoushigi::{BeatCommand, BeatPolicy};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,6 +36,18 @@ pub(crate) struct TransportArgs {
 
 #[derive(Subcommand, Debug)]
 enum TransportCommand {
+    /// Re-arm a musician's beat after a kernel restart. The scheduler's armed
+    /// map starts empty on cold start, so a restart silently stops every
+    /// musician's beat (auto-arm fires only on context *create*); this is the
+    /// manual recovery. Arms **stopped** + OODA-armed (no surprise token spend —
+    /// `kj transport play` starts the clock). The policy + lane come from the
+    /// persisted `beat_state` (the real tempo/cadence), falling back to the
+    /// musician default + label-derived lane for a never-persisted musician.
+    Arm {
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
     /// Start/resume the clock.
     Play {
         /// Target context: . (default) | <label> | <hex prefix>
@@ -89,7 +103,8 @@ impl TransportCommand {
     /// The `--context` ref this verb targets (shared across all verbs).
     fn context(&self) -> Option<&str> {
         match self {
-            TransportCommand::Play { context }
+            TransportCommand::Arm { context }
+            | TransportCommand::Play { context }
             | TransportCommand::Pause { context }
             | TransportCommand::Stop { context }
             | TransportCommand::Tempo { context, .. }
@@ -101,6 +116,7 @@ impl TransportCommand {
     /// The verb name for the result `action` field / data payload.
     fn action(&self) -> &'static str {
         match self {
+            TransportCommand::Arm { .. } => "arm",
             TransportCommand::Play { .. } => "play",
             TransportCommand::Pause { .. } => "pause",
             TransportCommand::Stop { .. } => "stop",
@@ -150,6 +166,14 @@ impl KjDispatcher {
         let action = command.action();
 
         let (cmd, verb): (BeatCommand, String) = match &command {
+            TransportCommand::Arm { .. } => {
+                let (policy, track) = match self.beat_arm_payload(ctx) {
+                    Ok(payload) => payload,
+                    Err(e) => return KjResult::Err(e),
+                };
+                let verb = format!("armed (stopped) on lane '{}'", track.as_str());
+                (BeatCommand::Arm { context_id: ctx, policy, track }, verb)
+            }
             TransportCommand::Play { .. } => (BeatCommand::Play(ctx), "playing".into()),
             TransportCommand::Pause { .. } => (BeatCommand::Pause(ctx), "paused".into()),
             TransportCommand::Stop { .. } => (BeatCommand::Stop(ctx), "stopped".into()),
@@ -224,6 +248,66 @@ impl KjDispatcher {
             })),
         }
     }
+
+    /// Assemble the `Arm` payload (policy + lane) for `kj transport arm`. Prefers
+    /// the persisted `beat_state` — the real tempo/cadence a restart should
+    /// restore — and falls back to the musician default + label-derived lane for
+    /// a musician that was never persisted (created before beat-state persistence,
+    /// or whose create-time write-through failed). Refuses loudly on a
+    /// non-musician context: there is nothing meaningful to arm.
+    fn beat_arm_payload(&self, ctx: ContextId) -> Result<(BeatPolicy, TrackId), String> {
+        let db = self.kernel_db().lock();
+        // Verify the context is a musician FIRST, regardless of whether a
+        // beat_state row exists. A context whose type was changed away from
+        // musician still carries its stale beat_state; arming it would start a
+        // beat on a non-musician. The type gate is the authority, not the row.
+        let row = db
+            .get_context(ctx)
+            .map_err(|e| format!("kj transport arm: {e}"))?
+            .ok_or_else(|| format!("kj transport arm: context {} not found", short_hex(ctx)))?;
+        if row.context_type != "musician" {
+            return Err(format!(
+                "kj transport arm: context {} is a '{}', not a musician — nothing to arm",
+                short_hex(ctx),
+                row.context_type
+            ));
+        }
+
+        // Prefer the persisted policy + lane (the real tempo/cadence a restart
+        // should restore).
+        if let Some(state) = db
+            .get_beat_state(ctx)
+            .map_err(|e| format!("kj transport arm: reading beat state: {e}"))?
+        {
+            // The stored track was a valid TrackId when written; a value that no
+            // longer parses is corruption, so fail loud rather than re-arm onto a
+            // bad lane. (get_beat_state already rejects an empty track / zero period.)
+            let track = TrackId::new(state.track.as_str()).map_err(|e| {
+                format!("kj transport arm: stored track {:?} is invalid: {e}", state.track)
+            })?;
+            let policy = BeatPolicy {
+                period: Duration::from_millis(state.period_ms),
+                beats_per_phrase: state.beats_per_phrase,
+                ooda_every: state.ooda_every,
+            };
+            return Ok((policy, track));
+        }
+
+        // No persisted state — derive the lane from the label + musician default.
+        let label = row.label.unwrap_or_default();
+        // Mirror the create path's lane derivation: strict first, then lossy-but-
+        // loud slugify; an empty slug is a hard error (never a silent shared lane).
+        let track = TrackId::new(label.as_str())
+            .ok()
+            .or_else(|| TrackId::slugify(&label))
+            .ok_or_else(|| {
+                format!(
+                    "kj transport arm: musician label {label:?} yields no valid track id \
+                     (slug is empty)"
+                )
+            })?;
+        Ok((BeatPolicy::musician_default(), track))
+    }
 }
 
 fn short_hex(id: kaijutsu_types::ContextId) -> String {
@@ -257,6 +341,139 @@ mod tests {
             BeatCommand::Play(id) => assert_eq!(id, ctx, "plays the current context"),
             other => panic!("expected Play, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_arm_uses_persisted_beat_state() {
+        // The point of beat-state persistence: a restart re-arm restores the real
+        // tempo/cadence, not BeatPolicy::musician_default().
+        use crate::kernel_db::PersistedBeatState;
+        use kaijutsu_types::TrackId;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        d.kernel_db().lock().update_context_type(ctx, "musician").unwrap();
+        d.kernel_db()
+            .lock()
+            .upsert_beat_state(
+                ctx,
+                &PersistedBeatState {
+                    period_ms: 250,
+                    beats_per_phrase: 12,
+                    ooda_every: 96,
+                    track: "bass".to_string(),
+                },
+            )
+            .unwrap();
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
+        assert!(result.is_ok(), "transport arm failed: {}", result.message());
+        match rx.try_recv().expect("an Arm should be sent") {
+            BeatCommand::Arm { context_id, policy, track } => {
+                assert_eq!(context_id, ctx);
+                assert_eq!(policy.period, Duration::from_millis(250), "persisted tempo restored");
+                assert_eq!(policy.beats_per_phrase, 12);
+                assert_eq!(policy.ooda_every, 96);
+                assert_eq!(track, TrackId::new("bass").unwrap(), "persisted lane restored");
+            }
+            other => panic!("expected Arm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_arm_falls_back_to_default_for_unpersisted_musician() {
+        // A musician with no persisted beat_state (created before persistence, or
+        // a failed create-time write) re-arms on the musician default + a lane
+        // derived from its label — never silently un-armed.
+        use kaijutsu_types::TrackId;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("Lead Synth"), None, principal);
+        // register_context stamps "default"; make it a musician so the fallback applies.
+        d.kernel_db().lock().update_context_type(ctx, "musician").unwrap();
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
+        assert!(result.is_ok(), "transport arm failed: {}", result.message());
+        match rx.try_recv().expect("an Arm should be sent") {
+            BeatCommand::Arm { policy, track, .. } => {
+                assert_eq!(policy.period, Duration::from_millis(500), "musician default tempo");
+                assert_eq!(policy.beats_per_phrase, 16);
+                assert_eq!(
+                    track,
+                    TrackId::slugify("Lead Synth").unwrap(),
+                    "lane slugified from the label"
+                );
+            }
+            other => panic!("expected Arm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_arm_refuses_non_musician_without_state() {
+        // Arming a non-musician with no persisted beat_state has nothing to arm —
+        // refuse loudly rather than send a meaningless Arm.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("coder-ctx"), None, principal); // "default" type
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
+        assert!(!result.is_ok(), "arming a non-musician should fail");
+        assert!(
+            result.message().contains("not a musician"),
+            "error should explain why: {}",
+            result.message()
+        );
+        assert!(rx.try_recv().is_err(), "no Arm command sent on refusal");
+    }
+
+    #[tokio::test]
+    async fn transport_arm_refuses_former_musician_with_stale_state() {
+        // A context that WAS a musician (so it carries a stale beat_state row) but
+        // whose type was changed away must still be refused — the type gate is the
+        // authority, not the persisted row. Guards the short-circuit DeepSeek flagged.
+        use crate::kernel_db::PersistedBeatState;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        d.kernel_db().lock().update_context_type(ctx, "musician").unwrap();
+        d.kernel_db()
+            .lock()
+            .upsert_beat_state(
+                ctx,
+                &PersistedBeatState {
+                    period_ms: 250,
+                    beats_per_phrase: 12,
+                    ooda_every: 96,
+                    track: "bass".to_string(),
+                },
+            )
+            .unwrap();
+        // Type changed away from musician — the row is now stale.
+        d.kernel_db().lock().update_context_type(ctx, "default").unwrap();
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
+        assert!(!result.is_ok(), "arming a former musician should still fail");
+        assert!(
+            result.message().contains("not a musician"),
+            "the type gate refuses despite a persisted row: {}",
+            result.message()
+        );
+        assert!(rx.try_recv().is_err(), "no Arm command sent on refusal");
     }
 
     #[tokio::test]

@@ -814,16 +814,26 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   for a track with a last-good tune, prepend that track's last-good header
   before validating/deriving. Pairs with the decouple above (a per-content-type
   "complete the fragment" step).
-- **Musicians are not re-armed on kernel cold-start (fail-silent).** Auto-arm
-  fires only on context *create* (`create_context_inner` / kj `context_create`,
-  via `BeatCommand::Arm`); the beat scheduler starts with an empty `armed` map
-  on restart and nothing re-arms existing musician contexts from the DB. So a
-  kernel restart silently stops every musician's beat until it is re-created —
-  and there is no `kj transport arm` verb to recover (only play/pause/stop/
-  tempo/ooda/rotate, all no-ops on an un-armed context). Re-arm live musicians
-  on cold start (scan `context_type = musician`, `Arm` each, seeding the
-  playhead from max committed tick as the create path does). Adjacent to
+- **Cold-start re-arm is MANUAL, not automatic (by choice, 2026-06-28).** Auto-arm
+  still fires only on context *create*; the scheduler starts with an empty `armed`
+  map on restart and nothing *automatically* re-arms existing musician contexts.
+  **What shipped:** a `kj transport arm [--context]` recovery verb + durable
+  `BeatPolicy` persistence (below), so an operator can re-arm a musician after a
+  restart and get its *real* tempo/cadence back (not the default). Arms **stopped**
+  + OODA-armed; the playhead reseeds from max committed tick (`arm()`'s existing
+  virgin-only seed). **Deliberately deferred** (Amy's call — "possible but not
+  automatic yet"): an automatic cold-start sweep that re-arms every persisted
+  musician on boot. The natural seam is the recovery loop at `rpc.rs:1270` (scan
+  `context_type = musician`, skip archived/concluded, `Arm` each from its persisted
+  `beat_state`) — but it must run *after* the beat scheduler is wired, else
+  `send_beat_command` returns false. Adjacent to
   `tech_debt_peer_reattach_on_reconnect` (restart-recovery gaps).
+  - **Follow-ups:** (a) `beat_count` is NOT persisted, so a re-arm restarts the
+    OODA cadence phase from 0 (the *playhead* is restored from max_tick; only the
+    coarse OODA counter resets — usually fine, the first OODA fires one cadence
+    later). (b) `clear_beat_state` exists but nothing calls it yet — wire it to
+    disarm/archive once an archive RPC lands (no row leak today; the row just
+    outlives a disarmed musician and a re-arm reuses it).
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
   exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
   fixed in `BeatPolicy::musician_default()`. Make the cadence a settable knob
@@ -842,18 +852,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   revisit once irregular phrases (per-phrase beat counts) make the beat
   denomination awkward.
 - **Transport surface beyond `kj`:** app transport buttons / spacebar + a capnp
-  transport surface (today `kj transport play|pause|stop|tempo|ooda` only).
-- **Re-arm-on-restart sweep unwired:** a kernel restart resets musicians to
-  stopped and does *not* re-arm them — the only `BeatCommand::Arm` sender is
-  `createContext` (`rpc.rs`). The seeding half is **done** (Chameleon batch 1, F1):
-  `arm` now reads `max_tick(ctx)` and seeds the playhead inside `arm_timeline`'s
-  `or_insert_with`, virgin-only (a non-virgin `seed_playhead` is `Err`), so re-arm
-  is safe whenever wired. Remaining: an actual restart sweep that re-arms persisted
-  musicians. (No archive RPC yet → disarm-on-archive also TODO.) **This is one
-  work item with `BeatPolicy` persistence (Chameleon batch 1, F2):** policy
-  (`beats_per_phrase`, `ooda_every`, period) and `beat_count` all evaporate on
-  restart, but persisting them alone is useless because nothing re-arms contexts
-  post-restart at all — the sweep and the persistence land together or not at all.
+  transport surface (today `kj transport arm|play|pause|stop|tempo|ooda|rotate`
+  only — no app/capnp surface). A restart-recovery `arm` button is a natural fit.
+- **BeatPolicy persistence — ✅ SHIPPED 2026-06-28** (was "Chameleon batch 1, F2",
+  bundled with the restart sweep). A new `beat_state` table (`kernel_db.rs`,
+  `context_id` PK, period/bpp/ooda + `track`) durably mirrors each musician's live
+  `BeatPolicy` + lane. The scheduler **writes through** on every policy mutation
+  (`beat.rs` `persist_state`, called from `arm`/`set_tempo`) — db-less stores
+  no-op, a db-backed write *failure* is loud (`log::error!`), never silent.
+  `kj transport arm` reads it back (`get_beat_state`) to reconstruct the `Arm`,
+  falling back to `musician_default()` + a label-slugged lane for a never-persisted
+  musician, and refusing loudly on a non-musician. A corrupt row (zero period /
+  empty track) is a loud `Validation` error, not a silent default. So the old
+  claim — *"persisting policy is useless because nothing re-arms"* — no longer
+  holds: persistence + a **manual** re-arm shipped together; the **automatic**
+  cold-start sweep is what's now deferred (see the re-arm item above), decoupled
+  from persistence. `arm`'s virgin-only playhead seed (F1) was already done.
+  Not persisted: `beat_count` (OODA phase resets on re-arm — follow-up above).
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a

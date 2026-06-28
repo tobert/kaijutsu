@@ -350,6 +350,39 @@ joined context (`block_events_client_and_filter`), cutting foreign-context volum
 to zero. Verified live against a busy 24-context kernel: the 300s command returned
 in 285ms. Related memory: `project_mcp_synceddocument_sync`.
 
+## Musician beat-state persistence + manual re-arm (2026-06-28)
+
+A kernel restart silently stopped every musician: auto-arm fires only on context
+*create*, so the scheduler's `armed` map came up empty on cold start and there was
+no verb to recover — a fail-silent that taxed every iteration on the runner (which
+restarts constantly). Amy's steer was to make re-arm **possible but not automatic
+yet**: ship the recovery path and the durable state it needs, but hold off on an
+automatic boot sweep.
+
+Two halves landed together. (1) **Durable `BeatPolicy`** — a new `beat_state`
+table mirrors each musician's live policy (period/beats-per-phrase/ooda) + lane;
+the scheduler writes it through on every policy mutation (`arm`, `set_tempo`), so
+the row never drifts behind the running `BeatState`. A db-less store (embedded/
+test) no-ops; a db-backed *write failure* is loud, never silent — a musician
+silently re-arming to the default tempo after a crash is exactly the fallback we
+reject. A corrupt row (zero period, empty track) reads back as a loud `Validation`
+error, not a silent default. (2) **`kj transport arm [--context]`** reconstructs
+the `Arm` from the persisted row (real tempo/cadence restored), falls back to the
+musician default + a label-slugged lane for a never-persisted musician, and
+refuses loudly on a non-musician. It arms *stopped* + OODA-armed (no surprise
+token spend — `kj transport play` starts the clock); the playhead reseeds from the
+block log's max tick via `arm()`'s existing virgin-only seed.
+
+This **decoupled** the old "sweep + persistence land together or not at all"
+bundle: persistence + a manual recovery shipped without the automatic sweep, which
+is now the deferred piece (the `rpc.rs:1270` cold-start recovery loop is the seam,
+once it's sequenced after the beat scheduler is wired). Not persisted: `beat_count`
+(the OODA phase counter resets on re-arm — the playhead is what carries musical
+position). `clear_beat_state` exists but waits on an archive RPC to call it. Tests:
+DB round-trip + corruption-loud + clear; scheduler write-through (arm + tempo);
+verb (persisted / default-fallback / non-musician-refusal). Memory:
+`project_chameleon`, `project_composer_transport`.
+
 ## Chameleon / musician — first loop reached MIDI (2026-06-13, `da59499`)
 
 The musician (né composer) transport + OODA loop reached its headline: the first

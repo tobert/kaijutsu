@@ -609,6 +609,23 @@ CREATE TABLE IF NOT EXISTS context_hydration (
     marker      TEXT    NOT NULL,
     window_size INTEGER NOT NULL
 );
+
+-- Durable mirror of a musician's live BeatPolicy + lane, so a kernel restart can
+-- RE-ARM it with its real tempo/cadence (not BeatPolicy::musician_default()).
+-- Written through by the beat scheduler whenever the policy mutates (arm, tempo);
+-- read by `kj transport arm` to reconstruct the Arm after a cold start. The
+-- scheduler's in-memory BeatState stays the live source of truth; this is the
+-- restart-recovery copy. `beat_count` and the runtime switches (playing/ooda)
+-- are deliberately NOT mirrored — a re-arm always lands stopped + OODA-armed (no
+-- surprise token spend), and the playhead reseeds from the block log's max tick.
+CREATE TABLE IF NOT EXISTS beat_state (
+    context_id       BLOB    NOT NULL PRIMARY KEY
+        REFERENCES contexts(context_id) ON DELETE CASCADE,
+    period_ms        INTEGER NOT NULL,
+    beats_per_phrase INTEGER NOT NULL,
+    ooda_every       INTEGER NOT NULL,
+    track            TEXT    NOT NULL
+);
 "#;
 
 // ============================================================================
@@ -628,6 +645,18 @@ fn read_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<ContextI
             "invalid ContextId bytes".into(),
         )
     })
+}
+
+/// A musician's persisted beat configuration — the durable mirror of its live
+/// `BeatPolicy` + lane needed to re-arm it after a kernel restart. Primitive-typed
+/// so `kernel_db` stays decoupled from `hyoushigi::BeatPolicy`/`TrackId`; the beat
+/// layer converts at the seam (`period_ms` ↔ `Duration`, `track` ↔ `TrackId`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedBeatState {
+    pub period_ms: u64,
+    pub beats_per_phrase: u64,
+    pub ooda_every: u64,
+    pub track: String,
 }
 
 fn read_opt_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<ContextId>> {
@@ -3135,6 +3164,107 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Beat state (musician BeatPolicy mirror — restart re-arm recovery)
+    // ========================================================================
+
+    /// Upsert the durable beat state for `context_id` — the mirror of a musician's
+    /// live `BeatPolicy` + lane. Written through by the scheduler on every policy
+    /// mutation (arm, tempo), so the row always reflects the running policy and a
+    /// later `kj transport arm` re-arms with the real values, not the default.
+    /// In-place (PK is `context_id`): a re-arm or tempo change updates one row.
+    pub fn upsert_beat_state(
+        &self,
+        context_id: ContextId,
+        state: &PersistedBeatState,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(context_id) DO UPDATE SET
+                 period_ms = ?2, beats_per_phrase = ?3, ooda_every = ?4, track = ?5",
+            params![
+                blob_param(context_id.as_bytes()),
+                state.period_ms as i64,
+                state.beats_per_phrase as i64,
+                state.ooda_every as i64,
+                state.track,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the persisted beat state for `context_id`, or `None` when the context
+    /// was never armed (no row). A *present but malformed* row — a zero period
+    /// (a beat that never advances) or an empty track (no lane) — is corruption,
+    /// not a legible policy, and returns `Err(Validation)` so the caller refuses
+    /// to re-arm rather than silently armed with a broken policy.
+    pub fn get_beat_state(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Option<PersistedBeatState>> {
+        // Read the raw signed columns and validate BEFORE casting to u64. SQLite
+        // INTEGER is signed; `upsert_beat_state` only ever writes `u64 as i64`
+        // (≥ 0), so a negative here is corruption (tampering, a non-Rust writer,
+        // bit rot). `-1_i64 as u64` would wrap to ~1.8e19 ms (≈ 584 million years)
+        // and sail PAST the zero-period guard into a silently-frozen beat — exactly
+        // the silent corruption this project rejects. Reject it loudly instead.
+        let row = self
+            .conn
+            .query_row(
+                "SELECT period_ms, beats_per_phrase, ooda_every, track
+                 FROM beat_state WHERE context_id = ?1",
+                params![blob_param(context_id.as_bytes())],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((period_ms, beats_per_phrase, ooda_every, track)) = row else {
+            return Ok(None);
+        };
+        if period_ms < 0 || beats_per_phrase < 0 || ooda_every < 0 {
+            return Err(KernelDbError::Validation(format!(
+                "context {} beat state has a negative field (period_ms={period_ms}, \
+                 beats_per_phrase={beats_per_phrase}, ooda_every={ooda_every}) — corrupt",
+                context_id.short()
+            )));
+        }
+        if period_ms == 0 {
+            return Err(KernelDbError::Validation(format!(
+                "context {} beat state has a zero period — corrupt (a beat that never advances)",
+                context_id.short()
+            )));
+        }
+        if track.is_empty() {
+            return Err(KernelDbError::Validation(format!(
+                "context {} beat state has an empty track — corrupt (no lane identity)",
+                context_id.short()
+            )));
+        }
+        Ok(Some(PersistedBeatState {
+            period_ms: period_ms as u64,
+            beats_per_phrase: beats_per_phrase as u64,
+            ooda_every: ooda_every as u64,
+            track,
+        }))
+    }
+
+    /// Drop the persisted beat state for `context_id` (e.g. on disarm/archive).
+    /// Returns the row count (0 or 1).
+    pub fn clear_beat_state(&self, context_id: ContextId) -> KernelDbResult<u64> {
+        let deleted = self.conn.execute(
+            "DELETE FROM beat_state WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    // ========================================================================
     // Context Config Fork + Workspace Query
     // ========================================================================
 
@@ -5278,6 +5408,153 @@ mod tests {
         assert!(
             db.get_hydration_policy(ctx.context_id).unwrap().is_none(),
             "cleared policy reverts to hydrate-everything"
+        );
+    }
+
+    fn beat_state(period_ms: u64, bpp: u64, ooda: u64, track: &str) -> PersistedBeatState {
+        PersistedBeatState {
+            period_ms,
+            beats_per_phrase: bpp,
+            ooda_every: ooda,
+            track: track.to_string(),
+        }
+    }
+
+    #[test]
+    fn beat_state_unset_is_none() {
+        // No row → None → context was never armed (re-arm falls back to default).
+        let db = KernelDb::in_memory().unwrap();
+        assert!(db.get_beat_state(ContextId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn beat_state_set_get_round_trip() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-rt"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let state = beat_state(250, 16, 128, "bass");
+        db.upsert_beat_state(ctx.context_id, &state).unwrap();
+
+        assert_eq!(
+            db.get_beat_state(ctx.context_id).unwrap(),
+            Some(state),
+            "policy + track survive write→read (the restart re-arm payload)"
+        );
+    }
+
+    #[test]
+    fn beat_state_upsert_updates_in_place() {
+        // A tempo change (or re-arm with a new policy) updates one row, not a
+        // second — the PK is context_id.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-up"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.upsert_beat_state(ctx.context_id, &beat_state(500, 16, 128, "bass"))
+            .unwrap();
+        // tempo up to 240 BPM (250ms), same lane.
+        db.upsert_beat_state(ctx.context_id, &beat_state(250, 16, 128, "bass"))
+            .unwrap();
+
+        assert_eq!(
+            db.get_beat_state(ctx.context_id).unwrap(),
+            Some(beat_state(250, 16, 128, "bass")),
+            "the second upsert overwrites the first (in-place tempo change)"
+        );
+    }
+
+    #[test]
+    fn beat_state_zero_period_is_loud_error() {
+        // A zero period is a beat that never advances — corrupt stored state, not
+        // a legible policy. Refuse loudly rather than re-arm a stalled musician.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-zero"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.conn
+            .execute(
+                "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
+                 VALUES (?1, 0, 16, 128, 'bass')",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                db.get_beat_state(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "a 0 period is corrupt → loud Validation error, not a silently-armed stall"
+        );
+    }
+
+    #[test]
+    fn beat_state_negative_field_is_loud_error() {
+        // A negative INTEGER (tampering / bit rot) must NOT wrap into a huge u64
+        // that sails past the zero-period guard into a silently-frozen beat. The
+        // upsert never writes negatives, so this row can only be corruption.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-neg"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.conn
+            .execute(
+                "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
+                 VALUES (?1, -1, 16, 128, 'bass')",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                db.get_beat_state(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "a negative period is corrupt → loud Validation error, not a u64-wrapped frozen beat"
+        );
+    }
+
+    #[test]
+    fn beat_state_empty_track_is_loud_error() {
+        // An empty track is no lane identity — corrupt (two musicians would
+        // collide on a shared default lane). Same stance: refuse loudly.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-notrack"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.conn
+            .execute(
+                "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
+                 VALUES (?1, 500, 16, 128, '')",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                db.get_beat_state(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "an empty track is corrupt → loud Validation error"
+        );
+    }
+
+    #[test]
+    fn beat_state_clear_reverts_to_none() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-clear"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.upsert_beat_state(ctx.context_id, &beat_state(500, 16, 128, "bass"))
+            .unwrap();
+        assert_eq!(db.clear_beat_state(ctx.context_id).unwrap(), 1);
+        assert!(
+            db.get_beat_state(ctx.context_id).unwrap().is_none(),
+            "cleared beat state reverts to never-armed"
         );
     }
 
