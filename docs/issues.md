@@ -860,6 +860,45 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   ack/nack so the verb can report the truth. Made the create-rc-arm verification
   harder (play-success is not proof of arm; had to read the `beat_state` row to
   confirm). Low urgency, but it's a genuine lie in the transport surface.
+  Concrete fixes (gemini-pro review 2026-06-28): (A) actor pattern — give
+  `BeatCommand::{Play,Pause,Stop}` a `oneshot::Sender<Result<(),String>>` and
+  `await` the scheduler's ACK/NACK in dispatch (note: `BeatCommand` is `Clone`
+  today, a oneshot sender isn't — that derive has to give); (B) cheaper — a
+  shared `Arc<…>` armed-set the scheduler maintains and the verb checks
+  synchronously before sending. (B) is the smaller change.
+- **Autonomous beat lifecycles run unprivileged — verified-fine, but a deliberate
+  asymmetry worth a decision (gemini-pro review 2026-06-28).** `fire_lifecycle`
+  (`beat.rs:802`) builds its `KjCaller` with `privileged: false` for the
+  scheduler-fired `tick`/`rotate` verbs, whereas the *create* lifecycle runs
+  privileged (S20-arm.kai relies on that to clear the Transport gate). Gemini
+  predicted the page-turn would fail with access-denied — but the live
+  runner-verify forked 14 deep through exactly this path, so under the current
+  shared-trust capability model (gates are ergonomic nudges, not hard
+  boundaries) it runs fine. The real question is the asymmetry: IF capabilities
+  ever become hard boundaries, beat-fired rotate breaks while create-fired arm
+  doesn't. Two defensible readings — (a) intentional: autonomous model-driven
+  beats *shouldn't* hold elevated privilege; (b) inconsistent: both are
+  kernel-initiated control-plane actions and should match. Decide deliberately;
+  do NOT blind-flip `privileged` either way.
+- **`set_tempo` doesn't update the Timeline's stored `TickClock` (latent, no
+  reader yet — gemini-pro review 2026-06-28).** `BeatScheduler::set_tempo`
+  (`beat.rs`) updates `st.policy.period` (the heap cadence) but `arm`'s
+  `kernel.arm_timeline(..., policy.clock(), ...)` uses `or_insert_with`, so the
+  `TickClock` living inside an already-armed `Timeline` keeps the old tempo.
+  Harmless *today*: I found no production reader of the timeline's stored clock
+  for tempo — `clock()` is recomputed from `policy.period` and `transport_vars`
+  reads the policy, not the timeline. It becomes a real bug the moment a
+  tempo-dependent reader of the timeline clock exists (MIDI wall-time export,
+  visual playhead). Fix when that lands: a `Kernel::update_timeline_clock(ctx,
+  clock)` that `set_tempo`/`arm` call on an existing timeline.
+- **`S10-rotate.kai` `$ROTATE_EVERY` has no fallback if unset (Low, gemini-pro
+  review 2026-06-28).** The scheduler always seeds `ROTATE_EVERY` when it fires
+  the rotate verb, so it's only exposed if the script is run manually with the
+  var unset — then `kj transport rotate --every` (empty) is a fatal clap error.
+  NOTE: the naive `${ROTATE_EVERY:-off}` (kaish *does* support `:-`) does NOT
+  work here — `--every` takes a number and `off` is a positional, so `--every
+  off` errors too. A correct guard needs conditional logic (rotate-with-`--every`
+  vs bare `off`), which is more than the firing path warrants for now.
 - **Musician `kj` loadout — tool-free (2026-06-13).** `musician` seeds
   `assets/defaults/rc/musician/create/S10-binding.kai` granting only `drive`:
   no `builtin.*` tool instances, no `facade:shell`/`submit_input`, no
