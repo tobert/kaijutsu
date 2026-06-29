@@ -57,6 +57,43 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
 - **Runner-verify** with a stock `sftp`/sshfs client through the real server
   (kernel rebuild+restart; capnp schema unchanged, but it's a new subsystem).
 
+## Shared state space + myaku (design `docs/shared-state.md`, `docs/myaku.md`)
+
+High-level sketches landed 2026-06-28; dedicated design sessions to follow. The
+thesis: the VFS *is* the shared-state namespace; tiers are mounts (`/run`
+`MemoryBackend` for ephemeral read-write — its own mount, `/scratch` likely retired
+— and `/v` for read-only/CRDT durable). No bespoke store. Open work that's already
+concrete:
+
+- **Delete `KvDocument`/`Kv`.** Test-only, no production callers — being deleted,
+  not deprecated. Remove `kv.rs`, the capnp surface (`kvGet`/`kvSet`/`kvDelete`/
+  `kvKeys`/`kvWatch`, @79–83), `kj kv`. **Migrate one tie first:**
+  `current_context` (per-session pointer, `kv.rs:53`, rendered at
+  `/v/session/<id>/context`) moves to the session registry (`PeerRegistry`/
+  `SessionContextMap`). Reconcile the audit ("test-only") vs memory ("app-restore
+  through KV") before cutting. **Touches the slash-v V2 entry below** (its `bound`/
+  `context` renders from KV today — repoint to session state).
+- **`VfsOps::append` (or open-for-append cursor).** No append primitive today;
+  `write_all`/`>>` are O(n) truncate+rewrite (`vfs/ops.rs` `write_all`;
+  `MemoryBackend::write` is O(1) at `offset=size`). myaku sidesteps via bounded
+  rewrite and OODA writes are turn-cadence, so this is not blocking — but an O(1)
+  append would make jsonl logs and `>>` cheap. Also closes the SFTP
+  concurrent-appender lost-update facet noted in the SFTP section above.
+- **myaku pulse facility** — *no synthesized backend* (deleted that idea). The
+  scheduler is **cadence + a death-certificate** (each probe's `exit_code` + stderr
+  tail in a `status` file, since only the parent sees a crash). **One executor, two
+  trigger front-ends**: wall interval (`#pulse every=1s`) + hyoushigi beat
+  (`#pulse on=beat`, the existing `beat.rs` playhead-advance event). Probes are
+  **kaish** scripts that write their own files into a `/run` `MemoryBackend` mount
+  (its own mount; `/scratch` likely retired) — `/run/pulse/<probe>/{now,history,status}`
+  via a `pulse_emit` kaish helper (snapshot + bounded ring trim + fail-loud column
+  check; *no* scalar files). Scheduler injects fire coords as flat `KJ_` vars
+  (`KJ_TICK` musical/frozen-off-beat, `KJ_PULSE` monotonic ordering, `KJ_EPOCH_NS`
+  shared wall stamp; cf. `KJ_PARENT_BLOCK_COUNT`). Probe defs in a CRDT rc tree
+  (`#pulse` header). First wave all kaish reading `/proc`·`/sys` (`date +%s%N` works,
+  builtin); Rust probes later use the same `/run` contract. The app `DockSparkline`
+  is a prototype — rewrite it to read `/run/pulse/<x>/history`. Design: `docs/myaku.md`.
+
 ## `/v/ctx` + `/v/session` virtual surfaces (design `docs/slash-v.md`; lands ahead of SFTP slice 3)
 
 Two sysfs-style read-mostly `VfsBackend`s under the existing `/v` namespace
