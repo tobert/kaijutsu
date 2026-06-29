@@ -64,6 +64,10 @@ pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 #[derive(Clone, Debug)]
 pub struct MockClient {
     pub canned_response: String,
+    /// Artificial latency applied to `prompt`/`prompt_with_system`, so a test
+    /// can model a slow provider (e.g. exercising the distill `patient` hold).
+    /// Zero by default; the streaming path ignores it.
+    pub delay: std::time::Duration,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -71,7 +75,15 @@ impl MockClient {
     pub fn new(response: impl Into<String>) -> Self {
         Self {
             canned_response: response.into(),
+            delay: std::time::Duration::ZERO,
         }
+    }
+
+    /// Builder: make `prompt`/`prompt_with_system` sleep `delay` before
+    /// returning the canned response.
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
     }
 }
 
@@ -475,7 +487,12 @@ impl Provider {
             Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
             Self::OpenAi(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(mock) => Ok(mock.canned_response.clone()),
+            Self::Mock(mock) => {
+                if !mock.delay.is_zero() {
+                    tokio::time::sleep(mock.delay).await;
+                }
+                Ok(mock.canned_response.clone())
+            }
         }
     }
 

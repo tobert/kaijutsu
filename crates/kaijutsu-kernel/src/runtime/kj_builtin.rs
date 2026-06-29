@@ -517,7 +517,27 @@ impl Tool for KjBuiltin {
             return self.dispatch_synth(&argv[1..], &caller).await;
         }
 
-        let result = self.dispatcher.dispatch(&argv, &caller).await;
+        // Distillation verbs make a blocking, in-line LLM completion
+        // (`summarize` → `prompt_with_system`, which has no internal timeout of
+        // its own). Without help, that model think-time races the script-level
+        // `kaish_request_timeout` watchdog — forcing the operator to choose
+        // between a watchdog tight enough to catch a wedged shell loop and one
+        // loose enough for a legitimately-slow distill. `ToolCtx::patient`
+        // dissolves that conflict: it freezes the script clock for the hold and
+        // governs the distill under its own `llm_request_timeout` budget
+        // (cancellation stays live, so a wedged provider or a user interrupt
+        // still aborts it). The guard is scoped to the dispatch call so it drops
+        // before the `match result` below re-borrows `ctx`. Only the distill
+        // verbs are wrapped — wrapping every `kj` call would freeze the clock
+        // through a tight `while true; do kj …; done` and the watchdog would
+        // never catch the runaway. See docs/issues.md (kaish `patient` adoption).
+        let result = if is_distill_verb(&argv) {
+            let budget = self.dispatcher.kernel().timeouts().llm_request_timeout;
+            let _patient = ctx.patient(budget);
+            self.dispatcher.dispatch(&argv, &caller).await
+        } else {
+            self.dispatcher.dispatch(&argv, &caller).await
+        };
 
         let exec = match result {
             KjResult::Ok {
@@ -618,6 +638,26 @@ fn render_json_envelope(exec: ExecResult) -> ExecResult {
     out.data = exec.data;
     out.baggage = exec.baggage;
     out
+}
+
+/// Does this `kj` invocation make a blocking, in-line LLM distillation call?
+///
+/// These are the only `kj` verbs that synchronously hold the kaish builtin on a
+/// `summarize`/`prompt_with_system` completion (kj/drift.rs + kj/fork.rs); every
+/// other verb either returns promptly or hands LLM work off to the server's
+/// stream loop (`kj drive` publishes a turn request and returns). `argv` here is
+/// post-normalization — `--confirm`/`--json` already stripped — so a flag like
+/// `--summarize`/`--compact` survives if the caller passed it. The match mirrors
+/// the dispatcher's routing; a miss only forfeits the patient hold (status quo),
+/// never miscarries the command.
+fn is_distill_verb(argv: &[String]) -> bool {
+    let has = |flag: &str| argv.iter().any(|a| a == flag);
+    match (argv.first().map(String::as_str), argv.get(1).map(String::as_str)) {
+        (Some("fork"), _) => has("--compact"),
+        (Some("drift"), Some("pull")) | (Some("drift"), Some("merge")) => true,
+        (Some("drift"), Some("push")) => has("--summarize"),
+        _ => false,
+    }
 }
 
 /// Build a command scope string from argv for nonce validation.
@@ -1363,6 +1403,132 @@ mod tests {
             "confirm in a fresh shell should succeed, got code {} / err {:?}",
             confirm.code,
             confirm.err
+        );
+    }
+
+    /// `is_distill_verb` must classify exactly the four in-line-LLM verbs and
+    /// nothing else. A false positive would freeze the script watchdog for a
+    /// fast command (e.g. a tight loop never trips its timeout); a false
+    /// negative silently forfeits the patient hold. Mirrors the dispatcher's
+    /// routing, so it fails loudly if the two drift apart.
+    #[test]
+    fn is_distill_verb_classifies_inline_llm_verbs() {
+        let argv = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+
+        // Positives: the only verbs that block on `summarize`/`prompt_with_system`.
+        assert!(is_distill_verb(&argv("fork --compact")));
+        assert!(is_distill_verb(&argv("fork --name x --compact")));
+        assert!(is_distill_verb(&argv("drift pull main what-changed")));
+        assert!(is_distill_verb(&argv("drift merge")));
+        assert!(is_distill_verb(&argv("drift merge some-ctx")));
+        assert!(is_distill_verb(&argv("drift push main --summarize")));
+
+        // Negatives: a plain fork copies (no distill); `drift push` without
+        // `--summarize` stages literal content; `drift flush`/`push` deliver;
+        // `drive` only publishes a turn request; everything else is local.
+        assert!(!is_distill_verb(&argv("fork --name x")));
+        assert!(!is_distill_verb(&argv("drift push main some literal content")));
+        assert!(!is_distill_verb(&argv("drift flush")));
+        assert!(!is_distill_verb(&argv("drift queue")));
+        assert!(!is_distill_verb(&argv("drive")));
+        assert!(!is_distill_verb(&argv("drive --prompt go")));
+        assert!(!is_distill_verb(&argv("block list")));
+        assert!(!is_distill_verb(&argv("context list")));
+        assert!(!is_distill_verb(&[]));
+    }
+
+    /// The headline guarantee of the `patient` adoption: a distill verb whose
+    /// LLM completion runs *longer than* the script-level `kaish_request_timeout`
+    /// still completes, because `ctx.patient(llm_request_timeout)` freezes the
+    /// script clock for the hold. Delete the `ctx.patient(...)` line in
+    /// `execute` and this test fails (the slow distill trips the watchdog → the
+    /// command errors). The control half proves the watchdog is genuinely armed
+    /// and tight in this harness, so the positive half isn't passing vacuously.
+    #[tokio::test]
+    async fn slow_distill_survives_tight_request_timeout() {
+        use crate::llm::{MockClient, Provider};
+        use std::time::Duration;
+
+        // A tight 300ms script watchdog, but a generous 10s per-LLM budget —
+        // exactly the split `patient` exists to honor.
+        let policy = kaijutsu_types::TimeoutPolicy {
+            kaish_request_timeout: Duration::from_millis(300),
+            llm_request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let dispatcher = Arc::new(
+            crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await,
+        );
+        dispatcher.set_self_arc();
+
+        // A provider that takes 800ms to answer — past the 300ms watchdog, well
+        // under the 10s LLM budget. summarize() falls to the registry default
+        // when the context has no model of its own.
+        {
+            let mut reg = dispatcher.kernel().llm().write().await;
+            reg.register(
+                "mock",
+                Arc::new(Provider::Mock(
+                    MockClient::new("distilled summary").with_delay(Duration::from_millis(800)),
+                )),
+            );
+            assert!(reg.set_default("mock"), "set default provider");
+            reg.set_default_model("mock-model");
+        }
+
+        let principal = PrincipalId::system();
+        let here = register_context(&dispatcher, Some("here"), None, principal);
+        register_context(&dispatcher, Some("sink"), None, principal);
+        // summarize needs blocks to distill — seed one.
+        dispatcher
+            .block_store()
+            .create_document(here, kaijutsu_types::DocKind::Conversation, None)
+            .expect("create_document");
+        dispatcher
+            .block_store()
+            .insert_block(
+                here,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "something worth distilling",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .expect("insert block");
+
+        let kaish = embedded_with_kj(dispatcher.clone(), here).await;
+
+        // Control: a plain shell sleep well past the 300ms watchdog is NOT
+        // wrapped in patient, so it must be interrupted (cancelled fast, nonzero
+        // exit) — proving the watchdog is live and tight in this harness.
+        let control = kaish
+            .execute_with_options("sleep 5", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (control sleep)");
+        assert!(
+            !control.ok(),
+            "control sleep 5 under a 300ms watchdog must be interrupted, got {control:?}"
+        );
+
+        // Headline: the 800ms distill outlasts the same 300ms watchdog but still
+        // completes, because patient froze the script clock for the LLM hold.
+        let res = kaish
+            .execute_with_options("kj drift push sink --summarize", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (distill)");
+        assert!(
+            res.ok(),
+            "slow distill should survive the tight watchdog under patient, got code {} / {:?}",
+            res.code,
+            res.text_out()
+        );
+        assert_ne!(res.code, 124, "distill must not trip the script timeout (124)");
+        assert!(
+            res.text_out().contains("staged drift"),
+            "distill should have staged the summary: {}",
+            res.text_out()
         );
     }
 }
