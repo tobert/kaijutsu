@@ -16,7 +16,7 @@ const MAX_TRACK_ID_LEN: usize = 64;
 /// **Lane identity ONLY** — never an ordering, barrier, or authorship concept.
 /// `track == None` (on a block snapshot) matches no track: a track id is a lane
 /// key and a lane key alone, and the scheduling principal is never a lane key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TrackId(String);
 

@@ -2400,13 +2400,13 @@ mod tests {
             .or_else(|| kaijutsu_types::TrackId::slugify("bassline"))
             .expect("bassline yields a valid track");
         match rx.recv().await {
-            Some(crate::hyoushigi::BeatCommand::Arm {
+            Some(crate::hyoushigi::BeatCommand::Attach {
                 context_id, track, ..
             }) => {
-                assert_eq!(context_id, id, "arms the musician we just created");
+                assert_eq!(context_id, id, "attaches the musician we just created");
                 assert_eq!(track, expected_track, "track derives from the label");
             }
-            other => panic!("musician create must send BeatCommand::Arm, got {other:?}"),
+            other => panic!("musician create must send BeatCommand::Attach, got {other:?}"),
         }
     }
 

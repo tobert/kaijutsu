@@ -610,32 +610,42 @@ CREATE TABLE IF NOT EXISTS context_hydration (
     window_size INTEGER NOT NULL
 );
 
--- Durable mirror of a musician's live BeatPolicy + lane, so a kernel restart can
--- RE-ARM it with its real tempo/cadence (not BeatPolicy::musician_default()).
--- Written through by the beat scheduler whenever the policy mutates (arm, tempo);
--- read by `kj transport arm` to reconstruct the Arm after a cold start. The
--- scheduler's in-memory BeatState stays the live source of truth; this is the
--- restart-recovery copy. `beat_count` and the runtime switches (playing/ooda)
--- are deliberately NOT mirrored — a re-arm always lands stopped + OODA-armed (no
--- surprise token spend), and the playhead reseeds from the block log's max tick.
-CREATE TABLE IF NOT EXISTS beat_state (
-    context_id           BLOB    NOT NULL PRIMARY KEY
-        REFERENCES contexts(context_id) ON DELETE CASCADE,
-    period_ms            INTEGER NOT NULL,
-    beats_per_phrase     INTEGER NOT NULL,
-    ooda_every           INTEGER NOT NULL,
-    track                TEXT    NOT NULL,
-    -- Self-fork rotate cadence in phrases (NULL = no rotation). Persisted so a
-    -- cold-restart re-arm restores the page-turn cadence, not just tempo/lane.
-    rotate_every_phrases INTEGER,
-    -- The lane's musical position (playhead tick) as of the last policy mutation.
-    -- Carried across a rotation page-turn: a spawn-fork child has no committed
-    -- blocks, so without this its `arm` would seed the playhead from max_tick=0
-    -- and musical time would RESET at every section. The re-arm seeds from
-    -- `max(max_tick, playhead_tick)`, so the value never *hides* committed time
-    -- (cold restart still trusts max_tick) but DOES continue a thin child's lane.
-    -- NULL = unknown (a legacy row or a never-snapshotted arm) → seed from max_tick.
-    playhead_tick        INTEGER
+-- Stage 1 track redesign (docs/tracks.md): `beat_state` is replaced by the
+-- per-track `tracks` table + per-(track,context) `attachments` table. The old
+-- table is dropped here so dev DBs shed it on the next open; it held only
+-- restart-recovery state that is safe to lose on a schema change (cold-start
+-- always re-arms stopped, per the original beat_state comment above).
+DROP TABLE IF EXISTS beat_state;
+
+-- ── Tracks (clock domains — docs/tracks.md) ─────────────────────
+-- One row per named clock domain. The track is PURELY the clock domain: the
+-- period (wall-clock driver; a ClockSource trait is Stage 3), the phrase length,
+-- the playhead, and the transport switch. The per-context wakeup cadence lives on
+-- the attachment (`attachments.wakeup_every`), NOT here — the track says when it
+-- beats; each attachment says how often it wants to be woken.
+-- `playhead_tick` is NULL until the track first beats; thereafter it is the
+-- max committed tick persisted for restart recovery (the live source of truth is
+-- the in-memory TrackState.playhead). `playing` mirrors the transport (1=Playing,
+-- 0=Stopped); cold-start always re-arms stopped — no surprise token spend.
+CREATE TABLE IF NOT EXISTS tracks (
+    track_id          TEXT    NOT NULL PRIMARY KEY,
+    period_ms         INTEGER NOT NULL,
+    beats_per_phrase  INTEGER NOT NULL,
+    playhead_tick     INTEGER,           -- NULL until first beat; else max committed tick
+    playing           INTEGER NOT NULL DEFAULT 0   -- 1=Playing, 0=Stopped
+);
+
+-- ── Attachments (context → track binding — docs/tracks.md §2+3) ─
+-- One row per (track, context) pair. The track stays ignorant of context
+-- lifecycles; contexts bind themselves. CASCADE on both sides cleans up
+-- automatically when a track is deleted or a context is archived/deleted.
+CREATE TABLE IF NOT EXISTS attachments (
+    track_id              TEXT    NOT NULL REFERENCES tracks(track_id) ON DELETE CASCADE,
+    context_id            BLOB    NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    wakeup_every          INTEGER NOT NULL,        -- beat divisor: wake this context every N beats
+    rotate_every_phrases  INTEGER,                 -- NULL = never auto-rotate
+    ooda_armed            INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, context_id)
 );
 "#;
 
@@ -658,26 +668,41 @@ fn read_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<ContextI
     })
 }
 
-/// A musician's persisted beat configuration — the durable mirror of its live
-/// `BeatPolicy` + lane needed to re-arm it after a kernel restart. Primitive-typed
-/// so `kernel_db` stays decoupled from `hyoushigi::BeatPolicy`/`TrackId`; the beat
-/// layer converts at the seam (`period_ms` ↔ `Duration`, `track` ↔ `TrackId`).
+/// A persisted track clock domain — the restart-recovery row for a `TrackState`.
+/// Primitive-typed so `kernel_db` stays decoupled from `hyoushigi`'s runtime
+/// types; the beat/scheduler layer converts at the seam. (`period_ms` ↔
+/// `Duration`, `track_id` ↔ `TrackId`, `playing` ↔ `TrackTransport`.)
+///
+/// Cold-start always re-arms stopped (`playing` restored from this row) so the
+/// scheduler never fires stale wakeups on a warm start — the caller calls
+/// `play` explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersistedBeatState {
+pub struct PersistedTrack {
+    pub track_id: String,
     pub period_ms: u64,
     pub beats_per_phrase: u64,
-    pub ooda_every: u64,
-    pub track: String,
-    /// Self-fork rotate cadence in phrases; `None` = no rotation. Restored on a
-    /// cold-restart re-arm so the page-turn survives a kernel restart.
+    /// The track's musical position (playhead tick) as of the last durable update.
+    /// `None` until the track first beats; thereafter the max committed tick so
+    /// a restart can reseed without scanning the block log.
+    pub playhead_tick: Option<i64>,
+    /// Transport state: `true` = Playing, `false` = Stopped.
+    pub playing: bool,
+}
+
+/// A persisted attachment — one (track_id, context_id) binding, the restart-
+/// recovery row for a `TrackState.attached[ctx]` entry. Primitive-typed for the
+/// same reason as `PersistedTrack`; the scheduler converts at the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAttachment {
+    pub track_id: String,
+    pub context_id: ContextId,
+    /// Beat divisor: wake this context every N beats on the track clock.
+    pub wakeup_every: u64,
+    /// Self-fork rotate cadence in phrases; `None` = never auto-rotate.
     pub rotate_every_phrases: Option<u64>,
-    /// The lane's musical position (playhead tick) at the last policy mutation.
-    /// `None` = unknown (legacy/never-snapshotted) → the re-arm seeds from the
-    /// block log's max tick alone. Carried by the fork copy so a rotation child
-    /// continues the parent's musical time instead of resetting to tick 0; the
-    /// re-arm takes `max(max_tick, playhead_tick)` so this never hides committed
-    /// time, it only supplies it when a thin child has none. See `beat.rs::arm`.
-    pub playhead_tick: Option<u64>,
+    /// Whether the OODA loop is armed for this attachment (blocks the next tick
+    /// until the context produces output).
+    pub ooda_armed: bool,
 }
 
 fn read_opt_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<ContextId>> {
@@ -930,8 +955,6 @@ impl KernelDb {
         let alters = [
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
-            "ALTER TABLE beat_state ADD COLUMN rotate_every_phrases INTEGER",
-            "ALTER TABLE beat_state ADD COLUMN playhead_tick INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -1463,12 +1486,6 @@ impl KernelDb {
         let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
         let binding = self.get_context_binding(source)?;
-        // Beat state travels with the fork so a forked musician keeps the PARENT's
-        // track (lane) + policy, not a label-derived one — the lane is the durable
-        // identity that persists across a fork-lineage (the rotation page-turn:
-        // `docs/chameleon.md`). A thin spawn-fork has no label, so without this the
-        // child has no lane to arm on. `None` for a non-musician parent (no-op).
-        let beat_state = self.get_beat_state(source)?;
 
         let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
         let doc = DocumentRow {
@@ -1500,9 +1517,12 @@ impl KernelDb {
         if let Some(binding) = binding {
             Self::write_binding(&tx, row.context_id, &binding)?;
         }
-        if let Some(state) = beat_state {
-            Self::write_beat_state(&tx, row.context_id, &state)?;
-        }
+        // Attachments travel with the fork: the child joins the SAME tracks as the
+        // parent (docs/tracks.md §3 — "The context binds; the child inherits the
+        // bind at fork"). The child re-binds via create/fork rc on the way up so
+        // the track never has to watch for forks. A non-musician parent has no
+        // attachments — the copy is a clean no-op.
+        Self::copy_attachments_for_fork(&tx, source, row.context_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -3196,149 +3216,312 @@ impl KernelDb {
     }
 
     // ========================================================================
-    // Beat state (musician BeatPolicy mirror — restart re-arm recovery)
+    // Tracks (clock domains — docs/tracks.md Stage 1)
     // ========================================================================
 
-    /// Upsert the durable beat state for `context_id` — the mirror of a musician's
-    /// live `BeatPolicy` + lane. Written through by the scheduler on every policy
-    /// mutation (arm, tempo), so the row always reflects the running policy and a
-    /// later `kj transport arm` re-arms with the real values, not the default.
-    /// In-place (PK is `context_id`): a re-arm or tempo change updates one row.
-    pub fn upsert_beat_state(
-        &self,
-        context_id: ContextId,
-        state: &PersistedBeatState,
-    ) -> KernelDbResult<()> {
-        Self::write_beat_state(&self.conn, context_id, state)
+    /// Upsert the durable `PersistedTrack` row. Called by the scheduler on every
+    /// policy mutation (attach, tempo, playhead advance) so the row always
+    /// reflects the running state and a cold-start can reconstruct it.
+    /// In-place (PK is `track_id`): a tempo change or playhead advance updates
+    /// one row without inserting a duplicate.
+    pub fn upsert_track(&self, t: &PersistedTrack) -> KernelDbResult<()> {
+        Self::write_track(&self.conn, t)
     }
 
-    /// Upsert beat state against `conn` (a `&Connection` or a `&Transaction` via
-    /// deref). Shared by `upsert_beat_state` and the transactional fork copy
-    /// ([`insert_forked_context`](Self::insert_forked_context)). Does NOT commit.
-    fn write_beat_state(
-        conn: &Connection,
-        context_id: ContextId,
-        state: &PersistedBeatState,
-    ) -> KernelDbResult<()> {
+    /// Upsert a track row against `conn` (a `&Connection` or `&Transaction` via
+    /// deref). Shared by `upsert_track` and transactional callers. Does NOT commit.
+    fn write_track(conn: &Connection, t: &PersistedTrack) -> KernelDbResult<()> {
         conn.execute(
-            "INSERT INTO beat_state
-                 (context_id, period_ms, beats_per_phrase, ooda_every, track,
-                  rotate_every_phrases, playhead_tick)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(context_id) DO UPDATE SET
-                 period_ms = ?2, beats_per_phrase = ?3, ooda_every = ?4, track = ?5,
-                 rotate_every_phrases = ?6, playhead_tick = ?7",
+            "INSERT INTO tracks
+                 (track_id, period_ms, beats_per_phrase, playhead_tick, playing)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(track_id) DO UPDATE SET
+                 period_ms = ?2, beats_per_phrase = ?3,
+                 playhead_tick = ?4, playing = ?5",
             params![
-                blob_param(context_id.as_bytes()),
-                state.period_ms as i64,
-                state.beats_per_phrase as i64,
-                state.ooda_every as i64,
-                state.track,
-                state.rotate_every_phrases.map(|n| n as i64),
-                state.playhead_tick.map(|n| n as i64),
+                t.track_id,
+                t.period_ms as i64,
+                t.beats_per_phrase as i64,
+                t.playhead_tick,
+                t.playing as i64,
             ],
         )?;
         Ok(())
     }
 
-    /// Read the persisted beat state for `context_id`, or `None` when the context
-    /// was never armed (no row). A *present but malformed* row — a zero period
-    /// (a beat that never advances) or an empty track (no lane) — is corruption,
-    /// not a legible policy, and returns `Err(Validation)` so the caller refuses
-    /// to re-arm rather than silently armed with a broken policy.
-    pub fn get_beat_state(
-        &self,
-        context_id: ContextId,
-    ) -> KernelDbResult<Option<PersistedBeatState>> {
-        // Read the raw signed columns and validate BEFORE casting to u64. SQLite
-        // INTEGER is signed; `upsert_beat_state` only ever writes `u64 as i64`
-        // (≥ 0), so a negative here is corruption (tampering, a non-Rust writer,
-        // bit rot). `-1_i64 as u64` would wrap to ~1.8e19 ms (≈ 584 million years)
-        // and sail PAST the zero-period guard into a silently-frozen beat — exactly
-        // the silent corruption this project rejects. Reject it loudly instead.
+    /// Read the persisted track for `track_id`, or `None` when no such track exists.
+    /// A *present but malformed* row — an empty `track_id` or a zero `period_ms`
+    /// (a beat that never advances) — is corruption and returns `Err(Validation)`
+    /// so the caller refuses to reconstruct a broken clock.
+    pub fn get_track(&self, track_id: &str) -> KernelDbResult<Option<PersistedTrack>> {
+        if track_id.is_empty() {
+            return Err(KernelDbError::Validation(
+                "get_track called with an empty track_id — corrupt (no identity)".into(),
+            ));
+        }
+        // Read raw signed integers and validate BEFORE casting. SQLite INTEGER is
+        // signed; the upsert only ever writes `u64 as i64` (≥ 0). A negative is
+        // corruption; silently wrapping to u64 would produce nonsense cadences.
         let row = self
             .conn
             .query_row(
-                "SELECT period_ms, beats_per_phrase, ooda_every, track,
-                        rotate_every_phrases, playhead_tick
-                 FROM beat_state WHERE context_id = ?1",
-                params![blob_param(context_id.as_bytes())],
+                "SELECT period_ms, beats_per_phrase, playhead_tick, playing
+                 FROM tracks WHERE track_id = ?1",
+                params![track_id],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases, playhead_tick)) =
-            row
-        else {
+        let Some((period_ms, beats_per_phrase, playhead_tick, playing)) = row else {
             return Ok(None);
         };
-        if period_ms < 0 || beats_per_phrase < 0 || ooda_every < 0 {
+        if period_ms < 0 || beats_per_phrase < 0 {
             return Err(KernelDbError::Validation(format!(
-                "context {} beat state has a negative field (period_ms={period_ms}, \
-                 beats_per_phrase={beats_per_phrase}, ooda_every={ooda_every}) — corrupt",
-                context_id.short()
-            )));
-        }
-        // A persisted rotate cadence must be positive (the live `set_rotate`
-        // stores `None` for "off" and filters `Some(0)`); a zero or negative is
-        // corruption, not "rotate every 0 phrases" (which would be a `% 0` panic).
-        if let Some(n) = rotate_every_phrases
-            && n <= 0
-        {
-            return Err(KernelDbError::Validation(format!(
-                "context {} beat state has rotate_every_phrases={n} — corrupt (must be ≥ 1 or NULL)",
-                context_id.short()
+                "track {track_id} has a negative field (period_ms={period_ms}, \
+                 beats_per_phrase={beats_per_phrase}) — corrupt"
             )));
         }
         if period_ms == 0 {
             return Err(KernelDbError::Validation(format!(
-                "context {} beat state has a zero period — corrupt (a beat that never advances)",
-                context_id.short()
+                "track {track_id} has a zero period_ms — corrupt (a beat that never advances)"
             )));
         }
-        if track.is_empty() {
-            return Err(KernelDbError::Validation(format!(
-                "context {} beat state has an empty track — corrupt (no lane identity)",
-                context_id.short()
-            )));
-        }
-        // A persisted playhead is a Tick (`u64`, written `as i64`); a negative is
-        // corruption that would wrap to a far-future seed and silently mis-place
-        // every beat. Reject it loudly (NULL stays the legible "unknown").
-        if let Some(t) = playhead_tick
-            && t < 0
-        {
-            return Err(KernelDbError::Validation(format!(
-                "context {} beat state has a negative playhead_tick={t} — corrupt",
-                context_id.short()
-            )));
-        }
-        Ok(Some(PersistedBeatState {
+        Ok(Some(PersistedTrack {
+            track_id: track_id.to_string(),
             period_ms: period_ms as u64,
             beats_per_phrase: beats_per_phrase as u64,
-            ooda_every: ooda_every as u64,
-            track,
-            rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
-            playhead_tick: playhead_tick.map(|n| n as u64),
+            playhead_tick,
+            playing: playing != 0,
         }))
     }
 
-    /// Drop the persisted beat state for `context_id` (e.g. on disarm/archive).
-    /// Returns the row count (0 or 1).
-    pub fn clear_beat_state(&self, context_id: ContextId) -> KernelDbResult<u64> {
+    /// List all persisted tracks. Order is not guaranteed.
+    pub fn list_tracks(&self) -> KernelDbResult<Vec<PersistedTrack>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, period_ms, beats_per_phrase, playhead_tick, playing
+             FROM tracks",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut tracks = Vec::new();
+        for row in rows {
+            let (track_id, period_ms, beats_per_phrase, playhead_tick, playing) = row?;
+            tracks.push(PersistedTrack {
+                track_id,
+                period_ms: period_ms as u64,
+                beats_per_phrase: beats_per_phrase as u64,
+                playhead_tick,
+                playing: playing != 0,
+            });
+        }
+        Ok(tracks)
+    }
+
+    /// Delete a track row by `track_id`. Cascades to all its `attachments` rows
+    /// via the FK `ON DELETE CASCADE`. Returns the row count (0 or 1).
+    pub fn delete_track(&self, track_id: &str) -> KernelDbResult<u64> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM tracks WHERE track_id = ?1", params![track_id])?;
+        Ok(deleted as u64)
+    }
+
+    // ========================================================================
+    // Attachments (context → track binding — docs/tracks.md §2+3)
+    // ========================================================================
+
+    /// Upsert an attachment row. In-place (PK is `(track_id, context_id)`):
+    /// a wakeup change or ooda-arm toggle updates one row.
+    pub fn upsert_attachment(&self, a: &PersistedAttachment) -> KernelDbResult<()> {
+        Self::write_attachment(&self.conn, a)
+    }
+
+    /// Upsert an attachment against `conn` (a `&Connection` or `&Transaction` via
+    /// deref). Shared by `upsert_attachment` and transactional callers (the fork
+    /// copy). Does NOT commit.
+    fn write_attachment(conn: &Connection, a: &PersistedAttachment) -> KernelDbResult<()> {
+        conn.execute(
+            "INSERT INTO attachments
+                 (track_id, context_id, wakeup_every, rotate_every_phrases, ooda_armed)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(track_id, context_id) DO UPDATE SET
+                 wakeup_every = ?3, rotate_every_phrases = ?4, ooda_armed = ?5",
+            params![
+                a.track_id,
+                blob_param(a.context_id.as_bytes()),
+                a.wakeup_every as i64,
+                a.rotate_every_phrases.map(|n| n as i64),
+                a.ooda_armed as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read one attachment by `(track_id, context_id)`, or `None` when absent.
+    pub fn get_attachment(
+        &self,
+        track_id: &str,
+        context_id: ContextId,
+    ) -> KernelDbResult<Option<PersistedAttachment>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT wakeup_every, rotate_every_phrases, ooda_armed
+                 FROM attachments WHERE track_id = ?1 AND context_id = ?2",
+                params![track_id, blob_param(context_id.as_bytes())],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((wakeup_every, rotate_every_phrases, ooda_armed)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(PersistedAttachment {
+            track_id: track_id.to_string(),
+            context_id,
+            wakeup_every: wakeup_every as u64,
+            rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
+            ooda_armed: ooda_armed != 0,
+        }))
+    }
+
+    /// List all attachments for a track (all contexts attached to `track_id`).
+    pub fn list_attachments_for_track(
+        &self,
+        track_id: &str,
+    ) -> KernelDbResult<Vec<PersistedAttachment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, wakeup_every, rotate_every_phrases, ooda_armed
+             FROM attachments WHERE track_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![track_id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (ctx_bytes, wakeup_every, rotate_every_phrases, ooda_armed) = row?;
+            let context_id = ContextId::try_from_slice(&ctx_bytes).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    "invalid ContextId bytes in attachments row".into(),
+                )
+            })?;
+            out.push(PersistedAttachment {
+                track_id: track_id.to_string(),
+                context_id,
+                wakeup_every: wakeup_every as u64,
+                rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
+                ooda_armed: ooda_armed != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// List all attachments for a context (all tracks this context is attached to).
+    pub fn list_attachments_for_context(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Vec<PersistedAttachment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, wakeup_every, rotate_every_phrases, ooda_armed
+             FROM attachments WHERE context_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (track_id, wakeup_every, rotate_every_phrases, ooda_armed) = row?;
+            out.push(PersistedAttachment {
+                track_id,
+                context_id,
+                wakeup_every: wakeup_every as u64,
+                rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
+                ooda_armed: ooda_armed != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete one attachment by `(track_id, context_id)`. Returns the row count
+    /// (0 = already absent, 1 = deleted).
+    pub fn delete_attachment(&self, track_id: &str, context_id: ContextId) -> KernelDbResult<u64> {
         let deleted = self.conn.execute(
-            "DELETE FROM beat_state WHERE context_id = ?1",
-            params![blob_param(context_id.as_bytes())],
+            "DELETE FROM attachments WHERE track_id = ?1 AND context_id = ?2",
+            params![track_id, blob_param(context_id.as_bytes())],
         )?;
         Ok(deleted as u64)
+    }
+
+    /// Copy all attachments from `source` context to `child` context, keyed on
+    /// the SAME `track_id`. Called inside the `insert_forked_context` transaction
+    /// so the attachment inheritance is atomic with the context-row write.
+    ///
+    /// This is the attachment equivalent of the old `write_beat_state` fork copy
+    /// (docs/tracks.md §3 — "the child inherits the bind at fork"). A non-musician
+    /// source has no attachments, so the copy is a clean no-op in that case.
+    /// Does NOT commit.
+    fn copy_attachments_for_fork(
+        conn: &Connection,
+        source: ContextId,
+        child: ContextId,
+    ) -> KernelDbResult<()> {
+        // Read all source attachments first so the transaction holds only writes.
+        let mut stmt = conn.prepare(
+            "SELECT track_id, wakeup_every, rotate_every_phrases, ooda_armed
+             FROM attachments WHERE context_id = ?1",
+        )?;
+        let rows: Vec<_> = stmt
+            .query_map(params![blob_param(source.as_bytes())], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        for (track_id, wakeup_every, rotate_every_phrases, ooda_armed) in rows {
+            let a = PersistedAttachment {
+                track_id,
+                context_id: child,
+                wakeup_every: wakeup_every as u64,
+                rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
+                ooda_armed: ooda_armed != 0,
+            };
+            Self::write_attachment(conn, &a)?;
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -5488,277 +5671,333 @@ mod tests {
         );
     }
 
-    fn beat_state(period_ms: u64, bpp: u64, ooda: u64, track: &str) -> PersistedBeatState {
-        PersistedBeatState {
+    // ── Tracks CRUD ───────────────────────────────────────────────────
+
+    fn make_track(track_id: &str, period_ms: u64) -> PersistedTrack {
+        PersistedTrack {
+            track_id: track_id.to_string(),
             period_ms,
-            beats_per_phrase: bpp,
-            ooda_every: ooda,
-            track: track.to_string(),
-            rotate_every_phrases: None,
+            beats_per_phrase: 16,
             playhead_tick: None,
+            playing: false,
+        }
+    }
+
+    fn make_attachment(track_id: &str, context_id: ContextId) -> PersistedAttachment {
+        PersistedAttachment {
+            track_id: track_id.to_string(),
+            context_id,
+            wakeup_every: 1,
+            rotate_every_phrases: None,
+            ooda_armed: false,
         }
     }
 
     #[test]
-    fn beat_state_unset_is_none() {
-        // No row → None → context was never armed (re-arm falls back to default).
+    fn track_upsert_get_round_trip() {
         let db = KernelDb::in_memory().unwrap();
-        assert!(db.get_beat_state(ContextId::new()).unwrap().is_none());
+        let t = make_track("bass", 250);
+        db.upsert_track(&t).unwrap();
+        assert_eq!(db.get_track("bass").unwrap(), Some(t), "track survives write→read");
     }
 
     #[test]
-    fn beat_state_set_get_round_trip() {
+    fn track_absent_is_none() {
+        let db = KernelDb::in_memory().unwrap();
+        assert!(
+            db.get_track("no-such-track").unwrap().is_none(),
+            "absent track → None"
+        );
+    }
+
+    #[test]
+    fn get_track_empty_id_is_loud_error() {
+        let db = KernelDb::in_memory().unwrap();
+        assert!(
+            matches!(db.get_track(""), Err(KernelDbError::Validation(_))),
+            "empty track_id is corrupt → Validation error, not a silent None"
+        );
+    }
+
+    #[test]
+    fn get_track_zero_period_is_loud_error() {
+        // A zero period is a beat that never advances — corrupt stored state.
+        let db = KernelDb::in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
+                 VALUES ('bad', 0, 16)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            matches!(db.get_track("bad"), Err(KernelDbError::Validation(_))),
+            "a 0 period_ms is corrupt → loud Validation error"
+        );
+    }
+
+    #[test]
+    fn get_track_negative_field_is_loud_error() {
+        // A negative INTEGER written into SQLite (tampering / bit rot) must not
+        // silently cast to a huge u64. Reject it loudly.
+        let db = KernelDb::in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
+                 VALUES ('neg', -1, 16)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            matches!(db.get_track("neg"), Err(KernelDbError::Validation(_))),
+            "a negative period_ms is corrupt → loud Validation error"
+        );
+    }
+
+    #[test]
+    fn track_upsert_updates_in_place() {
+        // A tempo change updates one row, not a second — PK is track_id.
+        let db = KernelDb::in_memory().unwrap();
+        db.upsert_track(&make_track("bass", 500)).unwrap();
+        db.upsert_track(&make_track("bass", 250)).unwrap(); // tempo up
+        assert_eq!(
+            db.get_track("bass").unwrap().unwrap().period_ms,
+            250,
+            "the second upsert overwrites the first"
+        );
+        assert_eq!(
+            db.list_tracks().unwrap().len(),
+            1,
+            "one upsert, not two rows"
+        );
+    }
+
+    #[test]
+    fn track_list_and_delete() {
         let db = KernelDb::in_memory().unwrap();
         let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-rt"));
+
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        db.upsert_track(&make_track("lead", 500)).unwrap();
+        assert_eq!(db.list_tracks().unwrap().len(), 2, "two tracks");
+
+        // Attach a context to bass so we can verify cascade.
+        let ctx = make_context_row(Some("ctx-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
-
-        let state = beat_state(250, 16, 128, "bass");
-        db.upsert_beat_state(ctx.context_id, &state).unwrap();
-
+        db.upsert_attachment(&make_attachment("bass", ctx.context_id)).unwrap();
         assert_eq!(
-            db.get_beat_state(ctx.context_id).unwrap(),
-            Some(state),
-            "policy + track survive write→read (the restart re-arm payload)"
+            db.list_attachments_for_track("bass").unwrap().len(),
+            1,
+            "attachment present before delete"
         );
 
-        // A persisted rotate cadence survives the round-trip too (the cold-restart
-        // page-turn fix) and clears back to None.
-        let with_rotate = PersistedBeatState {
+        // Delete bass — should cascade to the attachment.
+        assert_eq!(db.delete_track("bass").unwrap(), 1, "one row deleted");
+        assert_eq!(db.list_tracks().unwrap().len(), 1, "lead still present");
+        assert_eq!(
+            db.list_attachments_for_track("bass").unwrap().len(),
+            0,
+            "attachment cascade-deleted with the track"
+        );
+    }
+
+    #[test]
+    fn track_playhead_and_playing_round_trip() {
+        let db = KernelDb::in_memory().unwrap();
+        let t = PersistedTrack {
+            playhead_tick: Some(1024),
+            playing: true,
+            ..make_track("bass", 250)
+        };
+        db.upsert_track(&t).unwrap();
+        let got = db.get_track("bass").unwrap().unwrap();
+        assert_eq!(got.playhead_tick, Some(1024));
+        assert!(got.playing);
+    }
+
+    // ── Attachments CRUD ──────────────────────────────────────────────
+
+    #[test]
+    fn attachment_upsert_get_round_trip() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        let ctx = make_context_row(Some("att-rt"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let a = PersistedAttachment {
+            track_id: "bass".into(),
+            context_id: ctx.context_id,
+            wakeup_every: 8,
             rotate_every_phrases: Some(4),
-            ..beat_state(250, 16, 128, "bass")
+            ooda_armed: true,
         };
-        db.upsert_beat_state(ctx.context_id, &with_rotate).unwrap();
+        db.upsert_attachment(&a).unwrap();
         assert_eq!(
-            db.get_beat_state(ctx.context_id).unwrap().unwrap().rotate_every_phrases,
-            Some(4),
-            "rotate cadence survives write→read"
+            db.get_attachment("bass", ctx.context_id).unwrap(),
+            Some(a),
+            "all fields survive write→read"
         );
-        db.upsert_beat_state(ctx.context_id, &beat_state(250, 16, 128, "bass"))
-            .unwrap();
+    }
+
+    #[test]
+    fn attachment_absent_is_none() {
+        let db = KernelDb::in_memory().unwrap();
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        assert!(
+            db.get_attachment("bass", ContextId::new()).unwrap().is_none(),
+            "absent attachment → None"
+        );
+    }
+
+    #[test]
+    fn attachment_upsert_updates_in_place() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        let ctx = make_context_row(Some("att-up"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 1,
+            ..make_attachment("bass", ctx.context_id)
+        })
+        .unwrap();
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 8,
+            ..make_attachment("bass", ctx.context_id)
+        })
+        .unwrap();
         assert_eq!(
-            db.get_beat_state(ctx.context_id).unwrap().unwrap().rotate_every_phrases,
-            None,
-            "clearing the cadence persists as NULL"
+            db.get_attachment("bass", ctx.context_id).unwrap().unwrap().wakeup_every,
+            8,
+            "the second upsert overwrites the first (in-place update)"
         );
+    }
 
-        // The carried playhead survives the round-trip (the rotation tick-continuity
-        // value the fork copy hands the thin child), and clears back to NULL.
-        let with_tick = PersistedBeatState {
-            playhead_tick: Some(512),
-            ..beat_state(250, 16, 128, "bass")
-        };
-        db.upsert_beat_state(ctx.context_id, &with_tick).unwrap();
+    #[test]
+    fn list_attachments_for_track() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        db.upsert_track(&make_track("lead", 500)).unwrap();
+
+        let ctx1 = make_context_row(Some("att-list-1"));
+        let ctx2 = make_context_row(Some("att-list-2"));
+        let ctx3 = make_context_row(Some("att-list-3"));
+        insert_context_with_doc(&db, &ctx1, ws_id);
+        insert_context_with_doc(&db, &ctx2, ws_id);
+        insert_context_with_doc(&db, &ctx3, ws_id);
+
+        db.upsert_attachment(&make_attachment("bass", ctx1.context_id)).unwrap();
+        db.upsert_attachment(&make_attachment("bass", ctx2.context_id)).unwrap();
+        db.upsert_attachment(&make_attachment("lead", ctx3.context_id)).unwrap();
+
+        let bass_atts = db.list_attachments_for_track("bass").unwrap();
+        assert_eq!(bass_atts.len(), 2, "two bass attachments");
+        assert!(bass_atts.iter().all(|a| a.track_id == "bass"));
+
+        let lead_atts = db.list_attachments_for_track("lead").unwrap();
+        assert_eq!(lead_atts.len(), 1, "one lead attachment");
+    }
+
+    #[test]
+    fn list_attachments_for_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        db.upsert_track(&make_track("lead", 500)).unwrap();
+
+        let ctx = make_context_row(Some("att-ctx-list"));
+        let other = make_context_row(Some("att-ctx-other"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        insert_context_with_doc(&db, &other, ws_id);
+
+        db.upsert_attachment(&make_attachment("bass", ctx.context_id)).unwrap();
+        db.upsert_attachment(&make_attachment("lead", ctx.context_id)).unwrap();
+        db.upsert_attachment(&make_attachment("bass", other.context_id)).unwrap();
+
+        let ctx_atts = db.list_attachments_for_context(ctx.context_id).unwrap();
+        assert_eq!(ctx_atts.len(), 2, "ctx attached to two tracks");
+        assert!(ctx_atts.iter().all(|a| a.context_id == ctx.context_id));
+    }
+
+    #[test]
+    fn delete_attachment() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        let ctx = make_context_row(Some("att-del"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.upsert_attachment(&make_attachment("bass", ctx.context_id)).unwrap();
         assert_eq!(
-            db.get_beat_state(ctx.context_id).unwrap().unwrap().playhead_tick,
-            Some(512),
-            "playhead_tick survives write→read (carried across the page-turn)"
+            db.delete_attachment("bass", ctx.context_id).unwrap(),
+            1,
+            "one row deleted"
         );
-        db.upsert_beat_state(ctx.context_id, &beat_state(250, 16, 128, "bass"))
-            .unwrap();
+        assert!(
+            db.get_attachment("bass", ctx.context_id).unwrap().is_none(),
+            "attachment gone after delete"
+        );
         assert_eq!(
-            db.get_beat_state(ctx.context_id).unwrap().unwrap().playhead_tick,
-            None,
-            "clearing the playhead persists as NULL"
+            db.delete_attachment("bass", ctx.context_id).unwrap(),
+            0,
+            "second delete is a no-op"
         );
     }
 
-    #[test]
-    fn beat_state_negative_playhead_is_loud_error() {
-        // playhead_tick is a Tick (`u64`) written `as i64`; a negative is corruption
-        // that would wrap to a far-future seed and silently mis-place every beat.
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-ph"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.conn
-            .execute(
-                "INSERT INTO beat_state
-                     (context_id, period_ms, beats_per_phrase, ooda_every, track, playhead_tick)
-                 VALUES (?1, 250, 16, 128, 'bass', -1)",
-                params![blob_param(ctx.context_id.as_bytes())],
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                db.get_beat_state(ctx.context_id),
-                Err(KernelDbError::Validation(_))
-            ),
-            "a negative playhead_tick is rejected loudly, not wrapped to a far-future seed"
-        );
-    }
+    // ── Fork inheritance ──────────────────────────────────────────────
 
     #[test]
-    fn beat_state_nonpositive_rotate_is_loud_error() {
-        // `set_rotate` only ever stores `None` or `Some(n>=1)`; a zero/negative
-        // rotate_every_phrases is corruption that would `% 0`-panic the scheduler.
-        // Reject it loudly on read rather than re-arm into a divide-by-zero.
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-rot"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.conn
-            .execute(
-                "INSERT INTO beat_state
-                     (context_id, period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases)
-                 VALUES (?1, 250, 16, 128, 'bass', 0)",
-                params![blob_param(ctx.context_id.as_bytes())],
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                db.get_beat_state(ctx.context_id),
-                Err(KernelDbError::Validation(_))
-            ),
-            "a 0 rotate cadence is corrupt → loud Validation error, not a % 0 panic on re-arm"
-        );
-    }
-
-    #[test]
-    fn beat_state_upsert_updates_in_place() {
-        // A tempo change (or re-arm with a new policy) updates one row, not a
-        // second — the PK is context_id.
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-up"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.upsert_beat_state(ctx.context_id, &beat_state(500, 16, 128, "bass"))
-            .unwrap();
-        // tempo up to 240 BPM (250ms), same lane.
-        db.upsert_beat_state(ctx.context_id, &beat_state(250, 16, 128, "bass"))
-            .unwrap();
-
-        assert_eq!(
-            db.get_beat_state(ctx.context_id).unwrap(),
-            Some(beat_state(250, 16, 128, "bass")),
-            "the second upsert overwrites the first (in-place tempo change)"
-        );
-    }
-
-    #[test]
-    fn beat_state_zero_period_is_loud_error() {
-        // A zero period is a beat that never advances — corrupt stored state, not
-        // a legible policy. Refuse loudly rather than re-arm a stalled musician.
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-zero"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.conn
-            .execute(
-                "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
-                 VALUES (?1, 0, 16, 128, 'bass')",
-                params![blob_param(ctx.context_id.as_bytes())],
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                db.get_beat_state(ctx.context_id),
-                Err(KernelDbError::Validation(_))
-            ),
-            "a 0 period is corrupt → loud Validation error, not a silently-armed stall"
-        );
-    }
-
-    #[test]
-    fn beat_state_negative_field_is_loud_error() {
-        // A negative INTEGER (tampering / bit rot) must NOT wrap into a huge u64
-        // that sails past the zero-period guard into a silently-frozen beat. The
-        // upsert never writes negatives, so this row can only be corruption.
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-neg"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.conn
-            .execute(
-                "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
-                 VALUES (?1, -1, 16, 128, 'bass')",
-                params![blob_param(ctx.context_id.as_bytes())],
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                db.get_beat_state(ctx.context_id),
-                Err(KernelDbError::Validation(_))
-            ),
-            "a negative period is corrupt → loud Validation error, not a u64-wrapped frozen beat"
-        );
-    }
-
-    #[test]
-    fn beat_state_empty_track_is_loud_error() {
-        // An empty track is no lane identity — corrupt (two musicians would
-        // collide on a shared default lane). Same stance: refuse loudly.
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-notrack"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.conn
-            .execute(
-                "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
-                 VALUES (?1, 500, 16, 128, '')",
-                params![blob_param(ctx.context_id.as_bytes())],
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                db.get_beat_state(ctx.context_id),
-                Err(KernelDbError::Validation(_))
-            ),
-            "an empty track is corrupt → loud Validation error"
-        );
-    }
-
-    #[test]
-    fn beat_state_clear_reverts_to_none() {
-        let db = KernelDb::in_memory().unwrap();
-        let ws_id = setup_test_db(&db);
-        let ctx = make_context_row(Some("beat-clear"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        db.upsert_beat_state(ctx.context_id, &beat_state(500, 16, 128, "bass"))
-            .unwrap();
-        assert_eq!(db.clear_beat_state(ctx.context_id).unwrap(), 1);
-        assert!(
-            db.get_beat_state(ctx.context_id).unwrap().is_none(),
-            "cleared beat state reverts to never-armed"
-        );
-    }
-
-    #[test]
-    fn beat_state_travels_with_a_fork() {
-        // A forked musician must keep the PARENT's track + policy (the lane is the
-        // durable identity across a fork-lineage — the rotation page-turn). A thin
-        // spawn-fork has no label, so without this copy the child has no lane to
-        // arm on.
+    fn attachments_travel_with_a_fork() {
+        // A forked musician must join the SAME tracks as the parent — the track
+        // is the durable clock domain identity across the fork-lineage (the
+        // rotation page-turn: docs/tracks.md §3). A thin spawn-fork has no label,
+        // so without this copy the child would have no track to re-bind on.
         let mut db = KernelDb::in_memory().unwrap();
         let ws_id = setup_test_db(&db);
-        let parent = make_context_row(Some("bass"));
-        insert_context_with_doc(&db, &parent, ws_id);
-        let state = beat_state(250, 12, 96, "bass");
-        db.upsert_beat_state(parent.context_id, &state).unwrap();
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        db.upsert_track(&make_track("lead", 500)).unwrap();
 
-        // Fork: a labelless thin child (spawn shape).
+        let parent = make_context_row(Some("musician-parent"));
+        insert_context_with_doc(&db, &parent, ws_id);
+
+        // Parent is attached to two tracks with different wakeup divisors.
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 8,
+            rotate_every_phrases: Some(4),
+            ooda_armed: true,
+            ..make_attachment("bass", parent.context_id)
+        })
+        .unwrap();
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 64,
+            ..make_attachment("lead", parent.context_id)
+        })
+        .unwrap();
+
+        // Fork: labelless thin child (spawn shape).
         let mut child = make_context_row(None);
         child.forked_from = Some(parent.context_id);
-        db.insert_forked_context(&child, ws_id, parent.context_id)
-            .unwrap();
+        db.insert_forked_context(&child, ws_id, parent.context_id).unwrap();
 
-        assert_eq!(
-            db.get_beat_state(child.context_id).unwrap(),
-            Some(state),
-            "the child inherits the parent's track + policy via the fork"
-        );
+        // Child inherits both attachments with unchanged track_ids.
+        let bass_att = db.get_attachment("bass", child.context_id).unwrap().unwrap();
+        assert_eq!(bass_att.track_id, "bass");
+        assert_eq!(bass_att.wakeup_every, 8);
+        assert_eq!(bass_att.rotate_every_phrases, Some(4));
+        assert!(bass_att.ooda_armed, "ooda_armed copied from parent");
+
+        let lead_att = db.get_attachment("lead", child.context_id).unwrap().unwrap();
+        assert_eq!(lead_att.track_id, "lead");
+        assert_eq!(lead_att.wakeup_every, 64);
     }
 
     #[test]
-    fn fork_of_a_non_musician_copies_no_beat_state() {
-        // A non-musician parent has no beat_state; the fork copy is a clean no-op.
+    fn fork_of_a_non_musician_copies_no_attachments() {
+        // A non-musician parent has no attachments; the fork copy is a clean no-op
+        // (does not error, does not leave stale rows behind).
         let mut db = KernelDb::in_memory().unwrap();
         let ws_id = setup_test_db(&db);
         let parent = make_context_row(Some("coder"));
@@ -5766,13 +6005,54 @@ mod tests {
 
         let mut child = make_context_row(Some("coder-child"));
         child.forked_from = Some(parent.context_id);
-        db.insert_forked_context(&child, ws_id, parent.context_id)
-            .unwrap();
+        db.insert_forked_context(&child, ws_id, parent.context_id).unwrap();
 
         assert!(
-            db.get_beat_state(child.context_id).unwrap().is_none(),
-            "no parent beat_state → none copied (forks of non-musicians are unaffected)"
+            db.list_attachments_for_context(child.context_id).unwrap().is_empty(),
+            "no parent attachments → none copied (forks of non-musicians are unaffected)"
         );
+    }
+
+    #[test]
+    fn copy_attachments_for_fork_in_transaction() {
+        // Directly tests the tx-level primitive with two source attachments.
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        db.upsert_track(&make_track("lead", 500)).unwrap();
+
+        let source = make_context_row(Some("src-ctx"));
+        let child_row = make_context_row(Some("child-ctx"));
+        insert_context_with_doc(&db, &source, ws_id);
+        insert_context_with_doc(&db, &child_row, ws_id);
+
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 4,
+            ..make_attachment("bass", source.context_id)
+        })
+        .unwrap();
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 16,
+            rotate_every_phrases: Some(2),
+            ..make_attachment("lead", source.context_id)
+        })
+        .unwrap();
+
+        // Run the copy inside a transaction, just like insert_forked_context does.
+        let tx = db.conn.transaction().unwrap();
+        KernelDb::copy_attachments_for_fork(&tx, source.context_id, child_row.context_id).unwrap();
+        tx.commit().unwrap();
+
+        // Child now has the same two attachments, keyed on child's context_id.
+        let bass = db.get_attachment("bass", child_row.context_id).unwrap().unwrap();
+        assert_eq!(bass.wakeup_every, 4);
+        let lead = db.get_attachment("lead", child_row.context_id).unwrap().unwrap();
+        assert_eq!(lead.wakeup_every, 16);
+        assert_eq!(lead.rotate_every_phrases, Some(2));
+
+        // Source rows are untouched.
+        assert!(db.get_attachment("bass", source.context_id).unwrap().is_some());
+        assert!(db.get_attachment("lead", source.context_id).unwrap().is_some());
     }
 
     #[test]
@@ -6119,10 +6399,9 @@ mod tests {
         );
     }
 
-    /// The composite fork — document row + context row + shell/env/binding copy
-    /// — lands in one shot. Insert a source with full config, fork it into a
-    /// brand-new target via `insert_forked_context`, and prove every piece
-    /// arrived: both rows exist and all three config kinds copied.
+    /// The composite fork — document row + context row + shell/env/binding + attachment
+    /// copy — lands in one shot. Insert a source with full config, fork it into a
+    /// brand-new target via `insert_forked_context`, and prove every piece arrived.
     #[test]
     fn insert_forked_context_creates_rows_and_copies_config() {
         let mut db = KernelDb::in_memory().unwrap();
@@ -6142,12 +6421,15 @@ mod tests {
             &binding_with(&["builtin.file"], &[("read", "builtin.file", "file_read")]),
         )
         .unwrap();
-        // Beat state carries the lane (track) AND the playhead — the rotation
-        // page-turn relies on this copy to continue musical time in the thin child.
-        db.upsert_beat_state(
-            src.context_id,
-            &PersistedBeatState { playhead_tick: Some(768), ..beat_state(500, 16, 128, "bass") },
-        )
+        // Attachment carries the track binding into the child — the child joins
+        // the same clock domain the parent is on (docs/tracks.md §3).
+        db.upsert_track(&make_track("bass", 500)).unwrap();
+        db.upsert_attachment(&PersistedAttachment {
+            wakeup_every: 8,
+            rotate_every_phrases: Some(4),
+            ooda_armed: true,
+            ..make_attachment("bass", src.context_id)
+        })
         .unwrap();
 
         // The target is a fresh context that does not yet exist in any table.
@@ -6166,15 +6448,13 @@ mod tests {
         assert_eq!(db.get_context_env(tgt.context_id).unwrap().len(), 1);
         assert!(db.get_context_binding(tgt.context_id).unwrap().is_some());
 
-        // Beat state — track + carried playhead — followed the fork, so the child
-        // re-arms on the parent's lane AND continues its musical time (page-turn).
-        let child_beat = db.get_beat_state(tgt.context_id).unwrap().unwrap();
-        assert_eq!(child_beat.track, "bass", "the lane is the durable fork-lineage identity");
-        assert_eq!(
-            child_beat.playhead_tick,
-            Some(768),
-            "the carried playhead follows the fork so the page-turn continues musical time"
-        );
+        // Attachment followed the fork — child joins the same track (bass), keeping
+        // the wakeup divisor and rotate cadence from the parent.
+        let child_att = db.get_attachment("bass", tgt.context_id).unwrap().unwrap();
+        assert_eq!(child_att.track_id, "bass", "child attached to parent's track");
+        assert_eq!(child_att.wakeup_every, 8, "wakeup divisor carried");
+        assert_eq!(child_att.rotate_every_phrases, Some(4), "rotate cadence carried");
+        assert!(child_att.ooda_armed, "ooda_armed carried");
     }
 
     /// The whole fork is all-or-nothing: if a *later* write (the config copy)

@@ -27,9 +27,12 @@ use parking_lot::Mutex;
 use crate::block_store::SharedBlockStore;
 use crate::kernel::Kernel;
 
-/// How a context's beat runs: the wall-clock period of one beat, and how many
-/// beats make one coarse **OODA** cadence (when the `tick` rc verb fires). For a
-/// musician these are the two musical knobs (defaulted from tempo + bars).
+/// A track's musical clock knobs: the wall-clock period of one beat and how many
+/// beats make one phrase. **Track-level** — these are properties of the *clock
+/// domain* (the track owns the tempo + phrase length), not of any one context.
+/// How often a given context is *woken* on top of this clock is the per-context
+/// [`Attachment::wakeup`] divisor, which subsumed the old `ooda_every` field
+/// (see `docs/tracks.md`, Stage 1).
 #[derive(Debug, Clone, Copy)]
 pub struct BeatPolicy {
     /// Wall-clock duration of one beat (e.g. a quarter note).
@@ -41,22 +44,17 @@ pub struct BeatPolicy {
     /// [`phrase_delta`](Self::phrase_delta)/[`is_phrase_boundary`](Self::is_phrase_boundary),
     /// never the raw value.
     pub beats_per_phrase: u64,
-    /// Beats per OODA cadence — the `tick` verb fires every `ooda_every` beats.
-    /// Kept beat-denominated (the default is merely *expressed* in phrases); a
-    /// phrase-typed field is deferred (issues.md).
-    pub ooda_every: u64,
 }
 
 impl BeatPolicy {
-    /// The musician default: a quarter note at 120 BPM (500 ms/beat) in 4/4, a
-    /// 16-beat phrase (a 4-bar phrase in 4/4 collapsed at this edge), OODA every 8
-    /// phrases (= 128 beats ≈ 64 s; numerically identical to the old 32*4, no
-    /// cadence change). Tunable per context via rc.
+    /// The musician default clock: a quarter note at 120 BPM (500 ms/beat) in 4/4,
+    /// a 16-beat phrase (a 4-bar phrase in 4/4 collapsed at this edge). The OODA
+    /// wakeup cadence is no longer here — it rides the [`Attachment`]
+    /// ([`Attachment::musician_default`]). Tunable per track via rc.
     pub fn musician_default() -> Self {
         Self {
             period: Duration::from_millis(500),
             beats_per_phrase: 16,
-            ooda_every: 8 * 16,
         }
     }
 
@@ -84,57 +82,131 @@ impl BeatPolicy {
     }
 }
 
+/// A divisor on a counter: "every `every` of them." Reused for two cadences that
+/// ride a track's beat — the [`Attachment::wakeup`] divisor (counted in **beats**)
+/// and the [`Attachment::rotate`] page-turn (counted in **phrases**) — with the
+/// unit documented at each field, not on the type. A zero divisor never fires
+/// (defensive: no `% 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cadence {
+    pub every: u64,
+}
+
+impl Cadence {
+    pub fn new(every: u64) -> Self {
+        Self { every }
+    }
+
+    /// Whether `count` lands on a boundary of this cadence. The caller supplies
+    /// the right counter — `beat_count` for a wakeup, `phrase` for a rotate.
+    pub fn is_due(&self, count: u64) -> bool {
+        self.every > 0 && count % self.every == 0
+    }
+}
+
+/// How a track beats *one* attached context — the binding the **context** drives
+/// (entity #3 in `docs/tracks.md`: the context binds itself; the track holds the
+/// passive set). It travels with a fork: the child inherits the binding and
+/// re-binds (re-announces) to the same track on the way up, so the track never
+/// has to watch context lifecycles.
+#[derive(Debug, Clone, Copy)]
+pub struct Attachment {
+    /// How often this context is woken to run its **tick rc behaviour** — its own
+    /// divisor on the track's beat (in beats). Subsumes the old per-context
+    /// `ooda_every`. The track's *per-beat materialize* is independent of this;
+    /// `wakeup` gates only the rc fire.
+    pub wakeup: Cadence,
+    /// Self-fork page-turn cadence, in **phrases**; `None` = never auto-rotate. A
+    /// non-rotating attachment (interactive / observer / probe) is first-class.
+    /// At a phrase horizon where the cadence is due, the scheduler retires this
+    /// context (synchronous detach) and fires the `rotate` rc — the page-turn.
+    pub rotate: Option<Cadence>,
+    /// Whether the OODA loop is armed: the `tick` rc fires only when the track's
+    /// clock is playing *and* this is `true`. Armed/disarmed via `SetOoda`,
+    /// independent of the clock (a `Stop` no longer disarms it).
+    pub ooda_armed: bool,
+    /// Per-attachment monotonic wakeup counter → `KJ_PULSE`, the *reliable*
+    /// ordering key (unlike `KJ_TICK`, which can repeat or freeze off-beat).
+    /// Starts at 0, increments once per wakeup fire.
+    pub pulse: u64,
+}
+
+impl Attachment {
+    /// The musician default ride: woken (OODA) every 8 phrases (= 128 beats ≈ 64 s
+    /// at the default tempo — numerically the old `ooda_every`), no auto-rotation
+    /// until rc opts in, OODA **armed** (a created musician is ready to think;
+    /// the *clock* is what starts stopped, not the arm). Pulse starts at 0.
+    pub fn musician_default() -> Self {
+        Self {
+            wakeup: Cadence::new(8 * 16),
+            rotate: None,
+            ooda_armed: true,
+            pulse: 0,
+        }
+    }
+}
+
 /// A command to the beat scheduler — the transport control surface. Defined
 /// here (kernel-side) so the rc lifecycle and the `kj transport` verb can name
 /// and send it; the scheduler that consumes it lives in `kaijutsu-server`. The
 /// kernel holds the ingress `Sender`; the server owns the loop.
 ///
-/// Two switches per context: the **clock** (`Play`/`Pause`) and the **OODA-arm**
-/// (`SetOoda`). The `tick` verb fires only when the clock is playing *and* OODA
-/// is armed. The context tick is **event-counted**: it advances one step per beat
-/// *while playing*, so a pause freezes musical time and a resume picks up at +1 —
-/// no wall-clock catch-up. That lets the kernel stay alive 24×7 while a context
-/// goes quiescent at zero cost.
+/// **The clock lives on the track now** (`docs/tracks.md`, Stage 1). Clock-domain
+/// ops (`Play`/`Pause`/`Stop`/`SetTempo`) name a [`TrackId`]; per-context ops
+/// (`SetOoda`/`SetRotate`) name the track *and* the context. A context joins a
+/// track with `Attach` and leaves with `Detach`.
+///
+/// Two switches: the track's **clock** (`Play`/`Pause`/`Stop`) and each
+/// attachment's **OODA-arm** (`SetOoda`). The `tick` verb fires only when the
+/// clock is playing *and* the attachment's OODA is armed. The track tick is
+/// **event-counted**: the playhead advances one step per beat *while playing*, so
+/// a pause freezes musical time and a resume picks up at +1 — no wall-clock
+/// catch-up. That lets the kernel stay alive 24×7 while a track goes quiescent at
+/// zero cost (no heap entry).
 #[derive(Debug, Clone)]
 pub enum BeatCommand {
-    /// Arm a context with a beat policy, **stopped** (no surprise token spend):
-    /// the timeline is created and beat state registered, but the clock isn't
-    /// running until `Play`. Sent when a musician context is created/forked.
-    /// `track` is the musician's lane identity (its default chair) — the lane the
-    /// scheduled cells (and so the materialized blocks) belong to.
-    Arm {
-        context_id: ContextId,
-        policy: BeatPolicy,
+    /// Bind a context to a track — the context announces itself (entity #3). If
+    /// the track doesn't exist yet it is **created stopped** (no surprise token
+    /// spend) seeded from `policy`; if it already exists, `policy` is ignored (the
+    /// track owns its own clock) and this just registers/updates the context's
+    /// [`Attachment`]. Sent on musician create/fork and on a rotation page-turn
+    /// (the child re-binds to the same track).
+    Attach {
         track: TrackId,
-        /// Self-fork rotate cadence to restore (phrases; `None` = no rotation).
-        /// Carried so a cold-restart re-arm rebuilds the page-turn cadence from
-        /// the persisted `beat_state`, not just tempo + lane. A fresh arm with no
-        /// persisted cadence passes `None`.
-        rotate_every_phrases: Option<u64>,
+        context_id: ContextId,
+        attachment: Attachment,
+        /// Clock to seed the track with *iff* it doesn't exist yet. Ignored for a
+        /// track that's already live.
+        policy: BeatPolicy,
     },
-    /// Start the clock — the playhead advances one beat per period, and (if OODA
-    /// is armed) the `tick` verb fires on the coarse cadence.
-    Play(ContextId),
-    /// Hold the clock — the playhead freezes; a later `Play` resumes at +1. OODA
-    /// arm state is preserved.
-    Pause(ContextId),
-    /// Full halt — pause the clock *and* disarm OODA. A clean stopped state.
-    Stop(ContextId),
-    /// Set the beat period (tempo) for a context.
-    SetTempo { context_id: ContextId, period: Duration },
-    /// Arm or disarm the OODA loop without touching the clock.
-    SetOoda { context_id: ContextId, armed: bool },
-    /// Set (or clear, with `None`) the self-fork rotate cadence in phrases. At
-    /// every phrase horizon where `phrase % every_phrases == 0` the scheduler
-    /// retires the context (synchronous `stop`) and fires the `rotate` rc
-    /// lifecycle — the page-turn. The horizon decision lives in the scheduler
-    /// (Rust), not the rc, so the parent's disarm is synchronous with the beat
-    /// clock and can't race a stray tick (see `docs/issues.md`); the rotate
-    /// *action* (fork + arm child) stays rc. `Some(0)` is treated as `None`.
-    SetRotate { context_id: ContextId, every_phrases: Option<u64> },
-    /// Disarm a context entirely — drop its timeline and beat state (e.g. on
-    /// archive).
-    Disarm(ContextId),
+    /// Unbind a context from a track. Used by rotation's parent-side (the retiring
+    /// page) and by archive. The track persists with its remaining attachments;
+    /// pruning an empty track is a separate, deferred policy. Folds in the old
+    /// `Disarm` (drop the context's timeline + beat state).
+    Detach { track: TrackId, context_id: ContextId },
+    /// Start the track's clock — the playhead advances one beat per period; each
+    /// attached context whose `wakeup` is due (and OODA-armed) fires its `tick`.
+    /// Rotation resumes. Names the **track**.
+    Play(TrackId),
+    /// Hold the track's clock — the playhead freezes; a later `Play` resumes at
+    /// +1. Per-attachment OODA arm + rotate cadence are preserved.
+    Pause(TrackId),
+    /// Stop the track's clock (MIDI idiom: `stop` = stop the clock). Rotation is
+    /// *suspended/remembered*, not cleared; per-attachment OODA arm is untouched
+    /// (re-arm with `SetOoda`). Names the **track**.
+    Stop(TrackId),
+    /// Set the track's beat period (tempo). Names the **track**.
+    SetTempo { track: TrackId, period: Duration },
+    /// Arm or disarm one attached context's OODA loop, without touching the clock.
+    SetOoda { track: TrackId, context_id: ContextId, armed: bool },
+    /// Set (or clear, with `None`) one attached context's self-fork rotate cadence
+    /// (in phrases). At every phrase horizon where the cadence is due the scheduler
+    /// retires the context (synchronous detach) and fires the `rotate` rc — the
+    /// page-turn. The horizon decision lives in the scheduler (Rust), not the rc,
+    /// so the detach is synchronous with the beat clock and can't race a stray tick;
+    /// the rotate *action* (fork + re-bind child) stays rc. `Some(Cadence{every:0})`
+    /// is treated as `None`.
+    SetRotate { track: TrackId, context_id: ContextId, every: Option<Cadence> },
 }
 
 /// What the scheduler reports back for a transport command: `Ok(())` when it
@@ -1648,18 +1720,28 @@ mod tests {
 
     /// T2 (design-chameleon-batch1-f2-notation §16) — the musician default speaks
     /// in phrases. `beats_per_phrase` is the kernel's only musical chunking unit
-    /// above the beat (16 = a 4-bar phrase in 4/4); the OODA cadence stays
-    /// beat-denominated at 128 (= the old 32*4, no change). Consumers go through
-    /// `phrase_delta()`/`is_phrase_boundary()`, never the raw field.
+    /// above the beat (16 = a 4-bar phrase in 4/4). The OODA wakeup cadence is no
+    /// longer on `BeatPolicy` — it moved to `Attachment::wakeup` (Stage 1:
+    /// `docs/tracks.md`) and is 128 beats (8 phrases) in the musician default.
+    /// Consumers go through `phrase_delta()`/`is_phrase_boundary()`, never the raw
+    /// field.
     #[test]
     fn musician_default_speaks_phrases() {
         let p = super::BeatPolicy::musician_default();
         assert_eq!(p.beats_per_phrase, 16, "a 4-bar phrase in 4/4 is 16 beats");
-        assert_eq!(p.ooda_every, 128, "OODA cadence stays beat-denominated (8 phrases = 128 beats)");
         assert_eq!(p.phrase_delta(), TickDelta::new(16), "one phrase of lead is 16 beat-ticks");
         assert!(p.is_phrase_boundary(16), "beat 16 is a phrase boundary");
         assert!(p.is_phrase_boundary(32), "beat 32 is a phrase boundary");
         assert!(!p.is_phrase_boundary(17), "beat 17 is mid-phrase, not a boundary");
+
+        // The wakeup cadence now lives on the Attachment, not BeatPolicy.
+        let a = super::Attachment::musician_default();
+        assert_eq!(
+            a.wakeup.every,
+            128,
+            "OODA wakeup stays at 128 beats (8 phrases × 16) on the Attachment"
+        );
+        assert!(a.ooda_armed, "musician default: OODA armed");
     }
 
     /// Disarming drops the entry — the scheduler will skip a context with none.

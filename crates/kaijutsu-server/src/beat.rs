@@ -38,9 +38,10 @@ use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::hyoushigi::{
-    BeatAck, BeatCommand, BeatPolicy, BeatRequest, DeriverRegistry, MaterializeCursor,
-    materialize_committed, schedule_abc_cell,
+    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Cadence, DeriverRegistry,
+    MaterializeCursor, materialize_committed, schedule_abc_cell,
 };
+use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
 use kaijutsu_types::{
     BlockSnapshot, ContentType, ContextId, PrincipalId, SessionId, Tick, TickDelta, TrackId,
@@ -52,49 +53,78 @@ use crate::rpc::ServerRegistry;
 /// event-counted, so this is a pure increment, never scaled by elapsed time.
 const STEP: TickDelta = TickDelta::new(1);
 
-/// Per-armed-context beat bookkeeping. The two transport switches live here.
-struct BeatState {
+/// A track's beat bookkeeping — the **clock domain** (`docs/tracks.md`, Stage 1).
+/// The clock + playhead live HERE now, not on any one context's timeline: the
+/// track persists, contexts attach to be beaten by it and come and go. Keyed by
+/// [`TrackId`] in the scheduler's `tracks` map.
+struct TrackState {
+    /// The track's musical clock: beat period (tempo) + phrase length. Track-level
+    /// — the per-context wakeup cadence rides each [`AttachedContext`].
     policy: BeatPolicy,
     /// The clock switch. `false` = stopped/paused: no heap entry (quiescent),
-    /// playhead frozen. Default on arm (create stopped — no surprise tokens).
+    /// playhead frozen. A track is created stopped (no surprise tokens).
     playing: bool,
-    /// The OODA switch. The `tick` verb fires only when `playing && ooda_armed`.
-    ooda_armed: bool,
-    /// Self-fork rotate cadence, in phrases. `Some(n)` (n>0) = at every phrase
-    /// horizon where `phrase % n == 0` the scheduler retires this context
-    /// (synchronous `stop`) and fires the `rotate` rc lifecycle — the page-turn
-    /// (`docs/chameleon.md`). The horizon decision lives HERE in Rust, not in the
-    /// rc, precisely so the parent's disarm is synchronous with the scheduler's
-    /// own clock (an rc disarm via `kj transport ooda off` is async through the
-    /// ingress → a stray-tick / double-fork race; see `docs/issues.md`). `None` =
-    /// no rotation (the default; the rc `fork`/`arm` *action* is still rc).
-    rotate_every_phrases: Option<u64>,
-    /// The materialization cursor: how far whole committed cells have crossed the
-    /// write barrier (`high_water`) AND how far the in-progress cell's artifact
-    /// group got (`artifacts_done`), so a beat that fails mid-group resumes at the
-    /// failed artifact rather than re-inserting (and colliding on) the ones that
-    /// already landed. NOT an id source: materialization reserves ids from the
-    /// store's per-principal seq lanes (§3).
-    cursor: MaterializeCursor,
-    /// Beats elapsed *while playing* — drives the OODA cadence. Frozen across a
-    /// pause, like the playhead.
+    /// Musical time, **owned by the track** (moved off the per-context Timeline).
+    /// Event-counted: advances one [`STEP`] per beat while playing; a pause freezes
+    /// it and a resume picks up at +1, no wall-clock catch-up. Forward-only. Each
+    /// beat the attached contexts' timelines are slewed to this value (Stage-1
+    /// bridge — Stage 2 dissolves the per-context timeline into the track's score).
+    playhead: Tick,
+    /// Beats elapsed *while playing* — drives the wakeup/phrase/rotate cadences.
+    /// Frozen across a pause, like the playhead.
     beat_count: u64,
-    /// The musician's lane identity — the track its scheduled cells (and so its
-    /// materialized blocks) belong to. Lane identity ONLY, never the author.
-    track: TrackId,
-    /// Consecutive materialize failures on the SAME poison cell — the cell at the
-    /// current `high_water` that has refused to materialize on every retry. Reset
-    /// to 0 the moment any cell crosses (progress was made). When it reaches
-    /// [`MATERIALIZE_RETRY_BUDGET`] the bridge skips the poison cell with a loud
-    /// `error!` so the beat loop never silently retries the same cell forever
-    /// (the pre-F1 swallowed-Result poison channel; worsens with multiple tracks).
+    /// The wall-clock instant of the track's most recent beat, as nanoseconds since
+    /// the UNIX epoch — latched ONCE per beat in [`process_track`] and read back by
+    /// [`transport_env`] as `KJ_EPOCH_NS`. Latching it on the track (not re-reading
+    /// the clock per context) is what makes every context woken on the SAME beat see
+    /// the IDENTICAL value — the cross-context join key. `0` before the first beat.
+    last_epoch_ns: u64,
+    /// The binding set: which contexts are attached and how each rides the beat.
+    /// The track holds this passive view; the *context* drives the bind (entity #3)
+    /// and a forked child re-binds on the way up.
+    attached: HashMap<ContextId, AttachedContext>,
+}
+
+/// One context's binding to a track plus its **runtime** materialization state.
+/// The [`Attachment`] is the durable/wire binding contract (wakeup/rotate/
+/// ooda_armed/pulse, persisted in the `attachments` row); the cursor + failure
+/// counters below are scheduler-only bookkeeping, per-context because each
+/// attached context materializes into its *own* timeline (the Stage-1 bridge).
+struct AttachedContext {
+    /// The binding the context announced: its wakeup divisor, rotate cadence, OODA
+    /// arm, and monotonic pulse counter. Travels with a fork.
+    attachment: Attachment,
+    /// The materialization cursor for THIS context: how far whole committed cells
+    /// have crossed the write barrier (`high_water`) AND how far the in-progress
+    /// cell's artifact group got (`artifacts_done`), so a beat that fails mid-group
+    /// resumes at the failed artifact rather than re-inserting (and colliding on)
+    /// the ones that already landed. NOT an id source: materialization reserves ids
+    /// from the store's per-principal seq lanes (§3).
+    cursor: MaterializeCursor,
+    /// Consecutive materialize failures on the SAME poison cell — the cell at this
+    /// context's current `high_water` that has refused to materialize on every
+    /// retry. Reset to 0 the moment any cell crosses (progress was made). When it
+    /// reaches [`MATERIALIZE_RETRY_BUDGET`] the bridge skips the poison cell with a
+    /// loud `error!` so the beat loop never silently retries the same cell forever.
     materialize_failures: u32,
-    /// How far the engine failure ledger (`Timeline::failures()`) has been drained
-    /// into visible `BlockKind::Error` blocks (design §6, §8). Monotone: each
-    /// `process_one` surfaces every event past this cursor, one Error block apiece,
-    /// then advances past them — so a resolve failure is read back by the player
-    /// next turn (the producer-loop principle) and never re-surfaced on later beats.
+    /// How far this context's engine failure ledger (`Timeline::failures()`) has
+    /// been drained into visible `BlockKind::Error` blocks (design §6, §8).
+    /// Monotone: each beat surfaces every event past this cursor, one Error block
+    /// apiece, so a resolve failure is read back by the player next turn (the
+    /// producer-loop principle) and never re-surfaced on later beats.
     failure_water: usize,
+}
+
+impl AttachedContext {
+    /// A freshly-bound context: the announced attachment + zeroed runtime state.
+    fn new(attachment: Attachment) -> Self {
+        Self {
+            attachment,
+            cursor: MaterializeCursor::default(),
+            materialize_failures: 0,
+            failure_water: 0,
+        }
+    }
 }
 
 /// How many consecutive beats may fail to materialize the SAME poison cell before
@@ -149,9 +179,9 @@ fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(Str
     let secs = policy.period.as_secs_f64();
     let bpm = if secs > 0.0 { (60.0 / secs).round() as u64 } else { 0 };
     [
-        ("TICK".to_string(), playhead.get().to_string()),
-        ("PHRASE".to_string(), phrase.to_string()),
-        ("TEMPO".to_string(), bpm.to_string()),
+        ("KJ_TICK".to_string(), playhead.get().to_string()),
+        ("KJ_PHRASE".to_string(), phrase.to_string()),
+        ("KJ_TEMPO".to_string(), bpm.to_string()),
     ]
 }
 
@@ -238,22 +268,6 @@ pub struct BeatOutcome {
     pub rotate_due: Vec<ContextId>,
 }
 
-/// What one ticked beat crossed: the two cadence questions answered side by side.
-/// `process_one` computes both from the post-increment `beat_count` so the phrase
-/// boundary lands beside the OODA check at the single sequencer.
-#[derive(Debug, Default, Clone, Copy)]
-struct BeatTickReport {
-    /// Crossed an OODA cadence boundary AND OODA is armed — fire the `tick` verb.
-    ooda_due: bool,
-    /// Crossed a phrase boundary — report on `BeatOutcome.phrase_due`. NOT gated
-    /// on the OODA arm: a phrase boundary is a position in musical time.
-    phrase_due: bool,
-    /// Hit a rotate horizon (`rotate_every_phrases` set AND this phrase boundary
-    /// satisfies `phrase % n == 0`). Drives the synchronous parent-retire +
-    /// `rotate` lifecycle in `fire_due`.
-    rotate_due: bool,
-}
-
 /// The coalescing beat scheduler / transport. Holds the kernel (timelines +
 /// CAS), the block store (materialization), and an optional kj dispatcher (to
 /// fire the `tick` verb). The dispatcher is optional so the core is unit-testable
@@ -262,10 +276,18 @@ pub struct BeatScheduler {
     kernel: Arc<Kernel>,
     documents: SharedBlockStore,
     dispatcher: Option<Arc<KjDispatcher>>,
-    heap: BinaryHeap<Reverse<(Instant, ContextId)>>,
-    armed: HashMap<ContextId, BeatState>,
+    /// The wakeup heap, keyed by **track** now — one entry per playing track, not
+    /// per context. A track beats once per pop and wakes its attached contexts.
+    heap: BinaryHeap<Reverse<(Instant, TrackId)>>,
+    /// The live clock domains, keyed by [`TrackId`]. Replaces the old per-context
+    /// `armed` map: the clock + playhead live on the track now (`docs/tracks.md`).
+    tracks: HashMap<TrackId, TrackState>,
+    /// Reverse index context→track, maintained on attach/detach, so the
+    /// turn-completion handler and the env builder can find a context's track
+    /// without scanning every track's `attached` set.
+    context_track: HashMap<ContextId, TrackId>,
     /// The write-barrier derivation registry (ABC → MIDI). One per scheduler — the
-    /// derivers are stateless and shared across all armed contexts.
+    /// derivers are stateless and shared across all tracks.
     derivers: DeriverRegistry,
 }
 
@@ -276,9 +298,22 @@ impl BeatScheduler {
             documents,
             dispatcher: None,
             heap: BinaryHeap::new(),
-            armed: HashMap::new(),
+            tracks: HashMap::new(),
+            context_track: HashMap::new(),
             derivers: DeriverRegistry::production(),
         }
+    }
+
+    /// Resolve a context's track via the reverse index.
+    fn track_of(&self, ctx: ContextId) -> Option<TrackId> {
+        self.context_track.get(&ctx).cloned()
+    }
+
+    /// A track's current playhead, if the track has a live clock domain. Used by
+    /// tests to observe musical position.
+    #[cfg(test)]
+    fn track_playhead(&self, track_id: &TrackId) -> Option<Tick> {
+        self.tracks.get(track_id).map(|t| t.playhead)
     }
 
     /// Attach the kj dispatcher so OODA boundaries fire the `tick` rc verb.
@@ -287,231 +322,268 @@ impl BeatScheduler {
         self
     }
 
-    /// Arm a context **stopped**: ensure its kernel timeline exists and register
-    /// beat state, but don't start the clock (no heap entry until `play`). OODA
-    /// starts armed. Idempotent — re-arming updates the policy, preserving the
-    /// running state and playhead.
+    /// Attach a context to a track — the context announces its binding
+    /// (`docs/tracks.md`, entity #3: the context drives the bind, the track holds
+    /// the passive set). If the track doesn't exist yet it is created **stopped**
+    /// (no heap entry until `play`), its clock seeded from `policy` and its playhead
+    /// from the track's *durable* history. If the track already exists, `policy` is
+    /// ignored (the track owns its own clock) and this just registers/updates the
+    /// context's [`AttachedContext`]. Idempotent.
     ///
-    /// The playhead is seeded from `max(block-log max tick, carried playhead)` so
-    /// musical time stays globally monotone per context. The two sources answer
-    /// two cases: the **block-log max tick** keeps a context with committed history
-    /// monotone across restarts even when conversation inserts advanced the
-    /// coordinate past the last beat (chameleon.md); the **carried playhead** —
-    /// the parent's live position, fork-copied into this child's `beat_state` —
-    /// continues musical time across a rotation page-turn, where a thin spawn-fork
-    /// child has NO committed blocks (max tick = 0) and would otherwise reset to 0.
-    /// Taking the max means the carried value can never *hide* committed time (the
-    /// log always wins for a real context), it only supplies time when there is
-    /// none. The seed lands only on a freshly-created timeline inside
-    /// `arm_timeline`'s `or_insert_with`, so a re-arm of a live timeline never
-    /// re-seeds. A failed DB read (max-tick scan OR the carried-playhead row) is
-    /// **fatal**: `arm` returns `Err` rather than seed a stale (zero) playhead — a
-    /// rewound seed would overwrite committed history (`DuplicateBlock` cascade), so
-    /// we fail the arm loudly and let the caller retry (crash over corruption).
+    /// Two playheads are seeded, and they seed **differently** (the review caught
+    /// this — see `docs/tracks.md`):
     ///
-    /// CONSTRAINT (design §11.5): we seed the playhead tick but **deliberately do
-    /// NOT seed the fallback pool** from the persisted block log. The Timeline's
-    /// committed Vec — the `UseLastGood` candidate pool — is born empty here, so a
-    /// freshly (re)armed track resolves `UseLastGood` to Skip until its first good
-    /// phrase. Restart IS an empty track. Seeding the pool from the log would make
-    /// the first phrase after a restart a vamped repeat of a phrase the band has
-    /// no live memory of playing — a silent stale fallback, the exact failure mode
-    /// this project rejects (crash/silence over corruption). Warm-restart vamping,
-    /// if ever wanted, is an explicit opt-in feature (issues.md), never the default
-    /// that falls out of seeding a pool here.
-    pub fn arm(
+    /// - **Track playhead** (only when *creating* the track):
+    ///   `max(persisted tracks-row playhead, attaching context's max committed
+    ///   tick)`. NOT the context's `max_tick` alone — a rotation child has no
+    ///   committed blocks (`max_tick == 0`) and would rewind the whole lane on a
+    ///   restart re-create. The durable `tracks` row + the lane's blocks ARE the
+    ///   track's memory; the clock lives on the track and never leaves, so there is
+    ///   no fork-copied "carried playhead" anymore.
+    /// - **Per-context Timeline playhead** (every attach):
+    ///   `max(this context's max committed tick, the track's current playhead)`.
+    ///   The context's own max stops a context WITH committed history (a cold-restart
+    ///   re-attach) from being seeded behind its log → a `DuplicateBlock` cascade;
+    ///   the track's playhead places a FRESH child joining a running track at current
+    ///   musical time, so its next beat is one `advance_to` step, not a catch-up.
+    ///
+    /// A failed DB read at either seed is **fatal** (`Err`): a rewound seed
+    /// overwrites committed history, so fail loud and let the caller retry (crash
+    /// over corruption, per CLAUDE.md).
+    ///
+    /// CONSTRAINT (design §11.5): we seed the playhead tick but deliberately do NOT
+    /// seed the fallback pool from the persisted log — the Timeline's committed Vec
+    /// (the `UseLastGood` candidate pool) is born empty so a fresh/re-attached track
+    /// resolves `UseLastGood` to Skip until its first good phrase. No silent
+    /// warm-restart vamping (crash/silence over corruption).
+    pub fn attach(
         &mut self,
+        track_id: TrackId,
         context_id: ContextId,
+        attachment: Attachment,
         policy: BeatPolicy,
-        track: TrackId,
     ) -> Result<(), String> {
-        // A DB read failure here is FATAL to the arm, not a seed-from-zero fallback.
-        // Seeding a rewound (zero) playhead onto a virgin timeline — a cold-start
-        // re-arm or a thin fork child — makes the context overwrite committed
-        // history → a `DuplicateBlock` poison cascade. A transient SQLite lock must
-        // *fail the arm loudly* (the rc `&&` chain halts, the caller retries) rather
-        // than silently poison musical time (crash over corruption, per CLAUDE.md).
-        let from_log = self
+        // Create the track's live clock domain on first attach, seeding its playhead
+        // from the track's DURABLE history (the persisted `tracks` row ∪ the lane's
+        // committed blocks via the attaching context), never the context alone.
+        if !self.tracks.contains_key(&track_id) {
+            let persisted = match self.documents.db() {
+                Some(db) => db
+                    .lock()
+                    .get_track(track_id.as_str())
+                    .map_err(|e| {
+                        format!(
+                            "beat: attach to {}: reading persisted track: {e}",
+                            track_id.as_str()
+                        )
+                    })?
+                    .and_then(|t| t.playhead_tick),
+                None => None,
+            };
+            let from_log = self
+                .documents
+                .max_tick(context_id)
+                .map_err(|e| {
+                    format!(
+                        "beat: attach to {}: reading max committed tick: {e}",
+                        track_id.as_str()
+                    )
+                })?
+                .unwrap_or(Tick::ZERO);
+            let seed = from_log.max(persisted.map(Tick::new).unwrap_or(Tick::ZERO));
+            self.tracks.insert(
+                track_id.clone(),
+                TrackState {
+                    policy,
+                    playing: false,
+                    playhead: seed,
+                    beat_count: 0,
+                    last_epoch_ns: 0,
+                    attached: HashMap::new(),
+                },
+            );
+        }
+        // Seed the context's per-context Timeline at `max(its own committed tick, the
+        // track's current playhead)` — see the doc above for why both terms.
+        let track_playhead = self.tracks[&track_id].playhead;
+        let clock = self.tracks[&track_id].policy.clock();
+        let ctx_from_log = self
             .documents
             .max_tick(context_id)
-            .map_err(|e| format!("beat: arm {context_id}: reading max committed tick: {e}"))?
-            .unwrap_or(kaijutsu_types::Tick::ZERO);
-        // Tick continuity across the rotation page-turn (docs/chameleon.md): a thin
-        // spawn-fork child has no committed blocks, so `from_log` is zero — but the
-        // fork copied the parent's `beat_state.playhead_tick` (the lane's musical
-        // position). Seed from the MAX of the two: the carried tick continues a
-        // child's musical time, while `from_log` always wins for a context with real
-        // committed history (cold restart), so the carried value can never *hide*
-        // committed time — it only supplies it when there is none. A corrupt/locked
-        // row is fatal here too (same reasoning): bubble it, never seed from zero.
-        let carried = match self.documents.db() {
-            Some(db) => db
-                .lock()
-                .get_beat_state(context_id)
-                .map_err(|e| format!("beat: arm {context_id}: reading carried playhead: {e}"))?
-                .and_then(|s| s.playhead_tick),
-            None => None, // db-less store (embedded/test): no carried playhead
-        };
-        let seed = from_log.max(
-            carried
-                .map(|n| kaijutsu_types::Tick::new(n as i64))
-                .unwrap_or(kaijutsu_types::Tick::ZERO),
-        );
-        self.kernel.arm_timeline(context_id, policy.clock(), seed);
-        // A fresh arm starts with no rotate cadence; the cold-restart restore
-        // re-applies it via `set_rotate` after this call (see the `Arm` command
-        // handler) so `arm` keeps its narrow signature. A live re-arm preserves
-        // running state (playing / ooda / cadence) — only the policy updates.
-        self.armed
+            .map_err(|e| format!("beat: attach {context_id}: reading max committed tick: {e}"))?
+            .unwrap_or(Tick::ZERO);
+        let timeline_seed = ctx_from_log.max(track_playhead);
+        self.kernel.arm_timeline(context_id, clock, timeline_seed);
+        // Register/update the binding. A re-attach of a live binding keeps its
+        // runtime materialization state (cursor/failures) and refreshes the
+        // announced attachment.
+        let track = self.tracks.get_mut(&track_id).expect("track exists");
+        track
+            .attached
             .entry(context_id)
-            .and_modify(|s| s.policy = policy)
-            .or_insert(BeatState {
-                policy,
-                playing: false,
-                ooda_armed: true,
-                rotate_every_phrases: None,
-                cursor: MaterializeCursor::default(),
-                beat_count: 0,
-                track,
-                materialize_failures: 0,
-                failure_water: 0,
-            });
-        // Mirror the (possibly new) policy + lane to the DB so a kernel restart can
-        // re-arm this musician with its real values via `kj transport arm`. A write
-        // failure here is loud but NOT fatal to the arm: the live timeline is already
-        // correctly seeded, and the `max()` rule protects a later restart re-arm
-        // (max_tick wins over a stale row). The rotation page-turn's accuracy rides
-        // the SEPARATE horizon persist in `fire_due`, which IS checked — not this one.
-        let _ = self.persist_state(context_id);
+            .and_modify(|ac| ac.attachment = attachment)
+            .or_insert_with(|| AttachedContext::new(attachment));
+        self.context_track.insert(context_id, track_id.clone());
+        // Mirror to the DB so a restart can recover the track + binding. Loud but not
+        // fatal: the live state is correct; the cold-start re-arm sweep is deferred.
+        let _ = self.persist_track(&track_id);
+        let _ = self.persist_attachment(&track_id, context_id);
         Ok(())
     }
 
-    /// Mirror a context's live policy + lane into the `beat_state` table — the
-    /// durable copy a `kj transport arm` reads to recover the musician after a
-    /// kernel restart (the scheduler's `armed` map starts empty on cold start).
-    /// Called on every policy mutation (arm, tempo) so the row never drifts behind
-    /// the live `BeatState`.
-    ///
-    /// A db-less store (embedded / unit test) has nowhere to persist — a clean
-    /// no-op (`Ok`). A db-backed store whose write FAILS returns `Err` (and logs):
-    /// the live beat is unaffected, but the restart-recovery copy is now stale.
-    /// Most callers (arm, tempo) treat that as loud-but-tolerable — the `max()` seed
-    /// rule protects a later restart. The **rotate horizon** caller in `fire_due`
-    /// MUST check the result: there, a stale row would be fork-copied into the child
-    /// and rewind its musical time, so a failed persist defers the page-turn rather
-    /// than mint a corrupted child (crash/halt over corruption, per CLAUDE.md).
-    fn persist_state(&self, context_id: ContextId) -> Result<(), String> {
-        let Some(st) = self.armed.get(&context_id) else {
-            return Ok(()); // not armed: nothing to mirror
+    /// Mirror a track's clock state into the `tracks` row — the durable copy a
+    /// restart reads to recover the clock domain. Unlike the old per-context persist,
+    /// there is **no playhead-snapshot-before-stop dance**: the playhead lives ON the
+    /// track and never leaves, so the row simply mirrors `track.playhead`. A db-less
+    /// store is a clean no-op (`Ok`); a write failure is loud-but-tolerable (the live
+    /// clock is correct; the cold-start re-arm sweep is deferred anyway).
+    fn persist_track(&self, track_id: &TrackId) -> Result<(), String> {
+        let Some(track) = self.tracks.get(track_id) else {
+            return Ok(()); // unknown track: nothing to mirror
         };
         let Some(db) = self.documents.db() else {
             return Ok(()); // db-less store (embedded/test): nothing to persist to.
         };
-        // Snapshot the LIVE playhead so the fork copy can hand a rotation child the
-        // lane's current musical position (the child has no committed blocks to
-        // seed from). `None` if no timeline yet — a never-armed context — which
-        // seeds from max_tick on the eventual arm. Read live, not from `st`, because
-        // BeatState doesn't carry the playhead (it advances every beat; the row is
-        // refreshed only on policy mutations + at the rotate page-turn).
         // Playhead is forward-only from `Tick::ZERO`, so the i64 coordinate is
-        // non-negative — `as u64` is lossless and matches the struct's convention.
-        let playhead_tick = self
-            .kernel
-            .timeline(context_id)
-            .map(|t| t.lock().playhead().get() as u64);
-        let state = kaijutsu_kernel::kernel_db::PersistedBeatState {
-            period_ms: st.policy.period.as_millis() as u64,
-            beats_per_phrase: st.policy.beats_per_phrase,
-            ooda_every: st.policy.ooda_every,
-            track: st.track.as_str().to_string(),
-            rotate_every_phrases: st.rotate_every_phrases,
-            playhead_tick,
+        // non-negative; `Some(..)` once the track exists (it has a real playhead).
+        let row = PersistedTrack {
+            track_id: track_id.as_str().to_string(),
+            period_ms: track.policy.period.as_millis() as u64,
+            beats_per_phrase: track.policy.beats_per_phrase,
+            playhead_tick: Some(track.playhead.get()),
+            playing: track.playing,
         };
-        db.lock().upsert_beat_state(context_id, &state).map_err(|e| {
-            let msg = format!("beat: failed to persist beat state for {context_id}: {e}");
+        db.lock().upsert_track(&row).map_err(|e| {
+            let msg = format!("beat: failed to persist track {}: {e}", track_id.as_str());
             log::error!("{msg}");
             msg
         })
     }
 
-    /// Start (or resume) the clock. Pushes a heap entry one period out; the
-    /// playhead resumes at +1 from where it froze (event-counted — no catch-up).
-    pub fn play(&mut self, context_id: ContextId, now: Instant) {
-        let Some(st) = self.armed.get_mut(&context_id) else {
-            log::warn!("beat: play on un-armed context {context_id} ignored");
+    /// Mirror one context's binding into the `attachments` row — the durable copy a
+    /// fork inherits (via `insert_forked_context`'s `copy_attachments_for_fork`) and
+    /// a restart re-announces. db-less = no-op; write failure loud-but-tolerable.
+    fn persist_attachment(&self, track_id: &TrackId, context_id: ContextId) -> Result<(), String> {
+        let Some(track) = self.tracks.get(track_id) else {
+            return Ok(());
+        };
+        let Some(ac) = track.attached.get(&context_id) else {
+            return Ok(()); // not attached: nothing to mirror
+        };
+        let Some(db) = self.documents.db() else {
+            return Ok(());
+        };
+        let row = PersistedAttachment {
+            track_id: track_id.as_str().to_string(),
+            context_id,
+            wakeup_every: ac.attachment.wakeup.every,
+            rotate_every_phrases: ac.attachment.rotate.map(|c| c.every),
+            ooda_armed: ac.attachment.ooda_armed,
+        };
+        db.lock().upsert_attachment(&row).map_err(|e| {
+            let msg = format!(
+                "beat: failed to persist attachment {} / {context_id}: {e}",
+                track_id.as_str()
+            );
+            log::error!("{msg}");
+            msg
+        })
+    }
+
+    /// Start (or resume) a **track's** clock. Pushes one heap entry one period out;
+    /// the playhead resumes at +1 from where it froze (event-counted — no catch-up).
+    ///
+    /// KNOWN EDGE (pre-existing, deferred): a `stop`/`pause` immediately followed by
+    /// `play` *within the same period* — before the stale heap entry is popped and
+    /// lazily dropped — stacks a second entry, so the next `fire_due` beats the track
+    /// twice. Real usage (user/rc transport, seconds apart with a beat between)
+    /// drains the stale entry first, so this is a test-only artifact today; the clean
+    /// fix is a per-track generation token on heap entries (issues.md).
+    pub fn play(&mut self, track_id: &TrackId, now: Instant) {
+        let Some(track) = self.tracks.get_mut(track_id) else {
+            log::warn!("beat: play on unknown track {} ignored", track_id.as_str());
             return;
         };
-        if st.playing {
+        if track.playing {
             return; // already running — don't stack heap entries
         }
-        st.playing = true;
-        let period = st.policy.period;
-        self.heap.push(Reverse((now + period, context_id)));
+        track.playing = true;
+        let period = track.policy.period;
+        self.heap.push(Reverse((now + period, track_id.clone())));
+        let _ = self.persist_track(track_id);
     }
 
-    /// Hold the clock — the playhead freezes; OODA arm state is preserved. The
-    /// stale heap entry is dropped on its next pop (it won't re-arm while paused).
-    pub fn pause(&mut self, context_id: ContextId) {
-        if let Some(st) = self.armed.get_mut(&context_id) {
-            st.playing = false;
+    /// Hold a track's clock — the playhead freezes. The stale heap entry is dropped
+    /// on its next pop. Per-attachment OODA arm + rotate cadence are preserved.
+    pub fn pause(&mut self, track_id: &TrackId) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            track.playing = false;
         }
+        let _ = self.persist_track(track_id);
     }
 
-    /// Full halt — pause the clock *and* disarm OODA.
-    pub fn stop(&mut self, context_id: ContextId) {
-        if let Some(st) = self.armed.get_mut(&context_id) {
-            st.playing = false;
-            st.ooda_armed = false;
+    /// Stop a track's clock — MIDI idiom: **stop = stop the clock only**. Rotation is
+    /// suspended/remembered (the attachments keep their `rotate` cadence) and
+    /// per-attachment OODA arm is untouched (re-arm with `SetOoda`). The playhead is
+    /// forward-only, so `stop` then `play` resumes where it froze (no rewind), which
+    /// makes it behaviourally an alias of `pause` here — both kept for transport
+    /// vocabulary.
+    pub fn stop(&mut self, track_id: &TrackId) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            track.playing = false;
         }
+        let _ = self.persist_track(track_id);
     }
 
-    /// Set the beat period (tempo). Takes effect on the next re-arm.
-    pub fn set_tempo(&mut self, context_id: ContextId, period: Duration) {
-        let updated = match self.armed.get_mut(&context_id) {
-            Some(st) => {
-                st.policy.period = period;
-                true
+    /// Set a track's beat period (tempo). Takes effect on the next beat.
+    pub fn set_tempo(&mut self, track_id: &TrackId, period: Duration) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            track.policy.period = period;
+        }
+        // Persist the new tempo so a restart recovers it (not the default).
+        let _ = self.persist_track(track_id);
+    }
+
+    /// Arm or disarm one attached context's OODA loop, without touching the clock.
+    pub fn set_ooda(&mut self, track_id: &TrackId, context_id: ContextId, armed: bool) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            if let Some(ac) = track.attached.get_mut(&context_id) {
+                ac.attachment.ooda_armed = armed;
             }
-            None => false,
-        };
-        // Persist the new tempo so a restart re-arm carries it (not the default).
-        // Outside the `get_mut` borrow so `persist_state(&self)` can re-read. A
-        // failure is loud (logged inside) but tolerable — the live tempo is set; the
-        // recovery copy is stale, which the `max()` seed rule survives.
-        if updated {
-            let _ = self.persist_state(context_id);
         }
+        let _ = self.persist_attachment(track_id, context_id);
     }
 
-    /// Arm or disarm the OODA loop without touching the clock.
-    pub fn set_ooda(&mut self, context_id: ContextId, armed: bool) {
-        if let Some(st) = self.armed.get_mut(&context_id) {
-            st.ooda_armed = armed;
-        }
-    }
-
-    /// Set (or clear, with `None`) the self-fork rotate cadence in phrases. A
-    /// `Some(0)` is treated as `None` (no rotation) — never a `% 0`.
-    pub fn set_rotate(&mut self, context_id: ContextId, every_phrases: Option<u64>) {
-        let updated = match self.armed.get_mut(&context_id) {
-            Some(st) => {
-                st.rotate_every_phrases = every_phrases.filter(|n| *n > 0);
-                true
+    /// Set (or clear, with `None`) one attached context's self-fork rotate cadence
+    /// (in phrases). A `Some(Cadence { every: 0 })` is treated as `None` — never a
+    /// `% 0`.
+    pub fn set_rotate(
+        &mut self,
+        track_id: &TrackId,
+        context_id: ContextId,
+        every: Option<Cadence>,
+    ) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            if let Some(ac) = track.attached.get_mut(&context_id) {
+                ac.attachment.rotate = every.filter(|c| c.every > 0);
             }
-            None => false,
-        };
-        // Persist the cadence so a restart re-arm restores the page-turn (not just
-        // tempo/lane). Outside the `get_mut` borrow so `persist_state(&self)` can
-        // re-read. Mirrors `set_tempo` — loud-but-tolerable on failure.
-        if updated {
-            let _ = self.persist_state(context_id);
         }
+        // Persist so a restart restores the page-turn cadence.
+        let _ = self.persist_attachment(track_id, context_id);
     }
 
-    /// Disarm a context entirely: drop beat state and the kernel timeline. The
-    /// heap entry is skipped lazily on pop.
-    pub fn disarm(&mut self, context_id: ContextId) {
-        self.armed.remove(&context_id);
+    /// Unbind a context from a track — **LIVE-ONLY**. Removes it from the track's
+    /// attached set + the reverse index and drops its kernel timeline, but does NOT
+    /// delete the persisted `attachments` row: the rotate page-turn relies on the
+    /// child inheriting the parent's binding via the fork-copy of that row (automatic
+    /// in `insert_forked_context`), so deleting it here would break inheritance.
+    /// Persisted-row cleanup belongs to context archival (not wired in Stage 1). The
+    /// track persists with its remaining attachments (folds the old `Disarm`).
+    pub fn detach(&mut self, track_id: &TrackId, context_id: ContextId) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            track.attached.remove(&context_id);
+        }
+        self.context_track.remove(&context_id);
         self.kernel.disarm_timeline(context_id);
     }
 
@@ -520,91 +592,153 @@ impl BeatScheduler {
         self.heap.peek().map(|Reverse((t, _))| *t)
     }
 
-    /// Fire every context due at or before `now`: advance its playhead one beat,
-    /// bridge new committed cells, count the beat, and re-arm its next beat.
-    /// A popped entry for a paused/disarmed context is dropped (not re-armed).
+    /// Beat every **track** due at or before `now`: advance the track one beat, wake
+    /// its attached contexts (materialize + cadence), and re-arm the track's next
+    /// beat. A popped entry for a stopped/removed track is dropped (not re-armed).
     pub fn fire_due(&mut self, now: Instant) -> BeatOutcome {
         let mut outcome = BeatOutcome::default();
-        while let Some(Reverse((t, ctx))) = self.heap.peek().copied() {
+        // `TrackId` isn't `Copy`, so clone the peeked key (one short String).
+        while let Some(Reverse((t, track_id))) = self.heap.peek().cloned() {
             if t > now {
                 break;
             }
             self.heap.pop();
-            let Some((playing, period)) =
-                self.armed.get(&ctx).map(|s| (s.playing, s.policy.period))
+            let Some((playing, period)) = self
+                .tracks
+                .get(&track_id)
+                .map(|tr| (tr.playing, tr.policy.period))
             else {
-                continue; // disarmed → drop the stale entry
+                continue; // unknown/removed track → drop the stale entry
             };
             if !playing {
-                continue; // paused/stopped → drop the stale entry (no re-arm)
+                continue; // stopped/paused → drop the stale entry (no re-arm)
             }
-            let report = self.process_one(ctx);
-            outcome.fired.push(ctx);
-            // Rotate horizon: retire the parent SYNCHRONOUSLY, right here, in the
-            // same step that decided to rotate — before the loop can `select!`
-            // again, so no stray tick can fire for it and no second rotate can
-            // race in. `stop` (pause clock + disarm OODA) leaves the entry
-            // quiescent (zero cost, blocks/timeline preserved for the app). It is
-            // NOT re-pushed onto the heap → the parent's beat ends here. The
-            // `rotate` rc (fork + arm child) runs fire-and-forget; that async work
-            // is safe now that the parent is stopped.
-            if report.rotate_due {
-                // Snapshot the parent's live playhead into its `beat_state` row
-                // BEFORE retiring it, so the page-turn fork copies an ACCURATE tick
-                // and `arm` continues musical time instead of resetting to 0
-                // (docs/chameleon.md tick continuity). Persist FIRST, then stop:
-                // if the write fails, a fork now would copy a stale row and the
-                // child would silently rewind. So on failure we do NOT rotate — the
-                // parent stays on the clock (re-armed below like a normal beat) and
-                // retries at the next horizon. A deferred page-turn beats a
-                // corrupted child (crash/halt over corruption, per CLAUDE.md).
-                if self.persist_state(ctx).is_ok() {
-                    self.stop(ctx);
-                    outcome.rotate_due.push(ctx);
-                    continue;
-                }
-                log::error!(
-                    "beat: rotate deferred for {ctx} — beat_state persist failed; keeping the \
-                     parent on the clock (a delayed page-turn beats a rewound child)"
-                );
-                // fall through to the normal-beat path: re-arm + propagate ooda/phrase
-            }
-            self.heap.push(Reverse((now + period, ctx)));
-            if report.ooda_due {
-                outcome.ooda_due.push(ctx);
-            }
-            if report.phrase_due {
-                outcome.phrase_due.push(ctx);
-            }
+            self.process_track(&track_id, &mut outcome);
+            // Re-arm the TRACK's next beat. Rotation detaches CONTEXTS inside
+            // `process_track`, never the track — the clock keeps running across a
+            // page-turn (continuity is free; the production gap during the child's
+            // boot is absorbed by the speculation lead downstream, docs/tracks.md).
+            self.heap.push(Reverse((now + period, track_id)));
         }
         outcome
     }
 
-    /// Advance one context by one beat (event-counted), flush whatever committed,
-    /// count the beat, and report whether it crossed an OODA cadence and/or a
-    /// phrase boundary. Called only for a playing context.
-    fn process_one(&mut self, ctx: ContextId) -> BeatTickReport {
-        let Some(timeline) = self.kernel.timeline(ctx) else {
-            // Armed in the scheduler but no timeline in the kernel — shouldn't
-            // happen (arming pairs the two), but never panic the driver.
-            return BeatTickReport::default();
+    /// Beat one track: advance its playhead once (event-counted), latch the beat's
+    /// shared wall-clock epoch, then for EACH attached context slew its Timeline to
+    /// the track playhead, materialize whatever committed, and answer the cadence
+    /// questions. A context at a rotate horizon is detached synchronously this beat
+    /// (the clock keeps running). Called only for a playing track.
+    fn process_track(&mut self, track_id: &TrackId, outcome: &mut BeatOutcome) {
+        // Latch the beat's wall-clock epoch ONCE so every context woken this beat
+        // sees the identical `KJ_EPOCH_NS` (the cross-context join key) — never a
+        // per-context `now()` that would differ by microseconds.
+        let epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Phase 1: advance the track once (the brief &mut tracks borrow).
+        let (beat_count, playhead, policy, attached_ids) = {
+            let Some(track) = self.tracks.get_mut(track_id) else {
+                return;
+            };
+            track.playhead = track.playhead + STEP;
+            track.beat_count += 1;
+            track.last_epoch_ns = epoch_ns;
+            let ids: Vec<ContextId> = track.attached.keys().cloned().collect();
+            (track.beat_count, track.playhead, track.policy, ids)
         };
-        // The beat tick: advance the playhead by one step. Lock held only for the
-        // advance; the bridge re-locks internally. No `.await` under the lock.
+        // Phase 2: per attached context — materialize, then answer the cadence. No
+        // &mut tracks borrow is held across `materialize_one` (it re-borrows briefly).
+        let mut to_detach: Vec<ContextId> = Vec::new();
+        for ctx in attached_ids {
+            self.materialize_one(track_id, ctx, playhead);
+            let Some(att) = self
+                .tracks
+                .get(track_id)
+                .and_then(|t| t.attached.get(&ctx))
+                .map(|ac| ac.attachment)
+            else {
+                continue;
+            };
+            outcome.fired.push(ctx);
+            // Rotate horizon: a phrase boundary whose phrase index is a multiple of
+            // the cadence. NOT gated on `ooda_armed` — a paused-OODA player still owes
+            // its page-turn. A rotating context retires this beat (detached below) and
+            // does NOT also fire ooda/phrase.
+            let phrase_due = policy.is_phrase_boundary(beat_count);
+            let phrase = if policy.beats_per_phrase > 0 {
+                beat_count / policy.beats_per_phrase
+            } else {
+                0
+            };
+            let rotate_due = phrase_due
+                && policy.beats_per_phrase > 0
+                && att.rotate.is_some_and(|c| c.is_due(phrase));
+            if rotate_due {
+                to_detach.push(ctx);
+                outcome.rotate_due.push(ctx);
+                continue;
+            }
+            if phrase_due {
+                outcome.phrase_due.push(ctx);
+            }
+            // OODA wake: gated on the arm (it drives token spend) and the
+            // per-attachment wakeup divisor (subsumes the old `ooda_every`).
+            if att.ooda_armed && att.wakeup.is_due(beat_count) {
+                // Bump the per-attachment monotonic pulse (`KJ_PULSE`, the reliable
+                // ordering key) on the wake — once per THIS attachment's wakeup, so a
+                // sibling waking on other beats can't skip its sequence.
+                if let Some(ac) = self
+                    .tracks
+                    .get_mut(track_id)
+                    .and_then(|t| t.attached.get_mut(&ctx))
+                {
+                    ac.attachment.pulse += 1;
+                }
+                outcome.ooda_due.push(ctx);
+            }
+        }
+        // Synchronous detach of rotating contexts — AFTER the iteration so we never
+        // mutate `attached` while iterating it. The clock never pauses across the
+        // handoff: this is the GAP, never the OVERLAP (never two producers; a few
+        // producerless beats while the child boots, covered downstream by the
+        // speculation lead — docs/tracks.md "Rotation handoff").
+        for ctx in to_detach {
+            self.detach(track_id, ctx);
+        }
+    }
+
+    /// Materialize one attached context's newly-committed cells this beat: slew its
+    /// Timeline up to the track playhead (forward-only), run the CAS+block bridge with
+    /// the context's OWN cursor/poison budget, surface a poison-skip Error block, and
+    /// drain the engine failure ledger. All per-context state lives on the
+    /// [`AttachedContext`], so one context's poison cell never wedges a sibling.
+    fn materialize_one(&mut self, track_id: &TrackId, ctx: ContextId, track_playhead: Tick) {
+        let Some(timeline) = self.kernel.timeline(ctx) else {
+            // Attached but no timeline — shouldn't happen (attach pairs them), but
+            // never panic the driver.
+            return;
+        };
+        // Slew the context's Timeline to the track playhead (the Stage-1 bridge).
+        // Guarded forward-only: a context whose own committed log sits AHEAD of the
+        // track is left alone rather than advanced backward (`advance_to` panics on
+        // backward time — the write-barrier no-backdating stance).
         {
             let mut g = timeline.lock();
-            let target = g.playhead() + STEP;
-            g.advance_to(target);
+            if track_playhead > g.playhead() {
+                g.advance_to(track_playhead);
+            }
         }
-
         let cas = self.kernel.cas().clone();
-        // Take the cursor out so the &mut borrow of `s.cursor` doesn't collide with
-        // the shared &self.derivers read. Whole-cell progress = `high_water`
-        // advanced; the per-artifact `artifacts_done` makes a mid-group retry
-        // resumable but is NOT counted as poison-clearing progress on its own (a
-        // cell that always fails on the SAME sibling must still trip the budget).
-        let Some(mut cursor) = self.armed.get(&ctx).map(|s| s.cursor) else {
-            return BeatTickReport::default();
+        // Copy the cursor out so the &mut borrow of the attachment doesn't collide
+        // with the shared &self.documents/&self.derivers reads in the bridge.
+        let Some(mut cursor) = self
+            .tracks
+            .get(track_id)
+            .and_then(|t| t.attached.get(&ctx))
+            .map(|ac| ac.cursor)
+        else {
+            return;
         };
         let hw_before = cursor.high_water;
         let result = materialize_committed(
@@ -616,82 +750,66 @@ impl BeatScheduler {
             &self.derivers,
         );
         // Set when the SAME cell exhausts MATERIALIZE_RETRY_BUDGET and is skipped:
-        // (skipped high_water index, last error string). Surfaced as ONE Error
-        // block after the borrow of `s` ends — deduped by construction (the skip
-        // happens exactly once per poison cell, when the budget trips).
+        // (skipped high_water index, last error). Surfaced as ONE Error block after
+        // the attachment borrow ends — deduped by construction (skip happens once).
         let mut poison_skipped: Option<(usize, String)> = None;
         match result {
             Ok(_) => {
-                if let Some(s) = self.armed.get_mut(&ctx) {
-                    s.cursor = cursor;
-                    s.materialize_failures = 0; // a clean beat clears the poison count
+                if let Some(ac) =
+                    self.tracks.get_mut(track_id).and_then(|t| t.attached.get_mut(&ctx))
+                {
+                    ac.cursor = cursor;
+                    ac.materialize_failures = 0; // a clean beat clears the poison count
                 }
             }
             Err(e) => {
-                // The materialize bridge errored. `materialize_committed` advances
-                // `high_water` per crossed cell, so any whole-cell progress means the
-                // poison is a *fresh* cell at the new high_water — persist the
-                // progress and reset the failure count. Zero whole-cell progress means
-                // the SAME cell failed again (possibly after partial-artifact progress
-                // captured in `artifacts_done`): escalate loudly and, once the retry
-                // budget is spent, skip the poison cell so the beat loop never silently
-                // retries forever. (Pre-F1 this was a swallowed `log::warn` with no
-                // loop bound — the §7 poison-cell debt; worse with multiple tracks.)
-                if let Some(s) = self.armed.get_mut(&ctx) {
+                if let Some(ac) =
+                    self.tracks.get_mut(track_id).and_then(|t| t.attached.get_mut(&ctx))
+                {
                     if cursor.high_water > hw_before {
-                        s.cursor = cursor;
-                        s.materialize_failures = 0;
+                        // Whole-cell progress → the poison is a FRESH cell; persist
+                        // and reset the count.
+                        ac.cursor = cursor;
+                        ac.materialize_failures = 0;
                         log::error!(
                             "beat: materialize failed for context {ctx} after crossing \
                              {} cell(s) this beat; will retry the next cell: {e}",
                             cursor.high_water - hw_before
                         );
                     } else {
-                        // Persist the partial-artifact resume point even on failure so
-                        // a transient fault clears with a resume, not a re-insert.
-                        s.cursor = cursor;
-                        s.materialize_failures += 1;
-                        let failures = s.materialize_failures;
+                        // Same cell failed again — escalate; once the budget is spent,
+                        // skip the poison cell so the loop never silently retries.
+                        ac.cursor = cursor;
+                        ac.materialize_failures += 1;
+                        let failures = ac.materialize_failures;
                         log::error!(
                             "beat: materialize failed for context {ctx} on cell at \
-                             high_water={} (consecutive failure #{failures} \
-                             on the same cell): {e}",
+                             high_water={} (consecutive failure #{failures} on the \
+                             same cell): {e}",
                             cursor.high_water
                         );
                         if poison_action(failures) == PoisonAction::SkipPoison {
-                            // Bounded give-up: advance past the poison cell so the
-                            // loop terminates. Reset the per-artifact resume point —
-                            // we are abandoning this cell, not resuming it. The
-                            // operator has already seen MATERIALIZE_RETRY_BUDGET loud
-                            // errors for it.
-                            s.cursor.high_water += 1;
-                            s.cursor.artifacts_done = 0;
-                            s.cursor.source_block_id = None;
-                            s.materialize_failures = 0;
+                            ac.cursor.high_water += 1;
+                            ac.cursor.artifacts_done = 0;
+                            ac.cursor.source_block_id = None;
+                            ac.materialize_failures = 0;
                             log::error!(
-                                "beat: skipping poison cell at high_water={} \
-                                 for context {ctx} after {MATERIALIZE_RETRY_BUDGET} \
-                                 failed attempts — cell will NOT be materialized",
+                                "beat: skipping poison cell at high_water={} for context \
+                                 {ctx} after {MATERIALIZE_RETRY_BUDGET} failed attempts — \
+                                 cell will NOT be materialized",
                                 cursor.high_water
                             );
-                            // Surface the skip as a visible Error block (closes the
-                            // issues.md poison-cell "remaining" clause): a silently
-                            // dropped phrase is invisible to the player after the
-                            // logs scroll. The skip happens once, so this dedupes
-                            // naturally — no per-beat spam.
                             poison_skipped = Some((cursor.high_water, e.to_string()));
                         }
                     }
                 } else {
-                    log::error!("beat: materialize failed for un-armed context {ctx}: {e}");
+                    log::error!("beat: materialize failed for un-attached context {ctx}: {e}");
                 }
             }
         }
 
-        // The borrow of `s` has ended — surface the poison-skip as a visible Error
-        // block now (the document insert does not touch `self.armed`). Anchored at
-        // the document tail like the resolve-failure drain (the poison cell never
-        // committed a block to parent to). Insert failure is loud, never swallowed.
+        // Surface the poison-skip as a visible Error block now (the attachment borrow
+        // has ended). Anchored at the document tail like the resolve-failure drain.
         if let Some((skipped_hw, err)) = poison_skipped {
             let payload = kaijutsu_types::ErrorPayload {
                 category: kaijutsu_types::ErrorCategory::Kernel,
@@ -726,38 +844,9 @@ impl BeatScheduler {
             }
         }
 
-        // Drain the engine failure ledger into visible Error blocks (§6, §8): a
-        // resolve that erred (CAS read miss, validator reject) recorded a
-        // FailureEvent and dropped its cell (a hole, never a fake). Surface each so
-        // the player reads its own failure next turn — the producer-loop principle.
-        self.drain_failures(ctx, &timeline);
-
-        let Some(s) = self.armed.get_mut(&ctx) else {
-            return BeatTickReport::default();
-        };
-        s.beat_count += 1;
-        // The cadence questions answered side by side from the post-increment
-        // beat_count. OODA is gated on the arm (it drives token spend); the phrase
-        // boundary is not (it is a position in musical time, observed regardless).
-        let phrase_due = s.policy.is_phrase_boundary(s.beat_count);
-        // Rotate horizon: a phrase boundary whose phrase index is a multiple of
-        // the configured cadence. `beat_count` is post-increment, so the first
-        // boundary is phrase 1 (beat_count == beats_per_phrase) — a birth never
-        // self-rotates. Gated on `playing` (a stopped context can't rotate) but
-        // NOT on `ooda_armed`: a player paused mid-OODA still owes its page-turn.
-        let rotate_due = phrase_due
-            && s.policy.beats_per_phrase > 0
-            && s.rotate_every_phrases.is_some_and(|n| {
-                let phrase = s.beat_count / s.policy.beats_per_phrase;
-                phrase % n == 0
-            });
-        BeatTickReport {
-            ooda_due: s.ooda_armed
-                && s.policy.ooda_every > 0
-                && s.beat_count % s.policy.ooda_every == 0,
-            phrase_due,
-            rotate_due,
-        }
+        // Drain the engine failure ledger into visible Error blocks (§6, §8) so the
+        // player reads its own resolve failures next turn (the producer-loop principle).
+        self.drain_failures(track_id, ctx, &timeline);
     }
 
     /// Drain the engine failure ledger past `failure_water`, surfacing exactly one
@@ -771,13 +860,18 @@ impl BeatScheduler {
     /// Error blocks anchor at the document tail (the failure carries musical ticks,
     /// not a source block id — the cell that would have been its anchor never
     /// committed). A missing anchor or insert failure is loud, never a swallow.
-    fn drain_failures(&mut self, ctx: ContextId, timeline: &kaijutsu_kernel::hyoushigi::SharedTimeline) {
+    fn drain_failures(
+        &mut self,
+        track_id: &TrackId,
+        ctx: ContextId,
+        timeline: &kaijutsu_kernel::hyoushigi::SharedTimeline,
+    ) {
         // Snapshot the new events under the lock, then release it before touching
         // the block store (no nested lock; no `.await` was ever here anyway).
         let new_events: Vec<(kaijutsu_types::Tick, kaijutsu_types::Tick, String, String)> = {
             let g = timeline.lock();
             let failures = g.failures();
-            let Some(st) = self.armed.get(&ctx) else {
+            let Some(st) = self.tracks.get(track_id).and_then(|t| t.attached.get(&ctx)) else {
                 return;
             };
             if failures.len() <= st.failure_water {
@@ -834,45 +928,53 @@ impl BeatScheduler {
         // Advance the water past every event observed this beat — even any whose
         // Error-block insert errored above (already logged loudly). Re-surfacing a
         // drained event next beat would spam; the ledger length is the cursor.
-        if let Some(st) = self.armed.get_mut(&ctx) {
+        if let Some(st) = self.tracks.get_mut(track_id).and_then(|t| t.attached.get_mut(&ctx)) {
             st.failure_water += new_events.len();
         }
     }
 
-    /// Snapshot the transport heartbeat for `ctx` — `$TICK`/`$PHRASE`/`$TEMPO`
-    /// plus the `$HEARD` notation window — read NOW, on the scheduler thread with
-    /// the beat state in hand, so a spawned lifecycle sees facts coherent with the
-    /// beat that triggered it. Empty when the context isn't armed.
+    /// Snapshot the transport heartbeat for `ctx` — `KJ_TICK`/`KJ_PHRASE`/`KJ_TEMPO`
+    /// plus `KJ_HEARD`, `KJ_PULSE`, `KJ_EPOCH_NS` (and `KJ_ROTATE_EVERY` when it
+    /// rotates) — read NOW, on the scheduler thread with the track + attachment in
+    /// hand, so a spawned lifecycle sees facts coherent with the beat that triggered
+    /// it. The position facts come from the TRACK (it owns the clock now). Empty when
+    /// the context isn't attached to a track.
     fn transport_env(&self, ctx: ContextId) -> HashMap<String, String> {
-        let Some(st) = self.armed.get(&ctx) else {
+        let Some(track_id) = self.track_of(ctx) else {
             return HashMap::new();
         };
-        let playhead = self
-            .kernel
-            .timeline(ctx)
-            .map(|t| t.lock().playhead())
-            .unwrap_or(Tick::ZERO);
+        let Some(track) = self.tracks.get(&track_id) else {
+            return HashMap::new();
+        };
+        let Some(ac) = track.attached.get(&ctx) else {
+            return HashMap::new();
+        };
+        let playhead = track.playhead;
         let mut vars: HashMap<String, String> =
-            transport_vars(playhead, st.beat_count, &st.policy)
+            transport_vars(playhead, track.beat_count, &track.policy)
                 .into_iter()
                 .collect();
-        // $HEARD: the recent committed notation the player composes against. A
-        // read failure degrades to an empty list (the player composes from the
-        // chart + now-facts), never a dropped beat.
-        let window = TickDelta::new((HEARD_WINDOW_PHRASES * st.policy.beats_per_phrase) as i64);
+        // KJ_HEARD: the recent committed notation the player composes against. A read
+        // failure degrades to an empty list (compose from the chart + now-facts).
+        let window = TickDelta::new((HEARD_WINDOW_PHRASES * track.policy.beats_per_phrase) as i64);
         let heard = self
             .documents
             .block_snapshots(ctx)
             .map(|blocks| heard_json(&blocks, playhead, window))
             .unwrap_or_else(|_| "[]".to_string());
-        vars.insert("HEARD".to_string(), heard);
-        // $ROTATE_EVERY: the rotate cadence in phrases, when this context rotates.
-        // The page-turn rc re-establishes the same cadence on the child it spawns
-        // (the scheduler's `rotate_every_phrases` is per-BeatState and does NOT
-        // travel with the fork — re-arm starts un-rotating, like stopped/ooda),
-        // so the song keeps turning. Absent when the context doesn't rotate.
-        if let Some(n) = st.rotate_every_phrases {
-            vars.insert("ROTATE_EVERY".to_string(), n.to_string());
+        vars.insert("KJ_HEARD".to_string(), heard);
+        // KJ_PULSE: this attachment's monotonic wakeup counter (the reliable ordering
+        // key — `KJ_TICK` can repeat/freeze off-beat). KJ_EPOCH_NS: the beat's shared
+        // wall-clock instant, identical for every context woken on this beat (the
+        // human "when" + the cross-context join key).
+        vars.insert("KJ_PULSE".to_string(), ac.attachment.pulse.to_string());
+        vars.insert("KJ_EPOCH_NS".to_string(), track.last_epoch_ns.to_string());
+        // KJ_ROTATE_EVERY: the rotate cadence in phrases, when this context rotates.
+        // The cadence now TRAVELS with the fork (the attachment row is fork-copied), so
+        // an inheriting child re-binds with the same cadence by construction; this var
+        // is informational. Absent when the context doesn't rotate.
+        if let Some(c) = ac.attachment.rotate {
+            vars.insert("KJ_ROTATE_EVERY".to_string(), c.every.to_string());
         }
         vars
     }
@@ -910,10 +1012,12 @@ impl BeatScheduler {
         self.fire_lifecycle(ctx, "tick");
     }
 
-    /// Fire the `rotate` rc verb — the page-turn (`docs/chameleon.md`). Called for
-    /// a context the scheduler has ALREADY `stop`ped this beat (the synchronous
-    /// detach in `fire_due`), so the script's `kj fork --preset spawn` + arm-child
-    /// runs with no parent still on the clock to race. Absent rc scripts → no-op.
+    /// Fire the `rotate` rc verb — the page-turn (`docs/chameleon.md`). Called for a
+    /// context the scheduler has ALREADY `detach`ed this beat (the synchronous detach
+    /// in `process_track`), so the script's `kj fork --preset spawn` + re-attach child
+    /// runs with the parent already off the track. The TRACK's clock keeps running
+    /// across the handoff (the gap is covered by the speculation lead). Absent rc
+    /// scripts → no-op.
     fn fire_rotate(&self, ctx: ContextId) {
         self.fire_lifecycle(ctx, "rotate");
     }
@@ -940,13 +1044,25 @@ impl BeatScheduler {
     ///     only ever carry a real player Model block), so each is a loud
     ///     `log::error!`, refused, never silently skipped.
     fn on_turn_completed(&self, ctx: ContextId, output_block_id: Option<BlockId>) {
-        let (track, lead) = match self.armed.get(&ctx) {
-            // Schedule one phrase of lead ahead of the playhead (design §10): the
-            // fast write-barrier derive has ample room. Replaces the old fixed
-            // 4-beat OODA_LEAD const, which assumed bars; lead now tracks the
-            // policy's phrase length.
-            Some(st) if st.ooda_armed => (st.track.clone(), st.policy.phrase_delta()),
-            _ => return, // not an OODA-armed musician we manage
+        // Resolve the context's track + attachment; only an OODA-armed musician we
+        // manage gets its turn output crystallized. Schedule one phrase of lead ahead
+        // of the playhead (design §10) so the fast write-barrier derive has room —
+        // lead tracks the policy's phrase length (replaced the old fixed 4-beat
+        // OODA_LEAD). The track id IS the lane the cell belongs to.
+        let Some(track_id) = self.track_of(ctx) else {
+            return;
+        };
+        let lead = {
+            let Some(track) = self.tracks.get(&track_id) else {
+                return;
+            };
+            let Some(ac) = track.attached.get(&ctx) else {
+                return;
+            };
+            if !ac.attachment.ooda_armed {
+                return; // not an OODA-armed musician we manage
+            }
+            track.policy.phrase_delta()
         };
         // No output block → the turn produced no text; nothing to crystallize.
         let Some(block_id) = output_block_id else {
@@ -987,9 +1103,9 @@ impl BeatScheduler {
         }
         // `played_by` is the principal whose turn produced the ABC — the block's
         // own author (who PLAYED), which becomes the materialized cell's
-        // principal. `track` is the musician's lane.
+        // principal. `track_id` is the musician's lane.
         let played_by = b.id.principal_id;
-        if let Err(e) = schedule_abc_cell(&self.kernel, ctx, &abc, lead, track, played_by) {
+        if let Err(e) = schedule_abc_cell(&self.kernel, ctx, &abc, lead, track_id, played_by) {
             // A refused/failed schedule must be visible to the player, not just
             // logged (design §7): surface a BlockKind::Error anchored at the
             // turn's own output block so the player reads its own rejection next
@@ -1047,61 +1163,73 @@ impl BeatScheduler {
     /// reply before yielding.
     fn apply_command(&mut self, command: BeatCommand) -> BeatAck {
         match command {
-            BeatCommand::Arm { context_id, policy, track, rotate_every_phrases } => {
-                // A DB-read failure in `arm` bubbles to the BeatAck so `kj transport`
-                // (and the rc `&&` chain) sees a loud failure, never a silent
-                // poisoned (rewound) timeline reported as success.
-                self.arm(context_id, policy, track)?;
-                // Restore the persisted page-turn cadence after arming (a
-                // cold-restart re-arm). `None` leaves a live re-arm's cadence
-                // untouched; `Some` re-applies it (and re-persists, idempotently).
-                // `set_rotate` filters `Some(0)`.
-                if rotate_every_phrases.is_some() {
-                    self.set_rotate(context_id, rotate_every_phrases);
-                }
+            BeatCommand::Attach { track, context_id, attachment, policy } => {
+                // A DB-read failure in `attach` bubbles to the BeatAck so `kj
+                // transport` (and the rc `&&` chain) sees a loud failure, never a
+                // silent poisoned (rewound) timeline reported as success. The
+                // attachment carries wakeup/rotate/ooda, so there is no separate
+                // cadence-restore step (attach persists the binding itself).
+                self.attach(track, context_id, attachment, policy)
+            }
+            BeatCommand::Detach { track, context_id } => {
+                self.detach(&track, context_id);
                 Ok(())
             }
-            BeatCommand::Play(ctx) => {
-                self.play(ctx, Instant::now());
-                self.armed_ack(ctx)
+            BeatCommand::Play(track) => {
+                self.play(&track, Instant::now());
+                self.track_ack(&track)
             }
-            BeatCommand::Pause(ctx) => {
-                self.pause(ctx);
-                self.armed_ack(ctx)
+            BeatCommand::Pause(track) => {
+                self.pause(&track);
+                self.track_ack(&track)
             }
-            BeatCommand::Stop(ctx) => {
-                self.stop(ctx);
-                self.armed_ack(ctx)
+            BeatCommand::Stop(track) => {
+                self.stop(&track);
+                self.track_ack(&track)
             }
-            BeatCommand::SetTempo { context_id, period } => {
-                self.set_tempo(context_id, period);
-                self.armed_ack(context_id)
+            BeatCommand::SetTempo { track, period } => {
+                self.set_tempo(&track, period);
+                self.track_ack(&track)
             }
-            BeatCommand::SetOoda { context_id, armed } => {
-                self.set_ooda(context_id, armed);
-                self.armed_ack(context_id)
+            BeatCommand::SetOoda { track, context_id, armed } => {
+                self.set_ooda(&track, context_id, armed);
+                self.attached_ack(&track, context_id)
             }
-            BeatCommand::SetRotate { context_id, every_phrases } => {
-                self.set_rotate(context_id, every_phrases);
-                self.armed_ack(context_id)
-            }
-            BeatCommand::Disarm(ctx) => {
-                self.disarm(ctx);
-                Ok(())
+            BeatCommand::SetRotate { track, context_id, every } => {
+                self.set_rotate(&track, context_id, every);
+                self.attached_ack(&track, context_id)
             }
         }
     }
 
-    /// `Ok` if the context is armed (so the command that just ran was a real
-    /// effect), else a loud `Err` — none of the apply methods change membership,
-    /// so checking after the call is exact.
-    fn armed_ack(&self, ctx: ContextId) -> BeatAck {
-        if self.armed.contains_key(&ctx) {
+    /// `Ok` if the track has a live clock domain (so a clock-domain command landed),
+    /// else a loud `Err` — none of the apply methods drop a track, so checking after
+    /// the call is exact.
+    fn track_ack(&self, track_id: &TrackId) -> BeatAck {
+        if self.tracks.contains_key(track_id) {
             Ok(())
         } else {
             Err(format!(
-                "context {} is not armed — run `kj transport arm` first",
-                ctx.short()
+                "track '{}' has no clock — `kj transport attach` a context to it first",
+                track_id.as_str()
+            ))
+        }
+    }
+
+    /// `Ok` if the context is attached to the track (so a per-attachment command
+    /// landed), else a loud `Err`.
+    fn attached_ack(&self, track_id: &TrackId, ctx: ContextId) -> BeatAck {
+        let attached = self
+            .tracks
+            .get(track_id)
+            .is_some_and(|t| t.attached.contains_key(&ctx));
+        if attached {
+            Ok(())
+        } else {
+            Err(format!(
+                "context {} is not attached to track '{}' — run `kj transport attach` first",
+                ctx.short(),
+                track_id.as_str()
             ))
         }
     }
@@ -1214,7 +1342,8 @@ mod tests {
     use kaijutsu_kernel::Kernel;
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind, SharedBlockStore};
     use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
-    use kaijutsu_kernel::hyoushigi::BeatPolicy;
+    use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
+    use kaijutsu_kernel::hyoushigi::{Attachment, BeatPolicy, Cadence};
     use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
 
@@ -1302,29 +1431,31 @@ mod tests {
     /// The transport heartbeat reports the present-tense now-facts: playhead
     /// tick, phrases elapsed, and tempo in whole BPM. These are what a player
     /// composes its next phrase against; `$HEARD` is deliberately absent (a pull,
-    /// not a pushed var — see `transport_vars` docs).
+    /// not a pushed var — see `transport_vars` docs). Keys are `KJ_`-prefixed
+    /// (the kernel-injection convention from `docs/tracks.md`).
     #[test]
     fn transport_vars_report_now_facts() {
         // musician_default: 500 ms/beat (= 120 BPM), 16 beats/phrase.
         let m = vars_map(transport_vars(Tick::new(128), 128, &BeatPolicy::musician_default()));
-        assert_eq!(m["TICK"], "128", "playhead tick verbatim");
-        assert_eq!(m["PHRASE"], "8", "128 beats / 16 per phrase = phrase 8");
-        assert_eq!(m["TEMPO"], "120", "500 ms/beat rounds to 120 BPM");
+        assert_eq!(m["KJ_TICK"], "128", "playhead tick verbatim");
+        assert_eq!(m["KJ_PHRASE"], "8", "128 beats / 16 per phrase = phrase 8");
+        assert_eq!(m["KJ_TEMPO"], "120", "500 ms/beat rounds to 120 BPM");
     }
 
     /// A faster tempo and a mid-phrase playhead: tick is exact, phrase floors,
     /// BPM rounds. Guards the formatting against off-by-one phrase math.
     #[test]
     fn transport_vars_floor_phrase_and_round_bpm() {
+        // `ooda_every` is gone — it moved onto `Attachment::wakeup`. `BeatPolicy`
+        // is now purely track-level musical knobs (period + beats_per_phrase).
         let policy = BeatPolicy {
             period: Duration::from_millis(300), // 200 BPM
             beats_per_phrase: 16,
-            ooda_every: 16,
         };
         let m = vars_map(transport_vars(Tick::new(40), 40, &policy));
-        assert_eq!(m["TICK"], "40");
-        assert_eq!(m["PHRASE"], "2", "40 / 16 floors to 2 (mid third phrase)");
-        assert_eq!(m["TEMPO"], "200", "300 ms/beat = 200 BPM");
+        assert_eq!(m["KJ_TICK"], "40");
+        assert_eq!(m["KJ_PHRASE"], "2", "40 / 16 floors to 2 (mid third phrase)");
+        assert_eq!(m["KJ_TEMPO"], "200", "300 ms/beat = 200 BPM");
     }
 
     /// Defensive: a zero `beats_per_phrase` (no phrasing) reports phrase 0 rather
@@ -1334,10 +1465,9 @@ mod tests {
         let policy = BeatPolicy {
             period: Duration::from_millis(500),
             beats_per_phrase: 0,
-            ooda_every: 1,
         };
         let m = vars_map(transport_vars(Tick::new(5), 5, &policy));
-        assert_eq!(m["PHRASE"], "0", "no phrasing → phrase 0, never a divide-by-zero");
+        assert_eq!(m["KJ_PHRASE"], "0", "no phrasing → phrase 0, never a divide-by-zero");
     }
 
     /// The poison-cell retry budget: the bridge retries the SAME failing cell up to
@@ -1453,13 +1583,26 @@ mod tests {
         }
     }
 
-    /// A 1-second beat policy with a large OODA cadence and phrase length (neither
-    /// cadence nor phrase boundaries fire in the span of these tests).
+    /// A 1-second beat policy with a large phrase length (phrase boundaries never
+    /// fire in the span of these tests). `ooda_every` is now on the `Attachment`
+    /// — use `slow_attachment()` alongside this policy.
     fn slow_policy() -> BeatPolicy {
         BeatPolicy {
             period: Duration::from_secs(1),
             beats_per_phrase: 1_000_000,
-            ooda_every: 1_000_000,
+        }
+    }
+
+    /// A matching attachment for `slow_policy()`: wakeup cadence so large that
+    /// OODA never fires in the span of these tests (subsumes the old `ooda_every:
+    /// 1_000_000`). OODA is armed so tests that check it still work; a test that
+    /// explicitly wants OODA off calls `set_ooda` separately.
+    fn slow_attachment() -> Attachment {
+        Attachment {
+            wakeup: Cadence::new(1_000_000),
+            rotate: None,
+            ooda_armed: true,
+            pulse: 0,
         }
     }
 
@@ -1472,8 +1615,8 @@ mod tests {
             .collect()
     }
 
-    /// Playing drives one ticked block per beat in tick order; arming alone
-    /// produces nothing (create stopped); disarm halts.
+    /// Playing drives one ticked block per beat in tick order; attaching alone
+    /// produces nothing (track created stopped); detach halts.
     #[tokio::test]
     async fn play_produces_ticked_blocks_in_order_arm_is_stopped() {
         let (kernel, documents) = fresh_kernel_and_docs().await;
@@ -1483,16 +1626,17 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
+        let track_id = TrackId::solo();
 
-        // Armed but not played: stopped → no heap entry, no blocks.
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
-        assert!(sched.next_wake().is_none(), "arm alone schedules nothing (stopped)");
+        // Attached but not played: track created stopped → no heap entry, no blocks.
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        assert!(sched.next_wake().is_none(), "attach alone schedules nothing (track stopped)");
         let out = sched.fire_due(base + Duration::from_secs(1));
         assert!(out.fired.is_empty());
         assert_eq!(contents(&documents, ctx).len(), 0);
 
         // Play: now it beats.
-        sched.play(ctx, base);
+        sched.play(&track_id, base);
         for i in 1..=5 {
             let out = sched.fire_due(base + Duration::from_secs(i));
             assert_eq!(out.fired, vec![ctx], "beat {i}");
@@ -1503,12 +1647,14 @@ mod tests {
             vec!["beat-1", "beat-2", "beat-3", "beat-4", "beat-5"],
         );
 
-        sched.disarm(ctx);
+        // Detach: the context is removed; the track clock keeps running but fires
+        // no contexts. This is `disarm` in the old API — now explicit with track.
+        sched.detach(&track_id, ctx);
         let out = sched.fire_due(base + Duration::from_secs(6));
-        assert!(out.fired.is_empty(), "disarmed → no beats");
+        assert!(out.fired.is_empty(), "detached → context no longer fires");
     }
 
-    /// Pause freezes the playhead; resume picks up at +1 with no wall-clock
+    /// Pause freezes the track playhead; resume picks up at +1 with no wall-clock
     /// catch-up, even after a long quiescent gap.
     #[tokio::test]
     async fn pause_freezes_and_resume_continues_at_plus_one() {
@@ -1519,20 +1665,21 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(ctx, base);
+        let track_id = TrackId::solo();
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track_id, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // tick 1
         sched.fire_due(base + Duration::from_secs(2)); // tick 2
         assert_eq!(contents(&documents, ctx), vec!["beat-1", "beat-2"]);
 
         // Pause; the stale heap entry fires once and is dropped — no advance.
-        sched.pause(ctx);
+        sched.pause(&track_id);
         sched.fire_due(base + Duration::from_secs(3));
         assert_eq!(contents(&documents, ctx).len(), 2, "paused → frozen");
 
         // Resume much later in wall-clock; the tick continues at 3, not jumping.
-        sched.play(ctx, base + Duration::from_secs(3600));
+        sched.play(&track_id, base + Duration::from_secs(3600));
         sched.fire_due(base + Duration::from_secs(3601));
         assert_eq!(
             contents(&documents, ctx),
@@ -1541,7 +1688,9 @@ mod tests {
         );
     }
 
-    /// A context played mid-run gets its own beats — the heap coalesces contexts.
+    /// A second context attached to the same track mid-run also beats when the
+    /// track fires. Both contexts share one clock domain (the track), so the
+    /// second `play` call is a no-op (the track is already playing).
     #[tokio::test]
     async fn second_context_played_midrun_also_beats() {
         let (kernel, documents) = fresh_kernel_and_docs().await;
@@ -1554,23 +1703,34 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(a, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(a, base);
+        let track_id = TrackId::solo();
+        sched.attach(track_id.clone(), a, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track_id, base);
 
         sched.fire_due(base + Duration::from_secs(1));
         sched.fire_due(base + Duration::from_secs(2));
         assert_eq!(contents(&documents, a).len(), 2);
-        assert_eq!(contents(&documents, b).len(), 0, "b not playing yet");
+        assert_eq!(contents(&documents, b).len(), 0, "b not attached yet");
 
-        sched.arm(b, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(b, base + Duration::from_secs(2));
-        sched.fire_due(base + Duration::from_secs(3)); // both due
+        // Attach b to the already-playing track. b's timeline was pre-seeded at
+        // Tick::ZERO by preseed_markers (arm_timeline is idempotent), so it stays
+        // at 0 and catches up when the track next fires at beat 3.
+        sched.attach(track_id.clone(), b, slow_attachment(), slow_policy()).unwrap();
+        // `play` is a no-op — the track is already running.
+        sched.play(&track_id, base + Duration::from_secs(2));
+        // Beat 3: both a and b fire. b's timeline slews from 0→3 (catch-up),
+        // materializing beat-1, beat-2, beat-3.
+        sched.fire_due(base + Duration::from_secs(3));
         assert_eq!(contents(&documents, a).len(), 3);
-        assert_eq!(contents(&documents, b).len(), 1, "b got its first beat");
+        assert!(
+            !contents(&documents, b).is_empty(),
+            "b fires on its first beat (attached to a running track)"
+        );
     }
 
-    /// The OODA cadence fires every `ooda_every` beats — but only while OODA is
-    /// armed. `stop` (OODA off) and `set_ooda(false)` suppress it.
+    /// The wakeup cadence fires every N beats — but only while OODA is armed.
+    /// `set_ooda(false)` suppresses it without touching the clock. The wakeup
+    /// cadence moved from `BeatPolicy.ooda_every` onto `Attachment.wakeup`.
     #[tokio::test]
     async fn ooda_cadence_fires_every_n_beats_when_armed() {
         let (kernel, documents) = fresh_kernel_and_docs().await;
@@ -1584,17 +1744,16 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(
+        let track_id = TrackId::solo();
+        // wakeup every 3 beats (was `ooda_every: 3` on BeatPolicy).
+        sched.attach(
+            track_id.clone(),
             ctx,
-            BeatPolicy {
-                period: Duration::from_secs(1),
-                beats_per_phrase: 1_000_000,
-                ooda_every: 3,
-            },
-            TrackId::solo(),
+            Attachment { wakeup: Cadence::new(3), rotate: None, ooda_armed: true, pulse: 0 },
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 1_000_000 },
         )
         .unwrap();
-        sched.play(ctx, base);
+        sched.play(&track_id, base);
 
         let mut ooda_beats = Vec::new();
         for i in 1..=6 {
@@ -1605,8 +1764,8 @@ mod tests {
         }
         assert_eq!(ooda_beats, vec![3, 6], "OODA boundary every 3 beats while armed");
 
-        // Disarm OODA: cadence boundaries no longer report due.
-        sched.set_ooda(ctx, false);
+        // Disarm OODA: wakeup cadence boundaries no longer report due.
+        sched.set_ooda(&track_id, ctx, false);
         let mut after = Vec::new();
         for i in 7..=12 {
             let out = sched.fire_due(base + Duration::from_secs(i));
@@ -1635,18 +1794,16 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        // beats_per_phrase = 4; large ooda so the OODA cadence never coincides.
-        sched.arm(
+        let track_id = TrackId::solo();
+        // beats_per_phrase = 4; large wakeup so the OODA cadence never coincides.
+        sched.attach(
+            track_id.clone(),
             ctx,
-            BeatPolicy {
-                period: Duration::from_secs(1),
-                beats_per_phrase: 4,
-                ooda_every: 1_000_000,
-            },
-            TrackId::solo(),
+            Attachment { wakeup: Cadence::new(1_000_000), rotate: None, ooda_armed: true, pulse: 0 },
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4 },
         )
         .unwrap();
-        sched.play(ctx, base);
+        sched.play(&track_id, base);
 
         let mut phrase_beats = Vec::new();
         for i in 1..=12 {
@@ -1663,11 +1820,12 @@ mod tests {
         );
     }
 
-    /// The rotate-race fix (docs/issues.md): at a rotate horizon the scheduler
-    /// retires the parent SYNCHRONOUSLY in `fire_due` — it reports `rotate_due`
-    /// (NOT `ooda_due`, even when the OODA cadence coincides) and the parent does
-    /// not fire again. This is what closes the stray-tick / double-fork race that
-    /// a pure-rc `kj transport ooda off` (async via the ingress) could not.
+    /// At a rotate horizon the scheduler DETACHES the parent SYNCHRONOUSLY in
+    /// `fire_due` — it reports `rotate_due` (NOT `ooda_due`, even when the OODA
+    /// cadence coincides) and the parent does not fire again. This closes the
+    /// stray-tick / double-fork race that an async disarm could not. In the new
+    /// model, "retirement" is a synchronous detach (not just stop), and the
+    /// track's clock KEEPS RUNNING — continuity is free.
     #[tokio::test]
     async fn rotate_horizon_retires_parent_synchronously() {
         let (kernel, documents) = fresh_kernel_and_docs().await;
@@ -1681,16 +1839,18 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        // phrase = 2 beats; OODA also every 2 beats so the rotate beat COINCIDES
+        let track_id = TrackId::solo();
+        // phrase = 2 beats; wakeup also every 2 beats so the rotate beat COINCIDES
         // with an OODA boundary — proving rotate suppresses the stray ooda tick.
-        sched.arm(
+        sched.attach(
+            track_id.clone(),
             ctx,
-            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 2 },
-            TrackId::solo(),
+            Attachment { wakeup: Cadence::new(2), rotate: None, ooda_armed: true, pulse: 0 },
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2 },
         )
         .unwrap();
-        sched.set_rotate(ctx, Some(1)); // rotate every phrase
-        sched.play(ctx, base);
+        sched.set_rotate(&track_id, ctx, Some(Cadence::new(1))); // rotate every phrase
+        sched.play(&track_id, base);
 
         // Beat 1: mid-phrase — nothing due.
         let b1 = sched.fire_due(base + Duration::from_secs(1));
@@ -1698,14 +1858,27 @@ mod tests {
         assert!(b1.rotate_due.is_empty() && b1.ooda_due.is_empty());
 
         // Beat 2: phrase 1 horizon → rotate. Reported on rotate_due, and NOT on
-        // ooda_due even though 2 % ooda_every == 0 (the rotate suppresses it).
+        // ooda_due even though beat_count % wakeup_cadence == 0.
         let b2 = sched.fire_due(base + Duration::from_secs(2));
         assert_eq!(b2.rotate_due, vec![ctx], "horizon reports rotate_due");
         assert!(b2.ooda_due.is_empty(), "rotate suppresses the coincident ooda tick");
-        assert!(!sched.armed.get(&ctx).unwrap().playing, "parent stopped synchronously");
-        assert!(!sched.armed.get(&ctx).unwrap().ooda_armed, "parent OODA disarmed");
+        // In the new model, rotation DETACHES the context (not just stops it).
+        // The context is removed from the track's attached set and reverse index.
+        assert!(
+            !sched.tracks[&track_id].attached.contains_key(&ctx),
+            "parent is detached from the track after a rotate horizon (synchronous retire)"
+        );
+        assert!(
+            !sched.context_track.contains_key(&ctx),
+            "parent removed from the context→track reverse index"
+        );
+        // The track clock KEEPS RUNNING — continuity is free across the page-turn.
+        assert!(
+            sched.tracks[&track_id].playing,
+            "the track clock never pauses across a rotation page-turn"
+        );
 
-        // Beat 3+: the parent was not re-armed → it never fires again. No stray
+        // Beat 3+: the parent was detached → it never fires again. No stray
         // ticks could leak between the rotate decision and a (now unnecessary)
         // async disarm, because there is no async disarm.
         let b3 = sched.fire_due(base + Duration::from_secs(3));
@@ -1728,14 +1901,16 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(
+        let track_id = TrackId::solo();
+        sched.attach(
+            track_id.clone(),
             ctx,
-            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 1_000_000 },
-            TrackId::solo(),
+            Attachment { wakeup: Cadence::new(1_000_000), rotate: None, ooda_armed: true, pulse: 0 },
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2 },
         )
         .unwrap();
-        sched.set_rotate(ctx, Some(2)); // rotate every 2 phrases
-        sched.play(ctx, base);
+        sched.set_rotate(&track_id, ctx, Some(Cadence::new(2))); // rotate every 2 phrases
+        sched.play(&track_id, base);
 
         let mut rotate_beats = Vec::new();
         for i in 1..=4 {
@@ -1763,13 +1938,15 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(
+        let track_id = TrackId::solo();
+        sched.attach(
+            track_id.clone(),
             ctx,
-            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 1_000_000 },
-            TrackId::solo(),
+            Attachment { wakeup: Cadence::new(1_000_000), rotate: None, ooda_armed: true, pulse: 0 },
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2 },
         )
         .unwrap();
-        sched.play(ctx, base);
+        sched.play(&track_id, base);
 
         for i in 1..=4 {
             let out = sched.fire_due(base + Duration::from_secs(i));
@@ -1819,16 +1996,16 @@ mod tests {
             insert_player_abc(&documents, ctx, player, "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEFGABc|\n");
 
         // beats_per_phrase = 4 so the scheduling lead (= phrase_delta() = 4) is
-        // reachable in this 8-beat window; large ooda so the cadence never fires.
+        // reachable in this 8-beat window; large wakeup so the OODA cadence never fires.
         let phrase = BeatPolicy {
             period: Duration::from_secs(1),
             beats_per_phrase: 4,
-            ooda_every: 1_000_000,
         };
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, phrase, TrackId::solo()).unwrap();
-        sched.play(ctx, base);
+        let track_id = TrackId::solo();
+        sched.attach(track_id.clone(), ctx, slow_attachment(), phrase).unwrap();
+        sched.play(&track_id, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // playhead → 1
         // The cell is scheduled at playhead(1) + phrase_delta()(4) = tick 5. The
@@ -1890,7 +2067,6 @@ mod tests {
         let phrase = BeatPolicy {
             period: Duration::from_secs(1),
             beats_per_phrase: 4,
-            ooda_every: 1_000_000,
         };
 
         // Helper: count scheduled future cells.
@@ -1905,8 +2081,8 @@ mod tests {
             documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
-            sched.play(ctx, base);
+            sched.attach(TrackId::solo(), ctx, slow_attachment(), phrase).unwrap();
+            sched.play(&TrackId::solo(), base);
             sched.fire_due(base + Duration::from_secs(1));
             sched.on_turn_completed(ctx, None);
             assert_eq!(future_len(&kernel, ctx), 0, "None → nothing scheduled");
@@ -1920,8 +2096,8 @@ mod tests {
             preseed_markers(&kernel, ctx, 1);
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
-            sched.play(ctx, base);
+            sched.attach(TrackId::solo(), ctx, slow_attachment(), phrase).unwrap();
+            sched.play(&TrackId::solo(), base);
             sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
             let materialized = documents.last_block_id(ctx).unwrap();
             assert!(
@@ -1957,8 +2133,8 @@ mod tests {
                 .unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
-            sched.play(ctx, base);
+            sched.attach(TrackId::solo(), ctx, slow_attachment(), phrase).unwrap();
+            sched.play(&TrackId::solo(), base);
             sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
             sched.on_turn_completed(ctx, Some(beat_block));
@@ -1991,8 +2167,8 @@ mod tests {
             documents.set_ephemeral(ctx, &eph, true).unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
-            sched.play(ctx, base);
+            sched.attach(TrackId::solo(), ctx, slow_attachment(), phrase).unwrap();
+            sched.play(&TrackId::solo(), base);
             sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
             sched.on_turn_completed(ctx, Some(eph));
@@ -2012,8 +2188,8 @@ mod tests {
             let abc = insert_player_abc(&documents, ctx, player, "X:1\nK:C\nCDEFGABc|\n");
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
-            sched.play(ctx, base);
+            sched.attach(TrackId::solo(), ctx, slow_attachment(), phrase).unwrap();
+            sched.play(&TrackId::solo(), base);
             sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
             sched.on_turn_completed(ctx, Some(abc));
@@ -2043,13 +2219,14 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(
-            ctx,
-            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4, ooda_every: 1_000_000 },
+        sched.attach(
             TrackId::solo(),
+            ctx,
+            slow_attachment(),
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4 },
         )
         .unwrap();
-        sched.play(ctx, base);
+        sched.play(&TrackId::solo(), base);
         sched.fire_due(base + Duration::from_secs(1));
 
         let errors_before = documents
@@ -2123,7 +2300,7 @@ mod tests {
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
 
         // Arm: the playhead seeds to the max committed tick, not Tick::ZERO.
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
+        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
         let playhead_after_arm = kernel.timeline(ctx).unwrap().lock().playhead();
         assert_eq!(
             playhead_after_arm,
@@ -2133,7 +2310,7 @@ mod tests {
 
         // First beat advances from the seeded position: T → T+1.
         let base = Instant::now();
-        sched.play(ctx, base);
+        sched.play(&TrackId::solo(), base);
         sched.fire_due(base + Duration::from_secs(1));
         let playhead_after_beat = kernel.timeline(ctx).unwrap().lock().playhead();
         assert_eq!(
@@ -2145,7 +2322,7 @@ mod tests {
         // Re-arm of the now-LIVE timeline must NOT re-seed or rewind: the
         // playhead stays where the beat left it (seed_playhead is virgin-only,
         // applied inside or_insert_with which never fires on a re-arm).
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
+        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
         let playhead_after_rearm = kernel.timeline(ctx).unwrap().lock().playhead();
         assert_eq!(
             playhead_after_rearm,
@@ -2207,116 +2384,118 @@ mod tests {
         (kernel, documents, db, ctx)
     }
 
-    /// Arm and tempo-change write the live policy + lane through to `beat_state`,
-    /// so a kernel restart can re-arm the musician with its real values instead of
-    /// `BeatPolicy::musician_default()`. This is the durable half of "re-arm is
-    /// possible after a cold start" — the read half is `kj transport arm`.
+    /// Attach + tempo + rotate write the live clock through to the `tracks` row and
+    /// the binding through to the `attachments` row, so a kernel restart can recover
+    /// the clock domain + binding with their real values. The durable half of "re-arm
+    /// after a cold start"; the read half is `kj transport attach`.
     #[tokio::test]
-    async fn arm_and_tempo_persist_beat_state() {
-        use kaijutsu_kernel::kernel_db::PersistedBeatState;
-
+    async fn attach_and_tempo_persist_track_and_attachment() {
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
         let mut sched = BeatScheduler::new(kernel, documents);
 
-        // Arm with a non-default policy on the `bass` lane.
-        let policy = BeatPolicy { period: Duration::from_millis(500), beats_per_phrase: 12, ooda_every: 96 };
+        // Attach with a non-default policy + attachment on the `bass` lane.
+        let policy = BeatPolicy { period: Duration::from_millis(500), beats_per_phrase: 12 };
         let track = TrackId::new("bass").unwrap();
-        sched.arm(ctx, policy, track.clone()).unwrap();
+        let attachment =
+            Attachment { wakeup: Cadence::new(96), rotate: None, ooda_armed: true, pulse: 0 };
+        sched.attach(track.clone(), ctx, attachment, policy).unwrap();
 
+        // The track row mirrors the clock (tempo + phrase). Fresh ctx → playhead 0.
         assert_eq!(
-            db.lock().get_beat_state(ctx).unwrap(),
-            Some(PersistedBeatState {
+            db.lock().get_track("bass").unwrap(),
+            Some(PersistedTrack {
+                track_id: "bass".to_string(),
                 period_ms: 500,
                 beats_per_phrase: 12,
-                ooda_every: 96,
-                track: "bass".to_string(),
-                rotate_every_phrases: None,
-                // Fresh context, no committed blocks → playhead seeds to 0, and the
-                // arm-time snapshot mirrors that live position.
                 playhead_tick: Some(0),
+                playing: false,
             }),
-            "arm mirrors the policy + lane into beat_state for restart re-arm"
+            "attach mirrors the clock into the tracks row for restart recovery"
+        );
+        // The attachment row mirrors the binding.
+        assert_eq!(
+            db.lock().get_attachment("bass", ctx).unwrap(),
+            Some(PersistedAttachment {
+                track_id: "bass".to_string(),
+                context_id: ctx,
+                wakeup_every: 96,
+                rotate_every_phrases: None,
+                ooda_armed: true,
+            }),
+            "attach mirrors the binding into the attachments row"
         );
 
-        // A tempo change to 240 BPM (250 ms) updates the persisted period in place,
-        // leaving the rest of the policy intact.
-        sched.set_tempo(ctx, Duration::from_millis(250));
+        // A tempo change to 240 BPM (250 ms) updates the persisted period in place.
+        sched.set_tempo(&track, Duration::from_millis(250));
         assert_eq!(
-            db.lock().get_beat_state(ctx).unwrap(),
-            Some(PersistedBeatState {
-                period_ms: 250,
-                beats_per_phrase: 12,
-                ooda_every: 96,
-                track: "bass".to_string(),
-                rotate_every_phrases: None,
-                playhead_tick: Some(0),
-            }),
-            "set_tempo write-through updates the persisted period, not the whole row"
+            db.lock().get_track("bass").unwrap().unwrap().period_ms,
+            250,
+            "set_tempo write-through updates the persisted period"
         );
 
-        // Setting a rotate cadence write-throughs too — so a cold-restart re-arm
-        // restores the page-turn, not just tempo/lane (the gap kaibo flagged).
-        sched.set_rotate(ctx, Some(4));
+        // Setting a rotate cadence write-throughs to the attachment row.
+        sched.set_rotate(&track, ctx, Some(Cadence::new(4)));
         assert_eq!(
-            db.lock().get_beat_state(ctx).unwrap().unwrap().rotate_every_phrases,
+            db.lock().get_attachment("bass", ctx).unwrap().unwrap().rotate_every_phrases,
             Some(4),
-            "set_rotate persists the cadence for restart re-arm"
+            "set_rotate persists the cadence for restart recovery"
         );
         // Clearing it persists the cleared (NULL) state.
-        sched.set_rotate(ctx, None);
+        sched.set_rotate(&track, ctx, None);
         assert_eq!(
-            db.lock().get_beat_state(ctx).unwrap().unwrap().rotate_every_phrases,
+            db.lock().get_attachment("bass", ctx).unwrap().unwrap().rotate_every_phrases,
             None,
             "rotate off persists as NULL"
         );
     }
 
-    /// Tick continuity across the rotation page-turn (docs/chameleon.md): a thin
-    /// spawn-fork child has NO committed blocks (max_tick = 0), but the fork copied
-    /// the parent's `beat_state.playhead_tick`. `arm` must seed the child's playhead
-    /// from that carried value so musical time CONTINUES across the page-turn
-    /// instead of resetting to tick 0 (which is what shipped before this fix).
+    /// Continuity across a rotation page-turn WITHOUT a carry: the TRACK owns the
+    /// playhead and persists it in the `tracks` row. A child attaching to a track
+    /// whose durable row carries playhead 512 — but which has no committed blocks of
+    /// its own — seeds the (re-created) track AND its Timeline from the track's
+    /// durable playhead, so musical time continues from 512, not 0. This replaces the
+    /// old per-context `beat_state.playhead_tick` carry: the clock stayed on the
+    /// track, so "copy the number" became "the track never left."
     #[tokio::test]
-    async fn arm_seeds_carried_playhead_when_no_committed_blocks() {
+    async fn attach_continues_from_persisted_track_playhead_no_carry() {
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
 
-        // Stand in for the fork copy: the child's row carries the parent's live
-        // playhead (512) but the child has no committed blocks of its own.
+        // The track's durable row carries playhead 512 (e.g. left by the parent
+        // before the page-turn); the attaching child has no committed blocks.
         db.lock()
-            .upsert_beat_state(
-                ctx,
-                &kaijutsu_kernel::kernel_db::PersistedBeatState {
-                    period_ms: 500,
-                    beats_per_phrase: 16,
-                    ooda_every: 128,
-                    track: "bass".to_string(),
-                    rotate_every_phrases: None,
-                    playhead_tick: Some(512),
-                },
-            )
+            .upsert_track(&PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 500,
+                beats_per_phrase: 16,
+                playhead_tick: Some(512),
+                playing: false,
+            })
             .unwrap();
         assert_eq!(
             documents.max_tick(ctx).unwrap(),
             None,
-            "the thin child has no committed blocks — without the carry, seed = 0"
+            "the thin child has no committed blocks — without the track row, seed = 0"
         );
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents);
-        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap()).unwrap();
+        sched
+            .attach(TrackId::new("bass").unwrap(), ctx, slow_attachment(), slow_policy())
+            .unwrap();
 
         assert_eq!(
             kernel.timeline(ctx).unwrap().lock().playhead(),
             Tick::new(512),
-            "arm continues musical time from the carried playhead, not tick 0"
+            "attach continues musical time from the track's persisted playhead, not tick 0"
         );
     }
 
-    /// The carried playhead can never *hide* committed musical time: `arm` seeds
-    /// from `max(max_tick, carried)`, so a context with real committed history
-    /// (a cold-restart re-arm) trusts its block log even when a stale `beat_state`
-    /// row carries a lower playhead. Guards the `max()` direction.
+    /// The persisted track playhead can never *hide* committed musical time: the
+    /// track seed is `max(max_tick, persisted track playhead)`, so a lane with real
+    /// committed history (a cold-restart re-attach) trusts its block log even when a
+    /// stale `tracks` row carries a lower playhead. Guards the `max()` direction (no
+    /// carry; the clock is on the track now).
     #[tokio::test]
-    async fn committed_max_tick_wins_over_stale_carried_playhead() {
+    async fn committed_max_tick_wins_over_stale_persisted_track_playhead() {
         use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
 
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
@@ -2334,115 +2513,114 @@ mod tests {
                     .build();
             documents.insert_from_snapshot_as(ctx, snap, None, Some(player)).unwrap();
         }
-        // A stale carried playhead BELOW the committed high-water.
+        // A stale persisted track playhead BELOW the committed high-water.
         db.lock()
-            .upsert_beat_state(
-                ctx,
-                &kaijutsu_kernel::kernel_db::PersistedBeatState {
-                    period_ms: 500,
-                    beats_per_phrase: 16,
-                    ooda_every: 128,
-                    track: "bass".to_string(),
-                    rotate_every_phrases: None,
-                    playhead_tick: Some(42),
-                },
-            )
+            .upsert_track(&PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 500,
+                beats_per_phrase: 16,
+                playhead_tick: Some(42),
+                playing: false,
+            })
             .unwrap();
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents);
-        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap()).unwrap();
+        sched
+            .attach(TrackId::new("bass").unwrap(), ctx, slow_attachment(), slow_policy())
+            .unwrap();
 
         assert_eq!(
             kernel.timeline(ctx).unwrap().lock().playhead(),
             Tick::new(big_t),
-            "the committed max tick wins over a stale lower carried playhead"
+            "the committed max tick wins over a stale lower persisted track playhead"
         );
     }
 
-    /// A DB read failure during `arm` is FATAL, not a seed-from-zero fallback:
+    /// A DB read failure during `attach` is FATAL, not a seed-from-zero fallback:
     /// seeding a rewound playhead onto a virgin timeline would overwrite committed
-    /// history (`DuplicateBlock` cascade). A corrupt `beat_state` row (here a
-    /// negative `playhead_tick`, which `get_beat_state` rejects) must fail the arm
-    /// loudly and leave NO timeline behind — never silently seed from zero
-    /// (gemini review 2026-06-29; CLAUDE.md crash-over-corruption).
+    /// history (`DuplicateBlock` cascade). A corrupt `tracks` row (here `period_ms =
+    /// 0`, which `get_track` rejects) must fail the attach loudly and leave NO
+    /// timeline behind — never silently seed from zero (CLAUDE.md
+    /// crash-over-corruption).
     #[tokio::test]
-    async fn arm_fails_loud_on_corrupt_beat_state_never_seeds_zero() {
+    async fn attach_fails_loud_on_corrupt_track_row_never_seeds_zero() {
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
 
-        // Poison the row: `u64::MAX` is written `as i64` = -1, which `get_beat_state`
-        // rejects as corrupt (a negative coordinate would wrap to a far-future seed).
-        // Stands in for bit-rot / tampering / a non-Rust writer.
+        // Poison the track row: a zero period is corrupt (it would spin the beat
+        // scheduler), and `get_track` rejects it on read. Stands in for bit-rot /
+        // tampering / a non-Rust writer.
         db.lock()
-            .upsert_beat_state(
-                ctx,
-                &kaijutsu_kernel::kernel_db::PersistedBeatState {
-                    period_ms: 500,
-                    beats_per_phrase: 16,
-                    ooda_every: 128,
-                    track: "bass".to_string(),
-                    rotate_every_phrases: None,
-                    playhead_tick: Some(u64::MAX),
-                },
-            )
+            .upsert_track(&PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 0,
+                beats_per_phrase: 16,
+                playhead_tick: Some(0),
+                playing: false,
+            })
             .unwrap();
-        assert!(kernel.timeline(ctx).is_none(), "no timeline before arm");
+        assert!(kernel.timeline(ctx).is_none(), "no timeline before attach");
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents);
-        let result = sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap());
+        let result =
+            sched.attach(TrackId::new("bass").unwrap(), ctx, slow_attachment(), slow_policy());
 
-        assert!(result.is_err(), "arm must bubble the corrupt-row read error, not seed zero");
+        assert!(result.is_err(), "attach must bubble the corrupt-row read error, not seed zero");
         assert!(
             kernel.timeline(ctx).is_none(),
-            "a failed arm must NOT seed a (rewound) timeline — crash over corruption"
+            "a failed attach must NOT seed a (rewound) timeline — crash over corruption"
         );
     }
 
-    /// If the rotate-horizon `persist_state` FAILS, the page-turn is DEFERRED, not
-    /// taken from a stale row: a fork now would copy an out-of-date playhead and the
-    /// child would silently rewind. The parent stays on the clock and retries at the
-    /// next horizon — a delayed page-turn beats a corrupted child (gemini review
-    /// 2026-06-29; CLAUDE.md crash-over-corruption).
+    /// Rotation never pauses the clock and never rewinds: at the rotate horizon the
+    /// scheduler detaches the retiring context synchronously, but the TRACK keeps
+    /// beating (the playhead advances right through the page-turn). Replaces the old
+    /// "persist-before-stop defer" test — there is no persist-before-stop anymore
+    /// (the clock lives on the track and never leaves, so there is no horizon race to
+    /// defer; `docs/tracks.md` "the seed/carry logic collapses").
     #[tokio::test]
-    async fn rotate_horizon_defers_when_persist_fails() {
-        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
-        let mut sched = BeatScheduler::new(kernel.clone(), documents);
+    async fn rotate_horizon_detaches_context_but_track_keeps_beating() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        preseed_markers(&kernel, ctx, 6);
 
-        // 2-beat phrase, rotate every phrase → beat 2 is the rotate horizon.
-        sched
-            .arm(
-                ctx,
-                BeatPolicy {
-                    period: Duration::from_secs(1),
-                    beats_per_phrase: 2,
-                    ooda_every: 1_000_000,
-                },
-                TrackId::solo(),
-            )
-            .unwrap();
-        sched.set_rotate(ctx, Some(1)); // persisted while the context row still exists
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.play(ctx, base);
+        let track_id = TrackId::solo();
+        // 2-beat phrase, rotate every phrase → beat 2 is the rotate horizon.
+        let policy = BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2 };
+        let attachment = Attachment {
+            wakeup: Cadence::new(1_000_000),
+            rotate: Some(Cadence::new(1)),
+            ooda_armed: true,
+            pulse: 0,
+        };
+        sched.attach(track_id.clone(), ctx, attachment, policy).unwrap();
+        sched.play(&track_id, base);
 
-        // Poison the horizon persist: delete the context row. `ON DELETE CASCADE`
-        // drops the `beat_state` row, so the horizon's re-`upsert` FK-violates.
-        assert!(db.lock().delete_context(ctx).unwrap(), "context row deleted");
-
-        // Beat 1: mid-phrase, nothing due.
+        // Beat 1: mid-phrase, no rotate.
         let b1 = sched.fire_due(base + Duration::from_secs(1));
         assert!(b1.rotate_due.is_empty());
 
-        // Beat 2: the horizon — but the persist fails, so rotation is DEFERRED.
+        // Beat 2: the horizon — the context rotates (is detached) this beat.
         let b2 = sched.fire_due(base + Duration::from_secs(2));
+        assert_eq!(b2.rotate_due, vec![ctx], "the context hits its rotate horizon");
         assert!(
-            b2.rotate_due.is_empty(),
-            "rotation is deferred (not taken from a stale row) when the horizon persist fails"
+            sched.track_of(ctx).is_none(),
+            "the rotating context is detached synchronously (live-only)"
         );
 
-        // Beat 3: the parent is still on the clock — it kept beating, not retired.
+        // Beat 3: the TRACK kept beating across the page-turn — its playhead is at 3,
+        // not paused/rewound — even though no context is attached to produce.
         let b3 = sched.fire_due(base + Duration::from_secs(3));
         assert!(
-            b3.fired.contains(&ctx),
-            "the parent stays on the clock after a deferred page-turn (a delayed turn beats a rewound child)"
+            b3.fired.is_empty(),
+            "no producer is attached during the gap (the child re-binds via rc)"
+        );
+        assert_eq!(
+            sched.track_playhead(&track_id),
+            Some(Tick::new(3)),
+            "the track's clock never paused across the page-turn (continuity is free)"
         );
     }
 
@@ -2500,8 +2678,8 @@ mod tests {
         preseed_markers(&kernel, ctx, 1);
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(ctx, base);
+        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&TrackId::solo(), base);
         sched.fire_due(base + Duration::from_secs(1));
 
         // No Error block: a DuplicateBlock collision would surface (or wedge) here.
@@ -2580,8 +2758,8 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(ctx, base);
+        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&TrackId::solo(), base);
 
         let errors = |documents: &SharedBlockStore| -> Vec<String> {
             documents
@@ -2679,8 +2857,8 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(ctx, base);
+        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&TrackId::solo(), base);
 
         let errors = |documents: &SharedBlockStore| -> usize {
             documents
@@ -2741,8 +2919,8 @@ mod tests {
         preseed_markers(&kernel, ctx, 1);
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
-        sched.play(ctx, base);
+        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&TrackId::solo(), base);
         sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
         let last = documents
             .get_block_snapshot(ctx, &documents.last_block_id(ctx).unwrap())
@@ -2787,8 +2965,8 @@ mod tests {
             .unwrap();
         let mut sched_b = BeatScheduler::new(kernel_b.clone(), docs_b.clone());
         let base_b = Instant::now();
-        sched_b.arm(cb, slow_policy(), TrackId::solo()).unwrap();
-        sched_b.play(cb, base_b);
+        sched_b.attach(TrackId::solo(), cb, slow_attachment(), slow_policy()).unwrap();
+        sched_b.play(&TrackId::solo(), base_b);
         sched_b.fire_due(base_b + Duration::from_secs(1));
         sched_b.on_turn_completed(cb, docs_b.last_block_id(cb));
         for i in 2..=8 {
@@ -2829,13 +3007,15 @@ mod tests {
         // Short 4-beat phrase so the scheduling lead (= phrase_delta()) is small
         // enough to commit within this 8-beat window; large ooda so the cadence
         // never coincides.
-        sched_c.arm(
-            cc,
-            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4, ooda_every: 1_000_000 },
-            TrackId::solo(),
-        )
-        .unwrap();
-        sched_c.play(cc, base_c);
+        sched_c
+            .attach(
+                TrackId::solo(),
+                cc,
+                slow_attachment(),
+                BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4 },
+            )
+            .unwrap();
+        sched_c.play(&TrackId::solo(), base_c);
         sched_c.fire_due(base_c + Duration::from_secs(1));
         sched_c.on_turn_completed(cc, docs_c.last_block_id(cc));
         for i in 2..=8 {
@@ -2851,6 +3031,192 @@ mod tests {
         assert_eq!(
             midi.id.principal_id, player,
             "played_by is the ABC block's author (the player), threaded into the cell"
+        );
+    }
+
+    // ── Stage-1 track-model behaviours (the gemini-review TDD targets) ──────────
+
+    /// One beat that wakes TWO contexts on one track gives them the IDENTICAL
+    /// `KJ_EPOCH_NS` (the cross-context join key — latched ONCE per beat, not
+    /// re-read per context) and the same `KJ_TICK`. Pins the epoch-isolation finding.
+    #[tokio::test]
+    async fn one_beat_shares_epoch_and_tick_across_woken_contexts() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let a = ContextId::new();
+        let b = ContextId::new();
+        documents.create_document(a, DocumentKind::Conversation, None).unwrap();
+        documents.create_document(b, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let track_id = TrackId::solo();
+        // Both wake every beat (wakeup 1), OODA armed.
+        let att = Attachment { wakeup: Cadence::new(1), rotate: None, ooda_armed: true, pulse: 0 };
+        sched.attach(track_id.clone(), a, att, slow_policy()).unwrap();
+        sched.attach(track_id.clone(), b, att, slow_policy()).unwrap();
+        sched.play(&track_id, base);
+
+        let out = sched.fire_due(base + Duration::from_secs(1));
+        assert!(
+            out.ooda_due.contains(&a) && out.ooda_due.contains(&b),
+            "both contexts woke on beat 1"
+        );
+        let env_a = sched.transport_env(a);
+        let env_b = sched.transport_env(b);
+        assert_eq!(
+            env_a.get("KJ_EPOCH_NS"),
+            env_b.get("KJ_EPOCH_NS"),
+            "both see the beat's single latched wall-clock epoch"
+        );
+        assert!(
+            env_a.get("KJ_EPOCH_NS").is_some_and(|e| e != "0"),
+            "epoch is latched to a real instant"
+        );
+        assert_eq!(env_a.get("KJ_TICK"), env_b.get("KJ_TICK"), "same musical tick");
+    }
+
+    /// `KJ_PULSE` counts each attachment's OWN wakeups, not the track's beats: a
+    /// probe (wakeup 1) and a musician (wakeup 2) on one track diverge — after 4
+    /// beats the probe pulsed 4 times, the musician 2. Pins the pulse-isolation
+    /// finding (a sibling waking on other beats can't skip another's sequence).
+    #[tokio::test]
+    async fn pulse_is_per_attachment_not_per_track_beat() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let probe = ContextId::new();
+        let musician = ContextId::new();
+        documents.create_document(probe, DocumentKind::Conversation, None).unwrap();
+        documents.create_document(musician, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let track_id = TrackId::solo();
+        let probe_att =
+            Attachment { wakeup: Cadence::new(1), rotate: None, ooda_armed: true, pulse: 0 };
+        let musician_att =
+            Attachment { wakeup: Cadence::new(2), rotate: None, ooda_armed: true, pulse: 0 };
+        sched.attach(track_id.clone(), probe, probe_att, slow_policy()).unwrap();
+        sched.attach(track_id.clone(), musician, musician_att, slow_policy()).unwrap();
+        sched.play(&track_id, base);
+
+        for i in 1..=4 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        // Probe woke on beats 1,2,3,4 → pulse 4. Musician woke on 2,4 → pulse 2.
+        assert_eq!(sched.transport_env(probe).get("KJ_PULSE").unwrap(), "4");
+        assert_eq!(sched.transport_env(musician).get("KJ_PULSE").unwrap(), "2");
+        // On beat 4 BOTH woke → they share that beat's epoch + tick.
+        assert_eq!(
+            sched.transport_env(probe).get("KJ_EPOCH_NS"),
+            sched.transport_env(musician).get("KJ_EPOCH_NS"),
+        );
+        assert_eq!(sched.transport_env(probe).get("KJ_TICK").unwrap(), "4");
+    }
+
+    /// A FRESH context attached to an already-running track is seeded at the track's
+    /// CURRENT playhead, so its next beat is exactly ONE step — not a giant catch-up
+    /// from zero through a window it was never alive for. Pins the seed-gap finding
+    /// (the "rotation swaps the binding with zero discontinuity" target).
+    #[tokio::test]
+    async fn fresh_context_attaches_at_track_playhead_no_catchup() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let a = ContextId::new();
+        documents.create_document(a, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let track_id = TrackId::solo();
+        sched.attach(track_id.clone(), a, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track_id, base);
+        for i in 1..=5 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        assert_eq!(sched.track_playhead(&track_id), Some(Tick::new(5)));
+
+        // A FRESH context b (no pre-existing timeline) attaches to the running track.
+        let b = ContextId::new();
+        documents.create_document(b, DocumentKind::Conversation, None).unwrap();
+        sched.attach(track_id.clone(), b, slow_attachment(), slow_policy()).unwrap();
+        assert_eq!(
+            kernel.timeline(b).unwrap().lock().playhead(),
+            Tick::new(5),
+            "fresh context seeds at the track's current playhead, not zero"
+        );
+
+        // One more beat: b's Timeline advances exactly one step (5→6), no catch-up.
+        sched.fire_due(base + Duration::from_secs(6));
+        assert_eq!(
+            kernel.timeline(b).unwrap().lock().playhead(),
+            Tick::new(6),
+            "the first beat after attach is one step, not a catch-up from zero"
+        );
+    }
+
+    /// `stop` halts ONE track's clock and leaves a sibling track beating — two
+    /// independent clock domains (the myaku "metrics keep sampling while music
+    /// pauses" property is just two tracks).
+    #[tokio::test]
+    async fn stop_halts_one_track_leaves_sibling_running() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let a = ContextId::new();
+        let b = ContextId::new();
+        documents.create_document(a, DocumentKind::Conversation, None).unwrap();
+        documents.create_document(b, DocumentKind::Conversation, None).unwrap();
+        preseed_markers(&kernel, a, 5);
+        preseed_markers(&kernel, b, 5);
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let solo = TrackId::solo();
+        let bass = TrackId::new("bass").unwrap();
+        sched.attach(solo.clone(), a, slow_attachment(), slow_policy()).unwrap();
+        sched.attach(bass.clone(), b, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&solo, base);
+        sched.play(&bass, base);
+
+        sched.fire_due(base + Duration::from_secs(1));
+        assert_eq!(contents(&documents, a).len(), 1);
+        assert_eq!(contents(&documents, b).len(), 1);
+
+        // Stop only the solo track; the bass track is a separate clock domain.
+        sched.stop(&solo);
+        let out = sched.fire_due(base + Duration::from_secs(2));
+        assert_eq!(out.fired, vec![b], "only the bass track still beats");
+        assert_eq!(contents(&documents, a).len(), 1, "solo frozen");
+        assert_eq!(contents(&documents, b).len(), 2, "bass kept beating");
+    }
+
+    /// `stop` is clock-only: it does NOT disarm a context's OODA. After stop+play the
+    /// context fires its `tick` again with no manual re-arm (MIDI transport idiom;
+    /// the OLD per-context `Stop` cleared OODA, the track `Stop` does not).
+    #[tokio::test]
+    async fn stop_is_clock_only_does_not_disarm_ooda() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let track_id = TrackId::solo();
+        let att = Attachment { wakeup: Cadence::new(1), rotate: None, ooda_armed: true, pulse: 0 };
+        sched.attach(track_id.clone(), ctx, att, slow_policy()).unwrap();
+        sched.play(&track_id, base);
+
+        let out1 = sched.fire_due(base + Duration::from_secs(1));
+        assert_eq!(out1.ooda_due, vec![ctx], "OODA fires while playing");
+
+        // Stop the clock, then drain the stale heap entry (dropped because !playing —
+        // the lazy-drop; draining first avoids stacking a duplicate entry on replay).
+        sched.stop(&track_id);
+        let stopped = sched.fire_due(base + Duration::from_secs(2));
+        assert!(stopped.fired.is_empty(), "stopped → the clock is frozen");
+
+        // Play again — OODA must survive (clock-only stop), no manual re-arm.
+        sched.play(&track_id, base + Duration::from_secs(2));
+        let out2 = sched.fire_due(base + Duration::from_secs(3));
+        assert_eq!(
+            out2.ooda_due,
+            vec![ctx],
+            "stop did not disarm OODA — it fires again after play with no re-arm"
         );
     }
 }

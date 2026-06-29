@@ -411,3 +411,63 @@ Attachment { wakeup: Cadence, rotate: Option<Cadence>, ooda_armed: bool, pulse: 
   only halts the clock — rotation is *suspended/remembered*, per-attachment `ooda_armed`
   is untouched. Re-arming OODA is the separate `SetOoda` knob. The old `Disarm(ContextId)`
   folds into **`Detach`** (a context unbinds; rotation's parent-side + archive both use it).
+- **`TrackState` shape (from reading `beat.rs`):** the per-context materialization
+  bookkeeping — `cursor`, `materialize_failures`, `failure_water` — cannot sit flat on
+  the track once a track has >1 attached context. It moves into a per-context bundle:
+  `track.attached: HashMap<ContextId, AttachedContext>` where
+  `AttachedContext { attachment: Attachment, cursor, materialize_failures, failure_water }`.
+  The persisted `Attachment` (wakeup/rotate/ooda_armed/pulse) is the *binding contract*;
+  the materialization fields are *runtime-only*, never persisted. `TrackState` itself:
+  `{ policy: BeatPolicy, playing: bool, playhead: Tick, beat_count: u64, attached }`.
+- **Rotation never overlaps producers.** At a rotate horizon the track *synchronously*
+  detaches the retiring context (remove from `attached` + `disarm_timeline`; its
+  committed blocks persist in the store, so the app still shows them) and fires `rotate`;
+  the child forks and re-`Attach`es to the **same** track, seeded to the track's *current*
+  playhead. The clock never pauses → continuity is free and there is never a beat with two
+  producing bindings. This realizes "one playing binding; rotation swaps it" concretely.
+- **The seed/carry logic collapses (item 3 falls out of item 1).** No fork-copy of a
+  playhead number, no persist-playhead-before-stop, no horizon-race persist to get right.
+  But seeding still needs care (sharpened by the gemini review below) — there are **two**
+  playheads at attach:
+  - **TRACK playhead** (seeded only when *creating* the track's live state):
+    `max(get_track(track_id).playhead_tick, max_tick(attaching_ctx))`, fatal on DB error,
+    else `ZERO`. NOT the attaching context's `max_tick` alone — a rotation child has no
+    blocks (`max_tick`=0) and would rewind the whole lane on a restart re-create. The
+    durable `tracks` row + the lane's committed blocks are the track's memory.
+  - **Per-context Timeline playhead** (every attach): `max(max_tick(ctx), track.playhead)`.
+    `max_tick(ctx)` stops a context with its own committed history (cold-restart re-attach)
+    from re-seeding behind its log (`DuplicateBlock`); `track.playhead` puts a fresh child
+    at current musical time so the next beat is one `advance_to` step, not a giant catch-up
+    from zero.
+
+## Stage 1 review findings (gemini batch, 2026-06-29)
+
+A holistic two-prompt gemini review (whole files: tracks.md + hyoushigi.md + the spine +
+beat.rs) ahead of locking the surgery. It **confirmed** the clean parts (the
+`wakeup`/`ooda_every` decomposition; cursor + `materialize_failures` + `failure_water`
+*must* be per-attachment, not flat on the track; `KJ_EPOCH_NS` latched once per beat;
+`KJ_PULSE` per-attachment monotonic; `Stop` clock-only). It surfaced the two seed
+corrections folded in above, plus one decision:
+
+- **Rotation handoff = GAP, not OVERLAP (deliberate).** An exogenous clock that doesn't
+  pause during a page-turn must pick one: the parent detaches synchronously (a few
+  *producerless* beats while the child boots + re-binds — a GAP) or the parent lingers
+  until the child binds (two producers double-scheduling into the score — an OVERLAP).
+  Stage 1 takes the **gap** (synchronous parent-detach): never two producers, a few rest
+  beats during boot. This matches the doc's own "the band played a beat while the bass
+  player was unplugging." An **atomic `Swap`/`Rotate` transport command** that lets the
+  track briefly suspend its clock across the handoff (closing the gap) is a real future
+  option — deferred. `KJ_PULSE`/`KJ_TICK` continuity is unaffected either way (the track
+  holds the numbers).
+
+  **Why the gap is safe in practice (Amy, 2026-06-29):** the gap is in *live production*,
+  not in *playback*. Hyoushigi stages content **ahead of the playhead** (lead-time
+  derivation — `speculate_at = start − beats_for(lead_time)`): the retiring parent already
+  speculated/committed the handoff beats' notation *before* it detached, so the committed
+  score covers the rotation window. Whatever consumes the score downstream (ABC→MIDI, then
+  samples/synth) reads **continuous** notation across the page-turn — the producer gap
+  never reaches the DAC. So the rotation gap is a gap in *who's composing next*, not in
+  *what's playing now*; the speculation lead is exactly what absorbs it. (This is the
+  musician case from `hyoushigi.md` — the clock can't block, so content is staged ahead;
+  rotation is just another reason the lead exists.) This makes the atomic `Swap` a polish
+  item, not a correctness requirement, for any track whose lead ≥ the child's boot time.

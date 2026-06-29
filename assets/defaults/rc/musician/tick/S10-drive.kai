@@ -8,15 +8,19 @@
 # is the score, MIDI a render. This script is the user-editable seam — change
 # the prompt, gate the drive on conditions, or add pre-beat bookkeeping here.
 #
-# The beat scheduler seeds this run with the transport report:
-#   $TICK   — the playhead's logical tick (beat index)
-#   $PHRASE — phrases elapsed while playing
-#   $TEMPO  — tempo in whole BPM
-#   $HEARD  — JSON array of recent committed notation across tracks
-#             ([{tick, track, abc}, …], oldest→newest). The score blocks are
-#             hydration-silent, so this is the only way the player sees what was
-#             just played. (Stopgap JSON string; becomes a kaish array + a
-#             read-on-demand pull once the arrays plan lands — see beat.rs.)
+# The beat scheduler seeds this run with the transport report (KJ_-prefixed,
+# matching the kernel-injection convention — cf. KJ_PARENT_BLOCK_COUNT):
+#   $KJ_TICK      — the track's playhead tick (beat index, frozen off-beat)
+#   $KJ_PHRASE    — phrases elapsed while playing
+#   $KJ_TEMPO     — tempo in whole BPM
+#   $KJ_HEARD     — JSON array of recent committed notation across tracks
+#                   ([{tick, track, abc}, …], oldest→newest). The score blocks
+#                   are hydration-silent, so this is the only way the player
+#                   sees what was just played. (Stopgap JSON string; becomes a
+#                   kaish array + a read-on-demand pull once arrays land.)
+#   $KJ_PULSE     — per-attachment monotonic wakeup counter; reliable ordering
+#                   key (unlike KJ_TICK, which can freeze off-beat)
+#   $KJ_EPOCH_NS  — wall-clock ns, shared across all contexts woken the same beat
 # Composed into the --prompt below, they become the turn's transport report:
 # the fresh suffix the player reads each beat.
 #
@@ -25,4 +29,4 @@
 #
 # No positional context: the tick lifecycle runs with this context as the
 # current one, so `kj drive` targets it (avoids passing the raw id as an arg).
-kj drive --prompt "Transport: tick $TICK, phrase $PHRASE, $TEMPO BPM. Recently played (JSON): $HEARD. Play the next phrase and give it as one complete, self-contained ABC tune every turn — a full header (X:, T:, M:, L:, K:) then the body, never a bare phrase or a continuation: the score parser rejects a body without a header. Raw ABC only — no prose, no code fences."
+kj drive --prompt "Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM. Recently played (JSON): $KJ_HEARD. Play the next phrase and give it as one complete, self-contained ABC tune every turn — a full header (X:, T:, M:, L:, K:) then the body, never a bare phrase or a continuation: the score parser rejects a body without a header. Raw ABC only — no prose, no code fences."
