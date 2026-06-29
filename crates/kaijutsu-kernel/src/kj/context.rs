@@ -2314,9 +2314,21 @@ mod tests {
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
 
-        // Own the only beat ingress so we can observe what create sends.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Own the only beat ingress so we can observe what create sends. Dispatch
+        // now AWAITs the scheduler's ack, so stub a replier that acks Ok and
+        // forwards each command for inspection — else create's arm rc would hang.
+        let (tx, mut ingress) =
+            tokio::sync::mpsc::unbounded_channel::<crate::hyoushigi::BeatRequest>();
         assert!(d.kernel().set_beat_ingress(tx), "test owns the ingress");
+        let (cmd_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(crate::hyoushigi::BeatRequest { command, reply }) = ingress.recv().await {
+                let _ = cmd_tx.send(command);
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
 
         let c = caller_with_context(parent);
 
@@ -2347,8 +2359,8 @@ mod tests {
             .ok()
             .or_else(|| kaijutsu_types::TrackId::slugify("bassline"))
             .expect("bassline yields a valid track");
-        match rx.try_recv() {
-            Ok(crate::hyoushigi::BeatCommand::Arm {
+        match rx.recv().await {
+            Some(crate::hyoushigi::BeatCommand::Arm {
                 context_id, track, ..
             }) => {
                 assert_eq!(context_id, id, "arms the musician we just created");

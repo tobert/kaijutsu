@@ -137,6 +137,30 @@ pub enum BeatCommand {
     Disarm(ContextId),
 }
 
+/// What the scheduler reports back for a transport command: `Ok(())` when it
+/// was applied to an armed context, `Err(reason)` when it was a no-op (e.g. the
+/// context isn't armed). Lets `kj transport` report what actually happened
+/// instead of blindly claiming success after a fire-and-forget send — the
+/// scheduler owns the `armed` map, so it is the single source of truth.
+pub type BeatAck = Result<(), String>;
+
+/// A [`BeatCommand`] plus an optional reply channel. Fire-and-forget callers
+/// leave `reply` `None`; `kj transport` attaches a `oneshot` and awaits the
+/// [`BeatAck`] so its report reflects the scheduler's actual action. Not
+/// `Clone` (a `oneshot::Sender` isn't) — and nothing clones it.
+#[derive(Debug)]
+pub struct BeatRequest {
+    pub command: BeatCommand,
+    pub reply: Option<tokio::sync::oneshot::Sender<BeatAck>>,
+}
+
+impl From<BeatCommand> for BeatRequest {
+    /// A bare command becomes a fire-and-forget request (no ack wanted).
+    fn from(command: BeatCommand) -> Self {
+        BeatRequest { command, reply: None }
+    }
+}
+
 /// A context's timeline, shared between the beat scheduler (which pumps it) and
 /// the turn-completion handler (which schedules cells onto it).
 ///

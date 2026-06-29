@@ -38,8 +38,8 @@ use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::hyoushigi::{
-    BeatCommand, BeatPolicy, DeriverRegistry, MaterializeCursor, materialize_committed,
-    schedule_abc_cell,
+    BeatAck, BeatCommand, BeatPolicy, BeatRequest, DeriverRegistry, MaterializeCursor,
+    materialize_committed, schedule_abc_cell,
 };
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
 use kaijutsu_types::{
@@ -952,10 +952,73 @@ impl BeatScheduler {
         }
     }
 
+    /// Apply one transport command and report the truthful outcome — `Ok(())`
+    /// when it landed on an armed context, `Err(reason)` when it was a no-op so
+    /// the `kj transport` verb can say so instead of blind-claiming success.
+    /// `Arm` creates the entry (always `Ok`); `Disarm` is idempotent (`Ok`); the
+    /// rest require the context to be armed.
+    fn apply_command(&mut self, command: BeatCommand) -> BeatAck {
+        match command {
+            BeatCommand::Arm { context_id, policy, track, rotate_every_phrases } => {
+                self.arm(context_id, policy, track);
+                // Restore the persisted page-turn cadence after arming (a
+                // cold-restart re-arm). `None` leaves a live re-arm's cadence
+                // untouched; `Some` re-applies it (and re-persists, idempotently).
+                // `set_rotate` filters `Some(0)`.
+                if rotate_every_phrases.is_some() {
+                    self.set_rotate(context_id, rotate_every_phrases);
+                }
+                Ok(())
+            }
+            BeatCommand::Play(ctx) => {
+                self.play(ctx, Instant::now());
+                self.armed_ack(ctx)
+            }
+            BeatCommand::Pause(ctx) => {
+                self.pause(ctx);
+                self.armed_ack(ctx)
+            }
+            BeatCommand::Stop(ctx) => {
+                self.stop(ctx);
+                self.armed_ack(ctx)
+            }
+            BeatCommand::SetTempo { context_id, period } => {
+                self.set_tempo(context_id, period);
+                self.armed_ack(context_id)
+            }
+            BeatCommand::SetOoda { context_id, armed } => {
+                self.set_ooda(context_id, armed);
+                self.armed_ack(context_id)
+            }
+            BeatCommand::SetRotate { context_id, every_phrases } => {
+                self.set_rotate(context_id, every_phrases);
+                self.armed_ack(context_id)
+            }
+            BeatCommand::Disarm(ctx) => {
+                self.disarm(ctx);
+                Ok(())
+            }
+        }
+    }
+
+    /// `Ok` if the context is armed (so the command that just ran was a real
+    /// effect), else a loud `Err` — none of the apply methods change membership,
+    /// so checking after the call is exact.
+    fn armed_ack(&self, ctx: ContextId) -> BeatAck {
+        if self.armed.contains_key(&ctx) {
+            Ok(())
+        } else {
+            Err(format!(
+                "context {} is not armed — run `kj transport arm` first",
+                ctx.short()
+            ))
+        }
+    }
+
     /// Run the scheduler/transport loop until the ingress sender is dropped. One
     /// `select!` over the heap's nearest deadline, the command ingress, and the
     /// turn-completion bus (the OODA Act handoff).
-    pub async fn run(mut self, mut ingress: mpsc::UnboundedReceiver<BeatCommand>) {
+    pub async fn run(mut self, mut ingress: mpsc::UnboundedReceiver<BeatRequest>) {
         log::info!("Beat scheduler online");
         let mut completed = self.kernel.turn_flows().subscribe("turn.completed");
         let mut turn_bus_open = true;
@@ -964,34 +1027,15 @@ impl BeatScheduler {
             tokio::select! {
                 biased;
                 msg = ingress.recv() => match msg {
-                    Some(BeatCommand::Arm {
-                        context_id,
-                        policy,
-                        track,
-                        rotate_every_phrases,
-                    }) => {
-                        self.arm(context_id, policy, track);
-                        // Restore the persisted page-turn cadence after arming (a
-                        // cold-restart re-arm). `None` leaves a live re-arm's
-                        // cadence untouched; `Some` re-applies it (and re-persists,
-                        // idempotently). `set_rotate` filters `Some(0)`.
-                        if rotate_every_phrases.is_some() {
-                            self.set_rotate(context_id, rotate_every_phrases);
+                    Some(BeatRequest { command, reply }) => {
+                        let ack = self.apply_command(command);
+                        // Report the real outcome to a caller that wants it (`kj
+                        // transport`), so its message can't lie about an un-armed
+                        // no-op. A dropped receiver (fire-and-forget) is fine.
+                        if let Some(reply) = reply {
+                            let _ = reply.send(ack);
                         }
                     }
-                    Some(BeatCommand::Play(ctx)) => self.play(ctx, Instant::now()),
-                    Some(BeatCommand::Pause(ctx)) => self.pause(ctx),
-                    Some(BeatCommand::Stop(ctx)) => self.stop(ctx),
-                    Some(BeatCommand::SetTempo { context_id, period }) => {
-                        self.set_tempo(context_id, period)
-                    }
-                    Some(BeatCommand::SetOoda { context_id, armed }) => {
-                        self.set_ooda(context_id, armed)
-                    }
-                    Some(BeatCommand::SetRotate { context_id, every_phrases }) => {
-                        self.set_rotate(context_id, every_phrases)
-                    }
-                    Some(BeatCommand::Disarm(ctx)) => self.disarm(ctx),
                     None => break, // all senders dropped → shut down
                 },
                 msg = completed.recv(), if turn_bus_open => match msg {
@@ -1033,7 +1077,7 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// verb uses `spawn_local`). Installs the ingress sender on the kernel so the rc
 /// lifecycle and `kj transport` can arm/drive musician contexts.
 pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
-    let (tx, rx) = mpsc::unbounded_channel::<BeatCommand>();
+    let (tx, rx) = mpsc::unbounded_channel::<BeatRequest>();
     registry.kernel.kernel.set_beat_ingress(tx);
 
     let kernel = registry.kernel.kernel.clone();

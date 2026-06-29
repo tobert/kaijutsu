@@ -403,7 +403,7 @@ impl KjDispatcher {
         // Exempt from the active-context gate so `--context <ref>` works from a
         // session with no joined context (the beat scheduler is global).
         if cmd == "transport" {
-            return self.dispatch_transport(&argv[1..], caller);
+            return self.dispatch_transport(&argv[1..], caller).await;
         }
         // `kj kv` is the kernel-wide key–value store — global, no context.
         if cmd == "kv" {

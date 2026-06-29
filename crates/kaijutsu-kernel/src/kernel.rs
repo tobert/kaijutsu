@@ -96,7 +96,7 @@ pub struct Kernel {
     /// scheduler lives there, since it needs the block store too). Kernel-side rc
     /// code arms/disarms musician contexts by sending here; absent in embedded /
     /// test setups with no scheduler, where sends are simply no-ops.
-    beat_ingress: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatCommand>>,
+    beat_ingress: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatRequest>>,
     /// RAII guard for a `new_ephemeral()` data dir: removes the throwaway dir
     /// when the kernel drops, so repeated test runs don't accumulate `kj-eph-*`
     /// dirs (each holding a full CAS + DB) in `/tmp`. `None` for kernels rooted
@@ -743,20 +743,44 @@ impl Kernel {
     /// Returns whether it was set (false if already installed).
     pub fn set_beat_ingress(
         &self,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatCommand>,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatRequest>,
     ) -> bool {
         self.beat_ingress.set(tx).is_ok()
     }
 
-    /// Send a command to the beat scheduler, if one is installed. Returns whether
-    /// it was delivered — `false` when no scheduler is wired (embedded/test) or
-    /// the scheduler has shut down. Callers decide whether that's fatal; arming a
-    /// musician with no scheduler simply means it never beats (no silent
-    /// corruption, just no beat).
+    /// Send a fire-and-forget command to the beat scheduler, if one is installed.
+    /// Returns whether it was delivered — `false` when no scheduler is wired
+    /// (embedded/test) or the scheduler has shut down. Callers decide whether
+    /// that's fatal; arming a musician with no scheduler simply means it never
+    /// beats (no silent corruption, just no beat). Use [`send_beat_request`] when
+    /// you need to know whether the scheduler actually applied the command.
+    ///
+    /// [`send_beat_request`]: Self::send_beat_request
     pub fn send_beat_command(&self, cmd: crate::hyoushigi::BeatCommand) -> bool {
         match self.beat_ingress.get() {
-            Some(tx) => tx.send(cmd).is_ok(),
+            Some(tx) => tx.send(cmd.into()).is_ok(),
             None => false,
+        }
+    }
+
+    /// Send a command and get a receiver for the scheduler's [`BeatAck`] — the
+    /// truthful outcome (`Ok` applied, `Err(reason)` no-op, e.g. not armed). The
+    /// scheduler owns the armed map, so this is how `kj transport` reports what
+    /// really happened instead of blindly claiming success. `None` when no
+    /// scheduler is wired or it has shut down (same meaning as `send_beat_command`
+    /// returning `false`).
+    ///
+    /// [`BeatAck`]: crate::hyoushigi::BeatAck
+    pub fn send_beat_request(
+        &self,
+        cmd: crate::hyoushigi::BeatCommand,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::hyoushigi::BeatAck>> {
+        let tx = self.beat_ingress.get()?;
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let request = crate::hyoushigi::BeatRequest { command: cmd, reply: Some(reply) };
+        match tx.send(request) {
+            Ok(()) => Some(reply_rx),
+            Err(_) => None, // scheduler dropped its receiver
         }
     }
 

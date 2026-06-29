@@ -130,7 +130,7 @@ impl TransportCommand {
 }
 
 impl KjDispatcher {
-    pub(crate) fn dispatch_transport(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_transport(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<TransportArgs>();
         }
@@ -252,21 +252,32 @@ impl KjDispatcher {
             }
         };
 
-        if !self.kernel().send_beat_command(cmd) {
+        // Send and AWAIT the scheduler's verdict so the report reflects what
+        // actually happened — not a blind "playing" after a fire-and-forget send
+        // that the scheduler silently dropped on an un-armed context.
+        let Some(ack_rx) = self.kernel().send_beat_request(cmd) else {
             return KjResult::Err(
                 "kj transport: no beat scheduler is active; the command was not applied"
                     .to_string(),
             );
-        }
-
-        KjResult::Ok {
-            message: format!("transport: {} '{}'", verb, short_hex(ctx)),
-            content_type: ContentType::Plain,
-            ephemeral: false,
-            data: Some(serde_json::json!({
-                "context_id": ctx.to_hex(),
-                "action": action,
-            })),
+        };
+        match ack_rx.await {
+            Ok(Ok(())) => KjResult::Ok {
+                message: format!("transport: {} '{}'", verb, short_hex(ctx)),
+                content_type: ContentType::Plain,
+                ephemeral: false,
+                data: Some(serde_json::json!({
+                    "context_id": ctx.to_hex(),
+                    "action": action,
+                })),
+            },
+            // The scheduler refused (e.g. not armed) — report the truth, loudly.
+            Ok(Err(reason)) => KjResult::Err(format!("kj transport: {reason}")),
+            // The scheduler dropped the reply without answering (it shut down
+            // between send and reply) — don't claim success we can't confirm.
+            Err(_) => KjResult::Err(
+                "kj transport: the beat scheduler dropped the request without a reply".to_string(),
+            ),
         }
     }
 
@@ -336,12 +347,34 @@ fn short_hex(id: kaijutsu_types::ContextId) -> String {
 mod tests {
     use std::time::Duration;
 
-    use crate::hyoushigi::BeatCommand;
+    use crate::hyoushigi::{BeatAck, BeatCommand, BeatRequest};
     use crate::kj::test_helpers::*;
     use kaijutsu_types::PrincipalId;
 
     fn s(v: &str) -> String {
         v.to_string()
+    }
+
+    /// Stand in for the beat scheduler: ack every request with `ack` and forward
+    /// the command on the returned channel for inspection. Dispatch now AWAITS
+    /// the scheduler's ack, so a test that merely held the ingress receiver would
+    /// hang on the await — this replies (and lets a test assert the NACK path by
+    /// passing an `Err`). The command is forwarded before the ack is sent, so it
+    /// is already present by the time `dispatch` returns.
+    fn spawn_beat_stub(
+        mut ingress: tokio::sync::mpsc::UnboundedReceiver<BeatRequest>,
+        ack: BeatAck,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<BeatCommand> {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(BeatRequest { command, reply }) = ingress.recv().await {
+                let _ = cmd_tx.send(command);
+                if let Some(reply) = reply {
+                    let _ = reply.send(ack.clone());
+                }
+            }
+        });
+        cmd_rx
     }
 
     #[tokio::test]
@@ -350,15 +383,44 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("c"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(d.kernel().set_beat_ingress(tx), "ingress installs once");
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("play")], &c).await;
         assert!(result.is_ok(), "transport play failed: {}", result.message());
-        match rx.try_recv().expect("a BeatCommand should be sent") {
+        match cmds.recv().await.expect("a BeatCommand should be sent") {
             BeatCommand::Play(id) => assert_eq!(id, ctx, "plays the current context"),
             other => panic!("expected Play, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_play_reports_scheduler_refusal() {
+        // The blind-success fix: when the scheduler NACKs (e.g. the context isn't
+        // armed) `kj transport` reports an ERROR with the reason, never a blind
+        // "playing". Stub the refusal and assert dispatch surfaces it.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(
+            rx,
+            Err("context is not armed — run `kj transport arm` first".to_string()),
+        );
+
+        let result = d.dispatch(&[s("transport"), s("play")], &c).await;
+        assert!(
+            matches!(result, crate::kj::KjResult::Err(_)),
+            "a scheduler refusal must surface as an error, not blind success"
+        );
+        assert!(
+            result.message().contains("not armed"),
+            "the error carries the scheduler's reason: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -370,8 +432,9 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("c"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(d.kernel().set_beat_ingress(tx), "ingress installs once");
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let bad = d
             .dispatch(&[s("transport"), s("tempo"), s("60001")], &c)
@@ -381,7 +444,7 @@ mod tests {
             "60001 BPM must be rejected (would be a 0 ms period)"
         );
         assert!(
-            rx.try_recv().is_err(),
+            cmds.try_recv().is_err(),
             "a rejected tempo must NOT reach the scheduler"
         );
 
@@ -389,7 +452,7 @@ mod tests {
             .dispatch(&[s("transport"), s("tempo"), s("60000")], &c)
             .await;
         assert!(ok.is_ok(), "60000 BPM (1 ms) is the valid floor: {}", ok.message());
-        match rx.try_recv().expect("a valid tempo reaches the scheduler") {
+        match cmds.recv().await.expect("a valid tempo reaches the scheduler") {
             BeatCommand::SetTempo { period, .. } => {
                 assert_eq!(period, Duration::from_millis(1), "60000 BPM == 1 ms period");
             }
@@ -421,12 +484,13 @@ mod tests {
             )
             .unwrap();
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
         assert!(result.is_ok(), "transport arm failed: {}", result.message());
-        match rx.try_recv().expect("an Arm should be sent") {
+        match cmds.recv().await.expect("an Arm should be sent") {
             BeatCommand::Arm { context_id, policy, track, rotate_every_phrases } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(policy.period, Duration::from_millis(250), "persisted tempo restored");
@@ -455,12 +519,13 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("Lead Synth"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
         assert!(result.is_ok(), "transport arm failed: {}", result.message());
-        match rx.try_recv().expect("an Arm should be sent") {
+        match cmds.recv().await.expect("an Arm should be sent") {
             BeatCommand::Arm { policy, track, .. } => {
                 assert_eq!(policy.period, Duration::from_millis(500), "musician default tempo");
                 assert_eq!(policy.beats_per_phrase, 16);
@@ -483,8 +548,9 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, None, None, principal); // no label → no lane
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
         assert!(!result.is_ok(), "arming a context with no track lane should fail");
@@ -493,7 +559,7 @@ mod tests {
             "error should explain why: {}",
             result.message()
         );
-        assert!(rx.try_recv().is_err(), "no Arm command sent on refusal");
+        assert!(cmds.try_recv().is_err(), "no Arm command sent on refusal");
     }
 
     #[tokio::test]
@@ -533,8 +599,11 @@ mod tests {
             )
             .unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        // The rc runs `arm && rotate && play`, each AWAITing the scheduler ack;
+        // the stub acks Ok so the `&&` chain proceeds, and forwards each command.
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         // Fire the rotate lifecycle exactly as the beat scheduler's fire_rotate
         // does, seeding $ROTATE_EVERY (the scheduler sets it only when rotating).
@@ -547,7 +616,7 @@ mod tests {
 
         // The page-turn emits, in order, three commands — all for the forked CHILD
         // (the rc `--switch`ed onto it), never the retired parent.
-        let arm = rx.try_recv().expect("rotate arms the child");
+        let arm = cmds.recv().await.expect("rotate arms the child");
         let (child, track) = match arm {
             BeatCommand::Arm { context_id, track, .. } => (context_id, track),
             other => panic!("expected Arm first, got {other:?}"),
@@ -555,14 +624,14 @@ mod tests {
         assert_ne!(child, parent, "the child is a NEW context, not the parent");
         assert_eq!(track, TrackId::new("bass").unwrap(), "child keeps the parent's lane");
 
-        match rx.try_recv().expect("rotate re-establishes the cadence") {
+        match cmds.recv().await.expect("rotate re-establishes the cadence") {
             BeatCommand::SetRotate { context_id, every_phrases } => {
                 assert_eq!(context_id, child, "cadence set on the child");
                 assert_eq!(every_phrases, Some(4), "the song keeps turning at the same cadence");
             }
             other => panic!("expected SetRotate, got {other:?}"),
         }
-        match rx.try_recv().expect("rotate plays the child") {
+        match cmds.recv().await.expect("rotate plays the child") {
             BeatCommand::Play(id) => assert_eq!(id, child, "the child's clock starts (seamless continuation)"),
             other => panic!("expected Play, got {other:?}"),
         }
@@ -598,12 +667,13 @@ mod tests {
             )
             .unwrap();
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
         assert!(result.is_ok(), "arm with a persisted row should succeed: {}", result.message());
-        match rx.try_recv().expect("an Arm should be sent") {
+        match cmds.recv().await.expect("an Arm should be sent") {
             BeatCommand::Arm { policy, track, .. } => {
                 assert_eq!(policy.period, Duration::from_millis(250), "uses the persisted policy");
                 assert_eq!(track, TrackId::new("bass").unwrap());
@@ -618,12 +688,13 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("c"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("tempo"), s("120")], &c).await;
         assert!(result.is_ok(), "tempo failed: {}", result.message());
-        match rx.try_recv().expect("a SetTempo should be sent") {
+        match cmds.recv().await.expect("a SetTempo should be sent") {
             BeatCommand::SetTempo { context_id, period } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(period, Duration::from_millis(500), "120 BPM → 500 ms/beat");
@@ -638,12 +709,13 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("c"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("ooda"), s("off")], &c).await;
         assert!(result.is_ok(), "ooda off failed: {}", result.message());
-        match rx.try_recv().expect("a SetOoda should be sent") {
+        match cmds.recv().await.expect("a SetOoda should be sent") {
             BeatCommand::SetOoda { context_id, armed } => {
                 assert_eq!(context_id, ctx);
                 assert!(!armed, "ooda off → disarmed");
@@ -658,14 +730,15 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("c"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d
             .dispatch(&[s("transport"), s("rotate"), s("--every"), s("8")], &c)
             .await;
         assert!(result.is_ok(), "rotate --every failed: {}", result.message());
-        match rx.try_recv().expect("a SetRotate should be sent") {
+        match cmds.recv().await.expect("a SetRotate should be sent") {
             BeatCommand::SetRotate { context_id, every_phrases } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(every_phrases, Some(8));
@@ -680,12 +753,13 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("c"), None, principal);
         let c = caller_with_context(ctx);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
 
         let result = d.dispatch(&[s("transport"), s("rotate"), s("off")], &c).await;
         assert!(result.is_ok(), "rotate off failed: {}", result.message());
-        match rx.try_recv().expect("a SetRotate should be sent") {
+        match cmds.recv().await.expect("a SetRotate should be sent") {
             BeatCommand::SetRotate { every_phrases, .. } => {
                 assert_eq!(every_phrases, None, "off clears the cadence");
             }
