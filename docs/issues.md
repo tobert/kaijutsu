@@ -65,14 +65,23 @@ thesis: the VFS *is* the shared-state namespace; tiers are mounts (`/run`
 — and `/v` for read-only/CRDT durable). No bespoke store. Open work that's already
 concrete:
 
-- **Delete `KvDocument`/`Kv`.** Test-only, no production callers — being deleted,
-  not deprecated. Remove `kv.rs`, the capnp surface (`kvGet`/`kvSet`/`kvDelete`/
-  `kvKeys`/`kvWatch`, @79–83), `kj kv`. **Migrate one tie first:**
-  `current_context` (per-session pointer, `kv.rs:53`, rendered at
-  `/v/session/<id>/context`) moves to the session registry (`PeerRegistry`/
-  `SessionContextMap`). Reconcile the audit ("test-only") vs memory ("app-restore
-  through KV") before cutting. **Touches the slash-v V2 entry below** (its `bound`/
-  `context` renders from KV today — repoint to session state).
+- **Delete `KvDocument`/`Kv`.** Being deleted, not deprecated. Remove `kv.rs`, the
+  capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`, @79–83), `kj kv`. The
+  audit's "test-only" was wrong: the **app is a real caller** — it persists
+  `<client-id>.current_context` (`actor_plugin.rs:319`) and reads it back on reconnect
+  (`:534`). That one key **splits in two** (see `docs/shared-state.md`, *Retiring KV*):
+  - **Live acting context** (rendered at `/v/session/<id>/context`) → already
+    `SessionContextMap` (`runtime/context_engine.rs:31`), ephemeral by design. No KV.
+  - **Durable per-client restore** ("reopen last context") → a **typed per-client
+    store**, a normalized `KernelDb` row keyed by stable client-id with a typed RPC
+    (`setLastContext`/`getClientView`), *not* the ephemeral registries (they `detach()`
+    on disconnect, `peers.rs:148` — would silently break reattach-restore). Replaces
+    the stringly 64 KB-envelope/journal/compaction KV with less machinery and real
+    types. Projected as **`/v/clients`** (`docs/slash-v.md`, *Future*): a *writable*
+    `/v/clients/<id>/context` is both the client's own setter and a **remote steering**
+    surface (drive N tablets onto different contexts; players at them also drive).
+  **Touches the slash-v V2 entry below.** *(Code-alignment pass deferred per Amy:
+  land it once the design docs feel consistent + resonant.)*
 - **`VfsOps::append` (or open-for-append cursor).** No append primitive today;
   `write_all`/`>>` are O(n) truncate+rewrite (`vfs/ops.rs` `write_all`;
   `MemoryBackend::write` is O(1) at `offset=size`). myaku sidesteps via bounded
@@ -130,9 +139,12 @@ capability binding (which becomes a consumer of `/v/session`). Slices:
 - **V2 — `/v/session` read-only backend.** View over a live participant registry
   (generalize `PeerRegistry` to carry session *kind* — `PeerInfo` has no such field
   today, `peers.rs:50`; app/MCP already registered). `self` resolved per-surface at
-  adapter altitude. `bound` renders the session's current context — for app/MCP
-  that's KV `client.current_context` (set via `context switch`). `/proc`-style
-  ephemeral; reconnect-flicker visible (see peer-reattach tech-debt).
+  adapter altitude. `context` renders the session's **live** acting context from
+  `SessionContextMap` (`context_engine.rs:31`) — **not** KV (retired; the durable
+  per-client restore is a separate typed store, above). `/proc`-style ephemeral;
+  reconnect-flicker visible (see peer-reattach tech-debt). *(NB: the `bound`/binding
+  capability apparatus this entry predates is retired — slash-v.md now uses
+  per-operation join on the ambient `context_id`; V3 below is stale on that point.)*
 - **V3 — writable `bound`.** `set_bound(session, context_id)` + route privileged
   writes through the shared `context_allows_rc_write` guard. The guard already keys
   on `ctx.context_id` (`guard.rs:71`) — `guard.rs`/`binding.rs` unchanged. The real

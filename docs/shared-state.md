@@ -96,17 +96,42 @@ the shared space as its **Observe surface**, built entirely from existing primit
   (kernel-side, shared, thin agent) vs the agent reducing `history` itself
   (thin-client tension). Deferred to the myaku session.
 
-## Retiring KV (delete soon — one tie to migrate first)
+## Retiring KV (delete — it has one real caller, and it splits in two)
 
 `KvDocument`/`Kv` + the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`,
-@79–83) and `kj kv` go away. The one real dependency is **`current_context`** — the
-per-session pointer the app/MCP set via `kj context switch`, which `slash-v.md`
-renders read-only at `/v/session/<id>/context` (`kv.rs:53`). That is **per-session
-state, not shared KV**: it moves to the session registry (`PeerRegistry` /
-`SessionContextMap`), which slash-v already uses for the shell's live current
-context. *Verify the exact current wiring at implementation* — the audit found only
-test callers, but project memory recalls an app-restore path through KV; reconcile
-before deleting. Everything else KV might have held becomes a `/run` file.
+@79–83) and `kj kv` go away. The audit's "test-only" read was **too optimistic**: the
+app is a real, production caller. It persists exactly one key pattern —
+`<client-id>.current_context` (`kaijutsu-app/.../actor_plugin.rs:319` writes it on
+every switch; the reconnect bootstrap `kv_get`s it back into a `RestoreContext` at
+`:534`). That is the *entire* production use of a 64 KB-envelope, journaling,
+compacting store: **one `ContextId` per app installation — "reopen the context this
+window was last looking at."**
+
+That one job is actually **two** needs the old design blurred, and naming the split is
+what unblocks the deletion:
+
+- **Live acting context** — what `slash-v.md` renders at `/v/session/<id>/context`. It
+  is *per-session and ephemeral*: it dies with the connection, which is correct (a
+  disconnected session has no live context to show). It already lives in
+  `SessionContextMap` (`runtime/context_engine.rs:31`, an `Arc<DashMap<SessionId,
+  ContextId>>` the shell resolves per-op). **No KV.**
+- **Durable view restoration** — the app's actual KV use. It is *per-installation and
+  must survive the connection ending* — that is the whole point of writing it durably.
+  The ephemeral registries **cannot** hold it: `SessionContextMap` and `PeerRegistry`
+  (a `HashMap` with `detach()` on disconnect, `peers.rs:148`) both vanish exactly when
+  the restore value still has to exist. So "move it to the session registry" — the
+  obvious first answer — would *silently break reattach-restore*.
+
+The right home is what Amy called a "lil typed state the kernel manages on the client's
+behalf": a **small, normalized, per-client store** — a `KernelDb` row keyed by the
+stable client-id (`feedback_sql_schema`: relational, not a stringly JSON/KV blob), with
+a typed RPC (`setLastContext` / `getClientView`) replacing `kvGet("<uuid>.current_
+context")` and the hand-formatted key namespace (`client_id.rs`). This is strictly
+*more* type-safe and *less* machinery than KV — no envelope versioning, no
+overwrite-tuned journal/compaction, no stringly keys. It can be **projected read-only
+under `/v`** for introspection (the slash-v pattern: render kernel state as files, write
+via the typed path), so it honours "the VFS is the namespace" without resurrecting a
+general KV. Everything else KV might have held becomes a `/run` file.
 
 ## Open questions (deferred)
 
@@ -117,8 +142,15 @@ before deleting. Everything else KV might have held becomes a `/run` file.
   session.
 - **Reduction ownership** — which summaries the kernel projects vs the agent derives
   (the thin-client tension). → myaku session.
-- **`current_context` new home** — `PeerRegistry`/`SessionContextMap` vs a
-  `/v/session`-owned field; settle when KV is deleted.
+- **`current_context` split — settled in shape, open in surface.** The *live* render
+  reads `SessionContextMap`; the *durable* restore moves to a typed per-client
+  `KernelDb` store (see *Retiring KV*). The store's `/v` projection is sketched as
+  **`/v/clients`** (`docs/slash-v.md`, *Future*) — and it's more than read-only
+  introspection: `/v/clients/<id>/context` is *writable*, so the same field is the
+  client's own setter **and** a remote steering surface (drive a wall of tablets onto
+  different contexts; players at them can also drive). Open: the typed RPC shape, how a
+  steered client observes the change (poll `generation` vs. a `kvWatch` successor — KV's
+  is being deleted), and which other fields (theme, layout, spotlight) join `context`.
 - **Append gap** — `VfsOps` has no `append()`; `write_all`/`>>` are O(n). myaku
   sidesteps it (bounded rewrite) and OODA writes are turn-cadence, but a real
   `append()` (O(1) on `MemoryBackend` via `write(offset=size)`) is worth it someday.

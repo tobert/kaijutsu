@@ -232,7 +232,7 @@ connections register as new kinds (`docs/ssh-shell.md`).
 │   ├── kind        # "app"
 │   ├── principal   # <id>        (server-stamped)
 │   ├── attached    # <iso>
-│   └── context -> /v/ctx/<ab>/<id>   # read-only: its KV current_context (set via `kj context switch`)
+│   └── context -> /v/ctx/<ab>/<id>   # read-only: its *live* acting context (session registry, not KV)
 ├── <mcp-instance>/
 │   └── … context -> /v/ctx/<ab>/<id>
 └── <sftp-conn>/
@@ -244,9 +244,18 @@ connections register as new kinds (`docs/ssh-shell.md`).
 `ls -l /v/session/` (or one read of `index`) is a live roster of who's playing the
 instrument and what context each is acting as.
 
-**`context` is read-only observation, not a setter.** For app/MCP it renders
-`client.current_context` from KV (`crates/kaijutsu-kernel/src/kv.rs:53`), which `kj
-context switch` already writes. There is no symlink-to-arm and no TTL — see why next.
+**`context` is read-only observation, not a setter — and it renders *live* session
+state, never KV.** It shows the participant's **current acting context** (the context
+it has joined / `kj context switch`ed to) read from the live session state the kernel
+already tracks: `SessionContextMap` (`runtime/context_engine.rs:31`, an ephemeral
+`DashMap<SessionId, ContextId>` the shell resolves per-op). This is deliberately the
+*ephemeral* value — a disconnected session has no live context, so there is nothing to
+render. KV is **not** the source: an earlier draft read `client.current_context` from
+`KvDocument`, but KV is being deleted (`docs/shared-state.md`, *Retiring KV*). KV's one
+real job was the *orthogonal* concern of **durable** per-client restoration — "reopen the
+context this app window had last time" — which survives disconnect and therefore lives in
+a typed per-client store, **not** in `/v/session` (this tree only ever shows who is live
+*right now*). There is no symlink-to-arm and no TTL — see why next.
 
 **`conversation/` (deferred — omitted from the tree above on purpose).** The
 context/conversation split (durable multi-writer context vs. the append-only sequence
@@ -277,7 +286,8 @@ ambiently —
 
 - the **kaish shell** has `ExecContext.context_id`,
 - **MCP** has it,
-- the **app** has KV `current_context`,
+- the **app** has its live current context (the durable per-client store, *Future:
+  `/v/clients`* below — formerly KV),
 
 and the guard `context_allows_rc_write(ctx)`
 (`crates/kaijutsu-kernel/src/file_tools/guard.rs:71`) already keys on
@@ -292,7 +302,9 @@ the current context is ordinary ambient state, like cwd, not a capability token.
 
 - **Shell / MCP / app** — context is ambient. The shell resolves its current context
   **live** from `SessionContextMap` per operation (so a mid-line `kj attach` chains
-  like `cd` — see `docs/ssh-shell.md`); MCP/app read KV `current_context`. Writing
+  like `cd` — see `docs/ssh-shell.md`); MCP/app act as the context they have joined,
+  tracked the same live way (not KV — see *Retiring KV* in `docs/shared-state.md`).
+  Writing
   `/etc/rc/coder/create/S00-stance.kai` while acting as a privileged context routes
   `context_allows_rc_write(ctx)` and lands the write. No binding, no TTL, no arm.
 - **SFTP** — read/view, by design ("not everything needs to work over SFTP"). It
@@ -320,6 +332,52 @@ user**, and multiple sessions by one user (app windows, SSH logins) share that o
 principal and authorship lane (`BlockId.principal_id`). The per-connection `instance`
 distinguishes `/v/session` rows and rides traces, but never enters authorship — two
 logins are two ttys for one uid.
+
+## Future: `/v/clients` — durable per-client state, and steering it
+
+`/v/session` is the *live* roster (who's connected **now**, ephemeral, read-only). Its
+mirror-image sibling is **`/v/clients`** — the **durable** per-client state, keyed by the
+stable installation client-id (`client_id.rs`), surviving disconnect. This is the typed
+per-client store that replaces KV (`docs/shared-state.md`, *Retiring KV*), *projected* as
+files the slash-v way: the canonical store is a normalized `KernelDb` row with a typed RPC,
+and `/v/clients` is the introspection-and-control surface over it.
+
+```
+/v/clients/
+├── index                         # TSV: client-id  last-seen  context  …
+├── self -> <my-client-id>        # the durable id (cf. /v/session/self = the live instance)
+└── <client-id>/
+    ├── last_seen   # <iso>
+    └── context -> /v/ctx/<ab>/<id>   # the context this client should be showing
+```
+
+The axis that makes it interesting: unlike `/v/ctx` and `/v/session` (strictly
+read-only), **`/v/clients/<id>/context` is writable, and a write *steers* that client.**
+The client watches its own row (a `generation` bump, like every other hot file here) and
+follows the change. So `context` is simultaneously:
+
+- **the client's own setter** — the app writes it on a local `kj context switch` (this is
+  also the durable "reopen last context" restore value: setting it steers live *and*
+  persists);
+- **a remote steering surface** — *another* participant writes it to drive that display.
+
+The motivating scene (Amy): **four tablets on the wall, each running `kaijutsu-app`.** An
+orchestrator (a human at the console, or a context acting on its own) writes
+`/v/clients/tablet-3/context` to swing tablet 3 onto the bass line while the others stay
+on the score — *and* a player standing at tablet 3 can grab it and switch it themselves,
+writing the same field. The instrument-you-play stance made multi-surface: many hands, one
+keyboard, now literally across devices, with no bespoke protocol — it's a file write
+landing on shared kernel state every surface already sees.
+
+This rides the **per-operation-join** write model above: a steer is an ambient-context
+write in the shared-trust kernel (anyone connected can drive a display; that's the
+collaborative point, not a hole — there is no ownership). Open, for the dedicated session:
+how a steered client *observes* the change (poll `generation` vs. a `kvWatch`-style
+notify — note KV's `kvWatch` is being deleted, so this wants a successor or a plain poll);
+whether `context` is the only steerable field (theme, layout, a "spotlight this block"
+pointer all fit the same shape); and the exact typed-RPC vs. file-write split (the file is
+the *projection*; the RPC is canonical — same as `/v/ctx` reflecting verbs). Reserved as a
+direction now; `/v/ctx` + `/v/session` land first.
 
 ## Decisions (2026-06-27)
 
@@ -389,7 +447,8 @@ Independent of the remaining SFTP *adapter* work in `docs/sftp.md`; the SFTP-spe
 - `crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:47` — `VfsBackend` pattern to mirror
 - `crates/kaijutsu-types/src/ids.rs:52` — all ids are `Uuid::now_v7()` (the trailing-byte sharding rule)
 - `crates/kaijutsu-kernel/src/peers.rs:50,103` — `PeerInfo` / `PeerRegistry` (the session seed; `PeerInfo` needs a `kind` field)
-- `crates/kaijutsu-kernel/src/kv.rs:53` — `client.current_context` (app/MCP's read-only `context`)
+- `crates/kaijutsu-kernel/src/runtime/context_engine.rs:31` — `SessionContextMap` (the live acting-context source `context` renders; KV is retired, see `docs/shared-state.md`)
+- `crates/kaijutsu-app/src/connection/actor_plugin.rs:319,534` — the app's *durable* per-client restore (today via KV; migrates to a typed per-client store, **not** `/v/session`)
 - `crates/kaijutsu-types/src/block.rs:67,134` — `BlockId::to_key()`; `BlockHeader` (gains `content_len`)
 - `crates/kaijutsu-crdt/src/block_store.rs:199` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
 - `crates/kaijutsu-kernel/src/block_store.rs:182,153,1973` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write + remote merge)
