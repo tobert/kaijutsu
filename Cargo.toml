@@ -38,10 +38,10 @@ kaijutsu-client = { path = "crates/kaijutsu-client" }
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 
-# Kaish (execution engine + client) — pinned to published 0.9.
-kaish-kernel = "0.9"
-kaish-glob = "0.9"
-kaish-types = "0.9"
+# Kaish (execution engine + client) — pinned to published 0.10.
+kaish-kernel = "0.10"
+kaish-glob = "0.10"
+kaish-types = "0.10"
 
 # Cap'n Proto
 capnp = "0.25"

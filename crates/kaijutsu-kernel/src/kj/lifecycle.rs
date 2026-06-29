@@ -1858,9 +1858,9 @@ esac
             "kai",
             // Exit 99 if the var is set to anything. Empty/unset env
             // vars in kaish expand to empty string under `$VAR`, so
-            // `test -z` catches both.
+            // `[[ -z … ]]` catches both.
             r#"
-test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
+[[ -z "$KJ_PARENT_BLOCK_COUNT" ]] || exit 99
 "#,
         ).await;
 
