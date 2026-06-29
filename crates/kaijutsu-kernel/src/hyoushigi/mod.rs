@@ -1753,4 +1753,64 @@ mod tests {
         kernel.disarm_timeline(ctx);
         assert!(kernel.timeline(ctx).is_none(), "disarmed → no timeline");
     }
+
+    // --- Stage 2: the per-TRACK timeline registry (docs/tracks.md) -----------
+
+    /// Stage 2: arming a TRACK gives it a timeline keyed by `TrackId`, with **no
+    /// `ContextId` involved** — the clock now belongs to the track, and two tracks
+    /// are independent clock domains.
+    #[tokio::test]
+    async fn arm_track_then_lookup_returns_some_two_tracks_independent() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let bass = kaijutsu_types::TrackId::new("vbass").unwrap();
+        let drums = kaijutsu_types::TrackId::new("vdrums").unwrap();
+
+        assert!(kernel.track_timeline(&bass).is_none(), "not armed yet");
+        kernel.arm_track_timeline(bass.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        assert!(kernel.track_timeline(&bass).is_some(), "armed → has a timeline");
+        assert!(
+            kernel.track_timeline(&drums).is_none(),
+            "a different track is its own independent clock domain"
+        );
+    }
+
+    /// Stage 2: re-arming a track never clobbers the live timeline — continuity is
+    /// the whole point (a rotating producer must not reset the clock). Same handle.
+    #[tokio::test]
+    async fn arm_track_is_idempotent() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let t = kaijutsu_types::TrackId::new("vbass").unwrap();
+        let a = kernel.arm_track_timeline(t.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        let b = kernel.arm_track_timeline(t.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "re-arm returns the same track timeline");
+    }
+
+    /// Stage 2: the track seed lands on the playhead at creation (virgin), and a
+    /// re-arm does NOT re-seed — a producer rejoining a running track at a later
+    /// tick can't rewind it.
+    #[tokio::test]
+    async fn arm_track_seeds_once_rearm_does_not_rewind() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let t = kaijutsu_types::TrackId::new("vbass").unwrap();
+        let tl = kernel.arm_track_timeline(t.clone(), TickClock::default(), kaijutsu_types::Tick::new(40));
+        assert_eq!(tl.lock().playhead(), kaijutsu_types::Tick::new(40), "seeded at creation");
+        // A re-arm with a different (earlier) seed must be a no-op on the playhead.
+        kernel.arm_track_timeline(t.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        assert_eq!(
+            kernel.track_timeline(&t).unwrap().lock().playhead(),
+            kaijutsu_types::Tick::new(40),
+            "re-arm never re-seeds a live track playhead"
+        );
+    }
+
+    /// Stage 2: disarm drops a track's timeline — used on track teardown, never on
+    /// a context detach (the continuity invariant lives in the scheduler, not here).
+    #[tokio::test]
+    async fn disarm_track_removes_the_timeline() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let t = kaijutsu_types::TrackId::new("vbass").unwrap();
+        kernel.arm_track_timeline(t.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        kernel.disarm_track_timeline(&t);
+        assert!(kernel.track_timeline(&t).is_none(), "disarmed → no track timeline");
+    }
 }

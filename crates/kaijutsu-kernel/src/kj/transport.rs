@@ -608,6 +608,7 @@ mod tests {
                 beats_per_phrase: 16,
                 playhead_tick: None,
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
         d.kernel_db()
@@ -816,6 +817,7 @@ mod tests {
                 beats_per_phrase: 12,
                 playhead_tick: None,
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
         d.kernel_db()
@@ -1004,6 +1006,7 @@ mod tests {
                 beats_per_phrase: 12,
                 playhead_tick: None,
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
         d.kernel_db()
@@ -1293,6 +1296,7 @@ mod tests {
                 beats_per_phrase: 16,
                 playhead_tick: None,
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
         d.kernel_db()

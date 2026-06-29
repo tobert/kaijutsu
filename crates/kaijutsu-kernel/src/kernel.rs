@@ -92,6 +92,15 @@ pub struct Kernel {
     /// handler schedules cells onto them. Sharded by `ContextId` like
     /// `nonce_stores`, each behind a sync mutex (see [`SharedTimeline`]).
     timelines: dashmap::DashMap<kaijutsu_types::ContextId, crate::hyoushigi::SharedTimeline>,
+    /// Per-**track** hyoushigi timelines — Stage 2 (`docs/tracks.md`): the clock's
+    /// open future + committed score live on the TRACK now, not the producing
+    /// context, so the timeline never leaves when a producer detaches/rotates
+    /// (continuity is free) and N producers attached to one track share one open
+    /// future serialized at this `SharedTimeline`'s lock (the per-track sequencer).
+    /// Armed once on track creation; survives context detach; dropped only on track
+    /// teardown. Coexists with `timelines` (per-context, for coders) during the
+    /// Stage-2 cut. Keyed by `TrackId` like `timelines` is by `ContextId`.
+    track_timelines: dashmap::DashMap<kaijutsu_types::TrackId, crate::hyoushigi::SharedTimeline>,
     /// Ingress to the beat scheduler. Installed by the server at startup (the
     /// scheduler lives there, since it needs the block store too). Kernel-side rc
     /// code arms/disarms musician contexts by sending here; absent in embedded /
@@ -187,6 +196,7 @@ impl Kernel {
             file_cache: OnceLock::new(),
             nonce_stores: dashmap::DashMap::new(),
             timelines: dashmap::DashMap::new(),
+            track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
             kv: OnceLock::new(),
@@ -248,6 +258,7 @@ impl Kernel {
             file_cache: OnceLock::new(),
             nonce_stores: dashmap::DashMap::new(),
             timelines: dashmap::DashMap::new(),
+            track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
             kv: OnceLock::new(),
@@ -737,6 +748,55 @@ impl Kernel {
     /// context is archived. The beat scheduler skips a context with no entry.
     pub fn disarm_timeline(&self, context_id: kaijutsu_types::ContextId) {
         self.timelines.remove(&context_id);
+    }
+
+    // --- Stage 2: per-track timeline registry (docs/tracks.md) ---------------
+    //
+    // The clock + open future + committed score live on the TRACK now. These are
+    // the `TrackId`-keyed twins of the per-context arm/lookup/disarm above. The
+    // beat scheduler arms a track once (on first attach / track creation), pumps
+    // it each beat, and disarms it only on track teardown — NOT on context
+    // detach, so the timeline (and continuity) never leaves when a producer
+    // rotates out. `schedule_abc_cell` and the materialize bridge route here via
+    // the cell's/attachment's `TrackId`.
+
+    /// Arm a track's timeline: idempotent create-and-seed, keyed by `TrackId`.
+    /// First call constructs a fresh, resolver-registered timeline and seeds its
+    /// playhead (virgin by construction, like [`arm_timeline`]); a re-arm hits the
+    /// existing entry and leaves the live playhead untouched. Returns the shared
+    /// handle either way.
+    pub fn arm_track_timeline(
+        &self,
+        track_id: kaijutsu_types::TrackId,
+        clock: kaijutsu_hyoushigi::TickClock,
+        seed: kaijutsu_types::Tick,
+    ) -> crate::hyoushigi::SharedTimeline {
+        self.track_timelines
+            .entry(track_id)
+            .or_insert_with(|| {
+                let mut tl = kaijutsu_hyoushigi::Timeline::new(clock);
+                crate::hyoushigi::register_resolvers(&mut tl, self.cas.clone());
+                tl.seed_playhead(seed)
+                    .expect("freshly-constructed track timeline must be virgin for seed_playhead");
+                Arc::new(parking_lot::Mutex::new(tl))
+            })
+            .clone()
+    }
+
+    /// Look up a track's timeline, if it is armed. Returns `None` for an un-armed
+    /// track (lookup never arms).
+    pub fn track_timeline(
+        &self,
+        track_id: &kaijutsu_types::TrackId,
+    ) -> Option<crate::hyoushigi::SharedTimeline> {
+        self.track_timelines.get(track_id).map(|e| e.value().clone())
+    }
+
+    /// Disarm a track: drop its timeline and its open future. Used on **track
+    /// teardown**, never on a context detach (the whole point of moving the clock
+    /// onto the track is that it outlives any one producer).
+    pub fn disarm_track_timeline(&self, track_id: &kaijutsu_types::TrackId) {
+        self.track_timelines.remove(track_id);
     }
 
     /// Install the beat-scheduler ingress. Called once by the server at startup.

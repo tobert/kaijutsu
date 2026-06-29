@@ -632,7 +632,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     period_ms         INTEGER NOT NULL,
     beats_per_phrase  INTEGER NOT NULL,
     playhead_tick     INTEGER,           -- NULL until first beat; else max committed tick
-    playing           INTEGER NOT NULL DEFAULT 0   -- 1=Playing, 0=Stopped
+    playing           INTEGER NOT NULL DEFAULT 0,  -- 1=Playing, 0=Stopped
+    -- The non-producer context whose document holds the track's materialized
+    -- score. Set once at creation; never rewritten. NULL on a pre-score row.
+    score_context_id  BLOB
 );
 
 -- ── Attachments (context → track binding — docs/tracks.md §2+3) ─
@@ -655,6 +658,22 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 pub(crate) fn blob_param(id: &[u8; 16]) -> &[u8] {
     id.as_slice()
+}
+
+/// Parse a nullable `context_id` BLOB into `Option<ContextId>`, failing loud on a
+/// present-but-malformed blob (crash over corruption — a bad id is never silently None).
+fn parse_optional_context_id(
+    track_id: &str,
+    blob: Option<Vec<u8>>,
+) -> KernelDbResult<Option<ContextId>> {
+    match blob {
+        None => Ok(None),
+        Some(bytes) => ContextId::try_from_slice(&bytes).map(Some).ok_or_else(|| {
+            KernelDbError::Validation(format!(
+                "track {track_id} has a malformed score_context_id blob — corrupt"
+            ))
+        }),
+    }
 }
 
 fn read_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<ContextId> {
@@ -687,6 +706,10 @@ pub struct PersistedTrack {
     pub playhead_tick: Option<i64>,
     /// Transport state: `true` = Playing, `false` = Stopped.
     pub playing: bool,
+    /// The non-producer context whose document holds the track's materialized
+    /// score. Set once at creation; `write_track` never overwrites it, so an
+    /// upsert that omits it (passes `None`) can't wipe it. `None` on a pre-score row.
+    pub score_context_id: Option<ContextId>,
 }
 
 /// A persisted attachment — one (track_id, context_id) binding, the restart-
@@ -955,6 +978,7 @@ impl KernelDb {
         let alters = [
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
+            "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -3231,10 +3255,12 @@ impl KernelDb {
     /// Upsert a track row against `conn` (a `&Connection` or `&Transaction` via
     /// deref). Shared by `upsert_track` and transactional callers. Does NOT commit.
     fn write_track(conn: &Connection, t: &PersistedTrack) -> KernelDbResult<()> {
+        // `score_context_id` is set-once: written on INSERT, omitted from the
+        // ON CONFLICT UPDATE, so the frequent tempo/playhead upserts can't null it.
         conn.execute(
             "INSERT INTO tracks
-                 (track_id, period_ms, beats_per_phrase, playhead_tick, playing)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                 (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(track_id) DO UPDATE SET
                  period_ms = ?2, beats_per_phrase = ?3,
                  playhead_tick = ?4, playing = ?5",
@@ -3244,6 +3270,7 @@ impl KernelDb {
                 t.beats_per_phrase as i64,
                 t.playhead_tick,
                 t.playing as i64,
+                t.score_context_id.map(|c| c.as_bytes().to_vec()),
             ],
         )?;
         Ok(())
@@ -3265,7 +3292,7 @@ impl KernelDb {
         let row = self
             .conn
             .query_row(
-                "SELECT period_ms, beats_per_phrase, playhead_tick, playing
+                "SELECT period_ms, beats_per_phrase, playhead_tick, playing, score_context_id
                  FROM tracks WHERE track_id = ?1",
                 params![track_id],
                 |row| {
@@ -3274,11 +3301,12 @@ impl KernelDb {
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((period_ms, beats_per_phrase, playhead_tick, playing)) = row else {
+        let Some((period_ms, beats_per_phrase, playhead_tick, playing, score_blob)) = row else {
             return Ok(None);
         };
         if period_ms < 0 || beats_per_phrase < 0 {
@@ -3298,13 +3326,14 @@ impl KernelDb {
             beats_per_phrase: beats_per_phrase as u64,
             playhead_tick,
             playing: playing != 0,
+            score_context_id: parse_optional_context_id(track_id, score_blob)?,
         }))
     }
 
     /// List all persisted tracks. Order is not guaranteed.
     pub fn list_tracks(&self) -> KernelDbResult<Vec<PersistedTrack>> {
         let mut stmt = self.conn.prepare(
-            "SELECT track_id, period_ms, beats_per_phrase, playhead_tick, playing
+            "SELECT track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id
              FROM tracks",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -3314,17 +3343,20 @@ impl KernelDb {
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
             ))
         })?;
         let mut tracks = Vec::new();
         for row in rows {
-            let (track_id, period_ms, beats_per_phrase, playhead_tick, playing) = row?;
+            let (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_blob) = row?;
+            let score_context_id = parse_optional_context_id(&track_id, score_blob)?;
             tracks.push(PersistedTrack {
                 track_id,
                 period_ms: period_ms as u64,
                 beats_per_phrase: beats_per_phrase as u64,
                 playhead_tick,
                 playing: playing != 0,
+                score_context_id,
             });
         }
         Ok(tracks)
@@ -5680,6 +5712,7 @@ mod tests {
             beats_per_phrase: 16,
             playhead_tick: None,
             playing: false,
+            score_context_id: None,
         }
     }
 
@@ -5813,6 +5846,35 @@ mod tests {
         let got = db.get_track("bass").unwrap().unwrap();
         assert_eq!(got.playhead_tick, Some(1024));
         assert!(got.playing);
+    }
+
+    #[test]
+    fn track_score_context_round_trips_and_is_set_once() {
+        let db = KernelDb::in_memory().unwrap();
+        let score = ContextId::new();
+        // Created with a score context.
+        db.upsert_track(&PersistedTrack {
+            score_context_id: Some(score),
+            ..make_track("bass", 250)
+        })
+        .unwrap();
+        assert_eq!(db.get_track("bass").unwrap().unwrap().score_context_id, Some(score));
+
+        // A later upsert that does NOT carry the score context (a tempo/playhead
+        // change) must not wipe it — set-once.
+        db.upsert_track(&PersistedTrack {
+            playhead_tick: Some(512),
+            score_context_id: None,
+            ..make_track("bass", 250)
+        })
+        .unwrap();
+        let got = db.get_track("bass").unwrap().unwrap();
+        assert_eq!(got.playhead_tick, Some(512), "the upsert still updates mutable fields");
+        assert_eq!(got.score_context_id, Some(score), "set-once: score context survived");
+
+        // A pre-Stage-2 row (created without a score context) reads back as None.
+        db.upsert_track(&make_track("drums", 250)).unwrap();
+        assert_eq!(db.get_track("drums").unwrap().unwrap().score_context_id, None);
     }
 
     // ── Attachments CRUD ──────────────────────────────────────────────

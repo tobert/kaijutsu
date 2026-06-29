@@ -41,10 +41,11 @@ use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Cadence, DeriverRegistry,
     MaterializeCursor, materialize_committed, schedule_abc_cell,
 };
-use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
+use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
 use kaijutsu_types::{
-    BlockSnapshot, ContentType, ContextId, PrincipalId, SessionId, Tick, TickDelta, TrackId,
+    BlockSnapshot, ConsentMode, ContentType, ContextId, ContextState, DocKind, PrincipalId,
+    SessionId, Tick, TickDelta, TrackId, now_millis,
 };
 
 use crate::rpc::ServerRegistry;
@@ -87,6 +88,12 @@ struct TrackState {
     /// the clock per context) is what makes every context woken on the SAME beat see
     /// the IDENTICAL value — the cross-context join key. `0` before the first beat.
     last_epoch_ns: u64,
+    /// The track's score context: a real, app-viewable non-producer context whose
+    /// document holds the materialized score. Minted once when the track is created
+    /// (or recovered from the persisted `tracks` row) and never changes. The score
+    /// outlives any producer, which is the point of moving it off the per-context
+    /// timeline. (Materialize/HEARD re-point onto it in increment 3.)
+    score_context: ContextId,
     /// The binding set: which contexts are attached and how each rides the beat.
     /// The track holds this passive view; the *context* drives the bind (entity #3)
     /// and a forked child re-binds on the way up.
@@ -317,6 +324,69 @@ impl BeatScheduler {
         self.context_track.get(&ctx).cloned()
     }
 
+    /// Mint or recover the track's score context — a real, first-class context (so
+    /// it's browsable/viewable in the app like any other) that holds the track's
+    /// materialized score but is a *non-producer*: never armed, driven, or hydrated
+    /// to a model. Built the `lost+found` way (a real row + document + drift handle,
+    /// no rc lifecycle). `existing` is the id persisted on the `tracks` row: `Some`
+    /// on restart recovery (rows/document/handle already persist and are
+    /// re-registered at cold start), `None` for a brand-new track. A creation
+    /// failure is fatal — a track with nowhere to put its score is corruption, not
+    /// a fallback.
+    fn ensure_score_context(
+        &self,
+        track_id: &TrackId,
+        existing: Option<ContextId>,
+    ) -> Result<ContextId, String> {
+        if let Some(ctx) = existing {
+            return Ok(ctx);
+        }
+        let score_ctx = ContextId::new();
+        // `-`, not `:` — colons are reserved for tag:prefix label syntax.
+        let label = format!("score-{}", track_id.as_str());
+        let system = PrincipalId::system();
+        if let Some(db) = self.documents.db() {
+            let db = db.lock();
+            let ws = db.get_or_create_default_workspace(system).map_err(|e| {
+                format!("beat: score context workspace for {}: {e}", track_id.as_str())
+            })?;
+            let row = ContextRow {
+                context_id: score_ctx,
+                label: Some(label.clone()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: "score".to_string(),
+                created_at: now_millis() as i64,
+                created_by: system,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                concluded_at: None,
+                workspace_id: None,
+                preset_id: None,
+            };
+            db.insert_context_with_document(&row, ws).map_err(|e| {
+                format!("beat: creating score context for {}: {e}", track_id.as_str())
+            })?;
+        }
+        self.documents
+            .create_document(score_ctx, DocKind::Conversation, None)
+            .map_err(|e| {
+                format!("beat: score context document for {}: {e}", track_id.as_str())
+            })?;
+        self.kernel
+            .drift()
+            .write()
+            .register(score_ctx, Some(label.as_str()), None, system)
+            .map_err(|e| {
+                format!("beat: registering score context for {}: {e}", track_id.as_str())
+            })?;
+        Ok(score_ctx)
+    }
+
     /// A track's current playhead, if the track has a live clock domain. Used by
     /// tests to observe musical position.
     #[cfg(test)]
@@ -400,19 +470,18 @@ impl BeatScheduler {
         // committed blocks via the attaching context), never the context alone.
         if !self.tracks.contains_key(&track_id) {
             let persisted = match self.documents.db() {
-                Some(db) => db
-                    .lock()
-                    .get_track(track_id.as_str())
-                    .map_err(|e| {
-                        format!(
-                            "beat: attach to {}: reading persisted track: {e}",
-                            track_id.as_str()
-                        )
-                    })?
-                    .and_then(|t| t.playhead_tick),
+                Some(db) => db.lock().get_track(track_id.as_str()).map_err(|e| {
+                    format!(
+                        "beat: attach to {}: reading persisted track: {e}",
+                        track_id.as_str()
+                    )
+                })?,
                 None => None,
             };
-            let seed = ctx_from_log.max(persisted.map(Tick::new).unwrap_or(Tick::ZERO));
+            let persisted_playhead = persisted.as_ref().and_then(|t| t.playhead_tick);
+            let persisted_score = persisted.as_ref().and_then(|t| t.score_context_id);
+            let seed = ctx_from_log.max(persisted_playhead.map(Tick::new).unwrap_or(Tick::ZERO));
+            let score_context = self.ensure_score_context(&track_id, persisted_score)?;
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
@@ -422,6 +491,7 @@ impl BeatScheduler {
                     playhead: seed,
                     beat_count: 0,
                     last_epoch_ns: 0,
+                    score_context,
                     attached: HashMap::new(),
                 },
             );
@@ -479,6 +549,7 @@ impl BeatScheduler {
             beats_per_phrase: track.policy.beats_per_phrase,
             playhead_tick: Some(track.playhead.get()),
             playing: track.playing,
+            score_context_id: Some(track.score_context),
         };
         db.lock().upsert_track(&row).map_err(|e| {
             let msg = format!("beat: failed to persist track {}: {e}", track_id.as_str());
@@ -2470,6 +2541,8 @@ mod tests {
         sched.attach(track.clone(), ctx, attachment, policy).unwrap();
 
         // The track row mirrors the clock (tempo + phrase). Fresh ctx → playhead 0.
+        // attach also minted a score context; the row carries its id.
+        let score_ctx = sched.tracks.get(&track).expect("track exists").score_context;
         assert_eq!(
             db.lock().get_track("bass").unwrap(),
             Some(PersistedTrack {
@@ -2478,6 +2551,7 @@ mod tests {
                 beats_per_phrase: 12,
                 playhead_tick: Some(0),
                 playing: false,
+                score_context_id: Some(score_ctx),
             }),
             "attach mirrors the clock into the tracks row for restart recovery"
         );
@@ -2518,6 +2592,51 @@ mod tests {
         );
     }
 
+    /// Stage 2 increment 2: attaching creates the track's SCORE CONTEXT — a real,
+    /// app-viewable context (so it has a `contexts` row + a document) that is a
+    /// NON-producer (never armed for a turn, not attached, not in the reverse
+    /// index). A "restart" (a fresh scheduler over the same DB) reuses the persisted
+    /// score context rather than minting a second one.
+    #[tokio::test]
+    async fn attach_mints_a_viewable_nonproducer_score_context_reused_on_restart() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let track = TrackId::new("bass").unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        sched
+            .attach(track.clone(), ctx, Attachment::musician_default(), BeatPolicy::musician_default())
+            .unwrap();
+        let score = sched.tracks.get(&track).expect("track exists").score_context;
+
+        // A real, viewable context: it has a `contexts` row (so `kj context list` /
+        // the app can see it), tagged `context_type = "score"`.
+        let row = db.lock().get_context(score).unwrap().expect("score context has a row");
+        assert_eq!(row.context_type, "score", "score context is tagged for the app to recognize");
+        assert_eq!(
+            row.context_state,
+            kaijutsu_types::ContextState::Live,
+            "score context is live (not archived)"
+        );
+
+        // It is NOT a producer: no timeline is armed for it, it isn't bound to a
+        // track, and it never appears in the reverse index.
+        assert!(kernel.timeline(score).is_none(), "score context never gets a (producer) timeline");
+        assert!(sched.track_of(score).is_none(), "score context is not itself attached to a track");
+        assert_ne!(score, ctx, "the score context is distinct from the producing context");
+
+        // Restart: a fresh scheduler over the same DB recovers the SAME score context
+        // from the persisted `tracks` row — it does not mint a second one.
+        let mut sched2 = BeatScheduler::new(kernel.clone(), documents.clone());
+        sched2
+            .attach(track.clone(), ctx, Attachment::musician_default(), BeatPolicy::musician_default())
+            .unwrap();
+        assert_eq!(
+            sched2.tracks.get(&track).expect("track exists").score_context,
+            score,
+            "restart reuses the persisted score context, not a fresh mint"
+        );
+    }
+
     /// Continuity across a rotation page-turn WITHOUT a carry: the TRACK owns the
     /// playhead and persists it in the `tracks` row. A child attaching to a track
     /// whose durable row carries playhead 512 — but which has no committed blocks of
@@ -2538,6 +2657,7 @@ mod tests {
                 beats_per_phrase: 16,
                 playhead_tick: Some(512),
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
         assert_eq!(
@@ -2590,6 +2710,7 @@ mod tests {
                 beats_per_phrase: 16,
                 playhead_tick: Some(42),
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
 
@@ -2625,6 +2746,7 @@ mod tests {
                 beats_per_phrase: 16,
                 playhead_tick: Some(0),
                 playing: false,
+                score_context_id: None,
             })
             .unwrap();
         assert!(kernel.timeline(ctx).is_none(), "no timeline before attach");

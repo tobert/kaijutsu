@@ -528,3 +528,361 @@ a cluster of restart/handoff gaps. **Fixed in the follow-up commit:**
 - **Rotation gap is unbounded** if the child's boot/turn is queued behind other work; the
   speculation lead covers the *notation*, not the *production* gap. The atomic `Swap`
   transport command (suspend the clock across the handoff) is the eventual closer.
+
+---
+
+# Stage 2 implementation — the track owns its score
+
+> **Status:** design locked 2026-06-29 (Amy + Claude), not yet coded. This is the
+> *living* implementation tracker — a fresh session continues from here, exactly as
+> Stage 1 did. **No backwards compat; on `main`.** The two scoping decisions are made
+> (below); the work items are TDD and unstarted. Tick a box + add a one-line note when
+> an item lands; record fresh decisions under *Decisions made in-flight*.
+
+## The two scoping decisions (made 2026-06-29)
+
+1. **Minimal track-keyed store first** — move the `Timeline` (clock + open future +
+   committed log) onto the **track**, and add a **track-scoped block store/query** that
+   feeds materialize + `KJ_HEARD` now. The first-class, app-synced/scrubbable track
+   *Document* (the "track is like a good instrument" render) is a **later cut** — Stage 2
+   lands the kernel-side value (continuity-by-construction, the *real* band-view HEARD,
+   one materialize cursor) without the app surface.
+2. **Design concurrent producers now — by removing the single-producer assumption, not by
+   adding machinery.** See *The concurrent-producer model* — this turns out to be the
+   same work as the minimal store, done without baking in "one producer."
+
+## Where the code actually is (verified 2026-06-29, post-Stage-1)
+
+Stage 1 moved the *clock* onto `TrackState` (`beat.rs:60-94`: playhead, beat_count,
+transport, heap, generation). The **score is still per-context**:
+
+- **`Kernel.timelines: DashMap<ContextId, SharedTimeline>`** (`kernel.rs:711`) with
+  `arm_timeline`/`timeline`/`disarm_timeline` (`kernel.rs:705-740`) — **the central cut
+  point.** The score container is keyed by `ContextId`.
+- The `Timeline` (`hyoushigi/src/engine.rs:153-612`) holds `playhead`, `future: Vec<Scheduled>`
+  (open future), **`committed: Vec<Cell>`** (the durable score, in-RAM stand-in for the
+  block log), `cas`, `squashes`, **`failures`**. Public API: `schedule(cell)` (input,
+  `:239`), `advance_to`/`pump` (drive), `committed()`/`squashes()`/`failures()` (read),
+  `seed_playhead` (virgin re-arm), `materialize(cell, block_id)` (→ `BlockSnapshot`).
+- **The data is already track-tagged; only the container is per-context.** `Cell.track`
+  (lane identity, required) + `Cell.played_by` (producer principal) — `cell.rs:113-173`,
+  in `crates/kaijutsu-hyoushigi/src/cell.rs` (**not** `kaijutsu-types`). `commit()`
+  (`engine.rs:493-531`) already stamps every emitted sibling with the committing cell's
+  `track` + `played_by` and asserts loudly on divergence. `BlockSnapshot.track` +
+  `BlockId.principal_id` carry the same two axes to the block layer (`block.rs:1322-1334`).
+- **The Stage-1 bridge** (`beat.rs:778-787`, inside `materialize_one`): each beat slews
+  the per-context timeline's playhead to the track playhead. **This is the seam Stage 2
+  deletes** (the explicit Stage-1 note, lines 392-394).
+- **Per-context materialization bookkeeping** rides each `AttachedContext`
+  (`beat.rs:101-124`): `cursor: MaterializeCursor`, `materialize_failures`,
+  `failure_water` — it exists *because each context materializes into its own timeline +
+  own block store*. Becomes track-scoped (one cursor over the track's score).
+- **`KJ_HEARD` is a per-context lie today.** `transport_env` reads
+  `self.documents.block_snapshots(ctx)` (`beat.rs:1018`, keyed by `ContextId`) — a single
+  context's log — though the comments (`beat.rs:213-214`) already *describe* a cross-track
+  band view. The aspiration becomes true once the read is track-scoped.
+- **No track-owned or cross-context-by-track aggregation exists** anywhere
+  (`block_snapshots(ctx)`/`last_block_id(ctx)` are per-context, `block_store.rs:2097, 824`).
+  This is what Stage 2 builds. (It also closes the deferred Stage-1 "track-scoped
+  `max_tick`" item above — the seed can finally ask the *track's* high-water, not the
+  context's.)
+
+## The core data move
+
+| Today (per-context) | Stage 2 (per-track) |
+|---|---|
+| `Kernel.timelines: DashMap<ContextId, SharedTimeline>` | `tracks` own the `Timeline` — keyed by `TrackId` (held on/beside `TrackState`) |
+| `arm_timeline(ctx)` / `timeline(ctx)` / `disarm_timeline(ctx)` | track-keyed: arm on track-create, read by `TrackId`, disarm on track teardown (not on detach) |
+| `schedule_abc_cell(kernel, ctx, …)` routes input to the ctx's timeline | routes to the **track's** timeline (cell already carries `track`+`played_by`) |
+| per-`AttachedContext` `cursor`/`materialize_failures`/`failure_water` | **one track-scoped** cursor + failure ledger (the `Timeline.failures()` is already per-timeline → now per-track) |
+| materialized blocks land in the **producing context's** block store | land in the **track-scoped** block store (a cell carries no `ContextId`, only `played_by`) |
+| `KJ_HEARD` ← `block_snapshots(ctx)` | `KJ_HEARD` ← **track-scoped** read (the real band view, spanning the rotation chain) |
+| Stage-1 bridge slew (`beat.rs:778-787`) | **deleted** — the playhead lives on the track; nothing to slave |
+
+## The concurrent-producer model (the load-bearing design)
+
+The store is built so **N producing contexts can contribute to one track's score**, and
+this needs *almost no new machinery* — hyoushigi's existing invariants already make it
+correct. Music keeps "one producing binding at a time" as a **loadout policy** (two bass
+phrases on one beat clash), *not* a structural assumption — the kernel never forbids
+concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not enforcement).
+
+- **No conflict at the same tick.** Two producers committing at the same `Span` produce
+  two distinct cells, each with its own `played_by`; the shared-coordinate doctrine
+  already allows ties (`BlockId` is the unique row). Both copies persist with provenance —
+  the doc's "copies + back-reference make several contexts contributing *tractable*."
+- **The write barrier already holds per-cell**, not per-track-tick. A committing at tick N
+  never rewrites B's committed cell at tick N — different cells. N producers don't threaten
+  "never rewrite a committed cell."
+- **Speculation isolation is already structural** — a resolver only ever gets the
+  *committed* view, so A can't read B's uncommitted speculation; A *can* read B's committed
+  cells (the payoff — A composes against what B actually landed).
+- **Misprediction handles it for free** — B committing inside A's speculate→commit window
+  shifts A's `compute_basis` → A squashes and re-speculates against B's contribution; the
+  `Squashed` ledger records it.
+- **The genuinely new mechanisms (small, but NOT zero — the deepseek review corrected the
+  "almost no machinery" claim):**
+  1. **The per-track `Timeline`'s lock is the sequencer** — the per-track analog of the
+     per-context mailbox-as-sequencer (preserves "the kernel is the sole timeline
+     sequencer" with N producers; they queue at the track's lock).
+  2. **`FailureEvent` gains `played_by`, and failure-draining becomes per-context.** This
+     is the one *correctness* addition the review found: `FailureEvent` (`engine.rs:84-93`)
+     carries no producer identity today, and `drain_failures` (`beat.rs:919-990`) drains
+     *all* new failures into the *draining* context's conversation and advances one
+     `failure_water`. With N producers on one shared track timeline that **misattributes**
+     — producer B's resolve failures surface in producer A's conversation and B never sees
+     its own. So concurrent producers require: stamp `FailureEvent.played_by` from the
+     failing cell at construction (`engine.rs:396-401`), and make `drain_failures` filter
+     to the draining context's producer. (See WI 3.)
+- **`UseLastGood`/`last_committed_content_in` stays *lane*-scoped** (the track's last
+  committed cell, regardless of producer) — for music the listener hears the lane continue;
+  a `played_by`-scoped "repeat MY last" is a future refinement if a use case needs it. This
+  is a *behavioral change* from the single-producer baseline (A's fallback may now repeat
+  B's last phrase) — a decision, not a bug.
+
+## Work items (TDD throughout — tests that can and will fail)
+
+- [ ] **1. Move the `Timeline` registry onto the track.** `Kernel.timelines`
+  (`kernel.rs:711`) → `TrackId`-keyed (or hang the `SharedTimeline` on `TrackState`).
+  `arm_timeline`/`disarm_timeline` become **track**-keyed (`arm_track_timeline(track_id)` on
+  track create / first attach; `disarm_track_timeline(track_id)` on **track teardown**,
+  *not* on context detach). **`attach` must stop calling `arm_timeline(context_id)`**
+  (`beat.rs:434`) — that per-context arm is a Stage-1 artifact; a score context just joins
+  the track's `attached` set, the (already-armed) track timeline is the score target.
+  `timeline(ctx)` either goes away or becomes a convenience that does ctx→track→timeline.
+  Per-context timelines for **non-track** contexts (coders) are unaffected. **Drop timeline
+  cloning on fork (gemini):** `insert_forked_context` clones the per-context timeline today —
+  with the timeline on the track, a fork of an attached context must NOT clone it; the child
+  re-attaches and becomes a **co-producer on the existing shared track timeline** (cloning
+  would give it a disconnected open future, breaking one-timeline-per-track). *Tests:* a
+  track's timeline survives a detach; two tracks have independent timelines; rotation
+  (parent detach → child attach, same track) keeps one continuous timeline (no re-arm, no
+  seed dance); a freshly-attached score context creates **no** per-context timeline; a fork
+  of an attached context shares (does not clone) the track timeline.
+- [ ] **2. Re-point score input.** `schedule_abc_cell` (`mod.rs:320`) + its caller
+  `on_turn_completed` (`beat.rs:1106-1168`) schedule into the **track's** timeline by the
+  ctx→track index; cell keeps `track`+`played_by` so provenance survives. *Tests:* a cell
+  scheduled by ctx A then committed *after* A detaches still lands in the track score
+  (rotation hand-off); two producers' cells coexist in one track's committed log,
+  distinguished by `played_by`.
+- [ ] **3. Track-scoped materialize, but per-context error surfacing.** The score
+  **materialize** runs **once per track** (one cursor over the track's committed cells →
+  the track-scoped block store), retiring the per-`AttachedContext` `cursor`. **But error
+  surfacing stays per-context** — the deepseek review's key structural correction: the
+  `failures: Vec<FailureEvent>` *ledger* lives on the shared (per-track) timeline, yet
+  *draining* it (the `failure_water` cursor + inserting Error blocks, and the poison-skip
+  Error path `beat.rs:869-901`) must land in the **producing** context's conversation so a
+  model reads its *own* failures next turn. Concretely: (a) add `played_by` to
+  `FailureEvent` (`engine.rs:84-93`), stamped from the failing cell (`engine.rs:396-401`);
+  (b) materialize once per track; (c) a per-context loop drains failures **filtered by
+  `played_by`**, advancing a per-context water mark. *Needs:* a `ContextId → PrincipalId`
+  (the context's producer) mapping reachable from the drain — simplest is to store the
+  producer `played_by` on `AttachedContext` at attach. **Hoist materialize out of the
+  per-context loop (gemini):** `process_track` today loops `for each attached ctx →
+  materialize_one`; with a track-scoped cursor that would **double/triple-emit** per attached
+  context. Restructure: run `materialize_track(track_id)` **exactly once per beat**, then
+  iterate `attached` only for per-context cadence (rotate / phrase / ooda wake) + the
+  per-context failure drain. *Tests:* two producers materialize through one cursor with no
+  double-emit; a track with 3 attachments materializes each committed cell **once** per beat;
+  producer B's resolve failure surfaces in **B's** conversation, never A's; poison-skip is
+  attributed to the cell's `played_by`.
+- [ ] **4. The per-track score context (DECIDED: option C — do this FIRST, it gates 1–3).**
+  Create a durable **score context** when a track is created; its Conversation document holds
+  the materialized score. Because it's a **real `ContextId`**, *all* the per-context block APIs
+  are reused unchanged — `materialize_committed` keeps taking a `ContextId`, just the **score
+  context's**, not the producer's: `reserve_block_id(score_ctx, played_by)` (per-`(score_ctx,
+  principal)` seqs — the per-`(track,principal)` the review wanted, real and restart-seeded by
+  the existing block-log seeding), `insert_from_snapshot_as(score_ctx, …)`,
+  `last_block_id(score_ctx)` as the `after` anchor, `block_snapshots(score_ctx)` /
+  `max_tick(score_ctx)`. **No `TrackId` block-store API, no `kaijutsu-index`/RPC ripple** — the
+  (C) payoff (the per-`ContextId` index trait at `lib.rs:74` already works for the score ctx).
+  Store the score `ContextId` on `TrackState` + the persisted `tracks` row. The score context
+  must be a **non-producer** (no rc lifecycle, no turn, no LLM hydration — a kind/flag). The
+  **Error-block insert stays the PRODUCER's `ContextId`** (errors go to the producer's
+  conversation, per WI 3), NOT the score context. Closes the deferred **track-scoped
+  `max_tick`**: `attach`'s seed reads `max_tick(score_ctx)` (`beat.rs:393-397, 415`) instead of
+  the producer's. *Tests:* creating a track creates its score context (+ KernelDb row);
+  materialized blocks land in the score context, not the producer's; two producers' cells share
+  the score context distinguished by `played_by`/`BlockId`; the score context is flagged
+  non-producer (never armed for a turn); legacy `track == None` blocks match no track.
+- [ ] **5. Re-point `KJ_HEARD` at the track score** (`beat.rs:1013-1021`). The band view
+  becomes real — a producer hears the whole lane (all producers, across rotations) within
+  the window. *Test:* after a rotation, the child's `KJ_HEARD` includes the retired
+  parent's committed phrases; two concurrent producers each see the other's committed cells.
+- [ ] **6. Delete the Stage-1 bridge** (`beat.rs:778-787`) and the per-context seed/slew
+  it serves. The playhead lives only on the track. *Test:* the existing continuity tests
+  (re-pointed from Stage 1's "the clock stayed on the track") pass with the bridge gone.
+- [ ] **7. Persistence — persist the Cell log, do NOT reverse-engineer from blocks.**
+  Track score recovery across restart, folded into the `tracks` table / cold-start path (the
+  re-arm sweep stays deferred, but the shape must support re-hydrating a track's score).
+  **Decision (gemini): re-deriving the committed `Vec<Cell>` from materialized blocks is
+  LOSSY** — `materialize`→`BlockSnapshot` drops `CellState`, the `Recipe`, and full `Span`, so
+  a track that re-arms with an empty `committed` Vec leaves `last_committed_content_in` blind
+  and the **next `UseLastGood` fallback wedges the track**. So persist the timeline's own
+  append-only Cell log (at least `Concrete` cells with full `Span` + `played_by`) to a
+  track-scoped row, loaded at arm. **Chicken-and-egg:** `seed_playhead` (`engine.rs:287-298`)
+  is **virgin-only** (`committed.is_empty()`) and you can't schedule cells *behind* the
+  playhead — so loading a persisted log needs a real `Timeline::rehydrate(playhead,
+  committed_cells)` entry point (bypasses the virgin check), not `push_committed_for_test`
+  (`engine.rs:207-209`, test-gated). **Open future / squashes / in-flight speculations do NOT
+  survive restart** (consistent with conversation re-hydration) — state that as the contract,
+  like Stage 1 did for `KJ_PULSE`. *Test:* a `UseLastGood` fallback fired the beat *after* a
+  restart still finds the pre-restart phrase (the wedge-the-track regression); rehydrate
+  accepts a non-empty committed log + a playhead at/after its max tick.
+- [ ] **8. Docs** — flip these boxes; devlog entry; update `hyoushigi.md`'s "A context
+  owns a timeline" section (lines 220-228) to past tense once the timeline has actually
+  moved to the track; retire the Stage-1 "track-scoped `max_tick`" deferral above.
+- [ ] **9. Test audit (the review's risk finding).** The suite is deeply per-context
+  coupled, so many tests will **keep passing while exercising the wrong path** after the
+  cut — at-risk: `hyoushigi/mod.rs` tests `bridge_materializes_committed_cell_into_block_and_cas`
+  (`:877`), `materialize_after_reload_mints_fresh_seq_no_duplicate` (`:945`),
+  `score_cell_commits_abc_and_derives_midi_sibling` (`:1100`),
+  `materialize_after_restart_does_not_collide` (`:1275`), `partial_insert_resumes_per_artifact`
+  (`:1655`), `arm_then_lookup_returns_some…` (`:1700`), `disarm_removes_the_timeline`
+  (`:1749`). For each, add a **track-scoped** variant that exercises the new path. Add the
+  **concurrent-producer** test: two contexts schedule into one track timeline; both cells
+  materialize once into the track store; both appear in track-scoped `KJ_HEARD`; a failure
+  from one producer surfaces **only** in that producer's Error blocks. **Specific silent-pass
+  trap (gemini):** any test asserting on `block_snapshots(ctx).len()` to confirm a note
+  materialized will break/mislead once the score lands in the *track* store — grep them out
+  and re-point at the track-scoped query.
+
+## Decisions made in-flight
+
+- **WI 1–4 are ONE coherent cut, not independently green (found 2026-06-29, first code
+  pass).** `materialize_committed` (`mod.rs:586`) uses `context_id` for *three* block-store
+  calls — `last_block_id` (`:597`), `reserve_block_id` (`:685`), `insert_from_snapshot_as`
+  (`:718`). The moment the timeline becomes track-keyed (WI 1), a materialized cell has no
+  `ContextId` to write to (it carries only `track` + `played_by`), so the block store MUST be
+  track-keyed in the same change (WI 4). Schedule (WI 2) and the materialize hoist (WI 3) ride
+  along. **Real dependency order: WI 4 (track-keyed block container) → WI 1 (timeline
+  registry) → WI 2/3 (re-point) → WI 5/6.** The 8-item numbering is a checklist, not a landing
+  order.
+- **WI 4 container — DECIDED 2026-06-29 (Amy): (C) a real per-track "score context."** When a
+  track is created, create a durable backing context whose Conversation document **is** the
+  track's score; producers materialize into it. *Why (C) over the alternatives:* it reuses the
+  entire per-context block machinery via a **real `ContextId`** (so `reserve_block_id`/
+  `insert_from_snapshot_as`/`last_block_id`/`block_snapshots`/`max_tick` and per-`(ctx,principal)`
+  seqs all work unchanged — no TrackId block-store API, no `kaijutsu-index`/RPC ripple), it
+  satisfies `handle_implies_row` (no synthetic id), and it embodies the design's own thesis —
+  *the track persists, producers come and go* — the score context is the durable thing they
+  rotate around, and it's browsable as the track's score. (Rejected: (A) synthetic ContextId —
+  fake-id leak + `handle_implies_row` violation; (B) parallel `track_documents` store — most new
+  code + the index/RPC ripple.) **Consequence:** the score context is *not a conversational
+  producer* — it must NOT run rc lifecycle / take turns / hydrate to an LLM; it is a score
+  holder (a new `context_type`/kind or a "no-OODA, no-hydrate" flag). `TrackState` (and the
+  persisted `tracks` row) gains the score `ContextId` so materialize/HEARD/seed resolve it.
+  This partly delivers the deferred "first-class track Document" for free (the score context
+  renders like any context) — fine, just not required; keep app surface out of Stage 2.
+- **No literal timeline-clone on fork (corrects the gemini finding).** There is no
+  timeline-cloning code in `insert_forked_context`/`lifecycle.rs`; the fork child gets its own
+  per-context timeline because its `attach` calls `arm_timeline(context_id)` (`beat.rs:434`).
+  So "drop the fork clone" = the same fix as "attach stops arming a per-context timeline" — arm
+  once per track, attach joins. (WI 1.)
+- **Score contexts are APP-VIEWABLE (Amy, 2026-06-29), not hidden.** They're real `Live`
+  contexts (`context_type="score"`, label `score-<track>`) that appear in `kj context list` and
+  the app — the "first-class Document for free" upside of (C). "Non-producer" means only that
+  they never take a turn or hydrate to a model, NOT that they're hidden. (No app-side work is in
+  scope now; viewability is a property the kernel-side mint preserves.)
+- **Foundation step (additive, safe): the Kernel gains a `TrackId`-keyed timeline registry**
+  (`arm_track_timeline`/`track_timeline`/`disarm_track_timeline`) ALONGSIDE the per-context one,
+  so coders keep their per-context timelines and the re-point can proceed incrementally before
+  the per-context score path is deleted.
+
+## Open questions carried into Stage 2 coding
+
+- **The first-class track Document** (app-synced, scrubbable in the time-well) is
+  deliberately out of this cut. Where the minimal track-keyed store and that Document meet
+  (is the store *the* Document's backing, or a separate kernel structure the Document later
+  reads?) is decided when the render lands, not now — but item 4 should not paint it into a
+  corner (prefer a shape a Document can later wrap).
+- **Score ↔ conversation seam.** Stage 2 keeps the model's *turn* (its ABC output block)
+  in the producing context's conversation and moves the committed *score* to the track;
+  `KJ_HEARD` is the context's window onto the track score. Whether the hydration-marker
+  machinery should also re-point at the track (so a re-hydrated musician reads the track
+  score directly, not just via `KJ_HEARD`) is left for when it bites.
+- **Concurrent-producer ordering at the exact same tick** is by insertion order at the
+  track lock (shared-coordinate ties; `order_key` successor-derived). Deterministic per-run,
+  **not across runs** (depends which producer takes the lock first); `BlockId` is the unique
+  row so correctness holds regardless. If a use case needs deterministic cross-producer
+  ordering, revisit then.
+
+## Stage 2 review findings (deepseek, 2026-06-29 — pre-coding)
+
+A holistic whole-file review (engine.rs/cell.rs/beat.rs/hyoushigi mod.rs + the docs, no diff)
+ahead of coding. It **validated both scoping decisions** and tested the concurrent-producer
+claim (a)-(d) individually against the code: all four hold — the per-cell write barrier
+(`engine.rs:480-495`, append-only `commit`), speculation isolation (`CommittedCtx` borrows
+only the committed slice, `engine.rs:617-621`), ties-by-`played_by` (→ `BlockId.principal_id`,
+`mod.rs:685`), and squash-on-co-commit are all structurally sound. It also confirmed the
+clean parts: the per-track lock as a natural extension of the existing per-context lock; the
+gap-not-overlap rotation with the track timeline surviving detach; the `HeardEntry` struct
+already carrying `track` so the band view is structurally ready; the materialize cursor logic
+being *simpler* with one cursor per track.
+
+The findings (folded into the claim + work items above):
+
+1. **🔴 `FailureEvent` has no producer attribution** — the one correctness *bug*. Folded into
+   the concurrent-producer model + WI 3 (add `played_by`; per-context filtered draining).
+2. **Materialize-once-per-track vs. per-context error surfacing** — folded into WI 3 (the
+   "one failure ledger per track" language was misleading; the ledger is per-track, the
+   *draining* is per-context).
+3. **block-store API surface understated** — folded into WI 4 (enumerated the TrackId-keyed
+   variants + the `kaijutsu-index`/RPC ripple; Error insert stays per-context).
+4. **`arm/disarm_timeline` + `attach` per-ctx arm** — folded into WI 1.
+5. **`seed_playhead` virgin-only vs. re-derivation** — folded into WI 7 (rehydration ctor).
+6. **`attach` seed still `max_tick(ctx)`** — folded into WI 4 (→ `max_tick_track`).
+7. **Test suite silently passes on the wrong path** — became WI 9 (test audit).
+
+**Document, not fix (sound, but worth stating so the design doesn't mislead):**
+
+- **The squash / "misprediction handles it for free" path is structurally correct but
+  *dormant* for today's only resolver — and that is *correct musical behavior*, not a gap.**
+  Both reviewers (deepseek + gemini, independently) flagged this: `CasCommitResolver::compute_basis`
+  (`mod.rs:402-408`) hashes only the recipe's `hash` param — it never reads the committed view —
+  so a co-producer's commit can't change its basis and it never squashes under concurrency.
+  **Gemini's reframe:** for absolute notation that is exactly right — if two players land a note
+  at the same tick you want *both* to commit and play (a chord/clash), not for one to cancel and
+  re-evaluate the other. So claim (d)'s machinery is ready but should NOT be expected to fire for
+  concurrent `cas_commit` producers; both committing at one tick is the feature. (Squash only
+  re-activates for a future resolver whose basis depends on committed state.) **Action: the doc
+  must not imply concurrent producers squash each other — they coexist.**
+
+## Stage 2 review findings (gemini-pro batch, 2026-06-29 — pre-coding, second voice)
+
+A gemini-pro batch pass (succeeded on batch capacity while interactive gemini was 503-overloaded
+— *batch is the resilient path for gemini-pro*). It **independently endorsed the design**
+("locked and solid; proceed exactly as planned"), confirmed the parts deepseek did (per-cell
+barrier, the synchronous `parking_lot::Mutex` sequencer with **no `.await` under the lock →
+deadlock-impossible**, lane-scoped `UseLastGood` with `fire_fallback` correctly authoring repeats
+as `PrincipalId::beat()` so no forged provenance), and **converged** on the squash-dormancy above.
+It found **three new items** beyond deepseek's set (folded into the work items):
+
+1. **🟠 Restart re-derivation from blocks is LOSSY → persist the Cell log (sharpens WI 7).**
+   `materialize` (→ `BlockSnapshot`) drops `CellState`, the `Recipe`, and full `Span`. If a track
+   re-arms with an empty `committed` Vec (or an imperfect `BlockSnapshot → Cell` round-trip),
+   `last_committed_content_in` finds nothing and the **next `UseLastGood` fallback wedges the
+   track**. Resolution: do NOT reverse-engineer `Vec<Cell>` from blocks — persist the timeline's
+   own append-only Cell log (or at least `Concrete` cells with full `Span` + `played_by`) to a
+   track-scoped row, loaded at arm. (Folded into WI 7 below.)
+2. **🟠 Hoist materialize OUT of the per-context loop (sharpens WI 3).** `process_track` today
+   loops `for each attached ctx → materialize_one`. Making the cursor track-scoped *without*
+   restructuring would **double/triple-emit** per attached context per beat. Run
+   `materialize_track` exactly ONCE per beat, then iterate `attached` only for per-context cadence
+   (rotate / phrase / ooda wake). (Folded into WI 3.)
+3. **🔴 Drop timeline cloning on fork (new — WI 1).** `insert_forked_context` clones the
+   per-context timeline today. With the timeline on the track, a fork of an attached context must
+   NOT clone it — a fork becomes a **new co-producer joining the existing shared track timeline**.
+   Cloning would give the child a disconnected open future, violating one-timeline-per-track.
+   (Folded into WI 1.)
+
+Plus it sharpened **WI 4**: the CRDT `after` anchor (`last_block_id`) and `reserve_block_id` must
+*both* go track-scoped, and the per-`(TrackId, PrincipalId)` sequence must be **seeded from the
+track-scoped log on cold start** or interleaved producers collide `BlockId`s / scramble
+`order_key` across restarts. And **WI 5/9**: re-pointing `KJ_HEARD` removes the score from the
+*context's* block store, so any test asserting on `block_snapshots(ctx).len()` silently breaks —
+and the score↔conversation hydration seam (open question) must be settled before a re-hydrated
+musician can read its own past performance (note: the score blocks are already `ephemeral`/
+hydration-silent today, so the model's memory already flows *only* via `KJ_HEARD` — re-pointing
+HEARD at the track keeps that intact; the seam question is whether hydration should *also* read
+the track store directly).
