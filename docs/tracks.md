@@ -56,8 +56,10 @@ Track {
     playhead:    Tick,                // musical time, owned here (was per-context)
     beat_count:  u64,                 // for cadence math
     transport:   Playing | Stopped,   // MIDI-style: stop = stop the clock
-    score:       Timeline,            // the committed cells — OWNED BY THE TRACK
-    attached:    Map<ContextId, Attachment>,
+    score:       Timeline,            // the track's COPIES of its inputs + played_by
+                                      //   back-refs; the score is emergent (entity #1)
+    attached:    Map<ContextId, Attachment>, // the track's passive view of current
+                                      //   bindings — the CONTEXT binds itself (#3)
 }
 
 Attachment {
@@ -67,18 +69,23 @@ Attachment {
 }
 ```
 
-### 1. The track owns the score
+### 1. The track holds copies of its inputs; the score is emergent
 
-The committed cells — the *score* — belong to the track, not the ephemeral
-player. The score is the thing that persists while players rotate through the
-chair; `Cell` already carries a track lane, and the lane is already "the durable
-fork-lineage identity" (`chameleon.md`). Moving the `Timeline` itself onto the
-track makes that real: **contexts produce *into* the track's score**, they don't
-each own a private one. *Like code or a good instrument — it persists, the people
-come and go, each leaving a mark.*
+The track does two things with what its players produce: it **takes its own copy
+of its direct inputs**, and it **keeps a reference back to the producing context**.
+The **score is emergent** from that track-held data (plus the contexts'), not a
+single block log players write into and lose on retirement. `Cell` already carries
+a track lane *and* a separate `played_by` principal — so the track-tagged cell is
+the track's copy, and `played_by`/provenance is the back-reference; the mechanism
+mostly exists. A retired player's contributions persist as the track's copies (the
+score survives the page-turn), while the back-reference keeps provenance and a live
+handle to the context while it's around. *Like code or a good instrument — it
+persists, the people come and go, each leaving a mark.*
 
-This is the largest part of the surgery (the `Timeline` is per-context
-everywhere today). It **can be staged** — see *Staging*.
+So "the track owns the score" means it owns the **copies + provenance**, and the
+score is the emergent ordered view over them — *not* that contexts have no data of
+their own. This is the larger part of the surgery (today the `Timeline` and its
+cells are reached per-context). It **can be staged** — see *Staging*.
 
 ### 2. Contexts attach with a per-context wakeup cadence
 
@@ -92,12 +99,18 @@ wakeup divisor**, so one track can wake:
 This generalises today's per-context `ooda_every` cadence and moves its ownership
 onto the track (the track knows when to wake each attached context).
 
-### 3. Rotation cadence is per-attachment, owned by the track
+### 3. The context binds; the child inherits the bind at fork
 
-The self-fork page-turn cadence (today `rotate_every_phrases` on `BeatState`)
-becomes a field of the **attachment**, owned by the track. Rotation = the track
-**rebinds** the attachment from the retiring context to its fresh fork — the
-clock and score never pause, so there is no race, no carry, no `track_head`.
+The rotate cadence is part of the binding — but **the context drives the bind, not
+the track.** The track stays *ignorant of context lifecycles*; it just holds the
+current set of bindings. **At fork, the child inherits the bind** — it travels with
+the fork exactly as `beat_state.track` does today — and the child re-binds
+(announces itself to the track) on the way up. So a rotation page-turn is: the
+context self-forks, the child inherits the binding, the child re-binds/re-arms, and
+the track's binding set updates because the *child told it* — the track never had
+to watch for the fork. The clock and score never pause, so there's no race, no
+playhead carry, no `track_head`. Lifecycle knowledge stays on the context side
+(where `fork` already lives); the track stays a passive clock + score.
 
 ### 4. Non-rotating attachments are first-class
 
@@ -125,6 +138,16 @@ A track's clock is driven by a **`ClockSource`**, and the point is that you can
 
 **Start simple, design for more.** v1 is one wall-clock driver; the seam is a
 trait so MIDI and external signals slot in without touching the attachments.
+
+**Tracks are independent; there is no 'band' (yet).** Each track is its own clock
+domain — we deliberately do *not* add a broader band/ensemble entity that owns a
+shared clock. When tracks need to play together, what we actually want is to
+**align bars and beats**, and that alignment is **rare and intentional**, not
+continuous: a clock type can *align to a shared reference* — both slaved to a MIDI
+clock, or one clock type that phase-locks to another — at a bar/beat boundary, on
+demand. So cross-track sync is an occasional, explicit operation between
+independent clocks, not an always-on conductor. (It's also why the next point is
+free: separate clock domains pause independently.)
 
 The "metrics must keep sampling while the music is paused" problem that made
 `myaku` argue for its own scheduler **dissolves here**: that's just two tracks —
@@ -166,17 +189,19 @@ kj transport play  --track bass     # start broadcast + clock; rotation resumes
 kj transport tempo --track bass 120
 ```
 
-- **stop = stop the clock** for the lane. Rotation (the page-turn automation) is
-  *suspended*, not cleared — the attachment's `rotate` cadence is remembered.
+- **stop = stop the clock** for the track. Rotation (the page-turn automation) is
+  *suspended*, not cleared — the binding's `rotate` cadence is remembered.
 - **play = start broadcast + start the clock.** Whatever automation was in place
   resumes — including rotation. (An explicit `kj transport rotate off` stays the
   separate "permanently stop turning pages" knob.)
 - the **horizon race** that plagued the per-context design can't occur: a
-  page-turn just rebinds the attachment on a clock that's either running or
-  stopped; there's no second per-context entity to arm late.
+  page-turn just has the child inherit + re-bind on a clock that's either running
+  or stopped; there's no second per-context entity to arm late.
 
-Surface convention: name the lane directly (`--track <name>`); kaish does
-context→track lookups on the fly, so `kj` stays crisp.
+Surface convention: name the track directly (`--track <name>`); kaish does
+context→track lookups on the fly, so `kj` stays crisp. (*Vocabulary:* "track" is
+the DAW-sense clock domain / durable identity; "lane" stays reserved for automation
+*inside* a track and "voice" for ABC's `V:` field, per `chameleon.md`.)
 
 ## What this subsumes — myaku dissolves
 
@@ -202,33 +227,49 @@ This is real surgery — the clock/playhead/heap move up a level and contexts ga
 attach/detach. Stage it:
 
 1. **Move the clock first.** The track owns the clock + playhead + transport + the
-   attachment set (wakeup + rotate cadence). Contexts attach/detach. This alone
-   retires the playhead carry and `track_head`, gives native `stop/play --track`,
-   and kills the horizon race. The score can stay per-context-but-track-tagged for
-   this stage.
-2. **Move the score (`Timeline`) onto the track.** Contexts produce into the
-   track's score; retired players' marks persist on the lane. Larger, touches
-   every `Timeline` consumer.
-3. **Generalise the clock source.** Land the `ClockSource` trait + MIDI driver +
-   the external-signal seam.
+   binding set (wakeup + rotate cadence). Contexts bind/unbind. This alone retires
+   the playhead carry and `track_head`, gives native `stop/play --track`, and kills
+   the horizon race. The score can stay per-context-but-track-tagged for this stage.
+2. **Give the track its own score (copies + back-reference).** The track takes
+   copies of its direct inputs and keeps a `played_by`/provenance back-reference to
+   the producing context; the score is the emergent view. Retired players' copies
+   persist on the track. Larger — touches the cell/`Timeline` data path.
+3. **Generalise the clock source.** Land the `ClockSource` trait + a MIDI driver +
+   the external-signal seam, plus the rare/intentional cross-track bar/beat
+   alignment between independent clocks.
 
 The playhead-carry code (shipped 2026-06-29) is a stage-0 stepping stone: it
 encodes the invariant (musical time is continuous across the chain) and its tests
 describe the behaviour we want; when stage 1 lands, "the clock stayed on the
 track" replaces "copy the number," same observable, less machinery.
 
+## Decided (2026-06-29 design round)
+
+- **No 'band' entity (yet); cross-track sync is rare + intentional.** Tracks are
+  independent clock domains. Aligning bars/beats between tracks is an occasional,
+  explicit operation via alignable clock types (MIDI the prime mover), not an
+  always-on conductor. (Resolves the band-clock-vs-track-clock collision: there is
+  no band clock; there is no shared `Timeline`.) See *Clock sources*.
+- **Data locality: the track holds copies of its inputs + a back-reference; the
+  score is emergent.** Not one block log contexts write into and lose on
+  retirement. `Cell`'s `track` (the copy) + `played_by` (the back-ref) already
+  carry the shape. See entity #1.
+- **The context binds; the child inherits the bind at fork.** The track stays
+  ignorant of context lifecycles. See entity #3.
+
 ## Open questions (for the implementation session)
 
-- **Attachment multiplicity & roles.** Music keeps one *playing* attachment per
-  track (rotation swaps it); metrics has N. Is "the player" vs "an observer"
-  (e.g. the conductor, a user) a flag on the attachment, or just its wakeup/rotate
-  shape? How do multiple producing attachments share one score without clobbering?
-- **Score ownership vs context conversation.** The track owns the score; a context
-  still has its own conversation/hydration. Where's the seam (does a musician's
-  conversation *window* onto the track score, à la `$HEARD`)?
-- **Clock source trait shape** + whether the app's existing time-sync algorithms
-  are the right substrate for the MIDI driver.
-- **Transport scope above the track** — a "band" (all tracks) stop/play, and the
-  "cascading control planes" that implies. Deferred deliberately.
+- **Concurrent producers into one track.** Music keeps one *playing* binding per
+  track (rotation swaps it); a user/observer can bind read-mostly. The copies +
+  back-reference model makes several contexts contributing copies *tractable* (each
+  copy carries its `played_by`), but the conflict story — two producers, same beats
+  — is unspecified. Music sidesteps it (one at a time); decide if/when a track wants
+  concurrent producers.
+- **Score vs context conversation seam.** The score is the track's; a context still
+  has its own conversation/hydration. Does a musician's conversation *window* onto
+  the track's score (the `$HEARD`/hydration-marker machinery re-pointed at the
+  track), and how does that interact with the copies model?
+- **Clock-source trait shape** + whether the app's existing time-sync algorithms
+  are the right substrate for the MIDI driver and for cross-track bar/beat alignment.
 - **Migration / compatibility** — the `beat_state` table, `BeatCommand`, and
   `kj transport` all assume per-context; map each onto the track entity.

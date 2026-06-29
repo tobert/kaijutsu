@@ -219,6 +219,14 @@ that, opportunistic, never required for correctness.
 
 ## A context owns a timeline, over one store
 
+> **Direction (2026-06-29):** the beat is moving off the context and onto the
+> **track** — the track becomes the clock domain and holds the score (copies of its
+> inputs + a `played_by` back-reference; the score is emergent). So "a context owns
+> a timeline" below describes the *current* (stage-0) reality; under the track
+> reframe the clock + score live on the track and contexts bind to it. See
+> `docs/tracks.md` (the staged plan; this is its stage 1–2). Read this section as
+> the substrate the move builds on, not the end state.
+
 Each kaijutsu context (`ContextId`, a node in the fork/drift DAG) owns a timeline: its
 CRDT block log *with a temporal structure over it*. Hyoushigi does **not** invent its
 own persistence — it is the temporal schema and the live engine; the durable record

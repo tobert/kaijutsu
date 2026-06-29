@@ -297,6 +297,11 @@ concept — *track* — collapses most of the gap:
    re-shape **push → pull** (a `kj`-reachable read so the script chooses
    depth/track rather than a fixed injected window — shares the windowed read
    with the RC hydration-marker archive verb). TODOs on the code. Traps later.
+   *(Track reframe, 2026-06-29: today `$HEARD` is a tick-window query over the
+   per-context block log; once the **track** holds the score (`docs/tracks.md`),
+   `$HEARD` re-targets the track's score — the same window, read off the track's
+   copies rather than the context's log. The "score vs context-conversation seam"
+   in tracks.md tracks exactly this.)*
 
 **Cost guard:**
 
