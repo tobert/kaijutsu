@@ -207,6 +207,21 @@ impl KjDispatcher {
                         model = Some(alias_model.to_string());
                         provider = Some(alias_provider);
                     } else {
+                        // Catch the `provider:model` footgun. The separator is
+                        // `/`, never `:` — `:` collides with ollama tags like
+                        // `gemma4:31b`, so the parser can't split on it. If the
+                        // text before a `:` names a real provider, the user meant
+                        // the slash form; fail loud here rather than silently
+                        // shipping the literal to the default provider, where it
+                        // only surfaces much later as a turn-time
+                        // `not_found_error: model: <the whole string>`.
+                        if let Some((maybe_provider, rest)) = m.split_once(':')
+                            && registry.get(maybe_provider).is_some()
+                        {
+                            return Err(format!(
+                                "'{m}' looks like 'provider:model' — separate with a slash: '{maybe_provider}/{rest}'"
+                            ));
+                        }
                         match registry.default_provider_name() {
                             Some(p) => provider = Some(p.to_string()),
                             None => {
@@ -1559,6 +1574,75 @@ mod tests {
         assert!(
             result.message().contains("unknown provider"),
             "expected 'unknown provider' error, got: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_set_colon_provider_model_errors_with_slash_hint() {
+        // The `provider:model` footgun: a bare spec whose `:`-prefix names a
+        // real provider almost certainly meant the slash form. Fail loud at
+        // set time with a hint, instead of silently storing the literal on the
+        // default provider and only erroring at turn time.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal);
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("set"),
+                    s("."),
+                    s("--model"),
+                    s("mock:test-model"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "colon form should fail: {}", result.message());
+        assert!(
+            result.message().contains("provider:model")
+                && result.message().contains("mock/test-model"),
+            "expected slash hint, got: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_set_bare_colon_model_is_not_mistaken_for_provider() {
+        // An ollama-style tag like `gemma4:31b` must NOT trip the provider:model
+        // hint — `gemma4` is not a registered provider. This collision is the
+        // reason the parser separates on `/`, never `:`.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal);
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--model"), s("gemma4:31b")],
+                &c,
+            )
+            .await;
+        assert!(
+            !result.message().contains("provider:model"),
+            "ollama-style tag must not trip the provider:model hint: {}",
             result.message()
         );
     }

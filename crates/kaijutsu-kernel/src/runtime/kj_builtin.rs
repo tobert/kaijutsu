@@ -405,7 +405,7 @@ impl Tool for KjBuiltin {
                 ("Merge fork back to parent", "kj drift merge"),
                 (
                     "Set model on current context",
-                    "kj context set . --model anthropic:claude-sonnet-4-5-20250929",
+                    "kj context set . --model anthropic/claude-sonnet-4-5-20250929",
                 ),
                 ("Bulk synthesize keywords", "kj synth all"),
             ],

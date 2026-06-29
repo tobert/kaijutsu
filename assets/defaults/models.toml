@@ -43,8 +43,8 @@ type = "all"
 [providers.deepseek]
 enabled = true
 api_key_env = "DEEPSEEK_API_KEY"
-# Or read the key from a file instead of the environment:
-# api_key_file = "~/.deepseek-key"
+# Read the key from a file; falls back to DEEPSEEK_API_KEY env if unreadable.
+api_key_file = "~/.deepseek-key"
 default_model = "deepseek-v4-flash"
 # V4 models think by default; reasoning tokens count toward the output
 # budget (max 64K), so leave headroom above a plain-answer ceiling.
@@ -100,6 +100,8 @@ best     = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
 deepseek    = { provider = "deepseek", model = "deepseek-v4-flash" }
 ds-flash    = { provider = "deepseek", model = "deepseek-v4-flash" }
 ds-pro      = { provider = "deepseek", model = "deepseek-v4-pro" }
+deepseek-pro  = { provider = "deepseek", model = "deepseek-v4-pro" }
+deepseek-lite = { provider = "deepseek", model = "deepseek-v4-flash" }
 local       = { provider = "ollama", model = "gemma4:31b" }
 offline     = { provider = "ollama", model = "gemma4:31b" }
 local-vision = { provider = "ollama", model = "gemma4:31b" }
