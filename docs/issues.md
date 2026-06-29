@@ -1029,13 +1029,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     the rc-callable primitive. `--switch` moves the rc shell onto the child so the
     bare transport calls target it (no id capture). End-to-end test:
     `rotate_rc_forks_arms_and_plays_the_child_on_the_parent_track`.
-    **Remaining gap — tick continuity (still unbuilt):** a spawn-fork has no
-    committed blocks, so the child's `arm` seeds the playhead from `max_tick`=0 —
-    musical time RESETS in the child instead of continuing the parent's tick. The
-    chameleon rotation tick-continuity invariant (retire old committed history to
-    the durable log + CAS, carry the tick) is the fix; until then a page-turn
-    restarts the timeline. Pairs with the windowed-notation pull primitive below
-    (carrying recent notation into the child).
+    **✅ Tick continuity shipped 2026-06-29.** A spawn-fork has no committed blocks,
+    so the child's `arm` used to seed the playhead from `max_tick`=0 and musical
+    time RESET at every page-turn. Fixed by carrying the playhead *number* (no
+    history is retired/archived — contexts ARE the history, which is why we rotate
+    instead of wiping): `beat_state` gained a `playhead_tick` column
+    (`kernel_db.rs`, additive `ALTER TABLE`); `persist_state` snapshots the live
+    playhead, and `fire_due` re-snapshots the parent at the rotate horizon *before*
+    the fork copies its `beat_state` (`beat.rs`); `arm` seeds from
+    `max(block-log max tick, carried playhead)` so the carried tick continues a
+    thin child while the block log still wins for a context with real committed
+    history (cold restart). Tests: `arm_seeds_carried_playhead_when_no_committed_blocks`,
+    `committed_max_tick_wins_over_stale_carried_playhead` (beat.rs), the
+    `playhead_tick` round-trip + negative-guard + fork-copy assertions (kernel_db).
+    ⚠ **Runner-verify pending** (needs a kernel restart; no capnp/wire change, but
+    a live page-turn should now show continuous tick across the section boundary).
+    Still pairs with the windowed-notation pull primitive below (carrying recent
+    *notation* into the child is separate from carrying the tick).
     Runner-verified live 2026-06-28: a played musician forks a labelless child
     on the parent's track, tempo + `$ROTATE_EVERY` inherited, lineage is a clean
     LINEAR chain (verified via `kj context list --tree`) — song form, exactly as
@@ -1053,6 +1063,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     rotating lineage" verb, or `rotate off` that also clears the inherited cadence
     so the in-flight child doesn't re-arm it. Until then, to stop a song stop its
     live tip (`kj context list --tree` to find it) or restart the kernel.
+    **Leading approach (2026-06-29): scope the stop to the track, not a context id.**
+    The `track` (lane) is the durable cross-rotation identity — `insert_forked_context`
+    copies it to every child, so all segments of one song share one `track`, and the
+    scheduler's `armed` map already carries `BeatState.track` per segment. So "stop
+    the song" = walk `armed`, and for every context whose `track` matches the tip's,
+    `set_rotate(None)` + `stop`. No new ancestor link / no reverse latest-descendant
+    pointer needed (a separate explicit root→tip pointer would still be nice for the
+    app/time-well's "jump to the live tip", but it's not needed for *stop*). Residual:
+    the narrow race where a page-turn already in `rotate_due` produces one extra child
+    that arms *after* the stop — close it later with a scheduler-side halt flag that
+    `fire_rotate` checks, if the orphan segment ever actually bites. Fold in the
+    `$ROTATE_EVERY`-unset clap-error footgun (above) so `rotate off` is clean.
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed

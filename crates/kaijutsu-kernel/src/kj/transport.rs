@@ -480,6 +480,7 @@ mod tests {
                     ooda_every: 96,
                     track: "bass".to_string(),
                     rotate_every_phrases: Some(4),
+                    playhead_tick: None,
                 },
             )
             .unwrap();
@@ -595,6 +596,7 @@ mod tests {
                     ooda_every: 128,
                     track: "bass".to_string(),
                     rotate_every_phrases: None,
+                    playhead_tick: None,
                 },
             )
             .unwrap();
@@ -663,6 +665,7 @@ mod tests {
                     ooda_every: 96,
                     track: "bass".to_string(),
                     rotate_every_phrases: None,
+                    playhead_tick: None,
                 },
             )
             .unwrap();

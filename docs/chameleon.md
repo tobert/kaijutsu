@@ -127,9 +127,16 @@ band owns time — the transport (拍子木) does.
     scheduler stops the parent at the horizon and fires the `rotate` rc, which forks
     a spawn child, `--switch`es onto it, and arms+re-rotates+plays it on the
     PARENT's track (fork now copies `beat_state`, so the lane survives the
-    page-turn). Remaining gap: **tick continuity** — the thin child's playhead
-    seeds from `max_tick`=0, so musical time resets across the turn until the
-    retire-history-and-carry-tick invariant is built (issues.md).
+    page-turn). **✅ Tick continuity shipped 2026-06-29.** `beat_state` now carries
+    the lane's live playhead (`playhead_tick`): the scheduler snapshots it into the
+    parent's row at the rotate horizon, the fork copy hands it to the thin child,
+    and the child's `arm` seeds from `max(block-log max tick, carried playhead)` —
+    so musical time *continues* across the page-turn instead of resetting to 0. No
+    history is moved or archived to do this: the parent stays a complete, durable
+    segment (contexts **are** the history — that's *why* we rotate instead of
+    wiping and reusing), and only the playhead *number* is carried forward. The
+    `max()` rule means a real context with committed history (cold restart) still
+    trusts its block log; the carried tick only supplies time a thin child lacks.
   - **Producer edits are horizon-latched.** Scripts snapshot at instantiation
     (updates don't leak into a live context), so a producer's rc edit lands at
     the player's *next* page-turn — musically right (direction changes on a
@@ -419,13 +426,18 @@ Rotation invariants:
   bytes identical (prompt cache survives — Anthropic caching is
   content-keyed), tail window carried, `$HEARD` unbroken. The player cannot
   tell a rotation happened.
-- **Tick continuity** — the new segment's timeline/playhead seeds from the
-  old segment's committed max; musical time is global and monotone across
-  segments, never reset. This is a property of *rotation*, which carries a
-  tail window (and so copies the max-tick block — `fork_filtered` seeds from
-  the copied set). A *spawn* birth copies nothing and correctly starts at
-  tick 0; there is no prior segment to continue. (Adjacent to hyoushigi's
-  "seed playhead on re-arm" open item.)
+- **Tick continuity** (✅ shipped 2026-06-29) — musical time is global and
+  monotone across segments, never reset. The carry is the playhead *number*,
+  not blocks: `beat_state.playhead_tick` records the lane's live position, the
+  scheduler snapshots it at the rotate horizon, the fork copies it to the child,
+  and `arm` seeds from `max(block-log max tick, carried playhead)`. So a `spawn`
+  rotation that copies **no** blocks still continues musical time (the carried
+  tick supplies what the empty log can't), while a context with real committed
+  history trusts its block log (the max never lets a stale carried value hide
+  committed time). A truly *fresh* musician — a `create`, not a rotation — has no
+  carried tick and correctly starts at 0; there is no prior segment to continue.
+  Nothing is retired or archived to achieve this: the parent remains a complete,
+  durable segment, because the contexts **are** the history.
 - **Quantized to safe boundaries** — rotation fires between turns at a
   phrase boundary (a trap is the natural trigger: every N blocks or M
   phrases, quantized), so it can never split a tool_use/tool_result group or

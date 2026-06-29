@@ -627,7 +627,15 @@ CREATE TABLE IF NOT EXISTS beat_state (
     track                TEXT    NOT NULL,
     -- Self-fork rotate cadence in phrases (NULL = no rotation). Persisted so a
     -- cold-restart re-arm restores the page-turn cadence, not just tempo/lane.
-    rotate_every_phrases INTEGER
+    rotate_every_phrases INTEGER,
+    -- The lane's musical position (playhead tick) as of the last policy mutation.
+    -- Carried across a rotation page-turn: a spawn-fork child has no committed
+    -- blocks, so without this its `arm` would seed the playhead from max_tick=0
+    -- and musical time would RESET at every section. The re-arm seeds from
+    -- `max(max_tick, playhead_tick)`, so the value never *hides* committed time
+    -- (cold restart still trusts max_tick) but DOES continue a thin child's lane.
+    -- NULL = unknown (a legacy row or a never-snapshotted arm) → seed from max_tick.
+    playhead_tick        INTEGER
 );
 "#;
 
@@ -663,6 +671,13 @@ pub struct PersistedBeatState {
     /// Self-fork rotate cadence in phrases; `None` = no rotation. Restored on a
     /// cold-restart re-arm so the page-turn survives a kernel restart.
     pub rotate_every_phrases: Option<u64>,
+    /// The lane's musical position (playhead tick) at the last policy mutation.
+    /// `None` = unknown (legacy/never-snapshotted) → the re-arm seeds from the
+    /// block log's max tick alone. Carried by the fork copy so a rotation child
+    /// continues the parent's musical time instead of resetting to tick 0; the
+    /// re-arm takes `max(max_tick, playhead_tick)` so this never hides committed
+    /// time, it only supplies it when a thin child has none. See `beat.rs::arm`.
+    pub playhead_tick: Option<u64>,
 }
 
 fn read_opt_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<ContextId>> {
@@ -916,6 +931,7 @@ impl KernelDb {
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE beat_state ADD COLUMN rotate_every_phrases INTEGER",
+            "ALTER TABLE beat_state ADD COLUMN playhead_tick INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -3206,11 +3222,12 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         conn.execute(
             "INSERT INTO beat_state
-                 (context_id, period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (context_id, period_ms, beats_per_phrase, ooda_every, track,
+                  rotate_every_phrases, playhead_tick)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(context_id) DO UPDATE SET
                  period_ms = ?2, beats_per_phrase = ?3, ooda_every = ?4, track = ?5,
-                 rotate_every_phrases = ?6",
+                 rotate_every_phrases = ?6, playhead_tick = ?7",
             params![
                 blob_param(context_id.as_bytes()),
                 state.period_ms as i64,
@@ -3218,6 +3235,7 @@ impl KernelDb {
                 state.ooda_every as i64,
                 state.track,
                 state.rotate_every_phrases.map(|n| n as i64),
+                state.playhead_tick.map(|n| n as i64),
             ],
         )?;
         Ok(())
@@ -3241,7 +3259,8 @@ impl KernelDb {
         let row = self
             .conn
             .query_row(
-                "SELECT period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases
+                "SELECT period_ms, beats_per_phrase, ooda_every, track,
+                        rotate_every_phrases, playhead_tick
                  FROM beat_state WHERE context_id = ?1",
                 params![blob_param(context_id.as_bytes())],
                 |row| {
@@ -3251,11 +3270,13 @@ impl KernelDb {
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases)) = row
+        let Some((period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases, playhead_tick)) =
+            row
         else {
             return Ok(None);
         };
@@ -3289,12 +3310,24 @@ impl KernelDb {
                 context_id.short()
             )));
         }
+        // A persisted playhead is a Tick (`u64`, written `as i64`); a negative is
+        // corruption that would wrap to a far-future seed and silently mis-place
+        // every beat. Reject it loudly (NULL stays the legible "unknown").
+        if let Some(t) = playhead_tick
+            && t < 0
+        {
+            return Err(KernelDbError::Validation(format!(
+                "context {} beat state has a negative playhead_tick={t} — corrupt",
+                context_id.short()
+            )));
+        }
         Ok(Some(PersistedBeatState {
             period_ms: period_ms as u64,
             beats_per_phrase: beats_per_phrase as u64,
             ooda_every: ooda_every as u64,
             track,
             rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
+            playhead_tick: playhead_tick.map(|n| n as u64),
         }))
     }
 
@@ -5462,6 +5495,7 @@ mod tests {
             ooda_every: ooda,
             track: track.to_string(),
             rotate_every_phrases: None,
+            playhead_tick: None,
         }
     }
 
@@ -5506,6 +5540,52 @@ mod tests {
             db.get_beat_state(ctx.context_id).unwrap().unwrap().rotate_every_phrases,
             None,
             "clearing the cadence persists as NULL"
+        );
+
+        // The carried playhead survives the round-trip (the rotation tick-continuity
+        // value the fork copy hands the thin child), and clears back to NULL.
+        let with_tick = PersistedBeatState {
+            playhead_tick: Some(512),
+            ..beat_state(250, 16, 128, "bass")
+        };
+        db.upsert_beat_state(ctx.context_id, &with_tick).unwrap();
+        assert_eq!(
+            db.get_beat_state(ctx.context_id).unwrap().unwrap().playhead_tick,
+            Some(512),
+            "playhead_tick survives write→read (carried across the page-turn)"
+        );
+        db.upsert_beat_state(ctx.context_id, &beat_state(250, 16, 128, "bass"))
+            .unwrap();
+        assert_eq!(
+            db.get_beat_state(ctx.context_id).unwrap().unwrap().playhead_tick,
+            None,
+            "clearing the playhead persists as NULL"
+        );
+    }
+
+    #[test]
+    fn beat_state_negative_playhead_is_loud_error() {
+        // playhead_tick is a Tick (`u64`) written `as i64`; a negative is corruption
+        // that would wrap to a far-future seed and silently mis-place every beat.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-ph"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.conn
+            .execute(
+                "INSERT INTO beat_state
+                     (context_id, period_ms, beats_per_phrase, ooda_every, track, playhead_tick)
+                 VALUES (?1, 250, 16, 128, 'bass', -1)",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                db.get_beat_state(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "a negative playhead_tick is rejected loudly, not wrapped to a far-future seed"
         );
     }
 
@@ -6062,6 +6142,13 @@ mod tests {
             &binding_with(&["builtin.file"], &[("read", "builtin.file", "file_read")]),
         )
         .unwrap();
+        // Beat state carries the lane (track) AND the playhead — the rotation
+        // page-turn relies on this copy to continue musical time in the thin child.
+        db.upsert_beat_state(
+            src.context_id,
+            &PersistedBeatState { playhead_tick: Some(768), ..beat_state(500, 16, 128, "bass") },
+        )
+        .unwrap();
 
         // The target is a fresh context that does not yet exist in any table.
         let tgt = make_context_row(Some("ifc-tgt"));
@@ -6078,6 +6165,16 @@ mod tests {
         );
         assert_eq!(db.get_context_env(tgt.context_id).unwrap().len(), 1);
         assert!(db.get_context_binding(tgt.context_id).unwrap().is_some());
+
+        // Beat state — track + carried playhead — followed the fork, so the child
+        // re-arms on the parent's lane AND continues its musical time (page-turn).
+        let child_beat = db.get_beat_state(tgt.context_id).unwrap().unwrap();
+        assert_eq!(child_beat.track, "bass", "the lane is the durable fork-lineage identity");
+        assert_eq!(
+            child_beat.playhead_tick,
+            Some(768),
+            "the carried playhead follows the fork so the page-turn continues musical time"
+        );
     }
 
     /// The whole fork is all-or-nothing: if a *later* write (the config copy)

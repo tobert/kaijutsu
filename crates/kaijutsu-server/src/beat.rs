@@ -292,13 +292,20 @@ impl BeatScheduler {
     /// starts armed. Idempotent — re-arming updates the policy, preserving the
     /// running state and playhead.
     ///
-    /// The playhead is seeded from the document's max committed tick (design §4)
-    /// so musical time stays globally monotone per context across restarts even
-    /// when conversation inserts advanced the coordinate past the last beat
-    /// (chameleon.md:195-198). The seed lands only on a freshly-created timeline
-    /// inside `arm_timeline`'s `or_insert_with`, so a re-arm of a live timeline
-    /// never re-seeds. A failed `max_tick` scan is loud, not silent: we'd rather
-    /// hear it than seed a stale (zero) playhead and mis-place the first beat.
+    /// The playhead is seeded from `max(block-log max tick, carried playhead)` so
+    /// musical time stays globally monotone per context. The two sources answer
+    /// two cases: the **block-log max tick** keeps a context with committed history
+    /// monotone across restarts even when conversation inserts advanced the
+    /// coordinate past the last beat (chameleon.md); the **carried playhead** —
+    /// the parent's live position, fork-copied into this child's `beat_state` —
+    /// continues musical time across a rotation page-turn, where a thin spawn-fork
+    /// child has NO committed blocks (max tick = 0) and would otherwise reset to 0.
+    /// Taking the max means the carried value can never *hide* committed time (the
+    /// log always wins for a real context), it only supplies time when there is
+    /// none. The seed lands only on a freshly-created timeline inside
+    /// `arm_timeline`'s `or_insert_with`, so a re-arm of a live timeline never
+    /// re-seeds. A failed `max_tick` scan is loud, not silent: we'd rather hear it
+    /// than seed a stale (zero) playhead and mis-place the first beat.
     ///
     /// CONSTRAINT (design §11.5): we seed the playhead tick but **deliberately do
     /// NOT seed the fallback pool** from the persisted block log. The Timeline's
@@ -311,7 +318,7 @@ impl BeatScheduler {
     /// if ever wanted, is an explicit opt-in feature (issues.md), never the default
     /// that falls out of seeding a pool here.
     pub fn arm(&mut self, context_id: ContextId, policy: BeatPolicy, track: TrackId) {
-        let seed = match self.documents.max_tick(context_id) {
+        let from_log = match self.documents.max_tick(context_id) {
             Ok(t) => t.unwrap_or(kaijutsu_types::Tick::ZERO),
             Err(e) => {
                 log::error!(
@@ -320,6 +327,31 @@ impl BeatScheduler {
                 kaijutsu_types::Tick::ZERO
             }
         };
+        // Tick continuity across the rotation page-turn (docs/chameleon.md): a thin
+        // spawn-fork child has no committed blocks, so `from_log` is zero — but the
+        // fork copied the parent's `beat_state.playhead_tick` (the lane's musical
+        // position). Seed from the MAX of the two: the carried tick continues a
+        // child's musical time, while `from_log` always wins for a context with
+        // real committed history (cold restart), so the carried value can never
+        // *hide* committed time — it only supplies it when there is none. A corrupt
+        // row is loud, not silent: we log and fall back to the log tick rather than
+        // seed from a poisoned carried value.
+        let carried = self
+            .documents
+            .db()
+            .and_then(|db| match db.lock().get_beat_state(context_id) {
+                Ok(state) => state.and_then(|s| s.playhead_tick),
+                Err(e) => {
+                    log::error!(
+                        "beat: get_beat_state failed for {context_id}: {e}; \
+                         ignoring carried playhead (seeding from the block log)"
+                    );
+                    None
+                }
+            })
+            .map(|n| kaijutsu_types::Tick::new(n as i64))
+            .unwrap_or(kaijutsu_types::Tick::ZERO);
+        let seed = from_log.max(carried);
         self.kernel.arm_timeline(context_id, policy.clock(), seed);
         // A fresh arm starts with no rotate cadence; the cold-restart restore
         // re-applies it via `set_rotate` after this call (see the `Arm` command
@@ -362,12 +394,25 @@ impl BeatScheduler {
         let Some(db) = self.documents.db() else {
             return; // db-less store (embedded/test): nothing to persist to.
         };
+        // Snapshot the LIVE playhead so the fork copy can hand a rotation child the
+        // lane's current musical position (the child has no committed blocks to
+        // seed from). `None` if no timeline yet — a never-armed context — which
+        // seeds from max_tick on the eventual arm. Read live, not from `st`, because
+        // BeatState doesn't carry the playhead (it advances every beat; the row is
+        // refreshed only on policy mutations + at the rotate page-turn).
+        // Playhead is forward-only from `Tick::ZERO`, so the i64 coordinate is
+        // non-negative — `as u64` is lossless and matches the struct's convention.
+        let playhead_tick = self
+            .kernel
+            .timeline(context_id)
+            .map(|t| t.lock().playhead().get() as u64);
         let state = kaijutsu_kernel::kernel_db::PersistedBeatState {
             period_ms: st.policy.period.as_millis() as u64,
             beats_per_phrase: st.policy.beats_per_phrase,
             ooda_every: st.policy.ooda_every,
             track: st.track.as_str().to_string(),
             rotate_every_phrases: st.rotate_every_phrases,
+            playhead_tick,
         };
         if let Err(e) = db.lock().upsert_beat_state(context_id, &state) {
             log::error!("beat: failed to persist beat state for {context_id}: {e}");
@@ -488,6 +533,13 @@ impl BeatScheduler {
             // is safe now that the parent is stopped.
             if report.rotate_due {
                 self.stop(ctx);
+                // Snapshot the parent's live playhead into its `beat_state` row
+                // BEFORE the page-turn fork copies it, so the thin child inherits
+                // the lane's current musical position and `arm` continues musical
+                // time instead of resetting to tick 0 (docs/chameleon.md tick
+                // continuity). `stop` doesn't persist; the parent advanced many
+                // beats since its last policy-mutation snapshot, so refresh here.
+                self.persist_state(ctx);
                 outcome.rotate_due.push(ctx);
                 continue;
             }
@@ -2144,6 +2196,9 @@ mod tests {
                 ooda_every: 96,
                 track: "bass".to_string(),
                 rotate_every_phrases: None,
+                // Fresh context, no committed blocks → playhead seeds to 0, and the
+                // arm-time snapshot mirrors that live position.
+                playhead_tick: Some(0),
             }),
             "arm mirrors the policy + lane into beat_state for restart re-arm"
         );
@@ -2159,6 +2214,7 @@ mod tests {
                 ooda_every: 96,
                 track: "bass".to_string(),
                 rotate_every_phrases: None,
+                playhead_tick: Some(0),
             }),
             "set_tempo write-through updates the persisted period, not the whole row"
         );
@@ -2177,6 +2233,94 @@ mod tests {
             db.lock().get_beat_state(ctx).unwrap().unwrap().rotate_every_phrases,
             None,
             "rotate off persists as NULL"
+        );
+    }
+
+    /// Tick continuity across the rotation page-turn (docs/chameleon.md): a thin
+    /// spawn-fork child has NO committed blocks (max_tick = 0), but the fork copied
+    /// the parent's `beat_state.playhead_tick`. `arm` must seed the child's playhead
+    /// from that carried value so musical time CONTINUES across the page-turn
+    /// instead of resetting to tick 0 (which is what shipped before this fix).
+    #[tokio::test]
+    async fn arm_seeds_carried_playhead_when_no_committed_blocks() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+
+        // Stand in for the fork copy: the child's row carries the parent's live
+        // playhead (512) but the child has no committed blocks of its own.
+        db.lock()
+            .upsert_beat_state(
+                ctx,
+                &kaijutsu_kernel::kernel_db::PersistedBeatState {
+                    period_ms: 500,
+                    beats_per_phrase: 16,
+                    ooda_every: 128,
+                    track: "bass".to_string(),
+                    rotate_every_phrases: None,
+                    playhead_tick: Some(512),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            documents.max_tick(ctx).unwrap(),
+            None,
+            "the thin child has no committed blocks — without the carry, seed = 0"
+        );
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents);
+        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap());
+
+        assert_eq!(
+            kernel.timeline(ctx).unwrap().lock().playhead(),
+            Tick::new(512),
+            "arm continues musical time from the carried playhead, not tick 0"
+        );
+    }
+
+    /// The carried playhead can never *hide* committed musical time: `arm` seeds
+    /// from `max(max_tick, carried)`, so a context with real committed history
+    /// (a cold-restart re-arm) trusts its block log even when a stale `beat_state`
+    /// row carries a lower playhead. Guards the `max()` direction.
+    #[tokio::test]
+    async fn committed_max_tick_wins_over_stale_carried_playhead() {
+        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+
+        // Real committed history up to tick 1000 (what a restart loads).
+        let player = PrincipalId::new();
+        let big_t = 1000i64;
+        for t in [0i64, 500, big_t] {
+            let seq = documents.reserve_block_id(ctx, player).unwrap().seq;
+            let snap =
+                BlockSnapshotBuilder::new(BlockId::new(ctx, player, seq), BlockKind::Text)
+                    .tick(Tick::new(t))
+                    .order_key(format!("V{:0>11}AAAA", t))
+                    .content("c")
+                    .build();
+            documents.insert_from_snapshot_as(ctx, snap, None, Some(player)).unwrap();
+        }
+        // A stale carried playhead BELOW the committed high-water.
+        db.lock()
+            .upsert_beat_state(
+                ctx,
+                &kaijutsu_kernel::kernel_db::PersistedBeatState {
+                    period_ms: 500,
+                    beats_per_phrase: 16,
+                    ooda_every: 128,
+                    track: "bass".to_string(),
+                    rotate_every_phrases: None,
+                    playhead_tick: Some(42),
+                },
+            )
+            .unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents);
+        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap());
+
+        assert_eq!(
+            kernel.timeline(ctx).unwrap().lock().playhead(),
+            Tick::new(big_t),
+            "the committed max tick wins over a stale lower carried playhead"
         );
     }
 
