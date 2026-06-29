@@ -187,7 +187,7 @@ mod tests {
             "watched",
             // Exit non-zero if vars are missing or wrong; non-zero
             // produces an Error block.
-            "test -n \"$KJ_CONTEXT\" || exit 1\ncase \"$KJ_VERB\" in attach) ;; *) exit 2 ;; esac",
+            "[[ -n \"$KJ_CONTEXT\" ]] || exit 1\ncase \"$KJ_VERB\" in attach) ;; *) exit 2 ;; esac",
             "kai",
         )
         .await;

@@ -5387,7 +5387,7 @@ mod tests {
         // The hook body invokes `kj` AND inspects an overlay env var.
         // Fails with non-zero exit (and thus a Deny outcome) if either
         // the var is missing or `kj` isn't callable.
-        let body = "test -n \"$KJ_HOOK_TOOL\" && test -n \"$KJ_HOOK_PHASE\" && kj context list";
+        let body = "[[ -n \"$KJ_HOOK_TOOL\" ]] && [[ -n \"$KJ_HOOK_PHASE\" ]] && kj context list";
 
         broker.hooks().write().await.pre_call.entries.push(HookEntry {
             id: hook_id("kaish-kj"),

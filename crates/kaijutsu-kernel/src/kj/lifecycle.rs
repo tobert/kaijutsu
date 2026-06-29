@@ -1244,7 +1244,7 @@ mod tests {
             "S00",
             "introspect",
             "kai",
-            "test -n \"$KJ_CONTEXT\" && test -n \"$KJ_VERB\" && kj context list",
+            "[[ -n \"$KJ_CONTEXT\" ]] && [[ -n \"$KJ_VERB\" ]] && kj context list",
         ).await;
         let caller = unjoined_caller();
         let result = d
@@ -1434,9 +1434,9 @@ mod tests {
             "introspect",
             "kai",
             r#"
-test -n "$KJ_VERB" || exit 1
-test -n "$KJ_CONTEXT" || exit 2
-test -n "$KJ_DRIFT_INFO" || exit 3
+[[ -n "$KJ_VERB" ]] || exit 1
+[[ -n "$KJ_CONTEXT" ]] || exit 2
+[[ -n "$KJ_DRIFT_INFO" ]] || exit 3
 case "$KJ_VERB" in
   drift) ;;
   *) exit 4 ;;
@@ -1491,7 +1491,7 @@ esac
             "introspect",
             "kai",
             r#"
-test -n "$KJ_VERB" || exit 1
+[[ -n "$KJ_VERB" ]] || exit 1
 case "$KJ_VERB" in
   drift) ;;
   *) exit 2 ;;
@@ -1765,7 +1765,7 @@ esac
             //   exit 2 — env var not a positive integer
             //   exit 3 — env var doesn't match the seeded count of 3
             r#"
-test -n "$KJ_PARENT_BLOCK_COUNT" || exit 1
+[[ -n "$KJ_PARENT_BLOCK_COUNT" ]] || exit 1
 case "$KJ_PARENT_BLOCK_COUNT" in
   ''|*[!0-9]*) exit 2 ;;
 esac
