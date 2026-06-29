@@ -321,6 +321,10 @@ impl BeatScheduler {
             }
         };
         self.kernel.arm_timeline(context_id, policy.clock(), seed);
+        // A fresh arm starts with no rotate cadence; the cold-restart restore
+        // re-applies it via `set_rotate` after this call (see the `Arm` command
+        // handler) so `arm` keeps its narrow signature. A live re-arm preserves
+        // running state (playing / ooda / cadence) — only the policy updates.
         self.armed
             .entry(context_id)
             .and_modify(|s| s.policy = policy)
@@ -363,6 +367,7 @@ impl BeatScheduler {
             beats_per_phrase: st.policy.beats_per_phrase,
             ooda_every: st.policy.ooda_every,
             track: st.track.as_str().to_string(),
+            rotate_every_phrases: st.rotate_every_phrases,
         };
         if let Err(e) = db.lock().upsert_beat_state(context_id, &state) {
             log::error!("beat: failed to persist beat state for {context_id}: {e}");
@@ -426,8 +431,18 @@ impl BeatScheduler {
     /// Set (or clear, with `None`) the self-fork rotate cadence in phrases. A
     /// `Some(0)` is treated as `None` (no rotation) — never a `% 0`.
     pub fn set_rotate(&mut self, context_id: ContextId, every_phrases: Option<u64>) {
-        if let Some(st) = self.armed.get_mut(&context_id) {
-            st.rotate_every_phrases = every_phrases.filter(|n| *n > 0);
+        let updated = match self.armed.get_mut(&context_id) {
+            Some(st) => {
+                st.rotate_every_phrases = every_phrases.filter(|n| *n > 0);
+                true
+            }
+            None => false,
+        };
+        // Persist the cadence so a restart re-arm restores the page-turn (not just
+        // tempo/lane). Outside the `get_mut` borrow so `persist_state(&self)` can
+        // re-read. Mirrors `set_tempo`.
+        if updated {
+            self.persist_state(context_id);
         }
     }
 
@@ -949,8 +964,20 @@ impl BeatScheduler {
             tokio::select! {
                 biased;
                 msg = ingress.recv() => match msg {
-                    Some(BeatCommand::Arm { context_id, policy, track }) => {
-                        self.arm(context_id, policy, track)
+                    Some(BeatCommand::Arm {
+                        context_id,
+                        policy,
+                        track,
+                        rotate_every_phrases,
+                    }) => {
+                        self.arm(context_id, policy, track);
+                        // Restore the persisted page-turn cadence after arming (a
+                        // cold-restart re-arm). `None` leaves a live re-arm's
+                        // cadence untouched; `Some` re-applies it (and re-persists,
+                        // idempotently). `set_rotate` filters `Some(0)`.
+                        if rotate_every_phrases.is_some() {
+                            self.set_rotate(context_id, rotate_every_phrases);
+                        }
                     }
                     Some(BeatCommand::Play(ctx)) => self.play(ctx, Instant::now()),
                     Some(BeatCommand::Pause(ctx)) => self.pause(ctx),
@@ -2058,6 +2085,7 @@ mod tests {
                 beats_per_phrase: 12,
                 ooda_every: 96,
                 track: "bass".to_string(),
+                rotate_every_phrases: None,
             }),
             "arm mirrors the policy + lane into beat_state for restart re-arm"
         );
@@ -2072,8 +2100,25 @@ mod tests {
                 beats_per_phrase: 12,
                 ooda_every: 96,
                 track: "bass".to_string(),
+                rotate_every_phrases: None,
             }),
             "set_tempo write-through updates the persisted period, not the whole row"
+        );
+
+        // Setting a rotate cadence write-throughs too — so a cold-restart re-arm
+        // restores the page-turn, not just tempo/lane (the gap kaibo flagged).
+        sched.set_rotate(ctx, Some(4));
+        assert_eq!(
+            db.lock().get_beat_state(ctx).unwrap().unwrap().rotate_every_phrases,
+            Some(4),
+            "set_rotate persists the cadence for restart re-arm"
+        );
+        // Clearing it persists the cleared (NULL) state.
+        sched.set_rotate(ctx, None);
+        assert_eq!(
+            db.lock().get_beat_state(ctx).unwrap().unwrap().rotate_every_phrases,
+            None,
+            "rotate off persists as NULL"
         );
     }
 

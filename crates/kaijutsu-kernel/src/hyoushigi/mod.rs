@@ -106,6 +106,11 @@ pub enum BeatCommand {
         context_id: ContextId,
         policy: BeatPolicy,
         track: TrackId,
+        /// Self-fork rotate cadence to restore (phrases; `None` = no rotation).
+        /// Carried so a cold-restart re-arm rebuilds the page-turn cadence from
+        /// the persisted `beat_state`, not just tempo + lane. A fresh arm with no
+        /// persisted cadence passes `None`.
+        rotate_every_phrases: Option<u64>,
     },
     /// Start the clock — the playhead advances one beat per period, and (if OODA
     /// is armed) the `tick` verb fires on the coarse cadence.

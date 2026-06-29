@@ -169,12 +169,20 @@ impl KjDispatcher {
 
         let (cmd, verb): (BeatCommand, String) = match &command {
             TransportCommand::Arm { .. } => {
-                let (policy, track) = match self.beat_arm_payload(ctx) {
+                let (policy, track, rotate_every_phrases) = match self.beat_arm_payload(ctx) {
                     Ok(payload) => payload,
                     Err(e) => return KjResult::Err(e),
                 };
                 let verb = format!("armed (stopped) on lane '{}'", track.as_str());
-                (BeatCommand::Arm { context_id: ctx, policy, track }, verb)
+                (
+                    BeatCommand::Arm {
+                        context_id: ctx,
+                        policy,
+                        track,
+                        rotate_every_phrases,
+                    },
+                    verb,
+                )
             }
             TransportCommand::Play { .. } => (BeatCommand::Play(ctx), "playing".into()),
             TransportCommand::Pause { .. } => (BeatCommand::Pause(ctx), "paused".into()),
@@ -186,6 +194,17 @@ impl KjDispatcher {
                             .to_string(),
                     );
                 };
+                // A BPM above the 1 ms beat floor truncates to a zero period under
+                // integer division, and a zero period spins `fire_due` forever
+                // (it re-pushes the same instant and never advances past `now`),
+                // freezing the whole transport thread. Reject loudly rather than
+                // silently clamp — a sub-millisecond beat is never what was meant.
+                if bpm > 60_000 {
+                    return KjResult::Err(format!(
+                        "kj transport tempo: {bpm} BPM exceeds the 1 ms beat floor (max 60000); \
+                         a sub-millisecond period would freeze the beat scheduler"
+                    ));
+                }
                 let period = std::time::Duration::from_millis(60_000 / bpm);
                 (
                     BeatCommand::SetTempo { context_id: ctx, period },
@@ -257,7 +276,10 @@ impl KjDispatcher {
     /// a musician that was never persisted (created before beat-state persistence,
     /// or whose create-time write-through failed). Refuses loudly on a
     /// non-musician context: there is nothing meaningful to arm.
-    fn beat_arm_payload(&self, ctx: ContextId) -> Result<(BeatPolicy, TrackId), String> {
+    fn beat_arm_payload(
+        &self,
+        ctx: ContextId,
+    ) -> Result<(BeatPolicy, TrackId, Option<u64>), String> {
         let db = self.kernel_db().lock();
         // Prefer the persisted policy + lane (the real tempo/cadence a restart
         // should restore). A type-changed context still uses its persisted row —
@@ -277,7 +299,7 @@ impl KjDispatcher {
                 beats_per_phrase: state.beats_per_phrase,
                 ooda_every: state.ooda_every,
             };
-            return Ok((policy, track));
+            return Ok((policy, track, state.rotate_every_phrases));
         }
 
         // No persisted state — derive the lane from the context label + musician
@@ -302,7 +324,7 @@ impl KjDispatcher {
                     short_hex(ctx)
                 )
             })?;
-        Ok((BeatPolicy::musician_default(), track))
+        Ok((BeatPolicy::musician_default(), track, None))
     }
 }
 
@@ -340,6 +362,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_tempo_rejects_absurd_bpm() {
+        // A BPM that truncates the period to 0 ms would spin the beat scheduler;
+        // reject it loudly instead of silently clamping. 60000 BPM == 1 ms is the
+        // last valid value; 60001 truncates to 0.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(d.kernel().set_beat_ingress(tx), "ingress installs once");
+
+        let bad = d
+            .dispatch(&[s("transport"), s("tempo"), s("60001")], &c)
+            .await;
+        assert!(
+            matches!(bad, crate::kj::KjResult::Err(_)),
+            "60001 BPM must be rejected (would be a 0 ms period)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected tempo must NOT reach the scheduler"
+        );
+
+        let ok = d
+            .dispatch(&[s("transport"), s("tempo"), s("60000")], &c)
+            .await;
+        assert!(ok.is_ok(), "60000 BPM (1 ms) is the valid floor: {}", ok.message());
+        match rx.try_recv().expect("a valid tempo reaches the scheduler") {
+            BeatCommand::SetTempo { period, .. } => {
+                assert_eq!(period, Duration::from_millis(1), "60000 BPM == 1 ms period");
+            }
+            other => panic!("expected SetTempo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn transport_arm_uses_persisted_beat_state() {
         // The point of beat-state persistence: a restart re-arm restores the real
         // tempo/cadence, not BeatPolicy::musician_default().
@@ -358,6 +416,7 @@ mod tests {
                     beats_per_phrase: 12,
                     ooda_every: 96,
                     track: "bass".to_string(),
+                    rotate_every_phrases: Some(4),
                 },
             )
             .unwrap();
@@ -368,12 +427,17 @@ mod tests {
         let result = d.dispatch(&[s("transport"), s("arm")], &c).await;
         assert!(result.is_ok(), "transport arm failed: {}", result.message());
         match rx.try_recv().expect("an Arm should be sent") {
-            BeatCommand::Arm { context_id, policy, track } => {
+            BeatCommand::Arm { context_id, policy, track, rotate_every_phrases } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(policy.period, Duration::from_millis(250), "persisted tempo restored");
                 assert_eq!(policy.beats_per_phrase, 12);
                 assert_eq!(policy.ooda_every, 96);
                 assert_eq!(track, TrackId::new("bass").unwrap(), "persisted lane restored");
+                assert_eq!(
+                    rotate_every_phrases,
+                    Some(4),
+                    "persisted rotate cadence restored on re-arm (the cold-restart page-turn fix)"
+                );
             }
             other => panic!("expected Arm, got {other:?}"),
         }
@@ -464,6 +528,7 @@ mod tests {
                     beats_per_phrase: 16,
                     ooda_every: 128,
                     track: "bass".to_string(),
+                    rotate_every_phrases: None,
                 },
             )
             .unwrap();
@@ -528,6 +593,7 @@ mod tests {
                     beats_per_phrase: 12,
                     ooda_every: 96,
                     track: "bass".to_string(),
+                    rotate_every_phrases: None,
                 },
             )
             .unwrap();

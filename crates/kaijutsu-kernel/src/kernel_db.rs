@@ -619,12 +619,15 @@ CREATE TABLE IF NOT EXISTS context_hydration (
 -- are deliberately NOT mirrored — a re-arm always lands stopped + OODA-armed (no
 -- surprise token spend), and the playhead reseeds from the block log's max tick.
 CREATE TABLE IF NOT EXISTS beat_state (
-    context_id       BLOB    NOT NULL PRIMARY KEY
+    context_id           BLOB    NOT NULL PRIMARY KEY
         REFERENCES contexts(context_id) ON DELETE CASCADE,
-    period_ms        INTEGER NOT NULL,
-    beats_per_phrase INTEGER NOT NULL,
-    ooda_every       INTEGER NOT NULL,
-    track            TEXT    NOT NULL
+    period_ms            INTEGER NOT NULL,
+    beats_per_phrase     INTEGER NOT NULL,
+    ooda_every           INTEGER NOT NULL,
+    track                TEXT    NOT NULL,
+    -- Self-fork rotate cadence in phrases (NULL = no rotation). Persisted so a
+    -- cold-restart re-arm restores the page-turn cadence, not just tempo/lane.
+    rotate_every_phrases INTEGER
 );
 "#;
 
@@ -657,6 +660,9 @@ pub struct PersistedBeatState {
     pub beats_per_phrase: u64,
     pub ooda_every: u64,
     pub track: String,
+    /// Self-fork rotate cadence in phrases; `None` = no rotation. Restored on a
+    /// cold-restart re-arm so the page-turn survives a kernel restart.
+    pub rotate_every_phrases: Option<u64>,
 }
 
 fn read_opt_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<ContextId>> {
@@ -909,6 +915,7 @@ impl KernelDb {
         let alters = [
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
+            "ALTER TABLE beat_state ADD COLUMN rotate_every_phrases INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -3198,16 +3205,19 @@ impl KernelDb {
         state: &PersistedBeatState,
     ) -> KernelDbResult<()> {
         conn.execute(
-            "INSERT INTO beat_state (context_id, period_ms, beats_per_phrase, ooda_every, track)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO beat_state
+                 (context_id, period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(context_id) DO UPDATE SET
-                 period_ms = ?2, beats_per_phrase = ?3, ooda_every = ?4, track = ?5",
+                 period_ms = ?2, beats_per_phrase = ?3, ooda_every = ?4, track = ?5,
+                 rotate_every_phrases = ?6",
             params![
                 blob_param(context_id.as_bytes()),
                 state.period_ms as i64,
                 state.beats_per_phrase as i64,
                 state.ooda_every as i64,
                 state.track,
+                state.rotate_every_phrases.map(|n| n as i64),
             ],
         )?;
         Ok(())
@@ -3231,7 +3241,7 @@ impl KernelDb {
         let row = self
             .conn
             .query_row(
-                "SELECT period_ms, beats_per_phrase, ooda_every, track
+                "SELECT period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases
                  FROM beat_state WHERE context_id = ?1",
                 params![blob_param(context_id.as_bytes())],
                 |row| {
@@ -3240,17 +3250,30 @@ impl KernelDb {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((period_ms, beats_per_phrase, ooda_every, track)) = row else {
+        let Some((period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases)) = row
+        else {
             return Ok(None);
         };
         if period_ms < 0 || beats_per_phrase < 0 || ooda_every < 0 {
             return Err(KernelDbError::Validation(format!(
                 "context {} beat state has a negative field (period_ms={period_ms}, \
                  beats_per_phrase={beats_per_phrase}, ooda_every={ooda_every}) — corrupt",
+                context_id.short()
+            )));
+        }
+        // A persisted rotate cadence must be positive (the live `set_rotate`
+        // stores `None` for "off" and filters `Some(0)`); a zero or negative is
+        // corruption, not "rotate every 0 phrases" (which would be a `% 0` panic).
+        if let Some(n) = rotate_every_phrases
+            && n <= 0
+        {
+            return Err(KernelDbError::Validation(format!(
+                "context {} beat state has rotate_every_phrases={n} — corrupt (must be ≥ 1 or NULL)",
                 context_id.short()
             )));
         }
@@ -3271,6 +3294,7 @@ impl KernelDb {
             beats_per_phrase: beats_per_phrase as u64,
             ooda_every: ooda_every as u64,
             track,
+            rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
         }))
     }
 
@@ -5437,6 +5461,7 @@ mod tests {
             beats_per_phrase: bpp,
             ooda_every: ooda,
             track: track.to_string(),
+            rotate_every_phrases: None,
         }
     }
 
@@ -5461,6 +5486,53 @@ mod tests {
             db.get_beat_state(ctx.context_id).unwrap(),
             Some(state),
             "policy + track survive write→read (the restart re-arm payload)"
+        );
+
+        // A persisted rotate cadence survives the round-trip too (the cold-restart
+        // page-turn fix) and clears back to None.
+        let with_rotate = PersistedBeatState {
+            rotate_every_phrases: Some(4),
+            ..beat_state(250, 16, 128, "bass")
+        };
+        db.upsert_beat_state(ctx.context_id, &with_rotate).unwrap();
+        assert_eq!(
+            db.get_beat_state(ctx.context_id).unwrap().unwrap().rotate_every_phrases,
+            Some(4),
+            "rotate cadence survives write→read"
+        );
+        db.upsert_beat_state(ctx.context_id, &beat_state(250, 16, 128, "bass"))
+            .unwrap();
+        assert_eq!(
+            db.get_beat_state(ctx.context_id).unwrap().unwrap().rotate_every_phrases,
+            None,
+            "clearing the cadence persists as NULL"
+        );
+    }
+
+    #[test]
+    fn beat_state_nonpositive_rotate_is_loud_error() {
+        // `set_rotate` only ever stores `None` or `Some(n>=1)`; a zero/negative
+        // rotate_every_phrases is corruption that would `% 0`-panic the scheduler.
+        // Reject it loudly on read rather than re-arm into a divide-by-zero.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("beat-rot"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.conn
+            .execute(
+                "INSERT INTO beat_state
+                     (context_id, period_ms, beats_per_phrase, ooda_every, track, rotate_every_phrases)
+                 VALUES (?1, 250, 16, 128, 'bass', 0)",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                db.get_beat_state(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "a 0 rotate cadence is corrupt → loud Validation error, not a % 0 panic on re-arm"
         );
     }
 
