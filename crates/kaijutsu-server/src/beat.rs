@@ -957,6 +957,16 @@ impl BeatScheduler {
     /// the `kj transport` verb can say so instead of blind-claiming success.
     /// `Arm` creates the entry (always `Ok`); `Disarm` is idempotent (`Ok`); the
     /// rest require the context to be armed.
+    ///
+    /// MUST STAY FULLY SYNCHRONOUS — no `.await`. This runs inside `run`'s
+    /// `select!` ingress arm, and a rc-lifecycle script (`fire_rotate` /
+    /// `fire_lifecycle`, both `spawn_local` onto *this same LocalSet*) can issue a
+    /// `kj transport` command and then await the `BeatAck` reply. That awaiting rc
+    /// task only makes progress when this loop yields back to poll it; if
+    /// `apply_command` ever awaits, the rc-fired path can self-deadlock (the
+    /// scheduler parked awaiting something the rc task can't deliver because the
+    /// rc task is parked awaiting this reply). Keep the work here non-blocking and
+    /// reply before yielding.
     fn apply_command(&mut self, command: BeatCommand) -> BeatAck {
         match command {
             BeatCommand::Arm { context_id, policy, track, rotate_every_phrases } => {
@@ -1028,6 +1038,10 @@ impl BeatScheduler {
                 biased;
                 msg = ingress.recv() => match msg {
                     Some(BeatRequest { command, reply }) => {
+                        // `apply_command` is synchronous on purpose: a rc-fired
+                        // `kj transport` (spawn_local on this LocalSet) awaits the
+                        // reply below, so this arm must compute + send without
+                        // yielding or it self-deadlocks. See `apply_command` doc.
                         let ack = self.apply_command(command);
                         // Report the real outcome to a caller that wants it (`kj
                         // transport`), so its message can't lie about an un-armed
