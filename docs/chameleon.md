@@ -35,6 +35,16 @@ Members are **contexts**, not a new agent type (agent-emerges-not-noun). The
 model is per-context config; tiering costs zero new surface. Nobody in the
 band owns time — the transport (拍子木) does.
 
+> **Direction (2026-06-29): the beat is moving off the context and onto the
+> track** — the track becomes a *clock domain* a context **attaches to** to be
+> beaten, and the track owns the score, the clock source, and each attachment's
+> wakeup + rotate cadence. This is the substrate under both this doc and the
+> (now-retired) myaku pulse facility; it retires the per-context playhead carry
+> and the `track_head`/`stop --track` overlay we'd sketched. Design + staged
+> implementation plan: **`docs/tracks.md`**. Chameleon stays the *music
+> application* that consumes tracks; the band/players/rotation-as-song-form
+> below remain valid, read on the track's clock rather than the context's.
+
 ## Decisions
 
 - **Tracks, not voices (2026-06-11).** The stable lane identity on the

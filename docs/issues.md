@@ -88,20 +88,18 @@ concrete:
   rewrite and OODA writes are turn-cadence, so this is not blocking — but an O(1)
   append would make jsonl logs and `>>` cheap. Also closes the SFTP
   concurrent-appender lost-update facet noted in the SFTP section above.
-- **myaku pulse facility** — *no synthesized backend* (deleted that idea). The
-  scheduler is **cadence + a death-certificate** (each probe's `exit_code` + stderr
-  tail in a `status` file, since only the parent sees a crash). **One executor, two
-  trigger front-ends**: wall interval (`#pulse every=1s`) + hyoushigi beat
-  (`#pulse on=beat`, the existing `beat.rs` playhead-advance event). Probes are
-  **kaish** scripts that write their own files into a `/run` `MemoryBackend` mount
-  (its own mount; `/scratch` likely retired) — `/run/pulse/<probe>/{now,history,status}`
-  via a `pulse_emit` kaish helper (snapshot + bounded ring trim + fail-loud column
-  check; *no* scalar files). Scheduler injects fire coords as flat `KJ_` vars
-  (`KJ_TICK` musical/frozen-off-beat, `KJ_PULSE` monotonic ordering, `KJ_EPOCH_NS`
-  shared wall stamp; cf. `KJ_PARENT_BLOCK_COUNT`). Probe defs in a CRDT rc tree
-  (`#pulse` header). First wave all kaish reading `/proc`·`/sys` (`date +%s%N` works,
-  builtin); Rust probes later use the same `/run` contract. The app `DockSparkline`
-  is a prototype — rewrite it to read `/run/pulse/<x>/history`. Design: `docs/myaku.md`.
+- **myaku pulse facility — RETIRED 2026-06-29, folded into beat-on-track +
+  shared-state.** The standalone pulse facility (cadence + death-certificate, "one
+  executor, two trigger front-ends," probes writing `/run/pulse/<x>/{now,history,
+  status}` via `pulse_emit`, the `KJ_TICK`/`KJ_PULSE`/`KJ_EPOCH_NS` coords) was a
+  workaround for the beat being welded to the musician transport. The **beat-on-track**
+  direction (see the new top-level item below + `docs/tracks.md`) dissolves it: a
+  probe is *a context attached to a system-clock track whose tick behaviour writes
+  `/run`*. Its surviving pieces split — **cadence/coords/death-certificate → tracks**;
+  **the `/run` output substrate + `pulse_emit` → this section's shared-state work**
+  (write up the `/run/pulse/<x>/` layout here when that lands). `docs/myaku.md` is now
+  a redirect stub; the detailed standalone design is in git history. The app
+  `DockSparkline` rewrite-to-read-`/run` note still stands.
 
 ## `/v/ctx` + `/v/session` virtual surfaces (design `docs/slash-v.md`; lands ahead of SFTP slice 3)
 
@@ -859,6 +857,24 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Hyoushigi / Musician
 
+- **Beat-on-track refactor — move the beat off the context, onto the track
+  (DIRECTION SET 2026-06-29, `docs/tracks.md`; the big upcoming piece).** Today the
+  clock/playhead/heap are per-**context** and `track` is a label on `BeatState`.
+  Direction: the **track** becomes a clock domain that owns the clock, the score
+  (`Timeline`), a pluggable `ClockSource`, and a set of **attachments** (each with
+  its own wakeup cadence + optional rotate cadence); a **context attaches to a track
+  to be beaten**. Arming = attaching; rotation = the track rebinding an attachment to
+  its fork. This **retires** the per-context playhead carry (shipped 2026-06-29 — the
+  clock stops leaving the context, so continuity is free) and the `track_head` /
+  `stop --track` overlay we sketched (transport becomes native to the track's one
+  clock; the horizon race can't occur). It also **subsumes myaku** (a probe is a
+  context attached to a system-clock track writing `/run`). Staged: **(1)** clock +
+  playhead + transport + attachments onto the track (retires carry + `track_head`,
+  gives native `stop/play --track`); **(2)** the score `Timeline` onto the track
+  (contexts produce into it; largest part); **(3)** `ClockSource` trait + MIDI driver
+  + external-signal seam (solar/compute-availability; check the app's existing
+  time-sync algos for reuse). Full design + open questions in `docs/tracks.md`. A
+  fresh Claude + Amy start the surgery from that doc.
 - **Beat-lifecycle privilege asymmetry — RESOLVED by design (2026-06-28).**
   `fire_lifecycle` runs `tick`/`rotate` unprivileged while create runs
   privileged; gemini-pro flagged it. Decision: leave it. We deliberately keep
