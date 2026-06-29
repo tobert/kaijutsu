@@ -77,7 +77,10 @@ band owns time — the transport (拍子木) does.
   fork 2). The substance is unchanged from the original decision — notation
   is the score, MIDI a render — only the mechanism moved off the timeline:
   MIDI is never a committed cell, so the `UseLastGood` pool stays
-  notation-pure by construction.
+  notation-pure by construction. *(2026-06-29: MIDI-out **to hardware** is the same
+  idea taken one step — a **render target** on the track that emits committed cells
+  to ALSA MIDI out on an edge node, alongside app-display and audio samples. Design
+  in `docs/midi.md`.)*
 - **Event taxonomy by delivery semantics, not source:**
   - *heartbeat* → kaish vars, overwrite-in-place (`$TICK`, `$PHRASE`,
     `$TEMPO`)

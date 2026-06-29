@@ -57,7 +57,7 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
 - **Runner-verify** with a stock `sftp`/sshfs client through the real server
   (kernel rebuild+restart; capnp schema unchanged, but it's a new subsystem).
 
-## Shared state space + myaku (design `docs/shared-state.md`, `docs/myaku.md`)
+## Shared state space + myaku (design `docs/shared-state.md`; myaku detail in git history)
 
 High-level sketches landed 2026-06-28; dedicated design sessions to follow. The
 thesis: the VFS *is* the shared-state namespace; tiers are mounts (`/run`
@@ -97,8 +97,8 @@ concrete:
   probe is *a context attached to a system-clock track whose tick behaviour writes
   `/run`*. Its surviving pieces split — **cadence/coords/death-certificate → tracks**;
   **the `/run` output substrate + `pulse_emit` → this section's shared-state work**
-  (write up the `/run/pulse/<x>/` layout here when that lands). `docs/myaku.md` is now
-  a redirect stub; the detailed standalone design is in git history. The app
+  (write up the `/run/pulse/<x>/` layout here when that lands). `docs/myaku.md` was
+  deleted 2026-06-29; the detailed standalone design is in git history. The app
   `DockSparkline` rewrite-to-read-`/run` note still stands.
 
 ## `/v/ctx` + `/v/session` virtual surfaces (design `docs/slash-v.md`; lands ahead of SFTP slice 3)

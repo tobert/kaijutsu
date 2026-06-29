@@ -370,6 +370,13 @@ hardware-clocked, never network-clocked.** The DAC's clock drives the callback; 
 kernel timebase only aligns *musical* position, and the audio path slews loosely to it.
 Network jitter never enters an audio callback.
 
+> **Reused for external clock masters (2026-06-29, `docs/midi.md`).** This same
+> local-phasor + slew is the substrate for slaving a track to an *external* MIDI
+> clock (e.g. a KeyStep Pro): observe the master's pulses, fit a drift model that
+> emits `Timebase`-shaped corrections, and discipline the same local phasor — so a
+> WiFi/USB/RPC hop carries a *model*, never raw pulses. MIDI is `tracks.md` Stage 3's
+> `ClockSource`; the regenerate-locally half is here, only the estimator is new.
+
 ### One coalescing scheduler; virtual tickers and jobs
 
 The kernel does **not** run a timer per context. It runs **one** coalescing wakeup

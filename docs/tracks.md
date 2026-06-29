@@ -236,7 +236,13 @@ attach/detach. Stage it:
    persist on the track. Larger — touches the cell/`Timeline` data path.
 3. **Generalise the clock source.** Land the `ClockSource` trait + a MIDI driver +
    the external-signal seam, plus the rare/intentional cross-track bar/beat
-   alignment between independent clocks.
+   alignment between independent clocks. **The MIDI driver's shape is decided in
+   `docs/midi.md` (2026-06-29):** a `ClockSource` is a *proxy* for a clock that may
+   be *remote* and *drift-modeled* (observe → model tempo/phase/drift → regenerate
+   a tight local clock; distribute tempo/intent, not pulses). Design the trait
+   remote- and estimate-shaped from the start; MIDI is the second concrete voice
+   for it alongside the system clock. MIDI-out is a *render target* on the track
+   (a score consumer), not a clock concern.
 
 The playhead-carry code (shipped 2026-06-29) is a stage-0 stepping stone: it
 encodes the invariant (musical time is continuous across the chain) and its tests

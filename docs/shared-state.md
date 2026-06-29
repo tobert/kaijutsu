@@ -1,9 +1,11 @@
 # Shared state — the VFS *is* the namespace
 
 > **Status:** high-level sketch, captured 2026-06-28 from a framing conversation
-> (the same session that sketched `docs/myaku.md`). Directions, not commitments.
-> Companion to `docs/slash-v.md` (the `/v` sysfs/CRDT surfaces) and `docs/myaku.md`
-> (the pulse/sampling facility). Code is truth; this is where we're aiming.
+> (the same session that sketched the now-retired myaku pulse facility).
+> Directions, not commitments. Companion to `docs/slash-v.md` (the `/v` sysfs/CRDT
+> surfaces); the pulse/sampling design that lived in `docs/myaku.md` is **retired —
+> recover its detail from git history** and migrate it here (see *Open* below).
+> Code is truth; this is where we're aiming.
 
 ## The thesis
 
@@ -23,7 +25,7 @@ smell. See *Retiring KV* below for the one real tie to migrate first.
 
 | Need | Mount | Backend | Semantics |
 |------|-------|---------|-----------|
-| **Ephemeral, shared-within-kernel, read-write** | `/run` | `MemoryBackend` (exists, `vfs/backends/memory.rs`) | tmpfs/XDG `RUNTIME_DIR` vibe. `/run/pulse/` = metric/probe data (`docs/myaku.md`); `/run/<…>/` = agent/user scratchpad + OODA working trees. KV-replacement. |
+| **Ephemeral, shared-within-kernel, read-write** | `/run` | `MemoryBackend` (exists, `vfs/backends/memory.rs`) | tmpfs/XDG `RUNTIME_DIR` vibe. `/run/pulse/` = metric/probe data (design in git history, removed `docs/myaku.md`); `/run/<…>/` = agent/user scratchpad + OODA working trees. KV-replacement. |
 | **Durable, peer-synced, introspectable** | `/v/...` | CRDT + synthesized backends (`/v/docs`, `/v/ctx`, `/v/session`) | the durable + sysfs namespace `slash-v.md` designs |
 
 `/run` is its **own** mount (the existing `/scratch` `MemoryBackend` is likely
@@ -59,7 +61,7 @@ already builds.
 ## The file-layout convention (a kaish helper, not a backend)
 
 Because metrics are just files a probe writes, uniformity comes from a **shared
-kaish helper** (`pulse_emit`, `docs/myaku.md`) that every probe calls — *convention,
+kaish helper** (`pulse_emit`, designed in the removed `docs/myaku.md` — git history) that every probe calls — *convention,
 not enforcement*. It still honors `slash-v.md`'s hard-won sysfs principles, just in
 userspace:
 
@@ -84,7 +86,7 @@ the shared space as its **Observe surface**, built entirely from existing primit
 - **Observe = an `rc` verb.** `/etc/rc/<ooda-type>/observe/SXX-*.kai` runs kaish that
   `cat`s `/run/pulse/...` (and `/v/ctx`, `/v/session`) and **assembles blocks**: `.kai`
   stdout already routes to `Trace` blocks, `.md` to the system-prompt slot. No new
-  machinery — rc + kaish + blocks composed. (See `docs/myaku.md`; rc lifecycle in
+  machinery — rc + kaish + blocks composed. (myaku design in git history; rc lifecycle in
   `crates/kaijutsu-kernel` `/etc/rc`.)
 - **Pull and push.** The agent *pulls* by reading a file when it decides to look; the
   space can *push* by drifting a threshold crossing (`temp_c > 85`) into the
