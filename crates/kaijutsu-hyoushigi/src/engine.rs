@@ -212,6 +212,21 @@ impl Timeline {
         self.committed.push(cell);
     }
 
+    /// Rehydrate a freshly-armed timeline's committed log from durable history (the
+    /// materialized score reconstructed by the kernel), so `UseLastGood`
+    /// (`last_committed_content_in`) sees prior phrases across a restart. Only valid
+    /// on a **virgin** timeline (empty committed); the playhead must already be
+    /// seeded at/after these cells' ticks. A non-virgin rehydrate is a kernel bug —
+    /// crash over corrupting a live committed log. Empty `cells` is a clean no-op
+    /// (a fresh track with no history yet).
+    pub fn rehydrate_committed(&mut self, cells: Vec<Cell>) {
+        assert!(
+            self.committed.is_empty(),
+            "rehydrate_committed requires a virgin timeline (committed must be empty)"
+        );
+        self.committed = cells;
+    }
+
     pub fn playhead(&self) -> Tick {
         self.playhead
     }

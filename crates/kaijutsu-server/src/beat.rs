@@ -38,8 +38,8 @@ use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::hyoushigi::{
-    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Cadence, DeriverRegistry,
-    MaterializeCursor, materialize_committed, schedule_abc_cell,
+    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Cadence, Cell, ContentRef,
+    DeriverRegistry, MaterializeCursor, Span, materialize_committed, schedule_abc_cell,
 };
 use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
@@ -384,6 +384,36 @@ impl BeatScheduler {
         Ok(score_ctx)
     }
 
+    /// Reconstruct a track's committed cell log from its score context's materialized
+    /// ABC source blocks (Stage 2 WI 7, approach b) — so a freshly-(re)armed track
+    /// timeline can rehydrate its `UseLastGood` pool across a restart without a
+    /// separate cell-log table. Only the ABC *source* cells are committed Concrete
+    /// cells (the MIDI sibling is derived at the barrier, never committed); the
+    /// content-derived `ContentRef` hash matches the bytes already in durable CAS, so
+    /// a later fallback resolves them. A fresh track (empty score context) yields an
+    /// empty log — a clean no-op.
+    fn reconstruct_score_cells(&self, score_ctx: ContextId, track_id: &TrackId) -> Vec<Cell> {
+        // The score's source notation mime (matches `ABC_MIME` in the kernel bridge).
+        const ABC_MIME: &str = "text/vnd.abc";
+        let Ok(blocks) = self.documents.block_snapshots(score_ctx) else {
+            return Vec::new();
+        };
+        blocks
+            .into_iter()
+            .filter(|b| b.content_type == ContentType::Abc)
+            .filter_map(|b| {
+                let tick = b.tick?;
+                let track = b.track.clone().unwrap_or_else(|| track_id.clone());
+                Some(Cell::concrete_on(
+                    Span::instant(tick),
+                    ContentRef::of(b.content.as_bytes(), ABC_MIME),
+                    track,
+                    b.id.principal_id,
+                ))
+            })
+            .collect()
+    }
+
     /// A track's current playhead, if the track has a live clock domain. Used by
     /// tests to observe musical position.
     #[cfg(test)]
@@ -487,10 +517,15 @@ impl BeatScheduler {
             let seed = ctx_from_log.max(persisted_playhead.map(Tick::new).unwrap_or(Tick::ZERO));
             let score_context = self.ensure_score_context(&track_id, persisted_score)?;
             // Arm the TRACK's timeline once, at creation — the clock + open future +
-            // committed score live here now and never leave when a producer rotates
-            // out. Born with an empty committed pool (UseLastGood→Skip until the first
-            // good phrase; no warm-restart vamping).
-            self.kernel.arm_track_timeline(track_id.clone(), policy.clock(), seed);
+            // committed score live here now and never leave when a producer rotates out.
+            let tl = self.kernel.arm_track_timeline(track_id.clone(), policy.clock(), seed);
+            // Rehydrate the committed log from the score's durable blocks (WI 7b) so
+            // `UseLastGood` survives a restart. The materialize cursor starts PAST these
+            // — they're already materialized — so they're never re-emitted. A fresh
+            // track yields an empty log (UseLastGood→Skip until the first good phrase).
+            let restored = self.reconstruct_score_cells(score_context, &track_id);
+            let restored_n = restored.len();
+            tl.lock().rehydrate_committed(restored);
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
@@ -501,7 +536,7 @@ impl BeatScheduler {
                     beat_count: 0,
                     last_epoch_ns: 0,
                     score_context,
-                    cursor: MaterializeCursor::default(),
+                    cursor: MaterializeCursor { high_water: restored_n, ..Default::default() },
                     materialize_failures: 0,
                     failure_water: 0,
                     attached: HashMap::new(),
@@ -2704,6 +2739,79 @@ mod tests {
             score,
             "restart reuses the persisted score context, not a fresh mint"
         );
+    }
+
+    /// Stage 2 WI 7b: on a (re-)arm the track's committed log is rehydrated from its
+    /// score context's materialized ABC blocks, so `UseLastGood` survives a restart —
+    /// AND the materialize cursor starts PAST the rehydrated cells so they are never
+    /// re-emitted (no duplicate score, no DuplicateBlock).
+    #[tokio::test]
+    async fn attach_rehydrates_committed_from_persisted_score() {
+        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder, Role};
+
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let track = TrackId::new("bass").unwrap();
+
+        // A pre-existing score context carrying one committed ABC phrase at tick 5 (a
+        // prior session's materialized score) plus a non-ABC sibling that must be
+        // ignored. The persisted `tracks` row points the track at it (restart state).
+        let score = ContextId::new();
+        documents.create_document(score, DocumentKind::Conversation, None).unwrap();
+        let player = PrincipalId::new();
+        let seq = documents.reserve_block_id(score, player).unwrap().seq;
+        let abc = BlockSnapshotBuilder::new(BlockId::new(score, player, seq), BlockKind::Text)
+            .role(Role::Model)
+            .content("X:1\nK:C\nCDEF|\n")
+            .content_type(ContentType::Abc)
+            .tick(Tick::new(5))
+            .track(track.clone())
+            .build();
+        documents.insert_from_snapshot_as(score, abc, None, Some(player)).unwrap();
+        let seq2 = documents.reserve_block_id(score, player).unwrap().seq;
+        let midi = BlockSnapshotBuilder::new(BlockId::new(score, player, seq2), BlockKind::Text)
+            .role(Role::Asset)
+            .content("00112233445566778899aabbccddeeff")
+            .content_type(ContentType::Plain)
+            .tick(Tick::new(5))
+            .track(track.clone())
+            .build();
+        documents.insert_from_snapshot_as(score, midi, None, Some(player)).unwrap();
+        db.lock()
+            .upsert_track(&PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 500,
+                beats_per_phrase: 16,
+                playhead_tick: Some(5),
+                playing: false,
+                score_context_id: Some(score),
+            })
+            .unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        assert_eq!(sched.score_context(&track), score, "recovered the persisted score context");
+
+        // The committed log was rehydrated from the ABC source (the MIDI sibling is not
+        // a committed cell) — UseLastGood now has a view across the restart.
+        let tl = kernel.track_timeline(&track).unwrap();
+        assert_eq!(
+            tl.lock().committed().len(),
+            1,
+            "the prior ABC phrase rehydrated into the committed log; the MIDI sibling is excluded"
+        );
+
+        // The cursor starts past it: a beat must NOT re-materialize the rehydrated cell
+        // (the score context keeps exactly its one ABC block).
+        let base = Instant::now();
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_secs(1));
+        let abc_blocks = documents
+            .block_snapshots(score)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.content_type == ContentType::Abc)
+            .count();
+        assert_eq!(abc_blocks, 1, "the rehydrated cell is not re-materialized (cursor past it)");
     }
 
     /// Continuity across a rotation page-turn WITHOUT a carry: the TRACK owns the

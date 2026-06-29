@@ -712,23 +712,21 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
 - [x] **6. Delete the Stage-1 bridge** (`beat.rs:778-787`) and the per-context seed/slew
   it serves. The playhead lives only on the track. *Test:* the existing continuity tests
   (re-pointed from Stage 1's "the clock stayed on the track") pass with the bridge gone.
-- [ ] **7. Persistence — persist the Cell log, do NOT reverse-engineer from blocks.**
-  Track score recovery across restart, folded into the `tracks` table / cold-start path (the
-  re-arm sweep stays deferred, but the shape must support re-hydrating a track's score).
-  **Decision (gemini): re-deriving the committed `Vec<Cell>` from materialized blocks is
-  LOSSY** — `materialize`→`BlockSnapshot` drops `CellState`, the `Recipe`, and full `Span`, so
-  a track that re-arms with an empty `committed` Vec leaves `last_committed_content_in` blind
-  and the **next `UseLastGood` fallback wedges the track**. So persist the timeline's own
-  append-only Cell log (at least `Concrete` cells with full `Span` + `played_by`) to a
-  track-scoped row, loaded at arm. **Chicken-and-egg:** `seed_playhead` (`engine.rs:287-298`)
-  is **virgin-only** (`committed.is_empty()`) and you can't schedule cells *behind* the
-  playhead — so loading a persisted log needs a real `Timeline::rehydrate(playhead,
-  committed_cells)` entry point (bypasses the virgin check), not `push_committed_for_test`
-  (`engine.rs:207-209`, test-gated). **Open future / squashes / in-flight speculations do NOT
-  survive restart** (consistent with conversation re-hydration) — state that as the contract,
-  like Stage 1 did for `KJ_PULSE`. *Test:* a `UseLastGood` fallback fired the beat *after* a
-  restart still finds the pre-restart phrase (the wedge-the-track regression); rehydrate
-  accepts a non-empty committed log + a playhead at/after its max tick.
+- [x] **7. Persistence — `UseLastGood` survives a restart (approach b, chosen 2026-06-29).**
+  Rather than a separate cell-log table, the committed log is **reconstructed from the score
+  context's materialized ABC blocks on (re-)arm** (`reconstruct_score_cells` in `beat.rs`): the
+  ABC *source* blocks ARE the committed Concrete cells (the MIDI sibling is derived, never
+  committed), and a content-derived `ContentRef::of(content)` hash matches the bytes already in
+  durable CAS. `engine.rs` gained `rehydrate_committed(cells)` (virgin-only; crash over
+  corrupting a live log); `attach`'s create block rehydrates the track timeline and starts the
+  materialize cursor **past** the restored cells so they're never re-emitted. gemini called
+  reconstruction "lossy" (drops `CellState`/`Recipe`/`Span`), but those are all trivially
+  reconstructable for *committed Concrete* cells, which is exactly what `UseLastGood` needs — so
+  (b) avoids the new schema + blob-growth of (a). **Open future / squashes / in-flight
+  speculations still do NOT survive restart** (consistent with conversation re-hydration) — the
+  documented contract. *Test:* `attach_rehydrates_committed_from_persisted_score` — attach off a
+  persisted `tracks` row recovers the score context, rehydrates the prior ABC phrase into
+  `committed`, excludes the MIDI sibling, and a beat does not re-materialize it (cursor past it).
 - [x] **8. Docs** — devlog entry landed ("Tracks Stage 2 — the score moves onto the
   track", 2026-06-29); these boxes flipped; `hyoushigi.md` already carries a forward
   "Direction (2026-06-29)" note pointing here for the stage 1–2 move.
@@ -771,18 +769,13 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   (the real band view); the Stage-1 per-context bridge slew is **deleted** (the track timeline's
   `advance_to` is the legit pump); `attach` arms the track timeline (no per-ctx arm) and `detach`
   no longer disarms it. 37 beat + 1266 kernel tests green; full workspace builds.
-- **WI 8 (docs) + WI 9 (test audit) — DONE.** Devlog entry landed; beat tests migrated;
-  `two_producers_failures_route_to_their_own_conversations` pins the concurrent mechanism.
-- **Still open:** WI 7 (persist the Timeline's Cell log so `UseLastGood` survives restart — the
-  score *blocks* persist in the score ctx, but the in-RAM committed `Vec<Cell>` does not, so a
-  restart resets the UseLastGood pool — the gemini "wedge" risk). **Approach is an open fork**
-  (decide before coding): (a) persist the committed cells to a track-scoped row + rehydrate on
-  arm with cursor coordination (gemini's pick; new schema, blob-growth to bound); vs. (b)
-  reconstruct the committed `Vec<Cell>` from the score context's materialized ABC blocks on arm
-  (no new schema — re-hash inline ABC for the `ContentRef`; gemini warned this is "lossy" for
-  `CellState`/`Recipe`/`Span`, but those are all trivially reconstructable for *committed
-  Concrete* cells, which is all `UseLastGood` needs). Plus Stage 3 (`ClockSource`/MIDI) and a
-  real-kernel live-verify.
+- **WI 7 (`UseLastGood` restart) + WI 8 (docs) + WI 9 (test audit) — DONE.** WI 7 took approach
+  (b): reconstruct the committed log from the score context's ABC blocks on arm + a virgin
+  `rehydrate_committed`, cursor started past the restored cells. Devlog entry landed; beat tests
+  migrated; concurrent-producer + rehydrate tests added.
+- **All Stage 2 work items (1–9) are DONE.** Still ahead: **Stage 3** (`ClockSource` trait + MIDI
+  driver + cross-track bar/beat alignment) and a **real-kernel live-verify** (rebuild + restart;
+  the `tracks` table picks up `score_context_id` via the additive ALTER — should migrate clean).
 
 ## Decisions made in-flight
 
