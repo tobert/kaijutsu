@@ -304,8 +304,10 @@ impl BeatScheduler {
     /// log always wins for a real context), it only supplies time when there is
     /// none. The seed lands only on a freshly-created timeline inside
     /// `arm_timeline`'s `or_insert_with`, so a re-arm of a live timeline never
-    /// re-seeds. A failed `max_tick` scan is loud, not silent: we'd rather hear it
-    /// than seed a stale (zero) playhead and mis-place the first beat.
+    /// re-seeds. A failed DB read (max-tick scan OR the carried-playhead row) is
+    /// **fatal**: `arm` returns `Err` rather than seed a stale (zero) playhead — a
+    /// rewound seed would overwrite committed history (`DuplicateBlock` cascade), so
+    /// we fail the arm loudly and let the caller retry (crash over corruption).
     ///
     /// CONSTRAINT (design §11.5): we seed the playhead tick but **deliberately do
     /// NOT seed the fallback pool** from the persisted block log. The Timeline's
@@ -317,41 +319,44 @@ impl BeatScheduler {
     /// this project rejects (crash/silence over corruption). Warm-restart vamping,
     /// if ever wanted, is an explicit opt-in feature (issues.md), never the default
     /// that falls out of seeding a pool here.
-    pub fn arm(&mut self, context_id: ContextId, policy: BeatPolicy, track: TrackId) {
-        let from_log = match self.documents.max_tick(context_id) {
-            Ok(t) => t.unwrap_or(kaijutsu_types::Tick::ZERO),
-            Err(e) => {
-                log::error!(
-                    "beat: max_tick failed for context {context_id}: {e}; seeding playhead to zero"
-                );
-                kaijutsu_types::Tick::ZERO
-            }
-        };
+    pub fn arm(
+        &mut self,
+        context_id: ContextId,
+        policy: BeatPolicy,
+        track: TrackId,
+    ) -> Result<(), String> {
+        // A DB read failure here is FATAL to the arm, not a seed-from-zero fallback.
+        // Seeding a rewound (zero) playhead onto a virgin timeline — a cold-start
+        // re-arm or a thin fork child — makes the context overwrite committed
+        // history → a `DuplicateBlock` poison cascade. A transient SQLite lock must
+        // *fail the arm loudly* (the rc `&&` chain halts, the caller retries) rather
+        // than silently poison musical time (crash over corruption, per CLAUDE.md).
+        let from_log = self
+            .documents
+            .max_tick(context_id)
+            .map_err(|e| format!("beat: arm {context_id}: reading max committed tick: {e}"))?
+            .unwrap_or(kaijutsu_types::Tick::ZERO);
         // Tick continuity across the rotation page-turn (docs/chameleon.md): a thin
         // spawn-fork child has no committed blocks, so `from_log` is zero — but the
         // fork copied the parent's `beat_state.playhead_tick` (the lane's musical
         // position). Seed from the MAX of the two: the carried tick continues a
-        // child's musical time, while `from_log` always wins for a context with
-        // real committed history (cold restart), so the carried value can never
-        // *hide* committed time — it only supplies it when there is none. A corrupt
-        // row is loud, not silent: we log and fall back to the log tick rather than
-        // seed from a poisoned carried value.
-        let carried = self
-            .documents
-            .db()
-            .and_then(|db| match db.lock().get_beat_state(context_id) {
-                Ok(state) => state.and_then(|s| s.playhead_tick),
-                Err(e) => {
-                    log::error!(
-                        "beat: get_beat_state failed for {context_id}: {e}; \
-                         ignoring carried playhead (seeding from the block log)"
-                    );
-                    None
-                }
-            })
-            .map(|n| kaijutsu_types::Tick::new(n as i64))
-            .unwrap_or(kaijutsu_types::Tick::ZERO);
-        let seed = from_log.max(carried);
+        // child's musical time, while `from_log` always wins for a context with real
+        // committed history (cold restart), so the carried value can never *hide*
+        // committed time — it only supplies it when there is none. A corrupt/locked
+        // row is fatal here too (same reasoning): bubble it, never seed from zero.
+        let carried = match self.documents.db() {
+            Some(db) => db
+                .lock()
+                .get_beat_state(context_id)
+                .map_err(|e| format!("beat: arm {context_id}: reading carried playhead: {e}"))?
+                .and_then(|s| s.playhead_tick),
+            None => None, // db-less store (embedded/test): no carried playhead
+        };
+        let seed = from_log.max(
+            carried
+                .map(|n| kaijutsu_types::Tick::new(n as i64))
+                .unwrap_or(kaijutsu_types::Tick::ZERO),
+        );
         self.kernel.arm_timeline(context_id, policy.clock(), seed);
         // A fresh arm starts with no rotate cadence; the cold-restart restore
         // re-applies it via `set_rotate` after this call (see the `Arm` command
@@ -372,8 +377,13 @@ impl BeatScheduler {
                 failure_water: 0,
             });
         // Mirror the (possibly new) policy + lane to the DB so a kernel restart can
-        // re-arm this musician with its real values via `kj transport arm`.
-        self.persist_state(context_id);
+        // re-arm this musician with its real values via `kj transport arm`. A write
+        // failure here is loud but NOT fatal to the arm: the live timeline is already
+        // correctly seeded, and the `max()` rule protects a later restart re-arm
+        // (max_tick wins over a stale row). The rotation page-turn's accuracy rides
+        // the SEPARATE horizon persist in `fire_due`, which IS checked — not this one.
+        let _ = self.persist_state(context_id);
+        Ok(())
     }
 
     /// Mirror a context's live policy + lane into the `beat_state` table — the
@@ -383,16 +393,19 @@ impl BeatScheduler {
     /// the live `BeatState`.
     ///
     /// A db-less store (embedded / unit test) has nowhere to persist — a clean
-    /// no-op. A db-backed store whose write FAILS is loud (`log::error!`), never
-    /// silent: the live beat is unaffected, but the restart-recovery copy is now
-    /// stale, and a musician silently re-arming to the default tempo after a crash
-    /// is exactly the kind of silent fallback this project rejects.
-    fn persist_state(&self, context_id: ContextId) {
+    /// no-op (`Ok`). A db-backed store whose write FAILS returns `Err` (and logs):
+    /// the live beat is unaffected, but the restart-recovery copy is now stale.
+    /// Most callers (arm, tempo) treat that as loud-but-tolerable — the `max()` seed
+    /// rule protects a later restart. The **rotate horizon** caller in `fire_due`
+    /// MUST check the result: there, a stale row would be fork-copied into the child
+    /// and rewind its musical time, so a failed persist defers the page-turn rather
+    /// than mint a corrupted child (crash/halt over corruption, per CLAUDE.md).
+    fn persist_state(&self, context_id: ContextId) -> Result<(), String> {
         let Some(st) = self.armed.get(&context_id) else {
-            return;
+            return Ok(()); // not armed: nothing to mirror
         };
         let Some(db) = self.documents.db() else {
-            return; // db-less store (embedded/test): nothing to persist to.
+            return Ok(()); // db-less store (embedded/test): nothing to persist to.
         };
         // Snapshot the LIVE playhead so the fork copy can hand a rotation child the
         // lane's current musical position (the child has no committed blocks to
@@ -414,9 +427,11 @@ impl BeatScheduler {
             rotate_every_phrases: st.rotate_every_phrases,
             playhead_tick,
         };
-        if let Err(e) = db.lock().upsert_beat_state(context_id, &state) {
-            log::error!("beat: failed to persist beat state for {context_id}: {e}");
-        }
+        db.lock().upsert_beat_state(context_id, &state).map_err(|e| {
+            let msg = format!("beat: failed to persist beat state for {context_id}: {e}");
+            log::error!("{msg}");
+            msg
+        })
     }
 
     /// Start (or resume) the clock. Pushes a heap entry one period out; the
@@ -460,9 +475,11 @@ impl BeatScheduler {
             None => false,
         };
         // Persist the new tempo so a restart re-arm carries it (not the default).
-        // Outside the `get_mut` borrow so `persist_state(&self)` can re-read.
+        // Outside the `get_mut` borrow so `persist_state(&self)` can re-read. A
+        // failure is loud (logged inside) but tolerable — the live tempo is set; the
+        // recovery copy is stale, which the `max()` seed rule survives.
         if updated {
-            self.persist_state(context_id);
+            let _ = self.persist_state(context_id);
         }
     }
 
@@ -485,9 +502,9 @@ impl BeatScheduler {
         };
         // Persist the cadence so a restart re-arm restores the page-turn (not just
         // tempo/lane). Outside the `get_mut` borrow so `persist_state(&self)` can
-        // re-read. Mirrors `set_tempo`.
+        // re-read. Mirrors `set_tempo` — loud-but-tolerable on failure.
         if updated {
-            self.persist_state(context_id);
+            let _ = self.persist_state(context_id);
         }
     }
 
@@ -532,16 +549,25 @@ impl BeatScheduler {
             // `rotate` rc (fork + arm child) runs fire-and-forget; that async work
             // is safe now that the parent is stopped.
             if report.rotate_due {
-                self.stop(ctx);
                 // Snapshot the parent's live playhead into its `beat_state` row
-                // BEFORE the page-turn fork copies it, so the thin child inherits
-                // the lane's current musical position and `arm` continues musical
-                // time instead of resetting to tick 0 (docs/chameleon.md tick
-                // continuity). `stop` doesn't persist; the parent advanced many
-                // beats since its last policy-mutation snapshot, so refresh here.
-                self.persist_state(ctx);
-                outcome.rotate_due.push(ctx);
-                continue;
+                // BEFORE retiring it, so the page-turn fork copies an ACCURATE tick
+                // and `arm` continues musical time instead of resetting to 0
+                // (docs/chameleon.md tick continuity). Persist FIRST, then stop:
+                // if the write fails, a fork now would copy a stale row and the
+                // child would silently rewind. So on failure we do NOT rotate — the
+                // parent stays on the clock (re-armed below like a normal beat) and
+                // retries at the next horizon. A deferred page-turn beats a
+                // corrupted child (crash/halt over corruption, per CLAUDE.md).
+                if self.persist_state(ctx).is_ok() {
+                    self.stop(ctx);
+                    outcome.rotate_due.push(ctx);
+                    continue;
+                }
+                log::error!(
+                    "beat: rotate deferred for {ctx} — beat_state persist failed; keeping the \
+                     parent on the clock (a delayed page-turn beats a rewound child)"
+                );
+                // fall through to the normal-beat path: re-arm + propagate ooda/phrase
             }
             self.heap.push(Reverse((now + period, ctx)));
             if report.ooda_due {
@@ -1022,7 +1048,10 @@ impl BeatScheduler {
     fn apply_command(&mut self, command: BeatCommand) -> BeatAck {
         match command {
             BeatCommand::Arm { context_id, policy, track, rotate_every_phrases } => {
-                self.arm(context_id, policy, track);
+                // A DB-read failure in `arm` bubbles to the BeatAck so `kj transport`
+                // (and the rc `&&` chain) sees a loud failure, never a silent
+                // poisoned (rewound) timeline reported as success.
+                self.arm(context_id, policy, track)?;
                 // Restore the persisted page-turn cadence after arming (a
                 // cold-restart re-arm). `None` leaves a live re-arm's cadence
                 // untouched; `Some` re-applies it (and re-persists, idempotently).
@@ -1456,7 +1485,7 @@ mod tests {
         let base = Instant::now();
 
         // Armed but not played: stopped → no heap entry, no blocks.
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         assert!(sched.next_wake().is_none(), "arm alone schedules nothing (stopped)");
         let out = sched.fire_due(base + Duration::from_secs(1));
         assert!(out.fired.is_empty());
@@ -1490,7 +1519,7 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         sched.play(ctx, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // tick 1
@@ -1525,7 +1554,7 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(a, slow_policy(), TrackId::solo());
+        sched.arm(a, slow_policy(), TrackId::solo()).unwrap();
         sched.play(a, base);
 
         sched.fire_due(base + Duration::from_secs(1));
@@ -1533,7 +1562,7 @@ mod tests {
         assert_eq!(contents(&documents, a).len(), 2);
         assert_eq!(contents(&documents, b).len(), 0, "b not playing yet");
 
-        sched.arm(b, slow_policy(), TrackId::solo());
+        sched.arm(b, slow_policy(), TrackId::solo()).unwrap();
         sched.play(b, base + Duration::from_secs(2));
         sched.fire_due(base + Duration::from_secs(3)); // both due
         assert_eq!(contents(&documents, a).len(), 3);
@@ -1563,7 +1592,8 @@ mod tests {
                 ooda_every: 3,
             },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched.play(ctx, base);
 
         let mut ooda_beats = Vec::new();
@@ -1614,7 +1644,8 @@ mod tests {
                 ooda_every: 1_000_000,
             },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched.play(ctx, base);
 
         let mut phrase_beats = Vec::new();
@@ -1656,7 +1687,8 @@ mod tests {
             ctx,
             BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 2 },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched.set_rotate(ctx, Some(1)); // rotate every phrase
         sched.play(ctx, base);
 
@@ -1700,7 +1732,8 @@ mod tests {
             ctx,
             BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 1_000_000 },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched.set_rotate(ctx, Some(2)); // rotate every 2 phrases
         sched.play(ctx, base);
 
@@ -1734,7 +1767,8 @@ mod tests {
             ctx,
             BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 1_000_000 },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched.play(ctx, base);
 
         for i in 1..=4 {
@@ -1793,7 +1827,7 @@ mod tests {
         };
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, phrase, TrackId::solo());
+        sched.arm(ctx, phrase, TrackId::solo()).unwrap();
         sched.play(ctx, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // playhead → 1
@@ -1871,7 +1905,7 @@ mod tests {
             documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo());
+            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
             sched.play(ctx, base);
             sched.fire_due(base + Duration::from_secs(1));
             sched.on_turn_completed(ctx, None);
@@ -1886,7 +1920,7 @@ mod tests {
             preseed_markers(&kernel, ctx, 1);
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo());
+            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
             sched.play(ctx, base);
             sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
             let materialized = documents.last_block_id(ctx).unwrap();
@@ -1923,7 +1957,7 @@ mod tests {
                 .unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo());
+            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
             sched.play(ctx, base);
             sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
@@ -1957,7 +1991,7 @@ mod tests {
             documents.set_ephemeral(ctx, &eph, true).unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo());
+            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
             sched.play(ctx, base);
             sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
@@ -1978,7 +2012,7 @@ mod tests {
             let abc = insert_player_abc(&documents, ctx, player, "X:1\nK:C\nCDEFGABc|\n");
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
-            sched.arm(ctx, phrase, TrackId::solo());
+            sched.arm(ctx, phrase, TrackId::solo()).unwrap();
             sched.play(ctx, base);
             sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
@@ -2013,7 +2047,8 @@ mod tests {
             ctx,
             BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4, ooda_every: 1_000_000 },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched.play(ctx, base);
         sched.fire_due(base + Duration::from_secs(1));
 
@@ -2088,7 +2123,7 @@ mod tests {
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
 
         // Arm: the playhead seeds to the max committed tick, not Tick::ZERO.
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         let playhead_after_arm = kernel.timeline(ctx).unwrap().lock().playhead();
         assert_eq!(
             playhead_after_arm,
@@ -2110,7 +2145,7 @@ mod tests {
         // Re-arm of the now-LIVE timeline must NOT re-seed or rewind: the
         // playhead stays where the beat left it (seed_playhead is virgin-only,
         // applied inside or_insert_with which never fires on a re-arm).
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         let playhead_after_rearm = kernel.timeline(ctx).unwrap().lock().playhead();
         assert_eq!(
             playhead_after_rearm,
@@ -2186,7 +2221,7 @@ mod tests {
         // Arm with a non-default policy on the `bass` lane.
         let policy = BeatPolicy { period: Duration::from_millis(500), beats_per_phrase: 12, ooda_every: 96 };
         let track = TrackId::new("bass").unwrap();
-        sched.arm(ctx, policy, track.clone());
+        sched.arm(ctx, policy, track.clone()).unwrap();
 
         assert_eq!(
             db.lock().get_beat_state(ctx).unwrap(),
@@ -2267,7 +2302,7 @@ mod tests {
         );
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents);
-        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap());
+        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap()).unwrap();
 
         assert_eq!(
             kernel.timeline(ctx).unwrap().lock().playhead(),
@@ -2315,12 +2350,99 @@ mod tests {
             .unwrap();
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents);
-        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap());
+        sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap()).unwrap();
 
         assert_eq!(
             kernel.timeline(ctx).unwrap().lock().playhead(),
             Tick::new(big_t),
             "the committed max tick wins over a stale lower carried playhead"
+        );
+    }
+
+    /// A DB read failure during `arm` is FATAL, not a seed-from-zero fallback:
+    /// seeding a rewound playhead onto a virgin timeline would overwrite committed
+    /// history (`DuplicateBlock` cascade). A corrupt `beat_state` row (here a
+    /// negative `playhead_tick`, which `get_beat_state` rejects) must fail the arm
+    /// loudly and leave NO timeline behind — never silently seed from zero
+    /// (gemini review 2026-06-29; CLAUDE.md crash-over-corruption).
+    #[tokio::test]
+    async fn arm_fails_loud_on_corrupt_beat_state_never_seeds_zero() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+
+        // Poison the row: `u64::MAX` is written `as i64` = -1, which `get_beat_state`
+        // rejects as corrupt (a negative coordinate would wrap to a far-future seed).
+        // Stands in for bit-rot / tampering / a non-Rust writer.
+        db.lock()
+            .upsert_beat_state(
+                ctx,
+                &kaijutsu_kernel::kernel_db::PersistedBeatState {
+                    period_ms: 500,
+                    beats_per_phrase: 16,
+                    ooda_every: 128,
+                    track: "bass".to_string(),
+                    rotate_every_phrases: None,
+                    playhead_tick: Some(u64::MAX),
+                },
+            )
+            .unwrap();
+        assert!(kernel.timeline(ctx).is_none(), "no timeline before arm");
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents);
+        let result = sched.arm(ctx, slow_policy(), TrackId::new("bass").unwrap());
+
+        assert!(result.is_err(), "arm must bubble the corrupt-row read error, not seed zero");
+        assert!(
+            kernel.timeline(ctx).is_none(),
+            "a failed arm must NOT seed a (rewound) timeline — crash over corruption"
+        );
+    }
+
+    /// If the rotate-horizon `persist_state` FAILS, the page-turn is DEFERRED, not
+    /// taken from a stale row: a fork now would copy an out-of-date playhead and the
+    /// child would silently rewind. The parent stays on the clock and retries at the
+    /// next horizon — a delayed page-turn beats a corrupted child (gemini review
+    /// 2026-06-29; CLAUDE.md crash-over-corruption).
+    #[tokio::test]
+    async fn rotate_horizon_defers_when_persist_fails() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let mut sched = BeatScheduler::new(kernel.clone(), documents);
+
+        // 2-beat phrase, rotate every phrase → beat 2 is the rotate horizon.
+        sched
+            .arm(
+                ctx,
+                BeatPolicy {
+                    period: Duration::from_secs(1),
+                    beats_per_phrase: 2,
+                    ooda_every: 1_000_000,
+                },
+                TrackId::solo(),
+            )
+            .unwrap();
+        sched.set_rotate(ctx, Some(1)); // persisted while the context row still exists
+        let base = Instant::now();
+        sched.play(ctx, base);
+
+        // Poison the horizon persist: delete the context row. `ON DELETE CASCADE`
+        // drops the `beat_state` row, so the horizon's re-`upsert` FK-violates.
+        assert!(db.lock().delete_context(ctx).unwrap(), "context row deleted");
+
+        // Beat 1: mid-phrase, nothing due.
+        let b1 = sched.fire_due(base + Duration::from_secs(1));
+        assert!(b1.rotate_due.is_empty());
+
+        // Beat 2: the horizon — but the persist fails, so rotation is DEFERRED.
+        let b2 = sched.fire_due(base + Duration::from_secs(2));
+        assert!(
+            b2.rotate_due.is_empty(),
+            "rotation is deferred (not taken from a stale row) when the horizon persist fails"
+        );
+
+        // Beat 3: the parent is still on the clock — it kept beating, not retired.
+        let b3 = sched.fire_due(base + Duration::from_secs(3));
+        assert!(
+            b3.fired.contains(&ctx),
+            "the parent stays on the clock after a deferred page-turn (a delayed turn beats a rewound child)"
         );
     }
 
@@ -2378,7 +2500,7 @@ mod tests {
         preseed_markers(&kernel, ctx, 1);
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         sched.play(ctx, base);
         sched.fire_due(base + Duration::from_secs(1));
 
@@ -2458,7 +2580,7 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         sched.play(ctx, base);
 
         let errors = |documents: &SharedBlockStore| -> Vec<String> {
@@ -2557,7 +2679,7 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         sched.play(ctx, base);
 
         let errors = |documents: &SharedBlockStore| -> usize {
@@ -2619,7 +2741,7 @@ mod tests {
         preseed_markers(&kernel, ctx, 1);
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.arm(ctx, slow_policy(), TrackId::solo()).unwrap();
         sched.play(ctx, base);
         sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
         let last = documents
@@ -2665,7 +2787,7 @@ mod tests {
             .unwrap();
         let mut sched_b = BeatScheduler::new(kernel_b.clone(), docs_b.clone());
         let base_b = Instant::now();
-        sched_b.arm(cb, slow_policy(), TrackId::solo());
+        sched_b.arm(cb, slow_policy(), TrackId::solo()).unwrap();
         sched_b.play(cb, base_b);
         sched_b.fire_due(base_b + Duration::from_secs(1));
         sched_b.on_turn_completed(cb, docs_b.last_block_id(cb));
@@ -2711,7 +2833,8 @@ mod tests {
             cc,
             BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4, ooda_every: 1_000_000 },
             TrackId::solo(),
-        );
+        )
+        .unwrap();
         sched_c.play(cc, base_c);
         sched_c.fire_due(base_c + Duration::from_secs(1));
         sched_c.on_turn_completed(cc, docs_c.last_block_id(cc));
