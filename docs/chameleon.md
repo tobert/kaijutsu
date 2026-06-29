@@ -182,6 +182,20 @@ band owns time — the transport (拍子木) does.
     label yields a valid track lane (else refuses, so no silent shared lane).
     Arming IS the opt-in — shared-trust (capabilities are ergonomic nudges, not
     security). A type-changed context still re-arms from its persisted row.
+    - **Focus lives in the loadout, not in privilege (decided 2026-06-28).** A
+      player is kept safe to jam by what its loadout can *reach* — a `musician`
+      is tool-free except `drive`, so it literally can't call `kj transport`/
+      `fork` and can't fork-bomb or stomp a sibling, by construction — NOT by
+      auth denials. So "less privileged" for a player means *narrower focus*,
+      especially for a quantized model jamming freely; crosstalk that does leak
+      through is tolerated, because crosstalk is a feature (see
+      `docs/instrument-design.md`, "Many hands, one trust boundary"). Corollary:
+      the kernel's own beat lifecycles (`tick`/`rotate`) run *able to act* — the
+      page-turn needs to fork + arm — even though `fire_lifecycle` builds an
+      unprivileged caller; we deliberately do NOT make capabilities hard
+      boundaries, so that create-vs-beat privilege asymmetry is fine. Don't route
+      mistake-prevention through the permission system (it gets in the way of the
+      jam); route it through the loadout.
   - **✅ ENABLED — new context_types are pure rc, zero Rust.** `funkMusician` /
     `lyricist_in_time_with_music` become rc bundles whose `create/` calls
     `kj transport arm` + a flavored stance (+ later their own tempo). Building

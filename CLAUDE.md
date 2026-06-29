@@ -19,6 +19,17 @@ kernel is the sole owner (no host file, no write-through); embedded defaults und
 <path>` restores one to its embedded default. Change the shipped default by editing
 `assets/defaults/rc/` (the in-repo seed). See `docs/config-crdt-ownership.md`.
 
+**Shared trust, crosstalk-as-feature.** Every player — human, model, connected
+app, sibling context — is *inside* the trust boundary; the kernel runs as one
+unix user and the real boundaries live outside it. We design for resilience to
+boundary trespass, not enforcement between cooperating players: crosstalk is a
+feature (your neighbor's wrong note is one you cover). Capabilities/loadouts are
+**ergonomic nudges for focus and mistake-prevention, not security** — "less
+privileged" means *narrower focus* (footguns absent by construction), never less
+trusted, and mistake-prevention is routed through the loadout, not through auth
+denials between players. Full reasoning: `docs/instrument-design.md` ("Many hands,
+one trust boundary") + `docs/chameleon.md`.
+
 ## Crates
 
 `kaijutsu-types` first — the shared types every other crate depends on. Then

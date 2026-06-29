@@ -859,39 +859,16 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Hyoushigi / Musician
 
-- **`kj transport play` reports `"playing"` on an un-armed context (silent
-  no-op).** Surfaced during the rotate runner-verify 2026-06-28: `kj transport
-  play --context <mcp-context-never-armed>` prints `transport: playing
-  '<id>'` and exits 0, even though the scheduler has nothing armed for that
-  context and silently drops the `BeatCommand::Play`. The kj verb sends the
-  command and unconditionally formats success (`transport.rs` `Play =>
-  (BeatCommand::Play(ctx), "playing".into())`) without consulting the scheduler's
-  armed map. Against the crash-over-silent-fallback stance this should either (a)
-  refuse play on a context with no `beat_state`/scheduler entry with a loud
-  "context not armed — `kj transport arm` first", or (b) have the scheduler
-  ack/nack so the verb can report the truth. Made the create-rc-arm verification
-  harder (play-success is not proof of arm; had to read the `beat_state` row to
-  confirm). Low urgency, but it's a genuine lie in the transport surface.
-  Concrete fixes (gemini-pro review 2026-06-28): (A) actor pattern — give
-  `BeatCommand::{Play,Pause,Stop}` a `oneshot::Sender<Result<(),String>>` and
-  `await` the scheduler's ACK/NACK in dispatch (note: `BeatCommand` is `Clone`
-  today, a oneshot sender isn't — that derive has to give); (B) cheaper — a
-  shared `Arc<…>` armed-set the scheduler maintains and the verb checks
-  synchronously before sending. (B) is the smaller change.
-- **Autonomous beat lifecycles run unprivileged — verified-fine, but a deliberate
-  asymmetry worth a decision (gemini-pro review 2026-06-28).** `fire_lifecycle`
-  (`beat.rs:802`) builds its `KjCaller` with `privileged: false` for the
-  scheduler-fired `tick`/`rotate` verbs, whereas the *create* lifecycle runs
-  privileged (S20-arm.kai relies on that to clear the Transport gate). Gemini
-  predicted the page-turn would fail with access-denied — but the live
-  runner-verify forked 14 deep through exactly this path, so under the current
-  shared-trust capability model (gates are ergonomic nudges, not hard
-  boundaries) it runs fine. The real question is the asymmetry: IF capabilities
-  ever become hard boundaries, beat-fired rotate breaks while create-fired arm
-  doesn't. Two defensible readings — (a) intentional: autonomous model-driven
-  beats *shouldn't* hold elevated privilege; (b) inconsistent: both are
-  kernel-initiated control-plane actions and should match. Decide deliberately;
-  do NOT blind-flip `privileged` either way.
+- **Beat-lifecycle privilege asymmetry — RESOLVED by design (2026-06-28).**
+  `fire_lifecycle` runs `tick`/`rotate` unprivileged while create runs
+  privileged; gemini-pro flagged it. Decision: leave it. We deliberately keep
+  capabilities as ergonomic nudges (not hard boundaries), so the asymmetry never
+  bites; player focus/mistake-prevention lives in the *loadout* (a musician can't
+  reach `kj transport`/`fork` at all), not in privilege/auth — and the kernel's
+  own beat lifecycles stay able to act. Reasoning written into
+  `docs/instrument-design.md` ("Many hands, one trust boundary") + `docs/chameleon.md`.
+  (The `kj transport play` blind-success smell from the same review SHIPPED its
+  ACK fix — `f0c3eb90` — so its entry is retired.)
 - **`set_tempo` doesn't update the Timeline's stored `TickClock` (latent, no
   reader yet — gemini-pro review 2026-06-28).** `BeatScheduler::set_tempo`
   (`beat.rs`) updates `st.policy.period` (the heap cadence) but `arm`'s

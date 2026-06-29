@@ -76,6 +76,16 @@ Keep the checker's exact edge opaque to the input it judges, but name the defens
 
 ---
 
+## Many hands, one trust boundary
+
+The cooperative interior isn't only the model and one user — it's every player on the instrument at once: a human, a model, anyone with a connected app, and sibling contexts on the same kernel. They are all *inside* the boundary. The kernel runs as one unix user; the real boundaries live outside it (the OS, the network, the people in the room). So between players we design for **resilience to boundary trespass, not boundary enforcement.**
+
+**Crosstalk is a feature.** A jam works because your neighbor can play a wrong note and you cover it so it sounds intended — you don't wire the instrument to stop them. A version of this built for musicians would *expect* the bleed between channels and lean on it. So the kernel's "capabilities" are **ergonomic nudges, not security**: a deny-by-default loadout exists to give a player **focus** and to keep mistakes out of reach — which matters most when quantized models are jamming with a lot of freedom — never to defend one trusted player from another. The moment a capability check is doing *auth* between cooperating players, you've wrapped the system around a wall the music has to climb.
+
+This is the multi-player face of the same rule as the front-door checker: concentrate restraint where the trust actually ends (outside the unix user), and keep the interior an instrument. "Less privileged" inside means *narrower focus*, not *less trusted* — and it's expressed by narrowing what a player's loadout even reaches (so footguns are absent by construction), not by gating trusted actions behind permission denials. Autonomous control-plane work the instrument does on a player's behalf (a beat firing its page-turn) stays able to act; the focus lives in the player's loadout, not in starving the kernel's own lifecycle.
+
+---
+
 ## Beyond the single turn
 
 A system message competes with a growing history and, in agentic settings, a flood of tool output carrying its own machine register and sometimes injected instructions. Stance decays as recent content dominates attention; re-ground key boundaries deliberately — verbatim, stable position — rather than sprinkling reminders. Give tool failure an explicit stance, too: an over-charitable prompt can leave a model apologizing to the user for a tool error instead of retrying.
