@@ -64,6 +64,14 @@ struct TrackState {
     /// The clock switch. `false` = stopped/paused: no heap entry (quiescent),
     /// playhead frozen. A track is created stopped (no surprise tokens).
     playing: bool,
+    /// Monotonic clock-enlistment generation, bumped by every [`play`](BeatScheduler::play).
+    /// Each heap entry carries the generation it was enlisted under; `fire_due` drops a
+    /// popped entry whose generation is stale. This is what makes `stop`/`pause` then
+    /// `play` *within one period* beat exactly once — the pre-`play` entry (still in the
+    /// heap, not yet popped) is invalidated by the bump rather than processed alongside
+    /// `play`'s fresh entry (which would double-beat). Normal beats re-push under the
+    /// same generation, so they stay valid.
+    generation: u64,
     /// Musical time, **owned by the track** (moved off the per-context Timeline).
     /// Event-counted: advances one [`STEP`] per beat while playing; a pause freezes
     /// it and a resume picks up at +1, no wall-clock catch-up. Forward-only. Each
@@ -278,7 +286,7 @@ pub struct BeatScheduler {
     dispatcher: Option<Arc<KjDispatcher>>,
     /// The wakeup heap, keyed by **track** now — one entry per playing track, not
     /// per context. A track beats once per pop and wakes its attached contexts.
-    heap: BinaryHeap<Reverse<(Instant, TrackId)>>,
+    heap: BinaryHeap<Reverse<(Instant, TrackId, u64)>>,
     /// The live clock domains, keyed by [`TrackId`]. Replaces the old per-context
     /// `armed` map: the clock + playhead live on the track now (`docs/tracks.md`).
     tracks: HashMap<TrackId, TrackState>,
@@ -410,6 +418,7 @@ impl BeatScheduler {
                 TrackState {
                     policy,
                     playing: false,
+                    generation: 0,
                     playhead: seed,
                     beat_count: 0,
                     last_epoch_ns: 0,
@@ -511,12 +520,10 @@ impl BeatScheduler {
     /// Start (or resume) a **track's** clock. Pushes one heap entry one period out;
     /// the playhead resumes at +1 from where it froze (event-counted — no catch-up).
     ///
-    /// KNOWN EDGE (pre-existing, deferred): a `stop`/`pause` immediately followed by
-    /// `play` *within the same period* — before the stale heap entry is popped and
-    /// lazily dropped — stacks a second entry, so the next `fire_due` beats the track
-    /// twice. Real usage (user/rc transport, seconds apart with a beat between)
-    /// drains the stale entry first, so this is a test-only artifact today; the clean
-    /// fix is a per-track generation token on heap entries (issues.md).
+    /// Bumping the **generation** invalidates any pre-existing heap entry (e.g. the one
+    /// re-pushed by the last beat before a `stop`/`pause`), so a `stop`/`pause` then
+    /// `play` *within one period* beats exactly once: the stale entry is dropped on pop
+    /// (its generation no longer matches), and only this `play`'s fresh entry processes.
     pub fn play(&mut self, track_id: &TrackId, now: Instant) {
         let Some(track) = self.tracks.get_mut(track_id) else {
             log::warn!("beat: play on unknown track {} ignored", track_id.as_str());
@@ -526,8 +533,10 @@ impl BeatScheduler {
             return; // already running — don't stack heap entries
         }
         track.playing = true;
+        track.generation += 1; // invalidate any stale in-flight heap entry
+        let generation = track.generation;
         let period = track.policy.period;
-        self.heap.push(Reverse((now + period, track_id.clone())));
+        self.heap.push(Reverse((now + period, track_id.clone(), generation)));
         let _ = self.persist_track(track_id);
     }
 
@@ -630,36 +639,42 @@ impl BeatScheduler {
 
     /// The next wake instant, if any context is scheduled.
     pub fn next_wake(&self) -> Option<Instant> {
-        self.heap.peek().map(|Reverse((t, _))| *t)
+        self.heap.peek().map(|Reverse((t, _, _))| *t)
     }
 
     /// Beat every **track** due at or before `now`: advance the track one beat, wake
     /// its attached contexts (materialize + cadence), and re-arm the track's next
-    /// beat. A popped entry for a stopped/removed track is dropped (not re-armed).
+    /// beat. A popped entry is dropped (not re-armed) when its track is stopped/removed
+    /// OR its generation is stale (a `play` re-enlisted the track after this entry was
+    /// pushed — the generation token, so a stop+play within one period beats once).
     pub fn fire_due(&mut self, now: Instant) -> BeatOutcome {
         let mut outcome = BeatOutcome::default();
         // `TrackId` isn't `Copy`, so clone the peeked key (one short String).
-        while let Some(Reverse((t, track_id))) = self.heap.peek().cloned() {
+        while let Some(Reverse((t, track_id, generation))) = self.heap.peek().cloned() {
             if t > now {
                 break;
             }
             self.heap.pop();
-            let Some((playing, period)) = self
+            let Some((playing, period, cur_gen)) = self
                 .tracks
                 .get(&track_id)
-                .map(|tr| (tr.playing, tr.policy.period))
+                .map(|tr| (tr.playing, tr.policy.period, tr.generation))
             else {
                 continue; // unknown/removed track → drop the stale entry
             };
             if !playing {
                 continue; // stopped/paused → drop the stale entry (no re-arm)
             }
+            if generation != cur_gen {
+                continue; // a later `play` re-enlisted the track → this entry is stale
+            }
             self.process_track(&track_id, &mut outcome);
-            // Re-arm the TRACK's next beat. Rotation detaches CONTEXTS inside
-            // `process_track`, never the track — the clock keeps running across a
-            // page-turn (continuity is free; the production gap during the child's
-            // boot is absorbed by the speculation lead downstream, docs/tracks.md).
-            self.heap.push(Reverse((now + period, track_id)));
+            // Re-arm the TRACK's next beat under the SAME generation (a normal beat
+            // doesn't bump it). Rotation detaches CONTEXTS inside `process_track`, never
+            // the track — the clock keeps running across a page-turn (continuity is
+            // free; the production gap during the child's boot is absorbed by the
+            // speculation lead downstream, docs/tracks.md).
+            self.heap.push(Reverse((now + period, track_id, cur_gen)));
         }
         outcome
     }
@@ -3249,20 +3264,47 @@ mod tests {
         let out1 = sched.fire_due(base + Duration::from_secs(1));
         assert_eq!(out1.ooda_due, vec![ctx], "OODA fires while playing");
 
-        // Stop the clock, then drain the stale heap entry (dropped because !playing —
-        // the lazy-drop; draining first avoids stacking a duplicate entry on replay).
+        // Stop, then play again within one period — OODA must survive (clock-only stop),
+        // no manual re-arm, and the generation token keeps it to a single beat.
         sched.stop(&track_id);
-        let stopped = sched.fire_due(base + Duration::from_secs(2));
-        assert!(stopped.fired.is_empty(), "stopped → the clock is frozen");
-
-        // Play again — OODA must survive (clock-only stop), no manual re-arm.
-        sched.play(&track_id, base + Duration::from_secs(2));
-        let out2 = sched.fire_due(base + Duration::from_secs(3));
+        sched.play(&track_id, base + Duration::from_secs(1));
+        let out2 = sched.fire_due(base + Duration::from_secs(2));
         assert_eq!(
             out2.ooda_due,
             vec![ctx],
             "stop did not disarm OODA — it fires again after play with no re-arm"
         );
+    }
+
+    /// `stop` (or `pause`) then `play` WITHIN one beat period beats exactly ONCE: the
+    /// generation token invalidates the pre-stop heap entry (re-pushed by the last
+    /// beat) so it doesn't process alongside `play`'s fresh entry — the double-beat the
+    /// old lazy-drop allowed. Without the token both entries are due at `+2` and the
+    /// track would beat twice.
+    #[tokio::test]
+    async fn stop_then_play_within_one_period_beats_once() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        preseed_markers(&kernel, ctx, 10);
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let track_id = TrackId::solo();
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track_id, base);
+        sched.fire_due(base + Duration::from_secs(1)); // beat 1 → re-pushes at +2 (gen 1)
+        assert_eq!(contents(&documents, ctx).len(), 1);
+
+        // stop + play WITHIN the same period, before the re-pushed (gen 1) entry pops.
+        sched.stop(&track_id);
+        sched.play(&track_id, base + Duration::from_secs(1)); // gen 2, pushes at +2
+
+        // At +2 BOTH the stale gen-1 re-push and the fresh gen-2 entry are due; only the
+        // current generation processes.
+        let out = sched.fire_due(base + Duration::from_secs(2));
+        assert_eq!(out.fired, vec![ctx], "exactly one beat, not two (generation token)");
+        assert_eq!(contents(&documents, ctx).len(), 2, "playhead advanced once: +beat-2");
     }
 
     /// A context whose committed history is AHEAD of an already-running (stale) track

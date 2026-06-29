@@ -497,6 +497,15 @@ a cluster of restart/handoff gaps. **Fixed in the follow-up commit:**
 - **`attach` reads the context's `max_tick` once** (was twice) — no half-created
   track-without-attachment state if the second read failed.
 
+**Also fixed (follow-up #2):**
+
+- **stop/pause → play within one beat period no longer double-beats.** Each `TrackState`
+  carries a monotonic `generation` bumped by every `play`; heap entries carry the
+  generation they were enlisted under, and `fire_due` drops a popped entry whose
+  generation is stale. So the pre-stop entry (re-pushed by the last beat) is invalidated
+  by `play`'s bump instead of processing alongside `play`'s fresh entry. Normal beats
+  re-push under the same generation. (Test: `stop_then_play_within_one_period_beats_once`.)
+
 **Deferred (tracked here, not blocking Stage 1):**
 
 - **`KJ_PULSE` / `beat_count` reset on a kernel restart** (not persisted). This is now
