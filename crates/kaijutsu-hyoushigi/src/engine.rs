@@ -90,6 +90,10 @@ pub struct FailureEvent {
     pub resolver: ResolverId,
     /// The resolver's error string, preserved verbatim for surfacing.
     pub error: String,
+    /// The principal whose cell failed — its provenance. With N producers sharing
+    /// one track timeline, the kernel filters the shared ledger by this so a
+    /// producer's failures surface in *its own* conversation, never a sibling's.
+    pub played_by: PrincipalId,
 }
 
 /// Engine bookkeeping wrapped around a deferred [`Cell`].
@@ -388,6 +392,7 @@ impl Timeline {
                 debug_assert!(s.cell.state.can_advance_to(CellState::Failed));
                 s.cell.state = CellState::Failed;
                 let start = s.start;
+                let played_by = s.cell.played_by;
                 // Single-variant enum today; an irrefutable `let` keeps the error
                 // string verbatim (a future variant would force this back to a
                 // match — fine, the ledger only needs a String).
@@ -398,6 +403,7 @@ impl Timeline {
                     start,
                     resolver: recipe.resolver.clone(),
                     error,
+                    played_by,
                 });
                 // DEFERRED (flagged for Amy, issues.md): routing a Failed cell to
                 // `fire_fallback` instead of dropping it. That would amend the
