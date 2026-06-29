@@ -158,7 +158,7 @@ pub fn handle_toggle_surface(
 /// Handle Unfocus action (Escape — context-dependent "go up").
 ///
 /// Escape precedence:
-/// 1. FocusArea::Dialog → ignored (handled by dialog systems via FocusStack)
+/// 1. FocusArea::Dialog → ignored (dialog systems own their Escape)
 /// 2. FocusArea::Compose → FocusArea::Conversation
 pub fn handle_unfocus(
     mut actions: MessageReader<ActionFired>,
@@ -171,7 +171,7 @@ pub fn handle_unfocus(
             continue;
         }
 
-        // 1. Dialogs handle their own Escape/Unfocus via FocusStack.
+        // 1. Dialogs handle their own Escape/Unfocus.
         if matches!(*focus, FocusArea::Dialog) {
             continue;
         }

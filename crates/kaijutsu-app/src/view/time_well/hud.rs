@@ -500,14 +500,7 @@ fn hud_west(selected: ContextId, state: &TimeWellState) -> String {
 
 fn hud_south(d: &super::card::CardData) -> String {
     match &d.preview {
-        Some(p) => {
-            let snippet: String = p.chars().take(160).collect();
-            if p.chars().count() > 160 {
-                format!("{snippet}…")
-            } else {
-                snippet
-            }
-        }
+        Some(p) => crate::text::truncate_chars(p, 161),
         None => String::new(),
     }
 }

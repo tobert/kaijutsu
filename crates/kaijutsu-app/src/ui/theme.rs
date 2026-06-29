@@ -840,6 +840,7 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
 ///
 /// Uses substring matching: "anthropic" or "claude" → claude color, etc.
 /// Returns `agent_color_default` for unknown providers.
+#[allow(dead_code)] // Provider→color mapping; not yet wired to participant rendering (time-well).
 pub fn agent_color_for_provider(theme: &Theme, provider: Option<&str>) -> Color {
     let Some(p) = provider else {
         return theme.agent_color_default;

@@ -107,7 +107,6 @@ impl Plugin for InputPlugin {
 
         // Register resources
         app.init_resource::<focus::FocusArea>()
-            .init_resource::<focus::FocusStack>()
             .init_resource::<focus::ActiveSurface>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
@@ -119,7 +118,6 @@ impl Plugin for InputPlugin {
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
-            .register_type::<focus::FocusStack>()
             .register_type::<focus::ActiveSurface>()
             .register_type::<map::InputMap>()
             .register_type::<context::ActiveInputContexts>()

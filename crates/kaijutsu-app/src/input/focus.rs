@@ -5,44 +5,6 @@
 
 use bevy::prelude::*;
 
-/// Modal focus stack — push when opening a modal, pop when closing.
-///
-/// ## Two-Stack Architecture
-///
-/// Kaijutsu has two independent stacks that work together:
-///
-/// ### FocusStack (Modal Overlay Focus)
-/// Manages keyboard focus for modal dialogs (model picker, create context).
-/// - `push()`: Save current FocusArea, switch to Dialog
-/// - `pop()`: Restore previous FocusArea
-/// - Used by: model_picker, create_dialog
-#[derive(Resource, Default, Reflect)]
-#[reflect(Resource)]
-pub struct FocusStack(pub Vec<FocusArea>);
-
-impl FocusStack {
-    /// Push current focus onto the stack and switch to new focus.
-    pub fn push(&mut self, focus: &mut FocusArea, new: FocusArea) {
-        self.0.push(focus.clone());
-        *focus = new;
-    }
-
-    /// Pop and restore previous focus. Returns None if stack empty.
-    pub fn pop(&mut self, focus: &mut FocusArea) -> Option<FocusArea> {
-        if let Some(prev) = self.0.pop() {
-            let was = std::mem::replace(focus, prev.clone());
-            Some(was)
-        } else {
-            None
-        }
-    }
-
-    /// True if a modal layer is active (anything pushed).
-    pub fn is_modal(&self) -> bool {
-        !self.0.is_empty()
-    }
-}
-
 // ============================================================================
 // RUN CONDITIONS
 // ============================================================================
