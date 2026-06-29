@@ -350,6 +350,40 @@ joined context (`block_events_client_and_filter`), cutting foreign-context volum
 to zero. Verified live against a busy 24-context kernel: the 300s command returned
 in 285ms. Related memory: `project_mcp_synceddocument_sync`.
 
+## Transport ACK review — the no-deadlock property is real but contingent (2026-06-29)
+
+A morning second-opinion pass over the day's rotate/transport fixes (the ACK fix
+`f0c3eb90`, the sub-ms-tempo + rotate-cadence-persistence fix `f4af0bba`, the
+rc-verb single-source fix `8e2a158c`) — run through codebase-aware kaibo `consult`
+rather than the prior no-repo-access batch precedent, so the reviewers read the
+live tree themselves. Two independent casts (deepseek-v4-pro, chimera/claude-haiku;
+gemini was provider-overloaded all three tries) returned **zero correctness
+findings**: RecvError on a dropped oneshot is surfaced loudly, no lock is held
+across the `.await`, the BPM ceiling and the additive `rotate_every_phrases`
+column round-trip, and `RC_VERBS` is now genuinely single-source.
+
+The one thing worth a devlog beat: the two reviewers *disagreed on the threading
+topology*, which is exactly the kind of divergence that hides a latent hazard, so
+I traced it to the source. Truth (`beat.rs:1079–1098` + `:810`): the scheduler
+owns a dedicated `"beat-scheduler"` thread with its own `current_thread` runtime +
+LocalSet, and the rc lifecycle fires `kj transport` via `spawn_local` **onto that
+same LocalSet**. So the author's "one LocalSet" mental model was right (deepseek's
+read; chimera had described the interactive-RPC path instead). That makes the
+self-referential rc path — a rotate/arm script awaiting the scheduler that spawned
+it — a *separate task on the same single-threaded executor* as the scheduler loop.
+It does not deadlock, but **only because `apply_command` is fully synchronous**:
+nothing is awaited between the ingress `recv` and the `reply.send`, so the loop
+yields back and services the waiting rc task in the same poll cycle. The day
+someone adds an `.await` inside `apply_command`, the rc-fired path self-deadlocks
+(the scheduler parks awaiting work the parked rc task can't deliver). The property
+held by structure, but nothing *enforced* it — so the fix is a documented
+invariant: a "MUST STAY FULLY SYNCHRONOUS" note on `apply_command` plus a pointer
+at the `select!` ingress arm where a future edit would be tempted to await
+(`8afbf8fe`). The lesson echoes the rotate fork-bomb retraction from the day
+before — diagnose threading from the code, not from a reviewer's summary, and when
+two competent readers model the topology differently that *is* the signal to go
+look.
+
 ## Musician beat-state persistence + manual re-arm (2026-06-28)
 
 A kernel restart silently stopped every musician: auto-arm fires only on context
