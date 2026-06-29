@@ -425,7 +425,13 @@ impl ConnectionHandler {
             self.peer_addr.as_ref().map(|a| a.port()).unwrap_or(0),
         );
 
-        let builder = std::thread::Builder::new().name(session_label.clone());
+        // rc lifecycles (context create/fork, etc.) run on this session thread
+        // and re-enter kaish deeply; the default 2 MiB stack is too small for
+        // that nesting. Reserve a generous (virtual, commit-on-use) stack — see
+        // `KAISH_RC_THREAD_STACK` and the beat-scheduler thread.
+        let builder = std::thread::Builder::new()
+            .name(session_label.clone())
+            .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
         if let Err(e) = builder.spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()

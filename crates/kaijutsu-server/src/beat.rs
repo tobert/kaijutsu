@@ -1366,7 +1366,16 @@ pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     let kernel = registry.kernel.kernel.clone();
     let documents = registry.kernel.documents.clone();
     let dispatcher = registry.kernel.kj_dispatcher.clone();
-    let builder = std::thread::Builder::new().name("beat-scheduler".to_string());
+    // A `rotate` page-turn runs a deeply self-re-entrant rc chain on THIS
+    // thread (fire_rotate → run_rc_lifecycle → `kj fork` → the child's fork +
+    // attach rc → `kj transport attach`/`play`, each `kj` re-entering kaish via
+    // `.await`, so the whole nest accumulates on one stack). The default 2 MiB
+    // thread stack is too small for that depth with kaish's interpreter — it
+    // SIGABRTs the scheduler mid-rotate. Reserve a generous stack; it's virtual
+    // address space, committed page-by-page only as used. See docs/issues.md.
+    let builder = std::thread::Builder::new()
+        .name("beat-scheduler".to_string())
+        .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
     if let Err(e) = builder.spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -1226,8 +1226,38 @@ mod tests {
 
     // ── rotate rc end-to-end ──────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn rotate_rc_forks_attaches_and_plays_the_child_on_the_parent_track() {
+    /// Run `body` to completion on a thread sized for rc lifecycles, joining it
+    /// and re-raising any panic. Mirrors the server's beat-scheduler/SSH threads:
+    /// a deep rc nest (kaish re-entered many levels) overflows the default 2 MiB
+    /// test stack, so the work runs on [`crate::KAISH_RC_THREAD_STACK`] instead.
+    fn run_on_rc_stack(body: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(crate::KAISH_RC_THREAD_STACK)
+            .spawn(body)
+            .expect("spawn rc-stack thread")
+            .join()
+            .expect("rc-stack thread panicked");
+    }
+
+    #[test]
+    fn rotate_rc_forks_attaches_and_plays_the_child_on_the_parent_track() {
+        // The page-turn nests rc deeply (rotate → `kj fork` → the child's
+        // fork+attach rc → `kj transport attach`/`play`, each `kj` re-entering
+        // kaish), which overflows the default 2 MiB test stack — exactly as it
+        // would on the production beat-scheduler thread. Drive the body on the
+        // same generous stack that thread now uses.
+        run_on_rc_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime")
+                .block_on(rotate_rc_body());
+        });
+    }
+
+    /// Body of [`rotate_rc_forks_attaches_and_plays_the_child_on_the_parent_track`],
+    /// extracted verbatim so the wrapper can run it on a deep stack.
+    async fn rotate_rc_body() {
         // End-to-end page-turn: the `rotate` lifecycle (musician/rotate/S10-rotate.kai)
         // forks a spawn child, switches the rc shell to it, and attaches + plays it
         // on the PARENT's track. The child inherits the attachment (track + wakeup +

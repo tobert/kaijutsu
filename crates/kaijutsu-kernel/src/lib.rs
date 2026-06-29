@@ -37,6 +37,19 @@ pub mod seed_scripts;
 pub mod state;
 pub mod vfs;
 
+/// Stack size for any thread that drives rc lifecycles (the server's beat
+/// scheduler and SSH session threads; the equivalent test harnesses).
+///
+/// An rc verb re-enters kaish many levels deep on a single stack — a `rotate`
+/// page-turn nests `kj fork` → the forked child's fork+attach rc →
+/// `kj transport attach`/`play`, every `kj` re-entering the interpreter through
+/// `.await`, so the whole nest accumulates on one stack frame chain. The default
+/// 2 MiB thread stack overflows that depth with kaish's interpreter and SIGABRTs
+/// the thread (taking, e.g., the scheduler down with it). 16 MiB is virtual
+/// address space reserved up front but committed page-by-page only as touched,
+/// so the headroom is effectively free. Threads that run rc must opt into it.
+pub const KAISH_RC_THREAD_STACK: usize = 16 * 1024 * 1024;
+
 pub use peers::{
     InvokeRequest, InvokeResponse, PeerConfig, PeerError, PeerInfo, PeerRegistry,
     SharedPeerRegistry, peer_key, shared_peer_registry,
