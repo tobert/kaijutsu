@@ -363,6 +363,30 @@ impl BeatScheduler {
         attachment: Attachment,
         policy: BeatPolicy,
     ) -> Result<(), String> {
+        // Enforce one track per context (the `context_track` reverse index is 1:1).
+        // If this context is already attached to a DIFFERENT track, MOVE it: detach
+        // from the old track (live) and delete that stale persisted attachment row —
+        // otherwise the reverse index, the `KJ_*` env injection, and a restart
+        // re-attach would all see the context on two lanes (one track's beat firing
+        // with another's facts; `beat_attach_payload` erroring on the ambiguous
+        // `many` case). Rotation is unaffected: a forked child isn't in the index yet,
+        // so this never fires for it.
+        if let Some(old) = self.track_of(context_id) {
+            if old != track_id {
+                self.detach(&old, context_id);
+                if let Some(db) = self.documents.db() {
+                    let _ = db.lock().delete_attachment(old.as_str(), context_id);
+                }
+            }
+        }
+        // Read the attaching context's committed high-water ONCE — both seeds below
+        // use it, and reading it before the track-create means a read failure aborts
+        // BEFORE we insert a half-created (track-without-attachment) state.
+        let ctx_from_log = self
+            .documents
+            .max_tick(context_id)
+            .map_err(|e| format!("beat: attach {context_id}: reading max committed tick: {e}"))?
+            .unwrap_or(Tick::ZERO);
         // Create the track's live clock domain on first attach, seeding its playhead
         // from the track's DURABLE history (the persisted `tracks` row ∪ the lane's
         // committed blocks via the attaching context), never the context alone.
@@ -380,17 +404,7 @@ impl BeatScheduler {
                     .and_then(|t| t.playhead_tick),
                 None => None,
             };
-            let from_log = self
-                .documents
-                .max_tick(context_id)
-                .map_err(|e| {
-                    format!(
-                        "beat: attach to {}: reading max committed tick: {e}",
-                        track_id.as_str()
-                    )
-                })?
-                .unwrap_or(Tick::ZERO);
-            let seed = from_log.max(persisted.map(Tick::new).unwrap_or(Tick::ZERO));
+            let seed = ctx_from_log.max(persisted.map(Tick::new).unwrap_or(Tick::ZERO));
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
@@ -407,17 +421,21 @@ impl BeatScheduler {
         // track's current playhead)` — see the doc above for why both terms.
         let track_playhead = self.tracks[&track_id].playhead;
         let clock = self.tracks[&track_id].policy.clock();
-        let ctx_from_log = self
-            .documents
-            .max_tick(context_id)
-            .map_err(|e| format!("beat: attach {context_id}: reading max committed tick: {e}"))?
-            .unwrap_or(Tick::ZERO);
         let timeline_seed = ctx_from_log.max(track_playhead);
         self.kernel.arm_timeline(context_id, clock, timeline_seed);
         // Register/update the binding. A re-attach of a live binding keeps its
         // runtime materialization state (cursor/failures) and refreshes the
         // announced attachment.
         let track = self.tracks.get_mut(&track_id).expect("track exists");
+        // A context whose committed history sits AHEAD of the track (a restart where
+        // the persisted track playhead lagged the lane's blocks) pulls the track up to
+        // that frontier — otherwise the forward-only slew guard in `materialize_one`
+        // would freeze this context's Timeline for the gap while its OODA kept firing
+        // (gemini review 2026-06-29). `timeline_seed >= track.playhead` already, so
+        // this only fires when `ctx_from_log` genuinely exceeds the track.
+        if timeline_seed > track.playhead {
+            track.playhead = timeline_seed;
+        }
         track
             .attached
             .entry(context_id)
@@ -583,8 +601,31 @@ impl BeatScheduler {
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.attached.remove(&context_id);
         }
-        self.context_track.remove(&context_id);
-        self.kernel.disarm_timeline(context_id);
+        // Persist the track's playhead at the moment a context leaves — most
+        // importantly the rotate-horizon handoff, which is the durable record a
+        // 0-block child re-creating the track inherits across a crash (the beat path
+        // deliberately does NOT persist every beat; detach is rare). Without this a
+        // crash in the rotation gap would re-seed the track from a stale row and
+        // rewind the lane (gemini review 2026-06-29).
+        let _ = self.persist_track(track_id);
+        // Drop the kernel timeline + the reverse index ONLY if this context is no
+        // longer attached to ANY track. The 1:1 invariant means this is normally the
+        // last attachment, but guard defensively: a context that still rides another
+        // lane must keep its timeline (else that lane's `materialize_one` would
+        // silently no-op) and a reverse-index entry pointing at a surviving track.
+        let other = self
+            .tracks
+            .iter()
+            .find_map(|(tid, t)| (tid != track_id && t.attached.contains_key(&context_id)).then(|| tid.clone()));
+        match other {
+            Some(survivor) => {
+                self.context_track.insert(context_id, survivor);
+            }
+            None => {
+                self.context_track.remove(&context_id);
+                self.kernel.disarm_timeline(context_id);
+            }
+        }
     }
 
     /// The next wake instant, if any context is scheduled.
@@ -963,10 +1004,14 @@ impl BeatScheduler {
             .map(|blocks| heard_json(&blocks, playhead, window))
             .unwrap_or_else(|_| "[]".to_string());
         vars.insert("KJ_HEARD".to_string(), heard);
-        // KJ_PULSE: this attachment's monotonic wakeup counter (the reliable ordering
-        // key — `KJ_TICK` can repeat/freeze off-beat). KJ_EPOCH_NS: the beat's shared
-        // wall-clock instant, identical for every context woken on this beat (the
-        // human "when" + the cross-context join key).
+        // KJ_PULSE: this attachment's monotonic wakeup counter — the ordering key
+        // *within a run* (`KJ_TICK` can repeat/freeze off-beat). It is NOT persisted,
+        // so it resets to 0 on a kernel restart (like an uptime counter); that is
+        // consistent with the context's conversation being re-hydrated fresh on
+        // restart, so a model never carries a stale pulse across the boundary.
+        // Cross-restart durability is deferred with the cold-start re-arm sweep.
+        // KJ_EPOCH_NS: the beat's shared wall-clock instant, identical for every
+        // context woken on this beat (the human "when" + the cross-context join key).
         vars.insert("KJ_PULSE".to_string(), ac.attachment.pulse.to_string());
         vars.insert("KJ_EPOCH_NS".to_string(), track.last_epoch_ns.to_string());
         // KJ_ROTATE_EVERY: the rotate cadence in phrases, when this context rotates.
@@ -3217,6 +3262,84 @@ mod tests {
             out2.ooda_due,
             vec![ctx],
             "stop did not disarm OODA — it fires again after play with no re-arm"
+        );
+    }
+
+    /// A context whose committed history is AHEAD of an already-running (stale) track
+    /// pulls the track's playhead UP to its frontier on attach — so the forward-only
+    /// slew guard never freezes a producing context behind a lagging track (the
+    /// restart "thin attaches first, thick attaches later" wedge gemini flagged).
+    #[tokio::test]
+    async fn thick_context_attach_bumps_a_lagging_track_playhead() {
+        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let thin = ContextId::new();
+        documents.create_document(thin, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        let track_id = TrackId::solo();
+        // A thin context (no committed blocks) creates the track and runs it to tick 5.
+        sched.attach(track_id.clone(), thin, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track_id, base);
+        for i in 1..=5 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        assert_eq!(sched.track_playhead(&track_id), Some(Tick::new(5)));
+
+        // A thick context with committed history up to tick 20 attaches.
+        let thick = ContextId::new();
+        documents.create_document(thick, DocumentKind::Conversation, None).unwrap();
+        let player = PrincipalId::new();
+        let seq = documents.reserve_block_id(thick, player).unwrap().seq;
+        let snap = BlockSnapshotBuilder::new(BlockId::new(thick, player, seq), BlockKind::Text)
+            .tick(Tick::new(20))
+            .order_key(format!("V{:0>11}AAAA", 20))
+            .content("c")
+            .build();
+        documents.insert_from_snapshot_as(thick, snap, None, Some(player)).unwrap();
+        assert_eq!(documents.max_tick(thick).unwrap(), Some(Tick::new(20)));
+
+        sched.attach(track_id.clone(), thick, slow_attachment(), slow_policy()).unwrap();
+        assert_eq!(
+            sched.track_playhead(&track_id),
+            Some(Tick::new(20)),
+            "the track is pulled up to the joining context's committed frontier"
+        );
+        assert_eq!(
+            kernel.timeline(thick).unwrap().lock().playhead(),
+            Tick::new(20),
+            "the thick context's Timeline is at its frontier, not frozen behind the track"
+        );
+    }
+
+    /// `detach` persists the track's CURRENT playhead — the rotate-horizon handoff is
+    /// the durable record a 0-block child inherits across a crash. The beat path does
+    /// NOT persist every beat, so without the detach-persist a crash in the rotation
+    /// gap would rewind the lane on the child's re-attach (gemini review).
+    #[tokio::test]
+    async fn detach_persists_the_track_playhead_for_crash_safe_handoff() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let mut sched = BeatScheduler::new(kernel, documents);
+        let track = TrackId::new("bass").unwrap();
+        let base = Instant::now();
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track, base);
+        for i in 1..=4 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        // The beat path didn't persist: the row still reads the attach/play playhead.
+        assert_eq!(
+            db.lock().get_track("bass").unwrap().unwrap().playhead_tick,
+            Some(0),
+            "the beat path does not persist every beat (by design)"
+        );
+        // Detach (the rotation handoff) snapshots the live playhead durably.
+        sched.detach(&track, ctx);
+        assert_eq!(
+            db.lock().get_track("bass").unwrap().unwrap().playhead_tick,
+            Some(4),
+            "detach persists the handoff playhead so a 0-block child inherits it across a crash"
         );
     }
 }

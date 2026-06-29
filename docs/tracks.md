@@ -164,7 +164,7 @@ kernel-injection convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 | var | source | job |
 |-----|--------|-----|
 | `KJ_TICK` | the track's playhead | musical position (frozen off-beat by design) |
-| `KJ_PULSE` | a per-attachment monotonic counter | the reliable ordering key |
+| `KJ_PULSE` | a per-attachment monotonic counter | ordering key *within a run* (resets on restart; see Stage-1 follow-ups) |
 | `KJ_EPOCH_NS` | wall clock, shared across contexts woken the same tick | human "when" + cross-context join |
 
 So a **musician**'s tick behaviour produces ABC into the track's score; a
@@ -471,3 +471,51 @@ corrections folded in above, plus one decision:
   musician case from `hyoushigi.md` — the clock can't block, so content is staged ahead;
   rotation is just another reason the lead exists.) This makes the atomic `Swap` a polish
   item, not a correctness requirement, for any track whose lead ≥ the child's boot time.
+
+## Stage 1 review follow-ups (landed code, 2026-06-29)
+
+A second kaibo pass on the **landed** code (gemini-batch ×2 + a deepseek agent, whole
+files, no diff) confirmed the design (slew guard, the two seeds, borrow/iteration
+safety, fork-copy ordering, single-writer persistence all verified correct) and found
+a cluster of restart/handoff gaps. **Fixed in the follow-up commit:**
+
+- **`detach` persists the track playhead** — the rotate-horizon handoff is the durable
+  record a 0-block child inherits across a crash (the beat path deliberately does not
+  persist every beat; `detach` is rare). Without it a crash *in the rotation gap* would
+  re-seed the track from a stale row and rewind the lane.
+- **`attach` pulls a lagging track up to a joining context's committed frontier** — a
+  restart where a *thin* context (no blocks) created the track at a stale tick, then a
+  *thick* musician (committed history at tick N) attaches, no longer freezes the
+  musician's Timeline behind the track (the forward-only slew guard would otherwise pin
+  it for N beats while its OODA kept firing). This also makes the "silent pinned context
+  ahead of its track" state unreachable via `attach`.
+- **`attach` enforces one-track-per-context** (the `context_track` index is 1:1): moving
+  a context to a new track detaches it from the old (live) and deletes the stale
+  persisted attachment row, so one track's beat can't inject another's `KJ_*` facts and
+  a restart re-attach can't hit the ambiguous `many` case. `detach` guards the timeline
+  disarm so a (future) multi-lane context isn't silently killed.
+- **`attach` reads the context's `max_tick` once** (was twice) — no half-created
+  track-without-attachment state if the second read failed.
+
+**Deferred (tracked here, not blocking Stage 1):**
+
+- **`KJ_PULSE` / `beat_count` reset on a kernel restart** (not persisted). This is now
+  *documented as the contract*, not a silent gap: a restart re-hydrates the context's
+  conversation fresh, so a model never carries a stale pulse across the boundary — the
+  reset is consistent with the conversation lifecycle. Full cross-restart durability
+  lands with the **cold-start re-arm sweep** (already deferred), which is the right place
+  to persist these counters holistically rather than bolting a column on now.
+- **stop/pause → play within one beat period double-beats** (a stale heap entry isn't
+  dropped before `play` re-enlists the track). Pre-existing shape; real transport ops are
+  seconds apart with a beat between (which drains the stale entry), so it's a test-only
+  artifact today. Fix = a per-track **generation token** on heap entries (drop a popped
+  entry whose generation is stale). Documented at the `play()` call site.
+- **Track-scoped `max_tick`** — the track playhead seed uses the *context*'s committed
+  high-water, which over-inflates a cross-track re-attach (a context that played track A
+  to tick 500 then attaches to a fresh track B seeds B at 500). Harmless in Stage 1
+  (a musician is 1:1 with its lane for life) and forward-only (never a rewind); the
+  proper fix is a track-scoped tick query, which **is Stage 2** (the track owns its
+  score). 
+- **Rotation gap is unbounded** if the child's boot/turn is queued behind other work; the
+  speculation lead covers the *notation*, not the *production* gap. The atomic `Swap`
+  transport command (suspend the clock across the handoff) is the eventual closer.
