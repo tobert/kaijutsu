@@ -626,22 +626,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     mid-turn path the report hit. Fix each with an explicit timeout + a regression
     test that wedges the path and asserts a loud `TurnFlow::Failed`. Still worth:
     make per-provider/per-context `default_tools` the norm so players never get `all`.
-- **Adopt kaish 0.8.1 `ToolCtx::patient` for slow `kj`-in-kaish holds (deferred
-  2026-06-22).** `kj` runs *inside* kaish (the `KjBuiltin`), and some `kj` verbs do
-  LLM work — `kj drive`, peer consults — that legitimately takes minutes. Today the
-  only bound on an `EmbeddedKaish::execute_with_options` call is the kernel-wide
-  `kaish_request_timeout` snapshot (`runtime/embedded_kaish.rs`, read from
-  `Kernel::timeouts()`), so a genuinely-slow LLM turn launched from a kaish script
-  races that single deadline. kaish 0.8.1 added the right primitive: `ToolCtx::patient(budget)`
-  returns a `PatientGuard` that **freezes the script clock** for the duration of a
-  hold and governs it under its own budget, while keeping cancellation live (the
-  `timeout` builtin is deliberately *not* suspended). Wire the `kj` builtin's
-  LLM-blocking hold points (`runtime/kj_builtin.rs` drive/consult paths) to take a
-  `patient` budget so the request watchdog measures shell work, not the model's
-  think time. Pairs with the per-model/per-context `TimeoutPolicy` override knob
-  noted above. Needs: identify the exact hold points in `kj_builtin.rs`, decide the
-  budget source (reuse `llm_request_timeout`?), and a regression test that a long
-  hold inside a kaish script does **not** trip `kaish_request_timeout`.
 - **P3 — external `mcp__kaijutsu__shell` `data` needs a persisted block field.**
   The *in-kernel* `builtin.shell` now carries kj's `.data` in its `structured`
   envelope (shipped 2026-06-14, `mcp/servers/shell.rs`), and `kj <cmd> --json`
