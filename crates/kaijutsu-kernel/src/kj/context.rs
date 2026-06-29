@@ -8,7 +8,7 @@ use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 use super::format::{
     format_context_info, format_context_table, format_context_tree, format_fork_lineage,
 };
-use super::parse::parse_model_spec;
+use super::parse::resolve_model_choice;
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -184,52 +184,8 @@ impl KjDispatcher {
     ) -> Result<Option<ResolvedModel>, String> {
         let resolved_model = match cfg.model_spec {
             Some(ref spec) if !spec.is_empty() => {
-                let (mut provider, mut model) = parse_model_spec(spec);
                 let registry = self.kernel().llm().read().await;
-                if let Some(ref p) = provider {
-                    // Explicit provider — must exist.
-                    if registry.get(p).is_none() {
-                        return Err(format!("unknown provider '{p}'"));
-                    }
-                } else if let Some(m) = model.clone() {
-                    // Bare name: resolve a `models.toml` alias FIRST (e.g.
-                    // `local`, `local-fast`), then fall back to "a model on the
-                    // default provider". Before this, `--model local` stored the
-                    // alias verbatim and shipped "local" to the default provider
-                    // at turn time → `not_found_error: model: local`.
-                    if let Some((alias_provider, alias_model)) = registry.resolve_alias(&m) {
-                        let alias_provider = alias_provider.to_string();
-                        if registry.get(&alias_provider).is_none() {
-                            return Err(format!(
-                                "model alias '{m}' points at unknown provider '{alias_provider}'"
-                            ));
-                        }
-                        model = Some(alias_model.to_string());
-                        provider = Some(alias_provider);
-                    } else {
-                        // Catch the `provider:model` footgun. The separator is
-                        // `/`, never `:` — `:` collides with ollama tags like
-                        // `gemma4:31b`, so the parser can't split on it. If the
-                        // text before a `:` names a real provider, the user meant
-                        // the slash form; fail loud here rather than silently
-                        // shipping the literal to the default provider, where it
-                        // only surfaces much later as a turn-time
-                        // `not_found_error: model: <the whole string>`.
-                        if let Some((maybe_provider, rest)) = m.split_once(':')
-                            && registry.get(maybe_provider).is_some()
-                        {
-                            return Err(format!(
-                                "'{m}' looks like 'provider:model' — separate with a slash: '{maybe_provider}/{rest}'"
-                            ));
-                        }
-                        match registry.default_provider_name() {
-                            Some(p) => provider = Some(p.to_string()),
-                            None => {
-                                return Err(format!("no provider configured for model '{m}'"));
-                            }
-                        }
-                    }
-                }
+                let (provider, model) = resolve_model_choice(&registry, spec)?;
                 Some(ResolvedModel { provider, model })
             }
             _ => None,

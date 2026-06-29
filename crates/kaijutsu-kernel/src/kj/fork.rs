@@ -21,7 +21,7 @@ use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
-use super::parse::parse_model_spec;
+use super::parse::resolve_model_choice;
 use super::{KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug, Default)]
@@ -140,20 +140,14 @@ impl KjDispatcher {
 
         match model_spec {
             Some(spec) => {
-                let (mut provider, model) = parse_model_spec(spec);
+                // Same resolver as `kj context set` — resolves `models.toml`
+                // aliases (`deepseek-lite`), validates an explicit provider, and
+                // fails loud on the `provider:model` colon footgun. Before this,
+                // fork skipped alias resolution and silently pinned a bare alias
+                // to the default provider (anthropic), shipping the literal name
+                // → turn-time `not_found_error: model: <alias>`.
                 let registry = self.kernel().llm().read().await;
-                if let Some(ref p) = provider {
-                    // Explicit provider — validate it exists
-                    if registry.get(p).is_none() {
-                        return Err(format!("unknown provider '{p}'"));
-                    }
-                } else if let Some(ref m) = model {
-                    // Bare model name — resolve provider from registry
-                    match registry.default_provider_name() {
-                        Some(p) => provider = Some(p.to_string()),
-                        None => return Err(format!("no provider configured for model '{m}'")),
-                    }
-                }
+                let (provider, model) = resolve_model_choice(&registry, spec)?;
                 Ok(ResolvedModel {
                     provider,
                     model,
@@ -1484,6 +1478,111 @@ mod tests {
             contexts
                 .iter()
                 .any(|r| r.label.as_deref() == Some("branch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_model_bare_alias_resolves_to_provider() {
+        // Regression: `kj fork --model <alias>` must resolve the alias to its
+        // real provider, not silently pin the literal alias on the default
+        // provider — the old fork bug where `deepseek-lite` landed on anthropic
+        // and only failed at the first turn.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // anthropic registered first → default provider; deepseek + alias added.
+        {
+            use crate::llm::{MockClient, ModelAlias, Provider};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            let mut reg = d.kernel().llm().write().await;
+            reg.register("anthropic", Arc::new(Provider::Mock(MockClient::new("a"))));
+            reg.register("deepseek", Arc::new(Provider::Mock(MockClient::new("d"))));
+            let mut aliases = HashMap::new();
+            aliases.insert(
+                s("deepseek-lite"),
+                ModelAlias {
+                    provider: s("deepseek"),
+                    model: s("deepseek-v4-flash"),
+                },
+            );
+            reg.set_model_aliases(aliases);
+        }
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("child"),
+                    s("--model"),
+                    s("deepseek-lite"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        // The child must route to deepseek (the alias target), not the default.
+        let child = {
+            let db = d.kernel_db().lock();
+            db.list_active_contexts()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.label.as_deref() == Some("child"))
+                .expect("child context exists")
+                .context_id
+        };
+        let router = d.drift_router().read();
+        let handle = router.get(child).expect("child has a drift handle");
+        assert_eq!(handle.provider.as_deref(), Some("deepseek"));
+        assert_eq!(handle.model.as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    #[tokio::test]
+    async fn fork_model_colon_footgun_errors() {
+        // The `provider:model` colon form fails loud on the fork path too, not
+        // just `kj context set` — both share one resolver.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mut reg = d.kernel().llm().write().await;
+            reg.register("deepseek", Arc::new(Provider::Mock(MockClient::new("d"))));
+        }
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("child"),
+                    s("--model"),
+                    s("deepseek:deepseek-v4-flash"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            !result.is_ok(),
+            "colon form should fail: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("provider:model"),
+            "expected slash hint, got: {}",
+            result.message()
         );
     }
 
