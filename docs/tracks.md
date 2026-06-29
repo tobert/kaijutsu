@@ -642,7 +642,7 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
 
 ## Work items (TDD throughout — tests that can and will fail)
 
-- [ ] **1. Move the `Timeline` registry onto the track.** `Kernel.timelines`
+- [x] **1. Move the `Timeline` registry onto the track.** `Kernel.timelines`
   (`kernel.rs:711`) → `TrackId`-keyed (or hang the `SharedTimeline` on `TrackState`).
   `arm_timeline`/`disarm_timeline` become **track**-keyed (`arm_track_timeline(track_id)` on
   track create / first attach; `disarm_track_timeline(track_id)` on **track teardown**,
@@ -659,13 +659,13 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   (parent detach → child attach, same track) keeps one continuous timeline (no re-arm, no
   seed dance); a freshly-attached score context creates **no** per-context timeline; a fork
   of an attached context shares (does not clone) the track timeline.
-- [ ] **2. Re-point score input.** `schedule_abc_cell` (`mod.rs:320`) + its caller
+- [x] **2. Re-point score input.** `schedule_abc_cell` (`mod.rs:320`) + its caller
   `on_turn_completed` (`beat.rs:1106-1168`) schedule into the **track's** timeline by the
   ctx→track index; cell keeps `track`+`played_by` so provenance survives. *Tests:* a cell
   scheduled by ctx A then committed *after* A detaches still lands in the track score
   (rotation hand-off); two producers' cells coexist in one track's committed log,
   distinguished by `played_by`.
-- [ ] **3. Track-scoped materialize, but per-context error surfacing.** The score
+- [x] **3. Track-scoped materialize, but per-context error surfacing.** The score
   **materialize** runs **once per track** (one cursor over the track's committed cells →
   the track-scoped block store), retiring the per-`AttachedContext` `cursor`. **But error
   surfacing stays per-context** — the deepseek review's key structural correction: the
@@ -686,7 +686,7 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   double-emit; a track with 3 attachments materializes each committed cell **once** per beat;
   producer B's resolve failure surfaces in **B's** conversation, never A's; poison-skip is
   attributed to the cell's `played_by`.
-- [ ] **4. The per-track score context (DECIDED: option C — do this FIRST, it gates 1–3).**
+- [x] **4. The per-track score context (DECIDED: option C — do this FIRST, it gates 1–3).**
   Create a durable **score context** when a track is created; its Conversation document holds
   the materialized score. Because it's a **real `ContextId`**, *all* the per-context block APIs
   are reused unchanged — `materialize_committed` keeps taking a `ContextId`, just the **score
@@ -705,11 +705,11 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   materialized blocks land in the score context, not the producer's; two producers' cells share
   the score context distinguished by `played_by`/`BlockId`; the score context is flagged
   non-producer (never armed for a turn); legacy `track == None` blocks match no track.
-- [ ] **5. Re-point `KJ_HEARD` at the track score** (`beat.rs:1013-1021`). The band view
+- [x] **5. Re-point `KJ_HEARD` at the track score** (`beat.rs:1013-1021`). The band view
   becomes real — a producer hears the whole lane (all producers, across rotations) within
   the window. *Test:* after a rotation, the child's `KJ_HEARD` includes the retired
   parent's committed phrases; two concurrent producers each see the other's committed cells.
-- [ ] **6. Delete the Stage-1 bridge** (`beat.rs:778-787`) and the per-context seed/slew
+- [x] **6. Delete the Stage-1 bridge** (`beat.rs:778-787`) and the per-context seed/slew
   it serves. The playhead lives only on the track. *Test:* the existing continuity tests
   (re-pointed from Stage 1's "the clock stayed on the track") pass with the bridge gone.
 - [ ] **7. Persistence — persist the Cell log, do NOT reverse-engineer from blocks.**
@@ -746,6 +746,26 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   trap (gemini):** any test asserting on `block_snapshots(ctx).len()` to confirm a note
   materialized will break/mislead once the score lands in the *track* store — grep them out
   and re-point at the track-scoped query.
+
+## Status — increments landed (2026-06-29)
+
+- **Increment 1 (`9aa280f4`):** `TrackId`-keyed timeline registry on the Kernel.
+- **Increment 2 (`9aa280f4`):** the per-track **score context** (option C) — DB column +
+  set-once persist + `ensure_score_context` mint/recover, wired into `attach`.
+- **Prereq (`e446bbe4`):** `FailureEvent.played_by`.
+- **Increment 3 — the breaking re-point — DONE + green (this commit):** WI 1, 2, 3, 4, 5, 6 all
+  landed. `schedule_abc_cell` + materialize route to the track timeline + score context;
+  materialize is **hoisted once-per-beat** out of the per-context loop; the cursor +
+  failure-water live on `TrackState`; the failure ledger drains **per producer** (routed by
+  `played_by`, single-producer fallback, orphan→score ctx); `KJ_HEARD` reads the score context
+  (the real band view); the Stage-1 per-context bridge slew is **deleted** (the track timeline's
+  `advance_to` is the legit pump); `attach` arms the track timeline (no per-ctx arm) and `detach`
+  no longer disarms it. 37 beat + 1266 kernel tests green; full workspace builds.
+- **Still open:** WI 7 (persist the Timeline's Cell log so `UseLastGood` survives restart — the
+  score *blocks* persist in the score ctx, but the in-RAM committed `Vec<Cell>` does not, so a
+  restart resets the UseLastGood pool — the gemini "wedge" risk, deferred), WI 8 (devlog),
+  WI 9 (the existing tests were migrated; the dedicated concurrent-producer + per-producer-failure
+  tests are not added yet — `second_context` now covers two producers sharing one score).
 
 ## Decisions made in-flight
 

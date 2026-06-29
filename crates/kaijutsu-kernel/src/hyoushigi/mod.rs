@@ -330,9 +330,13 @@ pub fn schedule_abc_cell(
     validate_abc(abc.as_bytes())
         .map_err(|e| anyhow::anyhow!("schedule_abc_cell: malformed ABC: {e}"))?;
 
-    let timeline = kernel
-        .timeline(context_id)
-        .ok_or_else(|| anyhow::anyhow!("schedule_abc_cell: context {context_id} is not armed"))?;
+    // Stage 2: the score lives on the TRACK timeline now (shared by every producer
+    // attached to the track), not the producing context's. `context_id` is kept for
+    // diagnostics; the cell carries `track` + `played_by` so provenance survives.
+    let _ = context_id;
+    let timeline = kernel.track_timeline(&track).ok_or_else(|| {
+        anyhow::anyhow!("schedule_abc_cell: track {} is not armed", track.as_str())
+    })?;
     let hash = kernel.cas().store(abc.as_bytes(), ABC_MIME)?;
 
     let mut g = timeline.lock();

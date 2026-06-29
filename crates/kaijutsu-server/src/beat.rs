@@ -92,53 +92,50 @@ struct TrackState {
     /// document holds the materialized score. Minted once when the track is created
     /// (or recovered from the persisted `tracks` row) and never changes. The score
     /// outlives any producer, which is the point of moving it off the per-context
-    /// timeline. (Materialize/HEARD re-point onto it in increment 3.)
+    /// timeline. Materialize writes here; `KJ_HEARD` reads it (the band view).
     score_context: ContextId,
+    /// The single materialization cursor over the TRACK timeline's committed log:
+    /// how far whole committed cells have crossed the write barrier (`high_water`)
+    /// and how far the in-progress cell's artifact group got. One per track (the
+    /// score is the track's), so N producers' interleaved cells materialize through
+    /// it exactly once each — never per-attachment double-emit.
+    cursor: MaterializeCursor,
+    /// Consecutive materialize failures on the SAME poison cell at the track
+    /// cursor's head. Reset to 0 when any cell crosses; at [`MATERIALIZE_RETRY_BUDGET`]
+    /// the bridge skips the poison cell (loudly) so the beat never silently retries.
+    materialize_failures: u32,
+    /// How far the TRACK timeline's failure ledger has been drained into Error
+    /// blocks. One cursor over the shared ledger; each new event is routed to the
+    /// PRODUCING context (matched by `played_by`) so a producer reads its own
+    /// failures, never a sibling's. Monotone — never re-surfaces a drained event.
+    failure_water: usize,
     /// The binding set: which contexts are attached and how each rides the beat.
     /// The track holds this passive view; the *context* drives the bind (entity #3)
     /// and a forked child re-binds on the way up.
     attached: HashMap<ContextId, AttachedContext>,
 }
 
-/// One context's binding to a track plus its **runtime** materialization state.
-/// The [`Attachment`] is the durable/wire binding contract (wakeup/rotate/
-/// ooda_armed/pulse, persisted in the `attachments` row); the cursor + failure
-/// counters below are scheduler-only bookkeeping, per-context because each
-/// attached context materializes into its *own* timeline (the Stage-1 bridge).
+/// One context's binding to a track. The [`Attachment`] is the durable/wire
+/// binding contract (wakeup/rotate/ooda_armed/pulse, persisted in the
+/// `attachments` row). Materialization state is no longer here — the score lives
+/// on the track now (one cursor/ledger on [`TrackState`]); the only per-context
+/// runtime bit left is the producing principal, used to route the shared failure
+/// ledger back to the right producer's conversation.
 struct AttachedContext {
     /// The binding the context announced: its wakeup divisor, rotate cadence, OODA
     /// arm, and monotonic pulse counter. Travels with a fork.
     attachment: Attachment,
-    /// The materialization cursor for THIS context: how far whole committed cells
-    /// have crossed the write barrier (`high_water`) AND how far the in-progress
-    /// cell's artifact group got (`artifacts_done`), so a beat that fails mid-group
-    /// resumes at the failed artifact rather than re-inserting (and colliding on)
-    /// the ones that already landed. NOT an id source: materialization reserves ids
-    /// from the store's per-principal seq lanes (§3).
-    cursor: MaterializeCursor,
-    /// Consecutive materialize failures on the SAME poison cell — the cell at this
-    /// context's current `high_water` that has refused to materialize on every
-    /// retry. Reset to 0 the moment any cell crosses (progress was made). When it
-    /// reaches [`MATERIALIZE_RETRY_BUDGET`] the bridge skips the poison cell with a
-    /// loud `error!` so the beat loop never silently retries the same cell forever.
-    materialize_failures: u32,
-    /// How far this context's engine failure ledger (`Timeline::failures()`) has
-    /// been drained into visible `BlockKind::Error` blocks (design §6, §8).
-    /// Monotone: each beat surfaces every event past this cursor, one Error block
-    /// apiece, so a resolve failure is read back by the player next turn (the
-    /// producer-loop principle) and never re-surfaced on later beats.
-    failure_water: usize,
+    /// The principal this context plays under (the `played_by` it stamps on its
+    /// cells), recorded when it schedules a phrase. `None` until it has produced.
+    /// Used to route the track's shared failure ledger: an event whose `played_by`
+    /// matches this is surfaced in THIS context's conversation.
+    producer_principal: Option<PrincipalId>,
 }
 
 impl AttachedContext {
-    /// A freshly-bound context: the announced attachment + zeroed runtime state.
+    /// A freshly-bound context: the announced attachment, no production yet.
     fn new(attachment: Attachment) -> Self {
-        Self {
-            attachment,
-            cursor: MaterializeCursor::default(),
-            materialize_failures: 0,
-            failure_water: 0,
-        }
+        Self { attachment, producer_principal: None }
     }
 }
 
@@ -394,6 +391,13 @@ impl BeatScheduler {
         self.tracks.get(track_id).map(|t| t.playhead)
     }
 
+    /// A track's score context (where the materialized score lands). Test-only
+    /// observer for the Stage-2 re-point.
+    #[cfg(test)]
+    fn score_context(&self, track_id: &TrackId) -> ContextId {
+        self.tracks.get(track_id).expect("track exists").score_context
+    }
+
     /// Attach the kj dispatcher so OODA boundaries fire the `tick` rc verb.
     pub fn with_dispatcher(mut self, dispatcher: Arc<KjDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
@@ -482,6 +486,11 @@ impl BeatScheduler {
             let persisted_score = persisted.as_ref().and_then(|t| t.score_context_id);
             let seed = ctx_from_log.max(persisted_playhead.map(Tick::new).unwrap_or(Tick::ZERO));
             let score_context = self.ensure_score_context(&track_id, persisted_score)?;
+            // Arm the TRACK's timeline once, at creation — the clock + open future +
+            // committed score live here now and never leave when a producer rotates
+            // out. Born with an empty committed pool (UseLastGood→Skip until the first
+            // good phrase; no warm-restart vamping).
+            self.kernel.arm_track_timeline(track_id.clone(), policy.clock(), seed);
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
@@ -492,29 +501,33 @@ impl BeatScheduler {
                     beat_count: 0,
                     last_epoch_ns: 0,
                     score_context,
+                    cursor: MaterializeCursor::default(),
+                    materialize_failures: 0,
+                    failure_water: 0,
                     attached: HashMap::new(),
                 },
             );
         }
-        // Seed the context's per-context Timeline at `max(its own committed tick, the
-        // track's current playhead)` — see the doc above for why both terms.
-        let track_playhead = self.tracks[&track_id].playhead;
-        let clock = self.tracks[&track_id].policy.clock();
-        let timeline_seed = ctx_from_log.max(track_playhead);
-        self.kernel.arm_timeline(context_id, clock, timeline_seed);
-        // Register/update the binding. A re-attach of a live binding keeps its
-        // runtime materialization state (cursor/failures) and refreshes the
-        // announced attachment.
-        let track = self.tracks.get_mut(&track_id).expect("track exists");
         // A context whose committed history sits AHEAD of the track (a restart where
         // the persisted track playhead lagged the lane's blocks) pulls the track up to
-        // that frontier — otherwise the forward-only slew guard in `materialize_one`
-        // would freeze this context's Timeline for the gap while its OODA kept firing
-        // (gemini review 2026-06-29). `timeline_seed >= track.playhead` already, so
-        // this only fires when `ctx_from_log` genuinely exceeds the track.
-        if timeline_seed > track.playhead {
-            track.playhead = timeline_seed;
+        // that frontier — both the scheduler's `track.playhead` and the track timeline —
+        // so a thick joining producer isn't frozen behind a stale clock. `seed` already
+        // covered this when the track was first created; this only fires when a LATER
+        // joiner exceeds an existing track.
+        let track_playhead = self.tracks[&track_id].playhead;
+        if ctx_from_log > track_playhead {
+            if let Some(t) = self.tracks.get_mut(&track_id) {
+                t.playhead = ctx_from_log;
+            }
+            if let Some(tl) = self.kernel.track_timeline(&track_id) {
+                let mut g = tl.lock();
+                if ctx_from_log > g.playhead() {
+                    g.advance_to(ctx_from_log);
+                }
+            }
         }
+        // Register/update the binding (re-attach refreshes the announced attachment).
+        let track = self.tracks.get_mut(&track_id).expect("track exists");
         track
             .attached
             .entry(context_id)
@@ -671,12 +684,15 @@ impl BeatScheduler {
     }
 
     /// Unbind a context from a track — **LIVE-ONLY**. Removes it from the track's
-    /// attached set + the reverse index and drops its kernel timeline, but does NOT
-    /// delete the persisted `attachments` row: the rotate page-turn relies on the
-    /// child inheriting the parent's binding via the fork-copy of that row (automatic
-    /// in `insert_forked_context`), so deleting it here would break inheritance.
-    /// Persisted-row cleanup belongs to context archival (not wired in Stage 1). The
-    /// track persists with its remaining attachments (folds the old `Disarm`).
+    /// attached set + the reverse index, but does NOT delete the persisted
+    /// `attachments` row: the rotate page-turn relies on the child inheriting the
+    /// parent's binding via the fork-copy of that row (automatic in
+    /// `insert_forked_context`), so deleting it here would break inheritance.
+    /// Persisted-row cleanup belongs to context archival (not wired in Stage 1).
+    ///
+    /// Stage 2: detach does NOT touch the TRACK timeline — the clock + score live on
+    /// the track and outlive any producer (continuity is free; that's the whole
+    /// point). The track timeline is dropped only on track teardown (not wired yet).
     pub fn detach(&mut self, track_id: &TrackId, context_id: ContextId) {
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.attached.remove(&context_id);
@@ -688,11 +704,9 @@ impl BeatScheduler {
         // crash in the rotation gap would re-seed the track from a stale row and
         // rewind the lane (gemini review 2026-06-29).
         let _ = self.persist_track(track_id);
-        // Drop the kernel timeline + the reverse index ONLY if this context is no
-        // longer attached to ANY track. The 1:1 invariant means this is normally the
-        // last attachment, but guard defensively: a context that still rides another
-        // lane must keep its timeline (else that lane's `materialize_one` would
-        // silently no-op) and a reverse-index entry pointing at a surviving track.
+        // Keep the reverse index honest: if this context still rides another lane,
+        // point it there; otherwise drop it. (No per-context timeline to disarm
+        // anymore — the score is on the track.)
         let other = self
             .tracks
             .iter()
@@ -703,7 +717,6 @@ impl BeatScheduler {
             }
             None => {
                 self.context_track.remove(&context_id);
-                self.kernel.disarm_timeline(context_id);
             }
         }
     }
@@ -777,8 +790,13 @@ impl BeatScheduler {
         // Phase 2: per attached context — materialize, then answer the cadence. No
         // &mut tracks borrow is held across `materialize_one` (it re-borrows briefly).
         let mut to_detach: Vec<ContextId> = Vec::new();
+        // Materialize the track's newly-committed score ONCE this beat (gemini: hoist
+        // out of the per-context loop, or N attached contexts would re-emit each cell),
+        // then drain the track's failure ledger to each producer. The score is the
+        // track's; the cadence below is per-context.
+        self.materialize_track(track_id, playhead);
+        self.drain_track_failures(track_id);
         for ctx in attached_ids {
-            self.materialize_one(track_id, ctx, playhead);
             let Some(att) = self
                 .tracks
                 .get(track_id)
@@ -835,36 +853,51 @@ impl BeatScheduler {
         }
     }
 
-    /// Materialize one attached context's newly-committed cells this beat: slew its
-    /// Timeline up to the track playhead (forward-only), run the CAS+block bridge with
-    /// the context's OWN cursor/poison budget, surface a poison-skip Error block, and
-    /// drain the engine failure ledger. All per-context state lives on the
-    /// [`AttachedContext`], so one context's poison cell never wedges a sibling.
-    fn materialize_one(&mut self, track_id: &TrackId, ctx: ContextId, track_playhead: Tick) {
-        let Some(timeline) = self.kernel.timeline(ctx) else {
-            // Attached but no timeline — shouldn't happen (attach pairs them), but
-            // never panic the driver.
+    /// Resolve which attached context a `played_by` principal belongs to, so a
+    /// failure/poison on a cell that principal authored surfaces in ITS conversation.
+    /// Matched by the producing principal recorded on the attachment; if none match
+    /// but exactly one context is attached (the music / single-producer case), it's
+    /// that one. `None` → an orphaned producer (e.g. it rotated out) — the caller
+    /// routes to the score context so the failure is never silently dropped.
+    fn producer_ctx_for(&self, track_id: &TrackId, played_by: PrincipalId) -> Option<ContextId> {
+        let track = self.tracks.get(track_id)?;
+        if let Some((ctx, _)) = track
+            .attached
+            .iter()
+            .find(|(_, ac)| ac.producer_principal == Some(played_by))
+        {
+            return Some(*ctx);
+        }
+        if track.attached.len() == 1 {
+            return track.attached.keys().next().copied();
+        }
+        None
+    }
+
+    /// Materialize the TRACK's newly-committed score this beat: pump the track
+    /// timeline to the playhead (firing speculate/commit/squash), then run the
+    /// CAS+block bridge ONCE into the track's score context with the track's single
+    /// cursor + poison budget. A poison-skip is surfaced as an Error block attributed
+    /// to the poisoned cell's producer. (The failure-ledger drain is a separate
+    /// per-track pass, `drain_track_failures`.)
+    fn materialize_track(&mut self, track_id: &TrackId, playhead: Tick) {
+        let Some(timeline) = self.kernel.track_timeline(track_id) else {
             return;
         };
-        // Slew the context's Timeline to the track playhead (the Stage-1 bridge).
-        // Guarded forward-only: a context whose own committed log sits AHEAD of the
-        // track is left alone rather than advanced backward (`advance_to` panics on
-        // backward time — the write-barrier no-backdating stance).
+        let Some(score_ctx) = self.tracks.get(track_id).map(|t| t.score_context) else {
+            return;
+        };
+        // Pump the track timeline to the beat's playhead — forward-only (`advance_to`
+        // panics on backward time, the no-backdating write barrier). This is the
+        // legit clock drive, not the deleted per-context Stage-1 bridge.
         {
             let mut g = timeline.lock();
-            if track_playhead > g.playhead() {
-                g.advance_to(track_playhead);
+            if playhead > g.playhead() {
+                g.advance_to(playhead);
             }
         }
         let cas = self.kernel.cas().clone();
-        // Copy the cursor out so the &mut borrow of the attachment doesn't collide
-        // with the shared &self.documents/&self.derivers reads in the bridge.
-        let Some(mut cursor) = self
-            .tracks
-            .get(track_id)
-            .and_then(|t| t.attached.get(&ctx))
-            .map(|ac| ac.cursor)
-        else {
+        let Some(mut cursor) = self.tracks.get(track_id).map(|t| t.cursor) else {
             return;
         };
         let hw_before = cursor.high_water;
@@ -872,72 +905,73 @@ impl BeatScheduler {
             &timeline,
             &cas,
             &self.documents,
-            ctx,
+            score_ctx,
             &mut cursor,
             &self.derivers,
         );
         // Set when the SAME cell exhausts MATERIALIZE_RETRY_BUDGET and is skipped:
-        // (skipped high_water index, last error). Surfaced as ONE Error block after
-        // the attachment borrow ends — deduped by construction (skip happens once).
+        // (skipped high_water index, last error). Surfaced once after the borrow ends.
         let mut poison_skipped: Option<(usize, String)> = None;
         match result {
             Ok(_) => {
-                if let Some(ac) =
-                    self.tracks.get_mut(track_id).and_then(|t| t.attached.get_mut(&ctx))
-                {
-                    ac.cursor = cursor;
-                    ac.materialize_failures = 0; // a clean beat clears the poison count
+                if let Some(t) = self.tracks.get_mut(track_id) {
+                    t.cursor = cursor;
+                    t.materialize_failures = 0; // a clean beat clears the poison count
                 }
             }
             Err(e) => {
-                if let Some(ac) =
-                    self.tracks.get_mut(track_id).and_then(|t| t.attached.get_mut(&ctx))
-                {
+                if let Some(t) = self.tracks.get_mut(track_id) {
                     if cursor.high_water > hw_before {
-                        // Whole-cell progress → the poison is a FRESH cell; persist
-                        // and reset the count.
-                        ac.cursor = cursor;
-                        ac.materialize_failures = 0;
+                        // Whole-cell progress → the poison is a FRESH cell; persist.
+                        t.cursor = cursor;
+                        t.materialize_failures = 0;
                         log::error!(
-                            "beat: materialize failed for context {ctx} after crossing \
-                             {} cell(s) this beat; will retry the next cell: {e}",
+                            "beat: materialize failed for track {} after crossing {} \
+                             cell(s) this beat; will retry the next cell: {e}",
+                            track_id.as_str(),
                             cursor.high_water - hw_before
                         );
                     } else {
-                        // Same cell failed again — escalate; once the budget is spent,
-                        // skip the poison cell so the loop never silently retries.
-                        ac.cursor = cursor;
-                        ac.materialize_failures += 1;
-                        let failures = ac.materialize_failures;
+                        // Same cell failed again — escalate; skip once the budget is spent.
+                        t.cursor = cursor;
+                        t.materialize_failures += 1;
+                        let failures = t.materialize_failures;
                         log::error!(
-                            "beat: materialize failed for context {ctx} on cell at \
-                             high_water={} (consecutive failure #{failures} on the \
-                             same cell): {e}",
+                            "beat: materialize failed for track {} on cell at high_water={} \
+                             (consecutive failure #{failures} on the same cell): {e}",
+                            track_id.as_str(),
                             cursor.high_water
                         );
                         if poison_action(failures) == PoisonAction::SkipPoison {
-                            ac.cursor.high_water += 1;
-                            ac.cursor.artifacts_done = 0;
-                            ac.cursor.source_block_id = None;
-                            ac.materialize_failures = 0;
+                            t.cursor.high_water += 1;
+                            t.cursor.artifacts_done = 0;
+                            t.cursor.source_block_id = None;
+                            t.materialize_failures = 0;
                             log::error!(
-                                "beat: skipping poison cell at high_water={} for context \
-                                 {ctx} after {MATERIALIZE_RETRY_BUDGET} failed attempts — \
-                                 cell will NOT be materialized",
-                                cursor.high_water
+                                "beat: skipping poison cell at high_water={} for track {} \
+                                 after {MATERIALIZE_RETRY_BUDGET} failed attempts — cell \
+                                 will NOT be materialized",
+                                cursor.high_water,
+                                track_id.as_str()
                             );
                             poison_skipped = Some((cursor.high_water, e.to_string()));
                         }
                     }
-                } else {
-                    log::error!("beat: materialize failed for un-attached context {ctx}: {e}");
                 }
             }
         }
 
-        // Surface the poison-skip as a visible Error block now (the attachment borrow
-        // has ended). Anchored at the document tail like the resolve-failure drain.
+        // Surface the poison-skip as an Error block in the producer's conversation
+        // (anchored at its document tail). The poisoned cell stays in `committed`
+        // (skipping only advances the cursor), so we read its author for attribution.
         if let Some((skipped_hw, err)) = poison_skipped {
+            let played_by = {
+                let g = timeline.lock();
+                g.committed().get(skipped_hw).map(|c| c.played_by)
+            };
+            let target = played_by
+                .and_then(|p| self.producer_ctx_for(track_id, p))
+                .unwrap_or(score_ctx);
             let payload = kaijutsu_types::ErrorPayload {
                 category: kaijutsu_types::ErrorCategory::Kernel,
                 severity: kaijutsu_types::ErrorSeverity::Error,
@@ -950,30 +984,26 @@ impl BeatScheduler {
                 source_kind: None,
             };
             let summary = payload.summary_line();
-            match self.documents.last_block_id(ctx) {
+            match self.documents.last_block_id(target) {
                 Some(anchor) => {
                     if let Err(e) = self.documents.insert_error_block_as(
-                        ctx,
+                        target,
                         &anchor,
                         &payload,
                         summary,
                         Some(PrincipalId::beat()),
                     ) {
                         log::error!(
-                            "beat: failed to surface poison-skip Error block for {ctx} \
+                            "beat: failed to surface poison-skip Error block for {target} \
                              (skipped cell at high_water={skipped_hw}): {e}"
                         );
                     }
                 }
                 None => log::error!(
-                    "beat: poison-skip for {ctx} at high_water={skipped_hw} found no anchor block"
+                    "beat: poison-skip for {target} at high_water={skipped_hw} found no anchor block"
                 ),
             }
         }
-
-        // Drain the engine failure ledger into visible Error blocks (§6, §8) so the
-        // player reads its own resolve failures next turn (the producer-loop principle).
-        self.drain_failures(track_id, ctx, &timeline);
     }
 
     /// Drain the engine failure ledger past `failure_water`, surfacing exactly one
@@ -987,32 +1017,35 @@ impl BeatScheduler {
     /// Error blocks anchor at the document tail (the failure carries musical ticks,
     /// not a source block id — the cell that would have been its anchor never
     /// committed). A missing anchor or insert failure is loud, never a swallow.
-    fn drain_failures(
-        &mut self,
-        track_id: &TrackId,
-        ctx: ContextId,
-        timeline: &kaijutsu_kernel::hyoushigi::SharedTimeline,
-    ) {
-        // Snapshot the new events under the lock, then release it before touching
-        // the block store (no nested lock; no `.await` was ever here anyway).
-        let new_events: Vec<(kaijutsu_types::Tick, kaijutsu_types::Tick, String, String)> = {
+    fn drain_track_failures(&mut self, track_id: &TrackId) {
+        let Some(timeline) = self.kernel.track_timeline(track_id) else {
+            return;
+        };
+        // Snapshot the new events (with their author) under the lock, then release it
+        // before touching the block store (no nested lock; no `.await` here).
+        let new_events: Vec<(kaijutsu_types::Tick, PrincipalId, String, String)> = {
             let g = timeline.lock();
             let failures = g.failures();
-            let Some(st) = self.tracks.get(track_id).and_then(|t| t.attached.get(&ctx)) else {
+            let Some(water) = self.tracks.get(track_id).map(|t| t.failure_water) else {
                 return;
             };
-            if failures.len() <= st.failure_water {
+            if failures.len() <= water {
                 return; // nothing new since the last drain
             }
-            failures[st.failure_water..]
+            failures[water..]
                 .iter()
-                .map(|ev| {
-                    (ev.at, ev.start, ev.resolver.as_str().to_string(), ev.error.clone())
-                })
+                .map(|ev| (ev.start, ev.played_by, ev.resolver.as_str().to_string(), ev.error.clone()))
                 .collect()
         };
 
-        for (at, start, resolver, error) in &new_events {
+        for (start, played_by, resolver, error) in &new_events {
+            // Route to the PRODUCING context (so a player reads its own failures, not
+            // a sibling's); an orphan (producer rotated out) goes to the score context
+            // rather than being dropped.
+            let score_ctx = self.tracks.get(track_id).map(|t| t.score_context);
+            let Some(target) = self.producer_ctx_for(track_id, *played_by).or(score_ctx) else {
+                continue;
+            };
             let payload = kaijutsu_types::ErrorPayload {
                 category: kaijutsu_types::ErrorCategory::Parse,
                 severity: kaijutsu_types::ErrorSeverity::Error,
@@ -1025,38 +1058,33 @@ impl BeatScheduler {
                 source_kind: None,
             };
             let summary = payload.summary_line();
-            // Anchor at the current document tail. A musician context always has at
-            // least its rc/stance blocks, so a tail is expected; its absence is a
-            // structural anomaly we surface loudly rather than silently skip.
-            let Some(anchor) = self.documents.last_block_id(ctx) else {
+            let Some(anchor) = self.documents.last_block_id(target) else {
                 log::error!(
-                    "beat: failure ledger drain for {ctx} found no anchor block for the \
+                    "beat: failure ledger drain for {target} found no anchor block for the \
                      resolve failure at beat {} (resolver {resolver}): {error}",
                     start.get()
                 );
                 continue;
             };
             if let Err(e) = self.documents.insert_error_block_as(
-                ctx,
+                target,
                 &anchor,
                 &payload,
                 summary,
                 Some(PrincipalId::beat()),
             ) {
                 log::error!(
-                    "beat: failed to surface resolve-failure Error block for {ctx} \
-                     (failure at playhead {}, start {}): {e}",
-                    at.get(),
+                    "beat: failed to surface resolve-failure Error block for {target} \
+                     (start {}): {e}",
                     start.get()
                 );
             }
         }
 
-        // Advance the water past every event observed this beat — even any whose
-        // Error-block insert errored above (already logged loudly). Re-surfacing a
-        // drained event next beat would spam; the ledger length is the cursor.
-        if let Some(st) = self.tracks.get_mut(track_id).and_then(|t| t.attached.get_mut(&ctx)) {
-            st.failure_water += new_events.len();
+        // Advance the single track water past every event observed this beat — even
+        // any whose insert errored (already logged). Re-surfacing would spam.
+        if let Some(t) = self.tracks.get_mut(track_id) {
+            t.failure_water += new_events.len();
         }
     }
 
@@ -1081,12 +1109,14 @@ impl BeatScheduler {
             transport_vars(playhead, track.beat_count, &track.policy)
                 .into_iter()
                 .collect();
-        // KJ_HEARD: the recent committed notation the player composes against. A read
-        // failure degrades to an empty list (compose from the chart + now-facts).
+        // KJ_HEARD: the recent committed notation the player composes against — read
+        // from the TRACK's score context now, so it's the real band view (the whole
+        // lane across every producer + rotation), not just this context's own blocks.
+        // A read failure degrades to an empty list (compose from the chart + now-facts).
         let window = TickDelta::new((HEARD_WINDOW_PHRASES * track.policy.beats_per_phrase) as i64);
         let heard = self
             .documents
-            .block_snapshots(ctx)
+            .block_snapshots(track.score_context)
             .map(|blocks| heard_json(&blocks, playhead, window))
             .unwrap_or_else(|_| "[]".to_string());
         vars.insert("KJ_HEARD".to_string(), heard);
@@ -1174,7 +1204,7 @@ impl BeatScheduler {
     ///     A carried id that trips any guard is a BUG (the publish site should
     ///     only ever carry a real player Model block), so each is a loud
     ///     `log::error!`, refused, never silently skipped.
-    fn on_turn_completed(&self, ctx: ContextId, output_block_id: Option<BlockId>) {
+    fn on_turn_completed(&mut self, ctx: ContextId, output_block_id: Option<BlockId>) {
         // Resolve the context's track + attachment; only an OODA-armed musician we
         // manage gets its turn output crystallized. Schedule one phrase of lead ahead
         // of the playhead (design §10) so the fast write-barrier derive has room —
@@ -1236,6 +1266,12 @@ impl BeatScheduler {
         // own author (who PLAYED), which becomes the materialized cell's
         // principal. `track_id` is the musician's lane.
         let played_by = b.id.principal_id;
+        // Record this context's producing principal so the track's shared failure
+        // ledger routes a failure on its cell back to ITS conversation (not a
+        // sibling producer's). Set on every Act; stable for a given producer.
+        if let Some(ac) = self.tracks.get_mut(&track_id).and_then(|t| t.attached.get_mut(&ctx)) {
+            ac.producer_principal = Some(played_by);
+        }
         if let Err(e) = schedule_abc_cell(&self.kernel, ctx, &abc, lead, track_id, played_by) {
             // A refused/failed schedule must be visible to the player, not just
             // logged (design §7): surface a BlockKind::Error anchored at the
@@ -1723,6 +1759,26 @@ mod tests {
         }
     }
 
+    /// Stage-2 marker setup: arm `track`'s timeline with the marker clock
+    /// (commit_margin 0 so a cell commits exactly when the playhead reaches its tick)
+    /// and seed `count` marker cells. `arm_track_timeline` is idempotent, so a
+    /// following `attach` (which would arm with `policy.clock()`, commit_margin 1)
+    /// keeps THIS clock. Call after the `track` id is known and BEFORE `attach`. The
+    /// score lives on the track now, so materialized markers land in the score context
+    /// (`sched.score_context(track)`), not the producing context.
+    fn arm_track_with_markers(kernel: &Kernel, track: &TrackId, count: i64) {
+        let tl = kernel.arm_track_timeline(
+            track.clone(),
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        let mut g = tl.lock();
+        g.register_resolver(Box::new(Marker));
+        for t in 1..=count {
+            g.schedule(marker_cell(t)).unwrap();
+        }
+    }
+
     /// A 1-second beat policy with a large phrase length (phrase boundaries never
     /// fire in the span of these tests). `ooda_every` is now on the `Attachment`
     /// — use `slow_attachment()` alongside this policy.
@@ -1762,28 +1818,29 @@ mod tests {
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-        preseed_markers(&kernel, ctx, 5);
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
         let track_id = TrackId::solo();
+        arm_track_with_markers(&kernel, &track_id, 5);
 
         // Attached but not played: track created stopped → no heap entry, no blocks.
         sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track_id);
         assert!(sched.next_wake().is_none(), "attach alone schedules nothing (track stopped)");
         let out = sched.fire_due(base + Duration::from_secs(1));
         assert!(out.fired.is_empty());
-        assert_eq!(contents(&documents, ctx).len(), 0);
+        assert_eq!(contents(&documents, score).len(), 0);
 
-        // Play: now it beats.
+        // Play: now it beats — the score materializes into the track's score context.
         sched.play(&track_id, base);
         for i in 1..=5 {
             let out = sched.fire_due(base + Duration::from_secs(i));
             assert_eq!(out.fired, vec![ctx], "beat {i}");
-            assert_eq!(contents(&documents, ctx).len(), i as usize);
+            assert_eq!(contents(&documents, score).len(), i as usize);
         }
         assert_eq!(
-            contents(&documents, ctx),
+            contents(&documents, score),
             vec!["beat-1", "beat-2", "beat-3", "beat-4", "beat-5"],
         );
 
@@ -1801,28 +1858,29 @@ mod tests {
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-        preseed_markers(&kernel, ctx, 5);
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
         let track_id = TrackId::solo();
+        arm_track_with_markers(&kernel, &track_id, 5);
         sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track_id);
         sched.play(&track_id, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // tick 1
         sched.fire_due(base + Duration::from_secs(2)); // tick 2
-        assert_eq!(contents(&documents, ctx), vec!["beat-1", "beat-2"]);
+        assert_eq!(contents(&documents, score), vec!["beat-1", "beat-2"]);
 
         // Pause; the stale heap entry fires once and is dropped — no advance.
         sched.pause(&track_id);
         sched.fire_due(base + Duration::from_secs(3));
-        assert_eq!(contents(&documents, ctx).len(), 2, "paused → frozen");
+        assert_eq!(contents(&documents, score).len(), 2, "paused → frozen");
 
         // Resume much later in wall-clock; the tick continues at 3, not jumping.
         sched.play(&track_id, base + Duration::from_secs(3600));
         sched.fire_due(base + Duration::from_secs(3601));
         assert_eq!(
-            contents(&documents, ctx),
+            contents(&documents, score),
             vec!["beat-1", "beat-2", "beat-3"],
             "resume at +1, no catch-up for the hour spent paused"
         );
@@ -1838,34 +1896,35 @@ mod tests {
         let b = ContextId::new();
         documents.create_document(a, DocumentKind::Conversation, None).unwrap();
         documents.create_document(b, DocumentKind::Conversation, None).unwrap();
-        preseed_markers(&kernel, a, 5);
-        preseed_markers(&kernel, b, 5);
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
         let track_id = TrackId::solo();
+        arm_track_with_markers(&kernel, &track_id, 5);
         sched.attach(track_id.clone(), a, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track_id);
         sched.play(&track_id, base);
 
-        sched.fire_due(base + Duration::from_secs(1));
-        sched.fire_due(base + Duration::from_secs(2));
-        assert_eq!(contents(&documents, a).len(), 2);
-        assert_eq!(contents(&documents, b).len(), 0, "b not attached yet");
+        let out1 = sched.fire_due(base + Duration::from_secs(1));
+        let out2 = sched.fire_due(base + Duration::from_secs(2));
+        assert_eq!(out1.fired, vec![a]);
+        assert_eq!(out2.fired, vec![a], "only a attached so far");
+        // The score is the TRACK's — materialized once per beat regardless of how
+        // many contexts are attached (the hoist; no per-producer double-emit).
+        assert_eq!(contents(&documents, score).len(), 2);
 
-        // Attach b to the already-playing track. b's timeline was pre-seeded at
-        // Tick::ZERO by preseed_markers (arm_timeline is idempotent), so it stays
-        // at 0 and catches up when the track next fires at beat 3.
+        // Attach b to the already-playing track (same clock domain). `play` is a
+        // no-op — the track is already running.
         sched.attach(track_id.clone(), b, slow_attachment(), slow_policy()).unwrap();
-        // `play` is a no-op — the track is already running.
         sched.play(&track_id, base + Duration::from_secs(2));
-        // Beat 3: both a and b fire. b's timeline slews from 0→3 (catch-up),
-        // materializing beat-1, beat-2, beat-3.
-        sched.fire_due(base + Duration::from_secs(3));
-        assert_eq!(contents(&documents, a).len(), 3);
+        // Beat 3: BOTH a and b fire (the beat wakes every attached context); the
+        // shared score advances by exactly one, not once per producer.
+        let out3 = sched.fire_due(base + Duration::from_secs(3));
         assert!(
-            !contents(&documents, b).is_empty(),
-            "b fires on its first beat (attached to a running track)"
+            out3.fired.contains(&a) && out3.fired.contains(&b),
+            "both contexts fire on beat 3"
         );
+        assert_eq!(contents(&documents, score).len(), 3, "shared score advanced once");
     }
 
     /// The wakeup cadence fires every N beats — but only while OODA is armed.
@@ -2145,6 +2204,7 @@ mod tests {
         let base = Instant::now();
         let track_id = TrackId::solo();
         sched.attach(track_id.clone(), ctx, slow_attachment(), phrase).unwrap();
+        let score = sched.score_context(&track_id);
         sched.play(&track_id, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // playhead → 1
@@ -2153,8 +2213,9 @@ mod tests {
         // (asserted below) — `phrase_delta()` (4 here) not the deleted 4-const.
         sched.on_turn_completed(ctx, Some(abc_block));
 
+        // The score materializes into the TRACK's score context now, not the producer's.
         let asset_before = documents
-            .block_snapshots(ctx)
+            .block_snapshots(score)
             .unwrap()
             .iter()
             .filter(|b| b.role == Role::Asset)
@@ -2166,7 +2227,7 @@ mod tests {
             sched.fire_due(base + Duration::from_secs(i));
         }
 
-        let snaps = documents.block_snapshots(ctx).unwrap();
+        let snaps = documents.block_snapshots(score).unwrap();
         // The ABC source materializes as a Model staff (ephemeral) and the MIDI
         // sibling as an Asset hash — the F2 score↔render pair.
         let midi = snaps
@@ -2209,9 +2270,9 @@ mod tests {
             beats_per_phrase: 4,
         };
 
-        // Helper: count scheduled future cells.
-        fn future_len(kernel: &Kernel, ctx: ContextId) -> usize {
-            kernel.timeline(ctx).unwrap().lock().future_len()
+        // Helper: count scheduled future cells on the track's (shared) timeline.
+        fn future_len(kernel: &Kernel, _ctx: ContextId) -> usize {
+            kernel.track_timeline(&TrackId::solo()).unwrap().lock().future_len()
         }
 
         // — Case None: Completed{None} schedules nothing —
@@ -2228,24 +2289,32 @@ mod tests {
             assert_eq!(future_len(&kernel, ctx), 0, "None → nothing scheduled");
         }
 
-        // — Case materialized: a track-bearing block is refused —
+        // — Case materialized: a track-bearing block (what materialization stamps) is
+        //   refused. Materialized blocks live in the score context now, so to exercise
+        //   the `b.track.is_some()` guard we hand `on_turn_completed` a track-bearing
+        //   block placed in the producer's own doc directly (the case the guard defends).
         {
+            use kaijutsu_crdt::BlockSnapshotBuilder;
             let (kernel, documents) = fresh_kernel_and_docs().await;
             let ctx = ContextId::new();
             documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-            preseed_markers(&kernel, ctx, 1);
+            let player = PrincipalId::new();
+            let seq = documents.reserve_block_id(ctx, player).unwrap().seq;
+            let track_bearing = kaijutsu_crdt::BlockId::new(ctx, player, seq);
+            let snap = BlockSnapshotBuilder::new(track_bearing, BlockKind::Text)
+                .role(Role::Model)
+                .content("X:1\nK:C\nCDEF|\n")
+                .content_type(ContentType::Abc)
+                .track(TrackId::solo())
+                .build();
+            documents.insert_from_snapshot_as(ctx, snap, None, Some(player)).unwrap();
             let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
             let base = Instant::now();
             sched.attach(TrackId::solo(), ctx, slow_attachment(), phrase).unwrap();
             sched.play(&TrackId::solo(), base);
-            sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
-            let materialized = documents.last_block_id(ctx).unwrap();
-            assert!(
-                documents.get_block_snapshot(ctx, &materialized).unwrap().unwrap().track.is_some(),
-                "the marker carries a track"
-            );
+            sched.fire_due(base + Duration::from_secs(1));
             let future_before = future_len(&kernel, ctx);
-            sched.on_turn_completed(ctx, Some(materialized));
+            sched.on_turn_completed(ctx, Some(track_bearing));
             assert_eq!(
                 future_len(&kernel, ctx),
                 future_before,
@@ -2441,7 +2510,7 @@ mod tests {
 
         // Arm: the playhead seeds to the max committed tick, not Tick::ZERO.
         sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
-        let playhead_after_arm = kernel.timeline(ctx).unwrap().lock().playhead();
+        let playhead_after_arm = sched.track_playhead(&TrackId::solo()).unwrap();
         assert_eq!(
             playhead_after_arm,
             Tick::new(big_t),
@@ -2452,7 +2521,7 @@ mod tests {
         let base = Instant::now();
         sched.play(&TrackId::solo(), base);
         sched.fire_due(base + Duration::from_secs(1));
-        let playhead_after_beat = kernel.timeline(ctx).unwrap().lock().playhead();
+        let playhead_after_beat = sched.track_playhead(&TrackId::solo()).unwrap();
         assert_eq!(
             playhead_after_beat,
             Tick::new(big_t + 1),
@@ -2463,7 +2532,7 @@ mod tests {
         // playhead stays where the beat left it (seed_playhead is virgin-only,
         // applied inside or_insert_with which never fires on a re-arm).
         sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
-        let playhead_after_rearm = kernel.timeline(ctx).unwrap().lock().playhead();
+        let playhead_after_rearm = sched.track_playhead(&TrackId::solo()).unwrap();
         assert_eq!(
             playhead_after_rearm,
             Tick::new(big_t + 1),
@@ -2672,7 +2741,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            kernel.timeline(ctx).unwrap().lock().playhead(),
+            sched.track_playhead(&TrackId::new("bass").unwrap()).unwrap(),
             Tick::new(512),
             "attach continues musical time from the track's persisted playhead, not tick 0"
         );
@@ -2720,7 +2789,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            kernel.timeline(ctx).unwrap().lock().playhead(),
+            sched.track_playhead(&TrackId::new("bass").unwrap()).unwrap(),
             Tick::new(big_t),
             "the committed max tick wins over a stale lower persisted track playhead"
         );
@@ -2859,22 +2928,26 @@ mod tests {
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        // Persisted beat() blocks at seqs 0,1,2 (a restart's loaded history).
-        let seeded = preseed_beat_blocks(&documents, ctx, 3);
-        assert_eq!(seeded, vec![0, 1, 2], "preseeded the beat() lane 0..=2");
-
-        // A FRESH scheduler (cursor born at high_water=0) arms and materializes a
-        // marker cell — which plays under beat(), the same lane as the persisted
-        // blocks. preseed_markers wins (arm is idempotent) and seeds the timeline.
-        preseed_markers(&kernel, ctx, 1);
+        // Arm the track timeline with a marker (commit-margin-0), then attach to learn
+        // the SCORE context — the score lives there now, so its beat() seq lane is what
+        // materialization mints from.
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 1);
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
-        sched.play(&TrackId::solo(), base);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track);
+
+        // Persisted beat() blocks at seqs 0,1,2 in the SCORE context (a restart's
+        // loaded history on the lane materialization will mint onto).
+        let seeded = preseed_beat_blocks(&documents, score, 3);
+        assert_eq!(seeded, vec![0, 1, 2], "preseeded the score beat() lane 0..=2");
+
+        sched.play(&track, base);
         sched.fire_due(base + Duration::from_secs(1));
 
         // No Error block: a DuplicateBlock collision would surface (or wedge) here.
-        let snaps = documents.block_snapshots(ctx).unwrap();
+        let snaps = documents.block_snapshots(score).unwrap();
         let errors = snaps.iter().filter(|b| b.kind == BlockKind::Error).count();
         assert_eq!(errors, 0, "materialization after re-arm must not error (no DuplicateBlock)");
 
@@ -2901,9 +2974,11 @@ mod tests {
     /// `1..=count`. Each will record a `FailureEvent` in the engine ledger when the
     /// playhead reaches its tick — the data source the scheduler drains into Error
     /// blocks (§6, §8).
-    fn preseed_failing_cells(kernel: &Kernel, ctx: ContextId, count: i64) {
-        let tl = kernel.arm_timeline(
-            ctx,
+    fn preseed_failing_cells(kernel: &Kernel, _ctx: ContextId, count: i64) {
+        // Schedule onto the TRACK timeline (the score lives there now); a following
+        // `attach` keeps this commit-margin-0 clock (arm is idempotent).
+        let tl = kernel.arm_track_timeline(
+            TrackId::solo(),
             TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
             Tick::ZERO,
         );
@@ -3024,8 +3099,10 @@ mod tests {
         insert_player_abc(&documents, ctx, player, "X:1\nK:C\nCDEF|\n");
 
         // One cell at tick 1 that COMMITS clean but can never DERIVE (garbage ABC).
-        let tl = kernel.arm_timeline(
-            ctx,
+        // Scheduled onto the TRACK timeline (the score lives there); the later
+        // `attach` keeps this commit-margin-0 clock (arm is idempotent).
+        let tl = kernel.arm_track_timeline(
+            TrackId::solo(),
             TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
             Tick::ZERO,
         );
@@ -3101,33 +3178,37 @@ mod tests {
     async fn on_turn_completed_skips_materialized_blocks() {
         use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 
-        // — Case A: last block already carries a track (came off the timeline) —
+        // — Case A: a track-bearing block (what materialization stamps) is refused.
+        //   Materialized blocks live in the score context now, so we place the guard's
+        //   target — a track-bearing block — directly in the producer's own doc.
+        use kaijutsu_crdt::BlockSnapshotBuilder;
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-        // Materialize one cell so the last block carries track=Some (the shim
-        // cell plays under beat() on the solo() lane).
-        preseed_markers(&kernel, ctx, 1);
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
         sched.attach(TrackId::solo(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&TrackId::solo());
+        let player_a = PrincipalId::new();
+        let seq_a = documents.reserve_block_id(ctx, player_a).unwrap().seq;
+        let track_bearing = kaijutsu_crdt::BlockId::new(ctx, player_a, seq_a);
+        let snap_a = BlockSnapshotBuilder::new(track_bearing, BlockKind::Text)
+            .role(Role::Model)
+            .content("X:1\nK:C\nCDEF|\n")
+            .content_type(ContentType::Abc)
+            .track(TrackId::solo())
+            .build();
+        documents.insert_from_snapshot_as(ctx, snap_a, None, Some(player_a)).unwrap();
         sched.play(&TrackId::solo(), base);
-        sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
-        let last = documents
-            .get_block_snapshot(ctx, &documents.last_block_id(ctx).unwrap())
-            .unwrap()
-            .unwrap();
-        assert!(last.track.is_some(), "the materialized marker carries a track");
 
-        // on_turn_completed carrying the track-bearing block's own id schedules
-        // NOTHING — no new Asset (MIDI) block ever appears, even after a lead.
-        // (The carried id is the materialized marker; the guard refuses it.)
-        sched.on_turn_completed(ctx, documents.last_block_id(ctx));
-        for i in 2..=8 {
+        // on_turn_completed carrying the track-bearing block schedules NOTHING — no
+        // Asset (MIDI) ever appears in the score (the guard refuses it).
+        sched.on_turn_completed(ctx, Some(track_bearing));
+        for i in 1..=8 {
             sched.fire_due(base + Duration::from_secs(i));
         }
         let assets = documents
-            .block_snapshots(ctx)
+            .block_snapshots(score)
             .unwrap()
             .into_iter()
             .filter(|b| b.role == Role::Asset)
@@ -3157,6 +3238,7 @@ mod tests {
         let mut sched_b = BeatScheduler::new(kernel_b.clone(), docs_b.clone());
         let base_b = Instant::now();
         sched_b.attach(TrackId::solo(), cb, slow_attachment(), slow_policy()).unwrap();
+        let score_b = sched_b.score_context(&TrackId::solo());
         sched_b.play(&TrackId::solo(), base_b);
         sched_b.fire_due(base_b + Duration::from_secs(1));
         sched_b.on_turn_completed(cb, docs_b.last_block_id(cb));
@@ -3164,7 +3246,7 @@ mod tests {
             sched_b.fire_due(base_b + Duration::from_secs(i));
         }
         let assets_b = docs_b
-            .block_snapshots(cb)
+            .block_snapshots(score_b)
             .unwrap()
             .into_iter()
             .filter(|b| b.role == Role::Asset)
@@ -3206,6 +3288,7 @@ mod tests {
                 BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4 },
             )
             .unwrap();
+        let score_c = sched_c.score_context(&TrackId::solo());
         sched_c.play(&TrackId::solo(), base_c);
         sched_c.fire_due(base_c + Duration::from_secs(1));
         sched_c.on_turn_completed(cc, docs_c.last_block_id(cc));
@@ -3213,7 +3296,7 @@ mod tests {
             sched_c.fire_due(base_c + Duration::from_secs(i));
         }
         let midi = docs_c
-            .block_snapshots(cc)
+            .block_snapshots(score_c)
             .unwrap()
             .into_iter()
             .find(|b| b.role == Role::Asset);
@@ -3328,7 +3411,7 @@ mod tests {
         documents.create_document(b, DocumentKind::Conversation, None).unwrap();
         sched.attach(track_id.clone(), b, slow_attachment(), slow_policy()).unwrap();
         assert_eq!(
-            kernel.timeline(b).unwrap().lock().playhead(),
+            sched.track_playhead(&track_id).unwrap(),
             Tick::new(5),
             "fresh context seeds at the track's current playhead, not zero"
         );
@@ -3336,7 +3419,7 @@ mod tests {
         // One more beat: b's Timeline advances exactly one step (5→6), no catch-up.
         sched.fire_due(base + Duration::from_secs(6));
         assert_eq!(
-            kernel.timeline(b).unwrap().lock().playhead(),
+            sched.track_playhead(&track_id).unwrap(),
             Tick::new(6),
             "the first beat after attach is one step, not a catch-up from zero"
         );
@@ -3352,28 +3435,30 @@ mod tests {
         let b = ContextId::new();
         documents.create_document(a, DocumentKind::Conversation, None).unwrap();
         documents.create_document(b, DocumentKind::Conversation, None).unwrap();
-        preseed_markers(&kernel, a, 5);
-        preseed_markers(&kernel, b, 5);
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
         let solo = TrackId::solo();
         let bass = TrackId::new("bass").unwrap();
+        arm_track_with_markers(&kernel, &solo, 5);
+        arm_track_with_markers(&kernel, &bass, 5);
         sched.attach(solo.clone(), a, slow_attachment(), slow_policy()).unwrap();
         sched.attach(bass.clone(), b, slow_attachment(), slow_policy()).unwrap();
+        let score_a = sched.score_context(&solo);
+        let score_b = sched.score_context(&bass);
         sched.play(&solo, base);
         sched.play(&bass, base);
 
         sched.fire_due(base + Duration::from_secs(1));
-        assert_eq!(contents(&documents, a).len(), 1);
-        assert_eq!(contents(&documents, b).len(), 1);
+        assert_eq!(contents(&documents, score_a).len(), 1);
+        assert_eq!(contents(&documents, score_b).len(), 1);
 
         // Stop only the solo track; the bass track is a separate clock domain.
         sched.stop(&solo);
         let out = sched.fire_due(base + Duration::from_secs(2));
         assert_eq!(out.fired, vec![b], "only the bass track still beats");
-        assert_eq!(contents(&documents, a).len(), 1, "solo frozen");
-        assert_eq!(contents(&documents, b).len(), 2, "bass kept beating");
+        assert_eq!(contents(&documents, score_a).len(), 1, "solo frozen");
+        assert_eq!(contents(&documents, score_b).len(), 2, "bass kept beating");
     }
 
     /// `stop` is clock-only: it does NOT disarm a context's OODA. After stop+play the
@@ -3417,15 +3502,16 @@ mod tests {
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-        preseed_markers(&kernel, ctx, 10);
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
         let track_id = TrackId::solo();
+        arm_track_with_markers(&kernel, &track_id, 10);
         sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track_id);
         sched.play(&track_id, base);
         sched.fire_due(base + Duration::from_secs(1)); // beat 1 → re-pushes at +2 (gen 1)
-        assert_eq!(contents(&documents, ctx).len(), 1);
+        assert_eq!(contents(&documents, score).len(), 1);
 
         // stop + play WITHIN the same period, before the re-pushed (gen 1) entry pops.
         sched.stop(&track_id);
@@ -3435,7 +3521,7 @@ mod tests {
         // current generation processes.
         let out = sched.fire_due(base + Duration::from_secs(2));
         assert_eq!(out.fired, vec![ctx], "exactly one beat, not two (generation token)");
-        assert_eq!(contents(&documents, ctx).len(), 2, "playhead advanced once: +beat-2");
+        assert_eq!(contents(&documents, score).len(), 2, "playhead advanced once: +beat-2");
     }
 
     /// A context whose committed history is AHEAD of an already-running (stale) track
@@ -3480,7 +3566,7 @@ mod tests {
             "the track is pulled up to the joining context's committed frontier"
         );
         assert_eq!(
-            kernel.timeline(thick).unwrap().lock().playhead(),
+            kernel.track_timeline(&track_id).unwrap().lock().playhead(),
             Tick::new(20),
             "the thick context's Timeline is at its frontier, not frozen behind the track"
         );
