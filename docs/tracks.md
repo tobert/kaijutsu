@@ -729,11 +729,20 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   like Stage 1 did for `KJ_PULSE`. *Test:* a `UseLastGood` fallback fired the beat *after* a
   restart still finds the pre-restart phrase (the wedge-the-track regression); rehydrate
   accepts a non-empty committed log + a playhead at/after its max tick.
-- [ ] **8. Docs** — flip these boxes; devlog entry; update `hyoushigi.md`'s "A context
-  owns a timeline" section (lines 220-228) to past tense once the timeline has actually
-  moved to the track; retire the Stage-1 "track-scoped `max_tick`" deferral above.
-- [ ] **9. Test audit (the review's risk finding).** The suite is deeply per-context
-  coupled, so many tests will **keep passing while exercising the wrong path** after the
+- [x] **8. Docs** — devlog entry landed ("Tracks Stage 2 — the score moves onto the
+  track", 2026-06-29); these boxes flipped; `hyoushigi.md` already carries a forward
+  "Direction (2026-06-29)" note pointing here for the stage 1–2 move.
+- [x] **9. Test audit (the review's risk finding).** Done: the `beat.rs` tests were
+  migrated to the track model (marker tests pre-arm the *track* timeline + read the score
+  context; failure/poison tests schedule onto the track timeline); `second_context` became a
+  real two-producers-share-one-score test; and `two_producers_failures_route_to_their_own_conversations`
+  pins the concurrent-producer mechanism. Note: the at-risk `hyoushigi/mod.rs` tests stayed
+  green *unchanged* — `materialize_committed` kept its `ContextId` signature (the re-point
+  routes the score ctx from `beat.rs`), so those isolation tests still exercise the bridge
+  correctly. Original risk note kept below for the record.
+  <details><summary>(original at-risk list)</summary>
+  The suite was deeply per-context
+  coupled, so many tests would **keep passing while exercising the wrong path** after the
   cut — at-risk: `hyoushigi/mod.rs` tests `bridge_materializes_committed_cell_into_block_and_cas`
   (`:877`), `materialize_after_reload_mints_fresh_seq_no_duplicate` (`:945`),
   `score_cell_commits_abc_and_derives_midi_sibling` (`:1100`),
@@ -746,6 +755,7 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   trap (gemini):** any test asserting on `block_snapshots(ctx).len()` to confirm a note
   materialized will break/mislead once the score lands in the *track* store — grep them out
   and re-point at the track-scoped query.
+  </details>
 
 ## Status — increments landed (2026-06-29)
 
@@ -761,11 +771,18 @@ concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not en
   (the real band view); the Stage-1 per-context bridge slew is **deleted** (the track timeline's
   `advance_to` is the legit pump); `attach` arms the track timeline (no per-ctx arm) and `detach`
   no longer disarms it. 37 beat + 1266 kernel tests green; full workspace builds.
+- **WI 8 (docs) + WI 9 (test audit) — DONE.** Devlog entry landed; beat tests migrated;
+  `two_producers_failures_route_to_their_own_conversations` pins the concurrent mechanism.
 - **Still open:** WI 7 (persist the Timeline's Cell log so `UseLastGood` survives restart — the
   score *blocks* persist in the score ctx, but the in-RAM committed `Vec<Cell>` does not, so a
-  restart resets the UseLastGood pool — the gemini "wedge" risk, deferred), WI 8 (devlog),
-  WI 9 (the existing tests were migrated; the dedicated concurrent-producer + per-producer-failure
-  tests are not added yet — `second_context` now covers two producers sharing one score).
+  restart resets the UseLastGood pool — the gemini "wedge" risk). **Approach is an open fork**
+  (decide before coding): (a) persist the committed cells to a track-scoped row + rehydrate on
+  arm with cursor coordination (gemini's pick; new schema, blob-growth to bound); vs. (b)
+  reconstruct the committed `Vec<Cell>` from the score context's materialized ABC blocks on arm
+  (no new schema — re-hash inline ABC for the `ContentRef`; gemini warned this is "lossy" for
+  `CellState`/`Recipe`/`Span`, but those are all trivially reconstructable for *committed
+  Concrete* cells, which is all `UseLastGood` needs). Plus Stage 3 (`ClockSource`/MIDI) and a
+  real-kernel live-verify.
 
 ## Decisions made in-flight
 

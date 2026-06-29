@@ -3057,6 +3057,83 @@ mod tests {
         );
     }
 
+    /// Stage 2 concurrent producers: two contexts share ONE track timeline, each
+    /// producing under its own principal. When each one's cell fails, the shared
+    /// failure ledger routes the Error block to the PRODUCING context's conversation
+    /// (matched by `played_by`) — a player reads its OWN failure, never a sibling's.
+    /// This is the one real new mechanism behind the "concurrent producers are free"
+    /// claim (the rest is the existing invariants).
+    #[tokio::test]
+    async fn two_producers_failures_route_to_their_own_conversations() {
+        use kaijutsu_crdt::BlockKind;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let a = ContextId::new();
+        let b = ContextId::new();
+        documents.create_document(a, DocumentKind::Conversation, None).unwrap();
+        documents.create_document(b, DocumentKind::Conversation, None).unwrap();
+        // Each producer plays under its own principal; anchor blocks give the Error
+        // blocks a document tail to attach to.
+        let pa = PrincipalId::new();
+        let pb = PrincipalId::new();
+        insert_player_abc(&documents, a, pa, "X:1\nK:C\nCDEF|\n");
+        insert_player_abc(&documents, b, pb, "X:1\nK:C\nCDEF|\n");
+
+        // Two failing cells on the shared TRACK timeline: one authored by pa (tick 1),
+        // one by pb (tick 2).
+        let track = TrackId::solo();
+        let tl = kernel.arm_track_timeline(
+            track.clone(),
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(AlwaysFails));
+            for (t, played_by) in [(1i64, pa), (2i64, pb)] {
+                g.schedule(Cell::deferred_on(
+                    Span::instant(Tick::new(t)),
+                    Recipe {
+                        resolver: ResolverId::new("always_fails"),
+                        params: serde_json::Value::Null,
+                        query: ContextQuery::default(),
+                        fallback: Fallback::Skip,
+                    },
+                    track.clone(),
+                    played_by,
+                ))
+                .unwrap();
+            }
+        }
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.attach(track.clone(), a, slow_attachment(), slow_policy()).unwrap();
+        sched.attach(track.clone(), b, slow_attachment(), slow_policy()).unwrap();
+        // Record each context's producing principal (normally set on its first Act,
+        // in `on_turn_completed`). Same-module access to the private field.
+        sched.tracks.get_mut(&track).unwrap().attached.get_mut(&a).unwrap().producer_principal =
+            Some(pa);
+        sched.tracks.get_mut(&track).unwrap().attached.get_mut(&b).unwrap().producer_principal =
+            Some(pb);
+        sched.play(&track, base);
+
+        let errors = |ctx: ContextId| -> usize {
+            documents
+                .block_snapshots(ctx)
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.kind == BlockKind::Error)
+                .count()
+        };
+
+        sched.fire_due(base + Duration::from_secs(1)); // pa's cell fails
+        sched.fire_due(base + Duration::from_secs(2)); // pb's cell fails
+
+        assert_eq!(errors(a), 1, "producer a's failure surfaces in a's conversation");
+        assert_eq!(errors(b), 1, "producer b's failure surfaces in b's conversation — not a's");
+    }
+
     /// A resolver that COMMITS garbage bytes under the ABC mime — bypassing the
     /// cas_commit validator — so the cell commits clean but its derivation at the
     /// write barrier fails every beat (unparseable ABC violates the first-commit

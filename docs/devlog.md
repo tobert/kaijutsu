@@ -384,6 +384,59 @@ before — diagnose threading from the code, not from a reviewer's summary, and 
 two competent readers model the topology differently that *is* the signal to go
 look.
 
+## Tracks Stage 2 — the score moves onto the track (2026-06-29)
+
+Stage 1 (earlier the same day, `f6478bdf`→`d43fe9aa`) moved the *clock* — playhead,
+beat_count, transport, the scheduler heap — from per-context onto a per-track
+`TrackState`. Stage 2 moves the other half: the **score** (the `Timeline`'s open
+future + committed cell log) off the per-context `Kernel.timelines` map and onto the
+track, so the score never leaves when a producer detaches or rotates, and N producers
+attached to one track share one open future. Canonical plan + the two-voice review:
+`docs/tracks.md` ("Stage 2 implementation").
+
+We designed it as a co-design round, then **stress-tested the locked design with two
+independent voices before cutting code** (the Stage-1 habit): DeepSeek (agentic, reads
+the repo itself) and a gemini-pro *batch* — and a side-lesson landed there: interactive
+gemini-pro 503'd hard under load while the batch sailed through on separate capacity, so
+batch is the resilient path for a big gemini-pro review (now an auto-memory). Both voices
+endorsed the design and converged on a subtle point — the squash/misprediction path is
+dormant for today's only resolver, and that's *correct*: two players landing a note at
+one tick should both commit (a chord), not cancel each other. They also caught the one
+real new mechanism the "concurrent producers are free" claim needs, and three
+implementation gaps; all folded into the tracker before coding.
+
+The headline decision (with Amy): the score's container is a **real per-track "score
+context"** (option C) — a normal, app-viewable context (`context_type="score"`, minted
+the `lost+found` way: real row + document + drift handle) whose Conversation document
+holds the materialized score, but which never takes a turn or hydrates. This reused the
+*entire* per-context block machinery via a real `ContextId` — no `TrackId` block-store
+API, no index/RPC ripple — and it embodies the doc's own thesis: the track persists, the
+players come and go. (Rejected: a synthetic ContextId, which would violate
+`handle_implies_row`; and a parallel `track_documents` store, which was the most new code.)
+
+The cut landed in increments so the tree stayed green: (1) a `TrackId`-keyed timeline
+registry on the Kernel; (2) the score context — a set-once `score_context_id` on the
+`tracks` row (the frequent tempo/playhead upserts mustn't wipe it) minted/recovered in
+`attach`; then (3) the breaking re-point — `schedule_abc_cell` + materialize route to the
+track timeline + score context, materialize **hoisted once-per-beat** out of the
+per-context loop (or N attached contexts would re-emit each cell), the cursor + failure
+ledger moved onto `TrackState`, and the shared failure ledger drained **per producer**
+(each `FailureEvent` now carries `played_by`, routed back to the producing context's
+conversation so a player reads its *own* failures). `KJ_HEARD` finally reads the score
+context — the real band view it had only ever claimed to be. The Stage-1 per-context
+bridge slew is gone; the track timeline's `advance_to` is the legit clock pump.
+
+The biggest sweat was the test migration: ~16 tests were welded to per-context timelines
+and `block_snapshots(ctx)`. The marker/clock tests now pre-arm the *track* timeline with a
+commit-margin-0 clock (idempotent, so the later `attach` keeps it) and read the score
+context; `second_context` became a genuine two-producers-share-one-score test; and a new
+`two_producers_failures_route_to_their_own_conversations` pins the concurrent-producer
+mechanism. 37 beat + 1266 kernel tests green; full workspace builds.
+
+Deferred (in `docs/tracks.md` "Still open"): persisting the in-RAM committed `Vec<Cell>`
+so the `UseLastGood` vamp-insurance pool survives a restart (the score *blocks* persist;
+the cell pool doesn't yet), and Stage 3 (the `ClockSource` trait + a MIDI driver).
+
 ## Musician beat-state persistence + manual re-arm (2026-06-28)
 
 A kernel restart silently stopped every musician: auto-arm fires only on context
