@@ -273,3 +273,141 @@ track" replaces "copy the number," same observable, less machinery.
   are the right substrate for the MIDI driver and for cross-track bar/beat alignment.
 - **Migration / compatibility** — the `beat_state` table, `BeatCommand`, and
   `kj transport` all assume per-context; map each onto the track entity.
+
+---
+
+# Stage 1 implementation — move the clock onto the Track
+
+> **Status:** locked 2026-06-29 (Amy + Claude), in progress. This is the *living*
+> implementation tracker — a fresh session continues from here. **No backwards
+> compat; on `main`.** Decisions below are firmer than the design sketch above
+> because they're checked against current code; where code disagrees with the
+> sketch, code wins and the divergence is noted. Tick a box and add a one-line
+> note when an item lands; record fresh decisions under *Decisions made in-flight*.
+
+## Where the code actually is (verified 2026-06-29)
+
+The doc above is the design; these are the corrections that survived a code sweep,
+and the plan is built on them:
+
+- The beat/clock lives in **`kaijutsu-server/src/beat.rs`** (2856 lines), *not* the
+  kernel. `BeatScheduler` holds `heap: BinaryHeap<(Instant, ContextId)>` (`:265`)
+  and `armed: HashMap<ContextId, BeatState>` (`:266`).
+- **The live playhead is NOT on `BeatState`.** It lives on the per-context
+  `Timeline` (`crates/kaijutsu-hyoushigi/src/engine.rs:156`), read live each beat
+  (`advance_to(playhead + STEP)`, `beat.rs:594`). `beat_state.playhead_tick` is only
+  the **SQLite recovery copy** the carry reads/writes. So "move the playhead to the
+  track" = move it off the per-context `Timeline`.
+- The fire-coordinate env vars are **un-prefixed** today: `$TICK/$PHRASE/$TEMPO/
+  $HEARD/$ROTATE_EVERY` (`beat.rs:139-156, 846-878`). The doc's `KJ_TICK/KJ_PULSE/
+  KJ_EPOCH_NS` **do not exist yet**. `KJ_PARENT_BLOCK_COUNT` is real but **fork-only**
+  (`kj/lifecycle.rs:452`), and is the precedent for the `KJ_` kernel-injection
+  convention we adopt.
+- **`track_head`, `halted_tracks`, `myaku` are docs-only** — zero code. Nothing to
+  delete there; `track_head` is retired before it was ever built.
+- **No `Track` entity, no `Attachment`, no `ClockSource`, no wakeup divisor** exist.
+  `TrackId` is a `String` newtype (`kaijutsu-types/src/track.rs:21`) carried as a
+  label on `BeatState` (`beat.rs:84`), `Cell` (`cell.rs:126`), and the block
+  (`block.rs:1334`). `ooda_every` is a single `BeatPolicy` field (`hyoushigi/
+  mod.rs:47`).
+- `BeatCommand` + `BeatPolicy` + `BeatAck` live in
+  `kaijutsu-kernel/src/hyoushigi/mod.rs:34-155`; `kj transport` in
+  `kaijutsu-kernel/src/kj/transport.rs`; `beat_state` DDL + `PersistedBeatState` +
+  CRUD + fork-copy in `kaijutsu-kernel/src/kernel_db.rs:615-681, 1466-1505,
+  3207-3336`.
+
+## The core data move
+
+| Today (per-context) | Stage 1 (per-track) |
+|---|---|
+| `heap: BinaryHeap<(Instant, ContextId)>` | `heap: BinaryHeap<(Instant, TrackId)>` — **one entry per track** |
+| `armed: HashMap<ContextId, BeatState>` | `tracks: HashMap<TrackId, TrackState>` |
+| live playhead on per-context `Timeline`; `beat_state.playhead_tick` recovery copy | playhead **owned on `TrackState`**; per-context `Timeline.playhead` slaved to it each beat (Stage-1 bridge) |
+| `beat_state` row keyed by `context_id` | new `tracks` (PK `track_id`) + `attachments` (track_id, context_id) tables; **drop `beat_state`** |
+
+```
+TrackState {                                  // runtime, in the scheduler (beat.rs)
+    clock:       ClockState,                  // period + next-fire (system clock; the ClockSource trait is Stage 3)
+    playhead:    Tick,                        // moved off the per-context Timeline
+    beat_count:  u64,
+    transport:   Playing | Stopped,
+    policy:      BeatPolicy,                   // period/beats_per_phrase/ooda_every — reused as-is
+    attached:    HashMap<ContextId, Attachment>,
+    materialize_failures, failure_water,       // carried over from BeatState
+}
+Attachment { wakeup: Cadence, rotate: Option<Cadence>, ooda_armed: bool, pulse: u64 }
+```
+
+## Work items (TDD throughout — tests that can and will fail)
+
+- [ ] **1. Types** (`kaijutsu-types` + `kernel/hyoushigi/mod.rs`). Add `Attachment`
+  + `Cadence` (a beat-divisor newtype) beside `BeatPolicy`. Reshape `BeatCommand`:
+  `Arm{…}` → **`Attach{track, ctx, attachment, policy_if_new}`** + **`Detach{track,
+  ctx}`**; `Play/Pause/Stop/SetTempo/SetOoda/SetRotate` re-key `ContextId` → **`TrackId`**.
+  *Tests:* command round-trip; attach-creates-track-once; divisor math.
+- [ ] **2. Scheduler re-key** (`beat.rs`, the bulk). `armed` → `tracks`; heap →
+  `(Instant, TrackId)`. `fire_due`/`process_one`: a track beats once → advance its
+  own playhead + `beat_count` → for each attached ctx whose `wakeup` divisor is due,
+  seed that ctx's `Timeline.playhead` from the track playhead, materialize, then
+  `fire_lifecycle(tick)`; rotate-due → `fire_rotate`. *Tests:* pause freezes /
+  resume at +1 (preserve existing behaviour); two attachments with different wakeup
+  divisors fire independently; stopped track = no heap entry.
+- [ ] **3. Retire the playhead-carry** (`beat.rs:295-435, 551-571`). Delete the
+  `from_log.max(carried)` seed dance, the persist-playhead-before-stop, and the
+  rotate-horizon defer. Track playhead persists once in its `tracks` row, never
+  leaves. **Preserve the carry's tests** re-pointed at "the clock stayed on the
+  track — continuity is free" (the carry is a stage-0 stepping stone whose tests
+  describe the target).
+- [ ] **4. Fork inheritance + re-bind** (`kernel_db.rs:1466-1505` + fork rc). At
+  fork, copy the child's `attachments` row like `beat_state` is copied today. Child
+  re-binds via an `Attach` from create/fork rc — the track never watches forks.
+  Rotation = child attaches to the **same** track (clock never pauses) + parent
+  detaches. No persist-before-stop, no horizon race. *Test:* rotation swaps the
+  playing binding with zero playhead discontinuity.
+- [ ] **5. Persistence** (`kernel_db.rs`). Drop `beat_state`; add
+  `tracks(track_id PK, period_ms, beats_per_phrase, ooda_every, playhead_tick,
+  transport)` + `attachments(track_id, context_id, wakeup_every,
+  rotate_every_phrases, ooda_armed)`. Cold-start re-arm sweep stays **deferred** (as
+  today: restart resets to stopped), but the shape supports it. *Test:* CRUD +
+  fork-copy of an attachment row.
+- [ ] **6. Transport surface** (`kj/transport.rs`). `arm` → `attach --track <name>
+  [--wakeup N] [--rotate N]`; add `detach`; `play/pause/stop/tempo/rotate` take
+  `--track <name>` (kaish does ctx→track lookup so `kj` stays crisp). *Test:* `stop
+  --track` halts one domain, leaves a sibling track running.
+- [ ] **7. Fire-coordinate env vars** (`beat.rs:139-156, 846-878` +
+  `assets/defaults/rc/musician/`). Rename to **`KJ_TICK/KJ_PHRASE/KJ_TEMPO/KJ_HEARD/
+  KJ_ROTATE_EVERY`**; add **`KJ_PULSE`** (per-attachment monotonic counter on
+  `Attachment.pulse`) + **`KJ_EPOCH_NS`** (one wall-clock reading shared across all
+  contexts woken on the same beat). Update `tick/S10-drive.kai` +
+  `rotate/S10-rotate.kai`. *Test:* two contexts woken on one beat see identical
+  `KJ_EPOCH_NS` and distinct monotonic `KJ_PULSE`.
+- [ ] **8. Docs** — flip Stage 1 boxes here as they land; devlog entry; update the
+  `hyoushigi.md` direction note when the clock has actually moved.
+
+## Decisions made in-flight
+
+- **Env vars adopt the `KJ_` prefix** (matching `KJ_PARENT_BLOCK_COUNT`) and gain
+  `KJ_PULSE` + `KJ_EPOCH_NS` (chosen 2026-06-29). No back-compat alias for the
+  un-prefixed names; the musician rc scripts move with them.
+- **Stage-1 bridge: the per-context `Timeline` still owns committed cells**; its
+  playhead is slaved to the track playhead each beat. This is the explicit seam
+  Stage 2 removes — keep it visible so the later cut is clean.
+- **Concurrent producers:** Stage 1 keeps "one *playing* binding per track; rotation
+  swaps it." A non-rotating read-mostly attachment is allowed but produces no score
+  yet (defers the design's open question).
+- **`Attachment.wakeup` subsumes `BeatPolicy.ooda_every`** (refinement, 2026-06-29).
+  The clean split that fell out of writing the spine: `BeatPolicy` is now purely
+  *track-level* musical knobs (`period` = tempo, `beats_per_phrase` = phrase length —
+  properties of the clock domain); the former `ooda_every` moves onto the per-context
+  `Attachment` as `wakeup: Cadence` (the divisor that fires the context's tick rc).
+  `ooda_armed` stays as the on/off gate. The **per-beat materialize is the track's own
+  work** (runs every beat for each producing attachment, independent of `wakeup`);
+  `wakeup` gates *only* the rc tick behaviour. So one track can wake a musician every
+  128 beats and a conductor every 1024 with no new machinery. `Cadence` is a divisor
+  newtype reused for both `wakeup` (beats) and `rotate` (phrases), unit documented per
+  field.
+- **Transport `Stop` = stop the clock only** (MIDI idiom, per design). The old
+  `Stop(ContextId)` also disarmed OODA ("clean stopped state"); the new `Stop(TrackId)`
+  only halts the clock — rotation is *suspended/remembered*, per-attachment `ooda_armed`
+  is untouched. Re-arming OODA is the separate `SetOoda` knob. The old `Disarm(ContextId)`
+  folds into **`Detach`** (a context unbinds; rotation's parent-side + archive both use it).
