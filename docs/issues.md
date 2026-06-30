@@ -1896,3 +1896,26 @@ in MIDI; `%%MIDI transpose`; short-form decorations H/T/u/v; aligned the dead
 
 **Verified NOT bugs (don't "fix"):** cross-octave accidental propagation (spec default
 `%%propagate-accidentals pitch` = all octaves); unit-length default; broken-rhythm multipliers.
+
+---
+
+## Players / loadout
+
+- **EXPLORE — give players a read-only kaish instead of "tool-free" (found 2026-06-30,
+  standing up the bass player).** Today a musician's loadout grants only `drive` and **no
+  tools at all**, because a small local model handed the full tool palette emits a thinking
+  block then *hangs* (GPU cold, no completion, no error — a fail-loud violation; the
+  hard-won Chameleon lesson, `project_chameleon_first_loop`). "Tool-free" was the blunt
+  fix. The better future: a **read-only kaish** loadout — the same RO-kaish posture kaibo
+  already uses (reads the repo, never mutates), which is *great* for cheap on-the-fly
+  arithmetic/lookups that are cheaper via a tool than via the model's weights (true for
+  humans and models alike). A player could compute bar math, transpositions, scale degrees,
+  etc. with RO kaish rather than burning weights or risking a wrong count. **Not wiring
+  this now** — the immediate bar-fill math is precomputed in the tick rc (kaish math in
+  `musician/tick/S10-drive.kai`, injected as spelled-out facts), so the model needs no tool.
+  But RO-kaish-for-players is worth designing: it removes the "tool palette = hang" cliff by
+  construction (no mutation surface to stall on) and makes the calculator-as-tool option
+  real. Pairs with the precompute-in-rc win (rc does the arithmetic) — RO kaish is the
+  *escape hatch* for math the rc didn't precompute. Decide: which RO builtins (math/`expr`,
+  read-only `grep`/`glob`, block/resource reads — but no mutation) + whether small local
+  models tolerate a *read-only* palette where they choke on the full one.
