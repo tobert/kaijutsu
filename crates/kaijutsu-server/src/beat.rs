@@ -48,6 +48,7 @@ use kaijutsu_types::{
     SessionId, Tick, TickDelta, TrackId, now_millis,
 };
 
+use crate::clock::{ClockSource, ClockSourceKind};
 use crate::rpc::ServerRegistry;
 
 /// Ticks the playhead advances per beat (PPQ 1: one tick per beat). The tick is
@@ -59,9 +60,17 @@ const STEP: TickDelta = TickDelta::new(1);
 /// track persists, contexts attach to be beaten by it and come and go. Keyed by
 /// [`TrackId`] in the scheduler's `tracks` map.
 struct TrackState {
-    /// The track's musical clock: beat period (tempo) + phrase length. Track-level
-    /// — the per-context wakeup cadence rides each [`AttachedContext`].
-    policy: BeatPolicy,
+    /// The track's clock source — what drives *when* it beats (Stage 3). The
+    /// SINGLE source of truth for the live beat period; `set_tempo` mutates it and
+    /// every period read goes through `clock.period()`, so there is no second,
+    /// stale copy. `SystemClock`-only this stage; `Modeled` (MIDI drift) lands at
+    /// M3. See [`crate::clock`].
+    clock: ClockSourceKind,
+    /// Beats per phrase — the only musical chunking knob above the beat. Lives
+    /// here (not on the clock — phrasing is not a clock concern); the live period
+    /// comes from `clock`. [`Self::phrasing`] rebuilds a [`BeatPolicy`] from the
+    /// two for the phrase-math helpers and `transport_vars`.
+    beats_per_phrase: u64,
     /// The clock switch. `false` = stopped/paused: no heap entry (quiescent),
     /// playhead frozen. A track is created stopped (no surprise tokens).
     playing: bool,
@@ -113,6 +122,19 @@ struct TrackState {
     /// The track holds this passive view; the *context* drives the bind (entity #3)
     /// and a forked child re-binds on the way up.
     attached: HashMap<ContextId, AttachedContext>,
+}
+
+impl TrackState {
+    /// Rebuild the [`BeatPolicy`] view (live period + phrasing) for the phrase-math
+    /// helpers and `transport_vars`. The period is pulled LIVE from `clock`, so this
+    /// view never goes stale against a `set_tempo` — there is no second period to
+    /// drift. Cheap: `BeatPolicy` is `Copy`.
+    fn phrasing(&self) -> BeatPolicy {
+        BeatPolicy {
+            period: self.clock.period(),
+            beats_per_phrase: self.beats_per_phrase,
+        }
+    }
 }
 
 /// One context's binding to a track. The [`Attachment`] is the durable/wire
@@ -529,7 +551,8 @@ impl BeatScheduler {
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
-                    policy,
+                    clock: ClockSourceKind::system(policy.period),
+                    beats_per_phrase: policy.beats_per_phrase,
                     playing: false,
                     generation: 0,
                     playhead: seed,
@@ -593,8 +616,8 @@ impl BeatScheduler {
         // non-negative; `Some(..)` once the track exists (it has a real playhead).
         let row = PersistedTrack {
             track_id: track_id.as_str().to_string(),
-            period_ms: track.policy.period.as_millis() as u64,
-            beats_per_phrase: track.policy.beats_per_phrase,
+            period_ms: track.clock.period().as_millis() as u64,
+            beats_per_phrase: track.beats_per_phrase,
             playhead_tick: Some(track.playhead.get()),
             playing: track.playing,
             score_context_id: Some(track.score_context),
@@ -654,7 +677,7 @@ impl BeatScheduler {
         track.playing = true;
         track.generation += 1; // invalidate any stale in-flight heap entry
         let generation = track.generation;
-        let period = track.policy.period;
+        let period = track.clock.period();
         self.heap.push(Reverse((now + period, track_id.clone(), generation)));
         let _ = self.persist_track(track_id);
     }
@@ -681,10 +704,14 @@ impl BeatScheduler {
         let _ = self.persist_track(track_id);
     }
 
-    /// Set a track's beat period (tempo). Takes effect on the next beat.
+    /// Set a track's beat period (tempo). Takes effect on the next beat. Routes to
+    /// the clock source (the single source of truth for the period). NOTE: the
+    /// armed track `Timeline`'s speculation `TickClock` is NOT yet re-slaved here —
+    /// that's WI 2 (`Timeline::set_clock`); today, as before Stage 3, the
+    /// speculation budget stays at its arm-time tempo until the track re-arms.
     pub fn set_tempo(&mut self, track_id: &TrackId, period: Duration) {
         if let Some(track) = self.tracks.get_mut(track_id) {
-            track.policy.period = period;
+            track.clock.set_period(period);
         }
         // Persist the new tempo so a restart recovers it (not the default).
         let _ = self.persist_track(track_id);
@@ -777,7 +804,7 @@ impl BeatScheduler {
             let Some((playing, period, cur_gen)) = self
                 .tracks
                 .get(&track_id)
-                .map(|tr| (tr.playing, tr.policy.period, tr.generation))
+                .map(|tr| (tr.playing, tr.clock.period(), tr.generation))
             else {
                 continue; // unknown/removed track → drop the stale entry
             };
@@ -820,7 +847,7 @@ impl BeatScheduler {
             track.beat_count += 1;
             track.last_epoch_ns = epoch_ns;
             let ids: Vec<ContextId> = track.attached.keys().cloned().collect();
-            (track.beat_count, track.playhead, track.policy, ids)
+            (track.beat_count, track.playhead, track.phrasing(), ids)
         };
         // Phase 2: per attached context — materialize, then answer the cadence. No
         // &mut tracks borrow is held across `materialize_one` (it re-borrows briefly).
@@ -1141,14 +1168,14 @@ impl BeatScheduler {
         };
         let playhead = track.playhead;
         let mut vars: HashMap<String, String> =
-            transport_vars(playhead, track.beat_count, &track.policy)
+            transport_vars(playhead, track.beat_count, &track.phrasing())
                 .into_iter()
                 .collect();
         // KJ_HEARD: the recent committed notation the player composes against — read
         // from the TRACK's score context now, so it's the real band view (the whole
         // lane across every producer + rotation), not just this context's own blocks.
         // A read failure degrades to an empty list (compose from the chart + now-facts).
-        let window = TickDelta::new((HEARD_WINDOW_PHRASES * track.policy.beats_per_phrase) as i64);
+        let window = TickDelta::new((HEARD_WINDOW_PHRASES * track.beats_per_phrase) as i64);
         let heard = self
             .documents
             .block_snapshots(track.score_context)
@@ -1258,7 +1285,7 @@ impl BeatScheduler {
             if !ac.attachment.ooda_armed {
                 return; // not an OODA-armed musician we manage
             }
-            track.policy.phrase_delta()
+            track.phrasing().phrase_delta()
         };
         // No output block → the turn produced no text; nothing to crystallize.
         let Some(block_id) = output_block_id else {

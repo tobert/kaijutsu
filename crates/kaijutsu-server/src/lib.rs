@@ -4,6 +4,7 @@
 
 pub mod auth_db;
 pub mod beat;
+pub mod clock;
 pub mod constants;
 pub mod interrupt;
 pub mod llm_stream;
