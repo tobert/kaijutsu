@@ -8,6 +8,7 @@ pub mod clock;
 pub mod constants;
 pub mod interrupt;
 pub mod llm_stream;
+pub mod render;
 pub mod rpc;
 pub mod sftp;
 pub mod ssh;

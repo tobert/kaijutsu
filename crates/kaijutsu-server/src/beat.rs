@@ -38,22 +38,40 @@ use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::hyoushigi::{
-    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Cadence, Cell, ContentRef,
+    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ContentRef,
     DeriverRegistry, MaterializeCursor, Span, materialize_committed, schedule_abc_cell,
 };
 use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
-use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
+use kaijutsu_kernel::{ContentStore, Kernel, KjCaller, KjDispatcher};
 use kaijutsu_types::{
     BlockSnapshot, ConsentMode, ContentType, ContextId, ContextState, DocKind, PrincipalId,
     SessionId, Tick, TickDelta, TrackId, now_millis,
 };
 
 use crate::clock::{ClockSource, ClockSourceKind};
+use crate::render::RenderTarget;
 use crate::rpc::ServerRegistry;
+
+/// The score's source-notation mime — the only content a render target consumes
+/// (matches `ABC_MIME` in the kernel bridge). A committed cell of any other mime
+/// is not handed to a (MIDI) render target.
+const ABC_MIME: &str = "text/vnd.abc";
 
 /// Ticks the playhead advances per beat (PPQ 1: one tick per beat). The tick is
 /// event-counted, so this is a pure increment, never scaled by elapsed time.
 const STEP: TickDelta = TickDelta::new(1);
+
+/// The local instant at which a committed cell starting at `start` should render,
+/// given the beat's jitter-free scheduled fire instant (`base`), the live beat
+/// `period`, and the current `playhead` (Stage 3 WI 4). A cell commits AHEAD of
+/// the playhead (the speculation lead), so `start ≥ playhead` → the instant is in
+/// the near future. A late or out-of-order `start` behind the playhead clamps to
+/// `base` (offset 0): a render is NEVER scheduled into the past (the `next_fire`
+/// MONOTONIC contract, applied at the render seam).
+fn render_instant(base: Instant, period: Duration, start: Tick, playhead: Tick) -> Instant {
+    let offset_beats = (start - playhead).get().max(0) as u32;
+    base + period * offset_beats
+}
 
 /// A track's beat bookkeeping — the **clock domain** (`docs/tracks.md`, Stage 1).
 /// The clock + playhead live HERE now, not on any one context's timeline: the
@@ -122,6 +140,18 @@ struct TrackState {
     /// The track holds this passive view; the *context* drives the bind (entity #3)
     /// and a forked child re-binds on the way up.
     attached: HashMap<ContextId, AttachedContext>,
+    /// The beat's *scheduled* fire instant (the heap entry's `t`), latched in
+    /// [`fire_due`] right after the pop — BEFORE `process_track`/`materialize_track`
+    /// run. This is the jitter-free reference a render target schedules off: NOT
+    /// the `SystemTime`-derived `last_epoch_ns` (the jittery *actual* wakeup), so
+    /// per-beat scheduler jitter never accumulates into the output (Stage 3 review).
+    /// Init'd to `now` at create; overwritten on the first beat before any emit.
+    last_fire_scheduled: Instant,
+    /// Render targets — consumers of the committed score (Stage 3). Fed from the
+    /// materialize crossing (`materialize_track`): each newly-crossed `Concrete` ABC
+    /// cell's resolved ABC + local instant is handed to every target. Empty by
+    /// default (the common case), so a track with no render incurs zero overhead.
+    render_targets: Vec<Box<dyn RenderTarget>>,
 }
 
 impl TrackState {
@@ -415,8 +445,6 @@ impl BeatScheduler {
     /// a later fallback resolves them. A fresh track (empty score context) yields an
     /// empty log — a clean no-op.
     fn reconstruct_score_cells(&self, score_ctx: ContextId, track_id: &TrackId) -> Vec<Cell> {
-        // The score's source notation mime (matches `ABC_MIME` in the kernel bridge).
-        const ABC_MIME: &str = "text/vnd.abc";
         let Ok(blocks) = self.documents.block_snapshots(score_ctx) else {
             return Vec::new();
         };
@@ -588,6 +616,8 @@ impl BeatScheduler {
                     materialize_failures: 0,
                     failure_water: 0,
                     attached: HashMap::new(),
+                    last_fire_scheduled: Instant::now(),
+                    render_targets: Vec::new(),
                 },
             );
         }
@@ -715,6 +745,14 @@ impl BeatScheduler {
     pub fn pause(&mut self, track_id: &TrackId) {
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.playing = false;
+            // The speculation lead means a render target's device queue holds ~a
+            // phrase of FUTURE events; the clock stopping won't unschedule them.
+            // Truncate everything after `now` + silence sounding notes (Stage 3
+            // review SEV-1), so a pause doesn't blindly play the buffered phrase.
+            let now = Instant::now();
+            for target in track.render_targets.iter_mut() {
+                target.flush_scheduled_after(now);
+            }
         }
         let _ = self.persist_track(track_id);
     }
@@ -728,6 +766,13 @@ impl BeatScheduler {
     pub fn stop(&mut self, track_id: &TrackId) {
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.playing = false;
+            // Same as `pause`: truncate the render targets' buffered (lead-time)
+            // events past `now` so a stop doesn't play out ~a phrase of queued
+            // notes + leave them hanging (Stage 3 review SEV-1).
+            let now = Instant::now();
+            for target in track.render_targets.iter_mut() {
+                target.flush_scheduled_after(now);
+            }
         }
         let _ = self.persist_track(track_id);
     }
@@ -859,6 +904,12 @@ impl BeatScheduler {
             }
             if generation != cur_gen {
                 continue; // a later `play` re-enlisted the track → this entry is stale
+            }
+            // Latch the SCHEDULED fire instant (`t`, the heap entry's deadline) BEFORE
+            // processing — this is the jitter-free reference the render seam schedules
+            // off, not the late actual wakeup `now` (Stage 3 review, deepseek).
+            if let Some(tr) = self.tracks.get_mut(&track_id) {
+                tr.last_fire_scheduled = t;
             }
             self.process_track(&track_id, &mut outcome);
             // Re-arm the TRACK's next beat under the SAME generation (a normal beat
@@ -1026,6 +1077,10 @@ impl BeatScheduler {
                     t.cursor = cursor;
                     t.materialize_failures = 0; // a clean beat clears the poison count
                 }
+                // Hand the cells that just crossed the write barrier to the track's
+                // render targets (Stage 3 WI 4). No-op (and no CAS reads) when the
+                // track has none — the common case.
+                self.emit_to_render_targets(track_id, hw_before, cursor.high_water, playhead);
             }
             Err(e) => {
                 if let Some(t) = self.tracks.get_mut(track_id) {
@@ -1110,6 +1165,127 @@ impl BeatScheduler {
                 None => log::error!(
                     "beat: poison-skip for {target} at high_water={skipped_hw} found no anchor block"
                 ),
+            }
+        }
+    }
+
+    /// Register a render target (a score *consumer*) on a track (Stage 3 WI 4).
+    /// The target is fed from the materialize crossing — newly-committed ABC cells
+    /// + their near-future instants. A no-op on an unknown track.
+    pub fn add_render_target(&mut self, track_id: &TrackId, target: Box<dyn RenderTarget>) {
+        match self.tracks.get_mut(track_id) {
+            Some(track) => track.render_targets.push(target),
+            None => log::warn!(
+                "beat: add_render_target on unknown track {} ignored",
+                track_id.as_str()
+            ),
+        }
+    }
+
+    /// Hand the cells that crossed the write barrier this beat (`[hw_before,
+    /// hw_after)` in the track's committed log) to every render target (Stage 3 WI
+    /// 4). A render target is a score *consumer*: it receives the **pre-resolved**
+    /// ABC `&str` (so it never re-hits CAS) and the cell's near-future local
+    /// `Instant`. Cheap exit (no CAS reads) when the track has no targets — the
+    /// common case. The materialize crossing already stored every crossed cell's
+    /// source bytes in durable CAS, so a single `retrieve` per cell here resolves
+    /// the ABC once for ALL targets.
+    fn emit_to_render_targets(
+        &mut self,
+        track_id: &TrackId,
+        hw_before: usize,
+        hw_after: usize,
+        playhead: Tick,
+    ) {
+        if hw_after <= hw_before {
+            return; // nothing crossed this beat
+        }
+        // Zero work + zero CAS reads when no target is attached.
+        let has_targets = self
+            .tracks
+            .get(track_id)
+            .is_some_and(|t| !t.render_targets.is_empty());
+        if !has_targets {
+            return;
+        }
+        let Some(timeline) = self.kernel.track_timeline(track_id) else {
+            return;
+        };
+        // Snapshot the newly-crossed cells' content refs + start ticks under the
+        // lock; resolve the bytes afterwards (the lock is for the committed slice,
+        // not the CAS read).
+        let crossed: Vec<(ContentRef, Tick)> = {
+            let g = timeline.lock();
+            let committed = g.committed();
+            (hw_before..hw_after)
+                .filter_map(|i| committed.get(i))
+                .filter_map(|cell| match &cell.body {
+                    Body::Concrete(cref) => Some((cref.clone(), cell.span.start)),
+                    // A committed cell is always concrete (timeline invariant); a
+                    // non-concrete one would already have failed materialize above.
+                    Body::Deferred(_) => None,
+                })
+                .collect()
+        };
+        // The jitter-free reference + the live period: `at = scheduled fire instant
+        // + (cell.start − playhead) beats × period`. Cells commit AHEAD of the
+        // playhead (the speculation lead), so the offset is ≥ 0 → `at` is in the
+        // near future; clamp at 0 so a render is NEVER scheduled into the past.
+        let Some((period, base)) = self
+            .tracks
+            .get(track_id)
+            .map(|t| (t.clock.period(), t.last_fire_scheduled))
+        else {
+            return;
+        };
+        let cas = self.kernel.cas().clone();
+        let mut rendered: Vec<(String, Instant)> = Vec::with_capacity(crossed.len());
+        for (cref, start) in crossed {
+            if cref.mime != ABC_MIME {
+                continue; // only ABC is handed to a (MIDI) render target this stage
+            }
+            let bytes = match cas.retrieve(&cref.hash) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    log::error!(
+                        "beat: render of track {} skipped a cell — its source bytes \
+                         ({}) are missing from durable CAS",
+                        track_id.as_str(),
+                        cref.hash.as_str()
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::error!(
+                        "beat: render of track {} skipped a cell — durable CAS read \
+                         for {} failed: {e}",
+                        track_id.as_str(),
+                        cref.hash.as_str()
+                    );
+                    continue;
+                }
+            };
+            let abc = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!(
+                        "beat: render of track {} skipped a cell — source is not UTF-8 \
+                         ABC: {e}",
+                        track_id.as_str()
+                    );
+                    continue;
+                }
+            };
+            rendered.push((abc, render_instant(base, period, start, playhead)));
+        }
+        if rendered.is_empty() {
+            return;
+        }
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            for (abc, at) in &rendered {
+                for target in track.render_targets.iter_mut() {
+                    target.emit(abc, *at);
+                }
             }
         }
     }
@@ -1633,8 +1809,10 @@ mod tests {
 
     use super::BeatScheduler;
     use super::{
-        MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json, poison_action, transport_vars,
+        MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json, poison_action, render_instant,
+        transport_vars,
     };
+    use crate::render::RenderTarget;
     use kaijutsu_types::{
         BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, Role as BlockRole,
     };
@@ -3545,6 +3723,138 @@ mod tests {
             errors(&documents),
             1,
             "the skipped poison cell surfaces ONE Error block, not one per later beat"
+        );
+    }
+
+    /// Stage 3 WI 4: the `at` arithmetic in isolation. A cell starting `n` beats
+    /// ahead of the playhead renders `n × period` after the jitter-free base; a
+    /// cell at or behind the playhead clamps to the base (never the past).
+    #[test]
+    fn render_instant_offsets_by_lead_and_clamps_at_zero() {
+        let base = Instant::now();
+        let period = Duration::from_millis(500);
+        // 3 beats ahead → base + 1500 ms.
+        assert_eq!(
+            render_instant(base, period, Tick::new(8), Tick::new(5)),
+            base + Duration::from_millis(1500)
+        );
+        // Exactly at the playhead → base (offset 0).
+        assert_eq!(render_instant(base, period, Tick::new(5), Tick::new(5)), base);
+        // Behind the playhead (shouldn't happen for a fresh commit) → clamped to base.
+        assert_eq!(render_instant(base, period, Tick::new(3), Tick::new(5)), base);
+    }
+
+    /// A resolver that commits a fixed, valid (derivable) ABC phrase under the ABC
+    /// mime — so its cells materialize cleanly and reach the render seam (unlike
+    /// `GarbageAbc`, which wedges derivation).
+    struct ValidAbc;
+    impl Resolver for ValidAbc {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("valid_abc")
+        }
+        fn estimate_cost(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::ZERO
+        }
+        fn compute_basis(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"stable")
+        }
+        fn resolve(
+            &self,
+            _p: &serde_json::Value,
+            _c: &dyn ResolverCtx,
+        ) -> Result<Resolution, ResolveError> {
+            Ok(Resolution::new(b"X:1\nK:C\nCDEF|\n".to_vec(), "text/vnd.abc"))
+        }
+    }
+
+    /// A render target that records every `emit`/`flush_scheduled_after` call, so a
+    /// test can inspect what the materialize crossing handed it.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        emits: Arc<std::sync::Mutex<Vec<(String, Instant)>>>,
+        flushes: Arc<std::sync::Mutex<Vec<Instant>>>,
+    }
+    impl RenderTarget for Recorder {
+        fn emit(&mut self, abc: &str, at: Instant) {
+            self.emits.lock().unwrap().push((abc.to_string(), at));
+        }
+        fn flush_scheduled_after(&mut self, at: Instant) {
+            self.flushes.lock().unwrap().push(at);
+        }
+    }
+
+    /// Stage 3 WI 4 end-to-end: a render target attached to a track receives one
+    /// `emit` per committed cell, in commit order, with the resolved ABC; the `at`
+    /// is the beat's SCHEDULED fire instant — jitter-free, NOT the (deliberately
+    /// late) actual wakeup `now`; and `stop` calls `flush_scheduled_after`.
+    #[tokio::test]
+    async fn render_target_gets_committed_cells_jitter_free_and_flush_on_stop() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let track = TrackId::solo();
+
+        // Marker clock (commit-margin 0: a cell commits when the playhead reaches its
+        // tick) + a resolver that commits valid ABC. Two cells at ticks 1 and 2.
+        let tl = kernel.arm_track_timeline(
+            track.clone(),
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(ValidAbc));
+            for t in 1..=2 {
+                g.schedule(Cell::deferred_on(
+                    Span::instant(Tick::new(t)),
+                    Recipe {
+                        resolver: ResolverId::new("valid_abc"),
+                        params: serde_json::Value::Null,
+                        query: ContextQuery::default(),
+                        fallback: Fallback::Skip,
+                    },
+                    track.clone(),
+                    PrincipalId::beat(),
+                ))
+                .unwrap();
+            }
+        }
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        // slow_policy → 1 s period; clock.period() drives the render `at`.
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let rec = Recorder::default();
+        sched.add_render_target(&track, Box::new(rec.clone()));
+
+        sched.play(&track, base); // first beat scheduled at base + 1 s
+        // Fire beat 1 LATE: the scheduled instant was base + 1 s; we wake at base + 5 s.
+        sched.fire_due(base + Duration::from_secs(5));
+        // Beat 1 re-pushed at now + period = base + 6 s; fire it (late again).
+        sched.fire_due(base + Duration::from_secs(10));
+
+        let emits = rec.emits.lock().unwrap().clone();
+        assert_eq!(emits.len(), 2, "one emit per committed cell");
+        assert_eq!(emits[0].0, "X:1\nK:C\nCDEF|\n", "emit carries the resolved ABC");
+        assert_eq!(emits[1].0, "X:1\nK:C\nCDEF|\n");
+        // Cell 1 committed on beat 1 (playhead 1 = its tick → offset 0): its `at` is
+        // the SCHEDULED fire instant base + 1 s, NOT the late wakeup base + 5 s.
+        assert_eq!(
+            emits[0].1,
+            base + Duration::from_secs(1),
+            "render `at` tracks the scheduled fire instant, not the jittery late wakeup"
+        );
+        // Beat 2 was scheduled at base + 6 s (beat 1's re-push at its late `now`).
+        assert_eq!(emits[1].1, base + Duration::from_secs(6));
+
+        // Stop truncates the render target's lead-time queue exactly once.
+        assert!(rec.flushes.lock().unwrap().is_empty(), "no flush before stop");
+        sched.stop(&track);
+        assert_eq!(
+            rec.flushes.lock().unwrap().len(),
+            1,
+            "stop calls flush_scheduled_after on the render target (truncate the buffered phrase)"
         );
     }
 

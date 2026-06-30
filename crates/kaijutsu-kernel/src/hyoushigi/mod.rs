@@ -16,8 +16,8 @@ use std::time::Duration;
 use kaijutsu_abc::ParseMode;
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_hyoushigi::{
-    Body, ContextHash, ContextQuery, Fallback, Recipe, ResolveError, Resolution, Resolver,
-    ResolverCtx, ResolverId, TickDelta, Timeline,
+    ContextHash, ContextQuery, Fallback, Recipe, ResolveError, Resolution, Resolver, ResolverCtx,
+    ResolverId, TickDelta, Timeline,
 };
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId, Role, TrackId,
@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 // Re-export the hyoushigi cell primitives the server's beat scheduler needs to
 // reconstruct a track's committed log (Stage 2 WI 7) — so `kaijutsu-server` reaches
 // them through this façade like the rest of the beat types, not a direct dep.
-pub use kaijutsu_hyoushigi::{Cell, ContentRef, Span};
+pub use kaijutsu_hyoushigi::{Body, Cell, ContentRef, Span};
 
 use crate::block_store::SharedBlockStore;
 use crate::kernel::Kernel;
