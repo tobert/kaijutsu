@@ -15,10 +15,13 @@ Minimal valid tune:
 X:1
 T:phrase
 M:4/4
-L:1/8
+L:1/4
 K:C
-C2 E2 G2 c2 | G4 z4 |
+C E G c | G E C C |
 ```
+
+With `L:1/4` (the simplest grid for keeping time) a bare note letter is exactly
+**one beat** — write one note per beat, four per `4/4` bar, no length numbers.
 
 (The fenced example above is for your reference only — do not emit the fences.)
 
