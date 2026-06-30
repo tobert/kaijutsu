@@ -705,13 +705,20 @@ impl BeatScheduler {
     }
 
     /// Set a track's beat period (tempo). Takes effect on the next beat. Routes to
-    /// the clock source (the single source of truth for the period). NOTE: the
-    /// armed track `Timeline`'s speculation `TickClock` is NOT yet re-slaved here —
-    /// that's WI 2 (`Timeline::set_clock`); today, as before Stage 3, the
-    /// speculation budget stays at its arm-time tempo until the track re-arms.
+    /// the clock source (the single source of truth for the period) AND re-slaves
+    /// the armed track `Timeline`'s speculation `TickClock` (WI 2) so the lead can't
+    /// go stale against the new firing period — a sped-up clock would otherwise
+    /// under-lead and wedge the fallback. The new `TickClock` is derived from the
+    /// now-updated live period via `phrasing().clock()`.
     pub fn set_tempo(&mut self, track_id: &TrackId, period: Duration) {
-        if let Some(track) = self.tracks.get_mut(track_id) {
+        let new_tick_clock = self.tracks.get_mut(track_id).map(|track| {
             track.clock.set_period(period);
+            track.phrasing().clock()
+        });
+        if let Some(tick_clock) = new_tick_clock {
+            if let Some(tl) = self.kernel.track_timeline(track_id) {
+                tl.lock().set_clock(tick_clock);
+            }
         }
         // Persist the new tempo so a restart recovers it (not the default).
         let _ = self.persist_track(track_id);
@@ -1911,6 +1918,35 @@ mod tests {
         sched.detach(&track_id, ctx);
         let out = sched.fire_due(base + Duration::from_secs(6));
         assert!(out.fired.is_empty(), "detached → context no longer fires");
+    }
+
+    /// `set_tempo` re-slaves the armed track timeline's speculation `TickClock`
+    /// (WI 2), not just the clock source — so a tempo change can't leave the lead
+    /// stale and wedge the fallback.
+    #[tokio::test]
+    async fn set_tempo_reslaves_the_track_timeline_clock() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track_id = TrackId::solo();
+        // attach arms the track timeline from slow_policy()'s 1s period → 1 tick/sec.
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        assert_eq!(
+            kernel.track_timeline(&track_id).unwrap().lock().clock_for_test().ticks_per_sec,
+            1.0,
+            "armed at the 1s policy period",
+        );
+
+        // Quadruple the tempo (250 ms/beat): both the clock source AND the timeline's
+        // speculation clock must move to 4 ticks/sec.
+        sched.set_tempo(&track_id, Duration::from_millis(250));
+        assert_eq!(
+            kernel.track_timeline(&track_id).unwrap().lock().clock_for_test().ticks_per_sec,
+            4.0,
+            "set_tempo slaved the new TickClock down to the track timeline",
+        );
     }
 
     /// Pause freezes the track playhead; resume picks up at +1 with no wall-clock

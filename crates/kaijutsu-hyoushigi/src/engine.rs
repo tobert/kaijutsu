@@ -195,6 +195,35 @@ impl Timeline {
         self.resolvers.insert(resolver.id().0, resolver);
     }
 
+    /// Re-slave the speculation [`TickClock`] (WI 2, docs/tracks.md Stage 3). A
+    /// track's firing tempo can change mid-flight (`kj transport tempo`, or — at
+    /// M3 — a drift estimate). The `TickClock` converts a resolver's wall-clock
+    /// `estimate_cost` into the tick lead a cell speculates at and the tick it must
+    /// commit by; if it stays at the arm-time tempo while the firing period
+    /// changes, the lead goes stale — a sped-up clock under-leads, cells miss
+    /// their commit deadline, and the fallback pool wedges. So a tempo change MUST
+    /// push the new clock down here. Affects cells scheduled AFTER this call; cells
+    /// already in the open future keep the deadlines they were sized under (the
+    /// tempo in force when they were scheduled — re-pricing a half-led cell would
+    /// be the corruption we avoid).
+    pub fn set_clock(&mut self, clock: TickClock) {
+        self.clock = clock;
+    }
+
+    /// TEST-ONLY: the `speculate_at` tick of the Nth open-future cell, so a test
+    /// can assert [`set_clock`](Self::set_clock) re-derived the speculation lead.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn scheduled_speculate_at(&self, idx: usize) -> Option<Tick> {
+        self.future.get(idx).map(|s| s.speculate_at)
+    }
+
+    /// TEST-ONLY: the timeline's current speculation [`TickClock`], so a kernel/
+    /// scheduler test can assert a tempo change slaved the new clock down here.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn clock_for_test(&self) -> TickClock {
+        self.clock
+    }
+
     /// Poke the ambient context — what a real beat / environment / sibling event
     /// would mutate between turns. Changing this between a speculate and its
     /// commit is what drives a squash.
@@ -756,6 +785,50 @@ mod tests {
             }
             _ => panic!("committed cell must be concrete"),
         }
+    }
+
+    /// `set_clock` re-derives the speculation lead for cells scheduled after it
+    /// (WI 2): a faster clock leads further ahead in ticks for the same wall-clock
+    /// estimate, so the same `start` speculates earlier. Cells already in the open
+    /// future keep their original lead.
+    #[test]
+    fn set_clock_reslaves_the_speculation_lead() {
+        // Clock A: 1 tick/sec, safety 2.0 → est 3s ⇒ lead beats_for(6s)=6 ⇒
+        // a cell at start=100 speculates at 94.
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(2),
+        });
+        tl.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_secs(3),
+        }));
+        tl.schedule(deferred_at(100, Fallback::Skip)).unwrap();
+        assert_eq!(
+            tl.scheduled_speculate_at(0),
+            Some(Tick::new(94)),
+            "clock A: speculate_at = start(100) − lead(6)"
+        );
+
+        // Faster clock B: 2 ticks/sec → est 3s ⇒ lead beats_for(6s)=12 ⇒ a cell at
+        // start=101 speculates at 89. Proves the new schedule used B, not stale A.
+        tl.set_clock(TickClock {
+            ticks_per_sec: 2.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(2),
+        });
+        tl.schedule(deferred_at(101, Fallback::Skip)).unwrap();
+        assert_eq!(
+            tl.scheduled_speculate_at(1),
+            Some(Tick::new(89)),
+            "clock B re-slaved: speculate_at = start(101) − lead(12)"
+        );
+        // The pre-existing cell kept clock A's lead — not re-priced mid-flight.
+        assert_eq!(
+            tl.scheduled_speculate_at(0),
+            Some(Tick::new(94)),
+            "already-scheduled cell keeps its original lead"
+        );
     }
 
     /// Squash with no recovery budget → the required fallback fires. The miss is
