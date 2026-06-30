@@ -1299,24 +1299,35 @@ abc 137; full workspace builds). The track has a sound output. Commits:
 - The `alsa` `MidiEvent` encoder isn't `Send`, so it's constructed per-`emit` (one
   alloc per phrase, beats apart) rather than stored on `AlsaMidiOut`.
 
-**`kj transport render` — the attach surface (landed 2026-06-30, after the WI list).**
-`kj transport render --track <t> [--to alsa-midi] [--port <name>]` attaches a render
-target to a track: it sends a `BeatCommand::AddRenderTarget { track, RenderTargetSpec }`
-(spec is data-only, kernel-side; the server's scheduler constructs the concrete
-`AlsaMidiOut` so the `alsa` FFI stays out of the kernel crate), and `apply_command`
-opens the seq port + registers it — surfacing an ALSA open failure as a loud `BeatAck`
-Err, never a silent no-op. `--to` is the forward-looking extension point (an unknown
-kind is refused loudly; `docs/pcm.md`'s PCM target is the planned sibling that joins via
-`--to pcm`); `--port` defaults to the track name (so `aconnect -l` shows
-`kaijutsu:<track>`). Additive — a track can carry several targets. Tests: transport
-dispatch builds the right command (`transport_render_builds_alsa_midi_add_render_target`,
-default-port + unknown-kind), beat `add_render_target_on_unknown_track_is_loud_err`
-(CI-safe — checks the track before opening ALSA), and an `#[ignore]` live e2e
-(`add_render_target_then_beat_plays_through_alsa`) **verified on zorak**: the command
-path attaches an out, a beat commits an ABC cell, and NoteOns reach a subscribed reader.
+**`kj transport render` — the attach/detach surface (landed 2026-06-30, after the WI
+list; live-verified on zorak).** One verb, keyed by the seq port name:
+
+```
+kj transport render --track <t> [--to alsa-midi] [--port <name>]  # attach (additive)
+kj transport render --track <t> --off [--port <name>]             # detach one, or all
+kj transport render --track <t> --replace [--port <name>]         # clear all, then add
+```
+
+It sends a `BeatCommand::RenderTarget { track, op }` where `op` is `Add(spec)` /
+`Replace(spec)` / `Remove { id }` (spec/op are data-only, kernel-side; the server's
+scheduler constructs the concrete `AlsaMidiOut`, so the `alsa` FFI stays out of the
+kernel crate). `apply_command` opens the seq port + registers it under its id (the port
+name) — an ALSA open failure is a loud `BeatAck` Err, never a silent no-op. Detach
+properties that matter: a removed target is **silenced** (`flush_scheduled_after` →
+truncate its queued lead-time phrase + all-notes-off) *before* it's dropped, so no
+hanging notes on subscribers; `--replace` builds the new target *before* clearing the
+old ones (a failed open leaves working output intact); removing a missing id / on an
+empty track is a loud Err; `--off`/`--replace` are clap-conflicting. `--to` is the
+forward-looking extension point (unknown kind refused loudly; `docs/pcm.md`'s PCM target
+joins via `--to pcm`); `--port` defaults to the track name (`aconnect -l` shows
+`kaijutsu:<track>`). Tests: transport dispatch for add / default-port / unknown-kind /
+`--off` (by-port + all) / `--replace`; beat `add_render_target_on_unknown_track_is_loud_err`
++ `remove_render_targets_by_id_and_all_silences_and_reports` (CI-safe, fake targets); and
+two `#[ignore]` live ALSA tests (loopback + `add_render_target_then_beat_plays_through_alsa`)
+**verified on zorak**, plus a live walk of attach→`--off`→`--replace` against
+`/proc/asound/seq/clients`.
 
 **Still ahead (out of M1 scope):** M2 (input telemetry), M3 (the drift-modeled
 clock-in — the real `apply_estimate` producer + the heap-re-enlistment hook the trait
-is already shaped for), M4 (cross-node + edge node) per `docs/midi.md`; a *detach*/replace
-verb for render targets (attach is additive; no removal surface yet). Also still pending
+is already shaped for), M4 (cross-node + edge node) per `docs/midi.md`. Also still pending
 from earlier stages: a real-kernel live-verify of the Stage 2 score-context path.

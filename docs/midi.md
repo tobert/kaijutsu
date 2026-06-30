@@ -185,11 +185,12 @@ real KSP / loft node in later.
   real target (`AlsaMidiOut`, relative real-time queue scheduling) both landed; the
   ALSA loopback ran live on zorak. The lead-covers-scheduling property holds by
   construction (cells commit ahead → `at` is in the near future). Canonical record:
-  `tracks.md` "Status — M1 landed". The attach surface landed too:
-  **`kj transport render --track <t> [--to alsa-midi] [--port <name>]`** opens the seq
-  port and registers the target (a `BeatCommand::AddRenderTarget`); live-verified on
-  zorak end-to-end (command → beat → NoteOns at a subscribed reader). A
-  detach/replace verb is still TODO.
+  `tracks.md` "Status — M1 landed". The full attach/detach surface landed too:
+  **`kj transport render --track <t> [--to alsa-midi] [--port <name>]`** to attach,
+  **`--off [--port]`** to detach one or all (silencing the removed target first),
+  **`--replace`** to clear-then-add (`BeatCommand::RenderTarget { Add|Replace|Remove }`).
+  Live-verified on zorak end-to-end (command → beat → NoteOns at a subscribed reader,
+  and an attach→off→replace walk against `/proc/asound/seq/clients`).
 - **M2 — Input telemetry, batched.** Capture a local (virtual then real) MIDI in,
   timestamp with ALSA, batch into a MIDI-in track as score blocks over RPC.
   Snapshot = the track-scoped windowed read.
