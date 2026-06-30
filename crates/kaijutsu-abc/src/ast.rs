@@ -487,9 +487,11 @@ impl Duration {
         }
     }
 
-    /// Convert to MIDI ticks given ticks per unit note
+    /// Convert to MIDI ticks given ticks per unit note. A zero denominator can
+    /// only arise from malformed input (e.g. `A/0`); treat it as 1 rather than
+    /// dividing by zero — a parser over untrusted ABC must not panic.
     pub fn to_ticks(&self, ticks_per_unit: u32) -> u32 {
-        (ticks_per_unit * self.numerator as u32) / self.denominator as u32
+        (ticks_per_unit * self.numerator as u32) / (self.denominator.max(1) as u32)
     }
 
     /// Multiply duration by an integer

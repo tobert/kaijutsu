@@ -690,3 +690,15 @@ selecting per pass). The variant-ending fix needed the bar tokenizer normalized 
 Remaining open items (MED/LOW) recorded in `docs/issues.md`; engrave has its own copies of
 the tuplet + key-signature bugs to revisit when we turn to rendering. Next: Round 2 — deeper
 edge-case / round-trip / malformed-input testing — then rendering.
+
+### 2026-06-30 — abc Round 2: reliability test net (+ a div-by-zero the fuzz caught)
+
+Added `tests/robustness.rs`: the parse→to_midi→to_abc→parse pipeline must never
+panic on adversarial input, NoteOns/NoteOffs must balance (no hung notes) across
+ties/slurs/chords/tuplets/repeats/endings, the SMF must be well-framed (incl.
+multi-voice format-1), and round-trips must preserve the pitch sequence. The
+adversarial corpus immediately found a real divide-by-zero: `L:1/0` (and `M:0/0`,
+`A/0`) carried a zero denominator into the tick math. Guarded all four tick-math
+sites — a parser over untrusted ABC must degrade, not panic. Also ratcheted the
+spec-fixture warning baseline 59 → 49 (the `A//` and `|2`/`:|N` fixes removed
+unknown-character warnings). Suite now 340 green.

@@ -363,7 +363,7 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                     // Each inner element's duration scales by q/p. Notes, rests
                     // AND chords all participate — a dropped rest/chord would
                     // shorten the tuplet and start later notes early (ABC §4.13).
-                    let (q, p) = (tuplet.q as u32, tuplet.p as u32);
+                    let (q, p) = (tuplet.q as u32, (tuplet.p as u32).max(1)); // p=0 only on malformed input
                     for elem in &tuplet.elements {
                         match elem {
                             Element::Note(note) => {
@@ -565,7 +565,7 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                 Element::Tuplet(tuplet) => {
                     // Notes, rests and chords inside the tuplet all scale by q/p
                     // (ABC §4.13); dropping rests/chords corrupts timing.
-                    let (q, p) = (tuplet.q as u32, tuplet.p as u32);
+                    let (q, p) = (tuplet.q as u32, (tuplet.p as u32).max(1)); // p=0 only on malformed input
                     for elem in &tuplet.elements {
                         match elem {
                             Element::Note(note) => {
@@ -799,7 +799,8 @@ fn key_signature_accidentals(key: &Key) -> (i8, bool) {
 /// ABC v2.1 §4.5. NB: must use the denominator — `6/8` is 3 quarters, not 6.
 fn meter_bar_ticks(meter: Option<&crate::ast::Meter>, ticks_per_beat: u16) -> u32 {
     let (num, den) = meter.map(|m| m.to_fraction()).unwrap_or((4, 4));
-    (ticks_per_beat as u32 * 4 * num as u32) / den as u32
+    // `den` is 0 only for a malformed meter like `M:0/0`; clamp to avoid a panic.
+    (ticks_per_beat as u32 * 4 * num as u32) / (den.max(1) as u32)
 }
 
 /// Compute MIDI ticks per ABC unit note
@@ -808,7 +809,8 @@ fn compute_unit_ticks(unit_length: &UnitLength, ticks_per_beat: u16) -> u32 {
     // ticks_per_beat is ticks per quarter note
     // So ticks per whole note = ticks_per_beat * 4
     let ticks_per_whole = ticks_per_beat as u32 * 4;
-    (ticks_per_whole * unit_length.numerator as u32) / unit_length.denominator as u32
+    // A 0 denominator only comes from malformed input (`L:1/0`); clamp to 1.
+    (ticks_per_whole * unit_length.numerator as u32) / (unit_length.denominator.max(1) as u32)
 }
 
 /// MIDI file writer

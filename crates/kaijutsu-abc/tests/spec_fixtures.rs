@@ -53,7 +53,10 @@ use std::path::{Path, PathBuf};
 ///    107 — file-header inheritance per §2.2 (no net change in count
 ///          but eliminates the phantom-tune-0 from pre-X content)
 ///     59 — fixture curation: §4-9/04 (pseudo-syntax), §5-1/04 prose
-const MAX_TOTAL_WARNINGS: usize = 59;
+///     49 — spec-conformance round: `A//`/`///` durations parse (§4.3),
+///          `|2`/`:|N` variant-ending bars labelled (§4.9-4.10) — both
+///          previously hit the unknown-character fallback and warned
+const MAX_TOTAL_WARNINGS: usize = 49;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {
