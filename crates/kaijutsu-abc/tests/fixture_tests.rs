@@ -815,17 +815,15 @@ K:C
         .any(|e| matches!(e, kaijutsu_abc::Element::GraceNotes { .. }));
     assert!(has_grace, "Should have parsed grace notes");
 
-    // Note: Grace notes are currently NOT rendered to MIDI
-    // This test documents the current behavior - MIDI only has the main notes
-    let midi = to_midi(&result.value[0],&MidiParams::default());
+    // Grace notes {ga} now sound (stealing time from the principal note c),
+    // so MIDI carries 2 grace + 4 main = 6 NoteOns. §4.20.
+    let midi = to_midi(&result.value[0], &MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
-
-    // Currently only main notes (c, d, e, f) are in MIDI, grace notes are skipped
     assert_eq!(
         notes.len(),
-        4,
-        "MIDI has 4 main notes (grace notes not rendered)"
+        6,
+        "2 gracenotes + 4 main notes sound"
     );
 }
 

@@ -1874,9 +1874,6 @@ not `#`/`b`); first/second/`[N` variant-ending expansion (+ `|2`/`:|N` parser la
 `K:` `transpose=`/`octave=`.
 
 **Still open:**
-- **LOW — grace notes dropped from MIDI** (matrix claims midi). `{ga}c`. Deferred: needs a
-  timing decision (stolen time vs zero-duration) — current drop is timing-safe. Resolve as
-  either a simple steal-from-next implementation OR an honest matrix downgrade.
 - **LOW — tuplet default-q for `(5 (7 (9` ignores compound meter** (3 in 6/8). §4.13. Skipped:
   `default_q` is computed in `try_parse_tuplet` with no meter access; threading the meter
   through `parse_body → … → try_parse_tuplet` is high churn (10 test call sites) for a rare

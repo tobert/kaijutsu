@@ -747,3 +747,13 @@ helper + its tests were aligned to the live uppercase-C=middle-C convention. Spe
 fixture warning rail ratcheted 49 → 44. Suite 345 → 349. Left for later (in
 issues.md): grace-note MIDI (needs a timing decision), tuplet default-q in compound
 meter (high-churn, rare), and the lyric-alignment items (rendering phase).
+
+### 2026-06-30 — grace notes sound in MIDI (steal-from-next)
+
+Grace notes now play (the support matrix had claimed midi all along). Each grace
+runs ~1/8 of a unit note, the run capped at half the principal's duration, and the
+time is stolen from that principal note so the beat grid is preserved — `{ga}c d`
+sounds g,a then a shortened c, with d still landing on the beat. Wired into both
+the single-track and per-voice paths via a shared `play_grace_run` helper; the
+robustness note-balance test confirms no hung notes. (User picked steal-from-next
+over an honest matrix downgrade.) Suite 349 → 350.

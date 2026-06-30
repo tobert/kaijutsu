@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Accidental, Bar, Element, Key, Mode, NoteName, Tune, UnitLength, Voice};
+use crate::ast::{Accidental, Bar, Element, Key, Mode, Note, NoteName, Tune, UnitLength, Voice};
 use crate::MidiParams;
 
 /// Get the combined pitch offset from voice properties (transpose + octave)
@@ -37,6 +37,36 @@ fn apply_pitch_offset(base_pitch: u8, offset: i16) -> u8 {
 /// (ABC v2.1 §4.6). Distinct from, and added to, any `V:`-level offset.
 fn key_pitch_offset(key: &Key) -> i16 {
     key.transpose as i16 + (key.octave as i16) * 12
+}
+
+/// Play a run of gracenotes just before their principal note, stealing their
+/// time from it so the beat grid is preserved (ABC v2.1 §4.20). Each grace gets
+/// ~1/8 of a unit note, but the run is capped at half the principal's duration.
+/// Returns the ticks stolen (to subtract from the principal). `channel` lets the
+/// single-track and per-voice paths share this.
+#[allow(clippy::too_many_arguments)]
+fn play_grace_run(
+    writer: &mut MidiWriter,
+    graces: &[Note],
+    main_ticks: u32,
+    unit_ticks: u32,
+    bar_accidentals: &HashMap<NoteName, Accidental>,
+    pitch_offset: i16,
+    velocity: u8,
+    channel: u8,
+) -> u32 {
+    let count = graces.len() as u32;
+    if count == 0 {
+        return 0;
+    }
+    let total = (unit_ticks / 8).max(1).saturating_mul(count).min(main_ticks / 2);
+    let each = (total / count).max(1);
+    for g in graces {
+        let acc = effective_accidental(g.pitch, g.accidental, bar_accidentals, None);
+        let pitch = apply_pitch_offset(midi_pitch_with_accidental(g.pitch, g.octave, acc), pitch_offset);
+        writer.note_channel(pitch, velocity, each, channel);
+    }
+    each * count
 }
 
 /// Flatten `Element::SlurGroup` nesting away. Slurs have no MIDI
@@ -259,6 +289,8 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
         let mut voice_key_acc = key_accidentals.clone();
         let mut unit_ticks = unit_ticks;
         let mut cur_meter = tune.header.meter.clone();
+        // Gracenotes buffered until their principal note arrives (§4.20).
+        let mut pending_grace: Vec<Note> = Vec::new();
 
         for element in &elements {
             match element {
@@ -269,7 +301,24 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                         effective_accidental(note.pitch, note.accidental, &bar_accidentals, carried);
                     let base_pitch = midi_pitch_with_accidental(note.pitch, note.octave, eff_acc);
                     let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
-                    let ticks = note.duration.to_ticks(unit_ticks);
+                    let mut ticks = note.duration.to_ticks(unit_ticks);
+
+                    // Sound any buffered gracenotes, stealing their time from
+                    // this principal note so the beat grid stays intact.
+                    if !pending_grace.is_empty() {
+                        let stolen = play_grace_run(
+                            &mut writer,
+                            &pending_grace,
+                            ticks,
+                            unit_ticks,
+                            &bar_accidentals,
+                            pitch_offset,
+                            params.velocity,
+                            params.channel,
+                        );
+                        ticks = ticks.saturating_sub(stolen);
+                        pending_grace.clear();
+                    }
 
                     if let Some(held_ticks) = held_notes.remove(&midi_pitch) {
                         // Continue a tied note - add duration, advance time
@@ -305,7 +354,23 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                 }
 
                 Element::Chord(chord) => {
-                    let ticks = chord.duration.to_ticks(unit_ticks);
+                    let mut ticks = chord.duration.to_ticks(unit_ticks);
+
+                    // Gracenotes ornament the chord too; steal from its duration.
+                    if !pending_grace.is_empty() {
+                        let stolen = play_grace_run(
+                            &mut writer,
+                            &pending_grace,
+                            ticks,
+                            unit_ticks,
+                            &bar_accidentals,
+                            pitch_offset,
+                            params.velocity,
+                            params.channel,
+                        );
+                        ticks = ticks.saturating_sub(stolen);
+                        pending_grace.clear();
+                    }
 
                     // Note on for all notes
                     for note in &chord.notes {
@@ -370,6 +435,11 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                     'M' => cur_meter = Some(inline_meter(&field.value)),
                     _ => {}
                 },
+
+                Element::GraceNotes { notes, .. } => {
+                    // Buffer until the principal note/chord steals their time.
+                    pending_grace = notes.clone();
+                }
 
                 Element::Tuplet(tuplet) => {
                     // Each inner element's duration scales by q/p. Notes, rests
@@ -493,6 +563,7 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         let mut voice_key_acc = key_accidentals.clone();
         let mut unit_ticks = unit_ticks;
         let mut cur_meter = tune.header.meter.clone();
+        let mut pending_grace: Vec<Note> = Vec::new();
 
         for element in &elements {
             match element {
@@ -502,7 +573,22 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                         effective_accidental(note.pitch, note.accidental, &bar_accidentals, carried);
                     let base_pitch = midi_pitch_with_accidental(note.pitch, note.octave, eff_acc);
                     let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
-                    let ticks = note.duration.to_ticks(unit_ticks);
+                    let mut ticks = note.duration.to_ticks(unit_ticks);
+
+                    if !pending_grace.is_empty() {
+                        let stolen = play_grace_run(
+                            &mut writer,
+                            &pending_grace,
+                            ticks,
+                            unit_ticks,
+                            &bar_accidentals,
+                            pitch_offset,
+                            params.velocity,
+                            channel,
+                        );
+                        ticks = ticks.saturating_sub(stolen);
+                        pending_grace.clear();
+                    }
 
                     if let Some(held_ticks) = held_notes.remove(&midi_pitch) {
                         writer.advance(ticks);
@@ -531,7 +617,21 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                 }
 
                 Element::Chord(chord) => {
-                    let ticks = chord.duration.to_ticks(unit_ticks);
+                    let mut ticks = chord.duration.to_ticks(unit_ticks);
+                    if !pending_grace.is_empty() {
+                        let stolen = play_grace_run(
+                            &mut writer,
+                            &pending_grace,
+                            ticks,
+                            unit_ticks,
+                            &bar_accidentals,
+                            pitch_offset,
+                            params.velocity,
+                            channel,
+                        );
+                        ticks = ticks.saturating_sub(stolen);
+                        pending_grace.clear();
+                    }
                     for note in &chord.notes {
                         let base_pitch = note_to_midi_pitch(
                             note.pitch,
@@ -585,6 +685,10 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                     'M' => cur_meter = Some(inline_meter(&field.value)),
                     _ => {}
                 },
+
+                Element::GraceNotes { notes, .. } => {
+                    pending_grace = notes.clone();
+                }
 
                 Element::Tuplet(tuplet) => {
                     // Notes, rests and chords inside the tuplet all scale by q/p
@@ -1187,6 +1291,26 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(last_on, 2880, "[C2E2G2]3 = 6 units; trailing G at 2880");
+    }
+
+    #[test]
+    fn grace_notes_sound_and_steal_from_the_following_note() {
+        // §4.20: gracenotes sound briefly before their principal note. We steal
+        // their time from that note so the beat grid is preserved. `{ga}c d`:
+        // grace g(79),a(81) play first, then c(72), then d(74) still on the beat.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n{ga}c d|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let ons: Vec<(u32, u8)> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| (e.tick, e.data[1]))
+            .collect();
+        let pitches: Vec<u8> = ons.iter().map(|(_, p)| *p).collect();
+        assert_eq!(pitches, vec![79, 81, 72, 74], "grace g,a then c then d");
+        assert_eq!(ons[0].0, 0, "first grace starts at the beat");
+        let d = ons.iter().find(|(_, p)| *p == 74).unwrap();
+        assert_eq!(d.0, 480, "d stays on the beat — graces stole from c");
     }
 
     #[test]
