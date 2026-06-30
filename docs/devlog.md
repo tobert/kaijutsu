@@ -783,3 +783,14 @@ overlapping; invisible rests (x/X) draw nothing; whole rests hang a line higher
 than half rests; and M:none no longer draws a spurious 4/4. Suite 352 → 357.
 Remaining engrave items (tuplet bracket/number, multi-measure H-bar rest, inline
 [K:] redraw, middle=, grace notehead glyph, SourceSpans) logged in issues.md.
+
+### 2026-06-30 — engrave: multi-measure H-bar rest + tuplet bracket
+
+Two more visible rendering gaps closed. A multi-measure rest (`Z4`) now draws the
+conventional thick horizontal H-bar with vertical end-caps and the bar count
+numeral above the staff, instead of a lone single-bar rest glyph + empty space.
+Tuplets now get a bracket (a horizontal line with downward end-ticks) and the
+tuplet numeral centered above the group. Both verified visually (rsvg → PNG): the
+`Z3` H-bar with its "3" and the `(3` brackets render correctly. Suite 357 → 359.
+Noted a small title/tuplet-bracket overlap as polish. Remaining engrave items:
+inline `[K:]` staff redraw, `middle=`, the small grace-notehead glyph, SourceSpans.

@@ -673,8 +673,26 @@ fn render_staff(
             }
             Element::Rest(rest) => {
                 let span = (0usize, 0usize);
-                // Invisible rests (`x`/`X`) occupy time but draw nothing (§4.5).
-                if rest.visible {
+                if let Some(bars) = rest.multi_measure {
+                    // Multi-measure rest: a thick H-bar centered on the middle
+                    // line with vertical end caps, and the bar count above the
+                    // staff (§4.5). `X` (invisible) still just takes the space.
+                    let width = unit_width * bars as f64 * 4.0;
+                    if rest.visible {
+                        let mid = ctx.y_at(2.0);
+                        let x0 = cursor_x + ctx.sp * 0.5;
+                        let x1 = cursor_x + width - ctx.sp * 0.5;
+                        emit_h_bar_rest(elements, x0, x1, mid, ctx, span);
+                        elements.push(EngravingElement::Text {
+                            content: bars.to_string(),
+                            x: (x0 + x1) / 2.0,
+                            y: ctx.y_at(-1.0),
+                            size: ctx.sp * 1.6,
+                            source_span: span,
+                        });
+                    }
+                    cursor_x += width;
+                } else if rest.visible {
                     // A whole rest hangs from the line above the middle; a half
                     // rest sits on the middle line; shorter rests are centered
                     // on it. (pos 0 = top line, +1 per line down.)
@@ -692,24 +710,19 @@ fn render_staff(
                         scale: ctx.scale,
                         source_span: span,
                     });
-                    // Dotted rests carry augmentation dots too.
-                    if rest.multi_measure.is_none() {
-                        emit_dots(
-                            elements,
-                            dot_count(&rest.duration),
-                            cursor_x + rw,
-                            ctx.y_at(rest_pos),
-                            ctx,
-                            span,
-                        );
-                    }
-                }
-                let dur_width = if let Some(bars) = rest.multi_measure {
-                    unit_width * bars as f64 * 4.0
+                    emit_dots(
+                        elements,
+                        dot_count(&rest.duration),
+                        cursor_x + rw,
+                        ctx.y_at(rest_pos),
+                        ctx,
+                        span,
+                    );
+                    cursor_x += duration_to_width(&rest.duration, unit_width);
                 } else {
-                    duration_to_width(&rest.duration, unit_width)
-                };
-                cursor_x += dur_width;
+                    // Invisible rest (`x`): occupies time, draws nothing.
+                    cursor_x += duration_to_width(&rest.duration, unit_width);
+                }
             }
             Element::Bar(bar) => {
                 // A plain `|` that is the last real token of the tune is the
@@ -737,6 +750,7 @@ fn render_staff(
                 // following music isn't pulled in early.
                 let span = (0usize, 0usize);
                 let scale_factor = tuplet.q as f64 / (tuplet.p.max(1)) as f64;
+                let tuplet_start_x = cursor_x;
                 for elem in &tuplet.elements {
                     match elem {
                         Element::Note(note) => {
@@ -801,6 +815,37 @@ fn render_staff(
                         _ => {}
                     }
                 }
+                // Bracket + numeral above the group (§4.13). A horizontal line
+                // with short downward end-ticks, and the tuplet number `p`
+                // centered above it.
+                let bracket_y = ctx.y_at(-1.5);
+                let bx0 = tuplet_start_x;
+                let bx1 = (cursor_x - unit_width * 0.4).max(tuplet_start_x);
+                elements.push(EngravingElement::Line {
+                    x1: bx0,
+                    y1: bracket_y,
+                    x2: bx1,
+                    y2: bracket_y,
+                    width: STEM_WIDTH,
+                    source_span: span,
+                });
+                for tick_x in [bx0, bx1] {
+                    elements.push(EngravingElement::Line {
+                        x1: tick_x,
+                        y1: bracket_y,
+                        x2: tick_x,
+                        y2: bracket_y + ctx.sp * 0.6,
+                        width: STEM_WIDTH,
+                        source_span: span,
+                    });
+                }
+                elements.push(EngravingElement::Text {
+                    content: tuplet.p.to_string(),
+                    x: (bx0 + bx1) / 2.0,
+                    y: bracket_y - ctx.sp * 0.3,
+                    size: ctx.sp * 1.4,
+                    source_span: span,
+                });
             }
             Element::ChordSymbol(text) => {
                 elements.push(EngravingElement::Text {
@@ -1652,6 +1697,38 @@ fn dot_count(duration: &Duration) -> usize {
         7 => 2,
         15 => 3,
         _ => 0,
+    }
+}
+
+/// Emit the thick horizontal bar (with vertical end caps) of a multi-measure
+/// rest, centered on `mid_y` and spanning `x0..x1`. ABC v2.1 §4.5.
+fn emit_h_bar_rest(
+    elements: &mut Vec<EngravingElement>,
+    x0: f64,
+    x1: f64,
+    mid_y: f64,
+    ctx: StaffCtx,
+    span: SourceSpan,
+) {
+    // The thick horizontal bar (half a staff space tall).
+    elements.push(EngravingElement::Line {
+        x1: x0,
+        y1: mid_y,
+        x2: x1,
+        y2: mid_y,
+        width: ctx.sp * 0.7,
+        source_span: span,
+    });
+    // Vertical end caps, one staff space tall.
+    for cap_x in [x0, x1] {
+        elements.push(EngravingElement::Line {
+            x1: cap_x,
+            y1: mid_y - ctx.sp,
+            x2: cap_x,
+            y2: mid_y + ctx.sp,
+            width: STEM_WIDTH,
+            source_span: span,
+        });
     }
 }
 

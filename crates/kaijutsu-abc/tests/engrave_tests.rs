@@ -425,3 +425,31 @@ fn chord_seconds_offset_to_avoid_collision() {
     assert_eq!(xs.len(), 2, "two noteheads");
     assert!((xs[0] - xs[1]).abs() > 1.0, "noteheads must be offset, got {xs:?}");
 }
+
+#[test]
+fn multi_measure_rest_draws_h_bar_with_count() {
+    // §4.5: a multi-measure rest (Z4) draws as a thick horizontal bar with the
+    // bar count above it — not a single-bar rest glyph.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let els = layout::engrave(&parse("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nZ4|\n").value[0], &default_options());
+    let single_rest_glyphs = els
+        .iter()
+        .filter(|e| matches!(e, EngravingElement::Glyph { codepoint, .. } if (0xE4E3..=0xE4E7).contains(codepoint)))
+        .count();
+    assert_eq!(single_rest_glyphs, 0, "Z4 must not use a single-bar rest glyph");
+    let has_count = els
+        .iter()
+        .any(|e| matches!(e, EngravingElement::Text { content, .. } if content == "4"));
+    assert!(has_count, "the bar count '4' should be drawn above the H-bar");
+}
+
+#[test]
+fn tuplet_draws_bracket_and_number() {
+    // §4.13 engraving: a tuplet is marked with a bracket and its numeral.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let els = layout::engrave(&parse("X:1\nT:t\nM:4/4\nL:1/8\nK:C\n(3CDE D2|\n").value[0], &default_options());
+    let has_numeral = els
+        .iter()
+        .any(|e| matches!(e, EngravingElement::Text { content, .. } if content == "3"));
+    assert!(has_numeral, "tuplet numeral '3' should be drawn");
+}
