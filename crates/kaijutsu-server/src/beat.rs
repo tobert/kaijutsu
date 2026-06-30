@@ -39,7 +39,8 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ContentRef,
-    DeriverRegistry, MaterializeCursor, Span, materialize_committed, schedule_abc_cell,
+    DeriverRegistry, MaterializeCursor, RenderTargetSpec, Span, materialize_committed,
+    schedule_abc_cell,
 };
 use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
 use kaijutsu_kernel::{ContentStore, Kernel, KjCaller, KjDispatcher};
@@ -1650,7 +1651,47 @@ impl BeatScheduler {
                 self.set_rotate(&track, context_id, every);
                 self.attached_ack(&track, context_id)
             }
+            BeatCommand::AddRenderTarget { track, spec } => {
+                self.add_render_target_from_spec(&track, spec)
+            }
         }
+    }
+
+    /// Construct a render target from its [`RenderTargetSpec`] and register it on
+    /// the track. The track must already have a clock (be `attach`ed); constructing
+    /// the target can fail (no ALSA, no `/dev/snd/seq`) and that failure is surfaced
+    /// as a loud `Err` so `kj transport render` reports it, never a silent no-op.
+    /// Stays fully synchronous (see [`apply_command`]'s no-await contract) — opening
+    /// an ALSA seq client is a quick blocking FFI call, not an `.await`.
+    fn add_render_target_from_spec(
+        &mut self,
+        track_id: &TrackId,
+        spec: RenderTargetSpec,
+    ) -> BeatAck {
+        if !self.tracks.contains_key(track_id) {
+            return Err(format!(
+                "track '{}' has no clock — `kj transport attach` a context to it first",
+                track_id.as_str()
+            ));
+        }
+        let target: Box<dyn RenderTarget> = match spec {
+            RenderTargetSpec::AlsaMidi { client_name, port_name } => {
+                #[cfg(target_os = "linux")]
+                {
+                    match crate::render::AlsaMidiOut::new(&client_name, &port_name) {
+                        Ok(t) => Box::new(t),
+                        Err(e) => return Err(format!("could not open ALSA MIDI out: {e}")),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (client_name, port_name);
+                    return Err("ALSA MIDI out is only available on Linux".to_string());
+                }
+            }
+        };
+        self.add_render_target(track_id, target);
+        Ok(())
     }
 
     /// `Ok` if the track has a live clock domain (so a clock-domain command landed),
@@ -1803,7 +1844,9 @@ mod tests {
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind, SharedBlockStore};
     use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
     use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
-    use kaijutsu_kernel::hyoushigi::{Attachment, BeatPolicy, Cadence};
+    use kaijutsu_kernel::hyoushigi::{
+        Attachment, BeatCommand, BeatPolicy, Cadence, RenderTargetSpec,
+    };
     use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
 
@@ -3724,6 +3767,133 @@ mod tests {
             1,
             "the skipped poison cell surfaces ONE Error block, not one per later beat"
         );
+    }
+
+    /// `kj transport render` on a track with no clock is a loud Err — and (the point
+    /// of checking the track first) it never tries to open an ALSA port, so this runs
+    /// without `/dev/snd/seq`.
+    #[tokio::test]
+    async fn add_render_target_on_unknown_track_is_loud_err() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let mut sched = BeatScheduler::new(kernel, documents);
+        let ack = sched.apply_command(BeatCommand::AddRenderTarget {
+            track: TrackId::new("ghost").unwrap(),
+            spec: RenderTargetSpec::AlsaMidi {
+                client_name: "kaijutsu".to_string(),
+                port_name: "ghost".to_string(),
+            },
+        });
+        assert!(ack.is_err(), "render on a clockless track must fail loud");
+        assert!(
+            ack.unwrap_err().contains("no clock"),
+            "the error tells you to attach first"
+        );
+    }
+
+    /// Live end-to-end of the `kj transport render` wiring: AddRenderTarget through
+    /// `apply_command` on a real track attaches an AlsaMidiOut, and a beat that
+    /// commits an ABC cell renders NoteOns out the seq port. `#[ignore]` (needs
+    /// `/dev/snd/seq`); run on zorak.
+    #[tokio::test]
+    #[ignore = "needs a live ALSA sequencer (/dev/snd/seq); run on the zorak runner"]
+    async fn add_render_target_then_beat_plays_through_alsa() {
+        use alsa::seq::{Addr, EventType, PortCap, PortSubscribe, PortType};
+        use std::ffi::CString;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let track = TrackId::solo();
+        let tl = kernel.arm_track_timeline(
+            track.clone(),
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(ValidAbc));
+            g.schedule(Cell::deferred_on(
+                Span::instant(Tick::new(1)),
+                Recipe {
+                    resolver: ResolverId::new("valid_abc"),
+                    params: serde_json::Value::Null,
+                    query: ContextQuery::default(),
+                    fallback: Fallback::Skip,
+                },
+                track.clone(),
+                PrincipalId::beat(),
+            ))
+            .unwrap();
+        }
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        // Attach the render target THROUGH the command path (what `kj transport
+        // render` sends), then connect a reader to the seq port it opened.
+        let ack = sched.apply_command(BeatCommand::AddRenderTarget {
+            track: track.clone(),
+            spec: RenderTargetSpec::AlsaMidi {
+                client_name: "kj-render-e2e".to_string(),
+                port_name: "solo".to_string(),
+            },
+        });
+        assert!(ack.is_ok(), "AddRenderTarget on a live track should open the port: {ack:?}");
+
+        let reader = alsa::Seq::open(None, None, true).unwrap();
+        reader.set_client_name(&CString::new("kj-render-e2e-reader").unwrap()).unwrap();
+        let in_port = reader
+            .create_simple_port(
+                &CString::new("in").unwrap(),
+                PortCap::WRITE | PortCap::SUBS_WRITE,
+                PortType::MIDI_GENERIC | PortType::APPLICATION,
+            )
+            .unwrap();
+        // Find the kj-render-e2e client's port and subscribe to it.
+        let out_addr = {
+            use alsa::seq::{ClientIter, PortIter};
+            let mut found = None;
+            for client in ClientIter::new(&reader) {
+                for p in PortIter::new(&reader, client.get_client()) {
+                    let info = reader.get_any_port_info(p.addr()).unwrap();
+                    if info.get_name().map(|n| n == "solo").unwrap_or(false) {
+                        found = Some(p.addr());
+                    }
+                }
+            }
+            found.expect("the render port is visible to other seq clients")
+        };
+        let subs = PortSubscribe::empty().unwrap();
+        subs.set_sender(out_addr);
+        subs.set_dest(Addr { client: reader.client_id().unwrap(), port: in_port });
+        reader.subscribe_port(&subs).unwrap();
+
+        // Beat once: the tick-1 cell commits + materializes + renders.
+        let base = Instant::now();
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_secs(1));
+
+        // `fire_due` was handed a synthetic `base + 1s` instant while ~no real time
+        // elapsed, so the cell's render `at` lands ~1 s in the real future and the
+        // notes (one beat apart from there) span a few seconds — poll generously.
+        let mut note_ons = 0usize;
+        let mut input = reader.input();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline && note_ons == 0 {
+            if input.event_input_pending(true).unwrap_or(0) > 0 {
+                if let Ok(ev) = input.event_input() {
+                    if ev.get_type() == EventType::Noteon {
+                        if let Some(n) = ev.get_data::<alsa::seq::EvNote>() {
+                            if n.velocity > 0 {
+                                note_ons += 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(note_ons > 0, "the committed ABC cell rendered NoteOns through the kj-attached port");
     }
 
     /// Stage 3 WI 4: the `at` arithmetic in isolation. A cell starting `n` beats

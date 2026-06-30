@@ -1299,9 +1299,24 @@ abc 137; full workspace builds). The track has a sound output. Commits:
 - The `alsa` `MidiEvent` encoder isn't `Send`, so it's constructed per-`emit` (one
   alloc per phrase, beats apart) rather than stored on `AlsaMidiOut`.
 
+**`kj transport render` — the attach surface (landed 2026-06-30, after the WI list).**
+`kj transport render --track <t> [--to alsa-midi] [--port <name>]` attaches a render
+target to a track: it sends a `BeatCommand::AddRenderTarget { track, RenderTargetSpec }`
+(spec is data-only, kernel-side; the server's scheduler constructs the concrete
+`AlsaMidiOut` so the `alsa` FFI stays out of the kernel crate), and `apply_command`
+opens the seq port + registers it — surfacing an ALSA open failure as a loud `BeatAck`
+Err, never a silent no-op. `--to` is the forward-looking extension point (an unknown
+kind is refused loudly; `docs/pcm.md`'s PCM target is the planned sibling that joins via
+`--to pcm`); `--port` defaults to the track name (so `aconnect -l` shows
+`kaijutsu:<track>`). Additive — a track can carry several targets. Tests: transport
+dispatch builds the right command (`transport_render_builds_alsa_midi_add_render_target`,
+default-port + unknown-kind), beat `add_render_target_on_unknown_track_is_loud_err`
+(CI-safe — checks the track before opening ALSA), and an `#[ignore]` live e2e
+(`add_render_target_then_beat_plays_through_alsa`) **verified on zorak**: the command
+path attaches an out, a beat commits an ABC cell, and NoteOns reach a subscribed reader.
+
 **Still ahead (out of M1 scope):** M2 (input telemetry), M3 (the drift-modeled
 clock-in — the real `apply_estimate` producer + the heap-re-enlistment hook the trait
-is already shaped for), M4 (cross-node + edge node) per `docs/midi.md`; and a wiring
-surface to *attach* an `AlsaMidiOut` to a track from `kj transport` (M1 exposes
-`BeatScheduler::add_render_target`; no CLI verb yet). Also still pending from earlier
-stages: a real-kernel live-verify of the Stage 2 score-context path.
+is already shaped for), M4 (cross-node + edge node) per `docs/midi.md`; a *detach*/replace
+verb for render targets (attach is additive; no removal surface yet). Also still pending
+from earlier stages: a real-kernel live-verify of the Stage 2 score-context path.

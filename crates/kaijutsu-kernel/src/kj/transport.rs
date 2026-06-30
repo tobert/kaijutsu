@@ -19,7 +19,7 @@ use kaijutsu_types::{ContentType, ContextId, TrackId};
 
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
-use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence};
+use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence, RenderTargetSpec};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,6 +144,26 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
+    /// Attach a render target to a track — a *consumer* of the committed score
+    /// (docs/tracks.md Stage 3). The track's score is rendered out on the
+    /// speculation lead. M1: ALSA sequencer MIDI out — a virtual seq port that
+    /// synths/DAWs/`aseqdump` subscribe to (see it in `aconnect -l`). Additive: a
+    /// track can carry more than one target.
+    Render {
+        /// What to render to. M1: `alsa-midi` (the default). (PCM out is planned —
+        /// docs/pcm.md.)
+        #[arg(long, default_value = "alsa-midi")]
+        to: String,
+        /// ALSA seq port name (shown in `aconnect -l`). Default: the track name.
+        #[arg(long)]
+        port: Option<String>,
+        /// Target context (used for track lookup when --track is absent).
+        #[arg(long)]
+        context: Option<String>,
+        /// Track whose score to render. Omit to resolve from the context's attachment.
+        #[arg(long)]
+        track: Option<String>,
+    },
 }
 
 impl TransportCommand {
@@ -157,7 +177,8 @@ impl TransportCommand {
             | TransportCommand::Stop { context, .. }
             | TransportCommand::Tempo { context, .. }
             | TransportCommand::Ooda { context, .. }
-            | TransportCommand::Rotate { context, .. } => context.as_deref(),
+            | TransportCommand::Rotate { context, .. }
+            | TransportCommand::Render { context, .. } => context.as_deref(),
         }
     }
 
@@ -171,7 +192,8 @@ impl TransportCommand {
             | TransportCommand::Stop { track, .. }
             | TransportCommand::Tempo { track, .. }
             | TransportCommand::Ooda { track, .. }
-            | TransportCommand::Rotate { track, .. } => track.as_deref(),
+            | TransportCommand::Rotate { track, .. }
+            | TransportCommand::Render { track, .. } => track.as_deref(),
         }
     }
 
@@ -186,6 +208,7 @@ impl TransportCommand {
             TransportCommand::Tempo { .. } => "tempo",
             TransportCommand::Ooda { .. } => "ooda",
             TransportCommand::Rotate { .. } => "rotate",
+            TransportCommand::Render { .. } => "render",
         }
     }
 }
@@ -366,6 +389,31 @@ impl KjDispatcher {
                         verb,
                         Some(tid),
                     )
+                }
+
+                TransportCommand::Render { to, port, .. } => {
+                    // M1: the one render kind. `--to` is the forward-looking extension
+                    // point (docs/pcm.md's PCM target joins here); refuse an unknown
+                    // kind loudly rather than silently no-op.
+                    if to != "alsa-midi" {
+                        return KjResult::Err(format!(
+                            "kj transport render: unknown target '{to}' (M1 supports: alsa-midi)"
+                        ));
+                    }
+                    let track = match self.resolve_track_for_ctx(track_name, ctx) {
+                        Ok(t) => t,
+                        Err(e) => return KjResult::Err(e),
+                    };
+                    // Default the seq port name to the track name, so `aconnect -l`
+                    // shows `kaijutsu:<track>`.
+                    let port_name = port.clone().unwrap_or_else(|| track.as_str().to_string());
+                    let spec = RenderTargetSpec::AlsaMidi {
+                        client_name: "kaijutsu".to_string(),
+                        port_name: port_name.clone(),
+                    };
+                    let verb = format!("render → ALSA MIDI out '{port_name}' (track '{}')", track.as_str());
+                    let tid = track.as_str().to_string();
+                    (BeatCommand::AddRenderTarget { track, spec }, verb, Some(tid))
                 }
             };
 
@@ -562,7 +610,7 @@ fn short_hex(id: ContextId) -> String {
 mod tests {
     use std::time::Duration;
 
-    use crate::hyoushigi::{BeatAck, BeatCommand, BeatRequest, Cadence};
+    use crate::hyoushigi::{BeatAck, BeatCommand, BeatRequest, Cadence, RenderTargetSpec};
     use crate::kj::test_helpers::*;
     use kaijutsu_types::PrincipalId;
 
@@ -675,6 +723,72 @@ mod tests {
             }
             other => panic!("expected Play(TrackId), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_render_builds_alsa_midi_add_render_target() {
+        // `kj transport render --track bass --port out0` produces an
+        // AddRenderTarget(AlsaMidi) command for the resolved track + the given port.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
+
+        let result = d
+            .dispatch(
+                &[s("transport"), s("render"), s("--track"), s("bass"), s("--port"), s("out0")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "transport render failed: {}", result.message());
+        match cmds.recv().await.expect("a BeatCommand should be sent") {
+            BeatCommand::AddRenderTarget { track, spec } => {
+                assert_eq!(track, kaijutsu_types::TrackId::new("bass").unwrap());
+                match spec {
+                    RenderTargetSpec::AlsaMidi { client_name, port_name } => {
+                        assert_eq!(client_name, "kaijutsu");
+                        assert_eq!(port_name, "out0", "the --port name rides the spec");
+                    }
+                }
+            }
+            other => panic!("expected AddRenderTarget, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_render_defaults_port_to_track_name_and_rejects_unknown_kind() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
+
+        // No --port: the seq port name defaults to the track name.
+        let result = d.dispatch(&[s("transport"), s("render"), s("--track"), s("bass")], &c).await;
+        assert!(result.is_ok(), "render failed: {}", result.message());
+        match cmds.recv().await.expect("a BeatCommand should be sent") {
+            BeatCommand::AddRenderTarget { spec: RenderTargetSpec::AlsaMidi { port_name, .. }, .. } => {
+                assert_eq!(port_name, "bass", "port defaults to the track name");
+            }
+            other => panic!("expected AddRenderTarget(AlsaMidi), got {other:?}"),
+        }
+
+        // An unknown --to is refused loudly (no command sent).
+        let bad = d
+            .dispatch(
+                &[s("transport"), s("render"), s("--track"), s("bass"), s("--to"), s("kazoo")],
+                &c,
+            )
+            .await;
+        assert!(!bad.is_ok(), "an unknown render target must be a loud error");
+        assert!(bad.message().contains("kazoo"), "the error names the bad kind: {}", bad.message());
     }
 
     #[tokio::test]
