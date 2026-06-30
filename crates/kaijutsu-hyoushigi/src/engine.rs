@@ -174,6 +174,17 @@ pub struct Timeline {
     /// past a cursor into one Error block per event so the player reads its own
     /// failure next turn.
     failures: Vec<FailureEvent>,
+    /// Wall-clock reading of the last [`pump`](Self::pump), so the playhead is
+    /// integrated forward *incrementally* — each interval converted at the rate in
+    /// force during it — rather than re-derived from absolute time at the current
+    /// rate. Origin is `Duration::ZERO` (musical tick 0 ↔ wall-clock origin), so a
+    /// constant-tempo run reads identically to the old absolute mapping; a tempo
+    /// change only re-rates time AFTER it (no retroactive playhead jump under
+    /// dynamic tempo — gemini-pro Stage-3 SEV-2).
+    last_pump: Duration,
+    /// Sub-tick phase carried between pumps so fractional ticks aren't dropped or
+    /// double-counted as the playhead is integrated forward.
+    pump_phase_frac: f64,
 }
 
 impl Timeline {
@@ -188,6 +199,8 @@ impl Timeline {
             cas: HashMap::new(),
             squashes: Vec::new(),
             failures: Vec::new(),
+            last_pump: Duration::ZERO,
+            pump_phase_frac: 0.0,
         }
     }
 
@@ -345,16 +358,6 @@ impl Timeline {
         Ok(())
     }
 
-    /// Map wall-clock elapsed-since-epoch to a [`Tick`] via the clock's rate.
-    ///
-    /// This is the (stub) wall-clock binding — PPQ + tempo collapse to
-    /// `ticks_per_sec` here; the real binding carries epoch + tempo + PPQ. It is
-    /// the boundary the doc calls "a logical integer coordinate with a pluggable
-    /// wall-clock binding": ticks are pure integers, wall-clock lives only here.
-    pub fn tick_at(&self, since_epoch: Duration) -> Tick {
-        Tick::new((since_epoch.as_secs_f64() * self.clock.ticks_per_sec).round() as i64)
-    }
-
     /// Drive the playhead from a wall-clock reading — the **internal beat**.
     ///
     /// The beat advances on its own schedule; it does *not* wait for resolves.
@@ -362,9 +365,29 @@ impl Timeline {
     /// as it passes. This is the can't-block discipline: an integrator (kernel or
     /// client timer) calls `pump` on each beat tick, and the playhead is wherever
     /// wall-clock says — content is either staged ahead in time or the fallback
-    /// fired. Monotonic: a reading behind the playhead is ignored.
+    /// fired. Monotonic: a reading at or behind the last pump is ignored.
+    ///
+    /// Phase is integrated **incrementally**: the elapsed wall time since the last
+    /// pump is converted at the current rate and accumulated (sub-tick remainder
+    /// carried in `pump_phase_frac`). It is deliberately NOT re-derived as
+    /// `since_epoch × rate` — under a mutable tempo (WI 2) that would reinterpret
+    /// all prior time at the new rate and rocket the playhead far into the future,
+    /// firing every scheduled cell (gemini-pro Stage-3 SEV-2). A rate change thus
+    /// only affects time after it. (Caveat: the first pump integrates the whole
+    /// `[0, reading]` span at the then-current rate — set the tempo before pumping,
+    /// as the documented usage does; the real M3 binding carries epoch + tempo +
+    /// PPQ explicitly.)
     pub fn pump(&mut self, since_epoch: Duration) {
-        let target = self.tick_at(since_epoch);
+        // Monotonic: a stale or duplicate reading never rewinds the beat.
+        if since_epoch <= self.last_pump {
+            return;
+        }
+        let delta = since_epoch - self.last_pump;
+        self.last_pump = since_epoch;
+        let advanced = delta.as_secs_f64() * self.clock.ticks_per_sec + self.pump_phase_frac;
+        let whole = advanced.floor();
+        self.pump_phase_frac = advanced - whole;
+        let target = self.playhead + TickDelta::new(whole as i64);
         if target > self.playhead {
             self.advance_to(target);
         }
@@ -465,14 +488,22 @@ impl Timeline {
     /// squash, then re-speculate if budget remains, else fire the fallback.
     fn commit_or_squash(&mut self, idx: usize) {
         let recipe = self.deferred_recipe(idx);
-        let now = self.playhead;
+        // The validation context's `now` is the cell's musical `start` — the SAME
+        // tick `speculate` used (line ~406). It must NOT be the current playhead
+        // (which equals the commit_deadline here, earlier than `start`): a resolver
+        // whose basis reads `ctx.now()` would then see predicted(start) ≠
+        // actual(deadline) every time and squash forever in an otherwise-stable
+        // context (gemini-pro Stage-3 SEV-2; dormant only because CasCommitResolver
+        // ignores `now()`). The playhead is captured separately for the budget math.
+        let current_tick = self.playhead;
+        let start = self.future[idx].start;
 
         let resolver = self
             .resolvers
             .get(&recipe.resolver.0)
             .expect("resolver presence checked at schedule time");
         let ctx = CommittedCtx {
-            now,
+            now: start,
             ambient: &self.ambient,
             committed: &self.committed,
         };
@@ -485,9 +516,8 @@ impl Timeline {
         }
 
         // --- squash ---------------------------------------------------------
-        let start = self.future[idx].start;
         let est_cost = self.future[idx].est_cost;
-        let budget = start - now; // ticks left until the content is actually needed
+        let budget = start - current_tick; // ticks left until the content is actually needed
         let can_respeculate = !self.future[idx].final_attempt && budget >= est_cost;
 
         let recovery = if can_respeculate {
@@ -496,7 +526,7 @@ impl Timeline {
             Recovery::FellBack
         };
         self.squashes.push(SquashEvent {
-            at: now,
+            at: current_tick,
             start,
             predicted,
             actual,
@@ -727,6 +757,27 @@ mod tests {
         }
     }
 
+    /// A resolver whose basis is the validation tick `ctx.now()` — so it commits
+    /// only if `speculate` and `commit_or_squash` agree on what `now` is. Pins
+    /// SEV-2: both phases must validate at the cell's musical `start`. Registered
+    /// under "echo" so it slots into `deferred_at`'s recipe.
+    struct NowBasis;
+
+    impl Resolver for NowBasis {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("echo")
+        }
+        fn estimate_cost(&self, _p: &Value, _ctx: &dyn ResolverCtx) -> Duration {
+            Duration::from_secs(3)
+        }
+        fn compute_basis(&self, _p: &Value, ctx: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(&ctx.now().get().to_le_bytes())
+        }
+        fn resolve(&self, _p: &Value, _ctx: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
+            Ok(Resolution::new(b"X".to_vec(), "text/plain"))
+        }
+    }
+
     fn deferred_at(start: i64, fallback: Fallback) -> Cell {
         deferred_at_track(start, fallback, TrackId::solo())
     }
@@ -785,6 +836,33 @@ mod tests {
             }
             _ => panic!("committed cell must be concrete"),
         }
+    }
+
+    /// SEV-2 (gemini-pro Stage-3 review): `commit_or_squash` must validate the
+    /// basis at the cell's musical `start` — the SAME tick `speculate` used — not at
+    /// the earlier commit-deadline playhead. A resolver whose basis reads `ctx.now()`
+    /// would otherwise always see predicted(start) ≠ actual(deadline) and squash
+    /// forever, even in a context that never changed. In a stable context this cell
+    /// must COMMIT with no squash.
+    #[test]
+    fn commit_validates_at_start_not_the_commit_deadline() {
+        let clock = TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(2), // deadline = start − 2, strictly before start
+        };
+        let mut tl = Timeline::new(clock);
+        tl.register_resolver(Box::new(NowBasis));
+        tl.schedule(deferred_at(100, Fallback::Skip)).unwrap();
+
+        tl.advance_to(Tick::new(94)); // speculate at start=100
+        tl.advance_to(Tick::new(100)); // crosses commit_deadline=98; must re-validate at start=100
+
+        assert!(
+            tl.squashes().is_empty(),
+            "a now()-based basis in a stable context must not squash (validate at start, not the deadline)",
+        );
+        assert_eq!(tl.committed().len(), 1, "the cell commits cleanly");
     }
 
     /// `set_clock` re-derives the speculation lead for cells scheduled after it
@@ -941,6 +1019,29 @@ mod tests {
         let p = tl.playhead();
         tl.pump(Duration::from_secs(2)); // stale reading
         assert_eq!(tl.playhead(), p, "stale beat reading must not rewind the playhead");
+    }
+
+    /// SEV-2 (gemini-pro Stage-3 review): `pump` integrates phase incrementally, so
+    /// a mid-stream tempo change (WI 2 made the rate mutable) only re-rates time
+    /// AFTER it. The old absolute mapping (`since_epoch × current_rate`) would have
+    /// reinterpreted all prior elapsed time at the new rate and jumped the playhead
+    /// far ahead, firing every scheduled cell.
+    #[test]
+    fn pump_integrates_phase_across_a_tempo_change() {
+        let mut tl = Timeline::new(TickClock { ticks_per_sec: 1.0, ..TickClock::default() });
+        tl.pump(Duration::from_secs(10)); // 10s at 1 tick/sec → tick 10
+        assert_eq!(tl.playhead(), Tick::new(10));
+
+        // Double the rate, then advance one more wall-second. The new rate applies
+        // only to the +1s delta (=+2 ticks → 12), NOT to the whole 11s-since-origin
+        // (which the old `tick_at` would have mapped to 22, a 12-tick jump).
+        tl.set_clock(TickClock { ticks_per_sec: 2.0, ..TickClock::default() });
+        tl.pump(Duration::from_secs(11));
+        assert_eq!(
+            tl.playhead(),
+            Tick::new(12),
+            "a tempo change re-rates only time after it — no retroactive playhead jump",
+        );
     }
 
     /// Scheduling behind the playhead is rejected — crash over corruption, never a

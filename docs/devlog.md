@@ -384,6 +384,40 @@ before — diagnose threading from the code, not from a reviewer's summary, and 
 two competent readers model the topology differently that *is* the signal to go
 look.
 
+## Tracks Stage 3 — three clock-correctness fixes from the landed-code review (2026-06-30)
+
+Stage 3 generalised the clock source behind a `ClockSourceKind` enum and made tempo
+mutable mid-flight (WI 1 + WI 2, `2e3dc6c5`→`4c55a5dd`). We ran the usual two-voice
+review on the *shipped* code: deepseek's consult came back clean, and a gemini-pro
+**batch** (the resilient path under gemini's interactive 503s) surfaced three real
+correctness hazards we'd missed. All three are now fixed TDD — each with a test that
+fails against the old code. Full record: `docs/tracks.md` ("Landed-code review of WI 1
++ WI 2").
+
+The headline one is a **silent-fallback data loss**, exactly the class CLAUDE.md tells
+us to crash over: a cold restart reverted a saved tempo. `set_tempo` persists
+`period_ms` to the `tracks` row *precisely so a restart recovers it* — but `attach`'s
+track-create path read the row only for the playhead and the score context, and armed
+the live clock from the attaching context's `BeatPolicy` DTO (which defaults to 120
+BPM). So the first re-attach after a restart quietly threw the saved tempo away. The
+fix builds an `active_policy` from the persisted row when one exists; the DTO is the
+seed only for a genuinely fresh track.
+
+The other two are latent traps the mutable-tempo work exposed in `engine.rs`.
+`commit_or_squash` validated the basis at `self.playhead` (the commit deadline) while
+`speculate` used the cell's `start` — so any resolver reading `ctx.now()` would
+mispredict and squash forever; dormant only because `CasCommitResolver` ignores
+`now()`. And `pump`/`tick_at` mapped `since_epoch × current_rate`, so a tempo change
+reinterpreted *all* of prior elapsed time at the new rate — a 120→240 jump would
+rocket the playhead decades ahead and fire every scheduled cell. `BeatScheduler` dodges
+it (it drives `advance_to` with event-counted ticks, never `pump`), but it was a public
+footgun. We removed `tick_at` and made `pump` integrate phase incrementally, so a rate
+change only re-rates time after it.
+
+The pattern across all three: WI 2 made the tempo *dynamic*, and each bug was a place
+that had quietly assumed the tempo was constant for all time. Gemini-pro's whole-repo
+read caught what a diff-focused pass would have missed.
+
 ## Tracks Stage 2 — the score moves onto the track (2026-06-29)
 
 Stage 1 (earlier the same day, `f6478bdf`→`d43fe9aa`) moved the *clock* — playhead,

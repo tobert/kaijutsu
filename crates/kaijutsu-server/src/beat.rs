@@ -538,9 +538,24 @@ impl BeatScheduler {
             let persisted_score = persisted.as_ref().and_then(|t| t.score_context_id);
             let seed = ctx_from_log.max(persisted_playhead.map(Tick::new).unwrap_or(Tick::ZERO));
             let score_context = self.ensure_score_context(&track_id, persisted_score)?;
+            // The clock lives on the TRACK, so a restart must recover it from the
+            // durable `tracks` row — NOT from the attaching context's `policy` DTO
+            // (which defaults to 120 BPM). `set_tempo` persists `period_ms` precisely
+            // so the saved tempo survives; reverting to the DTO here would silently
+            // discard it on the first re-attach (gemini-pro Stage-3 SEV-1). The DTO
+            // `policy` is the seed ONLY for a genuinely fresh track (no persisted row).
+            // `period_ms`/`beats_per_phrase` are validated non-zero/non-negative on
+            // read (`get_track`), so this can't resurrect a corrupt clock.
+            let active_policy = match persisted.as_ref() {
+                Some(t) => BeatPolicy {
+                    period: Duration::from_millis(t.period_ms),
+                    beats_per_phrase: t.beats_per_phrase,
+                },
+                None => policy,
+            };
             // Arm the TRACK's timeline once, at creation — the clock + open future +
             // committed score live here now and never leave when a producer rotates out.
-            let tl = self.kernel.arm_track_timeline(track_id.clone(), policy.clock(), seed);
+            let tl = self.kernel.arm_track_timeline(track_id.clone(), active_policy.clock(), seed);
             // Rehydrate the committed log from the score's durable blocks (WI 7b) so
             // `UseLastGood` survives a restart. The materialize cursor starts PAST these
             // — they're already materialized — so they're never re-emitted. A fresh
@@ -551,8 +566,8 @@ impl BeatScheduler {
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
-                    clock: ClockSourceKind::system(policy.period),
-                    beats_per_phrase: policy.beats_per_phrase,
+                    clock: ClockSourceKind::system(active_policy.period),
+                    beats_per_phrase: active_policy.beats_per_phrase,
                     playing: false,
                     generation: 0,
                     playhead: seed,
@@ -1957,6 +1972,56 @@ mod tests {
             kernel.track_timeline(&track_id).unwrap().lock().clock_for_test().ticks_per_sec,
             4.0,
             "set_tempo slaved the new TickClock down to the track timeline",
+        );
+    }
+
+    /// SEV-1 (gemini-pro Stage-3 review): a cold restart must recover the
+    /// **persisted** tempo + phrasing, not silently revert to the attaching
+    /// context's [`BeatPolicy`] DTO (which defaults to 120 BPM). `set_tempo`
+    /// persists the new period *precisely so a restart recovers it* — but `attach`
+    /// armed the live clock + speculation timeline from the DTO, throwing the saved
+    /// tempo away on the first re-attach. This persists a fast 240-BPM / 4-beat
+    /// track, then re-attaches with the SLOW default policy and asserts the live
+    /// clock came from the row, not the DTO.
+    #[tokio::test]
+    async fn attach_recovers_persisted_tempo_not_the_dto_policy() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let track = TrackId::new("bass").unwrap();
+
+        // A prior session saved a fast track: 250 ms/beat (240 BPM), 4-beat phrase.
+        db.lock()
+            .upsert_track(&PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 250,
+                beats_per_phrase: 4,
+                playhead_tick: None,
+                playing: false,
+                score_context_id: None,
+            })
+            .unwrap();
+
+        // Restart: a fresh scheduler re-attaches with the SLOW default policy (1
+        // s/beat, 1_000_000-beat phrase) — the DTO the Attach command carries, NOT
+        // the saved tempo.
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        // The live clock and the armed speculation timeline both reflect the
+        // PERSISTED 250 ms/beat → 4 ticks/sec, not the DTO's 1 s/beat → 1 tick/sec.
+        let phrasing = sched.tracks.get(&track).expect("track exists").phrasing();
+        assert_eq!(
+            phrasing.period,
+            Duration::from_millis(250),
+            "restart recovers the persisted beat period, not the DTO default",
+        );
+        assert_eq!(
+            phrasing.beats_per_phrase, 4,
+            "restart recovers the persisted phrase length, not the DTO default",
+        );
+        assert_eq!(
+            kernel.track_timeline(&track).unwrap().lock().clock_for_test().ticks_per_sec,
+            4.0,
+            "the speculation timeline is armed from the persisted period, not the DTO",
         );
     }
 

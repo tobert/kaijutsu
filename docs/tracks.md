@@ -1201,3 +1201,40 @@ Distinct contributions:
   sleeps through the correction — M3 design-completeness) and the 🟠 `Timeline::
   set_clock` TickClock-desync fix (Stage 3 makes tempo dynamic, so the latent
   stale-TickClock bug becomes reachable → WI 2).
+
+### Landed-code review of WI 1 + WI 2 (gemini-pro batch, 2026-06-30)
+
+A second gemini-pro batch read the *shipped* WI 1 + WI 2 code (commits `2e3dc6c5`,
+`e5a89c38`, `4c55a5dd`). It positively confirmed the things we designed on purpose —
+the uninhabited `ModeledClock` enum is sound, already-scheduled cells are protected
+from `set_clock` re-pricing, the `set_tempo` borrow structure is correct, `phrasing()`
+is zero-cost, the `test-util` gating is best-practice — and surfaced **three real
+correctness hazards, all fixed this session (TDD, deepseek's consult had been clean):**
+
+- **🔴 SEV-1 — cold restart silently reverted persisted tempo.** `attach`'s
+  track-create path read the persisted `tracks` row only for `playhead_tick` +
+  `score_context_id`; it armed the live clock + speculation timeline from the
+  attaching context's `BeatPolicy` DTO (default 120 BPM) instead of the saved
+  `period_ms`/`beats_per_phrase`. `set_tempo` persists the tempo *precisely so a
+  restart recovers it*, so this was a silent-fallback data loss (CLAUDE.md: crash over
+  corruption). **Fix:** when a persisted row exists, build an `active_policy` from it
+  and arm/seed from that; the DTO is the seed only for a genuinely fresh track. The
+  row's fields are already validated non-zero/non-negative on read, so this can't
+  resurrect a corrupt clock. Test: `attach_recovers_persisted_tempo_not_the_dto_policy`.
+- **🔴 SEV-2 (dormant) — `commit_or_squash` validated at the wrong tick.** It passed
+  `now = self.playhead` (= the commit_deadline, earlier than `start`) into the
+  validation `CommittedCtx`, while `speculate` used `now = start`. A resolver whose
+  basis reads `ctx.now()` would see predicted ≠ actual every time and squash forever.
+  Dormant only because `CasCommitResolver` ignores `now()`. **Fix:** validate at
+  `start` (matching speculate); a separate `current_tick` carries the playhead for the
+  budget math. Test: `commit_validates_at_start_not_the_commit_deadline` (verified it
+  fails against the old code).
+- **🔴 SEV-2 (latent) — `pump`/`tick_at` was fatal under dynamic tempo.** `tick_at`
+  mapped `since_epoch × current_rate`, so once WI 2 made the rate mutable a tempo
+  change reinterpreted *all* prior elapsed time at the new rate and rocketed the
+  playhead ~decades ahead, firing every scheduled cell. Safe today only because
+  `BeatScheduler` drives `advance_to` with event-counted ticks and never calls `pump`
+  — but `pump` is a public footgun. **Fix:** removed `tick_at`; `pump` now integrates
+  phase *incrementally* (each interval converted at the rate in force during it,
+  sub-tick remainder carried), so a rate change only re-rates time after it. Existing
+  pump tests preserved; regression test: `pump_integrates_phase_across_a_tempo_change`.
