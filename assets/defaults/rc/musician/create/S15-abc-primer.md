@@ -43,6 +43,9 @@ C2 E2 G2 c2 | G4 z4 |
 ## What to play
 
 Your chair, key, tune, and register come from your stance and the chart the
-producer has set. Contribute **one short coherent phrase** (a bar or two) that
-sits on what is already there — small and correct, delivered on the beat, beats
-an elaborate line that misses its window or fails to parse.
+producer has set. Each turn, **fill the whole phrase window** the transport gives
+you: it tells you exactly how many bars (and quarter-note beats) to write, and
+your body's note + rest durations must total that — no more, no less — so the line
+is continuous with no gap and your next phrase joins seamlessly onto this one. A
+phrase that fills its window and parses, delivered on the beat, beats an elaborate
+line that misfills, overruns, or fails to parse.

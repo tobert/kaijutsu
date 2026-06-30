@@ -1092,7 +1092,7 @@ mod tests {
         match cmds.recv().await.expect("an Attach should be sent") {
             BeatCommand::Attach { policy, track, attachment, .. } => {
                 assert_eq!(policy.period, Duration::from_millis(500), "musician default tempo");
-                assert_eq!(policy.beats_per_phrase, 16);
+                assert_eq!(policy.beats_per_phrase, 32, "musician default phrase = 8 bars");
                 assert_eq!(
                     track,
                     TrackId::slugify("Lead Synth").unwrap(),
@@ -1100,8 +1100,8 @@ mod tests {
                 );
                 assert_eq!(
                     attachment.wakeup,
-                    Cadence::new(8 * 16),
-                    "musician default wakeup (8 phrases × 16 beats)"
+                    Cadence::new(32),
+                    "musician default wakeup = one phrase (compose back-to-back)"
                 );
                 assert!(attachment.ooda_armed, "musician default: OODA armed");
             }

@@ -1,32 +1,37 @@
 # Musician beat — the OODA cadence hook.
 #
-# Fired by the kernel beat scheduler on this context's coarse cadence
-# (default: every 8 phrases of 16 beats @ 120 BPM). `kj drive` publishes a
-# turn request for the current context; the server's turn driver runs the
-# model turn. Its ABC output is committed to the shared score on the beat,
-# and MIDI is derived from that committed notation for playback — notation
-# is the score, MIDI a render. This script is the user-editable seam — change
-# the prompt, gate the drive on conditions, or add pre-beat bookkeeping here.
+# Fired by the kernel beat scheduler on this context's wakeup cadence (the
+# musician default is once per phrase, so phrases compose back-to-back and tile
+# the line). `kj drive` publishes a turn request for the current context; the
+# server's turn driver runs the model turn. Its ABC output is committed to the
+# shared score on the beat, and MIDI is derived from that committed notation for
+# playback — notation is the score, MIDI a render. This script is the
+# user-editable seam — change the prompt, gate the drive, precompute facts here.
 #
 # The beat scheduler seeds this run with the transport report (KJ_-prefixed,
 # matching the kernel-injection convention — cf. KJ_PARENT_BLOCK_COUNT):
-#   $KJ_TICK      — the track's playhead tick (beat index, frozen off-beat)
-#   $KJ_PHRASE    — phrases elapsed while playing
-#   $KJ_TEMPO     — tempo in whole BPM
-#   $KJ_HEARD     — JSON array of recent committed notation across tracks
-#                   ([{tick, track, abc}, …], oldest→newest). The score blocks
-#                   are hydration-silent, so this is the only way the player
-#                   sees what was just played. (Stopgap JSON string; becomes a
-#                   kaish array + a read-on-demand pull once arrays land.)
-#   $KJ_PULSE     — per-attachment monotonic wakeup counter; reliable ordering
-#                   key (unlike KJ_TICK, which can freeze off-beat)
-#   $KJ_EPOCH_NS  — wall-clock ns, shared across all contexts woken the same beat
-# Composed into the --prompt below, they become the turn's transport report:
-# the fresh suffix the player reads each beat.
+#   $KJ_TICK         — the track's playhead tick (beat index, frozen off-beat)
+#   $KJ_PHRASE       — phrases elapsed while playing
+#   $KJ_TEMPO        — tempo in whole BPM
+#   $KJ_PHRASE_BEATS — beats in one phrase window: the amount of music to compose
+#                      this turn (the schedule lead is one phrase, so a turn's
+#                      phrase tiles the next window). The fill target.
+#   $KJ_HEARD        — JSON array of recent committed notation across tracks
+#                      ([{tick, track, abc}, …], oldest→newest). The score blocks
+#                      are hydration-silent, so this is the only way the player
+#                      sees what was just played.
+#   $KJ_PULSE        — per-attachment monotonic wakeup counter; reliable ordering
+#   $KJ_EPOCH_NS     — wall-clock ns, shared across contexts woken the same beat
+#
+# PRECOMPUTE IN RC (a big win for rc as a feature): rather than make the model do
+# bar arithmetic in its weights (error-prone, and a small model can't be handed a
+# calculator tool without stalling — see issues.md "RO-kaish for players"), do the
+# math here in kaish and hand the model spelled-out, exact fill targets. In 4/4 a
+# beat is a quarter note, so bars = beats / 4.
+bars=$(( KJ_PHRASE_BEATS / 4 ))
 #
 # `kj drive --prompt` writes the report as a real User block, so the model
-# hydrates it as the fresh user turn (not a discarded seed).
-#
-# No positional context: the tick lifecycle runs with this context as the
-# current one, so `kj drive` targets it (avoids passing the raw id as an arg).
-kj drive --prompt "Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM. Recently played (JSON): $KJ_HEARD. Play the next phrase and give it as one complete, self-contained ABC tune every turn — a full header (X:, T:, M:, L:, K:) then the body, never a bare phrase or a continuation: the score parser rejects a body without a header. Raw ABC only — no prose, no code fences."
+# hydrates it as the fresh user turn (a cloud model REQUIRES a user message —
+# Anthropic rejects a system-only turn). No positional context: the tick runs
+# with this context current, so `kj drive` targets it.
+kj drive --prompt "Transport: tick $KJ_TICK, phrase $KJ_PHRASE, $KJ_TEMPO BPM, 4/4 in K:C. Recently played (oldest→newest JSON): $KJ_HEARD. Play the NEXT phrase, continuing seamlessly from what you just played — fill exactly $bars bars (= $KJ_PHRASE_BEATS quarter-note beats) so the line stays continuous with no gap. Output ONE complete ABC tune: header (X:1, T:, M:4/4, L:1/8, K:C) then a body whose note+rest durations total exactly $KJ_PHRASE_BEATS beats. Raw ABC only — no prose, no code fences."

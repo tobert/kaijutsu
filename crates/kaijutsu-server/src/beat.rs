@@ -1432,6 +1432,12 @@ impl BeatScheduler {
             transport_vars(playhead, track.beat_count, &track.phrasing())
                 .into_iter()
                 .collect();
+        // KJ_PHRASE_BEATS: the length of one phrase window in beats — the amount of
+        // music a musician should compose per turn (the schedule lead is one phrase,
+        // so a turn's phrase tiles the next window). The tick rc precomputes bars
+        // from this (kaish math) and hands the model spelled-out fill targets, so the
+        // model never has to do the arithmetic. 0 means "no phrasing" (compose freely).
+        vars.insert("KJ_PHRASE_BEATS".to_string(), track.beats_per_phrase.to_string());
         // KJ_HEARD: the recent committed notation the player composes against — read
         // from the TRACK's score context now, so it's the real band view (the whole
         // lane across every producer + rotation), not just this context's own blocks.
@@ -2008,10 +2014,10 @@ mod tests {
     /// (the kernel-injection convention from `docs/tracks.md`).
     #[test]
     fn transport_vars_report_now_facts() {
-        // musician_default: 500 ms/beat (= 120 BPM), 16 beats/phrase.
+        // musician_default: 500 ms/beat (= 120 BPM), 32 beats/phrase (8 bars).
         let m = vars_map(transport_vars(Tick::new(128), 128, &BeatPolicy::musician_default()));
         assert_eq!(m["KJ_TICK"], "128", "playhead tick verbatim");
-        assert_eq!(m["KJ_PHRASE"], "8", "128 beats / 16 per phrase = phrase 8");
+        assert_eq!(m["KJ_PHRASE"], "4", "128 beats / 32 per phrase = phrase 4");
         assert_eq!(m["KJ_TEMPO"], "120", "500 ms/beat rounds to 120 BPM");
     }
 

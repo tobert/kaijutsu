@@ -53,13 +53,17 @@ pub struct BeatPolicy {
 
 impl BeatPolicy {
     /// The musician default clock: a quarter note at 120 BPM (500 ms/beat) in 4/4,
-    /// a 16-beat phrase (a 4-bar phrase in 4/4 collapsed at this edge). The OODA
-    /// wakeup cadence is no longer here — it rides the [`Attachment`]
-    /// ([`Attachment::musician_default`]). Tunable per track via rc.
+    /// a **32-beat phrase** (8 bars of 4/4). At 120 BPM that's a ~16 s window, and
+    /// since the schedule lead is one phrase ([`on_turn_completed`] schedules at
+    /// `playhead + phrase_delta`), the producer has ~16 s to compose the next phrase
+    /// while the current one plays — a generous buffer so a slow/loaded GPU doesn't
+    /// gap the line (it composes more bars, less often). The OODA wakeup cadence is
+    /// no longer here — it rides the [`Attachment`] ([`Attachment::musician_default`],
+    /// set to one phrase so phrases tile back-to-back). Tunable per track via rc.
     pub fn musician_default() -> Self {
         Self {
             period: Duration::from_millis(500),
-            beats_per_phrase: 16,
+            beats_per_phrase: 32,
         }
     }
 
@@ -137,13 +141,17 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    /// The musician default ride: woken (OODA) every 8 phrases (= 128 beats ≈ 64 s
-    /// at the default tempo — numerically the old `ooda_every`), no auto-rotation
-    /// until rc opts in, OODA **armed** (a created musician is ready to think;
-    /// the *clock* is what starts stopped, not the arm). Pulse starts at 0.
+    /// The musician default ride: woken (OODA) **once per phrase** (32 beats ≈ 16 s
+    /// at the default tempo), so phrases compose **back-to-back** and tile the line
+    /// continuously — each turn fills the next phrase window while the current one
+    /// plays (the schedule lead is one phrase). No auto-rotation until rc opts in,
+    /// OODA **armed** (a created musician is ready to think; the *clock* is what
+    /// starts stopped, not the arm). Pulse starts at 0. (Was 128 beats / 8 phrases —
+    /// that composed once a minute, leaving long rests; dialed to one phrase so the
+    /// score is gapless without hammering the producer — see `BeatPolicy::musician_default`.)
     pub fn musician_default() -> Self {
         Self {
-            wakeup: Cadence::new(8 * 16),
+            wakeup: Cadence::new(32),
             rotate: None,
             ooda_armed: true,
             pulse: 0,
@@ -1763,26 +1771,26 @@ mod tests {
 
     /// T2 (design-chameleon-batch1-f2-notation §16) — the musician default speaks
     /// in phrases. `beats_per_phrase` is the kernel's only musical chunking unit
-    /// above the beat (16 = a 4-bar phrase in 4/4). The OODA wakeup cadence is no
+    /// above the beat (32 = an 8-bar phrase in 4/4). The OODA wakeup cadence is no
     /// longer on `BeatPolicy` — it moved to `Attachment::wakeup` (Stage 1:
-    /// `docs/tracks.md`) and is 128 beats (8 phrases) in the musician default.
-    /// Consumers go through `phrase_delta()`/`is_phrase_boundary()`, never the raw
-    /// field.
+    /// `docs/tracks.md`) and is one phrase (32 beats) in the musician default so
+    /// phrases tile back-to-back. Consumers go through
+    /// `phrase_delta()`/`is_phrase_boundary()`, never the raw field.
     #[test]
     fn musician_default_speaks_phrases() {
         let p = super::BeatPolicy::musician_default();
-        assert_eq!(p.beats_per_phrase, 16, "a 4-bar phrase in 4/4 is 16 beats");
-        assert_eq!(p.phrase_delta(), TickDelta::new(16), "one phrase of lead is 16 beat-ticks");
-        assert!(p.is_phrase_boundary(16), "beat 16 is a phrase boundary");
+        assert_eq!(p.beats_per_phrase, 32, "an 8-bar phrase in 4/4 is 32 beats");
+        assert_eq!(p.phrase_delta(), TickDelta::new(32), "one phrase of lead is 32 beat-ticks");
         assert!(p.is_phrase_boundary(32), "beat 32 is a phrase boundary");
-        assert!(!p.is_phrase_boundary(17), "beat 17 is mid-phrase, not a boundary");
+        assert!(p.is_phrase_boundary(64), "beat 64 is a phrase boundary");
+        assert!(!p.is_phrase_boundary(33), "beat 33 is mid-phrase, not a boundary");
 
-        // The wakeup cadence now lives on the Attachment, not BeatPolicy.
+        // The wakeup cadence now lives on the Attachment, not BeatPolicy — one phrase
+        // so the producer composes the next window back-to-back (gapless, GPU-friendly).
         let a = super::Attachment::musician_default();
         assert_eq!(
-            a.wakeup.every,
-            128,
-            "OODA wakeup stays at 128 beats (8 phrases × 16) on the Attachment"
+            a.wakeup.every, 32,
+            "OODA wakeup is one phrase (32 beats) on the Attachment so phrases tile"
         );
         assert!(a.ooda_armed, "musician default: OODA armed");
     }
