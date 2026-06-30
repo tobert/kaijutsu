@@ -794,3 +794,15 @@ tuplet numeral centered above the group. Both verified visually (rsvg → PNG): 
 `Z3` H-bar with its "3" and the `(3` brackets render correctly. Suite 357 → 359.
 Noted a small title/tuplet-bracket overlap as polish. Remaining engrave items:
 inline `[K:]` staff redraw, `middle=`, the small grace-notehead glyph, SourceSpans.
+
+### 2026-06-30 — engrave: mid-staff inline [K:] clef/key change
+
+The last SEVERE engrave gap: a mid-tune [K:clef=bass] (or [K:bass]) was dropped by
+the renderer's catch-all, so the staff kept reading in treble even though MIDI had
+already switched. render_staff's ctx is now mutable; on an inline K: field the
+engraver re-parses the key, and (a) if the clef changed, updates ctx.clef, draws a
+new clef glyph, and every following note repositions automatically through pos_for;
+(b) if the value names a key root (A–G), redraws the key signature at that point.
+A bare clef change (value not starting A–G) leaves the key signature alone, so
+[K:clef=bass] doesn't wrongly wipe the current key. Verified visually: CDEF…|[K:bass]
+draws the F-clef and drops the following notes into bass-clef positions. Suite 359→360.

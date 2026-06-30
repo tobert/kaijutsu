@@ -333,7 +333,7 @@ fn render_staff(
     elements: &mut Vec<EngravingElement>,
     header: &Header,
     voice: &Voice,
-    ctx: StaffCtx,
+    mut ctx: StaffCtx,
 ) -> (usize, usize, f64) {
     let font = font_cache();
     let sp = ctx.sp;
@@ -855,6 +855,55 @@ fn render_staff(
                     size: sp * 1.2,
                     source_span: (0, 0),
                 });
+            }
+            // Mid-staff inline key/clef change (§3.2/§4.6). A clef change
+            // repositions the following notes and draws a new clef; a key change
+            // (value starting with a root A–G) redraws the key signature here.
+            Element::InlineField(field) if field.field_type == 'K' => {
+                let val = field.value.trim();
+                let mut fc = crate::feedback::FeedbackCollector::new();
+                let new_key = crate::parser::key::parse_key_field(val, &mut fc);
+                cursor_x += sp * 0.5;
+
+                if let Some(new_clef) = new_key.clef {
+                    if new_clef != ctx.clef {
+                        ctx.clef = new_clef;
+                        if let Some((cp, line_pos)) = clef_glyph(ctx.clef) {
+                            elements.push(EngravingElement::Glyph {
+                                codepoint: cp,
+                                x: cursor_x,
+                                y: ctx.y_at(line_pos),
+                                scale: ctx.scale,
+                                source_span: (0, 0),
+                            });
+                            cursor_x += sp * 3.0;
+                        }
+                    }
+                }
+
+                if matches!(val.chars().next(), Some('A'..='G')) {
+                    let (count, is_sharp) = new_key.signature();
+                    let acc_cp = if is_sharp { 0xE262u32 } else { 0xE260u32 };
+                    let placements = if is_sharp {
+                        sharp_octaves(ctx.clef)
+                    } else {
+                        flat_octaves(ctx.clef)
+                    };
+                    for &(note, oct) in placements.iter().take((count as usize).min(7)) {
+                        elements.push(EngravingElement::Glyph {
+                            codepoint: acc_cp,
+                            x: cursor_x,
+                            y: ctx.y_at(ctx.pos_for(&note, oct)),
+                            scale: ctx.scale,
+                            source_span: (0, 0),
+                        });
+                        cursor_x += sp;
+                    }
+                    if count > 0 {
+                        cursor_x += sp * 0.5;
+                    }
+                }
+                cursor_x += sp * 0.5;
             }
             // Space, LineBreak, decorations, slurs, lyrics, etc. — defer.
             _ => {}

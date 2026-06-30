@@ -453,3 +453,29 @@ fn tuplet_draws_bracket_and_number() {
         .any(|e| matches!(e, EngravingElement::Text { content, .. } if content == "3"));
     assert!(has_numeral, "tuplet numeral '3' should be drawn");
 }
+
+#[test]
+fn inline_clef_change_redraws_clef_and_repositions() {
+    // §3.2/§4.6: a mid-tune [K:bass] (clef change) draws a bass clef and
+    // repositions the notes that follow it.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let els = layout::engrave(
+        &parse("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nCDEF|[K:bass]CDEF|\n").value[0],
+        &default_options(),
+    );
+    let bass_clefs = els
+        .iter()
+        .filter(|e| matches!(e, EngravingElement::Glyph { codepoint: 0xE062, .. }))
+        .count();
+    assert_eq!(bass_clefs, 1, "a bass clef glyph should be drawn at [K:bass]");
+
+    let head_ys: Vec<f64> = els
+        .iter()
+        .filter_map(|e| match e {
+            EngravingElement::Glyph { codepoint, y, .. } if (0xE0A2..=0xE0A4).contains(codepoint) => Some(*y),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(head_ys.len(), 8, "eight noteheads");
+    assert_ne!(head_ys[0], head_ys[4], "the C repositions under the bass clef");
+}

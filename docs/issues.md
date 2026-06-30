@@ -1926,11 +1926,10 @@ Remaining, ranked; delete when shipped. (Most are IR-assertable in tests/engrave
 **Shipped (commits d722f492, 8fb17d87, + this round):** shared `Key::signature()` (sharp-minor
 keys); tuplet renders rests/chords; augmentation dots on dotted notes/rests; chord-second
 notehead offset; invisible rest `x` draws nothing; whole-rest hangs higher than half;
-`M:none` omits the time sig; multi-measure rest H-bar + count numeral; tuplet bracket + numeral.
+`M:none` omits the time sig; multi-measure rest H-bar + count numeral; tuplet bracket + numeral;
+mid-staff inline `[K:]` clef change (redraws clef + repositions notes) and key-sig redraw.
 
 **Still open:**
-- **SEVERE — inline `[K:]`/clef changes dropped in rendering** (`_ => {}` in the element match).
-  Mid-staff key change isn't redrawn on the staff (MIDI already handles it). `[K:G]` mid-tune.
 - **MED — `K: middle=<pitch>` ignored** (only the per-clef default middle line is used).
 - **LOW — grace notes use the regular notehead glyph**, not the SMuFL small notehead.
 - **LOW — every `SourceSpan` is hardcoded `(0,0)`**, so click-to-edit span attrs are dead.
