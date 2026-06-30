@@ -609,6 +609,7 @@ mod tests {
                 playhead_tick: None,
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
         d.kernel_db()
@@ -818,6 +819,7 @@ mod tests {
                 playhead_tick: None,
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
         d.kernel_db()
@@ -1007,6 +1009,7 @@ mod tests {
                 playhead_tick: None,
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
         d.kernel_db()
@@ -1297,6 +1300,7 @@ mod tests {
                 playhead_tick: None,
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
         d.kernel_db()

@@ -113,6 +113,22 @@ impl ClockSourceKind {
         Self::System(SystemClock::new(period))
     }
 
+    /// Reconstruct a persisted clock source from its `clock_kind` discriminator
+    /// (the `tracks.clock_kind` column) and the persisted period. M1 can build
+    /// only `"system"`; a `"modeled"` row names a driver this stage cannot
+    /// construct ([`ModeledClock`] is uninhabited until M3), so we **crash loud**
+    /// rather than silently downgrade the track's clock to the system one
+    /// (CLAUDE.md: crash over corruption; "silent fallbacks are often a mistake").
+    pub fn from_persisted(kind: &str, period: Duration) -> Result<Self, String> {
+        match kind {
+            "system" => Ok(Self::system(period)),
+            other => Err(format!(
+                "track clock_kind {other:?} is not constructable in M1 (only \
+                 'system'); refusing to silently downgrade the clock"
+            )),
+        }
+    }
+
     /// The persisted discriminator (`clock_kind` column). MUTABLE over a track's
     /// life — a track sketched on the system clock can later be slaved to MIDI
     /// (Stage 3 lock; unlike set-once `score_context_id`).

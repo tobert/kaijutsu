@@ -537,7 +537,6 @@ impl BeatScheduler {
             let persisted_playhead = persisted.as_ref().and_then(|t| t.playhead_tick);
             let persisted_score = persisted.as_ref().and_then(|t| t.score_context_id);
             let seed = ctx_from_log.max(persisted_playhead.map(Tick::new).unwrap_or(Tick::ZERO));
-            let score_context = self.ensure_score_context(&track_id, persisted_score)?;
             // The clock lives on the TRACK, so a restart must recover it from the
             // durable `tracks` row — NOT from the attaching context's `policy` DTO
             // (which defaults to 120 BPM). `set_tempo` persists `period_ms` precisely
@@ -553,6 +552,17 @@ impl BeatScheduler {
                 },
                 None => policy,
             };
+            // Reconstruct the clock SOURCE from the persisted `clock_kind` (Stage 3
+            // WI 3) — a track slaved to MIDI must re-arm as that driver, not silently
+            // revert to the system clock. M1 only builds "system"; a "modeled" row
+            // crashes loud (from_persisted). A fresh track defaults to the system clock.
+            // Computed BEFORE any side effect (the score-context mint below) so a
+            // corrupt clock_kind fails the attach clean, with no half-created state.
+            let active_clock = match persisted.as_ref() {
+                Some(t) => ClockSourceKind::from_persisted(&t.clock_kind, active_policy.period)?,
+                None => ClockSourceKind::system(active_policy.period),
+            };
+            let score_context = self.ensure_score_context(&track_id, persisted_score)?;
             // Arm the TRACK's timeline once, at creation — the clock + open future +
             // committed score live here now and never leave when a producer rotates out.
             let tl = self.kernel.arm_track_timeline(track_id.clone(), active_policy.clock(), seed);
@@ -566,7 +576,7 @@ impl BeatScheduler {
             self.tracks.insert(
                 track_id.clone(),
                 TrackState {
-                    clock: ClockSourceKind::system(active_policy.period),
+                    clock: active_clock,
                     beats_per_phrase: active_policy.beats_per_phrase,
                     playing: false,
                     generation: 0,
@@ -636,6 +646,9 @@ impl BeatScheduler {
             playhead_tick: Some(track.playhead.get()),
             playing: track.playing,
             score_context_id: Some(track.score_context),
+            // MUTABLE: mirror the live driver's kind so a restart reconstructs the
+            // same clock source. M1 only ever writes "system".
+            clock_kind: track.clock.kind_str().to_string(),
         };
         db.lock().upsert_track(&row).map_err(|e| {
             let msg = format!("beat: failed to persist track {}: {e}", track_id.as_str());
@@ -1997,6 +2010,7 @@ mod tests {
                 playhead_tick: None,
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
 
@@ -2022,6 +2036,43 @@ mod tests {
             kernel.track_timeline(&track).unwrap().lock().clock_for_test().ticks_per_sec,
             4.0,
             "the speculation timeline is armed from the persisted period, not the DTO",
+        );
+    }
+
+    /// WI 3 (Stage 3): re-attach reconstructs the clock SOURCE from the persisted
+    /// `clock_kind`. A `"system"` row re-arms a system clock (no regression). A
+    /// `"modeled"` row names a driver M1 can't construct ([`ModeledClock`] is
+    /// uninhabited until M3) — `attach` crashes loud rather than silently
+    /// downgrading the clock to the system one (CLAUDE.md: crash over corruption).
+    #[tokio::test]
+    async fn attach_crashes_loud_on_an_unconstructable_clock_kind() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let track = TrackId::new("bass").unwrap();
+
+        // A row that claims a MIDI-slaved (modeled) clock — a future M3 driver.
+        db.lock()
+            .upsert_track(&PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 250,
+                beats_per_phrase: 4,
+                playhead_tick: None,
+                playing: false,
+                score_context_id: None,
+                clock_kind: "modeled".to_string(),
+            })
+            .unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let err = sched
+            .attach(track.clone(), ctx, slow_attachment(), slow_policy())
+            .expect_err("M1 cannot construct a modeled clock — attach must fail loud");
+        assert!(
+            err.contains("clock_kind") && err.contains("modeled"),
+            "the error names the unconstructable clock_kind, got: {err}"
+        );
+        assert!(
+            sched.tracks.get(&track).is_none(),
+            "a failed clock reconstruction leaves no half-armed track"
         );
     }
 
@@ -2794,6 +2845,7 @@ mod tests {
                 beats_per_phrase: 12,
                 playhead_tick: Some(0),
                 playing: false,
+                clock_kind: "system".to_string(),
                 score_context_id: Some(score_ctx),
             }),
             "attach mirrors the clock into the tracks row for restart recovery"
@@ -2923,6 +2975,7 @@ mod tests {
                 playhead_tick: Some(5),
                 playing: false,
                 score_context_id: Some(score),
+                clock_kind: "system".to_string(),
             })
             .unwrap();
 
@@ -2974,6 +3027,7 @@ mod tests {
                 playhead_tick: Some(512),
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
         assert_eq!(
@@ -3027,6 +3081,7 @@ mod tests {
                 playhead_tick: Some(42),
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
 
@@ -3063,6 +3118,7 @@ mod tests {
                 playhead_tick: Some(0),
                 playing: false,
                 score_context_id: None,
+                clock_kind: "system".to_string(),
             })
             .unwrap();
         assert!(kernel.timeline(ctx).is_none(), "no timeline before attach");

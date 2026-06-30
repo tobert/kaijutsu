@@ -635,7 +635,12 @@ CREATE TABLE IF NOT EXISTS tracks (
     playing           INTEGER NOT NULL DEFAULT 0,  -- 1=Playing, 0=Stopped
     -- The non-producer context whose document holds the track's materialized
     -- score. Set once at creation; never rewritten. NULL on a pre-score row.
-    score_context_id  BLOB
+    score_context_id  BLOB,
+    -- The clock-source discriminator (ClockSourceKind::kind_str). MUTABLE over a
+    -- track's life (docs/tracks.md Stage 3): a track sketched on the system clock
+    -- can later be slaved to a MIDI master — unlike set-once `score_context_id`,
+    -- the clock *source* is circumstantial. `'system'` is the only kind M1 builds.
+    clock_kind        TEXT    NOT NULL DEFAULT 'system'
 );
 
 -- ── Attachments (context → track binding — docs/tracks.md §2+3) ─
@@ -710,6 +715,11 @@ pub struct PersistedTrack {
     /// score. Set once at creation; `write_track` never overwrites it, so an
     /// upsert that omits it (passes `None`) can't wipe it. `None` on a pre-score row.
     pub score_context_id: Option<ContextId>,
+    /// The clock-source discriminator (`ClockSourceKind::kind_str`: `"system"` /
+    /// `"modeled"`). MUTABLE — `write_track` rewrites it on every upsert (Stage 3:
+    /// a track's clock source is circumstantial, slaveable to MIDI), unlike the
+    /// set-once `score_context_id`. A pre-Stage-3 row reads back as `"system"`.
+    pub clock_kind: String,
 }
 
 /// A persisted attachment — one (track_id, context_id) binding, the restart-
@@ -979,6 +989,7 @@ impl KernelDb {
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
+            "ALTER TABLE tracks ADD COLUMN clock_kind TEXT NOT NULL DEFAULT 'system'",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -3257,13 +3268,15 @@ impl KernelDb {
     fn write_track(conn: &Connection, t: &PersistedTrack) -> KernelDbResult<()> {
         // `score_context_id` is set-once: written on INSERT, omitted from the
         // ON CONFLICT UPDATE, so the frequent tempo/playhead upserts can't null it.
+        // `clock_kind` is the opposite — MUTABLE, in the UPDATE SET, so a driver
+        // swap (system → modeled) persists (docs/tracks.md Stage 3).
         conn.execute(
             "INSERT INTO tracks
-                 (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id, clock_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(track_id) DO UPDATE SET
                  period_ms = ?2, beats_per_phrase = ?3,
-                 playhead_tick = ?4, playing = ?5",
+                 playhead_tick = ?4, playing = ?5, clock_kind = ?7",
             params![
                 t.track_id,
                 t.period_ms as i64,
@@ -3271,6 +3284,7 @@ impl KernelDb {
                 t.playhead_tick,
                 t.playing as i64,
                 t.score_context_id.map(|c| c.as_bytes().to_vec()),
+                t.clock_kind,
             ],
         )?;
         Ok(())
@@ -3292,7 +3306,7 @@ impl KernelDb {
         let row = self
             .conn
             .query_row(
-                "SELECT period_ms, beats_per_phrase, playhead_tick, playing, score_context_id
+                "SELECT period_ms, beats_per_phrase, playhead_tick, playing, score_context_id, clock_kind
                  FROM tracks WHERE track_id = ?1",
                 params![track_id],
                 |row| {
@@ -3302,11 +3316,13 @@ impl KernelDb {
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((period_ms, beats_per_phrase, playhead_tick, playing, score_blob)) = row else {
+        let Some((period_ms, beats_per_phrase, playhead_tick, playing, score_blob, clock_kind)) = row
+        else {
             return Ok(None);
         };
         if period_ms < 0 || beats_per_phrase < 0 {
@@ -3327,13 +3343,14 @@ impl KernelDb {
             playhead_tick,
             playing: playing != 0,
             score_context_id: parse_optional_context_id(track_id, score_blob)?,
+            clock_kind,
         }))
     }
 
     /// List all persisted tracks. Order is not guaranteed.
     pub fn list_tracks(&self) -> KernelDbResult<Vec<PersistedTrack>> {
         let mut stmt = self.conn.prepare(
-            "SELECT track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id
+            "SELECT track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id, clock_kind
              FROM tracks",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -3344,11 +3361,13 @@ impl KernelDb {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         let mut tracks = Vec::new();
         for row in rows {
-            let (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_blob) = row?;
+            let (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_blob, clock_kind) =
+                row?;
             let score_context_id = parse_optional_context_id(&track_id, score_blob)?;
             tracks.push(PersistedTrack {
                 track_id,
@@ -3357,6 +3376,7 @@ impl KernelDb {
                 playhead_tick,
                 playing: playing != 0,
                 score_context_id,
+                clock_kind,
             });
         }
         Ok(tracks)
@@ -5713,6 +5733,7 @@ mod tests {
             playhead_tick: None,
             playing: false,
             score_context_id: None,
+            clock_kind: "system".to_string(),
         }
     }
 
@@ -5875,6 +5896,65 @@ mod tests {
         // A pre-Stage-2 row (created without a score context) reads back as None.
         db.upsert_track(&make_track("drums", 250)).unwrap();
         assert_eq!(db.get_track("drums").unwrap().unwrap().score_context_id, None);
+    }
+
+    #[test]
+    fn track_clock_kind_round_trips_and_is_mutable() {
+        // Unlike `score_context_id` (set-once), `clock_kind` is MUTABLE: a track
+        // sketched on the system clock can be slaved to a MIDI master later
+        // (docs/tracks.md Stage 3). The driver swap must survive an upsert.
+        let db = KernelDb::in_memory().unwrap();
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        assert_eq!(
+            db.get_track("bass").unwrap().unwrap().clock_kind,
+            "system",
+            "default clock_kind round-trips"
+        );
+
+        // A tempo upsert that keeps the same kind preserves it.
+        db.upsert_track(&PersistedTrack {
+            period_ms: 300,
+            ..make_track("bass", 0) // period_ms overridden above; 0 unused
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_track("bass").unwrap().unwrap().clock_kind,
+            "system",
+            "a tempo upsert preserves the clock kind"
+        );
+
+        // A driver swap (system → modeled) is persisted — clock_kind is in the
+        // ON CONFLICT UPDATE SET, the opposite of set-once score_context_id.
+        db.upsert_track(&PersistedTrack {
+            clock_kind: "modeled".to_string(),
+            ..make_track("bass", 250)
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_track("bass").unwrap().unwrap().clock_kind,
+            "modeled",
+            "a driver swap updates clock_kind (MUTABLE, not set-once)"
+        );
+    }
+
+    #[test]
+    fn track_clock_kind_defaults_to_system_on_a_pre_stage3_row() {
+        // A row inserted without the `clock_kind` column (the pre-Stage-3 shape an
+        // additive ALTER backfills) reads back as 'system' via the column DEFAULT,
+        // never NULL — `get_track`'s `String` read would fail loud on NULL.
+        let db = KernelDb::in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
+                 VALUES ('legacy', 500, 16)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_track("legacy").unwrap().unwrap().clock_kind,
+            "system",
+            "a pre-Stage-3 row backfills to the 'system' default"
+        );
     }
 
     // ── Attachments CRUD ──────────────────────────────────────────────
