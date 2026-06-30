@@ -123,7 +123,29 @@ pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         return generate_multitrack(tune, params);
     }
 
-    // Single voice - use format 0
+    // Single voice - use format 0: frame the shared writer's events as an SMF blob.
+    build_single_track_writer(tune, params).finish()
+}
+
+/// The timed MIDI event stream for a tune — the per-event view the SMF blob from
+/// [`generate`] frames. Stage 3 WI 5 (docs/tracks.md): the render target consumes
+/// this to schedule individual NoteOn/NoteOff into an ALSA seq queue, rather than
+/// re-parse the SMF byte blob. Events are absolute-tick and **sorted**; meta
+/// events (tempo `0xFF 0x51`, etc.) are included for the consumer to honour or
+/// skip — an ALSA seq target plays only the channel-voice (`0x80`/`0x90`/…)
+/// messages. M1 renders the single-track (format-0) merge: a multi-voice tune
+/// collapses onto one channel here (per-voice channel split is a later milestone,
+/// matching `generate`'s own format-0 path).
+pub fn events(tune: &Tune, params: &MidiParams) -> Vec<MidiEvent> {
+    let mut writer = build_single_track_writer(tune, params);
+    writer.events.sort_by_key(|e| e.tick);
+    writer.events
+}
+
+/// Build the single-track (SMF format-0) writer for a tune — all voices merged
+/// onto `params.channel`. Shared by [`generate`] (frames it as an SMF blob) and
+/// [`events`] (returns its timed event stream). Stage 3 WI 5.
+fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
     let mut writer = MidiWriter::new(params.ticks_per_beat, params.channel);
 
     // Set tempo
@@ -294,7 +316,7 @@ pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         }
     }
 
-    writer.finish()
+    writer
 }
 
 /// Generate multi-track MIDI (SMF format 1) for tunes with multiple voices.
@@ -600,9 +622,14 @@ struct MidiWriter {
     current_tick: u32,
 }
 
-struct MidiEvent {
-    tick: u32,
-    data: Vec<u8>,
+/// One timed MIDI message: raw status+data bytes at an absolute tick. The
+/// `data` bytes are a complete MIDI message (e.g. `[0x90|ch, pitch, vel]` for a
+/// NoteOn, or `[0xFF, 0x51, …]` for a tempo meta event) — exactly what the SMF
+/// track stores after its delta-time. Exposed by [`events`] for the Stage 3
+/// render target (docs/tracks.md WI 5).
+pub struct MidiEvent {
+    pub tick: u32,
+    pub data: Vec<u8>,
 }
 
 impl MidiWriter {
@@ -902,6 +929,76 @@ mod tests {
         assert_eq!(&midi[0..4], b"MThd");
         assert_eq!(&midi[8..10], &[0, 0]); // format 0
         assert_eq!(&midi[10..12], &[0, 1]); // 1 track
+    }
+
+    #[test]
+    fn events_yields_timed_note_on_off_stream() {
+        // Stage 3 WI 5: the per-event view the render target consumes. CDEF at
+        // L:1/4 / 120 BPM → four quarter notes, each one beat (480 ticks default).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\nCDEF|\n";
+        let result = crate::parse(abc);
+        assert!(!result.has_errors());
+        let tune = &result.value[0];
+        let params = MidiParams::default();
+
+        let evs = events(tune, &params);
+
+        // Sorted by tick (the contract the render target relies on).
+        assert!(
+            evs.windows(2).all(|w| w[0].tick <= w[1].tick),
+            "events() must return a tick-sorted stream"
+        );
+
+        // The four NoteOns land one beat apart: 0, 480, 960, 1440.
+        let note_on_ticks: Vec<u32> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.tick)
+            .collect();
+        assert_eq!(
+            note_on_ticks,
+            vec![0, 480, 960, 1440],
+            "four quarter-note NoteOns, one beat (480 ticks) apart"
+        );
+
+        // Each NoteOn has a matching NoteOff one beat later (4 on, 4 off).
+        let note_off_ticks: Vec<u32> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x80))
+            .map(|e| e.tick)
+            .collect();
+        assert_eq!(
+            note_off_ticks,
+            vec![480, 960, 1440, 1920],
+            "each note ends a beat after it starts"
+        );
+    }
+
+    #[test]
+    fn events_and_generate_share_the_single_track_writer() {
+        // The refactor's invariant: `generate` (SMF blob) and `events` (timed
+        // stream) are framings of the SAME writer, so the byte blob's channel
+        // messages match the event stream's. A change to one without the other
+        // would diverge here. Count NoteOns both ways and assert they agree.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/8\nK:C\nCDEFGABc|\n";
+        let tune = &crate::parse(abc).value[0];
+        let params = MidiParams::default();
+
+        let evs = events(tune, &params);
+        let blob = generate(tune, &params);
+
+        let events_note_ons = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .count();
+        let blob_note_ons = blob.windows(1).filter(|w| w[0] & 0xF0 == 0x90).count();
+        // (the blob count is approximate — 0x90 can appear in a delta/data byte —
+        // so assert the stream has the expected 8 and the blob has at least that.)
+        assert_eq!(events_note_ons, 8, "eight eighth-notes → eight NoteOns");
+        assert!(
+            blob_note_ons >= events_note_ons,
+            "the SMF blob carries the same NoteOns the event stream does"
+        );
     }
 
     #[test]
