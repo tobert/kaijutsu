@@ -384,6 +384,65 @@ before — diagnose threading from the code, not from a reviewer's summary, and 
 two competent readers model the topology differently that *is* the signal to go
 look.
 
+## Tracks Stage 3 M1 — sound out the door (clock_kind, render seam, AlsaMidiOut) (2026-06-30)
+
+With WI 1+2 (the `ClockSourceKind` enum + mutable tempo) and the three landed-code
+fixes (below) in, the rest of Stage 3 M1 landed in four commits
+(`b3cd1761`→`508bc0c4`) and the track grew an actual *sound output*. The arc is
+**midi.md M1**: ABC committed on a track → MIDI scheduled into an ALSA seq queue,
+system clock, output-first.
+
+**WI 3 — `clock_kind` persistence (`b3cd1761`).** The clock *source* is the
+deliberate opposite of the set-once `score_context_id`: a track's identity is
+durable, but you sketch on the system clock and later slave the *same* track to a
+MIDI master, so `clock_kind` is MUTABLE — it rides the `ON CONFLICT UPDATE SET`,
+persisted on every driver swap (gemini won that call in the lock; my original
+"set-once" line was wrong). `attach` reconstructs the source from the row, not just
+the period — and because M1 can only build `"system"` (`ModeledClock` is
+uninhabited until M3), a `"modeled"` row makes `attach` crash loud rather than
+silently downgrade the clock. Additive ALTER, so a pre-Stage-3 row backfills to
+`"system"`, never NULL.
+
+**WI 5 — the ABC per-event stream (`f5b7cb16`).** `midi.rs` already built a timed
+`MidiEvent` list internally and then framed it as an SMF blob; re-parsing that blob
+to recover the events would be backwards. So `pub fn events(tune, params)` exposes
+the sorted, absolute-tick stream, and `generate` became a thin SMF wrapper over the
+shared `build_single_track_writer` — its bytes unchanged (the whole pre-existing
+suite guards that).
+
+**WI 4 — the render-target seam (`77f73fa1`).** A render is a *consumer* of the
+score, not a producer — so `RenderTarget` hangs on `TrackState` (a small `Vec`), not
+as an `AttachedContext`, and is fed from the materialize crossing: each
+newly-committed `Concrete` ABC cell's resolved ABC + a near-future instant go to
+every target. Two review fixes are baked into the seam. The instant is computed off
+a **jitter-free** reference — `last_fire_scheduled`, the heap entry's *scheduled*
+fire `Instant` latched in `fire_due`, NOT the `SystemTime` latched after the pop (the
+jittery *actual* wakeup) — so per-beat scheduler jitter never accumulates into the
+output (deepseek). And because the speculation lead means a device queue holds ~a
+phrase of future events, `stop`/`pause` call `flush_scheduled_after(now)` to truncate
+the tail rather than let the clock-stop play it out (both casts, SEV-1). The seam is a
+zero-CAS-read no-op when a track has no targets — the common case.
+
+**WI 6 — `AlsaMidiOut`, live on zorak (`508bc0c4`).** The one real target: opens an
+ALSA seq client + a subscribe-readable port + a started real-time queue. `emit`
+resolves the ABC to the WI 5 event stream and schedules each channel-voice message
+**relative** to now — `(at − now) + within-phrase-tick × secs-per-tick` — so we never
+have to sync the kernel's monotonic clock to the ALSA queue's clock; the per-tick
+duration comes from the ABC's own `Q:` tempo. Raw MIDI bytes go through the `alsa`
+crate's `MidiEvent` encoder (no bespoke seq-event construction). `flush_scheduled_after`
+drops the queue's pending OUTPUT and fires ALL_SOUNDS_OFF/ALL_NOTES_OFF direct on every
+channel. The loopback test (a reader port subscribed to the out port, assert four
+NoteOns arrive in ascending pitch order, then flush) is `#[ignore]` so CI without ALSA
+stays green — and it **ran live on zorak this session: passes**. (The encoder isn't
+`Send`, so it's built per-emit; `AlsaMidiOut` itself is `Send` because `alsa::Seq` is.)
+
+The decisive constraint from `docs/midi.md` held all the way through: the scheduler
+stays purely generative-local. There is no realtime pulse path — the heap, the
+generation/stale-drop logic, and zero-CPU idle are all untouched. M1 ships the system
+clock only; the `ClockSource` trait is shaped (estimate/remote-aware `next_fire`,
+the M3 heap-re-enlistment hook) so the drift-modeled MIDI-*in* clock slots in at M3
+without rework — but no `ClockEstimate` stub ships now (no dead-code theater).
+
 ## Tracks Stage 3 — three clock-correctness fixes from the landed-code review (2026-06-30)
 
 Stage 3 generalised the clock source behind a `ClockSourceKind` enum and made tempo

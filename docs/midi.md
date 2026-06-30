@@ -176,11 +176,18 @@ real KSP / loft node in later.
 
 ## Staging
 
-- **M1 — Output on zorak, virtual MIDI, system clock.** A track renders its
+- **M1 — Output on zorak, virtual MIDI, system clock. ✅ SHIPPED 2026-06-30**
+  (`tracks.md` Stage 3 WIs 1–7, commits `2e3dc6c5`→`508bc0c4`). A track renders its
   committed score (ABC→MIDI) to a local ALSA MIDI out, scheduled with the
-  speculation lead. No network, no external clock. Proves the render-target seam
-  and that the lead covers scheduling. (Depends on `tracks.md` Stage 3 starting —
-  the `ClockSource` trait + a render-target seam on the track.)
+  speculation lead. No network, no external clock. The render-target seam
+  (`RenderTarget` on the track, fed from the materialize crossing, jitter-free
+  scheduled-instant reference, `flush_scheduled_after` on stop/pause) and the one
+  real target (`AlsaMidiOut`, relative real-time queue scheduling) both landed; the
+  ALSA loopback ran live on zorak. The lead-covers-scheduling property holds by
+  construction (cells commit ahead → `at` is in the near future). Canonical record:
+  `tracks.md` "Status — M1 landed". *Still no `kj transport` verb to attach an out
+  to a track* — `BeatScheduler::add_render_target` is the seam; CLI wiring is a small
+  follow-up.
 - **M2 — Input telemetry, batched.** Capture a local (virtual then real) MIDI in,
   timestamp with ALSA, batch into a MIDI-in track as score blocks over RPC.
   Snapshot = the track-scoped windowed read.

@@ -1109,7 +1109,10 @@ make `generate` a thin SMF-framing wrapper over it) so the render target consume
 (input telemetry), M3 (drift-modeled clock-in — the real `apply_estimate` producer),
 and M4 (cross-node + edge node) are sequenced in `docs/midi.md` and out of scope here.
 
-TDD work items for M1 (revised post-review — `ClockEstimate` dropped, two folded in):
+TDD work items for M1 (revised post-review — `ClockEstimate` dropped, two folded in).
+**ALL SEVEN LANDED + green 2026-06-30** — see "Status — M1 landed" at the end of this
+section for the commits + how each shipped; the per-WI sketches below are the plan as
+locked (kept for the record).
 
 - **WI 1 — `ClockSourceKind` enum + `SystemClock`, behaviour-preserving.** Introduce
   the enum (`System(SystemClock)` + a `Modeled` placeholder that's unconstructable
@@ -1238,3 +1241,67 @@ correctness hazards, all fixed this session (TDD, deepseek's consult had been cl
   phase *incrementally* (each interval converted at the rate in force during it,
   sub-tick remainder carried), so a rate change only re-rates time after it. Existing
   pump tests preserved; regression test: `pump_integrates_phase_across_a_tempo_change`.
+
+## Status — M1 landed (2026-06-30)
+
+All seven M1 work items shipped + green (kernel 1268, server 104 (+1 ignored ALSA),
+abc 137; full workspace builds). The track has a sound output. Commits:
+
+- **WI 1 (`2e3dc6c5`) + WI 2 (`e5a89c38`, `4c55a5dd`)** — the `ClockSourceKind` enum
+  (`System(SystemClock)` + the uninhabited `ModeledClock`), `period` moved off
+  `BeatPolicy` into `SystemClock`, and `Timeline::set_clock` re-slaving the
+  speculation `TickClock` on a tempo change. (Detail above + the landed-code-review
+  fixes in `3a385e37`.)
+- **WI 3 (`b3cd1761`) — `clock_kind` persistence, MUTABLE.** `clock_kind TEXT NOT
+  NULL DEFAULT 'system'` on `tracks` (SCHEMA + additive ALTER); in the `ON CONFLICT
+  UPDATE SET` (a driver swap persists) — the deliberate opposite of set-once
+  `score_context_id`. `attach` rebuilds the clock SOURCE from the row via
+  `ClockSourceKind::from_persisted`, which builds only `"system"` in M1 and crashes
+  loud on a `"modeled"` row (no silent downgrade) — computed before the score-context
+  mint so a corrupt row fails clean. Tests: kernel_db round-trip / tempo-upsert-
+  preserves / driver-swap-updates / pre-Stage-3-defaults-to-system; beat
+  `attach_crashes_loud_on_an_unconstructable_clock_kind`.
+- **WI 5 (`f5b7cb16`) — `pub fn events(tune, params) -> Vec<MidiEvent>`** in
+  `kaijutsu-abc/src/midi.rs` (`MidiEvent` pub). `generate` and `events` now share
+  `build_single_track_writer`; `generate`'s SMF bytes are unchanged. M1 renders the
+  format-0 single-track merge (single-voice bass). Done before WI 4/6 since they
+  consume it.
+- **WI 4 (`77f73fa1`) — the render-target seam.** New `render` module
+  (`RenderTarget { emit(abc:&str, at), flush_scheduled_after(at) }`).
+  `TrackState.render_targets` + `last_fire_scheduled`; `fire_due` latches the
+  *scheduled* heap instant before `process_track`; `materialize_track`'s Ok path calls
+  `emit_to_render_targets`, which resolves each newly-crossed ABC cell once (durable
+  CAS) and hands `(abc, render_instant(base, period, start, playhead))` to every
+  target. `stop`/`pause` call `flush_scheduled_after(now)`. Cheap no-op when a track
+  has no target. Tests: `render_instant_offsets_by_lead_and_clamps_at_zero`,
+  `render_target_gets_committed_cells_jitter_free_and_flush_on_stop`.
+- **WI 6 (`508bc0c4`) — `AlsaMidiOut`, live-verified on zorak.** ALSA seq client +
+  subscribe-readable port + started real-time queue; `emit` schedules each
+  channel-voice message **relative** to now (`(at − now) + tick × secs-per-tick`,
+  per-tick from the ABC's `Q:` tempo) via the `alsa` crate's `MidiEvent` byte→event
+  encoder; `flush_scheduled_after` drops the queue's pending OUTPUT + ALL_SOUNDS_OFF
+  / ALL_NOTES_OFF direct. `alsa = "0.9"` is a Linux-only target dep (the version
+  already in-tree via bevy_audio/cpal). The loopback test is `#[ignore]` (needs
+  `/dev/snd/seq`) and **ran live on zorak this session — passes** (four NoteOns in
+  ascending pitch order through a subscribed reader port, then flush).
+- **WI 7 — this section + the `docs/midi.md` M1 status note + the devlog entry**
+  ("Tracks Stage 3 M1 — sound out the door").
+
+**Divergences from the locked plan (small, all defensible):**
+- Only `MidiEvent` went `pub` (not `MidiWriter`): the writer isn't in the public API
+  surface; the event stream is.
+- The `at` arithmetic was extracted to a pure `render_instant` free fn so the offset
+  multiply + the never-schedule-into-the-past clamp are unit-tested directly (the
+  beat-driven test exercises the offset-0 + jitter-free path).
+- `flush_scheduled_after` removes ALL pending OUTPUT on the queue (a conservative
+  whole-tail truncation) rather than a precise `TIME_AFTER at` cut — for a stop/pause
+  we want the whole buffered phrase gone, and `at ≈ now` makes the two equivalent.
+- The `alsa` `MidiEvent` encoder isn't `Send`, so it's constructed per-`emit` (one
+  alloc per phrase, beats apart) rather than stored on `AlsaMidiOut`.
+
+**Still ahead (out of M1 scope):** M2 (input telemetry), M3 (the drift-modeled
+clock-in — the real `apply_estimate` producer + the heap-re-enlistment hook the trait
+is already shaped for), M4 (cross-node + edge node) per `docs/midi.md`; and a wiring
+surface to *attach* an `AlsaMidiOut` to a track from `kj transport` (M1 exposes
+`BeatScheduler::add_render_target`; no CLI verb yet). Also still pending from earlier
+stages: a real-kernel live-verify of the Stage 2 score-context path.
