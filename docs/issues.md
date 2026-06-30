@@ -1942,3 +1942,40 @@ Remaining, ranked; delete when shipped. (Most are IR-assertable in tests/engrave
   signature). The engraver only draws explicit accidentals. (Audit false positive.)
 - **LOW — grace notes use the regular notehead glyph**, not the SMuFL small notehead.
 - **LOW — every `SourceSpan` is hardcoded `(0,0)`**, so click-to-edit span attrs are dead.
+
+---
+
+## kj config / shell surface (papercuts — found 2026-06-30 wiring local llama.cpp providers)
+
+Standing up a local-model musician meant editing `models.toml`, which surfaced a
+cluster of friction in the config + shell surface:
+
+- **Config drift is silent (want a `kj config doctor`).** The live CRDT
+  `models.toml` pointed its local providers at `ollama` (:11434) and `lemonade`
+  (:8000) — both stopped/disabled — with **no provider** for the actually-running
+  llama.cpp servers (:2020 gemma4-26b, :2021 gemma4-e4b); the stale host
+  `~/.config/kaijutsu/models.toml` pointed at a *third* dead endpoint (vestigial
+  lemonade :13305). Nothing flags that a configured provider's `base_url` is
+  unreachable until a turn fails (or, worse, hangs). A `kj config doctor` /
+  startup probe that pings each enabled provider's `base_url` and warns on the dead
+  ones would turn a silent config-vs-reality drift into a loud one (same class as
+  the rc/source drift we watch for).
+- **`kj config set` ignores piped stdin** even though `--help` says "stdin is piped
+  here when omitted": `cat new.toml | kj config set /etc/config/models.toml` →
+  `missing content`. Had to use `--content "$(cat …)"`. Either wire stdin through
+  or fix the help text (the wrong help is the real footgun).
+- **No `kj config edit` and no set-from-path.** `kj rc` has `edit` (opens an
+  interactive vi session on the script); `kj config` has only `show`/`set`/`reset`.
+  `show` wraps the body in a `path:`/`length:` header + ```` ```toml ```` fences, but
+  `set` wants the *raw* body — so editing a 6 KB file is a clunky show→strip→edit→set
+  round-trip. Add `kj config edit` (mirror `kj rc edit`) and/or `set --from <path>`.
+- **The MCP/context shell is read-only for host writes** — `> file` (even
+  `> /dev/null`) fails `redirect: read-only filesystem`, so you can't stage a temp
+  file in-shell; the edit had to be staged via a separate host write and read back.
+  If RO is intentional, a `/dev/null` sink and a writable scratch dir would remove
+  the sharp edge for scripting.
+- **`kj context create` took ~60 s** for one musician (others were instant) —
+  anomalous, possibly a blocking create-time hydrate/model call; worth a look.
+- **(unreproduced) a `kj` shell call hung the full 300 s timeout once** mid-session;
+  `kj context list --tree` and `kj model list` both return fast now, so noting it
+  as a one-off to watch, not a fixable repro yet.
