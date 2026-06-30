@@ -222,16 +222,26 @@ impl Mode {
     /// Parse mode from string (case-insensitive, allows abbreviations)
     pub fn parse(s: &str) -> Option<Mode> {
         let s = s.to_lowercase();
-        match s.as_str() {
-            "maj" | "major" | "" => Some(Mode::Major),
-            "min" | "minor" | "m" => Some(Mode::Minor),
-            "ion" | "ionian" => Some(Mode::Ionian),
-            "dor" | "dorian" => Some(Mode::Dorian),
-            "phr" | "phrygian" => Some(Mode::Phrygian),
-            "lyd" | "lydian" => Some(Mode::Lydian),
-            "mix" | "mixolydian" => Some(Mode::Mixolydian),
-            "aeo" | "aeolian" => Some(Mode::Aeolian),
-            "loc" | "locrian" => Some(Mode::Locrian),
+        if s.is_empty() {
+            return Some(Mode::Major);
+        }
+        // `m` alone is the conventional minor shorthand.
+        if s == "m" {
+            return Some(Mode::Minor);
+        }
+        // ABC v2.1 §3.1.14: only the first three letters of a mode name are
+        // significant, so `Mixolydian`, `mixo` and `Mix` are all Mixolydian.
+        let prefix: String = s.chars().take(3).collect();
+        match prefix.as_str() {
+            "maj" => Some(Mode::Major),
+            "min" => Some(Mode::Minor),
+            "ion" => Some(Mode::Ionian),
+            "dor" => Some(Mode::Dorian),
+            "phr" => Some(Mode::Phrygian),
+            "lyd" => Some(Mode::Lydian),
+            "mix" => Some(Mode::Mixolydian),
+            "aeo" => Some(Mode::Aeolian),
+            "loc" => Some(Mode::Locrian),
             _ => None,
         }
     }
@@ -667,6 +677,12 @@ mod tests {
         assert_eq!(Mode::parse("Mixolydian"), Some(Mode::Mixolydian));
         assert_eq!(Mode::parse(""), Some(Mode::Major));
         assert_eq!(Mode::parse("invalid"), None);
+        // §3.1.14: only the first three letters are significant, so any
+        // abbreviation of length ≥3 must resolve (e.g. `mixo`, `minor`).
+        assert_eq!(Mode::parse("mixo"), Some(Mode::Mixolydian));
+        assert_eq!(Mode::parse("minor"), Some(Mode::Minor));
+        assert_eq!(Mode::parse("phry"), Some(Mode::Phrygian));
+        assert_eq!(Mode::parse("Locrian"), Some(Mode::Locrian));
     }
 
     #[test]

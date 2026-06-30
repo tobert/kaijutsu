@@ -33,6 +33,12 @@ fn apply_pitch_offset(base_pitch: u8, offset: i16) -> u8 {
     ((base_pitch as i16) + offset).clamp(0, 127) as u8
 }
 
+/// Playback pitch offset from a `K:` field's `transpose=`/`octave=` attributes
+/// (ABC v2.1 §4.6). Distinct from, and added to, any `V:`-level offset.
+fn key_pitch_offset(key: &Key) -> i16 {
+    key.transpose as i16 + (key.octave as i16) * 12
+}
+
 /// Flatten `Element::SlurGroup` nesting away. Slurs have no MIDI
 /// semantics; their inner notes need to be heard as if the brackets
 /// weren't there.
@@ -49,10 +55,72 @@ fn flatten_slurs(elements: &[Element]) -> Vec<Element> {
     out
 }
 
+/// True for a bar that opens a variant ending (`|2`, `:|2`, `[2`, `[3-4`, …).
+fn is_ending_marker(e: &Element) -> bool {
+    matches!(
+        e,
+        Element::Bar(Bar::SecondEnding) | Element::Bar(Bar::NthEnding(_))
+    )
+}
+
+/// Expand a first/second variant-ending repeat into a flat linear stream:
+/// `|: common |1 first :|2 second |` becomes `common first | common second`.
+/// ABC v2.1 §4.9-4.10. Returns `None` when no first-ending marker is present
+/// (so the caller falls back to simple repeat expansion). Handles a single
+/// ended repeat section; the `:|2` and `|1 … :| [2 …` shapes both work.
+fn expand_variant_endings(elements: &[Element]) -> Option<Vec<Element>> {
+    let fe = elements
+        .iter()
+        .position(|e| matches!(e, Element::Bar(Bar::FirstEnding)))?;
+    // Optional repeat-start before the first ending; common body follows it.
+    let common_start = elements[..fe]
+        .iter()
+        .rposition(|e| matches!(e, Element::Bar(Bar::RepeatStart)))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    // Pass-1 terminator after the first ending: a repeat-end or an ending marker.
+    let back = (fe + 1..elements.len()).find(|&i| {
+        matches!(elements[i], Element::Bar(Bar::RepeatEnd)) || is_ending_marker(&elements[i])
+    })?;
+    // The second ending opens at `back` (when `:|2`/`[2`) or just after a bare `:|`.
+    let se = if is_ending_marker(&elements[back]) {
+        back
+    } else {
+        (back + 1..elements.len()).find(|&i| is_ending_marker(&elements[i]))?
+    };
+    // The second ending runs until the next repeat section (or end of voice).
+    let second_end = (se + 1..elements.len())
+        .find(|&i| matches!(elements[i], Element::Bar(Bar::RepeatStart)))
+        .unwrap_or(elements.len());
+
+    let common = &elements[common_start..fe];
+    let first = &elements[fe + 1..back];
+    let second = &elements[se + 1..second_end];
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&elements[..common_start]); // prefix incl. RepeatStart
+    out.extend_from_slice(common);
+    out.push(Element::Bar(Bar::Single));
+    out.extend_from_slice(first);
+    out.push(Element::Bar(Bar::Single)); // repeat back to common
+    out.extend_from_slice(common);
+    out.push(Element::Bar(Bar::Single));
+    out.extend_from_slice(second);
+    out.extend_from_slice(&elements[second_end..]); // tail (unrepeated)
+    Some(out)
+}
+
 /// Expand repeats in a voice's elements.
 ///
-/// Handles `|:` ... `:|` simple repeats. First/second endings are passed through unchanged.
+/// Handles `|:` ... `:|` simple repeats and first/second variant endings
+/// (`|1 … :|2 …`); falls back to the simple form when no ending is present.
 fn expand_repeats(elements: &[Element]) -> Vec<Element> {
+    // Variant endings need bespoke handling (pick the ending per pass).
+    if let Some(expanded) = expand_variant_endings(elements) {
+        return expanded;
+    }
+
     let mut result = Vec::new();
     let mut repeat_start_idx: Option<usize> = None;
 
@@ -150,9 +218,9 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
 
     // Set tempo
     if let Some(tempo) = &tune.header.tempo {
-        writer.tempo(tempo.bpm);
+        writer.tempo(tempo.beat_unit, tempo.bpm);
     } else {
-        writer.tempo(120); // Default
+        writer.tempo((1, 4), 120); // Default: quarter = 120
     }
 
     // Set program: ABC %%MIDI program takes priority, then params.program
@@ -171,7 +239,8 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
     // Process all voices (merge into single track for format 0)
     for voice in &tune.voices {
         // Get pitch offset from voice properties (transpose, octave)
-        let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs);
+        let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
+            + key_pitch_offset(&tune.header.key);
 
         // Strip slur grouping (MIDI-irrelevant), then expand repeats.
         let flat = flatten_slurs(&voice.elements);
@@ -182,17 +251,20 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
 
         // Track held (tied) notes: midi_pitch -> accumulated ticks
         let mut held_notes: HashMap<u8, u32> = HashMap::new();
+        // Accidental carried by a tie to the next same-pitch note, so it stays
+        // valid across the bar-line accidental reset (§4.2). Keyed (letter, octave).
+        let mut tie_carry: HashMap<(NoteName, i8), Accidental> = HashMap::new();
+        // Active key signature, mutated by inline `[K:…]` fields (§3.2).
+        let mut voice_key_acc = key_accidentals.clone();
 
         for element in &elements {
             match element {
                 Element::Note(note) => {
-                    // Determine pitch with accidentals, then apply voice offset
-                    let base_pitch = note_to_midi_pitch(
-                        note.pitch,
-                        note.octave,
-                        note.accidental,
-                        &bar_accidentals,
-                    );
+                    // Resolve the accidental (own > bar > tie-carry), then pitch.
+                    let carried = tie_carry.remove(&(note.pitch, note.octave));
+                    let eff_acc =
+                        effective_accidental(note.pitch, note.accidental, &bar_accidentals, carried);
+                    let base_pitch = midi_pitch_with_accidental(note.pitch, note.octave, eff_acc);
                     let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
                     let ticks = note.duration.to_ticks(unit_ticks);
 
@@ -214,6 +286,13 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                     } else {
                         // Regular note, emit immediately
                         writer.note(midi_pitch, params.velocity, ticks);
+                    }
+
+                    // A tie carries the effective accidental to the next note.
+                    if note.tie {
+                        if let Some(acc) = eff_acc {
+                            tie_carry.insert((note.pitch, note.octave), acc);
+                        }
                     }
 
                     // Update bar accidentals if note has explicit accidental
@@ -259,14 +338,8 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
 
                 Element::Rest(rest) => {
                     if let Some(bars) = rest.multi_measure {
-                        // Multi-measure rest - advance by bars * beats per bar
-                        let (beats_per_bar, _) = tune
-                            .header
-                            .meter
-                            .as_ref()
-                            .map(|m| m.to_fraction())
-                            .unwrap_or((4, 4));
-                        let ticks_per_bar = params.ticks_per_beat as u32 * beats_per_bar as u32;
+                        let ticks_per_bar =
+                            meter_bar_ticks(tune.header.meter.as_ref(), params.ticks_per_beat);
                         writer.advance(ticks_per_bar * bars as u32);
                     } else {
                         let ticks = rest.duration.to_ticks(unit_ticks);
@@ -275,32 +348,70 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                 }
 
                 Element::Bar(_) => {
-                    // Reset bar accidentals
-                    bar_accidentals = key_accidentals.clone();
+                    // Reset bar accidentals to the (possibly inline-changed) key.
+                    bar_accidentals = voice_key_acc.clone();
+                }
+
+                Element::InlineField(field) if field.field_type == 'K' => {
+                    // Mid-tune key change (§3.2): swap the active signature and
+                    // reset the bar-scoped accidentals to it immediately.
+                    voice_key_acc = inline_key_accidentals(&field.value);
+                    bar_accidentals = voice_key_acc.clone();
                 }
 
                 Element::Tuplet(tuplet) => {
-                    // Scale durations by q/p
-                    let scale_num = tuplet.q as u32;
-                    let scale_den = tuplet.p as u32;
-
+                    // Each inner element's duration scales by q/p. Notes, rests
+                    // AND chords all participate — a dropped rest/chord would
+                    // shorten the tuplet and start later notes early (ABC §4.13).
+                    let (q, p) = (tuplet.q as u32, tuplet.p as u32);
                     for elem in &tuplet.elements {
-                        if let Element::Note(note) = elem {
-                            let base_pitch = note_to_midi_pitch(
-                                note.pitch,
-                                note.octave,
-                                note.accidental,
-                                &bar_accidentals,
-                            );
-                            let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
-                            let base_ticks = note.duration.to_ticks(unit_ticks);
-                            let ticks = (base_ticks * scale_num) / scale_den;
-
-                            writer.note(midi_pitch, params.velocity, ticks);
-
-                            if let Some(acc) = note.accidental {
-                                bar_accidentals.insert(note.pitch, acc);
+                        match elem {
+                            Element::Note(note) => {
+                                let base_pitch = note_to_midi_pitch(
+                                    note.pitch,
+                                    note.octave,
+                                    note.accidental,
+                                    &bar_accidentals,
+                                );
+                                let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
+                                let ticks = note.duration.to_ticks(unit_ticks) * q / p;
+                                writer.note(midi_pitch, params.velocity, ticks);
+                                if let Some(acc) = note.accidental {
+                                    bar_accidentals.insert(note.pitch, acc);
+                                }
                             }
+                            Element::Rest(rest) => {
+                                writer.advance(rest.duration.to_ticks(unit_ticks) * q / p);
+                            }
+                            Element::Chord(chord) => {
+                                let ticks = chord.duration.to_ticks(unit_ticks) * q / p;
+                                for note in &chord.notes {
+                                    let base_pitch = note_to_midi_pitch(
+                                        note.pitch,
+                                        note.octave,
+                                        note.accidental,
+                                        &bar_accidentals,
+                                    );
+                                    writer.note_on(
+                                        apply_pitch_offset(base_pitch, pitch_offset),
+                                        params.velocity,
+                                    );
+                                    if let Some(acc) = note.accidental {
+                                        bar_accidentals.insert(note.pitch, acc);
+                                    }
+                                }
+                                writer.advance(ticks);
+                                for note in &chord.notes {
+                                    let base_pitch = note_to_midi_pitch(
+                                        note.pitch,
+                                        note.octave,
+                                        note.accidental,
+                                        &bar_accidentals,
+                                    );
+                                    writer.note_off(apply_pitch_offset(base_pitch, pitch_offset));
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -330,9 +441,9 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
     // Track 0: Tempo track (meta events only)
     let mut tempo_writer = MidiWriter::new(params.ticks_per_beat, 0);
     if let Some(tempo) = &tune.header.tempo {
-        tempo_writer.tempo(tempo.bpm);
+        tempo_writer.tempo(tempo.beat_unit, tempo.bpm);
     } else {
-        tempo_writer.tempo(120);
+        tempo_writer.tempo((1, 4), 120);
     }
     tracks.push(tempo_writer.encode_track());
 
@@ -343,7 +454,8 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         }
 
         // Get pitch offset from voice properties (transpose, octave)
-        let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs);
+        let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
+            + key_pitch_offset(&tune.header.key);
 
         // Use different MIDI channel per voice (0-15, skip 9 which is percussion)
         let channel = if voice_idx >= 9 {
@@ -364,16 +476,16 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         let elements = expand_repeats(&flat);
         let mut bar_accidentals = key_accidentals.clone();
         let mut held_notes: HashMap<u8, u32> = HashMap::new();
+        let mut tie_carry: HashMap<(NoteName, i8), Accidental> = HashMap::new();
+        let mut voice_key_acc = key_accidentals.clone();
 
         for element in &elements {
             match element {
                 Element::Note(note) => {
-                    let base_pitch = note_to_midi_pitch(
-                        note.pitch,
-                        note.octave,
-                        note.accidental,
-                        &bar_accidentals,
-                    );
+                    let carried = tie_carry.remove(&(note.pitch, note.octave));
+                    let eff_acc =
+                        effective_accidental(note.pitch, note.accidental, &bar_accidentals, carried);
+                    let base_pitch = midi_pitch_with_accidental(note.pitch, note.octave, eff_acc);
                     let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
                     let ticks = note.duration.to_ticks(unit_ticks);
 
@@ -390,6 +502,12 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                         held_notes.insert(midi_pitch, ticks);
                     } else {
                         writer.note_channel(midi_pitch, params.velocity, ticks, channel);
+                    }
+
+                    if note.tie {
+                        if let Some(acc) = eff_acc {
+                            tie_carry.insert((note.pitch, note.octave), acc);
+                        }
                     }
 
                     if let Some(acc) = note.accidental {
@@ -427,13 +545,8 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
 
                 Element::Rest(rest) => {
                     if let Some(bars) = rest.multi_measure {
-                        let (beats_per_bar, _) = tune
-                            .header
-                            .meter
-                            .as_ref()
-                            .map(|m| m.to_fraction())
-                            .unwrap_or((4, 4));
-                        let ticks_per_bar = params.ticks_per_beat as u32 * beats_per_bar as u32;
+                        let ticks_per_bar =
+                            meter_bar_ticks(tune.header.meter.as_ref(), params.ticks_per_beat);
                         writer.advance(ticks_per_bar * bars as u32);
                     } else {
                         writer.advance(rest.duration.to_ticks(unit_ticks));
@@ -441,27 +554,70 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                 }
 
                 Element::Bar(_) => {
-                    bar_accidentals = key_accidentals.clone();
+                    bar_accidentals = voice_key_acc.clone();
+                }
+
+                Element::InlineField(field) if field.field_type == 'K' => {
+                    voice_key_acc = inline_key_accidentals(&field.value);
+                    bar_accidentals = voice_key_acc.clone();
                 }
 
                 Element::Tuplet(tuplet) => {
-                    let scale_num = tuplet.q as u32;
-                    let scale_den = tuplet.p as u32;
+                    // Notes, rests and chords inside the tuplet all scale by q/p
+                    // (ABC §4.13); dropping rests/chords corrupts timing.
+                    let (q, p) = (tuplet.q as u32, tuplet.p as u32);
                     for elem in &tuplet.elements {
-                        if let Element::Note(note) = elem {
-                            let base_pitch = note_to_midi_pitch(
-                                note.pitch,
-                                note.octave,
-                                note.accidental,
-                                &bar_accidentals,
-                            );
-                            let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
-                            let base_ticks = note.duration.to_ticks(unit_ticks);
-                            let ticks = (base_ticks * scale_num) / scale_den;
-                            writer.note_channel(midi_pitch, params.velocity, ticks, channel);
-                            if let Some(acc) = note.accidental {
-                                bar_accidentals.insert(note.pitch, acc);
+                        match elem {
+                            Element::Note(note) => {
+                                let base_pitch = note_to_midi_pitch(
+                                    note.pitch,
+                                    note.octave,
+                                    note.accidental,
+                                    &bar_accidentals,
+                                );
+                                let midi_pitch = apply_pitch_offset(base_pitch, pitch_offset);
+                                let ticks = note.duration.to_ticks(unit_ticks) * q / p;
+                                writer.note_channel(midi_pitch, params.velocity, ticks, channel);
+                                if let Some(acc) = note.accidental {
+                                    bar_accidentals.insert(note.pitch, acc);
+                                }
                             }
+                            Element::Rest(rest) => {
+                                writer.advance(rest.duration.to_ticks(unit_ticks) * q / p);
+                            }
+                            Element::Chord(chord) => {
+                                let ticks = chord.duration.to_ticks(unit_ticks) * q / p;
+                                for note in &chord.notes {
+                                    let base_pitch = note_to_midi_pitch(
+                                        note.pitch,
+                                        note.octave,
+                                        note.accidental,
+                                        &bar_accidentals,
+                                    );
+                                    writer.note_on_channel(
+                                        apply_pitch_offset(base_pitch, pitch_offset),
+                                        params.velocity,
+                                        channel,
+                                    );
+                                    if let Some(acc) = note.accidental {
+                                        bar_accidentals.insert(note.pitch, acc);
+                                    }
+                                }
+                                writer.advance(ticks);
+                                for note in &chord.notes {
+                                    let base_pitch = note_to_midi_pitch(
+                                        note.pitch,
+                                        note.octave,
+                                        note.accidental,
+                                        &bar_accidentals,
+                                    );
+                                    writer.note_off_channel(
+                                        apply_pitch_offset(base_pitch, pitch_offset),
+                                        channel,
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -498,6 +654,20 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
     out
 }
 
+/// Resolve the accidental in effect for a note: its own explicit accidental,
+/// else a bar-scoped accidental (which is seeded from the key signature), else
+/// an accidental carried across a bar line by a tie. ABC v2.1 §4.2.
+fn effective_accidental(
+    pitch: NoteName,
+    note_accidental: Option<Accidental>,
+    bar_accidentals: &HashMap<NoteName, Accidental>,
+    carried: Option<Accidental>,
+) -> Option<Accidental> {
+    note_accidental
+        .or_else(|| bar_accidentals.get(&pitch).copied())
+        .or(carried)
+}
+
 /// Convert note to MIDI pitch, applying accidentals from context
 fn note_to_midi_pitch(
     pitch: NoteName,
@@ -505,19 +675,26 @@ fn note_to_midi_pitch(
     note_accidental: Option<Accidental>,
     bar_accidentals: &HashMap<NoteName, Accidental>,
 ) -> u8 {
-    let base = pitch.to_semitone();
+    let acc = effective_accidental(pitch, note_accidental, bar_accidentals, None);
+    midi_pitch_with_accidental(pitch, octave, acc)
+}
 
+/// MIDI pitch for a note with its accidental already resolved.
+fn midi_pitch_with_accidental(pitch: NoteName, octave: i8, acc: Option<Accidental>) -> u8 {
+    let base = pitch.to_semitone();
     // ABC octave 0 (uppercase C-B) = MIDI 60-71 (middle C octave)
     // ABC octave 1 (lowercase c-b) = MIDI 72-83
     let octave_offset = (octave + 5) * 12;
-
-    // Priority: note's own accidental > bar context > key signature
-    let acc_offset = note_accidental
-        .or_else(|| bar_accidentals.get(&pitch).copied())
-        .map(|a| a.to_semitone_offset())
-        .unwrap_or(0);
-
+    let acc_offset = acc.map(|a| a.to_semitone_offset()).unwrap_or(0);
     ((base as i16) + (octave_offset as i16) + (acc_offset as i16)).clamp(0, 127) as u8
+}
+
+/// Key-signature accidentals for an inline `[K:…]` field value (e.g. `"G"`,
+/// `"D dor"`). A mid-tune key change replaces the active key signature; the
+/// caller also resets the bar-scoped accidentals to the new signature. §3.2.
+fn inline_key_accidentals(value: &str) -> HashMap<NoteName, Accidental> {
+    let mut fc = crate::feedback::FeedbackCollector::new();
+    compute_key_accidentals(&crate::parser::key::parse_key_field(value, &mut fc))
 }
 
 /// Compute accidentals from key signature
@@ -561,30 +738,41 @@ fn compute_key_accidentals(key: &Key) -> HashMap<NoteName, Accidental> {
         }
     }
 
+    // Explicit / modifying accidentals in the K: field (e.g. `K:C exp ^f`,
+    // `K:Hp`) apply like a key signature — to every matching pitch in all
+    // octaves — and override the circle-of-fifths entry for that letter.
+    // ABC v2.1 §4.2 / §6.1.2. The parser populates `explicit_accidentals`;
+    // honour it here so K:Hp keeps its C# and `exp` accidentals sound.
+    for (acc, note) in &key.explicit_accidentals {
+        accidentals.insert(*note, *acc);
+    }
+
     accidentals
 }
 
 /// Get number of sharps (positive) or flats (negative) for a key
 fn key_signature_accidentals(key: &Key) -> (i8, bool) {
-    // Base sharps/flats for major keys
-    let base = match (&key.root, &key.accidental) {
-        (NoteName::C, None) => 0,
-        (NoteName::G, None) => 1,
-        (NoteName::D, None) => 2,
-        (NoteName::A, None) => 3,
-        (NoteName::E, None) => 4,
-        (NoteName::B, None) => 5,
-        (NoteName::F, Some(Accidental::Sharp)) => 6,
-        (NoteName::C, Some(Accidental::Sharp)) => 7,
-        (NoteName::F, None) => -1,
-        (NoteName::B, Some(Accidental::Flat)) => -2,
-        (NoteName::E, Some(Accidental::Flat)) => -3,
-        (NoteName::A, Some(Accidental::Flat)) => -4,
-        (NoteName::D, Some(Accidental::Flat)) => -5,
-        (NoteName::G, Some(Accidental::Flat)) => -6,
-        (NoteName::C, Some(Accidental::Flat)) => -7,
+    // Position of the (major) tonic on the circle of fifths = its key-signature
+    // count. Each note letter has a base fifths-index; a sharp adds 7, a flat
+    // subtracts 7. This handles accidental'd tonics (G#, D#, A#, …) that aren't
+    // in the 15 standard-major spellings. ABC v2.1 §3.1.14.
+    let letter_fifths = match key.root {
+        NoteName::F => -1,
+        NoteName::C => 0,
+        NoteName::G => 1,
+        NoteName::D => 2,
+        NoteName::A => 3,
+        NoteName::E => 4,
+        NoteName::B => 5,
+    };
+    let acc_fifths = match key.accidental {
+        Some(Accidental::Sharp) => 7,
+        Some(Accidental::DoubleSharp) => 14,
+        Some(Accidental::Flat) => -7,
+        Some(Accidental::DoubleFlat) => -14,
         _ => 0,
     };
+    let base: i8 = letter_fifths + acc_fifths;
 
     // Adjust for mode
     let mode_offset = match key.mode {
@@ -603,6 +791,15 @@ fn key_signature_accidentals(key: &Key) -> (i8, bool) {
     } else {
         (-total, false)
     }
+}
+
+/// Ticks in one full bar of the tune's meter, for multi-measure rests (`Zn`).
+/// A bar lasts `num/den` of a whole note; a whole note is `ticks_per_beat*4`
+/// ticks (ticks_per_beat is per quarter). Free meter (`M:none`) assumes 4/4.
+/// ABC v2.1 §4.5. NB: must use the denominator — `6/8` is 3 quarters, not 6.
+fn meter_bar_ticks(meter: Option<&crate::ast::Meter>, ticks_per_beat: u16) -> u32 {
+    let (num, den) = meter.map(|m| m.to_fraction()).unwrap_or((4, 4));
+    (ticks_per_beat as u32 * 4 * num as u32) / den as u32
 }
 
 /// Compute MIDI ticks per ABC unit note
@@ -642,14 +839,25 @@ impl MidiWriter {
         }
     }
 
-    fn tempo(&mut self, bpm: u16) {
-        let us_per_beat = 60_000_000u32 / bpm as u32;
+    /// Emit a Set Tempo meta event. `beat_unit` is the ABC `Q:` beat (e.g.
+    /// `(1, 4)` for a quarter, `(1, 2)` for a half) and `bpm` is beats per
+    /// minute. The MIDI meta stores microseconds-per-QUARTER, so we convert:
+    /// one beat = `num/den` of a whole note = `4*num/den` quarters, hence
+    /// `us_per_quarter = 60_000_000 * den / (bpm * num * 4)`. ABC v2.1 §3.1.8.
+    fn tempo(&mut self, beat_unit: (u8, u8), bpm: u16) {
+        let (num, den) = beat_unit;
+        let denom = (bpm as u64) * (num as u64) * 4;
+        let us_per_quarter = if denom == 0 {
+            500_000
+        } else {
+            (60_000_000u64 * den as u64 / denom) as u32
+        };
         self.meta_event(
             0x51,
             vec![
-                ((us_per_beat >> 16) & 0xFF) as u8,
-                ((us_per_beat >> 8) & 0xFF) as u8,
-                (us_per_beat & 0xFF) as u8,
+                ((us_per_quarter >> 16) & 0xFF) as u8,
+                ((us_per_quarter >> 8) & 0xFF) as u8,
+                (us_per_quarter & 0xFF) as u8,
             ],
         );
     }
@@ -788,6 +996,173 @@ mod tests {
         assert_eq!(encode_variable_length(16384), vec![0x81, 0x80, 0x00]);
     }
 
+    /// Pull the microseconds-per-quarter value out of a tempo meta event
+    /// (`0xFF 0x51 0x03 b0 b1 b2`) in an event stream.
+    fn tempo_us_per_quarter(evs: &[MidiEvent]) -> Option<u32> {
+        evs.iter()
+            .find(|e| e.data.len() >= 6 && e.data[0] == 0xFF && e.data[1] == 0x51)
+            .map(|e| {
+                ((e.data[3] as u32) << 16) | ((e.data[4] as u32) << 8) | (e.data[5] as u32)
+            })
+    }
+
+    #[test]
+    fn tempo_respects_non_quarter_beat_unit() {
+        // ABC v2.1 §3.1.8: Q:<beat>=<bpm>. The MIDI tempo meta stores
+        // microseconds-per-QUARTER regardless of the notated beat, so a
+        // non-quarter beat unit must be converted, not passed through as bpm.
+        let cases = [
+            // (Q field, expected us/quarter)
+            ("1/4=120", 500_000), // quarter=120 → 500000 (baseline)
+            ("1/2=120", 250_000), // half=120 → quarter=240 → 250000
+            ("3/8=120", 333_333), // dotted-quarter=120 → quarter=180 → 333333
+            ("1/8=120", 1_000_000), // eighth=120 → quarter=60 → 1000000
+        ];
+        for (q, expected) in cases {
+            let abc = format!("X:1\nT:t\nM:4/4\nL:1/4\nQ:{q}\nK:C\nCDEF|\n");
+            let tune = &crate::parse(&abc).value[0];
+            let evs = events(tune, &MidiParams::default());
+            let got = tempo_us_per_quarter(&evs).expect("a tempo meta event");
+            assert_eq!(got, expected, "Q:{q} → wrong us/quarter");
+        }
+    }
+
+    #[test]
+    fn key_level_transpose_and_octave_apply_in_midi() {
+        // ABC v2.1 §4.6: K: `transpose=<semitones>` and `octave=<int>` shift
+        // playback for the whole tune.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C transpose=2\nC|\n";
+        let evs = events(&crate::parse(abc).value[0], &MidiParams::default());
+        let first = evs
+            .iter()
+            .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .unwrap();
+        assert_eq!(first.data[1], 62, "C transposed +2 semitones = D (62)");
+
+        let abc2 = "X:1\nT:t\nM:4/4\nL:1/4\nK:C octave=1\nC|\n";
+        let evs2 = events(&crate::parse(abc2).value[0], &MidiParams::default());
+        let first2 = evs2
+            .iter()
+            .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .unwrap();
+        assert_eq!(first2.data[1], 72, "C up one octave = 72");
+    }
+
+    #[test]
+    fn inline_key_change_applies_in_midi() {
+        // ABC v2.1 §3.2: an inline [K:] changes the key mid-tune. In K:C an F is
+        // natural (65); after [K:G] it must sound as F# (66).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\nF|[K:G]F|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let ons: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.data[1])
+            .collect();
+        assert_eq!(ons, vec![65, 66], "F natural, then F# after [K:G]");
+    }
+
+    #[test]
+    fn tie_carries_accidental_across_barline() {
+        // ABC v2.1 §4.2/§4.11: an accidental is carried by a tie across a bar
+        // line, so `^C-|C` is a single sustained C# — not a stuck C# (never
+        // released) plus a separate natural C. Exactly one on (61) + one off.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n^C-|C|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let ons: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.data[1])
+            .collect();
+        let offs: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x80))
+            .map(|e| e.data[1])
+            .collect();
+        assert_eq!(ons, vec![61], "one tied C# note-on");
+        assert_eq!(offs, vec![61], "one matching note-off — no hung note");
+    }
+
+    #[test]
+    fn chord_inner_note_duration_sets_length() {
+        // ABC v2.1 §4.17: when inner notes carry a length, the chord's duration
+        // is the first note's (inner × outer). `[c4a4]` at L:1/4 = 4 quarters =
+        // 1920 ticks, so a following G starts at 1920 (not 480).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n[c4a4]G|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let on_ticks: Vec<u32> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.tick)
+            .collect();
+        assert_eq!(on_ticks, vec![0, 0, 1920], "chord c+a last 4 units; G at 1920");
+    }
+
+    #[test]
+    fn chord_inner_times_outer_duration() {
+        // `[C2E2G2]3` ≡ `[CEG]6` (inner 2 × outer 3 = 6 units). At L:1/4 → 6
+        // quarters = 2880 ticks; following G at 2880.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n[C2E2G2]3 G|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let last_on = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.tick)
+            .max()
+            .unwrap();
+        assert_eq!(last_on, 2880, "[C2E2G2]3 = 6 units; trailing G at 2880");
+    }
+
+    #[test]
+    fn tuplet_rest_advances_time() {
+        // ABC v2.1 §4.13: a tuplet groups notes/rests/chords; each element's
+        // duration scales by q/p. `(3zab` = rest,a,b in the time of 2: at L:1/4
+        // (480 ticks) each slot is 480*2/3 = 320. The rest must advance time, so
+        // a starts at 320 and b at 640 — not a@0 (rest silently dropped).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n(3zab|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let on_ticks: Vec<u32> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.tick)
+            .collect();
+        assert_eq!(on_ticks, vec![320, 640], "rest slot advances; a@320 b@640");
+    }
+
+    #[test]
+    fn tuplet_chord_sounds_all_notes() {
+        // `(3[CEG]ab`: triplet of chord,a,b. The chord must sound all three of
+        // its notes (not be dropped). Expect 3 (chord) + 1 + 1 = 5 NoteOns.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n(3[CEG]ab|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let on_count = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .count();
+        assert_eq!(on_count, 5, "chord(3) + a + b = 5 NoteOns");
+    }
+
+    #[test]
+    fn multi_measure_rest_uses_meter_denominator() {
+        // ABC v2.1 §4.5: `Zn` rests for n full bars. A 6/8 bar = 6 eighths =
+        // 3 quarters = 1440 ticks at 480/quarter, so Z2 = 2880 ticks and the
+        // following note must start there (not 5760 from beat-count × num).
+        let abc = "X:1\nT:t\nM:6/8\nL:1/8\nQ:1/4=120\nK:C\nZ2 C|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let first_on = evs
+            .iter()
+            .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .expect("a note on after the rest");
+        assert_eq!(first_on.tick, 2880, "Z2 in 6/8 should advance 2*1440 ticks");
+    }
+
     #[test]
     fn test_compute_unit_ticks() {
         // L:1/4 with 480 ticks/beat = 480 ticks per unit (quarter note)
@@ -868,6 +1243,78 @@ mod tests {
         let acc = compute_key_accidentals(&key);
         assert_eq!(acc.get(&NoteName::B), Some(&Accidental::Flat));
         assert_eq!(acc.len(), 1);
+    }
+
+    #[test]
+    fn key_explicit_accidentals_reach_midi() {
+        // ABC v2.1 §4.2/§6.1.2: explicit/modifying accidentals in K: apply to
+        // every matching pitch (all octaves) like a key signature. K:Hp marks
+        // F# AND C#; the circle of fifths for D Mixolydian only yields F#, so
+        // the C# must come from key.explicit_accidentals. Both C's → C# (61/73).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:Hp\nC c F f|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let on_pitches: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.data[1])
+            .collect();
+        // C#4=61, C#5=73, F#4=66, F#5=78
+        assert_eq!(on_pitches, vec![61, 73, 66, 78], "K:Hp must sharpen C and F");
+    }
+
+    #[test]
+    fn key_exp_accidental_reaches_midi() {
+        // K:C exp ^f — explicit sharp on F over an otherwise-empty signature.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C exp ^f\nF f|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let on_pitches: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.data[1])
+            .collect();
+        assert_eq!(on_pitches, vec![66, 78], "K:C exp ^f must sharpen both F's");
+    }
+
+    #[test]
+    fn sharp_minor_and_modal_keys_get_correct_signature() {
+        // ABC v2.1 §3.1.14: G#m = 5 sharps, D#m = 6 sharps, A#m = 7 sharps.
+        // Tonics with an accidental (G#, D#, A#) aren't in the standard-major
+        // table; the signature must come from the circle-of-fifths position.
+        fn sharps(root: NoteName, acc: Option<Accidental>, mode: Mode) -> Vec<NoteName> {
+            let key = Key {
+                root,
+                accidental: acc,
+                mode,
+                ..Default::default()
+            };
+            let mut v: Vec<NoteName> = compute_key_accidentals(&key)
+                .iter()
+                .filter(|(_, a)| **a == Accidental::Sharp)
+                .map(|(n, _)| *n)
+                .collect();
+            v.sort_by_key(|n| n.to_semitone());
+            v
+        }
+        // G#m → 5 sharps: F# C# G# D# A#
+        assert_eq!(
+            sharps(NoteName::G, Some(Accidental::Sharp), Mode::Minor).len(),
+            5,
+            "G#m should have 5 sharps"
+        );
+        // D#m → 6 sharps
+        assert_eq!(
+            sharps(NoteName::D, Some(Accidental::Sharp), Mode::Minor).len(),
+            6,
+            "D#m should have 6 sharps"
+        );
+        // A#m → 7 sharps
+        assert_eq!(
+            sharps(NoteName::A, Some(Accidental::Sharp), Mode::Minor).len(),
+            7,
+            "A#m should have 7 sharps"
+        );
     }
 
     #[test]
@@ -1086,6 +1533,43 @@ mod tests {
             .filter(|w| w[0] == 0x90 && w[1] == 72)
             .count();
         assert_eq!(note_ons, 1, "Tie across bar should produce single note-on");
+    }
+
+    #[test]
+    fn variant_endings_expand_in_midi() {
+        // ABC v2.1 §4.9: `|: common |1 first :|2 second |` plays the common body
+        // + first ending on pass 1, then the common body + second ending on pass
+        // 2. `|:CD|1E:|2F|` → C D E (pass 1) then C D F (pass 2).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n|:CD|1E:|2F|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let ons: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.data[1])
+            .collect();
+        // C=60 D=62 E=64 F=65
+        assert_eq!(
+            ons,
+            vec![60, 62, 64, 60, 62, 65],
+            "common+1st ending, repeat, common+2nd ending"
+        );
+    }
+
+    #[test]
+    fn variant_endings_explicit_repeat_end_form() {
+        // The `|1 … :| [2 …` shape: first ending closes at an explicit `:|`, and
+        // the second ending opens with a bracket `[2`. `|:A|1B:|[2C|` →
+        // A B (pass 1), A C (pass 2). A=69 B=71 C=60.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n|:A|1B:|[2C|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let ons: Vec<u8> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .map(|e| e.data[1])
+            .collect();
+        assert_eq!(ons, vec![69, 71, 69, 60], "common+1st, repeat, common+2nd");
     }
 
     #[test]

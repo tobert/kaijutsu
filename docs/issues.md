@@ -1851,3 +1851,40 @@ rc create/fork/drift (`project_cache_breakpoint_policy`); `usage.cache_*` parsed
 - **Encode the cache-placement rules by construction:** situational date/OS/cwd lands
   *after* the last breakpoint (a message, not `build_system_prompt`); per-directory
   `KAIJUTSU.md` *appends to the tool result*, never re-hydrates `system`.
+
+---
+## kaijutsu-abc — ABC v2.1 spec conformance (audit 2026-06-30)
+
+Three-model holistic audit (deepseek interactive ×2, gemini-pro batch, opus batch) over the
+full verbatim spec cache + all crate code. **14 bugs fixed TDD this round** (failing test →
+fix), suite 320 → 336 green. Shipped: tempo `Q:` beat-unit; multi-measure-rest `Z`
+denominator; tuplets honouring inner rests/chords; `K:` explicit accidentals (`K:Hp`/`exp`);
+sharp-minor/modal key signatures (`G#m`…); chord inner-note durations (`[c4a4]`); tie carrying
+an accidental across a bar line (was a hung note); inline mid-tune `[K:]`; mode abbreviations
+(`mixo`); `K:Bbm` parse; `A//`/`///` durations; `to_abc` note-accidental round-trip (`^`/`_`
+not `#`/`b`); first/second/`[N` variant-ending expansion (+ `|2`/`:|N` parser labels);
+`K:` `transpose=`/`octave=`.
+
+**Still open (verified, not yet fixed):**
+- **MED — `X` multi-measure invisible rest unimplemented** → dropped, shifts timing.
+  `parse_rest` one_of(['z','x','Z']); body rest guard omits 'X'. §4.5.
+- **MED — broken rhythm aborts on a chord/grace neighbour.** `[CEG]>C`, `A>{g}B`:
+  `try_broken_rhythm` only finds/parses `Element::Note`. §4.4/§4.12/§4.17.
+- **MED — inline mid-tune `[M:]`/`[L:]` ignored by MIDI** (only `[K:]` handled). Needs the
+  per-voice unit_ticks/meter to become mutable; mid-tune `[K:]` already done. §3.2.
+- **MED — `+:` continuation corrupts lyric alignment** (joined with `\n`; `tokenize_lyrics`
+  doesn't treat `\n` as whitespace). §3.3.
+- **LOW — grace notes dropped from MIDI** (matrix claims midi). `{ga}c`.
+- **LOW — tuplet default-q for `(5 (7 (9` ignores compound meter** (3 in 6/8). §4.13.
+- **LOW — `%%MIDI transpose N` parsed-then-ignored** though matrix claims midi.
+- **LOW — short-form decorations H/T/u/v never parse before a note** (tests `#[ignore]`d).
+- **LOW — `Duration::to_ticks` integer-truncates** (odd denominators; inaudible at 480 TPQN).
+- **LOW — lyrics `w:` `|` barline-sync marker ignored** (known v1 limitation). §5.1.
+- **LATENT — `ast.rs Note::to_midi_pitch` uses the wrong reference octave** ((octave+4)*12),
+  contradicting the live MIDI/engrave paths; dead code, but `ast::test_note_to_midi_pitch`
+  locks the wrong convention. Delete or fix the helper+tests.
+- **Engrave parity:** `engrave/layout.rs` has its own copies of the tuplet-drops-rests/chords
+  and key-signature bugs — revisit when we move to rendering.
+
+**Verified NOT bugs (don't "fix"):** cross-octave accidental propagation (spec default
+`%%propagate-accidentals pitch` = all octaves); unit-length default; broken-rhythm multipliers.

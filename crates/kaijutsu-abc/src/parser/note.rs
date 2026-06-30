@@ -80,12 +80,21 @@ pub fn parse_duration(input: &mut &str) -> PResult<Duration> {
     })
 }
 
-/// Parse the divisor part of a duration (/2, /, /4)
+/// Parse the divisor part of a duration. Forms (ABC v2.1 §4.3): `/n` is an
+/// explicit denominator; a run of bare slashes each halves again, so `/` = /2,
+/// `//` = /4, `///` = /8.
 fn parse_divisor(input: &mut &str) -> PResult<Option<u16>> {
     '/'.parse_next(input)?;
+    // Additional bare slashes each halve again.
+    let mut slashes = 1u32;
+    while input.starts_with('/') {
+        *input = &input[1..];
+        slashes += 1;
+    }
     let den_str: &str = take_while(0.., |c: char| c.is_ascii_digit()).parse_next(input)?;
     if den_str.is_empty() {
-        Ok(None)
+        // Pure slashes: denominator = 2^slashes (`/`→2, `//`→4, `///`→8).
+        Ok(Some(2u16.saturating_pow(slashes)))
     } else {
         Ok(den_str.parse().ok())
     }
@@ -155,8 +164,15 @@ pub fn parse_chord(input: &mut &str) -> PResult<Chord> {
 
     ']'.parse_next(input)?;
 
-    // Duration after chord applies to the whole chord
-    let duration = parse_duration(input)?;
+    // ABC v2.1 §4.17: a duration after `]` multiplies the whole chord, and inner
+    // notes may carry their own length. The chord's duration is the first note's
+    // length × the outer multiplier — e.g. `[c4a4]` = 4 units, `[C2E2G2]3` = 6.
+    let outer = parse_duration(input)?;
+    let first = notes.first().map(|n| n.duration).unwrap_or_else(Duration::unit);
+    let duration = Duration {
+        numerator: first.numerator * outer.numerator,
+        denominator: first.denominator * outer.denominator,
+    };
 
     Ok(Chord { notes, duration })
 }
@@ -242,6 +258,15 @@ mod tests {
 
         let mut input = "";
         assert_eq!(parse_duration(&mut input).unwrap(), Duration::new(1, 1));
+
+        // §4.3: each extra `/` halves again — `//` = /4, `///` = /8.
+        let mut input = "//";
+        assert_eq!(parse_duration(&mut input).unwrap(), Duration::new(1, 4));
+        let mut input = "///";
+        assert_eq!(parse_duration(&mut input).unwrap(), Duration::new(1, 8));
+        // An explicit denominator still wins: `/3`.
+        let mut input = "/3";
+        assert_eq!(parse_duration(&mut input).unwrap(), Duration::new(1, 3));
     }
 
     #[test]

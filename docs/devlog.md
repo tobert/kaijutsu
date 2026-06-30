@@ -667,3 +667,26 @@ enum docs now state the MCP scope and forward-reference the sibling surface.
 `cargo build -p kaijutsu-kernel -p kaijutsu-server` green. Remaining prep (input-limit
 table, EMA calculator, `RetryPolicy`, the sibling phase enum + its open reuse-vs-parallel
 fork) is logged in issues.md.
+
+## 2026-06-30 — kaijutsu-abc spec-conformance round (kaibo three-model audit)
+
+Ran a holistic ABC v2.1 conformance audit on the `abc` crate using kaibo: two interactive
+deepseek consults on the semantic core, plus gemini-pro and claude-opus **batches** each
+handed the full verbatim spec cache (`docs/abc-spec-cache.md`) + all 38 src/test files (no
+diff — holistic, the way we like it). High cross-model agreement. The spec-in-context paid
+off twice over: it let us *reject* a confident "SEVERE cross-octave accidental" finding —
+ABC's `%%propagate-accidentals` defaults to all-octaves, so the code was already right.
+
+Fixed 14 real bugs, strict TDD (failing test first), suite 320 → 336 green, zero regressions.
+Highlights: `Q:` tempo ignored the beat unit (half-note tempos played at half speed);
+multi-measure `Z` ignored the meter denominator (2× in 6/8); tuplets silently dropped inner
+rests/chords; `K:` explicit accidentals never reached MIDI (`K:Hp` lost its C#); sharp-minor
+keys got flats instead of sharps; chords ignored inner note durations; a tie carrying an
+accidental across a bar line left a **hung MIDI note**; and — the big one — first/second
+variant endings weren't expanded at all (`|1…:|2…` played both endings once instead of
+selecting per pass). The variant-ending fix needed the bar tokenizer normalized first
+(`|2` had been mislabeled `FirstEnding`).
+
+Remaining open items (MED/LOW) recorded in `docs/issues.md`; engrave has its own copies of
+the tuplet + key-signature bugs to revisit when we turn to rendering. Next: Round 2 — deeper
+edge-case / round-trip / malformed-input testing — then rendering.

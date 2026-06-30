@@ -5,7 +5,7 @@
 
 mod body;
 mod header;
-mod key;
+pub(crate) mod key;
 mod note;
 
 use crate::ast::{Element, Header, InfoField, LinebreakMode, Tune, Voice};

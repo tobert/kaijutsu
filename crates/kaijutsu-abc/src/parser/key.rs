@@ -79,17 +79,10 @@ pub fn parse_key_field(value: &str, collector: &mut FeedbackCollector) -> Key {
         chars.next();
         Some(Accidental::Sharp)
     } else if chars.peek() == Some(&'b') {
-        // 'b' is flat only if not followed by a letter (which would be mode like "bm")
-        // Check what comes after the 'b'
-        let mut lookahead = chars.clone();
-        lookahead.next(); // skip the 'b'
-        let next_char = lookahead.next();
-        if !matches!(next_char, Some('a'..='z' | 'A'..='Z')) {
-            chars.next();
-            Some(Accidental::Flat)
-        } else {
-            None
-        }
+        // A `b` immediately after the root is always a flat: no ABC mode name
+        // begins with `b`, so `Bbm` is B-flat minor and `Bbmin`/`Bb dor` work too.
+        chars.next();
+        Some(Accidental::Flat)
     } else {
         None
     };
@@ -329,6 +322,17 @@ fn parse_clef_from_key(s: &str) -> Option<Clef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bbm_is_b_flat_minor() {
+        // `K:Bbm` (no space) is B-flat minor. No ABC mode starts with `b`, so the
+        // `b` after the root must be a flat, and `m` is the minor mode. §3.1.14.
+        let mut collector = FeedbackCollector::new();
+        let key = parse_key_field("Bbm", &mut collector);
+        assert_eq!(key.root, NoteName::B);
+        assert_eq!(key.accidental, Some(Accidental::Flat));
+        assert_eq!(key.mode, Mode::Minor);
+    }
 
     #[test]
     fn test_parse_simple_key() {

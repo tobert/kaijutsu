@@ -651,13 +651,17 @@ fn try_parse_bar(input: &mut &str) -> Option<Bar> {
         return Some(Bar::RepeatStart);
     }
     if input.starts_with(":|") {
-        // Check for :|2 etc.
-        if input.len() >= 3 && input.chars().nth(2).is_some_and(|c| c.is_ascii_digit()) {
-            *input = &input[2..];
-            // Parse the number
-            let num_str: String = input.chars().take_while(|c| c.is_ascii_digit()).collect();
-            *input = &input[num_str.len()..];
-            return Some(Bar::SecondEnding);
+        // `:|N` is a repeat-end that also opens variant ending N (§4.9-4.10).
+        if input.chars().nth(2).is_some_and(|c| c.is_ascii_digit()) {
+            let (nums, consumed) = parse_ending_list(&input[2..]);
+            if !nums.is_empty() {
+                *input = &input[2 + consumed..];
+                return Some(match nums.as_slice() {
+                    [1] => Bar::FirstEnding,
+                    [2] => Bar::SecondEnding,
+                    _ => Bar::NthEnding(nums),
+                });
+            }
         }
         *input = &input[2..];
         return Some(Bar::RepeatEnd);
@@ -666,9 +670,17 @@ fn try_parse_bar(input: &mut &str) -> Option<Bar> {
         *input = &input[2..];
         return Some(Bar::RepeatBoth);
     }
-    if input.starts_with("|1") || input.starts_with("|2") {
-        *input = &input[2..];
-        return Some(Bar::FirstEnding);
+    // Variant ending bar form: `|1`, `|2`, `|3`, `|1-3`, `|1,3` (§4.9-4.10).
+    if input.starts_with('|') && input.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+        let (nums, consumed) = parse_ending_list(&input[1..]);
+        if !nums.is_empty() {
+            *input = &input[1 + consumed..];
+            return Some(match nums.as_slice() {
+                [1] => Bar::FirstEnding,
+                [2] => Bar::SecondEnding,
+                _ => Bar::NthEnding(nums),
+            });
+        }
     }
     if input.starts_with('|') {
         *input = &input[1..];

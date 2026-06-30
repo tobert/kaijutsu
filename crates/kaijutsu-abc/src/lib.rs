@@ -254,12 +254,27 @@ fn format_note_name(note: &NoteName) -> &'static str {
     }
 }
 
+/// Key-signature accidental syntax (`K:F#`, `K:Bb`). For a note prefix use
+/// [`format_note_accidental`] instead — notes use `^/_/=`, not `#/b`.
 fn format_accidental(acc: &Accidental) -> &'static str {
     match acc {
         Accidental::Sharp => "#",
         Accidental::Flat => "b",
         Accidental::DoubleSharp => "##",
         Accidental::DoubleFlat => "bb",
+        Accidental::Natural => "=",
+    }
+}
+
+/// Note-accidental syntax (ABC v2.1 §4.2): `^`/`_`/`=` and the doubled `^^`/`__`.
+/// `#`/`b` are key-signature spellings the parser does NOT accept on a note, so
+/// emitting them here would break to_abc → parse round-trips.
+fn format_note_accidental(acc: &Accidental) -> &'static str {
+    match acc {
+        Accidental::Sharp => "^",
+        Accidental::Flat => "_",
+        Accidental::DoubleSharp => "^^",
+        Accidental::DoubleFlat => "__",
         Accidental::Natural => "=",
     }
 }
@@ -280,7 +295,7 @@ fn format_mode(mode: &Mode) -> &'static str {
 
 fn format_note(output: &mut String, note: &Note) {
     if let Some(acc) = note.accidental {
-        output.push_str(format_accidental(&acc));
+        output.push_str(format_note_accidental(&acc));
     }
     let note_name = format_note_name(&note.pitch);
     if note.octave >= 1 {
@@ -307,7 +322,7 @@ fn format_element(output: &mut String, element: &Element) {
             output.push('[');
             for note in &chord.notes {
                 if let Some(acc) = note.accidental {
-                    output.push_str(format_accidental(&acc));
+                    output.push_str(format_note_accidental(&acc));
                 }
                 let note_name = format_note_name(&note.pitch);
                 if note.octave >= 1 {
@@ -485,6 +500,35 @@ pub fn semitones_to_key(source: &Key, target: &str) -> Result<i8, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_abc_round_trips_note_accidentals() {
+        // A note accidental must render in ABC note syntax (^ _ ^^ __ =), not
+        // key-style #/b, so to_abc output re-parses to the same accidentals. §4.2.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n^C _D ^^E __F =G|\n";
+        let tune = &parse(abc).value[0];
+        let rendered = to_abc(tune);
+        let reparsed = &parse(&rendered).value[0];
+        let accs: Vec<Option<Accidental>> = reparsed.voices[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Note(n) => Some(n.accidental),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            accs,
+            vec![
+                Some(Accidental::Sharp),
+                Some(Accidental::Flat),
+                Some(Accidental::DoubleSharp),
+                Some(Accidental::DoubleFlat),
+                Some(Accidental::Natural),
+            ],
+            "note accidentals must round-trip; rendered: {rendered}"
+        );
+    }
 
     fn round_trip(abc: &str) -> String {
         let result = parse(abc);

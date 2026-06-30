@@ -955,24 +955,28 @@ K:C
     assert!(has_first_ending, "Should have parsed first ending |1");
     assert!(has_second_ending, "Should have parsed second ending :|2");
 
-    // Note: Current expand_repeats() does NOT implement first/second ending logic
-    // It just passes through the bar markers and does a simple repeat
-    // Expected correct behavior: C D E F C D G A (8 notes)
-    // Current behavior: C D E F C D E F (simple repeat, ignores endings)
-    let midi = to_midi(&result.value[0],&MidiParams::default());
+    // Correct §4.9 expansion: pass 1 plays the common body + first ending,
+    // pass 2 the common body + second ending → C D E F | C D G A (8 notes).
+    let midi = to_midi(&result.value[0], &MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
-    let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
-
-    // Document current behavior - this will need to change when endings are implemented
-    // For now, just verify it doesn't crash and produces some notes
-    assert!(notes.len() >= 4, "Should produce at least 4 notes");
+    let pitches: Vec<u8> = tracks[0]
+        .iter()
+        .filter(|e| e.is_note_on)
+        .map(|e| e.pitch)
+        .collect();
+    // C=60 D=62 E=64 F=65 G=67 A=69
+    assert_eq!(
+        pitches,
+        vec![60, 62, 64, 65, 60, 62, 67, 69],
+        "common+1st ending, then common+2nd ending"
+    );
 }
 
-/// Test chord inside tuplet - documents current LIMITATION
-/// NOTE: Tuplet MIDI generation only handles Note elements, not Chord elements
+/// Chords inside a tuplet must sound — ABC v2.1 §4.13 groups notes, rests AND
+/// chords. Three triplet chords of three notes each → 9 NoteOns.
 #[test]
 fn test_chord_in_tuplet() {
-    // (3[CEG][FAC][GBD] = triplet of three chords
+    // (3[CEG][FAc][GBd] = triplet of three chords
     let abc = r#"X:1
 T:Chord in Tuplet Test
 M:4/4
@@ -991,19 +995,15 @@ K:C
         .any(|e| matches!(e, kaijutsu_abc::Element::Tuplet(_)));
     assert!(has_tuplet, "Should have parsed tuplet");
 
-    // LIMITATION: Current MIDI generator only handles Note inside Tuplet, not Chord
-    // The midi.rs Tuplet handler has: `if let Element::Note(note) = elem { ... }`
-    // This means chords inside tuplets are silently skipped
-    let midi = to_midi(&result.value[0],&MidiParams::default());
+    let midi = to_midi(&result.value[0], &MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
 
-    // Document current behavior: chords in tuplets produce NO notes
-    // This should be 9 notes when properly implemented (3 chords * 3 notes each)
+    // 3 chords × 3 notes = 9 NoteOns.
     assert_eq!(
         notes.len(),
-        0,
-        "LIMITATION: Chords inside tuplets are not rendered to MIDI"
+        9,
+        "three triplet chords of three notes each should sound 9 notes"
     );
 }
 
