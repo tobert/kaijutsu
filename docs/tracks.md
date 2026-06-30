@@ -922,3 +922,282 @@ musician can read its own past performance (note: the score blocks are already `
 hydration-silent today, so the model's memory already flows *only* via `KJ_HEARD` — re-pointing
 HEARD at the track keeps that intact; the seam question is whether hydration should *also* read
 the track store directly).
+
+---
+
+# Stage 3 design lock — generalise the clock source (+ the render-target seam)
+
+> **Status:** design direction, 2026-06-29 (Amy + Claude). No code yet — this is
+> the pre-code lock for the two-cast review, the same ritual Stage 1/2 ran.
+> Companion: `docs/midi.md` decides the *network/drift* shape this trait must
+> accommodate; this section is the kernel-local trait + seam it lands behind.
+
+## What Stage 3 is (and is NOT)
+
+There are **two distinct "clocks"** in the beat path; Stage 3 generalises exactly
+one of them:
+
+- **The firing schedule** — `BeatScheduler::run`'s wall-clock arm
+  (`beat.rs` `sleep_until_opt(next)` over a heap of `now + period` `Instant`s).
+  This decides *when* a track beats. **← Stage 3 generalises this.**
+- **`TickClock`** (`BeatPolicy::clock()`, `hyoushigi/mod.rs`) — speculation-cost
+  math (`ticks_per_sec`/`safety_factor`/`commit_margin`) the engine uses to place
+  speculate/commit deadlines. **Downstream of firing; unchanged.** It is *derived*
+  from the effective period (`1.0 / period.as_secs_f64()`), so once the period
+  lives behind a `ClockSource`, `clock()` reads `source.period()`.
+
+**The decisive constraint, from `docs/midi.md`:** the kernel scheduler stays
+**purely generative-local for every clock, system and MIDI alike.** The wire never
+carries realtime pulses to the scheduler — it carries *intent* (tempo / phase /
+transport). A MIDI clock source is a **proxy** for a possibly-remote, drift-modeled
+clock: an edge node observes the master locally, fits a tempo/phase/drift model,
+and ships low-rate *estimates* over the RPC control plane; the kernel runs a tight
+**local** clock phase-locked to that estimate. **So there is no new realtime select
+arm and no pulse channel — the heap stays, the generation/stale-drop logic stays,
+zero-CPU idle stays.** The whole Stage-3 surgery is: put today's `now + period`
+behind a trait, and add an out-of-band estimate-correction hook that only modeled
+sources implement.
+
+## The `ClockSource` trait (SystemClock-only this stage; estimate/remote-shaped now)
+
+Two concrete voices at design (the `≥2 implementations` directive): the **system
+clock** (built this stage) and **midi.md's drift-modeled clock** (built at M3). The
+trait must satisfy both without rework — that is the whole point of shaping it now.
+
+```rust
+/// What drives a track's beat — a *proxy* for a clock that may be remote and
+/// drift-modeled (docs/midi.md). The kernel always runs a tight LOCAL clock; a
+/// source answers "when is the next beat?" locally and folds low-rate estimate
+/// corrections in out-of-band — NEVER on a realtime pulse path.
+pub trait ClockSource: Send {
+    /// The local instant of the next beat after `last`, consulting `now` and the
+    /// source's internal model. Heap-schedulable (generative), MONOTONIC (never
+    /// schedules into the past — a late estimate clamps forward, never rewinds).
+    /// SystemClock: `now + period` (preserves today's behaviour exactly). A
+    /// modeled clock predicts the master's next beat instant and phase-corrects.
+    fn next_fire(&mut self, last: Instant, now: Instant) -> Instant;
+
+    /// The current effective beat period — drives the BPM readback in
+    /// `transport_vars`, the persisted tempo, and the derived `TickClock`. Fixed
+    /// for SystemClock; the modeled estimate for a drift clock.
+    fn period(&self) -> Duration;
+
+    /// Human/transport tempo override (`kj transport tempo`). SystemClock sets its
+    /// period; a modeled clock MAY honour it as a manual nudge or ignore it while
+    /// slaved (decided at M3). Slaving the new period DOWN to the track's armed
+    /// `Timeline` (`Timeline::set_clock`) is the caller's job — see the
+    /// TickClock-desync amendment below.
+    fn set_period(&mut self, _period: Duration) {}
+
+    // M3 ONLY — NOT shipped in M1 (the review's "no dead-code theater"). The M1
+    // surface is exactly the three methods above. M3 adds:
+    //   fn apply_estimate(&mut self, est: ClockEstimate) -> FireMoved;
+    // where `FireMoved::Earlier` tells the scheduler to bump the track's
+    // generation token + push a fresh heap entry NOW (else it sleeps through a
+    // forward phase correction — gemini's heap-re-enlistment finding). The
+    // estimate stream rides the RPC control plane, never a realtime pulse.
+}
+```
+
+- **`SystemClock { period: Duration }`** is the only impl this stage. `next_fire`
+  returns `now + self.period` (byte-for-byte today's re-push), `period()` returns
+  it, `set_period` writes it. No `apply_estimate` ships in M1.
+- **`ClockEstimate`** is **NOT defined in M1** (review consensus: a struct with no
+  producer/consumer is dead-code theater). Its shape (observed tempo, a phase
+  reference instant, an observation timestamp, a rate-of-change term) is designed
+  in `docs/midi.md`; it lands with its producer at M3. The trait is proven
+  M3-ready by the `next_fire(last, now)` + heap-re-enlistment *design*, not by a
+- **Where it lives:** `TrackState.policy.period` moves *into* `SystemClock`;
+  `TrackState` gains `clock: ClockSourceKind` (**enum, decided** — see below).
+  `BeatPolicy` keeps `beats_per_phrase` (phrasing is not a clock concern).
+  `set_tempo` routes to `clock.set_period`; persistence reads `clock.period()`;
+  `fire_due`'s re-push and `play`'s initial push call `clock.next_fire(last, now)`.
+
+**Open trait questions — RESOLVED by the 2-cast review (deepseek + gemini-batch):**
+1. **Enum, decided (unanimous).** `enum ClockSourceKind { System(SystemClock),
+   Modeled(ModeledClock) }` with a dispatch `match`, NOT `Box<dyn>`. `TrackState`
+   already isn't `Clone`/`Debug` (it holds `HashMap`/`MaterializeCursor`), so the
+   trait-object's only upside is moot; the enum dodges a vtable + heap alloc in the
+   hot loop (two `next_fire` calls/beat) and maps 1:1 to the `clock_kind` column.
+   `Modeled` is unconstructable until M3 (panics/`unreachable!` on build). Promote
+   to a trait only if runtime-pluggable (plugin/WASM) sources ever appear — distant.
+2. **`next_fire(last, now)` — keep `now`-spacing for SystemClock (confirmed).** But
+   **document `last`'s semantics**: it is the `Instant` previously *returned* by
+   `next_fire` (the scheduler's *scheduled* fire time), NOT the jittery `now` the
+   heap popped at — so a modeled clock measures residual drift apples-to-apples.
+3. **Persistence: `clock_kind` is MUTABLE, not set-once (gemini correction; my
+   original "set-once like `score_context_id`" was wrong).** A track's *identity* is
+   durable but its clock *source* is circumstantial: you sketch on the system clock,
+   then plug in the KeyStep Pro and `kj transport slave --track bass KSP`, swapping
+   the SAME track's driver to `Modeled` (the core `midi.md` workflow). Set-once would
+   force archiving the track to sync it to hardware. So: `clock_kind TEXT DEFAULT
+   'system'` (additive ALTER, existing rows → `'system'`), **updated in
+   `persist_track` whenever the driver changes** — unlike `score_context_id`, which
+   stays set-once because the score IS the track's durable identity.
+
+## The render-target seam (M1's other half)
+
+`docs/midi.md` "output first": a track declares "render my committed score to ALSA
+MIDI out on node X." A **render is a consumer of the track's score, not a
+producer** — it never schedules cells, never takes a turn, never appears in the
+failure-routing. So it is NOT an `AttachedContext`. Proposed shape:
+
+- `TrackState.render_targets: Vec<Box<dyn RenderTarget>>` (a small registry,
+  parallel to `attached` but consumer-side). **On `TrackState`, decided** (both
+  casts): the scheduler already owns the materialize crossing where `emit` fires,
+  and an M4 cross-node target is just a `RenderTarget` impl that sends over
+  RTP-MIDI — the trait's *home* doesn't constrain its *transport*.
+- The trait, **as amended by the review:**
+  ```rust
+  pub trait RenderTarget: Send {
+      /// Schedule one committed cell's rendered MIDI at `at`. Takes the
+      /// PRE-RESOLVED ABC `&str` (the materialize crossing just ran the deriver),
+      /// so a render target never re-resolves a `ContentRef` from CAS.
+      fn emit(&mut self, abc: &str, at: Instant);
+      /// Transport halt (stop/pause): TRUNCATE this target's already-scheduled
+      /// events after `at` and silence sounding notes. Default no-op.
+      fn flush_scheduled_after(&mut self, at: Instant);
+  }
+  ```
+- **Fed from the materialize crossing:** when `materialize_track` advances the
+  cursor past a newly-committed `Concrete` cell into the score, it reads the cells
+  newly crossed (`committed()[hw_before..cursor.high_water]`) and hands each one's
+  resolved ABC + its local instant to every render target. Cells commit *ahead* of
+  the playhead (the speculation lead), so `at` is in the near future — scheduled
+  into the ALSA seq queue ahead of time, never just-in-time. **The speculation lead
+  IS the jitter buffer** (midi.md constraint-remover #1).
+- 🔴 **`at` must be computed from a jitter-free reference instant (deepseek).** NOT
+  `last_epoch_ns` — that's `SystemTime::now()` latched *after* the heap pop, i.e.
+  the jittery *actual* wakeup, so scheduling off it propagates per-beat scheduler
+  jitter into the output (cumulatively, ~16–32 ms over a 16-beat phrase). Add
+  `TrackState.last_fire_scheduled: Instant` — the heap entry's *scheduled* `t`, set
+  in `fire_due` right after the pop — and compute
+  `at = last_fire_scheduled + (cell.start − playhead) * clock.period()`. A 3-line
+  data addition, no design rework; **WI 6's ALSA loopback test is what exposes it.**
+- 🟠 **Transport-stop vs the ALSA queue (both casts, SEV-1).** The lead means ALSA's
+  `snd_seq` queue holds ~a phrase of future NoteOn/NoteOff. On `kj transport
+  stop`/`pause` the clock stops and no more cells materialize, **but ALSA blindly
+  plays the buffered phrase** (≈8 s of music + hanging notes). So `RenderTarget` is
+  not a pure sink: `BeatScheduler::stop`/`pause` call `flush_scheduled_after(now)`
+  on every target → `AlsaMidiOut` truncates the queue past `now` and emits
+  ALL_NOTES_OFF (CC 123) + ALL_SOUNDS_OFF (CC 120).
+- M1's one impl: `AlsaMidiOut { seq, port }` — renders the ABC via the per-event
+  path (below) and `snd_seq_event_output`s NoteOn/NoteOff at `at`.
+- 🟢 **Squash-after-render is impossible by construction (both casts — phantom
+  risk).** A cell enters the committed log only *after* its `commit_deadline` passes
+  with a matching basis; `CasCommitResolver`'s basis hashes only the recipe param,
+  never committed state, so a committed cell never squashes; `materialize_committed`
+  reads only `committed()`. The render target only ever sees finalized cells. (If a
+  squash-*capable* resolver lands post-M1, document `emit` as fire-and-forget and
+  either buffer renders until the playhead passes the cell or accept sub-perceptual
+  glitches — a deferred concern, not M1's.)
+
+## The renderer gap (mechanical, M1)
+
+`kaijutsu-abc/src/midi.rs::generate(tune, params) -> Vec<u8>` emits a whole
+**Standard MIDI File byte blob**. M1 needs the per-event stream it already builds
+internally — `MidiWriter.events: Vec<MidiEvent { tick: u32, data: Vec<u8> }>` — to
+schedule individual NoteOn/NoteOff into an ALSA seq queue. **Expose the timed event
+list** (a `pub fn events(tune, params) -> Vec<MidiEvent>` alongside `generate`, or
+make `generate` a thin SMF-framing wrapper over it) so the render target consumes
+`(relative_tick, data)` and maps each to a local instant via the track clock. The
+`alsa` crate is already in the workspace dependency graph (pawlsa).
+
+## Staging (mirrors midi.md M1; M2–M4 are midi.md's)
+
+**This stage delivers midi.md M1 only** (output, virtual MIDI, system clock). M2
+(input telemetry), M3 (drift-modeled clock-in — the real `apply_estimate` producer),
+and M4 (cross-node + edge node) are sequenced in `docs/midi.md` and out of scope here.
+
+TDD work items for M1 (revised post-review — `ClockEstimate` dropped, two folded in):
+
+- **WI 1 — `ClockSourceKind` enum + `SystemClock`, behaviour-preserving.** Introduce
+  the enum (`System(SystemClock)` + a `Modeled` placeholder that's unconstructable
+  until M3) + the dispatch `match` for `next_fire`/`period`/`set_period`; move
+  `period` off `BeatPolicy` into `SystemClock`; route
+  `set_tempo`/persistence/`fire_due`/`play`/`clock()` through it. Attach
+  order-of-operations: construct `SystemClock` → `arm_track_timeline(clock.period())`
+  → construct `TrackState { clock, .. }`. *Test:* every existing beat test stays
+  green (pure refactor — same firing schedule); add one asserting
+  `SystemClock::next_fire(last, now)` == today's `now + period`.
+- **WI 2 — `Timeline::set_clock` (the TickClock-desync fix, gemini SEV-2).** Give
+  `Timeline` a `set_clock(TickClock)`; `set_tempo` (and, at M3, `apply_estimate`)
+  slaves the updated `TickClock` down to the armed track timeline, so the
+  speculation budget can't go stale against a changed firing period (stale → missed
+  commit deadlines → fallback wedge). *Test:* arm a track, change tempo, assert the
+  timeline's next schedule uses the NEW `ticks_per_sec` for its commit deadline.
+- **WI 3 — `clock_kind` persistence (additive, MUTABLE — corrected).** ALTER `tracks`
+  with `clock_kind TEXT DEFAULT 'system'`; re-arm reads it; `persist_track` writes
+  the current driver's kind (NOT set-once — see open-question 3). *Test:* round-trip;
+  a tempo upsert preserves `clock_kind`; a driver swap updates it.
+- **WI 4 — render-target seam + `RenderTarget` trait + jitter-free `at`.**
+  `TrackState.render_targets` + `last_fire_scheduled: Instant` (set in `fire_due`
+  from the heap entry's scheduled `t`). `materialize_track` reads newly-crossed
+  cells (`committed()[hw_before..high_water]`), resolves each to ABC, and calls
+  `emit(abc, at)` with `at = last_fire_scheduled + (cell.start − playhead)*period()`.
+  `stop`/`pause` call `flush_scheduled_after(now)` on every target. *Test:* a fake
+  `RenderTarget` records `(abc, at)`; assert one emit per committed cell in commit
+  order, `at` ahead of `now` AND jitter-free (advance the clock with a deliberately
+  *late* `now` and assert `at` tracks the scheduled instant, not the late wakeup);
+  assert `stop` calls `flush_scheduled_after`.
+- **WI 5 — expose the ABC per-event stream.** `pub fn events(tune, params) ->
+  Vec<MidiEvent>` in `kaijutsu-abc/src/midi.rs` (`MidiWriter`/`MidiEvent` go `pub`);
+  `generate` becomes a thin SMF-framing wrapper over it. *Test:* a known tune yields
+  the expected NoteOn/NoteOff ticks; `generate` output unchanged (golden).
+- **WI 6 — `AlsaMidiOut` render target (zorak, virtual port).** The one real impl:
+  open an ALSA seq client + virtual out port, schedule events at `at`,
+  `flush_scheduled_after` truncates the queue + ALL_NOTES_OFF/ALL_SOUNDS_OFF.
+  *Test:* integration-gated (needs ALSA) — open a virtual port, render a 1-bar tune,
+  read it back off a virtual in port, assert the NoteOn sequence + that a mid-phrase
+  `stop` truncates the tail. Runner-verify on zorak.
+- **WI 7 — docs + devlog.** Fold the landed shape into this section + `docs/midi.md`
+  M1 status; devlog entry.
+
+## Decided (2026-06-29, Stage 3 lock — amended by the 2-cast review)
+
+- **No realtime pulse path into the scheduler; the heap stays.** Every clock is
+  generative-local; MIDI corrects an out-of-band estimate, never streams pulses.
+- **`ClockSource` is a proxy for a possibly-remote, drift-modeled clock**, shaped
+  estimate/remote-aware now (`next_fire(last, now)` + the M3 heap-re-enlistment
+  hook), **`SystemClock`-only this stage — no `ClockEstimate` stub shipped** (review:
+  no dead-code theater).
+- **`ClockSourceKind` enum, not `Box<dyn>`** (both casts) — `TrackState` already
+  isn't Clone/Debug; enum dodges a hot-loop vtable + maps to `clock_kind`.
+- **`clock_kind` is MUTABLE** (gemini correction) — a track's clock source is
+  circumstantial (sketch on system, slave to KSP, back); only `score_context_id`
+  stays set-once. My original "set-once" line was wrong.
+- **A render is a score *consumer*, not a producer** — `RenderTarget` on the track,
+  fed from the materialize crossing, scheduled on the speculation lead off a
+  **jitter-free `last_fire_scheduled`**, with `flush_scheduled_after` on stop/pause.
+- **`emit(abc: &str)`, not `emit(&Cell)`** — the crossing already resolved the ABC;
+  the render target never re-hits CAS.
+- **Squash-after-render is impossible by construction** — committed cells never
+  squash; the render target only sees finalized cells.
+- **This stage = midi.md M1 only.** M2–M4 follow per `docs/midi.md`.
+
+## Stage 3 review findings (deepseek + gemini-batch, 2026-06-29 — pre-coding)
+
+Same two-cast ritual as Stage 1/2 (deepseek agent + gemini-pro on **batch** capacity,
+no diff, whole-repo). **Both independently endorsed the design and converged on the
+load-bearing call: there is NO rewrite-forcing trap — the `ClockSource` trait
+survives M3 intact.** They converged on: squash-after-render is a phantom risk
+(gemini: "being afraid of it means misreading `engine.rs`"); the enum over `Box<dyn>`;
+the transport-stop-vs-ALSA-queue hazard as a real SEV-1 (→ `flush_scheduled_after`);
+and M1 as the right slice with WI 6's loopback as the right verification. They split
+on two judgment calls, broken in the lock above:
+
+- **`clock_kind` mutability — gemini won.** Deepseek backed set-once (the
+  `score_context_id` analogy); gemini showed it breaks the core `midi.md` workflow
+  (slave a live track to the KeyStep Pro). → mutable.
+- **`ClockEstimate` in M1 — gemini won.** Deepseek wanted a no-op stub to "prove the
+  shape"; gemini called it dead-code theater. → design the hook, ship it at M3.
+
+Distinct contributions:
+- **deepseek** found the 🔴 `at`-has-no-jitter-free-reference-instant trap
+  (`last_epoch_ns` is the *jittery actual* wakeup; need `last_fire_scheduled`) and
+  the `emit(abc:&str)`-not-`&Cell` CAS-coupling fix.
+- **gemini** found the 🔴 heap-re-enlistment requirement (an estimate that pulls the
+  next fire *earlier* must bump the generation token + push fresh, else the scheduler
+  sleeps through the correction — M3 design-completeness) and the 🟠 `Timeline::
+  set_clock` TickClock-desync fix (Stage 3 makes tempo dynamic, so the latent
+  stale-TickClock bug becomes reachable → WI 2).
