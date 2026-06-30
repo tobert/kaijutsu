@@ -53,28 +53,24 @@ fn staccato_emits_dot_glyph() {
 // Until the parser is loosened, these short forms are unreachable by the
 // renderer regardless of what we do here.
 #[test]
-#[ignore = "parser: short-form H/T/u/v reject any alphabetic follower"]
 fn fermata_short_form_emits_glyph() {
     let els = engrave("X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nHc|\n");
     assert_eq!(glyphs(&els, FERMATA).len(), 1);
 }
 
 #[test]
-#[ignore = "parser: short-form H/T/u/v reject any alphabetic follower"]
 fn trill_short_form_emits_glyph() {
     let els = engrave("X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nTc|\n");
     assert_eq!(glyphs(&els, TRILL).len(), 1);
 }
 
 #[test]
-#[ignore = "parser: short-form H/T/u/v reject any alphabetic follower"]
 fn up_bow_emits_glyph() {
     let els = engrave("X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nuc|\n");
     assert_eq!(glyphs(&els, UP_BOW).len(), 1);
 }
 
 #[test]
-#[ignore = "parser: short-form H/T/u/v reject any alphabetic follower"]
 fn down_bow_emits_glyph() {
     let els = engrave("X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nvc|\n");
     assert_eq!(glyphs(&els, DOWN_BOW).len(), 1);

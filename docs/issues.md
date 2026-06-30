@@ -1873,26 +1873,26 @@ an accidental across a bar line (was a hung note); inline mid-tune `[K:]`; mode 
 not `#`/`b`); first/second/`[N` variant-ending expansion (+ `|2`/`:|N` parser labels);
 `K:` `transpose=`/`octave=`.
 
-**Still open (verified, not yet fixed):**
-- **MED — `X` multi-measure invisible rest unimplemented** → dropped, shifts timing.
-  `parse_rest` one_of(['z','x','Z']); body rest guard omits 'X'. §4.5.
-- **MED — broken rhythm aborts on a chord/grace neighbour.** `[CEG]>C`, `A>{g}B`:
-  `try_broken_rhythm` only finds/parses `Element::Note`. §4.4/§4.12/§4.17.
-- **MED — inline mid-tune `[M:]`/`[L:]` ignored by MIDI** (only `[K:]` handled). Needs the
-  per-voice unit_ticks/meter to become mutable; mid-tune `[K:]` already done. §3.2.
-- **MED — `+:` continuation corrupts lyric alignment** (joined with `\n`; `tokenize_lyrics`
-  doesn't treat `\n` as whitespace). §3.3.
-- **LOW — grace notes dropped from MIDI** (matrix claims midi). `{ga}c`.
-- **LOW — tuplet default-q for `(5 (7 (9` ignores compound meter** (3 in 6/8). §4.13.
-- **LOW — `%%MIDI transpose N` parsed-then-ignored** though matrix claims midi.
-- **LOW — short-form decorations H/T/u/v never parse before a note** (tests `#[ignore]`d).
+**Still open:**
+- **LOW — grace notes dropped from MIDI** (matrix claims midi). `{ga}c`. Deferred: needs a
+  timing decision (stolen time vs zero-duration) — current drop is timing-safe. Resolve as
+  either a simple steal-from-next implementation OR an honest matrix downgrade.
+- **LOW — tuplet default-q for `(5 (7 (9` ignores compound meter** (3 in 6/8). §4.13. Skipped:
+  `default_q` is computed in `try_parse_tuplet` with no meter access; threading the meter
+  through `parse_body → … → try_parse_tuplet` is high churn (10 test call sites) for a rare
+  corner (5/7/9 *without* explicit `:q` *in compound meter*).
 - **LOW — `Duration::to_ticks` integer-truncates** (odd denominators; inaudible at 480 TPQN).
-- **LOW — lyrics `w:` `|` barline-sync marker ignored** (known v1 limitation). §5.1.
-- **LATENT — `ast.rs Note::to_midi_pitch` uses the wrong reference octave** ((octave+4)*12),
-  contradicting the live MIDI/engrave paths; dead code, but `ast::test_note_to_midi_pitch`
-  locks the wrong convention. Delete or fix the helper+tests.
-- **Engrave parity:** `engrave/layout.rs` has its own copies of the tuplet-drops-rests/chords
-  and key-signature bugs — revisit when we move to rendering.
+  Would need rational accumulation; leave unless it bites.
+- **LAYOUT (rendering phase) — `+:` continuation corrupts lyric alignment** (joined with `\n`;
+  `tokenize_lyrics` doesn't treat `\n` as whitespace). §3.3.
+- **LAYOUT (rendering phase) — lyrics `w:` `|` barline-sync marker ignored** (v1 limit). §5.1.
+- **Engrave parity (rendering phase):** `engrave/layout.rs` has its own copies of the
+  tuplet-drops-rests/chords and key-signature bugs — fix when we move to rendering.
+
+**Shipped since the audit (this MED/LOW round):** `X` invisible multi-measure rest; broken
+rhythm transparent to chord/grace neighbours (§4.4/4.12/4.17); inline mid-tune `[M:]`/`[L:]`
+in MIDI; `%%MIDI transpose`; short-form decorations H/T/u/v; aligned the dead
+`ast::Note::to_midi_pitch` octave convention; plus div-by-zero guards from Round 2's fuzz.
 
 **Verified NOT bugs (don't "fix"):** cross-octave accidental propagation (spec default
 `%%propagate-accidentals pitch` = all octaves); unit-length default; broken-rhythm multipliers.

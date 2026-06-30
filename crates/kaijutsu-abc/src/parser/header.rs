@@ -218,7 +218,7 @@ pub fn parse_header<'a>(
 }
 
 /// Parse meter field value (e.g., "4/4", "C", "C|", "6/8")
-fn parse_meter(value: &str, collector: &mut FeedbackCollector) -> Meter {
+pub(crate) fn parse_meter(value: &str, collector: &mut FeedbackCollector) -> Meter {
     let trimmed = value.trim();
 
     match trimmed {
@@ -465,6 +465,19 @@ fn parse_midi_directive(directive: &str, header: &mut Header, collector: &mut Fe
                 }
             } else {
                 collector.warning("%%MIDI program requires a number (0-127)");
+            }
+        }
+        "transpose" => {
+            if let Some(n) = parts.get(1) {
+                match n.parse::<i8>() {
+                    Ok(semitones) => header.midi_transpose = Some(semitones),
+                    Err(_) => collector.warning(format!(
+                        "Invalid %%MIDI transpose '{}', expected a semitone count",
+                        n
+                    )),
+                }
+            } else {
+                collector.warning("%%MIDI transpose requires a semitone count");
             }
         }
         other => {

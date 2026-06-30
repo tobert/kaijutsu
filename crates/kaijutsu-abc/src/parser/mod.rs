@@ -4,7 +4,7 @@
 //! parsing even when encountering issues, collecting feedback for the user.
 
 mod body;
-mod header;
+pub(crate) mod header;
 pub(crate) mod key;
 mod note;
 

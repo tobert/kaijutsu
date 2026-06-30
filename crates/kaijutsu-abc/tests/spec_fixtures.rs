@@ -56,7 +56,9 @@ use std::path::{Path, PathBuf};
 ///     49 — spec-conformance round: `A//`/`///` durations parse (§4.3),
 ///          `|2`/`:|N` variant-ending bars labelled (§4.9-4.10) — both
 ///          previously hit the unknown-character fallback and warned
-const MAX_TOTAL_WARNINGS: usize = 49;
+///     44 — short-form letter decorations H/T/u/v parse before their note
+///          (§4.14) instead of hitting the unknown-character fallback
+const MAX_TOTAL_WARNINGS: usize = 44;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

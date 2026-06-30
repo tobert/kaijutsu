@@ -240,7 +240,8 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
     for voice in &tune.voices {
         // Get pitch offset from voice properties (transpose, octave)
         let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
-            + key_pitch_offset(&tune.header.key);
+            + key_pitch_offset(&tune.header.key)
+            + tune.header.midi_transpose.map(|t| t as i16).unwrap_or(0);
 
         // Strip slur grouping (MIDI-irrelevant), then expand repeats.
         let flat = flatten_slurs(&voice.elements);
@@ -254,8 +255,10 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
         // Accidental carried by a tie to the next same-pitch note, so it stays
         // valid across the bar-line accidental reset (§4.2). Keyed (letter, octave).
         let mut tie_carry: HashMap<(NoteName, i8), Accidental> = HashMap::new();
-        // Active key signature, mutated by inline `[K:…]` fields (§3.2).
+        // Key/length/meter, mutated by inline `[K:]`/`[L:]`/`[M:]` fields (§3.2).
         let mut voice_key_acc = key_accidentals.clone();
+        let mut unit_ticks = unit_ticks;
+        let mut cur_meter = tune.header.meter.clone();
 
         for element in &elements {
             match element {
@@ -339,7 +342,7 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                 Element::Rest(rest) => {
                     if let Some(bars) = rest.multi_measure {
                         let ticks_per_bar =
-                            meter_bar_ticks(tune.header.meter.as_ref(), params.ticks_per_beat);
+                            meter_bar_ticks(cur_meter.as_ref(), params.ticks_per_beat);
                         writer.advance(ticks_per_bar * bars as u32);
                     } else {
                         let ticks = rest.duration.to_ticks(unit_ticks);
@@ -352,12 +355,21 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                     bar_accidentals = voice_key_acc.clone();
                 }
 
-                Element::InlineField(field) if field.field_type == 'K' => {
-                    // Mid-tune key change (§3.2): swap the active signature and
-                    // reset the bar-scoped accidentals to it immediately.
-                    voice_key_acc = inline_key_accidentals(&field.value);
-                    bar_accidentals = voice_key_acc.clone();
-                }
+                // Mid-tune inline field changes (§3.2): K: swaps the signature,
+                // L: the unit length, M: the meter (multi-measure-rest length).
+                Element::InlineField(field) => match field.field_type {
+                    'K' => {
+                        voice_key_acc = inline_key_accidentals(&field.value);
+                        bar_accidentals = voice_key_acc.clone();
+                    }
+                    'L' => {
+                        if let Some(ul) = inline_unit_length(&field.value) {
+                            unit_ticks = compute_unit_ticks(&ul, params.ticks_per_beat);
+                        }
+                    }
+                    'M' => cur_meter = Some(inline_meter(&field.value)),
+                    _ => {}
+                },
 
                 Element::Tuplet(tuplet) => {
                     // Each inner element's duration scales by q/p. Notes, rests
@@ -455,7 +467,8 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
 
         // Get pitch offset from voice properties (transpose, octave)
         let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs)
-            + key_pitch_offset(&tune.header.key);
+            + key_pitch_offset(&tune.header.key)
+            + tune.header.midi_transpose.map(|t| t as i16).unwrap_or(0);
 
         // Use different MIDI channel per voice (0-15, skip 9 which is percussion)
         let channel = if voice_idx >= 9 {
@@ -478,6 +491,8 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         let mut held_notes: HashMap<u8, u32> = HashMap::new();
         let mut tie_carry: HashMap<(NoteName, i8), Accidental> = HashMap::new();
         let mut voice_key_acc = key_accidentals.clone();
+        let mut unit_ticks = unit_ticks;
+        let mut cur_meter = tune.header.meter.clone();
 
         for element in &elements {
             match element {
@@ -546,7 +561,7 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                 Element::Rest(rest) => {
                     if let Some(bars) = rest.multi_measure {
                         let ticks_per_bar =
-                            meter_bar_ticks(tune.header.meter.as_ref(), params.ticks_per_beat);
+                            meter_bar_ticks(cur_meter.as_ref(), params.ticks_per_beat);
                         writer.advance(ticks_per_bar * bars as u32);
                     } else {
                         writer.advance(rest.duration.to_ticks(unit_ticks));
@@ -557,10 +572,19 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                     bar_accidentals = voice_key_acc.clone();
                 }
 
-                Element::InlineField(field) if field.field_type == 'K' => {
-                    voice_key_acc = inline_key_accidentals(&field.value);
-                    bar_accidentals = voice_key_acc.clone();
-                }
+                Element::InlineField(field) => match field.field_type {
+                    'K' => {
+                        voice_key_acc = inline_key_accidentals(&field.value);
+                        bar_accidentals = voice_key_acc.clone();
+                    }
+                    'L' => {
+                        if let Some(ul) = inline_unit_length(&field.value) {
+                            unit_ticks = compute_unit_ticks(&ul, params.ticks_per_beat);
+                        }
+                    }
+                    'M' => cur_meter = Some(inline_meter(&field.value)),
+                    _ => {}
+                },
 
                 Element::Tuplet(tuplet) => {
                     // Notes, rests and chords inside the tuplet all scale by q/p
@@ -695,6 +719,22 @@ fn midi_pitch_with_accidental(pitch: NoteName, octave: i8, acc: Option<Accidenta
 fn inline_key_accidentals(value: &str) -> HashMap<NoteName, Accidental> {
     let mut fc = crate::feedback::FeedbackCollector::new();
     compute_key_accidentals(&crate::parser::key::parse_key_field(value, &mut fc))
+}
+
+/// Parse an inline `[L:n/m]` value into a [`UnitLength`]. Returns `None` for a
+/// malformed value so the caller keeps the current unit length. §3.2.
+fn inline_unit_length(value: &str) -> Option<UnitLength> {
+    let (n, d) = value.trim().split_once('/')?;
+    Some(UnitLength {
+        numerator: n.trim().parse().ok()?,
+        denominator: d.trim().parse().ok()?,
+    })
+}
+
+/// Parse an inline `[M:…]` value into a [`crate::ast::Meter`]. §3.2.
+fn inline_meter(value: &str) -> crate::ast::Meter {
+    let mut fc = crate::feedback::FeedbackCollector::new();
+    crate::parser::header::parse_meter(value.trim(), &mut fc)
 }
 
 /// Compute accidentals from key signature
@@ -1030,6 +1070,20 @@ mod tests {
     }
 
     #[test]
+    fn midi_transpose_directive_applies() {
+        // `%%MIDI transpose N` shifts playback by N semitones (matrix: midi).
+        let abc = "X:1\nT:t\n%%MIDI transpose -14\nM:4/4\nL:1/4\nK:C\nc|\n";
+        let tune = &crate::parse(abc).value[0];
+        assert_eq!(tune.header.midi_transpose, Some(-14));
+        let evs = events(tune, &MidiParams::default());
+        let first = evs
+            .iter()
+            .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .unwrap();
+        assert_eq!(first.data[1], 58, "c (72) transposed -14 semitones = 58");
+    }
+
+    #[test]
     fn key_level_transpose_and_octave_apply_in_midi() {
         // ABC v2.1 §4.6: K: `transpose=<semitones>` and `octave=<int>` shift
         // playback for the whole tune.
@@ -1048,6 +1102,22 @@ mod tests {
             .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
             .unwrap();
         assert_eq!(first2.data[1], 72, "C up one octave = 72");
+    }
+
+    #[test]
+    fn inline_unit_length_change_applies_in_midi() {
+        // ABC v2.1 §3.2: an inline [L:] changes the unit note length mid-tune.
+        // L:1/4 → first C is a quarter (480t); after [L:1/8] the second C is an
+        // eighth (240t): note-offs land at 480 and 720, not 480 and 960.
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\nC[L:1/8]C|\n";
+        let tune = &crate::parse(abc).value[0];
+        let evs = events(tune, &MidiParams::default());
+        let offs: Vec<u32> = evs
+            .iter()
+            .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x80))
+            .map(|e| e.tick)
+            .collect();
+        assert_eq!(offs, vec![480, 720], "second C is an eighth after [L:1/8]");
     }
 
     #[test]
@@ -1148,6 +1218,24 @@ mod tests {
             .filter(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
             .count();
         assert_eq!(on_count, 5, "chord(3) + a + b = 5 NoteOns");
+    }
+
+    #[test]
+    fn uppercase_x_multi_measure_invisible_rest() {
+        // ABC v2.1 §4.5: `Xn` is an invisible multi-measure rest with the same
+        // timing as `Zn`. `X2` in 4/4 advances two full bars (2×1920 = 3840).
+        let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\nX2 C|\n";
+        let tune = &crate::parse(abc).value[0];
+        let has_invisible_mm = tune.voices[0].elements.iter().any(
+            |e| matches!(e, Element::Rest(r) if r.multi_measure == Some(2) && !r.visible),
+        );
+        assert!(has_invisible_mm, "X2 should be an invisible 2-bar rest");
+        let evs = events(tune, &MidiParams::default());
+        let first_on = evs
+            .iter()
+            .find(|e| e.data.first().map(|b| b & 0xF0) == Some(0x90))
+            .unwrap();
+        assert_eq!(first_on.tick, 3840, "X2 advances two full bars");
     }
 
     #[test]

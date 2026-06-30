@@ -702,3 +702,17 @@ adversarial corpus immediately found a real divide-by-zero: `L:1/0` (and `M:0/0`
 sites — a parser over untrusted ABC must degrade, not panic. Also ratcheted the
 spec-fixture warning baseline 59 → 49 (the `A//` and `|2`/`:|N` fixes removed
 unknown-character warnings). Suite now 340 green.
+
+### 2026-06-30 — abc MED/LOW sweep (6 more fixes)
+
+Cleared the remaining medium/low spec items so MIDI + parse are fully aligned
+before rendering: `X` invisible multi-measure rest; broken rhythm now transparent
+to grace notes and accepts chords on either side (§4.4/4.12/4.17); inline mid-tune
+`[M:]`/`[L:]` take effect in MIDI (per-voice unit-ticks/meter made mutable, joining
+the `[K:]` handler); `%%MIDI transpose N`; short-form letter decorations H/T/u/v
+parse before their note (the old guard rejected every alphabetic follower, so they
+never fired — 4 `#[ignore]`d tests un-ignored); and the dead `ast::Note::to_midi_pitch`
+helper + its tests were aligned to the live uppercase-C=middle-C convention. Spec
+fixture warning rail ratcheted 49 → 44. Suite 345 → 349. Left for later (in
+issues.md): grace-note MIDI (needs a timing decision), tuplet default-q in compound
+meter (high-churn, rare), and the lyric-alignment items (rendering phase).

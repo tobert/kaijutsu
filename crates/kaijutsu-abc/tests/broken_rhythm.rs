@@ -126,3 +126,32 @@ fn lone_chevron_without_following_note_falls_through() {
         .any(|f| f.message.contains("Skipping unknown character"));
     assert!(has_warning, "stray > should warn, got: {:?}", result.feedback);
 }
+
+#[test]
+fn broken_rhythm_with_chord_neighbour() {
+    // §4.17: a chord takes the same broken-rhythm postfix as a note.
+    // `[CEG]>C` → chord ×3/2, C ×1/2.
+    let result = parse_with_mode("[CEG]>C", ParseMode::Fragment);
+    assert!(!result.has_errors(), "{:?}", result.feedback);
+    let els = &result.value[0].voices[0].elements;
+    let chord = els
+        .iter()
+        .find_map(|e| match e {
+            Element::Chord(c) => Some(c),
+            _ => None,
+        })
+        .expect("a chord");
+    assert_eq!(chord.duration, dur(3, 2), "chord should be lengthened");
+    let last = notes(&result.value[0]);
+    assert_eq!(last.last().unwrap().duration, dur(1, 2), "C should be shortened");
+}
+
+#[test]
+fn broken_rhythm_transparent_to_grace_notes() {
+    // §4.12: gracenotes are transparent to broken rhythm. `A>{g}B` → A×3/2, B×1/2.
+    let result = parse_with_mode("A>{g}B", ParseMode::Fragment);
+    assert!(!result.has_errors(), "{:?}", result.feedback);
+    let ns = notes(&result.value[0]);
+    assert_eq!(ns[0].duration, dur(3, 2), "A lengthened");
+    assert_eq!(ns[1].duration, dur(1, 2), "B shortened");
+}

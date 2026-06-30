@@ -39,6 +39,8 @@ pub struct Header {
     pub other_fields: Vec<InfoField>,
     /// MIDI program number from %%MIDI program directive (0-127)
     pub midi_program: Option<u8>,
+    /// Semitone transposition from a `%%MIDI transpose N` directive.
+    pub midi_transpose: Option<i8>,
 }
 
 impl Default for Header {
@@ -58,6 +60,7 @@ impl Default for Header {
             voice_defs: Vec::new(),
             other_fields: Vec::new(),
             midi_program: None,
+            midi_transpose: None,
         }
     }
 }
@@ -456,9 +459,9 @@ impl Note {
     /// Does not account for key signature - caller must handle that
     pub fn to_midi_pitch(&self) -> u8 {
         let base = self.pitch.to_semitone();
-        // ABC octave 1 (lowercase c-b) = MIDI 60-71 (middle C octave)
-        // So: base + (octave + 4) * 12
-        let octave_offset = (self.octave + 4) * 12;
+        // ABC octave 0 (uppercase C-B) = MIDI 60-71 (middle C octave), matching
+        // the live MIDI generator and engraver: base + (octave + 5) * 12.
+        let octave_offset = (self.octave + 5) * 12;
         let acc_offset = self.accidental.map(|a| a.to_semitone_offset()).unwrap_or(0);
 
         ((base as i16) + (octave_offset as i16) + (acc_offset as i16)).clamp(0, 127) as u8
@@ -620,32 +623,34 @@ mod tests {
 
     #[test]
     fn test_note_to_midi_pitch() {
-        // Middle C (c in ABC, octave 1) should be MIDI 60
-        let middle_c = Note::new(NoteName::C, 1);
+        // ABC convention (matches the live MIDI/engrave paths): uppercase `C`
+        // is middle C, octave 0 → MIDI 60. Lowercase `c` is octave 1 → 72.
+        let middle_c = Note::new(NoteName::C, 0);
         assert_eq!(middle_c.to_midi_pitch(), 60);
 
-        // C below middle C (C in ABC, octave 0) should be MIDI 48
-        let low_c = Note::new(NoteName::C, 0);
-        assert_eq!(low_c.to_midi_pitch(), 48);
-
-        // C an octave above middle C (c' in ABC, octave 2)
-        let high_c = Note::new(NoteName::C, 2);
+        // Lowercase c (octave 1) is the octave above middle C.
+        let high_c = Note::new(NoteName::C, 1);
         assert_eq!(high_c.to_midi_pitch(), 72);
 
-        // C, (octave -1) should be MIDI 36
-        let very_low_c = Note::new(NoteName::C, -1);
+        // C, (octave -1) is the octave below middle C.
+        let low_c = Note::new(NoteName::C, -1);
+        assert_eq!(low_c.to_midi_pitch(), 48);
+
+        // C,, (octave -2).
+        let very_low_c = Note::new(NoteName::C, -2);
         assert_eq!(very_low_c.to_midi_pitch(), 36);
     }
 
     #[test]
     fn test_note_with_accidental() {
-        let mut c_sharp = Note::new(NoteName::C, 1);
+        let mut c_sharp = Note::new(NoteName::C, 0);
         c_sharp.accidental = Some(Accidental::Sharp);
         assert_eq!(c_sharp.to_midi_pitch(), 61);
 
-        let mut b_flat = Note::new(NoteName::B, 0);
+        // B, with a flat is the Bb just below middle C → MIDI 58.
+        let mut b_flat = Note::new(NoteName::B, -1);
         b_flat.accidental = Some(Accidental::Flat);
-        assert_eq!(b_flat.to_midi_pitch(), 58); // Bb below middle C
+        assert_eq!(b_flat.to_midi_pitch(), 58);
     }
 
     #[test]

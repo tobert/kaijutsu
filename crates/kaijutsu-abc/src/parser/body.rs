@@ -389,23 +389,35 @@ fn try_broken_rhythm(remaining: &mut &str, elements: &mut Vec<Element>) -> bool 
     if chevrons == 0 || chevrons > 3 {
         return false;
     }
-    // Peek past operator + optional whitespace and try to parse a note.
+    // Peek past operator + optional whitespace. Gracenotes are transparent to
+    // broken rhythm (§4.12), so a leading grace group on the second beat is
+    // captured and re-emitted before the scaled note. The second beat may be a
+    // note or a chord (§4.17).
     let after_op = &remaining[chevrons..];
     let mut peek = after_op;
     let _ = skip_spaces(&mut peek);
-    let next_note = match super::note::parse_note.parse_next(&mut peek) {
-        Ok(n) => n,
-        Err(_) => return false,
+    let next_grace = try_parse_grace_notes(&mut peek);
+    if next_grace.is_some() {
+        let _ = skip_spaces(&mut peek);
+    }
+    let mut next_elem = if let Ok(n) = super::note::parse_note.parse_next(&mut peek) {
+        Element::Note(n)
+    } else if let Ok(c) = parse_chord.parse_next(&mut peek) {
+        Element::Chord(c)
+    } else {
+        return false;
     };
-    // Find the previous note in the element stream (skip Spaces /
-    // LineBreaks / ornamental elements that don't alter rhythm). If the
-    // intervening element is a Bar / Rest / Chord / etc., bail.
+
+    // Find the previous beat in the element stream — a note or a chord. Skip
+    // Spaces / LineBreaks / ornamental elements and gracenotes (transparent).
+    // If the intervening element is a Bar / Rest / etc., bail.
     let prev_idx = elements.iter().enumerate().rev().find_map(|(i, e)| match e {
-        Element::Note(_) => Some(Ok(i)),
+        Element::Note(_) | Element::Chord(_) => Some(Ok(i)),
         Element::Space
         | Element::LineBreak
         | Element::ChordSymbol(_)
-        | Element::Decoration(_) => None,
+        | Element::Decoration(_)
+        | Element::GraceNotes { .. } => None,
         _ => Some(Err(())),
     });
     let prev_idx = match prev_idx {
@@ -418,14 +430,25 @@ fn try_broken_rhythm(remaining: &mut &str, elements: &mut Vec<Element>) -> bool 
     let signed: i32 = chevrons as i32 * if op_char == '>' { 1 } else { -1 };
     let (a_num, a_den, b_num, b_den) = broken_rhythm_ratios(signed);
 
-    if let Element::Note(prev) = &mut elements[prev_idx] {
-        prev.duration.numerator = prev.duration.numerator.saturating_mul(a_num);
-        prev.duration.denominator = prev.duration.denominator.saturating_mul(a_den);
+    let scale = |d: &mut crate::ast::Duration, num: u16, den: u16| {
+        d.numerator = d.numerator.saturating_mul(num);
+        d.denominator = d.denominator.saturating_mul(den);
+    };
+    match &mut elements[prev_idx] {
+        Element::Note(prev) => scale(&mut prev.duration, a_num, a_den),
+        Element::Chord(prev) => scale(&mut prev.duration, a_num, a_den),
+        _ => {}
     }
-    let mut next_note = next_note;
-    next_note.duration.numerator = next_note.duration.numerator.saturating_mul(b_num);
-    next_note.duration.denominator = next_note.duration.denominator.saturating_mul(b_den);
-    elements.push(Element::Note(next_note));
+    match &mut next_elem {
+        Element::Note(n) => scale(&mut n.duration, b_num, b_den),
+        Element::Chord(c) => scale(&mut c.duration, b_num, b_den),
+        _ => {}
+    }
+
+    if let Some(grace) = next_grace {
+        elements.push(grace);
+    }
+    elements.push(next_elem);
     *remaining = peek;
     true
 }
@@ -592,8 +615,8 @@ fn try_parse_element(
         }
     }
 
-    // Try rest
-    if input.starts_with('z') || input.starts_with('x') || input.starts_with('Z') {
+    // Try rest (z/x visible/invisible; Z/X multi-measure visible/invisible, §4.5)
+    if input.starts_with(['z', 'x', 'Z', 'X']) {
         if let Ok(rest) = parse_rest.parse_next(input) {
             return Some(Element::Rest(rest));
         }
@@ -944,6 +967,19 @@ fn try_parse_inline_field(input: &mut &str) -> Option<InfoField> {
 }
 
 /// Try to parse a decoration
+/// True for a character that can begin an element a decoration attaches to:
+/// a note, accidental, rest, chord, grace group, or another stacked decoration.
+fn is_decoration_target(c: char) -> bool {
+    matches!(c,
+        'A'..='G' | 'a'..='g'          // note letters
+        | '^' | '_' | '='              // accidentals
+        | 'z' | 'x' | 'Z' | 'X'        // rests
+        | '[' | '{'                    // chord, grace group
+        | '.' | '~' | '!' | '+'        // stacked symbol decorations
+        | 'H' | 'T' | 'u' | 'v'        // stacked letter decorations
+    )
+}
+
 fn try_parse_decoration(input: &mut &str) -> Option<crate::ast::Decoration> {
     use crate::ast::Decoration;
 
@@ -956,46 +992,24 @@ fn try_parse_decoration(input: &mut &str) -> Option<crate::ast::Decoration> {
         *input = &input[1..];
         return Some(Decoration::Roll);
     }
-    if input.starts_with('H') && !input.chars().nth(1).is_some_and(|c| c.is_ascii_lowercase()) {
-        // H not followed by lowercase (which would be a note like Ha - invalid anyway)
-        // Actually H alone is fermata, but H followed by uppercase might be note
-        // Let's be conservative
-        if input.len() == 1
-            || !input
-                .chars()
-                .nth(1)
-                .is_some_and(|c| c.is_ascii_alphabetic())
-        {
-            *input = &input[1..];
-            return Some(Decoration::Fermata);
-        }
+    // Letter decorations H/T/u/v (§4.14). They are never note names, so they
+    // fire whenever followed by something they can decorate — a note, accidental,
+    // rest, chord, grace group, or another (stacked) decoration. The old guard
+    // rejected *any* alphabetic follower, which meant they never fired before a
+    // note (the whole point), so the short forms were dead.
+    if input.starts_with('H') && input.chars().nth(1).is_some_and(is_decoration_target) {
+        *input = &input[1..];
+        return Some(Decoration::Fermata);
     }
-    if input.starts_with('T')
-        && !input.chars().nth(1).is_some_and(|c| c.is_ascii_lowercase())
-        && (input.len() == 1
-            || !input
-                .chars()
-                .nth(1)
-                .is_some_and(|c| c.is_ascii_alphabetic()))
-    {
+    if input.starts_with('T') && input.chars().nth(1).is_some_and(is_decoration_target) {
         *input = &input[1..];
         return Some(Decoration::Trill);
     }
-    if input.starts_with('u')
-        && !input
-            .chars()
-            .nth(1)
-            .is_some_and(|c| c.is_ascii_alphabetic())
-    {
+    if input.starts_with('u') && input.chars().nth(1).is_some_and(is_decoration_target) {
         *input = &input[1..];
         return Some(Decoration::UpBow);
     }
-    if input.starts_with('v')
-        && !input
-            .chars()
-            .nth(1)
-            .is_some_and(|c| c.is_ascii_alphabetic())
-    {
+    if input.starts_with('v') && input.chars().nth(1).is_some_and(is_decoration_target) {
         *input = &input[1..];
         return Some(Decoration::DownBow);
     }

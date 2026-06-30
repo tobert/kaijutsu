@@ -120,17 +120,17 @@ pub fn parse_note(input: &mut &str) -> PResult<Note> {
 
 /// Parse a rest (z, x, Z)
 pub fn parse_rest(input: &mut &str) -> PResult<Rest> {
-    let rest_char = one_of(['z', 'x', 'Z']).parse_next(input)?;
+    let rest_char = one_of(['z', 'x', 'Z', 'X']).parse_next(input)?;
 
     match rest_char {
-        'Z' => {
-            // Multi-measure rest
+        // `Z` (visible) / `X` (invisible) multi-measure rests (§4.5).
+        'Z' | 'X' => {
             let count_str: &str =
                 take_while(0.., |c: char| c.is_ascii_digit()).parse_next(input)?;
             let count: u16 = count_str.parse().unwrap_or(1);
             Ok(Rest {
                 duration: Duration::unit(),
-                visible: true,
+                visible: rest_char == 'Z',
                 multi_measure: Some(count),
             })
         }
