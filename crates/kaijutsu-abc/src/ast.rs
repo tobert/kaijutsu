@@ -101,6 +101,49 @@ impl Default for Key {
     }
 }
 
+impl Key {
+    /// Key-signature accidental count and direction as `(count, is_sharp)`.
+    /// Derived from the tonic's position on the circle of fifths (note letter +
+    /// accidental) plus the mode offset, so accidental'd tonics (G#, D#, A#, …)
+    /// resolve correctly instead of falling through a major-only table. ABC
+    /// v2.1 §3.1.14. Shared by the MIDI generator and the engraver so the two
+    /// can't drift. (Count may exceed 7 for theoretical keys; callers that draw
+    /// or apply a fixed 7-slot signature clamp it.)
+    pub fn signature(&self) -> (i8, bool) {
+        let letter_fifths = match self.root {
+            NoteName::F => -1,
+            NoteName::C => 0,
+            NoteName::G => 1,
+            NoteName::D => 2,
+            NoteName::A => 3,
+            NoteName::E => 4,
+            NoteName::B => 5,
+        };
+        let acc_fifths = match self.accidental {
+            Some(Accidental::Sharp) => 7,
+            Some(Accidental::DoubleSharp) => 14,
+            Some(Accidental::Flat) => -7,
+            Some(Accidental::DoubleFlat) => -14,
+            _ => 0,
+        };
+        let mode_offset = match self.mode {
+            Mode::Major | Mode::Ionian => 0,
+            Mode::Minor | Mode::Aeolian => -3,
+            Mode::Dorian => -2,
+            Mode::Phrygian => -4,
+            Mode::Lydian => 1,
+            Mode::Mixolydian => -1,
+            Mode::Locrian => -5,
+        };
+        let total = letter_fifths + acc_fifths + mode_offset;
+        if total >= 0 {
+            (total, true)
+        } else {
+            (-total, false)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NoteName {
     C,

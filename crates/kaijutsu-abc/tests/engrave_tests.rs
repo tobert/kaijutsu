@@ -295,3 +295,51 @@ fn accidental_note_gets_accidental_glyph() {
         "Should have at least 1 sharp accidental glyph"
     );
 }
+
+#[test]
+fn sharp_minor_key_signature_draws_correct_sharps() {
+    // K:G#m has 5 sharps (relative major B). The staff must draw 5 sharps, not
+    // fall through the major-only table to 3 flats. §3.1.14.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let abc = "X:1\nT:t\nM:4/4\nK:G#m\nz|\n";
+    let result = parse(abc);
+    assert!(!result.has_errors(), "{:?}", result.feedback);
+    let elements = layout::engrave(&result.value[0], &default_options());
+    let sharps = elements
+        .iter()
+        .filter(|e| matches!(e, EngravingElement::Glyph { codepoint: 0xE262, .. }))
+        .count();
+    let flats = elements
+        .iter()
+        .filter(|e| matches!(e, EngravingElement::Glyph { codepoint: 0xE260, .. }))
+        .count();
+    assert_eq!(sharps, 5, "G#m → 5 sharps on the staff");
+    assert_eq!(flats, 0, "G#m → no flats");
+}
+
+#[test]
+fn tuplet_renders_inner_chords_and_rests() {
+    // §4.13: a tuplet groups notes, rests AND chords — the layout must render
+    // all of them, not just bare notes (the old arm dropped rests/chords).
+    use kaijutsu_abc::engrave::EngravingElement;
+    let is_head = |cp: u32| (0xE0A2..=0xE0A4).contains(&cp);
+    let is_rest = |cp: u32| (0xE4E3..=0xE4E7).contains(&cp);
+
+    // `(3[CEG]ab` → chord (3 noteheads) + a + b = 5 noteheads.
+    let abc = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n(3[CEG]ab|\n";
+    let els = layout::engrave(&parse(abc).value[0], &default_options());
+    let heads = els
+        .iter()
+        .filter(|e| matches!(e, EngravingElement::Glyph { codepoint, .. } if is_head(*codepoint)))
+        .count();
+    assert!(heads >= 5, "chord(3)+a+b should be ≥5 noteheads, got {heads}");
+
+    // `(3zab` → one rest glyph for the z inside the tuplet.
+    let abc2 = "X:1\nT:t\nM:4/4\nL:1/4\nK:C\n(3zab|\n";
+    let els2 = layout::engrave(&parse(abc2).value[0], &default_options());
+    let rests = els2
+        .iter()
+        .filter(|e| matches!(e, EngravingElement::Glyph { codepoint, .. } if is_rest(*codepoint)))
+        .count();
+    assert_eq!(rests, 1, "the z inside the tuplet renders a rest glyph");
+}

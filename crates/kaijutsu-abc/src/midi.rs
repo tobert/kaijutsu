@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Accidental, Bar, Element, Key, Mode, Note, NoteName, Tune, UnitLength, Voice};
+use crate::ast::{Accidental, Bar, Element, Key, Note, NoteName, Tune, UnitLength, Voice};
 use crate::MidiParams;
 
 /// Get the combined pitch offset from voice properties (transpose + octave)
@@ -866,7 +866,7 @@ fn compute_key_accidentals(key: &Key) -> HashMap<NoteName, Accidental> {
     ];
 
     // Determine number of sharps/flats based on key
-    let (count, is_sharp) = key_signature_accidentals(key);
+    let (count, is_sharp) = key.signature();
 
     let affected = if is_sharp { &sharps } else { &flats };
     for i in 0..count as usize {
@@ -892,49 +892,6 @@ fn compute_key_accidentals(key: &Key) -> HashMap<NoteName, Accidental> {
     }
 
     accidentals
-}
-
-/// Get number of sharps (positive) or flats (negative) for a key
-fn key_signature_accidentals(key: &Key) -> (i8, bool) {
-    // Position of the (major) tonic on the circle of fifths = its key-signature
-    // count. Each note letter has a base fifths-index; a sharp adds 7, a flat
-    // subtracts 7. This handles accidental'd tonics (G#, D#, A#, …) that aren't
-    // in the 15 standard-major spellings. ABC v2.1 §3.1.14.
-    let letter_fifths = match key.root {
-        NoteName::F => -1,
-        NoteName::C => 0,
-        NoteName::G => 1,
-        NoteName::D => 2,
-        NoteName::A => 3,
-        NoteName::E => 4,
-        NoteName::B => 5,
-    };
-    let acc_fifths = match key.accidental {
-        Some(Accidental::Sharp) => 7,
-        Some(Accidental::DoubleSharp) => 14,
-        Some(Accidental::Flat) => -7,
-        Some(Accidental::DoubleFlat) => -14,
-        _ => 0,
-    };
-    let base: i8 = letter_fifths + acc_fifths;
-
-    // Adjust for mode
-    let mode_offset = match key.mode {
-        Mode::Major | Mode::Ionian => 0,
-        Mode::Minor | Mode::Aeolian => -3, // Relative minor is 3 flats less
-        Mode::Dorian => -2,
-        Mode::Phrygian => -4,
-        Mode::Lydian => 1,
-        Mode::Mixolydian => -1,
-        Mode::Locrian => -5,
-    };
-
-    let total = base + mode_offset;
-    if total >= 0 {
-        (total, true)
-    } else {
-        (-total, false)
-    }
 }
 
 /// Ticks in one full bar of the tune's meter, for multi-measure rests (`Zn`).
@@ -1131,7 +1088,7 @@ fn encode_variable_length(mut value: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Duration, Header, Meter, Note, Rest, Tempo, Voice};
+    use crate::ast::{Duration, Header, Meter, Mode, Note, Rest, Tempo, Voice};
 
     #[test]
     fn test_variable_length_encoding() {

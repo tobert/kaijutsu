@@ -188,41 +188,9 @@ fn accidental_codepoint(acc: Accidental) -> u32 {
 
 /// Key signature accidental count and sign — same logic as midi.rs.
 fn key_signature_info(key: &Key) -> (i8, bool) {
-    let base = match (&key.root, &key.accidental) {
-        (NoteName::C, None) => 0,
-        (NoteName::G, None) => 1,
-        (NoteName::D, None) => 2,
-        (NoteName::A, None) => 3,
-        (NoteName::E, None) => 4,
-        (NoteName::B, None) => 5,
-        (NoteName::F, Some(Accidental::Sharp)) => 6,
-        (NoteName::C, Some(Accidental::Sharp)) => 7,
-        (NoteName::F, None) => -1,
-        (NoteName::B, Some(Accidental::Flat)) => -2,
-        (NoteName::E, Some(Accidental::Flat)) => -3,
-        (NoteName::A, Some(Accidental::Flat)) => -4,
-        (NoteName::D, Some(Accidental::Flat)) => -5,
-        (NoteName::G, Some(Accidental::Flat)) => -6,
-        (NoteName::C, Some(Accidental::Flat)) => -7,
-        _ => 0,
-    };
-
-    let mode_offset = match key.mode {
-        Mode::Major | Mode::Ionian => 0,
-        Mode::Minor | Mode::Aeolian => -3,
-        Mode::Dorian => -2,
-        Mode::Phrygian => -4,
-        Mode::Lydian => 1,
-        Mode::Mixolydian => -1,
-        Mode::Locrian => -5,
-    };
-
-    let total = base + mode_offset;
-    if total >= 0 {
-        (total, true)
-    } else {
-        (-total, false)
-    }
+    // Shared circle-of-fifths computation (also used by the MIDI generator), so
+    // the staff signature and playback can't drift. §3.1.14.
+    key.signature()
 }
 
 // --- Pitch → staff position ------------------------------------------------
@@ -721,25 +689,73 @@ fn render_staff(
                 }
             }
             Element::Tuplet(tuplet) => {
+                // A tuplet groups notes, rests AND chords (§4.13); render all of
+                // them at the q/p-scaled width so nothing is dropped and the
+                // following music isn't pulled in early.
                 let span = (0usize, 0usize);
-                let scale_factor = tuplet.q as f64 / tuplet.p as f64;
+                let scale_factor = tuplet.q as f64 / (tuplet.p.max(1)) as f64;
                 for elem in &tuplet.elements {
-                    if let Element::Note(note) = elem {
-                        let orig_width = duration_to_width(&note.duration, unit_width);
-                        let scaled_width = orig_width * scale_factor;
-                        let pos = ctx.pos_for(&note.pitch, note.octave);
-                        let cp = notehead_codepoint(&note.duration, &unit_length);
-                        let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-                        elements.push(EngravingElement::Glyph {
-                            codepoint: cp,
-                            x: cursor_x,
-                            y: ctx.y_at(pos),
-                            scale: ctx.scale,
-                            source_span: span,
-                        });
-                        emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
-                        emit_stem(elements, pos, cursor_x, ctx, &note.duration, &unit_length, span);
-                        cursor_x += scaled_width;
+                    match elem {
+                        Element::Note(note) => {
+                            let pos = ctx.pos_for(&note.pitch, note.octave);
+                            let cp = notehead_codepoint(&note.duration, &unit_length);
+                            let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+                            if let Some(acc) = note.accidental {
+                                elements.push(EngravingElement::Glyph {
+                                    codepoint: accidental_codepoint(acc),
+                                    x: cursor_x - ctx.sp * 0.8,
+                                    y: ctx.y_at(pos),
+                                    scale: ctx.scale,
+                                    source_span: span,
+                                });
+                            }
+                            elements.push(EngravingElement::Glyph {
+                                codepoint: cp,
+                                x: cursor_x,
+                                y: ctx.y_at(pos),
+                                scale: ctx.scale,
+                                source_span: span,
+                            });
+                            emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
+                            emit_stem(elements, pos, cursor_x, ctx, &note.duration, &unit_length, span);
+                            cursor_x += duration_to_width(&note.duration, unit_width) * scale_factor;
+                        }
+                        Element::Rest(rest) => {
+                            elements.push(EngravingElement::Glyph {
+                                codepoint: rest_codepoint(&rest.duration, &unit_length),
+                                x: cursor_x,
+                                y: ctx.y_at(2.0),
+                                scale: ctx.scale,
+                                source_span: span,
+                            });
+                            cursor_x += duration_to_width(&rest.duration, unit_width) * scale_factor;
+                        }
+                        Element::Chord(chord) => {
+                            for note in &chord.notes {
+                                let pos = ctx.pos_for(&note.pitch, note.octave);
+                                let cp = notehead_codepoint(&chord.duration, &unit_length);
+                                let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+                                if let Some(acc) = note.accidental {
+                                    elements.push(EngravingElement::Glyph {
+                                        codepoint: accidental_codepoint(acc),
+                                        x: cursor_x - ctx.sp * 0.8,
+                                        y: ctx.y_at(pos),
+                                        scale: ctx.scale,
+                                        source_span: span,
+                                    });
+                                }
+                                elements.push(EngravingElement::Glyph {
+                                    codepoint: cp,
+                                    x: cursor_x,
+                                    y: ctx.y_at(pos),
+                                    scale: ctx.scale,
+                                    source_span: span,
+                                });
+                                emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
+                            }
+                            cursor_x += duration_to_width(&chord.duration, unit_width) * scale_factor;
+                        }
+                        _ => {}
                     }
                 }
             }

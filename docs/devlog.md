@@ -757,3 +757,15 @@ sounds g,a then a shortened c, with d still landing on the beat. Wired into both
 the single-track and per-voice paths via a shared `play_grace_run` helper; the
 robustness note-balance test confirms no hung notes. (User picked steal-from-next
 over an honest matrix downgrade.) Suite 349 → 350.
+
+### 2026-06-30 — rendering phase begins: the engraver's parallel bugs
+
+Started the engrave audit (kaibo over engrave/). First fixed the two bugs the
+earlier audit flagged as living in BOTH midi.rs and the engraver: (1) the
+key-signature computation in layout.rs was an exact copy of the pre-fix major-only
+table, so sharp-tonic minor/modal keys (G#m, D#m, A#m) drew the wrong accidentals —
+fixed at the root by extracting one shared `Key::signature()` on the AST that both
+the MIDI generator and the engraver call, so they can't drift again; (2) the
+layout Tuplet arm dropped inner rests and chords (same shape as the old MIDI bug) —
+it now renders notes, rests and chords at the q/p-scaled width. Suite 350 → 352.
+The broader engrave audit is still running; more rendering fixes to come.
