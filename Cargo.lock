@@ -5907,6 +5907,7 @@ dependencies = [
 name = "kaijutsu-server"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "anyhow",
  "async-trait",
  "bytes",
@@ -5916,6 +5917,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hostname",
+ "kaijutsu-abc",
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-hyoushigi",
