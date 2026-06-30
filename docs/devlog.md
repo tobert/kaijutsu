@@ -384,6 +384,37 @@ before — diagnose threading from the code, not from a reviewer's summary, and 
 two competent readers model the topology differently that *is* the signal to go
 look.
 
+## Tracks Stage 3 M1 — first sound, all the way through to a synth (2026-06-30)
+
+The milestone the rest of M1 was building toward: kaijutsu *composed a line and it
+came out of a synth*, end to end on zorak. Chain, every hop real:
+
+  musician (Haiku, tool-free) → `X:1` ABC turn → `on_turn_completed` →
+  `schedule_abc_cell` onto the `synth` track timeline → beat commits the cell →
+  `materialize_track` → `emit_to_render_targets` → `AlsaMidiOut` (`kaijutsu 129:0`)
+  → `aconnect 129:0 128:0` → TiMidity 128:0 → PipeWire → speakers.
+
+Orchestrated live over MCP: `kj transport render --track synth` opened the seq port
+(confirmed in `/proc/asound/seq/clients` + `aplaymidi -l`), `aconnect` routed it to
+TiMidity, `kj transport play` + `kj drive synth --prompt "…"` produced the phrase.
+Two findings from the live run worth keeping:
+
+- **A cloud model needs a user turn.** The musician's create-time hydrate fired with
+  a system-only message and Anthropic rejected it (`invalid request`); the OODA *tick*
+  injects a `Transport: …` **user** block, so ticked turns (and `kj drive --prompt`)
+  succeed. The chameleon loop was bootstrapped on a local model that tolerates
+  system-only — Anthropic is stricter. (Use `--prompt`, or rely on the tick's user msg.)
+- **It plays sparse, not continuous — by configuration, not bug.** The musician's
+  `wakeup` cadence defaults to `8 * 16` = 128 beats (~once/minute at 120 BPM) and the
+  primers ask for "a bar or two," while the phrase window is 16 beats — so you hear a
+  short phrase then a long rest. The contiguity *mechanism* is already right (the
+  schedule lead is `phrase_delta()`, one phrase ahead); the dial-in is wakeup-=phrase +
+  telling the model the phrase-window beats + "fill it." That's the next thread.
+
+This is `midi.md` M1 reaching its real acceptance test — audible output — not just the
+unit/loopback tests. `aseqdump` captures read 0 only because the background dump kept
+getting reaped when its wrapper shell exited; the ear was the instrument.
+
 ## Tracks Stage 3 M1 — sound out the door (clock_kind, render seam, AlsaMidiOut) (2026-06-30)
 
 With WI 1+2 (the `ClockSourceKind` enum + mutable tempo) and the three landed-code
