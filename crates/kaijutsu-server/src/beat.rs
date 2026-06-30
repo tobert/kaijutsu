@@ -716,8 +716,19 @@ impl BeatScheduler {
             track.phrasing().clock()
         });
         if let Some(tick_clock) = new_tick_clock {
-            if let Some(tl) = self.kernel.track_timeline(track_id) {
-                tl.lock().set_clock(tick_clock);
+            match self.kernel.track_timeline(track_id) {
+                Some(tl) => tl.lock().set_clock(tick_clock),
+                // A track in `self.tracks` always has an armed timeline today
+                // (attach arms it on create, detach never disarms). If that ever
+                // stops holding, the firing period would advance while the
+                // speculation TickClock stayed stale — a silent divergence that
+                // under-leads and wedges the fallback. Make it observable rather
+                // than let it pass quietly.
+                None => log::warn!(
+                    "beat: set_tempo on {} updated the firing clock but found no armed \
+                     timeline to re-slave; speculation lead may be stale",
+                    track_id.as_str()
+                ),
             }
         }
         // Persist the new tempo so a restart recovers it (not the default).
