@@ -187,6 +187,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Architecture & System Design
 
+- **Hardware I/O out of the kernel process (audio + MIDI):** lean (2026-06-30) —
+  the kernel/server binary should own *no* audio/MIDI FFI; hardware emission lives
+  in peripherals that attach over RPC (the Bevy app, or a headless edge-node
+  agent = `midi.md`'s "first kernel-owned compute node"). Consequence: extract the
+  already-shipped `AlsaMidiOut` from `crates/kaijutsu-server/src/clock.rs` into the
+  edge-node agent so the server stops linking `alsa` (the speculation-lead `at`
+  scheduling travels with it). Sequence with M4 edge-node work. PCM samples follow
+  the same rule from the start — see `docs/pcm.md`.
 - **SSH shell subsystem (`kaijutsu-shell`):** give an `ssh` user an interactive kaish
   with `kj` that starts in a lobby and attaches into contexts (VFS reflows on switch).
   Design + wiring captured in [`ssh-shell.md`](ssh-shell.md). Start after the SFTP
