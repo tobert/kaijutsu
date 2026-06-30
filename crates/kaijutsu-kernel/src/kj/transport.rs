@@ -19,7 +19,9 @@ use kaijutsu_types::{ContentType, ContextId, TrackId};
 
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
-use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence, RenderTargetSpec};
+use crate::hyoushigi::{
+    Attachment, BeatCommand, BeatPolicy, Cadence, RenderTargetOp, RenderTargetSpec,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -154,9 +156,18 @@ enum TransportCommand {
         /// docs/pcm.md.)
         #[arg(long, default_value = "alsa-midi")]
         to: String,
-        /// ALSA seq port name (shown in `aconnect -l`). Default: the track name.
+        /// ALSA seq port name (shown in `aconnect -l`), also the target's id for
+        /// `--off`. Default: the track name.
         #[arg(long)]
         port: Option<String>,
+        /// Detach a render target instead of adding one: removes the `--port`-named
+        /// target, or ALL of the track's targets when `--port` is omitted. The
+        /// removed target is silenced (all-notes-off) before it's dropped.
+        #[arg(long, conflicts_with = "replace")]
+        off: bool,
+        /// Replace: clear the track's existing render targets, then add this one.
+        #[arg(long)]
+        replace: bool,
         /// Target context (used for track lookup when --track is absent).
         #[arg(long)]
         context: Option<String>,
@@ -391,29 +402,45 @@ impl KjDispatcher {
                     )
                 }
 
-                TransportCommand::Render { to, port, .. } => {
-                    // M1: the one render kind. `--to` is the forward-looking extension
-                    // point (docs/pcm.md's PCM target joins here); refuse an unknown
-                    // kind loudly rather than silently no-op.
-                    if to != "alsa-midi" {
-                        return KjResult::Err(format!(
-                            "kj transport render: unknown target '{to}' (M1 supports: alsa-midi)"
-                        ));
-                    }
+                TransportCommand::Render { to, port, off, replace, .. } => {
                     let track = match self.resolve_track_for_ctx(track_name, ctx) {
                         Ok(t) => t,
                         Err(e) => return KjResult::Err(e),
                     };
-                    // Default the seq port name to the track name, so `aconnect -l`
-                    // shows `kaijutsu:<track>`.
-                    let port_name = port.clone().unwrap_or_else(|| track.as_str().to_string());
-                    let spec = RenderTargetSpec::AlsaMidi {
-                        client_name: "kaijutsu".to_string(),
-                        port_name: port_name.clone(),
-                    };
-                    let verb = format!("render → ALSA MIDI out '{port_name}' (track '{}')", track.as_str());
                     let tid = track.as_str().to_string();
-                    (BeatCommand::AddRenderTarget { track, spec }, verb, Some(tid))
+                    if *off {
+                        // Detach: by --port name, or all when --port is omitted. `--to`
+                        // is irrelevant here (we're removing, not building).
+                        let verb = match port {
+                            Some(p) => format!("render off '{p}' (track '{}')", track.as_str()),
+                            None => format!("render off — all targets (track '{}')", track.as_str()),
+                        };
+                        let op = RenderTargetOp::Remove { id: port.clone() };
+                        (BeatCommand::RenderTarget { track, op }, verb, Some(tid))
+                    } else {
+                        // M1: the one render kind. `--to` is the forward-looking
+                        // extension point (docs/pcm.md's PCM target joins here);
+                        // refuse an unknown kind loudly rather than silently no-op.
+                        if to != "alsa-midi" {
+                            return KjResult::Err(format!(
+                                "kj transport render: unknown target '{to}' (M1 supports: alsa-midi)"
+                            ));
+                        }
+                        // Default the seq port name to the track name, so `aconnect -l`
+                        // shows `kaijutsu:<track>`. The port name is also the target id.
+                        let port_name = port.clone().unwrap_or_else(|| track.as_str().to_string());
+                        let spec = RenderTargetSpec::AlsaMidi {
+                            client_name: "kaijutsu".to_string(),
+                            port_name: port_name.clone(),
+                        };
+                        let (op, how) = if *replace {
+                            (RenderTargetOp::Replace(spec), "render (replace) →")
+                        } else {
+                            (RenderTargetOp::Add(spec), "render →")
+                        };
+                        let verb = format!("{how} ALSA MIDI out '{port_name}' (track '{}')", track.as_str());
+                        (BeatCommand::RenderTarget { track, op }, verb, Some(tid))
+                    }
                 }
             };
 
@@ -610,7 +637,9 @@ fn short_hex(id: ContextId) -> String {
 mod tests {
     use std::time::Duration;
 
-    use crate::hyoushigi::{BeatAck, BeatCommand, BeatRequest, Cadence, RenderTargetSpec};
+    use crate::hyoushigi::{
+        BeatAck, BeatCommand, BeatRequest, Cadence, RenderTargetOp, RenderTargetSpec,
+    };
     use crate::kj::test_helpers::*;
     use kaijutsu_types::PrincipalId;
 
@@ -746,7 +775,7 @@ mod tests {
             .await;
         assert!(result.is_ok(), "transport render failed: {}", result.message());
         match cmds.recv().await.expect("a BeatCommand should be sent") {
-            BeatCommand::AddRenderTarget { track, spec } => {
+            BeatCommand::RenderTarget { track, op: RenderTargetOp::Add(spec) } => {
                 assert_eq!(track, kaijutsu_types::TrackId::new("bass").unwrap());
                 match spec {
                     RenderTargetSpec::AlsaMidi { client_name, port_name } => {
@@ -755,7 +784,7 @@ mod tests {
                     }
                 }
             }
-            other => panic!("expected AddRenderTarget, got {other:?}"),
+            other => panic!("expected RenderTarget(Add), got {other:?}"),
         }
     }
 
@@ -774,10 +803,13 @@ mod tests {
         let result = d.dispatch(&[s("transport"), s("render"), s("--track"), s("bass")], &c).await;
         assert!(result.is_ok(), "render failed: {}", result.message());
         match cmds.recv().await.expect("a BeatCommand should be sent") {
-            BeatCommand::AddRenderTarget { spec: RenderTargetSpec::AlsaMidi { port_name, .. }, .. } => {
+            BeatCommand::RenderTarget {
+                op: RenderTargetOp::Add(RenderTargetSpec::AlsaMidi { port_name, .. }),
+                ..
+            } => {
                 assert_eq!(port_name, "bass", "port defaults to the track name");
             }
-            other => panic!("expected AddRenderTarget(AlsaMidi), got {other:?}"),
+            other => panic!("expected RenderTarget(Add(AlsaMidi)), got {other:?}"),
         }
 
         // An unknown --to is refused loudly (no command sent).
@@ -789,6 +821,70 @@ mod tests {
             .await;
         assert!(!bad.is_ok(), "an unknown render target must be a loud error");
         assert!(bad.message().contains("kazoo"), "the error names the bad kind: {}", bad.message());
+    }
+
+    #[tokio::test]
+    async fn transport_render_off_builds_remove_by_port_or_all() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
+
+        // --off --port out0 → Remove { id: Some("out0") }.
+        let r = d
+            .dispatch(
+                &[s("transport"), s("render"), s("--track"), s("bass"), s("--off"), s("--port"), s("out0")],
+                &c,
+            )
+            .await;
+        assert!(r.is_ok(), "render --off failed: {}", r.message());
+        match cmds.recv().await.expect("a command") {
+            BeatCommand::RenderTarget { op: RenderTargetOp::Remove { id }, .. } => {
+                assert_eq!(id.as_deref(), Some("out0"), "removes the named target");
+            }
+            other => panic!("expected RenderTarget(Remove), got {other:?}"),
+        }
+
+        // --off with no --port → Remove { id: None } (all).
+        let r = d.dispatch(&[s("transport"), s("render"), s("--track"), s("bass"), s("--off")], &c).await;
+        assert!(r.is_ok(), "render --off (all) failed: {}", r.message());
+        match cmds.recv().await.expect("a command") {
+            BeatCommand::RenderTarget { op: RenderTargetOp::Remove { id }, .. } => {
+                assert_eq!(id, None, "no --port removes all targets");
+            }
+            other => panic!("expected RenderTarget(Remove all), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_render_replace_builds_replace_op() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(()));
+
+        let r = d
+            .dispatch(
+                &[s("transport"), s("render"), s("--track"), s("bass"), s("--replace"), s("--port"), s("only")],
+                &c,
+            )
+            .await;
+        assert!(r.is_ok(), "render --replace failed: {}", r.message());
+        match cmds.recv().await.expect("a command") {
+            BeatCommand::RenderTarget {
+                op: RenderTargetOp::Replace(RenderTargetSpec::AlsaMidi { port_name, .. }),
+                ..
+            } => assert_eq!(port_name, "only"),
+            other => panic!("expected RenderTarget(Replace), got {other:?}"),
+        }
     }
 
     #[tokio::test]

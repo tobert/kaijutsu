@@ -39,8 +39,8 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ContentRef,
-    DeriverRegistry, MaterializeCursor, RenderTargetSpec, Span, materialize_committed,
-    schedule_abc_cell,
+    DeriverRegistry, MaterializeCursor, RenderTargetOp, RenderTargetSpec, Span,
+    materialize_committed, schedule_abc_cell,
 };
 use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
 use kaijutsu_kernel::{ContentStore, Kernel, KjCaller, KjDispatcher};
@@ -72,6 +72,29 @@ const STEP: TickDelta = TickDelta::new(1);
 fn render_instant(base: Instant, period: Duration, start: Tick, playhead: Tick) -> Instant {
     let offset_beats = (start - playhead).get().max(0) as u32;
     base + period * offset_beats
+}
+
+/// Build a concrete render target from its [`RenderTargetSpec`], returning it with
+/// its id (the key `RenderTargetOp::Remove` matches — the `AlsaMidi` port name).
+/// Opening the device can fail (no ALSA, no `/dev/snd/seq`) → loud `Err`, never a
+/// silently-dropped target. A free fn (no `&self`) so it can run before the
+/// scheduler touches its `tracks` (e.g. `Replace` builds before it clears).
+fn build_render_target(spec: RenderTargetSpec) -> Result<(String, Box<dyn RenderTarget>), String> {
+    match spec {
+        RenderTargetSpec::AlsaMidi { client_name, port_name } => {
+            #[cfg(target_os = "linux")]
+            {
+                let target = crate::render::AlsaMidiOut::new(&client_name, &port_name)
+                    .map_err(|e| format!("could not open ALSA MIDI out: {e}"))?;
+                Ok((port_name, Box::new(target)))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = client_name;
+                Err(format!("ALSA MIDI out is only available on Linux (port '{port_name}')"))
+            }
+        }
+    }
 }
 
 /// A track's beat bookkeeping — the **clock domain** (`docs/tracks.md`, Stage 1).
@@ -152,7 +175,16 @@ struct TrackState {
     /// materialize crossing (`materialize_track`): each newly-crossed `Concrete` ABC
     /// cell's resolved ABC + local instant is handed to every target. Empty by
     /// default (the common case), so a track with no render incurs zero overhead.
-    render_targets: Vec<Box<dyn RenderTarget>>,
+    /// Each entry is keyed by id (the `AlsaMidi` port name) so `kj transport render
+    /// --off <port>` can detach one.
+    render_targets: Vec<RenderTargetEntry>,
+}
+
+/// One registered render target plus its id (the `AlsaMidi` port name) — the key
+/// `RenderTargetOp::Remove { id }` matches against.
+struct RenderTargetEntry {
+    id: String,
+    target: Box<dyn RenderTarget>,
 }
 
 impl TrackState {
@@ -751,8 +783,8 @@ impl BeatScheduler {
             // Truncate everything after `now` + silence sounding notes (Stage 3
             // review SEV-1), so a pause doesn't blindly play the buffered phrase.
             let now = Instant::now();
-            for target in track.render_targets.iter_mut() {
-                target.flush_scheduled_after(now);
+            for entry in track.render_targets.iter_mut() {
+                entry.target.flush_scheduled_after(now);
             }
         }
         let _ = self.persist_track(track_id);
@@ -771,8 +803,8 @@ impl BeatScheduler {
             // events past `now` so a stop doesn't play out ~a phrase of queued
             // notes + leave them hanging (Stage 3 review SEV-1).
             let now = Instant::now();
-            for target in track.render_targets.iter_mut() {
-                target.flush_scheduled_after(now);
+            for entry in track.render_targets.iter_mut() {
+                entry.target.flush_scheduled_after(now);
             }
         }
         let _ = self.persist_track(track_id);
@@ -1170,12 +1202,18 @@ impl BeatScheduler {
         }
     }
 
-    /// Register a render target (a score *consumer*) on a track (Stage 3 WI 4).
-    /// The target is fed from the materialize crossing — newly-committed ABC cells
-    /// + their near-future instants. A no-op on an unknown track.
-    pub fn add_render_target(&mut self, track_id: &TrackId, target: Box<dyn RenderTarget>) {
+    /// Register a render target (a score *consumer*) on a track under `id` (Stage 3
+    /// WI 4). The target is fed from the materialize crossing — newly-committed ABC
+    /// cells + their near-future instants. Additive (a track can carry several);
+    /// `id` (the `AlsaMidi` port name) keys it for `--off`. A no-op on an unknown track.
+    pub fn add_render_target(
+        &mut self,
+        track_id: &TrackId,
+        id: String,
+        target: Box<dyn RenderTarget>,
+    ) {
         match self.tracks.get_mut(track_id) {
-            Some(track) => track.render_targets.push(target),
+            Some(track) => track.render_targets.push(RenderTargetEntry { id, target }),
             None => log::warn!(
                 "beat: add_render_target on unknown track {} ignored",
                 track_id.as_str()
@@ -1284,8 +1322,8 @@ impl BeatScheduler {
         }
         if let Some(track) = self.tracks.get_mut(track_id) {
             for (abc, at) in &rendered {
-                for target in track.render_targets.iter_mut() {
-                    target.emit(abc, *at);
+                for entry in track.render_targets.iter_mut() {
+                    entry.target.emit(abc, *at);
                 }
             }
         }
@@ -1651,47 +1689,77 @@ impl BeatScheduler {
                 self.set_rotate(&track, context_id, every);
                 self.attached_ack(&track, context_id)
             }
-            BeatCommand::AddRenderTarget { track, spec } => {
-                self.add_render_target_from_spec(&track, spec)
-            }
+            BeatCommand::RenderTarget { track, op } => self.apply_render_target_op(&track, op),
         }
     }
 
-    /// Construct a render target from its [`RenderTargetSpec`] and register it on
-    /// the track. The track must already have a clock (be `attach`ed); constructing
-    /// the target can fail (no ALSA, no `/dev/snd/seq`) and that failure is surfaced
-    /// as a loud `Err` so `kj transport render` reports it, never a silent no-op.
-    /// Stays fully synchronous (see [`apply_command`]'s no-await contract) — opening
-    /// an ALSA seq client is a quick blocking FFI call, not an `.await`.
-    fn add_render_target_from_spec(
-        &mut self,
-        track_id: &TrackId,
-        spec: RenderTargetSpec,
-    ) -> BeatAck {
+    /// Add / replace / remove a render target on a track ([`RenderTargetOp`]). The
+    /// track must already have a clock (be `attach`ed). Building a target can fail
+    /// (no ALSA, no `/dev/snd/seq`); that surfaces as a loud `Err` so `kj transport
+    /// render` reports it, never a silent no-op. Stays fully synchronous (see
+    /// [`apply_command`]'s no-await contract) — opening an ALSA seq client is a quick
+    /// blocking FFI call, not an `.await`.
+    fn apply_render_target_op(&mut self, track_id: &TrackId, op: RenderTargetOp) -> BeatAck {
         if !self.tracks.contains_key(track_id) {
             return Err(format!(
                 "track '{}' has no clock — `kj transport attach` a context to it first",
                 track_id.as_str()
             ));
         }
-        let target: Box<dyn RenderTarget> = match spec {
-            RenderTargetSpec::AlsaMidi { client_name, port_name } => {
-                #[cfg(target_os = "linux")]
-                {
-                    match crate::render::AlsaMidiOut::new(&client_name, &port_name) {
-                        Ok(t) => Box::new(t),
-                        Err(e) => return Err(format!("could not open ALSA MIDI out: {e}")),
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = (client_name, port_name);
-                    return Err("ALSA MIDI out is only available on Linux".to_string());
+        match op {
+            RenderTargetOp::Add(spec) => {
+                let (id, target) = build_render_target(spec)?;
+                self.add_render_target(track_id, id, target);
+                Ok(())
+            }
+            RenderTargetOp::Replace(spec) => {
+                // Build BEFORE clearing, so a failed open leaves the existing targets
+                // intact (no silent loss of working output on a bad replace).
+                let (id, target) = build_render_target(spec)?;
+                self.remove_render_targets(track_id, None);
+                self.add_render_target(track_id, id, target);
+                Ok(())
+            }
+            RenderTargetOp::Remove { id } => {
+                let removed = self.remove_render_targets(track_id, id.as_deref());
+                if removed == 0 {
+                    Err(match id {
+                        Some(want) => format!(
+                            "track '{}' has no render target '{want}' to remove",
+                            track_id.as_str()
+                        ),
+                        None => {
+                            format!("track '{}' has no render targets to remove", track_id.as_str())
+                        }
+                    })
+                } else {
+                    Ok(())
                 }
             }
+        }
+    }
+
+    /// Remove render targets from a track: the one whose id matches (`Some`), or all
+    /// (`None`). Each removed target is **silenced** (`flush_scheduled_after(now)` →
+    /// truncate its queue + all-notes-off) before it's dropped, so detaching a live
+    /// MIDI out doesn't leave notes hanging on its subscribers. Returns the count.
+    fn remove_render_targets(&mut self, track_id: &TrackId, id: Option<&str>) -> usize {
+        let Some(track) = self.tracks.get_mut(track_id) else {
+            return 0;
         };
-        self.add_render_target(track_id, target);
-        Ok(())
+        let now = Instant::now();
+        let mut removed = 0;
+        track.render_targets.retain_mut(|entry| {
+            let matched = id.is_none_or(|want| entry.id == want);
+            if matched {
+                entry.target.flush_scheduled_after(now);
+                removed += 1;
+                false // drop it
+            } else {
+                true // keep it
+            }
+        });
+        removed
     }
 
     /// `Ok` if the track has a live clock domain (so a clock-domain command landed),
@@ -1845,7 +1913,7 @@ mod tests {
     use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
     use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
     use kaijutsu_kernel::hyoushigi::{
-        Attachment, BeatCommand, BeatPolicy, Cadence, RenderTargetSpec,
+        Attachment, BeatCommand, BeatPolicy, Cadence, RenderTargetOp, RenderTargetSpec,
     };
     use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
@@ -3776,17 +3844,69 @@ mod tests {
     async fn add_render_target_on_unknown_track_is_loud_err() {
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let mut sched = BeatScheduler::new(kernel, documents);
-        let ack = sched.apply_command(BeatCommand::AddRenderTarget {
+        let ack = sched.apply_command(BeatCommand::RenderTarget {
             track: TrackId::new("ghost").unwrap(),
-            spec: RenderTargetSpec::AlsaMidi {
+            op: RenderTargetOp::Add(RenderTargetSpec::AlsaMidi {
                 client_name: "kaijutsu".to_string(),
                 port_name: "ghost".to_string(),
-            },
+            }),
         });
         assert!(ack.is_err(), "render on a clockless track must fail loud");
         assert!(
             ack.unwrap_err().contains("no clock"),
             "the error tells you to attach first"
+        );
+    }
+
+    /// `--off` detach semantics, exercised with fake targets (no ALSA needed): remove
+    /// one by id leaves the others; remove-all clears; a removed target is flushed
+    /// (silenced) on the way out; removing a non-existent id is a loud Err.
+    #[tokio::test]
+    async fn remove_render_targets_by_id_and_all_silences_and_reports() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 1);
+        let mut sched = BeatScheduler::new(kernel, documents);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let a = Recorder::default();
+        let b = Recorder::default();
+        sched.add_render_target(&track, "a".to_string(), Box::new(a.clone()));
+        sched.add_render_target(&track, "b".to_string(), Box::new(b.clone()));
+
+        // Remove "a" by id: it is flushed (silenced) and dropped; "b" survives.
+        let ack = sched.apply_command(BeatCommand::RenderTarget {
+            track: track.clone(),
+            op: RenderTargetOp::Remove { id: Some("a".to_string()) },
+        });
+        assert!(ack.is_ok(), "removing an existing target succeeds: {ack:?}");
+        assert_eq!(a.flushes.lock().unwrap().len(), 1, "the removed target was silenced");
+        assert!(b.flushes.lock().unwrap().is_empty(), "the surviving target was not touched");
+        assert_eq!(
+            sched.tracks.get(&track).unwrap().render_targets.len(),
+            1,
+            "only 'a' was removed"
+        );
+
+        // Removing a missing id is a loud Err (not a silent no-op).
+        let miss = sched.apply_command(BeatCommand::RenderTarget {
+            track: track.clone(),
+            op: RenderTargetOp::Remove { id: Some("nope".to_string()) },
+        });
+        assert!(miss.is_err(), "removing a non-existent id must error");
+
+        // Remove all: "b" is flushed and the registry empties.
+        let all = sched.apply_command(BeatCommand::RenderTarget {
+            track: track.clone(),
+            op: RenderTargetOp::Remove { id: None },
+        });
+        assert!(all.is_ok(), "remove-all succeeds: {all:?}");
+        assert_eq!(b.flushes.lock().unwrap().len(), 1, "remove-all silenced 'b'");
+        assert!(
+            sched.tracks.get(&track).unwrap().render_targets.is_empty(),
+            "remove-all clears the registry"
         );
     }
 
@@ -3830,12 +3950,12 @@ mod tests {
 
         // Attach the render target THROUGH the command path (what `kj transport
         // render` sends), then connect a reader to the seq port it opened.
-        let ack = sched.apply_command(BeatCommand::AddRenderTarget {
+        let ack = sched.apply_command(BeatCommand::RenderTarget {
             track: track.clone(),
-            spec: RenderTargetSpec::AlsaMidi {
+            op: RenderTargetOp::Add(RenderTargetSpec::AlsaMidi {
                 client_name: "kj-render-e2e".to_string(),
                 port_name: "solo".to_string(),
-            },
+            }),
         });
         assert!(ack.is_ok(), "AddRenderTarget on a live track should open the port: {ack:?}");
 
@@ -3996,7 +4116,7 @@ mod tests {
         sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
 
         let rec = Recorder::default();
-        sched.add_render_target(&track, Box::new(rec.clone()));
+        sched.add_render_target(&track, "rec".to_string(), Box::new(rec.clone()));
 
         sched.play(&track, base); // first beat scheduled at base + 1 s
         // Fire beat 1 LATE: the scheduled instant was base + 1 s; we wake at base + 5 s.

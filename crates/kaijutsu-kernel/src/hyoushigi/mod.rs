@@ -212,14 +212,27 @@ pub enum BeatCommand {
     /// the rotate *action* (fork + re-bind child) stays rc. `Some(Cadence{every:0})`
     /// is treated as `None`.
     SetRotate { track: TrackId, context_id: ContextId, every: Option<Cadence> },
-    /// Attach a render target — a *consumer* of the track's committed score (Stage 3
-    /// "the render-target seam"). The scheduler constructs the concrete target from
-    /// the [`RenderTargetSpec`] (e.g. opens an ALSA seq port) and registers it on the
-    /// track; from then on each newly-committed cell is rendered out on the
-    /// speculation lead. **Additive** — a track can carry several targets (the
-    /// `RenderTarget` Vec is by design; cf. `docs/pcm.md`, where a PCM target joins
-    /// the MIDI one). Names the **track**.
-    AddRenderTarget { track: TrackId, spec: RenderTargetSpec },
+    /// Add / replace / remove a render target — a *consumer* of the track's
+    /// committed score (Stage 3 "the render-target seam"). For `Add`/`Replace` the
+    /// scheduler constructs the concrete target from the [`RenderTargetSpec`] (e.g.
+    /// opens an ALSA seq port) and registers it; from then on each newly-committed
+    /// cell is rendered out on the speculation lead. Targets are keyed by id (the
+    /// `AlsaMidi` port name) so `Remove` can name one. Names the **track**.
+    RenderTarget { track: TrackId, op: RenderTargetOp },
+}
+
+/// What to do to a track's render-target registry ([`BeatCommand::RenderTarget`]).
+#[derive(Debug, Clone)]
+pub enum RenderTargetOp {
+    /// Add a target — **additive**, a track can carry several (cf. `docs/pcm.md`,
+    /// where a PCM target joins the MIDI one).
+    Add(RenderTargetSpec),
+    /// Clear *all* of the track's render targets, then add this one. The new target
+    /// is built BEFORE the clear, so a failed open leaves the existing ones intact.
+    Replace(RenderTargetSpec),
+    /// Remove the target with this id (the `AlsaMidi` port name), or **all** of them
+    /// when `None`. A removed target is silenced (all-notes-off) before it's dropped.
+    Remove { id: Option<String> },
 }
 
 /// How to build a render target for [`BeatCommand::AddRenderTarget`]. Lives in the
