@@ -1974,3 +1974,28 @@ cluster of friction in the config + shell surface:
 - **(unreproduced) a `kj` shell call hung the full 300 s timeout once** mid-session;
   `kj context list --tree` and `kj model list` both return fast now, so noting it
   as a one-off to watch, not a fixable repro yet.
+- **A provider's NAME must be a built-in TYPE — and an unknown one fails silently
+  (found 2026-06-30, the real blocker for local models).** `[providers.<name>]`'s
+  `<name>` *is* the provider type, matched against a fixed set
+  (`anthropic, deepseek, openai, ollama, lemonade, local` — the last four all the
+  one OpenAI-compatible client keyed by `base_url`). A sensible-looking
+  `[providers.local-e4b]` is **silently dropped at startup** — logged as
+  `WARN failed to initialize provider (missing API key?) ... Unknown or unsupported
+  provider type: local-e4b` (the "missing API key?" is misleading; the real cause
+  is the bad type) and then skipped, so the kernel boots "fine" and you only learn
+  at `kj context create` ("unknown provider"). Two fixes: (1) **validate provider
+  names at `kj config set`** (reject/​warn on an unknown type then, not silently at
+  boot) — a config doctor; (2) **drop the "missing API key?" guess** from that warn
+  and say "unknown provider type 'X' (supported: …)". Bonus: with only the 4 fixed
+  OpenAI-compat type-names, you can't have two *distinct-named* local servers —
+  you reuse `ollama`/`lemonade`/`local`/`openai` as base_url slots, which reads
+  oddly (a llama.cpp server named `lemonade`). Consider a real `type =` field so a
+  provider can be named freely (`[providers.gemma-e4b] type = "openai"`).
+- **Two `models.toml` files, only one is read.** The kernel loads providers from
+  the **CRDT** `/etc/config/models.toml` (via `kj config`), and the legacy host
+  `~/.config/kaijutsu/models.toml` is **ignored** — but it still exists, looks
+  authoritative, and disagrees (it had a vestigial `openai-local` → dead :13305).
+  Editing the host file does nothing; you must `kj config set`. Either delete the
+  host file on migration, or have the kernel warn that it found+ignored it. (Same
+  CRDT-vs-host ownership confusion as rc, but here there's a stale host artifact
+  actively misleading.)
