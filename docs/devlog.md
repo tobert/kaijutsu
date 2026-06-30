@@ -769,3 +769,17 @@ the MIDI generator and the engraver call, so they can't drift again; (2) the
 layout Tuplet arm dropped inner rests and chords (same shape as the old MIDI bug) —
 it now renders notes, rests and chords at the q/p-scaled width. Suite 350 → 352.
 The broader engrave audit is still running; more rendering fixes to come.
+
+### 2026-06-30 — engrave correctness sweep (kaibo audit → 6 more fixes)
+
+The engrave audit (kaibo/deepseek) confirmed the two parallel bugs (already fixed)
+and surfaced a dozen rendering issues; verified each against the IR before acting
+(and rejected one — "redundant key-sig accidentals" — the parser doesn't stamp
+key-sig accidentals onto notes, so K:G FFFF draws exactly 1 sharp). Fixed, TDD with
+IR-level assertions in engrave_tests.rs: augmentation dots on dotted notes/rests
+(the engraver had NO dot logic — every dotted rhythm rendered as undotted); chord
+noteheads a second apart now offset to opposite sides of the stem instead of
+overlapping; invisible rests (x/X) draw nothing; whole rests hang a line higher
+than half rests; and M:none no longer draws a spurious 4/4. Suite 352 → 357.
+Remaining engrave items (tuplet bracket/number, multi-measure H-bar rest, inline
+[K:] redraw, middle=, grace notehead glyph, SourceSpans) logged in issues.md.

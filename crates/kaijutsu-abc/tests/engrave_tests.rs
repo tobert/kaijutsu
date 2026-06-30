@@ -343,3 +343,85 @@ fn tuplet_renders_inner_chords_and_rests() {
         .count();
     assert_eq!(rests, 1, "the z inside the tuplet renders a rest glyph");
 }
+
+#[test]
+fn invisible_rest_draws_no_glyph() {
+    // §4.5: `x` is an invisible rest — it occupies time but draws nothing,
+    // unlike the visible `z`.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let count_rests = |abc: &str| {
+        layout::engrave(&parse(abc).value[0], &default_options())
+            .iter()
+            .filter(|e| matches!(e, EngravingElement::Glyph { codepoint, .. } if (0xE4E3..=0xE4E7).contains(codepoint)))
+            .count()
+    };
+    assert_eq!(count_rests("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nC z D|\n"), 1, "z draws a rest");
+    assert_eq!(count_rests("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nC x D|\n"), 0, "x draws nothing");
+}
+
+#[test]
+fn whole_rest_hangs_higher_than_half_rest() {
+    // A whole rest hangs from the line above the middle (smaller y = higher);
+    // a half rest sits on the middle line.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let rest_y = |abc: &str| {
+        layout::engrave(&parse(abc).value[0], &default_options())
+            .iter()
+            .find_map(|e| match e {
+                EngravingElement::Glyph { codepoint, y, .. }
+                    if (0xE4E3..=0xE4E7).contains(codepoint) => Some(*y),
+                _ => None,
+            })
+            .expect("a rest glyph")
+    };
+    let whole = rest_y("X:1\nT:t\nM:4/4\nL:1/1\nK:C\nz|\n");
+    let half = rest_y("X:1\nT:t\nM:4/4\nL:1/2\nK:C\nz|\n");
+    assert!(whole < half, "whole rest ({whole}) should hang higher than half ({half})");
+}
+
+#[test]
+fn free_meter_draws_no_time_signature() {
+    // M:none is free meter — no time signature should be drawn.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let count_timesig = |abc: &str| {
+        layout::engrave(&parse(abc).value[0], &default_options())
+            .iter()
+            .filter(|e| matches!(e, EngravingElement::Glyph { codepoint, .. } if (0xE080..=0xE089).contains(codepoint)))
+            .count()
+    };
+    assert!(count_timesig("X:1\nT:t\nM:4/4\nK:C\nC|\n") > 0, "4/4 draws a time sig");
+    assert_eq!(count_timesig("X:1\nT:t\nM:none\nK:C\nC|\n"), 0, "M:none draws none");
+}
+
+#[test]
+fn dotted_notes_get_augmentation_dots() {
+    // §4.3: dotted durations draw augmentation dots. C3/2 = 1 dot, C7/4 = 2.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let count_dots = |abc: &str| {
+        layout::engrave(&parse(abc).value[0], &default_options())
+            .iter()
+            .filter(|e| matches!(e, EngravingElement::Glyph { codepoint: 0xE1E7, .. }))
+            .count()
+    };
+    assert_eq!(count_dots("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nC3/2 D|\n"), 1, "dotted quarter");
+    assert_eq!(count_dots("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nC7/4 D|\n"), 2, "double-dotted");
+    assert_eq!(count_dots("X:1\nT:t\nM:4/4\nL:1/4\nK:C\nC D|\n"), 0, "plain, no dots");
+}
+
+#[test]
+fn chord_seconds_offset_to_avoid_collision() {
+    // §4.17 engraving: notes a staff-second apart in a chord must offset so
+    // their noteheads don't overlap. [CD] are adjacent — two distinct x's.
+    use kaijutsu_abc::engrave::EngravingElement;
+    let els = layout::engrave(&parse("X:1\nT:t\nM:4/4\nK:C\n[CD]|\n").value[0], &default_options());
+    let xs: Vec<f64> = els
+        .iter()
+        .filter_map(|e| match e {
+            EngravingElement::Glyph { codepoint, x, .. }
+                if (0xE0A2..=0xE0A4).contains(codepoint) => Some(*x),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(xs.len(), 2, "two noteheads");
+    assert!((xs[0] - xs[1]).abs() > 1.0, "noteheads must be offset, got {xs:?}");
+}

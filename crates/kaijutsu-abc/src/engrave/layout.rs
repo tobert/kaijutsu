@@ -400,12 +400,14 @@ fn render_staff(
         cursor_x += sp * 0.5;
     }
 
-    // 4. Time signature.
+    // 4. Time signature. Free meter (`M:none`) draws none.
     if let Some(meter) = &header.meter {
-        let (num, den) = meter.to_fraction();
-        emit_time_sig_digit(elements, num, cursor_x, ctx.y_at(1.0), ctx.scale);
-        emit_time_sig_digit(elements, den, cursor_x, ctx.y_at(3.0), ctx.scale);
-        cursor_x += sp * 2.5;
+        if !matches!(meter, Meter::None) {
+            let (num, den) = meter.to_fraction();
+            emit_time_sig_digit(elements, num, cursor_x, ctx.y_at(1.0), ctx.scale);
+            emit_time_sig_digit(elements, den, cursor_x, ctx.y_at(3.0), ctx.scale);
+            cursor_x += sp * 2.5;
+        }
     }
 
     cursor_x += sp * 0.5; // padding before first note
@@ -598,10 +600,28 @@ fn render_staff(
             Element::Chord(chord) => {
                 let span = (0usize, 0usize);
                 let dur_width = duration_to_width(&chord.duration, unit_width);
+                let cp = notehead_codepoint(&chord.duration, &unit_length);
+                let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
 
-                for note in &chord.notes {
-                    let pos = ctx.pos_for(&note.pitch, note.octave);
-                    let y = ctx.y_at(pos);
+                // Sort top-to-bottom (ascending staff position) so adjacent
+                // entries that are a second apart can be offset to opposite
+                // sides of the stem, avoiding overlapping noteheads.
+                let mut placed: Vec<(f64, &Note)> = chord
+                    .notes
+                    .iter()
+                    .map(|n| (ctx.pos_for(&n.pitch, n.octave), n))
+                    .collect();
+                placed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut prev_pos: Option<f64> = None;
+                let mut prev_offset = false;
+                for (pos, note) in &placed {
+                    let y = ctx.y_at(*pos);
+                    // A second from the previously-placed head (and that one
+                    // wasn't itself offset) → shift this head right of the stem.
+                    let offset =
+                        matches!(prev_pos, Some(p) if (pos - p).abs() < 0.75) && !prev_offset;
+                    let head_x = if offset { cursor_x + nw } else { cursor_x };
                     if let Some(acc) = note.accidental {
                         elements.push(EngravingElement::Glyph {
                             codepoint: accidental_codepoint(acc),
@@ -611,16 +631,16 @@ fn render_staff(
                             source_span: span,
                         });
                     }
-                    let cp = notehead_codepoint(&chord.duration, &unit_length);
-                    let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
                     elements.push(EngravingElement::Glyph {
                         codepoint: cp,
-                        x: cursor_x,
+                        x: head_x,
                         y,
                         scale: ctx.scale,
                         source_span: span,
                     });
-                    emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
+                    emit_ledger_lines(elements, *pos, head_x, nw, ctx, span);
+                    prev_pos = Some(*pos);
+                    prev_offset = offset;
                 }
 
                 // Stem on the chord (highest to lowest note).
@@ -653,14 +673,37 @@ fn render_staff(
             }
             Element::Rest(rest) => {
                 let span = (0usize, 0usize);
-                let cp = rest_codepoint(&rest.duration, &unit_length);
-                elements.push(EngravingElement::Glyph {
-                    codepoint: cp,
-                    x: cursor_x,
-                    y: ctx.y_at(2.0),
-                    scale: ctx.scale,
-                    source_span: span,
-                });
+                // Invisible rests (`x`/`X`) occupy time but draw nothing (§4.5).
+                if rest.visible {
+                    // A whole rest hangs from the line above the middle; a half
+                    // rest sits on the middle line; shorter rests are centered
+                    // on it. (pos 0 = top line, +1 per line down.)
+                    let rest_pos = if absolute_ratio(&rest.duration, &unit_length) >= 1.0 {
+                        1.0
+                    } else {
+                        2.0
+                    };
+                    let rcp = rest_codepoint(&rest.duration, &unit_length);
+                    let rw = font.glyph_advance(rcp).unwrap_or(500.0) * ctx.scale;
+                    elements.push(EngravingElement::Glyph {
+                        codepoint: rcp,
+                        x: cursor_x,
+                        y: ctx.y_at(rest_pos),
+                        scale: ctx.scale,
+                        source_span: span,
+                    });
+                    // Dotted rests carry augmentation dots too.
+                    if rest.multi_measure.is_none() {
+                        emit_dots(
+                            elements,
+                            dot_count(&rest.duration),
+                            cursor_x + rw,
+                            ctx.y_at(rest_pos),
+                            ctx,
+                            span,
+                        );
+                    }
+                }
                 let dur_width = if let Some(bars) = rest.multi_measure {
                     unit_width * bars as f64 * 4.0
                 } else {
@@ -1446,6 +1489,8 @@ fn emit_note_with(
         source_span: span,
     });
 
+    emit_dots(elements, dot_count(&note.duration), cursor_x + notehead_width, y, ctx, span);
+
     emit_ledger_lines(elements, pos, cursor_x, notehead_width, ctx, span);
     // Beamed notes (forced_stem_up = Some) get their stems drawn by
     // `emit_beam`, which knows the final (slope-clamped) beam line each
@@ -1570,6 +1615,64 @@ fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: Staff
 fn absolute_ratio(duration: &Duration, unit: &UnitLength) -> f64 {
     (duration.numerator as f64 * unit.numerator as f64)
         / (duration.denominator as f64 * unit.denominator as f64)
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// Number of augmentation dots implied by a duration fraction. A single dot
+/// multiplies the base by 3/2, two dots by 7/4, three by 15/8 — so after
+/// reducing num/den and stripping powers of two, a standard dotted value has a
+/// power-of-two denominator and an odd numerator of 3, 7 or 15. ABC v2.1 §4.3.
+fn dot_count(duration: &Duration) -> usize {
+    let mut n = duration.numerator as u32;
+    let mut d = (duration.denominator as u32).max(1);
+    if n == 0 {
+        return 0;
+    }
+    let g = gcd(n, d);
+    n /= g;
+    d /= g;
+    while d % 2 == 0 {
+        d /= 2;
+    }
+    if d != 1 {
+        return 0; // not a plain power-of-two value (e.g. a tuplet ratio)
+    }
+    while n % 2 == 0 {
+        n /= 2;
+    }
+    match n {
+        3 => 1,
+        7 => 2,
+        15 => 3,
+        _ => 0,
+    }
+}
+
+/// Emit `count` augmentation dots to the right of a notehead/rest at `head_right`.
+fn emit_dots(
+    elements: &mut Vec<EngravingElement>,
+    count: usize,
+    head_right: f64,
+    y: f64,
+    ctx: StaffCtx,
+    span: SourceSpan,
+) {
+    for i in 0..count {
+        elements.push(EngravingElement::Glyph {
+            codepoint: 0xE1E7,
+            x: head_right + ctx.sp * (0.3 + 0.35 * i as f64),
+            y,
+            scale: ctx.scale,
+            source_span: span,
+        });
+    }
 }
 
 fn notehead_codepoint(duration: &Duration, unit: &UnitLength) -> u32 {

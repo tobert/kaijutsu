@@ -1916,3 +1916,29 @@ in MIDI; `%%MIDI transpose`; short-form decorations H/T/u/v; aligned the dead
   *escape hatch* for math the rc didn't precompute. Decide: which RO builtins (math/`expr`,
   read-only `grep`/`glob`, block/resource reads — but no mutation) + whether small local
   models tolerate a *read-only* palette where they choke on the full one.
+
+## kaijutsu-abc — engrave (SVG rendering) audit (2026-06-30, kaibo/deepseek)
+
+Audit of engrave/layout.rs. The two parallel bugs (tuplet drops rests/chords; sharp-minor
+key sig) are FIXED via shared `Key::signature()` + tuplet render arm (commit d722f492).
+Remaining, ranked; delete when shipped. (Most are IR-assertable in tests/engrave_tests.rs.)
+
+- **SEVERE — no augmentation dots on dotted notes.** "dot" appears nowhere in the engraver;
+  `C>` (dotted quarter) draws as a plain eighth. Add a dot glyph after dotted-duration
+  noteheads/rests. `layout.rs` emit_note_with + Chord/Rest arms.
+- **SEVERE — chord noteheads at a second collide.** All chord notes share `cursor_x`; `[CD]`
+  overlaps. Offset the second notehead left/right. `layout.rs:~614`.
+- **SEVERE — inline `[K:]`/clef changes dropped in rendering** (`_ => {}` at ~756). Mid-staff
+  key change isn't redrawn (MIDI already handles it). `[K:G]` mid-tune.
+- **SEVERE — no tuplet bracket/number** drawn over `(3CDE`. Addition, not a regression.
+- **HIGH — multi-measure rest draws a single-bar rest glyph**, not an H-bar + count numeral. `Z4`.
+- **HIGH — invisible rest `x` renders a visible glyph** (`rest.visible` never checked). Quick.
+- **HIGH — whole/half rest at wrong staff position** (all rests at line 2.0; whole hangs from
+  4th line, half sits on 3rd). `layout.rs:~692`.
+- **MED — `M:none` draws a spurious `4/4`** (to_fraction→(4,4)); free meter omits the time sig.
+- **MED — `K: middle=<pitch>` ignored** (only the per-clef default is used).
+- ~~MED — redundant key-sig accidentals~~ — VERIFIED NOT A BUG: the parser doesn't stamp
+  key-sig accidentals onto `note.accidental`, so `K:G FFFF` draws exactly 1 sharp (the key
+  signature). The engraver only draws explicit accidentals. (Audit false positive.)
+- **LOW — grace notes use the regular notehead glyph**, not the SMuFL small notehead.
+- **LOW — every `SourceSpan` is hardcoded `(0,0)`**, so click-to-edit span attrs are dead.
