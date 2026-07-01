@@ -13,6 +13,9 @@ kaijutsu-telemetry.workspace = true
 kaijutsu-abc.workspace = true
 kaish-kernel.workspace = true
 
+# Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint on the wire.
+kaijutsu-audio.workspace = true
+
 capnp.workspace = true
 capnp-rpc.workspace = true
 tokio.workspace = true

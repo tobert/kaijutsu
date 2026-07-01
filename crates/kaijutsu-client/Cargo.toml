@@ -28,6 +28,10 @@ diamond-types-extended.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 
+# Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint carried by ServerEvent::PlayAudio.
+kaijutsu-audio.workspace = true
+kaijutsu-cas.workspace = true
+
 [build-dependencies]
 capnpc.workspace = true
 

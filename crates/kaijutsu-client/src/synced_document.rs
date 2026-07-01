@@ -105,7 +105,8 @@ impl SyncedDocument {
             | ServerEvent::SyncReset { context_id, .. }
             | ServerEvent::InputTextOps { context_id, .. }
             | ServerEvent::InputCleared { context_id, .. }
-            | ServerEvent::ContextSwitched { context_id, .. } => Some(*context_id),
+            | ServerEvent::ContextSwitched { context_id, .. }
+            | ServerEvent::PlayAudio { context_id, .. } => Some(*context_id),
             // Editor events are session-scoped, not context-scoped — the
             // editor renders off its own subscription, not the doc cache.
             // A post-reconnect resync delivery names its target context inline.
@@ -437,7 +438,11 @@ impl SyncedDocument {
             // delivery is applied via `apply_sync_state` (not the streamed-event
             // path) — neither touches the doc here.
             | ServerEvent::Reconnected
-            | ServerEvent::ContextResynced { .. } => SyncEffect::Ignored,
+            | ServerEvent::ContextResynced { .. }
+            // A kernel directive (`kj play`), not a block-log event — it
+            // names no block and touches no CRDT state. The Bevy sink (slice
+            // 3) handles it off the raw event stream, not the doc cache.
+            | ServerEvent::PlayAudio { .. } => SyncEffect::Ignored,
         }
     }
 

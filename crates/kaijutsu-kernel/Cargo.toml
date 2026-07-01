@@ -25,6 +25,9 @@ kaijutsu-types.workspace = true
 kaijutsu-editor.workspace = true
 kaijutsu-cas.workspace = true
 
+# Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint for `kj play`.
+kaijutsu-audio.workspace = true
+
 # Hyoushigi — per-context timeline engine (the beat substrate)
 kaijutsu-hyoushigi.workspace = true
 

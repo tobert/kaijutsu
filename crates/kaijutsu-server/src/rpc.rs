@@ -2482,6 +2482,34 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
+                                BlockFlow::PlayAudio { context_id, ref audio } => {
+                                    let mut req = callback.on_play_audio_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_audio_ref(params.reborrow().init_audio(), audio);
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(msg) = async {
@@ -5062,6 +5090,7 @@ impl kernel::Server for KernelImpl {
                     kaijutsu_types::BlockFlowKind::OutputChanged => "block.output",
                     kaijutsu_types::BlockFlowKind::MetadataChanged => "block.metadata",
                     kaijutsu_types::BlockFlowKind::ContextSwitched => "block.context_switched",
+                    kaijutsu_types::BlockFlowKind::PlayAudio => "block.play_audio",
                 }
             } else {
                 "block.*"
@@ -5412,6 +5441,34 @@ impl kernel::Server for KernelImpl {
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         build_block_metadata(params.reborrow().init_metadata(), metadata);
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
+                                BlockFlow::PlayAudio { context_id, ref audio } => {
+                                    let mut req = callback.on_play_audio_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_audio_ref(params.reborrow().init_audio(), audio);
                                     }
                                     match tokio::time::timeout(
                                         CALLBACK_TIMEOUT, req.send().promise,
@@ -6148,6 +6205,32 @@ fn build_block_metadata(
     if let Some(ref stderr) = meta.stderr {
         builder.set_has_stderr(true);
         builder.set_stderr(stderr);
+    }
+}
+
+/// `kaijutsu_audio::AudioFormatHint` → its capnp mirror. Kept a plain map (no
+/// `From` impl in `kaijutsu-audio`, which is deliberately FFI/wire-free — see
+/// its crate doc) rather than a `TryFrom`/`From` on either side.
+fn audio_format_to_capnp(format: kaijutsu_audio::AudioFormatHint) -> crate::kaijutsu_capnp::AudioFormatHint {
+    use crate::kaijutsu_capnp::AudioFormatHint as Capnp;
+    use kaijutsu_audio::AudioFormatHint as Hint;
+    match format {
+        Hint::Wav => Capnp::Wav,
+        Hint::Flac => Capnp::Flac,
+        Hint::Mp3 => Capnp::Mp3,
+        Hint::Ogg => Capnp::Ogg,
+        Hint::Aac => Capnp::Aac,
+    }
+}
+
+/// Fill a Cap'n Proto `AudioRef` builder from the typed audio ref (docs/pcm.md
+/// "The wire"). Shared by both FlowBus bridges (`subscribe_blocks` and
+/// `subscribe_blocks_filtered`) so the union-arm wiring lives in one place.
+fn set_audio_ref(mut builder: crate::kaijutsu_capnp::audio_ref::Builder<'_>, audio: &kaijutsu_audio::AudioRef) {
+    builder.set_format(audio_format_to_capnp(audio.format()));
+    match audio {
+        kaijutsu_audio::AudioRef::Encoded { bytes, .. } => builder.set_encoded(bytes),
+        kaijutsu_audio::AudioRef::Cas { hash, .. } => builder.set_cas_hash(&hash.to_string()),
     }
 }
 
@@ -7116,6 +7199,9 @@ fn parse_block_event_filter(
                             }
                             crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched => {
                                 kaijutsu_types::BlockFlowKind::ContextSwitched
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::PlayAudio => {
+                                kaijutsu_types::BlockFlowKind::PlayAudio
                             }
                         })
                     })

@@ -294,6 +294,11 @@ enum BlockFlowKind {
   metadataChanged @8;
   contextSwitched @9;
   excludedChanged @10;
+  # A directive, not a block-level event — never meaningfully filterable by
+  # context/kind (see `BlockFlow::matches_filter`'s unconditional bypass for
+  # `PlayAudio`). Kept 1:1 with the Rust `BlockFlowKind` enum anyway so the
+  # two never drift silently out of sync.
+  playAudio @11;
 }
 
 # Server-side filter for block event subscriptions.
@@ -322,6 +327,28 @@ struct BlockMetadata {
   toolUseId @5 :Text;         # LLM-assigned tool invocation id ("" if unset)
   stderr @6 :Text;            # Standard error stream
   hasStderr @7 :Bool;         # True if stderr is set (distinguishes "" from unset)
+}
+
+# Audio sample format hint — mirrors kaijutsu_audio::AudioFormatHint. The wire
+# MIME derives from it (audio/wav, audio/flac, audio/mpeg, audio/ogg, audio/aac).
+enum AudioFormatHint {
+  wav @0;
+  flac @1;
+  mp3 @2;
+  ogg @3;
+  aac @4;
+}
+
+# A reference to an audio sample crossing the render seam (docs/pcm.md "The
+# seam"). Mirrors kaijutsu_audio::AudioRef: inline encoded bytes for tiny
+# samples, or a CAS hash the sink resolves (the primary path once the
+# speculation-lead prefetch lands, slice 5). `format` tags the decoder.
+struct AudioRef {
+  format @0 :AudioFormatHint;
+  union {
+    encoded @1 :Data;    # inline encoded bytes (tiny samples / standalone slice)
+    casHash @2 :Text;    # 32-hex ContentHash — resolved from CAS at the sink
+  }
 }
 
 # Callback for receiving block updates from server
@@ -355,6 +382,12 @@ interface BlockEvents {
   # Structured output data changed (output is not DTE-tracked, so it rides
   # its own event rather than the block text op stream).
   onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData);
+
+  # Play an audio sample (docs/pcm.md). A kernel directive (from `kj play`),
+  # not a block change — carried on this channel because it already fans out to
+  # every attached client. `contextId` is the originating context (reserved for
+  # future per-listener routing); the standalone slice forwards unconditionally.
+  onPlayAudio @13 (contextId :Data, audio :AudioRef);
 }
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).

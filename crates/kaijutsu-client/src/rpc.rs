@@ -1948,6 +1948,9 @@ fn set_block_event_filter_builder(
                     kaijutsu_types::BlockFlowKind::ContextSwitched => {
                         crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched
                     }
+                    kaijutsu_types::BlockFlowKind::PlayAudio => {
+                        crate::kaijutsu_capnp::BlockFlowKind::PlayAudio
+                    }
                 },
             );
         }

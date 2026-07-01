@@ -24,6 +24,7 @@ pub mod fork;
 pub mod format;
 pub mod kv;
 pub mod parse;
+pub mod play;
 pub mod policy;
 pub mod preset;
 pub mod editor;
@@ -354,6 +355,12 @@ impl KjDispatcher {
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
         }
+        // `kj play` resolves its own target via `--context <ref>` (falling
+        // back to the caller's active context, same as `kj transport`), so
+        // it's exempt from the active-context gate below.
+        if cmd == "play" {
+            return self.dispatch_play(&argv[1..], caller);
+        }
         if cmd == "rc" {
             return self.dispatch_rc(&argv[1..], caller).await;
         }
@@ -629,6 +636,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(workspace::WorkspaceArgs::command())
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
+        .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())
         .subcommand(editor::EditorArgs::command())
         .subcommand(config::ConfigArgs::command())

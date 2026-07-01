@@ -131,6 +131,14 @@ pub enum ServerEvent {
     /// orchestration lives in the actor (which owns the reconnect); the renderer
     /// just applies. `sync.context_id` names the target.
     ContextResynced { sync: SyncState },
+    /// Play an audio sample (`kj play`, docs/pcm.md). A kernel directive, not
+    /// a block-log event — it names no block. The Bevy sink (slice 3) turns
+    /// this into an `AudioPlayer` spawn; this crate only decodes the wire
+    /// shape, it never touches audio hardware.
+    PlayAudio {
+        context_id: ContextId,
+        audio: kaijutsu_audio::AudioRef,
+    },
 }
 
 /// Connection lifecycle status broadcast by the reconnect FSM.
@@ -788,6 +796,79 @@ impl block_events::Server for BlockEventsForwarder {
             tracing::warn!("Event channel closed, dropping ContextSwitched event");
         }
         Promise::ok(())
+    }
+
+    fn on_play_audio(
+        self: Rc<Self>,
+        params: block_events::OnPlayAudioParams,
+        _results: block_events::OnPlayAudioResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let audio_reader = match params.get_audio() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let audio = match parse_audio_ref(audio_reader) {
+            Ok(a) => a,
+            Err(e) => return Promise::err(e),
+        };
+
+        let event = ServerEvent::PlayAudio { context_id, audio };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping PlayAudio event");
+        }
+        Promise::ok(())
+    }
+}
+
+/// `crate::kaijutsu_capnp::AudioFormatHint` → `kaijutsu_audio::AudioFormatHint`.
+fn parse_audio_format_hint(
+    format: crate::kaijutsu_capnp::AudioFormatHint,
+) -> kaijutsu_audio::AudioFormatHint {
+    use crate::kaijutsu_capnp::AudioFormatHint as Capnp;
+    use kaijutsu_audio::AudioFormatHint as Hint;
+    match format {
+        Capnp::Wav => Hint::Wav,
+        Capnp::Flac => Hint::Flac,
+        Capnp::Mp3 => Hint::Mp3,
+        Capnp::Ogg => Hint::Ogg,
+        Capnp::Aac => Hint::Aac,
+    }
+}
+
+/// Parse a Cap'n Proto `AudioRef` reader into the typed
+/// `kaijutsu_audio::AudioRef` — the union arm decides `Encoded` vs `Cas`; a
+/// malformed CAS hash fails the promise loudly rather than silently dropping
+/// the sample (house style: crashing beats data corruption).
+fn parse_audio_ref(
+    reader: crate::kaijutsu_capnp::audio_ref::Reader<'_>,
+) -> Result<kaijutsu_audio::AudioRef, capnp::Error> {
+    let format = parse_audio_format_hint(reader.get_format().map_err(|e| {
+        capnp::Error::failed(format!("invalid AudioFormatHint on wire: {e}"))
+    })?);
+    match reader.which()? {
+        crate::kaijutsu_capnp::audio_ref::Encoded(bytes) => Ok(kaijutsu_audio::AudioRef::Encoded {
+            bytes: bytes?.to_vec(),
+            format,
+        }),
+        crate::kaijutsu_capnp::audio_ref::CasHash(text) => {
+            let hash_str = text?.to_str()?;
+            let hash = kaijutsu_cas::ContentHash::from_str_checked(hash_str)
+                .map_err(|e| capnp::Error::failed(format!("invalid CAS hash in AudioRef: {e}")))?;
+            Ok(kaijutsu_audio::AudioRef::Cas { hash, format })
+        }
     }
 }
 
