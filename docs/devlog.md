@@ -350,6 +350,66 @@ joined context (`block_events_client_and_filter`), cutting foreign-context volum
 to zero. Verified live against a busy 24-context kernel: the 300s command returned
 in 285ms. Related memory: `project_mcp_synceddocument_sync`.
 
+## Music-stack docs harmonization — present tense, one story (2026-07-01)
+
+The music/timing docs grew organically across three intense weeks
+(hyoushigi → chameleon → tracks → midi → pcm), and after Tracks Stages 1–3 M1
+landed, four of them still taught superseded mechanisms as current. A
+review session (Amy + Fable, two Sonnet explorers verifying every claim
+against code) rewrote them to present tense so a fresh implementer lands on
+the real substrate. The choices:
+
+- **`docs/playback.md` retired** (the myaku treatment: deleted, detail in git
+  history). Its 2026-06-10 peer-pull model and pause=mute/stop=clock-freeze
+  verb remap conflicted with the landed `RenderTarget`/transport design; its
+  surviving ideas (peer capability advertisement, `TransportFlow`, routing,
+  the metronome slice, midi→pcm for dumb sinks) moved to `docs/pcm.md`
+  § Distributed listening, each marked with what superseded the rest.
+- **`docs/chameleon.md` rewritten to present tense.** The playhead-carry
+  tick-continuity story (shipped 2026-06-29, deleted by Stage 1 the same
+  week), the `arm` vocabulary, un-prefixed `$TICK`-era env vars, and the
+  closed 2026-06-11 gap analysis all melted into a "Substrate status" section
+  + devlog/git-history pointers. The decisions and their rationale stayed.
+- **`docs/hyoushigi.md`'s three chronological status blockquotes** became one
+  "as landed" block (coordinate / engine / kernel integration / barrier /
+  transport, all code-verified); the per-context-timeline sections now say
+  plainly that music timelines live on the track and coders keep their own.
+- **`docs/tracks.md`** got its never-flipped Stage 1 boxes flipped and two
+  stale deferred items (double-beat, track-scoped `max_tick`) marked fixed.
+- **`docs/pcm.md`** had a corrupted tail (a previous agent's tool-call
+  envelope leaked into the file — stray `</content></invoke>` text) — fixed,
+  plus three leftover "kernel sink" phrasings that contradicted the doc's own
+  kernel-owns-no-FFI decision, now "edge-node sink".
+- **`docs/issues.md` Hyoushigi section swept** per delete-when-shipped:
+  beat-on-track (shipped), `set_tempo`/TickClock staleness (fixed by Stage 3
+  WI 2), the `$ROTATE_EVERY` footgun (the rotate script no longer passes it),
+  rc-driven last-good rehydration (Stage 2 WI 7 made it the built-in attach
+  behavior), and the stop-a-rotate-chain gap (closed by native
+  `stop --track`) all deleted or compressed; the RAM-growth entry reframed
+  (rotation is deliberately *not* the answer anymore — the track timeline
+  survives page-turns, so the fix is windowing the in-RAM committed log).
+
+The pattern worth keeping: these docs are living notes, but "living" had come
+to mean *stratified* — direction notes on top of superseded status on top of
+good design. The fix wasn't more banners; it was moving chronology here (and
+to git history) and letting each doc state the present.
+
+**Follow-up (same day): a tri-model review of the harmonized suite.** Opus
+(docs-only whole-file read), gemini-pro on batch capacity, and a deepseek
+kaibo consult with the code lens — all three called the suite unusually
+strong and surfaced a short convergent fix list: a truncated `tracks.md`
+sentence, midi.md M2's unspecified capture mapping, the edge-node RPC model
+existing only by analogy, and pcm.md's slice-5 emit-contract ambiguity.
+Applying it, Amy's CAS-cue reframe settled the render-seam convergence as one
+direction instead of an (a)/(b) fork: **mime-keyed symbolic emit — bytes never
+ride the track.** A placed sample is a *clip cell* (CAS ref + placement);
+bytes prefetch under the speculation lead over SFTP + `/v/blobs` into a
+client-side XDG CAS cache — retired playback.md's pull-from-CAS idea reborn in
+a better home, and zero new RPC surface. The clip payload format is deferred
+to its first consumer with a prior-art shortlist (OTIO, Csound/Tidal, WebVTT,
+SMIL/TTML, QLab/MSC) recorded in pcm.md; "clip" joins track/lane/voice in the
+locked vocabulary so it never collides with chameleon's trap "cues".
+
 ## Transport ACK review — the no-deadlock property is real but contingent (2026-06-29)
 
 A morning second-opinion pass over the day's rotate/transport fixes (the ACK fix

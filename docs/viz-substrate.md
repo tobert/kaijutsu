@@ -735,5 +735,3 @@ closed the layout question (three lifecycle bands). These remain genuinely open:
   look-at, `bevy_math::curve` easing, and the app's own `vello_ui_texture` RTT for
   card text. Examples: `~/src/bevy/examples/shader/automatic_instancing.rs`,
   `picking/mesh_picking.rs`, `animation/eased_motion.rs`.
-</content>
-</invoke>

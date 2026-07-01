@@ -191,7 +191,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   the kernel/server binary should own *no* audio/MIDI FFI; hardware emission lives
   in peripherals that attach over RPC (the Bevy app, or a headless edge-node
   agent = `midi.md`'s "first kernel-owned compute node"). Consequence: extract the
-  already-shipped `AlsaMidiOut` from `crates/kaijutsu-server/src/clock.rs` into the
+  already-shipped `AlsaMidiOut` from `crates/kaijutsu-server/src/render.rs` into the
   edge-node agent so the server stops linking `alsa` (the speculation-lead `at`
   scheduling travels with it). Sequence with M4 edge-node work. PCM samples follow
   the same rule from the start — see `docs/pcm.md`.
@@ -212,8 +212,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   resolution. The **beat** coupling — the 3 `== "musician"` sites that gated arming
   — is **resolved 2026-06-28**: the create-arm moved into `musician/create/
   S20-arm.kai` (deleting the duplicated Rust arm in both `rpc.rs` and
-  `kj/context.rs`), and `kj transport arm`'s gate is now "has a track lane", not a
-  type name. Zero beat-related string checks remain, so the `ContextType(String)`
+  `kj/context.rs`), and the arming verb's gate (now `kj transport attach`) is
+  "has a track lane", not a type name. Zero beat-related string checks remain, so the `ContextType(String)`
   newtype is **not worth doing** (declined, not deferred). Remaining `"musician"`
   literals are inert (rc-path strings, test fixtures, the `seed_scripts` assertion).
   The live follow-ons are the *other axes* (decouple-Act-from-ABC; per-type
@@ -849,24 +849,12 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Hyoushigi / Musician
 
-- **Beat-on-track refactor — move the beat off the context, onto the track
-  (DIRECTION SET 2026-06-29, `docs/tracks.md`; the big upcoming piece).** Today the
-  clock/playhead/heap are per-**context** and `track` is a label on `BeatState`.
-  Direction: the **track** becomes a clock domain that owns the clock, the score
-  (`Timeline`), a pluggable `ClockSource`, and a set of **attachments** (each with
-  its own wakeup cadence + optional rotate cadence); a **context attaches to a track
-  to be beaten**. Arming = attaching; rotation = the track rebinding an attachment to
-  its fork. This **retires** the per-context playhead carry (shipped 2026-06-29 — the
-  clock stops leaving the context, so continuity is free) and the `track_head` /
-  `stop --track` overlay we sketched (transport becomes native to the track's one
-  clock; the horizon race can't occur). It also **subsumes myaku** (a probe is a
-  context attached to a system-clock track writing `/run`). Staged: **(1)** clock +
-  playhead + transport + attachments onto the track (retires carry + `track_head`,
-  gives native `stop/play --track`); **(2)** the score `Timeline` onto the track
-  (contexts produce into it; largest part); **(3)** `ClockSource` trait + MIDI driver
-  + external-signal seam (solar/compute-availability; check the app's existing
-  time-sync algos for reuse). Full design + open questions in `docs/tracks.md`. A
-  fresh Claude + Amy start the surgery from that doc.
+- **Beat-on-track refactor — ✅ SHIPPED (Stages 1–3 M1, 2026-06-29/30).** The track
+  owns clock/playhead/transport/score (score context), contexts attach; `ClockSource`
+  + `RenderTarget` landed. Remaining stages (M2–M4: input telemetry, drift-modeled
+  clock-in, edge node) are sequenced in `docs/midi.md`; still-open external-signal
+  clock sources (solar/compute-availability) ride the same `ClockSourceKind` seam.
+  Story: `docs/tracks.md` + devlog.
 - **Beat-lifecycle privilege asymmetry — RESOLVED by design (2026-06-28).**
   `fire_lifecycle` runs `tick`/`rotate` unprivileged while create runs
   privileged; gemini-pro flagged it. Decision: leave it. We deliberately keep
@@ -877,25 +865,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `docs/instrument-design.md` ("Many hands, one trust boundary") + `docs/chameleon.md`.
   (The `kj transport play` blind-success smell from the same review SHIPPED its
   ACK fix — `f0c3eb90` — so its entry is retired.)
-- **`set_tempo` doesn't update the Timeline's stored `TickClock` (latent, no
-  reader yet — gemini-pro review 2026-06-28).** `BeatScheduler::set_tempo`
-  (`beat.rs`) updates `st.policy.period` (the heap cadence) but `arm`'s
-  `kernel.arm_timeline(..., policy.clock(), ...)` uses `or_insert_with`, so the
-  `TickClock` living inside an already-armed `Timeline` keeps the old tempo.
-  Harmless *today*: I found no production reader of the timeline's stored clock
-  for tempo — `clock()` is recomputed from `policy.period` and `transport_vars`
-  reads the policy, not the timeline. It becomes a real bug the moment a
-  tempo-dependent reader of the timeline clock exists (MIDI wall-time export,
-  visual playhead). Fix when that lands: a `Kernel::update_timeline_clock(ctx,
-  clock)` that `set_tempo`/`arm` call on an existing timeline.
-- **`S10-rotate.kai` `$ROTATE_EVERY` has no fallback if unset (Low, gemini-pro
-  review 2026-06-28).** The scheduler always seeds `ROTATE_EVERY` when it fires
-  the rotate verb, so it's only exposed if the script is run manually with the
-  var unset — then `kj transport rotate --every` (empty) is a fatal clap error.
-  NOTE: the naive `${ROTATE_EVERY:-off}` (kaish *does* support `:-`) does NOT
-  work here — `--every` takes a number and `off` is a positional, so `--every
-  off` errors too. A correct guard needs conditional logic (rotate-with-`--every`
-  vs bare `off`), which is more than the firing path warrants for now.
 - **Musician `kj` loadout — tool-free (2026-06-13).** `musician` seeds
   `assets/defaults/rc/musician/create/S10-binding.kai` granting only `drive`:
   no `builtin.*` tool instances, no `facade:shell`/`submit_input`, no
@@ -906,6 +875,29 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   the gig (key/tune/register) belongs to the stance + producer chart, NOT the
   base rc — migrate any song-specific primer content to the producer/chart
   layer when it lands ("big models author vocabularies").
+- **No chart is seeded into a player's context — the gig metadata gap (found
+  2026-06-30, standing up a bass player for the Chameleon line).** The
+  musician stance + ABC primer (`musician/create/S00-stance.md`, `S15-abc-primer.md`)
+  both say "your chair, key, tune, and register come from your stance and the
+  chart the producer has set" — but **there is no chart**. A search of every
+  document + KV finds the Chameleon spec (B♭ Dorian, B♭m7–E♭7 vamp, bass chair)
+  only in `docs/chameleon.md`; **nothing writes it into a musician context**, and
+  no `create` script seeds it. So a freshly-created player arms correctly, hears
+  itself + siblings via `KJ_HEARD`, and drives on the beat — but does **not know
+  what tune it's playing**. The *now-facts* channel (`KJ_TICK`/`KJ_PHRASE`/
+  `KJ_TEMPO`/`KJ_HEARD`) is wired; the *gig* channel is not. This is the producer's job
+  (Opus authors the vocabulary, the player speaks it) and the producer chair
+  isn't built — but slice one (bass-gemma vamping B♭ Dorian) needs a chart NOW.
+  Minimal fix that fits "players are rc programs / setup is declarative rc":
+  a `musician/create/S05-chart.md` (numbered into the cached system prefix,
+  before the generic primer) carrying the song-specific gig — key, vamp changes,
+  register, the bass chair. Hand-authored for the audition; becomes the
+  producer's `drift`-delivered, hydrate-latched revision surface when that chair
+  lands. Pairs with the "migrate song-specific primer content to the producer/
+  chart layer" note in the tool-free-loadout entry above and the
+  marker-advance-on-durable-revision item below. Decide: per-song chart files vs.
+  a single chart whose body the producer rewrites — the rotation/hydrate boundary
+  already gives a clean delivery point either way.
 - **Decouple the OODA Act from ABC (generalize the loop primitive).** The Act
   path is hardwired to one notation: `on_turn_completed` → `schedule_abc_cell`
   eager-*parses ABC* to validate, and the `DeriverRegistry` derives MIDI from
@@ -930,34 +922,28 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   for a track with a last-good tune, prepend that track's last-good header
   before validating/deriving. Pairs with the decouple above (a per-content-type
   "complete the fragment" step).
-- **Cold-start re-arm is MANUAL, not automatic (by choice, 2026-06-28).** Auto-arm
-  still fires only on context *create*; the scheduler starts with an empty `armed`
-  map on restart and nothing *automatically* re-arms existing musician contexts.
-  **What shipped:** a `kj transport arm [--context]` recovery verb + durable
-  `BeatPolicy` persistence (below), so an operator can re-arm a musician after a
-  restart and get its *real* tempo/cadence back (not the default). Arms **stopped**
-  + OODA-armed; the playhead reseeds from max committed tick (`arm()`'s existing
-  virgin-only seed). **Deliberately deferred** (Amy's call — "possible but not
-  automatic yet"): an automatic cold-start sweep that re-arms every persisted
-  musician on boot. The natural seam is the recovery loop at `rpc.rs:1270` (scan
-  `context_type = musician`, skip archived/concluded, `Arm` each from its persisted
-  `beat_state`) — but it must run *after* the beat scheduler is wired, else
-  `send_beat_command` returns false. Adjacent to
-  `tech_debt_peer_reattach_on_reconnect` (restart-recovery gaps).
-  - **Follow-ups:** (a) `beat_count` is NOT persisted, so a re-arm restarts the
-    OODA cadence phase from 0 (the *playhead* is restored from max_tick; only the
-    coarse OODA counter resets — usually fine, the first OODA fires one cadence
-    later). (b) `clear_beat_state` exists but nothing calls it yet — wire it to
-    disarm/archive once an archive RPC lands (no row leak today; the row just
-    outlives a disarmed musician and a re-arm reuses it).
-- **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
-  exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
-  fixed in `BeatPolicy::musician_default()`. Make the cadence a settable knob
-  (rc-declared and/or a `kj transport` arg), persisted per context. Fine to do
-  later. (Until then, a high BPM via `kj transport tempo` shrinks the wall-clock
-  per OODA turn for testing — 128 beats @ 1000 BPM ≈ 7.7 s.) Per-type `BeatPolicy`
-  defaults are an axis of the **`context_type` feature-decomposition**
-  (`docs/chameleon.md`): a `funkMusician` shouldn't be stuck on `musician_default()`.
+- **Cold-start re-attach is MANUAL, not automatic (by choice, 2026-06-28;
+  re-stated in track vocabulary 2026-07-01).** The scheduler starts with an
+  empty track map on restart; nothing automatically re-attaches persisted
+  musicians. **What exists:** `kj transport attach` recovers a musician after a
+  restart from its persisted `tracks` + `attachments` rows — real tempo/cadence
+  back, attaches stopped + OODA-armed, playhead + committed log rehydrated from
+  the score context (restart-safe by construction, `tracks.md` Stage 2 WI 7).
+  **Deliberately deferred** (Amy's call): an automatic cold-start sweep that
+  re-attaches every persisted attachment on boot; the natural seam is the
+  recovery loop in `rpc.rs`, and it must run *after* the beat scheduler is
+  wired. Adjacent to `tech_debt_peer_reattach_on_reconnect`.
+  - **Follow-ups:** (a) `beat_count`/`KJ_PULSE` are NOT persisted — documented
+    as the contract (`tracks.md` Stage 1 deferred list); persist them
+    holistically when the sweep lands. (b) attachment-row cleanup on
+    disarm/archive once an archive RPC lands (no row leak today).
+- **Per-type `BeatPolicy` defaults (the surviving half of "cadence settable per
+  context").** The per-context cadence knob LANDED with the track model:
+  `kj transport attach --wakeup N --rotate N` sets each attachment's divisors,
+  persisted in the `attachments` row. What remains is per-*type* defaults for
+  the track-level knobs (period / `beats_per_phrase`) so a `funkMusician` rc
+  bundle isn't stuck on `musician_default()` — an axis of the **`context_type`
+  feature-decomposition** (`docs/chameleon.md`).
 - **`kj transport meter` inbound verb (Chameleon batch 1, F2):** add
   `kj transport meter <beats_per_phrase>` with a `--bars N --beats-per-bar M`
   convenience that multiplies to beats *at the edge* → new
@@ -970,141 +956,66 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   revisit once irregular phrases (per-phrase beat counts) make the beat
   denomination awkward.
 - **Transport surface beyond `kj`:** app transport buttons / spacebar + a capnp
-  transport surface (today `kj transport arm|play|pause|stop|tempo|ooda|rotate`
-  only — no app/capnp surface). A restart-recovery `arm` button is a natural fit.
-- **BeatPolicy persistence — ✅ SHIPPED 2026-06-28** (was "Chameleon batch 1, F2",
-  bundled with the restart sweep). A new `beat_state` table (`kernel_db.rs`,
-  `context_id` PK, period/bpp/ooda + `track`) durably mirrors each musician's live
-  `BeatPolicy` + lane. The scheduler **writes through** on every policy mutation
-  (`beat.rs` `persist_state`, called from `arm`/`set_tempo`) — db-less stores
-  no-op, a db-backed write *failure* is loud (`log::error!`), never silent.
-  `kj transport arm` reads it back (`get_beat_state`) to reconstruct the `Arm`,
-  falling back to `musician_default()` + a label-slugged lane for a never-persisted
-  musician, and refusing loudly on a non-musician. A corrupt row (zero period /
-  empty track) is a loud `Validation` error, not a silent default. So the old
-  claim — *"persisting policy is useless because nothing re-arms"* — no longer
-  holds: persistence + a **manual** re-arm shipped together; the **automatic**
-  cold-start sweep is what's now deferred (see the re-arm item above), decoupled
-  from persistence. `arm`'s virgin-only playhead seed (F1) was already done.
-  Not persisted: `beat_count` (OODA phase resets on re-arm — follow-up above).
+  transport surface (today
+  `kj transport attach|detach|play|pause|stop|tempo|ooda|rotate|render` only —
+  no app/capnp surface). A restart-recovery `attach` button is a natural fit.
+  Overlaps the retired playback.md's `TransportFlow` idea, now recorded in
+  `docs/pcm.md` § Distributed listening.
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
   "transport" label for `beat()`-authored fallback repeats so a vamp insurance
   repeat reads as the transport, not a mystery principal.
-- **`$HEARD` shipped as a JSON push; array + pull are follow-ups (Chameleon
-  batch 2, 2026-06-11):** `$HEARD` ships as a pragmatic **JSON-string push** —
-  `beat.rs::heard_json` reads committed notation in the last
-  `HEARD_WINDOW_PHRASES` (block-log tick-window, `ContentType::Abc` only, all
-  tracks) and seeds it as a JSON array string. Load-bearing **even solo**: score
-  blocks are `ephemeral` (hydration-silent), so this is the only way a player
-  sees its own prior phrases. **Two follow-ups (TODOs on the code), when the
-  kaish arrays/hashes plan lands:** (1) expose `$HEARD` as a real kaish **array
-  of hashes** (indexable, `for phrase in $HEARD`) instead of a JSON string the
-  script can't index; (2) re-shape **push → pull** — a `kj`-reachable windowed
-  read so the script chooses depth/track rather than a fixed injected window
-  (shares the read with the RC hydration-marker archive verb). Also open:
+- **`KJ_HEARD` shipped as a JSON push; array + pull are follow-ups (Chameleon
+  batch 2, 2026-06-11; re-pointed at the track score with Stage 2):**
+  `KJ_HEARD` ships as a pragmatic **JSON-string push** — `beat.rs::heard_json`
+  reads committed notation in the last `HEARD_WINDOW_PHRASES` (8) from the
+  **track's score context** (`ContentType::Abc` only, all producers, across
+  rotations — the real band view) and seeds it as a JSON array string.
+  Load-bearing **even solo**: score blocks are `ephemeral` (hydration-silent),
+  so this is the only way a player sees its own prior phrases. **Two follow-ups
+  (TODOs on the code), when the kaish arrays/hashes plan lands:** (1) expose it
+  as a real kaish **array of hashes** (indexable, `for phrase in $KJ_HEARD`)
+  instead of a JSON string the script can't index; (2) re-shape **push → pull**
+  — a `kj`-reachable windowed read so the script chooses depth/track rather
+  than a fixed injected window (shares the read with the RC hydration-marker
+  archive verb and fork-carry — one read, three consumers). Also open:
   per-context window tuning (`HEARD_WINDOW_PHRASES` is a const). `content_before`
   in `ResolverCtx` stays deliberately track-blind regardless (no resolver reads
   it; `CasCommitResolver` reads CAS by hash).
-- **Player spawn = thin fork + rc-rebuilds (hydration marker SHIPPED + review-
-  hardened 2026-06-12; design LOCKED 2026-06-12).** Resolves
-  "fork drops the hydration policy" — see the "Players are rc programs" decision
-  in `docs/chameleon.md`. A player is spawned by a `spawn`-preset fork
-  (`kj fork --preset spawn` per `docs/fork-filters.md`; formerly `--shallow`)
-  that keeps ~nothing; the child's `musician/fork/` rc re-establishes setup and
-  re-runs `kj context hydrate --window N` (mirror of `create`, marker defaults
-  to the child's tail). Because the child is thin, re-anchoring at the tail is
-  cheap and correct — which is *why* we dropped the alternative (copy the row /
-  preserve `P_parent` via a new `KJ_PARENT_HYDRATION_MARKER` read surface): a
-  thin child makes the naive re-anchor right, so the read surface isn't needed
-  for fork. (We considered it; the thin fork dissolved the need.) What this
-  needs, sequenced:
-  - **Lock now (small):** `musician/fork/S30-hydrate.kai` (rebuild + re-mark)
-    and confirm a musician fork is thin. `kj transport ooda on|off --context`
-    already exists, so transport-follow (arm child / disarm parent) is pure rc.
-  - **Rotate action rc — ✅ SHIPPED 2026-06-28.** The scheduler trigger was already
-    built (`SetRotate` + `kj transport rotate`; at the horizon `fire_due` `stop`s the
-    parent synchronously and fires the `rotate` lifecycle). Now the ACTION exists:
-    `VERB_ROTATE` wired into `verb_is_wired`, and `musician/rotate/S10-rotate.kai` =
-    `kj fork --preset spawn --switch && kj transport arm && kj transport rotate
-    --every $ROTATE_EVERY && kj transport play`. Three enablers landed with it: (1)
-    **fork copies `beat_state`** (`insert_forked_context`), so the thin (labelless)
-    child re-arms on the PARENT's track — the lane is the durable fork-lineage
-    identity, not a label-derived slug; (2) **`$ROTATE_EVERY`** seeded into the
-    transport vars when rotating, so the child re-establishes the cadence and the
-    song keeps turning; (3) the arm-is-rc decomposition gave `kj transport arm` as
-    the rc-callable primitive. `--switch` moves the rc shell onto the child so the
-    bare transport calls target it (no id capture). End-to-end test:
-    `rotate_rc_forks_arms_and_plays_the_child_on_the_parent_track`.
-    **✅ Tick continuity shipped 2026-06-29.** A spawn-fork has no committed blocks,
-    so the child's `arm` used to seed the playhead from `max_tick`=0 and musical
-    time RESET at every page-turn. Fixed by carrying the playhead *number* (no
-    history is retired/archived — contexts ARE the history, which is why we rotate
-    instead of wiping): `beat_state` gained a `playhead_tick` column
-    (`kernel_db.rs`, additive `ALTER TABLE`); `persist_state` snapshots the live
-    playhead, and `fire_due` re-snapshots the parent at the rotate horizon *before*
-    the fork copies its `beat_state` (`beat.rs`); `arm` seeds from
-    `max(block-log max tick, carried playhead)` so the carried tick continues a
-    thin child while the block log still wins for a context with real committed
-    history (cold restart). Tests: `arm_seeds_carried_playhead_when_no_committed_blocks`,
-    `committed_max_tick_wins_over_stale_carried_playhead` (beat.rs), the
-    `playhead_tick` round-trip + negative-guard + fork-copy assertions (kernel_db).
-    ⚠ **Runner-verify pending** (needs a kernel restart; no capnp/wire change, but
-    a live page-turn should now show continuous tick across the section boundary).
-    Still pairs with the windowed-notation pull primitive below (carrying recent
-    *notation* into the child is separate from carrying the tick).
-    Runner-verified live 2026-06-28: a played musician forks a labelless child
-    on the parent's track, tempo + `$ROTATE_EVERY` inherited, lineage is a clean
-    LINEAR chain (verified via `kj context list --tree`) — song form, exactly as
-    designed. (Birth-rotation is already guarded: `beat_count` is post-increment
-    so the earliest rotate is phrase 1, never phrase 0 — `beat.rs process_one`;
-    rotation is driven by `beat_count` which resets on arm, INDEPENDENT of the
-    playhead tick reset above. An earlier note here mis-diagnosed a "phrase-0
-    fork bomb" — retracted; no such bug.)
-    **Operational gap — no clean way to STOP a live rotate chain.** `rotate
-    --every N` keeps turning the page every N phrases until something stops the
-    current tip, and the child inherits the cadence by design, so the song
-    out-runs a `kj transport stop` driven off a stale context list (each stop
-    races the advancing tip). The reliable halt was a full server restart (armed
-    map clears on cold start). Worth an affordance: a "stop/disarm the whole
-    rotating lineage" verb, or `rotate off` that also clears the inherited cadence
-    so the in-flight child doesn't re-arm it. Until then, to stop a song stop its
-    live tip (`kj context list --tree` to find it) or restart the kernel.
-    **Leading approach (2026-06-29): scope the stop to the track, not a context id.**
-    The `track` (lane) is the durable cross-rotation identity — `insert_forked_context`
-    copies it to every child, so all segments of one song share one `track`, and the
-    scheduler's `armed` map already carries `BeatState.track` per segment. So "stop
-    the song" = walk `armed`, and for every context whose `track` matches the tip's,
-    `set_rotate(None)` + `stop`. No new ancestor link / no reverse latest-descendant
-    pointer needed (a separate explicit root→tip pointer would still be nice for the
-    app/time-well's "jump to the live tip", but it's not needed for *stop*). Residual:
-    the narrow race where a page-turn already in `rotate_due` produces one extra child
-    that arms *after* the stop — close it later with a scheduler-side halt flag that
-    `fire_rotate` checks, if the orphan segment ever actually bites. Fold in the
-    `$ROTATE_EVERY`-unset clap-error footgun (above) so `rotate off` is clean.
-  - **Build when convenient — the windowed-notation pull primitive.** No
-    cross-context block-copy verb exists today; a player carrying recent
-    notation into its thin-forked child needs one. This is the *same* windowed
-    read as `$HEARD`'s push→pull follow-up and the marker-archive read — **one
-    read, three consumers** (`$HEARD` indexable array, fork-carry, marker
-    archive). Strong signal it's the right primitive; keeps the carry in rc.
-  - **Defer — horizon self-fork-rotate (page-turns / song sections).** The
-    player self-`kj fork --preset spawn`s on a phrase horizon; fork-lineage becomes
-    song form. Two trigger forms: **(a)** a `musician/tick/SXX-rotate.kai` that
-    fires every tick (`$PHRASE` is seeded) and acts only at the horizon
-    (`phrase mod N == 0`) — **NOT zero new machinery after all** (see the verified
-    ordering race above: the rc disarm is async, so pure-rc rotation leaks stray
-    parent ticks); the horizon trigger must be scheduler-side Rust
-    (`RotateOnPhrase`), with `musician/fork/` doing only the rebuild; **(b) later**
-    a declarative "fire script at tick T" timeline scheduler riding
-    `schedule_abc_cell`'s rails, worth building once the producer schedules more
-    than rotates (section/tempo/dynamics events — clear second consumers). Not
-    needed for solo-bass slice 1 (the marker bounds cost; thin-fork-at-spawn gives
-    the lean start).
-  - **Marker-advance on durable revision** still pairs here: when the producer
-    writes revision blocks, re-run `kj context hydrate` to advance P. Pure rc
-    once the producer exists.
+- **Player spawn = thin fork + rc-rebuilds (design locked 2026-06-12; core
+  SHIPPED — current mechanism in `docs/chameleon.md` § Rotation, chronology in
+  devlog).** A player is spawned by `kj fork --preset spawn` (fork-filters,
+  `docs/fork-filters.md`); the child's `musician/fork/S40-hydrate.kai` re-marks
+  the hydration window at its tail. The page-turn is scheduler-driven: at the
+  rotate horizon the scheduler synchronously detaches the parent (race-free)
+  and fires `rotate/S10-rotate.kai` = `kj fork --preset spawn --switch &&
+  kj transport attach && kj transport play`; the attachment row (track +
+  wakeup + rotate cadence) travels with the fork, and tick continuity is by
+  construction (the clock lives on the track — the 2026-06-29 playhead carry
+  is deleted). `kj transport stop --track <t>` halts a whole rotating lineage
+  in one verb, closing the old "no clean way to stop a chain" gap; residual
+  narrow race: a rotate rc already in flight ends in `kj transport play` and
+  could restart a just-stopped track — add a scheduler-side halt check if it
+  ever bites. Still open:
+  - **Rotate chains pollute the director's context tree (found 2026-07-15, DS
+    Director `019f14ba`).** Every page-turn is a thin `spawn` fork, so a song
+    running N phrases produces N+1 contexts in a linear chain — `kj context
+    list --tree` renders the whole lineage and an operator must visually skip
+    past it (a 17-deep chain observed from one song). Fix ideas (pick one):
+    (a) `--hide-archived` collapse, (b) fold same-track rotate chains into a
+    compact `root→…→tip (N segments)` one-liner, (c) auto-archive rotated-out
+    segments. No correctness issue — operator UX tax.
+  - **The windowed-notation pull primitive.** No cross-context block-copy verb
+    exists; a player carrying recent notation into its thin-forked child needs
+    one. Same windowed read as `KJ_HEARD`'s push→pull follow-up and the
+    marker-archive read — **one read, three consumers**; keeps the carry in rc.
+  - **A declarative "fire script at tick T" timeline scheduler** — worth
+    building once the producer schedules more than rotates (section/tempo/
+    dynamics events are the clear second consumers).
+  - **Marker-advance on durable revision** — when the producer writes revision
+    blocks, re-run `kj context hydrate` to advance the marker. Pure rc once
+    the producer exists.
 
 - **Fork primitives — full/thin mental model (Amy, 2026-06-12).** Full fork
   (regular `kj fork`) is the *powerful* path: take the whole context into a fresh
@@ -1162,11 +1073,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     breakpoints sit at message indices that windowing shifts; harmless for the
     local bass (no prompt cache; musician sets no breakpoints today so the
     byte-stable prefix is inert), reconcile when API-model chairs join.
-- **Optional rc-driven last-good rehydration on arm:** after restart every
-  track's engine history is empty → `UseLastGood` → Skip → **silence until the
-  first good phrase** (locked default). A future rc-driven arm option could
-  rehydrate last-good content from the block log on arm — an opt-in, never the
-  engine default.
 - **Standing per-phrase `UseLastGood` cells (whole-turn-miss hole) (Chameleon
   batch 1, F2):** `UseLastGood` only fires when a cell was *scheduled* and then
   squashed; a turn that produces no cell at all (the model never spoke) leaves no
@@ -1180,12 +1086,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   (T22 prints ~300 µs release for the ABC deriver). Add a timed `debug_assert`
   (or a soft warn) around `derive()` so a future heavy deriver trips loudly in
   dev rather than silently stalling the beat under the lock.
-- **In-RAM committed `Vec` / RAM-CAS unbounded growth (Chameleon batch 1, F2):**
-  the timeline's committed `Vec` and RAM CAS grow without bound for a long-armed
-  musician (every phrase appends). **Rotation is the answer** — the chameleon
-  rotation tick-continuity invariant retires old committed history into the
-  durable block log + CAS and starts a fresh window — but it is not built. Until
-  then a marathon set leaks RAM.
+- **In-RAM committed `Vec` / RAM-CAS unbounded growth (Chameleon batch 1, F2;
+  reframed 2026-07-01):** the track timeline's committed `Vec` and RAM CAS grow
+  without bound for a long-playing track (every phrase appends). Rotation is
+  deliberately NOT the answer anymore — the track timeline *survives*
+  page-turns by design (`tracks.md` Stage 2). The durable record already lives
+  in the score context's blocks + CAS, and `UseLastGood`/`KJ_HEARD` only need a
+  recent tail, so the fix is windowing/compacting the *in-RAM* committed log
+  (drop cells older than the largest read window; rehydration-from-blocks
+  already exists for the tail). Until then a marathon set leaks RAM.
 - **Band track↔chair mapping source of truth:** musician-create derives a track
   from the context label (`TrackId::new`→`slugify`, hard-error on empty slug).
   Once a band config exists (multiple chairs on one timeline), decide where the
@@ -1218,7 +1127,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   region) and a richer `compute_basis`.
 - **`Midi` render variant + UI timeline:** `audio/midi` projects to `ContentType::Plain`
   today; add a `Midi` variant + renderer, and the scrubbable timeline render.
-  **Deliberately deferred to its first consumer (playback slice 2), not added in
+  **Deliberately deferred to its first consumer (an app-side MIDI renderer /
+  peer sink — `docs/pcm.md` § Distributed listening), not added in
   Chameleon batch 1, F2:** `ContentType` is a closed enum that rides
   `BlockHeader` inside `SyncPayload` ops, and the CBOR codec is fail-loud by
   design — a new variant breaks old decoders. Per the project rule a variant
@@ -1233,23 +1143,28 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   hash** (real lead time, scheduled like any resolver), or (b) a measured
   **budget-excepted deriver** (only if midi→pcm proves fast enough to run at the
   barrier — almost certainly not, soundfont synthesis is heavy). See
-  `docs/playback.md` item 8.
+  `docs/pcm.md` § Distributed listening (playback.md retired 2026-07-01).
+- **Clip payload format — design session pending (direction set 2026-07-01).**
+  The render seam goes mime-keyed over symbolic content (`docs/pcm.md` "How it
+  converges"): a placed sample is a **clip cell** (CAS ref + placement/params),
+  bytes move out-of-band (SFTP + `/v/blobs`, client-side XDG CAS cache,
+  prefetched under the speculation lead — the lead is the transfer budget).
+  The clip MIME's shape is deferred to its first consumer; prior-art shortlist
+  recorded in pcm.md (OTIO, Csound/Tidal, WebVTT, SMIL/TTML, QLab/MSC/MOS).
+  Pairs with decouple-Act-from-ABC above (same content-type generalization,
+  input side). Vocabulary: "clip" (DAW sense); "cue" stays the trap message.
 - **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
   spans now that a producer exists.
-- **Playback via peer sinks — design settled, see `docs/playback.md`:**
-  peers advertise sound output at attach; kernel schedules objects via
-  hyoushigi (materialized beat blocks = the scheduling unit); sinks pull
-  from CAS and fire on a locally-held clock. Decisions 2026-06-10:
-  pull-from-CAS (out-of-band capable later), transport state on FlowBus
-  (new `TransportFlow`), and a **pause/stop verb remap** — pause = mute
-  (clock keeps running, presentation-only, no BeatCommand), stop = clock
-  freeze + OODA disarm (today's `BeatCommand::Pause`/`Stop`,
-  `kj/transport.rs:43-54`). Prep checklist + slices in the doc; slice one
-  is sink advertisement + clock distribution + a local 拍子木 metronome
-  click. Scheduled after the registry extraction + FlowBus cleanups.
-  Longer-term design conversation, not a task yet: unify hyoushigi
-  beat-time and conversation wall-time ("the conversation has a tempo")
-  so the timeline is the kernel's one clock rather than a music sidecar.
+- **Multi-listener playback (was `docs/playback.md` — retired 2026-07-01).**
+  The 2026-06-10 peer-sink design predates the track/`RenderTarget`
+  architecture; its superseded mechanism decisions (sink-pull scheduling, the
+  pause=mute verb remap) are recorded as such and its surviving ideas
+  (peer capability advertisement, capnp/`TransportFlow` transport surface,
+  routing, the metronome slice, midi→pcm for dumb sinks) now live in
+  `docs/pcm.md` § Distributed listening. Longer-term design conversation, not
+  a task yet: unify hyoushigi beat-time and conversation wall-time ("the
+  conversation has a tempo") so the timeline is the kernel's one clock rather
+  than a music sidecar.
 
 ## config-shadow cache: residual cross-alias staleness (found 2026-06-24)
 

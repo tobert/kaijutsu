@@ -265,6 +265,14 @@ track" replaces "copy the number," same observable, less machinery.
 
 ## Open questions (for the implementation session)
 
+> **2026-07-01:** all four were resolved by the staged implementation below —
+> concurrent producers by Stage 2's copies+`played_by` model (one *playing*
+> binding stays a loadout policy), `KJ_HEARD` re-pointed at the track score by
+> Stage 2 WI 5 (the hydration side of the seam is still deliberately open, see
+> Stage 2's open questions), the clock-source trait by Stage 3, and the
+> migration by Stage 1 (`beat_state` → `tracks`+`attachments`). Kept for the
+> reasoning:
+
 - **Concurrent producers into one track.** Music keeps one *playing* binding per
   track (rotation swaps it); a user/observer can bind read-mostly. The copies +
   back-reference model makes several contexts contributing copies *tractable* (each
@@ -337,7 +345,7 @@ TrackState {                                  // runtime, in the scheduler (beat
     playhead:    Tick,                        // moved off the per-context Timeline
     beat_count:  u64,
     transport:   Playing | Stopped,
-    policy:      BeatPolicy,                   // period/beats_per_phrase/ooda_every — reused as-is
+    policy:      BeatPolicy,                   // (superseded in-flight: ooda_every → Attachment.wakeup; Stage 3 moved period into SystemClock)
     attached:    HashMap<ContextId, Attachment>,
     materialize_failures, failure_water,       // carried over from BeatState
 }
@@ -346,48 +354,55 @@ Attachment { wakeup: Cadence, rotate: Option<Cadence>, ooda_armed: bool, pulse: 
 
 ## Work items (TDD throughout — tests that can and will fail)
 
-- [ ] **1. Types** (`kaijutsu-types` + `kernel/hyoushigi/mod.rs`). Add `Attachment`
+> **All eight landed 2026-06-29** (the follow-up sections below record the
+> review fixes); boxes flipped 2026-07-01 during the docs harmonization pass.
+> As landed: `Attachment`/`Cadence` live in `kaijutsu-kernel/src/hyoushigi/mod.rs`
+> (imported by `beat.rs`), the env vars are `KJ_`-prefixed exactly as WI 7
+> specifies, and the transport surface is
+> `kj transport attach|detach|play|pause|stop|tempo|ooda|rotate` (no `arm`).
+
+- [x] **1. Types** (`kaijutsu-types` + `kernel/hyoushigi/mod.rs`). Add `Attachment`
   + `Cadence` (a beat-divisor newtype) beside `BeatPolicy`. Reshape `BeatCommand`:
   `Arm{…}` → **`Attach{track, ctx, attachment, policy_if_new}`** + **`Detach{track,
   ctx}`**; `Play/Pause/Stop/SetTempo/SetOoda/SetRotate` re-key `ContextId` → **`TrackId`**.
   *Tests:* command round-trip; attach-creates-track-once; divisor math.
-- [ ] **2. Scheduler re-key** (`beat.rs`, the bulk). `armed` → `tracks`; heap →
+- [x] **2. Scheduler re-key** (`beat.rs`, the bulk). `armed` → `tracks`; heap →
   `(Instant, TrackId)`. `fire_due`/`process_one`: a track beats once → advance its
   own playhead + `beat_count` → for each attached ctx whose `wakeup` divisor is due,
   seed that ctx's `Timeline.playhead` from the track playhead, materialize, then
   `fire_lifecycle(tick)`; rotate-due → `fire_rotate`. *Tests:* pause freezes /
   resume at +1 (preserve existing behaviour); two attachments with different wakeup
   divisors fire independently; stopped track = no heap entry.
-- [ ] **3. Retire the playhead-carry** (`beat.rs:295-435, 551-571`). Delete the
+- [x] **3. Retire the playhead-carry** (`beat.rs:295-435, 551-571`). Delete the
   `from_log.max(carried)` seed dance, the persist-playhead-before-stop, and the
   rotate-horizon defer. Track playhead persists once in its `tracks` row, never
   leaves. **Preserve the carry's tests** re-pointed at "the clock stayed on the
   track — continuity is free" (the carry is a stage-0 stepping stone whose tests
   describe the target).
-- [ ] **4. Fork inheritance + re-bind** (`kernel_db.rs:1466-1505` + fork rc). At
+- [x] **4. Fork inheritance + re-bind** (`kernel_db.rs:1466-1505` + fork rc). At
   fork, copy the child's `attachments` row like `beat_state` is copied today. Child
   re-binds via an `Attach` from create/fork rc — the track never watches forks.
   Rotation = child attaches to the **same** track (clock never pauses) + parent
   detaches. No persist-before-stop, no horizon race. *Test:* rotation swaps the
   playing binding with zero playhead discontinuity.
-- [ ] **5. Persistence** (`kernel_db.rs`). Drop `beat_state`; add
+- [x] **5. Persistence** (`kernel_db.rs`). Drop `beat_state`; add
   `tracks(track_id PK, period_ms, beats_per_phrase, ooda_every, playhead_tick,
   transport)` + `attachments(track_id, context_id, wakeup_every,
   rotate_every_phrases, ooda_armed)`. Cold-start re-arm sweep stays **deferred** (as
   today: restart resets to stopped), but the shape supports it. *Test:* CRUD +
   fork-copy of an attachment row.
-- [ ] **6. Transport surface** (`kj/transport.rs`). `arm` → `attach --track <name>
+- [x] **6. Transport surface** (`kj/transport.rs`). `arm` → `attach --track <name>
   [--wakeup N] [--rotate N]`; add `detach`; `play/pause/stop/tempo/rotate` take
   `--track <name>` (kaish does ctx→track lookup so `kj` stays crisp). *Test:* `stop
   --track` halts one domain, leaves a sibling track running.
-- [ ] **7. Fire-coordinate env vars** (`beat.rs:139-156, 846-878` +
+- [x] **7. Fire-coordinate env vars** (`beat.rs:139-156, 846-878` +
   `assets/defaults/rc/musician/`). Rename to **`KJ_TICK/KJ_PHRASE/KJ_TEMPO/KJ_HEARD/
   KJ_ROTATE_EVERY`**; add **`KJ_PULSE`** (per-attachment monotonic counter on
   `Attachment.pulse`) + **`KJ_EPOCH_NS`** (one wall-clock reading shared across all
   contexts woken on the same beat). Update `tick/S10-drive.kai` +
   `rotate/S10-rotate.kai`. *Test:* two contexts woken on one beat see identical
   `KJ_EPOCH_NS` and distinct monotonic `KJ_PULSE`.
-- [ ] **8. Docs** — flip Stage 1 boxes here as they land; devlog entry; update the
+- [x] **8. Docs** — flip Stage 1 boxes here as they land; devlog entry; update the
   `hyoushigi.md` direction note when the clock has actually moved.
 
 ## Decisions made in-flight
@@ -520,17 +535,9 @@ a cluster of restart/handoff gaps. **Fixed in the follow-up commit:**
   reset is consistent with the conversation lifecycle. Full cross-restart durability
   lands with the **cold-start re-arm sweep** (already deferred), which is the right place
   to persist these counters holistically rather than bolting a column on now.
-- **stop/pause → play within one beat period double-beats** (a stale heap entry isn't
-  dropped before `play` re-enlists the track). Pre-existing shape; real transport ops are
-  seconds apart with a beat between (which drains the stale entry), so it's a test-only
-  artifact today. Fix = a per-track **generation token** on heap entries (drop a popped
-  entry whose generation is stale). Documented at the `play()` call site.
-- **Track-scoped `max_tick`** — the track playhead seed uses the *context*'s committed
-  high-water, which over-inflates a cross-track re-attach (a context that played track A
-  to tick 500 then attaches to a fresh track B seeds B at 500). Harmless in Stage 1
-  (a musician is 1:1 with its lane for life) and forward-only (never a rewind); the
-  proper fix is a track-scoped tick query, which **is Stage 2** (the track owns its
-  score). 
+- **Track-scoped `max_tick`** — ✅ closed by Stage 2 WI 4: the seed reads
+  `max_tick(score_ctx)` (the track's own high-water), not the attaching
+  context's.
 - **Rotation gap is unbounded** if the child's boot/turn is queued behind other work; the
   speculation lead covers the *notation*, not the *production* gap. The atomic `Swap`
   transport command (suspend the clock across the handoff) is the eventual closer.
@@ -1007,6 +1014,7 @@ pub trait ClockSource: Send {
   reference instant, an observation timestamp, a rate-of-change term) is designed
   in `docs/midi.md`; it lands with its producer at M3. The trait is proven
   M3-ready by the `next_fire(last, now)` + heap-re-enlistment *design*, not by a
+  shipped no-op stub.
 - **Where it lives:** `TrackState.policy.period` moves *into* `SystemClock`;
   `TrackState` gains `clock: ClockSourceKind` (**enum, decided** — see below).
   `BeatPolicy` keeps `beats_per_phrase` (phrasing is not a clock concern).

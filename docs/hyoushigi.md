@@ -219,13 +219,15 @@ that, opportunistic, never required for correctness.
 
 ## A context owns a timeline, over one store
 
-> **Direction (2026-06-29):** the beat is moving off the context and onto the
-> **track** — the track becomes the clock domain and holds the score (copies of its
-> inputs + a `played_by` back-reference; the score is emergent). So "a context owns
-> a timeline" below describes the *current* (stage-0) reality; under the track
-> reframe the clock + score live on the track and contexts bind to it. See
-> `docs/tracks.md` (the staged plan; this is its stage 1–2). Read this section as
-> the substrate the move builds on, not the end state.
+> **Landed (2026-06-29/30, `docs/tracks.md` Stages 1–3 M1):** the beat moved
+> off the context and onto the **track** — the track is the clock domain and
+> owns the clock, playhead, transport, and score (a durable **score context**,
+> `context_type="score"`, holds the materialized blocks; producers attach,
+> come, and go). So today: a **beaten** (musician) context produces into its
+> *track's* timeline, while a plain coder context owns a per-context timeline
+> exactly as described below. Read this section as the substrate — true
+> per-context for coders, per-track for music — with `docs/tracks.md` as the
+> implementation tracker.
 
 Each kaijutsu context (`ContextId`, a node in the fork/drift DAG) owns a timeline: its
 CRDT block log *with a temporal structure over it*. Hyoushigi does **not** invent its
@@ -386,7 +388,9 @@ callback), advanced lazily by the scheduler, never a loop of its own. A context'
 is *computed on demand* from the timebase (`epoch_tick + elapsed × rate`); a playhead
 nobody is watching is never advanced.
 
-The scheduler is a min-heap of `(next_wake_tick, ContextId)` plus a message ingress, run
+The scheduler is a min-heap of wakeup deadlines — as landed, `(Instant, TrackId)`:
+one entry per *track* (clock domain), each carrying a generation token so a stale
+entry after a stop→play can't double-beat — plus a message ingress, run
 as a single `select!` over two arms:
 
 - **the heap** — sleep until the nearest deadline, wake, coalesce everything due within
@@ -396,11 +400,12 @@ as a single `select!` over two arms:
 
 This makes the cheap things cheap **by construction**:
 
-- **Pausing an inactive context is free** — "paused" is simply *no heap entry*. There is
-  no loop to stop; the context is dormant state at zero CPU until an inbound event re-arms
-  it. A **coder never has a heap entry at all** — it is event-driven, its `Tick` bumped
-  synchronously when a turn appends a block. Contrast N per-context OS timers, where idle
-  still costs a wakeup and a slot each.
+- **Stopping an inactive track is free** — "stopped" is simply *no heap entry*. There is
+  no loop to stop; the track (and every context attached to it) is dormant state at zero
+  CPU until a transport `play` or inbound event re-arms it. A **coder never has a heap
+  entry at all** — it is event-driven, its `Tick` bumped synchronously when a turn appends
+  a block. Contrast N per-context OS timers, where idle still costs a wakeup and a slot
+  each.
 - **Backoff is one heap operation** — push a context's next deadline out (double on
   repeat). The single heap owns the policy globally, and it can be *driven by signals the
   engine already emits*: the `Squashed` ledger (a context burning compute on repeated
@@ -411,7 +416,8 @@ Wakeup work is **fire-and-forget and lightweight on the scheduler** — it advan
 timeline and enqueues/flushes; it must never run a model turn or synthesis inline, or the
 single driver stalls behind one slow context (and the beat can't block). Slow work is
 dispatched to a worker and commits back asynchronously through the existing mailbox /
-block-insert path. The natural work hook is a **new rc verb, `tick`** (a.k.a. `beat`),
+block-insert path. The natural work hook is the **rc verb `tick`** (landed — the
+musician's `tick/S10-drive.kai` rides it, and `rotate` joined it for page-turns),
 materialized the same throwaway-kaish way `create` / `fork` / `drift` already are — new
 verb, old mechanism, no new runtime.
 
@@ -470,7 +476,9 @@ queryable and well-ordered, which is exactly what writing it into the block log 
   never an automatic merge. The associative graph is delegated to the existing DAG +
   `kaijutsu-index`.
 - The kernel is the **time authority**, publishing a per-context **timebase** (not raw
-  pulses); clients run **disciplined** followers. Audio is hardware-clocked.
+  pulses); clients run **disciplined** followers. Audio is hardware-clocked. (Per-*track*
+  for beaten contexts since the track landing; the distribution surface itself is still
+  future — see the status block's "not yet" list.)
 - Hyoushigi is **symmetric across kernel and client** — same crate, same API and
   per-`ContextId` registry; role (authoritative vs. disciplined) is the only difference.
 - **Speculation is narrow:** idempotent/reversible resolves only; side-effecting tools
@@ -515,10 +523,14 @@ queryable and well-ordered, which is exactly what writing it into the block log 
   document may keep evolving without violating the barrier. And the sequencer is continuous
   with the existing per-context **mailbox** — already the atomicity gate that serializes
   block insertion and keeps tool_use/tool_result paired — it merely also assigns the `Tick`.
+  (With the track-owned score, the per-track `Timeline` lock plays the same sequencer role:
+  N producers queue at the track's lock — the per-track analog of the mailbox.)
   So no CRDT capability in actual use is lost: content co-editing and cross-context sync are
   untouched. (Enforcement — rejecting or re-sequencing client-proposed blocks that backdate
-  behind the commit point — lands when multi-writer timelines do; the single-writer first
-  proof needs none of it. Rejected alternatives: per-author/per-lane barriers, which leave
+  behind the commit point — lands when *client-proposed* multi-writer timelines do. Note the
+  distinction: N kernel-side *producers* on one track already ship and serialize at the
+  track lock, above; the deferred enforcement is only about clients proposing blocks that
+  backdate the barrier. Rejected alternatives: per-author/per-lane barriers, which leave
   global state at a tick undefined and force vector-clock-aware cells; conflict-as-squash,
   where a late packet could squash seconds of paid generation.)
 - **`order_key` and `Tick` coexist cleanly.** `order_key` stays the CRDT's sibling-ordering
@@ -531,8 +543,13 @@ queryable and well-ordered, which is exactly what writing it into the block log 
 - **drift's interior** — the receiver-side beat-match (cross-PPQ rescale as a deliberate
   musical op), the in-context preview/listen-before-merge, and the accept/place/re-tempo
   UI. fork (incl. optional sync) is settled; drift's interior is wide open and deferred.
-- **The equivalence-class projection** (`compute_basis`) for the first real resolvers —
-  too strict thrashes, too loose commits stale content. Unwritten until a resolver exists.
+- **The equivalence-class projection** (`compute_basis`) for *reactive* resolvers —
+  too strict thrashes, too loose commits stale content. The first production resolver
+  exists (`CasCommitResolver`) and deliberately hashes only its recipe param — its squash
+  path is **dormant by design** (absolute notation: two players landing notes at one tick
+  should both commit, not cancel each other; the Stage 2 two-cast review confirmed this is
+  the feature). The open part is a basis that *reads committed state*, for a future
+  resolver that reacts to what siblings landed.
 - **Beat cadence (the residue of beat policy).** The *policy* — quantize vs. advance-now
   — is settled above; what stays open is the tuning: the beat *period* per context, and
   whether sibling contexts can share one clock for ensemble drive. Both want the real
@@ -547,132 +564,99 @@ speculation engine that has never speculated. So the first proof is a **musician
 context: the smallest thing whose clock *can't block*, so speculation, squash, and
 fallback are exercised by their first user.
 
-> **Status (landed):** steps 1–3 and the headless core of 4 are implemented and
-> green. The build order was reordered from the list below — the speculative
-> engine (4-core) was proven against an in-memory committed log *before* wiring
-> real block materialization (3), so the novel squash/fallback logic got TDD
-> feedback first. Done: `Tick`/`TickDelta` in `kaijutsu-types` (+ `trybuild`
-> compile-fail guard); the `kaijutsu-hyoushigi` crate (`Cell`/`Body`/`Recipe`/
-> `Fallback`/`CellState`/`Resolver`/`ContentRef`); the in-memory `Timeline` with
-> lead-time derivation, the speculate→commit-or-squash→fallback loop, and a
-> `SquashEvent` ledger (predicted vs. actual basis) — exercised by clean-commit,
-> squash→fallback, and squash→re-speculate→commit tests; a `tick: Option<Tick>`
-> field on `BlockSnapshot` through the **full capnp wire** (schema + both
-> conversion directions + roundtrip test) and all struct-literal sites; the
-> `Cell → BlockSnapshot` materialization (mime → `ContentType::from_mime`, text
-> inline vs. binary-as-CAS-hash byte homes); and the **internal beat** —
-> `tick_at`/`pump` drive the playhead from a wall-clock reading without waiting
-> for resolves (the actual interval timer is the kernel/client integrator's job,
-> keeping the crate runtime-agnostic).
+> **Status — as landed (rewritten to present tense 2026-07-01; the build
+> chronology lives in `docs/devlog.md` — the Tracks Stage 1/2/3 and musician
+> entries — and in this file's git history).** Steps 1–4 below are done; step
+> 5's musician half is done and its external-MIDI half is `docs/midi.md` M3;
+> step 6 is designed in `docs/pcm.md` + `docs/midi.md`. What exists, verified
+> against code:
 >
-> **Kernel integration (landed — the musician slice):** hyoushigi is no longer an
-> island. `kaijutsu-kernel` depends on it and owns a per-context `timelines`
-> registry (`arm_timeline`/`timeline`/`disarm_timeline`); `Resolver` gained a
-> `Send + Sync` bound so a timeline can be pumped from a scheduler thread. The
-> **single coalescing beat scheduler** lives in `kaijutsu-server`
-> (`beat.rs`, twin of the turn driver): a min-heap + ingress, one `select!`,
-> arming only contexts that own a beat (coders never get a heap entry). Each beat
-> it `pump`s the timeline and runs the **CAS+block bridge**
-> (`hyoushigi::materialize_committed`): committed cell → durable CAS → ticked
-> `BlockSnapshot` → `insert_from_snapshot` (now tick-aware: `order_key` derives
-> from the cell's beat coordinate). Materialized cells are authored by
-> `PrincipalId::beat()`. The **`tick` rc verb** is wired; the **musician**
-> `context_type` ships (`assets/defaults/rc/musician/` stance + binding + cache +
-> `tick/S10-drive.kai`), is armed on create, and on its coarse OODA cadence (32
-> bars @ 120 BPM default) fires the `tick` verb (`kj drive`) to request the next
-> turn. (The first production `Resolver` was `abc_to_midi`, crystallizing
-> ABC-by-hash into SMF MIDI; F2 below replaced it with notation-first
-> `cas_commit` + a barrier-side MIDI deriver.) Note: `block.tick` was unified by commit `3d437d4`
-> into a **shared per-context coordinate** (ties allowed; `BlockId` is the unique
-> row id), correcting the earlier "Some only for materialized cells" framing.
->
-> **Transport + closed OODA loop (landed):** the scheduler is the musician's
-> **transport**, with two independent switches — the **clock** (`play`/`pause`/
-> `stop`) and the **OODA-arm** — driven by `kj transport play|pause|stop|tempo
-> <bpm>|ooda <on|off>` (→ `BeatCommand` over the kernel ingress). The context tick
-> is **event-counted**: while playing each beat does `advance_to(playhead + 1)`,
-> so a pause freezes musical time and a resume picks up at **+1** with no
-> wall-clock catch-up — the kernel runs 24×7 and keeps its scheduler alive while a
-> context goes quiescent (no heap entry, zero tokens) and continues "as if nothing
-> happened." Contexts arm **stopped** on create (and after restart) — no surprise
-> token spend; explicit `play` starts. There is **no rewind** (the playhead is
-> forward-only; revisiting the past is an *export* of committed content, not a
-> seek). The OODA loop is closed: on `turn.completed` for an OODA-armed musician
-> the scheduler reads the model's ABC block, stores it to CAS, and
-> `schedule_abc_cell`s a notation cell **one phrase ahead** (F2; was a fixed bar
-> ahead) — so a played musician turns model output into committed notation, and
-> the write barrier derives the MIDI sibling, on the beat, end to end.
+> - **The coordinate:** `Tick`/`TickDelta` in `kaijutsu-types/src/tick.rs`
+>   (+ a `trybuild` compile-fail guard on `Tick + Tick`); `tick: Option<Tick>`
+>   rides `BlockSnapshot` through the full capnp wire. `block.tick` is a
+>   **shared per-context coordinate** (ties allowed; `BlockId` is the unique
+>   row id), while append `order_key`s derive from the predecessor's key
+>   (successor-derived, strictly increasing) — CRDT order matches tick order
+>   without the two ever being the same number.
+> - **The engine:** `crates/kaijutsu-hyoushigi` — `Cell` carries `track` (the
+>   lane identity) + `played_by` (who played; never a lane key — `track ==
+>   None` matches no track); `Body`/`Recipe`/`Fallback`/`CellState`/
+>   `Resolver`/`ContentRef` as specified above; the `Timeline` with lead-time
+>   derivation, the speculate→commit-or-squash→fallback loop, a `SquashEvent`
+>   ledger (predicted vs. actual basis), a `FailureEvent` ledger stamped with
+>   `played_by` (so failures drain to the producer that owns them),
+>   `set_clock` (a tempo change re-slaves the speculation `TickClock`),
+>   `seed_playhead` (virgin-only, crash on time travel), and
+>   `rehydrate_committed` (restart recovery of the committed log). The crate
+>   stays runtime-agnostic; `pump` integrates phase incrementally so a tempo
+>   change only re-rates time after it.
+> - **Kernel integration — track-keyed (`docs/tracks.md`):** for beaten
+>   contexts the timeline lives on the **track**, which owns clock + playhead
+>   + transport + score. A durable **score context** (`context_type="score"`,
+>   app-viewable, never takes a turn) holds the materialized blocks, so every
+>   per-context block API is reused unchanged. Materialize runs **once per
+>   track per beat** through one cursor; resolve failures drain into the
+>   **producing** context's conversation, routed by `played_by`. N producers
+>   on one track coexist structurally (copies + provenance; ties at a tick
+>   allowed); music keeps one playing binding as loadout policy. Coders keep
+>   per-context timelines and never get a heap entry.
+> - **The write barrier in practice:** committed cell → durable CAS → ticked
+>   `BlockSnapshot` → insert into the score context. The committed cell is the
+>   **notation itself** (a validating `cas_commit` resolver commits
+>   `text/vnd.abc` at the tick); a mime-keyed **`DeriverRegistry`**
+>   (`kaijutsu-kernel/src/hyoushigi/mod.rs`) inserts derived siblings at the
+>   barrier — ABC→MIDI as a `Role::Asset` block, `parent_id` = the source,
+>   ≲1 ms measured; anything heavier stays a timeline resolver, never a
+>   deriver. Score blocks are `ephemeral` (hydration-silent), so `KJ_HEARD` is
+>   the player's *only* window onto the score — a player's memory of its own
+>   output flows entirely through it (`docs/chameleon.md` § The stamp-turn
+>   process model).
+> - **The transport:** the beat scheduler (`kaijutsu-server/src/beat.rs`) is
+>   the single coalescing driver described above — one `(Instant, TrackId)`
+>   heap + ingress, generation tokens against stale entries. Surface:
+>   `kj transport attach|detach|play|pause|stop|tempo|ooda|rotate|render`,
+>   track-scoped. The tick is **event-counted**: pause freezes musical time
+>   and resume picks up at +1 — no wall-clock catch-up, no rewind (revisiting
+>   the past is an export, not a seek). Tracks arm **stopped** (no surprise
+>   token spend). The OODA (observe–orient–decide–act) loop is closed: on `turn.completed` for an
+>   OODA-armed attachment, the scheduler validates the model's ABC and
+>   schedules a notation cell **one phrase ahead** (`beats_per_phrase` on the
+>   policy; `phrase_delta()`/`is_phrase_boundary()` are the consumers). Clock
+>   sources are pluggable behind `ClockSourceKind`
+>   (`kaijutsu-server/src/clock.rs` — `SystemClock` today, the drift-modeled
+>   MIDI source at `docs/midi.md` M3), and committed cells feed
+>   `RenderTarget`s (`kaijutsu-server/src/render.rs` — `AlsaMidiOut`
+>   live-verified on zorak, attached via `kj transport render`).
 >
 > **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
-> transport surface (today `kj transport` only); external-MIDI clock discipline;
-> disarm-on-archive and the cold-start **re-arm sweep** (no archive RPC yet;
-> restart resets to stopped, doesn't re-arm — but arming is now restart-safe:
-> F2's arm-time playhead seed and log-seeded seq lanes make a future sweep safe
-> by construction); a richer `compute_basis` / section-placement policy (the
-> notation cell is scheduled one phrase ahead for now); a `Midi` `ContentType`
-> render variant; and step 6 (audio). **Still open:** attach `hyoushigi.tick` as a span attribute on the materialize→insert
-> spans (the producer now exists, so this can land).
->
-> **Order/tick decoupling + track identity (Chameleon batch 1, F1 — landed):**
-> append `order_key`s are now derived from the **predecessor's key** (a
-> width-preserving successor), never from any tick/seq counter — so a stale
-> counter after a restart oplog replay can no longer mis-sort a fresh append.
-> `Tick` is the **pure semantic coordinate** (windowed reads, `$HEARD`,
-> transport), stamped from the per-context tick high-water (restored by
-> `merge_ops` and seeded across forks); `order_key` is the CRDT sibling-ordering
-> index. They co-vary at the sole sequencer but are no longer the same number.
-> **Successor keys are strictly increasing**, so within-beat order = insertion
-> order at the sequencer; ties *at the tick coordinate* remain allowed
-> (shared-coordinate doctrine — `BlockId` is the unique row id), but two appends
-> never share a key. **Lane-vs-author contract:** a materialized block carries a
-> `track` (the stable lane identity, DAW sense — where the clip lives) while
-> `BlockId.principal_id` records **who played** (the player whose turn produced
-> the ABC, or `beat()` when the transport itself filled a vamp). The principal is
-> **never** a lane key; `track` is the only lane identity, and `track == None`
-> matches **no** track — a legacy/untracked block can never satisfy another
-> track's `UseLastGood` or a future `$HEARD` query.
->
-> **Notation-first materialization + phrase vocabulary (Chameleon batch 1, F2 —
-> landed):** the committed cell is now the **notation itself**. A trivial
-> validating `cas_commit` resolver (replacing `abc_to_midi`) commits the ABC
-> body (`text/vnd.abc`) at the tick; the write barrier
-> (`materialize_committed`) consults a mime-keyed **`DeriverRegistry`** and
-> inserts the MIDI as a **derived sibling block** — same tick, same track,
-> `Role::Asset`, content = 32-hex CAS hash, `parent_id` = the ABC source block.
-> The MIDI never enters the committed log, so the `UseLastGood` pool is
-> notation-pure by construction; fallback copies derive their own sibling at the
-> new tick (the vamp repeat falls out, no second mechanism). The ABC source
-> materializes as `Role::Model` + inline + `ContentType::Abc` → renders as a
-> staff with zero app change. Both blocks are stamped **`ephemeral`** so the
-> score does not flood hydration as assistant text (a batch-1 mitigation;
-> batch-2's hydration marker subsumes it). Derivation runs in **≲1 ms** at the
-> barrier (measured: ~300 µs release, ABC parse + `to_midi` + CAS + two inserts);
-> anything heavier (midi→pcm) stays a timeline resolver, never a deriver. The
-> timebase policy now speaks **`beats_per_phrase`** (`musician_default` = 16,
-> `ooda_every` = 8×16 = 128 beats); `phrase_delta()`/`is_phrase_boundary()` are
-> the only consumers, and `OODA_LEAD` is gone — turns schedule **one phrase
-> ahead**. **Restart safety landed in-slice:** per-principal seq lanes seed from
-> the block log (no `DuplicateBlock` after restart), `seed_playhead` seeds the
-> playhead from the max committed tick at arm (fresh-only, crash on time
-> travel), and `insert_from_snapshot` bumps `next_tick` past a carried tick.
+> transport surface (today `kj transport` is the only surface); external-MIDI
+> clock discipline (`docs/midi.md` M3); disarm-on-archive and the cold-start
+> re-attach sweep (restart resets to stopped; re-attach is manual, and arming
+> is restart-safe by construction — playhead and committed log rehydrate from
+> the score context); a richer `compute_basis` / section-placement policy
+> (cells schedule a fixed phrase ahead); a `Midi` `ContentType` render
+> variant; audio (step 6 — `docs/pcm.md`); the `hyoushigi.tick` span
+> attribute on the materialize→insert spans.
 
-1. **Generalize position first** — land the `Tick` / `TickDelta` split as the
+1. ✅ **Generalize position first** — land the `Tick` / `TickDelta` split as the
    logical-coordinate-with-pluggable-binding generalization, per the spec'd algebra under
    "PPQ is resolution." Both `i64` newtypes in `kaijutsu-types`; the binding is stubbed.
    TDD: assert the arithmetic, plus a compile-fail check (`trybuild`) that `Tick + Tick`
    is rejected. Per-context PPQ rides on the binding, not the coordinate.
-2. **Create the crate** `crates/kaijutsu-hyoushigi`, depending on `kaijutsu-cas` for
+2. ✅ **Create the crate** `crates/kaijutsu-hyoushigi`, depending on `kaijutsu-cas` for
    content refs and on the CRDT block model for materialization. (New surface — the doc no
    longer assumes anything is latent in the block model; see "the reuse is structural.")
-3. **Plumb materialization** — committed cells → blocks. This is where the open data-model
+3. ✅ **Plumb materialization** — committed cells → blocks. This is where the open data-model
    questions get answered, not deferred: `order_key`-vs-`tick`, and `content`/`output`/
    `ContentType` vs. `ContentRef`. Single-writer to start, so the write-barrier-vs-CRDT
    problem is sidestepped (and gated before any collaborative timeline).
-4. **First proof — musician-lite.** A context driven by a minimal *internal* beat (no
+4. ✅ **First proof — musician-lite.** A context driven by a minimal *internal* beat (no
    external MIDI yet) whose playhead can't block, one `Resolver`, and a real
    speculate→commit-or-squash→fallback loop against a first `compute_basis`. This forces
-   the hard core to actually run. Render the resulting timeline in the UI.
-5. **Real musician** — discipline the beat to an *external* MIDI clock, add the musician
-   `context_type` (rc scripts, tool policy), and a MIDI resolver via `kaijutsu-abc`.
-6. **Then the fast end** — audio drivers (hardware-clocked), and the distributed timebase
-   for clients that need to follow a context's beat.
+   the hard core to actually run. (The UI timeline render is the one piece still open.)
+5. ◐ **Real musician** — the musician `context_type` (rc scripts, tool policy) and the
+   ABC path (`kaijutsu-abc` via the `DeriverRegistry`) landed — a local model played the
+   room live 2026-06-30; disciplining the beat to an *external* MIDI clock is
+   `docs/midi.md` M3.
+6. **Then the fast end** — audio drivers (hardware-clocked, `docs/pcm.md`), and the
+   distributed timebase for clients that need to follow a track's beat.

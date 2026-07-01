@@ -2,12 +2,14 @@
 
 > **Status:** design direction, captured 2026-06-29 in a co-design session
 > (Amy + Claude). Decisions are *directions*, not commitments — code is truth,
-> this is where we're aiming. No code yet. Companions: `docs/tracks.md` (the
-> clock-domain substrate; MIDI is its Stage 3 `ClockSource` + a render target),
-> `docs/chameleon.md` (the music application — "MIDI is a render of the score"),
-> `docs/hyoushigi.md` (the `Tick`/`Timeline` primitive and the speculation lead
-> this leans on), `docs/shared-state.md` (the `/run` substrate a probe writes).
-> `tracks.md` is paused on the decisions below.
+> this is where we're aiming. **M1 shipped 2026-06-30** (see Staging); M2–M4
+> are future work. Companions: `docs/tracks.md` (the clock-domain substrate;
+> MIDI is its Stage 3 `ClockSource` + a render target — Stage 3 M1 landed on
+> the decisions below), `docs/chameleon.md` (the music application — "MIDI is
+> a render of the score"), `docs/hyoushigi.md` (the `Tick`/`Timeline` primitive
+> and the speculation lead this leans on), `docs/pcm.md` (the samples half:
+> PCM through the same render seam), `docs/shared-state.md` (the `/run`
+> substrate a probe writes).
 
 ## The insight
 
@@ -193,13 +195,27 @@ real KSP / loft node in later.
   and an attach→off→replace walk against `/proc/asound/seq/clients`).
 - **M2 — Input telemetry, batched.** Capture a local (virtual then real) MIDI in,
   timestamp with ALSA, batch into a MIDI-in track as score blocks over RPC.
-  Snapshot = the track-scoped windowed read.
+  Snapshot = the track-scoped windowed read. The capture spec (written
+  2026-07-01 so the session doesn't rediscover it): captured events commit as
+  `audio/midi` cells; each ALSA timestamp **quantizes to the nearest `Tick` on
+  the track's grid, keeping the raw offset as block metadata** (the M3 drift
+  model's food, and the explicit micro-timing data chameleon's
+  groove-as-data decision wants). The capture loop is a new
+  `crates/kaijutsu-server/src/midi_in.rs` (sibling of `render.rs`), opened via
+  a data-only spec variant analogous to `RenderTargetSpec`, reading an ALSA seq
+  port with the mirrored caps (`WRITE | SUBS_WRITE`, vs `AlsaMidiOut`'s
+  `READ | SUBS_READ`). The MIDI-in context attaches as a probe
+  (`ooda_armed: false`) — a producer that never takes a turn.
 - **M3 — Drift-modeled clock-in.** Observe the virtual clock (then KSP over USB),
   fit the tempo/phase/drift model, phase-lock a local `ClockSource`. This is the
   real Stage 3 MIDI driver, built remote- and estimate-shaped from the start.
 - **M4 — Cross-node + the edge node.** Stand up the loft Lenovo as a kaijutsu
   compute node owning the Eurorack's USB-MIDI; RTP-MIDI for any realtime hop;
   KSP-on-laptop hosts the clock observer and ships the model to the kernel.
+  **Named prerequisite (shared with `docs/pcm.md` slice 4):** the node-agent
+  attach/discovery/ownership RPC model exists only by analogy today ("the
+  first kernel-owned compute node") — write its companion design before either
+  consumer lands.
 - **Later — sense all the clocks; samples-with-MIDI; MIDI 2.0/UMP.** Model the
   drift of every clock we have an app on (multi-clock observation). Sampler nodes
   (MIDI trigger → PipeWire sample). UMP is already in ALSA rawmidi; the symbolic
@@ -213,18 +229,33 @@ real KSP / loft node in later.
   phase-correction vs a lightweight Kalman over the observed pulse intervals,
   emitting `Timebase`-shaped corrections. What observability we want (the model's
   residual is a great health signal — a probe could write it to `/run`). Decide
-  when M3 starts; M1/M2 don't need it.
-- **`ClockSource` trait surface for remote + estimate-driven sources** — settled
-  with `tracks.md` Stage 3, but this doc is the second concrete voice for it
-  (alongside the system clock): bring both to that trait's design.
-- **Render-target seam on the track** — how a track declares "render committed
-  cells to ALSA MIDI out on node X" alongside app-display/audio. Where it lives
-  relative to the score context (a render is a consumer of the track's score, not
-  a producer — likely an attachment shape or a separate render registry).
+  when M3 starts; M1/M2 don't need it. The kernel-side hook it feeds
+  (`apply_estimate` + heap re-enlistment) is already designed into the
+  `ClockSource` shape — `tracks.md` Stage 3 — but deliberately not stubbed.
+  Two contract facts for that session, already fixed by the landed trait
+  (`crates/kaijutsu-server/src/clock.rs`): `next_fire(last, now)`'s `last` is
+  the previously *scheduled* fire instant (not the jittery pop time), so the
+  model measures residual drift apples-to-apples; and `period()` must return
+  the *instantaneous effective* period — `KJ_TEMPO` readback and the
+  speculation `TickClock` both derive from it, so a curve-holding estimator
+  snapshots its current point there.
 - **Where the clock observer process lives** when KSP is on the WiFi laptop — a
   kaijutsu node agent on the laptop is fine (it ships a model, not pulses), but
   confirm the laptop runs a node agent vs. moving KSP's USB to a wired node.
-- **MIDI-in track conflict with music producers** — `tracks.md` left concurrent
-  producers as a loadout policy; a MIDI-in (human) track and a model producer on
-  the *same* lane is exactly the concurrent-producer case to think through if Amy
-  wants to play *with* the band on one lane rather than a parallel one.
+- **MIDI-in on the same lane as a model producer** — the *substrate* answer
+  landed with `tracks.md` Stage 2's concurrent-producer model: N producers on
+  one track coexist by construction (each committed cell carries `played_by`;
+  ties at a tick are allowed; nothing squashes a co-producer's absolute
+  notation). Music keeps one *playing* binding per track as **loadout policy**,
+  not structure. What's still open is the *musical* policy when Amy plays with
+  the band on one lane: does the human's MIDI-in share the model's lane
+  (two `played_by`s, one track) or ride a parallel track — and what
+  `UseLastGood` should repeat in the mixed case (today it's lane-scoped,
+  producer-blind — a decision, not a bug).
+
+Resolved since the design round (kept here so old readers don't re-open them):
+the **`ClockSource` trait surface** and the **render-target seam** both landed
+2026-06-30 with `tracks.md` Stage 3 M1 — `ClockSourceKind`/`SystemClock` in
+`crates/kaijutsu-server/src/clock.rs`, `RenderTarget`/`AlsaMidiOut` in
+`crates/kaijutsu-server/src/render.rs`, attach/detach via
+`kj transport render` (see Staging M1 above).
