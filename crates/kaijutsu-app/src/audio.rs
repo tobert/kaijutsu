@@ -43,8 +43,12 @@ fn play_audio_directives(
 
         match audio {
             AudioRef::Encoded { bytes, .. } => {
+                // One copy: `Arc::from(&[u8])` clones the slice straight into the
+                // Arc allocation. (`bytes.clone().into()` would allocate a Vec
+                // copy *then* reallocate it into the Arc — two copies of the
+                // sample.) `Encoded` is the small-sample path, but even so.
                 let handle = sources.add(AudioSource {
-                    bytes: bytes.clone().into(),
+                    bytes: std::sync::Arc::from(bytes.as_slice()),
                 });
                 // DESPAWN (not the ONCE default): a fire-and-forget sample
                 // shouldn't leave a drained-sink entity sitting in the world

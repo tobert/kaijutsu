@@ -5072,32 +5072,11 @@ impl kernel::Server for KernelImpl {
 
         let has_filter = filter.has_active_constraint();
 
-        // Determine which FlowBus topics to subscribe to based on event_types filter.
-        // If event_types is set, only subscribe to matching topics (leveraging Phase 2 topic partitioning).
-        let subscribe_pattern = if !filter.event_types.is_empty() {
-            // If only one event type, subscribe to just that topic for maximum efficiency.
-            // Otherwise fall back to wildcard.
-            if filter.event_types.len() == 1 {
-                match filter.event_types[0] {
-                    kaijutsu_types::BlockFlowKind::Inserted => "block.inserted",
-                    kaijutsu_types::BlockFlowKind::TextOps => "block.text_ops",
-                    kaijutsu_types::BlockFlowKind::Deleted => "block.deleted",
-                    kaijutsu_types::BlockFlowKind::StatusChanged => "block.status",
-                    kaijutsu_types::BlockFlowKind::CollapsedChanged => "block.collapsed",
-                    kaijutsu_types::BlockFlowKind::ExcludedChanged => "block.excluded",
-                    kaijutsu_types::BlockFlowKind::Moved => "block.moved",
-                    kaijutsu_types::BlockFlowKind::SyncReset => "block.sync_reset",
-                    kaijutsu_types::BlockFlowKind::OutputChanged => "block.output",
-                    kaijutsu_types::BlockFlowKind::MetadataChanged => "block.metadata",
-                    kaijutsu_types::BlockFlowKind::ContextSwitched => "block.context_switched",
-                    kaijutsu_types::BlockFlowKind::PlayAudio => "block.play_audio",
-                }
-            } else {
-                "block.*"
-            }
-        } else {
-            "block.*"
-        };
+        // Which FlowBus topics to subscribe to, given the event_types filter.
+        // Must stay a superset of what `matches_filter` can pass — directives
+        // (PlayAudio) always pass, so the narrow single-topic partition is only
+        // safe for a lone directive filter (see `filtered_subscribe_pattern`).
+        let subscribe_pattern = filtered_subscribe_pattern(&filter.event_types);
 
         {
             let block_flows = self.kernel.kernel.block_flows().clone();
@@ -6231,6 +6210,29 @@ fn set_audio_ref(mut builder: crate::kaijutsu_capnp::audio_ref::Builder<'_>, aud
     match audio {
         kaijutsu_audio::AudioRef::Encoded { bytes, .. } => builder.set_encoded(bytes),
         kaijutsu_audio::AudioRef::Cas { hash, .. } => builder.set_cas_hash(&hash.to_string()),
+    }
+}
+
+/// The FlowBus topic pattern a **filtered** client block-subscription listens on.
+///
+/// This pattern must be a *superset* of everything `BlockFlow::matches_filter`
+/// can pass: the pattern gates what reaches the bridge, `matches_filter` gates
+/// what is forwarded, and anything the pattern excludes is silently dropped
+/// before `matches_filter` ever runs. `PlayAudio` is a directive that
+/// `matches_filter` passes **unconditionally** (docs/pcm.md — "every subscriber
+/// hears it"), so every filtered subscription MUST include `block.play_audio`.
+/// A single FlowBus pattern can't express "block.status OR block.play_audio",
+/// so the narrow single-topic fast path is only safe when the lone requested
+/// type *is* that directive; any other single type widens to `block.*` and lets
+/// `matches_filter` do the gating. (Found by the deepseek review 2026-07-01: the
+/// old inline code narrowed e.g. `[StatusChanged]` → `block.status` and silently
+/// dropped audio directives.) If a high-throughput narrow subscriber ever needs
+/// the topic partition back, the fix is a *second* subscription for directive
+/// topics, not re-narrowing here.
+fn filtered_subscribe_pattern(event_types: &[kaijutsu_types::BlockFlowKind]) -> &'static str {
+    match event_types {
+        [kaijutsu_types::BlockFlowKind::PlayAudio] => "block.play_audio",
+        _ => "block.*",
     }
 }
 
@@ -7869,6 +7871,35 @@ impl vfs::Server for VfsImpl {
 // ============================================================================
 // Synthesis (Rhai-driven keyword extraction + representative block selection)
 // ============================================================================
+
+#[cfg(test)]
+mod filtered_subscribe_pattern_tests {
+    //! The filtered block-subscription FlowBus pattern must always be a superset
+    //! of what `matches_filter` passes — in particular it must never narrow away
+    //! `PlayAudio` directives (which `matches_filter` passes unconditionally).
+    use super::filtered_subscribe_pattern;
+    use kaijutsu_types::BlockFlowKind::*;
+
+    #[test]
+    fn lone_directive_filter_can_use_its_own_topic() {
+        assert_eq!(filtered_subscribe_pattern(&[PlayAudio]), "block.play_audio");
+    }
+
+    #[test]
+    fn single_non_directive_filter_widens_to_catch_directives() {
+        // The old inline code narrowed these to "block.status" / "block.text_ops"
+        // and silently dropped PlayAudio directives — this is the regression guard.
+        assert_eq!(filtered_subscribe_pattern(&[StatusChanged]), "block.*");
+        assert_eq!(filtered_subscribe_pattern(&[TextOps]), "block.*");
+        assert_eq!(filtered_subscribe_pattern(&[Inserted]), "block.*");
+    }
+
+    #[test]
+    fn empty_and_multi_type_filters_widen() {
+        assert_eq!(filtered_subscribe_pattern(&[]), "block.*");
+        assert_eq!(filtered_subscribe_pattern(&[StatusChanged, Inserted]), "block.*");
+    }
+}
 
 #[cfg(test)]
 mod live_status_tests {
