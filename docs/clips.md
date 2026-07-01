@@ -1,6 +1,7 @@
 # Clips — placed media on the track
 
-> **Status:** design locked 2026-07-01 (Amy + Claude), synthesized from the
+> **Status:** design settled 2026-07-01 (Amy + Claude) — living notes, revised
+> freely, per house style. Synthesized from the
 > industry survey in `docs/cue-prior-art.md` (seven domains: show control,
 > film post, broadcast, audio production, game middleware, music programming,
 > W3C timed media). **No code yet** — implementation lands with its first
