@@ -178,13 +178,16 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
 
 ## Bevy 0.18 audio specifics
 
-- `kaijutsu-app` already enables Bevy `"default"` features, which include
-  `bevy_audio`. **Add the `wav` format feature** for WAV decode. (`AudioPlayer`
-  component + `AudioSource` asset + `AudioSink`; remember 0.18's `Message`/
-  `MessageReader`/`MessageWriter` rename, per CLAUDE.md.) Slice-3 checklist
-  item: **verify `AudioPlugin` is actually in the app's plugin set** (it rides
-  `DefaultPlugins` when `bevy_audio` is enabled, but neither doc nor code has
-  confirmed the app's plugin group includes it — check `main.rs` first).
+- `kaijutsu-app` enables Bevy `"default"` features. **Checklist item RESOLVED
+  (2026-07-01):** `AudioPlugin` *is* in the plugin set — `default` → `audio =
+  ["bevy_audio", "vorbis"]` → `bevy_audio` (verified against `~/src/bevy`
+  Cargo.toml), and `main.rs` uses `DefaultPlugins` disabling only `LogPlugin`,
+  so no plugin-group work is needed. **But the only decoder `default` turns on
+  is `vorbis` (Ogg) — `wav` is NOT enabled**, so slice 3 MUST add `"wav"` to
+  `crates/kaijutsu-app/Cargo.toml`'s bevy features (`["default", "bevy_ui_debug",
+  "wav"]`) or a WAV `AudioSource` won't decode. (`AudioPlayer` component +
+  `AudioSource` asset + `AudioSink`; remember 0.18's `Message`/`MessageReader`/
+  `MessageWriter` rename, per CLAUDE.md.)
 - **Symphonia later:** rodio (under `bevy_audio`) has a Symphonia backend; enable
   the corresponding Bevy/rodio format features (FLAC/MP3/OGG/AAC) when we want
   them in `-app`. Same crate (`symphonia`) is the kernel sink's decoder.
