@@ -961,6 +961,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   no app/capnp surface). A restart-recovery `attach` button is a natural fit.
   Overlaps the retired playback.md's `TransportFlow` idea, now recorded in
   `docs/pcm.md` § Distributed listening.
+- **Per-listener audio routing (PCM slices 1–3 landed 2026-07-01):** `kj play`'s
+  `BlockFlow::PlayAudio` deliberately **bypasses `matches_filter`** — every
+  attached client hears every `kj play`, regardless of which context it's on.
+  Correct for first-sound (robust when the caller's context ≠ the app's joined
+  context), but the eventual "every listener hears playback on their own output =
+  shared listening" (`docs/pcm.md` § Distributed listening) wants context-scoped
+  routing + a `kj transport route <sink>` verb. Revisit when listening goes
+  multi-peer; it's the natural home for the `PeerConfig` capabilities bag.
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
