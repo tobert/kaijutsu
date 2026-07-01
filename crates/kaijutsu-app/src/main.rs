@@ -39,6 +39,7 @@ struct Cli {
     insecure: bool,
 }
 
+mod audio;
 mod cell;
 mod commands;
 mod config;
@@ -154,6 +155,8 @@ fn main() {
         ))
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ActorPlugin { ssh_config })
+        // PCM sample playback sink (docs/pcm.md slice 3): ServerEvent::PlayAudio -> AudioPlayer
+        .add_plugins(audio::AudioOutPlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

@@ -13,6 +13,7 @@ dynamic_linking = ["bevy/dynamic_linking"]
 
 [dependencies]
 kaijutsu-abc.workspace = true
+kaijutsu-audio.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-kernel.workspace = true
@@ -24,7 +25,9 @@ kaijutsu-telemetry.workspace = true
 kaish-kernel.workspace = true
 logos = "0.16"
 
-bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
+# "wav" decodes PCM samples (docs/pcm.md slice 3); "default" only turns on
+# "vorbis" (Ogg), so a WAV AudioSource would silently fail to decode without it.
+bevy = { version = "0.18", features = ["default", "bevy_ui_debug", "wav"] }
 bevy_brp_extras.workspace = true
 bevy_mesh.workspace = true
 bevy_remote.workspace = true
@@ -81,3 +84,4 @@ image = "0.25"
 crossbeam-channel = "0.5"
 tempfile = "3"
 pollster = "0.4"
+kaijutsu-cas.workspace = true

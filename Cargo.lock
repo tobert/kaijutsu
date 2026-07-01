@@ -4917,6 +4917,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "http"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5697,6 +5703,8 @@ dependencies = [
  "image",
  "indexmap",
  "kaijutsu-abc",
+ "kaijutsu-audio",
+ "kaijutsu-cas",
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",
@@ -8956,6 +8964,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7ceb6607dd738c99bc8cb28eff249b7cd5c8ec88b9db96c0608c1480d140fb1"
 dependencies = [
  "cpal",
+ "hound",
  "lewton",
 ]
 
