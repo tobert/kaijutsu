@@ -5732,6 +5732,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kaijutsu-cas",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kaijutsu-cas"
 version = "0.1.0"
 dependencies = [

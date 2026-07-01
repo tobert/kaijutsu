@@ -96,11 +96,13 @@ pub enum AudioRef {
 - **`AudioFormatHint` values align with Symphonia's codec set** (`Wav | Flac |
   Mp3 | Ogg | Aac` to start); the wire MIME derives from it (`audio/wav`, …).
 
-The trait + `AudioRef` + format types live in the **`kaijutsu-audio` crate
-(confirmed — no longer an open question)**, which is **FFI-free**: no
-`alsa`/`pipewire`/`symphonia`. Its dependency set is `kaijutsu-cas` (for
-`ContentHash`) + `kaijutsu-types`, nothing kernel-ward — never
-`kaijutsu-hyoushigi`/`-kernel`/`-server`. The FFI deps live only in the
+The trait + `AudioRef` + format types live in the **`kaijutsu-audio` crate**
+(landed, slice 1), which is **FFI-free**: no `alsa`/`pipewire`/`symphonia`,
+no `tokio` (the trait's `at` is a `std::time::Instant`; sinks convert). Its
+dependency set is `kaijutsu-cas` (for `ContentHash`) — `kaijutsu-types` is
+allowed but not currently pulled (nothing in it needs it yet) — plus `anyhow`
+(the trait's `Result`) + `serde` (the wire/record derives); nothing
+kernel-ward, never `kaijutsu-hyoushigi`/`-kernel`/`-server`. The FFI deps live only in the
 consuming binaries (`kaijutsu-app`, the edge-node agent), so the kernel can
 depend on `kaijutsu-audio` for orchestration without ever linking a hardware
 library.
@@ -189,9 +191,11 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
 
 ## Slices
 
-1. **Seam + types.** `AudioRenderTarget` trait + `AudioRef`/`AudioFormatHint` in
-   the new **FFI-free `kaijutsu-audio` crate**. No platform code, no audio deps —
+1. **Seam + types. ✅ landed.** `AudioRenderTarget` trait + `AudioRef`/`AudioFormatHint`
+   in the new **FFI-free `kaijutsu-audio` crate**. No platform code, no audio deps —
    the kernel depends on this for orchestration; sinks live in their binaries.
+   `AudioFormatHint` carries the `mime()`/`from_mime()`/`from_path_extension()`
+   round-trip (the wire MIME + `kj play` extension sniff). 7 tests green.
 2. **Wire the directive.** New `BlockEvents` audio-play callback in
    `kaijutsu.capnp`; client forwarder plumbing in `subscriptions.rs`; `kj play`
    command that resolves a sample and emits it.
