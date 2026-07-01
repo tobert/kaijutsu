@@ -21,7 +21,13 @@ pub trait AudioRenderTarget: Send {
 /// What crosses the wire / the seam. Encoded bytes + a format tag, or a CAS
 /// ref the sink resolves. Decoding lives at the sink (Bevy decoders /
 /// Symphonia) — the wire never carries raw PCM.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// `Debug` is hand-written (not derived) so it NEVER formats the raw sample
+/// bytes: a directive carrying an inline sample can be large, and a stray
+/// `tracing::debug!(?flow)` deriving down to this type would otherwise dump the
+/// whole buffer as an int array into a log line. We print the byte *count*
+/// instead (gemini-pro review, 2026-07-01).
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AudioRef {
     /// Small samples inline.
     Encoded {
@@ -34,6 +40,24 @@ pub enum AudioRef {
         hash: ContentHash,
         format: AudioFormatHint,
     },
+}
+
+impl std::fmt::Debug for AudioRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioRef::Encoded { bytes, format } => f
+                .debug_struct("Encoded")
+                .field("format", format)
+                // The count, never the bytes — see the type doc.
+                .field("bytes", &format_args!("[{} bytes]", bytes.len()))
+                .finish(),
+            AudioRef::Cas { hash, format } => f
+                .debug_struct("Cas")
+                .field("format", format)
+                .field("hash", hash)
+                .finish(),
+        }
+    }
 }
 
 impl AudioRef {
@@ -164,6 +188,30 @@ mod tests {
         };
         assert_eq!(encoded.format(), AudioFormatHint::Ogg);
         assert_eq!(encoded.mime(), "audio/ogg");
+    }
+
+    #[test]
+    fn debug_elides_sample_bytes() {
+        // A directive's Debug must never dump the raw sample buffer (a stray
+        // `debug!(?flow)` would otherwise log MB of int array). Derived Debug
+        // would print `bytes: [1, 2, 3, 4, 5]`; the hand-written one prints the
+        // count. This test fails on the derive.
+        let r = AudioRef::Encoded {
+            bytes: vec![1, 2, 3, 4, 5],
+            format: AudioFormatHint::Wav,
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("[5 bytes]"), "debug shows the byte count: {s}");
+        assert!(!s.contains("1, 2, 3"), "debug must NOT dump raw bytes: {s}");
+        assert!(s.contains("Wav"), "debug still shows the format: {s}");
+
+        // Cas has no bytes to leak — but confirm it still Debugs its hash.
+        let c = AudioRef::Cas {
+            hash: ContentHash::from_data(b"x"),
+            format: AudioFormatHint::Flac,
+        };
+        let cs = format!("{c:?}");
+        assert!(cs.contains("Cas") && cs.contains("Flac"), "cas debug: {cs}");
     }
 
     #[test]

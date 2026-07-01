@@ -990,18 +990,21 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **PCM review findings — gemini-pro batch (2026-07-01), triaged:** the batch
   reviewed slices 1–3 holistically. Verdicts (deepseek's filtered-subs bug was
   the one already fixed in `9b1842ea`):
-  - **Encoded byte-churn — REAL, worth doing.** `AudioRef::Encoded{bytes: Vec<u8>}`
-    is deep-cloned per FlowBus receiver (async_broadcast clones), again into the
-    client `ServerEvent`, again in the app. Fix candidates: (a) `Arc<[u8]>` on the
-    type (needs serde `rc` feature; makes every pipeline clone an atomic bump), or
-    (b) the *design* answer — `Encoded` is contractually the **tiny-sample** path;
-    large samples should ride `Cas` (slice 5), which keeps bytes off the bus
-    entirely. Likely both: Arc for the tiny path + enforce a size cap that routes
-    large → Cas. **Design call for Amy before landing** (touches the type + 4 crates).
-  - **`Debug`/`Serialize` byte-spam — REAL (latent).** `BlockFlow` derives `Debug`;
-    a `tracing::debug!(?flow)` on a `PlayAudio` would dump the whole sample as an
-    int array. No current logger does, but a manual `Debug` for `AudioRef` that
-    elides bytes (`[u8; N]`) is cheap insurance. Bundle with the Arc change.
+  - **Encoded byte-churn — noted opportunity, deprioritized (Amy, 2026-07-01).**
+    `AudioRef::Encoded{bytes: Vec<u8>}` is deep-cloned per FlowBus receiver
+    (async_broadcast clones), again into the client `ServerEvent`, again in the
+    app. An `Arc<[u8]>` would make every clone an atomic bump — but we're NOT
+    optimizing the inline path. **The decided direction is to push most/all bulky
+    IO through CAS** (`Encoded` stays the genuinely-tiny path; large samples ride
+    `Cas`, which keeps bytes off the bus entirely — the slice-5 convergence,
+    `docs/pcm.md` "How it converges"). So the fix is architectural (route bulk →
+    CAS), not an `Arc` micro-opt. Revisit `Arc` only if a real tiny-sample hot
+    path ever shows churn.
+  - **`Debug` byte-spam — FIXED (2026-07-01).** `AudioRef` now hand-writes `Debug`
+    to print the byte *count*, not the buffer, so a `tracing::debug!(?flow)` down
+    through `BlockFlow::PlayAudio` can't dump a whole sample into a log line.
+    (`Serialize` still round-trips the bytes — that's the wire/record contract,
+    not a logging path; nothing serializes `AudioRef` to JSON for logs.)
   - **"Echo" multi-subscription bug — NOT REAL as described (verified).** Claim: N
     open contexts → N subscriptions → N simultaneous plays. But subscriptions are
     deduped by `(principal, instance)` (a client instance holds ONE, replaced not
