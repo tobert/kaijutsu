@@ -199,11 +199,21 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
    the kernel depends on this for orchestration; sinks live in their binaries.
    `AudioFormatHint` carries the `mime()`/`from_mime()`/`from_path_extension()`
    round-trip (the wire MIME + `kj play` extension sniff). 7 tests green.
-2. **Wire the directive.** New `BlockEvents` audio-play callback in
-   `kaijutsu.capnp`; client forwarder plumbing in `subscriptions.rs`; `kj play`
-   command that resolves a sample and emits it.
-3. **App sink.** `BevyAudioOut` + the Bevy system; add the `wav` feature.
-   **Verify a WAV plays end-to-end:** `kj play <wav>` → sound.
+2. **Wire the directive. ✅ landed.** New `BlockEvents.onPlayAudio @13` in
+   `kaijutsu.capnp` (+ wire `AudioRef` union encoded|casHash + `AudioFormatHint`
+   enum); the directive rides a new `BlockFlow::PlayAudio` on the in-process
+   **FlowBus** (not a client-callback list) — both `rpc.rs` bridges forward it,
+   `matches_filter` bypasses it (a directive, not a filterable block). Client
+   forwarder `on_play_audio` → `ServerEvent::PlayAudio` in `subscriptions.rs`;
+   `kj play <path>` resolves a sample (sniff-before-read, fail loud) and emits it.
+3. **App sink. ✅ landed + live-verified.** `crates/kaijutsu-app/src/audio.rs`
+   (`AudioOutPlugin` + a `MessageReader<ServerEventMessage>` system → `AudioSource`
+   + `AudioPlayer`/`PlaybackSettings::DESPAWN`); added the `wav` feature. **Verified
+   live on the runner box (2026-07-01):** `kj play pawlsa-test.wav` → "209850 bytes,
+   audio/wav — 2 listener(s)"; BRP `world_query` caught the spawned entity
+   (`PlaybackSettings{ mode: Despawn }` — `AudioPlayer<AudioSource>` is a generic,
+   so not reflection-registered; query `PlaybackSettings` instead). Audible-sound
+   confirmation: Amy (speakers on the Wayland box).
 4. **(later) Edge-node agent sink.** A new peripheral binary (the `midi.md`
    "first kernel-owned compute node") attaches over RPC and runs `AlsaPcmOut` —
    Symphonia decode + `pawlsa`'s ALSA PCM loop; headless play with no GUI. The
