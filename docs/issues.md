@@ -987,6 +987,39 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   so a forward-compat client loses its subscription for not knowing one new push.
   A "best-effort, ignore-if-unimplemented" push tier for directive-style events
   (vs. must-deliver block ops) might be the right shape.
+- **PCM review findings — gemini-pro batch (2026-07-01), triaged:** the batch
+  reviewed slices 1–3 holistically. Verdicts (deepseek's filtered-subs bug was
+  the one already fixed in `9b1842ea`):
+  - **Encoded byte-churn — REAL, worth doing.** `AudioRef::Encoded{bytes: Vec<u8>}`
+    is deep-cloned per FlowBus receiver (async_broadcast clones), again into the
+    client `ServerEvent`, again in the app. Fix candidates: (a) `Arc<[u8]>` on the
+    type (needs serde `rc` feature; makes every pipeline clone an atomic bump), or
+    (b) the *design* answer — `Encoded` is contractually the **tiny-sample** path;
+    large samples should ride `Cas` (slice 5), which keeps bytes off the bus
+    entirely. Likely both: Arc for the tiny path + enforce a size cap that routes
+    large → Cas. **Design call for Amy before landing** (touches the type + 4 crates).
+  - **`Debug`/`Serialize` byte-spam — REAL (latent).** `BlockFlow` derives `Debug`;
+    a `tracing::debug!(?flow)` on a `PlayAudio` would dump the whole sample as an
+    int array. No current logger does, but a manual `Debug` for `AudioRef` that
+    elides bytes (`[u8; N]`) is cheap insurance. Bundle with the Arc change.
+  - **"Echo" multi-subscription bug — NOT REAL as described (verified).** Claim: N
+    open contexts → N subscriptions → N simultaneous plays. But subscriptions are
+    deduped by `(principal, instance)` (a client instance holds ONE, replaced not
+    stacked), and live-verify showed exactly **1** `AudioPlayer` per play ("2
+    listeners" = app + mcp). Genuinely-multiple sinks each playing IS the intended
+    distributed-listening behavior. A `directive_id` nonce + client LRU dedupe is a
+    reasonable *future* idempotency guard if we ever fan one client into many subs.
+  - **`kj play` requires an ambient context — MINOR.** It resolves the caller
+    context to stamp the directive; with no ambient context it errors. Since the
+    directive bypasses context filtering anyway, falling back to `ContextId::nil()`
+    (which `on_play_audio` already tolerates, unlike `on_context_switched`) would
+    let a truly context-less caller broadcast. Low priority; a design nicety.
+  - **capnp `AudioRef` union default — NOTE only.** Lowest-`@` union arm (`encoded`)
+    is the default discriminant, so a malformed/empty `AudioRef` decodes as
+    `Encoded{empty, Wav}` → the sink EOFs on 0 bytes (a failed decode, logged — not
+    corruption). Benign; document if a `streamingUrl @3`-style arm is ever added.
+  - `from_path_extension` uses `rsplit_once('.')`; `Path::extension()` is more
+    idiomatic (a dir-with-a-dot edge case already fails-loud → error, not misplay).
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
