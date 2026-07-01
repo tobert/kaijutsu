@@ -133,15 +133,13 @@ the standalone slices; `Encoded` inline bytes shrink to a tiny-sample
 convenience. Late-fetch behavior (skip loud vs fire late) is decided at the
 first real sink — the fallback machinery is the natural hook.
 
-The **clip payload format** is deliberately unspecified until its first
-consumer (the lands-with-its-consumer rule). Prior art to mine when that
-session comes: **OpenTimelineIO** (media-reference indirection, JSON),
-**Csound score / TidalCycles mini-notation** (musical-time textual events with
-sample refs + params), **WebVTT** (the minimal id + time-range + payload cue
-shape), **SMIL/TTML** (the W3C XML timing vocabulary), **QLab / MIDI Show
-Control / MOS** (trigger + rundown semantics). None carry CAS refs or musical
-`Tick` natively — expect a small data MIME that borrows vocabulary, not an
-adopted format.
+The **clip payload is designed: `docs/clips.md`** (Shape A —
+`application/vnd.kaijutsu.clip+json`: media hash + mime + required label +
+source range + gain, versioned record + extension bag), synthesized from the
+industry survey in `docs/cue-prior-art.md`. The *code* still lands with its
+first consumer (slice 5); the schema, validation rules, tempo-change default,
+and growth path (stretch policy → Shape B; late-bound cues = Shape C
+resolvers) are locked there so the session starts from a map.
 
 ## Reusable code from `~/src/pawlsa-mcp`
 
@@ -267,10 +265,10 @@ survives, to pick up when listening goes multi-peer:
 - **Inline vs CAS on the wire** — the lean is DECIDED ("How it converges"):
   `Cas` primary + a client-side XDG CAS cache; `Encoded` only for tiny samples.
   Residual: the actual size threshold number.
-- **The clip payload format** — deferred to its first consumer; prior-art
-  shortlist in "How it converges". Its design session pairs with the
-  decouple-Act-from-ABC generalization (`docs/issues.md` — same
-  content-type-keyed move, input side).
+- **The clip payload format** — RESOLVED: designed in `docs/clips.md`
+  (Shape A), research record in `docs/cue-prior-art.md`. The clip *validator*
+  is a voice of the decouple-Act-from-ABC generalization (`docs/issues.md` —
+  same content-type-keyed move, input side).
 - **Routing/volume** — `pawlsa`'s `pw` graph control (default endpoint, node
   volume/mute, links) is deferred to a later surface; first sound just plays to
   the default sink.

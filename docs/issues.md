@@ -1144,15 +1144,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   **budget-excepted deriver** (only if midi→pcm proves fast enough to run at the
   barrier — almost certainly not, soundfont synthesis is heavy). See
   `docs/pcm.md` § Distributed listening (playback.md retired 2026-07-01).
-- **Clip payload format — design session pending (direction set 2026-07-01).**
-  The render seam goes mime-keyed over symbolic content (`docs/pcm.md` "How it
-  converges"): a placed sample is a **clip cell** (CAS ref + placement/params),
-  bytes move out-of-band (SFTP + `/v/blobs`, client-side XDG CAS cache,
-  prefetched under the speculation lead — the lead is the transfer budget).
-  The clip MIME's shape is deferred to its first consumer; prior-art shortlist
-  recorded in pcm.md (OTIO, Csound/Tidal, WebVTT, SMIL/TTML, QLab/MSC/MOS).
-  Pairs with decouple-Act-from-ABC above (same content-type generalization,
-  input side). Vocabulary: "clip" (DAW sense); "cue" stays the trap message.
+- **Clip cells — design DONE (`docs/clips.md`, 2026-07-01); implementation
+  lands with pcm.md slice 5.** Shape A payload
+  (`application/vnd.kaijutsu.clip+json`) over the mime-keyed render seam;
+  bytes out-of-band (SFTP + `/v/blobs`, client XDG CAS cache, prefetched
+  under the speculation lead). Research record: `docs/cue-prior-art.md`.
+  Remaining work when slice 5 opens: the record type + validator in
+  `kaijutsu-audio` (the validator is a voice of decouple-Act-from-ABC above),
+  the first clip-MIME render target, the prefetch path, and the `kj play`
+  clip-emitting form.
 - **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
   spans now that a producer exists.
 - **Multi-listener playback (was `docs/playback.md` — retired 2026-07-01).**

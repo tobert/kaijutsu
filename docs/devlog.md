@@ -410,6 +410,24 @@ to its first consumer with a prior-art shortlist (OTIO, Csound/Tidal, WebVTT,
 SMIL/TTML, QLab/MSC) recorded in pcm.md; "clip" joins track/lane/voice in the
 locked vocabulary so it never collides with chameleon's trap "cues".
 
+**Follow-up ×2 (same day): the clip design itself.** A Sonnet researcher
+surveyed seven industries' cue systems (`docs/cue-prior-art.md`, ~1000 lines,
+spec-verified where it could fetch) and the synthesis wrote itself into
+`docs/clips.md`: every industry re-invents the same six field clusters, and
+hyoushigi's `Cell` already carries half of them — so **`Cell` does not
+expand** (the substrate stays content-agnostic; placement vs source range
+split across cell vs payload, per the EDL/OTIO lesson). Shape A locked:
+`application/vnd.kaijutsu.clip+json` — media hash + mime + *required* label
+(CAS refs are opaque; the label is the anti-SCTE-35-hex repayment) + ms
+source range + dB gain, versioned record + extension bag. The survey's
+sharpest gift was what to say *out loud*: the tempo-change default (tick-
+anchored, no stretch — Reaper's "timebase: time"), span-vs-source-range
+precedence, and that trigger semantics live in the transport, never the
+committed record. Late-bound cues (Wwise-grade) turn out to be
+`Deferred(Recipe)` wearing a different hat — zero new payload fields, gated
+on the reactive `compute_basis` question. No standalone format, ever, unless
+interchange knocks: OTIO won model-first; AES31 stalled format-first.
+
 ## Transport ACK review — the no-deadlock property is real but contingent (2026-06-29)
 
 A morning second-opinion pass over the day's rotate/transport fixes (the ACK fix
