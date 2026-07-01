@@ -969,6 +969,24 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   shared listening" (`docs/pcm.md` § Distributed listening) wants context-scoped
   routing + a `kj transport route <sink>` verb. Revisit when listening goes
   multi-peer; it's the natural home for the `PeerConfig` capabilities bag.
+- **A capnp callback-method addition can wedge a stale client (found 2026-07-01
+  during PCM live-verify):** adding `BlockEvents.onPlayAudio @13` means every
+  client's `block_events` forwarder must implement it. A client built from the
+  OLD schema returns `Unimplemented: Method not implemented` when the kernel
+  pushes the new callback — observed on the un-rebuilt `kaijutsu-mcp` binary
+  (rebuilt `kaijutsu-server` + app, forgot the MCP server), and it appeared to
+  **wedge that client's MCP↔kernel session for ~300s** (a `kj play` shell RPC
+  timed out at 300s, then the session reconnected and the retry returned in
+  118ms; the sound itself played fine — only the un-rebuilt subscriber erred).
+  Two takeaways: (1) **operational** — a capnp change requires rebuilding ALL
+  clients (`-server`, `-app`, AND `-mcp`), not just the two obvious ones; worth a
+  note in the dev-loop docs. (2) **design** — should the kernel tolerate a
+  subscriber that `Unimplement`s a *newer* callback method without wedging or
+  eventually dropping its whole (still-valid) block subscription? The bridge
+  already logs+counts the failure (`SubscriberHealth`/`MAX_SUBSCRIBER_FAILURES`),
+  so a forward-compat client loses its subscription for not knowing one new push.
+  A "best-effort, ignore-if-unimplemented" push tier for directive-style events
+  (vs. must-deliver block ops) might be the right shape.
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
