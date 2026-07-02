@@ -12,23 +12,13 @@ Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
 the `"sftp"` arm in `ssh.rs`). Two DeepSeek reviews + a Gemini Pro batch
 whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
 
-- **Slice 3 — ~~capability binding~~ dissolved (2026-06-27, `docs/slash-v.md`
-  "Capability").** No `bound`, no arming symlink, no TTL: SFTP stays read/view
-  with the lexical `privileged_write_denied` deny; privileged writes happen via
-  shell/MCP/app where the acting `context_id` is ambient (per-operation join).
-  Surviving crumbs: register SFTP connections in the participant registry
-  (slash-v track V slice 2), and the altitude note below stands as hygiene.
-  **The altitude bug the Gemini review flagged:** the lexical deny sits
-  *above* symlink resolution, so a symlink resolving into the gated tree would
-  slip past it (not a live bypass today — symlinks don't cross mount backends and
-  host `/` is read-only — but the gate belongs below resolution).
-  **Re-verified 2026-06-27** (gpal batch raised it again): `LocalBackend::resolve`
-  canonicalizes *and* re-clamps with `canonical.starts_with(canonical_root)`
-  (`vfs/backends/local.rs:102-113`), so a symlink escaping its backend root is
-  rejected `path_escapes_root`; gated paths (`/etc/rc`, `/etc/config`) are a
-  separate `ConfigCrdtFs` mount reached by VFS prefix, not OS-symlink-reachable
-  from another backend. Confirmed not-a-bypass — the altitude fix is hygiene, not
-  a live hole.
+- **Slice 3 dissolved (2026-06-27, `docs/slash-v.md` "Capability")** — SFTP stays
+  read/view with the lexical `privileged_write_denied` deny; per-operation join
+  on the ambient `context_id` covers the real write surfaces. Surviving crumb:
+  register SFTP connections in the participant registry (slash-v track V slice 2).
+  Hygiene note: the lexical deny sits *above* symlink resolution — verified
+  not-a-bypass (twice: `LocalBackend::resolve` re-clamps to root, and gated paths
+  are a separate mount) but the gate belongs below resolution.
 - **Slice 4 — adapter limits.** Rate-limiting + traversal-depth/size caps to
   survive an editor-indexer crawl (the access-pattern-shift DoS in
   `docs/sftp.md` → Security posture). The open-handle cap (1024/session) is a
@@ -53,8 +43,6 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
   not intra-session. Returning the new `FileAttr` atomically from
   `VfsOps::write`/`setattr` closes (a); (b) also needs an atomic-append primitive
   or per-path write serialization. Kernel-wide change, worth doing before slice 4.
-- **Runner-verify** with a stock `sftp`/sshfs client through the real server
-  (kernel rebuild+restart; capnp schema unchanged, but it's a new subsystem).
 
 ## Shared state space + myaku (design `docs/shared-state.md`; myaku detail in git history)
 
@@ -87,18 +75,11 @@ concrete:
   rewrite and OODA writes are turn-cadence, so this is not blocking — but an O(1)
   append would make jsonl logs and `>>` cheap. Also closes the SFTP
   concurrent-appender lost-update facet noted in the SFTP section above.
-- **myaku pulse facility — RETIRED 2026-06-29, folded into beat-on-track +
-  shared-state.** The standalone pulse facility (cadence + death-certificate, "one
-  executor, two trigger front-ends," probes writing `/run/pulse/<x>/{now,history,
-  status}` via `pulse_emit`, the `KJ_TICK`/`KJ_PULSE`/`KJ_EPOCH_NS` coords) was a
-  workaround for the beat being welded to the musician transport. The **beat-on-track**
-  direction (see the new top-level item below + `docs/tracks.md`) dissolves it: a
-  probe is *a context attached to a system-clock track whose tick behaviour writes
-  `/run`*. Its surviving pieces split — **cadence/coords/death-certificate → tracks**;
-  **the `/run` output substrate + `pulse_emit` → this section's shared-state work**
-  (write up the `/run/pulse/<x>/` layout here when that lands). `docs/myaku.md` was
-  deleted 2026-06-29; the detailed standalone design is in git history. The app
-  `DockSparkline` rewrite-to-read-`/run` note still stands.
+- **myaku pulse facility — RETIRED 2026-06-29** into beat-on-track (a probe is a
+  context attached to a system-clock track whose tick writes `/run`; detail in git
+  history, `docs/myaku.md` deleted). Surviving open pieces: the `/run` output
+  substrate + `pulse_emit` land here (write up the `/run/pulse/<x>/` layout when
+  they do); the app `DockSparkline` rewrite-to-read-`/run` note still stands.
 
 ## `/v` surfaces (design canonical in `docs/slash-v.md`; refreshed 2026-07-02)
 
@@ -133,17 +114,6 @@ the design details live in the doc, this entry is the backlog pointer:
 The pass that reframed kaijutsu as an instrument, rewrote the rc create-stances,
 and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
-- **rc DRY — whole-file done, stance-fragment deferred (2026-06-22).** The
-  duplicated whole-file scripts (3 cache bodies × 5 types, broad binding ×3) are
-  now single canonical bodies under a `lib` context_type, composed in by
-  init.d-style symlinks (`ConfigCrdtFs` follows; seed format = a seed file whose
-  body is just a target path; `kj rc` is link-aware). What's *not* done:
-  factoring the shared collaborator ethos out of the `coder`/`director`/`mcp`
-  stances — assessed and **dropped**, the reframe made those genuinely distinct
-  voices with only faint shared sentiment, not a verbatim block worth a fragment.
-  If a real shared stance fragment emerges later, the mechanisms exist: a symlink
-  for a verbatim fragment, or a `.kai` that `cat`s a shared file and emits a block
-  when content must branch on the bound model (proven by the `coder` stance).
 - **Toolie taxonomy:** today's `toolie` is the read-only kind (kaibo-explorer
   style). Add a second, Edit-capable toolie that does bounded editing work —
   distinct binding + stance.
@@ -176,22 +146,11 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   SFTP-style or needs the RPC dedicated-thread treatment.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
-- **`context_type` stringly-typed — beat-decomposition done; newtype declined
-  (`docs/chameleon.md` → "context_type is an rc bundle of features", 2026-06-28).**
-  `context_type` is a bare `String` duplicated across ~6 struct defs
-  (`kernel_db::ContextRow`, `kj/rc.rs`, `kaijutsu-client` rpc+actor,
-  `kaijutsu-mcp::models`, the time-well card), crossing SQLite, capnp, and rc-path
-  resolution. The **beat** coupling — the 3 `== "musician"` sites that gated arming
-  — is **resolved 2026-06-28**: the create-arm moved into `musician/create/
-  S20-arm.kai` (deleting the duplicated Rust arm in both `rpc.rs` and
-  `kj/context.rs`), and the arming verb's gate (now `kj transport attach`) is
-  "has a track lane", not a type name. Zero beat-related string checks remain, so the `ContextType(String)`
-  newtype is **not worth doing** (declined, not deferred). Remaining `"musician"`
-  literals are inert (rc-path strings, test fixtures, the `seed_scripts` assertion).
-  The live follow-ons are the *other axes* (decouple-Act-from-ABC; per-type
-  `BeatPolicy` so `funkMusician` isn't stuck on `musician_default()`), tracked under
-  Hyoushigi. Do NOT make `context_type` a closed `enum`: it names an open
-  **rc-bucket directory** (`project_rc_lifecycle`).
+- **`context_type` newtype — declined, not deferred (2026-06-28).** The beat
+  coupling that motivated it is gone (arm moved into rc; the gate is "has a track
+  lane"). Do NOT make `context_type` a closed `enum` or newtype: it names an open
+  **rc-bucket directory** (`project_rc_lifecycle`). Live follow-ons are the other
+  axes (decouple-Act-from-ABC; per-type `BeatPolicy`), tracked under Hyoushigi.
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
 - **Context-type tool policy (unified governance):** The `kj` surface is now
   capability-gated — escalation-relevant verbs check the caller's loadout via
@@ -207,67 +166,26 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     binding until they're re-created or the kernel restarts. (Editing the seed
     via `kj rc edit` / `kj rc reset` changes what *new* contexts get, not live
     ones — rc fires at lifecycle boundaries, not retroactively.)
-- **RPC session reaping — mostly closed (2026-06-14).** The original report
-  ("warned every 60s for 21+ hours that session `019eb229` is still active —
-  no reap path") was two conflated problems, both now addressed:
-  - *Reaping* is handled at the transport layer by SSH **keepalive**
-    (`ssh.rs` server `Config`, added 2026-05-24: 30s × 3 ≈ 90s dead-peer
-    detection — postdates the 21h zombie). A vanished peer's transport now
-    EOFs, `rpc_system.await` returns, and `ConnectionState::Drop` removes the
-    `session_contexts` entry. Verified on the live server (booted 2026-06-13):
-    every session that was ever warned about *ended cleanly*, including ones
-    open for hours; no surviving zombie.
-  - *The watchdog was a false alarm.* `run_rpc_watchdog` logged `WARN ...
-    still active` every 60s for the entire life of **any** session, so a
-    healthy hour-long connection emitted ~58 lines — it could not tell a
-    long-lived session from a wedge, burying the one signal it existed to
-    surface. Now **activity-gated** (`ssh.rs`): an `ActivityStream` wrapper
-    stamps a timestamp on every byte read/written, and the watchdog warns only
-    when a connection is open but idle past `RPC_IDLE_WARN_THRESHOLD` (120s,
-    above the keepalive reap window).
-  - **Residual (by design, low):** a *truly* wedged `current_thread` LocalSet
-    (a blocking handler) can't be force-killed from outside without thread
-    injection, and the in-thread watchdog goes quiet with it — that silence is
-    the only remaining signal. Not worth chasing until it actually recurs.
-  - Related: auto-memory `tech_debt_peer_reattach_on_reconnect` (app doesn't
-    re-attach after kernel restart). Original find: 2026-06-11 journaling
-    forensics.
-- **Move post-reconnect re-sync orchestration into `kaijutsu-client` — detection DONE,
-  re-fetch delivery remaining (2026-06-24).** Goal: **client owns sync orchestration,
-  app renders** (editor's Design A pushed one boundary out; refines
-  `feedback_thin_client_smart_kernel` at the app/client seam).
-  - **DONE:** reconnect *detection* now lives in the actor — `enter_connected` emits
-    `ServerEvent::Reconnected` on a Connected-after-drop (`bound_kernel_id.is_some()` is
-    the free signal; never the first connect). The app just reacts (bumps
-    `SyncGeneration`); the `ReconnectTracker` fold + its app unit tests are gone. The
-    cuttable-proxy e2e asserts the actor emits `Reconnected`.
-  - **DONE — re-fetch delivery:** `enter_connected` now spawns a re-fetch of the joined
-    context's `get_context_sync` and emits `ServerEvent::ContextResynced { sync }`; the
-    app merges it via `apply_sync_state` (and marks the doc fresh so
-    `check_cache_staleness` won't re-fetch it). The e2e applies the *delivered*
-    `SyncState` and asserts it reconstructs the gap block — the whole client-side loop,
-    not just the signal. The **multi-context wrinkle** resolved as a clean division (not
-    a dual path): the actor eagerly delivers its *joined* context; `Reconnected`'s
-    `SyncGeneration` bump is the *coarse* backstop that re-syncs *non-joined* cached docs
-    lazily on next view (+ the lag case). The joined+active context is covered by the
-    eager delivery, so no redundant fetch in the common case.
-  - **CLEANUP:** there are now **two `SyncGeneration` types** — `kaijutsu-client`
-    (`subscriptions.rs`, doc-commented "bumped on lag or reconnect", currently unused)
-    and the app's own (`actor_plugin.rs`, the wired one). The client one was clearly
-    meant for this; fold the app's into it (or delete the dead one) as part of moving the
-    cache. (Moving the whole `DocumentCache` into the client is the bigger refactor.)
+- **RPC session reaping — residual only (mostly closed 2026-06-14).** Keepalive
+  reaps dead peers (30s × 3) and the watchdog is activity-gated. Residual (by
+  design, low): a *truly* wedged `current_thread` LocalSet can't be force-killed
+  from outside, and the in-thread watchdog goes quiet with it — that silence is
+  the only remaining signal. Not worth chasing until it actually recurs. Related:
+  `tech_debt_peer_reattach_on_reconnect`.
+- **Post-reconnect re-sync — CLEANUP only (detection + re-fetch delivery both
+  shipped 2026-06-24; story in devlog/git).** There are **two `SyncGeneration`
+  types** — `kaijutsu-client` (`subscriptions.rs`, currently unused) and the
+  app's own (`actor_plugin.rs`, the wired one). Fold the app's into the client
+  one (or delete the dead one) as part of moving the cache; moving the whole
+  `DocumentCache` into the client is the bigger refactor.
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.
-- **Reasoning-continuity cross-provider guard (policy, not Rust):** cross-turn
-  thinking now rehydrates — `BlockSnapshot.signature` is an opaque "rehydratable"
-  token (real Anthropic/Gemini sig, or a DeepSeek nonce), set on `ThinkingEnd`,
-  persisted (CRDT snapshot + Cap'n Proto wire), and `hydrate` re-emits *signed*
-  Thinking as `Reasoning` (one block per thinking block). Remaining: block
-  `kj context set --model` across provider families when signed Thinking exists
-  in history (a DeepSeek nonce fed to Anthropic 400s); allow the transition only
-  at `fork`, where an rc script decides to elide thinking or downgrade it to
-  plain blocks.
+- **Reasoning-continuity cross-provider guard (policy, not Rust; the rehydration
+  machinery itself shipped):** block `kj context set --model` across provider
+  families when signed Thinking exists in history (a DeepSeek nonce fed to
+  Anthropic 400s); allow the transition only at `fork`, where an rc script
+  decides to elide thinking or downgrade it to plain blocks.
 - **Cold start seeds no binding-admin context (want a ROOT director).** The
   bootstrap (`kaijutsu-server/src/rpc.rs:1369`) seeds exactly one **`coder`**
   context (`genesis`) when the kernel comes up with zero contexts — nothing with
@@ -327,27 +245,9 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Persistence & Sync
 
-- **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`).** CRDT is the
-  sole owner of config + rc; embedded Rust seeds it once — no host-disk
-  write-through/reload, which **deletes** the dual-ownership silent-fallback cluster
-  for these mounts by construction (supersedes the `MountBackend::read` stale-bytes
-  serve, `append` wipe, `LocalBackend::setattr` mtime no-op, and stale-rc-seed
-  entries elsewhere here, for the rc mount).
-  - **Slice 1 (rc) — ✅ SHIPPED 2026-06-16** (`debfb33`/`2b763c6`/`49c819a`/`a2c1045`):
-    `ConfigCrdtFs` VfsOps backend (`UUIDv5(path)→DocKind::Config`, `documents` table
-    *is* the readdir manifest), seeded from embedded; `/etc/rc` remounted on it; `kj
-    rc` + `load_rc_scripts` route VFS-direct. ⚠ **Live runner verification pending**
-    (needs a server restart).
-  - **Slice 2 (config TOMLs) — ✅ SHIPPED 2026-06-17** (`93c72a7`/`fdd1c18`/`9e581aa`/
-    `a30b266`/`6f2ce9f`): `ConfigCrdtBackend` (debounced host flush + watcher + dirty
-    tracker + disk read-back) **deleted**; a second `ConfigCrdtFs` mounts at
-    `/etc/config`, seeded from embedded (or, on a fresh kernel, from a host
-    `config_dir` if provided — a one-time seed source for tests, never set in
-    production). Readers (models.toml, system.md) route VFS-direct; `kj config
-    show/list/set/reset` is the editing surface, gated on a new `config-write`
-    authority; the app fetches `theme.toml` over RPC (`get_config`) on connect.
-    ⚠ **Live runner verification pending** (needs a server restart), same as slice 1.
-  - Deferred: CRDT scratch mount.
+- **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`) — slices 1+2
+  shipped 2026-06-16/17 and long since exercised live** (`kj rc edit`/`kj config
+  set` are the daily surface). Remaining: the deferred CRDT scratch mount.
 - **rc cutover follow-ups (from slice 1):**
   - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_crdt_rc`
     (DB-backed block store sharing the in-memory `KernelDb` handle) hangs the
@@ -409,28 +309,12 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   conversation with rich content; (2) the unfocused-pane summary, the one
   surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
   multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
-- **Vi editor command mode — `:` dialect (Slice 3, `docs/vi.md` → *Command mode*).**
-  Steps 1+2+3 **shipped** (core verbs `:w/:q/:wq/:q!/:x/:w!`; `:s`/`:%s`/`:N,Ms`;
-  `:r <file>`/`:r !cmd`; Ctrl+Z-suspend / `fg`-resume). Design notes that held:
-  surface stays kernel-owned (app forwards every key); the dialect is its own
-  thing (Rust-regex `:s`, not vim BRE); intent pattern
-  (`CommandRequest`/`take_commands`), **not** modalkit's command machine.
-  **Slice-3 polish landed 2026-06-27** (headless green, **runner-verify pending** —
-  capnp `@6` ⇒ kernel+app rebuild+restart, eyeball `:r !cmd` splice, a bad `:cmd`
-  showing E492 on the strip, and `fg` from a second window):
-  - **`:r !cmd`** now shells out in the **opener's** context (was fail-loud-deferred).
-  - **Opener capture fixed** — `EditorOpener { principal, context_id, session_id }`
-    captured at builtin construction (the old `ToolCtx`→kaijutsu-`ExecContext`
-    downcast was a type mismatch that *always* failed, so `fg` only ever hit the
-    most-recent-of-any fallback). `fg` now targets the caller's own session.
-  - **Bad `:cmd` / bad `:s`** report on `EditorState.message` (vim E492) and keep
-    the session open, instead of erroring `editor_keys`.
-  - **`:w!` == `:w`** (decided 2026-06-27) — `force` reserved for a future
-    changed-under-us guard (concurrent-writer detection), not a permission gate.
-  - **Step 4 — `:e <path>`** (rebind the session to another block) — deferred.
-  - Related separate thread: the Ctrl+Z shell may become a **shadow context**
-    (blocks excluded from the conversation until drifted) — simplify-by-construction,
-    its own design pass; `project_shadow_context_shell` memory.
+- **Vi editor command mode (Slice 3, `docs/vi.md`) — steps 1–3 shipped; open
+  remainders:** runner-verify the slice-3 polish (capnp `@6` ⇒ kernel+app
+  rebuild+restart; eyeball `:r !cmd` splice, bad-`:cmd` E492 on the strip, `fg`
+  from a second window); **step 4 `:e <path>`** (rebind the session to another
+  block) deferred; the Ctrl+Z shell may become a **shadow context** (its own
+  design pass; `project_shadow_context_shell` memory).
 - **Vi editor — residual `config_owned` prefix on the cache-invalidation path.**
   `resolve_editor_target` now decides config-ownership via the mount table
   (`MountTable::owner_of` + `VfsOps::owns_config_docs`, 2026-06-27), but
@@ -580,32 +464,17 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   the `models.toml [model_aliases]` entry to its concrete `provider/model`
   before storage (`resolve_context_config`, 2026-06-14), so the quoted form
   works end-to-end; only the bare-`local` lexer footgun remains.
-- **Local-model turn watchdog — mostly closed; two narrow gaps remain (re-triaged
-  2026-06-16).** The original report ("small local model + full tool palette emits
-  a thinking block then stalls — GPU cold, no `Completed`, no error, turn never
-  terminates", observed 2026-06-13) was addressed on two fronts, both verified in
-  code at HEAD (not re-reproduced):
-  - *Watchdog already exists* (landed `3fdcf79`, 2026-05-10 — a month **before** the
-    report). The turn loop has a dual-layer timeout: `llm_idle_timeout` (30s) wraps
-    **every** `stream.next_event()` (`llm_stream.rs:912`,`:944`) and
-    `llm_request_timeout` (300s) is the total cap (`:903`,`:934`); both emit
-    `StreamEvent::Error` → `TurnFlow::Failed`. Tool calls are individually capped at
-    `TOOL_TIMEOUT_SECS` 120s + interrupt propagation (`:1361`), and they run in a
-    per-tool loop (no unbounded collective). So the mid-turn cold-GPU stall the
-    report describes **should fail loud within 30s at HEAD**. `TimeoutPolicy` is
-    kernel-wide (`kaijutsu-types/src/timeout.rs`); per-model/per-context overrides
-    are the open knob if 30s/300s ever prove wrong for a slow local model.
-  - *The trigger was also removed* — the musician/player rc loadout is now tool-free
-    (see "Musician `kj` loadout — tool-free" under Hyoushigi), so small players no
-    longer get the full palette that provoked the stall.
-  - **Residual (small, genuinely unguarded):** (a) the `provider.stream()` start
-    `.await` (`llm_stream.rs:815`) has retry/backoff but **no explicit timeout** — a
-    provider that accepts the connection but never returns the response object leans
-    on reqwest's defaults; (b) pre-stream hydration / cache reads have no timeout, so
-    a wedge *before* the stream loop emits no terminal event. Both are off the
-    mid-turn path the report hit. Fix each with an explicit timeout + a regression
-    test that wedges the path and asserts a loud `TurnFlow::Failed`. Still worth:
-    make per-provider/per-context `default_tools` the norm so players never get `all`.
+- **Turn-loop timeout gaps (residual of the local-model stall, re-triaged
+  2026-06-16; the dual-layer watchdog + tool-free player loadout cover the main
+  path).** Genuinely unguarded: (a) the `provider.stream()` start `.await`
+  (`llm_stream.rs:815`) has retry/backoff but **no explicit timeout** — a provider
+  that accepts the connection but never returns the response object leans on
+  reqwest's defaults; (b) pre-stream hydration / cache reads have no timeout, so a
+  wedge *before* the stream loop emits no terminal event. Fix each with an
+  explicit timeout + a regression test that wedges the path and asserts a loud
+  `TurnFlow::Failed`. Also worth: per-provider/per-context `default_tools` as the
+  norm so players never get `all`; per-model timeout overrides if 30s/300s ever
+  prove wrong for a slow local model.
 - **P3 — external `mcp__kaijutsu__shell` `data` needs a persisted block field.**
   The *in-kernel* `builtin.shell` now carries kj's `.data` in its `structured`
   envelope (shipped 2026-06-14, `mcp/servers/shell.rs`), and `kj <cmd> --json`
@@ -623,84 +492,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `shell_execute` and read it in the MCP `to_json` (`kaijutsu-mcp/src/lib.rs`).
   CBOR oplog evolution is additive (safe); capnp is the work. P3 because the
   `--json` envelope already unblocks consumers today.
-- **External `mcp__kaijutsu__shell` hangs to timeout — ✅ ROOT-CAUSED + FIXED
-  2026-06-17.** Symptom: after a server+app restart, *every* external shell call
-  timed out — `echo hi` at 20s, `kj context list --tree` at 300s — returning a
-  `block_id` but never the output (`status: "timeout"`); non-CRDT-poll paths
-  (`whoami`/`submit_input`/`listContexts`) stayed responsive, isolating it to
-  shell-output replication. **Root cause (not the network — it's localhost):
-  executor starvation on the MCP client's single-threaded RPC LocalSet, converted
-  into a *permanent silent* failure by a too-aggressive server reap.** Three
-  compounding factors: (1) the MCP subscribed to block events **kernel-wide**
-  (`BlockEventFilter::default()`, `context_ids` empty = all contexts), firehosing
-  it with every other context's events after a restart (cold-start re-hydration +
-  app's director/musician/drift traffic); (2) every delivered event woke the shell
-  poll's `find_terminal`, which called `blocks_ordered()` (the `order_key().to_string()`
-  per-block re-sort, see the perf entry below) under the lock; (3) `from_sync_state`
-  replays the full op-log synchronously on that same thread (register_session +
-  every shell call's Phase 2). Stacked on one `current_thread` executor, a
-  multi-second stall is easy — and the server's FlowBus bridge **broke the
-  subscription permanently on the first 5s callback timeout** (`rpc.rs` `if !success
-  { break }`), so the MCP went silent for the rest of the connection with no
-  re-subscribe path. Fixes shipped: **(1)** server bridge tolerates transient
-  callback stalls via `SubscriberHealth` (reap only after 3 consecutive failures,
-  a success resets; the load-bearing 5s timeout stays — it protects the server's
-  RpcSystem); both bridge loops + unit tests. **(2)** client `resubscribe_blocks`
-  primitive (same `instance` ⇒ server replaces the prior sub); MCP calls it on a
-  shell-poll timeout to recover without a full reconnect. **(3)** block subscription
-  is now **scoped to the joined context** (`block_events_client_and_filter`):
-  handshake scopes from the re-joined context, and `JoinedContext` re-subscribes
-  scoped after register_session — cutting foreign-context volume to zero (also kills
-  the factor-2 `blocks_ordered()` churn for foreign events). Verified: server +
-  client unit tests, `kaijutsu-mcp` `e2e_shell` (incl. sequential commands),
-  `rpc_integration`/`context_sync` green. **Live verification 2026-06-17:** after a
-  server+app rebuild/restart, `echo hi` (257ms) and `kj context list --tree` (285ms,
-  was the 300s-timeout command) and sequential calls all returned `status: "done"`
-  against a *busy* 24-context kernel (running musicians + THE_DIRECTOR ⇒ live
-  foreign-context event flow) — the original symptom is gone. Note this exercised
-  the **server fix (`SubscriberHealth`) + the OLD MCP client** (this session's MCP
-  binary predates the build), so fix (1) — the load-bearing one — is verified live;
-  the client-side scoping + resubscribe (2,3) ride in the MCP binary and are
-  covered by `e2e_shell` until a session whose MCP binary is rebuilt confirms them
-  in situ. Related: P3 above + `project_mcp_synceddocument_sync`.
+- **External shell-hang fix — one residual verification.** The 2026-06-17
+  executor-starvation hang is fixed (`SubscriberHealth` reap tolerance +
+  `resubscribe_blocks` + joined-context-scoped subscription; story in devlog).
+  The server fix is verified live; the *client-side* scoping + resubscribe (2,3)
+  ride in the MCP binary and are covered by `e2e_shell` until a session whose MCP
+  binary is rebuilt confirms them in situ. Related: P3 above +
+  `project_mcp_synceddocument_sync`.
 - **mcp-context default model is an invalid id (observed 2026-06-17).** A context
   created via `register_session` (context_type `mcp`/`default`) defaulted to
   `anthropic/claude-haiku-4-5-20250101` (also seen as `…-20250929`) — a wrong date;
   the valid id is `claude-haiku-4-5-20251001`. Chat turns fail with
   `not_found_error` after 3 attempts. Fix the default model id wherever mcp/default
   contexts are seeded.
-- **`builtin.file` edit/read hardening — ✅ MOSTLY RESOLVED 2026-06-17** (the
-  `docs/issues.md` corruption post-mortem, THE_DIRECTOR `019ed674`). **Root cause
-  (the one the original post-mortem missed):** `edit` computed match positions
-  with `str::match_indices` (BYTE offsets) and `old_string.len()` (BYTE length),
-  then passed them to the **character**-indexed CRDT `BlockStore::edit_text`. On
-  any file with multibyte UTF-8 before the edit site (issues.md is full of `→ ✅
-  改善 ≳ ×`) the offset/length drifted, so it spliced/over-deleted at the wrong
-  place while honestly reporting `Replaced 1 occurrence` (the byte search *did*
-  find a match). The reported contributing factors were real but secondary: (a)
-  the "lying" diff preview was the CRDT faithfully rendering already-corrupted
-  bytes; (b) the line-numbered `read` prefix vs whitespace-exact matching is now
-  sidestepped by hashline anchors; (c) in-context recovery (no `git`/revert) is
-  still open. **Shipped** (`crates/kaijutsu-kernel/src/file_tools/`):
-  - byte→char offset conversion + char-count delete length (`edit.rs`
-    `plan_string_edit`/`byte_to_char`);
-  - **fail-loud post-write verification** — an independently-computed `expected`
-    string is compared to the read-back; any mismatch fails the op instead of
-    reporting false success (the directive: crash over corruption);
-  - **hashline addressing** (per "The Harness Problem" / anthropics/claude-code
-    #25775): `read` now prints `LINE:hash→ content`; `edit` gained an `anchor`
-    mode (`N:hash` or `N:hash..M:hash`) that re-verifies the line hash before
-    writing — a stale anchor fails loud with the current hashes. Subsumes factor
-    (b); the model addresses a line by reference instead of retyping it;
-  - CRLF terminator preservation on anchor edits; empty-file/edge-case guards;
-  - unit + e2e broker tests (multibyte round-trip, anchor round-trip, stale-anchor
-    fail-loud); two DeepSeek/kaibo reviews + a `/code-review` pass.
-  **Remaining (small):** (1) in-context recovery affordance — expose `git`/a
-  revert or `kj block diff --original` in the kaish shell (factor c, untouched);
-  (2) the post-write verification reads the CRDT cache, not the VFS disk, so a
-  faulty flush is only caught by `flush_one`'s own error (documented in `edit.rs`);
-  (3) `FileDocumentCache` CRDT-native pass-through (already tracked under
-  Persistence & Sync) would let `read`'s hashes anchor `/etc/rc` cleanly.
+- **`builtin.file` hardening — remaining (small; the byte→char corruption fix +
+  hashline addressing shipped 2026-06-17, story in devlog +
+  `project_file_tools_hashline`):** (1) in-context recovery affordance — expose
+  `git`/a revert or `kj block diff --original` in the kaish shell; (2) the
+  post-write verification reads the CRDT cache, not the VFS disk, so a faulty
+  flush is only caught by `flush_one`'s own error (documented in `edit.rs`);
+  (3) `FileDocumentCache` CRDT-native pass-through (tracked under Persistence &
+  Sync) would let `read`'s hashes anchor `/etc/rc` cleanly.
   - **kaish-side build-out — design direction (not yet built).** The hash is an
     *edit-addressing* feature, so the kaish read surface wants **two read modes**:
     keep `cat`/`tail`/`sed`/`grep` streaming + **hash-free** (logs/huge files; never
@@ -727,64 +539,26 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
 
-- **Time-well HDR+Bloom — ✅ RESOLVED 2026-06-17 via a single shared camera.**
-  The earlier failure (adding `Bloom` to the `TimeWellCamera` made the cards
-  vanish) was the *two-camera* mismatch: an HDR 3D camera (order 0) composited
-  with the app's LDR `Camera2d` (order 1, `ClearColorConfig::None`) on one target.
-  Fix: the app now has **one always-on `Camera3d`** (`main::setup_camera`, marked
-  `IsDefaultUiCamera`) with `Hdr` + `Bloom::NATURAL` + `Tonemapping::TonyMcMapface`.
-  Bevy UI renders on it (the UI pass runs *after* tonemapping/bloom, so the
-  conversation UI is untouched), and the well repurposes the same camera on enter
-  (adds the `TimeWellCamera` marker + swaps the clear color) instead of spawning
-  its own. No second camera, no composite, no `Camera2d` anywhere. Well cards
-  (3D meshes) now bloom; the conversation is visually unchanged. Driving the
-  cards' SDF rims/pulses to HDR (>1.0) so they bloom brightly is the follow-on
-  (`WellCardMaterial` `params`/emissive).
-- **Time-well step-4 polish (shipped 2026-06-16, `view/time_well/`):**
-  - *Fixed-pitch overlap:* band slots use a fixed angular pitch (TAU/24) so
-    append stays motion-free; but a band with >24 cards wraps slots onto each
-    other (coincident cards → z-fight/draw-swap; `AlphaMode::Mask` mitigates the
-    sort but not coincidence). Real fix for very full bands: sub-rings, smaller
-    cards, or radius LOD. Band 0 is meant for ~10 so this only bites test data.
-  - *Status coverage (gap 3):* ✅ RESOLVED 2026-06-17 (`df3b65b`) — not via
-    `subscribeBlocksFiltered` but via a kernel-derived `ContextInfo.liveStatus`
-    @14: the server reads each context's block statuses in timeline order
-    (`derive_context_live_status`: any Running→Running, else tail Error→Error,
-    else idle) and ships it on every `listContexts` poll. The well sets
-    `Card.status` from it for every visible card, driving the rim pulse; the
-    event-based `apply_block_status` is retired (single source = the poll;
-    the breathe itself is continuous via `globals.time`). Thin-client aligned.
-  - *Readability:* card sizing/camera zoom is functional but text is small at
-    the default framing; tune when the active view (step 6) lands.
-  - *Band-1 sweep direction (cosmetic taste call):* band-1 currently sweeps CCW
-    from the top anchor (positive pitch). A literal clock-face vs. this
-    newest-first sweep is unsettled — the recency *ordering* is settled, the
-    visual sweep is one constant flip away (`scene.rs` `band1_anchor` / pitch sign).
-  - *Hot rim fills only the top semicircle (cosmetic):* ~13 cards from 3 o'clock
-    CCW over 0–180°; the bottom half of the screen is unused. Rebalance the hot
-    start angle if it bugs you.
-- **Edge HUD → in-scene MSDF panels — ✅ SHIPPED 2026-06-18.** The HUD's
-  first-prototype flat Bevy `Text` nodes are now in-scene **MSDF panels**: 3D
-  quads parented to the well camera (screen-stable, no billboard), drawn as thin
-  glowing **accent-tinted borders** with no body fill (`WellCardMaterial.border`
-  uniform), MSDF text inside — HDR/bloom + depth, same vocabulary as the cards.
-  N is centered top with the context name in a larger font; E/W tuck into the top
-  corners (below the status bar); S is hidden. Placed via the pure, unit-tested
-  `hud_slot_offset` (aspect-adaptive, re-derived each frame; size-aware fit hugs
-  the screen edge). Built on the shared `view/time_well/panel.rs` primitive
-  (`create_msdf_panel` + `commit_panel_glyphs`), also used by the rim/reading
-  cards. All knobs are consts at the top of `hud.rs`. Follow-ups (non-blocking):
-  - The mid/lower **E/W sides are now open canvas** — candidates for the drift
-    arcs / activity layer or a secondary readout.
-  - The E specs panel wraps a long model badge (cosmetic).
-- **RTT type rename + split — ✅ SHIPPED 2026-06-18.** `view/vello_ui_texture.rs`
-  → `view/ui_rtt.rs`; `VelloUiTexture` → `UiRttTexture` (now also carries the
-  content-neutral `built_width/height`), `VelloUiScene` → `UiVectorScene`
-  (`{scene, version}`, vello-only). Pure-MSDF surfaces (well cards/reading/HUD,
-  overlay, shell-dock) carry **no** vello type; dual-mode block cells +
-  role-group borders keep `UiVectorScene`. Follow-up (optional, low): `overlay.rs`
-  / `shell_dock.rs` could also adopt `create_msdf_panel`/`commit_panel_glyphs`
-  for their MSDF surfaces (Phase 0 already dropped their vector type).
+- **HDR bloom follow-on:** drive the well cards' SDF rims/pulses to HDR (>1.0)
+  so they bloom brightly (`WellCardMaterial` `params`/emissive). (The shared
+  single-camera HDR+Bloom fix itself shipped 2026-06-17; devlog.)
+- **Time-well step-4 residuals:**
+  - *Fixed-pitch overlap:* a band with >24 cards wraps slots onto each other
+    (coincident cards → z-fight). Real fix for very full bands: sub-rings,
+    smaller cards, or radius LOD. Band 0 is meant for ~10, so this only bites
+    test data.
+  - *Readability:* text is small at the default framing; tune when the active
+    view (step 6) lands.
+  - *Band-1 sweep direction (cosmetic taste call):* clock-face vs the current
+    newest-first CCW sweep — one constant flip (`scene.rs` `band1_anchor`).
+  - *Hot rim fills only the top semicircle (cosmetic):* rebalance the hot start
+    angle if it bugs you.
+- **Edge HUD follow-ups (panels shipped 2026-06-18; devlog):** the mid/lower
+  E/W sides are open canvas — candidates for the drift arcs / activity layer or
+  a secondary readout; the E specs panel wraps a long model badge (cosmetic).
+- **RTT follow-up (rename/split shipped 2026-06-18):** `overlay.rs` /
+  `shell_dock.rs` could adopt `create_msdf_panel`/`commit_panel_glyphs` for
+  their MSDF surfaces (optional, low).
 - **Time-well — deferred UI ideas (parked 2026-06-17, picking up the activity
   layer instead).** All real, none blocking; the active iteration is the
   base-ring kernel-activity indicator (see `viz-substrate.md` step 7.7):
@@ -821,70 +595,35 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Hyoushigi / Musician
 
-- **Beat-on-track refactor — ✅ SHIPPED (Stages 1–3 M1, 2026-06-29/30).** The track
-  owns clock/playhead/transport/score (score context), contexts attach; `ClockSource`
-  + `RenderTarget` landed. Remaining stages (M2–M4: input telemetry, drift-modeled
-  clock-in, edge node) are sequenced in `docs/midi.md`; still-open external-signal
-  clock sources (solar/compute-availability) ride the same `ClockSourceKind` seam.
-  Story: `docs/tracks.md` + devlog.
-- **Relative-lead render timing — ANALYZED before building on it (2026-07-02,
-  Opus + gemini-pro batch + deepseek).** Verdict: the substrate is sound, build
-  the PCM path on it — but a framing correction and a findings list came out of
-  the two-cast review (no diff, whole-file). **The correction:** the
-  `RenderCue { lead }` scheme is NOT a jitter buffer — the playout anchor *is* the
-  jittered arrival (`receipt + lead`), so it *passes arrival jitter through*, it
-  doesn't absorb it. Blast radius is bounded: a whole phrase's MIDI events schedule
-  into the ALSA queue off one anchor, so *intra-phrase* timing is sub-ms perfect;
-  jitter only lands at *phrase/cell boundaries* (seconds apart) → musically
-  invisible for sustained single-sink material, audible only for PCM attack
-  transients + multi-sink flam (app + edge node on independent streams). The
-  algebra holds: Θ (clock offset) cancels, constant latency is free, only jitter
-  costs — provided `lead ≥ transit + sink granularity`. Actionable findings:
-    1. **`beat.rs:940` re-arms `now + period`, not `t + period`** — beat cadence is
-       a *random walk* of accumulated wakeup jitter. Musically irrelevant at phrase
-       granularity now (documented intentional at `clock.rs:65-69`, "absorbs
-       scheduler jitter into the period"), but once `SystemClock` is the *reference
-       for a remote edge-node PLL*, the drift becomes a bias that accumulates.
-       One-line fix (`t + period`), and it's what a metronome wants. Deferred — a
-       timing-behavior change; land with a red-first test + Amy's nod.
-    2. **Two-phase prefetch for PCM** (three-way convergence) — a long-lead
-       `prepare`/`preload` (10–30s, warm the XDG CAS cache) separate from a short
-       fire `lead` (~100ms once local). Don't force one budget to be both jitter
-       buffer and bulk-I/O window. Shapes the clip-cue schema (`docs/clips.md` could
-       carry a `prepare_at` tick / `prepare_lead`).
-    3. **Bevy has no audio-scheduling primitive** — the real PCM build risk, not the
-       timing math. `AudioPlayer` plays on spawn (`audio.rs:40-78` ignores
-       `cue.lead`). Honoring `lead` for samples is net-new substrate (delayed-spawn/
-       unmute at frame granularity ~16ms, or pierce to the `rodio` Sink; headless →
-       the `pawlsa` ALSA-PCM loop). Contrast MIDI, which delegates sub-ms timing to
-       the ALSA seq queue (`midi.rs:237`).
-    4. **Snapshot `receipt` at parse-time, before the fetch** — else SFTP fetch
-       latency folds into audio jitter (the "snapshot trap"). Pairs with #2.
-    5. **Late-fetch = skip-loud** (converged) — never fire-late or time-stretch a
-       transient; log the underrun and drop. Resolves the `pcm.md` "skip vs fire
-       late, decided at the first real sink" open question.
-    6. **Capture `now` close to the send** in `publish_render_cues` (`beat.rs:1297`
-       captures pre-loop) — fine for tiny ABC, but PCM CAS reads inside that loop
-       widen the gap into the lead budget.
-    7. **Multi-sink flam + whole-queue flush** (`midi.rs:92` flushes the *whole*
-       ALSA queue regardless of track) — future concern; per-track flush + shared-
-       clock scheduling are the eventual answer.
-  The **shared "good-enough" hyoushigi** (a loose local beat / PLL slewing to
-  low-rate `{tick, tempo, phase}` refs, never hard-resync) is validated by both
-  casts as the right continuous-timebase companion. **DECIDED (Amy, 2026-07-02):
-  the continuous timebase and the per-cue trigger COMPOSE** — two parallel
-  subsystems, both renderings of the same kernel timeline, neither feeding the
-  other (per-cue owns *sound onset*; the local phasor owns *"where's the beat
-  now"* — metronome/playhead/visuals). Divergence is **measured, not prevented by
-  construction**. Gemini's *replace-with-absolute-tick-through-PLL* is retained as
-  the **upgrade path**, reached for only if the metronome test shows the per-cue
-  path's boundary jitter audibly pulling away from the visual playhead (PCM
-  transients / multi-sink) — not a prerequisite. Validator: the **metronome
-  slice** (`pcm.md` "the metronome slice") — click-on-local-beat vs
-  MIDI-note-on-per-cue, inter-onset within ~1ms, watch for drift — which also
-  builds the local beat we want anyway. PLL failure modes to design against
-  (deepseek): starvation drift (ref rate must bound drift < ~1ms), tempo-step slew
-  limit, phase-slew-not-step, reference-jitter outlier rejection.
+- **Beat-on-track — remaining stages** (Stages 1–3 M1 shipped 2026-06-29/30;
+  story in `docs/tracks.md` + devlog): M2–M4 (input telemetry, drift-modeled
+  clock-in, edge node) sequenced in `docs/midi.md`; external-signal clock sources
+  (solar/compute-availability) ride the same `ClockSourceKind` seam.
+- **Relative-lead timing — open findings from the 2026-07-02 analysis** (the
+  substrate verdict + resolved findings live in `docs/midi.md` "The relative-lead
+  timebase, analyzed" and `docs/pcm.md`; this is the still-open remainder):
+    1. **`beat.rs:940` re-arms `now + period`, not `t + period`** — beat cadence
+       is a random walk of accumulated wakeup jitter. Fine at phrase granularity
+       (documented intentional, `clock.rs:65-69`) but becomes an accumulating
+       bias once `SystemClock` is the reference for a remote edge-node PLL.
+       One-line fix; land with a red-first test + Amy's nod.
+    2. **Bevy has no audio-scheduling primitive** — the real PCM build risk.
+       `AudioPlayer` plays on spawn (`audio.rs:40-78` ignores `cue.lead`);
+       honoring `lead` for samples is net-new substrate (delayed-spawn at ~16ms
+       frame granularity, or pierce to the `rodio` Sink). MIDI delegates sub-ms
+       timing to the ALSA seq queue (`midi.rs:237`).
+    3. **Capture `now` close to the send** in `publish_render_cues`
+       (`beat.rs:1297` captures pre-loop) — fine for tiny ABC, but PCM CAS reads
+       inside that loop widen the gap into the lead budget.
+    4. **Multi-sink flam + whole-queue flush** (`midi.rs:92` flushes the *whole*
+       ALSA queue regardless of track) — future; per-track flush + shared-clock
+       scheduling are the eventual answer.
+    5. **PLL failure modes to design against** when the modeled clock lands
+       (deepseek): starvation drift (ref rate must bound drift < ~1ms),
+       tempo-step slew limit, phase-slew-not-step, reference-jitter outlier
+       rejection. The absolute-tick-through-PLL shape is the *upgrade path*,
+       reached for only if the metronome test shows per-cue boundary jitter
+       audibly pulling away from the visual playhead.
 - **Metronome click should be configurable (found live 2026-07-02).** The 拍子木
   click is hardcoded in the app: `CLICK_NOTE = 84` (C6) on channel 15, velocity
   110, ~60ms gate (`kaijutsu-app/src/metronome.rs` + `MidiSink::click` in
@@ -897,52 +636,17 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   metronome settings block — rather than baked in. Downbeat accent (a different
   note on bar-one) also wants meter info the `BeatRef` doesn't carry yet. Low
   priority; the current defaults are audible and fine for the slice.
-- **Metronome phasor "sloshes" — the correction controller needs redesign (found
-  live 2026-07-02, Amy).** The metronome is audible + on-tempo (mean interval
-  605ms at 100 BPM, dead on) but **not steady**: measured inter-click stddev
-  ~50ms, and it wobbles audibly. Two contributing factors already fixed this
-  session — per-beat references (the phasor chased kernel scheduler jitter → now
-  low-rate, `BEAT_SYNC_EVERY=8` in beat.rs) and frame-time click firing (→ now
-  pre-scheduled into the ALSA queue at the predicted beat time, `schedule_due` +
-  `MidiSink::click_at`). The **residual slosh is the slew controller itself**
-  (`LocalBeat::observe`, `kaijutsu-audio/src/timebase.rs`): it applies the
-  correction as a **persistent rate bias** (`tempo = ref_tempo + error/window`)
-  that runs until the *next* reference (~8 beats ≈ 4.8s), long past the `window`
-  (1s) it was sized for → it over-drives ~3.8× too long, overshoots the target
-  by ~3.8× the error, and the next reference over-corrects the other way =
-  oscillation. **Integrator wind-up / a mistuned proportional-rate controller.**
-  Fix direction (Amy: "PID line of algos"): the reference carries the EXACT tempo
-  (feedforward), so start simple — **P-only phase correction with feedforward
-  tempo**: always run at `ref_tempo` (no persistent rate bias → can't wind up),
-  apply a small one-time *fractional* phase nudge (`ref_beat = cur + k·error`,
-  k~0.1–0.3) per reference; tempo stays exact so beats are evenly spaced and
-  phase locks over a few references. Graduate to a full PI/PID (with damping
-  tuning + integral for steady-state) when a modeled/remote clock (M3) introduces
-  real drift that feedforward can't cancel. Add a phasor-slew metric (the
-  correction magnitude per reference) to quantify it — pairs with the OTel-metrics
-  note. TDD target: a `timebase.rs` test that a steady stream of jittery-but-
-  unbiased references leaves inter-beat spacing within a tight bound (the current
-  slew fails it; the P-phase controller passes).
-- **Beat-lifecycle privilege asymmetry — RESOLVED by design (2026-06-28).**
-  `fire_lifecycle` runs `tick`/`rotate` unprivileged while create runs
-  privileged; gemini-pro flagged it. Decision: leave it. We deliberately keep
-  capabilities as ergonomic nudges (not hard boundaries), so the asymmetry never
-  bites; player focus/mistake-prevention lives in the *loadout* (a musician can't
-  reach `kj transport`/`fork` at all), not in privilege/auth — and the kernel's
-  own beat lifecycles stay able to act. Reasoning written into
-  `docs/instrument-design.md` ("Many hands, one trust boundary") + `docs/chameleon.md`.
-  (The `kj transport play` blind-success smell from the same review SHIPPED its
-  ACK fix — `f0c3eb90` — so its entry is retired.)
-- **Musician `kj` loadout — tool-free (2026-06-13).** `musician` seeds
-  `assets/defaults/rc/musician/create/S10-binding.kai` granting only `drive`:
-  no `builtin.*` tool instances, no `facade:shell`/`submit_input`, no
-  `fork`/`drift`/`transport`/`operator`. A player is an ABC-only voice — its
-  turn text *is* the score (`on_turn_completed` eager-parses it), so it needs no
-  tools, and a small local model handed the full palette stalls the turn. The
-  generic ABC-output primer rides the system slot (`create/S15-abc-primer.md`);
-  the gig (key/tune/register) belongs to the stance + producer chart, NOT the
-  base rc — migrate any song-specific primer content to the producer/chart
-  layer when it lands ("big models author vocabularies").
+- **Metronome controller — graduate to PI/PID later.** The slosh was fixed
+  (`d2b1f55c`, P-phase correction with feedforward tempo — diagnosis in
+  `79c4b6b5`'s message). Remaining: graduate to a full PI/PID (damping + integral
+  for steady-state) when a modeled/remote clock (M3) introduces real drift
+  feedforward can't cancel; add a phasor-slew metric (correction magnitude per
+  reference) to quantify — pairs with the OTel-metrics note.
+- **Musician loadout is tool-free by design (2026-06-13)** — a player is an
+  ABC-only voice; a small local model handed the full palette stalls the turn.
+  Open migration note: the gig (key/tune/register) belongs to the stance +
+  producer chart, NOT the base rc — migrate any song-specific primer content to
+  the producer/chart layer when it lands ("big models author vocabularies").
 - **No chart is seeded into a player's context — the gig metadata gap (found
   2026-06-30, standing up a bass player for the Chameleon line).** The
   musician stance + ABC primer (`musician/create/S00-stance.md`, `S15-abc-primer.md`)
@@ -1055,42 +759,22 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   so a forward-compat client loses its subscription for not knowing one new push.
   A "best-effort, ignore-if-unimplemented" push tier for directive-style events
   (vs. must-deliver block ops) might be the right shape.
-- **PCM review findings — gemini-pro batch (2026-07-01), triaged:** the batch
-  reviewed slices 1–3 holistically. Verdicts (deepseek's filtered-subs bug was
-  the one already fixed in `9b1842ea`):
-  - **Encoded byte-churn — noted opportunity, deprioritized (Amy, 2026-07-01).**
-    `AudioRef::Encoded{bytes: Vec<u8>}` is deep-cloned per FlowBus receiver
-    (async_broadcast clones), again into the client `ServerEvent`, again in the
-    app. An `Arc<[u8]>` would make every clone an atomic bump — but we're NOT
-    optimizing the inline path. **The decided direction is to push most/all bulky
-    IO through CAS** (`Encoded` stays the genuinely-tiny path; large samples ride
-    `Cas`, which keeps bytes off the bus entirely — the slice-5 convergence,
-    `docs/pcm.md` "How it converges"). So the fix is architectural (route bulk →
-    CAS), not an `Arc` micro-opt. Revisit `Arc` only if a real tiny-sample hot
-    path ever shows churn.
-  - **`Debug` byte-spam — FIXED (2026-07-01).** `AudioRef` now hand-writes `Debug`
-    to print the byte *count*, not the buffer, so a `tracing::debug!(?flow)` down
-    through `BlockFlow::PlayAudio` can't dump a whole sample into a log line.
-    (`Serialize` still round-trips the bytes — that's the wire/record contract,
-    not a logging path; nothing serializes `AudioRef` to JSON for logs.)
-  - **"Echo" multi-subscription bug — NOT REAL as described (verified).** Claim: N
-    open contexts → N subscriptions → N simultaneous plays. But subscriptions are
-    deduped by `(principal, instance)` (a client instance holds ONE, replaced not
-    stacked), and live-verify showed exactly **1** `AudioPlayer` per play ("2
-    listeners" = app + mcp). Genuinely-multiple sinks each playing IS the intended
-    distributed-listening behavior. A `directive_id` nonce + client LRU dedupe is a
-    reasonable *future* idempotency guard if we ever fan one client into many subs.
-  - **`kj play` requires an ambient context — MINOR.** It resolves the caller
-    context to stamp the directive; with no ambient context it errors. Since the
-    directive bypasses context filtering anyway, falling back to `ContextId::nil()`
-    (which `on_play_audio` already tolerates, unlike `on_context_switched`) would
-    let a truly context-less caller broadcast. Low priority; a design nicety.
-  - **capnp `AudioRef` union default — NOTE only.** Lowest-`@` union arm (`encoded`)
-    is the default discriminant, so a malformed/empty `AudioRef` decodes as
-    `Encoded{empty, Wav}` → the sink EOFs on 0 bytes (a failed decode, logged — not
-    corruption). Benign; document if a `streamingUrl @3`-style arm is ever added.
+- **PCM review findings — open remainder (gemini-pro batch 2026-07-01; the FIXED
+  and verified-not-real verdicts are in devlog/git):**
+  - **Encoded byte-churn — deprioritized on purpose (Amy):** the fix is
+    architectural (route bulk through CAS — the slice-5 convergence), not an
+    `Arc<[u8]>` micro-opt; revisit `Arc` only if a real tiny-sample hot path
+    shows churn.
+  - **`kj play` requires an ambient context — MINOR.** Falling back to
+    `ContextId::nil()` (which `on_play_audio` tolerates) would let a truly
+    context-less caller broadcast. Design nicety.
+  - **capnp union default — NOTE.** The lowest-`@` arm is the default
+    discriminant, so a malformed cue decodes as empty-inline → sink EOFs on 0
+    bytes (logged, benign). Document if another arm is ever added.
+  - A `directive_id` nonce + client LRU dedupe is a reasonable *future*
+    idempotency guard if one client ever fans into many subscriptions.
   - `from_path_extension` uses `rsplit_once('.')`; `Path::extension()` is more
-    idiomatic (a dir-with-a-dot edge case already fails-loud → error, not misplay).
+    idiomatic (edge case already fails loud).
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
@@ -1113,18 +797,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   per-context window tuning (`HEARD_WINDOW_PHRASES` is a const). `content_before`
   in `ResolverCtx` stays deliberately track-blind regardless (no resolver reads
   it; `CasCommitResolver` reads CAS by hash).
-- **Player spawn = thin fork + rc-rebuilds (design locked 2026-06-12; core
-  SHIPPED — current mechanism in `docs/chameleon.md` § Rotation, chronology in
-  devlog).** A player is spawned by `kj fork --preset spawn` (fork-filters,
-  `docs/fork-filters.md`); the child's `musician/fork/S40-hydrate.kai` re-marks
-  the hydration window at its tail. The page-turn is scheduler-driven: at the
-  rotate horizon the scheduler synchronously detaches the parent (race-free)
-  and fires `rotate/S10-rotate.kai` = `kj fork --preset spawn --switch &&
-  kj transport attach && kj transport play`; the attachment row (track +
-  wakeup + rotate cadence) travels with the fork, and tick continuity is by
-  construction (the clock lives on the track — the 2026-06-29 playhead carry
-  is deleted). `kj transport stop --track <t>` halts a whole rotating lineage
-  in one verb, closing the old "no clean way to stop a chain" gap; residual
+- **Player spawn / rotation — open remainders** (mechanism shipped; current
+  design in `docs/chameleon.md` § Rotation, chronology in devlog). Residual
   narrow race: a rotate rc already in flight ends in `kj transport play` and
   could restart a just-stopped track — add a scheduler-side halt check if it
   ever bites. Still open:
@@ -1296,25 +970,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   conversation has a tempo") so the timeline is the kernel's one clock rather
   than a music sidecar.
 
-## config-shadow cache: residual cross-alias staleness (found 2026-06-24)
+## config-shadow cache: residual cross-alias staleness (found 2026-06-24; common case fixed)
 
-A config/rc path gets a *shadow* copy in the shared `FileDocumentCache` (keyed by
-`file_context_id`) separate from the `ConfigCrdtFs` block (keyed by
-`config_context_id`). A direct config-block write leaves that shadow stale for the
-kaish `cat`/file-tool read path (execution via `ConfigCrdtFs` + the app renderer
-stay coherent).
-
-**The common case is FIXED** — editor (`b4ba9238`) and `kj rc`/`kj config`
-dispatch now call `Kernel::invalidate_config_file_cache` after a direct write, via
-`FileDocumentCache::invalidate_document` (drops the shadow *doc*, not just the
-entry, so the next read fully reloads). Covers "write a path, read that same path."
-
-**Residual (low priority): cross-alias.** Invalidation is by the written/opened
-path only, so writing one symlink alias and reading another stays stale until
-cache eviction — e.g. `kj rc reset lib/S20` then `cat coder/S20` (coder→lib), or
-editing `coder/S20` then `cat lib/S20`. Cosmetic (cat path only), self-heals on
-LRU/TTL. A full fix needs alias-aware invalidation (forward-resolve the written
-path to its terminal *and* reverse-scan symlinks that point at it) — deferred.
+Invalidation after a direct config write is by the written/opened path only
+(`Kernel::invalidate_config_file_cache`, the fixed common case), so writing one
+symlink alias and reading another stays stale until cache eviction — e.g.
+`kj rc reset lib/S20` then `cat coder/S20` (coder→lib). Cosmetic (cat path
+only), self-heals on LRU/TTL. A full fix needs alias-aware invalidation
+(forward-resolve the written path to its terminal *and* reverse-scan symlinks
+that point at it) — deferred.
 
 ## VFS / cache: coherency + consistency + test-coverage audit (2026-06-27)
 
@@ -1378,22 +1042,6 @@ fail loud if neither parses. Real root may be client-side arg encoding for
 verification of the Screen-transition fix; verified instead via the
 server-pushed `ContextSwitched` path (`kj context switch`), which exercises the
 same `handle_context_switch` landing.
-
-## kaijutsu-mcp — capnp schema skew breaks subscribe (found 2026-06-23)
-
-After `systemctl --user restart kaijutsu-server` onto a fresh `target/debug`
-build, `register_session` fails in its subscribe step with `Unimplemented:
-method kernel::Server::list_mcp_prompts not implemented` (@67 in the schema).
-**Not a missing handler** — no client code calls `list_mcp_prompts`; the index
-is landing on the wrong method slot, i.e. the **MCP client binary Claude Code
-launches was built against a different `kaijutsu.capnp` than the running
-server** (capnp identifies methods by index, reports the *server's* name for
-that slot). Same "fresh server + old MCP-client binary" state the 2026-06-17
-signoff noted. The MCP feature-expansion that widened the schema around @60–@74
-landed in `a31d802` (2026-02-01). **Fix:** rebuild/reinstall the kaijutsu MCP
-client binary so its schema matches the server (it's launched outside an agent
-shell). Until then the over-the-wire MCP shell is down; headless kernel tests
-are unaffected. Blocked a live vi smoke-test (vi proven by 1200 headless tests).
 
 ## kaijutsu-mcp — June 2026 SyncedDocument migration review
 
@@ -1520,16 +1168,6 @@ existing entry are marked *(confirms above)*.
 **`LocalBackend::setattr` mtime is a no-op** (`kaijutsu-kernel/src/vfs/backends/
 local.rs:354`) — it opens the file but doesn't set the timestamp, yet mtime is
 load-bearing for `FileDocumentCache` staleness detection.
-
-**LLM providers:**
-- **Gemini stub removed (2026-06-16).** The dead `Provider::Gemini` (returned
-  `Unavailable`, advertised uncallable models), its module, `UsageExtra::Gemini`,
-  and `gemini_from_env` were deleted. Remaining work when Gemini is actually
-  wanted: add a real provider, OR point the OpenAI-compatible core at Google's
-  OpenAI-shaped endpoint (likely zero new code). Tracked in `project_unrig`
-  auto-memory.
-  (The stale "Phase 1: real-provider variants return Unavailable" doc comments in
-  `llm/mod.rs` + `llm/stream.rs` were corrected in the same pass.)
 
 **`kj` single-source guarantee is manual** — `dispatch()` routing and
 `kj_command()` schema tree must be hand-kept in sync; a subcommand added to one
@@ -1881,11 +1519,8 @@ rc create/fork/drift (`project_cache_breakpoint_policy`); `usage.cache_*` parsed
   (retry, estimate-gate, usage capture). Rewriting the request every turn would fight the
   cache by construction — keep that out of the per-turn hook.
 
-**Remaining work (not yet code):**
-- **`HookPhase` → `McpHookPhase` rename — SHIPPED 2026-06-24.** All five variants are
-  MCP-broker-scoped, so the *enum* was renamed, not the variants; persistence strings
-  (`pre_call`…) unchanged (empty DB, no migration). Frees `BeforeModelTurn`/
-  `AfterModelTurn` to be a sibling enum.
+**Remaining work (not yet code; the `HookPhase`→`McpHookPhase` rename already
+shipped 2026-06-24, freeing the sibling enum):**
 - **Per-model input-limit table** — static config + `model_input_limit(model) -> Option<u32>`.
   Kills the "blindly 400'd by the provider" case on its own; foundation for the calculator.
 - **AdaptiveTokenCalculator** — EMA chars→tokens ratio, calibrated by the provider `usage`
@@ -1908,15 +1543,8 @@ rc create/fork/drift (`project_cache_breakpoint_policy`); `usage.cache_*` parsed
 ---
 ## kaijutsu-abc — ABC v2.1 spec conformance (audit 2026-06-30)
 
-Three-model holistic audit (deepseek interactive ×2, gemini-pro batch, opus batch) over the
-full verbatim spec cache + all crate code. **14 bugs fixed TDD this round** (failing test →
-fix), suite 320 → 336 green. Shipped: tempo `Q:` beat-unit; multi-measure-rest `Z`
-denominator; tuplets honouring inner rests/chords; `K:` explicit accidentals (`K:Hp`/`exp`);
-sharp-minor/modal key signatures (`G#m`…); chord inner-note durations (`[c4a4]`); tie carrying
-an accidental across a bar line (was a hung note); inline mid-tune `[K:]`; mode abbreviations
-(`mixo`); `K:Bbm` parse; `A//`/`///` durations; `to_abc` note-accidental round-trip (`^`/`_`
-not `#`/`b`); first/second/`[N` variant-ending expansion (+ `|2`/`:|N` parser labels);
-`K:` `transpose=`/`octave=`.
+Three-model holistic audit; 14+ bugs fixed TDD across two rounds (lists in
+devlog/git — suite 320 → 336 green).
 
 **Still open:**
 - **LOW — tuplet default-q for `(5 (7 (9` ignores compound meter** (3 in 6/8). §4.13. Skipped:
@@ -1930,11 +1558,6 @@ not `#`/`b`); first/second/`[N` variant-ending expansion (+ `|2`/`:|N` parser la
 - **LAYOUT (rendering phase) — lyrics `w:` `|` barline-sync marker ignored** (v1 limit). §5.1.
 - **Engrave parity (rendering phase):** `engrave/layout.rs` has its own copies of the
   tuplet-drops-rests/chords and key-signature bugs — fix when we move to rendering.
-
-**Shipped since the audit (this MED/LOW round):** `X` invisible multi-measure rest; broken
-rhythm transparent to chord/grace neighbours (§4.4/4.12/4.17); inline mid-tune `[M:]`/`[L:]`
-in MIDI; `%%MIDI transpose`; short-form decorations H/T/u/v; aligned the dead
-`ast::Note::to_midi_pitch` octave convention; plus div-by-zero guards from Round 2's fuzz.
 
 **Verified NOT bugs (don't "fix"):** cross-octave accidental propagation (spec default
 `%%propagate-accidentals pitch` = all octaves); unit-length default; broken-rhythm multipliers.
@@ -1964,15 +1587,9 @@ in MIDI; `%%MIDI transpose`; short-form decorations H/T/u/v; aligned the dead
 
 ## kaijutsu-abc — engrave (SVG rendering) audit (2026-06-30, kaibo/deepseek)
 
-Audit of engrave/layout.rs. The two parallel bugs (tuplet drops rests/chords; sharp-minor
-key sig) are FIXED via shared `Key::signature()` + tuplet render arm (commit d722f492).
-Remaining, ranked; delete when shipped. (Most are IR-assertable in tests/engrave_tests.rs.)
-
-**Shipped (commits d722f492, 8fb17d87, + this round):** shared `Key::signature()` (sharp-minor
-keys); tuplet renders rests/chords; augmentation dots on dotted notes/rests; chord-second
-notehead offset; invisible rest `x` draws nothing; whole-rest hangs higher than half;
-`M:none` omits the time sig; multi-measure rest H-bar + count numeral; tuplet bracket + numeral;
-mid-staff inline `[K:]` clef change (redraws clef + repositions notes) and key-sig redraw.
+Audit of engrave/layout.rs; the fix rounds shipped in `d722f492`/`8fb17d87`
+(lists in git). Remaining, ranked; delete when shipped. (Most are IR-assertable
+in tests/engrave_tests.rs.)
 
 **Still open:**
 - **MED — `K: middle=<pitch>` ignored** (only the per-clef default middle line is used).
