@@ -47,6 +47,7 @@ mod connection;
 mod constants;
 mod input;
 mod kaish;
+mod metronome;
 mod midi;
 mod peers;
 mod shaders;
@@ -160,6 +161,9 @@ fn main() {
         // dispatched by mime — audio/* → AudioPlayer, text/vnd.abc → ALSA MIDI.
         .add_plugins(audio::AudioOutPlugin)
         .add_plugins(midi::MidiOutPlugin)
+        // The metronome: the app's continuous local timebase made audible —
+        // a phasor slaved to ServerEvent::BeatSync, clicking through midi's port.
+        .add_plugins(metronome::MetronomePlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

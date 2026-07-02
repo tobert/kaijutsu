@@ -44,11 +44,35 @@ fn open_midi_sink(mut sink: NonSendMut<MidiSink>) {
 
 /// Lazily-opened ALSA seq sink. Opened on the first MIDI cue; `failed` latches
 /// once an open attempt fails (no `/dev/snd/seq`) so we warn once, not per-cue.
+/// `pub(crate)` so the metronome (`crate::metronome`) can click through the SAME
+/// seq port the render cues use — one app, one port, so `aconnect`-ing to a synth
+/// wires up both the music and the 拍子木 click.
 #[derive(Default)]
-struct MidiSink {
+pub(crate) struct MidiSink {
     #[cfg(target_os = "linux")]
     out: Option<MidiOut>,
     failed: bool,
+}
+
+impl MidiSink {
+    /// Send one percussion click NOW — direct (not queued), because the
+    /// metronome click is driven by the phasor's *current* position, not
+    /// scheduled ahead on a lead like a render cue. GM percussion (channel 9);
+    /// opens the sink on first use. No-op without ALSA.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn click(&mut self, note: u8) {
+        if !ensure_open(self) {
+            return;
+        }
+        if let Some(out) = self.out.as_mut() {
+            out.click_now(note);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn click(&mut self, _note: u8) {
+        ensure_open(self);
+    }
 }
 
 /// Render ABC → a flat list of `(offset-from-phrase-start, raw channel-voice
@@ -273,6 +297,22 @@ impl MidiOut {
                 e.set_direct();
                 let _ = self.seq.event_output(&mut e);
             }
+        }
+        let _ = self.seq.drain_output();
+    }
+
+    /// Send one percussion NoteOn immediately (direct delivery, bypassing the
+    /// scheduled queue) — the metronome 拍子木 on channel 9. Percussion is a
+    /// one-shot, so a NoteOn alone is enough (the synth owns the decay).
+    fn click_now(&mut self, note: u8) {
+        use alsa::seq::{EvNote, Event, EventType};
+        let ev = EvNote { channel: 9, note, velocity: 100, off_velocity: 0, duration: 0 };
+        let mut e = Event::new(EventType::Noteon, &ev);
+        e.set_source(self.port);
+        e.set_subs();
+        e.set_direct();
+        if let Err(err) = self.seq.event_output(&mut e) {
+            error!("metronome click event_output failed: {err}");
         }
         let _ = self.seq.drain_output();
     }
