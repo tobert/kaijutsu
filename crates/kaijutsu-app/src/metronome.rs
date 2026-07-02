@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use kaijutsu_audio::LocalBeat;
+use kaijutsu_audio::{LocalBeat, RENDER_FLUSH_MIME};
 use kaijutsu_client::ServerEvent;
 
 use crate::connection::actor_plugin::ServerEventMessage;
@@ -41,7 +41,7 @@ impl Plugin for MetronomePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Metronome>();
         // Ingest references first, then click off the (freshly corrected) phasor.
-        app.add_systems(Update, (ingest_beat_sync, click_on_beat).chain());
+        app.add_systems(Update, (ingest_beat_signals, click_on_beat).chain());
     }
 }
 
@@ -79,6 +79,16 @@ impl Metronome {
         }
     }
 
+    /// Halt the metronome: drop the phasor so it stops free-running (and stops
+    /// scheduling clicks). Called on a transport flush (stop/pause) — the phasor
+    /// can't distinguish "clock stopped" from "gap between low-rate references"
+    /// on its own, so the flush is the explicit stop signal. A new reference
+    /// (the next `play`) re-anchors it.
+    fn reset(&mut self) {
+        self.beat = None;
+        self.next_beat = None;
+    }
+
     /// Return the offsets-from-`now` at which to schedule a click for every
     /// integer beat whose predicted time falls within `horizon` — each beat
     /// returned exactly once across calls. Pure (no audio), so the schedule is
@@ -113,17 +123,23 @@ impl Metronome {
     }
 }
 
-/// Fold every `BeatSync` reference on the event stream into the phasor. `receipt`
-/// is `Instant::now()` at frame time — the same re-anchor-at-receipt the render
-/// sinks use for `lead` (frame-quantized, and that's the accepted tradeoff).
-fn ingest_beat_sync(
+/// Drive the phasor from the transport signals on the event stream: fold every
+/// `BeatSync` reference in (`receipt` is `Instant::now()` at frame time — the
+/// same re-anchor-at-receipt the render sinks use for `lead`), and **reset on a
+/// `RENDER_FLUSH` cue** (stop/pause) so the metronome halts instead of
+/// free-running past the end of the take.
+fn ingest_beat_signals(
     mut messages: MessageReader<ServerEventMessage>,
     mut metronome: ResMut<Metronome>,
 ) {
     let now = Instant::now();
     for ServerEventMessage(event) in messages.read() {
-        if let ServerEvent::BeatSync { beat_ref, .. } = event {
-            metronome.observe(*beat_ref, now);
+        match event {
+            ServerEvent::BeatSync { beat_ref, .. } => metronome.observe(*beat_ref, now),
+            ServerEvent::RenderCue { cue, .. } if cue.mime == RENDER_FLUSH_MIME => {
+                metronome.reset()
+            }
+            _ => {}
         }
     }
 }
@@ -217,7 +233,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Metronome>()
             .add_message::<ServerEventMessage>()
-            .add_systems(Update, ingest_beat_sync);
+            .add_systems(Update, ingest_beat_signals);
 
         // No phasor before any reference.
         assert!(app.world().resource::<Metronome>().beat.is_none());
@@ -230,5 +246,37 @@ mod tests {
 
         let m = app.world().resource::<Metronome>();
         assert!(m.beat.is_some(), "a BeatSync message must anchor the phasor");
+    }
+
+    /// A transport flush (stop/pause) halts the metronome — otherwise the phasor
+    /// free-runs past the end of the take and keeps clicking (the "note still
+    /// playing after stop" bug). After a flush the phasor is dropped, so
+    /// `schedule_due` queues nothing until the next `play` re-anchors it.
+    #[test]
+    fn a_flush_cue_stops_the_metronome() {
+        use kaijutsu_audio::{CuePayload, RenderCue};
+        use kaijutsu_types::ContextId;
+
+        let mut m = Metronome::default();
+        let t0 = Instant::now();
+        m.observe(BeatRef::new(0.0, 2.0), t0);
+        m.schedule_due(t0, H); // running: phasor anchored, next_beat seeded
+        assert!(m.beat.is_some());
+
+        // The flush arrives on the same stream as a RenderCue.
+        let flush = ServerEvent::RenderCue {
+            context_id: ContextId::new(),
+            cue: RenderCue { mime: RENDER_FLUSH_MIME.into(), payload: CuePayload::Inline(vec![]), lead: Duration::ZERO },
+        };
+        let mut app = App::new();
+        app.insert_resource(m)
+            .add_message::<ServerEventMessage>()
+            .add_systems(Update, ingest_beat_signals);
+        app.world_mut().write_message(ServerEventMessage(flush));
+        app.update();
+
+        let m = app.world().resource::<Metronome>();
+        assert!(m.beat.is_none(), "flush drops the phasor");
+        assert!(m.next_beat.is_none(), "flush clears the schedule cursor");
     }
 }
