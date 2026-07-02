@@ -350,6 +350,53 @@ joined context (`block_events_client_and_filter`), cutting foreign-context volum
 to zero. Verified live against a busy 24-context kernel: the 300s command returned
 in 285ms. Related memory: `project_mcp_synceddocument_sync`.
 
+## Render seam — PCM slice 5c: MIDI moves off-box onto the wire cue (2026-07-02)
+
+The convergence's payoff, landed and audible on zorak: **MIDI now renders
+through the app as a wire cue, and the server links no audio/MIDI FFI at all.**
+Three sub-slices, each live-verified, ending in a ~1000-line demolition.
+
+**5c-1 — the app is the first MIDI sink (`e4f57e24`).** A `RenderCue { mime:
+"text/vnd.abc", ... }` carries a committed score symbolically; the app renders it
+to MIDI with the *same* `kaijutsu_abc::midi::events` path the server used, and
+schedules it into a local ALSA seq port at `receipt + lead`. The design deviation
+that made this simple: I'd planned to ship pre-rendered SMF (so the sink stays
+dumb), but the app *already* depends on `kaijutsu-abc` (its staff renderer), so
+"keep the sink dumb, no ABC crate" doesn't apply — shipping ABC and rendering at
+the sink reuses the exact tested path with zero new deps. The wire stays
+mime-keyed, so a truly-dumb edge node later takes a pre-rendered `audio/midi` cue
+instead; the mime says which. `kj play *.abc` is the standalone trigger. The seq
+port opens eagerly at startup so it's `aconnect`-able before the first cue. Live:
+`kj play scale.abc` → app → `aconnect` → TiMidity → Amy heard it; `aseqdump`
+caught the NoteOns.
+
+**5c-2 — the track publishes cues (`6e378d34`).** `emit_to_render_targets` (now
+`publish_render_cues`) publishes a `RenderCue` per crossed ABC cell over the
+FlowBus, keyed by the track's score context; stop/pause publish a
+`RENDER_FLUSH_MIME` cue (the wire twin of `flush_scheduled_after`). MIDI is
+sink-dependent now (`docs/midi.md`): the track publishes, any attached app plays,
+a track with no sink is silent-but-preserved. Live: a local gemma4-e4b musician
+(`wirebass`) with **no in-process target registered** → its ABC materialized →
+kernel published cues → app played a C/G bass ostinato (Amy: "lovely harmony");
+`kj transport stop` → the app emitted all-sounds-off/all-notes-off on every
+channel → silence.
+
+**5c-3 — demolish the in-process path (`70ae8c36`).** With parity proven, deleted
+`render.rs` (the `RenderTarget` trait + `AlsaMidiOut`), the `render_targets`
+machinery + in-process emit/flush loops in `beat.rs`, the `kj transport render`
+verb, `BeatCommand::RenderTarget`/`RenderTargetOp`/`RenderTargetSpec`, and the
+server's `alsa` dependency. The kernel/server binary now links no audio/MIDI FFI
+— the goal `midi.md`/`pcm.md` set. Intended tradeoff: headless in-process MIDI-out
+is gone until the edge-node agent (tracked in `issues.md`); a headless kernel
+makes no sound, but the score is preserved and replayable. Smoke: the demolished
+kernel still plays `kj play scale.abc` through the app (`aseqdump` caught the C
+scale).
+
+Recurring operational note: after every kernel restart the MCP `shell` tool
+intermittently times out waiting for the result block (stale FlowBus
+subscription); the kernel executes fine (logs + `aseqdump` confirm). Pass
+`timeout_secs` so a flake costs seconds; `/mcp` reconnect is the clean fix.
+
 ## Render seam — PCM slice 5a/5b: the mime-keyed RenderCue + Shape A clip (2026-07-02)
 
 The design pass of 2026-07-01 (`d54c001a`) converged MIDI and samples onto one

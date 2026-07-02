@@ -260,13 +260,21 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
      against a stub. (Code is truth: `ContentHash` is serde-transparent and
      does NOT validate on deserialize — well-formedness is checked explicitly;
      and a hash is 32 hex chars, not the "64-hex" this doc/clips.md loosely say.)
-   - **5c — (next) the sinks + prefetch (needs the runner box + speakers).** App
-     consumes cues by mime: clip → parse+validate the record → resolve `media`
-     from the XDG CAS cache, miss → SFTP `/v/blobs/<hash>`, decode, fire (honor
-     `lead`); ABC/MIDI → queue events into a local ALSA seq port. The
-     materialize crossing publishes cues instead of calling the in-process
-     target; verify parity on zorak, then demolish server-side `AlsaMidiOut` +
-     the `RenderTarget` trait.
+   - **5c — the MIDI sink + demolition. ✅ landed (2026-07-02, live on zorak).**
+     The app is the first MIDI sink: it renders `text/vnd.abc` cues to MIDI (same
+     `kaijutsu_abc::midi::events` path — the app already deps `kaijutsu-abc`, so
+     render-at-sink beat shipping SMF) and schedules into a local ALSA seq port at
+     `receipt + lead`; `kj play *.abc` is the standalone trigger (5c-1). The
+     materialize crossing publishes a `RenderCue` per crossed cell (keyed by the
+     track's score context) + a `RENDER_FLUSH_MIME` cue on stop/pause, so a real
+     musician track plays through the app with **no** in-process target (5c-2).
+     With parity proven, the server-side `AlsaMidiOut` + `RenderTarget` trait +
+     `kj transport render` verb + the `alsa` server dep were demolished — the
+     kernel/server binary links no audio/MIDI FFI (5c-3). **Still ahead in 5c:**
+     the *clip/PCM* half — clip cue → parse+validate → resolve `media` from an XDG
+     CAS cache, miss → SFTP `/v/blobs/<hash>`, decode, fire honoring `lead` (the
+     CAS prefetch under the lead); and the headless edge-node sink (slice 4 /
+     `midi.md` M4) so a kernel with no app can still make sound.
    The `abc→midi` render stays kernel-side for now (a relocatable phase — see the
    three-phase split in `midi.md`); an ABC-consuming sampler ("NoteOn → pick
    sample → play") is a later mime on the same seam (`midi.md` "samples-with-MIDI").
@@ -284,15 +292,15 @@ and MIDI and PCM ride one `RenderCue`. The speculation-lead scheduling
 sink re-anchors — exactly `midi.md`'s "the node near the gear regenerates fine
 timing."
 
-The unlock that de-risks it: **the app is the first MIDI sink, so this does NOT
-wait on the M4 edge node.** The app already renders samples over the wire (slice
-3); teaching it to queue MIDI cues into a local ALSA seq port proves the whole
-path on zorak with no capability loss (→ `aconnect` → TiMidity, same box). The
-edge-node agent becomes *just another sink* on the same protocol — the headless
-sink for MIDI and PCM alike — not a prerequisite for either. Do it side-by-side
-with the landed in-process target, verify parity, then demolish the server-side
-`AlsaMidiOut` + the `RenderTarget` trait. Full design + phase split:
-`docs/midi.md` "Render is a wire cue."
+The unlock that de-risked it: **the app is the first MIDI sink, so this did NOT
+wait on the M4 edge node.** This **landed 2026-07-02 (slice 5c)**, live on zorak:
+the app renders `text/vnd.abc` cues to MIDI into a local ALSA seq port (→
+`aconnect` → TiMidity, same box), the materialize crossing publishes the cues
+side-by-side with the in-process target, parity was verified on a real musician
+track, and then the server-side `AlsaMidiOut` + `RenderTarget` trait + the `alsa`
+server dep were demolished. The edge-node agent becomes *just another sink* on
+the same protocol — the headless sink for MIDI and PCM alike — still ahead
+(slice 4 / M4). Full design + phase split: `docs/midi.md` "Render is a wire cue."
 
 ## Distributed listening — later (absorbs `playback.md`, retired 2026-07-01)
 

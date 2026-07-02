@@ -161,10 +161,15 @@ kernel-owned compute node** — the resource-offered-wholly-owned-by-the-kernel
 fleet idea, deliberately scoped down to one well-defined resource (ALSA MIDI +
 a realtime scheduler). Building it prototypes that future, small.
 
-## Render is a wire cue; the sink owns the hardware (2026-07-01)
+## Render is a wire cue; the sink owns the hardware (2026-07-01; LANDED 2026-07-02)
 
-M1 shipped MIDI-out **in-process** — `AlsaMidiOut` in `kaijutsu-server` opens an
-ALSA seq port and schedules NoteOns locally. The real-time stance says that was a
+> **Status: shipped (PCM slice 5c, live on zorak).** The app is the MIDI sink;
+> the materialize crossing publishes `RenderCue`s; the in-process `AlsaMidiOut` +
+> `RenderTarget` trait + the server `alsa` dep are demolished. Below is the
+> design as decided; the headless edge-node sink (M4) is the remaining piece.
+
+M1 shipped MIDI-out **in-process** — `AlsaMidiOut` in `kaijutsu-server` opened an
+ALSA seq port and scheduled NoteOns locally. The real-time stance says that was a
 convenience, not a requirement: in-process buys nothing the lead doesn't already
 buy, because timing precision comes from scheduling into a *local* device queue
 ahead of time, and any sink — including one across the wire — has a local queue.
