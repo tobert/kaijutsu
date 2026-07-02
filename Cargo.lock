@@ -5769,10 +5769,12 @@ dependencies = [
 name = "kaijutsu-client"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "capnp",
  "capnp-rpc",
  "capnpc",
  "diamond-types-extended",
+ "dirs",
  "env_logger",
  "futures",
  "home",
@@ -5785,7 +5787,9 @@ dependencies = [
  "rand 0.10.1",
  "rand 0.8.5",
  "russh",
+ "russh-sftp",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

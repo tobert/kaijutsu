@@ -67,6 +67,13 @@ pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNo
 /// like SFTP and a debug shell will join this namespace.
 pub const SSH_RPC_SUBSYSTEM: &str = "kaijutsu-rpc";
 
+/// SSH subsystem name for the SFTP file-transfer channel — the sibling of
+/// [`SSH_RPC_SUBSYSTEM`]. The server binds it to the `russh_sftp` adapter over
+/// the kernel VFS (`kaijutsu-server/src/sftp.rs`); the client requests it on a
+/// second session channel to read blobs (`/v/blobs/<hash>`) and browse `/v`.
+/// Standard SSH name so off-the-shelf clients (`sftp`, `sshfs`) work too.
+pub const SSH_SFTP_SUBSYSTEM: &str = "sftp";
+
 // Re-export primary types at crate root for convenience.
 pub use block::{
     BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockMetadata,

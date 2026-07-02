@@ -24,16 +24,11 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use kaijutsu_types::{Principal, SSH_RPC_SUBSYSTEM};
+use kaijutsu_types::{Principal, SSH_RPC_SUBSYSTEM, SSH_SFTP_SUBSYSTEM};
 
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
 use crate::rpc::{ConnectionState, ServerRegistry, WorldImpl};
-
-/// SSH subsystem name for SFTP — the protocol-standard "sftp" every stock
-/// client requests. A second named tenant of the channel-dispatch scaffold
-/// alongside [`SSH_RPC_SUBSYSTEM`].
-const SSH_SFTP_SUBSYSTEM: &str = "sftp";
 
 /// Source for the SSH host key.
 #[derive(Clone)]

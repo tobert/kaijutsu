@@ -105,6 +105,7 @@ pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> Socke
 }
 
 /// Connect to server with ephemeral key.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn connect_client(addr: SocketAddr) -> RpcClient {
     let config = SshConfig {
         host: addr.ip().to_string(),
