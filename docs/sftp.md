@@ -2,11 +2,13 @@
 
 *Design note. Status: slices 0–2 + OpenSSH extensions + tracing **landed**
 (2026-06-26; commit trail in `signoff.md`). The `generation` prerequisite is
-landed. Slice 3 (capability binding) was **redesigned 2026-06-26** and its
-substrate extracted to **`docs/slash-v.md`**: a read-only `/v/ctx` introspection
-tree + a `/v/session` participant registry whose per-session `bound` context the
-guard keys on. SFTP becomes a consumer (sets `bound` via a symlink). The old
-"three options" are resolved (the arming symlink is option 3 made practical).*
+landed. Slice 3 (capability binding) was extracted to **`docs/slash-v.md`** and
+then **dissolved there (2026-06-27)**: the per-session `bound`/arming-symlink/TTL
+apparatus was SFTP-shaped scaffolding, replaced by per-operation join on the
+ambient `context_id`. SFTP stays **read/view** and keeps its lexical deny on
+privileged paths — sections below that describe `bound` are superseded and
+marked. The first real SFTP consumer is **client CAS sync against `/v/blobs`**
+(`docs/slash-v.md` track B).*
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
 client (sshfs, `sftp`, Nautilus, an editor's remote-FS plugin) can read and
@@ -15,11 +17,13 @@ memory scratch at `/tmp` — through the same SSH server that already carries th
 Cap'n Proto RPC channel.
 
 This is plumbing, not new architecture. The VFS is already SFTP-shaped; the
-work is a channel-dispatch scaffold on the SSH session-channel surface, an SFTP
-adapter, and one genuine design decision about how an SFTP session reaches a
-capability verdict. That scaffold is shared with two siblings — a cleaner
-**named RPC** (today it's positional) and a future **debug kaish** shell — so
-this doc covers the whole surface, not SFTP alone.
+work was a channel-dispatch scaffold on the SSH session-channel surface, an
+SFTP adapter, and one design decision — how an SFTP session reaches a
+capability verdict — that was ultimately *dissolved* (SFTP stays read/view; see
+"superseded" below). The scaffold is shared with two siblings — the **named
+RPC** (landed with slice 0) and a future **debug kaish** shell — so this doc
+covers the whole surface, not SFTP alone. Sections describing the pre-landing
+state are kept as design record.
 
 ## Why this is mostly already done
 
@@ -43,7 +47,7 @@ this doc covers the whole surface, not SFTP alone.
   threading pattern to copy already exists for the RPC channel
   (`crates/kaijutsu-server/src/ssh.rs:696`).
 
-## The gap
+## The gap (historical — closed by slices 0–2)
 
 `ConnectionHandler` (`crates/kaijutsu-server/src/ssh.rs:632`) implements only
 `channel_open_session`, `auth_publickey`, and `channel_close`. The russh 0.61.1
@@ -58,7 +62,7 @@ verify up front is its compatibility with the pinned russh version, since that
 pairing has historically been version-sensitive. The alternative is parsing
 `SSH_FXP_*` packets by hand over the channel stream — more code, no upside.
 
-## The SSH session-channel surface (and why RPC migrates first)
+## The SSH session-channel surface (and why RPC migrated first — landed)
 
 SFTP doesn't land in isolation — it's the second tenant of the SSH
 session-channel surface, and the first tenant is set up in a way that's worth
@@ -116,14 +120,17 @@ way, wire its stream to an `EmbeddedKaish` bound to the authenticated principal
 `window_change_request` for a line-oriented shell; add them for a full TTY. It
 reuses the same binding decision SFTP raises (settle it once for both).
 
-## Context + session surfaces live in `docs/slash-v.md`
+## The `/v` surfaces live in `docs/slash-v.md`
 
-Slice 3's capability binding rests on two new `/v` VFS surfaces — **`/v/ctx`**
-(context + block-log introspection) and **`/v/session`** (live participants and
-each one's *bound context*). They are general, every-surface backends, not SFTP
-details, so their design lives in **`docs/slash-v.md`** and can land **ahead** of
-this work. SFTP is a *consumer*: it registers each connection as a session and
-sets that session's `bound` via a symlink (see the arming subsection below).
+Three `/v` VFS surfaces are general, every-surface backends, not SFTP details,
+so their design lives in **`docs/slash-v.md`**: **`/v/blobs`** (the CAS pool —
+track B, the active work item; SFTP is how clients sync it), **`/v/ctx`**
+(context + block-log introspection), and **`/v/session`** (live participants).
+All mount on the kernel `MountTable`, which the landed SFTP adapter already
+serves — each becomes SFTP-visible the moment it mounts, with zero adapter work.
+SFTP is a *consumer* of these trees, not their capability driver: the old plan
+where each SFTP session set a `bound` context via symlink was dissolved
+2026-06-27 (see "Capability" in `docs/slash-v.md`).
 
 ## Principal threading — the load-bearing decision
 
@@ -145,43 +152,23 @@ session authenticates a *who* but arrives without the *context* that the
 existing capability machinery keys on. Plumbing the principal through is
 necessary but not sufficient.
 
-### How an SFTP session reaches a capability verdict — the arming symlink
+### How an SFTP session reaches a capability verdict — superseded
 
-The verdict mechanism is defined in `docs/slash-v.md` (`/v/session` → "`bound` is
-one field — the capability unification"). SFTP's part is small:
-
-- **Register the connection** as a session (kind `sftp`, the server-stamped
-  `Principal`) in the participant registry, so it appears under `/v/session` and
-  `self` resolves to it.
-- **Intercept `symlink`/`readlink` on `/v/session/self/bound`.**
-  `ln -sf /v/ctx/by-id/<id> /v/session/self/bound` records the per-connection arm
-  `armed: Option<(ContextId, Instant)>`; `readlink` returns it (or `ENOENT` when
-  unset/expired). A post-connect op stock clients support — which is why the old
-  "three options" collapse to one (it's option 3, "inherit a live context", made
-  practical).
-- **Route privileged writes** (`/etc/rc`→`RcWrite`, `/etc/config`→`ConfigWrite`,
-  `crates/kaijutsu-kernel/src/mcp/binding.rs:94`) through the bound context to the
-  **one** shared guard `context_allows_rc_write`
-  (`crates/kaijutsu-kernel/src/file_tools/guard.rs:71`). Everything else falls out
-  of the mount's `read_only()` flag. One enforcement point; SFTP can't become a
-  capability bypass — and the gate now sits **below** symlink resolution, fixing
-  the deny-altitude bug (the slice-2 lexical deny sat above it).
-
-**Per-connection sliding TTL (~15m), default-deny, fail-loud.** The arm lapses on
-idle so an idle sshfs mount disarms (a *safe-operation* constraint, not security);
-until armed, a session can browse `/v/ctx` read-only and set its `bound` symlink,
-nothing else on the privileged paths — no "most-recent-context" guess. The
-`SSH_FXP_STATUS` deny names the remedy:
-
-```
-SSH_FX_PERMISSION_DENIED
-"session not attached; `ln -s /v/ctx/by-id/<id> /v/session/self/bound` to arm writes (expires in 15m)"
-```
-
-This keeps capabilities an *ergonomic nudge in a shared-trust kernel* — host
-`vim`/`kj rc` bypass these gates by design and SFTP sits at the same trust level;
-an SFTP write is no *easier* a way to clobber a privileged file than the file
-tools, not a sandbox.
+*(2026-06-27, design session with Amy — full reasoning in `docs/slash-v.md`
+"Capability — per-operation join, not per-session binding.")* The answer is:
+**it doesn't need to.** SFTP is read/view by design — it keeps the lexical deny
+on privileged paths (`privileged_write_denied`, `sftp.rs:234`), and privileged
+writes happen via the shell/MCP/app, where the acting context is ambient and
+`context_allows_rc_write(ctx)` already keys on it. The earlier design here — a
+per-connection `bound` context set by an arming symlink on
+`/v/session/self/bound`, with a sliding TTL and default-deny — was scaffolding
+this bare file protocol seemed to need, and dissolving it kept the unification
+(one guard, one `context_id` axis) with less machinery. If SFTP ever genuinely
+needs to write a privileged tree, the shape is a *path-derived* per-operation
+join (a context-projected writable view where `context_id` falls out of the
+path) — deferred until a real need appears. Registering SFTP connections in the
+participant registry (so they appear under `/v/session`) survives as track V
+slice 2 work.
 
 ## Handle mapping — the one real impedance mismatch
 
@@ -253,8 +240,9 @@ above — so the handle guard and the cache now share one primitive.
 
 - SFTP is reachable only after the existing pubkey auth succeeds; there is no
   new authentication surface.
-- Capability binding (whichever option lands) means privileged-path writes honor
-  the same deny-by-default grants as the rest of the system.
+- Privileged-path writes are lexically denied over SFTP (read/view by design);
+  privileged writes route through the shell/MCP/app, where the ambient context
+  hits the shared guard — SFTP cannot become a capability bypass.
 - Mount `read_only()` flags are enforced by the VFS regardless of principal, so
   read-only mounts stay read-only over SFTP for free. **Note:** root `/` is a
   *read-only* host anchor (`LocalBackend::read_only("/")`); only the project
@@ -299,13 +287,11 @@ above — so the handle guard and the cache now share one primitive.
      `EOF`, …); botching `EOF` on reads hangs clients.
    - The handle map, pipelining/backpressure, and `FileAttr`↔SFTP-attr
      conversions.
-3. **Capability binding (consumer of `/v/session`).** Prereq: the `/v/ctx` +
-   `/v/session` backends land first — their own work, in `docs/slash-v.md`
-   (slices V1–V3), with no SFTP dependency. SFTP's part: register each connection
-   as a session, intercept `symlink`/`readlink` on `/v/session/self/bound` to set
-   the per-connection arm (`armed: Option<(ContextId, Instant)>`, sliding TTL),
-   route privileged writes through the bound context to the shared guard, and
-   deny-with-message otherwise. Replaces the slice-2 `/etc/rc` fail-loud stopgap.
+3. **~~Capability binding~~ — dissolved (2026-06-27).** The `bound`/arming
+   apparatus is gone (see "superseded" above; `docs/slash-v.md` "Capability").
+   SFTP stays read/view; the lexical deny stands. What survives here: register
+   each SFTP connection in the participant registry so it appears under
+   `/v/session` (rides `docs/slash-v.md` track V slice 2, not SFTP work).
 4. **Adapter-level limits.** Rate-limiting and traversal-depth/size caps to
    survive editor-indexer crawls (the `/v/ctx` tree makes this sharper);
    directory-handle eviction.
@@ -315,12 +301,12 @@ above — so the handle guard and the cache now share one primitive.
    and exercises the rename-replace TOCTOU guard. Grow it per slice, the way the
    e2e live-eval harness does.
 
-**Dependency order:** slices 0–2 + extensions + tracing are **done**. The `/v`
-surfaces (`docs/slash-v.md`, V1–V3) are next and can land ahead — they're
-self-contained read-only-then-writable backends with no SFTP dependency. SFTP
-slice 3 then consumes `/v/session`; limits (4) and the TOCTOU guard are not
-optional polish. A debug-kaish `shell`/`subsystem` is a later tenant of the same
-scaffold.
+**Dependency order:** slices 0–2 + extensions + tracing are **done**; slice 3
+dissolved. The active consumer is **`/v/blobs` client CAS sync**
+(`docs/slash-v.md` track B) — kernel backend + client fetcher; the landed SFTP
+adapter needs nothing for it beyond the mount existing. Limits (4) and the
+TOCTOU guard are not optional polish. A debug-kaish `shell`/`subsystem` is a
+later tenant of the same scaffold.
 
 ## File references
 
@@ -328,9 +314,9 @@ scaffold.
 - `crates/kaijutsu-kernel/src/vfs/mount.rs` — `MountTable` routing
 - `crates/kaijutsu-kernel/src/runtime/mount_backend.rs:293` — CRDT write-through
 - `crates/kaijutsu-server/src/ssh.rs:632` — `ConnectionHandler` (subsystem gap)
-- `crates/kaijutsu-server/src/ssh.rs:686` — ordinal `channel_index == 1` RPC selection (to be replaced)
+- `crates/kaijutsu-server/src/ssh.rs:686` — ordinal `channel_index == 1` RPC selection (historical — replaced by named-subsystem dispatch in slice 0)
 - `crates/kaijutsu-server/src/ssh.rs:696` — RPC per-connection thread pattern
-- `crates/kaijutsu-client/src/ssh.rs:235` — client opens control/rpc/events in order
+- `crates/kaijutsu-client/src/ssh.rs:235` — client opened control/rpc/events in order (historical — now `connect_subsystem`, `ssh.rs:210`)
 - `crates/kaijutsu-client/src/rpc.rs:101` — `retain_ssh_channels` holds the dead control/events channels
 - russh 0.61.1 `server/mod.rs:633` (`subsystem_request`) / `channels/mod.rs:249` (`request_subsystem`)
 - `crates/kaijutsu-kernel/src/mcp/binding.rs:94` — `Capability` (`RcWrite`, `ConfigWrite`)
@@ -347,7 +333,8 @@ handle hazard, sshfs caching vs. CRDT mtime, the adapter/effort underestimate
 DoS, and path-based context routing as a candidate binding option. Pushed back
 on the host-FS RCE claim — root `/` is read-only, so it doesn't hold as stated.*
 
-*Binding superseded 2026-06-26 (design session with Amy): the three options
-collapse to a per-connection arming symlink (`/v/session/self/bound`) over the
-`/v/ctx` + `/v/session` surfaces — option 3 made practical, no parallel grant
-axis, one guard. Full design extracted to `docs/slash-v.md`; SFTP is a consumer.*
+*Binding superseded twice: 2026-06-26 the three options collapsed to a
+per-connection arming symlink; 2026-06-27 that too dissolved — per-operation
+join on the ambient `context_id`, SFTP stays read/view. Full design in
+`docs/slash-v.md`; SFTP is a consumer of the `/v` trees, first for CAS sync
+(`/v/blobs`, track B).*

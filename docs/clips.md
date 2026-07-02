@@ -59,7 +59,8 @@ unknown keys preserved and ignored.
 ```jsonc
 {
   "v": 1,                       // record version (per-record, OTIO-style)
-  "media": "<64-hex ContentHash>", // REQUIRED — the sample bytes, in CAS
+  "media": "<32-hex ContentHash>", // REQUIRED — the sample bytes, in CAS
+                                //   (128-bit BLAKE3 as 32 hex chars — code is truth)
   "mime": "audio/wav",          // REQUIRED — what the sink decodes (AudioFormatHint source)
   "label": "rimshot, dry",      // REQUIRED, non-empty — CAS hashes are opaque;
                                 //   the label is how humans and models read the
@@ -124,8 +125,9 @@ until the first good clip, matching the locked chameleon default.
    rides the speculation lead — the transfer budget; the sink re-anchors it at
    `receipt + lead`.
 3. The sink resolves `media` from its local XDG CAS cache, pulling a miss
-   over SFTP against `/v/blobs/<hash>`; decodes per `mime` (Bevy decoders /
-   Symphonia); fires at `at` with the source range and gain applied.
+   over SFTP against `/v/blobs/<ab>/<hash>` (mount + fetcher:
+   `docs/slash-v.md` track B); decodes per `mime` (Bevy decoders / Symphonia);
+   fires at `at` with the source range and gain applied.
 4. Transport stop/pause flushes scheduled audio exactly as MIDI
    (`flush_scheduled_after`), and the derived sibling machinery is **not
    involved** — a clip renders directly; there is no barrier-side deriver.

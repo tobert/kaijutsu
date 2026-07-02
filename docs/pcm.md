@@ -126,9 +126,10 @@ decouple-Act-from-ABC axis: one generalization, both sides of the barrier.
 **Sample bytes move out-of-band, prefetched under the speculation lead.** Cells
 commit ahead of the playhead, so `emit` fires with `at` in the near future —
 that lead is the transfer budget. A sink checks a client-side CAS cache (XDG
-dir), pulls a miss over **SFTP against `/v/blobs/<hash>`** (the VFS already
-mounts CAS and SFTP already speaks the VFS — zero new RPC; sshfs is the
-prototyping path), and fires on time. Same constraint-remover as MIDI output:
+dir), pulls a miss over **SFTP against `/v/blobs/<ab>/<hash>`** (the `/v/blobs`
+CAS mount + the client fetcher/cache are designed in `docs/slash-v.md` track B —
+the mount does **not** exist yet; SFTP already speaks the VFS, so it's zero new
+RPC, and sshfs is the prototyping path), and fires on time. Same constraint-remover as MIDI output:
 the network delivers *ahead of time*, never just-in-time. Consequence for the
 wire type above: `AudioRef::Cas` + the client cache is the primary path even in
 the standalone slices; `Encoded` inline bytes shrink to a tiny-sample
@@ -272,9 +273,11 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
      `kj transport render` verb + the `alsa` server dep were demolished — the
      kernel/server binary links no audio/MIDI FFI (5c-3). **Still ahead in 5c:**
      the *clip/PCM* half — clip cue → parse+validate → resolve `media` from an XDG
-     CAS cache, miss → SFTP `/v/blobs/<hash>`, decode, fire honoring `lead` (the
-     CAS prefetch under the lead); and the headless edge-node sink (slice 4 /
-     `midi.md` M4) so a kernel with no app can still make sound.
+     CAS cache, miss → SFTP `/v/blobs/<ab>/<hash>` (the mount + `BlobResolver` are
+     `docs/slash-v.md` track B, the active prerequisite), decode, fire honoring
+     `lead` (the CAS prefetch under the prepare horizon); and the headless
+     edge-node sink (slice 4 / `midi.md` M4) so a kernel with no app can still
+     make sound.
    The `abc→midi` render stays kernel-side for now (a relocatable phase — see the
    three-phase split in `midi.md`); an ABC-consuming sampler ("NoteOn → pick
    sample → play") is a later mime on the same seam (`midi.md` "samples-with-MIDI").

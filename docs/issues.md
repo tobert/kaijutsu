@@ -6,20 +6,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## SFTP over the VFS (slices 0–2 + extensions + tracing landed 2026-06-26; slice 3+ open)
+## SFTP over the VFS (slices 0–2 + extensions + tracing landed 2026-06-26; slice 3 dissolved; limits + TOCTOU open)
 
 Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
 the `"sftp"` arm in `ssh.rs`). Two DeepSeek reviews + a Gemini Pro batch
 whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
 
-- **Slice 3 — capability binding (consumer of `/v/session`).** Prereq = the `/v`
-  surfaces below (own work, `docs/slash-v.md`). SFTP's part: register each
-  connection as a session, intercept `symlink`/`readlink` on
-  `/v/session/self/bound` to set the per-connection arm (sliding TTL ~15m), route
-  privileged writes through the bound `context_id` to the shared
-  `context_allows_rc_write` guard, deny-with-message otherwise. Replaces the
-  stopgap `privileged_write_denied` (lexical `/etc/rc`+`/etc/config` deny).
-  **Also fixes the altitude bug the Gemini review flagged:** the lexical deny sits
+- **Slice 3 — ~~capability binding~~ dissolved (2026-06-27, `docs/slash-v.md`
+  "Capability").** No `bound`, no arming symlink, no TTL: SFTP stays read/view
+  with the lexical `privileged_write_denied` deny; privileged writes happen via
+  shell/MCP/app where the acting `context_id` is ambient (per-operation join).
+  Surviving crumbs: register SFTP connections in the participant registry
+  (slash-v track V slice 2), and the altitude note below stands as hygiene.
+  **The altitude bug the Gemini review flagged:** the lexical deny sits
   *above* symlink resolution, so a symlink resolving into the gated tree would
   slip past it (not a live bypass today — symlinks don't cross mount backends and
   host `/` is read-only — but the gate belongs below resolution).
@@ -101,61 +100,33 @@ concrete:
   deleted 2026-06-29; the detailed standalone design is in git history. The app
   `DockSparkline` rewrite-to-read-`/run` note still stands.
 
-## `/v/ctx` + `/v/session` virtual surfaces (design `docs/slash-v.md`; lands ahead of SFTP slice 3)
+## `/v` surfaces (design canonical in `docs/slash-v.md`; refreshed 2026-07-02)
 
-Two sysfs-style read-mostly `VfsBackend`s under the existing `/v` namespace
-(joins `/v/docs`, `/v/input`, `/v/blobs`). Every surface (app/kaish/file-tools/
-SFTP) sees them. Self-contained — no SFTP dependency — and unblocks the SFTP
-capability binding (which becomes a consumer of `/v/session`). Slices:
+Nothing under `/v` is built yet (the doc's earlier "already hosts `/v/blobs`"
+claim was wrong — test literals only; and `/v/docs`/`/v/input` are kaish-side
+mounts, not kernel-`MountTable`, so not SFTP-visible). Two independent tracks;
+the design details live in the doc, this entry is the backlog pointer:
 
-- **V0 — `content_len` on `BlockHeader` (prerequisite, not `/v`-specific).** Block
-  byte size isn't stored, so a naive `getattr` would materialize the whole CRDT
-  body (a 5 MB tool result re-allocated for `ls -l`). Add an additive `content_len`
-  field (`kaijutsu-types/src/block.rs:134`), set on write/merge → O(1) size. CBOR
-  schema bump is additive/fail-loud. Slice V1 depends on it.
-- **V1 — `/v/ctx` read-only backend.** Contexts + CRDT block logs:
-  `/v/ctx/by-id/<id>/blocks/by-id/<key>/{role,kind,status,content,json,...}` with
-  **flat kind-conditional** attrs (tool-call: `tool_name`/`tool_input`/
-  `tool_use_id`; tool-result: `exit_code`/`is_error`/`call->`) — *not* nested
-  `tool/`·`error/` dirs (locked 2026-06-26) + `by-time/NNNN` symlink view
-  (stable-id-primary; never iterate `BlockId` order as timeline — use
-  `block_ids_ordered()`). Contexts from `list_all_contexts()` (`kernel_db.rs:1680`);
-  blocks from each **per-context** store in `documents: DashMap<ContextId,
-  DocumentEntry>` (`block_store.rs:182`) — no global filter. `generation` ←
-  `DocumentEntry::version()` (`block_store.rs:153`, bumps on local write + remote
-  merge), not a bespoke map. Scalar files + opt-in `json`; relationships as
-  symlinks; `0`/`1` booleans. `EROFS` writes; size from `content_len`; `read_all`
-  override (sizing gotcha). No shard (paged readdir + `/v` being a deliberate
-  destination handle scale); `live/<label>` (KernelDb-unique, short-id fallback)·
-  `by-type/`·`by-lineage/` (from `context_edges`) are convenience views. Testable
-  via `kaish ls /v/ctx`.
-  - ⚠️ **Deferred optimization (slice 1 ships naive):** `block_ids_ordered()`
-    (`block_store.rs:199`) re-sorts the whole context per call and caches nothing,
-    so `ls -l .../by-time/` is O(N²·log N) (one `readdir` + N `readlink`s = N+1
-    sorts). Fix later: backend cache of the ordered `Vec<BlockId>` keyed on
-    `DocumentEntry::version()`. Known-slow on large contexts until then.
-- **V2 — `/v/session` read-only backend.** View over a live participant registry
-  (generalize `PeerRegistry` to carry session *kind* — `PeerInfo` has no such field
-  today, `peers.rs:50`; app/MCP already registered). `self` resolved per-surface at
-  adapter altitude. `context` renders the session's **live** acting context from
-  `SessionContextMap` (`context_engine.rs:31`) — **not** KV (retired; the durable
-  per-client restore is a separate typed store, above). `/proc`-style ephemeral;
-  reconnect-flicker visible (see peer-reattach tech-debt). *(NB: the `bound`/binding
-  capability apparatus this entry predates is retired — slash-v.md now uses
-  per-operation join on the ambient `context_id`; V3 below is stale on that point.)*
-- **V3 — writable `bound`.** `set_bound(session, context_id)` + route privileged
-  writes through the shared `context_allows_rc_write` guard. The guard already keys
-  on `ctx.context_id` (`guard.rs:71`) — `guard.rs`/`binding.rs` unchanged. The real
-  work is the SFTP **consumer** side: `SftpSession` (`sftp.rs:107`, holds only
-  `Principal`) gains a guard handle + `bound_context_id`, and the lexical
-  `privileged_write_denied` (`sftp.rs:234`) is replaced by a real guard call in
-  every write handler; the `ln -s` symlink is only the setter. Join point with
-  SFTP slice 3 (setter + sliding TTL + fail-loud deny). App/MCP keep `context switch`.
-
-Locked 2026-06-26: `live/<label>` keying; flat kind-conditional block attrs;
-`content_len` on `BlockHeader`; `generation` ← `DocumentEntry::version()`; slice 1
-naive (ordered-id cache deferred, above). Open: huge-`content` range-read vs cap;
-slice-3 sliding-TTL storage home (`PeerInfo` carries no expiry today).
+- **Track B — `/v/blobs` + client CAS sync (ACTIVE; unblocks `pcm.md` 5c's clip
+  half).** B1 read-only `CasFs` backend over the kernel `FileStore`, mounted at
+  `/v/blobs` before the mount-table freeze (leading-byte shards, full-hash
+  leaves, EROFS); B2 `index` TSV (hash/mime/size/path); B3 `SftpClient` +
+  `BlobResolver` in `kaijutsu-client` (`sftp` subsystem on its own SSH
+  connection — the capnp world is `!Send`; `russh-sftp` client half) + XDG
+  `FileStore` cache + re-hash verify (fail loud) + single-flight. Ingest stays `kj cas put` (SFTP→`/tmp` two-step for remote
+  files); writable staging-over-SFTP deferred. Deferred optimization: cached
+  `index` (naive walk per read at first).
+- **Track V — `/v/ctx` + `/v/session` (redesigned 2026-06-27 — script-first:
+  TSV `index` resolver, sharded pools, symlink edges; no `by-id`/`by-time`/
+  `live` farms; no writable `bound` — the capability apparatus dissolved into
+  per-operation join, SFTP stays read/view).** V0 `content_len` on `BlockHeader`
+  (prerequisite, additive CBOR); V1 `/v/ctx` backend (trailing-byte context
+  shards, `blocks/index` ordered by `block_ids_ordered()`, `generation` ←
+  `DocumentEntry::version()`); V2 `/v/session` over `PeerRegistry` (+ session
+  `kind` field; `context` from live `SessionContextMap`, never KV); V3 SFTP
+  mounts them read-only. Deferred optimization (V1 ships naive):
+  `block_ids_ordered()` re-sorts per call — cache the ordered `Vec<BlockId>`
+  keyed on `DocumentEntry::version()`. Open: huge-`content` range-read vs cap.
 
 ## Instrument reframing & RC stances (follow-ups from the 2026-06-22 pass)
 
