@@ -186,6 +186,7 @@ impl FlowTopics for BlockFlow {
         "block.metadata",
         "block.context_switched",
         "block.render_cue",
+        "block.beat_sync",
     ];
 
     fn topic_capacity(topic: &str) -> Option<usize> {
@@ -381,6 +382,18 @@ pub enum BlockFlow {
         /// The cue to render (mime-keyed; the sink dispatches on `cue.mime`).
         cue: kaijutsu_audio::RenderCue,
     },
+    /// A low-rate beat reference for a sink's continuous timebase (the metronome
+    /// phasor; docs/midi.md "The relative-lead timebase, analyzed"). Like
+    /// `RenderCue` it is a kernel *directive*, not a block-log event (no
+    /// `block_id`), and rides `BlockFlow` for the same reason — the fan-out to
+    /// every attached sink is the plumbing `BlockEvents` already has.
+    BeatSync {
+        /// The track's score context (the same key `RenderCue` uses), so a sink
+        /// can associate a beat reference with its track.
+        context_id: ContextId,
+        /// The beat coordinate + tempo at emission; the sink's phasor slews toward it.
+        beat_ref: kaijutsu_audio::BeatRef,
+    },
 }
 
 impl BlockFlow {
@@ -399,6 +412,7 @@ impl BlockFlow {
             Self::MetadataChanged { .. } => "block.metadata",
             Self::ContextSwitched { .. } => "block.context_switched",
             Self::RenderCue { .. } => "block.render_cue",
+            Self::BeatSync { .. } => "block.beat_sync",
         }
     }
 
@@ -416,7 +430,8 @@ impl BlockFlow {
             | Self::OutputChanged { context_id, .. }
             | Self::MetadataChanged { context_id, .. }
             | Self::ContextSwitched { context_id, .. }
-            | Self::RenderCue { context_id, .. } => *context_id,
+            | Self::RenderCue { context_id, .. }
+            | Self::BeatSync { context_id, .. } => *context_id,
         }
     }
 
@@ -432,7 +447,10 @@ impl BlockFlow {
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
             | Self::MetadataChanged { block_id, .. } => Some(block_id),
-            Self::SyncReset { .. } | Self::ContextSwitched { .. } | Self::RenderCue { .. } => None,
+            Self::SyncReset { .. }
+            | Self::ContextSwitched { .. }
+            | Self::RenderCue { .. }
+            | Self::BeatSync { .. } => None,
         }
     }
 
@@ -456,9 +474,10 @@ impl BlockFlow {
             | Self::Moved { source, .. }
             | Self::OutputChanged { source, .. }
             | Self::MetadataChanged { source, .. } => *source,
-            Self::SyncReset { .. } | Self::ContextSwitched { .. } | Self::RenderCue { .. } => {
-                OpSource::Local
-            }
+            Self::SyncReset { .. }
+            | Self::ContextSwitched { .. }
+            | Self::RenderCue { .. }
+            | Self::BeatSync { .. } => OpSource::Local,
         }
     }
 
@@ -487,6 +506,7 @@ impl BlockFlow {
             Self::MetadataChanged { .. } => BlockFlowKind::MetadataChanged,
             Self::ContextSwitched { .. } => BlockFlowKind::ContextSwitched,
             Self::RenderCue { .. } => BlockFlowKind::RenderCue,
+            Self::BeatSync { .. } => BlockFlowKind::BeatSync,
         }
     }
 
@@ -501,7 +521,7 @@ impl BlockFlow {
         // *stream* of block changes). The standalone slice forwards it to
         // every subscriber unconditionally; per-context "distributed
         // listening" is future work (docs/pcm.md).
-        if matches!(self, Self::RenderCue { .. }) {
+        if matches!(self, Self::RenderCue { .. } | Self::BeatSync { .. }) {
             return true;
         }
         // Event type constraint
@@ -1850,6 +1870,10 @@ mod tests {
                 context_id: ctx,
                 cue: kaijutsu_audio::RenderCue::now_inline("audio/wav", vec![1, 2, 3]),
             },
+            BlockFlow::BeatSync {
+                context_id: ctx,
+                beat_ref: kaijutsu_audio::BeatRef::new(0.0, 2.0),
+            },
         ];
 
         // Exhaustiveness gate: a new variant without an arm here breaks
@@ -1867,7 +1891,8 @@ mod tests {
                 | BlockFlow::OutputChanged { .. }
                 | BlockFlow::MetadataChanged { .. }
                 | BlockFlow::ContextSwitched { .. }
-                | BlockFlow::RenderCue { .. } => {}
+                | BlockFlow::RenderCue { .. }
+                | BlockFlow::BeatSync { .. } => {}
             }
         }
 

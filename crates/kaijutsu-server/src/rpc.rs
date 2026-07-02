@@ -2510,6 +2510,34 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
+                                BlockFlow::BeatSync { context_id, ref beat_ref } => {
+                                    let mut req = callback.on_beat_sync_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_beat_ref(params.reborrow().init_beat_ref(), beat_ref);
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(msg) = async {
@@ -5470,6 +5498,34 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
+                                BlockFlow::BeatSync { context_id, ref beat_ref } => {
+                                    let mut req = callback.on_beat_sync_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_beat_ref(params.reborrow().init_beat_ref(), beat_ref);
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(msg) = async {
@@ -6203,6 +6259,14 @@ fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, c
     }
 }
 
+/// Fill a Cap'n Proto `BeatRef` builder from the typed reference (docs/midi.md
+/// "The relative-lead timebase, analyzed"). Carries no instant — the sink stamps
+/// receipt locally, like `RenderCue.leadNanos`.
+fn set_beat_ref(mut builder: crate::kaijutsu_capnp::beat_ref::Builder<'_>, beat_ref: &kaijutsu_audio::BeatRef) {
+    builder.set_beat(beat_ref.beat);
+    builder.set_tempo_bps(beat_ref.tempo_bps);
+}
+
 /// The FlowBus topic pattern a **filtered** client block-subscription listens on.
 ///
 /// This pattern must be a *superset* of everything `BlockFlow::matches_filter`
@@ -6222,6 +6286,7 @@ fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, c
 fn filtered_subscribe_pattern(event_types: &[kaijutsu_types::BlockFlowKind]) -> &'static str {
     match event_types {
         [kaijutsu_types::BlockFlowKind::RenderCue] => "block.render_cue",
+        [kaijutsu_types::BlockFlowKind::BeatSync] => "block.beat_sync",
         _ => "block.*",
     }
 }
@@ -7194,6 +7259,9 @@ fn parse_block_event_filter(
                             }
                             crate::kaijutsu_capnp::BlockFlowKind::RenderCue => {
                                 kaijutsu_types::BlockFlowKind::RenderCue
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::BeatSync => {
+                                kaijutsu_types::BlockFlowKind::BeatSync
                             }
                         })
                     })

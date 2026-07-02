@@ -106,7 +106,8 @@ impl SyncedDocument {
             | ServerEvent::InputTextOps { context_id, .. }
             | ServerEvent::InputCleared { context_id, .. }
             | ServerEvent::ContextSwitched { context_id, .. }
-            | ServerEvent::RenderCue { context_id, .. } => Some(*context_id),
+            | ServerEvent::RenderCue { context_id, .. }
+            | ServerEvent::BeatSync { context_id, .. } => Some(*context_id),
             // Editor events are session-scoped, not context-scoped — the
             // editor renders off its own subscription, not the doc cache.
             // A post-reconnect resync delivery names its target context inline.
@@ -442,8 +443,10 @@ impl SyncedDocument {
             // A kernel render directive (`kj play`, the track render seam),
             // not a block-log event — it names no block and touches no CRDT
             // state. A render sink handles it off the raw event stream, not
-            // the doc cache.
-            | ServerEvent::RenderCue { .. } => SyncEffect::Ignored,
+            // the doc cache. `BeatSync` (the metronome beat reference) is the
+            // same shape: a directive the sink's phasor consumes, not doc state.
+            | ServerEvent::RenderCue { .. }
+            | ServerEvent::BeatSync { .. } => SyncEffect::Ignored,
         }
     }
 

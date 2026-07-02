@@ -1951,6 +1951,9 @@ fn set_block_event_filter_builder(
                     kaijutsu_types::BlockFlowKind::RenderCue => {
                         crate::kaijutsu_capnp::BlockFlowKind::RenderCue
                     }
+                    kaijutsu_types::BlockFlowKind::BeatSync => {
+                        crate::kaijutsu_capnp::BlockFlowKind::BeatSync
+                    }
                 },
             );
         }

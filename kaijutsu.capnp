@@ -299,6 +299,10 @@ enum BlockFlowKind {
   # bypass for `RenderCue`). Kept 1:1 with the Rust `BlockFlowKind` enum anyway
   # so the two never drift silently out of sync.
   renderCue @11;
+  # A low-rate beat reference for the sink's continuous timebase (the metronome
+  # phasor, docs/midi.md "The relative-lead timebase, analyzed"). Also a
+  # directive — bypasses `matches_filter` like `renderCue`.
+  beatSync @12;
 }
 
 # Server-side filter for block event subscriptions.
@@ -344,6 +348,17 @@ struct RenderCue {
   }
 }
 
+# A low-rate beat reference for a sink's continuous local timebase (docs/midi.md
+# "The relative-lead timebase, analyzed"). Mirrors kaijutsu_audio::BeatRef: the
+# fractional beat coordinate at emission plus the tempo. Carries no absolute
+# instant (a process-local one can't cross the wire) — the sink stamps receipt
+# locally, exactly as it re-anchors RenderCue.leadNanos. The phasor slews toward
+# it; it never hard-resyncs.
+struct BeatRef {
+  beat @0 :Float64;       # fractional beat coordinate at emission; integers are onsets
+  tempoBps @1 :Float64;   # tempo in beats per second (120 BPM == 2.0)
+}
+
 # Callback for receiving block updates from server
 interface BlockEvents {
   onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
@@ -382,6 +397,14 @@ interface BlockEvents {
   # client. `contextId` is the originating context (reserved for future
   # per-listener routing); the standalone slice forwards unconditionally.
   onRenderCue @13 (contextId :Data, cue :RenderCue);
+
+  # A beat reference for the sink's continuous timebase (docs/midi.md "The
+  # relative-lead timebase, analyzed"). Emitted at a low rate while a track's
+  # clock rolls; the sink's phasor extrapolates the beats between and slews
+  # toward each reference. Like onRenderCue, a directive that fans out to every
+  # attached client. `contextId` is the track's score context (the same key
+  # onRenderCue uses), so a sink can associate a beat with its track.
+  onBeatSync @14 (contextId :Data, beatRef :BeatRef);
 }
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).

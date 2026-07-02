@@ -140,6 +140,15 @@ pub enum ServerEvent {
         context_id: ContextId,
         cue: kaijutsu_audio::RenderCue,
     },
+    /// A low-rate beat reference for a sink's continuous timebase (the metronome
+    /// phasor; docs/midi.md "The relative-lead timebase, analyzed"). A kernel
+    /// directive, not a block change — emitted while a track's clock rolls.
+    /// `context_id` is the track's score context (the same key `RenderCue` uses).
+    /// This crate only decodes the wire shape; the phasor lives at the sink.
+    BeatSync {
+        context_id: ContextId,
+        beat_ref: kaijutsu_audio::BeatRef,
+    },
 }
 
 /// Connection lifecycle status broadcast by the reconnect FSM.
@@ -829,6 +838,40 @@ impl block_events::Server for BlockEventsForwarder {
         let event = ServerEvent::RenderCue { context_id, cue };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping RenderCue event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_beat_sync(
+        self: Rc<Self>,
+        params: block_events::OnBeatSyncParams,
+        _results: block_events::OnBeatSyncResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let beat_reader = match params.get_beat_ref() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let beat_ref = kaijutsu_audio::BeatRef {
+            beat: beat_reader.get_beat(),
+            tempo_bps: beat_reader.get_tempo_bps(),
+        };
+
+        let event = ServerEvent::BeatSync { context_id, beat_ref };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BeatSync event");
         }
         Promise::ok(())
     }

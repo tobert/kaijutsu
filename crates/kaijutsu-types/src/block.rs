@@ -2446,6 +2446,9 @@ pub enum BlockFlowKind {
     /// but kept in the 1:1 mapping anyway so `BlockFlow::kind()` stays honest
     /// and this enum never silently drifts out of sync with `BlockFlow`.
     RenderCue,
+    /// A low-rate beat reference for a sink's continuous timebase (the metronome
+    /// phasor). Also a directive — `matches_filter` bypasses it like `RenderCue`.
+    BeatSync,
 }
 
 /// Server-side filter for block event subscriptions.
