@@ -60,6 +60,13 @@ const ABC_MIME: &str = "text/vnd.abc";
 /// event-counted, so this is a pure increment, never scaled by elapsed time.
 const STEP: TickDelta = TickDelta::new(1);
 
+/// How often the beat scheduler emits a `BeatSync` reference for a sink's
+/// continuous timebase (the metronome phasor): every Nth beat, plus the first.
+/// Low by design — the phasor free-runs between references, so a reference every
+/// beat would make it chase per-beat scheduler jitter (audible wobble). On one
+/// machine drift is ~0, so every 8 beats keeps it locked while staying steady.
+const BEAT_SYNC_EVERY: u64 = 8;
+
 /// The local instant at which a committed cell starting at `start` should render,
 /// given the beat's jitter-free scheduled fire instant (`base`), the live beat
 /// `period`, and the current `playhead` (Stage 3 WI 4). A cell commits AHEAD of
@@ -975,11 +982,17 @@ impl BeatScheduler {
         // track's; the cadence below is per-context.
         self.materialize_track(track_id, playhead);
         // Emit a beat reference for the app's continuous timebase (the metronome
-        // phasor) once this beat, independent of whether any cell crossed —
-        // a bare rolling clock still ticks. Auto-emitted while the clock rolls;
-        // the audible click is the sink's opt-in (docs/midi.md "The relative-lead
-        // timebase, analyzed").
-        self.publish_beat_sync(track_id, playhead);
+        // phasor) at a LOW rate while the clock rolls — NOT every beat. The
+        // phasor free-runs at the reference tempo between references and only
+        // gently slews toward each one; a reference every beat would make it
+        // chase the kernel's per-beat scheduler jitter and oscillate (audible
+        // wobble). So anchor promptly on the first beat, then correct every
+        // `BEAT_SYNC_EVERY` (drift is ~0 on one machine, so this stays locked;
+        // it also cuts the wire chatter). The click is the sink's opt-in
+        // (docs/midi.md "The relative-lead timebase, analyzed").
+        if beat_count == 1 || beat_count % BEAT_SYNC_EVERY == 0 {
+            self.publish_beat_sync(track_id, playhead);
+        }
         self.drain_track_failures(track_id);
         for ctx in attached_ids {
             let Some(att) = self
@@ -2346,28 +2359,35 @@ mod tests {
 
         let base = Instant::now();
         sched.play(&track, base);
-        sched.fire_due(base + Duration::from_secs(1)); // beat 1
-        sched.fire_due(base + Duration::from_secs(2)); // beat 2
+        // Fire beats 1..8. The phasor free-runs between references, so the kernel
+        // emits at a LOW rate: beat 1 (anchor) + beat 8 (BEAT_SYNC_EVERY), and
+        // NOT the beats in between.
+        for beat in 1..=8u64 {
+            sched.fire_due(base + Duration::from_secs(beat));
+        }
 
-        let (ctx1, ref1) = match sub.try_recv().expect("beat 1 reference").payload {
+        let (ctx1, ref1) = match sub.try_recv().expect("beat 1 anchor reference").payload {
             BlockFlow::BeatSync { context_id, beat_ref } => (context_id, beat_ref),
             other => panic!("expected BeatSync, got {other:?}"),
         };
         assert_eq!(ctx1, score, "keyed by the track's score context");
         assert!((ref1.tempo_bps - 1.0).abs() < 1e-9, "60 BPM = 1 beat/sec, got {}", ref1.tempo_bps);
 
-        let (ctx2, ref2) = match sub.try_recv().expect("beat 2 reference").payload {
+        // Beats 2..7 emit nothing (low-rate) — the next reference is beat 8.
+        let (_ctx2, ref2) = match sub.try_recv().expect("beat 8 reference").payload {
             BlockFlow::BeatSync { context_id, beat_ref } => (context_id, beat_ref),
-            other => panic!("expected BeatSync, got {other:?}"),
+            other => panic!("expected the beat-8 BeatSync, got {other:?}"),
         };
-        assert_eq!(ctx2, score);
         assert!((ref2.tempo_bps - 1.0).abs() < 1e-9);
         assert!(
-            (ref2.beat - ref1.beat - 1.0).abs() < 1e-9,
-            "the beat coordinate advances one per beat: {} → {}",
+            (ref2.beat - ref1.beat - 7.0).abs() < 1e-9,
+            "references are 7 beats apart (beat 1 → beat 8): {} → {}",
             ref1.beat,
             ref2.beat,
         );
+
+        // And nothing else was published in that window (no per-beat chatter).
+        assert!(sub.try_recv().is_none(), "only beats 1 and 8 emit, not every beat");
     }
 
     /// A headless kernel (no sink subscribed on `block.beat_sync`) emits no beat
