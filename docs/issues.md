@@ -89,18 +89,26 @@ mounts, not kernel-`MountTable`, so not SFTP-visible). Two independent tracks;
 the design details live in the doc, this entry is the backlog pointer:
 
 - **Track B — `/v/blobs` + client CAS sync (ACTIVE; unblocks `pcm.md` 5c's clip
-  half).** B3's `SftpClient`+`BlobResolver` landed (`cca8ce7b`+`52d377e7`);
-  remaining per the doc (incl. the 2026-07-02 gemini-batch blockers folded
-  there): **B0** `kaijutsu-cas` hardening (atomic `store()` via staging+rename —
-  the XDG cache is multi-process and `retrieve` never re-hashes, torn reads are
-  real; `ContentHash` serde `try_from` defense-in-depth); **B1** `CasFs` backend
-  + mount before the freeze (leading-byte shards, full-hash leaves, EROFS,
-  `real_path`=None; synthesized `index` must serve exact generated size — the
-  default `read_all` truncates at `getattr().size`); **B2** `index` TSV
-  (absolute `path` column); **B3 residue** — sharded `blob_path()`,
+  half).** LANDED: B3's `SftpClient`+`BlobResolver` (`cca8ce7b`+`52d377e7`);
+  **B0** `kaijutsu-cas` hardening (`a82c332a` — atomic `store()` via
+  staging+rename since the XDG cache is multi-process and `retrieve` never
+  re-hashes; `retrieve` TOCTOU→`NotFound`=None; `ContentHash` serde `try_from`
+  validation); **B1** `CasFs` backend + mount before the freeze (`1854cbcf` —
+  leading-byte shards, full-hash leaves, positioned reads, EROFS,
+  `real_path`=None). REMAINING: **B3 residue** — sharded `blob_path()`,
   single-flight per hash, whole-blob read loops to EOF (256 KiB SFTP packet
   cap), e2e vs a live server. Ingest stays `kj cas put` (SFTP→`/tmp` two-step);
-  writable staging-over-SFTP deferred; cached `index` deferred.
+  writable staging-over-SFTP deferred.
+- **`/v/blobs/index` TSV — DESIGNED, DEFERRED (2026-07-02, Amy).** The B2
+  resolver file (`hash  mime  size  path`, absolute path column, mime from
+  `inspect()`) is fully designed in `docs/slash-v.md` but was **not shipped**:
+  nothing consumes it (the client resolver addresses blobs by exact hash, never
+  by reading `index`), and the first-cut shape — regenerate by walking
+  `objects/` (O(N) `stat`+`inspect`) on *every* read, no cache — is
+  under-designed and would bake a bad ABI. Build it only with (a) a real
+  consumer *and* (b) a cache keyed on a pool-version stamp (invalidate on
+  store/remove), or a per-shard `index` (256-way) if a single roster gets large.
+  `kj cas ls` covers human listing meanwhile.
 - **Track V — `/v/ctx` + `/v/session` (redesigned 2026-06-27 — script-first:
   TSV `index` resolver, sharded pools, symlink edges; no `by-id`/`by-time`/
   `live` farms; no writable `bound` — the capability apparatus dissolved into

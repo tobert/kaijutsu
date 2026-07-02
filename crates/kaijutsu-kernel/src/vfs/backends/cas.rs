@@ -8,10 +8,16 @@
 //!
 //! ```text
 //! /v/blobs/
-//! ├── index            # TSV: hash  mime  size  path   (one row per object)
 //! └── <ab>/            # shard dirs — the hash's LEADING two hex chars
 //!     └── <full-hash>  # the raw bytes, immutable; leaf name is the FULL 32-hex hash
 //! ```
+//!
+//! A greppable `index` TSV (`hash  mime  size  path`) is designed in
+//! `docs/slash-v.md` but **not shipped**: nothing consumes it yet (the client
+//! resolver addresses blobs by exact hash, never by browsing), and a naive
+//! walk-the-pool-per-read index is under-designed for scale. It lands with a
+//! real consumer and a cache (keyed on a pool-version stamp, or split per
+//! shard) — see `docs/issues.md`.
 //!
 //! ## Read-only by construction, not by flag
 //!

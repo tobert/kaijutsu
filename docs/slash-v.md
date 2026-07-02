@@ -147,10 +147,14 @@ by construction, not by mount flag.
 
 ```
 /v/blobs/
-├── index            # TSV: hash  mime  size  path   (one row per object)
+├── index            # TSV: hash  mime  size  path  — DESIGNED, DEFERRED (see B2)
 └── <ab>/            # shard dirs — the hash's LEADING two hex chars
     └── <full-hash>  # the raw bytes, immutable; leaf name is the FULL 32-hex hash
 ```
+
+*`index` is designed below but **not shipped** — see the B2 slice for why (no
+consumer yet, and a walk-the-pool-per-read index is under-designed). The blob
+leaves are the whole substrate the client resolver needs.*
 
 - **Shard on the leading byte — deliberately unlike contexts.** The UUIDv7
   trailing-byte rule (below) exists because v7's leading bytes are a clock.
@@ -191,9 +195,9 @@ by construction, not by mount flag.
 - **`staging/` and `metadata/` are deliberately not exposed.** Staging is a
   kernel-internal ingest mechanism; metadata is projected through `index`.
   `/v/blobs` is the object pool, nothing else (the junk-drawer rule).
-- **readdir** of `/v/blobs` lists `index` + the shard dirs that exist on disk;
-  readdir of a shard lists full-hash leaf names. Paged readdir (landed with
-  SFTP) keeps a fat shard correct.
+- **readdir** of `/v/blobs` lists the shard dirs that exist on disk (plus
+  `index` once B2 ships); readdir of a shard lists full-hash leaf names. Paged
+  readdir (landed with SFTP) keeps a fat shard correct.
 
 ### Client sync — `SftpClient` + `BlobResolver` and the XDG cache
 
@@ -273,8 +277,17 @@ review's blockers.
   `/v/blobs` in the server bootstrap before the freeze. Verify from kaish
   (`ls /v/blobs`, `cat` a known hash) and over stock `sftp` (byte-identical
   round-trip against `kj cas get`).
-- **B2 — `index` TSV.** The resolver file, mime joined from metadata. Verify:
-  `grep <hash> /v/blobs/index` from kaish; row count matches `kj cas ls`.
+- **B2 — `index` TSV. DEFERRED (2026-07-02, Amy) — do not ship yet.** The
+  resolver file was designed here (mime joined from metadata, absolute `path`
+  column), but there is **no consumer**: the client resolver addresses blobs by
+  exact hash (`/v/blobs/<ab>/<hash>`), never by reading `index`; it is purely a
+  human/script grep-the-pool convenience. And the first-cut shape — regenerate
+  by walking `objects/` (an O(N) `stat`+`inspect` sweep) on *every* read, no
+  cache — is under-designed: shipping it commits us to an ABI we'd outgrow.
+  YAGNI. It lands with (a) a real consumer and (b) a cache keyed on a
+  pool-version stamp (invalidate on store/remove), or a per-shard `index`
+  (256-way) if a single roster ever gets large. Tracked in `docs/issues.md`.
+  Until then `kj cas ls` already lists the pool for humans.
 - **B3 — client resolver + XDG cache.** `SftpClient` + `BlobResolver` landed
   (`cca8ce7b` + hardening `52d377e7`); remaining in-slice work:
   - **align `blob_path()` to the sharded shape**
@@ -603,8 +616,9 @@ direction now; `/v/ctx` + `/v/session` land first.
 
 - **`/v/blobs` is a read-only `CasFs` on the kernel `MountTable`** — sharded on
   the *leading* two hex chars (BLAKE3 is uniform; matches disk), full-hash leaf
-  names, `index` TSV with mime/size, `staging/`+`metadata/` unexposed, constant
-  `generation` (immutable objects). Track B, lands first.
+  names, `staging/`+`metadata/` unexposed, constant `generation` (immutable
+  objects). Track B, lands first. The `index` TSV (mime/size) is designed but
+  **deferred** (B2) until it has a consumer and a cache.
 - **Client CAS sync = the `sftp` subsystem on its own SSH connection (same keys,
   same server; the capnp RPC world is `!Send`) + an XDG `FileStore` cache +
   re-hash verification** — no new RPC, fail-loud on hash mismatch, single-flight
