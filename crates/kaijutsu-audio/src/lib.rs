@@ -104,11 +104,6 @@ impl RenderCue {
             lead: Duration::ZERO,
         }
     }
-
-    /// The cue's MIME dispatch key.
-    pub fn mime(&self) -> &str {
-        &self.mime
-    }
 }
 
 /// Aligns with Symphonia's codec set; the wire MIME derives from it.
@@ -212,7 +207,7 @@ mod tests {
     #[test]
     fn now_inline_builds_a_zero_lead_inline_cue() {
         let cue = RenderCue::now_inline("audio/wav", vec![1, 2, 3]);
-        assert_eq!(cue.mime(), "audio/wav");
+        assert_eq!(cue.mime, "audio/wav");
         assert_eq!(cue.lead, Duration::ZERO, "play-now == zero lead");
         assert_eq!(cue.payload, CuePayload::Inline(vec![1, 2, 3]));
     }

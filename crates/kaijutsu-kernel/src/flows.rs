@@ -701,6 +701,17 @@ impl<T: Clone + Send + HasSubject + 'static> FlowBus<T> {
         self.topics.values().map(|tx| tx.receiver_count()).sum()
     }
 
+    /// Number of active subscribers on a single topic (0 if the topic is unknown
+    /// or has none). Lets a producer skip expensive work — a CAS read, a render —
+    /// when nobody is listening on that specific subject (e.g. a headless kernel
+    /// with no sink attached should do no render work: docs/midi.md).
+    pub fn topic_subscribers(&self, topic: &str) -> usize {
+        self.topics
+            .get(topic)
+            .map(|tx| tx.receiver_count())
+            .unwrap_or(0)
+    }
+
     /// Get the default capacity.
     pub fn capacity(&self) -> usize {
         self.default_capacity

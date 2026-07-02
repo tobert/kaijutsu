@@ -739,6 +739,14 @@ impl BeatScheduler {
     /// "Render is a wire cue"): drop the speculation lead's buffered phrase +
     /// silence sounding notes, so a stop/pause doesn't play on. Keyed by the
     /// track's score context.
+    ///
+    /// This is a **contentless directive cue** by design — the mime IS the
+    /// message and the payload is deliberately empty. It rides `RenderCue` (not a
+    /// separate `BlockFlow` variant) so it fans out on the exact plumbing the
+    /// render cues use and the sink dispatches it by mime like any other. Not
+    /// gated on `topic_subscribers` like `publish_render_cues`: it's cheap (no CAS
+    /// read) and a late-attaching sink flushing a queue it hasn't filled is a
+    /// harmless no-op.
     fn publish_render_flush(&self, context_id: ContextId) {
         let cue = kaijutsu_audio::RenderCue {
             mime: kaijutsu_audio::RENDER_FLUSH_MIME.to_string(),
@@ -1199,6 +1207,15 @@ impl BeatScheduler {
     ) {
         if hw_after <= hw_before {
             return; // nothing crossed this beat
+        }
+        // Sink-dependent by design (docs/midi.md "Render is a wire cue"): with no
+        // subscriber on the render-cue topic (a headless kernel, no app/edge sink
+        // attached) there is nobody to render, so skip the CAS reads + cue build
+        // entirely. The score is still durable — `materialize_committed` wrote the
+        // blocks into the score context separately; only the ephemeral render is
+        // gated here. (Attach a sink later and replay.)
+        if self.kernel.block_flows().topic_subscribers("block.render_cue") == 0 {
+            return;
         }
         let Some(timeline) = self.kernel.track_timeline(track_id) else {
             return;
@@ -1808,9 +1825,9 @@ mod tests {
     };
     use kaijutsu_kernel::Kernel;
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind, SharedBlockStore};
-    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
+    use kaijutsu_kernel::flows::{BlockFlow, FlowBus, SharedBlockFlowBus};
     use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
-    use kaijutsu_kernel::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence};
+    use kaijutsu_kernel::hyoushigi::{Attachment, BeatPolicy, Cadence};
     use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
 
@@ -2027,6 +2044,28 @@ mod tests {
         )
     }
 
+    /// A resolver that commits a fixed, valid ABC tune (mime `text/vnd.abc`) — the
+    /// render-cue tests need a real ABC cell to cross the barrier.
+    struct ValidAbc;
+    impl Resolver for ValidAbc {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("valid_abc")
+        }
+        fn estimate_cost(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::ZERO
+        }
+        fn compute_basis(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"stable")
+        }
+        fn resolve(
+            &self,
+            _p: &serde_json::Value,
+            _c: &dyn ResolverCtx,
+        ) -> Result<Resolution, ResolveError> {
+            Ok(Resolution::new(b"X:1\nK:C\nCDEF|\n".to_vec(), "text/vnd.abc"))
+        }
+    }
+
     async fn fresh_kernel_and_docs() -> (Arc<Kernel>, SharedBlockStore) {
         let kernel = Arc::new(Kernel::new_ephemeral("test").await);
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
@@ -2141,6 +2180,109 @@ mod tests {
         sched.detach(&track_id, ctx);
         let out = sched.fire_due(base + Duration::from_secs(6));
         assert!(out.fired.is_empty(), "detached → context no longer fires");
+    }
+
+    /// 5c-2 core: when a committed ABC cell crosses the write barrier, the
+    /// materialize crossing publishes a wire `RenderCue{ text/vnd.abc }` — keyed
+    /// by the track's score context, carrying the resolved ABC inline. This is the
+    /// path the app MIDI sink consumes; it replaced the deleted in-process
+    /// `AlsaMidiOut` emit, so it needs its own regression guard.
+    #[tokio::test]
+    async fn crossing_an_abc_cell_publishes_a_render_cue() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let track = TrackId::solo();
+        // Arm the track with a DEFERRED cell + a resolver that commits valid ABC;
+        // resolving commits it Concrete AND stores its bytes in CAS, so the
+        // publish path's `retrieve` finds them (commit-margin 0 → the cell commits
+        // when the playhead reaches its tick).
+        let tl = kernel.arm_track_timeline(
+            track.clone(),
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(ValidAbc));
+            g.schedule(Cell::deferred_on(
+                Span::instant(Tick::new(1)),
+                Recipe {
+                    resolver: ResolverId::new("valid_abc"),
+                    params: serde_json::Value::Null,
+                    query: ContextQuery::default(),
+                    fallback: Fallback::Skip,
+                },
+                track.clone(),
+                PrincipalId::beat(),
+            ))
+            .unwrap();
+        }
+        let abc = "X:1\nK:C\nCDEF|\n"; // what ValidAbc resolves to
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track);
+
+        // Subscribe BEFORE playing: the sink-dependency gate needs an active
+        // receiver on the topic, and the FlowBus is a live broadcast.
+        let mut sub = kernel.block_flows().subscribe("block.render_cue");
+
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_secs(1)); // playhead reaches tick 1
+
+        let msg = sub
+            .try_recv()
+            .expect("a RenderCue must be published for the crossed ABC cell");
+        match msg.payload {
+            BlockFlow::RenderCue { context_id, cue } => {
+                assert_eq!(context_id, score, "cue is keyed by the track's score context");
+                assert_eq!(cue.mime, kaijutsu_audio::ABC_MIME, "ABC cue mime");
+                match cue.payload {
+                    kaijutsu_audio::CuePayload::Inline(bytes) => {
+                        assert_eq!(bytes, abc.as_bytes(), "the resolved ABC rides inline");
+                    }
+                    other => panic!("expected Inline payload, got {other:?}"),
+                }
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
+    }
+
+    /// 5c-2 flush: `stop` (and `pause`) publish a contentless `RENDER_FLUSH_MIME`
+    /// cue keyed by the track's score context, so every wire sink drops its
+    /// buffered phrase + silences — the wire twin of the deleted in-process
+    /// `flush_scheduled_after`. Unlike the render cue this fires even for a track
+    /// that never played (a bare `attach` then `stop`).
+    #[tokio::test]
+    async fn stop_publishes_a_render_flush_cue() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 1);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track);
+
+        let mut sub = kernel.block_flows().subscribe("block.render_cue");
+        sched.stop(&track);
+
+        let msg = sub.try_recv().expect("stop must publish a flush cue");
+        match msg.payload {
+            BlockFlow::RenderCue { context_id, cue } => {
+                assert_eq!(context_id, score, "flush is keyed by the track's score context");
+                assert_eq!(cue.mime, kaijutsu_audio::RENDER_FLUSH_MIME, "flush cue mime");
+                assert!(
+                    matches!(cue.payload, kaijutsu_audio::CuePayload::Inline(ref b) if b.is_empty()),
+                    "flush is a contentless directive cue",
+                );
+            }
+            other => panic!("expected a flush RenderCue, got {other:?}"),
+        }
     }
 
     /// `set_tempo` re-slaves the armed track timeline's speculation `TickClock`
