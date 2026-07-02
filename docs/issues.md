@@ -856,6 +856,64 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   clock-in, edge node) are sequenced in `docs/midi.md`; still-open external-signal
   clock sources (solar/compute-availability) ride the same `ClockSourceKind` seam.
   Story: `docs/tracks.md` + devlog.
+- **Relative-lead render timing — ANALYZED before building on it (2026-07-02,
+  Opus + gemini-pro batch + deepseek).** Verdict: the substrate is sound, build
+  the PCM path on it — but a framing correction and a findings list came out of
+  the two-cast review (no diff, whole-file). **The correction:** the
+  `RenderCue { lead }` scheme is NOT a jitter buffer — the playout anchor *is* the
+  jittered arrival (`receipt + lead`), so it *passes arrival jitter through*, it
+  doesn't absorb it. Blast radius is bounded: a whole phrase's MIDI events schedule
+  into the ALSA queue off one anchor, so *intra-phrase* timing is sub-ms perfect;
+  jitter only lands at *phrase/cell boundaries* (seconds apart) → musically
+  invisible for sustained single-sink material, audible only for PCM attack
+  transients + multi-sink flam (app + edge node on independent streams). The
+  algebra holds: Θ (clock offset) cancels, constant latency is free, only jitter
+  costs — provided `lead ≥ transit + sink granularity`. Actionable findings:
+    1. **`beat.rs:940` re-arms `now + period`, not `t + period`** — beat cadence is
+       a *random walk* of accumulated wakeup jitter. Musically irrelevant at phrase
+       granularity now (documented intentional at `clock.rs:65-69`, "absorbs
+       scheduler jitter into the period"), but once `SystemClock` is the *reference
+       for a remote edge-node PLL*, the drift becomes a bias that accumulates.
+       One-line fix (`t + period`), and it's what a metronome wants. Deferred — a
+       timing-behavior change; land with a red-first test + Amy's nod.
+    2. **Two-phase prefetch for PCM** (three-way convergence) — a long-lead
+       `prepare`/`preload` (10–30s, warm the XDG CAS cache) separate from a short
+       fire `lead` (~100ms once local). Don't force one budget to be both jitter
+       buffer and bulk-I/O window. Shapes the clip-cue schema (`docs/clips.md` could
+       carry a `prepare_at` tick / `prepare_lead`).
+    3. **Bevy has no audio-scheduling primitive** — the real PCM build risk, not the
+       timing math. `AudioPlayer` plays on spawn (`audio.rs:40-78` ignores
+       `cue.lead`). Honoring `lead` for samples is net-new substrate (delayed-spawn/
+       unmute at frame granularity ~16ms, or pierce to the `rodio` Sink; headless →
+       the `pawlsa` ALSA-PCM loop). Contrast MIDI, which delegates sub-ms timing to
+       the ALSA seq queue (`midi.rs:237`).
+    4. **Snapshot `receipt` at parse-time, before the fetch** — else SFTP fetch
+       latency folds into audio jitter (the "snapshot trap"). Pairs with #2.
+    5. **Late-fetch = skip-loud** (converged) — never fire-late or time-stretch a
+       transient; log the underrun and drop. Resolves the `pcm.md` "skip vs fire
+       late, decided at the first real sink" open question.
+    6. **Capture `now` close to the send** in `publish_render_cues` (`beat.rs:1297`
+       captures pre-loop) — fine for tiny ABC, but PCM CAS reads inside that loop
+       widen the gap into the lead budget.
+    7. **Multi-sink flam + whole-queue flush** (`midi.rs:92` flushes the *whole*
+       ALSA queue regardless of track) — future concern; per-track flush + shared-
+       clock scheduling are the eventual answer.
+  The **shared "good-enough" hyoushigi** (a loose local beat / PLL slewing to
+  low-rate `{tick, tempo, phase}` refs, never hard-resync) is validated by both
+  casts as the right continuous-timebase companion. **DECIDED (Amy, 2026-07-02):
+  the continuous timebase and the per-cue trigger COMPOSE** — two parallel
+  subsystems, both renderings of the same kernel timeline, neither feeding the
+  other (per-cue owns *sound onset*; the local phasor owns *"where's the beat
+  now"* — metronome/playhead/visuals). Divergence is **measured, not prevented by
+  construction**. Gemini's *replace-with-absolute-tick-through-PLL* is retained as
+  the **upgrade path**, reached for only if the metronome test shows the per-cue
+  path's boundary jitter audibly pulling away from the visual playhead (PCM
+  transients / multi-sink) — not a prerequisite. Validator: the **metronome
+  slice** (`pcm.md` "the metronome slice") — click-on-local-beat vs
+  MIDI-note-on-per-cue, inter-onset within ~1ms, watch for drift — which also
+  builds the local beat we want anyway. PLL failure modes to design against
+  (deepseek): starvation drift (ref rate must bound drift < ~1ms), tempo-step slew
+  limit, phase-slew-not-step, reference-jitter outlier rejection.
 - **Beat-lifecycle privilege asymmetry — RESOLVED by design (2026-06-28).**
   `fire_lifecycle` runs `tick`/`rotate` unprivileged while create runs
   privileged; gemini-pro flagged it. Decision: leave it. We deliberately keep

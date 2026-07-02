@@ -225,6 +225,53 @@ proves the whole wire-cue path on zorak (app renders/queues MIDI → ALSA seq �
 becomes *just another sink* speaking the same cue protocol — and it is the
 **headless** sink for *everything*, MIDI and PCM alike, not a PCM-only errand.
 
+## The relative-lead timebase, analyzed (2026-07-02)
+
+Before building the PCM path on the wire-cue substrate we analyzed its timing
+model (a two-cast review — gemini-pro batch + deepseek — plus the derivation
+below). **Verdict: sound, build on it.** But a phrase above needs an honest
+correction, and a companion subsystem falls out of it.
+
+**Correction to "wire jitter vanishes into the lead."** The `receipt + lead`
+scheme is *not* a jitter buffer: a real jitter buffer decouples the read clock
+from the write clock, but here the play-out anchor **is** the (jittered) arrival,
+so it *passes arrival jitter through* rather than absorbing it. The blast radius
+is bounded, which is why it works: a whole phrase's events schedule into the
+local ALSA queue off **one anchor**, so *intra-phrase* timing is sub-millisecond
+perfect; jitter lands only at *phrase/cell boundaries* (seconds apart). That is
+musically invisible for sustained single-sink material — but audible for PCM
+attack transients and for **multi-sink flam** (two sinks on independent streams
+fire the same note at `a + d₁` vs `a + d₂`). The clean part still holds: with
+`sink_clock = kernel_clock + Θ`, an event intended at kernel-instant `a` fires at
+`a + d`; **Θ cancels** (no clock-sync needed), constant latency is free, only
+transit *jitter* costs — provided `lead ≥ transit + sink scheduling granularity`.
+
+**Two subsystems that COMPOSE (decided, Amy, 2026-07-02).** The per-cue trigger
+path and a *continuous local timebase* are separate renderings of the same kernel
+timeline, neither feeding the other:
+
+- **Per-cue trigger** (`RenderCue { lead }`, exists) — fire-and-forget one-shots,
+  jitter-sensitive. Owns **sound onset**.
+- **Continuous timebase** (the "good-enough shared hyoushigi", to build) — a
+  local phasor in the sink that free-runs and *slews* toward low-rate
+  `{tick, tempo, phase}` references from the kernel (never hard-resync; a little
+  jitter buys resilience). Owns **"where's the beat now"** — metronome, a smooth
+  playhead, beat-synced visuals. This is `## Distribute tempo, not pulses`
+  applied to *output*.
+
+Divergence between them is **measured, not prevented by construction** — the
+metronome slice is the validator (click-on-local-beat vs MIDI-note-on-per-cue,
+inter-onset within ~1 ms, watch for drift). Gemini's alternative — *replace* the
+per-cue anchor with an absolute **tick** the sink converts through its PLL-smoothed
+clock (a true jitter buffer that also keeps audio locked to the visual playhead)
+— is retained as the **upgrade path**, reached for only if the metronome test
+shows the boundary jitter audibly pulling audio away from the phasor (PCM
+transients / multi-sink). Not a prerequisite. PLL failure modes to design against:
+starvation drift (reference rate must bound free-run drift < ~1 ms), tempo-step
+slew limiting, phase-slew-not-step, reference-jitter outlier rejection. The full
+findings list (incl. the `beat.rs:940` random-walk cadence one-liner and the PCM
+guardrails) lives in `docs/issues.md` → Hyoushigi / Musician.
+
 ## The topology (Amy's room, 2026-06-29)
 
 - **KeyStep Pro (KSP) — usual clock master**, on a long-range USB3 hub with the

@@ -346,11 +346,31 @@ survives, to pick up when listening goes multi-peer:
   (Shape A), research record in `docs/cue-prior-art.md`. The clip *validator*
   is a voice of the decouple-Act-from-ABC generalization (`docs/issues.md` —
   same content-type-keyed move, input side).
+- **Prefetch vs. fire — RESOLVED (timing analysis, 2026-07-02): two-phase.** Do
+  not force one `lead` to be both jitter buffer and bulk-I/O window. A cache-cold
+  multi-MB SFTP fetch can exceed the fire lead; so a long-lead **prepare/preload**
+  horizon (10–30 s, warm the XDG CAS cache when the cell becomes *known*) is
+  separate from the short **fire** `lead` (~100 ms, once the sample is verified
+  local). Same relative-lead substrate, two horizons — the clip cue / `docs/clips.md`
+  grows a `prepare_at` tick (or `prepare_lead`). Snapshot `receipt` at parse-time,
+  *before* the fetch, or the fetch latency folds into audio jitter. Full findings:
+  `docs/issues.md` → Hyoushigi / Musician.
+- **Late-fetch policy — RESOLVED (timing analysis, 2026-07-02): skip-loud.** If the
+  sample isn't decoded and local by its deadline, log the underrun and **drop** it —
+  never fire-late or time-stretch a transient (a late kick destroys the groove; a
+  stretched transient sounds worse). The fallback machinery is the hook. Decode runs
+  off a pool, never blocking the scheduling frame; if it isn't ready by
+  `lead − safety`, fire the fallback.
 - **Routing/volume** — `pawlsa`'s `pw` graph control (default endpoint, node
   volume/mute, links) is deferred to a later surface; first sound just plays to
   the default sink.
-- **Timing** — first slice plays immediately (`at = None`); scheduled playback
-  against the speculation lead arrives with the track integration (slice 5).
+- **Timing — RESOLVED (2026-07-02): the substrate is the relative-lead wire cue,
+  and it's sound.** First slice plays immediately (`at = None`); scheduled playback
+  fires at `receipt + lead`. The timing model was analyzed before building on it
+  (`docs/midi.md` "The relative-lead timebase, analyzed" + `docs/issues.md`); the
+  one net-new build item is that Bevy's `AudioPlayer` has no scheduling primitive,
+  so honoring `lead` for *samples* needs a scheduler the MIDI path (ALSA seq queue)
+  gets for free.
 
 ## Verification
 
