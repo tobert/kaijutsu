@@ -181,6 +181,31 @@ pub struct BlobResolver<F: BlobFetch> {
     locks: Mutex<HashMap<ContentHash, Arc<AsyncMutex<()>>>>,
 }
 
+/// Prunes a single-flight lock-map entry when a resolve's hold on the hash's
+/// lock ends — on return, on a cancelled task dropped mid-await, or on a panic
+/// in the fetch. Race-free because every clone of the lock `Arc` happens under
+/// the same std `Mutex` this guard takes: `strong_count <= 2` (the map entry +
+/// this guard's clone) means no other resolve still holds the lock, so removing
+/// it is safe; a queued waiter keeps a third clone, so the last one out prunes.
+struct FlightGuard<'a> {
+    locks: &'a Mutex<HashMap<ContentHash, Arc<AsyncMutex<()>>>>,
+    hash: ContentHash,
+    lock: Arc<AsyncMutex<()>>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        // A Drop must not panic (a double-panic aborts); the std `Mutex` here is
+        // only ever held for these O(1) map ops and never across user code, so
+        // it can't actually be poisoned — but tolerate it defensively.
+        if let Ok(mut locks) = self.locks.lock() {
+            if Arc::strong_count(&self.lock) <= 2 {
+                locks.remove(&self.hash);
+            }
+        }
+    }
+}
+
 impl<F: BlobFetch> BlobResolver<F> {
     /// Build a resolver over an explicit cache directory (tests, custom roots).
     pub fn new(cache: FileStore, fetch: F) -> Self {
@@ -217,8 +242,8 @@ impl<F: BlobFetch> BlobResolver<F> {
         }
 
         // Single-flight: take (or create) this hash's fetch lock. All clones
-        // happen while holding the std `Mutex`, so the strong-count prune below
-        // is race-free.
+        // happen while holding the std `Mutex`, so the strong-count prune in the
+        // guard is race-free.
         let lock = {
             let mut locks = self.locks.lock().unwrap();
             locks
@@ -226,23 +251,18 @@ impl<F: BlobFetch> BlobResolver<F> {
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
-
-        let result = {
-            let _guard = lock.lock().await;
-            self.fetch_verify_store(hash).await
+        // The guard prunes the map entry on *every* exit — normal return, a
+        // cancelled task dropped mid-await, or a panic in the fetch — so a
+        // coalescing lock can never leak. It is declared before `_guard` so on
+        // scope exit `_guard` (the async lock) releases first, then the prune
+        // runs.
+        let flight = FlightGuard {
+            locks: &self.locks,
+            hash: hash.clone(),
+            lock,
         };
-
-        // Reclaim the slot once no concurrent resolve still holds this lock
-        // (map + our local `lock` == 2). A waiter still queued keeps a clone, so
-        // the count stays > 2 and the last one out prunes it.
-        {
-            let mut locks = self.locks.lock().unwrap();
-            if Arc::strong_count(&lock) <= 2 {
-                locks.remove(hash);
-            }
-        }
-
-        result
+        let _guard = flight.lock.lock().await;
+        self.fetch_verify_store(hash).await
     }
 
     /// The miss path, run under the per-hash lock: re-check the cache (a prior
@@ -417,6 +437,35 @@ mod tests {
         assert!(
             resolver.locks.lock().unwrap().is_empty(),
             "per-hash lock entry must be reclaimed once the flight completes"
+        );
+    }
+
+    /// A panic in the fetch must not leak the single-flight lock entry — the
+    /// RAII `FlightGuard` prunes it on unwind, so a later resolve of the same
+    /// hash doesn't find a stale lock (and the map doesn't grow forever).
+    #[tokio::test]
+    async fn a_panicking_fetch_does_not_leak_the_flight_lock() {
+        struct PanicFetch;
+        #[async_trait]
+        impl BlobFetch for PanicFetch {
+            async fn fetch(&self, _hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+                panic!("fetch blew up");
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let hash = ContentHash::from_data(b"will panic on fetch");
+        let resolver = Arc::new(BlobResolver::new(FileStore::at_path(dir.path()), PanicFetch));
+
+        // Run on a task so the panic surfaces as a JoinError, not a test abort.
+        let r = resolver.clone();
+        let h = hash.clone();
+        let joined = tokio::spawn(async move { r.resolve(&h).await }).await;
+        assert!(joined.is_err(), "the panicking fetch should surface as a JoinError");
+
+        assert!(
+            resolver.locks.lock().unwrap().is_empty(),
+            "the single-flight lock entry must be pruned even when the fetch panics"
         );
     }
 

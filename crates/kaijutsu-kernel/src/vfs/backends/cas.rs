@@ -222,11 +222,17 @@ impl VfsOps for CasFs {
                     std::io::ErrorKind::NotFound => VfsError::not_found(hash.to_string()),
                     _ => VfsError::Io(e),
                 })?;
+                // Bound the allocation to the bytes actually available from
+                // `offset`: `size` is a caller-supplied u32 (up to ~4 GiB), so a
+                // huge request must not pre-allocate gigabytes for a small
+                // object. Objects are immutable, so this length is stable.
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                let want = (size as u64).min(len.saturating_sub(offset)) as usize;
                 f.seek(SeekFrom::Start(offset)).map_err(VfsError::Io)?;
-                // Positioned read of up to `size` bytes — never materialize the
+                // Positioned read of up to `want` bytes — never materialize the
                 // whole object for a range read (the SFTP path chunks a large
                 // blob at 256 KiB, so whole-file reads here would be O(n²)).
-                let mut buf = vec![0u8; size as usize];
+                let mut buf = vec![0u8; want];
                 let mut filled = 0usize;
                 while filled < buf.len() {
                     match f.read(&mut buf[filled..]) {

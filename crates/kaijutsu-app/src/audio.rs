@@ -109,32 +109,67 @@ impl BlobPrefetch {
 }
 
 /// Resolve `hash`, connecting the shared resolver on first use. A transport
-/// failure clears the connection so the next cue reconnects; a per-object
-/// failure (NotFound / HashMismatch) leaves the healthy transport in place.
+/// failure drops the connection so it redials; a per-object failure (NotFound /
+/// HashMismatch) leaves the healthy transport in place.
 async fn resolve_with_lazy_connect(
     slot: &AsyncMutex<Option<Arc<BlobResolver<SftpClient>>>>,
     hash: &ContentHash,
     config: SshConfig,
 ) -> Result<Vec<u8>, SftpError> {
-    let resolver = {
-        let mut guard = slot.lock().await;
-        if guard.is_none() {
-            let sftp = SftpClient::connect(config).await?;
-            *guard = Some(Arc::new(BlobResolver::with_xdg_cache(sftp)));
-        }
-        // Just inserted or already present.
-        guard.as_ref().expect("resolver present").clone()
-    };
-
-    match resolver.resolve(hash).await {
-        Ok(bytes) => Ok(bytes),
-        Err(e) => {
-            if matches!(e, SftpError::Ssh(_) | SftpError::Protocol(_)) {
-                // The transport is suspect — drop it so the next cue redials.
-                *slot.lock().await = None;
+    // One reconnect-retry: a connection dropped while idle (server timeout) only
+    // surfaces as a transport error on the *first* cue after the drop; retrying
+    // once — after redialing — makes that flap invisible instead of skipping the
+    // cue. A second transport failure is real, so return it.
+    let mut redialed = false;
+    loop {
+        let resolver = get_or_connect(slot, &config).await?;
+        match resolver.resolve(hash).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                let transport = matches!(e, SftpError::Ssh(_) | SftpError::Protocol(_));
+                if transport {
+                    // Drop the dead transport so the next attempt/cue redials —
+                    // but ONLY if the slot still holds the resolver that just
+                    // failed. A concurrent cue may have already swapped in a
+                    // fresh, healthy connection; clearing that blindly would
+                    // thrash it.
+                    reset_slot_if_same(slot, &resolver).await;
+                }
+                if transport && !redialed {
+                    redialed = true;
+                    continue;
+                }
+                return Err(e);
             }
-            Err(e)
         }
+    }
+}
+
+/// Get the shared resolver, connecting it on first use. Holding the slot lock
+/// across `connect` also single-flights the dial: concurrent first cues wait,
+/// then reuse the one connection.
+async fn get_or_connect(
+    slot: &AsyncMutex<Option<Arc<BlobResolver<SftpClient>>>>,
+    config: &SshConfig,
+) -> Result<Arc<BlobResolver<SftpClient>>, SftpError> {
+    let mut guard = slot.lock().await;
+    if guard.is_none() {
+        let sftp = SftpClient::connect(config.clone()).await?;
+        *guard = Some(Arc::new(BlobResolver::with_xdg_cache(sftp)));
+    }
+    Ok(guard.as_ref().expect("resolver present").clone())
+}
+
+/// Clear the slot only if it still holds `failed` — so a concurrent cue's fresh
+/// reconnection is never wiped by a late loser's error handler (the transport
+/// slot-clearing race).
+async fn reset_slot_if_same(
+    slot: &AsyncMutex<Option<Arc<BlobResolver<SftpClient>>>>,
+    failed: &Arc<BlobResolver<SftpClient>>,
+) {
+    let mut guard = slot.lock().await;
+    if guard.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, failed)) {
+        *guard = None;
     }
 }
 

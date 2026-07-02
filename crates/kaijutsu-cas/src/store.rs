@@ -148,8 +148,24 @@ impl FileStore {
             match fs::rename(staging_path, obj_path) {
                 Ok(()) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                    fs::copy(staging_path, obj_path).map_err(StoreError::Copy)?;
-                    let _ = fs::remove_file(staging_path);
+                    // Cross-filesystem staging (staging/ and objects/ on
+                    // different mounts). A direct `fs::copy` to `obj_path` would
+                    // expose a *torn* object to a concurrent reader — the very
+                    // thing the atomic rename exists to prevent. So copy into a
+                    // uniquely-named temp file **in the destination directory**
+                    // (same FS as `obj_path`), then rename that into place.
+                    let tmp =
+                        obj_path.with_extension(format!("tmp.{}", StagingId::new()));
+                    fs::copy(staging_path, &tmp).map_err(StoreError::Copy)?;
+                    match fs::rename(&tmp, obj_path) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(staging_path);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&tmp);
+                            return Err(StoreError::Rename(e));
+                        }
+                    }
                 }
                 Err(e) => return Err(StoreError::Rename(e)),
             }
@@ -178,10 +194,30 @@ impl FileStore {
             size,
         };
         let json = serde_json::to_string(&metadata).map_err(StoreError::MetadataSerde)?;
-        fs::write(&meta_path, json).map_err(|e| StoreError::MetadataWrite {
-            path: meta_path,
+        // Write to a temp sidecar in the same directory, then rename into place,
+        // so a concurrent `inspect()` never reads a torn (half-written) JSON and
+        // fails to parse it. (Metadata is non-authoritative — `inspect` degrades
+        // to octet-stream when it's *missing* — but a torn file is a present
+        // parse error, not a graceful miss.)
+        let fname = meta_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = meta_path.with_file_name(format!("{fname}.tmp.{}", StagingId::new()));
+        fs::write(&tmp, json).map_err(|e| StoreError::MetadataWrite {
+            path: tmp.clone(),
             source: e,
-        })
+        })?;
+        match fs::rename(&tmp, &meta_path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(StoreError::MetadataWrite {
+                    path: meta_path,
+                    source: e,
+                })
+            }
+        }
     }
 
     pub fn create_staging(&self) -> Result<StagingChunk, StoreError> {
