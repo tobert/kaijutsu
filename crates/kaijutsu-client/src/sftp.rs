@@ -16,10 +16,13 @@
 //! thread), SFTP futures are `Send`, so this rides the ambient async runtime /
 //! Bevy task pool — it never touches the RPC actor's `spawn_local` world.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use russh_sftp::client::SftpSession;
+use tokio::sync::Mutex as AsyncMutex;
 
 use kaijutsu_cas::{CasConfig, ContentHash, ContentStore, FileStore, StoreError};
 use kaijutsu_types::SSH_SFTP_SUBSYSTEM;
@@ -92,8 +95,14 @@ pub struct SftpClient {
 
 impl SftpClient {
     /// The canonical VFS path for a content-addressed blob.
+    ///
+    /// Sharded on the hash's **leading** two hex chars, matching the server's
+    /// `/v/blobs/<ab>/<full-hash>` layout (BLAKE3 is uniform in every byte, so
+    /// the UUIDv7 trailing-byte sharding rule deliberately does NOT apply to
+    /// hashes). The blob pool is the one `/v` pool that grows without bound, so
+    /// it is sharded 256× to keep any single `readdir` bounded.
     pub fn blob_path(hash: &ContentHash) -> String {
-        format!("/v/blobs/{hash}")
+        format!("/v/blobs/{}/{}", hash.prefix(), hash)
     }
 
     /// Open an SSH connection, authenticate, and bind a channel to the `sftp`
@@ -113,6 +122,14 @@ impl SftpClient {
 
     /// Read an entire VFS path over SFTP. A missing path is [`SftpError::NotFound`]
     /// (fail loud), never empty bytes.
+    ///
+    /// **Reads to EOF across the packet cap.** `SftpSession::read` opens the file
+    /// and drives `read_to_end`, whose `poll_read` issues one SFTP `READ` per
+    /// packet — each capped at the negotiated `max_read_len` (256 KiB
+    /// server-side) — advancing the offset until EOF (verified against
+    /// russh-sftp 2.3 `client/fs/file.rs`). So a blob larger than one packet is
+    /// reassembled whole, and the resolver's re-hash verifies the full object,
+    /// not a truncated prefix.
     ///
     /// Reads the whole object into memory. Fine for the symbolic scores and
     /// small clips of the first cut; a large-media streaming path (chunked read
@@ -154,12 +171,24 @@ impl BlobFetch for SftpClient {
 pub struct BlobResolver<F: BlobFetch> {
     cache: FileStore,
     fetch: F,
+    /// Per-hash fetch locks — the single-flight gate. Concurrent misses for one
+    /// hash serialize on the hash's `AsyncMutex`, so only the first crosses the
+    /// wire; the rest wake to a cache hit (the double-check inside the lock). A
+    /// vamp repeating one clip must not open N transfers. The map is keyed by
+    /// hash and self-prunes: the last holder out of a hash's lock drops its
+    /// entry (all clones happen under this std `Mutex`, so the strong-count
+    /// check is race-free).
+    locks: Mutex<HashMap<ContentHash, Arc<AsyncMutex<()>>>>,
 }
 
 impl<F: BlobFetch> BlobResolver<F> {
     /// Build a resolver over an explicit cache directory (tests, custom roots).
     pub fn new(cache: FileStore, fetch: F) -> Self {
-        Self { cache, fetch }
+        Self {
+            cache,
+            fetch,
+            locks: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Build a resolver whose cache is the per-user XDG blob cache
@@ -178,8 +207,48 @@ impl<F: BlobFetch> BlobResolver<F> {
         Self::new(FileStore::new(config), fetch)
     }
 
-    /// Resolve a blob to its bytes, fetching + caching on a miss.
+    /// Resolve a blob to its bytes, fetching + caching on a miss. Concurrent
+    /// resolves for the same hash coalesce onto a single wire transfer
+    /// (single-flight).
     pub async fn resolve(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+        // Fast path: a cache hit needs no lock and no wire.
+        if let Some(bytes) = self.cache.retrieve(hash)? {
+            return Ok(bytes);
+        }
+
+        // Single-flight: take (or create) this hash's fetch lock. All clones
+        // happen while holding the std `Mutex`, so the strong-count prune below
+        // is race-free.
+        let lock = {
+            let mut locks = self.locks.lock().unwrap();
+            locks
+                .entry(hash.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+
+        let result = {
+            let _guard = lock.lock().await;
+            self.fetch_verify_store(hash).await
+        };
+
+        // Reclaim the slot once no concurrent resolve still holds this lock
+        // (map + our local `lock` == 2). A waiter still queued keeps a clone, so
+        // the count stays > 2 and the last one out prunes it.
+        {
+            let mut locks = self.locks.lock().unwrap();
+            if Arc::strong_count(&lock) <= 2 {
+                locks.remove(hash);
+            }
+        }
+
+        result
+    }
+
+    /// The miss path, run under the per-hash lock: re-check the cache (a prior
+    /// holder may have just filled it), else fetch, verify, and cache.
+    async fn fetch_verify_store(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+        // Double-check: whoever held the lock before us may have cached it.
         if let Some(bytes) = self.cache.retrieve(hash)? {
             return Ok(bytes);
         }
@@ -245,9 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn blob_path_is_v_blobs_hash() {
+    fn blob_path_is_sharded_on_leading_two_hex() {
         let h = ContentHash::from_data(b"whatever");
-        assert_eq!(SftpClient::blob_path(&h), format!("/v/blobs/{h}"));
+        assert_eq!(
+            SftpClient::blob_path(&h),
+            format!("/v/blobs/{}/{}", h.prefix(), h)
+        );
+        // The shard is the leaf hash's own prefix — the server maps it back.
+        assert!(SftpClient::blob_path(&h).starts_with(&format!("/v/blobs/{}/", h.prefix())));
     }
 
     #[tokio::test]
@@ -288,6 +362,62 @@ mod tests {
         let got = resolver.resolve(&hash).await.unwrap();
         assert_eq!(got, body);
         assert_eq!(resolver.fetch.call_count(), 0, "cache hit skips the wire");
+    }
+
+    /// A fetch stub that sleeps (so concurrent resolves genuinely overlap) and
+    /// counts calls across threads.
+    struct SlowStub {
+        body: Vec<u8>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BlobFetch for SlowStub {
+        async fn fetch(&self, _hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(self.body.clone())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_resolves_of_one_hash_coalesce_to_one_fetch() {
+        let dir = TempDir::new().unwrap();
+        let body = b"repeated clip in a vamp".to_vec();
+        let hash = ContentHash::from_data(&body);
+        let resolver = Arc::new(BlobResolver::new(
+            FileStore::at_path(dir.path()),
+            SlowStub {
+                body: body.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+        ));
+
+        // Fire eight concurrent resolves for the SAME hash; the slow fetch means
+        // they all reach the per-hash lock before the first completes.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let r = resolver.clone();
+                let h = hash.clone();
+                tokio::spawn(async move { r.resolve(&h).await })
+            })
+            .collect();
+
+        for handle in handles {
+            let got = handle.await.unwrap().unwrap();
+            assert_eq!(got, body, "every resolver gets the bytes");
+        }
+
+        assert_eq!(
+            resolver.fetch.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "single-flight: concurrent misses coalesce onto one wire transfer"
+        );
+        // The lock map self-pruned after the flight settled.
+        assert!(
+            resolver.locks.lock().unwrap().is_empty(),
+            "per-hash lock entry must be reclaimed once the flight completes"
+        );
     }
 
     #[tokio::test]

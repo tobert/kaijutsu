@@ -48,6 +48,7 @@ capnpc.workspace = true
 
 [dev-dependencies]
 kaijutsu-client.workspace = true
+kaijutsu-cas.workspace = true
 kaijutsu-kernel = { workspace = true, features = ["test-mock"] }
 kaijutsu-types.workspace = true
 kaijutsu-hyoushigi = { workspace = true, features = ["test-util"] }

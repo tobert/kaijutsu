@@ -15,8 +15,9 @@ mod common;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::{run_local, start_server};
-use kaijutsu_client::{KeySource, SftpClient, SftpError, SshConfig};
+use common::{run_local, start_server, start_server_with_state_dir};
+use kaijutsu_cas::{ContentStore, FileStore};
+use kaijutsu_client::{BlobResolver, KeySource, SftpClient, SftpError, SshConfig};
 
 fn ephemeral_config(addr: std::net::SocketAddr) -> SshConfig {
     SshConfig {
@@ -74,5 +75,84 @@ fn sftp_read_of_a_missing_path_fails_loud() {
         let missing = format!("/tmp/{}", unique_tmp_name("missing"));
         let err = sftp.read(&missing).await.expect_err("missing path must error");
         assert!(matches!(err, SftpError::NotFound(_)), "got {err:?}");
+    });
+}
+
+/// The whole track-B round trip over real SSH: a blob seeded into the server's
+/// CAS is fetched by a `BlobResolver` through the `/v/blobs` mount, verified,
+/// and cached. This is the first e2e exercising `CasFs` + the client resolver
+/// together (the resolver unit tests use a stub; this pins the live mount).
+#[test]
+fn blob_resolves_over_v_blobs_and_verifies() {
+    run_local(async {
+        // Seed a blob into the server's CAS *before* it starts — CasFs reads the
+        // pool live, and the resolver's sharded path maps straight onto it.
+        let state = tempfile::tempdir().expect("state dir");
+        let server_cas = FileStore::at_path(state.path().join("cas"));
+        let body: &[u8] = b"a clip's worth of bytes, resolved over /v/blobs\n";
+        let hash = server_cas.store(body, "audio/wav").expect("seed server CAS");
+
+        let addr = start_server_with_state_dir(state.path().to_path_buf()).await;
+
+        // A fresh client cache: the first resolve must cross the wire.
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let sftp = SftpClient::connect(ephemeral_config(addr))
+            .await
+            .expect("sftp subsystem connect");
+        let resolver = BlobResolver::new(FileStore::at_path(cache_dir.path()), sftp);
+
+        let got = resolver.resolve(&hash).await.expect("resolve over /v/blobs");
+        assert_eq!(got, body, "resolved bytes match the seeded blob");
+
+        // The verified blob landed in the client cache (content-addressed), so a
+        // fresh FileStore over the same dir sees it.
+        let cache = FileStore::at_path(cache_dir.path());
+        assert_eq!(
+            cache.retrieve(&hash).expect("cache read").as_deref(),
+            Some(body),
+            "the fetched blob is cached under its hash"
+        );
+    });
+}
+
+/// A blob whose on-disk server bytes have been corrupted must fail the
+/// resolver's re-hash verification (crash over corruption) and leave the client
+/// cache clean — the CAS is self-verifying end to end, past SSH's transport
+/// integrity.
+#[test]
+fn a_corrupted_server_blob_fails_verification_and_caches_nothing() {
+    run_local(async {
+        let state = tempfile::tempdir().expect("state dir");
+        let server_cas = FileStore::at_path(state.path().join("cas"));
+        let body: &[u8] = b"the real clip bytes, long enough to matter\n";
+        let hash = server_cas.store(body, "audio/wav").expect("seed server CAS");
+
+        // Corrupt the object on disk (flip a byte). CasFs serves the file by its
+        // hash-named path regardless of content, so the wire now carries a lie.
+        let obj = server_cas.path(&hash).expect("object path on disk");
+        let mut corrupt = std::fs::read(&obj).expect("read object");
+        corrupt[0] ^= 0xff;
+        std::fs::write(&obj, &corrupt).expect("corrupt object");
+
+        let addr = start_server_with_state_dir(state.path().to_path_buf()).await;
+
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let sftp = SftpClient::connect(ephemeral_config(addr))
+            .await
+            .expect("sftp subsystem connect");
+        let resolver = BlobResolver::new(FileStore::at_path(cache_dir.path()), sftp);
+
+        let err = resolver
+            .resolve(&hash)
+            .await
+            .expect_err("corrupted blob must fail verification");
+        assert!(matches!(err, SftpError::HashMismatch { .. }), "got {err:?}");
+
+        // Nothing corrupt entered the cache.
+        let cache = FileStore::at_path(cache_dir.path());
+        assert!(
+            cache.retrieve(&hash).expect("cache read").is_none(),
+            "corrupt bytes must never be cached"
+        );
     });
 }
