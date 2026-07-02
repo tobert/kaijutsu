@@ -13,16 +13,26 @@
 //! not scheduled on a lead), so this is the empirical validator of "good enough":
 //! run a track and compare the click against the per-cue MIDI notes (`aseqdump`).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use kaijutsu_audio::{beat_onsets_in, LocalBeat};
+use kaijutsu_audio::LocalBeat;
 use kaijutsu_client::ServerEvent;
 
 use crate::connection::actor_plugin::ServerEventMessage;
 
-/// GM percussion note 76, "Hi Wood Block" — the 拍子木 click.
-const CLICK_NOTE: u8 = 76;
+/// The click pitch — a high, short note (C6) on the sink's dedicated metronome
+/// channel. A pitched click, not a drum: GM channel-9 percussion is silent under
+/// game soundfonts (the FF4 one on zorak), so `MidiSink::click_at` gates a
+/// melodic note instead. C6 reads as a crisp 拍子木-like tick.
+const CLICK_NOTE: u8 = 84;
+
+/// How far ahead the phasor pre-schedules clicks into the ALSA queue. Must exceed
+/// the app's frame interval so a beat is always queued *before* it sounds — the
+/// click then lands at the ALSA-precise predicted time, independent of the
+/// (irregular) Bevy frame cadence. Comfortably under one beat so a low-rate
+/// reference's gentle slew barely moves an already-queued click.
+const SCHEDULE_HORIZON: Duration = Duration::from_millis(250);
 
 /// Consumes `ServerEvent::BeatSync` into a local phasor and clicks the beat.
 pub struct MetronomePlugin;
@@ -43,8 +53,9 @@ impl Plugin for MetronomePlugin {
 pub struct Metronome {
     /// The phasor, once a first reference has anchored it.
     beat: Option<LocalBeat>,
-    /// Phasor position at the previous tick — the low edge of the click window.
-    last_pos: f64,
+    /// The next integer beat not yet scheduled into the sink queue (monotonic;
+    /// each beat is scheduled exactly once, ahead of time).
+    next_beat: Option<i64>,
     /// Whether the audible click sounds. Auto-emit of references is always-on in
     /// the kernel; the click is the sink's opt-in (default on for this slice; a
     /// keybind toggle is future work).
@@ -53,36 +64,52 @@ pub struct Metronome {
 
 impl Default for Metronome {
     fn default() -> Self {
-        Self { beat: None, last_pos: 0.0, enabled: true }
+        Self { beat: None, next_beat: None, enabled: true }
     }
 }
 
 impl Metronome {
-    /// Fold a reference into the phasor (creating it on the first one). On
-    /// creation, seed `last_pos` to the phasor's own position so the first tick
-    /// doesn't fire a burst of onsets from zero.
+    /// Fold a reference into the phasor (creating it on the first one). `next_beat`
+    /// is left untouched — it seeds lazily from the phasor in [`schedule_due`] and
+    /// stays monotonic across corrections (which keep position continuous).
     fn observe(&mut self, reference: kaijutsu_audio::BeatRef, at: Instant) {
         match &mut self.beat {
             Some(beat) => beat.observe(reference, at),
-            None => {
-                let beat = LocalBeat::new(reference, at);
-                self.last_pos = beat.position(at);
-                self.beat = Some(beat);
-            }
+            None => self.beat = Some(LocalBeat::new(reference, at)),
         }
     }
 
-    /// Advance the phasor to `now` and return the integer beat onsets crossed
-    /// since the last tick (empty until a reference has anchored it). Pure — no
-    /// audio — so the click cadence is unit-testable without ALSA.
-    fn tick(&mut self, now: Instant) -> Vec<i64> {
+    /// Return the offsets-from-`now` at which to schedule a click for every
+    /// integer beat whose predicted time falls within `horizon` — each beat
+    /// returned exactly once across calls. Pure (no audio), so the schedule is
+    /// unit-testable without ALSA. Scheduling *ahead* into the device queue is
+    /// what makes the click land at the phasor's beat time rather than at the
+    /// irregular frame that noticed it (docs/midi.md real-time stance).
+    fn schedule_due(&mut self, now: Instant, horizon: Duration) -> Vec<Duration> {
         let Some(beat) = &self.beat else {
             return Vec::new();
         };
         let cur = beat.position(now);
-        let onsets = beat_onsets_in(self.last_pos, cur);
-        self.last_pos = cur;
-        onsets
+        let tempo = beat.tempo_bps();
+        if tempo <= 0.0 {
+            return Vec::new();
+        }
+        // First call: start at the next whole beat after the anchor (don't
+        // retro-fire the beat we anchored on).
+        let mut next = self.next_beat.unwrap_or_else(|| cur.floor() as i64 + 1);
+        let horizon_secs = horizon.as_secs_f64();
+        let mut offsets = Vec::new();
+        loop {
+            let secs = (next as f64 - cur) / tempo;
+            if secs > horizon_secs {
+                break;
+            }
+            // Clamp a just-missed beat to "now" rather than scheduling the past.
+            offsets.push(Duration::from_secs_f64(secs.max(0.0)));
+            next += 1;
+        }
+        self.next_beat = Some(next);
+        offsets
     }
 }
 
@@ -101,7 +128,9 @@ fn ingest_beat_sync(
     }
 }
 
-/// Click the 拍子木 once for every beat the phasor crossed this frame.
+/// Pre-schedule a 拍子木 click into the sink queue for every beat coming due
+/// within the horizon — so ALSA fires it at the beat's predicted time, not at
+/// this (irregular) frame.
 fn click_on_beat(
     mut metronome: ResMut<Metronome>,
     mut sink: NonSendMut<crate::midi::MidiSink>,
@@ -109,9 +138,8 @@ fn click_on_beat(
     if !metronome.enabled {
         return;
     }
-    let onsets = metronome.tick(Instant::now());
-    for _ in onsets {
-        sink.click(CLICK_NOTE);
+    for offset in metronome.schedule_due(Instant::now(), SCHEDULE_HORIZON) {
+        sink.click_at(CLICK_NOTE, offset);
     }
 }
 
@@ -119,52 +147,66 @@ fn click_on_beat(
 mod tests {
     use super::*;
     use kaijutsu_audio::BeatRef;
-    use std::time::Duration;
 
-    #[test]
-    fn a_fresh_metronome_never_clicks() {
-        let mut m = Metronome::default();
-        assert!(m.tick(Instant::now()).is_empty(), "no reference yet → no click");
+    const H: Duration = SCHEDULE_HORIZON; // 250 ms
+
+    // Assert two Durations are within 1 ms (predicted schedule offsets).
+    fn near(a: Duration, b_ms: f64) -> bool {
+        (a.as_secs_f64() * 1000.0 - b_ms).abs() < 1.0
     }
 
     #[test]
-    fn the_first_reference_anchors_without_a_click_burst() {
-        // A reference arriving at beat 100 must NOT fire clicks for beats 0..100
-        // — seeding last_pos to the phasor position prevents the burst.
+    fn a_fresh_metronome_schedules_nothing() {
+        let mut m = Metronome::default();
+        assert!(m.schedule_due(Instant::now(), H).is_empty(), "no reference yet");
+    }
+
+    #[test]
+    fn the_first_reference_does_not_retro_schedule() {
+        // A reference arriving at beat 100 must NOT queue clicks for beats 0..100
+        // — scheduling starts at the next whole beat, and that beat is a full
+        // period away (500 ms > 250 ms horizon), so nothing is due yet.
         let mut m = Metronome::default();
         let t0 = Instant::now();
         m.observe(BeatRef::new(100.0, 2.0), t0);
-        assert!(m.tick(t0).is_empty(), "anchoring is silent");
+        assert!(m.schedule_due(t0, H).is_empty(), "anchoring queues nothing");
     }
 
     #[test]
-    fn the_phasor_clicks_each_beat_crossing() {
+    fn beats_are_scheduled_once_at_their_predicted_offset() {
         let mut m = Metronome::default();
         let t0 = Instant::now();
         m.observe(BeatRef::new(0.0, 2.0), t0); // 120 BPM: a beat every 0.5 s
-        assert!(m.tick(t0).is_empty(), "anchored at beat 0, nothing crossed yet");
-        // 0.6 s later the phasor is at 1.2 → beat 1 crossed.
-        assert_eq!(m.tick(t0 + Duration::from_secs_f64(0.6)), vec![1]);
-        // Another 0.5 s → 2.2 → beat 2.
-        assert_eq!(m.tick(t0 + Duration::from_secs_f64(1.1)), vec![2]);
-        // A slow frame that spans two beats fires both.
-        assert_eq!(m.tick(t0 + Duration::from_secs_f64(2.1)), vec![3, 4]);
+        // At t0 the next beat (1) is 500 ms away — outside the 250 ms horizon.
+        assert!(m.schedule_due(t0, H).is_empty());
+        // 300 ms in, beat 1 (at t0+500ms) is 200 ms away → scheduled at +200 ms.
+        let due = m.schedule_due(t0 + Duration::from_millis(300), H);
+        assert_eq!(due.len(), 1);
+        assert!(near(due[0], 200.0), "beat 1 lands 200 ms out, got {:?}", due[0]);
+        // 350 ms in, beat 1 is already queued; beat 2 (at 1.0 s) is 650 ms away.
+        assert!(m.schedule_due(t0 + Duration::from_millis(350), H).is_empty());
+        // 800 ms in, beat 2 is 200 ms away → scheduled once.
+        let due2 = m.schedule_due(t0 + Duration::from_millis(800), H);
+        assert_eq!(due2.len(), 1, "beat 2 scheduled exactly once");
+        assert!(near(due2[0], 200.0));
     }
 
     #[test]
-    fn a_later_reference_keeps_the_beat_continuous() {
-        // A correcting reference must not skip or double-fire a beat: the click
-        // cadence stays monotone across an `observe`.
+    fn a_stalled_frame_catches_up_without_replaying_the_past() {
+        // A long gap (a stalled frame) schedules every beat that came due in it,
+        // each once, clamping an already-past beat to now (offset 0) rather than
+        // scheduling into the past.
         let mut m = Metronome::default();
         let t0 = Instant::now();
         m.observe(BeatRef::new(0.0, 2.0), t0);
-        let _ = m.tick(t0);
-        let _ = m.tick(t0 + Duration::from_secs_f64(0.6)); // clicked beat 1
-        // A reference at ~beat 2 arrives slightly ahead of our extrapolation.
-        m.observe(BeatRef::new(2.05, 2.0), t0 + Duration::from_secs_f64(1.0));
-        // We still click beat 2 exactly once as the phasor passes it.
-        let onsets = m.tick(t0 + Duration::from_secs_f64(1.2));
-        assert_eq!(onsets, vec![2], "beat 2 fires once, not skipped nor doubled");
+        m.schedule_due(t0, H); // start scheduling (seeds next_beat = 1)
+        // Now a long stall to 1.6 s: beats 1 (0.5s), 2 (1.0s), 3 (1.5s) all came
+        // due during the gap and must each be scheduled once, clamped to now.
+        let due = m.schedule_due(t0 + Duration::from_millis(1600), H);
+        assert_eq!(due.len(), 3, "beats 1,2,3 each scheduled once: {due:?}");
+        assert!(due.iter().all(|d| d.as_secs_f64() < 0.001), "past beats clamp to now");
+        // Nothing replays on the next call.
+        assert!(m.schedule_due(t0 + Duration::from_millis(1650), H).is_empty());
     }
 
     /// The Bevy wiring: a `ServerEvent::BeatSync` message anchors the phasor.

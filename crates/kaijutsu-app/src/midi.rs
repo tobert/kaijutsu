@@ -55,22 +55,21 @@ pub(crate) struct MidiSink {
 }
 
 impl MidiSink {
-    /// Send one percussion click NOW — direct (not queued), because the
-    /// metronome click is driven by the phasor's *current* position, not
-    /// scheduled ahead on a lead like a render cue. GM percussion (channel 9);
-    /// opens the sink on first use. No-op without ALSA.
+    /// Schedule one metronome click `offset` from now into the sink queue — so
+    /// ALSA fires it at the phasor's predicted beat time, not at the irregular
+    /// frame that scheduled it. Opens the sink on first use. No-op without ALSA.
     #[cfg(target_os = "linux")]
-    pub(crate) fn click(&mut self, note: u8) {
+    pub(crate) fn click_at(&mut self, note: u8, offset: std::time::Duration) {
         if !ensure_open(self) {
             return;
         }
         if let Some(out) = self.out.as_mut() {
-            out.click_now(note);
+            out.click_at(note, offset);
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn click(&mut self, _note: u8) {
+    pub(crate) fn click_at(&mut self, _note: u8, _offset: std::time::Duration) {
         ensure_open(self);
     }
 }
@@ -301,20 +300,24 @@ impl MidiOut {
         let _ = self.seq.drain_output();
     }
 
-    /// Send one percussion NoteOn immediately (direct delivery, bypassing the
-    /// scheduled queue) — the metronome 拍子木 on channel 9. Percussion is a
-    /// one-shot, so a NoteOn alone is enough (the synth owns the decay).
-    fn click_now(&mut self, note: u8) {
-        use alsa::seq::{EvNote, Event, EventType};
-        let ev = EvNote { channel: 9, note, velocity: 100, off_velocity: 0, duration: 0 };
-        let mut e = Event::new(EventType::Noteon, &ev);
-        e.set_source(self.port);
-        e.set_subs();
-        e.set_direct();
-        if let Err(err) = self.seq.event_output(&mut e) {
-            error!("metronome click event_output failed: {err}");
-        }
-        let _ = self.seq.drain_output();
+    /// Schedule a metronome click at `offset` from now: a short **gated** note
+    /// (~60 ms, NoteOn then NoteOff) on a dedicated channel, queued into the ALSA
+    /// real-time queue so it fires at the precise predicted beat time. Gated and
+    /// on a *normal* (non-drum) channel so it sounds under any patch — GM
+    /// channel-9 percussion is silent under game soundfonts (the FF4 one on
+    /// zorak has no drum kit), and a bare NoteOn on a sustaining patch would
+    /// drone. Reuses the proven render-queue path, so it's audible exactly where
+    /// the music is.
+    fn click_at(&mut self, note: u8, offset: Duration) {
+        // Channel 15: off the music's channel 0, so the click keeps its own
+        // patch and never collides with a musician's render on the same port.
+        const CH: u8 = 15;
+        let on = vec![0x90 | CH, note, 110];
+        let off = vec![0x80 | CH, note, 0];
+        self.schedule(
+            &[(offset, on), (offset + Duration::from_millis(60), off)],
+            Duration::ZERO,
+        );
     }
 }
 
