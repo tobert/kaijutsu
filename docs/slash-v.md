@@ -7,9 +7,12 @@ apparatus is gone (it was SFTP-shaped scaffolding — see below), navigation is 
 `index` rather than human symlink farms, and the canonical pools are sharded.
 Revised 2026-07-02: `/v/blobs` promoted from a passing mention to a first-class
 plan (**track B**, the active work item — it unblocks client CAS sync for
-`docs/pcm.md`'s clip prefetch), and the mount-table reality corrected below. All
-of `/v` is unbuilt as of this revision; track B lands first and is independent of
-the `/v/ctx`/`/v/session` track.*
+`docs/pcm.md`'s clip prefetch), and the mount-table reality corrected below;
+same day, a gemini-pro kaibo batch reviewed the plan and its verified blockers
+were folded into the track B slices. Status at that revision: every `/v` mount
+is unbuilt; of track B, the client half (`SftpClient`/`BlobResolver`,
+`cca8ce7b`+`52d377e7`) is landed with named residue, and B0/B1/B2 are unstarted.
+Track B lands first and is independent of the `/v/ctx`/`/v/session` track.*
 
 `/v` is kaijutsu's virtual / CRDT namespace. This note plans three **sysfs-style**
 surfaces under it:
@@ -119,8 +122,9 @@ that whole apparatus dissolved.
 from a local cache and pulls misses from the kernel under the prepare horizon
 (`docs/pcm.md` "How it converges" + slice 5c's open clip half; `docs/clips.md`
 "How a clip plays"). SFTP already speaks the VFS (`docs/sftp.md`, landed), so
-what's missing is (a) a real `/v/blobs` backend on the kernel mount table and
-(b) a client-side fetcher + cache. **No new RPC.***
+what was missing was (a) a real `/v/blobs` backend on the kernel mount table
+and (b) a client-side fetcher + cache. **No new RPC.** (b) landed 2026-07-02
+(with residue — see B3); (a) is the open gap, slices B0–B2.*
 
 ### What exists to build on
 
@@ -686,7 +690,7 @@ Track B (`/v/blobs`):
 - `crates/kaijutsu-kernel/src/vfs/mount.rs:68` — `MountTable::freeze()`
 - `crates/kaijutsu-server/src/ssh.rs:837` / `sftp.rs:121` — `SftpSession::new(principal, vfs)` serves the kernel `MountTable` (so `/v/blobs` is SFTP-visible on mount, zero adapter work)
 - `crates/kaijutsu-client/src/ssh.rs:210` — `connect_subsystem` (dial + auth + bind a named subsystem; the `SftpClient` transport)
-- `crates/kaijutsu-client/src/sftp.rs` — `SftpClient`/`BlobFetch`/`BlobResolver` (in flight, uncommitted 2026-07-02)
+- `crates/kaijutsu-client/src/sftp.rs` — `SftpClient`/`BlobFetch`/`BlobResolver` (landed `cca8ce7b`+`52d377e7`; B3 residue: sharded `blob_path`, single-flight, read-to-EOF)
 - `crates/kaijutsu-app/src/audio.rs:138` — the CAS-payload skip B4 replaces
 - `Cargo.toml:60` — `russh-sftp = "2.3"` (workspace; has the client half)
 
