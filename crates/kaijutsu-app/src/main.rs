@@ -47,6 +47,7 @@ mod connection;
 mod constants;
 mod input;
 mod kaish;
+mod midi;
 mod peers;
 mod shaders;
 mod text;
@@ -155,8 +156,10 @@ fn main() {
         ))
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ActorPlugin { ssh_config })
-        // Render sink (docs/pcm.md, docs/midi.md): ServerEvent::RenderCue -> AudioPlayer
+        // Render sinks (docs/pcm.md, docs/midi.md): ServerEvent::RenderCue,
+        // dispatched by mime — audio/* → AudioPlayer, text/vnd.abc → ALSA MIDI.
         .add_plugins(audio::AudioOutPlugin)
+        .add_plugins(midi::MidiOutPlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

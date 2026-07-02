@@ -5684,6 +5684,7 @@ dependencies = [
 name = "kaijutsu-app"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "arboard",
  "avian2d",
  "bevy",

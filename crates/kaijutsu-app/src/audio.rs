@@ -62,13 +62,9 @@ fn play_render_cues(
                 commands.spawn((AudioPlayer(handle), PlaybackSettings::DESPAWN));
             }
             CuePayload::Inline(_) => {
-                // A non-audio inline cue (MIDI/ABC/clip JSON) — the ALSA-seq /
-                // clip sinks land in slice 5c.
-                warn!(
-                    "non-audio render cue not yet handled in the app sink — \
-                     arrives with slice 5c (mime={})",
-                    cue.mime
-                );
+                // A non-audio inline cue (e.g. `text/vnd.abc` → the MIDI sink in
+                // `midi.rs`, or a future clip renderer). Another sink handles it
+                // off the same message stream; nothing to do here.
             }
             CuePayload::Cas(hash) => {
                 warn!(

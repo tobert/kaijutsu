@@ -79,6 +79,12 @@ capnp-rpc.workspace = true
 # Configuration
 toml = { workspace = true }
 
+# ALSA sequencer MIDI-out sink (docs/pcm.md slice 5c / docs/midi.md "Render is a
+# wire cue"): the app is the first MIDI sink. Linux-only, same crate/version as
+# the server's soon-to-be-demolished AlsaMidiOut.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
 [dev-dependencies]
 image = "0.25"
 crossbeam-channel = "0.5"

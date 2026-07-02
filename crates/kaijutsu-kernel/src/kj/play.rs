@@ -53,19 +53,28 @@ impl KjDispatcher {
             }
         };
 
-        // Sniff the format from the extension BEFORE reading the file — an
+        // Derive the wire MIME from the extension BEFORE reading the file — an
         // unrecognized/missing extension is a loud error, never a silently
-        // guessed default (a mis-decoded sample is a worse failure mode than
-        // a rejected command).
-        let format = match AudioFormatHint::from_path_extension(&parsed.path) {
-            Some(f) => f,
-            None => {
-                return KjResult::Err(format!(
-                    "kj play: {}: unrecognized or missing audio extension \
-                     (expected one of .wav/.flac/.mp3/.ogg/.aac/.m4a)",
-                    parsed.path
-                ));
-            }
+        // guessed default (a mis-rendered file is a worse failure mode than a
+        // rejected command). An `.abc` score renders to MIDI at the sink
+        // (docs/midi.md "Render is a wire cue"); audio extensions play as a
+        // sample. Both ride the one mime-keyed `RenderCue`.
+        let ext = parsed
+            .path
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase());
+        let mime: String = match ext.as_deref() {
+            Some("abc") => "text/vnd.abc".to_string(),
+            _ => match AudioFormatHint::from_path_extension(&parsed.path) {
+                Some(f) => f.mime().to_string(),
+                None => {
+                    return KjResult::Err(format!(
+                        "kj play: {}: unrecognized or missing extension \
+                         (expected .abc or one of .wav/.flac/.mp3/.ogg/.aac/.m4a)",
+                        parsed.path
+                    ));
+                }
+            },
         };
 
         let bytes = match std::fs::read(&parsed.path) {
@@ -82,7 +91,7 @@ impl KjDispatcher {
         };
 
         let byte_count = bytes.len();
-        let cue = RenderCue::now_inline(format.mime(), bytes);
+        let cue = RenderCue::now_inline(mime.clone(), bytes);
         let receivers = self.kernel().block_flows().publish(BlockFlow::RenderCue {
             context_id,
             cue,
@@ -91,10 +100,7 @@ impl KjDispatcher {
         KjResult::ok_ephemeral(
             format!(
                 "playing {} ({} bytes, {}) — {} listener(s)",
-                parsed.path,
-                byte_count,
-                format.mime(),
-                receivers,
+                parsed.path, byte_count, mime, receivers,
             ),
             ContentType::Plain,
         )
@@ -148,6 +154,40 @@ mod tests {
                     CuePayload::Inline(bytes) => {
                         assert_eq!(bytes, sample_bytes, "bytes ride the cue verbatim inline");
                     }
+                    other => panic!("expected Inline, got {other:?}"),
+                }
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
+    }
+
+    /// `kj play <tune.abc>` emits a `text/vnd.abc` cue carrying the ABC text
+    /// inline (rendered to MIDI at the sink, docs/midi.md), not an audio cue.
+    #[tokio::test]
+    async fn play_abc_emits_a_text_vnd_abc_cue() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let abc_path = dir.path().join("bass.abc");
+        let abc = b"X:1\nT:t\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\nCDEF|\n".to_vec();
+        std::fs::write(&abc_path, &abc).expect("write abc");
+
+        let result = dispatcher.dispatch_play(&[abc_path.to_string_lossy().into_owned()], &caller);
+        assert!(result.is_ok(), "kj play .abc failed: {result:?}");
+
+        let msg = sub.try_recv().expect("RenderCue should have been published");
+        match msg.payload {
+            BlockFlow::RenderCue { cue, .. } => {
+                assert_eq!(cue.mime, "text/vnd.abc", "abc extension → the abc MIME");
+                assert_eq!(cue.lead, Duration::ZERO);
+                match cue.payload {
+                    CuePayload::Inline(bytes) => assert_eq!(bytes, abc, "abc text rides inline"),
                     other => panic!("expected Inline, got {other:?}"),
                 }
             }
