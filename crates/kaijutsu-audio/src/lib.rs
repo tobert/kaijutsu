@@ -12,6 +12,9 @@ use std::time::Duration;
 pub mod clip;
 pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};
 
+pub mod timebase;
+pub use timebase::{beat_onsets_in, BeatRef, LocalBeat};
+
 /// A committed ABC score, rendered to MIDI at the sink (`docs/midi.md` "Render
 /// is a wire cue"). The payload is the ABC text; a render sink that can render
 /// ABC (the app) turns it into MIDI, a dumb sink ignores it.
