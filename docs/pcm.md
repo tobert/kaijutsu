@@ -236,21 +236,37 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
    named prerequisite (see `midi.md` M4 — it exists only by analogy today), and
    the **`alsa` crate version** (pawlsa rides `0.11`; the in-tree M1 target
    rides `0.9` via bevy/cpal).
-5. **(next) Fold into the Track — the wire `RenderCue` (see "How it converges"
-   + `midi.md` "Render is a wire cue").** This is the unified render seam, and it
+5. **Fold into the Track — the wire `RenderCue` (see "How it converges" +
+   `midi.md` "Render is a wire cue").** This is the unified render seam, and it
    subsumes MIDI. Natural sub-slices, each landing buildable:
-   - **5a — the cue seam.** Generalize the play-now `PlayAudio` directive into a
-     mime-keyed `RenderCue { mime, payload: inline-symbolic | CAS-ref, lead }`
-     over the FlowBus/`BlockEvents` (additive capnp bump). `lead` is relative;
-     the sink schedules at `receipt + lead`.
-   - **5b — the clip record + validator** in `kaijutsu-audio` (pure data,
-     FFI-free): Shape A (`docs/clips.md`) + the content-type-keyed validator
-     (fail loud at schedule; `media` present in CAS). Fully unit-testable.
-   - **5c — the sinks + prefetch.** App consumes cues by mime: clip → resolve
-     `media` from the XDG CAS cache, miss → SFTP `/v/blobs/<hash>`, decode,
-     fire; ABC/MIDI → queue events into a local ALSA seq port. The materialize
-     crossing publishes cues instead of calling the in-process target; verify
-     parity on zorak, then demolish server-side `AlsaMidiOut`.
+   - **5a — the cue seam. ✅ landed.** The play-now `PlayAudio`/`AudioRef` pair
+     was replaced outright by a mime-keyed `RenderCue { mime, payload:
+     Inline | Cas, lead }` in `kaijutsu-audio`, over the FlowBus/`BlockEvents`
+     (`onPlayAudio@13` → `onRenderCue@13`; the `AudioFormatHint` *wire* enum
+     dropped — `mime` is free Text, so the wire is content-agnostic). `lead` is
+     a relative `Duration` (nanos on the wire; a process-local `Instant` can't
+     cross it); the sink schedules at `receipt + lead`. `kj play` stays play-now
+     (`lead == ZERO`) with an inline payload; the app sink dispatches by mime
+     (inline `audio/*` plays, CAS + non-audio warn+skip = 5c). `AudioFormatHint`
+     survives as the kj-play extension→MIME sniff helper (off the wire); the
+     FFI-free trait is now `RenderSink::emit(&self, RenderCue)`.
+   - **5b — the clip record + validator. ✅ landed.** Shape A
+     (`docs/clips.md`) `Clip` record + the content-type-keyed validator in
+     `kaijutsu-audio` (pure data, FFI-free). `Clip::parse` is structural (v
+     known, label/mime non-empty, media a well-formed hash);
+     `Clip::parse_validated(json, &dyn ContentStore)` adds "media present in
+     CAS" (fail loud at schedule) — the presence check lives here because
+     `ContentStore::exists` is a pure trait boundary, keeping it unit-testable
+     against a stub. (Code is truth: `ContentHash` is serde-transparent and
+     does NOT validate on deserialize — well-formedness is checked explicitly;
+     and a hash is 32 hex chars, not the "64-hex" this doc/clips.md loosely say.)
+   - **5c — (next) the sinks + prefetch (needs the runner box + speakers).** App
+     consumes cues by mime: clip → parse+validate the record → resolve `media`
+     from the XDG CAS cache, miss → SFTP `/v/blobs/<hash>`, decode, fire (honor
+     `lead`); ABC/MIDI → queue events into a local ALSA seq port. The
+     materialize crossing publishes cues instead of calling the in-process
+     target; verify parity on zorak, then demolish server-side `AlsaMidiOut` +
+     the `RenderTarget` trait.
    The `abc→midi` render stays kernel-side for now (a relocatable phase — see the
    three-phase split in `midi.md`); an ABC-consuming sampler ("NoteOn → pick
    sample → play") is a later mime on the same seam (`midi.md` "samples-with-MIDI").

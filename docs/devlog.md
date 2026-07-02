@@ -350,6 +350,52 @@ joined context (`block_events_client_and_filter`), cutting foreign-context volum
 to zero. Verified live against a busy 24-context kernel: the 300s command returned
 in 285ms. Related memory: `project_mcp_synceddocument_sync`.
 
+## Render seam — PCM slice 5a/5b: the mime-keyed RenderCue + Shape A clip (2026-07-02)
+
+The design pass of 2026-07-01 (`d54c001a`) converged MIDI and samples onto one
+wire cue; this session cashed the first half of it in code, TDD-first, two
+slices, both green. Architect (Opus) held the design and drove the load-bearing
+wire cut directly; the clip record's CAS-presence boundary was pinned before a
+line was written.
+
+**5a — the cue seam (`13ca4147`).** The slice-3 play-now `PlayAudio`/`AudioRef`
+pair became a mime-keyed `RenderCue { mime, payload: Inline | Cas, lead }`. We
+replaced it outright rather than side-by-side: `PlayAudio` had no other
+consumers, the docs framed 5a as "generalize," and there are no old peers to
+skew against (kernel/client/app rebuild together), so one coherent cut across
+`kaijutsu-audio` → capnp → `flows.rs` → `kj play` → both server/client rpc
+bridges → the app sink left no transient dead path. `onPlayAudio@13` became
+`onRenderCue@13` at the same ordinal; the `AudioFormatHint` *wire* enum dropped
+entirely — `mime` is a free `Text`, so the wire is content-agnostic now (MIDI,
+ABC, clip JSON, audio all ride it). `lead` is a *relative* `Duration` (nanos on
+the wire — a process-local `Instant` can't cross it); the sink re-anchors at
+`receipt + lead`. `kj play` stays play-now (`lead == ZERO`, inline payload);
+`AudioFormatHint` survives as the extension→MIME sniff helper, off the wire. The
+app sink dispatches by mime (inline `audio/*` plays; CAS payloads and non-audio
+mimes warn+skip = 5c), and the FFI-free trait is now `RenderSink::emit(&self,
+RenderCue)`. Green: audio 8, kernel 1277, server 109, client 78, app audio 3.
+
+**5b — Shape A clip record + validator (`ea83853d`).** The clip design
+(`docs/clips.md`) reached code as `kaijutsu_audio::Clip` — the render-side
+sibling of ABC's validator on the decouple-Act-from-ABC axis. Two-tier,
+fail-loud: `Clip::parse` is structural (v known, label/mime non-empty, media a
+well-formed hash), `Clip::parse_validated(json, &dyn ContentStore)` adds "media
+present in CAS" at schedule time. The design call this session: that presence
+check lives *in kaijutsu-audio*, not the kernel, because `ContentStore::exists`
+is a pure trait boundary — the crate stays FFI-free and the validator is fully
+unit-testable against a stub store (no filesystem). Two places code corrected
+the docs: `ContentHash` is `#[serde(transparent)]` and does NOT validate on
+deserialize (so well-formedness is an explicit check), and a hash is 32 hex
+chars (128-bit BLAKE3), not the "64-hex" the docs loosely said. The `ext` bag
+preserves unknown keys across round-trips (the OTIO forward-compat lesson). 8
+clip tests green.
+
+**Next: 5c** — the sinks + prefetch, the one sub-slice that needs the runner box
++ Amy's speakers (app consumes cues by mime, SFTP `/v/blobs` prefetch under the
+lead, then demolish server-side `AlsaMidiOut`). The running kernel is now behind
+the capnp change (`onRenderCue`) — rebuild `kaijutsu-server` + restart before
+the next live jam, same as any capnp bump.
+
 ## Music-stack docs harmonization — present tense, one story (2026-07-01)
 
 The music/timing docs grew organically across three intense weeks
