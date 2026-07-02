@@ -4,8 +4,14 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// A content hash — 128 bits (16 bytes, 32 hex chars) of BLAKE3.
+///
+/// Deserialization is validated: `try_from = "String"` routes every decode
+/// through [`ContentHash::from_str_checked`], so a malformed hash fails loud at
+/// the boundary rather than panicking later in `prefix()`/`remainder()`. It
+/// still serializes as the bare hex string (`into = "String"`), so the wire and
+/// at-rest formats are unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct ContentHash(String);
 
 #[derive(Debug, Error)]
@@ -62,6 +68,20 @@ impl FromStr for ContentHash {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_str_checked(s)
+    }
+}
+
+impl TryFrom<String> for ContentHash {
+    type Error = HashError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::from_str_checked(&s)
+    }
+}
+
+impl From<ContentHash> for String {
+    fn from(hash: ContentHash) -> Self {
+        hash.0
     }
 }
 
@@ -130,8 +150,31 @@ mod tests {
     fn test_serde_roundtrip() {
         let hash = ContentHash::from_data(b"serde test");
         let json = serde_json::to_string(&hash).unwrap();
+        assert_eq!(json, format!("\"{}\"", hash.as_str()));
         let restored: ContentHash = serde_json::from_str(&json).unwrap();
         assert_eq!(hash, restored);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_short_string() {
+        // A malformed hash must not deserialize — otherwise prefix()/remainder()
+        // panic on the too-short string at some later call site.
+        let result: Result<ContentHash, _> = serde_json::from_str("\"abc\"");
+        assert!(result.is_err(), "short hash should fail to deserialize");
+    }
+
+    #[test]
+    fn test_deserialize_rejects_non_hex() {
+        let result: Result<ContentHash, _> =
+            serde_json::from_str("\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"");
+        assert!(result.is_err(), "non-hex hash should fail to deserialize");
+    }
+
+    #[test]
+    fn test_deserialize_accepts_valid() {
+        let restored: ContentHash =
+            serde_json::from_str("\"abcdef01234567890123456789abcdef\"").unwrap();
+        assert_eq!(restored.as_str(), "abcdef01234567890123456789abcdef");
     }
 
     #[test]

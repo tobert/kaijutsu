@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -123,12 +123,38 @@ impl FileStore {
             .join(id.remainder())
     }
 
-    fn ensure_parent(&self, path: &PathBuf) -> Result<(), StoreError> {
+    fn ensure_parent(&self, path: &Path) -> Result<(), StoreError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| StoreError::CreateDir {
                 path: parent.to_path_buf(),
                 source: e,
             })?;
+        }
+        Ok(())
+    }
+
+    /// Atomically move a fully-written staging file into its object slot.
+    ///
+    /// The rename is the atomicity gate: a concurrent reader sees either no
+    /// object or the whole object, never a torn prefix — which matters because
+    /// the XDG client cache is multi-process and a cache-hit `retrieve` never
+    /// re-hashes. Idempotent under dedup and racing writers: if the object
+    /// already exists, the staging file is discarded and the existing object
+    /// kept. Falls back to copy+remove across filesystems (`EXDEV`).
+    fn place_object(&self, staging_path: &Path, obj_path: &Path) -> Result<(), StoreError> {
+        self.ensure_parent(obj_path)?;
+
+        if !obj_path.exists() {
+            match fs::rename(staging_path, obj_path) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                    fs::copy(staging_path, obj_path).map_err(StoreError::Copy)?;
+                    let _ = fs::remove_file(staging_path);
+                }
+                Err(e) => return Err(StoreError::Rename(e)),
+            }
+        } else {
+            let _ = fs::remove_file(staging_path);
         }
         Ok(())
     }
@@ -200,20 +226,7 @@ impl FileStore {
         let size_bytes = data.len() as u64;
         let obj_path = self.object_path(&content_hash);
 
-        self.ensure_parent(&obj_path)?;
-
-        if !obj_path.exists() {
-            match fs::rename(staging_path, &obj_path) {
-                Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                    fs::copy(staging_path, &obj_path).map_err(StoreError::Copy)?;
-                    let _ = fs::remove_file(staging_path);
-                }
-                Err(e) => return Err(StoreError::Rename(e)),
-            }
-        } else {
-            let _ = fs::remove_file(staging_path);
-        }
+        self.place_object(staging_path, &obj_path)?;
 
         self.write_metadata(&content_hash, mime_type, size_bytes)?;
 
@@ -259,13 +272,15 @@ impl ContentStore for FileStore {
         let hash = ContentHash::from_data(data);
         let obj_path = self.object_path(&hash);
 
-        self.ensure_parent(&obj_path)?;
-
+        // Skip the write entirely when the object already exists (dedup).
+        // Otherwise write into a unique staging file and atomically rename it
+        // into place, so a concurrent reader never sees a torn object.
         if !obj_path.exists() {
-            fs::write(&obj_path, data).map_err(|e| StoreError::WriteObject {
-                path: obj_path,
-                source: e,
-            })?;
+            let mut chunk = self.create_staging()?;
+            chunk.write(data)?;
+            chunk.sync()?;
+            chunk.close();
+            self.place_object(&chunk.path, &obj_path)?;
         }
 
         self.write_metadata(&hash, mime_type, data.len() as u64)?;
@@ -274,15 +289,15 @@ impl ContentStore for FileStore {
     }
 
     fn retrieve(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>, StoreError> {
+        // Attempt the read directly rather than exists()-then-read: the store is
+        // multi-process, and a check-then-read races a concurrent remove into a
+        // spurious error. A missing object (never present, or unlinked mid-race)
+        // is `Ok(None)`; any other error is real and bubbles.
         let path = self.object_path(hash);
-        if path.exists() {
-            let data = fs::read(&path).map_err(|e| StoreError::ReadObject {
-                path,
-                source: e,
-            })?;
-            Ok(Some(data))
-        } else {
-            Ok(None)
+        match fs::read(&path) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::ReadObject { path, source: e }),
         }
     }
 
@@ -562,6 +577,97 @@ mod tests {
 
         let retrieved = store.retrieve(&expected).unwrap().unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn test_store_never_exposes_a_torn_object() {
+        // The XDG client cache is multi-process and a cache-hit `retrieve` never
+        // re-hashes, so `store()` must be atomic: a concurrent reader sees either
+        // no object or the whole object, never a truncated prefix. A raw
+        // `fs::write` (create+truncate, then fill) exposes the partial file at its
+        // final path — this test catches that.
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(FileStore::at_path(temp_dir.path()));
+
+        // Large enough that the write window is wide; distinct bytes so a
+        // truncated read is a *different* length than the whole object.
+        let data = Arc::new(vec![0xABu8; 2 * 1024 * 1024]);
+        let hash = ContentHash::from_data(&data);
+        let full_len = data.len();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Writers: repeatedly remove + re-store so the object flickers
+        // absent → (writing) → present, re-opening the torn window each pass.
+        let writers: Vec<_> = (0..2)
+            .map(|_| {
+                let s = store.clone();
+                let d = data.clone();
+                let h = hash.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        let _ = s.remove(&h);
+                        s.store(&d, "application/octet-stream").unwrap();
+                    }
+                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        // Readers: any object we can read must be complete.
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let s = store.clone();
+                let h = hash.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(bytes) = s.retrieve(&h).unwrap() {
+                            assert_eq!(
+                                bytes.len(),
+                                full_len,
+                                "reader observed a torn object ({} of {} bytes)",
+                                bytes.len(),
+                                full_len
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().unwrap();
+        }
+        for r in readers {
+            r.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_store_leaves_no_staging_residue() {
+        // A successful atomic store consumes its staging file via rename — nothing
+        // is left behind in staging/.
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileStore::at_path(temp_dir.path());
+
+        store.store(b"leaves nothing behind", "text/plain").unwrap();
+
+        let staging_dir = store.config().staging_dir();
+        let residue: Vec<_> = std::fs::read_dir(&staging_dir)
+            .map(|rd| rd.flatten().collect())
+            .unwrap_or_default();
+        // The staging tree may hold shard subdirs, but no files should linger.
+        let mut stack = residue;
+        while let Some(entry) = stack.pop() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.extend(std::fs::read_dir(&path).unwrap().flatten());
+            } else {
+                panic!("staging residue left behind: {}", path.display());
+            }
+        }
     }
 
     #[test]
