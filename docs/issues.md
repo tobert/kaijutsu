@@ -914,6 +914,44 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   builds the local beat we want anyway. PLL failure modes to design against
   (deepseek): starvation drift (ref rate must bound drift < ~1ms), tempo-step slew
   limit, phase-slew-not-step, reference-jitter outlier rejection.
+- **Metronome click should be configurable (found live 2026-07-02).** The 拍子木
+  click is hardcoded in the app: `CLICK_NOTE = 84` (C6) on channel 15, velocity
+  110, ~60ms gate (`kaijutsu-app/src/metronome.rs` + `MidiSink::click` in
+  `midi.rs`), and `Metronome.enabled` defaults on with no user surface. Live
+  verify surfaced the first footgun: the click was originally GM channel-9
+  percussion (note 76) which is **silent under a non-GM game soundfont** (zorak's
+  FF4 TiMidity has no drum kit) — so it moved to a gated melodic note. That
+  choice (note/channel/velocity/gate, and whether to sound at all) should be
+  user-configurable someday — a config knob or a `kj`/app toggle + a small
+  metronome settings block — rather than baked in. Downbeat accent (a different
+  note on bar-one) also wants meter info the `BeatRef` doesn't carry yet. Low
+  priority; the current defaults are audible and fine for the slice.
+- **Metronome phasor "sloshes" — the correction controller needs redesign (found
+  live 2026-07-02, Amy).** The metronome is audible + on-tempo (mean interval
+  605ms at 100 BPM, dead on) but **not steady**: measured inter-click stddev
+  ~50ms, and it wobbles audibly. Two contributing factors already fixed this
+  session — per-beat references (the phasor chased kernel scheduler jitter → now
+  low-rate, `BEAT_SYNC_EVERY=8` in beat.rs) and frame-time click firing (→ now
+  pre-scheduled into the ALSA queue at the predicted beat time, `schedule_due` +
+  `MidiSink::click_at`). The **residual slosh is the slew controller itself**
+  (`LocalBeat::observe`, `kaijutsu-audio/src/timebase.rs`): it applies the
+  correction as a **persistent rate bias** (`tempo = ref_tempo + error/window`)
+  that runs until the *next* reference (~8 beats ≈ 4.8s), long past the `window`
+  (1s) it was sized for → it over-drives ~3.8× too long, overshoots the target
+  by ~3.8× the error, and the next reference over-corrects the other way =
+  oscillation. **Integrator wind-up / a mistuned proportional-rate controller.**
+  Fix direction (Amy: "PID line of algos"): the reference carries the EXACT tempo
+  (feedforward), so start simple — **P-only phase correction with feedforward
+  tempo**: always run at `ref_tempo` (no persistent rate bias → can't wind up),
+  apply a small one-time *fractional* phase nudge (`ref_beat = cur + k·error`,
+  k~0.1–0.3) per reference; tempo stays exact so beats are evenly spaced and
+  phase locks over a few references. Graduate to a full PI/PID (with damping
+  tuning + integral for steady-state) when a modeled/remote clock (M3) introduces
+  real drift that feedforward can't cancel. Add a phasor-slew metric (the
+  correction magnitude per reference) to quantify it — pairs with the OTel-metrics
+  note. TDD target: a `timebase.rs` test that a steady stream of jittery-but-
+  unbiased references leaves inter-beat spacing within a tight bound (the current
+  slew fails it; the P-phase controller passes).
 - **Beat-lifecycle privilege asymmetry — RESOLVED by design (2026-06-28).**
   `fire_lifecycle` runs `tick`/`rotate` unprivileged while create runs
   privileged; gemini-pro flagged it. Decision: leave it. We deliberately keep
