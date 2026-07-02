@@ -1,16 +1,16 @@
-//! `kj play <path>` — resolve an audio sample and push a play directive over
-//! the FlowBus (docs/pcm.md "The wire").
+//! `kj play <path>` — resolve an audio sample and push a render cue over the
+//! FlowBus (docs/pcm.md "The wire").
 //!
 //! The kernel never touches audio hardware. `kj play` reads the file, sniffs
-//! its format from the extension, wraps the bytes in an [`AudioRef::Encoded`]
-//! (inline — correct for this slice; a `Cas` ref is the primary path once the
-//! speculation-lead prefetch lands, slice 5), and publishes
-//! `BlockFlow::PlayAudio` — the same FlowBus every `BlockEvents` subscription
-//! bridge already drains, so every attached client's `AudioRenderTarget`
-//! receives it with no new transport.
+//! its format from the extension to derive the wire MIME, wraps the bytes in a
+//! play-now [`RenderCue`] (inline, `lead == 0` — correct for this slice; a
+//! `Cas` payload is the primary path once the speculation-lead prefetch lands,
+//! slice 5c), and publishes `BlockFlow::RenderCue` — the same FlowBus every
+//! `BlockEvents` subscription bridge already drains, so every attached
+//! client's render sink receives it with no new transport.
 
 use clap::Parser;
-use kaijutsu_audio::{AudioFormatHint, AudioRef};
+use kaijutsu_audio::{AudioFormatHint, RenderCue};
 use kaijutsu_types::ContentType;
 
 use super::refs;
@@ -82,10 +82,10 @@ impl KjDispatcher {
         };
 
         let byte_count = bytes.len();
-        let audio = AudioRef::Encoded { bytes, format };
-        let receivers = self.kernel().block_flows().publish(BlockFlow::PlayAudio {
+        let cue = RenderCue::now_inline(format.mime(), bytes);
+        let receivers = self.kernel().block_flows().publish(BlockFlow::RenderCue {
             context_id,
-            audio,
+            cue,
         });
 
         KjResult::ok_ephemeral(
@@ -105,23 +105,25 @@ impl KjDispatcher {
 mod tests {
     use crate::flows::BlockFlow;
     use crate::kj::test_helpers::{register_context, test_dispatcher};
-    use kaijutsu_audio::AudioFormatHint;
+    use kaijutsu_audio::CuePayload;
     use kaijutsu_types::PrincipalId;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    /// TDD anchor: `kj play <tempwav>` must publish a `BlockFlow::PlayAudio`
-    /// on the FlowBus, carrying the file's bytes verbatim and the sniffed
-    /// format. Subscribe BEFORE dispatch — the FlowBus is a live broadcast,
-    /// not a queue a late subscriber can catch up on.
+    /// TDD anchor: `kj play <tempwav>` must publish a `BlockFlow::RenderCue`
+    /// on the FlowBus, carrying the file's bytes verbatim (inline), the MIME
+    /// sniffed from the extension, and a zero lead (play now). Subscribe
+    /// BEFORE dispatch — the FlowBus is a live broadcast, not a queue a late
+    /// subscriber can catch up on.
     #[tokio::test]
-    async fn play_publishes_block_flow_play_audio() {
+    async fn play_publishes_block_flow_render_cue() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
         let principal = PrincipalId::new();
         let ctx = register_context(&dispatcher, Some("c"), None, principal);
         let caller = crate::kj::test_helpers::caller_with_context(ctx);
 
-        let mut sub = dispatcher.kernel().block_flows().subscribe("block.play_audio");
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
 
         let dir = tempfile::tempdir().expect("tmpdir");
         let wav_path = dir.path().join("kick.wav");
@@ -136,19 +138,20 @@ mod tests {
 
         let msg = sub
             .try_recv()
-            .expect("BlockFlow::PlayAudio should have been published");
+            .expect("BlockFlow::RenderCue should have been published");
         match msg.payload {
-            BlockFlow::PlayAudio { context_id, audio } => {
+            BlockFlow::RenderCue { context_id, cue } => {
                 assert_eq!(context_id, ctx, "directive names the resolved context");
-                match audio {
-                    kaijutsu_audio::AudioRef::Encoded { bytes, format } => {
-                        assert_eq!(bytes, sample_bytes, "bytes ride the directive verbatim");
-                        assert_eq!(format, AudioFormatHint::Wav, "extension sniffed as wav");
+                assert_eq!(cue.mime, "audio/wav", "extension sniffed to the wav MIME");
+                assert_eq!(cue.lead, Duration::ZERO, "kj play is play-now (zero lead)");
+                match cue.payload {
+                    CuePayload::Inline(bytes) => {
+                        assert_eq!(bytes, sample_bytes, "bytes ride the cue verbatim inline");
                     }
-                    other => panic!("expected Encoded, got {other:?}"),
+                    other => panic!("expected Inline, got {other:?}"),
                 }
             }
-            other => panic!("expected PlayAudio, got {other:?}"),
+            other => panic!("expected RenderCue, got {other:?}"),
         }
     }
 
@@ -161,7 +164,7 @@ mod tests {
         let ctx = register_context(&dispatcher, Some("c"), None, principal);
         let caller = crate::kj::test_helpers::caller_with_context(ctx);
 
-        let mut sub = dispatcher.kernel().block_flows().subscribe("block.play_audio");
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
 
         let result = dispatcher.dispatch_play(
             &["/nonexistent/path/to/x.wav".to_string()],
@@ -182,7 +185,7 @@ mod tests {
         let ctx = register_context(&dispatcher, Some("c"), None, principal);
         let caller = crate::kj::test_helpers::caller_with_context(ctx);
 
-        let mut sub = dispatcher.kernel().block_flows().subscribe("block.play_audio");
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
 
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("notes.xyz");

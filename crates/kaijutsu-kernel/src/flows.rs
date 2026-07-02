@@ -185,7 +185,7 @@ impl FlowTopics for BlockFlow {
         "block.output",
         "block.metadata",
         "block.context_switched",
-        "block.play_audio",
+        "block.render_cue",
     ];
 
     fn topic_capacity(topic: &str) -> Option<usize> {
@@ -367,18 +367,19 @@ pub enum BlockFlow {
         context_id: ContextId,
     },
 
-    /// Play an audio sample (`kj play`, docs/pcm.md). A kernel *directive*,
-    /// not a block-log event — it carries no `block_id` because it targets no
+    /// Render a cue (`kj play`, later the track render seam; docs/pcm.md,
+    /// docs/midi.md "Render is a wire cue"). A kernel *directive*, not a
+    /// block-log event — it carries no `block_id` because it targets no
     /// block. Rides `BlockFlow` anyway because the server→client fan-out this
     /// event needs (every attached client, unfiltered) is exactly what the
     /// existing `BlockEvents` subscription bridges already do; a parallel bus
     /// would just duplicate that plumbing (docs/pcm.md "The wire").
-    PlayAudio {
-        /// The context that issued the play directive (reserved for future
+    RenderCue {
+        /// The context that issued the directive (reserved for future
         /// per-listener routing; the standalone slice forwards unconditionally).
         context_id: ContextId,
-        /// The sample to play.
-        audio: kaijutsu_audio::AudioRef,
+        /// The cue to render (mime-keyed; the sink dispatches on `cue.mime`).
+        cue: kaijutsu_audio::RenderCue,
     },
 }
 
@@ -397,7 +398,7 @@ impl BlockFlow {
             Self::OutputChanged { .. } => "block.output",
             Self::MetadataChanged { .. } => "block.metadata",
             Self::ContextSwitched { .. } => "block.context_switched",
-            Self::PlayAudio { .. } => "block.play_audio",
+            Self::RenderCue { .. } => "block.render_cue",
         }
     }
 
@@ -415,7 +416,7 @@ impl BlockFlow {
             | Self::OutputChanged { context_id, .. }
             | Self::MetadataChanged { context_id, .. }
             | Self::ContextSwitched { context_id, .. }
-            | Self::PlayAudio { context_id, .. } => *context_id,
+            | Self::RenderCue { context_id, .. } => *context_id,
         }
     }
 
@@ -431,7 +432,7 @@ impl BlockFlow {
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
             | Self::MetadataChanged { block_id, .. } => Some(block_id),
-            Self::SyncReset { .. } | Self::ContextSwitched { .. } | Self::PlayAudio { .. } => None,
+            Self::SyncReset { .. } | Self::ContextSwitched { .. } | Self::RenderCue { .. } => None,
         }
     }
 
@@ -455,7 +456,7 @@ impl BlockFlow {
             | Self::Moved { source, .. }
             | Self::OutputChanged { source, .. }
             | Self::MetadataChanged { source, .. } => *source,
-            Self::SyncReset { .. } | Self::ContextSwitched { .. } | Self::PlayAudio { .. } => {
+            Self::SyncReset { .. } | Self::ContextSwitched { .. } | Self::RenderCue { .. } => {
                 OpSource::Local
             }
         }
@@ -485,7 +486,7 @@ impl BlockFlow {
             Self::OutputChanged { .. } => BlockFlowKind::OutputChanged,
             Self::MetadataChanged { .. } => BlockFlowKind::MetadataChanged,
             Self::ContextSwitched { .. } => BlockFlowKind::ContextSwitched,
-            Self::PlayAudio { .. } => BlockFlowKind::PlayAudio,
+            Self::RenderCue { .. } => BlockFlowKind::RenderCue,
         }
     }
 
@@ -500,7 +501,7 @@ impl BlockFlow {
         // *stream* of block changes). The standalone slice forwards it to
         // every subscriber unconditionally; per-context "distributed
         // listening" is future work (docs/pcm.md).
-        if matches!(self, Self::PlayAudio { .. }) {
+        if matches!(self, Self::RenderCue { .. }) {
             return true;
         }
         // Event type constraint
@@ -1834,12 +1835,9 @@ mod tests {
                 source: OpSource::Local,
             },
             BlockFlow::ContextSwitched { context_id: ctx },
-            BlockFlow::PlayAudio {
+            BlockFlow::RenderCue {
                 context_id: ctx,
-                audio: kaijutsu_audio::AudioRef::Encoded {
-                    bytes: vec![1, 2, 3],
-                    format: kaijutsu_audio::AudioFormatHint::Wav,
-                },
+                cue: kaijutsu_audio::RenderCue::now_inline("audio/wav", vec![1, 2, 3]),
             },
         ];
 
@@ -1858,27 +1856,24 @@ mod tests {
                 | BlockFlow::OutputChanged { .. }
                 | BlockFlow::MetadataChanged { .. }
                 | BlockFlow::ContextSwitched { .. }
-                | BlockFlow::PlayAudio { .. } => {}
+                | BlockFlow::RenderCue { .. } => {}
             }
         }
 
         assert_subjects_registered(&variants, BlockFlow::TOPICS);
     }
 
-    /// `PlayAudio` is a directive, not a filterable block-level event —
+    /// `RenderCue` is a directive, not a filterable block-level event —
     /// `matches_filter` must bypass every constraint unconditionally, even a
     /// filter naming a *different* context (the standalone slice forwards to
     /// every subscriber; per-context routing is future work, docs/pcm.md).
     #[test]
-    fn play_audio_bypasses_matches_filter_unconditionally() {
+    fn render_cue_bypasses_matches_filter_unconditionally() {
         let ctx = ContextId::new();
         let other_ctx = ContextId::new();
-        let flow = BlockFlow::PlayAudio {
+        let flow = BlockFlow::RenderCue {
             context_id: ctx,
-            audio: kaijutsu_audio::AudioRef::Encoded {
-                bytes: vec![1, 2, 3],
-                format: kaijutsu_audio::AudioFormatHint::Wav,
-            },
+            cue: kaijutsu_audio::RenderCue::now_inline("audio/wav", vec![1, 2, 3]),
         };
 
         let constrained = kaijutsu_types::BlockEventFilter {
@@ -1888,7 +1883,7 @@ mod tests {
         };
         assert!(
             flow.matches_filter(&constrained),
-            "PlayAudio must bypass context/event-type filtering unconditionally"
+            "RenderCue must bypass context/event-type filtering unconditionally"
         );
     }
 

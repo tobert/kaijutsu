@@ -2440,12 +2440,12 @@ pub enum BlockFlowKind {
     OutputChanged,
     MetadataChanged,
     ContextSwitched,
-    /// A directive (`kj play`), not a block-level event. Never meaningfully
-    /// filterable by context/kind — `BlockFlow::matches_filter` bypasses
-    /// filtering unconditionally for it — but kept in the 1:1 mapping anyway
-    /// so `BlockFlow::kind()` stays honest and this enum never silently
-    /// drifts out of sync with `BlockFlow`.
-    PlayAudio,
+    /// A render directive (`kj play`; the track render seam), not a
+    /// block-level event. Never meaningfully filterable by context/kind —
+    /// `BlockFlow::matches_filter` bypasses filtering unconditionally for it —
+    /// but kept in the 1:1 mapping anyway so `BlockFlow::kind()` stays honest
+    /// and this enum never silently drifts out of sync with `BlockFlow`.
+    RenderCue,
 }
 
 /// Server-side filter for block event subscriptions.

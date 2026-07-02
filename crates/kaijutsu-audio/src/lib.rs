@@ -1,4 +1,5 @@
-//! FFI-free audio render seam (see `docs/pcm.md` "The seam").
+//! FFI-free render seam (see `docs/pcm.md` "The seam", `docs/midi.md` "Render
+//! is a wire cue").
 //!
 //! This crate is pure data + one trait: no `alsa`/`pipewire`/`symphonia`, no
 //! `tokio`, no kernel-ward crates. The kernel depends on it for
@@ -6,72 +7,93 @@
 //! (`kaijutsu-app`'s Bevy sink today, an edge-node ALSA agent later).
 
 use kaijutsu_cas::ContentHash;
-use std::time::Instant;
+use std::time::Duration;
 
-/// One audio sink. Implemented in the app (Bevy) and, later, an edge-node
+/// One render sink. Implemented in the app (Bevy) and, later, an edge-node
 /// agent (ALSA). `&self` (not `&mut self`) because the Bevy sink spawns
 /// entities via `Commands` rather than mutating sink state, and the ALSA
 /// sink's handle lives behind internal mutability — see `docs/pcm.md`.
-pub trait AudioRenderTarget: Send {
-    /// Play one sample. `at == None` means "now" (first slice); a scheduled
-    /// instant arrives with the track integration (speculation lead).
-    fn play(&self, sample: AudioRef, at: Option<Instant>) -> anyhow::Result<()>;
+pub trait RenderSink: Send {
+    /// Emit one render cue. The sink dispatches on `cue.mime` and schedules at
+    /// `receipt + cue.lead` (`Duration::ZERO` == now).
+    fn emit(&self, cue: RenderCue) -> anyhow::Result<()>;
 }
 
-/// What crosses the wire / the seam. Encoded bytes + a format tag, or a CAS
-/// ref the sink resolves. Decoding lives at the sink (Bevy decoders /
-/// Symphonia) — the wire never carries raw PCM.
+/// A render directive crossing the wire / the seam to an off-box sink
+/// (`docs/midi.md` "Render is a wire cue"; `docs/pcm.md` "How it converges").
+/// Mime-keyed and content-agnostic: an audio sample, a clip record
+/// (`docs/clips.md`), timed MIDI events, or ABC all ride this one directive and
+/// the sink dispatches on `mime`. Generalizes the slice-3 play-now
+/// `PlayAudio`/`AudioRef` pair. The wire never carries raw decoded PCM — the
+/// payload is symbolic content (or encoded sample bytes for tiny inline
+/// samples); decoding lives at the sink (Bevy decoders / Symphonia).
 ///
-/// `Debug` is hand-written (not derived) so it NEVER formats the raw sample
-/// bytes: a directive carrying an inline sample can be large, and a stray
-/// `tracing::debug!(?flow)` deriving down to this type would otherwise dump the
-/// whole buffer as an int array into a log line. We print the byte *count*
-/// instead (gemini-pro review, 2026-07-01).
+/// `Debug` is hand-written (not derived) so it NEVER formats the inline
+/// payload bytes: a directive carrying an inline sample can be large, and a
+/// stray `tracing::debug!(?flow)` deriving down to this type would otherwise
+/// dump the whole buffer as an int array into a log line. We print the byte
+/// *count* instead (gemini-pro review, 2026-07-01).
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AudioRef {
-    /// Small samples inline.
-    Encoded {
-        bytes: Vec<u8>,
-        format: AudioFormatHint,
-    },
-    /// Larger samples: fetch from CAS (the primary path — see "How it
-    /// converges" in `docs/pcm.md`).
-    Cas {
-        hash: ContentHash,
-        format: AudioFormatHint,
-    },
+pub struct RenderCue {
+    /// MIME of `payload` — the sink's dispatch key. e.g. `audio/wav`,
+    /// `audio/midi`, `text/vnd.abc`, `application/vnd.kaijutsu.clip+json`.
+    pub mime: String,
+    /// The symbolic content inline, or a CAS ref the sink resolves (the
+    /// primary path under the speculation-lead prefetch — `docs/pcm.md`).
+    pub payload: CuePayload,
+    /// Relative schedule lead: the sink fires at `receipt + lead`. A
+    /// *relative* `Duration` because a process-local `Instant` can't cross the
+    /// wire; `Duration::ZERO` == play now (the old `PlayAudio` semantics).
+    pub lead: Duration,
 }
 
-impl std::fmt::Debug for AudioRef {
+/// The two forms a cue's content takes on the wire: small content inline, or a
+/// CAS hash the sink resolves from its cache / SFTP under the lead.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CuePayload {
+    /// Symbolic content (ABC/clip JSON/MIDI) or a tiny encoded sample, inline.
+    Inline(Vec<u8>),
+    /// Larger content: fetch from CAS (the primary path — see "How it
+    /// converges" in `docs/pcm.md`).
+    Cas(ContentHash),
+}
+
+impl std::fmt::Debug for RenderCue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderCue")
+            .field("mime", &self.mime)
+            .field("lead", &self.lead)
+            .field("payload", &self.payload)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CuePayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AudioRef::Encoded { bytes, format } => f
-                .debug_struct("Encoded")
-                .field("format", format)
-                // The count, never the bytes — see the type doc.
-                .field("bytes", &format_args!("[{} bytes]", bytes.len()))
-                .finish(),
-            AudioRef::Cas { hash, format } => f
-                .debug_struct("Cas")
-                .field("format", format)
-                .field("hash", hash)
-                .finish(),
+            // The count, never the bytes — see the RenderCue type doc.
+            CuePayload::Inline(bytes) => {
+                write!(f, "Inline([{} bytes])", bytes.len())
+            }
+            CuePayload::Cas(hash) => f.debug_tuple("Cas").field(hash).finish(),
         }
     }
 }
 
-impl AudioRef {
-    /// The format tag, regardless of variant.
-    pub fn format(&self) -> AudioFormatHint {
-        match self {
-            AudioRef::Encoded { format, .. } => *format,
-            AudioRef::Cas { format, .. } => *format,
+impl RenderCue {
+    /// A play-now cue carrying inline bytes (`lead == ZERO`). The slice-5a
+    /// shape of the old `kj play` directive.
+    pub fn now_inline(mime: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            mime: mime.into(),
+            payload: CuePayload::Inline(bytes),
+            lead: Duration::ZERO,
         }
     }
 
-    /// Convenience: `self.format().mime()`.
-    pub fn mime(&self) -> &'static str {
-        self.format().mime()
+    /// The cue's MIME dispatch key.
+    pub fn mime(&self) -> &str {
+        &self.mime
     }
 }
 
@@ -174,93 +196,96 @@ mod tests {
     }
 
     #[test]
-    fn audio_ref_format_and_mime_delegate_regardless_of_variant() {
-        let cas = AudioRef::Cas {
-            hash: ContentHash::from_data(b"whatever"),
-            format: AudioFormatHint::Flac,
-        };
-        assert_eq!(cas.format(), AudioFormatHint::Flac);
-        assert_eq!(cas.mime(), "audio/flac");
-
-        let encoded = AudioRef::Encoded {
-            bytes: vec![1, 2, 3],
-            format: AudioFormatHint::Ogg,
-        };
-        assert_eq!(encoded.format(), AudioFormatHint::Ogg);
-        assert_eq!(encoded.mime(), "audio/ogg");
+    fn now_inline_builds_a_zero_lead_inline_cue() {
+        let cue = RenderCue::now_inline("audio/wav", vec![1, 2, 3]);
+        assert_eq!(cue.mime(), "audio/wav");
+        assert_eq!(cue.lead, Duration::ZERO, "play-now == zero lead");
+        assert_eq!(cue.payload, CuePayload::Inline(vec![1, 2, 3]));
     }
 
     #[test]
-    fn debug_elides_sample_bytes() {
-        // A directive's Debug must never dump the raw sample buffer (a stray
+    fn debug_elides_inline_payload_bytes() {
+        // A directive's Debug must never dump the raw payload buffer (a stray
         // `debug!(?flow)` would otherwise log MB of int array). Derived Debug
-        // would print `bytes: [1, 2, 3, 4, 5]`; the hand-written one prints the
+        // would print `[1, 2, 3, 4, 5]`; the hand-written one prints the
         // count. This test fails on the derive.
-        let r = AudioRef::Encoded {
-            bytes: vec![1, 2, 3, 4, 5],
-            format: AudioFormatHint::Wav,
+        let cue = RenderCue {
+            mime: "audio/wav".into(),
+            payload: CuePayload::Inline(vec![1, 2, 3, 4, 5]),
+            lead: Duration::from_millis(250),
         };
-        let s = format!("{r:?}");
+        let s = format!("{cue:?}");
         assert!(s.contains("[5 bytes]"), "debug shows the byte count: {s}");
         assert!(!s.contains("1, 2, 3"), "debug must NOT dump raw bytes: {s}");
-        assert!(s.contains("Wav"), "debug still shows the format: {s}");
+        assert!(s.contains("audio/wav"), "debug still shows the mime: {s}");
 
         // Cas has no bytes to leak — but confirm it still Debugs its hash.
-        let c = AudioRef::Cas {
-            hash: ContentHash::from_data(b"x"),
-            format: AudioFormatHint::Flac,
+        let cas = RenderCue {
+            mime: "audio/flac".into(),
+            payload: CuePayload::Cas(ContentHash::from_data(b"x")),
+            lead: Duration::ZERO,
         };
-        let cs = format!("{c:?}");
-        assert!(cs.contains("Cas") && cs.contains("Flac"), "cas debug: {cs}");
+        let cs = format!("{cas:?}");
+        assert!(cs.contains("Cas"), "cas debug names the variant: {cs}");
     }
 
     #[test]
-    fn serde_round_trip_for_format_and_encoded_ref() {
+    fn serde_round_trip_for_format_and_render_cue() {
         let format = AudioFormatHint::Wav;
         let json = serde_json::to_string(&format).expect("serialize format");
         let back: AudioFormatHint = serde_json::from_str(&json).expect("deserialize format");
         assert_eq!(back, format);
 
-        let audio_ref = AudioRef::Encoded {
-            bytes: vec![1, 2, 3],
-            format: AudioFormatHint::Wav,
+        // Inline payload + non-zero lead round-trips whole.
+        let cue = RenderCue {
+            mime: "audio/wav".into(),
+            payload: CuePayload::Inline(vec![1, 2, 3]),
+            lead: Duration::from_millis(500),
         };
-        let json = serde_json::to_string(&audio_ref).expect("serialize AudioRef");
-        let back: AudioRef = serde_json::from_str(&json).expect("deserialize AudioRef");
-        assert_eq!(back, audio_ref);
+        let json = serde_json::to_string(&cue).expect("serialize RenderCue");
+        let back: RenderCue = serde_json::from_str(&json).expect("deserialize RenderCue");
+        assert_eq!(back, cue);
+
+        // Cas payload round-trips too.
+        let cas = RenderCue {
+            mime: "application/vnd.kaijutsu.clip+json".into(),
+            payload: CuePayload::Cas(ContentHash::from_data(b"clip")),
+            lead: Duration::ZERO,
+        };
+        let json = serde_json::to_string(&cas).expect("serialize cas cue");
+        let back: RenderCue = serde_json::from_str(&json).expect("deserialize cas cue");
+        assert_eq!(back, cas);
     }
 
     /// Object-safety + `&self`/interior-mutability shape check: a test-only
-    /// sink stored as `Box<dyn AudioRenderTarget>`. `play` takes `&self`, so
-    /// the recorder needs interior mutability (a shared `Arc<Mutex<..>>` so
-    /// the test can still observe what the boxed trait object captured).
+    /// sink stored as `Box<dyn RenderSink>`. `emit` takes `&self`, so the
+    /// recorder needs interior mutability (a shared `Arc<Mutex<..>>` so the
+    /// test can still observe what the boxed trait object captured).
     struct Recorder {
-        captured: Arc<Mutex<Vec<AudioFormatHint>>>,
+        captured: Arc<Mutex<Vec<String>>>,
     }
 
-    impl AudioRenderTarget for Recorder {
-        fn play(&self, sample: AudioRef, _at: Option<Instant>) -> anyhow::Result<()> {
-            self.captured.lock().unwrap().push(sample.format());
+    impl RenderSink for Recorder {
+        fn emit(&self, cue: RenderCue) -> anyhow::Result<()> {
+            self.captured.lock().unwrap().push(cue.mime);
             Ok(())
         }
     }
 
     #[test]
-    fn audio_render_target_is_object_safe_and_usable_behind_shared_ref() {
+    fn render_sink_is_object_safe_and_usable_behind_shared_ref() {
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let sink: Box<dyn AudioRenderTarget> = Box::new(Recorder {
+        let sink: Box<dyn RenderSink> = Box::new(Recorder {
             captured: captured.clone(),
         });
 
-        sink.play(
-            AudioRef::Cas {
-                hash: ContentHash::from_data(b"sample"),
-                format: AudioFormatHint::Mp3,
-            },
-            None,
-        )
-        .expect("play should succeed");
+        sink.emit(RenderCue {
+            mime: "audio/mpeg".into(),
+            payload: CuePayload::Cas(ContentHash::from_data(b"sample")),
+            lead: Duration::ZERO,
+        })
+        .expect("emit should succeed");
 
-        assert_eq!(*captured.lock().unwrap(), vec![AudioFormatHint::Mp3]);
+        assert_eq!(*captured.lock().unwrap(), vec!["audio/mpeg".to_string()]);
     }
 }

@@ -131,13 +131,14 @@ pub enum ServerEvent {
     /// orchestration lives in the actor (which owns the reconnect); the renderer
     /// just applies. `sync.context_id` names the target.
     ContextResynced { sync: SyncState },
-    /// Play an audio sample (`kj play`, docs/pcm.md). A kernel directive, not
-    /// a block-log event — it names no block. The Bevy sink (slice 3) turns
-    /// this into an `AudioPlayer` spawn; this crate only decodes the wire
-    /// shape, it never touches audio hardware.
-    PlayAudio {
+    /// Render a cue (`kj play`, later the track render seam; docs/pcm.md,
+    /// docs/midi.md "Render is a wire cue"). A kernel directive, not a
+    /// block-log event — it names no block. A render sink (the Bevy app today)
+    /// dispatches on `cue.mime` and schedules at `receipt + cue.lead`; this
+    /// crate only decodes the wire shape, it never touches audio hardware.
+    RenderCue {
         context_id: ContextId,
-        audio: kaijutsu_audio::AudioRef,
+        cue: kaijutsu_audio::RenderCue,
     },
 }
 
@@ -798,10 +799,10 @@ impl block_events::Server for BlockEventsForwarder {
         Promise::ok(())
     }
 
-    fn on_play_audio(
+    fn on_render_cue(
         self: Rc<Self>,
-        params: block_events::OnPlayAudioParams,
-        _results: block_events::OnPlayAudioResults,
+        params: block_events::OnRenderCueParams,
+        _results: block_events::OnRenderCueResults,
     ) -> Promise<(), capnp::Error> {
         let params = match params.get() {
             Ok(p) => p,
@@ -816,60 +817,45 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let audio_reader = match params.get_audio() {
+        let cue_reader = match params.get_cue() {
             Ok(r) => r,
             Err(e) => return Promise::err(e),
         };
-        let audio = match parse_audio_ref(audio_reader) {
-            Ok(a) => a,
+        let cue = match parse_render_cue(cue_reader) {
+            Ok(c) => c,
             Err(e) => return Promise::err(e),
         };
 
-        let event = ServerEvent::PlayAudio { context_id, audio };
+        let event = ServerEvent::RenderCue { context_id, cue };
         if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping PlayAudio event");
+            tracing::warn!("Event channel closed, dropping RenderCue event");
         }
         Promise::ok(())
     }
 }
 
-/// `crate::kaijutsu_capnp::AudioFormatHint` → `kaijutsu_audio::AudioFormatHint`.
-fn parse_audio_format_hint(
-    format: crate::kaijutsu_capnp::AudioFormatHint,
-) -> kaijutsu_audio::AudioFormatHint {
-    use crate::kaijutsu_capnp::AudioFormatHint as Capnp;
-    use kaijutsu_audio::AudioFormatHint as Hint;
-    match format {
-        Capnp::Wav => Hint::Wav,
-        Capnp::Flac => Hint::Flac,
-        Capnp::Mp3 => Hint::Mp3,
-        Capnp::Ogg => Hint::Ogg,
-        Capnp::Aac => Hint::Aac,
-    }
-}
-
-/// Parse a Cap'n Proto `AudioRef` reader into the typed
-/// `kaijutsu_audio::AudioRef` — the union arm decides `Encoded` vs `Cas`; a
+/// Parse a Cap'n Proto `RenderCue` reader into the typed
+/// `kaijutsu_audio::RenderCue` — the union arm decides `Inline` vs `Cas`; a
 /// malformed CAS hash fails the promise loudly rather than silently dropping
-/// the sample (house style: crashing beats data corruption).
-fn parse_audio_ref(
-    reader: crate::kaijutsu_capnp::audio_ref::Reader<'_>,
-) -> Result<kaijutsu_audio::AudioRef, capnp::Error> {
-    let format = parse_audio_format_hint(reader.get_format().map_err(|e| {
-        capnp::Error::failed(format!("invalid AudioFormatHint on wire: {e}"))
-    })?);
-    match reader.which()? {
-        crate::kaijutsu_capnp::audio_ref::Encoded(bytes) => Ok(kaijutsu_audio::AudioRef::Encoded {
-            bytes: bytes?.to_vec(),
-            format,
-        }),
-        crate::kaijutsu_capnp::audio_ref::CasHash(text) => {
+/// the cue (house style: crashing beats data corruption). `leadNanos` is a
+/// relative `Duration` the sink re-anchors at `receipt + lead`.
+fn parse_render_cue(
+    reader: crate::kaijutsu_capnp::render_cue::Reader<'_>,
+) -> Result<kaijutsu_audio::RenderCue, capnp::Error> {
+    let mime = reader.get_mime()?.to_str()?.to_string();
+    let lead = std::time::Duration::from_nanos(reader.get_lead_nanos());
+    let payload = match reader.which()? {
+        crate::kaijutsu_capnp::render_cue::Inline(bytes) => {
+            kaijutsu_audio::CuePayload::Inline(bytes?.to_vec())
+        }
+        crate::kaijutsu_capnp::render_cue::CasHash(text) => {
             let hash_str = text?.to_str()?;
             let hash = kaijutsu_cas::ContentHash::from_str_checked(hash_str)
-                .map_err(|e| capnp::Error::failed(format!("invalid CAS hash in AudioRef: {e}")))?;
-            Ok(kaijutsu_audio::AudioRef::Cas { hash, format })
+                .map_err(|e| capnp::Error::failed(format!("invalid CAS hash in RenderCue: {e}")))?;
+            kaijutsu_audio::CuePayload::Cas(hash)
         }
-    }
+    };
+    Ok(kaijutsu_audio::RenderCue { mime, payload, lead })
 }
 
 // ============================================================================

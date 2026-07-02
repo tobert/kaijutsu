@@ -294,11 +294,11 @@ enum BlockFlowKind {
   metadataChanged @8;
   contextSwitched @9;
   excludedChanged @10;
-  # A directive, not a block-level event — never meaningfully filterable by
-  # context/kind (see `BlockFlow::matches_filter`'s unconditional bypass for
-  # `PlayAudio`). Kept 1:1 with the Rust `BlockFlowKind` enum anyway so the
-  # two never drift silently out of sync.
-  playAudio @11;
+  # A render directive, not a block-level event — never meaningfully
+  # filterable by context/kind (see `BlockFlow::matches_filter`'s unconditional
+  # bypass for `RenderCue`). Kept 1:1 with the Rust `BlockFlowKind` enum anyway
+  # so the two never drift silently out of sync.
+  renderCue @11;
 }
 
 # Server-side filter for block event subscriptions.
@@ -329,25 +329,18 @@ struct BlockMetadata {
   hasStderr @7 :Bool;         # True if stderr is set (distinguishes "" from unset)
 }
 
-# Audio sample format hint — mirrors kaijutsu_audio::AudioFormatHint. The wire
-# MIME derives from it (audio/wav, audio/flac, audio/mpeg, audio/ogg, audio/aac).
-enum AudioFormatHint {
-  wav @0;
-  flac @1;
-  mp3 @2;
-  ogg @3;
-  aac @4;
-}
-
-# A reference to an audio sample crossing the render seam (docs/pcm.md "The
-# seam"). Mirrors kaijutsu_audio::AudioRef: inline encoded bytes for tiny
-# samples, or a CAS hash the sink resolves (the primary path once the
-# speculation-lead prefetch lands, slice 5). `format` tags the decoder.
-struct AudioRef {
-  format @0 :AudioFormatHint;
+# A render directive crossing the seam to an off-box sink (docs/midi.md
+# "Render is a wire cue"; docs/pcm.md "How it converges"). Mirrors
+# kaijutsu_audio::RenderCue: mime-keyed symbolic content (or a CAS hash the
+# sink resolves), scheduled at receipt + lead. Generalizes the slice-3
+# play-now audio directive — audio samples, clip records, MIDI, and ABC all
+# ride this one struct and the sink dispatches on `mime`.
+struct RenderCue {
+  mime @0 :Text;          # dispatch key: audio/wav, audio/midi, text/vnd.abc, …
+  leadNanos @1 :UInt64;   # relative schedule lead; sink fires at receipt+lead. 0 = now.
   union {
-    encoded @1 :Data;    # inline encoded bytes (tiny samples / standalone slice)
-    casHash @2 :Text;    # 32-hex ContentHash — resolved from CAS at the sink
+    inline @2 :Data;      # inline symbolic content / tiny sample bytes
+    casHash @3 :Text;     # hex ContentHash — resolved from CAS at the sink
   }
 }
 
@@ -383,11 +376,12 @@ interface BlockEvents {
   # its own event rather than the block text op stream).
   onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData);
 
-  # Play an audio sample (docs/pcm.md). A kernel directive (from `kj play`),
-  # not a block change — carried on this channel because it already fans out to
-  # every attached client. `contextId` is the originating context (reserved for
-  # future per-listener routing); the standalone slice forwards unconditionally.
-  onPlayAudio @13 (contextId :Data, audio :AudioRef);
+  # Render a cue (docs/pcm.md, docs/midi.md "Render is a wire cue"). A kernel
+  # directive (from `kj play`, later the track render seam), not a block change
+  # — carried on this channel because it already fans out to every attached
+  # client. `contextId` is the originating context (reserved for future
+  # per-listener routing); the standalone slice forwards unconditionally.
+  onRenderCue @13 (contextId :Data, cue :RenderCue);
 }
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).

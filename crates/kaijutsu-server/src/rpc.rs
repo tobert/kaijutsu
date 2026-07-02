@@ -2482,12 +2482,12 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                BlockFlow::PlayAudio { context_id, ref audio } => {
-                                    let mut req = callback.on_play_audio_request();
+                                BlockFlow::RenderCue { context_id, ref cue } => {
+                                    let mut req = callback.on_render_cue_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
-                                        set_audio_ref(params.reborrow().init_audio(), audio);
+                                        set_render_cue(params.reborrow().init_cue(), cue);
                                     }
                                     match tokio::time::timeout(
                                         CALLBACK_TIMEOUT, req.send().promise,
@@ -5074,7 +5074,7 @@ impl kernel::Server for KernelImpl {
 
         // Which FlowBus topics to subscribe to, given the event_types filter.
         // Must stay a superset of what `matches_filter` can pass — directives
-        // (PlayAudio) always pass, so the narrow single-topic partition is only
+        // (RenderCue) always pass, so the narrow single-topic partition is only
         // safe for a lone directive filter (see `filtered_subscribe_pattern`).
         let subscribe_pattern = filtered_subscribe_pattern(&filter.event_types);
 
@@ -5442,12 +5442,12 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                BlockFlow::PlayAudio { context_id, ref audio } => {
-                                    let mut req = callback.on_play_audio_request();
+                                BlockFlow::RenderCue { context_id, ref cue } => {
+                                    let mut req = callback.on_render_cue_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
-                                        set_audio_ref(params.reborrow().init_audio(), audio);
+                                        set_render_cue(params.reborrow().init_cue(), cue);
                                     }
                                     match tokio::time::timeout(
                                         CALLBACK_TIMEOUT, req.send().promise,
@@ -6187,29 +6187,19 @@ fn build_block_metadata(
     }
 }
 
-/// `kaijutsu_audio::AudioFormatHint` → its capnp mirror. Kept a plain map (no
-/// `From` impl in `kaijutsu-audio`, which is deliberately FFI/wire-free — see
-/// its crate doc) rather than a `TryFrom`/`From` on either side.
-fn audio_format_to_capnp(format: kaijutsu_audio::AudioFormatHint) -> crate::kaijutsu_capnp::AudioFormatHint {
-    use crate::kaijutsu_capnp::AudioFormatHint as Capnp;
-    use kaijutsu_audio::AudioFormatHint as Hint;
-    match format {
-        Hint::Wav => Capnp::Wav,
-        Hint::Flac => Capnp::Flac,
-        Hint::Mp3 => Capnp::Mp3,
-        Hint::Ogg => Capnp::Ogg,
-        Hint::Aac => Capnp::Aac,
-    }
-}
-
-/// Fill a Cap'n Proto `AudioRef` builder from the typed audio ref (docs/pcm.md
-/// "The wire"). Shared by both FlowBus bridges (`subscribe_blocks` and
-/// `subscribe_blocks_filtered`) so the union-arm wiring lives in one place.
-fn set_audio_ref(mut builder: crate::kaijutsu_capnp::audio_ref::Builder<'_>, audio: &kaijutsu_audio::AudioRef) {
-    builder.set_format(audio_format_to_capnp(audio.format()));
-    match audio {
-        kaijutsu_audio::AudioRef::Encoded { bytes, .. } => builder.set_encoded(bytes),
-        kaijutsu_audio::AudioRef::Cas { hash, .. } => builder.set_cas_hash(&hash.to_string()),
+/// Fill a Cap'n Proto `RenderCue` builder from the typed cue (docs/pcm.md "The
+/// wire", docs/midi.md "Render is a wire cue"). Shared by both FlowBus bridges
+/// (`subscribe_blocks` and `subscribe_blocks_filtered`) so the union-arm wiring
+/// lives in one place. `lead` is a *relative* nanosecond count — a
+/// process-local `Instant` can't cross the wire; the sink re-anchors at
+/// `receipt + lead`. Saturates rather than truncates on the (implausible) case
+/// of a lead past ~584 years.
+fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, cue: &kaijutsu_audio::RenderCue) {
+    builder.set_mime(&cue.mime);
+    builder.set_lead_nanos(u64::try_from(cue.lead.as_nanos()).unwrap_or(u64::MAX));
+    match &cue.payload {
+        kaijutsu_audio::CuePayload::Inline(bytes) => builder.set_inline(bytes),
+        kaijutsu_audio::CuePayload::Cas(hash) => builder.set_cas_hash(&hash.to_string()),
     }
 }
 
@@ -6218,20 +6208,20 @@ fn set_audio_ref(mut builder: crate::kaijutsu_capnp::audio_ref::Builder<'_>, aud
 /// This pattern must be a *superset* of everything `BlockFlow::matches_filter`
 /// can pass: the pattern gates what reaches the bridge, `matches_filter` gates
 /// what is forwarded, and anything the pattern excludes is silently dropped
-/// before `matches_filter` ever runs. `PlayAudio` is a directive that
+/// before `matches_filter` ever runs. `RenderCue` is a directive that
 /// `matches_filter` passes **unconditionally** (docs/pcm.md — "every subscriber
-/// hears it"), so every filtered subscription MUST include `block.play_audio`.
-/// A single FlowBus pattern can't express "block.status OR block.play_audio",
+/// hears it"), so every filtered subscription MUST include `block.render_cue`.
+/// A single FlowBus pattern can't express "block.status OR block.render_cue",
 /// so the narrow single-topic fast path is only safe when the lone requested
 /// type *is* that directive; any other single type widens to `block.*` and lets
 /// `matches_filter` do the gating. (Found by the deepseek review 2026-07-01: the
 /// old inline code narrowed e.g. `[StatusChanged]` → `block.status` and silently
-/// dropped audio directives.) If a high-throughput narrow subscriber ever needs
+/// dropped render directives.) If a high-throughput narrow subscriber ever needs
 /// the topic partition back, the fix is a *second* subscription for directive
 /// topics, not re-narrowing here.
 fn filtered_subscribe_pattern(event_types: &[kaijutsu_types::BlockFlowKind]) -> &'static str {
     match event_types {
-        [kaijutsu_types::BlockFlowKind::PlayAudio] => "block.play_audio",
+        [kaijutsu_types::BlockFlowKind::RenderCue] => "block.render_cue",
         _ => "block.*",
     }
 }
@@ -7202,8 +7192,8 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched => {
                                 kaijutsu_types::BlockFlowKind::ContextSwitched
                             }
-                            crate::kaijutsu_capnp::BlockFlowKind::PlayAudio => {
-                                kaijutsu_types::BlockFlowKind::PlayAudio
+                            crate::kaijutsu_capnp::BlockFlowKind::RenderCue => {
+                                kaijutsu_types::BlockFlowKind::RenderCue
                             }
                         })
                     })
@@ -7876,19 +7866,19 @@ impl vfs::Server for VfsImpl {
 mod filtered_subscribe_pattern_tests {
     //! The filtered block-subscription FlowBus pattern must always be a superset
     //! of what `matches_filter` passes — in particular it must never narrow away
-    //! `PlayAudio` directives (which `matches_filter` passes unconditionally).
+    //! `RenderCue` directives (which `matches_filter` passes unconditionally).
     use super::filtered_subscribe_pattern;
     use kaijutsu_types::BlockFlowKind::*;
 
     #[test]
     fn lone_directive_filter_can_use_its_own_topic() {
-        assert_eq!(filtered_subscribe_pattern(&[PlayAudio]), "block.play_audio");
+        assert_eq!(filtered_subscribe_pattern(&[RenderCue]), "block.render_cue");
     }
 
     #[test]
     fn single_non_directive_filter_widens_to_catch_directives() {
         // The old inline code narrowed these to "block.status" / "block.text_ops"
-        // and silently dropped PlayAudio directives — this is the regression guard.
+        // and silently dropped RenderCue directives — this is the regression guard.
         assert_eq!(filtered_subscribe_pattern(&[StatusChanged]), "block.*");
         assert_eq!(filtered_subscribe_pattern(&[TextOps]), "block.*");
         assert_eq!(filtered_subscribe_pattern(&[Inserted]), "block.*");
