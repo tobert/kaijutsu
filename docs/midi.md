@@ -347,6 +347,15 @@ real KSP / loft node in later.
   (two `played_by`s, one track) or ride a parallel track — and what
   `UseLastGood` should repeat in the mixed case (today it's lane-scoped,
   producer-blind — a decision, not a bug).
+- **Per-track channel + per-track render-cue routing** (the moment two tracks
+  sound at once). The wire-cue sink landed single-track (slice 5c): every cue
+  plays on MIDI **channel 0**, and a `RENDER_FLUSH_MIME` cue flushes the sink's
+  *whole* queue, so a second simultaneous track would collide on the channel and
+  cross-flush on stop. The cue already carries the track's score `context_id`;
+  the sink needs to schedule + flush *per context* and assign a channel per
+  track/lane (drums → ch 9). Full write-up + fix sites: `docs/chameleon.md`
+  "Open items" (per-track MIDI channel; per-track render-cue routing). Same
+  routing gap as `docs/pcm.md` "Distributed listening" — solve together.
 
 Resolved since the design round (kept here so old readers don't re-open them):
 the **`ClockSource` trait surface** and the **render-target seam** both landed

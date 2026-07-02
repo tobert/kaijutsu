@@ -364,3 +364,20 @@ flavor — see the eat-the-warmup invariant).
 - **Decouple the OODA Act from ABC** + **per-type `BeatPolicy` defaults** —
   the remaining context_type-decomposition axes (`docs/issues.md`).
 - **Cue traps** (`trap '…' PHRASE%4`) — the third delivery semantic, unbuilt.
+- **Per-track MIDI channel** (needed the moment two tracks sound at once). The
+  render seam landed single-track (PCM slice 5c): the app MIDI sink schedules
+  every cue on MIDI **channel 0** (`MidiParams::default().channel`), so two
+  simultaneous tracks would collide on one channel. The band needs a track→
+  channel assignment carried in the cue (or derived at the sink from the track/
+  lane), so keys, bass, and drums land on distinct channels (drums → ch 9 GM).
+  Until then, "one producing binding at a time" (the loadout policy, above)
+  keeps it safe. Sites: `RenderCue`/`MidiParams` (`kaijutsu-audio`, the app's
+  `midi.rs` render); it's the render-side twin of the "tracks, not voices" lane.
+- **Per-track render-cue routing (flush + fan-out).** The wire `RenderCue`
+  carries the track's **score `context_id`**, but the app sink currently ignores
+  it: it plays every cue and a `RENDER_FLUSH_MIME` cue flushes the sink's *whole*
+  ALSA queue — so stopping track A would silence track B through the same sink.
+  Multi-track needs the sink to key its scheduled events + flush by the cue's
+  context (one queue-region per track, or per-track ports). This is the same
+  routing gap `docs/pcm.md` "Distributed listening" names for multi-listener
+  playback — solve them together. Harmless single-track today.
