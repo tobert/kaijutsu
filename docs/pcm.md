@@ -260,7 +260,7 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
      `ContentStore::exists` is a pure trait boundary, keeping it unit-testable
      against a stub. (Code is truth: `ContentHash` is serde-transparent and
      does NOT validate on deserialize — well-formedness is checked explicitly;
-     and a hash is 32 hex chars, not the "64-hex" this doc/clips.md loosely say.)
+     and a hash is 32 hex chars — clips.md corrected 2026-07-02.)
    - **5c — the MIDI sink + demolition. ✅ landed (2026-07-02, live on zorak).**
      The app is the first MIDI sink: it renders `text/vnd.abc` cues to MIDI (same
      `kaijutsu_abc::midi::events` path — the app already deps `kaijutsu-abc`, so
@@ -344,7 +344,10 @@ survives, to pick up when listening goes multi-peer:
 
 - **Inline vs CAS on the wire** — the lean is DECIDED ("How it converges"):
   `Cas` primary + a client-side XDG CAS cache; `Encoded` only for tiny samples.
-  Residual: the actual size threshold number.
+  Residual number set **provisionally at 4 KiB** (2026-07-02 — a clip record is
+  <1 KiB, any real sample dwarfs it; the gemini batch asked for a hard number so
+  the kernel-side chooser isn't ambiguous). Revisit at the first real sink if it
+  chafes.
 - **The clip payload format** — RESOLVED: designed in `docs/clips.md`
   (Shape A), research record in `docs/cue-prior-art.md`. The clip *validator*
   is a voice of the decouple-Act-from-ABC generalization (`docs/issues.md` —

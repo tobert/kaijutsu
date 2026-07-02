@@ -89,14 +89,18 @@ mounts, not kernel-`MountTable`, so not SFTP-visible). Two independent tracks;
 the design details live in the doc, this entry is the backlog pointer:
 
 - **Track B — `/v/blobs` + client CAS sync (ACTIVE; unblocks `pcm.md` 5c's clip
-  half).** B1 read-only `CasFs` backend over the kernel `FileStore`, mounted at
-  `/v/blobs` before the mount-table freeze (leading-byte shards, full-hash
-  leaves, EROFS); B2 `index` TSV (hash/mime/size/path); B3 `SftpClient` +
-  `BlobResolver` in `kaijutsu-client` (`sftp` subsystem on its own SSH
-  connection — the capnp world is `!Send`; `russh-sftp` client half) + XDG
-  `FileStore` cache + re-hash verify (fail loud) + single-flight. Ingest stays `kj cas put` (SFTP→`/tmp` two-step for remote
-  files); writable staging-over-SFTP deferred. Deferred optimization: cached
-  `index` (naive walk per read at first).
+  half).** B3's `SftpClient`+`BlobResolver` landed (`cca8ce7b`+`52d377e7`);
+  remaining per the doc (incl. the 2026-07-02 gemini-batch blockers folded
+  there): **B0** `kaijutsu-cas` hardening (atomic `store()` via staging+rename —
+  the XDG cache is multi-process and `retrieve` never re-hashes, torn reads are
+  real; `ContentHash` serde `try_from` defense-in-depth); **B1** `CasFs` backend
+  + mount before the freeze (leading-byte shards, full-hash leaves, EROFS,
+  `real_path`=None; synthesized `index` must serve exact generated size — the
+  default `read_all` truncates at `getattr().size`); **B2** `index` TSV
+  (absolute `path` column); **B3 residue** — sharded `blob_path()`,
+  single-flight per hash, whole-blob read loops to EOF (256 KiB SFTP packet
+  cap), e2e vs a live server. Ingest stays `kj cas put` (SFTP→`/tmp` two-step);
+  writable staging-over-SFTP deferred; cached `index` deferred.
 - **Track V — `/v/ctx` + `/v/session` (redesigned 2026-06-27 — script-first:
   TSV `index` resolver, sharded pools, symlink edges; no `by-id`/`by-time`/
   `live` farms; no writable `bound` — the capability apparatus dissolved into

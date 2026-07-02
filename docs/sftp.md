@@ -264,18 +264,19 @@ above — so the handle guard and the cache now share one primitive.
 
 ## Implementation slices
 
-0. **RPC → named subsystem + channel-retention scaffold (~one session).** Build
+0. **RPC → named subsystem + channel-retention scaffold — ✅ landed.** Build
    the `HashMap<ChannelId, Channel<Msg>>` retention + `subsystem_request`
    dispatch (see "The SSH session-channel surface" above), migrate RPC to
    `"kaijutsu-rpc"`, drop the dead `control`/`events` channels. This is the
    shared scaffold; doing it first de-risks everything below on a path we
    already exercise. Flag-day client↔server cutover.
-1. **SFTP subsystem dispatch (~1 match arm).** With the scaffold in place,
+1. **SFTP subsystem dispatch — ✅ landed.** With the scaffold in place,
    `subsystem_request` gains a `name == "sftp"` arm that spawns the SFTP task
    with the channel stream + the authenticated `Principal`. Reject if `identity`
    is `None`.
-2. **Adapter (budget ~1,000+ lines, not 200–300).** The first estimate was
-   naïve. Bridging onto `VfsOps` also means:
+2. **Adapter — ✅ landed (~1,300 lines; the 200–300 first estimate was naïve).**
+   Everything below is **built** (`sftp.rs`), listed as the record of what
+   bridging onto `VfsOps` entailed:
    - `SSH_FXP_REALPATH` and `.`/`..` canonicalization — and getting it right
      *without* string manipulation that lets a client escape the mount boundary
      (directory-traversal risk).
