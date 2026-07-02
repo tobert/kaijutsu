@@ -15,7 +15,7 @@
 //! `Instant`-based: a sink drives it from its own local clock, exactly as it
 //! anchors `RenderCue.lead` at `receipt + lead`.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// A low-rate beat reference the kernel ships to sinks: the fractional beat
 /// coordinate at the instant of emission, plus the current tempo. Integer beat
@@ -40,32 +40,40 @@ impl BeatRef {
 
 /// A free-running local beat, corrected toward [`BeatRef`]s as they arrive.
 ///
-/// Between references it extrapolates linearly at the current effective tempo.
-/// On a reference it re-anchors *continuously* (no jump in [`position`]) and
-/// folds the phase error into a **bounded** tempo correction that absorbs it
-/// over `correction_window` — so the beat converges smoothly instead of
-/// stepping, and an outlier reference moves it only by the slew cap.
+/// The controller is **proportional-phase with feedforward tempo** (`docs/issues.md`
+/// "Metronome phasor sloshes"). Because a reference carries the *exact* tempo, we
+/// run the phasor at that tempo directly (feedforward) — never as a *persistent
+/// rate bias*, which is what an earlier slew did and it wound up like an
+/// integrator: a rate correction sized for a 1 s window kept driving until the
+/// next (seconds-later) reference, overshooting ~3.8× and sloshing. Here the rate
+/// is always exactly the reference's, so beats stay evenly spaced by construction;
+/// only *phase* is corrected, by a small **fractional step** toward the reference
+/// (gain `< 1` → always undershoots → never overshoots), bounded so an outlier
+/// reference can't yank the beat. The step is tiny for normal jitter
+/// (gain × a few-ms error) and the loop low-pass-filters reference jitter.
 ///
 /// [`position`]: LocalBeat::position
 #[derive(Debug, Clone)]
 pub struct LocalBeat {
-    /// Beat coordinate at `ref_at` (kept continuous across corrections).
+    /// Beat coordinate at `ref_at`.
     ref_beat: f64,
     /// Local clock instant the anchor was taken.
     ref_at: Instant,
-    /// Effective extrapolation rate = last reference tempo + slew correction.
+    /// Extrapolation rate — always the *reference* tempo (feedforward, no bias).
     tempo_bps: f64,
-    /// How long a phase error is spread over when correcting.
-    correction_window: Duration,
-    /// Slew cap as a fraction of the reference tempo — the max speed-up/slow-down
-    /// a single correction may apply, so an outlier can't yank the beat.
-    max_slew_fraction: f64,
+    /// Proportional phase gain: the fraction of the phase error corrected per
+    /// reference. `< 1` so the beat always undershoots the target (no overshoot).
+    phase_gain: f64,
+    /// Max phase step (beats) a single reference may apply — glitch protection so
+    /// an outlier reference nudges the beat only a little, never yanks it.
+    max_step: f64,
 }
 
 impl LocalBeat {
-    /// Default: absorb a phase error over ~1 s, never more than a 10% tempo nudge.
-    const DEFAULT_CORRECTION_WINDOW: Duration = Duration::from_secs(1);
-    const DEFAULT_MAX_SLEW_FRACTION: f64 = 0.10;
+    /// Default: correct 20% of the phase error per reference, never more than a
+    /// one-beat step (startup uses [`new`](Self::new), which locks fully).
+    const DEFAULT_PHASE_GAIN: f64 = 0.20;
+    const DEFAULT_MAX_STEP: f64 = 1.0;
 
     /// Anchor a fresh phasor on its first reference (an instant lock — startup
     /// and post-gap re-entry snap to the reference; only *ongoing* corrections
@@ -75,19 +83,19 @@ impl LocalBeat {
             ref_beat: initial.beat,
             ref_at: at,
             tempo_bps: initial.tempo_bps,
-            correction_window: Self::DEFAULT_CORRECTION_WINDOW,
-            max_slew_fraction: Self::DEFAULT_MAX_SLEW_FRACTION,
+            phase_gain: Self::DEFAULT_PHASE_GAIN,
+            max_step: Self::DEFAULT_MAX_STEP,
         }
     }
 
-    /// Override the correction tuning (window + slew cap). Chainable.
-    pub fn with_tuning(mut self, correction_window: Duration, max_slew_fraction: f64) -> Self {
-        self.correction_window = correction_window;
-        self.max_slew_fraction = max_slew_fraction;
+    /// Override the controller tuning (phase gain + max step). Chainable.
+    pub fn with_tuning(mut self, phase_gain: f64, max_step: f64) -> Self {
+        self.phase_gain = phase_gain;
+        self.max_step = max_step;
         self
     }
 
-    /// The current effective tempo (beats/sec), including any active slew.
+    /// The current extrapolation tempo (beats/sec) — the last reference's tempo.
     pub fn tempo_bps(&self) -> f64 {
         self.tempo_bps
     }
@@ -100,23 +108,19 @@ impl LocalBeat {
         self.ref_beat + self.tempo_bps * dt
     }
 
-    /// Ingest a reference received at local instant `at`. Re-anchors so
-    /// [`position`](Self::position) stays continuous at `at`, adopts the
-    /// reference tempo, and folds the phase error into a bounded correction that
-    /// absorbs it over `correction_window`. Never steps.
+    /// Ingest a reference received at local instant `at`: adopt its (exact) tempo
+    /// as feedforward — **no persistent rate bias** — and nudge *phase* a bounded
+    /// fraction of the way toward it. Re-anchoring at `at` keeps future
+    /// extrapolation exact; the small phase step (not a rate change) is what locks
+    /// the beat without sloshing.
     pub fn observe(&mut self, r: BeatRef, at: Instant) {
         let current = self.position(at);
         let error = r.beat - current; // beats we're behind (+) or ahead (−)
-        let window = self.correction_window.as_secs_f64();
-        let raw_correction = if window > 0.0 { error / window } else { 0.0 };
-        let cap = self.max_slew_fraction * r.tempo_bps.abs();
-        let correction = raw_correction.clamp(-cap, cap);
+        let step = (self.phase_gain * error).clamp(-self.max_step, self.max_step);
 
-        // Continuous re-anchor: position(at) is unchanged; only the forward rate
-        // changes, so the beat glides toward the reference rather than jumping.
-        self.ref_beat = current;
+        self.ref_beat = current + step;
         self.ref_at = at;
-        self.tempo_bps = r.tempo_bps + correction;
+        self.tempo_bps = r.tempo_bps; // feedforward — the loop cannot wind up
     }
 }
 
@@ -143,6 +147,7 @@ pub fn beat_onsets_in(prev: f64, cur: f64) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // A phase error this small (in beats) reads as "no audible step".
     const EPS: f64 = 1e-9;
@@ -180,47 +185,57 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_ahead_converges_without_a_step() {
+    fn observe_uses_feedforward_tempo_never_a_rate_bias() {
+        // THE anti-slosh invariant: a phase error must NOT bias the tempo. The
+        // old slew set tempo = ref_tempo + error/window (a persistent rate bias
+        // that wound up and sloshed); the feedforward controller keeps tempo
+        // EXACTLY the reference's, whatever the phase error.
         let t0 = Instant::now();
         let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0);
-        let t1 = t0 + Duration::from_secs(1); // phasor reads 2.0 here
-        // Reference says we should be at 2.1 — 0.1 beat ahead.
-        beat.observe(BeatRef::new(2.1, 2.0), t1);
-
-        // No jump: position at the observe instant is exactly where we were.
+        let t2 = t0 + Duration::from_secs(2); // phasor reads 4.0
+        beat.observe(BeatRef::new(5.5, 2.0), t2); // a big +1.5 phase error
         assert!(
-            (beat.position(t1) - 2.0).abs() < EPS,
-            "must be continuous at the correction, got {}",
+            (beat.tempo_bps() - 2.0).abs() < EPS,
+            "tempo stays exactly the reference tempo — no rate bias, got {}",
+            beat.tempo_bps()
+        );
+    }
+
+    #[test]
+    fn a_reference_ahead_steps_phase_a_bounded_fraction() {
+        let t0 = Instant::now();
+        let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0).with_tuning(0.25, 1.0);
+        let t1 = t0 + Duration::from_secs(1); // phasor reads 2.0
+        // Reference says 2.4 — 0.4 beat ahead. Gain 0.25 → step +0.1 → 2.1.
+        beat.observe(BeatRef::new(2.4, 2.0), t1);
+        assert!(
+            (beat.position(t1) - 2.1).abs() < EPS,
+            "phase nudged a quarter of the way (2.0 → 2.1), got {}",
             beat.position(t1)
         );
-        // We now run slightly fast to close the 0.1-beat gap.
-        assert!(beat.tempo_bps() > 2.0, "sped up to converge");
-        // After the ~1 s correction window, we've closed the gap: position ≈ the
-        // reference's own extrapolation (2.1 + 2.0·1 s = 4.1).
-        let t2 = t1 + Duration::from_secs(1);
-        assert!(
-            (beat.position(t2) - 4.1).abs() < 1e-6,
-            "converged to the reference line, got {}",
-            beat.position(t2)
-        );
+        // Undershoots the target (2.1 < 2.4) → never overshoots → cannot slosh.
+        assert!(beat.position(t1) < 2.4, "always undershoots the reference");
+        assert!((beat.tempo_bps() - 2.0).abs() < EPS, "tempo unchanged (feedforward)");
     }
 
     #[test]
-    fn a_reference_behind_slows_to_converge() {
+    fn a_reference_behind_steps_phase_back_keeping_tempo() {
         let t0 = Instant::now();
-        let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0);
+        let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0).with_tuning(0.25, 1.0);
         let t1 = t0 + Duration::from_secs(1); // reads 2.0
-        beat.observe(BeatRef::new(1.95, 2.0), t1); // we're 0.05 ahead
-        assert!((beat.position(t1) - 2.0).abs() < EPS, "continuous");
-        assert!(beat.tempo_bps() < 2.0, "slowed to let the reference catch up");
+        beat.observe(BeatRef::new(1.6, 2.0), t1); // 0.4 behind → step −0.1 → 1.9
+        assert!((beat.position(t1) - 1.9).abs() < EPS, "phase nudged back to 1.9");
+        assert!(beat.position(t1) > 1.6, "undershoots (doesn't overshoot backward)");
+        assert!((beat.tempo_bps() - 2.0).abs() < EPS, "tempo unchanged (feedforward)");
     }
 
     #[test]
-    fn tempo_change_updates_the_extrapolation_rate() {
+    fn tempo_change_is_adopted_directly() {
         let t0 = Instant::now();
         let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0);
         let t1 = t0 + Duration::from_secs(1); // reads 2.0
-        // Consistent phase, new tempo (180 BPM = 3.0 bps) → rate adopts 3.0.
+        // Consistent phase, new tempo (180 BPM = 3.0 bps) → rate adopts 3.0 at once
+        // (feedforward: the reference tempo is trusted, not slewed toward).
         beat.observe(BeatRef::new(2.0, 3.0), t1);
         assert!((beat.tempo_bps() - 3.0).abs() < EPS, "adopted the new tempo");
         assert!(
@@ -230,21 +245,19 @@ mod tests {
     }
 
     #[test]
-    fn an_outlier_reference_is_slew_bounded_not_a_jump() {
+    fn an_outlier_reference_is_step_bounded_not_a_jump() {
         let t0 = Instant::now();
-        let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0);
+        let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0); // max_step 1.0
         let t1 = t0 + Duration::from_secs(1); // reads 2.0
         // A wild reference (100 beats ahead — a glitch, not a real section jump).
+        // Gain 0.2 × 100 = 20 beats, but the step is capped at max_step (1.0).
         beat.observe(BeatRef::new(102.0, 2.0), t1);
-        assert!((beat.position(t1) - 2.0).abs() < EPS, "still no step");
-        // Correction is capped at 10% of tempo: 2.0 → at most 2.2 bps, nowhere
-        // near chasing a 100-beat error.
         assert!(
-            beat.tempo_bps() <= 2.0 + 0.10 * 2.0 + EPS,
-            "slew is capped, got {}",
-            beat.tempo_bps()
+            (beat.position(t1) - 3.0).abs() < EPS,
+            "step capped at one beat (2.0 → 3.0), not a 20-beat lurch, got {}",
+            beat.position(t1)
         );
-        assert!(beat.tempo_bps() > 2.0, "still nudging toward it, just gently");
+        assert!((beat.tempo_bps() - 2.0).abs() < EPS, "tempo still exact");
     }
 
     #[test]
@@ -270,8 +283,7 @@ mod tests {
         // shrink the error — it converges, it doesn't run away.
         let t0 = Instant::now();
         // Start it deliberately slow so it keeps falling behind a 2.0-bps truth.
-        let mut beat =
-            LocalBeat::new(BeatRef::new(0.0, 1.8), t0).with_tuning(Duration::from_secs(1), 0.5);
+        let mut beat = LocalBeat::new(BeatRef::new(0.0, 1.8), t0).with_tuning(0.5, 1.0);
         let mut prev_error = f64::INFINITY;
         for phrase in 1..=6 {
             let at = t0 + Duration::from_secs(phrase);
