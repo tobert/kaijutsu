@@ -111,6 +111,22 @@ the design details live in the doc, this entry is the backlog pointer:
   **clip-record** path (parse Shape A `Clip` → resolve `media`; the audio bytes
   path already exists). Also: B4's live audible verify needs a CAS-audio-cue
   trigger (`kj play` emits inline only today).
+- **Track B kaibo-review deferrals (2026-07-02, low/pre-existing).** The
+  two-model review (gemini-pro batch + deepseek) landed its real findings in
+  `95785e28` (EXDEV + metadata atomicity, the transport slot-race + a
+  reconnect-retry, the single-flight cancel/panic leak via a RAII guard, and a
+  bounded `CasFs::read` alloc). Left for later, none blocking: **(a)** `CasFs`
+  does synchronous `std::fs` inside `async` VfsOps — a large SFTP read blocks a
+  tokio worker; this matches `LocalBackend` and is a VFS-layer pattern, not a
+  track-B bug (fix the whole layer with `spawn_blocking`/`tokio::fs` if RPC
+  latency ever demands it). **(b)** `VfsOps::read_all` casts `getattr().size`
+  (u64) to u32 — truncates a >4 GiB file; shared-trait, theoretical for CAS.
+  **(c)** a `store()` error after staging leaves an orphan staging file (random
+  name; wants the same GC as abandoned uploads). **(d)** `remove()` leaves empty
+  `objects/<ab>` shard dirs (cosmetic; `readdir` of one returns `[]`). **(e)** a
+  drop-order regression test for `SftpClient`'s field ordering (the contract is
+  commented but compiler-invisible). **(f)** client-side `spawn_blocking` for the
+  blocking `FileStore` cache read in the async resolve (already an app follow-up).
 - **kaish `/v/blobs` is shadowed by kaish-kernel's `VirtualOverlayBackend`
   (papercut, 2026-07-02).** kaish reserves `/v/blobs` (alongside `/v/jobs`) as
   one of its own virtual paths (`kaish-kernel/src/backend/overlay.rs`
