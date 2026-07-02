@@ -88,17 +88,31 @@ claim was wrong — test literals only; and `/v/docs`/`/v/input` are kaish-side
 mounts, not kernel-`MountTable`, so not SFTP-visible). Two independent tracks;
 the design details live in the doc, this entry is the backlog pointer:
 
-- **Track B — `/v/blobs` + client CAS sync (ACTIVE; unblocks `pcm.md` 5c's clip
-  half).** LANDED: B3's `SftpClient`+`BlobResolver` (`cca8ce7b`+`52d377e7`);
-  **B0** `kaijutsu-cas` hardening (`a82c332a` — atomic `store()` via
-  staging+rename since the XDG cache is multi-process and `retrieve` never
-  re-hashes; `retrieve` TOCTOU→`NotFound`=None; `ContentHash` serde `try_from`
-  validation); **B1** `CasFs` backend + mount before the freeze (`1854cbcf` —
-  leading-byte shards, full-hash leaves, positioned reads, EROFS,
-  `real_path`=None). REMAINING: **B3 residue** — sharded `blob_path()`,
-  single-flight per hash, whole-blob read loops to EOF (256 KiB SFTP packet
-  cap), e2e vs a live server. Ingest stays `kj cas put` (SFTP→`/tmp` two-step);
-  writable staging-over-SFTP deferred.
+- **Track B — `/v/blobs` + client CAS sync (LANDED + LIVE-VERIFIED 2026-07-02;
+  unblocks `pcm.md` 5c's clip half).** DONE: B3's `SftpClient`+`BlobResolver`
+  (`cca8ce7b`+`52d377e7`); **B0** `kaijutsu-cas` hardening (`a82c332a` — atomic
+  `store()` via staging+rename since the XDG cache is multi-process and
+  `retrieve` never re-hashes; `retrieve` TOCTOU→`NotFound`=None; `ContentHash`
+  serde `try_from` validation); **B1** `CasFs` backend + mount before the freeze
+  (`1854cbcf` — leading-byte shards, full-hash leaves, positioned reads, EROFS,
+  `real_path`=None); **B3** sharded `blob_path()` + single-flight per hash +
+  read-to-EOF (verified russh-sftp 2.3 loops past the 256 KiB cap) + live-SSH
+  e2e (`f7dcef0f`). Live-verified on the runner: stock `sftp` fetch of
+  `/v/blobs/<ab>/<hash>` returns byte-exact CAS content and lists the sharded
+  pool. Ingest stays `kj cas put` (SFTP→`/tmp` two-step); writable
+  staging-over-SFTP deferred; B2 `index` deferred (below).
+- **kaish `/v/blobs` is shadowed by kaish-kernel's `VirtualOverlayBackend`
+  (papercut, 2026-07-02).** kaish reserves `/v/blobs` (alongside `/v/jobs`) as
+  one of its own virtual paths (`kaish-kernel/src/backend/overlay.rs`
+  `is_virtual_path`), so a *kaish* file op (`ls`/`cat /v/blobs/...`) hits kaish's
+  empty writable overlay, NOT the kernel `MountTable`'s `CasFs`. SFTP is
+  unaffected — it serves `kernel.vfs()` directly, bypassing the kaish VFS — so
+  the clip-prefetch path (`SftpClient` → `/v/blobs`) and `kj cas` both work; only
+  the kaish-shell *view* of `/v/blobs` is wrong (two different `/v/blobs`
+  depending on surface). Reconcile later: either drop kaish's `/v/blobs`
+  reservation, teach its overlay to defer to `MountBackend` when the kernel has
+  a real mount there, or mount `CasFs` on the kaish VFS too (like `/v/docs`).
+  Not blocking track B; the app never reads `/v/blobs` through kaish.
 - **`/v/blobs/index` TSV — DESIGNED, DEFERRED (2026-07-02, Amy).** The B2
   resolver file (`hash  mime  size  path`, absolute path column, mime from
   `inspect()`) is fully designed in `docs/slash-v.md` but was **not shipped**:
