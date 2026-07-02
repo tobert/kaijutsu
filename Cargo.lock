@@ -5945,6 +5945,7 @@ dependencies = [
  "hostname",
  "kaijutsu-abc",
  "kaijutsu-audio",
+ "kaijutsu-cas",
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-hyoushigi",
