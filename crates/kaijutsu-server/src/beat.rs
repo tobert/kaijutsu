@@ -974,6 +974,12 @@ impl BeatScheduler {
         // then drain the track's failure ledger to each producer. The score is the
         // track's; the cadence below is per-context.
         self.materialize_track(track_id, playhead);
+        // Emit a beat reference for the app's continuous timebase (the metronome
+        // phasor) once this beat, independent of whether any cell crossed —
+        // a bare rolling clock still ticks. Auto-emitted while the clock rolls;
+        // the audible click is the sink's opt-in (docs/midi.md "The relative-lead
+        // timebase, analyzed").
+        self.publish_beat_sync(track_id, playhead);
         self.drain_track_failures(track_id);
         for ctx in attached_ids {
             let Some(att) = self
@@ -1306,6 +1312,37 @@ impl BeatScheduler {
                 .block_flows()
                 .publish(BlockFlow::RenderCue { context_id: score_ctx, cue });
         }
+    }
+
+    /// Publish a low-rate `BeatSync` reference for the app's continuous timebase
+    /// (docs/midi.md "The relative-lead timebase, analyzed") once per beat while
+    /// the track's clock rolls. The sink's phasor slews toward it and clicks the
+    /// beats between; the beat coordinate is the playhead (1 tick == 1 beat) and
+    /// the tempo is `1 / period`. Sink-dependent + gated like
+    /// [`publish_render_cues`](Self::publish_render_cues): with no subscriber on
+    /// `block.beat_sync` (a headless kernel, no sink attached) this emits nothing.
+    fn publish_beat_sync(&self, track_id: &TrackId, playhead: Tick) {
+        if self.kernel.block_flows().topic_subscribers("block.beat_sync") == 0 {
+            return;
+        }
+        let Some((period, score_ctx)) = self
+            .tracks
+            .get(track_id)
+            .map(|t| (t.clock.period(), t.score_context))
+        else {
+            return;
+        };
+        let secs = period.as_secs_f64();
+        if secs <= 0.0 {
+            return; // a degenerate (zero) period has no defined tempo
+        }
+        let beat_ref = kaijutsu_audio::BeatRef {
+            beat: playhead.get() as f64,
+            tempo_bps: 1.0 / secs,
+        };
+        self.kernel
+            .block_flows()
+            .publish(BlockFlow::BeatSync { context_id: score_ctx, beat_ref });
     }
 
     /// Drain the engine failure ledger past `failure_water`, surfacing exactly one
@@ -2283,6 +2320,81 @@ mod tests {
             }
             other => panic!("expected a flush RenderCue, got {other:?}"),
         }
+    }
+
+    /// The metronome substrate (slice 3): while a track's clock rolls, each beat
+    /// auto-emits a `BeatSync` reference keyed by the score context — the beat
+    /// coordinate is the playhead (1 tick == 1 beat) and the tempo is `1/period`.
+    /// This feeds the app's continuous timebase (the phasor); the audible click is
+    /// the sink's opt-in. Emitted independent of whether any cell crossed (a bare
+    /// rolling clock still ticks), and gated on a subscriber like the render cue.
+    #[tokio::test]
+    async fn a_rolling_clock_emits_beat_sync_references() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 4);
+        // slow_policy() → 1s period → 1.0 beats/sec (60 BPM).
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track);
+
+        // Subscribe BEFORE playing — the sink-dependency gate needs a live receiver.
+        let mut sub = kernel.block_flows().subscribe("block.beat_sync");
+
+        let base = Instant::now();
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_secs(1)); // beat 1
+        sched.fire_due(base + Duration::from_secs(2)); // beat 2
+
+        let (ctx1, ref1) = match sub.try_recv().expect("beat 1 reference").payload {
+            BlockFlow::BeatSync { context_id, beat_ref } => (context_id, beat_ref),
+            other => panic!("expected BeatSync, got {other:?}"),
+        };
+        assert_eq!(ctx1, score, "keyed by the track's score context");
+        assert!((ref1.tempo_bps - 1.0).abs() < 1e-9, "60 BPM = 1 beat/sec, got {}", ref1.tempo_bps);
+
+        let (ctx2, ref2) = match sub.try_recv().expect("beat 2 reference").payload {
+            BlockFlow::BeatSync { context_id, beat_ref } => (context_id, beat_ref),
+            other => panic!("expected BeatSync, got {other:?}"),
+        };
+        assert_eq!(ctx2, score);
+        assert!((ref2.tempo_bps - 1.0).abs() < 1e-9);
+        assert!(
+            (ref2.beat - ref1.beat - 1.0).abs() < 1e-9,
+            "the beat coordinate advances one per beat: {} → {}",
+            ref1.beat,
+            ref2.beat,
+        );
+    }
+
+    /// A headless kernel (no sink subscribed on `block.beat_sync`) emits no beat
+    /// references — the same sink-dependency gate as the render cue. No subscriber,
+    /// no work.
+    #[tokio::test]
+    async fn no_subscriber_no_beat_sync() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 2);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        // Subscribe only AFTER the beat fires — the gate saw zero subscribers, so
+        // nothing was published; this late subscriber receives nothing.
+        let base = Instant::now();
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_secs(1));
+
+        let mut sub = kernel.block_flows().subscribe("block.beat_sync");
+        assert!(
+            sub.try_recv().is_none(),
+            "no beat references should have been published without a subscriber",
+        );
     }
 
     /// `set_tempo` re-slaves the armed track timeline's speculation `TickClock`
