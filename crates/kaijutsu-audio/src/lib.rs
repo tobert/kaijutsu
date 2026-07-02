@@ -12,6 +12,17 @@ use std::time::Duration;
 pub mod clip;
 pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};
 
+/// A committed ABC score, rendered to MIDI at the sink (`docs/midi.md` "Render
+/// is a wire cue"). The payload is the ABC text; a render sink that can render
+/// ABC (the app) turns it into MIDI, a dumb sink ignores it.
+pub const ABC_MIME: &str = "text/vnd.abc";
+
+/// A transport flush directive (`stop`/`pause`): a [`RenderCue`] with this mime
+/// and an empty payload tells every sink to drop its scheduled-but-unplayed
+/// events and silence sounding notes, so the speculation lead's buffered phrase
+/// doesn't play on after the clock stops. `lead` is `ZERO` (flush now).
+pub const RENDER_FLUSH_MIME: &str = "application/vnd.kaijutsu.render-flush";
+
 /// One render sink. Implemented in the app (Bevy) and, later, an edge-node
 /// agent (ALSA). `&self` (not `&mut self`) because the Bevy sink spawns
 /// entities via `Commands` rather than mutating sink state, and the ALSA

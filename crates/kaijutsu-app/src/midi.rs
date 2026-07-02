@@ -15,13 +15,10 @@
 use std::time::Duration;
 
 use bevy::prelude::*;
-use kaijutsu_audio::CuePayload;
+use kaijutsu_audio::{CuePayload, ABC_MIME, RENDER_FLUSH_MIME};
 use kaijutsu_client::ServerEvent;
 
 use crate::connection::actor_plugin::ServerEventMessage;
-
-/// The mime an ABC render cue carries (rendered to MIDI at the sink).
-const ABC_MIME: &str = "text/vnd.abc";
 
 /// Bridges `ServerEvent::RenderCue` ABC cues into scheduled ALSA seq MIDI.
 pub struct MidiOutPlugin;
@@ -91,6 +88,11 @@ fn play_midi_cues(
         let ServerEvent::RenderCue { cue, .. } = event else {
             continue;
         };
+        // A transport flush (stop/pause): drop the buffered phrase + silence.
+        if cue.mime == RENDER_FLUSH_MIME {
+            flush(&mut sink);
+            continue;
+        }
         if cue.mime != ABC_MIME {
             continue;
         }
@@ -159,6 +161,18 @@ fn schedule(sink: &mut MidiSink, events: Vec<(Duration, Vec<u8>)>, lead: Duratio
 fn schedule(sink: &mut MidiSink, _events: Vec<(Duration, Vec<u8>)>, _lead: Duration) {
     ensure_open(sink);
 }
+
+/// Transport flush (stop/pause): drop the buffered phrase + silence sounding
+/// notes. No-op if the sink was never opened (nothing scheduled).
+#[cfg(target_os = "linux")]
+fn flush(sink: &mut MidiSink) {
+    if let Some(out) = sink.out.as_mut() {
+        out.flush();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn flush(_sink: &mut MidiSink) {}
 
 /// An ALSA-sequencer MIDI-out sink: a subscribe-readable source port + a started
 /// real-time queue. Other clients (`aconnect` → TiMidity, a DAW, `aseqdump`)
@@ -235,6 +249,32 @@ impl MidiOut {
         if let Err(e) = self.seq.drain_output() {
             error!("MIDI drain_output failed: {e}");
         }
+    }
+
+    /// Drop every scheduled-but-unplayed event on our queue and silence sounding
+    /// notes (ALL_SOUNDS_OFF + ALL_NOTES_OFF on every channel, sent DIRECT so
+    /// they bypass the queue). Ported from the server's `flush_scheduled_after`.
+    fn flush(&mut self) {
+        use alsa::seq::{EvCtrl, Event, EventType, Remove, RemoveEvents};
+
+        if let Ok(rm) = RemoveEvents::new() {
+            rm.set_queue(self.queue);
+            rm.set_condition(Remove::OUTPUT);
+            if let Err(e) = self.seq.remove_events(rm) {
+                error!("MIDI remove_events failed: {e}");
+            }
+        }
+        for channel in 0..16u8 {
+            for param in [120u32, 123u32] {
+                let ctrl = EvCtrl { channel, param, value: 0 };
+                let mut e = Event::new(EventType::Controller, &ctrl);
+                e.set_source(self.port);
+                e.set_subs();
+                e.set_direct();
+                let _ = self.seq.event_output(&mut e);
+            }
+        }
+        let _ = self.seq.drain_output();
     }
 }
 

@@ -36,7 +36,7 @@ use tokio::time::Instant;
 
 use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::flows::TurnFlow;
+use kaijutsu_kernel::flows::{BlockFlow, TurnFlow};
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ContentRef,
     DeriverRegistry, MaterializeCursor, RenderTargetOp, RenderTargetSpec, Span,
@@ -775,17 +775,38 @@ impl BeatScheduler {
 
     /// Hold a track's clock — the playhead freezes. The stale heap entry is dropped
     /// on its next pop. Per-attachment OODA arm + rotate cadence are preserved.
+    /// Publish a transport flush directive to every attached sink (docs/midi.md
+    /// "Render is a wire cue"): drop the speculation lead's buffered phrase +
+    /// silence sounding notes, so a stop/pause doesn't play on. The wire twin of
+    /// `RenderTarget::flush_scheduled_after`; keyed by the track's score context.
+    fn publish_render_flush(&self, context_id: ContextId) {
+        let cue = kaijutsu_audio::RenderCue {
+            mime: kaijutsu_audio::RENDER_FLUSH_MIME.to_string(),
+            payload: kaijutsu_audio::CuePayload::Inline(Vec::new()),
+            lead: Duration::ZERO,
+        };
+        self.kernel
+            .block_flows()
+            .publish(BlockFlow::RenderCue { context_id, cue });
+    }
+
     pub fn pause(&mut self, track_id: &TrackId) {
+        let mut flush_ctx = None;
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.playing = false;
-            // The speculation lead means a render target's device queue holds ~a
-            // phrase of FUTURE events; the clock stopping won't unschedule them.
-            // Truncate everything after `now` + silence sounding notes (Stage 3
-            // review SEV-1), so a pause doesn't blindly play the buffered phrase.
+            // The speculation lead means a sink's device queue holds ~a phrase of
+            // FUTURE events; the clock stopping won't unschedule them. Truncate
+            // everything after `now` + silence sounding notes (Stage 3 review
+            // SEV-1), so a pause doesn't blindly play the buffered phrase — for
+            // in-process targets here, and for wire sinks via the flush cue below.
             let now = Instant::now();
             for entry in track.render_targets.iter_mut() {
                 entry.target.flush_scheduled_after(now);
             }
+            flush_ctx = Some(track.score_context);
+        }
+        if let Some(ctx) = flush_ctx {
+            self.publish_render_flush(ctx);
         }
         let _ = self.persist_track(track_id);
     }
@@ -797,15 +818,21 @@ impl BeatScheduler {
     /// makes it behaviourally an alias of `pause` here — both kept for transport
     /// vocabulary.
     pub fn stop(&mut self, track_id: &TrackId) {
+        let mut flush_ctx = None;
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.playing = false;
-            // Same as `pause`: truncate the render targets' buffered (lead-time)
-            // events past `now` so a stop doesn't play out ~a phrase of queued
-            // notes + leave them hanging (Stage 3 review SEV-1).
+            // Same as `pause`: truncate the buffered (lead-time) events past `now`
+            // so a stop doesn't play out ~a phrase of queued notes + leave them
+            // hanging (Stage 3 review SEV-1) — in-process targets here, wire sinks
+            // via the flush cue below.
             let now = Instant::now();
             for entry in track.render_targets.iter_mut() {
                 entry.target.flush_scheduled_after(now);
             }
+            flush_ctx = Some(track.score_context);
+        }
+        if let Some(ctx) = flush_ctx {
+            self.publish_render_flush(ctx);
         }
         let _ = self.persist_track(track_id);
     }
@@ -1239,14 +1266,12 @@ impl BeatScheduler {
         if hw_after <= hw_before {
             return; // nothing crossed this beat
         }
-        // Zero work + zero CAS reads when no target is attached.
-        let has_targets = self
-            .tracks
-            .get(track_id)
-            .is_some_and(|t| !t.render_targets.is_empty());
-        if !has_targets {
-            return;
-        }
+        // We publish a wire `RenderCue` for every crossed ABC cell regardless of
+        // whether an in-process target is attached — MIDI is sink-dependent now
+        // (docs/midi.md "Render is a wire cue"): any attached app sink plays it,
+        // and a track with no sink just makes no sound (the score is preserved).
+        // The only "nothing to do" gates are `hw_after <= hw_before` (above) and
+        // `rendered.is_empty()` (below, after we see if any crossed cell is ABC).
         let Some(timeline) = self.kernel.track_timeline(track_id) else {
             return;
         };
@@ -1270,10 +1295,10 @@ impl BeatScheduler {
         // + (cell.start − playhead) beats × period`. Cells commit AHEAD of the
         // playhead (the speculation lead), so the offset is ≥ 0 → `at` is in the
         // near future; clamp at 0 so a render is NEVER scheduled into the past.
-        let Some((period, base)) = self
+        let Some((period, base, score_ctx)) = self
             .tracks
             .get(track_id)
-            .map(|t| (t.clock.period(), t.last_fire_scheduled))
+            .map(|t| (t.clock.period(), t.last_fire_scheduled, t.score_context))
         else {
             return;
         };
@@ -1319,6 +1344,24 @@ impl BeatScheduler {
         }
         if rendered.is_empty() {
             return;
+        }
+        // Publish a wire `RenderCue` per crossed ABC cell to every attached sink
+        // (the app renders it to MIDI). `lead` is relative — `at` is a near-future
+        // local instant on the speculation lead, so `at − now` is the transfer +
+        // schedule budget the sink re-anchors at `receipt + lead`. This is the
+        // path that replaces the in-process target; the in-process emit below is
+        // kept side-by-side for A/B parity until 5c-3 demolishes it.
+        let now = Instant::now();
+        for (abc, at) in &rendered {
+            let lead = at.saturating_duration_since(now);
+            let cue = kaijutsu_audio::RenderCue {
+                mime: kaijutsu_audio::ABC_MIME.to_string(),
+                payload: kaijutsu_audio::CuePayload::Inline(abc.clone().into_bytes()),
+                lead,
+            };
+            self.kernel
+                .block_flows()
+                .publish(BlockFlow::RenderCue { context_id: score_ctx, cue });
         }
         if let Some(track) = self.tracks.get_mut(track_id) {
             for (abc, at) in &rendered {
