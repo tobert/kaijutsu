@@ -9,6 +9,9 @@
 use kaijutsu_cas::ContentHash;
 use std::time::Duration;
 
+pub mod clip;
+pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};
+
 /// One render sink. Implemented in the app (Bevy) and, later, an edge-node
 /// agent (ALSA). `&self` (not `&mut self`) because the Bevy sink spawns
 /// entities via `Commands` rather than mutating sink state, and the ALSA
