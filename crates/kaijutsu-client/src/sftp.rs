@@ -3,10 +3,14 @@
 //!
 //! The kernel already speaks SFTP (`kaijutsu-server/src/sftp.rs`) as a sibling
 //! subsystem of the Cap'n Proto RPC channel — this is the client half. A
-//! [`SftpClient`] opens a *second* session channel bound to the `sftp`
-//! subsystem and reads VFS paths; a [`BlobResolver`] layers a local XDG CAS
+//! [`SftpClient`] opens its **own** SSH connection and binds a channel to the
+//! `sftp` subsystem to read VFS paths; a [`BlobResolver`] layers a local XDG CAS
 //! cache on top so a clip's `media` hash resolves from disk on a hit and pulls
 //! the miss over the wire from `/v/blobs/<hash>` (docs/clips.md, docs/slash-v.md).
+//!
+//! (Multiplexing the SFTP channel onto the *existing* RPC connection instead of
+//! dialing a second one is a later optimization — it needs `SshClient` to split
+//! the connection `Handle` from its per-subsystem channel. First cut: own conn.)
 //!
 //! Unlike the capnp RPC path (which is `!Send` and pinned to a dedicated
 //! thread), SFTP futures are `Send`, so this rides the ambient async runtime /
@@ -17,10 +21,24 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use russh_sftp::client::SftpSession;
 
-use kaijutsu_cas::{ContentHash, ContentStore, FileStore, StoreError};
+use kaijutsu_cas::{CasConfig, ContentHash, ContentStore, FileStore, StoreError};
 use kaijutsu_types::SSH_SFTP_SUBSYSTEM;
 
 use crate::ssh::{SshClient, SshConfig, SshError};
+
+/// Map a `russh_sftp` client error into our typed error, preserving the
+/// no-such-file distinction (a genuinely-absent path) apart from opaque
+/// transport/protocol failures.
+fn map_sftp_err(e: russh_sftp::client::error::Error) -> SftpError {
+    use russh_sftp::client::error::Error as E;
+    use russh_sftp::protocol::StatusCode;
+    match e {
+        E::Status(s) if s.status_code == StatusCode::NoSuchFile => {
+            SftpError::NotFound(s.error_message)
+        }
+        other => SftpError::Protocol(other.to_string()),
+    }
+}
 
 /// Failures along the fetch path: the SSH transport, the SFTP protocol, a blob
 /// that failed its self-verification, or the local cache store.
@@ -31,6 +49,14 @@ pub enum SftpError {
 
     #[error("SFTP protocol: {0}")]
     Protocol(String),
+
+    /// The path does not exist on the server (SFTP `SSH_FX_NO_SUCH_FILE`). A
+    /// distinct variant so a caller can tell a genuinely-absent object from a
+    /// transport failure: `/v/blobs/<hash>` not yet replicated is a normal,
+    /// non-retryable "404", whereas a dropped connection mid-fetch is worth a
+    /// retry. Flattening both into an opaque string would erase that.
+    #[error("no such path: {0}")]
+    NotFound(String),
 
     /// Fetched bytes did not hash back to the requested address. The CAS is
     /// self-verifying: a corrupt or substituted object crashes the resolve
@@ -54,9 +80,14 @@ pub enum SftpError {
 /// the channel the SFTP session wraps — dropping the client closes the
 /// connection out from under the stream.
 pub struct SftpClient {
-    // Kept alive for the connection's lifetime; not used directly after connect.
-    _ssh: SshClient,
+    // Field order is load-bearing. Rust drops fields in *declaration* order, so
+    // `session` (declared first) drops — and cleanly closes its channel —
+    // BEFORE `_ssh` tears down the SSH connection underneath it. Reversed, the
+    // connection would die first and the session's close would race a dead
+    // transport. `_ssh` is otherwise unused after connect: it just keeps the
+    // connection alive for the session's lifetime.
     session: SftpSession,
+    _ssh: SshClient,
 }
 
 impl SftpClient {
@@ -65,24 +96,30 @@ impl SftpClient {
         format!("/v/blobs/{hash}")
     }
 
-    /// Connect, authenticate, and bind a second session channel to the `sftp`
+    /// Open an SSH connection, authenticate, and bind a channel to the `sftp`
     /// subsystem, returning a ready session.
+    ///
+    /// Opens its **own** connection (full TCP + auth), not a channel multiplexed
+    /// onto an existing one — see the module docs for why, and the future
+    /// optimization.
     pub async fn connect(config: SshConfig) -> Result<Self, SftpError> {
         let mut ssh = SshClient::new(config);
         let channel = ssh.connect_subsystem(SSH_SFTP_SUBSYSTEM).await?;
         let session = SftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| SftpError::Protocol(e.to_string()))?;
-        Ok(Self { _ssh: ssh, session })
+            .map_err(map_sftp_err)?;
+        Ok(Self { session, _ssh: ssh })
     }
 
-    /// Read an entire VFS path over SFTP. A missing path is an error (fail
-    /// loud), never empty bytes.
+    /// Read an entire VFS path over SFTP. A missing path is [`SftpError::NotFound`]
+    /// (fail loud), never empty bytes.
+    ///
+    /// Reads the whole object into memory. Fine for the symbolic scores and
+    /// small clips of the first cut; a large-media streaming path (chunked read
+    /// straight into CAS staging, incremental hash) is a deferred follow-up
+    /// (`docs/issues.md` `/v` Track B — `/v/blobs` + client CAS sync).
     pub async fn read(&self, path: &str) -> Result<Vec<u8>, SftpError> {
-        self.session
-            .read(path)
-            .await
-            .map_err(|e| SftpError::Protocol(e.to_string()))
+        self.session.read(path).await.map_err(map_sftp_err)
     }
 
     /// Read a blob from `/v/blobs/<hash>` (unverified — [`BlobResolver`] does
@@ -127,8 +164,18 @@ impl<F: BlobFetch> BlobResolver<F> {
 
     /// Build a resolver whose cache is the per-user XDG blob cache
     /// (`$XDG_CACHE_HOME/kaijutsu/cas`).
+    ///
+    /// Metadata sidecars are **off**: the cache keys on the content hash and the
+    /// mime is never read back here (the clip carries the real one), so a
+    /// per-object `.json` would just double the inode count — and `FileStore`'s
+    /// metadata is first-writer-wins, which would pin our placeholder mime.
     pub fn with_xdg_cache(fetch: F) -> Self {
-        Self::new(FileStore::at_path(default_cache_dir()), fetch)
+        let config = CasConfig {
+            base_path: default_cache_dir(),
+            store_metadata: false,
+            read_only: false,
+        };
+        Self::new(FileStore::new(config), fetch)
     }
 
     /// Resolve a blob to its bytes, fetching + caching on a miss.
@@ -195,6 +242,12 @@ mod tests {
             *self.calls.lock().unwrap() += 1;
             Ok(self.body.clone())
         }
+    }
+
+    #[test]
+    fn blob_path_is_v_blobs_hash() {
+        let h = ContentHash::from_data(b"whatever");
+        assert_eq!(SftpClient::blob_path(&h), format!("/v/blobs/{h}"));
     }
 
     #[tokio::test]

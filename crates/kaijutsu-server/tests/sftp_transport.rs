@@ -69,9 +69,10 @@ fn sftp_read_of_a_missing_path_fails_loud() {
             .await
             .expect("sftp subsystem connect");
 
-        // A missing object must surface as an error, never empty bytes.
+        // A missing object must surface as a typed NotFound (a normal "404" the
+        // resolver can distinguish from a transport failure), never empty bytes.
         let missing = format!("/tmp/{}", unique_tmp_name("missing"));
         let err = sftp.read(&missing).await.expect_err("missing path must error");
-        assert!(matches!(err, SftpError::Protocol(_)), "got {err:?}");
+        assert!(matches!(err, SftpError::NotFound(_)), "got {err:?}");
     });
 }
