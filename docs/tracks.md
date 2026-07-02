@@ -1045,6 +1045,16 @@ pub trait ClockSource: Send {
 
 ## The render-target seam (M1's other half)
 
+> **Direction since M1 (2026-07-01):** the in-process `RenderTarget` trait below
+> shipped and works, but it is **evolving into a wire cue** — the hardware emit
+> moves off the server binary to an off-box sink (the app first, an edge node
+> later), and MIDI and samples converge onto one mime-keyed `RenderCue { mime,
+> payload, lead }`. The trait's *home on the track* survives; its *transport*
+> becomes the wire, and `emit(abc, at)` becomes a cue whose `lead` the sink
+> re-anchors locally. Rationale + the compose/render/emit phase split:
+> `docs/midi.md` "Render is a wire cue; the sink owns the hardware" and
+> `docs/pcm.md`. The M1 record below stands as shipped.
+
 `docs/midi.md` "output first": a track declares "render my committed score to ALSA
 MIDI out on node X." A **render is a consumer of the track's score, not a
 producer** — it never schedules cells, never takes a turn, never appears in the

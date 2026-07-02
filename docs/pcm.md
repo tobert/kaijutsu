@@ -143,6 +143,20 @@ first consumer (slice 5); the schema, validation rules, tempo-change default,
 and growth path (stretch policy → Shape B; late-bound cues = Shape C
 resolvers) are locked there so the session starts from a map.
 
+**The seam is a wire cue, and MIDI joins it (decided 2026-07-01).** The
+convergence above is realized not as a mime growing on the *in-process*
+`RenderTarget::emit` but as a **`RenderCue { mime, payload, lead }` directive
+that crosses the wire to an off-box sink** — because the same real-time stance
+that lets a sample prefetch under the lead also says MIDI's hardware emit never
+needed to be in-process. So this is no longer "the samples half": **MIDI and
+samples are one render path**, both mime-keyed cues on the lead, and the
+in-process `RenderTarget` trait (`tracks.md`) dissolves into the wire cue as the
+sink moves to the app (now) and an edge node (later). The full statement — the
+`RenderCue` shape, the compose/render/emit phase split (with `abc→midi` staying
+kernel-side for now), and why MIDI becomes sink-dependent — lives in
+`docs/midi.md` "Render is a wire cue; the sink owns the hardware." This doc's
+slices below are the samples-shaped view of that one seam.
+
 ## Reusable code from `~/src/pawlsa-mcp`
 
 - `src/alsa/playback.rs` — ALSA PCM open + write loop (`alsa` crate 0.11). The
@@ -222,25 +236,47 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
    named prerequisite (see `midi.md` M4 — it exists only by analogy today), and
    the **`alsa` crate version** (pawlsa rides `0.11`; the in-tree M1 target
    rides `0.9` via bevy/cpal).
-5. **(later) Fold into the Track — the mime-keyed emit (see "How it
-   converges").** Add the mime parameter to `RenderTarget::emit` and register
-   targets by MIME. An audio target consumes **clip cells** (CAS ref +
-   placement), prefetches bytes under the speculation lead
-   (`at = Some(instant)`), and fires locally. An ABC-consuming sampler
-   ("NoteOn → pick sample → play") is simply a second target on the same seam —
-   `midi.md` "samples-with-MIDI".
+5. **(next) Fold into the Track — the wire `RenderCue` (see "How it converges"
+   + `midi.md` "Render is a wire cue").** This is the unified render seam, and it
+   subsumes MIDI. Natural sub-slices, each landing buildable:
+   - **5a — the cue seam.** Generalize the play-now `PlayAudio` directive into a
+     mime-keyed `RenderCue { mime, payload: inline-symbolic | CAS-ref, lead }`
+     over the FlowBus/`BlockEvents` (additive capnp bump). `lead` is relative;
+     the sink schedules at `receipt + lead`.
+   - **5b — the clip record + validator** in `kaijutsu-audio` (pure data,
+     FFI-free): Shape A (`docs/clips.md`) + the content-type-keyed validator
+     (fail loud at schedule; `media` present in CAS). Fully unit-testable.
+   - **5c — the sinks + prefetch.** App consumes cues by mime: clip → resolve
+     `media` from the XDG CAS cache, miss → SFTP `/v/blobs/<hash>`, decode,
+     fire; ABC/MIDI → queue events into a local ALSA seq port. The materialize
+     crossing publishes cues instead of calling the in-process target; verify
+     parity on zorak, then demolish server-side `AlsaMidiOut`.
+   The `abc→midi` render stays kernel-side for now (a relocatable phase — see the
+   three-phase split in `midi.md`); an ABC-consuming sampler ("NoteOn → pick
+   sample → play") is a later mime on the same seam (`midi.md` "samples-with-MIDI").
 
-## The MIDI parallel (a consequence, not yet committed)
+## The MIDI parallel — now the plan, not a later refactor (2026-07-01)
 
 The same principle — *the kernel process owns no hardware FFI* — applies to MIDI,
 which **already shipped in-process**: `AlsaMidiOut` lives in
-`crates/kaijutsu-server/src/render.rs` (M1, loopback-verified on zorak). Under
-this lean, that ALSA-seq emission is a candidate to **extract into the same
-edge-node agent** so the kernel/server binary stops linking `alsa`. The
-speculation-lead scheduling (`last_fire_scheduled`/jitter-free `at`) travels with
-it — which is exactly `midi.md`'s "the node near the gear regenerates fine
-timing." This is a refactor of landed code; tracked in `docs/issues.md`, sequenced
-with the M4 edge-node work, not part of the PCM slices above.
+`crates/kaijutsu-server/src/render.rs` (M1, loopback-verified on zorak). We
+**committed to converging them** (2026-07-01, with the real-time stance in
+`docs/midi.md`): MIDI's ALSA-seq emission moves off the server binary onto the
+**same wire sink** samples use, so the kernel/server binary stops linking `alsa`
+and MIDI and PCM ride one `RenderCue`. The speculation-lead scheduling
+(`last_fire_scheduled`/jitter-free `at`) travels with it as a *relative lead* the
+sink re-anchors — exactly `midi.md`'s "the node near the gear regenerates fine
+timing."
+
+The unlock that de-risks it: **the app is the first MIDI sink, so this does NOT
+wait on the M4 edge node.** The app already renders samples over the wire (slice
+3); teaching it to queue MIDI cues into a local ALSA seq port proves the whole
+path on zorak with no capability loss (→ `aconnect` → TiMidity, same box). The
+edge-node agent becomes *just another sink* on the same protocol — the headless
+sink for MIDI and PCM alike — not a prerequisite for either. Do it side-by-side
+with the landed in-process target, verify parity, then demolish the server-side
+`AlsaMidiOut` + the `RenderTarget` trait. Full design + phase split:
+`docs/midi.md` "Render is a wire cue."
 
 ## Distributed listening — later (absorbs `playback.md`, retired 2026-07-01)
 

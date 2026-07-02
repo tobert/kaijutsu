@@ -25,7 +25,27 @@ than chasing every pulse — it's the same exogenous-beat doctrine as `tracks.md
 The payoff, stated up front: **on Amy's topology, nothing needs hard-realtime
 transport across the network.** Three independent reasons (below) each remove a
 realtime constraint, leaving only *local-to-the-hardware* timing — which ALSA on
-the node that owns the USB already does well.
+the node that owns the USB already does well. The stance underneath that payoff
+is the next section, and it is the foundation of the whole render story.
+
+## The real-time stance — micro-batch, don't chase
+
+The load-bearing principle under all of this, made explicit: **we take real time
+seriously by refusing to chase it.** We don't lock to deadlines and hope; we
+**micro-batch** — commit work far enough ahead that we only ever promise what we
+can hit *99.99% of the time*. On this instrument that horizon is on the order of
+**a few seconds — 16–32 bars of music**, which is exactly the speculation lead
+`hyoushigi` already stages content against (`speculate_at = start −
+beats_for(lead_time)`). Everything downstream spends that budget: the network
+only has to deliver *ahead of time*, never *just in time*; a sink schedules into
+its **local** device queue and wire jitter vanishes into the lead.
+
+This is not a MIDI trick — it is the whole real-time story. It licenses samples
+(`docs/pcm.md`), drift-modeled clock-in (below), and every render crossing the
+wire to an off-box sink. The *only* place we pay hard realtime timing is the
+final, sub-lead, local-to-the-hardware scheduling — and that lives on the node
+that owns the gear, never on the wire. Say the guarantee out loud and design to
+it: **we make only the promises the lead can keep.**
 
 ## The latency truth (so we design for the right enemy)
 
@@ -132,13 +152,73 @@ No new abstractions — MIDI in/out reduce to `tracks.md` primitives:
 - **Publish to the bus** = a **render target.** `chameleon.md` already says "MIDI
   is a render of the score"; MIDI-**out**-to-hardware is just another renderer
   alongside app-display and audio-samples. The score stays symbolic (ABC + data);
-  the edge node renders committed cells to ALSA MIDI out.
+  a **wire sink** renders committed cells to hardware — see "Render is a wire cue"
+  below for where that sink lives and why it's off the kernel.
 
 So MIDI input and output are both "a track with a clock source / render target
 that happens to live on a node." Which makes the MIDI edge node **the first
 kernel-owned compute node** — the resource-offered-wholly-owned-by-the-kernel
 fleet idea, deliberately scoped down to one well-defined resource (ALSA MIDI +
 a realtime scheduler). Building it prototypes that future, small.
+
+## Render is a wire cue; the sink owns the hardware (2026-07-01)
+
+M1 shipped MIDI-out **in-process** — `AlsaMidiOut` in `kaijutsu-server` opens an
+ALSA seq port and schedules NoteOns locally. The real-time stance says that was a
+convenience, not a requirement: in-process buys nothing the lead doesn't already
+buy, because timing precision comes from scheduling into a *local* device queue
+ahead of time, and any sink — including one across the wire — has a local queue.
+So the direction (decided 2026-07-01, with `docs/pcm.md`) is to **move the
+hardware emit off the kernel/server binary entirely** and make it a *wire sink*:
+the app first (it already renders samples this way — `pcm.md` slice 3), a
+headless edge-node agent later. The server binary sheds its `alsa` dependency;
+the kernel stays what it always was — a durable orchestrator with no audio FFI.
+
+**MIDI and samples become one path.** A render is a **mime-keyed symbolic cue**
+scheduled on the lead. The committed score stays symbolic (ABC / a clip record,
+`docs/clips.md`); what crosses to the sink is a small cue, never the score:
+
+- **`RenderCue { mime, payload, lead }`** — `payload` is inline symbolic content
+  or a CAS ref; `lead` is a *relative* `Duration` (a process-local `Instant`
+  can't cross the wire), and the sink schedules at `receipt + lead`. This
+  generalizes slice-3's play-now `PlayAudio` directive. An ABC/MIDI cue and a
+  clip cue are the same directive with different mimes; the sink dispatches by
+  mime. This is the wire form of `tracks.md`'s in-process `RenderTarget` seam,
+  which dissolves into it as the sink moves off-box.
+
+**Three phases, each its own micro-batch** — the pipeline named so we can move a
+phase without a rewrite:
+
+1. **Compose** — a producer turn commits an ABC (or clip) cell on the track. The
+   score. Micro-batch = the OODA phrase.
+2. **Render** — `abc→midi` (or clip→resolved-sample). Near-**pure CPU**: no
+   hardware, only a CAS read. Its *placement is flexible* — kernel, sink, or a
+   compute node — and naming it a distinct phase is what lets us relocate it.
+   **For now it stays kernel/server-side** (reuse the proven
+   `kaijutsu_abc::midi::events`): the server renders `abc→midi` and the cue
+   carries the timed MIDI events, so the app sink stays dumb (queue events, no
+   ABC crate). Later we may ship the ABC symbolically and render at the sink —
+   the cue's mime says which, and a sink advertises the mimes it can consume vs.
+   needs pre-rendered.
+3. **Emit** — the sink schedules the cue into its local hardware queue at
+   `receipt + lead` (ALSA seq for MIDI, `bevy_audio`/ALSA-PCM for samples).
+   Micro-batch = the scheduled play-out. `AlsaMidiOut` splits along this phase
+   boundary: its *render* half (abc→events) stays server-side for now; its *emit*
+   half (events → ALSA-seq queue on the lead) moves to the sink.
+
+**MIDI becomes sink-dependent, and that is fine.** With the emit off-box, a track
+whose clock is rolling with no sink attached makes no sound — exactly like
+samples today. That is correct, not a regression: **the track is preserved** (its
+committed score is durable, `KJ_HEARD`-queryable, replayable), so silence-now is
+never lost work — attach a sink later and replay. The kernel (a headless systemd
+service) never needs an audio stack to keep a band playing into the score.
+
+**The app is the first MIDI sink — so the edge node (M4) is not a prerequisite.**
+Getting MIDI off the server no longer waits on the node-agent RPC model: the app
+proves the whole wire-cue path on zorak (app renders/queues MIDI → ALSA seq →
+`aconnect` → TiMidity, same box, no capability loss). The edge-node agent then
+becomes *just another sink* speaking the same cue protocol — and it is the
+**headless** sink for *everything*, MIDI and PCM alike, not a PCM-only errand.
 
 ## The topology (Amy's room, 2026-06-29)
 
@@ -175,6 +255,12 @@ real KSP / loft node in later.
 - **Edge node = the loft Lenovo**, repurposed later; not blocking the dev loop.
 - **The MIDI edge node is the first kernel-owned compute node** (fleet idea,
   scoped to one resource).
+- **Render is a wire cue; the sink owns the hardware (2026-07-01).** MIDI-out
+  moves off the server binary to a wire sink (app first, edge node later); MIDI
+  and samples share one mime-keyed `RenderCue` on the lead; `abc→midi` is a
+  distinct, relocatable micro-batch phase (kernel-side for now). Sink-dependency
+  is intended — the track is preserved and replayable. See the section of that
+  name; supersedes M1's in-process emit.
 
 ## Staging
 
@@ -193,6 +279,10 @@ real KSP / loft node in later.
   **`--replace`** to clear-then-add (`BeatCommand::RenderTarget { Add|Replace|Remove }`).
   Live-verified on zorak end-to-end (command → beat → NoteOns at a subscribed reader,
   and an attach→off→replace walk against `/proc/asound/seq/clients`).
+  **Direction since M1 (2026-07-01):** the in-process emit moves to a wire sink —
+  see "Render is a wire cue; the sink owns the hardware" — with `abc→midi` staying
+  kernel-side for now; M1's `AlsaMidiOut` splits along that render/emit phase
+  boundary. This is not a new milestone; it's how output evolves off the server.
 - **M2 — Input telemetry, batched.** Capture a local (virtual then real) MIDI in,
   timestamp with ALSA, batch into a MIDI-in track as score blocks over RPC.
   Snapshot = the track-scoped windowed read. The capture spec (written

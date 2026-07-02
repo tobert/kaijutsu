@@ -118,8 +118,11 @@ until the first good clip, matching the locked chameleon default.
    Late binding is a `Deferred(Recipe)` body, **zero new payload fields**;
    gated on the reactive `compute_basis` open question in hyoushigi.md).
 2. At the materialize crossing the mime-keyed seam (`docs/pcm.md` "How it
-   converges") hands `(record, mime, at)` to every render target registered
-   for the clip MIME; `at` rides the speculation lead — the transfer budget.
+   converges") emits a wire `RenderCue { mime, payload, lead }` to every sink
+   registered for the clip MIME — a clip cue is just one mime on this seam, the
+   ABC/MIDI cue (`docs/midi.md` "Render is a wire cue") its sibling. The `lead`
+   rides the speculation lead — the transfer budget; the sink re-anchors it at
+   `receipt + lead`.
 3. The sink resolves `media` from its local XDG CAS cache, pulling a miss
    over SFTP against `/v/blobs/<hash>`; decodes per `mime` (Bevy decoders /
    Symphonia); fires at `at` with the source range and gain applied.
