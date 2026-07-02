@@ -10,7 +10,8 @@
 //! client's render sink receives it with no new transport.
 
 use clap::Parser;
-use kaijutsu_audio::{AudioFormatHint, RenderCue};
+use kaijutsu_audio::{AudioFormatHint, CuePayload, RenderCue};
+use kaijutsu_cas::{ContentHash, ContentStore};
 use kaijutsu_types::ContentType;
 
 use super::refs;
@@ -25,8 +26,15 @@ use crate::flows::BlockFlow;
     no_binary_name = true
 )]
 pub(crate) struct PlayArgs {
-    /// Path to the audio file to play (OS path, not a VFS path — mirrors `kj cas put`).
-    path: String,
+    /// Path to the audio file to play (OS path, not a VFS path — mirrors `kj cas
+    /// put`). Mutually exclusive with `--cas`; exactly one is required.
+    path: Option<String>,
+    /// Play a blob already in the CAS by its content hash. The MIME is resolved
+    /// from the blob's CAS metadata, and the cue carries a `Cas` payload — so the
+    /// sink resolves the bytes from its XDG cache / SFTP `/v/blobs` (the
+    /// clip-prefetch path, docs/pcm.md 5c / docs/slash-v.md track B).
+    #[arg(long, conflicts_with = "path")]
+    cas: Option<String>,
     /// Target context: . (default) | <label> | <hex prefix>. Reserved for
     /// future per-listener routing; the standalone slice forwards to every
     /// attached client regardless of which context is named.
@@ -53,34 +61,57 @@ impl KjDispatcher {
             }
         };
 
-        // Derive the wire MIME from the extension BEFORE reading the file — an
-        // unrecognized/missing extension is a loud error, never a silently
-        // guessed default (a mis-rendered file is a worse failure mode than a
-        // rejected command). An `.abc` score renders to MIDI at the sink
-        // (docs/midi.md "Render is a wire cue"); audio extensions play as a
-        // sample. Both ride the one mime-keyed `RenderCue`.
-        let ext = parsed
-            .path
-            .rsplit_once('.')
-            .map(|(_, e)| e.to_ascii_lowercase());
-        let mime: String = match ext.as_deref() {
-            Some("abc") => "text/vnd.abc".to_string(),
-            _ => match AudioFormatHint::from_path_extension(&parsed.path) {
-                Some(f) => f.mime().to_string(),
-                None => {
-                    return KjResult::Err(format!(
-                        "kj play: {}: unrecognized or missing extension \
-                         (expected .abc or one of .wav/.flac/.mp3/.ogg/.aac/.m4a)",
-                        parsed.path
-                    ));
+        // Build the cue payload from exactly one source: a CAS hash (bytes stay
+        // out-of-band, the sink resolves them from /v/blobs) or a local file
+        // (bytes inline). `mime` + `desc` + `payload` fall out of whichever.
+        let (mime, payload, desc): (String, CuePayload, String) =
+            match (parsed.cas.as_deref(), parsed.path.as_deref()) {
+                (Some(hash_str), _) => {
+                    let hash = match hash_str.parse::<ContentHash>() {
+                        Ok(h) => h,
+                        Err(e) => return KjResult::Err(format!("kj play --cas: invalid hash: {e}")),
+                    };
+                    // The MIME comes from the blob's own CAS metadata — no
+                    // extension to sniff. A blob not in the pool is a loud error.
+                    let mime = match self.kernel().cas().inspect(&hash) {
+                        Ok(Some(r)) => r.mime_type,
+                        Ok(None) => {
+                            return KjResult::Err(format!("kj play --cas: not found: {hash}"));
+                        }
+                        Err(e) => return KjResult::Err(format!("kj play --cas: {e}")),
+                    };
+                    let desc = format!("cas:{hash}");
+                    (mime, CuePayload::Cas(hash), desc)
                 }
-            },
-        };
-
-        let bytes = match std::fs::read(&parsed.path) {
-            Ok(b) => b,
-            Err(e) => return KjResult::Err(format!("kj play: {}: {}", parsed.path, e)),
-        };
+                (None, Some(path)) => {
+                    // Derive the wire MIME from the extension BEFORE reading the
+                    // file — an unrecognized/missing extension is a loud error,
+                    // never a silently guessed default. An `.abc` score renders
+                    // to MIDI at the sink; audio extensions play as a sample.
+                    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+                    let mime: String = match ext.as_deref() {
+                        Some("abc") => "text/vnd.abc".to_string(),
+                        _ => match AudioFormatHint::from_path_extension(path) {
+                            Some(f) => f.mime().to_string(),
+                            None => {
+                                return KjResult::Err(format!(
+                                    "kj play: {path}: unrecognized or missing extension \
+                                     (expected .abc or one of .wav/.flac/.mp3/.ogg/.aac/.m4a)"
+                                ));
+                            }
+                        },
+                    };
+                    let bytes = match std::fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => return KjResult::Err(format!("kj play: {path}: {e}")),
+                    };
+                    let desc = format!("{path} ({} bytes)", bytes.len());
+                    (mime, CuePayload::Inline(bytes), desc)
+                }
+                // Neither given — show help (clap already rejects both via
+                // conflicts_with).
+                (None, None) => return clap_help_for::<PlayArgs>(),
+            };
 
         let context_id = {
             let db = self.kernel_db().lock();
@@ -90,18 +121,18 @@ impl KjDispatcher {
             }
         };
 
-        let byte_count = bytes.len();
-        let cue = RenderCue::now_inline(mime.clone(), bytes);
+        let cue = RenderCue {
+            mime: mime.clone(),
+            payload,
+            lead: std::time::Duration::ZERO,
+        };
         let receivers = self.kernel().block_flows().publish(BlockFlow::RenderCue {
             context_id,
             cue,
         });
 
         KjResult::ok_ephemeral(
-            format!(
-                "playing {} ({} bytes, {}) — {} listener(s)",
-                parsed.path, byte_count, mime, receivers,
-            ),
+            format!("playing {desc} ({mime}) — {receivers} listener(s)"),
             ContentType::Plain,
         )
     }
@@ -193,6 +224,66 @@ mod tests {
             }
             other => panic!("expected RenderCue, got {other:?}"),
         }
+    }
+
+    /// `kj play --cas <hash>` emits a `CuePayload::Cas` cue whose MIME comes
+    /// from the CAS metadata the blob was stored with — the clip-prefetch path:
+    /// the app sink resolves the hash from its XDG cache / SFTP `/v/blobs`.
+    #[tokio::test]
+    async fn play_cas_emits_a_cas_cue_with_the_stored_mime() {
+        use kaijutsu_cas::ContentStore;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+
+        // Seed a blob into the kernel CAS with a known mime.
+        let sample = b"RIFF....WAVE fake but hashable".to_vec();
+        let hash = dispatcher
+            .kernel()
+            .cas()
+            .store(&sample, "audio/wav")
+            .expect("seed cas");
+
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
+
+        let result =
+            dispatcher.dispatch_play(&["--cas".to_string(), hash.to_string()], &caller);
+        assert!(result.is_ok(), "kj play --cas failed: {result:?}");
+
+        let msg = sub.try_recv().expect("RenderCue should have been published");
+        match msg.payload {
+            BlockFlow::RenderCue { cue, .. } => {
+                assert_eq!(cue.mime, "audio/wav", "mime resolved from CAS metadata");
+                assert_eq!(cue.lead, Duration::ZERO);
+                match cue.payload {
+                    CuePayload::Cas(h) => assert_eq!(h, hash, "the cue names the CAS hash"),
+                    other => panic!("expected Cas, got {other:?}"),
+                }
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
+    }
+
+    /// `kj play --cas <unknown-hash>` is a loud error — no directive published.
+    #[tokio::test]
+    async fn play_cas_unknown_hash_errors() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
+
+        let result = dispatcher.dispatch_play(
+            &["--cas".to_string(), "00000000000000000000000000000000".to_string()],
+            &caller,
+        );
+        assert!(!result.is_ok(), "unknown CAS hash should error: {result:?}");
+        assert!(sub.try_recv().is_none(), "no directive published on error");
     }
 
     /// A nonexistent file is a loud error — no directive published.
