@@ -43,12 +43,6 @@ tracing-subscriber = { workspace = true }
 # Hostname detection
 hostname = { workspace = true }
 
-# ALSA sequencer MIDI-out render target (docs/tracks.md Stage 3 / midi.md M1).
-# Linux-only; the server is a Linux daemon. Pinned to the version already in the
-# tree (via bevy_audio/cpal) so the lockfile stays single-version.
-[target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.9"
-
 [build-dependencies]
 capnpc.workspace = true
 

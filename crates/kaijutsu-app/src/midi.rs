@@ -3,8 +3,8 @@
 //!
 //! A `RenderCue { mime: "text/vnd.abc", payload: Inline(abc), lead }` carries a
 //! committed ABC score *symbolically*. The app renders it to MIDI with the same
-//! `kaijutsu_abc::midi::events` path the (soon-demolished) server-side
-//! `AlsaMidiOut` used, and schedules the events into a local ALSA seq queue at
+//! `kaijutsu_abc::midi::events` path the now-demolished server-side
+//! `AlsaMidiOut` used to use, and schedules the events into a local ALSA seq queue at
 //! `receipt + lead`. Rendering at the sink is fine here because the app already
 //! depends on `kaijutsu-abc` (its ABC→staff renderer), so the "keep the sink
 //! dumb, no ABC crate" reason for kernel-side rendering doesn't apply — the mime

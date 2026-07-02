@@ -220,40 +220,6 @@ pub enum BeatCommand {
     /// the rotate *action* (fork + re-bind child) stays rc. `Some(Cadence{every:0})`
     /// is treated as `None`.
     SetRotate { track: TrackId, context_id: ContextId, every: Option<Cadence> },
-    /// Add / replace / remove a render target — a *consumer* of the track's
-    /// committed score (Stage 3 "the render-target seam"). For `Add`/`Replace` the
-    /// scheduler constructs the concrete target from the [`RenderTargetSpec`] (e.g.
-    /// opens an ALSA seq port) and registers it; from then on each newly-committed
-    /// cell is rendered out on the speculation lead. Targets are keyed by id (the
-    /// `AlsaMidi` port name) so `Remove` can name one. Names the **track**.
-    RenderTarget { track: TrackId, op: RenderTargetOp },
-}
-
-/// What to do to a track's render-target registry ([`BeatCommand::RenderTarget`]).
-#[derive(Debug, Clone)]
-pub enum RenderTargetOp {
-    /// Add a target — **additive**, a track can carry several (cf. `docs/pcm.md`,
-    /// where a PCM target joins the MIDI one).
-    Add(RenderTargetSpec),
-    /// Clear *all* of the track's render targets, then add this one. The new target
-    /// is built BEFORE the clear, so a failed open leaves the existing ones intact.
-    Replace(RenderTargetSpec),
-    /// Remove the target with this id (the `AlsaMidi` port name), or **all** of them
-    /// when `None`. A removed target is silenced (all-notes-off) before it's dropped.
-    Remove { id: Option<String> },
-}
-
-/// How to build a render target for [`BeatCommand::AddRenderTarget`]. Lives in the
-/// kernel (where `BeatCommand` lives) and is data-only — the concrete target
-/// (which pulls `alsa`/PipeWire FFI) is constructed by the server's scheduler, so
-/// this enum stays dependency-free. M1 has the one MIDI-out kind; `docs/pcm.md`'s
-/// PCM target is the planned sibling.
-#[derive(Debug, Clone)]
-pub enum RenderTargetSpec {
-    /// ALSA sequencer MIDI out: open a virtual seq port other clients (a synth, a
-    /// DAW, `aseqdump`) subscribe to. `client_name`/`port_name` are what show up in
-    /// `aconnect -l`.
-    AlsaMidi { client_name: String, port_name: String },
 }
 
 /// What the scheduler reports back for a transport command: `Ok(())` when it

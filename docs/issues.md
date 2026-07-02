@@ -187,14 +187,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Architecture & System Design
 
-- **Hardware I/O out of the kernel process (audio + MIDI):** lean (2026-06-30) —
-  the kernel/server binary should own *no* audio/MIDI FFI; hardware emission lives
-  in peripherals that attach over RPC (the Bevy app, or a headless edge-node
-  agent = `midi.md`'s "first kernel-owned compute node"). Consequence: extract the
-  already-shipped `AlsaMidiOut` from `crates/kaijutsu-server/src/render.rs` into the
-  edge-node agent so the server stops linking `alsa` (the speculation-lead `at`
-  scheduling travels with it). Sequence with M4 edge-node work. PCM samples follow
-  the same rule from the start — see `docs/pcm.md`.
+- **Headless render sink (edge-node agent) — MIDI + PCM:** PCM slice 5c-3
+  demolished the server's in-process `AlsaMidiOut` + `kj transport render`, so the
+  kernel/server binary now links **no** audio/MIDI FFI (goal achieved). The app is
+  the render sink today; a **headless kernel with no app attached makes no sound**
+  (MIDI is sink-dependent by design — `docs/midi.md`). The remaining gap: a
+  headless edge-node agent that attaches over RPC and plays cues (Symphonia/ALSA
+  for PCM, ALSA-seq for MIDI) — `midi.md`'s "first kernel-owned compute node" (M4)
+  and `pcm.md` slice 4. Reuses the exact wire `RenderCue` the app consumes; the
+  speculation-lead `at`→`lead` scheduling already travels with it.
 - **SSH shell subsystem (`kaijutsu-shell`):** give an `ssh` user an interactive kaish
   with `kj` that starts in a lobby and attaches into contexts (VFS reflows on switch).
   Design + wiring captured in [`ssh-shell.md`](ssh-shell.md). Start after the SFTP
