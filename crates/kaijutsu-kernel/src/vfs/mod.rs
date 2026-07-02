@@ -23,7 +23,7 @@ mod mount;
 mod ops;
 mod types;
 
-pub use backends::{LocalBackend, MemoryBackend};
+pub use backends::{CasFs, LocalBackend, MemoryBackend};
 pub use error::{VfsError, VfsResult};
 pub use mount::{MountInfo, MountTable};
 pub use ops::VfsOps;

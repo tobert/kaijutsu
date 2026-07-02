@@ -1158,6 +1158,16 @@ pub async fn create_shared_kernel(
     }
     kernel.mount("/etc/config", config_fs).await;
 
+    // Mount the CAS object pool read-only at /v/blobs (docs/slash-v.md track B).
+    // A CasFs over the kernel's FileStore renders every stored blob as an
+    // immutable file, sharded on the hash's leading two hex chars to match the
+    // on-disk objects/ layout. This is the substrate for client CAS sync: once
+    // mounted on the kernel MountTable, kaish, the file tools, and SFTP all
+    // reach it for free (no new RPC). Read-only by construction — every write
+    // returns EROFS from the backend, so it sidesteps the SFTP capability gate.
+    let blobs_fs = kaijutsu_kernel::vfs::CasFs::new(kernel.cas().clone());
+    kernel.mount("/v/blobs", blobs_fs).await;
+
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
     kernel.freeze_mounts();
