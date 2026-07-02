@@ -306,9 +306,17 @@ review's blockers.
     `BlobResolver`, byte + hash match; corruption test (flip a byte in the
     server store fixture → resolve fails loud with `HashMismatch`, cache stays
     clean).
-- **B4 — the consumer** (tracked in `docs/pcm.md` slice 5c, not here): the app
-  sink replaces its CAS-payload skip (`crates/kaijutsu-app/src/audio.rs:138`)
-  with a `BlobResolver` resolve (off-thread), on the prepare horizon.
+- **B4 — the consumer. ✅ landed (2026-07-02).** The app sink's CAS-payload
+  warn-and-skip (`crates/kaijutsu-app/src/audio.rs`) is now a `BlobResolver`
+  resolve: a `CuePayload::Cas` audio cue dispatches an off-thread resolve on a
+  **dedicated tokio runtime** (the SFTP world is `Send` and must stay off the RPC
+  actor's current-thread + `LocalSet` `!Send` runtime — `connection/bootstrap.rs`),
+  lazily connecting one `SftpClient`/XDG-cache `BlobResolver` for the session;
+  results cross back to Bevy on a crossbeam channel and play as `AudioPlayer`s.
+  First cut is **fetch-on-cue** (the two-phase prepare-horizon prefetch and
+  precise `lead` scheduling remain the `docs/pcm.md` follow-up); the clip-record
+  path (parse Shape A → resolve `media`) is the next slice. Transport errors drop
+  the connection so the next cue redials.
 
 Open questions for track B: none blocking. Non-blocking notes: the naive
 `index` walk (cache when it hurts); CAS garbage collection (`kj cas rm` is

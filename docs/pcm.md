@@ -271,13 +271,19 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
      musician track plays through the app with **no** in-process target (5c-2).
      With parity proven, the server-side `AlsaMidiOut` + `RenderTarget` trait +
      `kj transport render` verb + the `alsa` server dep were demolished — the
-     kernel/server binary links no audio/MIDI FFI (5c-3). **Still ahead in 5c:**
-     the *clip/PCM* half — clip cue → parse+validate → resolve `media` from an XDG
-     CAS cache, miss → SFTP `/v/blobs/<ab>/<hash>` (the mount + `BlobResolver` are
-     `docs/slash-v.md` track B, the active prerequisite), decode, fire honoring
-     `lead` (the CAS prefetch under the prepare horizon); and the headless
-     edge-node sink (slice 4 / `midi.md` M4) so a kernel with no app can still
-     make sound.
+     kernel/server binary links no audio/MIDI FFI (5c-3). **CAS-audio prefetch
+     landed 2026-07-02 (track B B4):** a `CuePayload::Cas` `audio/*` cue in the
+     app sink (`kaijutsu-app/src/audio.rs`) now resolves `media` through a
+     `BlobResolver` (XDG CAS cache, miss → SFTP `/v/blobs/<ab>/<hash>`, re-hash
+     verify) off a dedicated tokio runtime — kept off the RPC actor's `!Send`
+     current-thread world — and plays the resolved bytes; the `/v/blobs` mount +
+     `BlobResolver` are `docs/slash-v.md` track B (landed + live-verified). This
+     first cut is **fetch-on-cue**. **Still ahead in 5c:** the *clip-record* path
+     (parse+validate the Shape A `Clip`, then resolve its `media` hash — the
+     audio path above handles the bytes once parsed), firing under the two-phase
+     **prepare horizon** (warm the cache when a cell becomes known) with precise
+     `lead` scheduling rather than on-cue; and the headless edge-node sink
+     (slice 4 / `midi.md` M4) so a kernel with no app can still make sound.
    The `abc→midi` render stays kernel-side for now (a relocatable phase — see the
    three-phase split in `midi.md`); an ABC-consuming sampler ("NoteOn → pick
    sample → play") is a later mime on the same seam (`midi.md` "samples-with-MIDI").

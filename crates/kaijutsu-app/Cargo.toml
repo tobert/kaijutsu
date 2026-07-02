@@ -14,9 +14,11 @@ dynamic_linking = ["bevy/dynamic_linking"]
 [dependencies]
 kaijutsu-abc.workspace = true
 kaijutsu-audio.workspace = true
+kaijutsu-cas.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-kernel.workspace = true
+crossbeam-channel = "0.5"
 kaijutsu-types.workspace = true
 kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true
@@ -87,7 +89,5 @@ alsa = "0.9"
 
 [dev-dependencies]
 image = "0.25"
-crossbeam-channel = "0.5"
 tempfile = "3"
 pollster = "0.4"
-kaijutsu-cas.workspace = true

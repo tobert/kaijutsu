@@ -13,34 +13,140 @@
 //! sink role directly, per the brief.
 //!
 //! Slice 5a handles the play-now inline `audio/*` cue (slice-3 parity, one
-//! `AudioPlayer` per cue). Two things still belong to slice 5c: CAS-backed
-//! payloads (client-side prefetch under the speculation lead) and non-audio
-//! mimes (MIDI queued into a local ALSA seq port); both warn loudly and skip
-//! today rather than silently dropping the cue. `cue.lead` is likewise honored
-//! only for the zero-lead play-now case — scheduled playback arrives with 5c.
+//! `AudioPlayer` per cue). **Slice 5c / track-B B4** adds the CAS-backed audio
+//! path: a `CuePayload::Cas(hash)` audio cue no longer warns-and-skips — it
+//! resolves the hash through a [`BlobResolver`] (XDG CAS cache + SFTP fetch from
+//! `/v/blobs`, `docs/slash-v.md`) off the Bevy main thread, then plays the
+//! resolved bytes. This first cut is **fetch-on-cue**; the two-phase
+//! prepare-horizon prefetch (`docs/pcm.md` "Open questions") is a follow-up on
+//! the same resolver. `cue.lead` is honored only for the zero-lead play-now case
+//! (both inline and CAS) — scheduled playback also arrives with the prepare
+//! horizon. Non-audio mimes (MIDI `text/vnd.abc`) are owned by `midi.rs` off the
+//! same message stream.
+
+use std::sync::Arc;
 
 use bevy::prelude::*;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use kaijutsu_audio::CuePayload;
-use kaijutsu_client::ServerEvent;
+use kaijutsu_cas::ContentHash;
+use kaijutsu_client::{BlobResolver, ServerEvent, SftpClient, SftpError, SshConfig};
+use tokio::sync::Mutex as AsyncMutex;
 
-use crate::connection::actor_plugin::ServerEventMessage;
+use crate::connection::actor_plugin::{RpcConnectionState, ServerEventMessage};
 
 /// Bridges `ServerEvent::RenderCue` directives into Bevy `AudioPlayer` spawns.
 pub struct AudioOutPlugin;
 
 impl Plugin for AudioOutPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, play_render_cues);
+        app.insert_resource(BlobPrefetch::new())
+            .add_systems(Update, (play_render_cues, drain_prefetch_results));
     }
 }
 
-/// Consume `RenderCue` directives and spawn a one-shot `AudioPlayer` for each
-/// inline `audio/*` cue. CAS payloads and non-audio mimes aren't handled yet
-/// (slice 5c) — we warn loudly and skip rather than silently dropping the cue.
+/// A resolved (or failed) CAS prefetch, tagged with the cue's mime, bridged from
+/// the SFTP runtime back onto the Bevy main thread for [`drain_prefetch_results`].
+struct PrefetchOutcome {
+    mime: String,
+    result: Result<Vec<u8>, String>,
+}
+
+/// The app's client-side CAS prefetch, owning the **Send** SFTP world.
+///
+/// The RPC actor's runtime is current-thread + `LocalSet` (Cap'n Proto is
+/// `!Send`); SFTP futures are `Send` and must not ride that thread (a blocking
+/// cache read would stall RPC). So this owns a *separate* tokio runtime, and the
+/// resolver — its own SSH connection + XDG cache — lives entirely here. Results
+/// cross back to Bevy on a crossbeam channel, drained each frame.
+#[derive(Resource)]
+pub struct BlobPrefetch {
+    /// Dedicated runtime for SFTP + cache IO, off the RPC actor's `!Send` world.
+    rt: tokio::runtime::Runtime,
+    /// The resolver, connected lazily on the first CAS cue and reused after
+    /// (one SSH transport for the session). Cleared on a transport error so the
+    /// next cue reconnects.
+    resolver: Arc<AsyncMutex<Option<Arc<BlobResolver<SftpClient>>>>>,
+    tx: Sender<PrefetchOutcome>,
+    rx: Receiver<PrefetchOutcome>,
+}
+
+impl BlobPrefetch {
+    fn new() -> Self {
+        // One worker: prefetch is latency-tolerant (it runs under the prepare
+        // horizon), and a single background thread keeps SFTP + the blocking
+        // FileStore read off the render loop. (spawn_blocking for the cache IO
+        // is the recorded follow-up, `docs/issues.md`.)
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("kaijutsu-blob-prefetch")
+            .enable_all()
+            .build()
+            .expect("blob-prefetch tokio runtime");
+        let (tx, rx) = unbounded();
+        Self {
+            rt,
+            resolver: Arc::new(AsyncMutex::new(None)),
+            tx,
+            rx,
+        }
+    }
+
+    /// Kick off an async resolve of `hash`; the outcome (tagged with `mime`)
+    /// lands on `rx` for [`drain_prefetch_results`]. Lazily connects the resolver
+    /// on first use over `config` (the same SSH key/host the RPC channel used).
+    fn dispatch(&self, hash: ContentHash, mime: String, config: SshConfig) {
+        let slot = self.resolver.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = resolve_with_lazy_connect(&slot, &hash, config)
+                .await
+                .map_err(|e| e.to_string());
+            // A closed receiver just means the app is shutting down.
+            let _ = tx.send(PrefetchOutcome { mime, result });
+        });
+    }
+}
+
+/// Resolve `hash`, connecting the shared resolver on first use. A transport
+/// failure clears the connection so the next cue reconnects; a per-object
+/// failure (NotFound / HashMismatch) leaves the healthy transport in place.
+async fn resolve_with_lazy_connect(
+    slot: &AsyncMutex<Option<Arc<BlobResolver<SftpClient>>>>,
+    hash: &ContentHash,
+    config: SshConfig,
+) -> Result<Vec<u8>, SftpError> {
+    let resolver = {
+        let mut guard = slot.lock().await;
+        if guard.is_none() {
+            let sftp = SftpClient::connect(config).await?;
+            *guard = Some(Arc::new(BlobResolver::with_xdg_cache(sftp)));
+        }
+        // Just inserted or already present.
+        guard.as_ref().expect("resolver present").clone()
+    };
+
+    match resolver.resolve(hash).await {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            if matches!(e, SftpError::Ssh(_) | SftpError::Protocol(_)) {
+                // The transport is suspect — drop it so the next cue redials.
+                *slot.lock().await = None;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Consume `RenderCue` directives: play an inline `audio/*` cue now, and
+/// dispatch a CAS-backed `audio/*` cue to the prefetch resolver. Non-audio and
+/// unconnected cases are handled explicitly (never a silent drop).
 fn play_render_cues(
     mut messages: MessageReader<ServerEventMessage>,
     mut commands: Commands,
     mut sources: ResMut<Assets<AudioSource>>,
+    prefetch: Res<BlobPrefetch>,
+    connection: Option<Res<RpcConnectionState>>,
 ) {
     for ServerEventMessage(event) in messages.read() {
         let ServerEvent::RenderCue { cue, .. } = event else {
@@ -54,7 +160,7 @@ fn play_render_cues(
                 // copy *then* reallocate it into the Arc — two copies of the
                 // sample.) Inline is the small-sample path, but even so.
                 let handle = sources.add(AudioSource {
-                    bytes: std::sync::Arc::from(bytes.as_slice()),
+                    bytes: Arc::from(bytes.as_slice()),
                 });
                 // DESPAWN (not the ONCE default): a fire-and-forget sample
                 // shouldn't leave a drained-sink entity sitting in the world
@@ -66,14 +172,61 @@ fn play_render_cues(
                 // `midi.rs`, or a future clip renderer). Another sink handles it
                 // off the same message stream; nothing to do here.
             }
+            CuePayload::Cas(hash) if cue.mime.starts_with("audio/") => {
+                // Resolve off-thread from the XDG cache / SFTP, then play when
+                // the bytes land (drain_prefetch_results). Needs a live SSH
+                // config — cues only arrive after connect, so an unconnected
+                // state is the pre-connect edge, not the normal path.
+                match connection.as_deref() {
+                    Some(conn) if conn.connected => {
+                        prefetch.dispatch(hash.clone(), cue.mime.clone(), conn.ssh_config.clone());
+                    }
+                    _ => warn!(
+                        "CAS render cue arrived before a live connection — cannot prefetch \
+                         (hash={hash:?}, mime={})",
+                        cue.mime
+                    ),
+                }
+            }
             CuePayload::Cas(hash) => {
+                // A CAS blob with a non-audio mime (e.g. a rendered MIDI blob) —
+                // no sink here. The clip-record path (parse Shape A, resolve the
+                // media hash) is the next slice; this stays loud, not silent.
                 warn!(
-                    "CAS-backed render cue not yet supported in the app sink — \
-                     arrives with slice 5c's client-side prefetch \
+                    "CAS render cue with non-audio mime not handled by the audio sink \
                      (hash={hash:?}, mime={})",
                     cue.mime
                 );
             }
+        }
+    }
+}
+
+/// Play prefetched CAS blobs as they resolve — the async tail of the CAS branch
+/// in [`play_render_cues`]. Runs on the Bevy main thread (world access), so the
+/// off-thread resolve never touches `Commands`/`Assets` directly.
+fn drain_prefetch_results(
+    prefetch: Res<BlobPrefetch>,
+    mut commands: Commands,
+    mut sources: ResMut<Assets<AudioSource>>,
+) {
+    while let Ok(outcome) = prefetch.rx.try_recv() {
+        match outcome.result {
+            Ok(bytes) if outcome.mime.starts_with("audio/") => {
+                let handle = sources.add(AudioSource {
+                    bytes: Arc::from(bytes.as_slice()),
+                });
+                commands.spawn((AudioPlayer(handle), PlaybackSettings::DESPAWN));
+            }
+            Ok(bytes) => {
+                // Resolved fine but nothing here decodes it — loud, not silent.
+                warn!(
+                    "resolved a non-audio CAS blob ({} bytes, mime={}); no sink in the audio path",
+                    bytes.len(),
+                    outcome.mime
+                );
+            }
+            Err(e) => warn!("CAS prefetch failed (mime={}): {e}", outcome.mime),
         }
     }
 }
@@ -86,16 +239,19 @@ mod tests {
     use kaijutsu_types::ContextId;
     use std::str::FromStr;
 
-    /// Minimal headless app: just enough to run `play_render_cues`
-    /// without a real audio device — `TaskPoolPlugin` (asset IO needs task
-    /// pools) + `AssetPlugin` (registers `AssetServer`/`Assets<T>` plumbing)
-    /// + `init_asset::<AudioSource>()`, no `AudioPlugin`/window/speakers.
+    /// Minimal headless app: just enough to run the sink systems without a real
+    /// audio device — `TaskPoolPlugin` (asset IO needs task pools) +
+    /// `AssetPlugin` (registers `AssetServer`/`Assets<T>` plumbing) +
+    /// `init_asset::<AudioSource>()`, plus the `BlobPrefetch` resource. No
+    /// `AudioPlugin`/window/speakers, and no `ConnectionActor` (so CAS dispatch
+    /// hits the unconnected edge).
     fn test_app() -> App {
         let mut app = App::new();
         app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
             .init_asset::<AudioSource>()
             .add_message::<ServerEventMessage>()
-            .add_systems(Update, play_render_cues);
+            .insert_resource(BlobPrefetch::new())
+            .add_systems(Update, (play_render_cues, drain_prefetch_results));
         app
     }
 
@@ -110,6 +266,21 @@ mod tests {
             context_id: ContextId::new(),
             cue,
         }));
+        app.update();
+    }
+
+    /// Push a prefetch outcome straight onto the channel (same-module access) —
+    /// stands in for the off-thread resolve completing, so the drain system is
+    /// testable without a live SFTP server.
+    fn deliver(app: &mut App, mime: &str, result: Result<Vec<u8>, String>) {
+        app.world()
+            .resource::<BlobPrefetch>()
+            .tx
+            .send(PrefetchOutcome {
+                mime: mime.to_string(),
+                result,
+            })
+            .unwrap();
         app.update();
     }
 
@@ -135,10 +306,10 @@ mod tests {
         assert_eq!(player_count(&mut app), 1, "expected exactly one AudioPlayer entity");
     }
 
-    /// CAS payloads aren't resolved in this slice — the cue must be skipped
-    /// (with a loud warn, not silently), producing no asset and no entity.
+    /// A CAS audio cue with no connection can't prefetch — it warns and produces
+    /// nothing this frame (the resolve is off-thread and needs an SSH config).
     #[test]
-    fn cas_cue_is_skipped_not_played() {
+    fn cas_audio_cue_without_connection_produces_nothing() {
         let mut app = test_app();
         play(
             &mut app,
@@ -155,8 +326,41 @@ mod tests {
         assert_eq!(player_count(&mut app), 0);
     }
 
-    /// A non-audio mime (a clip record / MIDI cue) is slice-5c territory — the
-    /// app sink skips it today rather than mis-decoding it as a sample.
+    /// The async tail: a resolved `audio/*` blob delivered on the channel spawns
+    /// exactly one `AudioPlayer`. (Dummy bytes suffice — `AudioSource` stores
+    /// them; bevy_audio decodes lazily at play, which the headless app skips.)
+    #[test]
+    fn a_resolved_audio_blob_is_played() {
+        let mut app = test_app();
+        deliver(&mut app, "audio/wav", Ok(vec![1, 2, 3, 4]));
+
+        assert_eq!(app.world().resource::<Assets<AudioSource>>().len(), 1);
+        assert_eq!(player_count(&mut app), 1);
+    }
+
+    /// A failed prefetch is a loud no-op — no asset, no entity.
+    #[test]
+    fn a_failed_prefetch_plays_nothing() {
+        let mut app = test_app();
+        deliver(&mut app, "audio/wav", Err("no such path: /v/blobs/…".into()));
+
+        assert_eq!(app.world().resource::<Assets<AudioSource>>().len(), 0);
+        assert_eq!(player_count(&mut app), 0);
+    }
+
+    /// A resolved but non-audio blob has no sink in the audio path — warn, don't
+    /// mis-decode it as a sample.
+    #[test]
+    fn a_resolved_non_audio_blob_plays_nothing() {
+        let mut app = test_app();
+        deliver(&mut app, "application/octet-stream", Ok(vec![0, 1, 2]));
+
+        assert_eq!(app.world().resource::<Assets<AudioSource>>().len(), 0);
+        assert_eq!(player_count(&mut app), 0);
+    }
+
+    /// A non-audio inline mime (a clip record / MIDI cue) is another sink's
+    /// territory — the audio sink skips it rather than mis-decoding a sample.
     #[test]
     fn non_audio_inline_cue_is_skipped() {
         let mut app = test_app();

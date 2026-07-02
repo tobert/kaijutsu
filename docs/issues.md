@@ -99,8 +99,18 @@ the design details live in the doc, this entry is the backlog pointer:
   read-to-EOF (verified russh-sftp 2.3 loops past the 256 KiB cap) + live-SSH
   e2e (`f7dcef0f`). Live-verified on the runner: stock `sftp` fetch of
   `/v/blobs/<ab>/<hash>` returns byte-exact CAS content and lists the sharded
-  pool. Ingest stays `kj cas put` (SFTP→`/tmp` two-step); writable
-  staging-over-SFTP deferred; B2 `index` deferred (below).
+  pool. **B4** the app consumer (`kaijutsu-app/src/audio.rs`): a `CuePayload::Cas`
+  audio cue resolves off a dedicated tokio runtime (Send SFTP world, off the RPC
+  actor's `!Send` bootstrap runtime) via a lazily-connected `BlobResolver`,
+  bridged back to Bevy on a crossbeam channel → `AudioPlayer`. Ingest stays `kj
+  cas put` (SFTP→`/tmp` two-step); writable staging-over-SFTP deferred; B2
+  `index` deferred (below). **B4 follow-ups (not blocking):** fetch-on-cue today
+  → two-phase **prepare-horizon** prefetch + precise `lead` scheduling (warm the
+  cache when a cell becomes known — `docs/pcm.md` "Open questions"); the blocking
+  `FileStore` cache read in the async resolve wants `spawn_blocking`; and the
+  **clip-record** path (parse Shape A `Clip` → resolve `media`; the audio bytes
+  path already exists). Also: B4's live audible verify needs a CAS-audio-cue
+  trigger (`kj play` emits inline only today).
 - **kaish `/v/blobs` is shadowed by kaish-kernel's `VirtualOverlayBackend`
   (papercut, 2026-07-02).** kaish reserves `/v/blobs` (alongside `/v/jobs`) as
   one of its own virtual paths (`kaish-kernel/src/backend/overlay.rs`
