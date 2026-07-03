@@ -8,8 +8,8 @@ use bevy::prelude::*;
 use crate::text::shaping::VelloFont;
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor, LayoutGeneration,
-    MainCell, RoleGroupBorder, RoleGroupBorderLayout,
+    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, LayoutGeneration, MainCell,
+    RoleGroupBorder, RoleGroupBorderLayout,
 };
 use crate::shaders::BlockFxMaterial;
 
@@ -95,6 +95,7 @@ pub fn track_conversation_container(
         ),
     >,
     containers: Query<&BlockCellContainer>,
+    mut layout_gen: ResMut<LayoutGeneration>,
 ) {
     let Ok(focused) = focused_containers.single() else {
         return;
@@ -109,7 +110,11 @@ pub fn track_conversation_container(
     };
 
     // RE-PARENTING: When the container changes (e.g. pane split),
-    // all existing block cells must move to the new container.
+    // all existing block cells must move to the new container. This
+    // re-adds block cells then role headers, which interleaves them out of
+    // document order — bump LayoutGeneration so sync_role_headers +
+    // reorder_conversation_children repair the interleave on the next
+    // frames instead of leaving it stuck until app restart.
     if let Ok(container) = containers.get(main_ent) {
         trace!(
             "Re-parenting {} block cells to new container {:?}",
@@ -125,6 +130,7 @@ pub fn track_conversation_container(
     }
 
     entities.conversation_container = Some(focused);
+    layout_gen.bump();
 }
 
 /// Spawn or update BlockCell entities to match the MainCell's BlockStore.
@@ -289,11 +295,19 @@ pub fn spawn_block_cells(
         }
     }
 
-    if had_additions || had_removals {
+    // Reorder container.block_cells to match document order. A pure position
+    // change (server BlockMoved, or a merge that repositions an existing
+    // block) adds/removes nothing, so it must be detected here and folded
+    // into the bump decision below — otherwise reorder_conversation_children
+    // never re-runs and the visual order goes stale until app restart.
+    let order_changed = container.resort_to_document_order(&current_blocks);
+
+    if had_additions || had_removals || order_changed {
         info!(
-            "spawn_block_cells: additions={} removals={} container_now={}",
+            "spawn_block_cells: additions={} removals={} order_changed={} container_now={}",
             had_additions,
             had_removals,
+            order_changed,
             container.block_cells.len(),
         );
         layout_gen.bump();
@@ -302,18 +316,6 @@ pub fn spawn_block_cells(
     if had_additions {
         scroll_state.new_blocks_added = true;
     }
-
-    // Reorder container.block_cells to match document order
-    let block_order: std::collections::HashMap<&BlockId, usize> = current_blocks
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (id, i))
-        .collect();
-    container.block_cells.sort_by(|a, _, b, _| {
-        let a_idx = block_order.get(a).copied().unwrap_or(usize::MAX);
-        let b_idx = block_order.get(b).copied().unwrap_or(usize::MAX);
-        a_idx.cmp(&b_idx)
-    });
 }
 
 /// Sync RoleGroupBorder entities for role transitions.
@@ -408,5 +410,129 @@ pub fn sync_role_headers(
         }
 
         container.role_headers.push(entity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cell::ConversationContainer;
+    use crate::ui::tiling::PaneFocus;
+
+    fn build_test_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<LayoutGeneration>();
+        app.add_systems(Update, track_conversation_container);
+        app
+    }
+
+    /// Seed a MainCell with a BlockCellContainer holding `n` block cells and
+    /// one role header, parented under a stale (pre-split) container —
+    /// mirrors the state right after `tiling_reconciler` rebuilds panes and
+    /// orphans the old container.
+    fn seed_main_with_cells(app: &mut App, n: usize) -> (Entity, Vec<Entity>, Entity) {
+        let stale_conv = app.world_mut().spawn_empty().id();
+
+        let mut container = BlockCellContainer::default();
+        let mut cell_entities = Vec::with_capacity(n);
+        for i in 0..n {
+            let ent = app.world_mut().spawn_empty().id();
+            container.add(
+                kaijutsu_crdt::BlockId::new(
+                    kaijutsu_crdt::ContextId::new(),
+                    kaijutsu_crdt::PrincipalId::new(),
+                    i as u64,
+                ),
+                ent,
+            );
+            cell_entities.push(ent);
+        }
+        let header_ent = app.world_mut().spawn_empty().id();
+        container.role_headers.push(header_ent);
+
+        app.world_mut()
+            .entity_mut(stale_conv)
+            .add_children(&cell_entities);
+        app.world_mut().entity_mut(stale_conv).add_child(header_ent);
+
+        let main_ent = app.world_mut().spawn(container).id();
+
+        {
+            let mut entities = app.world_mut().resource_mut::<EditorEntities>();
+            entities.main_cell = Some(main_ent);
+            entities.conversation_container = Some(stale_conv);
+        }
+
+        (main_ent, cell_entities, header_ent)
+    }
+
+    #[test]
+    fn track_conversation_container_reparents_and_bumps_generation_on_focus_change() {
+        let mut app = build_test_app();
+        let (_main_ent, cell_entities, header_ent) = seed_main_with_cells(&mut app, 2);
+
+        let focused_conv = app
+            .world_mut()
+            .spawn((ConversationContainer, PaneFocus))
+            .id();
+
+        app.update();
+
+        let entities = app.world().resource::<EditorEntities>();
+        assert_eq!(
+            entities.conversation_container,
+            Some(focused_conv),
+            "EditorEntities.conversation_container must track the newly focused pane"
+        );
+
+        let layout_gen = app.world().resource::<LayoutGeneration>();
+        assert!(
+            layout_gen.0 > 0,
+            "reparenting block cells + role headers onto a new container must bump \
+             LayoutGeneration so sync_role_headers/reorder_conversation_children repair \
+             the interleaved order on the next frames — previously this bump was missing \
+             and the interleave stuck until app restart"
+        );
+
+        let children: Vec<Entity> = app
+            .world()
+            .get::<Children>(focused_conv)
+            .map(|c| c.iter().collect())
+            .unwrap_or_default();
+        for ent in cell_entities.iter().chain(std::iter::once(&header_ent)) {
+            assert!(
+                children.contains(ent),
+                "block cell / role header {ent:?} must be reparented onto the focused container"
+            );
+        }
+    }
+
+    #[test]
+    fn track_conversation_container_is_a_noop_once_focus_already_tracked() {
+        let mut app = build_test_app();
+        let (_main_ent, _cells, _header) = seed_main_with_cells(&mut app, 1);
+
+        let focused_conv = app
+            .world_mut()
+            .spawn((ConversationContainer, PaneFocus))
+            .id();
+
+        app.update();
+        let gen_after_first = app.world().resource::<LayoutGeneration>().0;
+        assert!(gen_after_first > 0);
+
+        // Running again with the same focused container already tracked
+        // must not bump the generation a second time.
+        app.update();
+        let gen_after_second = app.world().resource::<LayoutGeneration>().0;
+        assert_eq!(
+            gen_after_second, gen_after_first,
+            "no-op frames (focus unchanged) must not keep bumping LayoutGeneration"
+        );
+        assert_eq!(
+            app.world().resource::<EditorEntities>().conversation_container,
+            Some(focused_conv)
+        );
     }
 }

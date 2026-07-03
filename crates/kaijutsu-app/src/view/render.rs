@@ -380,15 +380,93 @@ pub fn update_block_cell_nodes(
     }
 }
 
+/// Compute the ConversationContainer's children in document order,
+/// interleaving role headers before their associated block.
+///
+/// Pure function — no ECS access — so the ordering logic can be unit
+/// tested without spinning up a Bevy `App`. Any block present in `blocks`
+/// but missing a `container` entry is reported via `on_missing_block`
+/// instead of being silently dropped from the ordering: that gap is the
+/// signature of an upstream spawn/removal bug (spawn_block_cells lagging
+/// or a stale container ref), not something this function should paper
+/// over.
+pub fn compute_ordered_children(
+    blocks: &[kaijutsu_crdt::BlockSnapshot],
+    container: &BlockCellContainer,
+    header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
+    mut on_missing_block: impl FnMut(&kaijutsu_crdt::BlockSnapshot),
+) -> Vec<Entity> {
+    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
+    let mut ordered_children = Vec::with_capacity(blocks.len());
+
+    for block in blocks {
+        // Skip tool blocks for role transition tracking (they use fieldset borders)
+        let dominated_by_border = block.kind == kaijutsu_crdt::BlockKind::ToolCall
+            || block.kind == kaijutsu_crdt::BlockKind::ToolResult;
+
+        if !dominated_by_border {
+            let is_transition = prev_role != Some(block.role);
+            if is_transition && let Some(&header_ent) = header_map.get(&block.id) {
+                ordered_children.push(header_ent);
+            }
+            prev_role = Some(block.role);
+        }
+
+        match container.get_entity(&block.id) {
+            Some(block_ent) => ordered_children.push(block_ent),
+            None => on_missing_block(block),
+        }
+    }
+
+    ordered_children
+}
+
+/// Among a container's *current* children, find live entities that are
+/// about to be dropped by a `replace_children` call to `ordered_children`.
+///
+/// `replace_children` silently un-parents anything missing from the new
+/// list — it does not despawn it. An entity that falls out of
+/// `ordered_children` while still alive as a `BlockCell` or
+/// `RoleGroupBorder` becomes a root UI node: rendered at window scope,
+/// never culled (culling walks the `BlockCellContainer` map), never
+/// measured (readback walks `Children`), never despawned. This is the
+/// orphan-leak bug — this function identifies which current children hit
+/// it so the caller can despawn them explicitly instead of leaking them
+/// until app restart.
+///
+/// Pure function — takes membership predicates instead of `Query` so it's
+/// unit-testable without ECS.
+pub fn find_orphaned_children(
+    current_children: &[Entity],
+    ordered_children: &[Entity],
+    is_block_cell: impl Fn(Entity) -> bool,
+    is_role_header: impl Fn(Entity) -> bool,
+) -> Vec<Entity> {
+    let ordered_set: std::collections::HashSet<Entity> =
+        ordered_children.iter().copied().collect();
+    current_children
+        .iter()
+        .copied()
+        .filter(|&child| !ordered_set.contains(&child))
+        .filter(|&child| is_block_cell(child) || is_role_header(child))
+        .collect()
+}
+
 /// Reorder ConversationContainer children to match document order.
 ///
-/// Interleaves role headers before their associated blocks.
+/// Interleaves role headers before their associated blocks. Any current
+/// child that would otherwise be silently orphaned by `replace_children`
+/// (a live `BlockCell`/`RoleGroupBorder` missing from the computed order)
+/// is despawned explicitly and logged loudly — see `find_orphaned_children`.
+/// Likewise, a live block with no container entry is logged loudly instead
+/// of just vanishing from the render order — see `compute_ordered_children`.
 pub fn reorder_conversation_children(
     entities: Res<EditorEntities>,
     mut commands: Commands,
     containers: Query<&BlockCellContainer>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     role_headers: Query<&RoleGroupBorder>,
+    block_cell_entities: Query<Entity, With<BlockCell>>,
     children_query: Query<&Children>,
     layout_gen: Res<LayoutGeneration>,
     mut last_gen: Local<u64>,
@@ -412,8 +490,6 @@ pub fn reorder_conversation_children(
     };
 
     let blocks = editor.blocks();
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
-    let mut ordered_children = Vec::new();
 
     let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
         std::collections::HashMap::new();
@@ -423,33 +499,46 @@ pub fn reorder_conversation_children(
         }
     }
 
-    for block in &blocks {
-        // Skip tool blocks for role transition tracking (they use fieldset borders)
-        let dominated_by_border = block.kind == kaijutsu_crdt::BlockKind::ToolCall
-            || block.kind == kaijutsu_crdt::BlockKind::ToolResult;
+    let ordered_children = compute_ordered_children(&blocks, container, &header_map, |block| {
+        error!(
+            "reorder_conversation_children: block {:?} (kind={:?}) is in editor.blocks() \
+             but has no BlockCellContainer entry — dropped from render order this frame; \
+             spawn_block_cells should have created it",
+            block.id, block.kind
+        );
+    });
 
-        if !dominated_by_border {
-            let is_transition = prev_role != Some(block.role);
-            if is_transition && let Some(&header_ent) = header_map.get(&block.id) {
-                ordered_children.push(header_ent);
-            }
-            prev_role = Some(block.role);
-        }
-        if let Some(block_ent) = container.get_entity(&block.id) {
-            ordered_children.push(block_ent);
-        }
+    let current_children: Vec<Entity> = children_query
+        .get(conv_entity)
+        .map(|c| c.iter().collect())
+        .unwrap_or_default();
+
+    // command-flush timing: this system runs in CellPhase::Layout, after the
+    // CellPhase::Spawn and CellPhase::Buffer phases each end in an
+    // ApplyDeferred, and no system between there and here despawns entities.
+    // So every `current_children` entry here is either wanted (present in
+    // `ordered_children`) or a genuine orphan — never a same-frame pending
+    // despawn we'd be racing.
+    let orphans = find_orphaned_children(
+        &current_children,
+        &ordered_children,
+        |e| block_cell_entities.contains(e),
+        |e| role_headers.contains(e),
+    );
+    for orphan in orphans {
+        error!(
+            "reorder_conversation_children: entity {orphan:?} fell out of document order \
+             (missing from container or an ordering bug) — despawning instead of leaking it \
+             as an un-parented root UI node"
+        );
+        commands.entity(orphan).try_despawn();
     }
 
-    let current_children = children_query.get(conv_entity).ok();
-    let order_matches = current_children
-        .map(|children| {
-            children.len() == ordered_children.len()
-                && children
-                    .iter()
-                    .zip(ordered_children.iter())
-                    .all(|(a, b)| a == *b)
-        })
-        .unwrap_or(false);
+    let order_matches = current_children.len() == ordered_children.len()
+        && current_children
+            .iter()
+            .zip(ordered_children.iter())
+            .all(|(a, b)| a == b);
 
     if !order_matches && let Ok(mut ec) = commands.get_entity(conv_entity) {
         ec.replace_children(&ordered_children);
@@ -609,5 +698,310 @@ pub fn cull_offscreen_blocks(
         if *vis != target {
             *vis = target;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Role};
+
+    fn test_block_id(seq: u64) -> BlockId {
+        BlockId::new(ContextId::new(), PrincipalId::new(), seq)
+    }
+
+    fn text_block(id: BlockId, role: Role) -> kaijutsu_crdt::BlockSnapshot {
+        BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(role)
+            .build()
+    }
+
+    // ------------------------------------------------------------------
+    // compute_ordered_children
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compute_ordered_children_interleaves_header_at_role_transition() {
+        let user_id = test_block_id(0);
+        let model_id = test_block_id(1);
+        let blocks = vec![
+            text_block(user_id, Role::User),
+            text_block(model_id, Role::Model),
+        ];
+
+        let mut container = BlockCellContainer::default();
+        let user_ent = Entity::from_raw_u32(1).unwrap();
+        let model_ent = Entity::from_raw_u32(2).unwrap();
+        container.add(user_id, user_ent);
+        container.add(model_id, model_ent);
+
+        let header_ent = Entity::from_raw_u32(3).unwrap();
+        let mut header_map = std::collections::HashMap::new();
+        header_map.insert(model_id, header_ent);
+
+        let mut missing = Vec::new();
+        let ordered =
+            compute_ordered_children(&blocks, &container, &header_map, |b| missing.push(b.id));
+
+        assert!(missing.is_empty());
+        // No header registered for the first (User) block, so it opens the
+        // list; the Model transition's header is interleaved before it.
+        assert_eq!(ordered, vec![user_ent, header_ent, model_ent]);
+    }
+
+    #[test]
+    fn compute_ordered_children_reports_block_with_no_container_entry() {
+        let present_id = test_block_id(0);
+        let missing_id = test_block_id(1);
+        let blocks = vec![
+            text_block(present_id, Role::User),
+            text_block(missing_id, Role::User),
+        ];
+
+        let mut container = BlockCellContainer::default();
+        let present_ent = Entity::from_raw_u32(1).unwrap();
+        container.add(present_id, present_ent);
+        // missing_id deliberately has no container entry — this is the
+        // upstream-bug signature (spawn_block_cells lag / stale container).
+
+        let mut missing = Vec::new();
+        let ordered = compute_ordered_children(
+            &blocks,
+            &container,
+            &std::collections::HashMap::new(),
+            |b| missing.push(b.id),
+        );
+
+        assert_eq!(ordered, vec![present_ent]);
+        assert_eq!(missing, vec![missing_id]);
+    }
+
+    // ------------------------------------------------------------------
+    // find_orphaned_children
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn find_orphaned_children_ignores_entities_still_in_ordered_list() {
+        let a = Entity::from_raw_u32(1).unwrap();
+        let b = Entity::from_raw_u32(2).unwrap();
+        let orphans =
+            find_orphaned_children(&[a, b], &[b, a], |_| true, |_| false);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn find_orphaned_children_flags_live_block_cell_missing_from_order() {
+        let kept = Entity::from_raw_u32(1).unwrap();
+        let leaked = Entity::from_raw_u32(2).unwrap();
+        // `leaked` is a live BlockCell that fell out of `ordered_children`
+        // (e.g. missing container entry) — this is the leak this function
+        // exists to catch, per the diagnosed replace_children orphan bug.
+        let orphans = find_orphaned_children(
+            &[kept, leaked],
+            &[kept],
+            |e| e == leaked,
+            |_| false,
+        );
+        assert_eq!(orphans, vec![leaked]);
+    }
+
+    #[test]
+    fn find_orphaned_children_flags_live_role_header_missing_from_order() {
+        let kept = Entity::from_raw_u32(1).unwrap();
+        let leaked = Entity::from_raw_u32(2).unwrap();
+        let orphans = find_orphaned_children(
+            &[kept, leaked],
+            &[kept],
+            |_| false,
+            |e| e == leaked,
+        );
+        assert_eq!(orphans, vec![leaked]);
+    }
+
+    #[test]
+    fn find_orphaned_children_leaves_neither_kind_alone() {
+        // An entity that fell out of order but is neither a live BlockCell
+        // nor a live RoleGroupBorder (e.g. already despawned, or some other
+        // node type) is not this function's problem to solve — it's not
+        // flagged.
+        let kept = Entity::from_raw_u32(1).unwrap();
+        let other = Entity::from_raw_u32(2).unwrap();
+        let orphans = find_orphaned_children(
+            &[kept, other],
+            &[kept],
+            |_| false,
+            |_| false,
+        );
+        assert!(orphans.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // reorder_conversation_children — full-system integration test
+    // ------------------------------------------------------------------
+    //
+    // Exercises the real system (not just the extracted pure helpers) over
+    // a minimal headless `App`: no rendering plugins are registered, only
+    // the ECS resources/components reorder_conversation_children touches.
+    // Bevy's parent/child relationship (ChildOf/Children) is core ECS
+    // (component hooks), not a plugin, so `add_child`/`replace_children`
+    // work without DefaultPlugins.
+
+    use kaijutsu_crdt::{ContentType, Status};
+
+    fn build_test_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<LayoutGeneration>();
+        app.init_resource::<ConversationScrollState>();
+        app.add_systems(Update, reorder_conversation_children);
+        app
+    }
+
+    /// Spawn a MainCell + CellEditor with `n` text blocks inserted in
+    /// document order, plus matching BlockCell entities parented under a
+    /// fresh conversation container (in that same order — the "everything
+    /// already agrees" starting point each test then perturbs).
+    fn seed_conversation(app: &mut App, block_count: usize) -> (Vec<BlockId>, Entity) {
+        let mut editor = CellEditor::new();
+        let mut ids = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            let id = editor
+                .store
+                .insert_block(
+                    None,
+                    ids.last(),
+                    Role::User,
+                    BlockKind::Text,
+                    format!("block {i}"),
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert_block");
+            ids.push(id);
+        }
+
+        let main_ent = app.world_mut().spawn((editor, MainCell)).id();
+
+        let mut container = BlockCellContainer::default();
+        let mut cell_entities = Vec::with_capacity(block_count);
+        for &id in &ids {
+            let ent = app.world_mut().spawn(BlockCell::new(id)).id();
+            container.add(id, ent);
+            cell_entities.push(ent);
+        }
+        app.world_mut().entity_mut(main_ent).insert(container);
+
+        let conv_ent = app.world_mut().spawn(Node::default()).id();
+        app.world_mut()
+            .entity_mut(conv_ent)
+            .add_children(&cell_entities);
+
+        {
+            let mut entities = app.world_mut().resource_mut::<EditorEntities>();
+            entities.main_cell = Some(main_ent);
+            entities.conversation_container = Some(conv_ent);
+        }
+
+        (ids, conv_ent)
+    }
+
+    fn children_of(app: &App, entity: Entity) -> Vec<Entity> {
+        app.world()
+            .get::<Children>(entity)
+            .map(|c| c.iter().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn reorder_repairs_children_after_order_only_change() {
+        let mut app = build_test_app();
+        let (ids, conv_ent) = seed_conversation(&mut app, 3);
+
+        // Starting order already matches document order — confirm the
+        // baseline, then run once so `last_gen` catches up to gen 0 (no
+        // bump has happened yet, so the system should no-op).
+        app.update();
+        assert_eq!(children_of(&app, conv_ent), {
+            let container = app
+                .world()
+                .get::<BlockCellContainer>(
+                    app.world().resource::<EditorEntities>().main_cell.unwrap(),
+                )
+                .unwrap();
+            ids.iter().map(|id| container.get_entity(id).unwrap()).collect::<Vec<_>>()
+        });
+
+        // Reposition the last block to the front via move_block — a pure
+        // order change with no additions/removals, same shape as a server
+        // BlockMoved or a merge reposition.
+        let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
+        {
+            let mut editor = app.world_mut().get_mut::<CellEditor>(main_ent).unwrap();
+            editor.store.move_block(&ids[2], None).expect("move_block");
+        }
+
+        // Simulate spawn_block_cells's job: resort the container to match
+        // the new document order and bump LayoutGeneration (fix #1).
+        let new_order = {
+            let editor = app.world().get::<CellEditor>(main_ent).unwrap();
+            editor.block_ids()
+        };
+        {
+            let mut container = app
+                .world_mut()
+                .get_mut::<BlockCellContainer>(main_ent)
+                .unwrap();
+            let changed = container.resort_to_document_order(&new_order);
+            assert!(changed, "order-only move should be detected as a change");
+        }
+        app.world_mut().resource_mut::<LayoutGeneration>().bump();
+
+        app.update();
+
+        let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
+        let expected: Vec<Entity> = new_order
+            .iter()
+            .map(|id| container.get_entity(id).unwrap())
+            .collect();
+        assert_eq!(
+            children_of(&app, conv_ent),
+            expected,
+            "reorder_conversation_children must repair Children to match the new document order"
+        );
+    }
+
+    #[test]
+    fn reorder_despawns_orphaned_block_cell_instead_of_leaking_it() {
+        let mut app = build_test_app();
+        let (ids, conv_ent) = seed_conversation(&mut app, 2);
+        let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
+
+        // Remove the second block's container entry without despawning its
+        // entity or removing it from editor.blocks() — simulating the
+        // orphan-leak bug: replace_children would otherwise silently drop
+        // this live BlockCell into a root UI node.
+        let orphan_ent = {
+            let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
+            container.get_entity(&ids[1]).unwrap()
+        };
+        {
+            let mut container = app
+                .world_mut()
+                .get_mut::<BlockCellContainer>(main_ent)
+                .unwrap();
+            container.remove(orphan_ent);
+        }
+
+        app.world_mut().resource_mut::<LayoutGeneration>().bump();
+        app.update();
+
+        assert!(
+            app.world().get_entity(orphan_ent).is_err(),
+            "orphaned BlockCell must be despawned, not left as a leaked root UI node"
+        );
+        assert!(
+            !children_of(&app, conv_ent).contains(&orphan_ent),
+            "orphaned BlockCell must not remain a child of the conversation container"
+        );
     }
 }

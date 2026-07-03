@@ -898,6 +898,34 @@ impl BlockCellContainer {
     pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
         self.block_cells.values().copied()
     }
+
+    /// Re-sort `block_cells` to match `current_blocks` (document order).
+    ///
+    /// Returns `true` if the sort actually changed key order. A pure
+    /// position change — a server `BlockMoved`, or a merge that repositions
+    /// an existing block without adding/removing any — must still surface
+    /// as "order changed" so the caller can bump `LayoutGeneration`.
+    /// Previously this sort ran unconditionally but nothing downstream
+    /// noticed unless a block was also added or removed, so
+    /// `reorder_conversation_children` never re-ran and the visual order
+    /// went stale until app restart.
+    pub fn resort_to_document_order(&mut self, current_blocks: &[BlockId]) -> bool {
+        let before: Vec<BlockId> = self.block_cells.keys().copied().collect();
+
+        let order: std::collections::HashMap<&BlockId, usize> = current_blocks
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
+        self.block_cells.sort_by(|a, _, b, _| {
+            let a_idx = order.get(a).copied().unwrap_or(usize::MAX);
+            let b_idx = order.get(b).copied().unwrap_or(usize::MAX);
+            a_idx.cmp(&b_idx)
+        });
+
+        let after: Vec<BlockId> = self.block_cells.keys().copied().collect();
+        before != after
+    }
 }
 
 /// Computed layout for a block cell.
@@ -941,6 +969,52 @@ pub struct RoleGroupBorderLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_block_id(seq: u64) -> BlockId {
+        BlockId::new(ContextId::new(), PrincipalId::new(), seq)
+    }
+
+    #[test]
+    fn resort_to_document_order_reports_no_change_when_already_sorted() {
+        let ids: Vec<BlockId> = (0..3).map(test_block_id).collect();
+        let mut container = BlockCellContainer::default();
+        for id in &ids {
+            container.add(*id, Entity::PLACEHOLDER);
+        }
+        assert!(!container.resort_to_document_order(&ids));
+    }
+
+    #[test]
+    fn resort_to_document_order_reports_change_on_pure_reorder() {
+        // Container built in insertion order A, B, C — then the document
+        // order moves C to the front (a BlockMoved / merge reposition with
+        // no additions or removals). This is the exact case that used to
+        // slip past spawn_block_cells's bump gate.
+        let ids: Vec<BlockId> = (0..3).map(test_block_id).collect();
+        let mut container = BlockCellContainer::default();
+        for id in &ids {
+            container.add(*id, Entity::PLACEHOLDER);
+        }
+
+        let document_order = vec![ids[2], ids[0], ids[1]];
+        assert!(container.resort_to_document_order(&document_order));
+
+        let after: Vec<BlockId> = container.block_cells.keys().copied().collect();
+        assert_eq!(after, document_order);
+    }
+
+    #[test]
+    fn resort_to_document_order_is_idempotent() {
+        let ids: Vec<BlockId> = (0..3).map(test_block_id).collect();
+        let mut container = BlockCellContainer::default();
+        for id in &ids {
+            container.add(*id, Entity::PLACEHOLDER);
+        }
+        let document_order = vec![ids[1], ids[2], ids[0]];
+        assert!(container.resort_to_document_order(&document_order));
+        // Second call against the same target order changes nothing further.
+        assert!(!container.resort_to_document_order(&document_order));
+    }
 
     fn scroll_state(
         content_height: f32,
