@@ -302,6 +302,25 @@ const TERRACE_DEPTH_GAP: f32 = 60.0;
 /// Number of terraces — one per [`Band`] variant.
 const N_TERRACES: usize = ALL_BANDS.len();
 
+/// One `(radius, depth)` pair per **interior** terrace boundary — the seam
+/// between band `k` and band `k + 1`, for `k` in `0..N_TERRACES - 1`
+/// (`N_TERRACES - 1` boundaries total; there is no boundary past the deepest
+/// terrace). Boundary `k` sits at band `k`'s inner (deep) edge:
+/// `terrace_envelope(k)`'s `radius_inner` (≈ the next band's outer radius —
+/// the shared step between the two terraces) and `depth_far` (how deep band
+/// `k`'s own envelope reaches). Single source of terrace-boundary geometry for
+/// the magic-circle ring visual (`terrace_ring_material`/`terrace_ring.wgsl`)
+/// so the terrace math stays in one place rather than re-derived at the call
+/// site.
+pub fn terrace_ring_geometry() -> Vec<(f32, f32)> {
+    (0..N_TERRACES - 1)
+        .map(|k| {
+            let (_radius_outer, radius_inner, _depth_near, depth_far) = terrace_envelope(k);
+            (radius_inner, depth_far)
+        })
+        .collect()
+}
+
 /// The `(radius_outer, radius_inner, depth_near, depth_far)` envelope band
 /// `band_index` (0 = `HotNow` … `N_TERRACES - 1` = `Horizon`) reserves for
 /// itself: the total mouth→throat radius/depth span divided evenly into
@@ -884,6 +903,25 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), labels.len(), "every band gets its own label text");
+    }
+
+    #[test]
+    fn terrace_ring_geometry_has_one_ring_per_interior_boundary() {
+        let rings = terrace_ring_geometry();
+        assert_eq!(rings.len(), N_TERRACES - 1, "one ring per interior boundary");
+
+        let mut prev_depth_mag = 0.0f32;
+        for (i, (radius, depth)) in rings.iter().enumerate() {
+            assert!(
+                *radius >= SPIRAL_R_THROAT - 1e-3 && *radius <= SPIRAL_R_MOUTH + 1e-3,
+                "ring {i} radius {radius} must sit within [{SPIRAL_R_THROAT}, {SPIRAL_R_MOUTH}]"
+            );
+            assert!(
+                depth.abs() > prev_depth_mag,
+                "ring {i} depth {depth} must be strictly deeper (larger magnitude) than the previous ring's {prev_depth_mag}"
+            );
+            prev_depth_mag = depth.abs();
+        }
     }
 
     #[test]

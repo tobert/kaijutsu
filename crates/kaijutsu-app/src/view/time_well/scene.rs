@@ -69,6 +69,15 @@ pub struct ReadingCard;
 #[derive(Component)]
 pub struct WellRingsDeck;
 
+/// A magic-circle ring at one terrace boundary (the Konosuba/"Explosion"-spell
+/// aesthetic — concentric glyph rings, counter-rotating, receding into the
+/// funnel). One entity per interior terrace boundary (see
+/// [`super::card::terrace_ring_geometry`]), driven by
+/// [`crate::shaders::TerraceRingMaterial`]. Despawned on exit alongside the
+/// rest of the well.
+#[derive(Component)]
+pub struct TerraceRing;
+
 /// Where a card wants to be. A smoothing system eases `Transform.translation`
 /// toward this each frame — the "transitions are Bevy's job" stance from the
 /// design doc (no transition system, just a tween on `Transform`).
@@ -166,6 +175,30 @@ const RING_DECK_SIZE: f32 = 1100.0;
 /// receded throat and faces up toward the camera.
 const RING_DECK_DEPTH: f32 = -460.0;
 
+/// Terrace-ring quad side length, as a multiple of the boundary radius (a bit
+/// larger than the ring itself so the annulus band + its corner-fade sit
+/// comfortably inside the quad). **Amy-tunable.**
+const TERRACE_RING_QUAD_SCALE: f32 = 2.2;
+
+/// Half-width (fraction of the quad half-extent) of the visible annulus band,
+/// centered on the boundary radius (`1.0 / TERRACE_RING_QUAD_SCALE` as a
+/// fraction of the quad half-extent). **Amy-tunable.**
+const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.035;
+
+/// Base spin rate (radians/sec-ish, tune by eye) for terrace ring `k`; each
+/// deeper ring spins a touch faster so the funnel reads as receding motion.
+/// **Amy-tunable — kept calm for the first cut.**
+const TERRACE_RING_SPIN_BASE: f32 = 0.10;
+const TERRACE_RING_SPIN_STEP: f32 = 0.04;
+
+/// Overall alpha/intensity for the terrace rings — kept low for the first cut
+/// so the driver tunes up from a subtle starting point. **Amy-tunable.**
+const TERRACE_RING_ALPHA: f32 = 0.35;
+
+/// Glyph color for the terrace rings: an icy cyan-white that reads against
+/// [`WELL_BG`] (the concept-art magic-circle palette). **Amy-tunable.**
+const TERRACE_RING_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
+
 /// Per-band recline (radians) layered on the billboard. With the whole funnel now
 /// reclined in space (see [`super::card::WELL_TILT`]), the cards read their 3D
 /// form from their *positions* and should face the camera cleanly, so the recline
@@ -206,6 +239,7 @@ pub fn enter_time_well(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
+    mut terrace_ring_materials: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
 ) {
@@ -263,6 +297,40 @@ pub fn enter_time_well(
         Name::new("WellRingsDeck"),
     ));
 
+    // Terrace magic-circle rings: one annulus quad per interior terrace
+    // boundary (the Konosuba/"Explosion"-spell aesthetic), counter-rotating
+    // and receding into the funnel on the same tilted axis as the deck/cards.
+    for (k, (radius, depth)) in super::card::terrace_ring_geometry().into_iter().enumerate() {
+        let side = TERRACE_RING_QUAD_SCALE * radius;
+        let ring_mesh = meshes.add(Rectangle::new(side, side));
+        let frac = 1.0 / TERRACE_RING_QUAD_SCALE;
+        let inner_frac = frac - TERRACE_RING_BAND_HALF_WIDTH;
+        let outer_frac = frac + TERRACE_RING_BAND_HALF_WIDTH;
+        let spin_dir = if k % 2 == 0 { 1.0 } else { -1.0 };
+        let spin_rate = TERRACE_RING_SPIN_BASE + TERRACE_RING_SPIN_STEP * k as f32;
+        let ring_material = terrace_ring_materials.add(crate::shaders::TerraceRingMaterial::new(
+            inner_frac,
+            outer_frac,
+            spin_rate,
+            spin_dir,
+            TERRACE_RING_COLOR,
+            TERRACE_RING_ALPHA,
+        ));
+        let ring_pos = tilt * Vec3::new(0.0, 0.0, depth);
+        commands.spawn((
+            TerraceRing,
+            Mesh3d(ring_mesh),
+            MeshMaterial3d(ring_material),
+            Transform {
+                translation: ring_pos,
+                rotation: tilt,
+                scale: Vec3::ONE,
+            },
+            Visibility::Inherited,
+            Name::new(format!("TerraceRing{k}")),
+        ));
+    }
+
     // Focus card: an in-world 3D card floating lower-center at the mouth of the
     // well (not a flat HUD panel — it lives in the scene, billboarded, and the
     // camera dollies into it on focus). It renders the current selection;
@@ -304,6 +372,7 @@ pub fn exit_time_well(
     cards: Query<Entity, With<Card>>,
     reading: Query<Entity, With<ReadingCard>>,
     decks: Query<Entity, With<WellRingsDeck>>,
+    terrace_rings: Query<Entity, With<TerraceRing>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
     for e in roots
@@ -311,6 +380,7 @@ pub fn exit_time_well(
         .chain(cards.iter())
         .chain(reading.iter())
         .chain(decks.iter())
+        .chain(terrace_rings.iter())
     {
         commands.entity(e).despawn();
     }

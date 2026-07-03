@@ -36,6 +36,7 @@ impl Plugin for TimeWellPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<crate::shaders::WellCardMaterial>::default())
             .add_plugins(MaterialPlugin::<crate::shaders::WellRingsMaterial>::default())
+            .add_plugins(MaterialPlugin::<crate::shaders::TerraceRingMaterial>::default())
             .init_resource::<scene::TimeWellState>()
             .init_resource::<activity::RingActivity>()
             .add_systems(
