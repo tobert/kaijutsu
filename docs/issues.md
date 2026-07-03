@@ -591,6 +591,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
 
+- **Time well evolution — plan is canonical in `docs/timewell.md` (2026-07-03).**
+  Staged: 0 tourniquet (hot sort newest-first) → 1 `last_activity_at` on the wire
+  (+ incremental liveStatus, replacing the every-poll all-blocks scan) → 2 stable
+  `0–9` rank slots (kernel-owned, mux semantics) → 3 `TrackInfo`/`listTracks` +
+  optional-cadence attachment + track decks in the well → 4 track→context→detail
+  progression → 5 event-horizon cutoff + LOD + `/` archive search → 6 polish.
+  Individual entries below fold into those stages as they ship.
+- **Doc/code hygiene from the 2026-07-03 review** (do with timewell Stage 0):
+  trim `viz-substrate.md`'s superseded three-band layout + build order to a
+  pointer; delete dead `CompactingBandLayout`/`RadialBands`/`LayoutConfig` from
+  `kaijutsu-viz/src/layout.rs` (no consumer since the 7.8 spiral; decision
+  recorded in timewell.md); pointer atop `time-well-concepts.md`.
 - **HDR bloom follow-on:** drive the well cards' SDF rims/pulses to HDR (>1.0)
   so they bloom brightly (`WellCardMaterial` `params`/emissive). (The shared
   single-camera HDR+Bloom fix itself shipped 2026-06-17; devlog.)
