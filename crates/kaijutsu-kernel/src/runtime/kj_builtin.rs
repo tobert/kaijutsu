@@ -774,6 +774,7 @@ mod tests {
             ctx,
             session_id,
                         session_contexts,
+            crate::runtime::embedded_kaish::ExternalExec::Deny,
             configure_tools,
         )
         .expect("EmbeddedKaish init")

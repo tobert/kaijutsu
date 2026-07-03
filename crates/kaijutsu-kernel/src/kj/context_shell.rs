@@ -199,6 +199,23 @@ impl KjDispatcher {
                 configure_tools,
             )?
         } else {
+            // Host subprocess policy from the context's loadout: the `exec`
+            // authority (deny-by-default — a context with no binding, or a
+            // binding without the grant, gets no external commands). PATH is
+            // the kernel's startup capture; kaish never reads OS env itself.
+            let external_exec = if self
+                .kernel()
+                .broker()
+                .binding(&context_id)
+                .await
+                .is_some_and(|b| b.allows(&crate::mcp::Capability::Exec))
+            {
+                crate::runtime::embedded_kaish::ExternalExec::Allow {
+                    path: self.kernel().host_path().map(str::to_string),
+                }
+            } else {
+                crate::runtime::embedded_kaish::ExternalExec::Deny
+            };
             EmbeddedKaish::with_identity(
                 name,
                 self.block_store().clone(),
@@ -208,6 +225,7 @@ impl KjDispatcher {
                 context_id,
                 session_id,
                 session_contexts,
+                external_exec,
                 configure_tools,
             )?
         };

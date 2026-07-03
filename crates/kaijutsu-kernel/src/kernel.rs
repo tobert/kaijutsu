@@ -279,6 +279,18 @@ impl Kernel {
         &self.broker
     }
 
+    /// The host `PATH` this kernel process started with — the `$PATH` seed for
+    /// exec-granted shells (kaish never reads OS env itself; see
+    /// `ExternalExec`). Captured once on first use and frozen: the kernel
+    /// process env is stable, and a snapshot keeps every materialized shell
+    /// seeing the same search path for the kernel's lifetime.
+    pub fn host_path(&self) -> Option<&str> {
+        static HOST_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        HOST_PATH
+            .get_or_init(|| std::env::var("PATH").ok())
+            .as_deref()
+    }
+
     /// Kernel-wide timeout policy. Read-only today; future revisions will
     /// load this from the config CRDT and expose RPC mutation via the kj CLI.
     pub fn timeouts(&self) -> &kaijutsu_types::TimeoutPolicy {

@@ -9,3 +9,7 @@ kj binding allow "fork"
 kj binding allow "drift"
 kj binding allow "transport"
 kj binding allow "operator"
+# Host subprocess exec from the context shell (cargo, git, aconnect…). A
+# subprocess bypasses the VFS entirely, so it's a dedicated authority — the
+# narrow roles (musician, toolie) never carry it.
+kj binding allow "exec"

@@ -113,6 +113,17 @@ pub trait VfsOps: Send + Sync {
     /// Returns `Err` if the path doesn't exist or escapes the mount root.
     async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>>;
 
+    /// The real host directory backing this mount's root, when the whole mount
+    /// is a 1:1 view of one (LocalBackend). **Sync** — the seam for callers
+    /// that can't await, like subprocess cwd resolution
+    /// (`MountBackend::resolve_real_path`, a sync kaish trait method). Purely
+    /// structural: no existence check, no per-path symlink resolution — pair
+    /// it with [`Self::real_path`] when those matter. Virtual/CRDT backends
+    /// keep the `None` default.
+    fn real_root(&self) -> Option<PathBuf> {
+        None
+    }
+
     // ========================================================================
     // Convenience methods (default implementations)
     // ========================================================================

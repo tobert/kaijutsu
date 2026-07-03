@@ -1808,39 +1808,39 @@ PipeWire `pw-cli`/`wpctl`, `which`, etc.) silently fails with no obvious
 workaround from inside an agent turn. We had to ask the user to run `aconnect 128:0
 129:0` manually to wire the app's render port to TiMidity.
 
-**Diagnosed 2026-07-03 — it's not PATH; external exec is compiled out, three
-layers deep** (verified live: `/usr/bin/true` → `command not found` in a
-*writable* shell):
+**Diagnosed + FIXED (slice 1) 2026-07-03 — it was never PATH; external exec was
+compiled out three layers deep.** Full design + direction now canonical in
+`docs/mounts.md` (the "opaque host" inversion: drop the host-root mount, curate
+PATH-dir bin mounts per context_type, VFS-mediated resolution upstream in kaish).
+Slice 1 shipped: `subprocess` feature on; `ExternalExec` deny-by-default policy at
+materialization gated on the new `exec` loadout authority (coder/mcp/default +
+director seeds grant it; musician/toolie never); `MountBackend::resolve_real_path`
+implemented (sync mount-table walk + `VfsOps::real_root`); `$PATH` seeded from the
+kernel process env into exec-granted shells.
 
-1. **The `subprocess` cargo feature is off.** kaish-kernel's default features
-   are `["localfs", "overlay"]`; subprocess exec is opt-in by design ("the
-   dangerous surface is named, not inherited") and kaijutsu's workspace dep is
-   bare `kaish-kernel = "0.10"` — so `try_execute_external` is the
-   `#[cfg(not(subprocess))]` stub returning `None` and *everything* external
-   falls through to `command not found`, absolute paths included.
-   (`allow_external_commands` defaults to `cfg!(feature = "subprocess")`, so
-   the flag follows the feature; the explicit
-   `with_allow_external_commands(false)` for read-only shells at
-   `runtime/embedded_kaish.rs:261` is currently redundant belt-and-suspenders —
-   it becomes load-bearing the moment the feature turns on.)
-2. **Virtual cwd:** even with the feature on, `try_execute_external` skips when
-   `backend.resolve_real_path(cwd)` is `None` — and both kaijutsu backends
-   return `None` unconditionally (`runtime/mount_backend.rs:706` "MountTable's
-   real_path is async, but this trait method is sync";
-   `runtime/kaish_backend.rs:648`). Needs a sync mount-table lookup (host-mount
-   prefix → real path) before any external exec works.
-3. **PATH is never seeded:** kaish never reads OS env; the embedder seeds
-   `PATH` via initial vars (the REPL does, EmbeddedKaish doesn't). Absolute
-   paths bypass PATH, so this only gates bare names — seed a minimal PATH or
-   document absolute-path usage.
+**Open remainder:**
 
-**Desired fix:** decide whether writable-shell contexts get external exec at all
-(shared-trust says yes as an ergonomic surface; the read-only lever already
-exists and becomes the real gate). If yes: enable the `subprocess` feature,
-implement `resolve_real_path` over the mount table, seed a minimal `PATH`. If
-no (or independently): add a dedicated `kj audio` / `kj midi` subcommand surface
-for the common ALSA wiring operations (connect, disconnect, list-clients) so the
-agent doesn't need raw `aconnect` at all.
+- **Deploy latch:** rc seeds are once-only — the live kernel needs `kj rc reset`
+  on `lib/create/S10-binding.kai` + `director/create/S10-binding.kai`, and
+  existing coder/director/mcp contexts need a one-time `kj binding allow "exec"`
+  from a binding-admin context (only new contexts run create-rc).
+- **`kj audio` / `kj midi` verbs still worth having** for the ALSA wiring
+  operations (connect, disconnect, list-clients): the wire is kernel-owned state,
+  not a shell errand, and the musician-adjacent flow shouldn't need raw
+  `aconnect` even with exec working. Related: nothing owns the
+  `aconnect 128:0 129:0` app→TiMidity wire; it dies on every app restart (the
+  app auto-connecting its render port when TiMidity is present is the likely
+  home).
+- **Unknown-command 300 s hang (found 2026-07-03, same investigation):** a bare
+  `mount` in the context shell hung the full shell timeout instead of failing
+  fast. `mount` is not a kaish builtin, so dispatch fell through to the
+  last-resort backend tool lookup (`backend.call_tool` → kernel tool registry)
+  and something in that path wedged — compare `git` (pre-fix), which returned
+  `command not found` immediately. The unknown-command path must be
+  loud-and-fast, never a 300 s stall; find the wedge in the backend dispatch
+  fallthrough.
+- **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
+  host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
 
 ---
 

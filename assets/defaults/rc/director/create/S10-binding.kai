@@ -26,6 +26,10 @@ kj binding allow "fork"
 kj binding allow "drift"
 kj binding allow "transport"
 kj binding allow "operator"
+# Host subprocess exec from the context shell — the director's operational
+# reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
+# the VFS, so it's a dedicated authority, not implied by anything above.
+kj binding allow "exec"
 # Facades: full interaction surface (shell + edit + submit). `shell` is the
 # context-bound shell tool; `edit_input` covers write_input too.
 kj binding allow "facade:shell"

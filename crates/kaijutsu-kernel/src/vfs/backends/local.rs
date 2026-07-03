@@ -452,6 +452,11 @@ impl VfsOps for LocalBackend {
         }
     }
 
+    fn real_root(&self) -> Option<PathBuf> {
+        // Root is canonicalized at construction; a 1:1 host-directory view.
+        Some(self.root.clone())
+    }
+
     async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>> {
         // Strip leading slash if present
         let path = path.strip_prefix("/").unwrap_or(path);

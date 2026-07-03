@@ -41,7 +41,10 @@ kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 
 # Kaish (execution engine + client) — pinned to published 0.10.
-kaish-kernel = "0.10"
+# `subprocess` compiles in host external-command execution; whether a given
+# shell may actually use it is decided per-context at materialization
+# (ExternalExec, gated on the `exec` loadout authority — deny by default).
+kaish-kernel = { version = "0.10", features = ["subprocess"] }
 kaish-glob = "0.10"
 kaish-types = "0.10"
 

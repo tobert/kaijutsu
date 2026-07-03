@@ -200,6 +200,74 @@ impl MountTable {
         best_match.map(|(mount_path, fs)| (mount_path.clone(), Arc::clone(fs)))
     }
 
+    /// Sync virtual→real path resolution for the subprocess seam: kaish's
+    /// `KernelBackend::resolve_real_path` is a sync trait method, so it can't
+    /// ride the async [`Self::real_path`]. Longest-prefix owner (same rule as
+    /// [`Self::owner_of`]) → the owner's structural [`VfsOps::real_root`] +
+    /// the relative remainder. `None` for virtual mounts (CRDT/memory) and
+    /// unmounted paths — the caller treats that as "no host cwd, skip external
+    /// exec". Purely structural: no existence check, no symlink resolution
+    /// (the spawned child's own syscalls resolve those).
+    ///
+    /// Uses `try_read`: the table is frozen right after startup mounts, so a
+    /// write-held lock is effectively impossible — but if it ever happens we
+    /// warn loudly rather than silently degrade, because the visible symptom
+    /// ("command not found" for a real binary) points nowhere near here.
+    pub fn resolve_real_path_sync(&self, path: &Path) -> Option<PathBuf> {
+        let path_str = path.to_string_lossy();
+        let normalized = if path_str.starts_with('/') {
+            path_str.into_owned()
+        } else {
+            format!("/{}", path_str)
+        };
+
+        let mounts = match self.mounts.try_read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::warn!(
+                    path = %normalized,
+                    "resolve_real_path_sync: mount table write-locked; \
+                     external command resolution will fail this call"
+                );
+                return None;
+            }
+        };
+
+        // Longest matching mount point — same matching rule as `owner_of`.
+        let mut best: Option<(&PathBuf, &Arc<dyn VfsOps>)> = None;
+        for (mount_path, fs) in mounts.iter() {
+            let mount_str = mount_path.to_string_lossy();
+            let is_match = if mount_str == "/" {
+                true
+            } else {
+                normalized == mount_str.as_ref()
+                    || normalized.starts_with(&format!("{}/", mount_str))
+            };
+            if is_match
+                && best.is_none_or(|(b, _)| mount_path.as_os_str().len() > b.as_os_str().len())
+            {
+                best = Some((mount_path, fs));
+            }
+        }
+        let (mount_path, fs) = best?;
+        let root = fs.real_root()?;
+
+        let mount_str = mount_path.to_string_lossy();
+        let relative = if mount_str == "/" {
+            normalized.trim_start_matches('/')
+        } else {
+            normalized
+                .strip_prefix(mount_str.as_ref())
+                .unwrap_or("")
+                .trim_start_matches('/')
+        };
+        if relative.is_empty() {
+            Some(root)
+        } else {
+            Some(root.join(relative))
+        }
+    }
+
     /// Find the mount point for a given path.
     ///
     /// Returns the mount and the path relative to that mount.
@@ -666,6 +734,42 @@ mod tests {
         let real = real.unwrap();
         assert!(real.is_absolute());
         assert!(real.ends_with("test.txt"));
+    }
+
+    /// The subprocess seam: sync resolution maps Local-backed mounts to real
+    /// host paths (longest-prefix wins), and virtual mounts yield `None` so
+    /// external exec is skipped for CRDT/memory cwds.
+    #[tokio::test]
+    async fn resolve_real_path_sync_maps_local_and_skips_virtual() {
+        use crate::vfs::backends::LocalBackend;
+
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir().unwrap();
+
+        let table = MountTable::new();
+        table.mount("/", LocalBackend::read_only(outer.path())).await;
+        table
+            .mount("/mnt/project", LocalBackend::new(inner.path()))
+            .await;
+        table.mount("/scratch", MemoryBackend::new()).await;
+
+        // Longest prefix: /mnt/project/* maps into the inner root…
+        let real = table
+            .resolve_real_path_sync(Path::new("/mnt/project/src/lib.rs"))
+            .expect("local mount resolves");
+        assert_eq!(real, inner.path().canonicalize().unwrap().join("src/lib.rs"));
+        // …the mount point itself maps to the root exactly…
+        assert_eq!(
+            table.resolve_real_path_sync(Path::new("/mnt/project")),
+            Some(inner.path().canonicalize().unwrap()),
+        );
+        // …everything else falls to "/" (relative remainder preserved)…
+        assert_eq!(
+            table.resolve_real_path_sync(Path::new("/home/user")),
+            Some(outer.path().canonicalize().unwrap().join("home/user")),
+        );
+        // …and a virtual mount has no real side.
+        assert_eq!(table.resolve_real_path_sync(Path::new("/scratch/x")), None);
     }
 
     #[tokio::test]

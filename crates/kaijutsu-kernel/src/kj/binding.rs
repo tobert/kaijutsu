@@ -383,7 +383,8 @@ pub(crate) fn cap_label(cap: &Capability) -> String {
         | Capability::Drift
         | Capability::Transport
         | Capability::Operator
-        | Capability::ConfigWrite => cap
+        | Capability::ConfigWrite
+        | Capability::Exec => cap
             .authority_name()
             .expect("authority variant has a token")
             .to_string(),

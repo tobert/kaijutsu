@@ -68,6 +68,22 @@ pub struct EmbeddedKaish {
     timeouts: kaijutsu_types::TimeoutPolicy,
 }
 
+/// Whether a materialized shell may spawn host subprocesses, and the `$PATH`
+/// it sees. Decided at materialization from the context's loadout (the `exec`
+/// authority — see `Capability::Exec`): kaish's `subprocess` feature is
+/// compiled in workspace-wide, so *every* shell must pass an explicit policy —
+/// deny-by-default, never inherited from kaish's feature-driven default.
+#[derive(Clone, Debug, Default)]
+pub enum ExternalExec {
+    /// No host subprocesses: unknown commands fail fast as `command not found`.
+    /// Builtins, `kj`, and backend tools are unaffected.
+    #[default]
+    Deny,
+    /// Host subprocess exec enabled. `path` seeds `$PATH` in the shell's scope
+    /// (kaish never reads OS env); absolute paths work regardless of `path`.
+    Allow { path: Option<String> },
+}
+
 impl EmbeddedKaish {
     /// Create a new embedded kaish executor with default identity.
     ///
@@ -88,6 +104,7 @@ impl EmbeddedKaish {
             ContextId::new(),
             SessionId::new(),
             crate::runtime::context_engine::session_context_map(),
+            ExternalExec::Deny,
             |_, _, _| {},
         )
     }
@@ -109,6 +126,7 @@ impl EmbeddedKaish {
         context_id: ContextId,
         session_id: SessionId,
         session_contexts: SessionContextMap,
+        external_exec: ExternalExec,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         Self::with_identity_mode(
@@ -121,6 +139,7 @@ impl EmbeddedKaish {
             session_id,
             session_contexts,
             false,
+            external_exec,
             configure_tools,
         )
     }
@@ -152,6 +171,9 @@ impl EmbeddedKaish {
             session_id,
             session_contexts,
             true,
+            // Read-only never spawns: external exec is the sandbox's fourth
+            // lever, held Deny by construction (no caller choice to get wrong).
+            ExternalExec::Deny,
             configure_tools,
         )
     }
@@ -173,6 +195,7 @@ impl EmbeddedKaish {
         session_id: SessionId,
         session_contexts: SessionContextMap,
         read_only: bool,
+        external_exec: ExternalExec,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         // Initialize session map entry if missing
@@ -253,12 +276,25 @@ impl EmbeddedKaish {
         // `ExecuteOptions::with_timeout` for stricter per-context bounds.
         config.request_timeout = Some(kernel.timeouts().kaish_request_timeout);
 
-        // Read-only's third lever (belt-and-suspenders alongside the read-only
-        // MountBackend + read-only `/v/*` mounts): no external commands. So a
-        // read-only shell can't shell out to `rm`/`git commit`/etc. and write
-        // through a path the VFS doesn't gate.
-        if read_only {
-            config = config.with_allow_external_commands(false);
+        // Host subprocess policy. With kaish's `subprocess` feature compiled
+        // in, `allow_external_commands` would default to true — so every shell
+        // states its policy explicitly, decided by the caller from the
+        // context's loadout (`exec` authority). Deny keeps the old behavior:
+        // unknown commands fail fast, builtins/kj unaffected. For read-only
+        // shells Deny is structural (the constructor pins it), the sandbox's
+        // fourth lever alongside the read-only MountBackend + `/v/*` wraps.
+        match &external_exec {
+            ExternalExec::Deny => {
+                config = config.with_allow_external_commands(false);
+            }
+            ExternalExec::Allow { path } => {
+                config = config.with_allow_external_commands(true);
+                if let Some(p) = path {
+                    config
+                        .initial_vars
+                        .insert("PATH".to_string(), kaish_kernel::ast::Value::String(p.clone()));
+                }
+            }
         }
 
         // The CRDT document views (`/v/docs`, `/v/input`) are mounted directly
@@ -671,6 +707,65 @@ mod tests {
         assert_eq!(r.text_out().trim(), "/etc/rc/lib/create/binding.kai");
     }
 
+    /// The external-exec policy end to end: `Allow` + a Local-mounted cwd runs
+    /// a real host binary through kaish's subprocess path; `Deny` fails fast
+    /// with `command not found` (127) — no PATH, no absolute-path escape.
+    /// Linux-shaped by design (the runner/CI are): `/bin/sh` is the probe.
+    #[tokio::test]
+    async fn external_exec_policy_gates_host_subprocesses() {
+        let principal = kaijutsu_types::PrincipalId::system();
+        let blocks = shared_block_store(principal);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-exec").await);
+        // Real host root so the shell's cwd resolves to a real directory —
+        // the same shape as production's read-only "/" mount.
+        kernel
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+
+        let mk = |name: &str, exec: ExternalExec| {
+            EmbeddedKaish::with_identity(
+                name,
+                blocks.clone(),
+                kernel.clone(),
+                Some(std::env::temp_dir()),
+                principal,
+                ContextId::new(),
+                SessionId::new(),
+                crate::runtime::context_engine::session_context_map(),
+                exec,
+                |_, _, _| {},
+            )
+            .unwrap()
+        };
+
+        // Allow: absolute path spawns for real.
+        let allowed = mk(
+            "test-exec-allow",
+            ExternalExec::Allow { path: Some("/usr/bin:/bin".to_string()) },
+        );
+        let r = allowed
+            .execute_with_options("/bin/sh -c true", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(r.ok(), "Allow + absolute path must spawn: {}", r.err);
+
+        // Allow + seeded PATH: bare names resolve too.
+        let r = allowed
+            .execute_with_options("sh -c true", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(r.ok(), "Allow + PATH must resolve bare names: {}", r.err);
+
+        // Deny: the same absolute path fails fast as command-not-found.
+        let denied = mk("test-exec-deny", ExternalExec::Deny);
+        let r = denied
+            .execute_with_options("/bin/sh -c true", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(!r.ok(), "Deny must refuse external exec");
+        assert_eq!(r.code, 127, "fail-fast command-not-found: {}", r.err);
+    }
+
     #[tokio::test]
     async fn test_embedded_kaish_variables() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
@@ -790,6 +885,7 @@ mod tests {
             context_id,
             sid,
             session_contexts,
+            ExternalExec::Deny,
             |_, _, _| {},
         )
         .unwrap();
@@ -895,6 +991,7 @@ mod tests {
             context_id,
             sid,
             session_contexts,
+            ExternalExec::Deny,
             |_, _, _| {},
         )
         .unwrap();

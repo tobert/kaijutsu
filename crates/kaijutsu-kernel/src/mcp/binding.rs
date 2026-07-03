@@ -55,7 +55,7 @@ pub const KNOWN_FACADES: &[&str] = &["shell", "shell_readonly", "edit_input", "s
 /// the `context_binding_authorities` table — extensible (a future authority is
 /// a new variant + token, no schema migration).
 pub const KNOWN_AUTHORITIES: &[&str] =
-    &["drive", "fork", "drift", "transport", "operator", "config-write"];
+    &["drive", "fork", "drift", "transport", "operator", "config-write", "exec"];
 
 /// Builtin broker instances that are the in-kernel **projection** of a facade,
 /// as `(instance, facade)` pairs.
@@ -135,6 +135,14 @@ pub enum Capability {
     ///
     /// [`RcWrite`]: Capability::RcWrite
     ConfigWrite,
+    /// May spawn host subprocesses from the context shell (kaish external
+    /// commands). Enforced at kaish materialization, not per-call: a context
+    /// without this authority gets a shell with external execution disabled
+    /// (`command not found`), builtins and `kj` unaffected. Like every
+    /// authority, deliberately not implied by `*` — a subprocess bypasses the
+    /// VFS entirely (real syscalls on the real host), so the roles that don't
+    /// need it (musician, toolie) never carry the footgun.
+    Exec,
 }
 
 impl Capability {
@@ -151,6 +159,7 @@ impl Capability {
             Capability::Transport => "transport",
             Capability::Operator => "operator",
             Capability::ConfigWrite => "config-write",
+            Capability::Exec => "exec",
             _ => return None,
         })
     }
@@ -165,6 +174,7 @@ impl Capability {
             "transport" => Capability::Transport,
             "operator" => Capability::Operator,
             "config-write" => Capability::ConfigWrite,
+            "exec" => Capability::Exec,
             _ => return None,
         })
     }
@@ -296,7 +306,8 @@ impl ContextToolBinding {
             | Capability::Drift
             | Capability::Transport
             | Capability::Operator
-            | Capability::ConfigWrite => {
+            | Capability::ConfigWrite
+            | Capability::Exec => {
                 cap.authority_name().is_some_and(|n| self.authorities.contains(n))
             }
         }
@@ -336,7 +347,8 @@ impl ContextToolBinding {
             | Capability::Drift
             | Capability::Transport
             | Capability::Operator
-            | Capability::ConfigWrite) => {
+            | Capability::ConfigWrite
+            | Capability::Exec) => {
                 if let Some(n) = c.authority_name() {
                     self.authorities.insert(n.to_string());
                 }
@@ -365,7 +377,8 @@ impl ContextToolBinding {
             | Capability::Drift
             | Capability::Transport
             | Capability::Operator
-            | Capability::ConfigWrite => {
+            | Capability::ConfigWrite
+            | Capability::Exec => {
                 if let Some(n) = cap.authority_name() {
                     self.authorities.remove(n);
                 }
@@ -564,6 +577,8 @@ mod tests {
             Capability::Drift,
             Capability::Transport,
             Capability::Operator,
+            Capability::ConfigWrite,
+            Capability::Exec,
         ] {
             assert!(
                 !b.allows(&cap),
@@ -581,6 +596,8 @@ mod tests {
             Capability::Drift,
             Capability::Transport,
             Capability::Operator,
+            Capability::ConfigWrite,
+            Capability::Exec,
         ] {
             let mut b = ContextToolBinding::new();
             assert!(!b.allows(&cap), "{cap:?} granted on a fresh binding");

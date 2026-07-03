@@ -703,11 +703,13 @@ impl KernelBackend for MountBackend {
         self.docs_tools.mounts()
     }
 
-    fn resolve_real_path(&self, _path: &Path) -> Option<PathBuf> {
-        // MountTable's real_path is async, but this trait method is sync.
-        // Callers that need real path resolution should use the VFS directly.
-        // Most callers (like git builtins) already resolve through ExecContext.
-        None
+    fn resolve_real_path(&self, path: &Path) -> Option<PathBuf> {
+        // The subprocess seam: kaish calls this (sync) to turn the shell's
+        // VFS cwd into a real host cwd before spawning an external command —
+        // a `None` here disables external exec for that call. Structural
+        // resolution via the mount table's sync path (longest-prefix owner +
+        // `real_root`); virtual cwds (/v/*, CRDT mounts) correctly yield None.
+        self.mount_table.resolve_real_path_sync(path)
     }
 }
 
