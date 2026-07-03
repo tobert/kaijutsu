@@ -84,6 +84,18 @@ pub struct TerraceRing;
 #[derive(Component)]
 pub struct CardTarget(pub Vec3);
 
+/// A card's discrete seat on its band ring: which band, its within-ring index,
+/// and the ring's card count. `sync` writes this from the recency-ordered band
+/// layout; [`spin_rings`] recomputes the card's [`CardTarget`] from it each
+/// frame using the ring's eased rotation (the projector spin), so the seat is
+/// the durable position and the world target is derived.
+#[derive(Component)]
+pub struct RingSeat {
+    pub band: kaijutsu_viz::layout::Band,
+    pub within_index: usize,
+    pub ring_len: usize,
+}
+
 // ============================================================================
 // RESOURCE
 // ============================================================================
@@ -105,7 +117,26 @@ pub struct TimeWellState {
     /// digits = the first decade at the mouth); its *world position* now comes
     /// from the terraced `(band, within_index)` pair instead (Stage 1 Slice F).
     pub spiral_order: Vec<ContextId>,
+    /// Each band ring's cards in within-ring (recency) order, indexed by
+    /// [`kaijutsu_viz::layout::Band::index`] — the ring-centric nav's source of
+    /// truth. `(focused_ring, ring_pos)` indexes into `ring_cards[focused_ring]`
+    /// to resolve [`selected`](Self::selected). Rebuilt each layout tick from
+    /// [`super::card::band_orders`].
+    pub ring_cards: [Vec<ContextId>; super::card::N_BANDS],
+    /// Which band ring is currently focused (0 = `HotNow` at the mouth …
+    /// `N_BANDS-1` = `Horizon` at the throat). Up/Down change it.
+    pub focused_ring: usize,
+    /// Position within the focused ring (Left/Right walk it, wrapping). Carried
+    /// across Up/Down (clamped to the new ring's size).
+    pub ring_pos: usize,
+    /// Per-ring current (eased) rotation in radians — the live projector spin,
+    /// advanced toward `ring_rotation_target` by [`spin_rings`].
+    pub ring_rotation: [f32; super::card::N_BANDS],
+    /// Per-ring rotation goal: nav sets the focused ring's target so the selected
+    /// card spins to the gate (see [`super::card::spin_target_to_gate`]).
+    pub ring_rotation_target: [f32; super::card::N_BANDS],
     /// The currently-selected card (highlighted; the target of Enter / `c`).
+    /// Derived from `(focused_ring, ring_pos)` on every nav change and layout tick.
     pub selected: Option<ContextId>,
     /// Whether the well is *focused* on the selection: Enter (from the overview)
     /// dollies the camera into the focus card; Esc backs out; a second Enter
@@ -127,6 +158,11 @@ impl Default for TimeWellState {
             entities: HashMap::new(),
             card_mesh: None,
             spiral_order: Vec::new(),
+            ring_cards: std::array::from_fn(|_| Vec::new()),
+            focused_ring: 0,
+            ring_pos: 0,
+            ring_rotation: [0.0; super::card::N_BANDS],
+            ring_rotation_target: [0.0; super::card::N_BANDS],
             selected: None,
             focused: false,
             cluster_of: HashMap::new(),
@@ -178,19 +214,22 @@ const FOCUS_DOLLY: f32 = 430.0;
 const RING_DECK_SIZE: f32 = 1100.0;
 
 /// Depth (along the funnel's local −Z) of the ring deck: just past the deepest
-/// band so it is the **throat floor** of the funnel. Lifted + tilted by the
-/// shared [`super::card::well_tilt_quat`] so the spiral core sits at the low,
-/// receded throat and faces up toward the camera.
-const RING_DECK_DEPTH: f32 = -460.0;
+/// band ring (`Horizon` sits at ≈ −690 under the per-band `band_ring` stack) so
+/// the vortex/spiral core is the **throat floor** all the rings spiral down
+/// into — on the same funnel axis, below every ring. Lifted + tilted by the
+/// shared [`super::card::well_tilt_quat`] so the core sits at the low, receded
+/// throat and faces up toward the camera. **Amy-tunable.**
+const RING_DECK_DEPTH: f32 = -850.0;
 
-/// Terrace-ring quad side length, as a multiple of the boundary radius (a bit
-/// larger than the ring itself so the annulus band + its corner-fade sit
-/// comfortably inside the quad). **Amy-tunable.**
-const TERRACE_RING_QUAD_SCALE: f32 = 2.2;
+/// Terrace-ring quad side length, as a multiple of the ring radius. The quad is
+/// comfortably larger than the ring (side = scale × radius) so the annulus band
+/// — which the shader draws centered on the *ring* radius (= where the cards are
+/// seated; see the spawn loop) — sits well inside the quad's inscribed circle
+/// with room for its half-width + corner-fade. **Amy-tunable.**
+const TERRACE_RING_QUAD_SCALE: f32 = 2.8;
 
 /// Half-width (fraction of the quad half-extent) of the visible annulus band,
-/// centered on the boundary radius (`1.0 / TERRACE_RING_QUAD_SCALE` as a
-/// fraction of the quad half-extent). Widened for the ornate grid (concentric
+/// centered on the ring radius. Widened for the ornate grid (concentric
 /// sub-rings + two-tier spokes + hexagram need room to read). **Amy-tunable.**
 const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 
@@ -223,6 +262,10 @@ fn card_tilt(band: Band) -> f32 {
 
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
+
+/// Exponential-smoothing rate for the per-ring projector spin (how fast a ring
+/// rotates its selected card to the gate). **Amy-tunable.**
+const RING_SPIN_EASE_RATE: f32 = 6.0;
 
 /// Blend dial for rim-card orientation: `0.0` = today's full camera-billboard,
 /// `1.0` = full ring-aligned (cards stand around their ring like a carousel,
@@ -314,15 +357,20 @@ pub fn enter_time_well(
         Name::new("WellRingsDeck"),
     ));
 
-    // Terrace magic-circle rings: one annulus quad per interior terrace
-    // boundary (the Konosuba/"Explosion"-spell aesthetic), counter-rotating
-    // and receding into the funnel on the same tilted axis as the deck/cards.
+    // Band magic-circle rings: one annulus quad per band ring (the
+    // Konosuba/"Explosion"-spell aesthetic), counter-rotating and receding into
+    // the funnel on the same tilted axis as the deck/cards. Each quad is sized
+    // to ITS ring's radius, and the band is drawn centered on that radius so it
+    // lands on the cards seated around the ring.
     for (k, (radius, depth)) in super::card::terrace_ring_geometry().into_iter().enumerate() {
         let side = TERRACE_RING_QUAD_SCALE * radius;
         let ring_mesh = meshes.add(Rectangle::new(side, side));
-        let frac = 1.0 / TERRACE_RING_QUAD_SCALE;
-        let inner_frac = frac - TERRACE_RING_BAND_HALF_WIDTH;
-        let outer_frac = frac + TERRACE_RING_BAND_HALF_WIDTH;
+        // The shader's radial coord is 0 at center → 1 at the quad edge (half
+        // -extent = side/2). Center the band on the ring radius so it sits on the
+        // seated cards: center_frac = radius / half_extent (= 2 / QUAD_SCALE).
+        let center_frac = radius / (side * 0.5);
+        let inner_frac = center_frac - TERRACE_RING_BAND_HALF_WIDTH;
+        let outer_frac = center_frac + TERRACE_RING_BAND_HALF_WIDTH;
         let spin_dir = if k % 2 == 0 { 1.0 } else { -1.0 };
         let spin_rate = TERRACE_RING_SPIN_BASE + TERRACE_RING_SPIN_STEP * k as f32;
         let ring_material = terrace_ring_materials.add(crate::shaders::TerraceRingMaterial::new(
@@ -404,6 +452,12 @@ pub fn exit_time_well(
 
     state.entities.clear();
     state.focused = false;
+    // Reset ring-centric nav so re-entering starts at the mouth ring, gate-front.
+    state.ring_cards = std::array::from_fn(|_| Vec::new());
+    state.focused_ring = 0;
+    state.ring_pos = 0;
+    state.ring_rotation = [0.0; super::card::N_BANDS];
+    state.ring_rotation_target = [0.0; super::card::N_BANDS];
     // Reset the join so re-entering rebuilds from scratch (the contexts are
     // re-polled by DriftState; nothing durable is lost).
     state.join = kaijutsu_viz::join::Join::new();
@@ -456,10 +510,15 @@ const DIGIT_KEYS: [(KeyCode, usize); 10] = [
     (KeyCode::Digit9, 9),
 ];
 
-/// Time-well keyboard navigation: an **odometer walk along the vortex spiral**.
-/// - `0–9` — quick-jump to that index near the mouth: select + switch + exit.
-/// - **Left / Right / Tab** — step ∓1 / ±1 along the spiral (one neighbour).
-/// - **Up / Down** — leap ∓10 / ±10 (toward the mouth / down toward the throat).
+/// Time-well keyboard navigation: **ring-centric**, with a Kodak-projector spin.
+/// Selection is `(focused_ring, ring_pos)`; the card at that seat is
+/// [`TimeWellState::selected`], so HUD / lineage / highlight / Enter all follow.
+/// - `0–9` — quick-jump to that flat spiral index near the mouth: select + exit.
+/// - **Left / Right / Tab** — step the position within the focused ring
+///   (wrapping), spinning the ring so the selected card eases to the front gate.
+/// - **Up / Down** — change the focused ring (Up → shallower/mouth, Down →
+///   deeper/throat), carrying the position index (clamped); the newly focused
+///   ring spins its selected card to the gate and the camera retargets to it.
 /// - **Enter** focuses then commits; **`c`** concludes the selection.
 ///
 /// Esc (focus-aware, back to conversation) is handled below.
@@ -470,8 +529,6 @@ pub fn well_keyboard(
     mut next: ResMut<NextState<Screen>>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
-    let len = state.spiral_order.len();
-
     // `0–9`: jump straight to that mouth-end index and drop into the conversation.
     for (kc, n) in DIGIT_KEYS {
         if keys.just_pressed(kc)
@@ -483,31 +540,61 @@ pub fn well_keyboard(
         }
     }
 
-    // Index of the current selection on the spiral (None → start at the mouth).
-    let current = state
-        .selected
-        .and_then(|sel| state.spiral_order.iter().position(|&x| x == sel));
+    let mut nav_changed = false;
 
-    // Left/Right = ±1 along the spiral; Up/Down = ±10 (the odometer's tens),
-    // Up toward the mouth (−), Down toward the throat (+).
-    let step = if keys.just_pressed(KeyCode::ArrowUp) {
-        -10
-    } else if keys.just_pressed(KeyCode::ArrowDown) {
-        10
-    } else if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
+    // Left/Right (Tab = Right): walk the focused ring, wrapping, and spin it so
+    // the newly selected seat rolls to the gate.
+    let lr = if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
         1
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
         -1
     } else {
         0
     };
+    if lr != 0 {
+        let fr = state.focused_ring;
+        let len = state.ring_cards.get(fr).map(|v| v.len()).unwrap_or(0);
+        if len > 0 {
+            let pos = super::card::step_ring_pos(state.ring_pos, len, lr);
+            state.ring_pos = pos;
+            let cur = state.ring_rotation_target[fr];
+            state.ring_rotation_target[fr] = super::card::spin_target_to_gate(cur, pos, len);
+            nav_changed = true;
+        }
+    }
 
-    if step != 0 && len > 0 {
-        let idx = match current {
-            Some(i) => (i as i32 + step).clamp(0, len as i32 - 1) as usize,
-            None => 0, // nothing selected yet → the mouth
-        };
-        state.selected = state.spiral_order.get(idx).copied();
+    // Up/Down: change the focused ring (clamp 0..N_BANDS-1), carry the position
+    // onto the new ring, spin the new ring to the gate. The camera follows
+    // because `ease_camera_to_focused_ring` keys on `focused_ring`.
+    let ud = if keys.just_pressed(KeyCode::ArrowUp) {
+        -1
+    } else if keys.just_pressed(KeyCode::ArrowDown) {
+        1
+    } else {
+        0
+    };
+    if ud != 0 {
+        let fr = state.focused_ring as i32;
+        let new_ring = (fr + ud).clamp(0, super::card::N_BANDS as i32 - 1) as usize;
+        if new_ring != state.focused_ring {
+            let new_len = state.ring_cards.get(new_ring).map(|v| v.len()).unwrap_or(0);
+            let pos = super::card::carry_ring_pos(state.ring_pos, new_len);
+            state.focused_ring = new_ring;
+            state.ring_pos = pos;
+            let cur = state.ring_rotation_target[new_ring];
+            state.ring_rotation_target[new_ring] =
+                super::card::spin_target_to_gate(cur, pos, new_len.max(1));
+            nav_changed = true;
+        }
+    }
+
+    // After any nav change, re-derive the selection from the seat so every
+    // downstream system (highlight, HUD, lineage) follows.
+    if nav_changed {
+        let fr = state.focused_ring;
+        let pos = state.ring_pos;
+        let sel = state.ring_cards.get(fr).and_then(|v| v.get(pos)).copied();
+        state.selected = sel;
     }
 
     // Enter is two-stage: from the overview it *focuses* (the camera dollies into
@@ -710,20 +797,34 @@ pub fn tick_and_sync_rings(
 const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 240.0, 900.0);
 const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 40.0, -150.0);
 
-/// Ease the well camera between two poses, exponentially smoothed (slower than
-/// the cards, so the view glides):
-/// - **focused** → dolly straight in front of the focus card so it fills the
-///   view (the Enter-to-focus zoom; Esc backs out).
-/// - **overview** → *lean* toward the current selection (look-point + a little
-///   x-parallax slide partway toward the selected card's settled `CardTarget`),
-///   keeping the whole well legible. Nothing selected → the base framing.
+/// Camera framing of the focused ring (first cut — Amy live-tunes on the runner).
+/// Back-off distance along the funnel axis, **as a multiple of the ring radius**,
+/// so a bigger ring is framed from proportionally further back (neighbor rings
+/// bleed off the top/bottom edges).
+const RING_CAM_BACK: f32 = 1.8;
+/// World-Y lift of the camera. With the gate-normal framing the gate card's face
+/// points down-and-forward, so the normal back-off pulls the camera below the
+/// gate; this lift raises it back to roughly level / gently looking down. Higher
+/// = steeper look-down onto the ring. Amy-tunable.
+const RING_CAM_LIFT: f32 = 450.0;
+/// How far in front of the ring center (along the axis, × radius) the look-point
+/// leads — 0 looks straight at the ring plane.
+const RING_CAM_LOOK_LEAD: f32 = 0.0;
+
+/// Ease the well camera, exponentially smoothed (slower than the cards, so the
+/// view glides):
+/// - **focused** (Enter-to-focus) → dolly straight in front of the focus card so
+///   it fills the view; Esc backs out.
+/// - **overview** → frame the **focused ring** ([`TimeWellState::focused_ring`]):
+///   look at its center (its tilted depth plane), backed off along the funnel
+///   axis by [`RING_CAM_BACK`]×radius and lifted, so that ring roughly fills the
+///   view with the neighbor rings bleeding off. Up/Down retarget it.
 ///
 /// The full dive *through* the card into the conversation is the later JOIN
 /// transition; here Enter-focus only zooms to the pedestal.
-pub fn ease_camera_to_selection(
+pub fn ease_camera_to_focused_ring(
     time: Res<Time>,
     state: Res<TimeWellState>,
-    cards: Query<(&Card, &CardTarget)>,
     mut cam: Query<&mut Transform, With<TimeWellCamera>>,
 ) {
     let Ok(mut tf) = cam.single_mut() else {
@@ -731,28 +832,26 @@ pub fn ease_camera_to_selection(
     };
 
     let (desired_pos, desired_look) = if state.focused {
-        // Dolly to a head-on framing of the focus card so it dominates the view
-        // (distance tuned so it fills most of the frame without overflowing).
+        // Dolly to a head-on framing of the focus card so it dominates the view.
         (FOCUS_CARD_POS + Vec3::new(0.0, 0.0, FOCUS_DOLLY), FOCUS_CARD_POS)
     } else {
-        let selected_pos = state
-            .selected
-            .and_then(|sel| cards.iter().find(|(c, _)| c.context_id == sel))
-            .map(|(_, t)| t.0);
-        match selected_pos {
-            Some(p) => {
-                // Lean the look-point toward the selection; nudge the camera x for
-                // a touch of parallax. Fractions kept low so the overview survives.
-                let look = Vec3::new(
-                    p.x * 0.4,
-                    CAM_BASE_LOOK.y + (p.y - CAM_BASE_LOOK.y) * 0.3,
-                    CAM_BASE_LOOK.z,
-                );
-                let pos = Vec3::new(p.x * 0.18, CAM_BASE_POS.y, CAM_BASE_POS.z);
-                (pos, look)
-            }
-            None => (CAM_BASE_POS, CAM_BASE_LOOK),
-        }
+        // Frame the focused ring. Its center rides the tilted funnel axis at the
+        // ring's depth; the axis (tilt·+Z) points up-and-toward the camera.
+        let band = kaijutsu_viz::layout::ALL_BANDS
+            [state.focused_ring.min(super::card::N_BANDS - 1)];
+        let (radius, depth) = super::card::band_ring(band);
+        let tilt = super::card::well_tilt_quat();
+        // Frame the GATE card face-on: sit out along the outward face-normal of the
+        // seat the selected slide spins to (`card::GATE_ANGLE`), backed off ∝ radius
+        // and lifted, looking at the gate point. Whatever card is at the gate reads
+        // face-on and roughly centered; the ring curves away behind it (relief), and
+        // the shallower/deeper rings sit above/below by depth and bleed off the edges.
+        let a = super::card::GATE_ANGLE;
+        let gate = tilt * Vec3::new(radius * a.cos(), radius * a.sin(), depth);
+        let normal = tilt * Vec3::new(-a.sin(), a.cos(), 0.0); // gate slide's face normal
+        let pos = gate + normal * (radius * RING_CAM_BACK) + Vec3::Y * RING_CAM_LIFT;
+        let look = gate + Vec3::Y * RING_CAM_LOOK_LEAD;
+        (pos, look)
     };
 
     let desired = Transform::from_translation(desired_pos).looking_at(desired_look, Vec3::Y);
@@ -817,6 +916,29 @@ pub fn billboard_cards(
         // rises (no double-reclining).
         rot *= Quat::from_rotation_x(-card_tilt(card.data.band) * (1.0 - RING_ALIGN));
         tf.rotation = rot;
+    }
+}
+
+/// Projector spin: ease each ring's `ring_rotation` toward its
+/// `ring_rotation_target` (the gate goal nav set), then recompute every card's
+/// [`CardTarget`] from its [`RingSeat`] and its ring's freshly-eased rotation.
+/// The existing [`move_cards_toward_target`] then glides each card's transform to
+/// that target — so the ring "spins to the gate" with no bespoke tween.
+pub fn spin_rings(
+    time: Res<Time>,
+    mut state: ResMut<TimeWellState>,
+    mut cards: Query<(&RingSeat, &mut CardTarget)>,
+) {
+    let alpha = 1.0 - (-RING_SPIN_EASE_RATE * time.delta_secs()).exp();
+    for i in 0..super::card::N_BANDS {
+        let cur = state.ring_rotation[i];
+        let tgt = state.ring_rotation_target[i];
+        state.ring_rotation[i] = cur + (tgt - cur) * alpha;
+    }
+    let rot = state.ring_rotation; // Copy [f32; N_BANDS]
+    for (seat, mut target) in cards.iter_mut() {
+        let r = rot[seat.band.index()];
+        target.0 = super::card::ring_seat_rotated(seat.band, seat.within_index, seat.ring_len, r);
     }
 }
 

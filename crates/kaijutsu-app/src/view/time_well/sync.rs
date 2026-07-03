@@ -14,8 +14,11 @@ use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 
-use super::card::{ClusterAssignment, assign_bands, card_base_scale, card_from, spiral_pos, spiral_positions};
-use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
+use super::card::{
+    ClusterAssignment, assign_bands, band_orders, card_base_scale, card_from, ring_seat_rotated,
+    spiral_positions,
+};
+use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, RingSeat, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use super::panel::create_msdf_panel;
 
@@ -44,7 +47,7 @@ pub fn sync_time_well(
     drift: Res<crate::ui::drift::DriftState>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut cards: Query<(&mut Card, &mut CardTarget)>,
+    mut cards: Query<(&mut Card, &mut CardTarget, &mut RingSeat)>,
 ) {
     // The well shows live + concluded contexts; archived are hidden entirely.
     let visible: Vec<&ContextInfo> = drift.contexts.iter().filter(|c| !c.archived).collect();
@@ -99,26 +102,55 @@ pub fn sync_time_well(
     // (which those loops mutate). It's Horizon-sized — a cheap clone.
     let cluster_of = state.cluster_of.clone();
     // The whole well as one ordered spiral (mouth → throat) plus each card's
-    // terraced `(band, within_index)` position — the flat order is the
-    // odometer address nav walks; the pair is what the terraced geometry
-    // (`spiral_pos`/`spiral_scale`) keys on. See `card::spiral_positions`.
+    // `(band, within_index)` position — the flat order is the digit-jump address;
+    // the pair is what the ring geometry (`ring_seat`/`card_base_scale`) keys on.
     let (order, pos_of) = spiral_positions(&contexts, &bands);
     state.spiral_order = order;
 
-    // Keep selection valid: drop it if its context left the well; default to the
-    // mouth (index 0) when nothing (valid) is selected.
-    let selection_valid = state
-        .selected
-        .is_some_and(|id| state.entities.contains_key(&id) || state.join.contains(&id));
-    if !selection_valid {
-        state.selected = state.spiral_order.first().copied();
-    }
+    // Ring-centric layout: each band ring's cards in within-ring (recency) order.
+    // This is the nav's source of truth — `(focused_ring, ring_pos)` indexes it.
+    state.ring_cards = band_orders(&contexts, &bands);
 
-    // Resolve a target position + base scale per id from its terraced
-    // (band, within_index) pair.
-    let target_of = |id: &ContextId| pos_of.get(id).map(|&(b, wi)| spiral_pos(b, wi));
+    // Snapshot per-band ring length + the eased per-ring rotation as plain locals
+    // so the placement closures don't borrow `state` (which we mutate just below).
+    let ring_len: [usize; super::card::N_BANDS] =
+        std::array::from_fn(|i| state.ring_cards[i].len());
+    let ring_rotation = state.ring_rotation;
+
+    // Re-derive the selection from the seat `(focused_ring, ring_pos)`, clamping
+    // the position to the (possibly changed) focused ring, and spin that ring so
+    // the selected card sits at the gate. Selection now follows *position*, not a
+    // context id — the ring-centric model.
+    let fr = state.focused_ring.min(super::card::N_BANDS - 1);
+    state.focused_ring = fr;
+    let flen = ring_len[fr];
+    let ring_pos = super::card::carry_ring_pos(state.ring_pos, flen);
+    state.ring_pos = ring_pos;
+    let sel = state.ring_cards[fr].get(ring_pos).copied();
+    state.selected = sel;
+    let cur_tgt = state.ring_rotation_target[fr];
+    state.ring_rotation_target[fr] =
+        super::card::spin_target_to_gate(cur_tgt, ring_pos, flen.max(1));
+
+    // Resolve a target position + base scale per id: seat it on its band's ring
+    // at its within-band index, spaced by the ring length, spun by the ring's
+    // current rotation.
+    let target_of = |id: &ContextId| {
+        pos_of.get(id).map(|&(b, wi)| {
+            ring_seat_rotated(b, wi, ring_len[b.index()], ring_rotation[b.index()])
+        })
+    };
     let scale_of = |id: &ContextId| {
         pos_of.get(id).map(|&(b, wi)| card_base_scale(b, wi)).unwrap_or(1.0)
+    };
+    // A card's discrete ring seat (band + within-ring index + ring length) — the
+    // durable position `spin_rings` re-derives the live `CardTarget` from.
+    let seat_of = |id: &ContextId| {
+        pos_of.get(id).map(|&(b, wi)| RingSeat {
+            band: b,
+            within_index: wi,
+            ring_len: ring_len[b.index()],
+        })
     };
 
     // ── Spawn entered cards at their resolved position. ──
@@ -175,6 +207,11 @@ pub fn sync_time_well(
                     base_scale: scale_of(&id),
                 },
                 CardTarget(pos),
+                seat_of(&id).unwrap_or(RingSeat {
+                    band,
+                    within_index: 0,
+                    ring_len: 1,
+                }),
                 Mesh3d(card_mesh.clone()),
                 MeshMaterial3d(material),
                 Transform::from_translation(pos),
@@ -191,11 +228,18 @@ pub fn sync_time_well(
     // Snapshot the id→entity pairs to avoid borrowing `state` inside the loop.
     let pairs: Vec<(ContextId, Entity)> = state.entities.iter().map(|(&id, &e)| (id, e)).collect();
     for (id, entity) in pairs {
-        let Ok((mut card, mut target)) = cards.get_mut(entity) else {
+        let Ok((mut card, mut target, mut seat)) = cards.get_mut(entity) else {
             continue; // just-spawned this frame; already correct
         };
         if let Some(pos) = target_of(&id) {
             target.0 = pos;
+        }
+        // Update the discrete ring seat so `spin_rings` re-seats it correctly if
+        // its within-ring index or ring length shifted this tick.
+        if let Some(next_seat) = seat_of(&id) {
+            seat.band = next_seat.band;
+            seat.within_index = next_seat.within_index;
+            seat.ring_len = next_seat.ring_len;
         }
         // Base scale follows the card's (possibly shifted) spiral index. Guarded
         // so a static card doesn't trip `Changed<Card>` (text rebuild) each poll.

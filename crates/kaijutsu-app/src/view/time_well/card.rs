@@ -116,7 +116,31 @@ fn effective_activity(info: &ContextInfo) -> u64 {
 /// override, and conclude-demotes). Archived contexts are expected to be
 /// filtered out *before* this call (the well doesn't show them) — see
 /// `sync::sync_time_well`.
+/// DEV/TUNING ONLY: the live data is currently all-recent (every context idles
+/// < 1 day → `HotNow`), so only the hot ring populates and the 4-ring stack can't
+/// be judged. When true, spread contexts evenly across the bands by recency rank
+/// (newest quarter → HotNow … oldest → Horizon) so every ring fills. Set false
+/// for the real idle-age banding. TODO(amy): drop once aged data exists / a
+/// runtime toggle lands.
+#[cfg(not(test))]
+const DEV_SPREAD_RINGS: bool = cfg!(debug_assertions); // dev/tuning builds only; off in release
+#[cfg(test)]
+const DEV_SPREAD_RINGS: bool = false; // tests exercise the real idle-age banding
+
 pub fn assign_bands(contexts: &[ContextInfo], now: i64) -> Vec<Band> {
+    if DEV_SPREAD_RINGS && !contexts.is_empty() {
+        // Rank by recency (newest first), split evenly into the bands.
+        let n = contexts.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(effective_activity(&contexts[i])));
+        let nb = ALL_BANDS.len();
+        let mut bands = vec![Band::HotNow; n];
+        for (rank, &i) in order.iter().enumerate() {
+            bands[i] = ALL_BANDS[(rank * nb / n).min(nb - 1)];
+        }
+        return bands;
+    }
+
     let lifecycles: Vec<ContextLifecycle<ContextId>> = contexts
         .iter()
         .map(|c| ContextLifecycle {
@@ -254,123 +278,156 @@ pub fn well_tilt_quat() -> Quat {
 }
 
 // ============================================================================
-// VORTEX SPIRAL (the terraced well — Stage 1 Slice F)
+// STACKED BAND RINGS (one magic-ring per idle-age band — cards seated on it)
 // ============================================================================
 //
-// Every card sits on a spiral funnel indexed **within its idle-age band**, and
-// each band occupies its own radius/depth **terrace** — a fixed envelope with
-// a visible step + gap before the next (colder) band's envelope begins. Within
-// a terrace the same geometric inward/downward decay as before runs on the
-// card's position *inside that band* (`within_index`), so append-stability is
-// preserved (a card's position depends only on its `(band, within_index)`
-// pair — appending within a band never reflows its siblings, and a band
-// transition never reflows another band). See `docs/timewell.md`, "The bowl,
-// revisited": this replaces the old single continuous spiral with the
-// terraced geometry mockup 27 taught — quantized bands, spiral ordering
-// continuing inside each one.
+// The well is a stack of concentric magic-circle rings, one per idle-age band
+// (`HotNow` → `ThisWeek` → `ThirtyDays` → `Horizon`), receding into the funnel
+// by depth. Each band's cards are seated **evenly around its ring**, on the
+// ring line, like slides in a Kodak Carousel tray (see [`ring_seat`]). This
+// SUPERSEDES the earlier spiral-within-terrace layout — cards moved from
+// *between* rings to *on* rings. A card's position keys only on its
+// `(band, within_index)` pair and the band's card count, so appends spread
+// evenly around a ring without reflowing another band. See `docs/timewell.md`.
 
-/// Rim radius at the mouth (band 0, within-index 0). Pulled in so cards sit
-/// closer together rather than flung wide across the rim.
-const SPIRAL_R_MOUTH: f32 = 330.0;
-/// Radius floor — the **mouth-open invariant**: no card, in any band, ever sits
-/// closer to the axis than this. The center stays reserved for the ring deck /
-/// accretion glow (mockup 27's calm core).
+/// Outermost ring radius — the `HotNow` ring at the mouth. Expanded (was ~330)
+/// so the well reads big. **Amy-tunable.**
+const SPIRAL_R_MOUTH: f32 = 500.0;
+/// Radius floor — the **mouth-open invariant**: no ring, in any band, shrinks
+/// below this; the center stays reserved for the ring deck / accretion glow.
 const SPIRAL_R_THROAT: f32 = 48.0;
-/// Throat depth (funnel-local −Z) the deepest terrace's envelope reaches toward.
-const SPIRAL_DEPTH: f32 = -560.0;
-/// Per-within-index geometric decay (how fast a terrace's own spiral winds in +
-/// down). Gentle, so a short arm spreads evenly through the terrace instead of
-/// bunching at its inner edge.
+/// Each deeper band's ring radius = the previous band's × this — a *modest*
+/// per-band shrink so the rings nest/stack without collapsing toward the axis.
+/// **Amy-tunable.**
+const RING_RADIUS_STEP: f32 = 0.85;
+/// Funnel-local depth (−Z) **step** per deeper band: `HotNow` sits at depth 0
+/// (the mouth) and each colder band steps this much deeper, so the rings stack
+/// as distinct planes (Up/Down will read as moving between them). **Amy-tunable.**
+const RING_DEPTH_STEP: f32 = -230.0;
+/// Per-within-index geometric decay retained for [`spiral_scale`] (the
+/// within-band scale falloff); it no longer positions cards.
 const SPIRAL_DECAY: f32 = 0.93;
-/// Radians wound per within-band index (~12 cards per revolution) — a tighter,
-/// denser arm. Resets to 0 at the start of every terrace (band index 0 sits at
-/// angle 0 in every band), so terraces read as stacked rings, not one
-/// continuously-winding ribbon.
-const SPIRAL_ANGLE_STEP: f32 = 0.50;
-/// Card base scale at the deepest terrace's inner edge (mouth cards are 1.0).
-/// Kept high so cards stay readable as they descend (bigger overall, per Amy).
+/// Card scale floor at the deepest band (mouth cards are 1.0), used by
+/// [`spiral_scale`]. Kept high so cards stay readable as they recede.
 const SPIRAL_SCALE_THROAT: f32 = 0.52;
 
-/// Visible **radial step** between adjacent terraces (world units). Carved out
-/// of each terrace's inner edge so band N's outer edge and band N+1's outer
-/// edge never touch. **Amy-tunable placeholder.**
-const TERRACE_RADIUS_GAP: f32 = 24.0;
-/// Visible **depth step** between adjacent terraces (world units), same role
-/// as [`TERRACE_RADIUS_GAP`] but along depth. **Amy-tunable placeholder.**
-const TERRACE_DEPTH_GAP: f32 = 60.0;
-
-/// Number of terraces — one per [`Band`] variant.
+/// Number of bands / rings — one per [`Band`] variant.
 const N_TERRACES: usize = ALL_BANDS.len();
 
-/// One `(radius, depth)` pair per terrace *ring* to draw — the mouth rim plus
-/// every interior terrace boundary, so cards in each band sit **between** two
-/// rings ("tiles between rings"). Returns `N_TERRACES` rings total:
+/// Number of band rings, exposed for the ring-centric nav state (array sizes in
+/// `scene::TimeWellState`). Same count as [`N_TERRACES`].
+pub const N_BANDS: usize = ALL_BANDS.len();
+
+/// The **gate** angle: the seat angle a ring is spun to so the selected card
+/// sits at the front. `PI` = the world −X seat (screen-left) — the ring position
+/// whose perpendicular slide, under the funnel tilt, turns its face down-and-toward
+/// a front camera (so it reads face-on). The camera framing sits on this seat's
+/// face normal, so whatever card spins here is centered and legible. **Amy-tunable.**
+pub const GATE_ANGLE: f32 = std::f32::consts::PI;
+
+/// The `(radius, depth)` of `band`'s ring, **funnel-local** (the
+/// [`well_tilt_quat`] recline is applied later, in [`ring_seat`] and the scene
+/// spawn). Radius shrinks modestly per deeper band ([`RING_RADIUS_STEP`],
+/// floored at [`SPIRAL_R_THROAT`]); depth steps clearly deeper per band
+/// ([`RING_DEPTH_STEP`], `HotNow` at depth 0). Single source of ring geometry
+/// for both card seating ([`ring_seat`]) and the magic-circle ring visual
+/// (`terrace_ring_material`/`terrace_ring.wgsl`).
+pub fn band_ring(band: Band) -> (f32, f32) {
+    let i = band.index() as i32;
+    let radius = (SPIRAL_R_MOUTH * RING_RADIUS_STEP.powi(i)).max(SPIRAL_R_THROAT);
+    let depth = RING_DEPTH_STEP * i as f32;
+    (radius, depth)
+}
+
+/// Seat the card at `within_index` (of `band_count` total in its band) **evenly
+/// around** its band's ring, on the ring line — like slides in a Kodak Carousel
+/// tray. Angle 0 is `within_index` 0; cards fan by `TAU / band_count`.
 ///
-/// - Ring 0 — the **mouth rim**: band 0's outer/shallow edge
-///   (`terrace_envelope(0)`'s `radius_outer` / `depth_near`). Brackets the top
-///   band (`HotNow`) from above, so its cards fill the pocket between this rim
-///   and the first interior boundary.
-/// - Rings `1..N_TERRACES` — the **interior boundaries**: the seam between band
-///   `k` and band `k + 1` (for `k` in `0..N_TERRACES - 1`), each at band `k`'s
-///   inner (deep) edge — `terrace_envelope(k)`'s `radius_inner` (≈ the next
-///   band's outer radius, the shared step between terraces) and `depth_far`.
+/// **The gate (angle 0):** the funnel recline [`WELL_TILT`] is a rotation about
+/// the world **+X** axis, which leaves +X fixed, so the local `+X` seat (angle
+/// 0) maps to world **+X** — the ring's rightmost point (screen-right /
+/// 3-o'clock under the base camera, which looks down −Z). A later slice will
+/// rotate the ring so the *selected* card lands at this gate; this pass only
+/// fixes where angle 0 is (world +X), it does not build nav.
 ///
-/// Radii strictly decrease and `|depth|` strictly increases down the list (the
-/// funnel narrows + recedes). Single source of terrace-ring geometry for the
-/// magic-circle ring visual (`terrace_ring_material`/`terrace_ring.wgsl`) so
-/// the terrace math stays in one place rather than re-derived at the call site.
+/// This is the zero-rotation convenience / documented reference form; the live
+/// placement path uses [`ring_seat_rotated`] with the ring's eased spin.
+#[allow(dead_code)] // documented reference form + test entry; runtime uses ring_seat_rotated
+pub fn ring_seat(band: Band, within_index: usize, band_count: usize) -> Vec3 {
+    ring_seat_rotated(band, within_index, band_count, 0.0)
+}
+
+/// [`ring_seat`] with a ring **rotation offset** (radians) added to the seat
+/// angle — the projector "spin." Cards ease into the spun position because
+/// `sync`/`spin_rings` recompute each card's `CardTarget` from this as the
+/// ring's eased rotation advances (no new tween). `rotation = 0` reproduces
+/// [`ring_seat`].
+pub fn ring_seat_rotated(band: Band, within_index: usize, band_count: usize, rotation: f32) -> Vec3 {
+    let (r, depth) = band_ring(band);
+    let a = std::f32::consts::TAU * within_index as f32 / band_count.max(1) as f32 + rotation;
+    well_tilt_quat() * Vec3::new(r * a.cos(), r * a.sin(), depth)
+}
+
+// ── Ring-centric navigation math (pure; unit-tested) ────────────────────────
+
+/// The absolute ring rotation that seats the card at `ring_pos` (of `ring_len`)
+/// exactly at [`GATE_ANGLE`]: solving `TAU·pos/len + rotation ≡ GATE_ANGLE`
+/// gives `rotation = GATE_ANGLE − TAU·pos/len`. Empty ring → `GATE_ANGLE`.
+pub fn gate_rotation(ring_pos: usize, ring_len: usize) -> f32 {
+    if ring_len == 0 {
+        return GATE_ANGLE;
+    }
+    GATE_ANGLE - std::f32::consts::TAU * ring_pos as f32 / ring_len as f32
+}
+
+/// Shortest signed delta (in `(-PI, PI]`) to turn from `current` to any angle
+/// congruent to `target` modulo a full turn — so the ring spins the *short* way,
+/// never multiple turns.
+pub fn shortest_angle_delta(current: f32, target: f32) -> f32 {
+    let d = (target - current).rem_euclid(std::f32::consts::TAU);
+    if d > std::f32::consts::PI {
+        d - std::f32::consts::TAU
+    } else {
+        d
+    }
+}
+
+/// New rotation **target** that spins `ring_len`'s `ring_pos` card to the gate,
+/// the short way from `current_target`. Accumulates on the current target (not
+/// re-wrapped) so repeated steps chain continuously; the *seat* angle is
+/// periodic, so the unbounded value is harmless.
+pub fn spin_target_to_gate(current_target: f32, ring_pos: usize, ring_len: usize) -> f32 {
+    let desired = gate_rotation(ring_pos, ring_len);
+    current_target + shortest_angle_delta(current_target, desired)
+}
+
+/// Step a within-ring position by `delta`, **wrapping** modulo `len` (Left/Right
+/// walk the ring). Empty ring → 0.
+pub fn step_ring_pos(pos: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let l = len as i32;
+    (((pos as i32 + delta) % l + l) % l) as usize
+}
+
+/// Carry a within-ring position onto a ring of `new_len` (Up/Down keep the index,
+/// clamped to the new ring's last slot). Empty target ring → 0.
+pub fn carry_ring_pos(pos: usize, new_len: usize) -> usize {
+    if new_len == 0 {
+        0
+    } else {
+        pos.min(new_len - 1)
+    }
+}
+
+/// One ring per band, in mouth→throat order (`HotNow` … `Horizon`), each a
+/// funnel-local `(radius, depth)` via [`band_ring`]. The scene spawns one
+/// magic-circle ring quad per entry (sized to its own radius); cards are seated
+/// on each ring via [`ring_seat`]. Radii shrink and `|depth|` grows down the
+/// list (the funnel narrows + recedes).
 pub fn terrace_ring_geometry() -> Vec<(f32, f32)> {
-    // Mouth rim: band 0's outer/shallow edge — the ceiling of the top band.
-    let (mouth_radius, _r_inner, mouth_depth, _d_far) = terrace_envelope(0);
-    let mut rings = vec![(mouth_radius, mouth_depth)];
-    // Interior boundaries: each band's inner/deep edge.
-    rings.extend((0..N_TERRACES - 1).map(|k| {
-        let (_radius_outer, radius_inner, _depth_near, depth_far) = terrace_envelope(k);
-        (radius_inner, depth_far)
-    }));
-    rings
-}
-
-/// The `(radius_outer, radius_inner, depth_near, depth_far)` envelope band
-/// `band_index` (0 = `HotNow` … `N_TERRACES - 1` = `Horizon`) reserves for
-/// itself: the total mouth→throat radius/depth span divided evenly into
-/// [`N_TERRACES`] slices, each shrunk on its inner/far edge by the terrace gap
-/// constants so consecutive terraces step visibly rather than blend. `radius_inner`
-/// is floored at [`SPIRAL_R_THROAT`] — the mouth-open invariant holds even for
-/// `Horizon`.
-fn terrace_envelope(band_index: usize) -> (f32, f32, f32, f32) {
-    let n = N_TERRACES as f32;
-    let i = band_index as f32;
-    let radius_span = (SPIRAL_R_MOUTH - SPIRAL_R_THROAT) / n;
-    let depth_span = SPIRAL_DEPTH / n; // negative: deeper per terrace
-
-    let radius_outer = SPIRAL_R_MOUTH - i * radius_span;
-    let radius_inner = (radius_outer - radius_span + TERRACE_RADIUS_GAP).max(SPIRAL_R_THROAT);
-
-    let depth_near = depth_span * i;
-    let depth_far = depth_span * (i + 1.0) + TERRACE_DEPTH_GAP;
-
-    (radius_outer, radius_inner, depth_near, depth_far)
-}
-
-/// Funnel-local terraced position for the card at `(band, within_index)`
-/// (`within_index` 0 = that band's outer/shallow edge). The existing geometric
-/// decay runs *inside* the band's envelope (see [`terrace_envelope`]); the
-/// angle resets to 0 at the start of every band.
-fn spiral_local(band: Band, within_index: usize) -> Vec3 {
-    let (radius_outer, radius_inner, depth_near, depth_far) = terrace_envelope(band.index());
-    let f = SPIRAL_DECAY.powi(within_index as i32); // 1 → 0 as within_index grows
-    let radius = radius_inner + (radius_outer - radius_inner) * f;
-    let depth = depth_near + (depth_far - depth_near) * (1.0 - f);
-    let angle = within_index as f32 * SPIRAL_ANGLE_STEP;
-    Vec3::new(radius * angle.cos(), radius * angle.sin(), depth)
-}
-
-/// World position of the card at `(band, within_index)`: the funnel-local
-/// terraced spiral tipped back by [`WELL_TILT`] (same recline as everything
-/// else in the well).
-pub fn spiral_pos(band: Band, within_index: usize) -> Vec3 {
-    well_tilt_quat() * spiral_local(band, within_index)
+    ALL_BANDS.iter().map(|&band| band_ring(band)).collect()
 }
 
 /// Per-card **within-terrace** scale at `(band, within_index)`: 1.0 at the
@@ -456,19 +513,18 @@ pub fn spiral_order(contexts: &[ContextInfo], bands: &[Band]) -> Vec<ContextId> 
 // spawn needs the same gating) and this pass has no live/runner verification
 // to catch a black-text or mispositioned regression.
 
-/// Amy-tunable placeholder: how far outside a terrace's outer (shallow) edge a
-/// band label parks, so it doesn't collide with that band's slot-0 card.
+/// Amy-tunable placeholder: how far outside a band's ring a label parks, so it
+/// doesn't collide with that ring's seated cards.
 #[allow(dead_code)] // groundwork for the not-yet-spawned in-world labels — see TODO above
 const LABEL_RADIUS_OFFSET: f32 = 36.0;
 
-/// World position for `band`'s floating label: parked just outside the
-/// terrace's outer edge, at its shallow (near) depth — the step a viewer's eye
-/// meets first on entering the band. Same recline as everything else in the
-/// well ([`well_tilt_quat`]).
+/// World position for `band`'s floating label: parked just outside the band's
+/// ring, at the ring's depth. Same recline as everything else in the well
+/// ([`well_tilt_quat`]).
 #[allow(dead_code)] // groundwork for the not-yet-spawned in-world labels — see TODO above
 pub fn band_label_pos(band: Band) -> Vec3 {
-    let (radius_outer, _radius_inner, depth_near, _depth_far) = terrace_envelope(band.index());
-    let local = Vec3::new(radius_outer + LABEL_RADIUS_OFFSET, 0.0, depth_near);
+    let (radius, depth) = band_ring(band);
+    let local = Vec3::new(radius + LABEL_RADIUS_OFFSET, 0.0, depth);
     well_tilt_quat() * local
 }
 
@@ -659,28 +715,129 @@ mod tests {
     }
 
     #[test]
-    fn spiral_winds_inward_and_down_within_a_terrace_then_asymptotes() {
-        let r = |v: Vec3| (v.x * v.x + v.y * v.y).sqrt();
-        let (mouth, mid, deep) = (
-            spiral_local(Band::HotNow, 0),
-            spiral_local(Band::HotNow, 5),
-            spiral_local(Band::HotNow, 40),
-        );
-        assert!(r(mouth) > r(mid) && r(mid) > r(deep), "radius winds inward within the terrace");
-        assert!(mid.z < mouth.z && deep.z < mid.z, "descends toward the terrace's inner edge");
+    fn band_ring_shrinks_radius_and_deepens_per_band() {
+        let rings: Vec<(f32, f32)> = ALL_BANDS.iter().map(|&b| band_ring(b)).collect();
+        // HotNow at the mouth: full radius, depth 0.
+        assert!((rings[0].0 - SPIRAL_R_MOUTH).abs() < 1e-3, "mouth ring is the full radius");
+        assert!(rings[0].1.abs() < 1e-3, "mouth ring sits at depth 0");
+        // Radius shrinks and |depth| grows down the stack.
+        for pair in rings.windows(2) {
+            assert!(pair[0].0 > pair[1].0, "radius shrinks per deeper band: {} -> {}", pair[0].0, pair[1].0);
+            assert!(pair[0].1.abs() < pair[1].1.abs(), "|depth| grows per deeper band");
+        }
+        // The radius floor holds for every band.
+        for (r, _d) in &rings {
+            assert!(*r >= SPIRAL_R_THROAT - 1e-3, "ring radius {r} stays above the floor");
+        }
     }
 
     #[test]
-    fn spiral_pos_is_append_stable_and_tipped() {
-        assert_eq!(
-            spiral_pos(Band::ThisWeek, 7),
-            spiral_pos(Band::ThisWeek, 7),
-            "position keys only on (band, within_index)"
-        );
-        // After the recline the funnel's depth maps mostly to world-Y, so the
-        // robust world-space invariant is "deeper cards sit lower".
-        let (near, far) = (spiral_pos(Band::HotNow, 0), spiral_pos(Band::Horizon, 30));
-        assert!(far.y < near.y, "a deeper-band card sits lower after the recline");
+    fn ring_seat_places_cards_evenly_on_the_band_ring() {
+        let band = Band::ThisWeek;
+        let (r, _depth) = band_ring(band);
+        let n = 6usize;
+        // Undo the rigid funnel tilt to check the local ring radius + angle.
+        let untilt = well_tilt_quat().inverse();
+        for i in 0..n {
+            let local = untilt * ring_seat(band, i, n);
+            let lr = (local.x * local.x + local.y * local.y).sqrt();
+            assert!((lr - r).abs() < 1e-2, "seat {i} local radius {lr} != ring radius {r}");
+        }
+        // Angle 0 (the gate) lands on local +X — the world +X the recline fixes.
+        let seat0 = untilt * ring_seat(band, 0, n);
+        assert!(seat0.x > 0.0 && seat0.y.abs() < 1e-3, "angle-0 seat sits on local +X (the gate)");
+        // Seats are evenly spaced (consecutive angular gap ≈ TAU / n).
+        let ang = |i: usize| {
+            let l = untilt * ring_seat(band, i, n);
+            l.y.atan2(l.x)
+        };
+        let step = ang(1) - ang(0);
+        assert!((step - std::f32::consts::TAU / n as f32).abs() < 1e-3, "even angular spacing");
+    }
+
+    #[test]
+    fn ring_seat_is_append_stable_and_deeper_bands_sit_lower() {
+        // Position keys only on (band, within_index, band_count).
+        assert_eq!(ring_seat(Band::ThisWeek, 2, 5), ring_seat(Band::ThisWeek, 2, 5));
+        // After the recline the funnel depth maps mostly to world-Y, so a
+        // deeper-band card sits lower in world space.
+        let near = ring_seat(Band::HotNow, 0, 4);
+        let far = ring_seat(Band::Horizon, 0, 4);
+        assert!(far.y < near.y, "a deeper-band ring sits lower after the recline");
+    }
+
+    #[test]
+    fn ring_seat_rotated_shifts_the_seat_angle_by_rotation() {
+        use std::f32::consts::TAU;
+        let untilt = well_tilt_quat().inverse();
+        let base = untilt * ring_seat_rotated(Band::HotNow, 1, 6, 0.0);
+        let spun = untilt * ring_seat_rotated(Band::HotNow, 1, 6, 0.3);
+        let ang = |v: Vec3| v.y.atan2(v.x);
+        let delta = (ang(spun) - ang(base)).rem_euclid(TAU);
+        assert!((delta - 0.3).abs() < 1e-3, "rotation offset adds to the seat angle");
+    }
+
+    // ── Ring-centric nav math ────────────────────────────────────────────────
+
+    #[test]
+    fn spin_target_to_gate_lands_the_selected_card_on_the_gate() {
+        use std::f32::consts::TAU;
+        // For a spread of ring sizes, positions, and starting rotations, the
+        // resulting seat angle of `ring_pos` must be congruent to GATE_ANGLE.
+        for len in [1usize, 2, 3, 6, 12] {
+            for pos in 0..len {
+                for &start in &[0.0f32, 1.0, -2.5, 9.0] {
+                    let tgt = spin_target_to_gate(start, pos, len);
+                    let seat = TAU * pos as f32 / len as f32 + tgt;
+                    let off = (seat - GATE_ANGLE).rem_euclid(TAU);
+                    let off = off.min(TAU - off); // distance to 0 either way
+                    assert!(off < 1e-3, "len {len} pos {pos} start {start}: seat off gate by {off}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spin_target_to_gate_takes_the_short_way() {
+        // A one-slot step must never move more than half a turn.
+        for len in [3usize, 6, 12, 100] {
+            let t0 = spin_target_to_gate(0.0, 0, len);
+            let t1 = spin_target_to_gate(t0, 1, len);
+            assert!(
+                (t1 - t0).abs() <= std::f32::consts::PI + 1e-4,
+                "len {len}: one step moved {} (> PI, the long way)",
+                (t1 - t0).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn shortest_angle_delta_is_bounded_and_correct() {
+        use std::f32::consts::{PI, TAU};
+        // Always within (-PI, PI].
+        for &(c, t) in &[(0.0f32, 0.1), (0.0, 6.0), (3.0, -3.0), (-1.0, 4.0)] {
+            let d = shortest_angle_delta(c, t);
+            assert!(d > -PI - 1e-4 && d <= PI + 1e-4, "delta {d} out of (-PI, PI]");
+            // c + d must be congruent to t.
+            let off = (c + d - t).rem_euclid(TAU);
+            assert!(off < 1e-3 || (TAU - off) < 1e-3, "c+d not congruent to t");
+        }
+    }
+
+    #[test]
+    fn step_ring_pos_wraps_both_ways() {
+        assert_eq!(step_ring_pos(0, 5, 1), 1);
+        assert_eq!(step_ring_pos(4, 5, 1), 0, "right wraps past the end");
+        assert_eq!(step_ring_pos(0, 5, -1), 4, "left wraps before the start");
+        assert_eq!(step_ring_pos(2, 5, -1), 1);
+        assert_eq!(step_ring_pos(3, 0, 1), 0, "empty ring stays at 0");
+    }
+
+    #[test]
+    fn carry_ring_pos_clamps_to_new_ring() {
+        assert_eq!(carry_ring_pos(3, 5), 3, "fits → kept");
+        assert_eq!(carry_ring_pos(7, 5), 4, "overflows → clamped to last slot");
+        assert_eq!(carry_ring_pos(2, 0), 0, "empty target ring → 0");
     }
 
     #[test]
@@ -694,62 +851,6 @@ mod tests {
             spiral_scale(Band::Horizon, 500) >= SPIRAL_SCALE_THROAT - 1e-4,
             "scale is floored at the throat"
         );
-    }
-
-    // ── Slice F: terracing ──────────────────────────────────────────────────
-
-    #[test]
-    fn same_band_cards_stay_within_one_terrace_depth_range() {
-        let (_, _, depth_near, depth_far) = terrace_envelope(Band::ThisWeek.index());
-        let a = spiral_local(Band::ThisWeek, 0);
-        let b = spiral_local(Band::ThisWeek, 1);
-        for d in [a.z, b.z] {
-            assert!(
-                d <= depth_near && d > depth_far,
-                "within-band depth {d} must sit in ({depth_far}, {depth_near}]"
-            );
-        }
-    }
-
-    #[test]
-    fn next_deeper_band_sits_below_a_visible_gap() {
-        // Take a card far enough into a terrace that it's near the terrace's far
-        // (deep, i.e. most-negative-z) edge, and compare against the shallow
-        // (near, least-negative-z) edge of the next band. Depth grows more
-        // negative with depth, so the *next* band's shallow edge must still be
-        // more negative than this band's deep edge, by at least the gap.
-        let deep_in_this_band = spiral_local(Band::HotNow, 200).z;
-        let shallow_edge_of_next = spiral_local(Band::ThisWeek, 0).z;
-        let gap = deep_in_this_band - shallow_edge_of_next;
-        assert!(
-            gap >= TERRACE_DEPTH_GAP - 1e-3,
-            "depth delta across a band boundary must be >= the gap constant, got {gap}"
-        );
-    }
-
-    #[test]
-    fn radius_never_drops_below_the_mouth_open_floor() {
-        for band in ALL_BANDS {
-            for within_index in [0usize, 1, 10, 500] {
-                let v = spiral_local(band, within_index);
-                let r = (v.x * v.x + v.y * v.y).sqrt();
-                assert!(
-                    r >= SPIRAL_R_THROAT - 1e-3,
-                    "{band:?}@{within_index}: radius {r} below the mouth-open floor"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn within_band_angle_advances_monotonically() {
-        let a = spiral_local(Band::ThirtyDays, 0);
-        let b = spiral_local(Band::ThirtyDays, 1);
-        let c = spiral_local(Band::ThirtyDays, 2);
-        let angle_of = |v: Vec3| v.y.atan2(v.x);
-        // SPIRAL_ANGLE_STEP (0.5 rad) is well under a half-turn, so unwrapped
-        // atan2 strictly increases across these three consecutive steps.
-        assert!(angle_of(a) < angle_of(b) && angle_of(b) < angle_of(c), "angle must advance monotonically");
     }
 
     #[test]
@@ -935,45 +1036,27 @@ mod tests {
     }
 
     #[test]
-    fn terrace_ring_geometry_brackets_every_band_between_two_rings() {
+    fn terrace_ring_geometry_is_one_ring_per_band() {
         let rings = terrace_ring_geometry();
-        // Mouth rim + one ring per interior boundary = one ring per band.
-        assert_eq!(rings.len(), N_TERRACES, "mouth rim + interior boundaries");
+        // One ring per band, in mouth→throat order.
+        assert_eq!(rings.len(), ALL_BANDS.len(), "one ring per band");
 
-        // Every radius sits within the mouth→throat span.
-        for (i, (radius, _depth)) in rings.iter().enumerate() {
+        // Every radius sits within the mouth→throat span; each ring matches its
+        // band's `band_ring`.
+        for (i, &band) in ALL_BANDS.iter().enumerate() {
+            let (radius, depth) = rings[i];
+            assert_eq!((radius, depth), band_ring(band), "ring {i} == band_ring({band:?})");
             assert!(
-                *radius >= SPIRAL_R_THROAT - 1e-3 && *radius <= SPIRAL_R_MOUTH + 1e-3,
+                radius >= SPIRAL_R_THROAT - 1e-3 && radius <= SPIRAL_R_MOUTH + 1e-3,
                 "ring {i} radius {radius} must sit within [{SPIRAL_R_THROAT}, {SPIRAL_R_MOUTH}]"
             );
         }
 
-        // The first ring is the mouth rim: the LARGEST radius and SHALLOWEST |depth|.
-        let (first_radius, first_depth) = rings[0];
-        for (radius, depth) in rings.iter().skip(1) {
-            assert!(
-                first_radius > *radius,
-                "mouth-rim radius {first_radius} must exceed every interior ring's {radius}"
-            );
-            assert!(
-                first_depth.abs() < depth.abs(),
-                "mouth-rim |depth| {} must be shallower than every interior ring's {}",
-                first_depth.abs(),
-                depth.abs()
-            );
-        }
-
-        // Radii strictly decrease and |depth| strictly increases down the list.
+        // |depth| strictly increases per deeper band (the rings stack + recede).
         for pair in rings.windows(2) {
             assert!(
-                pair[0].0 > pair[1].0,
-                "radii must strictly decrease: {} then {}",
-                pair[0].0,
-                pair[1].0
-            );
-            assert!(
                 pair[0].1.abs() < pair[1].1.abs(),
-                "|depth| must strictly increase: {} then {}",
+                "|depth| must strictly increase per deeper band: {} then {}",
                 pair[0].1.abs(),
                 pair[1].1.abs()
             );
