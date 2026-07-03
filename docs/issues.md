@@ -389,27 +389,37 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   3D scene (the atlas + shaping pipeline already support it; a renderer change, not
   architectural). Arbitrary zoom over vector content is explicitly declined.
 - **Text rendering (MSDF / 次):** TAA temporal super-resolution, glyph spacing per-font tuning, 1-frame blank flash on texture resize, large-context Vello "paint too large" crash.
+- **MSDF whole-document settle window (residual, after the 2026-07-03 atlas
+  fixes `a6734cbf`).** The silent failure modes are gone (atlas grows to 4096,
+  terminal failures are loud, the respawn loop is dead), but the *transient*
+  is inherent: async glyph generation means a freshly loaded document shows
+  partial text for a few frames until the last atlas batch lands and
+  re-composites. If it still reads as jank, the polish is presentation-side:
+  hold a block's texture (or fade it in) until its first *complete* composite
+  — every glyph region present — instead of showing partial bakes.
+- **Pre-existing clippy deny blocks full-crate `--tests` runs:**
+  `text/sparkline.rs:331` uses `3.14` as a test literal and trips
+  `deny(clippy::approx_constant)`, so `cargo clippy -p kaijutsu-app
+  --all-targets` fails before reaching new code (both 2026-07-03 fix agents
+  had to allow-list around it). Rename the literal (e.g. `3.5`) or allow the
+  lint on that test. Also: `ExtractedMsdfAtlas::default()`
+  (`text/msdf/renderer.rs:425`) hardcodes `1024` duplicating the atlas's
+  initial size — harmless (pre-first-extract only) but now that the atlas
+  grows at runtime the magic number is worth deleting.
 - **Auto-follow on local submit:** the conversation only re-engages
   scroll-follow when already at the bottom
   (`view/sync.rs:200-206`); a shell-dock submit is a strong signal of
   intent to watch the result — force `start_following()` on local
   submits (mirror the `InputCleared` handler at `sync.rs:309`). A
   "new content below" affordance would cover non-local appends.
-- **Stale GpuImage-preparation comments:** "ImageNode ensures the
-  GpuImage is prepared" (`view/lifecycle.rs:258`,
-  `view/block_render.rs:877-878`) is not how Bevy 0.18 works — GpuImage
-  prep is `AssetEvent`-driven with an inherent one-frame delay (the
-  benign single "MSDF render skipped … target_gpu=false" warn per cell).
-  Correct the comments so the next renderer investigation doesn't chase
-  the wrong layer.
-- **Error blocks stick to the bottom of the screen and obstruct new content
-  (observed 2026-06-17, THE_DIRECTOR session `019ed674`).** `system/error`
-  blocks render pinned to the bottom of the conversation view; as new content
-  arrives they don't scroll away with it and start occluding live output. The
-  ordering *is* correct in the CRDT — after an app restart the same errors
-  re-sort into their proper timeline position — so this is a view-side
-  sort/placement bug (errors are laid out by a different key than their tick),
-  not a data bug. Low priority for now; logged to revisit.
+- **Live-verify the error-block ordering fix (view-order holes, fixed
+  2026-07-03, `a47c9a18`).** The three diagnosed mechanisms are fixed with
+  unit + headless-App tests (see devlog), but the original "errors pinned at
+  the bottom" symptom (2026-06-17, session `019ed674`) was never reproduced
+  live before the fix landed. Next time an agentic session produces mid-turn
+  error blocks, watch for the new fail-loud `error!` logs from
+  `reorder_conversation_children` — if they fire, the upstream
+  container-entry gap they point at is the remaining bug to chase.
 - **Triple-Esc does not interrupt a running agentic loop (observed 2026-06-17,
   same session).** Tapping Esc three times while a context was mid-drive
   (autonomous turn / tool loop) did not cancel or interrupt it — the loop ran to

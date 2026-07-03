@@ -10,6 +10,55 @@ Newest work first within each area; dates are when the work landed.
 
 ---
 
+## Conversation view — ordering choreography + MSDF atlas hardening (landed 2026-07-03)
+
+Two long-standing view irritations fell in one arc: error blocks that stuck to
+the bottom of the conversation until restart, and text that loaded with holes
+when a whole document hydrated at once. The investigation started with a full
+read of the view pipeline, then fanned out the way we like: a gemini-pro batch
+and a deepseek consult over the same whole-file surface (no diff), both
+converging with the lead's static trace on the same mechanisms. The fixes were
+built by two Sonnet agents in parallel worktrees — TDD, kaibo-reviewed, then
+squash-merged (`a47c9a18`, `a6734cbf`).
+
+**Ordering (`a47c9a18`).** The CRDT/wire layer was verified sound end to end —
+order_keys are minted once in the kernel and preserved through every merge —
+so the bug had to be in the Bevy choreography that turns document order into
+`Children` order. Three holes, one shape: mutations that changed *order*
+without telling `reorder_conversation_children` to re-run. (1)
+`spawn_block_cells` only bumped `LayoutGeneration` on additions/removals, so a
+pure reposition never triggered the child rewrite — fixed by
+`BlockCellContainer::resort_to_document_order` reporting whether the sort
+moved anything. (2) `track_conversation_container` reparented cells-then-
+headers after a pane split (interleave destroyed) with no bump — now bumps.
+(3) `replace_children` silently un-parents anything missing from the new list,
+leaking it as a root UI node that nothing culls, measures, or despawns — the
+best match for "pinned at the bottom, survives everything, healed by restart."
+That's now fail-loud: orphans are despawned with an `error!`, and a live block
+missing its container entry logs the upstream bug instead of vanishing. The
+gen-gate itself stayed (a full `editor.blocks()` snapshot per frame is too
+expensive); the decision was to make the *bumps* complete rather than remove
+the gate.
+
+**MSDF atlas (`a6734cbf`).** The whole-document "text doesn't fully render"
+split into a benign transient (async glyph generation → version-bump →
+re-composite, self-healing) and two silent forever-failures: a full 1024²
+atlas made `insert()` return `None`, which left the key in `pending` and
+respawned a fresh generation task *every frame* — infinite CPU churn wearing a
+missing-glyph costume — and missing font data had the same unbounded-retry
+shape. The atlas now grows (doubling to a 4096 cap, largest-first repack with
+pixel copy, a new `growth_epoch` signal because growth moves regions without
+changing their count), terminal failures land loud in a `failed` set that
+`request()` respects, font-data waits get a 120-frame budget, and the ~29k
+known-benign one-frame `target_gpu=false` warns in real logs were downgraded
+to debug unless a texture stays stuck. Kanji-heavy documents were the
+motivating capacity case — 日本語 conversations should no longer lose glyphs.
+
+The copy/paste groundwork from the same evaluation (retain byte offsets on
+`PositionedGlyph`, selection as UI overlay quads, selection model riding
+`block_ids_ordered()`) is design direction, not yet code — it stacks on the
+ordering fix.
+
 ## `/v/blobs` — the CAS pool over the VFS, and client CAS sync (design: `docs/slash-v.md`, track B)
 
 ### The whole track landed, reviewed, and demoed by ear (landed 2026-07-02)
