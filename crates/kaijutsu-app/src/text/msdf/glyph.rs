@@ -16,6 +16,14 @@ impl FontId {
     pub fn from_parley(font: &parley::FontData) -> Self {
         Self(font.data.data().as_ptr() as usize)
     }
+
+    /// Construct an arbitrary FontId for tests that need distinct GlyphKeys
+    /// without a real `parley::FontData` (the real font pipeline isn't under
+    /// test here, only atlas/generator bookkeeping).
+    #[cfg(test)]
+    pub(crate) fn for_test(id: usize) -> Self {
+        Self(id)
+    }
 }
 
 /// Key for looking up glyphs in the atlas.

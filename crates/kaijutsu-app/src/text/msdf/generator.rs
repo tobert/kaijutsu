@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use msdfgen::{Bitmap, FillRule, FontExt, MsdfGeneratorConfig, Range, Rgba};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::atlas::MsdfAtlas;
 use super::glyph::GlyphKey;
@@ -32,6 +32,12 @@ pub struct MsdfGenerator {
     tasks: Vec<Task<GeneratedGlyph>>,
     /// Glyphs with in-flight async tasks (prevents duplicate spawns).
     queued: HashSet<GlyphKey>,
+    /// Consecutive frames a pending glyph has been skipped because its
+    /// font's data hasn't reached `FontDataMap` yet. Fonts register during
+    /// scene builds, so the data can legitimately arrive a frame or two
+    /// late — this bounds how long we tolerate that before treating it as a
+    /// real problem instead of retrying silently forever.
+    font_wait_attempts: HashMap<GlyphKey, u32>,
     /// MSDF range in pixels.
     pub msdf_range: f64,
     /// Pixels per em for generation.
@@ -47,6 +53,10 @@ impl Default for MsdfGenerator {
 }
 
 impl MsdfGenerator {
+    /// Number of frames to tolerate missing font data for a pending glyph
+    /// before giving up on it (loud, terminal) instead of retrying forever.
+    pub const FONT_WAIT_MAX_ATTEMPTS: u32 = 120;
+
     /// Create a new generator with default settings.
     ///
     /// MSDF range of 4.0 at 64px/em gives ~4px effective AA at 16px font size.
@@ -54,6 +64,7 @@ impl MsdfGenerator {
         Self {
             tasks: Vec::new(),
             queued: HashSet::new(),
+            font_wait_attempts: HashMap::new(),
             msdf_range: 4.0,
             px_per_em: 64.0,
             angle_threshold: 3.0,
@@ -63,23 +74,44 @@ impl MsdfGenerator {
     /// Queue glyph generation for pending glyphs in the atlas.
     ///
     /// `font_data_map` provides raw font bytes keyed by FontId.
-    /// Skips glyphs that already have in-flight tasks.
-    pub fn queue_pending(
-        &mut self,
-        atlas: &MsdfAtlas,
-        font_data_map: &super::FontDataMap,
-    ) {
+    /// Skips glyphs that already have in-flight tasks. A glyph whose font
+    /// data hasn't shown up after `FONT_WAIT_MAX_ATTEMPTS` frames is moved
+    /// to the atlas's terminal `failed` set (loud, once) instead of being
+    /// probed forever.
+    pub fn queue_pending(&mut self, atlas: &mut MsdfAtlas, font_data_map: &super::FontDataMap) {
         let pool = AsyncComputeTaskPool::get();
 
-        for &key in &atlas.pending {
+        // Snapshot: the loop body can call `atlas.mark_failed`, which
+        // mutates `atlas.pending` — can't hold a borrow of it across that.
+        let pending: Vec<GlyphKey> = atlas.pending.clone();
+
+        for key in pending {
             if self.queued.contains(&key) {
                 continue;
             }
 
             let Some(font_data) = font_data_map.get(&key.font_id) else {
-                warn!("Font data not found for font_id {:?}", key.font_id);
+                let attempts = self.font_wait_attempts.entry(key).or_insert(0);
+                *attempts += 1;
+                if should_retry_font_wait(*attempts, Self::FONT_WAIT_MAX_ATTEMPTS) {
+                    debug!(
+                        "Font data not found for font_id {:?} (attempt {}/{})",
+                        key.font_id, attempts, Self::FONT_WAIT_MAX_ATTEMPTS,
+                    );
+                } else {
+                    error!(
+                        "Font data never registered for font_id {:?} after {} frames — \
+                         giving up on glyph {:?} (marking permanently missing instead of \
+                         retrying every frame)",
+                        key.font_id, attempts, key,
+                    );
+                    self.font_wait_attempts.remove(&key);
+                    atlas.mark_failed(key);
+                }
                 continue;
             };
+
+            self.font_wait_attempts.remove(&key);
 
             let msdf_range = self.msdf_range;
             let px_per_em = self.px_per_em;
@@ -97,7 +129,7 @@ impl MsdfGenerator {
     }
 
     /// Poll for completed generation tasks and insert into atlas.
-    pub fn poll_completed(&mut self, atlas: &mut MsdfAtlas) {
+    pub fn poll_completed(&mut self, atlas: &mut MsdfAtlas, images: &mut Assets<Image>) {
         let mut completed = Vec::new();
         self.tasks.retain_mut(|task| {
             if task.is_finished() {
@@ -111,7 +143,7 @@ impl MsdfGenerator {
         for glyph in completed {
             self.queued.remove(&glyph.key);
             if glyph.is_placeholder {
-                atlas.insert_placeholder(glyph.key);
+                atlas.insert_placeholder(glyph.key, images);
             } else {
                 atlas.insert(
                     glyph.key,
@@ -120,11 +152,18 @@ impl MsdfGenerator {
                     glyph.anchor_x,
                     glyph.anchor_y,
                     &glyph.data,
+                    images,
                 );
             }
         }
     }
 
+}
+
+/// Pure retry-budget check, factored out for unit testing without a real
+/// task pool: is a pending glyph still within its font-data wait budget?
+fn should_retry_font_wait(attempts: u32, max_attempts: u32) -> bool {
+    attempts < max_attempts
 }
 
 /// Generate MSDF for a single glyph.
@@ -230,5 +269,43 @@ fn placeholder_glyph(key: GlyphKey) -> GeneratedGlyph {
         anchor_y: 0.0,
         data: Vec::new(),
         is_placeholder: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `queue_pending`/`poll_completed` themselves call
+    // `AsyncComputeTaskPool::get()`, which panics without a real Bevy App
+    // (TaskPoolPlugin) to initialize the global pool — so the retry-budget
+    // decision is tested here as the pure function it was factored into,
+    // per the "practical without a real task pool" testing note.
+
+    #[test]
+    fn retries_while_under_budget() {
+        assert!(should_retry_font_wait(0, MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS));
+        assert!(should_retry_font_wait(1, MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS));
+        assert!(should_retry_font_wait(
+            MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS - 1,
+            MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS
+        ));
+    }
+
+    #[test]
+    fn stops_retrying_once_budget_exhausted() {
+        assert!(!should_retry_font_wait(
+            MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS,
+            MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS
+        ));
+        assert!(!should_retry_font_wait(
+            MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS + 50,
+            MsdfGenerator::FONT_WAIT_MAX_ATTEMPTS
+        ));
+    }
+
+    #[test]
+    fn zero_budget_never_retries() {
+        assert!(!should_retry_font_wait(0, 0));
     }
 }

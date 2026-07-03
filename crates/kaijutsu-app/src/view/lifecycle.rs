@@ -260,7 +260,9 @@ pub fn spawn_block_cells(
     for block_id in &current_blocks {
         if !container.contains(block_id) {
             // Single-phase spawn: BlockCell + BlockScene + BlockTexture + ImageNode + MaterialNode.
-            // ImageNode ensures the GpuImage is prepared by Bevy's render asset pipeline.
+            // The GpuImage is prepared asynchronously by Bevy's RenderAssetPlugin, reacting
+            // to AssetEvent::Modified/Created on the Image asset — one frame after this
+            // spawn, not synchronously with it. ImageNode itself doesn't force preparation.
             // MaterialNode renders on top with shader effects (glow, animation).
             let material_handle = fx_materials.add(BlockFxMaterial::default());
             let entity = commands

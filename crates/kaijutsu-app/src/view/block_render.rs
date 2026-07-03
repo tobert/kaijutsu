@@ -824,7 +824,12 @@ pub fn resize_block_textures(
     let max_dim = gpu_limits.max_texture_dim;
 
     // Block cells: update material + ImageNode texture bindings.
-    // ImageNode ensures GpuImage is prepared by Bevy's RenderAssetPlugin.
+    // Bevy prepares the GpuImage asynchronously: RenderAssetPlugin reacts to
+    // AssetEvent::Modified/Created on the Image asset and (re)creates the
+    // wgpu texture on its own schedule, one frame after this mutation lands
+    // — there is no synchronous "ensure prepared" call here. Consumers that
+    // read the GpuImage this same frame (e.g. render_msdf_block_textures)
+    // must tolerate that one-frame gap.
     // MaterialNode's shader reads from the same texture for post-processing.
     for (mut texture, mat_node, mut image_node) in block_query.iter_mut() {
         if texture.built_width <= 0.0 || texture.built_height <= 0.0 {
@@ -979,7 +984,24 @@ pub fn render_msdf_block_textures(
             msdf_data
                 .last_rendered
                 .insert(item.image_handle.id(), item.version);
+            msdf_data.skip_attempts.remove(&item.image_handle.id());
         } else {
+            // A one-frame `target_gpu=false` here is the KNOWN-benign case:
+            // Bevy prepares GpuImage from Image asset changes via
+            // AssetEvent::Modified, which lands one frame after the Image
+            // is created/resized (there's no synchronous "ensure prepared"
+            // path — RenderAssetPlugin's prepare step runs on the render
+            // schedule, not inline with the main-world mutation). At
+            // document-load scale this fires ~100x/frame across newly
+            // spawned blocks, so only escalate to `warn!` once it's
+            // persisted past the expected one-frame delay; a single skip is
+            // `debug!`.
+            let attempts = msdf_data
+                .skip_attempts
+                .entry(item.image_handle.id())
+                .or_insert(0);
+            *attempts += 1;
+
             let pipe_ok = pipeline_cache
                 .get_render_pipeline(msdf_renderer.pipeline)
                 .is_some();
@@ -987,13 +1009,26 @@ pub fn render_msdf_block_textures(
                 .get_render_pipeline_state(msdf_renderer.pipeline);
             let target_ok = gpu_images.get(&item.image_handle).is_some();
             let atlas_ok = gpu_images.get(&msdf_atlas.texture).is_some();
-            warn!(
-                "MSDF render skipped: {}x{} glyphs={} verts={} pipeline={} ({:?}) target_gpu={} atlas_gpu={}",
-                item.width, item.height,
-                item.glyphs.len(), vertices.len(),
-                pipe_ok, pipe_state,
-                target_ok, atlas_ok,
-            );
+
+            if *attempts > 2 {
+                warn!(
+                    "MSDF render skipped {} consecutive frames: {}x{} glyphs={} verts={} pipeline={} ({:?}) target_gpu={} atlas_gpu={}",
+                    attempts,
+                    item.width, item.height,
+                    item.glyphs.len(), vertices.len(),
+                    pipe_ok, pipe_state,
+                    target_ok, atlas_ok,
+                );
+            } else {
+                debug!(
+                    "MSDF render skipped (attempt {}): {}x{} glyphs={} verts={} pipeline={} ({:?}) target_gpu={} atlas_gpu={}",
+                    attempts,
+                    item.width, item.height,
+                    item.glyphs.len(), vertices.len(),
+                    pipe_ok, pipe_state,
+                    target_ok, atlas_ok,
+                );
+            }
         }
     }
 }
@@ -1021,6 +1056,11 @@ struct ExtractedMsdfBlockItem {
 pub struct ExtractedMsdfBlockData {
     items: Vec<ExtractedMsdfBlockItem>,
     last_rendered: HashMap<AssetId<Image>, u64>,
+    /// Consecutive frames a texture's MSDF render was skipped (target not
+    /// GPU-prepared yet, pipeline not ready, etc). Used to keep the
+    /// known-benign one-frame `GpuImage` preparation delay at `debug!`
+    /// while still escalating to `warn!` if a texture stays stuck.
+    skip_attempts: HashMap<AssetId<Image>, u32>,
 }
 
 /// Extracted MSDF rendering parameters (from Theme + Time).

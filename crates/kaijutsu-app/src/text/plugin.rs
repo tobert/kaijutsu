@@ -49,6 +49,7 @@ fn poll_msdf_generator(
     font_data_map: Res<FontDataMap>,
     mut msdf_blocks: Query<&mut super::msdf::MsdfBlockGlyphs>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
+    mut last_growth_epoch: Local<u64>,
 ) {
     let Some(ref mut atlas) = atlas else {
         return;
@@ -69,19 +70,32 @@ fn poll_msdf_generator(
 
     // Poll completed generation tasks
     let before = atlas.regions.len();
-    generator.poll_completed(atlas);
+    generator.poll_completed(atlas, &mut images);
     let after = atlas.regions.len();
-    if after > before {
-        info!(
-            "MSDF atlas: {} new glyphs, {} total, version {}",
-            after - before,
-            after,
-            atlas.version,
-        );
+
+    // The atlas can also change shape without the region *count* changing:
+    // a grow() repacks every existing region into a larger texture, moving
+    // positions (and therefore UVs) even though no new glyph landed this
+    // frame. `growth_epoch` is the signal for that case — watch it
+    // alongside the region-count delta so a repack forces the same
+    // re-extract/re-render path as a newly-arrived glyph.
+    let grew = atlas.growth_epoch != *last_growth_epoch;
+    *last_growth_epoch = atlas.growth_epoch;
+
+    if after > before || grew {
+        if after > before {
+            info!(
+                "MSDF atlas: {} new glyphs, {} total, version {}",
+                after - before,
+                after,
+                atlas.version,
+            );
+        }
 
         // Bump version on all MSDF blocks so the render world re-extracts them.
         // This is cheaper than a full rebuild — no Parley re-layout, no texture resize,
-        // just a re-render with the now-complete atlas.
+        // just a re-render with the now-complete atlas. Required on growth too:
+        // region count is unchanged but every UV moved.
         for mut glyphs in msdf_blocks.iter_mut() {
             if !glyphs.glyphs.is_empty() {
                 glyphs.version = glyphs.version.wrapping_add(1);
