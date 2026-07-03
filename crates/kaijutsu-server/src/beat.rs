@@ -415,6 +415,7 @@ impl BeatScheduler {
                 fork_kind: None,
                 archived_at: None,
                 concluded_at: None,
+                last_activity_at: None,
                 workspace_id: None,
                 preset_id: None,
             };
@@ -3263,6 +3264,7 @@ mod tests {
                     workspace_id: None,
                     preset_id: None,
                     concluded_at: None,
+                    last_activity_at: None,
                 },
                 ws,
             )

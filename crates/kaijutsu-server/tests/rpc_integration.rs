@@ -166,6 +166,67 @@ fn test_create_context_appears_in_list() {
     });
 }
 
+/// Stage 1 (time-well) kernel truth, server slice: `listContexts` must
+/// populate `ContextHandleInfo.lastActivityAt` from the kernel DB's
+/// `last_activity_at` column, alongside the existing `set_concluded_at` (both
+/// come off the same `ContextRow`). Context creation itself already runs rc
+/// lifecycle (e.g. the stance block), so a fresh context can already carry a
+/// stamp — the invariant under test is that a *subsequent* block-mutating op
+/// (here, `shell_execute`'s synchronous command-block insert, which goes
+/// through `BlockStore::journal_op`) advances it to a fresh, recent value.
+#[test]
+fn test_context_last_activity_at_populated_after_block_op() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let context_id = kernel.create_context("activity-stamp").await.unwrap();
+        kernel
+            .join_context(context_id, "test-instance")
+            .await
+            .unwrap();
+
+        let before = kernel.list_contexts().await.unwrap();
+        let found_before = before
+            .iter()
+            .find(|c| c.id == context_id)
+            .expect("just-created context must appear in list_contexts");
+        // May already be `Some(_)` (rc create lifecycle inserts blocks too) —
+        // the point of this test is the *advance* past t0, not a bare `None`.
+        let before_stamp = found_before.last_activity_at;
+
+        // Guarantee millis-resolution separation from `before_stamp`.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let t0 = kaijutsu_types::now_millis();
+        kernel
+            .shell_execute("echo activity-stamp-probe", context_id, true)
+            .await
+            .unwrap_or_else(|e| panic!("shell_execute failed: {e}"));
+
+        let after = kernel.list_contexts().await.unwrap();
+        let found_after = after
+            .iter()
+            .find(|c| c.id == context_id)
+            .expect("context must still appear in list_contexts after the block op");
+        let stamped = found_after.last_activity_at.expect(
+            "a block-mutating op (shell_execute's command-block insert) must stamp \
+             last_activity_at via journal_op -> touch_context_activity",
+        );
+        assert!(
+            stamped >= t0,
+            "stamp {stamped} should be >= t0 {t0} recorded just before the block op"
+        );
+        if let Some(before) = before_stamp {
+            assert!(
+                stamped > before,
+                "stamp {stamped} should advance past the pre-op stamp {before}"
+            );
+        }
+    });
+}
+
 #[test]
 fn test_create_context_joinable() {
     run_local(async {

@@ -763,6 +763,7 @@ mod tests {
                 workspace_id: None,
                 preset_id: None,
                 concluded_at: None,
+                last_activity_at: None,
             },
             ws_id,
         )
@@ -859,6 +860,7 @@ mod tests {
                 workspace_id: None,
                 preset_id: None,
                 concluded_at: None,
+                last_activity_at: None,
             },
             ws_id,
         )

@@ -209,6 +209,14 @@ pub struct BlockStore {
     block_flows: Option<SharedBlockFlowBus>,
     /// FlowBus for input doc events.
     input_flows: Option<SharedInputDocFlowBus>,
+    /// Stage 1 (time-well) incremental live-status cache: one
+    /// `derive_context_live_status` reduction per context, bumped inside
+    /// `journal_op` (the one chokepoint every mutating block op funnels
+    /// through) instead of re-scanned on every 5s poll. Empty on a fresh
+    /// store (e.g. right after a kernel restart) — `live_status()` lazily
+    /// populates a miss with a one-time single-context scan rather than
+    /// defaulting wrongly to `Pending`.
+    live_status: DashMap<ContextId, Status>,
     /// TEST-ONLY fault injection: when `> 0`, each `insert_from_snapshot_as`
     /// decrements it, and the call on which it hits exactly 1 returns an error
     /// instead of inserting. Lets the per-artifact resumability spine
@@ -234,6 +242,7 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: None,
             input_flows: None,
+            live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -254,6 +263,7 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
             input_flows: None,
+            live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -278,6 +288,7 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: None,
             input_flows: None,
+            live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -308,6 +319,7 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
             input_flows: Some(input_flows),
+            live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -884,6 +896,30 @@ impl BlockStore {
         context_id: ContextId,
         payload: SyncPayload,
     ) -> BlockStoreResult<()> {
+        // Stage 1 (time-well) incremental live_status: recompute + cache this
+        // context's live status from its current (just-mutated) block
+        // statuses. Unconditional — non-persistent stores (app/client scratch,
+        // tests) need a correct cache too; only the DB journaling below is
+        // gated on `self.db`. (In practice `get` always hits here: every call
+        // site mutates via `get_mut` before calling journal_op, so the
+        // document is guaranteed to already exist.)
+        //
+        // Why not gate this on "the op changed a status" to skip the scan on
+        // streaming text deltas? The payload can't tell us: `ops_since` ALWAYS
+        // ships every known block's header (block_store.rs `ops_since`, "Always
+        // send header for known blocks so metadata changes propagate via LWW"),
+        // and `set_status` itself travels *only* as an updated header — so
+        // `updated_headers` is non-empty on every op and carries no signal that
+        // distinguishes a status change from a status-neutral edit. The scan is
+        // the cheapest thing that knows the new status, and it's dwarfed by the
+        // `append_op` SQLite write it sits beside, so leave it unconditional.
+        if let Some(entry) = self.get(context_id) {
+            let statuses: Vec<Status> =
+                entry.doc.blocks_ordered().iter().map(|b| b.status).collect();
+            drop(entry);
+            self.recompute_live_status(context_id, &statuses);
+        }
+
         let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
@@ -909,6 +945,16 @@ impl BlockStore {
             let db_guard = db.lock();
             db_guard
                 .append_op(context_id, seq as i64, &payload_bytes)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            // Stage 1 (time-well) kernel truth: stamp this context's
+            // last_activity_at on every mutating block op. `now_millis()` is
+            // the SAME Unix-millis clock `created_at` is stamped with
+            // (`kaijutsu_types::now_millis`, mirrored by kernel_db's private
+            // helper of the same name/formula) - the app computes
+            // `now - last_activity_at` directly against it, so the epoch must
+            // match exactly. One extra O(1) UPDATE under a lock already held.
+            db_guard
+                .touch_context_activity(context_id, kaijutsu_types::now_millis() as i64)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
@@ -2101,6 +2147,45 @@ impl BlockStore {
         Ok(entry.doc.blocks_ordered())
     }
 
+    /// Stage 1 (time-well) incremental live-status read: the cached
+    /// per-context reducer over block statuses that drives the time-well
+    /// pulse (Running = working, Error = last turn failed), bumped as a side
+    /// effect of every mutating block op (see `journal_op`) instead of
+    /// re-derived by scanning every block of every context on each 5s poll.
+    ///
+    /// Cold-cache landmine: the cache is a `DashMap`, empty on a fresh store
+    /// (e.g. right after a kernel restart, before any context has been
+    /// touched again). A miss lazily computes the correct answer with a
+    /// one-time single-context scan and populates the cache — it does NOT
+    /// default to `Pending` for an unread context. A context with no
+    /// document at all (never existed, or not yet hydrated from the DB) has
+    /// no blocks to be `Running`/`Error` about, so `Pending` is correct there.
+    pub fn live_status(&self, context_id: ContextId) -> Status {
+        if let Some(status) = self.live_status.get(&context_id) {
+            return *status;
+        }
+        let computed = match self.get(context_id) {
+            Some(entry) => {
+                let statuses: Vec<Status> =
+                    entry.doc.blocks_ordered().iter().map(|b| b.status).collect();
+                derive_context_live_status(&statuses)
+            }
+            None => Status::Pending,
+        };
+        self.live_status.insert(context_id, computed);
+        computed
+    }
+
+    /// Recompute and cache `context_id`'s live status from its current block
+    /// statuses. Called from `journal_op` — the one chokepoint every
+    /// mutating block op (insert, status change, edit, merge...) funnels
+    /// through — so the cache can never silently drift from the CRDT state
+    /// no matter which of the ~20 mutator functions was the actual caller.
+    fn recompute_live_status(&self, context_id: ContextId, statuses: &[Status]) {
+        self.live_status
+            .insert(context_id, derive_context_live_status(statuses));
+    }
+
     /// Get a single block snapshot by ID.
     pub fn get_block_snapshot(
         &self,
@@ -3029,6 +3114,31 @@ impl BlockStore {
     }
 }
 
+/// Derive a context's *live* status from its block statuses in timeline order
+/// (as returned by `block_snapshots`, i.e. `blocks_ordered`):
+///
+/// - any block `Running` → `Running` (the context is actively working);
+/// - else the tail block `Error` → `Error` (its most recent turn failed);
+/// - else `Pending` (idle — no rim in the time well).
+///
+/// Non-sticky by construction: a new turn appends a `Running` block, so a past
+/// error is superseded the moment work resumes. Pure over the ordered statuses
+/// so it is unit-testable without a block store.
+///
+/// Shared single-context reducer: `BlockStore::live_status` /
+/// `recompute_live_status` (this crate) and the `listContexts` poll site
+/// (`kaijutsu-server`, which re-exports this fn) both call the same logic —
+/// there is exactly one place this derivation is written.
+pub fn derive_context_live_status(statuses_in_order: &[Status]) -> Status {
+    if statuses_in_order.iter().any(|s| *s == Status::Running) {
+        Status::Running
+    } else if statuses_in_order.last() == Some(&Status::Error) {
+        Status::Error
+    } else {
+        Status::Pending
+    }
+}
+
 /// BFS from `root_id` collecting all descendant block IDs up to `max_depth` levels.
 /// Depth 0 = unlimited. The root itself is included in the result set.
 /// Validate ABC notation content, returning ErrorPayloads for each diagnostic.
@@ -3168,6 +3278,153 @@ mod tests {
 
     fn test_agent() -> PrincipalId {
         PrincipalId::new()
+    }
+
+    // ========================================================================
+    // Stage 1 (time-well) incremental live_status — cached per-context
+    // reducer over block statuses, bumped on every mutating op (journal_op
+    // is the one chokepoint), instead of the every-poll full block scan.
+    // ========================================================================
+
+    #[test]
+    fn live_status_defaults_to_pending_for_unknown_context() {
+        let store = BlockStore::new(test_agent());
+        let missing = ContextId::new();
+        assert_eq!(store.live_status(missing), Status::Pending);
+    }
+
+    #[test]
+    fn live_status_running_after_insert_running_block() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        // This test never calls block_snapshots itself — live_status must be
+        // correct off the cache alone, bumped as a side effect of insert_block.
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "working...",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        assert_eq!(store.live_status(ctx), Status::Running);
+    }
+
+    #[test]
+    fn live_status_done_reverts_running_block_to_pending() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "working...",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        assert_eq!(store.live_status(ctx), Status::Running);
+
+        store.set_status(ctx, &block_id, Status::Done).unwrap();
+        assert_eq!(
+            store.live_status(ctx),
+            Status::Pending,
+            "the only Running block finishing must revert live_status to Pending"
+        );
+    }
+
+    #[test]
+    fn live_status_error_on_last_block() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let first = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text, "ok",
+                Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        let last = store
+            .insert_block(
+                ctx, None, Some(&first), Role::Model, BlockKind::Text, "boom",
+                Status::Running, ContentType::Plain,
+            )
+            .unwrap();
+        assert_eq!(store.live_status(ctx), Status::Running);
+
+        store.set_status(ctx, &last, Status::Error).unwrap();
+        assert_eq!(
+            store.live_status(ctx),
+            Status::Error,
+            "Error on the tail (last) block must surface as live_status Error"
+        );
+    }
+
+    /// Landmine: the `live_status` DashMap is empty on kernel boot (a fresh
+    /// `BlockStore` backed by an existing on-disk DB, simulating a systemd
+    /// restart). The FIRST read after "boot" — before any mutation warms the
+    /// cache — must still be correct via a lazy single-context scan, not
+    /// silently default to `Pending` for everything.
+    #[test]
+    fn live_status_cold_cache_after_boot_is_correct_not_pending_default() {
+        use crate::kernel_db::KernelDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cold_cache.db");
+        let creator = PrincipalId::system();
+
+        let ctx = {
+            let db = Arc::new(parking_lot::Mutex::new(KernelDb::open(&db_path).unwrap()));
+            let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+            let store1 = BlockStore::with_db(db.clone(), ws_id, creator);
+            let ctx = ContextId::new();
+            store1
+                .create_document(ctx, DocumentKind::Conversation, None)
+                .unwrap();
+            store1
+                .insert_block(
+                    ctx, None, None, Role::Model, BlockKind::Text, "still going",
+                    Status::Running, ContentType::Plain,
+                )
+                .unwrap();
+            assert_eq!(store1.live_status(ctx), Status::Running);
+            // Drop store1 + db (unclean, simulating a kernel restart) before
+            // ever touching store2's cache.
+            ctx
+        };
+
+        // "Boot": a brand-new BlockStore, fresh (empty) live_status DashMap,
+        // backed by the same on-disk DB.
+        let db2 = Arc::new(parking_lot::Mutex::new(KernelDb::open(&db_path).unwrap()));
+        let ws_id2 = db2.lock().get_or_create_default_workspace(creator).unwrap();
+        let store2 = BlockStore::with_db(db2, ws_id2, creator);
+        store2.load_from_db().expect("load_from_db");
+
+        // First read after boot, no mutation yet — must lazily compute the
+        // correct answer (Running), not a stale/default Pending.
+        assert_eq!(
+            store2.live_status(ctx),
+            Status::Running,
+            "cold cache must lazily populate the correct status on first read"
+        );
     }
 
     #[test]
@@ -4275,6 +4532,90 @@ mod tests {
         let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snap.content, streaming_text);
         assert_eq!(snap.status, Status::Done);
+    }
+
+    /// Stage 1 (time-well) kernel truth: any mutating block op — funneled
+    /// through the one `journal_op` chokepoint — must stamp the context row's
+    /// `last_activity_at`, strictly after `created_at` and no earlier than a
+    /// `t0` recorded just before the op. Proves the wiring from
+    /// `BlockStore::journal_op` into `KernelDb::touch_context_activity`.
+    #[test]
+    fn journal_op_stamps_context_last_activity_at() {
+        use crate::kernel_db::{ContextRow, KernelDb};
+        use kaijutsu_types::{ConsentMode, ContextState};
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Context row, created safely in the past so `t0` (below) can't tie
+        // with it at millisecond resolution.
+        let created_at = kaijutsu_types::now_millis() as i64 - 60_000;
+        db.lock()
+            .insert_context(&ContextRow {
+                context_id: ctx,
+                label: None,
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: "default".to_string(),
+                created_at,
+                created_by: creator,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: Some(ws_id),
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+            })
+            .unwrap();
+
+        let row = db.lock().get_context(ctx).unwrap().unwrap();
+        assert_eq!(row.last_activity_at, None, "untouched row starts unstamped");
+
+        let t0 = kaijutsu_types::now_millis() as i64;
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "activity stamp",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let row = db.lock().get_context(ctx).unwrap().unwrap();
+        let stamped = row
+            .last_activity_at
+            .expect("insert_block must stamp last_activity_at via journal_op");
+        assert!(stamped >= t0, "stamp {stamped} should be >= t0 {t0}");
+        assert!(
+            stamped > created_at,
+            "stamp {stamped} should be after created_at {created_at}"
+        );
+
+        // A second mutating op (set_status) re-stamps forward.
+        let block_id = {
+            let entry = store.get(ctx).unwrap();
+            entry.doc.blocks_ordered().last().unwrap().id
+        };
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let t1 = kaijutsu_types::now_millis() as i64;
+        store.set_status(ctx, &block_id, Status::Done).unwrap();
+        let row2 = db.lock().get_context(ctx).unwrap().unwrap();
+        assert!(row2.last_activity_at.unwrap() >= t1);
     }
 
     /// Prove that merge_ops persists merged content to the database.

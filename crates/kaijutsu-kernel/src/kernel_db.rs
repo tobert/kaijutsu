@@ -90,6 +90,11 @@ pub struct ContextRow {
     pub concluded_at: Option<i64>,
     pub workspace_id: Option<WorkspaceId>,
     pub preset_id: Option<PresetId>,
+    /// Unix-millis of the most recent block append/mutation on this context,
+    /// or `None` if never touched since creation (or a pre-migration row).
+    /// Stamped by `touch_context_activity`, called from `BlockStore::journal_op`
+    /// — the one chokepoint every mutating block op funnels through.
+    pub last_activity_at: Option<i64>,
 }
 
 impl ContextRow {
@@ -355,7 +360,8 @@ CREATE TABLE IF NOT EXISTS contexts (
     archived_at  INTEGER,
     concluded_at INTEGER,
     workspace_id BLOB REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
-    preset_id    BLOB REFERENCES presets(preset_id) ON DELETE SET NULL
+    preset_id    BLOB REFERENCES presets(preset_id) ON DELETE SET NULL,
+    last_activity_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL;
@@ -990,6 +996,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
             "ALTER TABLE tracks ADD COLUMN clock_kind TEXT NOT NULL DEFAULT 'system'",
+            "ALTER TABLE contexts ADD COLUMN last_activity_at INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -1624,7 +1631,8 @@ impl KernelDb {
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id, concluded_at
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -1776,16 +1784,35 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
+    /// Stamp `last_activity_at` on a context — called from
+    /// `BlockStore::journal_op`, the one chokepoint every mutating block op
+    /// (insert, status change, text edit...) funnels through. Unlike
+    /// `concluded_at` (first-write-wins), this re-stamps on every call: it is
+    /// the kernel-truth "recency" fact the time-well vortex orders by.
+    ///
+    /// `ts` must be the same clock/epoch as `created_at` (Unix millis via
+    /// `now_millis()` / `kaijutsu_types::now_millis()`) — callers compute
+    /// `now − last_activity_at` directly against it, so a unit mismatch
+    /// corrupts idle-age math.
+    pub fn touch_context_activity(&self, context_id: ContextId, ts: i64) -> KernelDbResult<()> {
+        self.conn.execute(
+            "UPDATE contexts SET last_activity_at = ?2 WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes()), ts],
+        )?;
+        Ok(())
+    }
+
     /// List active (non-archived) contexts.
     pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id, concluded_at
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at
              FROM contexts
              WHERE archived_at IS NULL
-             ORDER BY created_at",
+             ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
 
         let rows = stmt.query_map([], |row| row_to_context_row(row))?;
@@ -1798,9 +1825,10 @@ impl KernelDb {
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id, concluded_at
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at
              FROM contexts
-             ORDER BY created_at",
+             ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
 
         let rows = stmt.query_map([], |row| row_to_context_row(row))?;
@@ -1835,7 +1863,8 @@ impl KernelDb {
             "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at
+                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
+                    c.last_activity_at
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -1853,7 +1882,8 @@ impl KernelDb {
             "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at
+                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
+                    c.last_activity_at
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -1891,7 +1921,7 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   dag.depth
+                   c.last_activity_at, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -1899,7 +1929,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(17)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1921,7 +1951,7 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   lineage.depth
+                   c.last_activity_at, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -1929,7 +1959,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(17)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1950,7 +1980,7 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   subtree.depth
+                   c.last_activity_at, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -1958,7 +1988,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(17)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -3769,7 +3799,8 @@ impl KernelDb {
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id, concluded_at
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at
              FROM contexts WHERE label = ?1",
         )?;
 
@@ -3821,6 +3852,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         workspace_id: read_opt_workspace_id(row, 13)?,
         preset_id: read_opt_preset_id(row, 14)?,
         concluded_at: row.get(15)?,
+        last_activity_at: row.get(16)?,
     })
 }
 
@@ -3897,6 +3929,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         workspace_id: None,
         preset_id: None,
         concluded_at: None,
+        last_activity_at: None,
     }
 }
 
@@ -4039,6 +4072,55 @@ mod tests {
         let db = KernelDb::in_memory().unwrap();
         // Apply schema again — should not error.
         db.conn.execute_batch(SCHEMA).unwrap();
+    }
+
+    /// Stage 1 (time-well): `last_activity_at` is added to `SCHEMA` directly
+    /// AND listed in `apply_additive_migrations` for pre-migration DBs. On a
+    /// fresh DB (column already in `SCHEMA`), re-running the migration must be
+    /// a guarded no-op — the same idempotency contract as `concluded_at`.
+    #[test]
+    fn last_activity_at_migration_is_idempotent_no_op_on_fresh_db() {
+        let db = KernelDb::in_memory().unwrap();
+        // in_memory() already ran apply_additive_migrations() once; running it
+        // again must not error (duplicate-column guard) and the column must
+        // still be queryable.
+        KernelDb::apply_additive_migrations(&db.conn);
+        KernelDb::apply_additive_migrations(&db.conn);
+
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("mig-check"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let loaded = db.get_context(row.context_id).unwrap().unwrap();
+        assert_eq!(loaded.last_activity_at, None, "fresh row: never touched");
+    }
+
+    /// `touch_context_activity` stamps `last_activity_at`, and pre-touch rows
+    /// read back `None` (not silently defaulted) — the list SELECTs are what
+    /// backfill via COALESCE, not this row-level accessor.
+    #[test]
+    fn touch_context_activity_stamps_and_advances() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("touch-me"));
+        let cid = row.context_id;
+        let created_at = row.created_at;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.last_activity_at, None);
+
+        let t0 = created_at + 1000;
+        db.touch_context_activity(cid, t0).unwrap();
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.last_activity_at, Some(t0));
+        assert!(loaded.last_activity_at.unwrap() > created_at);
+
+        // A second touch advances further (not a first-write-wins latch like
+        // concluded_at — activity is repeatedly re-stamped).
+        let t1 = t0 + 1000;
+        db.touch_context_activity(cid, t1).unwrap();
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.last_activity_at, Some(t1));
     }
 
     // ── WAL checkpoint ──────────────────────────────────────────────────
@@ -4733,6 +4815,7 @@ mod tests {
             workspace_id: None,
             preset_id: None,
             concluded_at: None,
+            last_activity_at: None,
         };
 
         let ctx = row.to_context();
@@ -4770,6 +4853,7 @@ mod tests {
             workspace_id: None,
             preset_id: None,
             concluded_at: None,
+            last_activity_at: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
@@ -4792,6 +4876,7 @@ mod tests {
             workspace_id: None,
             preset_id: None,
             concluded_at: None,
+            last_activity_at: None,
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -4866,6 +4951,7 @@ mod tests {
             workspace_id: Some(WorkspaceId::new()), // doesn't exist
             preset_id: None,
             concluded_at: None,
+            last_activity_at: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(

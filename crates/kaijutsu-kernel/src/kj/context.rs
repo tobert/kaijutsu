@@ -633,6 +633,7 @@ impl KjDispatcher {
                 workspace_id: None,
                 preset_id: None,
                 concluded_at: None,
+                last_activity_at: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -735,6 +736,7 @@ impl KjDispatcher {
                 workspace_id: None,
                 preset_id: None,
                 concluded_at: None,
+                last_activity_at: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));

@@ -78,6 +78,12 @@ use crate::kaijutsu_capnp::*;
 use crate::llm_stream::spawn_llm_for_prompt;
 
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+// `derive_context_live_status` moved to kaijutsu-kernel (single source of
+// truth shared with `BlockStore::live_status`'s incremental cache); only
+// `live_status_tests` below still exercises it directly, so the import is
+// test-only in this crate.
+#[cfg(test)]
+use kaijutsu_kernel::block_store::derive_context_live_status;
 use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
 use kaijutsu_kernel::{
     // FlowBus
@@ -1251,6 +1257,7 @@ pub async fn create_shared_kernel(
                     workspace_id: None,
                     preset_id: None,
                     concluded_at: None,
+                    last_activity_at: None,
                 };
                 let default_ws = db
                     .get_or_create_default_workspace(row.created_by)
@@ -1622,6 +1629,7 @@ async fn create_context_inner(
             workspace_id: None,
             preset_id: None,
             concluded_at: None,
+            last_activity_at: None,
         };
         let default_ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -2996,6 +3004,14 @@ impl kernel::Server for KernelImpl {
                         c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_context_type(&row.context_type);
+                        // Stage 1 (time-well) kernel truth: last block-op
+                        // recency, stamped by BlockStore::journal_op via
+                        // KernelDb::touch_context_activity. 0 = never/unknown
+                        // (client normalizes 0 -> None, same sentinel as
+                        // concluded_at above).
+                        c.set_last_activity_at(
+                            row.last_activity_at.map(|ts| ts as u64).unwrap_or(0),
+                        );
                     }
 
                     // Supplement with synthesis data (keywords + preview)
@@ -3014,17 +3030,11 @@ impl kernel::Server for KernelImpl {
                     }
 
                     // Live activity for the time-well pulse (Running = working,
-                    // Error = last turn failed). Derived from the context's block
-                    // statuses in timeline order; computed kernel-side so the client
-                    // stays thin. (Per-poll full snapshot is fine at this scale; a
-                    // cached per-context status is the optimization if it bites.)
-                    let live = match documents.block_snapshots(ctx.id) {
-                        Ok(blocks) => {
-                            let statuses: Vec<_> = blocks.iter().map(|b| b.status).collect();
-                            derive_context_live_status(&statuses)
-                        }
-                        Err(_) => kaijutsu_crdt::Status::Pending,
-                    };
+                    // Error = last turn failed). Stage 1 (time-well): now an
+                    // O(1) cache read (`BlockStore::live_status`), bumped
+                    // incrementally by `journal_op` on every mutating block
+                    // op, instead of a per-poll full block scan + reduce.
+                    let live = documents.live_status(ctx.id);
                     c.set_live_status(status_to_capnp(live));
                 }
 
@@ -7312,27 +7322,6 @@ fn parse_block_event_filter(
         context_ids,
         event_types,
         block_kinds,
-    }
-}
-
-/// Derive a context's *live* status from its block statuses in timeline order
-/// (as returned by `block_snapshots`, i.e. `blocks_ordered`):
-///
-/// - any block `Running` → `Running` (the context is actively working);
-/// - else the tail block `Error` → `Error` (its most recent turn failed);
-/// - else `Pending` (idle — no rim in the time well).
-///
-/// Non-sticky by construction: a new turn appends a `Running` block, so a past
-/// error is superseded the moment work resumes. Pure over the ordered statuses
-/// so it is unit-testable without a block store.
-fn derive_context_live_status(statuses_in_order: &[kaijutsu_crdt::Status]) -> kaijutsu_crdt::Status {
-    use kaijutsu_crdt::Status;
-    if statuses_in_order.iter().any(|s| *s == Status::Running) {
-        Status::Running
-    } else if statuses_in_order.last() == Some(&Status::Error) {
-        Status::Error
-    } else {
-        Status::Pending
     }
 }
 
