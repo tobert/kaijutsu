@@ -176,6 +176,14 @@ literally fed by two different kernel surfaces with opposite cost profiles.
 
 ## The layout — DECIDED: three lifecycle bands
 
+> **SUPERSEDED — see `docs/timewell.md`.** The time-well plan's own words: "its
+> build order and its three-band layout thesis are superseded." The 7.8 spiral
+> replaced the ring layout in code (`CompactingBandLayout` deleted 2026-07-03),
+> and `docs/timewell.md` ("Where we are") replaces the three-band thesis below
+> with the rank/vortex split + idle-age bands. Left in place as substrate
+> history — the D3 decomposition, data flow, wire gaps, and dependency notes
+> elsewhere in this doc still apply.
+
 The old framing (layered-DAG vs. one-radial; `d3.md` vs. mockups) turned out to be
 the wrong axis. The decision was settled by grounding it in the target workflow —
 4–5 concurrent agent sessions, 10–20+ contexts/day, worked like terminal-mux
@@ -387,6 +395,11 @@ the second screen lands — which is exactly when the time-well view ships.
 ---
 
 ## Build order
+
+> **SUPERSEDED — see `docs/timewell.md`.** This numbered step sequence (the
+> compacting-band layout, the active/haystack view split) is superseded by the
+> timewell plan's staged rollout. Kept for the historical record of what
+> actually shipped through step 7.8; do not use it to plan new work.
 
 *Status (June 2026): steps 1–3 shipped in `crates/kaijutsu-viz/` — pure,
 dependency-free, TDD, deepseek-reviewed. **Step 4 shipped** in

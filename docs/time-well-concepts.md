@@ -1,14 +1,18 @@
 # Time Well — Context Browser Concept Exploration
 
+> Forward plan: `docs/timewell.md`.
+
 June 2026. Amy + Claude worked through ~40 generated mockups to find a
 direction for rebuilding the constellation and conversation card stack as
 instanced 3D scenes (Bevy 0.18). This doc records the decided direction, the
 process, and the prompts that produced the keepers, so future iterations can
 pick up where we left off.
 
-Mockups live in `mockups/context-browser/` (numbered 01–40). Images were
-generated with gpal's `generate_image` (Imagen 4 Ultra and Nano Banana Pro).
-Companion memory: `project_time_well_context_browser` in auto-memory.
+The full ~40-image mockup set generated for this exploration moved out of the
+repo; only the canonical winner is kept, at `docs/mockups/27-time-well.png`.
+Images were generated with gpal's `generate_image` (Imagen 4 Ultra and Nano
+Banana Pro). Companion memory: `project_time_well_context_browser` in
+auto-memory.
 
 ## The decided direction
 
