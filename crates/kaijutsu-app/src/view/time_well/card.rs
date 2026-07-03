@@ -12,13 +12,8 @@
 
 use bevy::math::{Quat, Vec3};
 use kaijutsu_client::ContextInfo;
-use kaijutsu_types::ContextId;
-use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_band};
-
-/// How many of the most-recent concluded contexts live in band 1
-/// (`RecentConcluded`) before falling into the band-2 haystack. Matches the
-/// "last N = 10" rule from the design doc.
-pub const N_RECENT_CONCLUDED: usize = 10;
+use kaijutsu_types::{ContextId, Status};
+use kaijutsu_viz::layout::{ALL_BANDS, Band, ContextLifecycle, assign_idle_band};
 
 
 /// Card-model fields derived from a single [`ContextInfo`]. Pure data, no Bevy.
@@ -46,9 +41,12 @@ pub struct CardData {
     pub band: Band,
     /// Parent context for lineage overlay (`None` for a root).
     pub forked_from: Option<ContextId>,
-    /// Kernel-synthesized semantic-cluster label, set only for haystack (band-2)
-    /// cards that belong to a cluster. `None` for hot/recent cards and for
-    /// unclustered haystack cards.
+    /// Kernel-synthesized semantic-cluster label, set only for `Horizon` (the
+    /// deepest, coldest band — nearest analog to the old haystack) cards that
+    /// belong to a cluster. `None` for every warmer band and for unclustered
+    /// `Horizon` cards. (Semantic clustering proper is a Stage-3 concern; this
+    /// mapping just keeps the one existing field meaningful under the 4-band
+    /// scheme.)
     pub cluster_label: Option<String>,
 }
 
@@ -93,9 +91,9 @@ pub fn card_from(info: &ContextInfo, band: Band, cluster_label: Option<String>) 
         preview: info.top_block_preview.clone(),
         band,
         forked_from: info.forked_from,
-        // Only haystack cards carry a cluster label; the caller passes `None`
-        // for hot/recent cards (their angle encodes a different axis).
-        cluster_label: if band == Band::Haystack {
+        // Only Horizon cards carry a cluster label; the caller passes `None`
+        // for warmer cards (their angle encodes a different axis).
+        cluster_label: if band == Band::Horizon {
             cluster_label
         } else {
             None
@@ -103,90 +101,87 @@ pub fn card_from(info: &ContextInfo, band: Band, cluster_label: Option<String>) 
     }
 }
 
+/// The activity timestamp a context's band/order derives from: its
+/// `last_activity_at` when the kernel has one, else `created_at` (a context
+/// that has never been touched since creation is exactly as recent as its
+/// birth). Single source so `assign_bands` and `band_orders` never disagree.
+fn effective_activity(info: &ContextInfo) -> u64 {
+    info.last_activity_at.unwrap_or(info.created_at)
+}
+
 /// Assign a [`Band`] to each context, aligned positionally with `contexts`.
 ///
-/// Open (no `concluded_at`) → hot; concluded → recent-concluded (top-N by
-/// `concluded_at`) or haystack. Archived contexts are expected to be filtered
-/// out *before* this call (the well doesn't show them) — see
+/// A pure per-context derivation of `now - last_activity_at` (see
+/// [`assign_idle_band`] for the full rule set: age buckets, the `Running`
+/// override, and conclude-demotes). Archived contexts are expected to be
+/// filtered out *before* this call (the well doesn't show them) — see
 /// `sync::sync_time_well`.
-pub fn assign_bands(contexts: &[ContextInfo]) -> Vec<Band> {
+pub fn assign_bands(contexts: &[ContextInfo], now: i64) -> Vec<Band> {
     let lifecycles: Vec<ContextLifecycle<ContextId>> = contexts
         .iter()
         .map(|c| ContextLifecycle {
             id: c.id,
             created_at: c.created_at as i64,
             concluded_at: c.concluded_at.map(|ts| ts as i64),
+            last_activity_at: effective_activity(c) as i64,
+            running: c.live_status == Status::Running,
         })
         .collect();
 
-    assign_band(&lifecycles, N_RECENT_CONCLUDED)
+    assign_idle_band(&lifecycles, now)
 }
 
 /// Each band's context ids in **angular slot order**, indexed by [`Band::index`]
-/// (`[Haystack, RecentConcluded, Hot]`). This is the single source of slot
-/// order: the layout derives every `order_key` from it (so angle == slot), and
-/// keyboard navigation walks the same vectors (so the keys match the visuals).
+/// (`[HotNow, ThisWeek, ThirtyDays, Horizon]`). This is the single source of
+/// slot order: the layout derives every position from it (so angle == slot),
+/// and keyboard navigation walks the same vectors (so the keys match the
+/// visuals).
 ///
-/// Per-band ordering (the orthogonal-meaning rule from "The three bands"):
-/// - **Hot** — id descending (UUIDv7 = creation order, unique; newest first, so
-///   the mouth is the newest open context); this is what the `0–9` digit keys
-///   temporarily address (Stage 0 tourniquet — see `docs/timewell.md`).
-/// - **RecentConcluded** — most-recently-concluded first (`concluded_at`
-///   descending, id-tiebroken), so band-1 angle is "a clock of what I just
-///   finished" and slot 0 is the newest conclusion.
-/// - **Haystack** — semantic-cluster grouping (`haystack_order_keys`):
-///   same-cluster contexts adjacent, unclustered trailing.
-pub type BandOrders = [Vec<ContextId>; 3];
+/// **Every band orders the same way now** (Stage 1 replaces the old
+/// per-band-axis rule): `last_activity_at` descending, id-tiebroken — "the
+/// recency river." Within a band, slot 0 is whatever moved most recently.
+pub type BandOrders = [Vec<ContextId>; 4];
 
 /// Compute each band's [`BandOrders`] slot order over the current set.
-pub fn band_orders(
-    contexts: &[ContextInfo],
-    bands: &[Band],
-    cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
-) -> BandOrders {
+pub fn band_orders(contexts: &[ContextInfo], bands: &[Band]) -> BandOrders {
     debug_assert_eq!(
         contexts.len(),
         bands.len(),
         "bands must align with contexts"
     );
-    let in_band = |want: Band| -> Vec<&ContextInfo> {
-        contexts
+
+    let mut out: BandOrders = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for band in ALL_BANDS {
+        let mut in_band: Vec<&ContextInfo> = contexts
             .iter()
             .zip(bands.iter())
-            .filter(move |(_, b)| **b == want)
+            .filter(|(_, b)| **b == band)
             .map(|(c, _)| c)
-            .collect()
-    };
-
-    // Hot: id descending (newest first — mouth = newest open context; matches
-    // the `0–9` addressing).
-    let mut hot: Vec<ContextId> = in_band(Band::Hot).iter().map(|c| c.id).collect();
-    hot.sort_unstable_by(|a, b| b.cmp(a));
-
-    // RecentConcluded: newest conclusion first, id-tiebroken.
-    let mut recent = in_band(Band::RecentConcluded);
-    recent.sort_by(|a, b| b.concluded_at.cmp(&a.concluded_at).then(a.id.cmp(&b.id)));
-    let recent: Vec<ContextId> = recent.into_iter().map(|c| c.id).collect();
-
-    // Haystack: cluster-grouped (sort by the haystack rank).
-    let haystack_ids: Vec<ContextId> = in_band(Band::Haystack).iter().map(|c| c.id).collect();
-    let keys = haystack_order_keys(&haystack_ids, cluster_of);
-    let mut haystack = haystack_ids;
-    haystack.sort_by_key(|id| keys[id]);
-
-    // Index order is [Haystack, RecentConcluded, Hot] = Band::index.
-    [haystack, recent, hot]
+            .collect();
+        in_band.sort_by(|a, b| {
+            effective_activity(b)
+                .cmp(&effective_activity(a)) // descending: most-recent first
+                .then_with(|| a.id.cmp(&b.id)) // stable tie-break
+        });
+        out[band.index()] = in_band.into_iter().map(|c| c.id).collect();
+    }
+    out
 }
 
-/// Dense, collision-free order keys for the haystack band that group same-cluster
-/// contexts angularly adjacent.
+/// Dense, collision-free order keys that group same-cluster contexts angularly
+/// adjacent.
+///
+/// **Not called by [`band_orders`] as of Stage 1** — recency now orders every
+/// band uniformly (see `band_orders`'s doc). This is the Stage-3 grouping
+/// primitive (`docs/timewell.md`, "Tracks on the wire, and in the well"): kept
+/// live and reachable via its own tests below so it doesn't bit-rot before its
+/// caller lands.
 ///
 /// Contexts are ranked `0..n` after sorting by `(cluster_id, id)`, with
 /// **unclustered** contexts (no entry in `cluster_of`) trailing after all
-/// clusters (sorted among themselves by id). This makes band-2 angle encode
-/// *semantic cluster* — the design's job for the haystack — while staying
-/// deterministic: the keys depend only on cluster membership and id, never on
-/// input order, so re-deriving each poll is stable until clustering changes.
+/// clusters (sorted among themselves by id). Deterministic: the keys depend
+/// only on cluster membership and id, never on input order.
+#[allow(dead_code)] // Stage-3 grouping primitive; not called until tracks land (see doc above)
 pub fn haystack_order_keys(
     contexts: &[ContextId],
     cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
@@ -259,74 +254,185 @@ pub fn well_tilt_quat() -> Quat {
 }
 
 // ============================================================================
-// VORTEX SPIRAL (the "one continuous well" layout)
+// VORTEX SPIRAL (the terraced well — Stage 1 Slice F)
 // ============================================================================
 //
-// Instead of three discrete rings, every card sits on a single spiral funnel
-// indexed mouth → throat. Radius shrinks and depth grows geometrically per
-// index, so cards wind inward and downward and *asymptotically crowd the event
-// horizon* — the older a context (the further along the spiral), the deeper it
-// falls toward the singularity. Append-stable: a card's position depends only on
-// its integer index, so appending never reflows earlier cards.
+// Every card sits on a spiral funnel indexed **within its idle-age band**, and
+// each band occupies its own radius/depth **terrace** — a fixed envelope with
+// a visible step + gap before the next (colder) band's envelope begins. Within
+// a terrace the same geometric inward/downward decay as before runs on the
+// card's position *inside that band* (`within_index`), so append-stability is
+// preserved (a card's position depends only on its `(band, within_index)`
+// pair — appending within a band never reflows its siblings, and a band
+// transition never reflows another band). See `docs/timewell.md`, "The bowl,
+// revisited": this replaces the old single continuous spiral with the
+// terraced geometry mockup 27 taught — quantized bands, spiral ordering
+// continuing inside each one.
 
-/// Rim radius at the mouth (index 0). Pulled in so cards sit closer together
-/// rather than flung wide across the rim.
+/// Rim radius at the mouth (band 0, within-index 0). Pulled in so cards sit
+/// closer together rather than flung wide across the rim.
 const SPIRAL_R_MOUTH: f32 = 330.0;
-/// Radius the spiral asymptotes to — the event-horizon ring at the throat. Cards
-/// only approach it as the spiral grows long; with few contexts the arm stays in
-/// the upper funnel, leaving an *empty* stretch above the horizon (nothing has
-/// fallen in yet — it fills as contexts age). That gap is meaningful, not a bug.
+/// Radius floor — the **mouth-open invariant**: no card, in any band, ever sits
+/// closer to the axis than this. The center stays reserved for the ring deck /
+/// accretion glow (mockup 27's calm core).
 const SPIRAL_R_THROAT: f32 = 48.0;
-/// Throat depth (funnel-local −Z) the spiral asymptotes to.
+/// Throat depth (funnel-local −Z) the deepest terrace's envelope reaches toward.
 const SPIRAL_DEPTH: f32 = -560.0;
-/// Per-index geometric decay (how fast the spiral winds in + down). Gentle, so a
-/// short arm spreads evenly down the upper funnel instead of bunching at center.
+/// Per-within-index geometric decay (how fast a terrace's own spiral winds in +
+/// down). Gentle, so a short arm spreads evenly through the terrace instead of
+/// bunching at its inner edge.
 const SPIRAL_DECAY: f32 = 0.93;
-/// Radians wound per index (~12 cards per revolution) — a tighter, denser arm.
+/// Radians wound per within-band index (~12 cards per revolution) — a tighter,
+/// denser arm. Resets to 0 at the start of every terrace (band index 0 sits at
+/// angle 0 in every band), so terraces read as stacked rings, not one
+/// continuously-winding ribbon.
 const SPIRAL_ANGLE_STEP: f32 = 0.50;
-/// Card base scale at the throat (mouth cards are 1.0). Kept high so cards stay
-/// readable as they descend (bigger overall, per Amy).
+/// Card base scale at the deepest terrace's inner edge (mouth cards are 1.0).
+/// Kept high so cards stay readable as they descend (bigger overall, per Amy).
 const SPIRAL_SCALE_THROAT: f32 = 0.52;
 
-/// Funnel-local spiral position for the card at `index` (0 = mouth). See module
-/// note above: geometric inward/downward decay so cards pile toward the throat.
-fn spiral_local(index: usize) -> Vec3 {
-    let f = SPIRAL_DECAY.powi(index as i32); // 1 → 0 as index grows
-    let radius = SPIRAL_R_THROAT + (SPIRAL_R_MOUTH - SPIRAL_R_THROAT) * f;
-    let depth = SPIRAL_DEPTH * (1.0 - f);
-    let angle = index as f32 * SPIRAL_ANGLE_STEP;
+/// Visible **radial step** between adjacent terraces (world units). Carved out
+/// of each terrace's inner edge so band N's outer edge and band N+1's outer
+/// edge never touch. **Amy-tunable placeholder.**
+const TERRACE_RADIUS_GAP: f32 = 24.0;
+/// Visible **depth step** between adjacent terraces (world units), same role
+/// as [`TERRACE_RADIUS_GAP`] but along depth. **Amy-tunable placeholder.**
+const TERRACE_DEPTH_GAP: f32 = 60.0;
+
+/// Number of terraces — one per [`Band`] variant.
+const N_TERRACES: usize = ALL_BANDS.len();
+
+/// The `(radius_outer, radius_inner, depth_near, depth_far)` envelope band
+/// `band_index` (0 = `HotNow` … `N_TERRACES - 1` = `Horizon`) reserves for
+/// itself: the total mouth→throat radius/depth span divided evenly into
+/// [`N_TERRACES`] slices, each shrunk on its inner/far edge by the terrace gap
+/// constants so consecutive terraces step visibly rather than blend. `radius_inner`
+/// is floored at [`SPIRAL_R_THROAT`] — the mouth-open invariant holds even for
+/// `Horizon`.
+fn terrace_envelope(band_index: usize) -> (f32, f32, f32, f32) {
+    let n = N_TERRACES as f32;
+    let i = band_index as f32;
+    let radius_span = (SPIRAL_R_MOUTH - SPIRAL_R_THROAT) / n;
+    let depth_span = SPIRAL_DEPTH / n; // negative: deeper per terrace
+
+    let radius_outer = SPIRAL_R_MOUTH - i * radius_span;
+    let radius_inner = (radius_outer - radius_span + TERRACE_RADIUS_GAP).max(SPIRAL_R_THROAT);
+
+    let depth_near = depth_span * i;
+    let depth_far = depth_span * (i + 1.0) + TERRACE_DEPTH_GAP;
+
+    (radius_outer, radius_inner, depth_near, depth_far)
+}
+
+/// Funnel-local terraced position for the card at `(band, within_index)`
+/// (`within_index` 0 = that band's outer/shallow edge). The existing geometric
+/// decay runs *inside* the band's envelope (see [`terrace_envelope`]); the
+/// angle resets to 0 at the start of every band.
+fn spiral_local(band: Band, within_index: usize) -> Vec3 {
+    let (radius_outer, radius_inner, depth_near, depth_far) = terrace_envelope(band.index());
+    let f = SPIRAL_DECAY.powi(within_index as i32); // 1 → 0 as within_index grows
+    let radius = radius_inner + (radius_outer - radius_inner) * f;
+    let depth = depth_near + (depth_far - depth_near) * (1.0 - f);
+    let angle = within_index as f32 * SPIRAL_ANGLE_STEP;
     Vec3::new(radius * angle.cos(), radius * angle.sin(), depth)
 }
 
-/// World position of the card at spiral `index`: the funnel-local spiral tipped
-/// back by [`WELL_TILT`] (same recline as everything else in the well).
-pub fn spiral_pos(index: usize) -> Vec3 {
-    well_tilt_quat() * spiral_local(index)
+/// World position of the card at `(band, within_index)`: the funnel-local
+/// terraced spiral tipped back by [`WELL_TILT`] (same recline as everything
+/// else in the well).
+pub fn spiral_pos(band: Band, within_index: usize) -> Vec3 {
+    well_tilt_quat() * spiral_local(band, within_index)
 }
 
-/// Per-card base scale along the spiral: 1.0 at the mouth, shrinking toward
-/// [`SPIRAL_SCALE_THROAT`] at the throat so the vortex reads as receding depth.
-pub fn spiral_scale(index: usize) -> f32 {
-    let f = SPIRAL_DECAY.powi(index as i32);
-    SPIRAL_SCALE_THROAT + (1.0 - SPIRAL_SCALE_THROAT) * f
+/// Per-card base scale at `(band, within_index)`: 1.0 at the mouth, shrinking
+/// toward [`SPIRAL_SCALE_THROAT`] at the deepest terrace's inner edge, same
+/// per-band envelope-division as [`terrace_envelope`] (no gap needed — scale
+/// has no "visible step" requirement, just continuous recession).
+pub fn spiral_scale(band: Band, within_index: usize) -> f32 {
+    let n = N_TERRACES as f32;
+    let i = band.index() as f32;
+    let scale_span = (1.0 - SPIRAL_SCALE_THROAT) / n;
+    let scale_outer = 1.0 - i * scale_span;
+    let scale_inner = scale_outer - scale_span;
+    let f = SPIRAL_DECAY.powi(within_index as i32);
+    scale_inner + (scale_outer - scale_inner) * f
 }
 
-/// The whole well as one ordered spiral, **mouth → throat**: live (hot) first,
-/// then recently-concluded, then the haystack — each zone kept in its existing
-/// slot order (so recency + cluster grouping survive inside the sequence). The
-/// index into this vector is both a card's position on the vortex and its
-/// odometer address (Left/Right = ±1, Up/Down = ±10, digits = the first decade).
-pub fn spiral_order(
+/// Per-context `(Band, within-band index)`, alongside the flat mouth→throat
+/// odometer order. Single source: [`spiral_order`] derives its flat `Vec` from
+/// this; `sync.rs` resolves each card's terraced position/scale
+/// (`spiral_pos`/`spiral_scale`) from the `(band, within_index)` pair here.
+/// Ordering, the odometer address, and append-stability all still derive
+/// purely from band + within-band position — this just also exposes the pair
+/// the terraced geometry needs.
+pub fn spiral_positions(
     contexts: &[ContextInfo],
     bands: &[Band],
-    cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
-) -> Vec<ContextId> {
-    let orders = band_orders(contexts, bands, cluster_of);
-    let mut out = Vec::new();
-    for b in [Band::Hot, Band::RecentConcluded, Band::Haystack] {
-        out.extend_from_slice(&orders[b.index()]);
+) -> (Vec<ContextId>, std::collections::HashMap<ContextId, (Band, usize)>) {
+    let orders = band_orders(contexts, bands);
+    let mut flat = Vec::new();
+    let mut pos = std::collections::HashMap::new();
+    for band in ALL_BANDS {
+        for (within_index, &id) in orders[band.index()].iter().enumerate() {
+            pos.insert(id, (band, within_index));
+            flat.push(id);
+        }
     }
-    out
+    (flat, pos)
+}
+
+/// The whole well as one ordered spiral, **mouth → throat**: `HotNow` first,
+/// then `ThisWeek`, `ThirtyDays`, `Horizon` — each band in its own recency
+/// order (see `band_orders`). The index into this vector is a card's odometer
+/// address (Left/Right = ±1, Up/Down = ±10, digits = the first decade); it no
+/// longer determines world position directly (see [`spiral_positions`] for
+/// that), but the sequence itself is unchanged in spirit.
+#[allow(dead_code)] // `sync.rs` calls `spiral_positions` directly (needs the map too); kept as
+// the simpler pure entry point for tests and any future flat-order-only caller.
+pub fn spiral_order(contexts: &[ContextInfo], bands: &[Band]) -> Vec<ContextId> {
+    spiral_positions(contexts, bands).0
+}
+
+// ── Band labels (groundwork for the in-world terrace-edge labels) ──────────
+//
+// TODO(Slice F, in-world labels — see `docs/timewell.md` "The bowl, revisited"
+// and Stage 1's acceptance criteria): these two pure helpers are ready, but no
+// entity spawns/renders them yet. Wiring that up means an MSDF panel per band
+// (`panel::create_msdf_panel`, the pattern `scene::enter_time_well` uses for
+// `ReadingCard`) positioned at `band_label_pos`, text laid out via
+// `text::shaping::VelloFont::layout` with `band_label_text` — **landmine**:
+// pass the brush explicitly to `layout`/`collect_msdf_glyphs` or the text
+// renders black (`docs/timewell.md`, "Landmines"). Deferred rather than
+// half-done because it touches font-asset-loading timing (`build_card_scenes`
+// gates on `fonts.get(...)` being ready and retries next change — a one-shot
+// spawn needs the same gating) and this pass has no live/runner verification
+// to catch a black-text or mispositioned regression.
+
+/// Amy-tunable placeholder: how far outside a terrace's outer (shallow) edge a
+/// band label parks, so it doesn't collide with that band's slot-0 card.
+#[allow(dead_code)] // groundwork for the not-yet-spawned in-world labels — see TODO above
+const LABEL_RADIUS_OFFSET: f32 = 36.0;
+
+/// World position for `band`'s floating label: parked just outside the
+/// terrace's outer edge, at its shallow (near) depth — the step a viewer's eye
+/// meets first on entering the band. Same recline as everything else in the
+/// well ([`well_tilt_quat`]).
+#[allow(dead_code)] // groundwork for the not-yet-spawned in-world labels — see TODO above
+pub fn band_label_pos(band: Band) -> Vec3 {
+    let (radius_outer, _radius_inner, depth_near, _depth_far) = terrace_envelope(band.index());
+    let local = Vec3::new(radius_outer + LABEL_RADIUS_OFFSET, 0.0, depth_near);
+    well_tilt_quat() * local
+}
+
+/// Display text for a band's terrace-edge label.
+#[allow(dead_code)] // groundwork for the not-yet-spawned in-world labels — see TODO above
+pub fn band_label_text(band: Band) -> &'static str {
+    match band {
+        Band::HotNow => "HOT NOW",
+        Band::ThisWeek => "THIS WEEK",
+        Band::ThirtyDays => "30 DAYS",
+        Band::Horizon => "HORIZON",
+    }
 }
 
 #[cfg(test)]
@@ -395,10 +501,10 @@ mod tests {
     #[test]
     fn title_prefers_label_falls_back_to_short_id() {
         let id = id_of(1);
-        let labeled = card_from(&ctx(id, "my work"), Band::Hot, None);
+        let labeled = card_from(&ctx(id, "my work"), Band::HotNow, None);
         assert_eq!(labeled.title, "my work");
 
-        let unlabeled = card_from(&ctx(id, ""), Band::Hot, None);
+        let unlabeled = card_from(&ctx(id, ""), Band::HotNow, None);
         assert_eq!(unlabeled.title, id.short());
     }
 
@@ -407,10 +513,10 @@ mod tests {
         let mut info = ctx(id_of(1), "x");
         info.context_type = "coder".to_string();
         info.provider = "anthropic".to_string();
-        assert_eq!(card_from(&info, Band::Hot, None).accent, "coder");
+        assert_eq!(card_from(&info, Band::HotNow, None).accent, "coder");
 
         info.context_type = String::new();
-        assert_eq!(card_from(&info, Band::Hot, None).accent, "anthropic");
+        assert_eq!(card_from(&info, Band::HotNow, None).accent, "anthropic");
     }
 
     #[test]
@@ -419,112 +525,203 @@ mod tests {
         info.provider = "anthropic".to_string();
         info.model = "claude-opus-4-8".to_string();
         assert_eq!(
-            card_from(&info, Band::Hot, None).model_badge,
+            card_from(&info, Band::HotNow, None).model_badge,
             "anthropic/claude-opus-4-8"
         );
 
         info.model = String::new();
-        assert_eq!(card_from(&info, Band::Hot, None).model_badge, "anthropic");
+        assert_eq!(card_from(&info, Band::HotNow, None).model_badge, "anthropic");
 
         info.provider = String::new();
-        assert_eq!(card_from(&info, Band::Hot, None).model_badge, "");
+        assert_eq!(card_from(&info, Band::HotNow, None).model_badge, "");
     }
 
     #[test]
     fn fork_badge_present_only_for_nonempty_fork_kind() {
         let mut info = ctx(id_of(1), "x");
-        assert_eq!(card_from(&info, Band::Hot, None).fork_badge, None);
+        assert_eq!(card_from(&info, Band::HotNow, None).fork_badge, None);
 
         info.fork_kind = Some(String::new());
-        assert_eq!(card_from(&info, Band::Hot, None).fork_badge, None);
+        assert_eq!(card_from(&info, Band::HotNow, None).fork_badge, None);
 
         info.fork_kind = Some("subtree".to_string());
         assert_eq!(
-            card_from(&info, Band::Hot, None).fork_badge,
+            card_from(&info, Band::HotNow, None).fork_badge,
             Some("subtree".to_string())
         );
     }
 
     #[test]
-    fn open_contexts_are_hot_concluded_split_recent_and_haystack() {
-        // 12 concluded contexts with ascending concluded_at, plus one open.
-        let mut contexts: Vec<ContextInfo> = (0..12u8)
-            .map(|n| {
-                let mut c = ctx(id_of(n), "");
-                c.concluded_at = Some(100 + n as u64); // older → smaller
-                c
-            })
-            .collect();
-        let open = {
-            let mut c = ctx(id_of(200), "");
-            c.created_at = 999;
-            c
-        };
-        contexts.push(open);
+    fn assign_bands_buckets_by_idle_age() {
+        const NOW: i64 = 1_000_000_000_000;
+        const DAY: i64 = 24 * 60 * 60 * 1000;
 
-        let bands = assign_bands(&contexts);
+        let mut contexts: Vec<ContextInfo> = Vec::new();
+        // idle 1h -> HotNow
+        let mut hot = ctx(id_of(1), "");
+        hot.last_activity_at = Some((NOW - DAY / 24) as u64);
+        contexts.push(hot);
+        // idle 3d -> ThisWeek
+        let mut week = ctx(id_of(2), "");
+        week.last_activity_at = Some((NOW - 3 * DAY) as u64);
+        contexts.push(week);
+        // idle 15d -> ThirtyDays
+        let mut month = ctx(id_of(3), "");
+        month.last_activity_at = Some((NOW - 15 * DAY) as u64);
+        contexts.push(month);
+        // idle 45d -> Horizon
+        let mut old = ctx(id_of(4), "");
+        old.last_activity_at = Some((NOW - 45 * DAY) as u64);
+        contexts.push(old);
 
-        // The open one is hot.
-        assert_eq!(bands[12], Band::Hot);
-
-        // Of the 12 archived, the 10 most-recent (created_at 2..=11) are
-        // RecentConcluded; the 2 oldest (0,1) fall to the haystack.
-        let recent = bands[..12]
-            .iter()
-            .filter(|&&b| b == Band::RecentConcluded)
-            .count();
-        let haystack = bands[..12].iter().filter(|&&b| b == Band::Haystack).count();
-        assert_eq!(recent, N_RECENT_CONCLUDED);
-        assert_eq!(haystack, 2);
-        // The two oldest specifically.
-        assert_eq!(bands[0], Band::Haystack);
-        assert_eq!(bands[1], Band::Haystack);
+        let bands = assign_bands(&contexts, NOW);
+        assert_eq!(bands, vec![Band::HotNow, Band::ThisWeek, Band::ThirtyDays, Band::Horizon]);
     }
 
     #[test]
-    fn spiral_winds_inward_and_down_then_asymptotes() {
+    fn assign_bands_demotes_concluded_out_of_hot_now() {
+        const NOW: i64 = 1_000_000_000_000;
+        let mut c = ctx(id_of(1), "");
+        c.last_activity_at = Some(NOW as u64); // idle 0 -> would be HotNow
+        c.concluded_at = Some(NOW as u64);
+        let bands = assign_bands(&[c], NOW);
+        assert_eq!(bands[0], Band::ThisWeek, "conclude demotes past HotNow regardless of recency");
+    }
+
+    #[test]
+    fn assign_bands_running_forces_hot_now() {
+        const NOW: i64 = 1_000_000_000_000;
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        let mut c = ctx(id_of(1), "");
+        c.last_activity_at = Some((NOW - 60 * DAY) as u64); // very idle
+        c.live_status = kaijutsu_types::Status::Running;
+        let bands = assign_bands(&[c], NOW);
+        assert_eq!(bands[0], Band::HotNow, "running overrides idle age");
+    }
+
+    #[test]
+    fn assign_bands_coalesces_missing_last_activity_to_created_at() {
+        const NOW: i64 = 1_000_000_000_000;
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        let mut c = ctx(id_of(1), "");
+        c.last_activity_at = None;
+        c.created_at = (NOW - 45 * DAY) as u64; // old creation, never touched since
+        let bands = assign_bands(&[c], NOW);
+        assert_eq!(bands[0], Band::Horizon, "no last_activity_at falls back to created_at");
+    }
+
+    #[test]
+    fn spiral_winds_inward_and_down_within_a_terrace_then_asymptotes() {
         let r = |v: Vec3| (v.x * v.x + v.y * v.y).sqrt();
-        let (mouth, mid, deep) = (spiral_local(0), spiral_local(10), spiral_local(40));
-        assert!(r(mouth) > r(mid) && r(mid) > r(deep), "radius winds inward");
-        assert!(mid.z < mouth.z && deep.z < mid.z, "descends toward the throat");
-        // Cards pile at the event horizon rather than collapsing through it.
-        assert!(r(deep) >= SPIRAL_R_THROAT - 1.0, "radius asymptotes to the horizon");
-        assert!(deep.z > SPIRAL_DEPTH - 1.0, "depth asymptotes to the throat");
+        let (mouth, mid, deep) = (
+            spiral_local(Band::HotNow, 0),
+            spiral_local(Band::HotNow, 5),
+            spiral_local(Band::HotNow, 40),
+        );
+        assert!(r(mouth) > r(mid) && r(mid) > r(deep), "radius winds inward within the terrace");
+        assert!(mid.z < mouth.z && deep.z < mid.z, "descends toward the terrace's inner edge");
     }
 
     #[test]
     fn spiral_pos_is_append_stable_and_tipped() {
-        assert_eq!(spiral_pos(7), spiral_pos(7), "position keys only on index");
+        assert_eq!(
+            spiral_pos(Band::ThisWeek, 7),
+            spiral_pos(Band::ThisWeek, 7),
+            "position keys only on (band, within_index)"
+        );
         // After the recline the funnel's depth maps mostly to world-Y, so the
-        // robust world-space invariant is "deeper cards sit lower". (Funnel-local
-        // depth monotonicity is covered by `spiral_winds_inward_and_down…`.)
-        let (near, far) = (spiral_pos(2), spiral_pos(30));
-        assert!(far.y < near.y, "deeper card sits lower after the recline");
+        // robust world-space invariant is "deeper cards sit lower".
+        let (near, far) = (spiral_pos(Band::HotNow, 0), spiral_pos(Band::Horizon, 30));
+        assert!(far.y < near.y, "a deeper-band card sits lower after the recline");
     }
 
     #[test]
     fn spiral_scale_shrinks_to_a_floor() {
-        assert!(spiral_scale(0) > spiral_scale(8), "cards shrink down the spiral");
-        assert!(spiral_scale(0) <= 1.0 + 1e-4, "mouth scale ~1.0");
         assert!(
-            spiral_scale(500) >= SPIRAL_SCALE_THROAT - 1e-4,
+            spiral_scale(Band::HotNow, 0) > spiral_scale(Band::Horizon, 8),
+            "cards shrink from mouth to the deepest terrace"
+        );
+        assert!(spiral_scale(Band::HotNow, 0) <= 1.0 + 1e-4, "mouth scale ~1.0");
+        assert!(
+            spiral_scale(Band::Horizon, 500) >= SPIRAL_SCALE_THROAT - 1e-4,
             "scale is floored at the throat"
         );
     }
 
+    // ── Slice F: terracing ──────────────────────────────────────────────────
+
     #[test]
-    fn spiral_order_runs_hot_then_recent_then_haystack() {
+    fn same_band_cards_stay_within_one_terrace_depth_range() {
+        let (_, _, depth_near, depth_far) = terrace_envelope(Band::ThisWeek.index());
+        let a = spiral_local(Band::ThisWeek, 0);
+        let b = spiral_local(Band::ThisWeek, 1);
+        for d in [a.z, b.z] {
+            assert!(
+                d <= depth_near && d > depth_far,
+                "within-band depth {d} must sit in ({depth_far}, {depth_near}]"
+            );
+        }
+    }
+
+    #[test]
+    fn next_deeper_band_sits_below_a_visible_gap() {
+        // Take a card far enough into a terrace that it's near the terrace's far
+        // (deep, i.e. most-negative-z) edge, and compare against the shallow
+        // (near, least-negative-z) edge of the next band. Depth grows more
+        // negative with depth, so the *next* band's shallow edge must still be
+        // more negative than this band's deep edge, by at least the gap.
+        let deep_in_this_band = spiral_local(Band::HotNow, 200).z;
+        let shallow_edge_of_next = spiral_local(Band::ThisWeek, 0).z;
+        let gap = deep_in_this_band - shallow_edge_of_next;
+        assert!(
+            gap >= TERRACE_DEPTH_GAP - 1e-3,
+            "depth delta across a band boundary must be >= the gap constant, got {gap}"
+        );
+    }
+
+    #[test]
+    fn radius_never_drops_below_the_mouth_open_floor() {
+        for band in ALL_BANDS {
+            for within_index in [0usize, 1, 10, 500] {
+                let v = spiral_local(band, within_index);
+                let r = (v.x * v.x + v.y * v.y).sqrt();
+                assert!(
+                    r >= SPIRAL_R_THROAT - 1e-3,
+                    "{band:?}@{within_index}: radius {r} below the mouth-open floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn within_band_angle_advances_monotonically() {
+        let a = spiral_local(Band::ThirtyDays, 0);
+        let b = spiral_local(Band::ThirtyDays, 1);
+        let c = spiral_local(Band::ThirtyDays, 2);
+        let angle_of = |v: Vec3| v.y.atan2(v.x);
+        // SPIRAL_ANGLE_STEP (0.5 rad) is well under a half-turn, so unwrapped
+        // atan2 strictly increases across these three consecutive steps.
+        assert!(angle_of(a) < angle_of(b) && angle_of(b) < angle_of(c), "angle must advance monotonically");
+    }
+
+    #[test]
+    fn spiral_order_runs_hot_now_then_this_week_then_thirty_days_then_horizon() {
         let contexts = vec![
-            ctx(id_of(3), "hay"),
+            ctx(id_of(3), "horizon"),
             ctx(id_of(1), "hot"),
-            ctx(id_of(2), "rec"),
+            ctx(id_of(2), "this-week"),
+            ctx(id_of(4), "thirty-days"),
         ];
         // Bands aligned with contexts (not derived here — we're testing the flatten).
-        let bands = vec![Band::Haystack, Band::Hot, Band::RecentConcluded];
-        let order = spiral_order(&contexts, &bands, &std::collections::HashMap::new());
-        assert_eq!(order.first(), Some(&id_of(1)), "hot leads at the mouth");
-        assert_eq!(order.last(), Some(&id_of(3)), "haystack trails at the throat");
-        assert_eq!(order, vec![id_of(1), id_of(2), id_of(3)], "hot → recent → haystack");
+        let bands = vec![Band::Horizon, Band::HotNow, Band::ThisWeek, Band::ThirtyDays];
+        let order = spiral_order(&contexts, &bands);
+        assert_eq!(order.first(), Some(&id_of(1)), "hot-now leads at the mouth");
+        assert_eq!(order.last(), Some(&id_of(3)), "horizon trails at the throat");
+        assert_eq!(
+            order,
+            vec![id_of(1), id_of(2), id_of(4), id_of(3)],
+            "hot-now -> this-week -> thirty-days -> horizon"
+        );
     }
 
     fn cluster(id: u32, label: &str) -> ClusterAssignment {
@@ -578,64 +775,58 @@ mod tests {
     }
 
     #[test]
-    fn band_orders_rank_each_band_by_its_own_axis() {
+    fn band_orders_rank_every_band_by_recency() {
         use kaijutsu_viz::layout::Band;
-        use std::collections::HashMap;
 
-        // Hot: two open contexts (ids 5, 3) → expect id-descending [5, 3]
-        // (newest first, Stage 0 tourniquet — mouth = newest open context).
+        // HotNow: two contexts, id 3 more recently active than id 5 -> [3, 5].
         let mut hot_a = ctx(id_of(5), "");
-        hot_a.created_at = 10;
+        hot_a.last_activity_at = Some(10);
         let mut hot_b = ctx(id_of(3), "");
-        hot_b.created_at = 11;
-        // Recent: two concluded; id 9 concluded later than id 8 → recency [9, 8].
-        let mut rec_old = ctx(id_of(8), "");
-        rec_old.concluded_at = Some(100);
-        let mut rec_new = ctx(id_of(9), "");
-        rec_new.concluded_at = Some(200);
+        hot_b.last_activity_at = Some(20);
+        // ThisWeek: two contexts; id 9 more recently active than id 8 -> [9, 8].
+        let mut week_old = ctx(id_of(8), "");
+        week_old.last_activity_at = Some(100);
+        let mut week_new = ctx(id_of(9), "");
+        week_new.last_activity_at = Some(200);
 
-        let contexts = vec![hot_a, hot_b, rec_old, rec_new];
-        // Force the bands explicitly (don't depend on assign_bands' N window here).
-        let bands = vec![Band::Hot, Band::Hot, Band::RecentConcluded, Band::RecentConcluded];
+        let contexts = vec![hot_a, hot_b, week_old, week_new];
+        // Force the bands explicitly (don't depend on assign_bands here).
+        let bands = vec![Band::HotNow, Band::HotNow, Band::ThisWeek, Band::ThisWeek];
 
-        let orders = band_orders(&contexts, &bands, &HashMap::new());
+        let orders = band_orders(&contexts, &bands);
         assert_eq!(
-            orders[Band::Hot.index()],
-            vec![id_of(5), id_of(3)],
-            "hot orders by id descending (newest first)"
+            orders[Band::HotNow.index()],
+            vec![id_of(3), id_of(5)],
+            "HotNow orders by last_activity_at descending (most-recent first)"
         );
         assert_eq!(
-            orders[Band::RecentConcluded.index()],
+            orders[Band::ThisWeek.index()],
             vec![id_of(9), id_of(8)],
-            "recent orders newest-conclusion first"
+            "ThisWeek orders by the same recency axis"
         );
-        assert!(orders[Band::Haystack.index()].is_empty());
+        assert!(orders[Band::ThirtyDays.index()].is_empty());
+        assert!(orders[Band::Horizon.index()].is_empty());
     }
 
     #[test]
-    fn hot_band_puts_newest_at_the_mouth() {
+    fn hot_slot_zero_is_the_larger_last_activity_at() {
         use kaijutsu_viz::layout::Band;
-        use std::collections::HashMap;
 
-        // Several open (hot) contexts with increasing ids (creation order).
-        let contexts: Vec<ContextInfo> = (1..=5u8).map(|n| ctx(id_of(n), "")).collect();
-        let bands = vec![Band::Hot; contexts.len()];
+        let mut a = ctx(id_of(1), "");
+        a.last_activity_at = Some(500);
+        let mut b = ctx(id_of(2), "");
+        b.last_activity_at = Some(9000); // more recent -> slot 0
 
-        let order = spiral_order(&contexts, &bands, &HashMap::new());
+        let contexts = vec![a, b];
+        let bands = vec![Band::HotNow, Band::HotNow];
+        let order = spiral_order(&contexts, &bands);
 
-        // The mouth (index 0) must be the newest context (highest id), not the
-        // oldest — Stage 0 tourniquet: the well is a terminal multiplexer, not
-        // a creation-order log.
         assert_eq!(
             order.first(),
-            Some(&id_of(5)),
-            "mouth (index 0) must be the newest open context"
+            Some(&id_of(2)),
+            "the larger last_activity_at sorts to slot 0"
         );
-        assert_eq!(
-            order,
-            vec![id_of(5), id_of(4), id_of(3), id_of(2), id_of(1)],
-            "hot band runs id-descending, newest to oldest"
-        );
+        assert_eq!(order, vec![id_of(2), id_of(1)]);
     }
 
     #[test]
@@ -672,15 +863,39 @@ mod tests {
     }
 
     #[test]
-    fn cluster_label_set_only_for_haystack() {
+    fn cluster_label_set_only_for_horizon() {
         let info = ctx(id_of(1), "x");
-        // Haystack card carries the label.
-        let hay = card_from(&info, Band::Haystack, Some("rust".to_string()));
-        assert_eq!(hay.cluster_label.as_deref(), Some("rust"));
-        // Hot / recent cards never carry a cluster label, even if one is passed.
-        let hot = card_from(&info, Band::Hot, Some("rust".to_string()));
-        assert_eq!(hot.cluster_label, None);
-        let recent = card_from(&info, Band::RecentConcluded, Some("rust".to_string()));
-        assert_eq!(recent.cluster_label, None);
+        // Horizon card carries the label.
+        let deep = card_from(&info, Band::Horizon, Some("rust".to_string()));
+        assert_eq!(deep.cluster_label.as_deref(), Some("rust"));
+        // Every warmer band never carries a cluster label, even if one is passed.
+        for band in [Band::HotNow, Band::ThisWeek, Band::ThirtyDays] {
+            let c = card_from(&info, band, Some("rust".to_string()));
+            assert_eq!(c.cluster_label, None, "{band:?} must not carry a cluster label");
+        }
+    }
+
+    // ── Band label groundwork ────────────────────────────────────────────────
+
+    #[test]
+    fn band_label_text_is_distinct_per_band() {
+        let labels: Vec<&str> = ALL_BANDS.iter().map(|&b| band_label_text(b)).collect();
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "every band gets its own label text");
+    }
+
+    #[test]
+    fn band_label_pos_recedes_deeper_per_band() {
+        // Same recline as spiral_pos, so "deeper" reads as "lower Y" post-tilt.
+        let positions: Vec<Vec3> = ALL_BANDS.iter().map(|&b| band_label_pos(b)).collect();
+        for pair in positions.windows(2) {
+            assert!(
+                pair[1].y < pair[0].y,
+                "each successive band's label must sit lower (deeper) than the last: {:?}",
+                positions
+            );
+        }
     }
 }

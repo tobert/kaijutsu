@@ -14,10 +14,23 @@ use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 
-use super::card::{ClusterAssignment, assign_bands, card_from, spiral_order, spiral_pos, spiral_scale};
+use super::card::{ClusterAssignment, assign_bands, card_from, spiral_pos, spiral_positions, spiral_scale};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use super::panel::create_msdf_panel;
+
+/// Current wall-clock time as Unix-epoch millis. Idle age (`now -
+/// last_activity_at`) is real elapsed time, not app-uptime — so this reads
+/// `SystemTime`, **not** Bevy's `Res<Time>` (which is startup-relative and
+/// would misclassify every context as ancient after any nontrivial uptime).
+/// Fails loudly on a clock set before the epoch rather than silently
+/// defaulting to 0 (which would band everything as maximally idle).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is set before the Unix epoch")
+        .as_millis() as i64
+}
 
 /// Reconcile the well against the latest polled context list.
 ///
@@ -74,7 +87,8 @@ pub fn sync_time_well(
         .keys()
         .filter_map(|k| state.join.get(k).cloned())
         .collect();
-    let bands = assign_bands(&contexts);
+    let now = now_millis();
+    let bands = assign_bands(&contexts, now);
     let band_by_id: HashMap<ContextId, kaijutsu_viz::layout::Band> = contexts
         .iter()
         .map(|c| c.id)
@@ -82,13 +96,13 @@ pub fn sync_time_well(
         .collect();
     // Snapshot the cluster map so we can both feed the slot ordering and read
     // labels in the spawn/refresh loops below without re-borrowing `state`
-    // (which those loops mutate). It's haystack-sized — a cheap clone.
+    // (which those loops mutate). It's Horizon-sized — a cheap clone.
     let cluster_of = state.cluster_of.clone();
-    // The whole well as one ordered spiral (mouth → throat). A card's index here
-    // is its position on the vortex and its odometer address; nav walks it.
-    let order = spiral_order(&contexts, &bands, &cluster_of);
-    let index_of: HashMap<ContextId, usize> =
-        order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    // The whole well as one ordered spiral (mouth → throat) plus each card's
+    // terraced `(band, within_index)` position — the flat order is the
+    // odometer address nav walks; the pair is what the terraced geometry
+    // (`spiral_pos`/`spiral_scale`) keys on. See `card::spiral_positions`.
+    let (order, pos_of) = spiral_positions(&contexts, &bands);
     state.spiral_order = order;
 
     // Keep selection valid: drop it if its context left the well; default to the
@@ -100,9 +114,12 @@ pub fn sync_time_well(
         state.selected = state.spiral_order.first().copied();
     }
 
-    // Resolve a target position + base scale per id from its spiral index.
-    let target_of = |id: &ContextId| index_of.get(id).map(|&i| spiral_pos(i));
-    let scale_of = |id: &ContextId| index_of.get(id).map(|&i| spiral_scale(i)).unwrap_or(1.0);
+    // Resolve a target position + base scale per id from its terraced
+    // (band, within_index) pair.
+    let target_of = |id: &ContextId| pos_of.get(id).map(|&(b, wi)| spiral_pos(b, wi));
+    let scale_of = |id: &ContextId| {
+        pos_of.get(id).map(|&(b, wi)| spiral_scale(b, wi)).unwrap_or(1.0)
+    };
 
     // ── Spawn entered cards at their resolved position. ──
     let card_mesh = state
@@ -122,7 +139,7 @@ pub fn sync_time_well(
         let band = band_by_id
             .get(&id)
             .copied()
-            .unwrap_or(kaijutsu_viz::layout::Band::Hot);
+            .unwrap_or(kaijutsu_viz::layout::Band::HotNow);
         let cluster_label = cluster_of.get(&id).map(|a| a.label.clone());
         let data = card_from(&info, band, cluster_label);
         let pos = target_of(&id).unwrap_or(Vec3::ZERO);

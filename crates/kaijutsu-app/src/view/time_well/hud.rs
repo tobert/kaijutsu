@@ -433,9 +433,10 @@ fn status_label(status: Option<Status>) -> &'static str {
 
 fn band_label(band: Band) -> &'static str {
     match band {
-        Band::Hot => "hot",
-        Band::RecentConcluded => "recent",
-        Band::Haystack => "haystack",
+        Band::HotNow => "hot now",
+        Band::ThisWeek => "this week",
+        Band::ThirtyDays => "30 days",
+        Band::Horizon => "horizon",
     }
 }
 
@@ -525,7 +526,7 @@ mod tests {
 
     #[test]
     fn north_shows_title_type_and_status() {
-        let n = hud_north(&card(Band::Hot), Some(Status::Running));
+        let n = hud_north(&card(Band::HotNow), Some(Status::Running));
         assert!(n.starts_with("alpha"), "title leads");
         assert!(n.contains("coder"), "context-type shown");
         assert!(n.contains("running"), "live status shown");
@@ -533,7 +534,7 @@ mod tests {
 
     #[test]
     fn north_empty_type_falls_back_to_dash() {
-        let mut c = card(Band::Hot);
+        let mut c = card(Band::HotNow);
         c.accent = String::new();
         let n = hud_north(&c, None);
         assert!(n.contains("— · idle"), "empty type → dash, no status → idle: {n}");
@@ -541,7 +542,7 @@ mod tests {
 
     #[test]
     fn east_lists_specs_with_dash_fallbacks() {
-        let mut c = card(Band::RecentConcluded);
+        let mut c = card(Band::ThisWeek);
         c.model_badge = String::new();
         c.fork_badge = None;
         c.keywords = vec![];
@@ -549,13 +550,13 @@ mod tests {
         assert!(e.contains("model    —"), "empty model → dash: {e}");
         assert!(e.contains("fork     —"), "no fork → dash");
         assert!(e.contains("keywords —"), "no keywords → dash");
-        assert!(e.contains("band     recent"), "band labeled");
+        assert!(e.contains("band     this week"), "band labeled");
         assert!(!e.contains("cluster"), "no cluster line when unclustered");
     }
 
     #[test]
     fn east_shows_cluster_only_when_present() {
-        let mut c = card(Band::Haystack);
+        let mut c = card(Band::Horizon);
         c.cluster_label = Some("storage".into());
         let e = hud_east(&c);
         assert!(e.contains("cluster  ◇ storage"), "cluster line present: {e}");
@@ -564,7 +565,7 @@ mod tests {
 
     #[test]
     fn south_truncates_long_preview() {
-        let mut c = card(Band::Hot);
+        let mut c = card(Band::HotNow);
         c.preview = Some("x".repeat(300));
         let s = hud_south(&c);
         assert!(s.ends_with('…'), "long preview is elided");

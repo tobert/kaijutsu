@@ -88,11 +88,13 @@ pub struct TimeWellState {
     pub entities: HashMap<ContextId, Entity>,
     /// Shared quad mesh for every card (built lazily on first enter).
     pub card_mesh: Option<Handle<Mesh>>,
-    /// The whole well as one ordered spiral, **mouth → throat** (live → recent →
-    /// haystack, each zone in its slot order — see [`super::card::spiral_order`]),
-    /// rebuilt each layout tick. The single source of nav order: a card's index
-    /// here is its position on the vortex *and* its odometer address (Left/Right
-    /// = ±1, Up/Down = ±10, digits = the first decade at the mouth).
+    /// The whole well as one ordered spiral, **mouth → throat**: `HotNow` →
+    /// `ThisWeek` → `ThirtyDays` → `Horizon`, each band in its own recency
+    /// order — see [`super::card::spiral_order`] / [`super::card::spiral_positions`]
+    /// — rebuilt each layout tick. The single source of nav order: a card's
+    /// index here is its odometer address (Left/Right = ±1, Up/Down = ±10,
+    /// digits = the first decade at the mouth); its *world position* now comes
+    /// from the terraced `(band, within_index)` pair instead (Stage 1 Slice F).
     pub spiral_order: Vec<ContextId>,
     /// The currently-selected card (highlighted; the target of Enter / `c`).
     pub selected: Option<ContextId>,
@@ -102,9 +104,10 @@ pub struct TimeWellState {
     /// in [`ease_camera_to_selection`].
     pub focused: bool,
     /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
-    /// the band-2 `get_clusters` poll. Drives the haystack's cluster-grouped
-    /// angle and the cluster label on haystack cards. Empty when the kernel has
-    /// no semantic index — band-2 then falls back to creation-id order.
+    /// the `get_clusters` poll. Drives the cluster label on `Horizon` cards
+    /// (Stage 3 will extend this to cluster-grouped angle within a band; for
+    /// now it's label-only — see `card::card_from`). Empty when the kernel has
+    /// no semantic index.
     pub cluster_of: HashMap<ContextId, super::card::ClusterAssignment>,
 }
 
@@ -169,9 +172,10 @@ const RING_DECK_DEPTH: f32 = -460.0;
 /// is off. Kept as a per-band knob in case a slight lean reads better. Tunable.
 fn card_tilt(band: Band) -> f32 {
     match band {
-        Band::Hot => 0.0,
-        Band::RecentConcluded => 0.0,
-        Band::Haystack => 0.0,
+        Band::HotNow => 0.0,
+        Band::ThisWeek => 0.0,
+        Band::ThirtyDays => 0.0,
+        Band::Horizon => 0.0,
     }
 }
 

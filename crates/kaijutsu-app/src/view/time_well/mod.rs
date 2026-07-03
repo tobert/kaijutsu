@@ -1,8 +1,12 @@
 //! Time-well context browser — the first concrete consumer of `kaijutsu-viz`.
 //!
-//! A radial 3D "well" of context cards: radius encodes lifecycle band (hot rim →
-//! recent-concluded → haystack core), angle encodes within-band position. See
-//! `docs/viz-substrate.md` and `docs/time-well-concepts.md` for the design.
+//! A radial 3D "well" of context cards, terraced by idle-age band (Stage 1,
+//! "kernel truth: activity recency" — see `docs/timewell.md`): `HotNow` (the
+//! mouth) → `ThisWeek` → `ThirtyDays` → `Horizon` (the throat), each its own
+//! radius/depth terrace with a visible step + gap at the boundary; within a
+//! terrace, angle encodes recency-ordered within-band position. See
+//! `docs/viz-substrate.md` and `docs/time-well-concepts.md` for the earlier
+//! design record (superseded on the band scheme by `docs/timewell.md`).
 //!
 //! Module map:
 //! - [`card`] — pure `ContextInfo` → card-model mapping, band assignment, layout,

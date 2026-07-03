@@ -598,6 +598,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   optional-cadence attachment + track decks in the well → 4 track→context→detail
   progression → 5 event-horizon cutoff + LOD + `/` archive search → 6 polish.
   Individual entries below fold into those stages as they ship.
+- **Stage 1 Slices E/F landed 2026-07-03** (idle-age bands + terraced vortex,
+  app side): `kaijutsu-viz/src/layout.rs`'s `Band` is now the 4-variant
+  `HotNow`/`ThisWeek`/`ThirtyDays`/`Horizon` idle-age ladder (pure per-context
+  derivation of `now − last_activity_at`, no N-most-recent window);
+  `kaijutsu-app/src/view/time_well/card.rs`'s `band_orders`/`spiral_positions`
+  terrace the vortex (per-band radius/depth envelope + visible step/gap,
+  spiral ordering continuing within each terrace, mouth-open radius floor
+  preserved). **Not done yet: the in-world terrace-edge labels** ("HOT NOW" /
+  "THIS WEEK" / "30 DAYS" / "HORIZON" floating at each band boundary, per
+  `docs/timewell.md` "The bowl, revisited"). The pure position/text helpers
+  (`card::band_label_pos`, `card::band_label_text`) exist and are tested, but
+  no entity spawns/renders them — wiring that up means an MSDF panel per band
+  (the `ReadingCard` pattern in `scene.rs`), gated on font-asset load the same
+  way `text::build_card_scenes` is, and — landmine — passing the brush
+  explicitly to `VelloFont::layout`/`collect_msdf_glyphs` or the text renders
+  black. Deferred rather than half-done because this pass had no live/runner
+  verification available to catch a black-text or mispositioned regression.
+  The three boundary constants (`HOT_NOW_MILLIS`/`THIS_WEEK_MILLIS`/
+  `THIRTY_DAYS_MILLIS` in `layout.rs`) and the two terrace-gap constants
+  (`TERRACE_RADIUS_GAP`/`TERRACE_DEPTH_GAP` in `card.rs`) are placeholders —
+  Amy tunes them live once this is on screen.
 - **Doc/code hygiene from the 2026-07-03 review** (do with timewell Stage 0):
   trim `viz-substrate.md`'s superseded three-band layout + build order to a
   pointer; delete dead `CompactingBandLayout`/`RadialBands`/`LayoutConfig` from
