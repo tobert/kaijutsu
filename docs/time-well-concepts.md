@@ -3,8 +3,8 @@
 > Forward plan: `docs/timewell.md`.
 
 June 2026. Amy + Claude worked through ~40 generated mockups to find a
-direction for rebuilding the constellation and conversation card stack as
-instanced 3D scenes (Bevy 0.18). This doc records the decided direction, the
+direction for rebuilding the time well / context browser and conversation card
+stack as instanced 3D scenes (Bevy 0.18). This doc records the decided direction, the
 process, and the prompts that produced the keepers, so future iterations can
 pick up where we left off.
 
@@ -23,51 +23,62 @@ points, then sediment-grain at the core. The ~80% use case is "today through
 the last two weeks," so the rim gets the space; history grows *denser*, not
 bigger.
 
-> **Refinement (June 2026, design follow-up — see `docs/viz-substrate.md`).**
-> The radial axis was sharpened from *calendar time* to **three lifecycle
-> bands**, which is what the engineering design builds:
-> - **Band 0 (rim) — hot:** open contexts, a flat **compacting list** worked like
->   terminal-mux windows. New context appends to the end; an explicit **`conclude`**
->   act (≠ a transient detach) removes it and the rest compact. The only keyboard
->   surface: `ctrl-a 0–9`, capped at 10. Lineage is an on-demand overlay, not the
->   angular layout.
-> - **Band 1 (mid) — recent-concluded:** the last 10 concluded, recency-ordered;
->   the 11th falls inward. Clickops only.
-> - **Band 2 (core) — the haystack:** angle re-encodes to *semantic cluster*
->   (lineage stops mattering for cold data). Search-driven recovery, not
->   first-class.
+> **Refinement (2026-07-03 — see `docs/timewell.md`).** The radial axis
+> sharpened again, past the three-lifecycle-band scheme this section
+> originally described. Contexts now classify into **four idle-age bands** —
+> `HotNow` / `ThisWeek` / `ThirtyDays` / `Horizon` — as a **pure derivation of
+> `now − last_activity_at`** (plus two explicit overrides: `running` always
+> counts as `HotNow`, and `conclude` demotes immediately regardless of
+> recency). No expiry daemon, no N-most-recent window to maintain. Each band
+> renders as its own **magic-circle ring**, stacked by depth on a shared
+> funnel axis, receding toward a central throat glow. The keyboard surface is
+> ring-centric arrows — no `ctrl-a` prefix (the well is a dedicated
+> full-screen nav surface). The rule-governed `0–9` rank described elsewhere
+> in this doc is still a forward plan (Stage 2 in `docs/timewell.md`), not
+> what ships today; the built well has only a legacy `0–9` quick-jump over
+> the flat mouth→throat card order.
 >
-> So "active view vs haystack view" are not two views — they are two radii of one
-> well. Each band gets an *equal-width annulus* (history denser, not bigger →
-> a quantized radial scale). Reach cost scales with coldness: keystroke → click →
-> search. The bands map 1:1 onto the LOD/instancing tiers in the table below.
+> So "active view vs haystack view" are not two views — they are four rings of
+> one well, receding from the mouth to the throat. Reach cost still scales
+> with coldness: quick-jump (legacy) → arrow-nav → search. The bands still map
+> conceptually onto the LOD/instancing tiers in the table below, though the
+> instancing tiers themselves remain aspirational (see the note there).
 
 **Two-level navigation (the load-bearing rule, decided last):** the broad
 view does NOT show everything. It shows roots and drivers (or a similar
 summarization rule) — it exists to show the lay of the land. Selecting a
 system/subgraph dives in: that subgraph re-lays-out on the same table with
 its full topology, optimized for itself. Overview never overloads; detail is
-opt-in per subgraph.
+opt-in per subgraph. *(Still a forward plan — see Stage 3/4 in
+`docs/timewell.md`; today's well shows every context as a card, not a
+summarized overview with dive-in.)*
 
-> **Refinement (2026-06-17 — keyboard browse + reading slot; engineering in
-> `docs/viz-substrate.md` "Navigation & the reading slot").** The first GPU
-> framing showed ring cards are too small to read and the keyboard only walked
-> the hot rim. So selection became a 2D walk over the rings — **left/right**
-> within a band, **up/down** to hop bands (up warms toward the rim, down cools
-> toward the core), `0–9` still a hot quick-jump — and a **center-bottom reading
-> slot** renders the current selection at full, legible size with the rings
-> staying behind it as the spatial index. This is the keyboard precursor to the
-> mockup-34 JOIN dive: the reading slot *is* the focused card, parked rather than
-> dived-through. (Zooming the whole well to enlarge cards was tried and rejected
-> — it crops the side cards.)
+> **Refinement (2026-07-03 — see `docs/timewell.md`).** The 2026-06-17
+> keyboard scheme this section originally described — a 2D grid over the
+> rings (left/right within a band, up/down to hop bands) plus a center-bottom
+> reading slot — was itself superseded by the ring rebuild. Selection is now
+> **ring-centric**: Left/Right spin the *focused ring* so the selected card
+> eases to a front gate angle; Up/Down change which ring is focused while the
+> camera dollies to frame it. The reading slot's job — showing the selection
+> at a legible size — moved to the **edge HUD** (identity/specs/lineage/preview
+> fanned to the four screen edges) plus the in-world focus card shown on
+> Enter-focus, rather than a parked center-bottom card. Two-stage Enter
+> (focus → commit) carried over unchanged.
 >
-> **Aesthetic stance (Amy, 2026-06-17):** the time well should *look cool* — not
-> "yet another JavaScript thing." The full-width 2D bottom panel works
-> functionally but reads as generic web chrome. The intended direction is
-> **in-world, camera-driven**: the focus presentation should live in the 3D well
-> (the camera eases toward / dives into the selected card so it grows in place),
-> not as a flat HTML-style overlay. Camera movement is both the framing fix and
-> the aesthetic: motion + depth, not panels.
+> **Aesthetic stance (Amy, 2026-06-17) — achieved.** The time well should
+> *look cool* — not "yet another JavaScript thing." The intended direction was
+> **in-world, camera-driven**: the focus presentation lives in the 3D well
+> itself (the camera eases toward / dollies into the selected card), not a
+> flat HTML-style overlay. That stance held all the way through the ring
+> rebuild — the built well is an HDR/bloom scene, camera-driven throughout,
+> with no 2D panel anywhere in it.
+
+> **Palette note (2026-07-03).** The built well didn't keep mockup 27's
+> "indigo-teal-amber calm" palette — it landed on an HDR/bloom
+> Konosuba-"Explosion"-spell look (concentric grid + radial spokes + an
+> inscribed hexagram per ring, counter-rotating), brighter and more overtly
+> magical than the mockup. The geometry and navigation grammar below still
+> hold; only the color/material language moved.
 
 ### Visual grammar
 
@@ -97,7 +108,9 @@ opt-in per subgraph.
 
 ### Engine mapping (Bevy 0.18)
 
-LOD tiers map 1:1 to instancing tiers:
+LOD tiers map 1:1 to instancing tiers (**still aspirational, not built** — the
+well today renders every context as a full `Mesh3d` card regardless of band;
+see the LOD/horizon gap in `docs/timewell.md` Stage 5):
 
 | Tier | Representation | Bevy mechanism |
 |------|----------------|----------------|

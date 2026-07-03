@@ -1,18 +1,47 @@
 # Time Well — Evolution Plan
 
-2026-07-03. The vortex context browser (`crates/kaijutsu-app/src/view/time_well/`)
-works as a prototype: the spiral reads well, the musician swarm falling toward the
-event horizon is the right feeling, keyboard nav and the two-stage Enter are sound.
-But at 56 live contexts the assumptions it was built on have broken, and its real
-job has come into focus. This doc is the forward plan: what the time well is *for*,
-the ontology it navigates, and the staged evolution from fundamental fixes to a
-professional-feeling instrument.
+2026-07-03. The time well (`crates/kaijutsu-app/src/view/time_well/`) is now a
+**carousel of four per-band magic-circle rings** — HotNow / ThisWeek /
+ThirtyDays / Horizon, stacked by depth and receding into a central
+vortex/throat glow on a shared tilted funnel axis (Konosuba-"Explosion"
+HDR/bloom aesthetic). This supersedes the continuous log-spiral prototype this
+doc was originally written against: the spiral read well and the musician
+swarm falling toward the event horizon was the right feeling, but at 56 live
+contexts the assumptions the whole well was built on had broken, and its real
+job had come into focus. Keyboard nav is now ring-centric
+(`(focused_ring, ring_pos)`, spin-to-gate + camera dolly) rather than the
+spiral's odometer walk, but the two-stage Enter survived the rebuild intact.
+This doc remains the forward plan: what the time well is *for*, the ontology
+it navigates, and the staged evolution from fundamental fixes (now landed) to
+a professional-feeling instrument.
 
 **Relationship to the other docs.** `docs/time-well-concepts.md` stays as the UX
 design record (the 40 mockups, the visual grammar). `docs/viz-substrate.md` stays
 as the substrate reference (join / scales / data flow / wire gaps), but its build
 order and its three-band layout thesis are superseded — first by its own step 7.8
 vortex addendum, now by this plan. New open questions land here, not there.
+
+## Status (2026-07-03)
+
+What's actually built, so the staged plan below isn't mistaken for vaporware:
+
+- **Stage 0 (tourniquet)** — shipped: hot sorts newest-first, default
+  selection is the mouth.
+- **Stage 1, kernel half** — shipped: real `last_activity_at` on the wire,
+  `liveStatus` cached incrementally (O(1) per event, not a 5s full-scan), and
+  idle-age bands (`assign_idle_band` over `HotNow|ThisWeek|ThirtyDays|Horizon`)
+  as pure derivations of `now − last_activity_at`. No expiry daemon.
+- **Stage 1, app half** — shipped, but not as originally planned below (which
+  described terracing the continuous spiral). The app instead went through
+  the spiral and out the other side: idle-age bands now render as **four
+  discrete magic-circle rings**, one per band, each seated with its own cards
+  as perpendicular 3D "slides," navigated ring-centric —
+  `(focused_ring, ring_pos)` — with left/right spinning the focused ring to a
+  fixed gate angle and up/down changing the focused ring while the camera
+  dollies to frame it. `CompactingBandLayout`/`RadialBands`-layout is deleted;
+  the geometry substrate for every stage below is now rings, not a spiral.
+- **Stages 2–6** — still the forward plan, unbuilt. Read them as designed
+  against ring geometry, not the spiral this doc originally described.
 
 ---
 
@@ -45,12 +74,13 @@ That use case fixes the requirements precisely:
 Ground truth from a code deep-dive, a wire/census inventory, and an external
 (DeepSeek) review. The short version:
 
-- **The "new stuff at the bottom" glitch.** Hot contexts sort **id-ascending =
-  oldest-first** (`card.rs:161-162`); a new context (largest UUIDv7) lands at the
-  *end* of the hot run — deepest in the funnel, smallest, furthest from the
-  default selection (index 0 = the *oldest* open context, `sync.rs:99-101`).
-  Digits `0–9` address spiral indices 0–9 (`scene.rs:355-393`) — i.e. the ten
-  *oldest* open contexts. Every part of that is backwards for the mux use case.
+- **The "new stuff at the bottom" glitch — resolved by the ring rebuild.** The
+  original hot-sorts-oldest-first bug (Stage 0) is long fixed, and the rebuild
+  replaced spiral-index digit addressing entirely: navigation is now
+  ring-centric `(focused_ring, ring_pos)`, so there's no flat spiral index for
+  a digit to land on and no "ten oldest" trap. (Rule-governed digit-addressing
+  — the rank — is still Stage 2, unbuilt; see "Two navigation surfaces"
+  below.)
 - **"Hot" has stopped meaning anything.** Banding keys only on `concluded_at`
   (`kaijutsu-viz/src/layout.rs:130`). The census: 56 live contexts — ~23
   `musician` (16 of them unlabeled rotation-children), 9 `score` (kernel
@@ -73,9 +103,10 @@ Ground truth from a code deep-dive, a wire/census inventory, and an external
   the app to know tracks exist. Today's track is purely a **clock domain** —
   attachment *requires* a wakeup cadence.
 - **Solid and worth keeping:** the pure/tested band → slot-order → flatten →
-  index pipeline (`card.rs`), the `Join` reconcile, the odometer walk + two-stage
-  Enter, the edge HUD, the activity-ring pulse, `haystack_order_keys` as a
-  grouping primitive. The prototype's bones are good.
+  index pipeline (`card.rs`), the `Join` reconcile, two-stage Enter, the edge
+  HUD, the activity-ring pulse, `haystack_order_keys` as a grouping primitive.
+  The prototype's bones were good — the ring rebuild kept all of this and only
+  replaced the spiral's odometer walk with ring-centric nav.
 - **Dead code:** `CompactingBandLayout` (+ `RadialBands`, `LayoutConfig`) in
   `kaijutsu-viz/src/layout.rs` — no consumer since the 7.8 spiral. **Decision:
   delete it** (the spiral is append-stable by construction; the crate's own rule
@@ -129,8 +160,10 @@ wire additions (below) are additive, and a track with no clock is just a row.
 
 ## Two navigation surfaces, decoupled
 
-The prototype conflates the digit keys with spiral position — that's the root of
-the muscle-memory failure. They become two different instruments:
+The spiral prototype conflated the digit keys with a flat spiral position —
+that was the root of the muscle-memory failure this section originally
+diagnosed. The two-surface split below is still the target; only the
+*mechanism* under the skim surface changed with the ring rebuild:
 
 - **The rank** (digits `0–9`): an ordered active list with mux semantics —
   **rule-governed, not frozen**. Amy's real usage (2026-07-03): she adapts to a
@@ -145,14 +178,20 @@ the muscle-memory failure. They become two different instruments:
   The rank is the keyboard surface, curated by *membership* — shells, work
   contexts, a stats surface. Rendered as a fixed rail at the mouth of the well
   (and later, mirrored in the conversation view's dock so switching doesn't
-  require entering the well).
-- **The vortex** (arrows, the spiral): pure recency river. Newest activity at
-  the mouth, everything sinks toward the horizon as it idles. No stability
-  contract at all — it's for *skimming*, not addressing. Rank members also
-  appear in the river (the rank is an index, not a place).
+  require entering the well). **Not built yet** — the well today still has
+  only a legacy `0–9` quick-jump over the flat mouth→throat card order (select
+  + switch + exit), a holdover from the spiral that isn't the rule-governed
+  rank; Stage 2 replaces it.
+- **The rings** (arrows): pure recency river, now four discrete terraces
+  instead of a continuous spiral. Newest activity sits in the `HotNow` ring at
+  the mouth; everything sinks band by band toward `Horizon` at the throat as
+  it idles. Left/Right spin the focused ring so the selected card eases to the
+  gate; Up/Down change which ring is focused and dolly the camera to frame it.
+  No stability contract at all — it's for *skimming*, not addressing. Rank
+  members would also appear in the rings (the rank is an index, not a place).
 
 Effort scales with coldness, as the original design said: keystroke (rank) →
-skim (vortex) → search (horizon). The change is that the keystroke surface is no
+skim (rings) → search (horizon). The change is that the keystroke surface is no
 longer *derived from* the skim surface.
 
 ## The bowl, revisited — what mockup 27 still teaches
@@ -162,38 +201,41 @@ The full 01–40 mockup set moved out of the repo with Amy; only the winner is
 kept here.)*
 
 The original ring layout was abandoned for the continuous vortex because it
-wouldn't land — but the diagnosis matters: **the rings failed for population
-reasons, not geometry reasons.** Fixed-pitch rings wrapped onto themselves past
-~24 cards (issues.md, "fixed-pitch overlap") because nothing bounded band
-membership — "hot" was everything unconcluded. The vortex degrades more
-gracefully under unbounded load, which is why it "worked a little better," but
-it pays for that by dissolving everything 27 got right. This plan removes the
-cause (idle-age bands bound the hot set; track decks aggregate churn; LOD +
-horizon cap the tail), so the geometry can converge back toward the bowl.
-What 27 teaches, concretely:
+wouldn't land at the time — but the diagnosis mattered: **the rings failed for
+population reasons, not geometry reasons.** Fixed-pitch rings wrapped onto
+themselves past ~24 cards (issues.md, "fixed-pitch overlap") because nothing
+bounded band membership — "hot" was everything unconcluded. The vortex
+degraded more gracefully under unbounded load, which is why it "worked a
+little better," but it paid for that by dissolving everything 27 got right.
+Stage 1's idle-age bands removed the cause (a bounded hot set), and the app
+rebuilt the geometry back toward the bowl — **not** the terraced-spiral
+middle path this section originally proposed, but a fuller return to mockup
+27's ring grammar: one magic-circle ring per idle-age band, receding into the
+throat. What 27 taught, now built:
 
 - **Terraced bands, not continuous depth.** The eye finds "THIS WEEK" /
   "MONTHS AGO" / "YEARS OF HISTORY" because band boundaries are *steps*, not a
-  smooth gradient. Middle path that keeps the vortex's strengths: **quantize
-  depth/radius by idle-age band** (a visible step + gap between terraces) while
-  the spiral ordering continues *within* each terrace. Append-stability and the
-  odometer walk survive unchanged; the boundaries become legible. In-world band
-  labels ride the terrace edges.
-- **The mouth stays open.** In 27 the center is calm — sediment glow, no cards.
-  The live vortex piles cards into the axis. Visual invariant from Stage 1 on:
-  cards keep a radius floor; the core is reserved for the ring deck / accretion
-  glow (fully honest once the Stage 5 cutoff stops rendering the tail).
+  smooth gradient — now literally four separate rings at four depths, rather
+  than a quantized spiral. Cards seat evenly around their own band's ring
+  (perpendicular 3D "slides"), smaller per deeper ring. In-world band
+  *labels* are not built — the terrace step/gap and each ring's own size carry
+  the boundary today.
+- **The mouth stays open.** In 27 the center is calm — sediment glow, no
+  cards. The built well keeps a radius floor per ring and reserves the shared
+  vortex core for the throat glow, so the axis never fills with cards.
 - **The rim is a carousel.** Hot cards stand upright, evenly spaced,
   shoulder-to-shoulder, facing the viewer — a readable instrument panel, not
-  weather. Bounded hot membership is what makes this possible at all.
+  weather. This is now true per ring, not just the hot rim: every band's ring
+  is a carousel, spinnable to bring any of its cards to the front gate.
 - **Lineage drapes down the bowl wall.** The silk threads from rim cards to
   their ancestry below are the fork-lineage grammar made visible — and they
   need no new wire (`forked_from` is already on every context). The current
   selection-highlight rings are a pale substitute; draped curves (on-selection
-  first, ambient later) belong in the plan.
+  first, ambient later) still belong in the plan — not built.
 - **The table edge is the control ring.** 27 puts filters/affordances on the
   physical table rim. The Stage 2 rank rail should *be* that ring — stations
   around the table edge, instrument-styled — rather than a floating HUD strip.
+  Still forward-looking.
 
 The stages below absorb these as noted in place; none of them reorder the
 plan.
@@ -240,16 +282,24 @@ Make "recent" a real, cheap, wire-visible fact.
   score-contexts, spent verify sessions, and dormant musicians sink naturally;
   whatever is actually moving stays at the mouth. (The musician mass at the
   horizon — the part that already works — is preserved and *earned* now.)
-- **App half — terrace the vortex** (per "The bowl, revisited"): quantize
-  depth/radius by idle-age band — a visible step + gap at each band boundary,
-  spiral ordering continuing within each terrace — and float in-world band
-  labels at the terrace edges. Keep the radius floor that leaves the mouth
-  open. Geometry-only change (`card::spiral_local` keyed on band + within-band
-  index); ordering, odometer nav, and append-stability untouched.
+- **App half — landed differently than planned: discrete rings, not a
+  terraced spiral.** Where this stage originally proposed quantizing
+  depth/radius on the continuous spiral (a step + gap per band boundary,
+  spiral ordering continuing within each terrace), what actually shipped is
+  four separate magic-circle rings — one per idle-age band
+  (`assign_idle_band` over `HotNow|ThisWeek|ThirtyDays|Horizon`), stacked by
+  depth on a shared tilted funnel axis, receding into a central vortex/throat
+  glow. Cards seat evenly around their band's ring as perpendicular 3D
+  "slides," smaller per deeper ring. Navigation became ring-centric
+  `(focused_ring, ring_pos)` rather than the odometer walk: Left/Right spin
+  the focused ring so the selected card eases to a fixed gate angle; Up/Down
+  change the focused ring and dolly the camera to frame it. In-world band
+  *labels* were not built. The radius floor that keeps the mouth open
+  survived into the ring geometry.
 
-Acceptance: touch an old context via kj; its card surfaces at the mouth on the
-next poll — and a screenshot shows four legible terraces, labeled, with an
-open center.
+Acceptance (met): touch an old context via kj; its card surfaces at the mouth
+on the next poll — and a screenshot shows four legible rings, receding into
+the throat, with an open center.
 
 ### Stage 2 — The rank (replaces the mux)
 
@@ -378,16 +428,20 @@ The "not another JavaScript thing" pass, once the structure is honest.
 
 ---
 
-## Doc + code hygiene (do alongside Stage 0)
+## Doc + code hygiene
 
-- Trim `docs/viz-substrate.md`: mark the three-band layout section and build
-  order as superseded (pointer here); keep D3 decomposition, data flow, wire
-  gaps, dependency notes as the substrate reference.
-- Delete `CompactingBandLayout` + its config/tests from `kaijutsu-viz`
-  (decision recorded above).
-- `docs/time-well-concepts.md`: add a one-line pointer to this doc at top, and
-  fix the stale `mockups/context-browser/` reference — the full set moved out
-  of the repo; the canonical 27 is preserved at `docs/mockups/27-time-well.png`.
+- ✅ `docs/viz-substrate.md`: superseded banners are in place for the
+  three-band layout section and the build-order section; this pass added
+  matching banners to the navigation/reading-slot section and the
+  continuous-spiral section too, since both are themselves superseded by the
+  ring rebuild. D3 decomposition, data flow, wire gaps, and dependency notes
+  remain the substrate reference.
+- ✅ `CompactingBandLayout` + its config/tests — **deleted** from
+  `kaijutsu-viz` (2026-07-03; decision recorded above). `RadialBands`/scales
+  stay.
+- ✅ `docs/time-well-concepts.md`: has a pointer to this doc at top; the
+  `mockups/context-browser/` reference is fixed — the full set moved out of
+  the repo, the canonical 27 preserved at `docs/mockups/27-time-well.png`.
 
 ## Execution notes — details easy to miss
 

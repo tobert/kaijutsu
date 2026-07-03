@@ -98,11 +98,13 @@ the optional `:r` count; the engrave subtree has no feature gate.
 
 Pure, dependency-free D3-style toolkit; first/sole consumer is the time-well
 browser in `-app`. `ScaleLinear`/`ScaleTime`/`ScaleThreshold`/`RadialBands`
-(`scales.rs`), a `CompactingBandLayout` (`layout.rs:269`, pure + stateless,
-`compute(entries) → BTreeMap<Id, LayoutPos>`) over three lifecycle bands
-(`Hot|RecentConcluded|Haystack`), and a `Join` keyed data-join reconciler
-(`join.rs:131`) that structurally separates layout cadence from data cadence. The
-`order_key: i64` makes slot assignment re-derivable without stored state. Leaf
-crate (proptest dev-only); used by `-app`. Smells: untyped `order_key: i64`;
-`LayoutPos.x/y` are `f32` (implicit Bevy coupling); `compute` reconstructs `Band`
-from an index via an inline `match` (no `Band::from_index()`).
+(`scales.rs`, `RadialBands` unused by the current layout path), `assign_idle_band`
+(`layout.rs`, pure per-context classification, no stored state) over four
+idle-age bands (`HotNow|ThisWeek|ThirtyDays|Horizon`) derived from
+`now − last_activity_at`, and a `Join` keyed data-join reconciler
+(`join.rs`) that structurally separates layout cadence from data cadence. Leaf
+crate (proptest dev-only); used by `-app`. `CompactingBandLayout`/`LayoutPos`
+(the earlier concrete radial-position layout, along with the `order_key: i64`
+slot-assignment scheme it used) were deleted 2026-07-03 — the ring geometry
+that replaced them lives directly in `kaijutsu-app`'s `view/time_well/card.rs`
+now, not in this crate.

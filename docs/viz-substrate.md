@@ -97,6 +97,19 @@ Transitions are never a build step; they run throughout.
 
 ### 4. Layouts — write one algorithm; trait + state both turned out unneeded.
 
+> **SUPERSEDED — see `docs/timewell.md`.** `CompactingBandLayout` (the
+> concrete layout described below) was **deleted** 2026-07-03 — no consumer
+> since the vortex/ring rebuild. The current time-well layout is
+> `assign_idle_band` (four idle-age bands, still in `kaijutsu-viz::layout`)
+> feeding ring geometry that now lives directly in
+> `crates/kaijutsu-app/src/view/time_well/card.rs`, not a `kaijutsu-viz`
+> layout function. `RadialBands` (`scales.rs`) stays in the crate but is
+> unused by this path — the app divides its own radius/depth envelope
+> directly. The *reasoning* below (pure/stateless, `order_key`-derived,
+> append/conclude motion invariants, trait deferred until a second consumer)
+> still describes how the replacement works; only the concrete type and its
+> location changed.
+
 ```
 // SHIPPED (kaijutsu-viz::layout): one concrete layout, pure & stateless.
 fn compute(&self, entries: &[ContextEntry<Id>]) -> BTreeMap<Id, LayoutPos>;
@@ -507,6 +520,16 @@ throughout.
 
 ## Navigation & the reading slot (step 7.5)
 
+> **SUPERSEDED — see `docs/timewell.md`.** The 2D-grid cross-band nav
+> described below (Left/Right within a band, Up/Down hopping bands, a fixed
+> reading-slot card) was replaced by ring-centric nav: Left/Right spin the
+> *focused ring* so the selected card eases to a front gate, Up/Down change
+> which ring is focused and dolly the camera to frame it, and selection
+> detail moved to the edge HUD (step 7.7, below) rather than a parked reading
+> card. Two-stage Enter (focus → commit) survived unchanged. Kept for the
+> historical record of the reasoning that got the well to be browsable at
+> all.
+
 The first GPU framing exposed two real problems: cards on the rings are too
 small to *read*, and the keyboard only moved *within* the hot rim — there was no
 way to walk into the colder bands. Pushing the camera closer to enlarge cards
@@ -658,6 +681,16 @@ Code: `view/time_well/hud.rs` (formatters unit-tested).
 
 ## The vortex: one continuous spiral + tipped axis (step 7.8 — 2026-06-17)
 
+> **SUPERSEDED — see `docs/timewell.md`.** The continuous spiral described
+> below was itself replaced by the ring rebuild: the well is once again
+> discrete rings — now one magic-circle ring per idle-age band (`HotNow` /
+> `ThisWeek` / `ThirtyDays` / `Horizon`), navigated ring-centric rather than
+> by the odometer index. What survived from this step: the **tipped funnel
+> axis** (`WELL_TILT`, the geometry itself carries the recline) and the
+> **accretion-horizon throat glow** are still there, now as the shared core
+> the rings recede into. The odometer (`Left/Right = ±1, Up/Down = ±10`) did
+> not survive — see the ring-nav description in `docs/timewell.md`.
+
 Decided with Amy: drop the three discrete rings; make the well a **single
 continuous vortex**, which is more honest to the lifecycle metaphor (age = how
 far you've fallen down the funnel) and to the concept art.
@@ -703,9 +736,10 @@ closed the layout question (three lifecycle bands). These remain genuinely open:
    `setContextState @71` keeps its `Staging→Live` v1 gate (conclude is its own
    verb, not a state-set), and `contextLeave @74` is unrelated (session-binding
    drop only).
-2. **Band 1 angle — literal clock-face or just a recency-ordered arc?** Decided
-   it's recency, not lineage; the open part is whether it reads as a 12-o'clock
-   "most recent" clock or a simpler newest-first sweep.
+2. ~~**Band 1 angle — literal clock-face or just a recency-ordered arc?**~~ —
+   moot: the three-lifecycle-band scheme this question was asked about is
+   gone, replaced by four idle-age bands (`HotNow`/`ThisWeek`/`ThirtyDays`/
+   `Horizon`), each its own ring with cards seated in recency order around it.
 3. **Overview summarization rule** — which contexts the broad view shows: roots +
    drivers, roots + anything-with-active-drift, or RC-configurable per
    `contextType`? Affects the layout tick's query, not the substrate.

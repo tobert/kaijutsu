@@ -12,8 +12,9 @@ individual GPU textures using a **kaijutsu-owned vello rasterizer** (the
 
 ## Bevy architecture
 
-A single `Camera2d` clears to the theme background. One `Screen` state machine:
-`Conversation` (default) and `TimeWell` (`ui/screen.rs:24`). Plugins build in
+One always-on `Camera3d` (HDR + `Bloom::NATURAL`) clears to the theme
+background — there is no `Camera2d` anywhere in the app. One `Screen` state
+machine: `Conversation` (default) and `TimeWell` (`ui/screen.rs:24`). Plugins build in
 order: `KjText → Input → Cell → VelloRasterizer → VelloUiTexture → BlockRender →
 Peers → ShaderFx → Actor → AppScreen → Screen → Commands → Tiling →
 TilingReconciler → Dock → Drift → TimeWell → Timeline → Tweening`. Frame order:
@@ -48,10 +49,16 @@ background (`main.rs:181`).
     `shell_dock.rs` (Ctrl+Z shell row), `cursor.rs`, `fieldset.rs` (role-group
     rules), `format.rs`, `brp_methods.rs`.
   - `view/time_well/` — the full-viewport 3D context browser
-    (`Screen::TimeWell`): `card.rs` (pure `ContextInfo → CardData` + band
-    assignment using `kaijutsu_viz::layout::CompactingBandLayout`), `scene.rs`
-    (`TimeWellState`, camera/cards, keyboard nav), `sync.rs` (keyed-join
-    reconcile), `text.rs` (per-card vello scene).
+    (`Screen::TimeWell`), now a carousel of four per-idle-age-band
+    magic-circle rings receding into a shared throat glow: `card.rs` (pure
+    `ContextInfo → CardData` mapping + idle-age band assignment via
+    `kaijutsu_viz::layout::assign_idle_band` over `HotNow`/`ThisWeek`/
+    `ThirtyDays`/`Horizon`, plus the per-band ring geometry), `scene.rs`
+    (`TimeWellState`, camera/cards, ring-centric `(focused_ring, ring_pos)`
+    keyboard nav — spin-to-gate on Left/Right, camera dolly on Up/Down),
+    `sync.rs` (keyed-join reconcile), `text.rs` (per-card vello scene),
+    `hud.rs` (edge HUD), `activity.rs` (kernel-activity ring pulse), `panel.rs`
+    (shared in-scene MSDF panel primitive).
 - **`input/`** — focus-based action dispatch. `FocusArea` (`Compose|Conversation|
   Dialog`, `focus.rs:71`) is the single source of truth for what keys do;
   `ActiveSurface` (`Chat|Shell`, `focus.rs:116`) disambiguates within Compose

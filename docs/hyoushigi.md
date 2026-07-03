@@ -432,7 +432,7 @@ genuinely new surface and is deferred until the musician needs it.
 
 ### Clients run hyoushigi too
 
-The app may attach to several contexts at once (the constellation view), each needing its
+The app may attach to several contexts at once (the time well / context browser), each needing its
 own disciplined clock, so the client crate carries hyoushigi as well and exposes the same
 read/observe/schedule API and per-`ContextId` registry. Only the *role* differs:
 
