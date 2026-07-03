@@ -14,7 +14,7 @@ use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 
-use super::card::{ClusterAssignment, assign_bands, card_from, spiral_pos, spiral_positions, spiral_scale};
+use super::card::{ClusterAssignment, assign_bands, card_base_scale, card_from, spiral_pos, spiral_positions};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use super::panel::create_msdf_panel;
@@ -118,7 +118,7 @@ pub fn sync_time_well(
     // (band, within_index) pair.
     let target_of = |id: &ContextId| pos_of.get(id).map(|&(b, wi)| spiral_pos(b, wi));
     let scale_of = |id: &ContextId| {
-        pos_of.get(id).map(|&(b, wi)| spiral_scale(b, wi)).unwrap_or(1.0)
+        pos_of.get(id).map(|&(b, wi)| card_base_scale(b, wi)).unwrap_or(1.0)
     };
 
     // ── Spawn entered cards at their resolved position. ──

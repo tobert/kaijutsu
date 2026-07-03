@@ -302,23 +302,33 @@ const TERRACE_DEPTH_GAP: f32 = 60.0;
 /// Number of terraces — one per [`Band`] variant.
 const N_TERRACES: usize = ALL_BANDS.len();
 
-/// One `(radius, depth)` pair per **interior** terrace boundary — the seam
-/// between band `k` and band `k + 1`, for `k` in `0..N_TERRACES - 1`
-/// (`N_TERRACES - 1` boundaries total; there is no boundary past the deepest
-/// terrace). Boundary `k` sits at band `k`'s inner (deep) edge:
-/// `terrace_envelope(k)`'s `radius_inner` (≈ the next band's outer radius —
-/// the shared step between the two terraces) and `depth_far` (how deep band
-/// `k`'s own envelope reaches). Single source of terrace-boundary geometry for
-/// the magic-circle ring visual (`terrace_ring_material`/`terrace_ring.wgsl`)
-/// so the terrace math stays in one place rather than re-derived at the call
-/// site.
+/// One `(radius, depth)` pair per terrace *ring* to draw — the mouth rim plus
+/// every interior terrace boundary, so cards in each band sit **between** two
+/// rings ("tiles between rings"). Returns `N_TERRACES` rings total:
+///
+/// - Ring 0 — the **mouth rim**: band 0's outer/shallow edge
+///   (`terrace_envelope(0)`'s `radius_outer` / `depth_near`). Brackets the top
+///   band (`HotNow`) from above, so its cards fill the pocket between this rim
+///   and the first interior boundary.
+/// - Rings `1..N_TERRACES` — the **interior boundaries**: the seam between band
+///   `k` and band `k + 1` (for `k` in `0..N_TERRACES - 1`), each at band `k`'s
+///   inner (deep) edge — `terrace_envelope(k)`'s `radius_inner` (≈ the next
+///   band's outer radius, the shared step between terraces) and `depth_far`.
+///
+/// Radii strictly decrease and `|depth|` strictly increases down the list (the
+/// funnel narrows + recedes). Single source of terrace-ring geometry for the
+/// magic-circle ring visual (`terrace_ring_material`/`terrace_ring.wgsl`) so
+/// the terrace math stays in one place rather than re-derived at the call site.
 pub fn terrace_ring_geometry() -> Vec<(f32, f32)> {
-    (0..N_TERRACES - 1)
-        .map(|k| {
-            let (_radius_outer, radius_inner, _depth_near, depth_far) = terrace_envelope(k);
-            (radius_inner, depth_far)
-        })
-        .collect()
+    // Mouth rim: band 0's outer/shallow edge — the ceiling of the top band.
+    let (mouth_radius, _r_inner, mouth_depth, _d_far) = terrace_envelope(0);
+    let mut rings = vec![(mouth_radius, mouth_depth)];
+    // Interior boundaries: each band's inner/deep edge.
+    rings.extend((0..N_TERRACES - 1).map(|k| {
+        let (_radius_outer, radius_inner, _depth_near, depth_far) = terrace_envelope(k);
+        (radius_inner, depth_far)
+    }));
+    rings
 }
 
 /// The `(radius_outer, radius_inner, depth_near, depth_far)` envelope band
@@ -363,10 +373,13 @@ pub fn spiral_pos(band: Band, within_index: usize) -> Vec3 {
     well_tilt_quat() * spiral_local(band, within_index)
 }
 
-/// Per-card base scale at `(band, within_index)`: 1.0 at the mouth, shrinking
-/// toward [`SPIRAL_SCALE_THROAT`] at the deepest terrace's inner edge, same
-/// per-band envelope-division as [`terrace_envelope`] (no gap needed — scale
-/// has no "visible step" requirement, just continuous recession).
+/// Per-card **within-terrace** scale at `(band, within_index)`: 1.0 at the
+/// mouth, shrinking toward [`SPIRAL_SCALE_THROAT`] at the deepest terrace's
+/// inner edge, same per-band envelope-division as [`terrace_envelope`] (no gap
+/// needed — scale has no "visible step" requirement, just continuous
+/// recession). This is the continuous decay *inside* a band; the per-band
+/// terrace step ([`TERRACE_SCALE_STEP`]) is layered on top in
+/// [`card_base_scale`], which is what a card's `base_scale` actually reads.
 pub fn spiral_scale(band: Band, within_index: usize) -> f32 {
     let n = N_TERRACES as f32;
     let i = band.index() as f32;
@@ -375,6 +388,22 @@ pub fn spiral_scale(band: Band, within_index: usize) -> f32 {
     let scale_inner = scale_outer - scale_span;
     let f = SPIRAL_DECAY.powi(within_index as i32);
     scale_inner + (scale_outer - scale_inner) * f
+}
+
+/// Multiplicative per-band scale step: each deeper band's cards are this factor
+/// smaller than the previous band's, layered on top of the within-terrace
+/// [`spiral_scale`] decay so the terraces read as distinctly-sized tiers
+/// (`HotNow` 1.0× → `ThisWeek` 0.8× → `ThirtyDays` 0.64× → `Horizon` 0.512×).
+/// **Amy-tunable.**
+pub const TERRACE_SCALE_STEP: f32 = 0.8;
+
+/// The card's **base render scale** at `(band, within_index)` — the single
+/// source for a card's `base_scale` field (the value the render-scale tween
+/// reads). Combines the within-terrace [`spiral_scale`] decay with the
+/// per-band [`TERRACE_SCALE_STEP`] tier step, so deeper bands are distinctly
+/// smaller overall.
+pub fn card_base_scale(band: Band, within_index: usize) -> f32 {
+    spiral_scale(band, within_index) * TERRACE_SCALE_STEP.powi(band.index() as i32)
 }
 
 /// Per-context `(Band, within-band index)`, alongside the flat mouth→throat
@@ -906,21 +935,48 @@ mod tests {
     }
 
     #[test]
-    fn terrace_ring_geometry_has_one_ring_per_interior_boundary() {
+    fn terrace_ring_geometry_brackets_every_band_between_two_rings() {
         let rings = terrace_ring_geometry();
-        assert_eq!(rings.len(), N_TERRACES - 1, "one ring per interior boundary");
+        // Mouth rim + one ring per interior boundary = one ring per band.
+        assert_eq!(rings.len(), N_TERRACES, "mouth rim + interior boundaries");
 
-        let mut prev_depth_mag = 0.0f32;
-        for (i, (radius, depth)) in rings.iter().enumerate() {
+        // Every radius sits within the mouth→throat span.
+        for (i, (radius, _depth)) in rings.iter().enumerate() {
             assert!(
                 *radius >= SPIRAL_R_THROAT - 1e-3 && *radius <= SPIRAL_R_MOUTH + 1e-3,
                 "ring {i} radius {radius} must sit within [{SPIRAL_R_THROAT}, {SPIRAL_R_MOUTH}]"
             );
+        }
+
+        // The first ring is the mouth rim: the LARGEST radius and SHALLOWEST |depth|.
+        let (first_radius, first_depth) = rings[0];
+        for (radius, depth) in rings.iter().skip(1) {
             assert!(
-                depth.abs() > prev_depth_mag,
-                "ring {i} depth {depth} must be strictly deeper (larger magnitude) than the previous ring's {prev_depth_mag}"
+                first_radius > *radius,
+                "mouth-rim radius {first_radius} must exceed every interior ring's {radius}"
             );
-            prev_depth_mag = depth.abs();
+            assert!(
+                first_depth.abs() < depth.abs(),
+                "mouth-rim |depth| {} must be shallower than every interior ring's {}",
+                first_depth.abs(),
+                depth.abs()
+            );
+        }
+
+        // Radii strictly decrease and |depth| strictly increases down the list.
+        for pair in rings.windows(2) {
+            assert!(
+                pair[0].0 > pair[1].0,
+                "radii must strictly decrease: {} then {}",
+                pair[0].0,
+                pair[1].0
+            );
+            assert!(
+                pair[0].1.abs() < pair[1].1.abs(),
+                "|depth| must strictly increase: {} then {}",
+                pair[0].1.abs(),
+                pair[1].1.abs()
+            );
         }
     }
 

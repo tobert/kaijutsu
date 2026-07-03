@@ -137,8 +137,16 @@ impl Default for TimeWellState {
 /// Logical card size in well units (the quad geometry). Bigger than the original
 /// 64×40 so the spiral's cards read larger and closer together (1.6 aspect, to
 /// match the card texture so text isn't distorted).
-pub const CARD_WIDTH: f32 = 88.0;
-pub const CARD_HEIGHT: f32 = 55.0;
+pub const CARD_WIDTH: f32 = 120.0;
+pub const CARD_HEIGHT: f32 = 75.0;
+
+/// Rim-card thickness (well units) along the card's local Z: rim cards are thin
+/// 3D **blocks**, not flat quads, so a card facing away from the camera (far
+/// arc of a ring-aligned band) shows its rear large face — which is
+/// front-facing from the camera's side and so still renders under default
+/// back-face culling. Kept small so the card still reads as a card, not a
+/// slab. **Amy-tunable.**
+pub const CARD_THICKNESS: f32 = 8.0;
 
 /// Card texture size (logical px the vello scene is built in, then rasterized).
 /// 4× the quad units, same 1.6 aspect, so text stays crisp when sampled.
@@ -182,8 +190,9 @@ const TERRACE_RING_QUAD_SCALE: f32 = 2.2;
 
 /// Half-width (fraction of the quad half-extent) of the visible annulus band,
 /// centered on the boundary radius (`1.0 / TERRACE_RING_QUAD_SCALE` as a
-/// fraction of the quad half-extent). **Amy-tunable.**
-const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.035;
+/// fraction of the quad half-extent). Widened for the ornate grid (concentric
+/// sub-rings + two-tier spokes + hexagram need room to read). **Amy-tunable.**
+const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 
 /// Base spin rate (radians/sec-ish, tune by eye) for terrace ring `k`; each
 /// deeper ring spins a touch faster so the funnel reads as receding motion.
@@ -214,6 +223,13 @@ fn card_tilt(band: Band) -> f32 {
 
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
+
+/// Blend dial for rim-card orientation: `0.0` = today's full camera-billboard,
+/// `1.0` = full ring-aligned (cards stand around their ring like a carousel,
+/// face-normal radial-outward, up along the funnel axis). Intermediate values
+/// slerp between the two. The focus [`ReadingCard`] is unaffected (always
+/// billboarded). **Amy-tunable.**
+const RING_ALIGN: f32 = 1.0;
 
 /// Exponential-smoothing rate for the camera follow (lower = a slower, weightier
 /// glide than the cards, so the view leans rather than snaps).
@@ -246,9 +262,10 @@ pub fn enter_time_well(
     // Fresh entry always starts in the overview (not focused).
     state.focused = false;
 
-    // Build the shared card quad once.
+    // Build the shared rim-card block once (a thin 3D box, not a flat quad, so
+    // both large faces read from their own side — see [`card_block_mesh`]).
     if state.card_mesh.is_none() {
-        state.card_mesh = Some(meshes.add(Rectangle::new(CARD_WIDTH, CARD_HEIGHT)));
+        state.card_mesh = Some(meshes.add(card_block_mesh()));
     }
 
     // Repurpose the one app camera for the well: mark it so the well's per-frame
@@ -759,14 +776,46 @@ pub fn billboard_cards(
         // so text stays upright. `looking_at` points -Z at its target, so aim it
         // at the point opposite the camera (the quad mirror of the camera ray).
         let away = tf.translation * 2.0 - cam_pos;
-        let mut rot = Transform::from_translation(tf.translation)
+        let billboard_rot = Transform::from_translation(tf.translation)
             .looking_at(away, Vec3::Y)
             .rotation;
-        // Ring cards recline by band so they lie along the funnel slope (concept
-        // mockup 27); the focus card (no `Card`) stays head-on.
-        if let Some(card) = card {
-            rot *= Quat::from_rotation_x(-card_tilt(card.data.band));
+
+        // The focus card (no `Card`) stays fully billboarded, head-on.
+        let Some(card) = card else {
+            tf.rotation = billboard_rot;
+            continue;
+        };
+
+        // Rim cards: ring-align them so they stand around their ring like a
+        // carousel — face-normal radial-outward, up along the funnel axis —
+        // blended against the billboard by `RING_ALIGN`.
+        let tilt = super::card::well_tilt_quat();
+        let local = tilt.inverse() * tf.translation; // back into funnel-local space
+        let radial_local = Vec3::new(local.x, local.y, 0.0).normalize_or_zero();
+        if radial_local == Vec3::ZERO {
+            // Card sits on the axis: no radial direction to face — billboard it.
+            tf.rotation = billboard_rot;
+            continue;
         }
+        let axis = tilt * Vec3::Z; // world-space ring/funnel axis = card up
+        // Slide-tray orientation: the card stands PERPENDICULAR to the ring arc —
+        // like a slide in a Kodak Carousel cartridge or a tooth on a gear. Its
+        // broad face points along the ring TANGENT (toward its neighbours), its
+        // width runs radially (the card sticks out like a spoke), its height along
+        // the funnel axis. (Radial-facing = face-tangent-to-arc was the previous
+        // look Amy rejected — that made a smooth cylinder wall, not standing slides.)
+        let tangent_local = Vec3::new(-radial_local.y, radial_local.x, 0.0);
+        let tangent = tilt * tangent_local; // world-space ring tangent
+        // `looking_to` points -Z at its direction, so aim -tangent to put the
+        // visible +Z face along the tangent, with the funnel axis as up.
+        let ring_rot = Transform::from_translation(tf.translation)
+            .looking_to(-tangent, axis)
+            .rotation;
+        let mut rot = billboard_rot.slerp(ring_rot, RING_ALIGN);
+        // Per-band `card_tilt` recline only for the billboard share — the
+        // axis-up ring orientation supersedes it, so fade it out as RING_ALIGN
+        // rises (no double-reclining).
+        rot *= Quat::from_rotation_x(-card_tilt(card.data.band) * (1.0 - RING_ALIGN));
         tf.rotation = rot;
     }
 }
@@ -802,6 +851,36 @@ pub fn accent_vec4(accent: &str) -> Vec4 {
 /// and focus cards (both 1.6 aspect).
 pub fn card_shape() -> Vec4 {
     Vec4::new(1.6, 0.06, 0.045, 0.012)
+}
+
+/// Shared rim-card mesh: a thin 3D block (`CARD_WIDTH × CARD_HEIGHT ×
+/// [`CARD_THICKNESS`]`) whose **both** large faces render the card. A near card
+/// shows its outward `+Z` face; a far card (facing away in a ring-aligned band)
+/// shows its `−Z` face — front-facing from the camera's side, so it renders too
+/// under default back-face culling. No double-siding needed.
+///
+/// UV fix: Bevy's `Cuboid` authors the `−Z` (back) face's UVs so text reads
+/// upright + non-mirrored *from behind*, but the `+Z` (front) face's UVs are
+/// **V-flipped** relative to the [`Rectangle`] convention the MSDF panel
+/// texture is built for (`Rectangle`: uv (0,0) at the world top-left; `Cuboid`
+/// front: uv (0,0) at bottom-left). Left as-is, the front/near face would show
+/// text upside-down. We flip V on the front face's four vertices (the first
+/// four in Bevy's cuboid vertex order) so the front matches the `Rectangle`
+/// convention; the back face is already correct and untouched. Result: both
+/// large faces read upright + non-mirrored with culling left at its default.
+///
+/// (The thin ±X/±Y side faces sample texture slivers — acceptable for an
+/// 8-unit-thick block; not gold-plated.)
+fn card_block_mesh() -> Mesh {
+    use bevy::mesh::VertexAttributeValues;
+    let mut mesh = Mesh::from(Cuboid::new(CARD_WIDTH, CARD_HEIGHT, CARD_THICKNESS));
+    if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
+        // Front (+Z) face = the first four vertices in Bevy's cuboid order.
+        for uv in uvs.iter_mut().take(4) {
+            uv[1] = 1.0 - uv[1];
+        }
+    }
+    mesh
 }
 
 pub fn accent_color(accent: &str) -> Color {
