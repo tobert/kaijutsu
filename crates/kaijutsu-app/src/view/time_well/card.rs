@@ -350,6 +350,7 @@ mod tests {
             keywords: Vec::new(),
             top_block_preview: None,
             live_status: kaijutsu_types::Status::Pending,
+            last_activity_at: None,
         }
     }
 

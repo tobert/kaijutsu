@@ -217,6 +217,10 @@ pub struct ContextInfo {
     /// `Running` = actively working, `Error` = its most recent turn failed, else
     /// `Pending` (idle). Drives the time-well card pulse. Defaults to `Pending`.
     pub live_status: Status,
+    /// Unix-millis of the most recent block append/mutation, or `None` if
+    /// never set (0 on the wire). Drives the time-well's activity-recency
+    /// ordering and idle-age bands (Stage 1).
+    pub last_activity_at: Option<u64>,
 }
 
 /// A context returned by semantic search (`search_similar`) or neighbor lookup
@@ -2215,6 +2219,11 @@ fn parse_context_info(
         crate::kaijutsu_capnp::Status::Error => Status::Error,
     };
 
+    let last_activity_at = match reader.get_last_activity_at() {
+        0 => None,
+        ts => Some(ts),
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2230,6 +2239,7 @@ fn parse_context_info(
         keywords,
         top_block_preview,
         live_status,
+        last_activity_at,
     })
 }
 
@@ -3441,6 +3451,34 @@ mod tests {
                 level,
             );
         }
+    }
+
+    /// Stage 1 (time-well) wire spine: `lastActivityAt` on `ContextHandleInfo`
+    /// round-trips through `parse_context_info`, and an unset field (0 on the
+    /// wire) normalizes to `None` — same sentinel convention as `concluded_at`.
+    #[test]
+    fn test_parse_context_info_last_activity_at_roundtrip() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder =
+            message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[7u8; 16]);
+        builder.set_last_activity_at(1234);
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed = parse_context_info(&reader).unwrap();
+        assert_eq!(parsed.last_activity_at, Some(1234));
+
+        // Unset (default 0) must normalize to None, not Some(0).
+        let mut message2 = MessageBuilder::new_default();
+        let mut builder2 =
+            message2.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder2.set_id(&[7u8; 16]);
+        let reader2 = message2
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed2 = parse_context_info(&reader2).unwrap();
+        assert_eq!(parsed2.last_activity_at, None);
     }
 }
 

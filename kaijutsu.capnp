@@ -507,6 +507,7 @@ struct ContextHandleInfo {
   contextType @12 :Text;          # rc bucket / mode bundle (default "default")
   concludedAt @13 :UInt64;        # 0 = not concluded, else Unix millis of the explicit `conclude` act
   liveStatus @14 :Status;         # live activity: running (working) / error (last turn failed) / else idle
+  lastActivityAt @15 :UInt64;     # Unix millis of the most recent block append/mutation; 0 = never/unknown
 }
 
 struct PresetInfo {
