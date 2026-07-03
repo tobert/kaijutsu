@@ -907,15 +907,14 @@ dependencies = [
 
 [[package]]
 name = "bevy_brp_extras"
-version = "0.18.8"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a02ba4aae38b176a1e0d942ea8736cec6b9eadeb7a1c9479078a0bdc8ac1366e"
+checksum = "b18cf96aca02864c841de224a05d0325e3a7b0ef3f35fcd8345631101685463e"
 dependencies = [
  "bevy",
  "bevy_remote",
  "serde",
  "serde_json",
- "smol_str",
  "strum 0.28.0",
  "strum_macros 0.28.0",
  "thiserror 2.0.18",
