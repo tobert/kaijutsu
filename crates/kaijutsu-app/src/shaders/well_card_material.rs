@@ -42,6 +42,15 @@ pub struct WellCardMaterial {
     /// `Vec4::ZERO` (strength 0 → no border, unchanged look). HDR rgb blooms.
     #[uniform(5)]
     pub border: Vec4,
+
+    /// Focus dimming in `.x` (1.0 = full/focused, `<1.0` recedes the card so the
+    /// *focused* ring's cards pop). `.yzw` unused. Applied as a **color multiply**
+    /// in `well_card.wgsl` — this material is `AlphaMode::Mask(0.5)`, so dimming
+    /// the alpha instead would push the body under the cutoff and clip the whole
+    /// card rather than fade it. Written per-frame by `scene::dim_nonfocused_rings`
+    /// (rim cards only; the focus card + HUD panels stay 1.0).
+    #[uniform(6)]
+    pub dim: Vec4,
 }
 
 impl Material for WellCardMaterial {

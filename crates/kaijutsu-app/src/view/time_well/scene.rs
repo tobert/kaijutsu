@@ -69,14 +69,15 @@ pub struct ReadingCard;
 #[derive(Component)]
 pub struct WellRingsDeck;
 
-/// A magic-circle ring at one terrace boundary (the Konosuba/"Explosion"-spell
-/// aesthetic — concentric glyph rings, counter-rotating, receding into the
-/// funnel). One entity per interior terrace boundary (see
-/// [`super::card::terrace_ring_geometry`]), driven by
-/// [`crate::shaders::TerraceRingMaterial`]. Despawned on exit alongside the
-/// rest of the well.
+/// A magic-circle ring for one band (the Konosuba/"Explosion"-spell aesthetic —
+/// concentric glyph rings, counter-rotating, receding into the funnel). One
+/// entity per band ring (see [`super::card::terrace_ring_geometry`]), driven by
+/// [`crate::shaders::TerraceRingMaterial`]. Carries its **ring index** (= band
+/// index, 0 = `HotNow` … `N_BANDS-1` = `Horizon`) so [`dim_nonfocused_rings`]
+/// can brighten the focused ring and dim the rest. Despawned on exit alongside
+/// the rest of the well.
 #[derive(Component)]
-pub struct TerraceRing;
+pub struct TerraceRing(pub usize);
 
 /// Where a card wants to be. A smoothing system eases `Transform.translation`
 /// toward this each frame — the "transitions are Bevy's job" stance from the
@@ -247,6 +248,14 @@ const TERRACE_RING_ALPHA: f32 = 0.35;
 /// [`WELL_BG`] (the concept-art magic-circle palette). **Amy-tunable.**
 const TERRACE_RING_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
 
+/// Brightness multiplier for rings + cards **not** on the focused ring, so the
+/// focused ring clearly pops (a card parked in front by a neighbor ring no
+/// longer out-shines the ring you're navigating). 1.0 = full. **Amy-tunable.**
+const DIM_NONFOCUSED: f32 = 0.25;
+/// Easing rate for the focus dim, so Up/Down fades between rings rather than
+/// snapping. **Amy-tunable.**
+const DIM_EASE_RATE: f32 = 6.0;
+
 /// Per-band recline (radians) layered on the billboard. With the whole funnel now
 /// reclined in space (see [`super::card::WELL_TILT`]), the cards read their 3D
 /// form from their *positions* and should face the camera cleanly, so the recline
@@ -383,7 +392,7 @@ pub fn enter_time_well(
         ));
         let ring_pos = tilt * Vec3::new(0.0, 0.0, depth);
         commands.spawn((
-            TerraceRing,
+            TerraceRing(k),
             Mesh3d(ring_mesh),
             MeshMaterial3d(ring_material),
             Transform {
@@ -409,6 +418,7 @@ pub fn enter_time_well(
         params: Vec4::ZERO,
         shape: card_shape(),
         border: Vec4::ZERO,
+        dim: Vec4::ONE, // focus card is never dimmed (not a rim Card)
     });
     commands.spawn((
         ReadingCard,
@@ -939,6 +949,47 @@ pub fn spin_rings(
     for (seat, mut target) in cards.iter_mut() {
         let r = rot[seat.band.index()];
         target.0 = super::card::ring_seat_rotated(seat.band, seat.within_index, seat.ring_len, r);
+    }
+}
+
+/// Dim everything **not** on the focused ring so the focused ring pops. Eases
+/// each `TerraceRing`'s material alpha and each rim `Card`'s color-dim toward its
+/// target — full for the focused band, × [`DIM_NONFOCUSED`] otherwise — so
+/// Up/Down fades between rings. Ring alpha resets from [`TERRACE_RING_ALPHA`]
+/// each frame (no compounding). The focus [`ReadingCard`] + HUD panels are not
+/// rim `Card`s, so they're untouched and stay full brightness.
+pub fn dim_nonfocused_rings(
+    time: Res<Time>,
+    state: Res<TimeWellState>,
+    mut ring_materials: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
+    rings: Query<(&TerraceRing, &MeshMaterial3d<crate::shaders::TerraceRingMaterial>)>,
+    mut card_materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
+    cards: Query<(&Card, &MeshMaterial3d<crate::shaders::WellCardMaterial>)>,
+) {
+    let focused = state.focused_ring;
+    let alpha = 1.0 - (-DIM_EASE_RATE * time.delta_secs()).exp();
+
+    // Rings: reset from the base alpha × the focus factor, eased.
+    for (ring, handle) in rings.iter() {
+        let Some(mat) = ring_materials.get_mut(&handle.0) else {
+            continue;
+        };
+        let factor = if ring.0 == focused { 1.0 } else { DIM_NONFOCUSED };
+        let target = TERRACE_RING_ALPHA * factor;
+        mat.color.w += (target - mat.color.w) * alpha;
+    }
+
+    // Rim cards: dim the color (not alpha — the material is alpha-masked).
+    for (card, handle) in cards.iter() {
+        let Some(mat) = card_materials.get_mut(&handle.0) else {
+            continue;
+        };
+        let target = if card.data.band.index() == focused {
+            1.0
+        } else {
+            DIM_NONFOCUSED
+        };
+        mat.dim.x += (target - mat.dim.x) * alpha;
     }
 }
 

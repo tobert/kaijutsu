@@ -68,6 +68,7 @@ impl Plugin for TimeWellPlugin {
                     scene::highlight_drift,
                     scene::accumulate_ring_activity,
                     scene::tick_and_sync_rings,
+                    scene::dim_nonfocused_rings,
                     scene::sync_focus_card_visibility,
                     hud::position_well_hud,
                     hud::update_well_hud,

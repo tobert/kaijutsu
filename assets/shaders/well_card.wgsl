@@ -20,6 +20,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> border: vec4<f32>; // [r, g, b, strength] — steady outline (HUD); cards leave strength 0
+@group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, _, _, _] — non-focused ring dimming (1.0 = focused)
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
 fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
@@ -103,5 +104,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         alpha = max(alpha, band);
     }
 
-    return vec4<f32>(col, alpha);
+    // Focus dimming: recede non-focused-ring cards by scaling color only. The
+    // material is alpha-masked (Mask(0.5)), so scaling alpha would clip the body
+    // below the cutoff and vanish the card instead of fading it.
+    return vec4<f32>(col * dim.x, alpha);
 }

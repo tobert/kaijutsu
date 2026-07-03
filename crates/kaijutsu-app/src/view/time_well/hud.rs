@@ -238,6 +238,7 @@ pub fn spawn_well_hud(
             params: Vec4::ZERO, // plain panel: no selection/lineage/status rings
             shape: hud_shape(slot),
             border: Vec4::ZERO, // outline driven by the selection in update_well_hud
+            dim: Vec4::ONE, // HUD panels are never dimmed (not rim Cards)
         });
         commands
             .spawn((

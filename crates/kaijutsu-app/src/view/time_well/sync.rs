@@ -190,6 +190,7 @@ pub fn sync_time_well(
             params: Vec4::ZERO,
             shape: super::scene::card_shape(),
             border: Vec4::ZERO,
+            dim: Vec4::ONE, // full brightness until dim_nonfocused_rings sets it
         });
 
         let entity = commands
