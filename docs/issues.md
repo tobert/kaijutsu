@@ -672,6 +672,43 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     arcs/particles *between* the source/target cards, not just the per-card
     shimmer already shipped. Needs a new context→context drift-edge *list* wire
     (the per-card shimmer rode the existing staged-queue poll; arcs can't).
+- **Time-well ring-carousel — review findings (2026-07-03, gemini-pro batch +
+  deepseek).** The ring-per-band carousel (`band_ring`/`ring_seat_rotated`,
+  ring-centric nav, projector spin-to-gate, focus dimming) got a two-model
+  review. The safe wins (per-frame change-detection guards on the easing
+  systems; dead `card_tilt` multiply gated; stale `ring_seat` gate doc) are
+  **applied**. Remaining, recorded not-yet-fixed:
+  - *Cuboid front-face UV via `take(4)` is fragile* (gemini, medium). `card_block_mesh`
+    (`scene.rs`) V-flips the front face by hardcoded vertex indices `0..4`, which
+    breaks if Bevy changes its cuboid vertex order. Robust fix: identify the front
+    face by its `ATTRIBUTE_NORMAL` (≈ `[0,0,1]`) and flip those verts' V instead.
+  - *Redundant per-tick sort* (gemini, simplification). `sync_time_well` calls
+    `spiral_positions` (sorts via `band_orders`) **and** `ring_cards =
+    band_orders(...)` — the same recency sort twice per tick. Call `band_orders`
+    once and derive the flat odometer order + `(band, within_index)` pos-map from
+    that single result.
+  - *Passive-aging short-circuit* (gemini, design). `sync_time_well` early-exits
+    on an empty join diff, so cards don't re-band as wall-clock time passes — a
+    context won't demote to a deeper ring on idle alone until some *other* diff
+    arrives. Ties to the ring-MEMBERSHIP / coarse auto-decay thread (explicit
+    hot-row + coarse decay, see `signoff.md`): the band derivation likely needs a
+    coarse timer independent of the block diff.
+  - *`build_card_scenes` rebuilds MSDF glyphs on param-only changes* (deepseek,
+    minor). Selection/lineage/drift toggles flip `Changed<Card>`, which re-lays-out
+    glyphs even though only `mat.params` changed. Split the `mat.params` sync into
+    a separate `Changed<Card>` query that doesn't re-shape text.
+  - *Empty-ring spin* (deepseek, minor). A focused but empty ring still eases its
+    rotation toward the gate each tick (harmless); a `flen > 0` guard would skip it.
+  - *Spin chaining on rapid reversal* (deepseek, medium → downgraded on code-read).
+    `spin_target_to_gate` measures the short path from the accumulated *target*, not
+    the eased position, so a very fast direction-reversal could feel like the ring
+    keeps going before reversing. **Not a correctness bug** (resting target is the
+    gate π, steps are one-card; math verified sound by both models) — a possible
+    feel-tuning item only.
+  - *VERIFIED-FINE, do not re-audit:* gemini's "CRITICAL: no system writes Card
+    flags → material params" is **false** — `text.rs build_card_scenes` (a
+    `Changed<Card>` query) writes `mat.params = card_params(card)`; gemini's batch
+    context simply lacked `text.rs`. Selection/lineage/drift/status render correctly.
 - **`ScaleLinear`/`ScaleTime` round-trip loses precision under extreme
   domain→range compression** (≳10³–10⁸×): inverting through a tiny range
   amplifies f64 representation error past any sane tolerance. This is an f64

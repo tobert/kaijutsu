@@ -272,6 +272,18 @@ fn card_tilt(band: Band) -> f32 {
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
 
+/// Snap-and-hold threshold for the per-frame easing systems: once an eased value
+/// is within this of its target it's snapped to the exact target **once** and
+/// then left alone, so a settled entity stops writing (no per-frame
+/// `Assets::get_mut` re-extract, no `Changed<Transform>` at rest). Unitless
+/// values (dim, scale, rotation) use this directly; card *position* uses the
+/// squared world-distance [`CARD_SETTLE_DIST_SQ`].
+const SETTLE_EPS: f32 = 1e-4;
+
+/// Squared world-distance under which a card is "arrived" at its target and snaps
+/// (world units² — cards sit at radius ~300–500, so 0.01 ≈ 0.1u is imperceptible).
+const CARD_SETTLE_DIST_SQ: f32 = 0.01;
+
 /// Exponential-smoothing rate for the per-ring projector spin (how fast a ring
 /// rotates its selected card to the gate). **Amy-tunable.**
 const RING_SPIN_EASE_RATE: f32 = 6.0;
@@ -674,11 +686,19 @@ pub fn highlight_selection(
         }
 
         // Target = the card's spiral base size, popped by 1.35× while selected.
+        // Snap-and-hold: while easing, write the eased scale; once within
+        // SETTLE_EPS snap to the exact target once, then stop writing so a static
+        // selection no longer fires `Changed<Transform>` every frame.
         let base = card.base_scale;
         let target = if is_sel { base * 1.35 } else { base };
         let s = tf.scale.x;
-        let eased = s + (target - s) * 0.25;
-        tf.scale = Vec3::splat(eased);
+        if (s - target).abs() > SETTLE_EPS {
+            let eased = s + (target - s) * 0.25;
+            let next = if (eased - target).abs() <= SETTLE_EPS { target } else { eased };
+            tf.scale = Vec3::splat(next);
+        } else if s != target {
+            tf.scale = Vec3::splat(target);
+        }
     }
 }
 
@@ -923,8 +943,11 @@ pub fn billboard_cards(
         let mut rot = billboard_rot.slerp(ring_rot, RING_ALIGN);
         // Per-band `card_tilt` recline only for the billboard share — the
         // axis-up ring orientation supersedes it, so fade it out as RING_ALIGN
-        // rises (no double-reclining).
-        rot *= Quat::from_rotation_x(-card_tilt(card.data.band) * (1.0 - RING_ALIGN));
+        // rises (no double-reclining). Skipped entirely at full ring-align
+        // (RING_ALIGN == 1.0 zeroes the term); `card_tilt` stays the documented knob.
+        if RING_ALIGN < 1.0 {
+            rot *= Quat::from_rotation_x(-card_tilt(card.data.band) * (1.0 - RING_ALIGN));
+        }
         tf.rotation = rot;
     }
 }
@@ -940,15 +963,28 @@ pub fn spin_rings(
     mut cards: Query<(&RingSeat, &mut CardTarget)>,
 ) {
     let alpha = 1.0 - (-RING_SPIN_EASE_RATE * time.delta_secs()).exp();
+    // Ease each ring's rotation toward its gate target; snap-and-hold when close.
+    // Track which rings actually moved this frame so we only rewrite *their*
+    // cards' targets — a settled ring leaves its cards alone (Deepseek: the
+    // recompute is only needed while spinning).
+    let mut active = [false; super::card::N_BANDS];
     for i in 0..super::card::N_BANDS {
         let cur = state.ring_rotation[i];
         let tgt = state.ring_rotation_target[i];
-        state.ring_rotation[i] = cur + (tgt - cur) * alpha;
+        if cur != tgt {
+            let eased = cur + (tgt - cur) * alpha;
+            state.ring_rotation[i] = if (eased - tgt).abs() <= SETTLE_EPS { tgt } else { eased };
+            active[i] = true;
+        }
     }
     let rot = state.ring_rotation; // Copy [f32; N_BANDS]
     for (seat, mut target) in cards.iter_mut() {
-        let r = rot[seat.band.index()];
-        target.0 = super::card::ring_seat_rotated(seat.band, seat.within_index, seat.ring_len, r);
+        let b = seat.band.index();
+        if active[b] {
+            let r = rot[b];
+            target.0 =
+                super::card::ring_seat_rotated(seat.band, seat.within_index, seat.ring_len, r);
+        }
     }
 }
 
@@ -969,27 +1005,45 @@ pub fn dim_nonfocused_rings(
     let focused = state.focused_ring;
     let alpha = 1.0 - (-DIM_EASE_RATE * time.delta_secs()).exp();
 
-    // Rings: reset from the base alpha × the focus factor, eased.
+    // Snap-and-hold everywhere: read the current value via the immutable `get`
+    // (which does NOT dirty the asset) and only reach for `get_mut` — the
+    // expensive re-extract — when the value still differs from its target. Once
+    // eased within SETTLE_EPS, snap to the exact target once; thereafter the
+    // `cur != target` check is false and the material is never touched again.
+
+    // Rings: target = base alpha × the focus factor (reset each frame, no compound).
     for (ring, handle) in rings.iter() {
-        let Some(mat) = ring_materials.get_mut(&handle.0) else {
-            continue;
-        };
         let factor = if ring.0 == focused { 1.0 } else { DIM_NONFOCUSED };
         let target = TERRACE_RING_ALPHA * factor;
-        mat.color.w += (target - mat.color.w) * alpha;
+        let Some(cur) = ring_materials.get(&handle.0).map(|m| m.color.w) else {
+            continue;
+        };
+        if cur != target {
+            let eased = cur + (target - cur) * alpha;
+            let next = if (eased - target).abs() <= SETTLE_EPS { target } else { eased };
+            if let Some(mat) = ring_materials.get_mut(&handle.0) {
+                mat.color.w = next;
+            }
+        }
     }
 
     // Rim cards: dim the color (not alpha — the material is alpha-masked).
     for (card, handle) in cards.iter() {
-        let Some(mat) = card_materials.get_mut(&handle.0) else {
-            continue;
-        };
         let target = if card.data.band.index() == focused {
             1.0
         } else {
             DIM_NONFOCUSED
         };
-        mat.dim.x += (target - mat.dim.x) * alpha;
+        let Some(cur) = card_materials.get(&handle.0).map(|m| m.dim.x) else {
+            continue;
+        };
+        if cur != target {
+            let eased = cur + (target - cur) * alpha;
+            let next = if (eased - target).abs() <= SETTLE_EPS { target } else { eased };
+            if let Some(mat) = card_materials.get_mut(&handle.0) {
+                mat.dim.x = next;
+            }
+        }
     }
 }
 
@@ -999,6 +1053,16 @@ pub fn dim_nonfocused_rings(
 pub fn move_cards_toward_target(time: Res<Time>, mut cards: Query<(&mut Transform, &CardTarget)>) {
     let alpha = 1.0 - (-CARD_EASE_RATE * time.delta_secs()).exp();
     for (mut tf, target) in cards.iter_mut() {
+        // Snap-and-hold: once within CARD_SETTLE_DIST_SQ, snap to the exact target
+        // once (if not already there) and stop writing, so a card at rest no longer
+        // fires `Changed<Transform>` every frame. Read via Deref (no change mark);
+        // only the conditional assign marks it.
+        if tf.translation.distance_squared(target.0) <= CARD_SETTLE_DIST_SQ {
+            if tf.translation != target.0 {
+                tf.translation = target.0;
+            }
+            continue;
+        }
         tf.translation = tf.translation.lerp(target.0, alpha);
     }
 }

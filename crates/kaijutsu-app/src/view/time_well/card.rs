@@ -343,12 +343,14 @@ pub fn band_ring(band: Band) -> (f32, f32) {
 /// around** its band's ring, on the ring line — like slides in a Kodak Carousel
 /// tray. Angle 0 is `within_index` 0; cards fan by `TAU / band_count`.
 ///
-/// **The gate (angle 0):** the funnel recline [`WELL_TILT`] is a rotation about
+/// **Where angles land:** the funnel recline [`WELL_TILT`] is a rotation about
 /// the world **+X** axis, which leaves +X fixed, so the local `+X` seat (angle
-/// 0) maps to world **+X** — the ring's rightmost point (screen-right /
-/// 3-o'clock under the base camera, which looks down −Z). A later slice will
-/// rotate the ring so the *selected* card lands at this gate; this pass only
-/// fixes where angle 0 is (world +X), it does not build nav.
+/// 0, zero rotation) maps to world **+X** — the ring's rightmost point (3-o'clock
+/// under the base camera, which looks down −Z). The projector **gate** is
+/// [`GATE_ANGLE`] (currently `π` → world **−X**, screen-left), *not* angle 0: nav
+/// spins each ring so its selected card lands there. This zero-rotation
+/// [`ring_seat`] is the documented reference form; the live placement path is
+/// [`ring_seat_rotated`], which adds the ring's eased spin toward the gate.
 ///
 /// This is the zero-rotation convenience / documented reference form; the live
 /// placement path uses [`ring_seat_rotated`] with the ring's eased spin.
