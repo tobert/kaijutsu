@@ -83,10 +83,12 @@ which derives the lane from the label, attaches stopped + OODA-armed).
   a **derived sibling block** (same tick, same track, `Role::Asset`,
   `parent_id` = the ABC source). MIDI never enters the committed log, so the
   `UseLastGood` pool is notation-pure by construction. MIDI-out **to
-  hardware** is the same idea one step further: a `RenderTarget` on the track
-  (`kj transport render --track <t>`, `AlsaMidiOut`) emits committed cells to
-  ALSA, scheduled on the speculation lead — landed with `tracks.md` Stage 3
-  M1; design in `docs/midi.md`. Samples follow the same seam (`docs/pcm.md`).
+  hardware** is the same idea one step further: committed cells publish as
+  mime-keyed `RenderCue`s at the materialize crossing and an off-box sink
+  (the app) renders `text/vnd.abc`→MIDI into its local ALSA seq port at
+  `receipt + lead` (`docs/pcm.md` 5c, landed 2026-07-02; the in-process
+  `RenderTarget`/`kj transport render` first cut from `tracks.md` Stage 3 M1
+  was demolished). Samples follow the same seam (`docs/pcm.md`).
 - **Event taxonomy by delivery semantics, not source:**
   - *heartbeat* → env vars injected on the tick lifecycle, overwrite-in-place
     (`KJ_TICK`, `KJ_PHRASE`, `KJ_TEMPO`, `KJ_PHRASE_BEATS`, plus `KJ_PULSE` /

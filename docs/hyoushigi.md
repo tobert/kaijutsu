@@ -624,9 +624,10 @@ fallback are exercised by their first user.
 >   policy; `phrase_delta()`/`is_phrase_boundary()` are the consumers). Clock
 >   sources are pluggable behind `ClockSourceKind`
 >   (`kaijutsu-server/src/clock.rs` — `SystemClock` today, the drift-modeled
->   MIDI source at `docs/midi.md` M3), and committed cells feed
->   `RenderTarget`s (`kaijutsu-server/src/render.rs` — `AlsaMidiOut`
->   live-verified on zorak, attached via `kj transport render`).
+>   MIDI source at `docs/midi.md` M3), and committed cells publish as
+>   `RenderCue`s consumed by the app sink (`docs/pcm.md` 5c; the in-process
+>   `RenderTarget`/`render.rs`/`kj transport render` path was demolished
+>   2026-07-02).
 >
 > **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
 > transport surface (today `kj transport` is the only surface); external-MIDI

@@ -1045,15 +1045,15 @@ pub trait ClockSource: Send {
 
 ## The render-target seam (M1's other half)
 
-> **Direction since M1 (2026-07-01):** the in-process `RenderTarget` trait below
-> shipped and works, but it is **evolving into a wire cue** — the hardware emit
-> moves off the server binary to an off-box sink (the app first, an edge node
-> later), and MIDI and samples converge onto one mime-keyed `RenderCue { mime,
-> payload, lead }`. The trait's *home on the track* survives; its *transport*
-> becomes the wire, and `emit(abc, at)` becomes a cue whose `lead` the sink
-> re-anchors locally. Rationale + the compose/render/emit phase split:
-> `docs/midi.md` "Render is a wire cue; the sink owns the hardware" and
-> `docs/pcm.md`. The M1 record below stands as shipped.
+> **⚠️ SUPERSEDED — the wire-cue move LANDED 2026-07-02 (`docs/pcm.md` 5c).** The
+> in-process `RenderTarget` trait below shipped with M1 and was then **demolished**:
+> rendering is now a mime-keyed `RenderCue { mime, payload, lead }` published at the
+> materialize crossing and consumed by an off-box sink — the app first, which renders
+> `text/vnd.abc`→MIDI and schedules into its local ALSA seq port at `receipt + lead`.
+> `AlsaMidiOut`, the trait, `render.rs`, the `kj transport render` verb, and the
+> server `alsa` dep are gone; `kj play <file.abc>` is the standalone trigger. This
+> section stands as the design record of the seam's in-process first cut; the seam's
+> *home on the track* survived exactly as predicted.
 
 `docs/midi.md` "output first": a track declares "render my committed score to ALSA
 MIDI out on node X." A **render is a consumer of the track's score, not a
@@ -1263,7 +1263,10 @@ correctness hazards, all fixed this session (TDD, deepseek's consult had been cl
 ## Status — M1 landed (2026-06-30)
 
 All seven M1 work items shipped + green (kernel 1268, server 104 (+1 ignored ALSA),
-abc 137; full workspace builds). The track has a sound output. Commits:
+abc 137; full workspace builds). The track has a sound output. (⚠️ Historical note:
+the render half — the WI 4 seam, WI 6's `AlsaMidiOut`, and the later `kj transport
+render` verb — was demolished 2026-07-02 when render became a wire cue to the app
+sink, `docs/pcm.md` 5c. The clock half stands.) Commits:
 
 - **WI 1 (`2e3dc6c5`) + WI 2 (`e5a89c38`, `4c55a5dd`)** — the `ClockSourceKind` enum
   (`System(SystemClock)` + the uninhabited `ModeledClock`), `period` moved off
@@ -1318,7 +1321,9 @@ abc 137; full workspace builds). The track has a sound output. Commits:
   alloc per phrase, beats apart) rather than stored on `AlsaMidiOut`.
 
 **`kj transport render` — the attach/detach surface (landed 2026-06-30, after the WI
-list; live-verified on zorak).** One verb, keyed by the seq port name:
+list; live-verified on zorak; ⚠️ DEMOLISHED 2026-07-02 with the wire-cue move,
+`docs/pcm.md` 5c — the verb no longer exists; historical record).** One verb, keyed
+by the seq port name:
 
 ```
 kj transport render --track <t> [--to alsa-midi] [--port <name>]  # attach (additive)

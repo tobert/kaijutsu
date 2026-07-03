@@ -2,8 +2,11 @@
 
 > **Status:** design direction, captured 2026-06-29 in a co-design session
 > (Amy + Claude). Decisions are *directions*, not commitments — code is truth,
-> this is where we're aiming. **M1 shipped 2026-06-30** (see Staging); M2–M4
-> are future work. Companions: `docs/tracks.md` (the clock-domain substrate;
+> this is where we're aiming. **M1 shipped 2026-06-30**; its in-process render
+> half was **demolished 2026-07-02** when render became a wire cue to the app
+> sink (`docs/pcm.md` 5c — `kj play <file.abc>` is the trigger; `kj transport
+> render` no longer exists). M2–M4 are future work. Companions: `docs/tracks.md`
+> (the clock-domain substrate;
 > MIDI is its Stage 3 `ClockSource` + a render target — Stage 3 M1 landed on
 > the decisions below), `docs/chameleon.md` (the music application — "MIDI is
 > a render of the score"), `docs/hyoushigi.md` (the `Tick`/`Timeline` primitive
@@ -331,10 +334,12 @@ real KSP / loft node in later.
   **`--replace`** to clear-then-add (`BeatCommand::RenderTarget { Add|Replace|Remove }`).
   Live-verified on zorak end-to-end (command → beat → NoteOns at a subscribed reader,
   and an attach→off→replace walk against `/proc/asound/seq/clients`).
-  **Direction since M1 (2026-07-01):** the in-process emit moves to a wire sink —
-  see "Render is a wire cue; the sink owns the hardware" — with `abc→midi` staying
-  kernel-side for now; M1's `AlsaMidiOut` splits along that render/emit phase
-  boundary. This is not a new milestone; it's how output evolves off the server.
+  **Superseded 2026-07-02 (`docs/pcm.md` 5c):** the wire-sink move landed — the app
+  is the MIDI sink (it renders `text/vnd.abc` cues and schedules into its local ALSA
+  seq port at `receipt + lead`; `kj play <file.abc>` is the standalone trigger), and
+  the in-process pieces above — `AlsaMidiOut`, the `RenderTarget` trait, the
+  `kj transport render` verb, the server `alsa` dep — were demolished. The attach
+  surface described in this bullet is a historical record, not a live verb.
 - **M2 — Input telemetry, batched.** Capture a local (virtual then real) MIDI in,
   timestamp with ALSA, batch into a MIDI-in track as score blocks over RPC.
   Snapshot = the track-scoped windowed read. The capture spec (written
@@ -343,10 +348,10 @@ real KSP / loft node in later.
   the track's grid, keeping the raw offset as block metadata** (the M3 drift
   model's food, and the explicit micro-timing data chameleon's
   groove-as-data decision wants). The capture loop is a new
-  `crates/kaijutsu-server/src/midi_in.rs` (sibling of `render.rs`), opened via
-  a data-only spec variant analogous to `RenderTargetSpec`, reading an ALSA seq
-  port with the mirrored caps (`WRITE | SUBS_WRITE`, vs `AlsaMidiOut`'s
-  `READ | SUBS_READ`). The MIDI-in context attaches as a probe
+  `crates/kaijutsu-server/src/midi_in.rs` (sibling of `clock.rs`; the `render.rs`
+  it was first sketched against was demolished 2026-07-02), opened via
+  a data-only spec variant, reading an ALSA seq
+  port with capture caps (`WRITE | SUBS_WRITE`). The MIDI-in context attaches as a probe
   (`ooda_armed: false`) — a producer that never takes a turn.
 - **M3 — Drift-modeled clock-in.** Observe the virtual clock (then KSP over USB),
   fit the tempo/phase/drift model, phase-lock a local `ClockSource`. This is the
@@ -405,8 +410,9 @@ real KSP / loft node in later.
   routing gap as `docs/pcm.md` "Distributed listening" — solve together.
 
 Resolved since the design round (kept here so old readers don't re-open them):
-the **`ClockSource` trait surface** and the **render-target seam** both landed
-2026-06-30 with `tracks.md` Stage 3 M1 — `ClockSourceKind`/`SystemClock` in
-`crates/kaijutsu-server/src/clock.rs`, `RenderTarget`/`AlsaMidiOut` in
-`crates/kaijutsu-server/src/render.rs`, attach/detach via
-`kj transport render` (see Staging M1 above).
+the **`ClockSource` trait surface** landed 2026-06-30 with `tracks.md` Stage 3 M1
+(`ClockSourceKind`/`SystemClock` in `crates/kaijutsu-server/src/clock.rs`) and
+stands. The **render-target seam** landed the same day and was **demolished
+2026-07-02** when render became a wire cue to the app sink (`docs/pcm.md` 5c):
+`RenderTarget`/`AlsaMidiOut`/`render.rs` and the `kj transport render` verb are
+gone; the app consumes `RenderCue`s and `kj play <file.abc>` is the trigger.

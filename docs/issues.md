@@ -1793,3 +1793,87 @@ cluster of friction in the config + shell surface:
   host file on migration, or have the kernel warn that it found+ignored it. (Same
   CRDT-vs-host ownership confusion as rc, but here there's a stale host artifact
   actively misleading.)
+
+---
+
+## kaish PATH / external binary access
+
+Observed 2026-07-02 during Music Demo #1 (`019f249d`): kaish has no `$PATH` and
+won't run binaries by absolute path (`/usr/bin/aconnect`, `/usr/bin/pw-cli` etc. all
+hit "command not found"). `export PATH=...` is rejected as "undefined variable".
+`which` is also absent. Only binaries in kaish's built-in command set are reachable.
+
+Practical consequence: any shell step that needs a system tool (ALSA `aconnect`,
+PipeWire `pw-cli`/`wpctl`, `which`, etc.) silently fails with no obvious
+workaround from inside an agent turn. We had to ask the user to run `aconnect 128:0
+129:0` manually to wire the app's render port to TiMidity.
+
+**Diagnosed 2026-07-03 — it's not PATH; external exec is compiled out, three
+layers deep** (verified live: `/usr/bin/true` → `command not found` in a
+*writable* shell):
+
+1. **The `subprocess` cargo feature is off.** kaish-kernel's default features
+   are `["localfs", "overlay"]`; subprocess exec is opt-in by design ("the
+   dangerous surface is named, not inherited") and kaijutsu's workspace dep is
+   bare `kaish-kernel = "0.10"` — so `try_execute_external` is the
+   `#[cfg(not(subprocess))]` stub returning `None` and *everything* external
+   falls through to `command not found`, absolute paths included.
+   (`allow_external_commands` defaults to `cfg!(feature = "subprocess")`, so
+   the flag follows the feature; the explicit
+   `with_allow_external_commands(false)` for read-only shells at
+   `runtime/embedded_kaish.rs:261` is currently redundant belt-and-suspenders —
+   it becomes load-bearing the moment the feature turns on.)
+2. **Virtual cwd:** even with the feature on, `try_execute_external` skips when
+   `backend.resolve_real_path(cwd)` is `None` — and both kaijutsu backends
+   return `None` unconditionally (`runtime/mount_backend.rs:706` "MountTable's
+   real_path is async, but this trait method is sync";
+   `runtime/kaish_backend.rs:648`). Needs a sync mount-table lookup (host-mount
+   prefix → real path) before any external exec works.
+3. **PATH is never seeded:** kaish never reads OS env; the embedder seeds
+   `PATH` via initial vars (the REPL does, EmbeddedKaish doesn't). Absolute
+   paths bypass PATH, so this only gates bare names — seed a minimal PATH or
+   document absolute-path usage.
+
+**Desired fix:** decide whether writable-shell contexts get external exec at all
+(shared-trust says yes as an ergonomic surface; the read-only lever already
+exists and becomes the real gate). If yes: enable the `subprocess` feature,
+implement `resolve_real_path` over the mount table, seed a minimal `PATH`. If
+no (or independently): add a dedicated `kj audio` / `kj midi` subcommand surface
+for the common ALSA wiring operations (connect, disconnect, list-clients) so the
+agent doesn't need raw `aconnect` at all.
+
+---
+
+## Context time awareness — per-type date/time injection (found 2026-07-03)
+
+In-app contexts have no wall-clock source, so models guess dates when writing
+durable artifacts — and guess wrong. Evidence: two issues.md entries written
+in-app carried hallucinated dates (Music Demo #1 `019f249d` wrote "2026-07-04"
+for a 2026-07-02 session; DS Director `019f14ba` wrote "2026-07-15" for
+~2026-06-29). Both corrected 2026-07-03.
+
+**Shape: per-`context_type` cadence policy, not a global drip.** Time-awareness
+needs differ by role, so it's a policy row per rc bucket (same pattern as
+`BeatPolicy`):
+
+- **director** — coordinates work across sessions and writes dated records;
+  wants *regular* updates (e.g. a system note when the turn gap crosses a
+  threshold, or every N turns).
+- **coder** — an occasional heads-up: seed date/time at hydrate boundaries
+  (create/fork/attach) and maybe a note on day rollover; per-turn is noise.
+- **musician** — *none*. Musical time (`$PHRASE`, ticks, the track clock) is its
+  only time base; wall-clock drip is pure cache/attention pollution.
+
+**Mechanism (both halves already designed elsewhere in this file):**
+
+- **Placement is constrained by the cache rules** ("Cache placement is
+  load-bearing", above): date/time is the canonical *silent invalidator* — it
+  MUST land as a message *after the last breakpoint* (the mailbox system-note
+  path), never in `build_system_prompt`. A time note is just a mailbox system
+  block, so the append-only machinery already exists.
+- **Cadence wants the `BeforeModelTurn` hook seam** (Turn Loop section) once it
+  lands — a per-type rc script deciding "has enough wall time passed to be worth
+  a note?" is exactly the reactive/mechanical per-turn work that seam owns.
+  **First slice needs neither:** seed date/time once at the hydrate boundary via
+  each type's rc create/fork scripts (rc `.kai` stdout→block already works),
+  which alone would have prevented both hallucinated dates above.
