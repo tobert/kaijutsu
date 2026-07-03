@@ -1841,6 +1841,18 @@ kernel process env into exec-granted shells.
   fallthrough.
 - **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
   host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
+- **MCP-created context invisible to `kj context list` after kernel restart
+  (found 2026-07-03 during the exec live-verify).** A `register_session` context
+  (`investigate-d1d3257e`) kept working across a kernel restart — shell executes,
+  blocks write, `kj context switch <full id>` resolves it with its label — but
+  `kj context list` no longer shows it, and prefix/label resolution
+  (`kj binding allow exec 019f29bb`) fails "no context matches". The row is
+  durable; the *listing* filter loses it. Smells like the peer/registry
+  re-attach gap (auto-memory `tech_debt_peer_reattach_on_reconnect`) extended to
+  MCP sessions: list is registry-driven, resolution-by-full-id is DB-driven.
+  Symptom cost: an operator can't see or target a live working context by
+  prefix. Find where `list_all_contexts` vs the session/registry filter diverge
+  post-restart.
 
 ---
 

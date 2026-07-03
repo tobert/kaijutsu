@@ -66,7 +66,8 @@ enum BindingCommand {
     #[command(alias = "grant")]
     Allow {
         /// Capability: <instance> | <instance>:<tool> | facade:<name> | * |
-        /// facade:* | admin | rc-write | drive | fork | drift | transport | operator
+        /// facade:* | admin | rc-write | drive | fork | drift | transport |
+        /// operator | config-write | exec
         cap: String,
         /// Target context: . (default) | .parent | <label> | <hex prefix>
         ctx: Option<String>,
