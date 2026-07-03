@@ -352,7 +352,7 @@ impl KjDispatcher {
         for b in &filtered {
             out.push_str(&format!(
                 "{}  {}/{}  [{}]  {}\n",
-                short_key(&b.id.to_key()),
+                short_key(&b.id),
                 b.role.as_str(),
                 b.kind.as_str(),
                 b.status.as_str(),
@@ -1041,12 +1041,11 @@ fn parse_kind(s: &str) -> Option<BlockKind> {
     }
 }
 
-fn short_key(s: &str) -> String {
-    if s.len() > 16 {
-        format!("{}…", &s[..16])
-    } else {
-        s.to_string()
-    }
+/// Compact block handle for `kj block list`: `principal.short()#seq`. The list
+/// is scoped to one context, so the block-distinguishing part is enough — and it
+/// uses the entropy-tail `short()`, never the shared UUIDv7 timestamp front.
+fn short_key(id: &kaijutsu_types::BlockId) -> String {
+    format!("{}#{}", id.principal_id.short(), id.seq)
 }
 
 fn first_line_trunc(s: &str, max: usize) -> String {

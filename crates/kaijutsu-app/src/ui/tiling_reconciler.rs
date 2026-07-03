@@ -557,8 +557,12 @@ pub fn sync_unfocused_pane_summaries(
     }
 }
 
-/// Shorten a document_id to a readable label.
+/// Shorten a document_id to a readable label. A UUID document id shows its
+/// entropy-tail `short()`; non-UUID ids (paths) fall back to a leading slice.
 fn short_id(id: &str) -> String {
+    if let Ok(ctx) = kaijutsu_types::ContextId::parse(id) {
+        return ctx.short();
+    }
     if id.len() > 12 {
         format!("{}…", &id[..12])
     } else {

@@ -13,7 +13,7 @@
 //! ```
 
 use clap::Parser;
-use kaijutsu_types::{BlockKind, ContentType, ContextId, Role};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role};
 use regex::Regex;
 use serde::Serialize;
 
@@ -195,8 +195,8 @@ impl KjDispatcher {
             }
             out.push_str(&format!(
                 "{ctx_short}:{block_short}:{lineno}:{content}\n",
-                ctx_short = &m.context_id[..8.min(m.context_id.len())],
-                block_short = short_key(&m.block_id),
+                ctx_short = short_ctx(&m.context_id),
+                block_short = short_block(&m.block_id),
                 lineno = m.line + 1,
                 content = m.content,
             ));
@@ -235,12 +235,20 @@ fn parse_kind(s: &str) -> Option<BlockKind> {
     }
 }
 
-fn short_key(key: &str) -> String {
-    if key.len() > 12 {
-        format!("{}…", &key[..12])
-    } else {
-        key.to_string()
-    }
+/// Entropy-tail short of a context hex (`ctx_id.to_hex()`), for grep-ish output.
+fn short_ctx(hex: &str) -> String {
+    ContextId::parse(hex)
+        .map(|c| c.short())
+        .unwrap_or_else(|_| hex.to_string())
+}
+
+/// Block handle for grep-ish output: the block's `principal.short()#seq`. The
+/// stored key is `BlockId::to_key()` (`ctxhex_prinhex_seq`); the context is
+/// already shown separately, so we surface only the block-distinguishing part.
+fn short_block(key: &str) -> String {
+    BlockId::from_key(key)
+        .map(|b| format!("{}#{}", b.principal_id.short(), b.seq))
+        .unwrap_or_else(|| key.to_string())
 }
 
 #[cfg(test)]

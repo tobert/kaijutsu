@@ -141,7 +141,7 @@ impl KjDispatcher {
         }
 
         // Identify the driven context by a compact handle in the message.
-        let display = short_hex(target);
+        let display = target.short();
         KjResult::Ok {
             message: format!("driving turn in '{display}'"),
             content_type: ContentType::Plain,
@@ -152,12 +152,6 @@ impl KjDispatcher {
             })),
         }
     }
-}
-
-/// First 8 hex chars of a context id, for a compact human-facing handle.
-fn short_hex(id: kaijutsu_types::ContextId) -> String {
-    let hex = id.to_hex();
-    hex.chars().take(8).collect()
 }
 
 #[cfg(test)]

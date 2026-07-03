@@ -251,10 +251,11 @@ impl KjDispatcher {
         let mut out = String::new();
         for r in &rows {
             // `<short_id> <kind>[/<lang>] [N blocks] [label="..." model=...]`
-            let short = if r.document_id.len() > 12 {
-                &r.document_id[..12]
-            } else {
-                &r.document_id
+            // A UUID document id shows its entropy-tail short(); non-UUID ids
+            // (config paths, symlinks) fall back to a leading slice.
+            let short = match ContextId::parse(&r.document_id) {
+                Ok(c) => c.short(),
+                Err(_) => r.document_id.chars().take(12).collect(),
             };
             let kind_part = match &r.language {
                 Some(l) => format!("{}/{}", r.kind, l),
@@ -513,7 +514,7 @@ fn format_dag_node(
         "├─ "
     };
 
-    let short_id = format!("{}:{}", block_id.principal_id, block_id.seq);
+    let short_id = format!("{}:{}", block_id.principal_id.short(), block_id.seq);
     let role_kind = format!("[{}/{}]", block.role.as_str(), block.kind.as_str());
     let summary = summarize(&block.content, 40);
 

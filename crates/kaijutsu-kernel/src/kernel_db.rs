@@ -4694,9 +4694,8 @@ mod tests {
         let r = db.resolve_context("unique").unwrap();
         assert_eq!(r, ctx.context_id);
 
-        // Hex prefix
-        let hex = ctx.context_id.to_hex();
-        let r = db.resolve_context(&hex[..8]).unwrap();
+        // Short id (entropy tail)
+        let r = db.resolve_context(&ctx.context_id.short()).unwrap();
         assert_eq!(r, ctx.context_id);
 
         // Not found

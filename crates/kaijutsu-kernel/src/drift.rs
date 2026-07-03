@@ -717,13 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_by_hex_prefix() {
+    fn test_resolve_by_short_id() {
         let mut router = DriftRouter::new();
         let id = ContextId::new();
         router.register(id, None, None, PrincipalId::system()).unwrap();
-        let hex_prefix = &id.to_hex()[..8];
-        // Should match by hex prefix
-        let result = router.resolve_context(hex_prefix);
+        let short = id.short();
+        // Should match by the entropy-tail short id
+        let result = router.resolve_context(&short);
         match result {
             Ok(resolved) => assert_eq!(resolved, id),
             Err(DriftError::AmbiguousContext { .. }) => {} // possible but unlikely

@@ -380,7 +380,7 @@ impl KjDispatcher {
         };
         match ack_rx.await {
             Ok(Ok(())) => KjResult::Ok {
-                message: format!("transport: {} '{}'", verb, short_hex(ctx)),
+                message: format!("transport: {} '{}'", verb, ctx.short()),
                 content_type: ContentType::Plain,
                 ephemeral: false,
                 data: Some(serde_json::json!({
@@ -424,7 +424,7 @@ impl KjDispatcher {
             [] => Err(format!(
                 "kj transport: context {} is not attached to a track — \
                  run `kj transport attach` first",
-                short_hex(ctx)
+                ctx.short()
             )),
             [one] => TrackId::new(&one.track_id).map_err(|e| {
                 format!(
@@ -435,7 +435,7 @@ impl KjDispatcher {
             many => Err(format!(
                 "kj transport: context {} is attached to {} tracks — \
                  pass --track <name> to disambiguate",
-                short_hex(ctx),
+                ctx.short(),
                 many.len()
             )),
         }
@@ -483,7 +483,7 @@ impl KjDispatcher {
                         .get_context(ctx)
                         .map_err(|e| format!("kj transport attach: {e}"))?
                         .ok_or_else(|| {
-                            format!("kj transport attach: context {} not found", short_hex(ctx))
+                            format!("kj transport attach: context {} not found", ctx.short())
                         })?;
                     let label = row.label.unwrap_or_default();
                     TrackId::new(label.as_str())
@@ -493,7 +493,7 @@ impl KjDispatcher {
                             format!(
                                 "kj transport attach: context {} label {label:?} yields no valid \
                                  track lane (a beat participant needs a lane)",
-                                short_hex(ctx)
+                                ctx.short()
                             )
                         })?
                 }
@@ -511,7 +511,7 @@ impl KjDispatcher {
                     return Err(format!(
                         "kj transport attach: context {} is attached to {} tracks — \
                          pass --track <name>",
-                        short_hex(ctx),
+                        ctx.short(),
                         many.len()
                     ));
                 }
@@ -552,10 +552,6 @@ impl KjDispatcher {
 
         Ok((track, attachment, policy))
     }
-}
-
-fn short_hex(id: ContextId) -> String {
-    id.to_hex().chars().take(8).collect()
 }
 
 #[cfg(test)]

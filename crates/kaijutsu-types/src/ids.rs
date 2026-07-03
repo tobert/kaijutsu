@@ -2,8 +2,10 @@
 //!
 //! All ID types wrap UUIDv7 (time-ordered, globally unique). They're opaque on
 //! the wire (16 bytes / `Data` in Cap'n Proto) and display as standard UUID text
-//! for logging. The `short()` form (first 8 hex chars) is for human-facing UI —
-//! never used as a lookup key.
+//! for logging. The `short()` form is the *last* 8 hex chars — the random tail.
+//! UUIDv7 front-loads a millisecond clock, so any leading slice collides for
+//! every ID minted in the same ~65s window; the entropy lives in the tail. Both
+//! human display and prefix resolution read from that tail (see `matches_short`).
 //!
 //! `PrincipalId` also has a deterministic sentinel via `PrincipalId::system()`,
 //! derived from UUIDv5 for kernel-generated blocks.
@@ -52,9 +54,14 @@ macro_rules! impl_typed_id {
                 Self(uuid::Uuid::now_v7())
             }
 
-            /// First 8 hex characters — for human display only, not lookup.
+            /// The 8 high-entropy hex chars from the random tail of the
+            /// UUIDv7 — for human display and prefix resolution. NOT the front:
+            /// UUIDv7's leading bits are a millisecond timestamp shared by every
+            /// ID minted in the same ~65s window, so a leading slice is the worst
+            /// possible choice for a distinguishing handle.
             pub fn short(&self) -> String {
-                self.0.as_simple().to_string()[..8].to_string()
+                let hex = self.0.as_simple().to_string();
+                hex[hex.len() - 8..].to_string()
             }
 
             /// Full 32-character hex string (no hyphens).
@@ -96,9 +103,16 @@ macro_rules! impl_typed_id {
                 }
             }
 
-            /// Check if a query string matches this ID by hex prefix.
-            pub fn matches_hex_prefix(&self, prefix: &str) -> bool {
-                self.to_hex().starts_with(prefix)
+            /// Does `query` identify this ID? A full id (32-char hex or a
+            /// hyphenated UUID) matches exactly; otherwise `query` is treated as
+            /// a prefix of the entropy-rich `short()` form — the thing you see is
+            /// the thing you type. Never matches a leading slice of the raw hex:
+            /// that front is a shared millisecond timestamp in UUIDv7.
+            pub fn matches_short(&self, query: &str) -> bool {
+                if let Ok(full) = Self::parse(query) {
+                    return *self == full;
+                }
+                self.short().starts_with(query)
             }
 
             /// A nil / zero ID — for sentinel values only.
@@ -156,8 +170,8 @@ macro_rules! impl_typed_id {
         }
 
         impl PrefixResolvable for $T {
-            fn matches_hex_prefix(&self, prefix: &str) -> bool {
-                self.matches_hex_prefix(prefix)
+            fn matches_short(&self, query: &str) -> bool {
+                self.matches_short(query)
             }
             fn short(&self) -> String {
                 self.short()
@@ -180,9 +194,10 @@ impl_typed_id!(PresetId, "PresetId");
 /// Implemented automatically by `impl_typed_id!`. Enables generic
 /// `resolve_prefix()` for any ID type, not just `ContextId`.
 pub trait PrefixResolvable: Copy + PartialEq {
-    /// Check if a query string matches this ID by hex prefix.
-    fn matches_hex_prefix(&self, prefix: &str) -> bool;
-    /// First 8 hex characters — for human display and ambiguity reporting.
+    /// Does `query` identify this ID? A full id matches exactly; otherwise a
+    /// prefix of the entropy-rich `short()` form. See `matches_short`.
+    fn matches_short(&self, query: &str) -> bool;
+    /// The entropy-tail short form — for display and ambiguity reporting.
     fn short(&self) -> String;
 }
 
@@ -241,7 +256,7 @@ pub enum PrefixError {
 /// Resolution order:
 /// 1. Exact label match
 /// 2. Unique label prefix match
-/// 3. Unique hex prefix match
+/// 3. Unique short-id match (full id, or a prefix of the entropy-tail `short()`)
 /// 4. Error (no match or ambiguous)
 pub fn resolve_prefix<'a, T: PrefixResolvable>(
     items: impl Iterator<Item = (T, Option<&'a str>)>,
@@ -289,10 +304,10 @@ pub fn resolve_prefix<'a, T: PrefixResolvable>(
         });
     }
 
-    // 3. Unique hex prefix match
+    // 3. Unique short-id match (full id, or a prefix of the entropy-tail short())
     let hex_matches: Vec<T> = entries
         .iter()
-        .filter(|(id, _)| id.matches_hex_prefix(query))
+        .filter(|(id, _)| id.matches_short(query))
         .map(|(id, _)| *id)
         .collect();
 
@@ -335,6 +350,51 @@ mod tests {
     fn test_short_is_8_chars() {
         let id = KernelId::new();
         assert_eq!(id.short().len(), 8);
+    }
+
+    #[test]
+    fn test_short_is_hex_tail_not_front() {
+        let id = ContextId::new();
+        let hex = id.to_hex();
+        // short() reads the random tail, never the timestamp front.
+        assert_eq!(id.short(), hex[hex.len() - 8..]);
+        assert_ne!(id.short(), hex[..8]);
+    }
+
+    #[test]
+    fn test_short_distinct_for_ids_minted_together() {
+        // UUIDv7 front-loads a millisecond clock: 1000 IDs minted back-to-back
+        // almost certainly share their leading hex. short() must still be unique
+        // because it reads the random tail. This test fails loudly if short()
+        // ever regresses to a leading slice.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = ContextId::new();
+            assert!(
+                seen.insert(id.short()),
+                "short() collision — likely reading the timestamp front again"
+            );
+        }
+    }
+
+    #[test]
+    fn test_matches_short_full_id_exact() {
+        let a = ContextId::new();
+        let b = ContextId::new();
+        assert!(a.matches_short(&a.to_hex())); // 32-char hex
+        assert!(a.matches_short(&a.to_string())); // hyphenated UUID
+        assert!(!a.matches_short(&b.to_hex()));
+    }
+
+    #[test]
+    fn test_matches_short_prefix_of_displayed_short() {
+        let a = ContextId::new();
+        assert!(a.matches_short(&a.short())); // whole short
+        assert!(a.matches_short(&a.short()[..4])); // prefix of what you see
+        assert!(!a.matches_short("zzzz")); // non-hex garbage
+        // A leading slice of the raw hex (the old, broken behavior) must NOT match.
+        let front = &a.to_hex()[..8];
+        assert!(!a.matches_short(front) || a.short() == *front);
     }
 
     #[test]
@@ -556,17 +616,29 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_hex_prefix() {
+    fn test_resolve_short_prefix() {
         let a = ContextId::new();
         let b = ContextId::new();
-        let prefix = &a.to_hex()[..6];
+        let prefix = &a.short()[..6];
         let entries = vec![(a, None), (b, None)];
         let result = resolve_context_prefix(entries.into_iter(), prefix);
         match result {
             Ok(id) => assert_eq!(id, a),
-            Err(PrefixError::Ambiguous { .. }) => {} // possible with UUIDv7
+            // Two entropy-tail shorts sharing a 6-char prefix is astronomically
+            // unlikely but not impossible — tolerate the ambiguous verdict.
+            Err(PrefixError::Ambiguous { .. }) => {}
             Err(e) => panic!("unexpected error: {}", e),
         }
+    }
+
+    #[test]
+    fn test_resolve_by_full_id() {
+        let a = ContextId::new();
+        let b = ContextId::new();
+        let entries = vec![(a, None), (b, None)];
+        // A full id (as kj emits) round-trips through prefix resolution.
+        let result = resolve_context_prefix(entries.into_iter(), &a.to_hex()).unwrap();
+        assert_eq!(result, a);
     }
 
     #[test]
