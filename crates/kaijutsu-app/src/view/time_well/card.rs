@@ -128,8 +128,9 @@ pub fn assign_bands(contexts: &[ContextInfo]) -> Vec<Band> {
 /// keyboard navigation walks the same vectors (so the keys match the visuals).
 ///
 /// Per-band ordering (the orthogonal-meaning rule from "The three bands"):
-/// - **Hot** — id ascending (UUIDv7 = creation order, unique); this is what the
-///   `0–9` digit keys address.
+/// - **Hot** — id descending (UUIDv7 = creation order, unique; newest first, so
+///   the mouth is the newest open context); this is what the `0–9` digit keys
+///   temporarily address (Stage 0 tourniquet — see `docs/timewell.md`).
 /// - **RecentConcluded** — most-recently-concluded first (`concluded_at`
 ///   descending, id-tiebroken), so band-1 angle is "a clock of what I just
 ///   finished" and slot 0 is the newest conclusion.
@@ -157,9 +158,10 @@ pub fn band_orders(
             .collect()
     };
 
-    // Hot: id ascending (creation order; matches the `0–9` addressing).
+    // Hot: id descending (newest first — mouth = newest open context; matches
+    // the `0–9` addressing).
     let mut hot: Vec<ContextId> = in_band(Band::Hot).iter().map(|c| c.id).collect();
-    hot.sort_unstable();
+    hot.sort_unstable_by(|a, b| b.cmp(a));
 
     // RecentConcluded: newest conclusion first, id-tiebroken.
     let mut recent = in_band(Band::RecentConcluded);
@@ -579,7 +581,8 @@ mod tests {
         use kaijutsu_viz::layout::Band;
         use std::collections::HashMap;
 
-        // Hot: two open contexts (ids 5, 3) → expect id-ascending [3, 5].
+        // Hot: two open contexts (ids 5, 3) → expect id-descending [5, 3]
+        // (newest first, Stage 0 tourniquet — mouth = newest open context).
         let mut hot_a = ctx(id_of(5), "");
         hot_a.created_at = 10;
         let mut hot_b = ctx(id_of(3), "");
@@ -597,8 +600,8 @@ mod tests {
         let orders = band_orders(&contexts, &bands, &HashMap::new());
         assert_eq!(
             orders[Band::Hot.index()],
-            vec![id_of(3), id_of(5)],
-            "hot orders by id ascending"
+            vec![id_of(5), id_of(3)],
+            "hot orders by id descending (newest first)"
         );
         assert_eq!(
             orders[Band::RecentConcluded.index()],
@@ -606,6 +609,32 @@ mod tests {
             "recent orders newest-conclusion first"
         );
         assert!(orders[Band::Haystack.index()].is_empty());
+    }
+
+    #[test]
+    fn hot_band_puts_newest_at_the_mouth() {
+        use kaijutsu_viz::layout::Band;
+        use std::collections::HashMap;
+
+        // Several open (hot) contexts with increasing ids (creation order).
+        let contexts: Vec<ContextInfo> = (1..=5u8).map(|n| ctx(id_of(n), "")).collect();
+        let bands = vec![Band::Hot; contexts.len()];
+
+        let order = spiral_order(&contexts, &bands, &HashMap::new());
+
+        // The mouth (index 0) must be the newest context (highest id), not the
+        // oldest — Stage 0 tourniquet: the well is a terminal multiplexer, not
+        // a creation-order log.
+        assert_eq!(
+            order.first(),
+            Some(&id_of(5)),
+            "mouth (index 0) must be the newest open context"
+        );
+        assert_eq!(
+            order,
+            vec![id_of(5), id_of(4), id_of(3), id_of(2), id_of(1)],
+            "hot band runs id-descending, newest to oldest"
+        );
     }
 
     #[test]
