@@ -276,6 +276,21 @@ impl EmbeddedKaish {
         // `ExecuteOptions::with_timeout` for stricter per-context bounds.
         config.request_timeout = Some(kernel.timeouts().kaish_request_timeout);
 
+        // Seed `HOME` for EVERY shell flavor (read-only included), not just
+        // exec-granted ones. kaish is hermetic: it never reads the host
+        // `std::env::var("HOME")`, so with empty `initial_vars` the scope has no
+        // `HOME` — `$HOME` expands to empty AND `~` is left literal (both read
+        // the same scope var via kaish's `scope_home()`). Seeding it here makes
+        // the two agree by construction (`echo $HOME` == the `~` target) and
+        // exports it to child processes. `KaishConfig::named()` already lands the
+        // shell's default cwd on this same directory, so `~` == cwd in the common
+        // case. A durable `context_env` HOME still wins: `apply_context_config`
+        // exports it after construction.
+        let home = kaish_kernel::home_dir().to_string_lossy().into_owned();
+        config
+            .initial_vars
+            .insert("HOME".to_string(), kaish_kernel::ast::Value::String(home));
+
         // Host subprocess policy. With kaish's `subprocess` feature compiled
         // in, `allow_external_commands` would default to true — so every shell
         // states its policy explicitly, decided by the caller from the
@@ -764,6 +779,53 @@ mod tests {
             .unwrap();
         assert!(!r.ok(), "Deny must refuse external exec");
         assert_eq!(r.code, 127, "fail-fast command-not-found: {}", r.err);
+    }
+
+    /// `$HOME` and `~` must give the SAME answer, and it must be non-empty.
+    /// kaish reads both from the session scope's `HOME` (never the host env), so
+    /// an unseeded shell has `$HOME` empty *and* `~` left literal — `$HOME/path`
+    /// then silently resolves wrong while `~/path` also fails. Seeding `HOME` at
+    /// materialization makes the two agree by construction. Runs against the
+    /// default `EmbeddedKaish::new` (a Deny, non-read-only shell) to prove the
+    /// seeding is unconditional, not gated on the exec grant.
+    #[tokio::test]
+    async fn home_var_and_tilde_agree() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-home").await);
+        let kaish = EmbeddedKaish::new("test-home", blocks, kernel, None).unwrap();
+
+        let home = kaish
+            .execute_with_options("echo $HOME", ExecuteOptions::default())
+            .await
+            .unwrap();
+        let home = home.text_out().trim().to_string();
+        assert!(
+            !home.is_empty(),
+            "$HOME must be seeded (non-empty) in the materialized shell",
+        );
+
+        let tilde = kaish
+            .execute_with_options("echo ~", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tilde.text_out().trim(),
+            home,
+            "`~` must expand to exactly $HOME — the variable and the tilde must agree",
+        );
+
+        // The concrete failure the seeding fixes: `~/sub` must root at the seeded
+        // HOME (kaish rejects `$HOME/sub` token-pasting, so the bare tilde word
+        // is the surface a user actually types).
+        let tilde_sub = kaish
+            .execute_with_options("echo ~/sub", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tilde_sub.text_out().trim(),
+            format!("{home}/sub"),
+            "`~/sub` must root at the seeded HOME",
+        );
     }
 
     #[tokio::test]
