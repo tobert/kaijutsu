@@ -202,6 +202,11 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.
+  - **`Registry::resolve_model` pins a bare model name on the *default*
+    provider** (`llm/mod.rs:721`) — the sharp edge behind the 2026-07-04
+    cross-provider distill bug (fixed by routing the distill default around
+    it, not by changing `resolve_model`). Audit its remaining callers for the
+    same trap.
 - **Reasoning-continuity cross-provider guard (policy, not Rust; the rehydration
   machinery itself shipped):** block `kj context set --model` across provider
   families when signed Thinking exists in history (a DeepSeek nonce fed to
@@ -458,29 +463,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     you wanted fork's history). Strengthens the case for (c) `kj fork --type`:
     the director's natural move is "branch this work into a coder *with* the
     working context," which neither verb currently does in one step.
-- **`kj fork --compact` label-conflict error is unhelpful (found 2026-07-04,
-  DEMO DEMO `7566da79`).** When the target label already exists, the error is a
-  bare `label conflict: label 'X' already in use` — it doesn't surface the
-  existing context, offer to switch to it, or hint at renaming/removing. The
-  caller must manually discover whether the fork partially succeeded (the
-  context exists and is usable) vs needing a fresh name. Fix: surface the
-  existing context ID in the error and suggest `kj context switch` or a rename.
-- **`kj fork --include` range parsing rejects `end-N` and integer ranges (found
-  2026-07-04, same session).** `--include "end-2:"` and `--include "0:1"` both
-  fail with `is not a valid endpoint — expected an integer, 'end', or 'end-N'`.
-  The `end-N` form is documented in `--help` but the parser doesn't accept it;
-  even bare integer ranges fail, suggesting a deeper parsing issue (possibly
-  shell escaping interacting with the JSON array representation). Either fix
-  the parser or update the docs. Until fixed, there is no working way to fork a
-  near-empty child context via `--include`.
-- **`kj fork --compact` cross-provider model failure (found 2026-07-04, same
-  session).** `kj fork --compact --model deepseek/deepseek-v4-pro` from a haiku
-  context fails with `LLM summarization failed: invalid request:
-  not_found_error: model: deepseek-v4-pro` — the compact fork appears to use
-  the *target* model for distillation rather than the calling context's model,
-  so compact forking across providers is impossible without `--distill-model`.
-  Fix: default `--distill-model` to the calling context's model, or detect the
-  cross-provider case and fail with a clear message suggesting it.
 - **`$HOME` env var is empty in the context shell (minor; `~` now fixed).**
   `~` expansion is fixed by a kaish upgrade (2026-06-17), so `~/path` resolves.
   The remaining gap is the `$HOME` *variable*: it's still empty in both the
@@ -1829,36 +1811,26 @@ kernel process env into exec-granted shells.
 
 ---
 
-## Context time awareness — per-type date/time injection (found 2026-07-03)
+## Context time awareness — per-type date/time injection (found 2026-07-03; slice 1 SHIPPED 2026-07-04)
 
-In-app contexts have no wall-clock source, so models guess dates when writing
-durable artifacts — and guess wrong. Evidence: two issues.md entries written
-in-app carried hallucinated dates (Music Demo #1 `019f249d` wrote "2026-07-04"
-for a 2026-07-02 session; DS Director `019f14ba` wrote "2026-07-15" for
-~2026-06-29). Both corrected 2026-07-03.
+In-app contexts had no wall-clock source, so models hallucinated dates in
+durable artifacts (three incidents — the third being the 2026-07-04 issues.md
+ghost re-introducing an already-corrected date).
 
-**Shape: per-`context_type` cadence policy, not a global drip.** Time-awareness
-needs differ by role, so it's a policy row per rc bucket (same pattern as
-`BeatPolicy`):
+**Slice 1 SHIPPED 2026-07-04:** `lib/{create/S25,fork/S40}-datetime.kai` rc
+seeds (kaish's chrono-backed `date` builtin → `kj block create --kind
+notification`), symlinked init.d-style into coder/director/mcp/default;
+musician/toolie deliberately get none (musical time is their only time base).
+`BlockKind::Notification` was the load-bearing choice: it hydrates as an
+appended user-role message and is never swept into the system prompt — a
+`(Role::System, BlockKind::Text)` block would be folded into the cached prefix
+by `extract_system_prompt_sections` on every call and silently invalidate the
+`--target=system` breakpoint daily (the exact anti-pattern the cache-placement
+rules forbid; rc `.kai` stdout was also ruled out — it lands as model-hidden
+`Trace`). Tests pin the mechanism: visible in hydrate, absent from
+system-prompt sections, per-type policy matrix, fork re-seeds.
 
-- **director** — coordinates work across sessions and writes dated records;
-  wants *regular* updates (e.g. a system note when the turn gap crosses a
-  threshold, or every N turns).
-- **coder** — an occasional heads-up: seed date/time at hydrate boundaries
-  (create/fork/attach) and maybe a note on day rollover; per-turn is noise.
-- **musician** — *none*. Musical time (`$PHRASE`, ticks, the track clock) is its
-  only time base; wall-clock drip is pure cache/attention pollution.
-
-**Mechanism (both halves already designed elsewhere in this file):**
-
-- **Placement is constrained by the cache rules** ("Cache placement is
-  load-bearing", above): date/time is the canonical *silent invalidator* — it
-  MUST land as a message *after the last breakpoint* (the mailbox system-note
-  path), never in `build_system_prompt`. A time note is just a mailbox system
-  block, so the append-only machinery already exists.
-- **Cadence wants the `BeforeModelTurn` hook seam** (Turn Loop section) once it
-  lands — a per-type rc script deciding "has enough wall time passed to be worth
-  a note?" is exactly the reactive/mechanical per-turn work that seam owns.
-  **First slice needs neither:** seed date/time once at the hydrate boundary via
-  each type's rc create/fork scripts (rc `.kai` stdout→block already works),
-  which alone would have prevented both hallucinated dates above.
+**Remaining — cadence (slice 2, not-now):** regular re-seeding (director's
+"note when the turn gap crosses a threshold / every N turns") wants the
+`BeforeModelTurn` hook seam (Turn Loop section) once it lands; per-turn drip
+stays out of the cached prefix by the same placement rule.
