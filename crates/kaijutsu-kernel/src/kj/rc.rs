@@ -39,7 +39,10 @@ enum RcCommand {
         #[arg(long)]
         content: Option<String>,
     },
-    /// List installed scripts, optionally filtered.
+    /// List installed scripts, optionally filtered. Each entry is marked
+    /// against its embedded seed: in-sync, differs (edited since seeding),
+    /// or no-seed (a live-only, user-authored script). Indicator only — never
+    /// auto-resets; `kj rc reset <path>` is the explicit manual pull.
     #[command(alias = "ls")]
     List {
         /// Filter by context_type
@@ -48,6 +51,11 @@ enum RcCommand {
         /// Filter by verb (create|fork|attach|drift|tick|rotate)
         #[arg(long = "verb")]
         verb_filter: Option<String>,
+        /// Emit a JSON object (with a per-entry seed_status record) instead
+        /// of the marked human listing. `.data` stays the flat path array
+        /// either way (the kj list-command iteration convention).
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a script.
     #[command(alias = "remove")]
@@ -81,6 +89,43 @@ enum RcCommand {
         /// Canonical rc path to restore from the embedded default
         path: String,
     },
+}
+
+/// Staleness classification for `kj rc list`'s per-entry seed comparison
+/// (indicator only — nothing here writes anything; `kj rc reset` is the
+/// existing explicit manual pull).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RcSeedStatus {
+    /// The live script's body (or symlink target) matches its embedded seed
+    /// exactly.
+    InSync,
+    /// A seed ships for this path, but the live script has drifted from it
+    /// (edited, or a link/file shape mismatch).
+    Differs,
+    /// No embedded seed ships for this path — a live-only, user-authored
+    /// script. Nothing to compare against, so it's neither in-sync nor
+    /// differing.
+    NoSeed,
+}
+
+impl RcSeedStatus {
+    /// Human-readable marker appended to a `kj rc list` line.
+    fn as_str(&self) -> &'static str {
+        match self {
+            RcSeedStatus::InSync => "in-sync",
+            RcSeedStatus::Differs => "differs from seed",
+            RcSeedStatus::NoSeed => "no seed",
+        }
+    }
+
+    /// snake_case token for the `--json` structured record.
+    fn as_json_str(&self) -> &'static str {
+        match self {
+            RcSeedStatus::InSync => "in_sync",
+            RcSeedStatus::Differs => "differs",
+            RcSeedStatus::NoSeed => "no_seed",
+        }
+    }
 }
 
 /// Canonical rc path format. The verb alternation is built from
@@ -186,7 +231,11 @@ impl KjDispatcher {
             RcCommand::List {
                 type_filter,
                 verb_filter,
-            } => self.rc_list(type_filter.as_deref(), verb_filter.as_deref()).await,
+                json,
+            } => {
+                self.rc_list(type_filter.as_deref(), verb_filter.as_deref(), json)
+                    .await
+            }
             RcCommand::Rm { path } => self.rc_rm(&path).await,
             RcCommand::Show { path, json } => self.rc_show(&path, json).await,
             RcCommand::Edit { path, content } => {
@@ -290,7 +339,12 @@ impl KjDispatcher {
             .map(|t| t.to_string_lossy().into_owned())
     }
 
-    async fn rc_list(&self, type_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
+    async fn rc_list(
+        &self,
+        type_filter: Option<&str>,
+        verb_filter: Option<&str>,
+        json: bool,
+    ) -> KjResult {
         let mut paths = match self.walk_rc_paths().await {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
@@ -313,19 +367,90 @@ impl KjDispatcher {
         }
 
         // `data` stays an array of full path strings (the resolver keys for
-        // `kj rc rm`/`show`) per the kj structured-data convention. The link
-        // target is an annotation on the *human* line only: `link → target`.
+        // `kj rc rm`/`show`) per the kj structured-data convention
+        // (`project_kj_structured_data.md`: list commands emit an array of
+        // identifier strings so `for x in $(kj …)` iterates handles) — the
+        // per-entry seed status below rides `--json`'s message instead of
+        // reshaping `data` into an array of records.
         let data = serde_json::Value::Array(
             paths.iter().cloned().map(serde_json::Value::String).collect(),
         );
-        let mut lines = Vec::with_capacity(paths.len());
+
+        // One pass: resolve each path's live symlink target (if any) and its
+        // seed staleness, shared by both the human listing and `--json`.
+        let mut rows: Vec<(String, Option<String>, RcSeedStatus)> = Vec::with_capacity(paths.len());
         for p in &paths {
-            match self.rc_link_target(p).await {
-                Some(target) => lines.push(format!("  {p} → {target}")),
-                None => lines.push(format!("  {p}")),
+            let link = self.rc_link_target(p).await;
+            let status = self.rc_seed_status(p, link.as_deref()).await;
+            rows.push((p.clone(), link, status));
+        }
+
+        if json {
+            let scripts: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(p, link, status)| {
+                    serde_json::json!({
+                        "path": p,
+                        "link": link,
+                        "seed_status": status.as_json_str(),
+                    })
+                })
+                .collect();
+            let out = serde_json::json!({ "count": rows.len(), "scripts": scripts });
+            return KjResult::ok_with_data(out.to_string(), data);
+        }
+
+        let mut lines = Vec::with_capacity(rows.len());
+        for (p, link, status) in &rows {
+            let marker = format!(" [{}]", status.as_str());
+            match link {
+                Some(target) => lines.push(format!("  {p} → {target}{marker}")),
+                None => lines.push(format!("  {p}{marker}")),
             }
         }
         KjResult::ok_with_data(lines.join("\n"), data)
+    }
+
+    /// Compare a live rc script at `path` against its embedded seed, without
+    /// touching anything — an indicator only (`kj rc reset <path>` remains the
+    /// explicit manual pull; live is truth by design). `live_link` is the raw
+    /// symlink target at `path` (the caller already resolved it for the `→
+    /// target` annotation, so this reuses it instead of re-issuing the same
+    /// VFS readlink).
+    ///
+    /// A seed whose body is itself a link-target path ([`config_crdt_fs::
+    /// seed_link_target`], the init.d composition seeding reconstructs as a
+    /// symlink) compares link-target-to-link-target; every other seed compares
+    /// literal body-to-body. Mixing the two (a live file where the seed wants
+    /// a link, or vice versa) is `Differs`, never silently treated as a match.
+    async fn rc_seed_status(&self, path: &str, live_link: Option<&str>) -> RcSeedStatus {
+        let Some(seed) = crate::seed_scripts::seed_body(path) else {
+            return RcSeedStatus::NoSeed;
+        };
+        let known: std::collections::HashSet<String> = crate::seed_scripts::seed_files()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let expected_link =
+            crate::runtime::config_crdt_fs::seed_link_target(path, seed, &known);
+
+        match (expected_link.as_deref(), live_link) {
+            (Some(want), Some(got)) => {
+                if want == got {
+                    RcSeedStatus::InSync
+                } else {
+                    RcSeedStatus::Differs
+                }
+            }
+            // Seed wants a symlink but live is a real file (or absent) — or
+            // vice versa: a mismatched shape is a divergence, not a partial
+            // match.
+            (Some(_), None) | (None, Some(_)) => RcSeedStatus::Differs,
+            (None, None) => match self.read_rc_content(path).await {
+                Ok(Some(body)) if body == seed => RcSeedStatus::InSync,
+                Ok(_) | Err(_) => RcSeedStatus::Differs,
+            },
+        }
     }
 
     /// Walk the `/etc/rc` tree (`<type>/<verb>/SXX-name.ext`) and return all
@@ -1234,4 +1359,238 @@ mod tests {
         }
     }
 
+    // ── New: rc list seed-staleness indicator ──────────────────────────
+
+    /// An untouched, freshly-seeded literal-content script (the coder stance)
+    /// is marked in-sync — no divergence from its embedded default.
+    #[tokio::test]
+    async fn rc_list_marks_seeded_script_in_sync() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains("/etc/rc/coder/create/S00-stance.kai [in-sync]"),
+                "expected in-sync marker: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// Editing a seeded script's body away from its embedded default flips
+    /// its `kj rc list` marker to "differs from seed" — an indicator only;
+    /// nothing auto-resets it (`kj rc reset` remains the manual pull).
+    #[tokio::test]
+    async fn rc_list_marks_edited_seeded_script_as_differs() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("edit"),
+                s("/etc/rc/coder/create/S00-stance.kai"),
+                s("--content"),
+                s("# user override"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains("/etc/rc/coder/create/S00-stance.kai [differs from seed]"),
+                "expected differs marker: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// A live-only script with no embedded seed (user-authored context_type)
+    /// is marked "no seed" — neither in-sync nor differing, since there's
+    /// nothing to compare it against.
+    #[tokio::test]
+    async fn rc_list_marks_user_only_script_as_no_seed() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/mine/create/S00-custom.kai"),
+                s("--content"),
+                s("true"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(&[s("rc"), s("list"), s("--type"), s("mine")], &c)
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains("/etc/rc/mine/create/S00-custom.kai [no seed]"),
+                "expected no-seed marker: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// An untouched seed *symlink* (the init.d-style composed cache script)
+    /// is in-sync too — the comparison follows the link-target-vs-seed-body
+    /// rule, not a literal-content diff.
+    #[tokio::test]
+    async fn rc_list_marks_seed_symlink_in_sync() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("default"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => assert!(
+                message.contains(
+                    "/etc/rc/default/create/S20-cache.kai → /etc/rc/lib/create/S20-cache.kai [in-sync]"
+                ),
+                "expected in-sync symlink marker: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// Replacing a seeded symlink with a literal file at the same path is a
+    /// shape mismatch against the seed (which expects a link there) — marked
+    /// "differs from seed", and it no longer carries the `→ target`
+    /// annotation since it's a real file now.
+    #[tokio::test]
+    async fn rc_list_marks_symlink_replaced_by_real_file_as_differs() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[s("rc"), s("rm"), s("/etc/rc/default/create/S20-cache.kai")],
+            &c,
+        )
+        .await;
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/default/create/S20-cache.kai"),
+                s("--content"),
+                s("# diverged, no longer a link"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("list"), s("--type"), s("default"), s("--verb"), s("create")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, .. } => {
+                assert!(
+                    message.contains("/etc/rc/default/create/S20-cache.kai [differs from seed]"),
+                    "expected differs marker: {message}"
+                );
+                assert!(
+                    !message.contains("/etc/rc/default/create/S20-cache.kai →"),
+                    "should no longer show a symlink annotation: {message}"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// `--json` carries the same per-entry seed_status fact in its message
+    /// object; `.data` stays the flat path-string array regardless (the
+    /// list-command iteration convention — `project_kj_structured_data.md`).
+    #[tokio::test]
+    async fn rc_list_json_carries_per_entry_seed_status() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        let result = d
+            .dispatch(
+                &[
+                    s("rc"),
+                    s("list"),
+                    s("--type"),
+                    s("coder"),
+                    s("--verb"),
+                    s("create"),
+                    s("--json"),
+                ],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { message, data: Some(v), .. } => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&message).expect("--json message is JSON");
+                let scripts = parsed["scripts"].as_array().expect("scripts array");
+                let entry = scripts
+                    .iter()
+                    .find(|e| e["path"] == "/etc/rc/coder/create/S00-stance.kai")
+                    .expect("stance entry present");
+                assert_eq!(entry["seed_status"], "in_sync");
+
+                let paths: Vec<&str> = v
+                    .as_array()
+                    .expect("data stays an array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(
+                    paths.contains(&"/etc/rc/coder/create/S00-stance.kai"),
+                    "data must stay the flat path array even under --json: {paths:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
 }

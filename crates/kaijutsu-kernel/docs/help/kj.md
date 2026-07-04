@@ -46,7 +46,7 @@ kj drift merge
 ```
 attach          Attach to an existing context and run its rc attach lifecycle
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
-block           list, ls, inspect, count, read, create, append, history, diff, edit, status
+block           list, ls, inspect, count, read, cat, create, append, history, diff, edit, status
 cache           list, add, clear — Claude prompt-cache breakpoints
 cas             put, get, ls, info, rm — content-addressed blob storage
 context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag, hydrate
