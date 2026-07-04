@@ -738,8 +738,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   choice (note/channel/velocity/gate, and whether to sound at all) should be
   user-configurable someday — a config knob or a `kj`/app toggle + a small
   metronome settings block — rather than baked in. Downbeat accent (a different
-  note on bar-one) also wants meter info the `BeatRef` doesn't carry yet. Low
-  priority; the current defaults are audible and fine for the slice.
+  note on bar-one) also wants meter info the `BeatRef` doesn't carry yet.
+  **Sharpened 2026-07-04 (second live bite):** the metronome **free-runs with
+  no clock behind it** — post-restart, kernel transport fully cold (nothing
+  attached), the app still clicked ch15/note-84 every ~2s on its render port;
+  it became audible the moment the app→TiMidity `aconnect` wire was remade,
+  and the only off switch was cutting the wire. Spec upgrade: **silent when no
+  track clock is running** (click only when following a live kernel beat), on
+  top of the toggle/config knob. No longer "defaults are fine" — an idle app
+  emits noise onto whatever synth is wired.
 - **Metronome controller — graduate to PI/PID later.** The slosh was fixed
   (`d2b1f55c`, P-phase correction with feedforward tempo — diagnosis in
   `79c4b6b5`'s message). Remaining: graduate to a full PI/PID (damping + integral
