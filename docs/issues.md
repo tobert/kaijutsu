@@ -424,6 +424,22 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   move`, …) — they share the latch helper, so it's one change at the source.
   **ON HOLD (Amy, 2026-07-04):** don't fix now — the next kaish release rewrites
   the latch code with proper APIs; fold this into that migration.
+- **`--out` writes bypass the VFS (`kj cas get` + `kj block cat`; gemini-pro
+  review 2026-07-04).** Both verbs `std::fs::write` the `--out` path
+  (`kj/cas.rs:119`, `kj/block.rs:730` — the new verb deliberately mirrored the
+  old one's convention). Not a trust issue (shared-trust kernel) but a
+  coherence one: the write lands relative to the *server process* cwd, not the
+  shell's VFS cwd, and never hits VFS mounts/caches. Decide once for both:
+  route `--out` through `VfsOps::write_all` (needs the block/cas dispatch arms
+  async) or document host-side semantics loudly.
+- **`KjBuiltin` argv/stdin quirks (gemini-pro review 2026-07-04, both
+  pre-existing/low):** (a) the `--json` global flag is stripped with
+  `argv.retain(|a| a != "--json")` (`runtime/kj_builtin.rs:524`), which also
+  eats a literal `"--json"` passed as a *value* (e.g. `--content --json`) —
+  prefer a targeted named-arg strip; (b) `wants_stdin_content` promotion means
+  a forgotten `--content` on an interactive TTY blocks reading stdin until
+  Ctrl+D instead of failing "missing content" — cat-like POSIX behavior, but a
+  papercut worth a TTY check if it ever bites.
 - **Workspace path mount points:** `kj workspace add --mount <target>` was
   documented + parsed but silently ignored (no backing storage) — removed during
   the clap migration so it now fails loud. To implement: add a `mount` column to
