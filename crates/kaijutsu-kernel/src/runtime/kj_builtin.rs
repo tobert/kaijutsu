@@ -451,20 +451,55 @@ impl Tool for KjBuiltin {
             })
             .collect();
 
-        // Reconstruct --key value pairs from named args
+        // Reconstruct --key value pairs from named args.
         for (key, val) in &args.named {
             let flag = if key.len() == 1 {
                 format!("-{key}")
             } else {
                 format!("--{key}")
             };
-            argv.push(flag);
             match val {
-                Value::String(s) => argv.push(s.clone()),
-                Value::Int(n) => argv.push(n.to_string()),
-                Value::Float(f) => argv.push(f.to_string()),
-                Value::Bool(b) => argv.push(b.to_string()),
-                other => argv.push(format!("{other:?}")),
+                // Repeatable value flags (clap `ArgAction::Append`, i.e. a
+                // `Vec<String>` arg like fork's `--include` / `--exclude`) are
+                // accumulated by kaish under one `named` key as a
+                // `Value::Json(Array(...))` — one element per occurrence (see
+                // kaish `push_repeatable_value`). Emit the flag once per element
+                // so clap's `Vec<_>` re-parse sees each value as its own
+                // occurrence. Before this, the array fell through to the
+                // `{other:?}` arm below and reached clap as a single
+                // Debug-formatted token like `Json(Array [String("0:1")])`,
+                // which the range parser then rejected as a bad endpoint — the
+                // live `kj fork --include 0:1` failure. A `serde_json` string
+                // element must be pushed raw (its `to_string()` re-quotes it).
+                Value::Json(serde_json::Value::Array(items)) => {
+                    for item in items {
+                        argv.push(flag.clone());
+                        match item {
+                            serde_json::Value::String(s) => argv.push(s.clone()),
+                            other => argv.push(other.to_string()),
+                        }
+                    }
+                }
+                Value::String(s) => {
+                    argv.push(flag);
+                    argv.push(s.clone());
+                }
+                Value::Int(n) => {
+                    argv.push(flag);
+                    argv.push(n.to_string());
+                }
+                Value::Float(f) => {
+                    argv.push(flag);
+                    argv.push(f.to_string());
+                }
+                Value::Bool(b) => {
+                    argv.push(flag);
+                    argv.push(b.to_string());
+                }
+                other => {
+                    argv.push(flag);
+                    argv.push(format!("{other:?}"));
+                }
             }
         }
 
@@ -1671,5 +1706,72 @@ mod tests {
              instead of intercepting it; root params = {:?}",
             schema.params.iter().map(|p| &p.name).collect::<Vec<_>>(),
         );
+    }
+
+    /// Bug 1 (2026-07-04): `kj fork --include <range>` through the kaish bridge.
+    /// `--include` reflects as a repeatable clap flag (`Vec<String>` →
+    /// `ArgAction::Append`), so kaish hands the builtin its value as a
+    /// `Value::Json(Array(...))` (one element per occurrence). Before the fix,
+    /// `KjBuiltin::execute`'s argv reconstruction had no arm for that and
+    /// Debug-formatted the whole array into one token
+    /// (`Json(Array [String("0:1")])`), which the range parser then rejected as
+    /// a bad endpoint — so every documented range form failed live even though
+    /// the parser and the direct dispatcher path were both fine. This drives the
+    /// forms end-to-end through kaish, including a repeated `--include` (two
+    /// occurrences → the array path is guaranteed).
+    #[tokio::test]
+    async fn fork_include_ranges_survive_kaish_bridge() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let source = register_context(&dispatcher, Some("src"), None, principal);
+        dispatcher
+            .block_store()
+            .create_document(source, kaijutsu_types::DocKind::Conversation, None)
+            .expect("create_document");
+        for body in ["alpha", "bravo", "charlie", "delta"] {
+            dispatcher
+                .block_store()
+                .insert_block(
+                    source,
+                    None,
+                    None,
+                    kaijutsu_types::Role::User,
+                    kaijutsu_types::BlockKind::Text,
+                    body,
+                    kaijutsu_types::Status::Done,
+                    kaijutsu_types::ContentType::Plain,
+                )
+                .expect("insert block");
+        }
+
+        let kaish = embedded_with_kj(dispatcher.clone(), source).await;
+
+        // Every documented endpoint form (int, end, end-N), plus a repeated
+        // `--include` that forces the multi-occurrence array path.
+        let cases = [
+            ("k0", "--include 0:1"),
+            ("k1", "--include end-2:"),
+            ("k2", "--include :"),
+            ("k3", "--include 2:end"),
+            ("k4", "--include 0:1 --include 2:4"),
+        ];
+        for (label, flags) in cases {
+            let script = format!("kj fork --name {label} {flags}");
+            let res = kaish
+                .execute_with_options(&script, ExecuteOptions::default())
+                .await
+                .expect("kaish exec");
+            let combined = format!("out={} err={}", res.text_out(), res.err);
+            assert!(
+                res.ok(),
+                "`{script}` must survive the kaish bridge: {combined}"
+            );
+            // Guard against a mangled token reaching the range parser.
+            assert!(
+                !combined.contains("valid endpoint") && !combined.contains("not a range"),
+                "`{script}` reached the parser mangled: {combined}"
+            );
+        }
     }
 }

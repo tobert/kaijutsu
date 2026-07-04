@@ -552,36 +552,80 @@ impl KjDispatcher {
 
         let user_prompt = build_distillation_prompt(&blocks, directed_prompt);
 
-        // Resolution order: explicit override > source context's model >
-        // registry default.
-        let inherited = self
+        // The calling context's OWN (provider, model) pair — the combination
+        // known to work for it. Read under the sync router lock before the async
+        // registry lock (guard drops at the block's end; no await while held).
+        let ctx_pair = self
             .drift
             .read()
             .get(context_id)
-            .and_then(|h| h.model.clone());
-        let chosen = distill_model
-            .map(|s| s.to_string())
-            .or(inherited);
+            .map(|h| (h.provider.clone(), h.model.clone()));
+
         let registry = self.kernel.llm().read().await;
 
-        let (provider, model) = match &chosen {
-            Some(m) => registry
-                .resolve_model(m)
-                .ok_or_else(|| format!("model '{}' not found in registry", m))?,
-            None => {
-                let p = registry.default_provider().ok_or("no LLM configured")?;
-                let m = registry
-                    .default_model()
-                    .ok_or("no default model configured")?
-                    .to_string();
-                (p, m)
+        // Distillation model resolution:
+        //   1. explicit `--distill-model` → alias-aware registry resolution.
+        //   2. else the calling context's OWN provider+model (the known-good
+        //      pair). This previously used only the context's *model*, re-pinned
+        //      on the registry's *default provider* via `resolve_model` — so a
+        //      caller on `anthropic` whose registry default was `deepseek` would
+        //      try to distill anthropic's model on deepseek, the cross-provider
+        //      `not_found_error` papercut. Using the pair keeps distill on the
+        //      caller's own provider.
+        //   3. else the registry default.
+        let (provider, provider_name, model) = match distill_model {
+            Some(spec) => {
+                // An explicit override is alias-aware but still pins a *bare*
+                // model on the default provider — that can mismatch, and we
+                // can't verify a provider serves a model without calling it. The
+                // failure below names the pairing and suggests the slash form.
+                let (p, m) = registry.resolve_model(spec).ok_or_else(|| {
+                    format!(
+                        "distill model '{spec}' not found — pass an explicit \
+                         `--distill-model provider/model` or a configured alias"
+                    )
+                })?;
+                let name = p.name().to_string();
+                (p, name, m)
             }
+            None => match ctx_pair {
+                Some((Some(p_name), Some(m))) => {
+                    let provider = registry.get(&p_name).ok_or_else(|| {
+                        format!(
+                            "distillation: the calling context's provider '{p_name}' is not \
+                             registered — pass an explicit `--distill-model provider/model`"
+                        )
+                    })?;
+                    (provider, p_name, m)
+                }
+                // The calling context lacks a complete provider+model pair; fall
+                // to the registry default rather than pinning a half-known model
+                // on a possibly-wrong provider.
+                _ => {
+                    let name = registry
+                        .default_provider_name()
+                        .ok_or("no LLM configured")?
+                        .to_string();
+                    let p = registry.default_provider().ok_or("no LLM configured")?;
+                    let m = registry
+                        .default_model()
+                        .ok_or("no default model configured")?
+                        .to_string();
+                    (p, name, m)
+                }
+            },
         };
 
         provider
             .prompt_with_system(&model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
             .await
-            .map_err(|e| format!("LLM summarization failed: {e}"))
+            .map_err(|e| {
+                format!(
+                    "LLM summarization failed on {provider_name}/{model}: {e} — if the \
+                     provider and model don't match, pass an explicit \
+                     `--distill-model provider/model`"
+                )
+            })
     }
 }
 

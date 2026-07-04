@@ -357,6 +357,31 @@ impl KjDispatcher {
         })
     }
 
+    /// Fail fast when a fork's requested `--name` is already taken — BEFORE any
+    /// context/document/LLM work — so a conflict can't strand a half-built child
+    /// (an orphan distilled document) and the caller gets an actionable message
+    /// (the existing context's full id + how to reach it) instead of a bare
+    /// unique-constraint bounce from deep inside the insert. The DB's unique
+    /// index stays the real guard: a label that wins the race between this check
+    /// and the insert still fails loud there. `None`/free label → `Ok`.
+    fn ensure_label_available(&self, label: Option<&str>) -> Result<(), String> {
+        let Some(label) = label else {
+            return Ok(());
+        };
+        let existing = {
+            let db = self.kernel_db().lock();
+            db.find_context_by_label(label).map_err(|e| e.to_string())?
+        };
+        if let Some(row) = existing {
+            let id = row.context_id.to_hex();
+            return Err(format!(
+                "label '{label}' is already in use by context {id} — switch to it with \
+                 `kj context switch {id}`, or fork under a different --name"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let args = match ForkArgs::try_parse_from(argv) {
             Ok(a) => a,
@@ -408,6 +433,14 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return e,
         };
+
+        // Reject a taken label up front — before copying the document — so a
+        // conflict can't strand an orphan copy and the caller gets an
+        // actionable message instead of a late unique-constraint bounce.
+        if let Err(e) = self.ensure_label_available(label.as_deref()) {
+            return KjResult::Err(format!("kj fork: {e}"));
+        }
+
         let new_id = ContextId::new();
 
         // Validate --model BEFORE any mutations
@@ -688,6 +721,16 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return e,
         };
+
+        // Reject a taken label up front — BEFORE the (slow, billed) distill and
+        // before any document is created — so a conflict can't strand an orphan
+        // distilled document and the caller gets an actionable message instead
+        // of a bare unique-constraint bounce after the summary was already paid
+        // for.
+        if let Err(e) = self.ensure_label_available(label.as_deref()) {
+            return KjResult::Err(format!("kj fork --compact: {e}"));
+        }
+
         let new_id = ContextId::new();
 
         // Validate --model BEFORE any mutations
@@ -2813,6 +2856,203 @@ mod tests {
         assert!(
             sub.try_recv().is_none(),
             "a bare subtree fork must not request a turn"
+        );
+    }
+
+    // ── 2026-07-04 papercuts: compact-fork label conflict + distill provider ──
+
+    /// Bug 2 (2026-07-04): `kj fork --compact --name <taken>` where the label is
+    /// already in use must fail with an ACTIONABLE message — the existing
+    /// context's full id plus how to reach it — not a bare
+    /// `label conflict: label 'X' already in use`. Before the fix the conflict
+    /// surfaced only at the final DB insert, deep after the (billed) distill and
+    /// a created orphan document.
+    #[tokio::test]
+    async fn fork_compact_label_conflict_actionable_message() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        // A working distill provider + a source block, so that WITHOUT the fix
+        // the distill succeeds and the fork gets all the way to the failing
+        // insert (proving the conflict is caught late).
+        setup_compact_source(&d, source, principal).await;
+        // The pre-existing context that owns the label.
+        let taken = register_context(&d, Some("taken"), None, principal);
+
+        let c = caller_with_context(source);
+        let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        let result = d
+            .dispatch(&[s("fork"), s("--compact"), s("--name"), s("taken")], &c)
+            .await;
+        assert!(!result.is_ok(), "conflicting label must fail: {}", result.message());
+        let msg = result.message();
+        assert!(
+            msg.contains(&taken.to_hex()),
+            "error must name the existing context's full id: {msg}"
+        );
+        assert!(
+            msg.contains("switch"),
+            "error must hint how to reach the existing context: {msg}"
+        );
+        // No partially-created context row survives the failed fork.
+        let after = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        assert_eq!(before, after, "a conflicting fork must not create a context");
+    }
+
+    /// The label check must run BEFORE the distillation LLM call — a conflict
+    /// shouldn't burn a (slow, billed) summary first. With no LLM configured the
+    /// unfixed path fails inside `summarize` ("no LLM configured"); the fixed
+    /// path fails earlier with the label conflict + switch hint.
+    #[tokio::test]
+    async fn fork_compact_label_conflict_precedes_distill() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "some content"); // non-empty source
+        register_context(&d, Some("taken"), None, principal);
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--compact"), s("--name"), s("taken")], &c)
+            .await;
+        assert!(!result.is_ok(), "conflicting label must fail: {}", result.message());
+        let msg = result.message();
+        assert!(
+            msg.contains("switch"),
+            "label check must win over the distill: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("llm") && !msg.contains("summariz"),
+            "must not have reached the distill step: {msg}"
+        );
+    }
+
+    /// Bug 3 (2026-07-04): a `--compact` distillation must run on the CALLING
+    /// context's OWN provider+model — the pair known to work — not the source's
+    /// model re-pinned on the registry's default provider. Here the caller runs
+    /// on anthropic while the registry default is deepseek; before the fix the
+    /// distill resolved the inherited model through the default provider and ran
+    /// on deepseek. Two providers with distinct canned summaries reveal which
+    /// one ran via the child's seed block.
+    #[tokio::test]
+    async fn fork_compact_distill_uses_calling_context_provider() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "material to distill");
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.register(
+                "deepseek",
+                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
+            );
+            // Default provider is the WRONG one for an anthropic caller — the
+            // old resolver pinned the inherited model here.
+            reg.set_default("deepseek");
+        }
+        // The calling context runs on anthropic.
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
+        }
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")], &c)
+            .await;
+        assert!(result.is_ok(), "compact fork failed: {}", result.message());
+
+        let seed = ordered_contents(&d, child_id(&d, "child"));
+        assert!(
+            seed.iter().any(|c| c.contains("ANTHROPIC-DISTILL")),
+            "distill must run on the calling context's own provider (anthropic): {seed:?}"
+        );
+        assert!(
+            !seed.iter().any(|c| c.contains("DEEPSEEK-DISTILL")),
+            "distill must NOT fall to the registry default provider (deepseek): {seed:?}"
+        );
+    }
+
+    /// An explicit `--distill-model` overrides the calling-context default and
+    /// resolves through the registry (alias-aware) — locking that the Bug 3 fix
+    /// only changed the *default*, not the override.
+    #[tokio::test]
+    async fn fork_compact_distill_model_override_wins() {
+        use crate::llm::{MockClient, ModelAlias, Provider};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "material to distill");
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.register(
+                "deepseek",
+                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
+            );
+            reg.set_default("anthropic");
+            let mut aliases = HashMap::new();
+            aliases.insert(
+                s("cheap"),
+                ModelAlias {
+                    provider: s("deepseek"),
+                    model: s("deepseek-flash"),
+                },
+            );
+            reg.set_model_aliases(aliases);
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
+        }
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--compact"),
+                    s("--name"),
+                    s("child"),
+                    s("--distill-model"),
+                    s("cheap"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "compact fork failed: {}", result.message());
+
+        let seed = ordered_contents(&d, child_id(&d, "child"));
+        assert!(
+            seed.iter().any(|c| c.contains("DEEPSEEK-DISTILL")),
+            "--distill-model must override to deepseek despite the anthropic caller/default: {seed:?}"
         );
     }
 }
