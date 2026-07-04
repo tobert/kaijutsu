@@ -80,11 +80,27 @@ pub fn initialize_llm_registry(config: &LlmConfig) -> LlmResult<LlmRegistry> {
                 tracing::info!(provider = %name, "registered LLM provider");
                 registry.register(&name, Arc::new(provider));
             }
-            Err(e) => {
+            // Only an actual credential failure should guess "missing API
+            // key?" — an unknown provider type (`Provider::from_config`'s
+            // `Unavailable` arm, message from `unknown_provider_type_message`)
+            // names its own cause, and the old blanket "(missing API key?)"
+            // hint on every failure misdiagnosed it (2026-06-30 config
+            // papercuts). `kj config set` now rejects unknown types at write
+            // time (`kj/config.rs`); this boot-time warn is the fallback for
+            // configs written before that validation existed, or edited
+            // outside `kj config set` entirely.
+            Err(e @ LlmError::AuthError(_)) => {
                 tracing::warn!(
                     provider = %provider_config.provider_type,
                     error = %e,
                     "failed to initialize provider (missing API key?)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_config.provider_type,
+                    error = %e,
+                    "failed to initialize provider"
                 );
             }
         }
@@ -450,4 +466,93 @@ type = "all"
         );
     }
 
+    /// 2026-06-30 config papercut, Fix 1: the startup warn's "(missing API
+    /// key?)" guess must appear ONLY for a genuine `AuthError`, never for an
+    /// unknown provider type — that case names its own cause via
+    /// `unknown_provider_type_message`. Captures real tracing output (not
+    /// just the returned error) so it guards the log line an operator
+    /// actually sees, not just the underlying `LlmError`.
+    #[test]
+    fn init_registry_warns_key_hint_only_for_auth_not_unknown_type() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Minimal tracing Layer that stringifies each event (message + all
+        // fields) so the test can grep the rendered warn lines. Mirrors the
+        // `LogCaptureLayer` pattern in `mcp/broker.rs`'s hook-attribution
+        // tests.
+        struct LogCaptureLayer(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct StringVisitor<'a>(&'a mut String);
+                impl tracing::field::Visit for StringVisitor<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write;
+                        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                    }
+                }
+                let mut s = String::new();
+                event.record(&mut StringVisitor(&mut s));
+                self.0.lock().unwrap().push(s);
+            }
+        }
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer(events.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let toml = r#"
+default_provider = "mock"
+
+[providers.local-e4b]
+enabled = true
+
+[providers.anthropic]
+enabled = true
+api_key_env = "KAIJUTSU_TEST_DEFINITELY_UNSET_XYZ"
+
+[providers.mock]
+enabled = true
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        // "mock" (cfg(test)-only) registers successfully, so this doesn't
+        // error out before both bad providers get a chance to warn.
+        initialize_llm_registry(&config).expect("mock default registers");
+
+        let recorded = events.lock().unwrap().clone();
+        // Match on the exact `provider=<name>` field (the `%provider_type`
+        // Display value, unquoted) rather than a loose substring — the
+        // unknown-type message's own "(supported: anthropic, ...)" list
+        // contains the literal text "anthropic", so a bare `.contains("anthropic")`
+        // would nondeterministically match either line depending on
+        // `HashMap` provider-iteration order.
+        let unknown_type_line = recorded
+            .iter()
+            .find(|s| s.contains("provider=local-e4b"))
+            .unwrap_or_else(|| panic!("no warn line mentioned provider=local-e4b: {recorded:?}"));
+        assert!(
+            unknown_type_line.contains("unknown provider type"),
+            "unknown-type warn should name the cause: {unknown_type_line}"
+        );
+        assert!(
+            !unknown_type_line.to_lowercase().contains("key"),
+            "unknown-type warn must not guess about API keys: {unknown_type_line}"
+        );
+
+        let auth_error_line = recorded
+            .iter()
+            .find(|s| s.contains("provider=anthropic"))
+            .unwrap_or_else(|| panic!("no warn line mentioned provider=anthropic: {recorded:?}"));
+        assert!(
+            auth_error_line.to_lowercase().contains("missing api key"),
+            "genuine auth failure should keep the key hint: {auth_error_line}"
+        );
+    }
 }

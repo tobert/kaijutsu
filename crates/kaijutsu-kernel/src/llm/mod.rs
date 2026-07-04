@@ -42,14 +42,14 @@ pub mod toml_config;
 // Re-export key types
 pub use config::ProviderConfig;
 pub use mailbox::ConversationMailbox;
+pub use stream::{
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
+    StreamError, StreamEvent, UsageExtra,
+};
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
     load_llm_config_toml, load_models_config_toml,
-};
-pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
-    StreamError, StreamEvent, UsageExtra,
 };
 
 use serde::{Deserialize, Serialize};
@@ -376,6 +376,32 @@ pub enum Provider {
     Mock(MockClient),
 }
 
+/// Provider type names `Provider::from_config` accepts — the `[providers.
+/// <name>]` TOML table name in `models.toml` IS the type. Shared with `kj
+/// config set`'s write-time validation of `models.toml` (`kj/config.rs`) so
+/// both surfaces agree on the supported list and its wording (2026-06-30
+/// config papercuts: a typo'd provider type should fail loud at write time,
+/// not silently drop at boot and hang a turn later).
+pub const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
+    "anthropic",
+    "deepseek",
+    "openai",
+    "ollama",
+    "lemonade",
+    "local",
+];
+
+/// Build the standard "unknown provider type" message — used by both
+/// `Provider::from_config` (boot-time init) and `kj config set`'s
+/// `models.toml` validation (write-time rejection), so an operator sees the
+/// same wording regardless of which surface caught the typo.
+pub fn unknown_provider_type_message(name: &str) -> String {
+    format!(
+        "unknown provider type '{name}' (supported: {})",
+        SUPPORTED_PROVIDER_TYPES.join(", ")
+    )
+}
+
 impl Provider {
     /// Create a provider from configuration.
     ///
@@ -430,10 +456,7 @@ impl Provider {
                     "Mock summary for testing (model: {model})."
                 ))))
             }
-            other => Err(LlmError::Unavailable(format!(
-                "Unknown or unsupported provider type: {other} \
-                 (supported: anthropic, deepseek, openai, ollama, lemonade, local)"
-            ))),
+            other => Err(LlmError::Unavailable(unknown_provider_type_message(other))),
         }
     }
 
@@ -980,6 +1003,49 @@ mod tests {
         assert_eq!(
             Provider::DeepSeek(deepseek::Client::new("fake")).name(),
             "deepseek"
+        );
+    }
+
+    /// An unknown `[providers.<name>]` type must name the type precisely and
+    /// list the supported set — and must NOT guess about API keys (that
+    /// guess belongs to the actual `AuthError` case below). Regression for
+    /// the 2026-06-30 config papercut: `local-e4b` was reported as "Unknown
+    /// or unsupported provider type" with no indication that the fix is to
+    /// rename the table, not hunt for a missing key.
+    #[test]
+    fn from_config_unknown_type_names_it_precisely_no_key_guess() {
+        let config = ProviderConfig::new("local-e4b");
+        let err = Provider::from_config(&config).unwrap_err();
+        assert!(matches!(err, LlmError::Unavailable(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown provider type 'local-e4b'"),
+            "msg: {msg}"
+        );
+        assert!(
+            msg.contains("supported: anthropic, deepseek, openai, ollama, lemonade, local"),
+            "msg: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("key"),
+            "unknown-type error must not guess about API keys: {msg}"
+        );
+    }
+
+    /// A genuine credential failure (no resolvable API key) is the ONLY case
+    /// that should mention keys — the flip side of the assertion above. Uses
+    /// an explicit bogus `api_key_env` (rather than relying on
+    /// `ANTHROPIC_API_KEY` being unset) so the test is deterministic
+    /// regardless of the host's real environment.
+    #[test]
+    fn from_config_missing_key_is_an_auth_error_mentioning_key() {
+        let config =
+            ProviderConfig::new("anthropic").with_api_key_env("KAIJUTSU_TEST_DEFINITELY_UNSET_XYZ");
+        let err = Provider::from_config(&config).unwrap_err();
+        assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
+        assert!(
+            err.to_string().to_lowercase().contains("key"),
+            "auth error should mention key: {err}"
         );
     }
 
@@ -2431,9 +2497,15 @@ mod tests {
                 "[gpal] tool added: example_tool",
             );
             let msgs = hydrate_from_blocks(&[block]);
-            assert_eq!(msgs.len(), 1, "expected one user message for one notification");
+            assert_eq!(
+                msgs.len(),
+                1,
+                "expected one user message for one notification"
+            );
             assert_eq!(msgs[0].role, Role::User);
-            let text = msgs[0].as_text().expect("notification should hydrate as text");
+            let text = msgs[0]
+                .as_text()
+                .expect("notification should hydrate as text");
             // Envelope produced by format_notification_for_llm.
             assert!(
                 text.starts_with("<notification "),
@@ -2475,10 +2547,12 @@ mod tests {
             assert_eq!(msgs[1].role, Role::Assistant);
             assert_eq!(msgs[1].as_text(), Some("mid"));
             assert_eq!(msgs[2].role, Role::User);
-            assert!(msgs[2]
-                .as_text()
-                .expect("notification text")
-                .contains("kind=\"tool_removed\""));
+            assert!(
+                msgs[2]
+                    .as_text()
+                    .expect("notification text")
+                    .contains("kind=\"tool_removed\"")
+            );
             assert_eq!(msgs[3].role, Role::Assistant);
             assert_eq!(msgs[3].as_text(), Some("after"));
         }
@@ -2501,7 +2575,11 @@ mod tests {
             );
             assert_eq!(block.role, BlockRole::System, "sanity: role is System");
             let msgs = hydrate_from_blocks(&[block]);
-            assert_eq!(msgs.len(), 1, "System-role Notification must not be filtered out");
+            assert_eq!(
+                msgs.len(),
+                1,
+                "System-role Notification must not be filtered out"
+            );
         }
 
         // ── (Tool, Text) content-typed blocks (svg_block / abc_block, A1) ──
