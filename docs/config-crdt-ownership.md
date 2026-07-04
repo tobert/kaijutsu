@@ -6,8 +6,10 @@ the CRDT owns the content. No host-disk write-through, no reload-from-host, no
 mtime staleness. Project repo source files are **not** in scope — there the host
 disk is the truth (cargo/git/editor read real files) and write-through stays.
 
-Status: **direction LOCKED 2026-06-16** (decided with Amy). No code yet. This doc
-is the durable record; slices below are the build order.
+Status: **SHIPPED** — slice 1 (rc) landed 2026-06-16, slice 2 (config TOMLs)
+2026-06-17. This doc is the durable design record; the slices below were the
+build order. It supersedes the earlier `FileDocumentCache`-era design
+(`docs/rc-crdt-vfs-bridge.md`, deleted 2026-07-04 — git history has it).
 
 ---
 

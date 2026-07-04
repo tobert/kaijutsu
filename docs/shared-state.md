@@ -100,6 +100,10 @@ the shared space as its **Observe surface**, built entirely from existing primit
 
 ## Retiring KV (delete — it has one real caller, and it splits in two)
 
+> Confirmed with Amy 2026-07-04: KV retirement is the plan. The original KV
+> design record (`docs/kernel-kv.md`) is deleted — git history has it. The code
+> deletion below is still to do (tracked in issues.md, "Delete KvDocument/Kv").
+
 `KvDocument`/`Kv` + the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`,
 @79–83) and `kj kv` go away. The audit's "test-only" read was **too optimistic**: the
 app is a real, production caller. It persists exactly one key pattern —

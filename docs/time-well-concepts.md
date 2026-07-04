@@ -331,10 +331,10 @@ but ベタ/クサい, i.e. cheesy).
 
 ## Open questions for the next iteration
 
-These are the UX-level questions; the engineering-level open questions (the
-`conclude` wire shape, band-1 clock-vs-arc, dive-in re-layout) now live in
-`docs/viz-substrate.md`. The radial-axis question is resolved there (three
-lifecycle bands).
+These are the UX-level questions; the engineering-level open questions now
+live in `docs/timewell.md` (`docs/viz-substrate.md` was retired 2026-07-04 —
+its still-true substrate content is timewell.md's appendix, the rest is git
+history). The radial-axis question is resolved there (four idle-age bands).
 
 - What exactly is the overview summarization rule — roots + drivers, or
   roots + anything-with-active-drift, or RC-configurable per context_type?

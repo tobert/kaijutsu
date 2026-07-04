@@ -16,10 +16,12 @@ it navigates, and the staged evolution from fundamental fixes (now landed) to
 a professional-feeling instrument.
 
 **Relationship to the other docs.** `docs/time-well-concepts.md` stays as the UX
-design record (the 40 mockups, the visual grammar). `docs/viz-substrate.md` stays
-as the substrate reference (join / scales / data flow / wire gaps), but its build
-order and its three-band layout thesis are superseded — first by its own step 7.8
-vortex addendum, now by this plan. New open questions land here, not there.
+design record (the 40 mockups, the visual grammar). `docs/viz-substrate.md` was
+retired 2026-07-04: its still-true substrate reference (D3 decomposition, data
+flow / wire grounding, card + shader vocabulary, wire gaps, dependency notes) is
+folded into the "Substrate notes" appendix below; its superseded halves (the
+three-band layout thesis, the build order, the spiral) live only in git history.
+New open questions land here.
 
 ## Status (2026-07-03)
 
@@ -173,7 +175,8 @@ diagnosed. The two-surface split below is still the target; only the
   the "I started it second, it's 2" rule), holds its position while it lives,
   and **conclude compacts** the later slots by exactly one. That's the whole
   rule; muscle memory rides the rule, not fixed addresses. (This is the
-  "predictable motion, not zero motion" principle from viz-substrate, applied
+  "predictable motion, not zero motion" principle from the substrate notes
+  appendix, applied
   to the keyboard surface too.) Pinning is deferred until the itch is real.
   The rank is the keyboard surface, curated by *membership* — shells, work
   contexts, a stats surface. Rendered as a fixed rail at the mouth of the well
@@ -401,7 +404,7 @@ Old contexts stop being geometry and become an archive.
   the search form on demand. Additive wire change, deferrable until payload
   size actually hurts.
 - **LOD between mouth and horizon**: mid-river cards drop to instanced chips
-  (`MeshTag` + shared material, per the substrate doc's validated plan) —
+  (`MeshTag` + shared material, per the appendix's validated rendering notes) —
   fixes the throat overlap and the 50-entity texture cost.
 - **Search at the horizon**: `/` opens the archive form — query over
   label/keywords/`search_similar`/`get_clusters` (the RPCs exist and are
@@ -430,12 +433,12 @@ The "not another JavaScript thing" pass, once the structure is honest.
 
 ## Doc + code hygiene
 
-- ✅ `docs/viz-substrate.md`: superseded banners are in place for the
-  three-band layout section and the build-order section; this pass added
-  matching banners to the navigation/reading-slot section and the
-  continuous-spiral section too, since both are themselves superseded by the
-  ring rebuild. D3 decomposition, data flow, wire gaps, and dependency notes
-  remain the substrate reference.
+- ✅ `docs/viz-substrate.md`: retired (2026-07-04, `git rm`). Its still-true
+  content is the "Substrate notes" appendix below; the superseded sections
+  (three-band layout, build order, reading-slot nav, continuous spiral) are
+  git-history only. Code comments still citing `docs/viz-substrate.md`
+  (`time_well/mod.rs`, `card.rs`, `sync.rs`; `kaijutsu-viz` `join.rs`,
+  `scales.rs`, `lib.rs`) should be repointed here on next touch.
 - ✅ `CompactingBandLayout` + its config/tests — **deleted** from
   `kaijutsu-viz` (2026-07-03; decision recorded above). `RadialBands`/scales
   stay.
@@ -466,7 +469,7 @@ won't discover until they hurt:
 - **Parked on purpose** (don't pick up opportunistically): drift arcs/particle
   layer (needs a context→context edge-list wire), the JOIN dive-through
   camera, ViewSpec extraction. The conversation view's `Screen`-transition
-  formalization (viz-substrate "ViewSpec" section) is a known precursor to the
+  formalization (appendix, "ViewSpec + the kj→app seam") is a known precursor to the
   Stage 2 digit-key hook — do the minimum.
 - **Landmines**: Bevy 0.18 renames (trust the `CLAUDE.md` table over training
   memory). BRP `send_keys` ships named keys with `logical_key=Unidentified`
@@ -502,3 +505,133 @@ won't discover until they hurt:
    general concept; every track has a clock slot, noop for non-musical lanes,
    with a coder clock expected to develop over time (or a musical clock used
    for fun). One noun, no rename.
+
+---
+
+## Appendix: substrate notes (folded from `docs/viz-substrate.md`, retired 2026-07-04)
+
+The engineering substrate under the well — `kaijutsu-viz` + the
+`view/time_well/` code. Compressed from the retired doc; its superseded halves
+(three-band thesis, build order, reading-slot nav, continuous spiral) are in
+git history only.
+
+### Stance
+
+Procedural, not framework-y. Port the ideas from D3 that ECS lacks; delete the
+ones the engine already gives us (frame loop, camera, depth, shaders, picking).
+A substrate to build views *on*, not a charting library — no abstraction until
+a second consumer exists (the crate's standing rule).
+
+### D3, decomposed — what was ported, what wasn't
+
+- **Data-join — ported; the foundation.** `Join<K,V>` in `kaijutsu-viz`: keyed
+  data in, entity diff out (enter/update/exit). Key on `ContextId`, never an
+  array index — stable keys are what keep transitions coherent. The two
+  cadences are *structural*, not a caller convention: the **data tick**
+  (`update`/`touch`, event-driven, cheap, must never relayout) vs the **layout
+  tick** (`enter`/`exit`, poll-driven, `needs_relayout()`).
+- **Scales — ported.** Pure functions, domain → range, **invertible** (invert
+  is the picking/hit-test path); invert round-trip proptests. `RadialBands`
+  stays in the crate but the ring path doesn't use it — the app divides its own
+  radius/depth envelope directly.
+- **Transitions — not ported.** D3 transitions exist because the DOM has no
+  frame loop. Hand-roll on `bevy_math::curve` (`EasingCurve` +
+  `sample_clamped(t)` driven by a tiny `Tween` component, ~15 lines). Caveat:
+  material **alpha** lives in `Assets<Material>`, not on the entity —
+  position/scale via `Transform` are free. Never a build step; they run
+  throughout.
+- **Layouts — one concrete algorithm at a time, pure & stateless.** Position
+  derives from a stable `order_key` at fixed pitch; no persisted slot table
+  (`LayoutState` was drafted and disproved). The motion invariants: *append*
+  moves nothing; *conclude* shifts later slots by exactly one. The bar is
+  **"predictable motion, not zero motion"** — motion must be rule-governed and
+  memorable; a count-relative reflow of a live band stays banned (non-local,
+  not rule-memorable). A `Layout` trait waits for the second layout.
+
+### Data flow — grounded in the wire surface
+
+- **Layout tick = poll.** There are **no context-lifecycle push events** in the
+  schema; the view polls `listContexts` and diffs — the diff *is* the layout
+  tick. Topology changes are rare relative to frames; the payload is one struct
+  per context, with `forkKind`/`parentId` aboard so lineage is known at enter
+  time. `getClusters`/`getNeighbors` feed the cold-band relation layer on the
+  same cadence, pull-only.
+- **Data tick = subscribe.** Live status is *not* a `ContextHandleInfo` field;
+  it's inferred from `subscribeBlocksFiltered` scoped to the **currently
+  visible** contexts (`statusChanged`, `inserted`, `metadataChanged`) — status
+  is only paid for on cards that are on screen.
+- Two cadences, two kernel surfaces, opposite cost profiles — why the split is
+  structural in the `Join`.
+
+### The card
+
+Populated from `ContextHandleInfo` via the join: `label` → title (short-id
+fallback), `contextType` → accent, `model`/`provider` → badge, `forkKind` →
+fork badge, `keywords` → chips, `topBlockPreview` → preview, `parentId` →
+lineage; the live status glyph is the data tick, not a struct field. Anything
+that writes `ContextHandleInfo` is picked up on the next poll — new ways to
+distinguish cards are new metadata fields + encoding rules, not new rendering
+code.
+
+Rendering notes (validated against Bevy 0.18):
+
+- **Instance ≠ entity.** Entities sharing one mesh + material auto-batch into
+  one draw; each chip stays its own pickable `Entity` (`MeshPickingPlugin`
+  resolves to entities). **Per-instance color breaks the batch** unless it goes
+  through `MeshTag(u32)` → storage buffer sampled in the shader; `Transform`
+  varies free while batched. Billboarding is a manual `looking_at` system.
+- **Card material: MSDF text + SDF decor, not vello RTT.** Vello RTT was the
+  first-cut expedient but blurs under the focus dolly; the split is
+  `block_fx.wgsl`'s own — texture = text content, shader
+  (`WellCardMaterial`/`well_card.wgsl`) = border/glow/rings/pulse, because
+  baked pixels can't animate cheaply and shader uniforms can. Slice 1 (the
+  material) shipped; migrating card *text* onto MSDF glyphs is unfinished
+  (glyphs are atlas-async — decor-only for a frame or two is fine).
+- **Glow = HDR + Bloom on the one shared `Camera3d`** (`Hdr` +
+  `Bloom::NATURAL` + `TonyMcMapface`; the UI pass runs after tonemapping, so
+  the conversation view is untouched). The tiering rule: **bright = live
+  action** — selection rims/status pulses go HDR (>1.0) so they bloom; passive
+  structural state (drift shimmer) stays LDR. The activity ring deck rides the
+  kernel-wide `ServerEvent` stream (zero new wire), each event rippling at the
+  producing context's ring angle (`activity.rs`, pure + unit-tested).
+
+### Data-model gaps — wire additions still open
+
+Gap 0 (`conclude` + `concludedAt` + `ContextState::Concluded`) shipped long
+ago. Still open: **block/message count** (only if card size should encode
+conversation length; one `UInt64` field or a count RPC); **fork density**
+(derivable client-side by folding over `parentId` in the poll — no wire
+change); **context-level live status** (defer until an overview needs
+"streaming" on a context whose blocks aren't subscribed); **drift edges,
+context → context** — the arcs/particles-between-cards layer needs an edge
+*list* (active + historical) that neither `driftQueue` nor per-block Drift
+snapshots give; the per-card shimmer shipped without it.
+
+### ViewSpec + the kj→app seam
+
+`ViewSpec { query, layout, encodings }` (so `kj view …` spawns views) stays
+deferred until it can be *extracted from two real consumers* — it was the part
+most at risk of being over-built. The deferral is safe because the transport
+already exists: `invoke_peer` / `PeerCommands.invoke(action, params)` is live
+(proven by `switch_context`), so a future `kj view` is purely additive — a
+handler, a `dispatch_peer_action` arm, a message, a `Screen` variant; no
+wire-schema change. One precursor: `Screen` has only `Conversation`, and
+context switches don't drive `Screen` — formalize that linkage when the second
+screen lands.
+
+### Dependency notes (verified June 2026)
+
+- **Scales: our own** (~200 lines; band-invert is a bisect, time-`nice` a few
+  extra lines). No maintained d3-scale crate worth a dependency. **Tweening:
+  `bevy_math::curve`**, no crate (`bevy_tweening 0.15` is the fallback if
+  declarative sequences are ever wanted).
+- **`fjadra` 0.2.1 — adopt *if* force ever lands**, don't reimplement
+  (`Simulation` in a `Resource`, `step()` per frame, never `iter()` in a frame
+  loop). The well is deterministic geometry; this may never be needed. Borrowed
+  patterns if it does: egui_graphs' stateless-algorithm / persisted-state
+  split; Rerun `re_view_graph` — persistent sim, re-heat alpha on structural
+  change, seed new nodes near their neighbours.
+- **Layout output stays dependency-free 2D `f32`** (`LayoutPos`); the app lifts
+  to `glam::Vec3` at its boundary — keeps `kaijutsu-viz` zero-dep and dodges
+  lockstep with Bevy's pinned `glam` (the tree already carries two `glam`s).
+  `kurbo` is card *rasterization*, wrong layer for scene coordinates.

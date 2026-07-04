@@ -1,18 +1,23 @@
 # トラック tracks — the beat belongs to the track, not the player
 
-> **Status:** design direction, captured 2026-06-29 in a co-design session
-> (Amy + Claude). Decisions are *directions*, not commitments — code is truth,
-> this is where we're aiming. The implementation is future work; a fresh
-> Claude + Amy should start the surgery from this doc. Companions:
-> `docs/hyoushigi.md` (the low-level `Tick`/`Timeline` primitive this builds on),
-> `docs/chameleon.md` (the music application that consumes tracks),
-> `docs/shared-state.md` (the `/run` output substrate a probe attachment writes).
+> **Status:** SHIPPED — Stages 1–3 M1 landed 2026-06-29/30 (clock on the track,
+> score on the track, `ClockSource` generalised + first sound out the door). This
+> doc states the design as built; `docs/devlog.md` ("The music stack") carries the
+> build story and git history keeps the stage-by-stage trackers and review logs.
+> Companions: `docs/hyoushigi.md` (the `Tick`/`Timeline` primitive underneath),
+> `docs/chameleon.md` (the music application on top), `docs/midi.md` (network/drift
+> clock design + the M2–M4 roadmap), `docs/pcm.md` (the render/wire-cue side),
+> `docs/shared-state.md` (the `/run` substrate a probe attachment writes).
+>
+> **Ahead** (per `docs/midi.md`): M2 MIDI-in telemetry, M3 the drift-modeled clock
+> (the `Modeled` variant + `apply_estimate`), M4 cross-node + the edge node. Also
+> deferred: the cold-start re-arm sweep (a kernel restart resets tracks to stopped).
 
 ## The insight
 
 The beat is **exogenous**. Your watch, the family, the pets; my NTP, compute
 availability, a good cluster vs a noisy neighbour — none of those clocks are
-*ours*. We are *beaten by the world around us*. So the beat should not belong to
+*ours*. We are *beaten by the world around us*. So the beat does not belong to
 the player. It belongs to the **track**, and **a context attaches to a track to
 be beaten by it.**
 
@@ -21,1336 +26,325 @@ a set of attached contexts. The track persists; contexts and users come and go,
 leaving their mark on it and it on them — *a track is a bit like code, or a good
 instrument*. A player is whoever is sitting in the chair right now.
 
-This is the substrate under both halves we'd been designing separately:
+This is the substrate under both halves that were once designed separately:
 **chameleon** (musicians playing to a beat) and **myaku** (probes sampling on a
 cadence) are the *same shape* — a context attached to a clock domain — seen from
 the music side and the metrics side. (See *What this subsumes*.)
 
-## Where the beat lives today (and why we're moving it)
-
-Today everything that clocks is per-**context**:
-
-- the timeline + playhead is `kernel.timeline(context_id)` (`beat.rs`);
-- the scheduler heap entries are keyed by `ContextId`;
-- `armed: HashMap<ContextId, BeatState>` holds the policy, and **`track` is just a
-  field on `BeatState`** — a label copied across forks, with no entity of its own.
-
-So the track is currently an *emergent grouping* of contexts that share a label.
-That forced two workarounds that this model retires:
-
-- **the playhead carry** (`beat_state.playhead_tick`, shipped 2026-06-29): musical
-  time is made continuous across a rotation chain by *copying the tick number*
-  context→context, precisely because the clock keeps leaving with the retired
-  context. If the clock lives on the track, **it never leaves — continuity is
-  free, no carry.**
-- **`track_head`** (the per-track "who's the live tip" pointer we were about to
-  add for `stop --track`/`play --track`): unnecessary once the track *is* the
-  entity and knows its own attached contexts.
+Because the clock lives on the track, continuity across a rotation chain is free
+by construction: musical time never leaves with a retired context, so there is no
+playhead-carry, no `track_head` pointer, no horizon race — the machinery those
+workarounds existed for is simply absent.
 
 ## The track entity
 
+The runtime shape (`TrackState` in `kaijutsu-server/src/beat.rs`):
+
 ```
-Track {
-    id:          TrackId,             // the durable lane identity (already exists)
-    clock:       ClockSource,         // what drives the beat — see "Clock sources"
-    playhead:    Tick,                // musical time, owned here (was per-context)
-    beat_count:  u64,                 // for cadence math
-    transport:   Playing | Stopped,   // MIDI-style: stop = stop the clock
-    score:       Timeline,            // the track's COPIES of its inputs + played_by
-                                      //   back-refs; the score is emergent (entity #1)
-    attached:    Map<ContextId, Attachment>, // the track's passive view of current
-                                      //   bindings — the CONTEXT binds itself (#3)
+TrackState {
+    clock:          ClockSourceKind,   // what drives the beat — see "Clock sources"
+    playhead:       Tick,              // musical time, owned here
+    beat_count:     u64,               // cadence math
+    transport:      Playing | Stopped, // MIDI-style: stop = stop the clock
+    score_context:  ContextId,         // the durable score container — see below
+    attached:       Map<ContextId, AttachedContext>,
 }
 
-Attachment {
-    wakeup:  Cadence,        // wake THIS context every N beats/bars (its own divisor)
+Attachment {                           // the persisted binding contract
+    wakeup:  Cadence,        // wake THIS context every N beats (its own divisor)
     rotate:  Option<Cadence>,// self-fork page-turn cadence; None = never auto-rotate
     // (role/behavior is the context's own tick rc — see "Behavior on a beat")
 }
 ```
 
+Each `AttachedContext` bundles the `Attachment` with runtime-only materialization
+bookkeeping (failure counters, drain water marks) that is never persisted. A
+context is attached to **at most one track** at a time; attaching to a new track
+detaches from the old, so one track's beat can never inject another's `KJ_*`
+facts.
+
 ### 1. The track holds copies of its inputs; the score is emergent
 
 The track does two things with what its players produce: it **takes its own copy
-of its direct inputs**, and it **keeps a reference back to the producing context**.
-The **score is emergent** from that track-held data (plus the contexts'), not a
-single block log players write into and lose on retirement. `Cell` already carries
-a track lane *and* a separate `played_by` principal — so the track-tagged cell is
-the track's copy, and `played_by`/provenance is the back-reference; the mechanism
-mostly exists. A retired player's contributions persist as the track's copies (the
-score survives the page-turn), while the back-reference keeps provenance and a live
-handle to the context while it's around. *Like code or a good instrument — it
-persists, the people come and go, each leaving a mark.*
+of its direct inputs**, and it **keeps a reference back to the producing
+context**. The **score is emergent** from that track-held data, not a single
+block log players write into and lose on retirement. `Cell` carries a track lane
+*and* a separate `played_by` principal — the track-tagged cell is the track's
+copy, `played_by` is the back-reference. A retired player's contributions persist
+as the track's copies (the score survives the page-turn), while the
+back-reference keeps provenance and a live handle to the context while it's
+around. *Like code or a good instrument — it persists, the people come and go,
+each leaving a mark.*
 
-So "the track owns the score" means it owns the **copies + provenance**, and the
-score is the emergent ordered view over them — *not* that contexts have no data of
-their own. This is the larger part of the surgery (today the `Timeline` and its
-cells are reached per-context). It **can be staged** — see *Staging*.
+### 2. The score container is a real per-track score context (option C)
 
-### 2. Contexts attach with a per-context wakeup cadence
+The score's durable home is a **score context** minted when the track is created:
+a real `Live` context (`context_type="score"`, label `score-<track>`) whose
+Conversation document *is* the track's score, stored set-once on the `tracks`
+row. Because it is a **real `ContextId`**, the entire per-context block machinery
+is reused unchanged — `reserve_block_id`, `insert_from_snapshot_as`,
+`last_block_id`, `block_snapshots`, `max_tick` all take the score context's id,
+with no `TrackId` block-store API and no index/RPC ripple — and it embodies the
+design's own thesis: the score context is the durable thing producers rotate
+around, browsable in the app like any context. It is a **non-producer**: it never
+runs an rc lifecycle, takes a turn, or hydrates to a model — viewable, not
+hidden.
+
+The track also owns the live `Timeline` (clock + open future + committed log),
+keyed by `TrackId` on the kernel. It is armed on track create and disarmed on
+track teardown, **not** on context detach — the timeline survives page-turns. A
+fork of an attached context never clones it; the child re-attaches and becomes a
+co-producer on the same shared timeline.
+
+### 3. Contexts attach with a per-context wakeup cadence
 
 Attachment is not "fire everyone every beat." Each attachment carries its **own
-wakeup divisor**, so one track can wake:
+wakeup divisor**, so one track can wake the **musician** every 8 or 16 bars (play
+a phrase) and the **conductor** every 64 bars to check in — and the conductor
+*can take its time* manipulating the track and the other contexts' inputs between
+wakeups. `wakeup` gates only the rc tick behaviour; the per-beat materialize is
+the track's own work and runs regardless. Track-level musical knobs (tempo,
+`beats_per_phrase`) live on the track's `BeatPolicy`; the wakeup cadence is the
+attachment's.
 
-- the **musician** every 8 or 16 bars (play a phrase), and
-- the **conductor** every 64 bars to check in — and the conductor *can take its
-  time* manipulating the track and the other contexts' inputs between wakeups.
+### 4. The context binds; the child inherits the bind at fork
 
-This generalises today's per-context `ooda_every` cadence and moves its ownership
-onto the track (the track knows when to wake each attached context).
+The rotate cadence is part of the binding — but **the context drives the bind,
+not the track.** The track stays *ignorant of context lifecycles*; it just holds
+the current set of bindings. At fork, the child inherits the bind (the
+attachment row copies with the fork) and re-binds — announces itself to the track
+— on the way up. A rotation page-turn is: the context self-forks, the child
+inherits the binding, the child re-attaches to the **same** track, the parent
+detaches. The clock and score never pause. Lifecycle knowledge stays on the
+context side (where `fork` already lives); the track stays a passive clock +
+score.
 
-### 3. The context binds; the child inherits the bind at fork
-
-The rotate cadence is part of the binding — but **the context drives the bind, not
-the track.** The track stays *ignorant of context lifecycles*; it just holds the
-current set of bindings. **At fork, the child inherits the bind** — it travels with
-the fork exactly as `beat_state.track` does today — and the child re-binds
-(announces itself to the track) on the way up. So a rotation page-turn is: the
-context self-forks, the child inherits the binding, the child re-binds/re-arms, and
-the track's binding set updates because the *child told it* — the track never had
-to watch for the fork. The clock and score never pause, so there's no race, no
-playhead carry, no `track_head`. Lifecycle knowledge stays on the context side
-(where `fork` already lives); the track stays a passive clock + score.
-
-### 4. Non-rotating attachments are first-class
+### 5. Non-rotating attachments are first-class
 
 A context can attach with `rotate: None` — an **interactive / user-driven**
-context that wants the two-way observability and the other goodies of being on a
-track (it's woken on a cadence, it can read/write the track's score and siblings),
-but is never auto-rotated. Attaching is the opt-in; rotation is a separate choice.
-This is also why tracks are useful **outside music** — "attach a context to a
-cadence" is a general capability (a watcher, a heartbeat, a periodic check-in).
+context that wants the two-way observability of being on a track (woken on a
+cadence, reads/writes the track's score and siblings) but is never auto-rotated.
+Attaching is the opt-in; rotation is a separate choice. This is also why tracks
+are useful **outside music** — "attach a context to a cadence" is a general
+capability (a watcher, a heartbeat, a periodic check-in).
 
 ## Clock sources — pluggable drivers
 
-A track's clock is driven by a **`ClockSource`**, and the point is that you can
-**plug in different drivers and experiment**:
+A track's clock is a **`ClockSourceKind`** (`kaijutsu-server/src/clock.rs`) — an
+enum, deliberately not a `Box<dyn>` (no hot-loop vtable; maps 1:1 to the
+persisted `clock_kind` column):
 
-- **v1: the system clock** — a wall-period timer at a tempo (what `beat.rs`
-  already does). Start here.
-- **MIDI clock** — for sure happening. We'll want some tracks on the system clock
-  and some on MIDI timing, running side by side. *(Possible reuse: the app may
-  already have time-matching / sync algorithms — worth checking before writing new
-  ones. To investigate during implementation.)*
-- **arbitrary external signals** — solar-power peaks, compute-availability cycles,
-  "good cluster / bad cluster." The track is the seam between an exogenous beat and
-  whoever's attached: the world beats the track, the track beats the players.
+- **`System(SystemClock)`** — a wall-period timer at a tempo. `next_fire(last,
+  now)` returns `now + period`; `set_period` is the tempo knob. The only
+  constructable variant today.
+- **`Modeled`** — the MIDI/drift-modeled clock, uninhabited until M3. Its shape
+  is decided in `docs/midi.md`: a `ClockSource` is a *proxy* for a clock that may
+  be *remote* and *drift-modeled* — an edge node observes the master, fits a
+  tempo/phase/drift model, and ships low-rate *estimates* over the RPC control
+  plane; the kernel regenerates a tight local clock phase-locked to that
+  estimate. Distribute tempo and intent, never pulses.
+- **arbitrary external signals** — solar-power peaks, compute-availability
+  cycles, "good cluster / bad cluster." The track is the seam between an
+  exogenous beat and whoever's attached: the world beats the track, the track
+  beats the players.
 
-**Start simple, design for more.** v1 is one wall-clock driver; the seam is a
-trait so MIDI and external signals slot in without touching the attachments.
+**No realtime pulse path into the scheduler; the heap stays.** Every clock is
+generative-local — the scheduler's `BinaryHeap<(Instant, TrackId)>`, the
+generation/stale-drop logic (a `stop` then `play` within one period never
+double-beats; `play` bumps a generation token that invalidates stale heap
+entries), and zero-CPU idle all survive every clock kind. A drift clock corrects
+an out-of-band estimate; it never streams pulses at the kernel. At M3,
+`apply_estimate` returning "fire moved earlier" must bump the generation and push
+a fresh heap entry so the scheduler doesn't sleep through a forward phase
+correction — the trait is already shaped for it.
+
+**`clock_kind` is MUTABLE and persisted per driver swap.** A track's *identity*
+is durable but its clock *source* is circumstantial: you sketch on the system
+clock, then plug in the KeyStep Pro and slave the same track to it. So
+`clock_kind` updates in `persist_track` whenever the driver changes — the
+deliberate opposite of `score_context_id`, which stays set-once because the score
+IS the track's durable identity. A restart rebuilds the source from the row and
+crashes loud on a kind it can't construct (no silent downgrade to the system
+clock).
+
+The speculation-cost `TickClock` is *derived* from the effective period; a tempo
+change re-slaves it down to the armed timeline (`Timeline::set_clock`) so the
+speculation budget can't go stale against a changed firing period.
 
 **Tracks are independent; there is no 'band' (yet).** Each track is its own clock
-domain — we deliberately do *not* add a broader band/ensemble entity that owns a
-shared clock. When tracks need to play together, what we actually want is to
-**align bars and beats**, and that alignment is **rare and intentional**, not
-continuous: a clock type can *align to a shared reference* — both slaved to a MIDI
-clock, or one clock type that phase-locks to another — at a bar/beat boundary, on
-demand. So cross-track sync is an occasional, explicit operation between
-independent clocks, not an always-on conductor. (It's also why the next point is
-free: separate clock domains pause independently.)
+domain — no broader ensemble entity owns a shared clock. When tracks need to play
+together, what we actually want is to **align bars and beats**, and that
+alignment is **rare and intentional**, not continuous: a clock type can align to
+a shared reference (both slaved to a MIDI clock, or one phase-locking to another)
+at a bar/beat boundary, on demand. Cross-track sync is an occasional, explicit
+operation between independent clocks, not an always-on conductor.
 
-The "metrics must keep sampling while the music is paused" problem that made
-`myaku` argue for its own scheduler **dissolves here**: that's just two tracks —
-a system-clock metrics track you never stop, and a musical track you do. Pausing
-one clock domain doesn't touch the other.
+That independence is also why the "metrics must keep sampling while the music is
+paused" problem dissolves: that's just two tracks — a system-clock metrics track
+you never stop, and a musical track you do. Pausing one clock domain doesn't
+touch the other.
 
 ## Behavior on a beat
 
-The track owns *when*; the attached **context owns *what*.** When a track wakes an
-attached context, it runs that context's **tick behaviour** — an rc lifecycle —
-and injects the fire coordinates as `KJ_` env vars (the existing
-kernel-injection convention, cf. `KJ_PARENT_BLOCK_COUNT`):
+The track owns *when*; the attached **context owns *what*.** When a track wakes
+an attached context, it runs that context's **tick behaviour** — an rc lifecycle
+— and injects the fire coordinates as `KJ_` env vars (the kernel-injection
+convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 
 | var | source | job |
 |-----|--------|-----|
 | `KJ_TICK` | the track's playhead | musical position (frozen off-beat by design) |
-| `KJ_PULSE` | a per-attachment monotonic counter | ordering key *within a run* (resets on restart; see Stage-1 follow-ups) |
-| `KJ_EPOCH_NS` | wall clock, shared across contexts woken the same tick | human "when" + cross-context join |
+| `KJ_PHRASE` / `KJ_TEMPO` / `KJ_ROTATE_EVERY` | track policy + attachment | cadence facts |
+| `KJ_HEARD` | the track's score context | recent committed notation — the **band view**, spanning all producers across rotations |
+| `KJ_PULSE` | per-attachment monotonic counter | ordering key *within a run* (resets on restart — the documented contract, consistent with conversation re-hydration) |
+| `KJ_EPOCH_NS` | wall clock, latched once per beat | human "when" + cross-context join — identical for every context woken on the same beat |
 
-So a **musician**'s tick behaviour produces ABC into the track's score; a
-**probe**'s tick behaviour runs a kaish script that writes `/run` (the output
-substrate, `shared-state.md`). Same mechanism, different rc. *Being a "musician"
-= being attached to a beat track with the musician tick behaviour* — which is
-exactly the `context_type`-is-an-rc-bundle decomposition (`chameleon.md`):
-**arming is attaching.**
+A **musician**'s tick behaviour produces ABC into the track's score; a
+**probe**'s tick behaviour runs a kaish script that writes `/run`
+(`shared-state.md`). Same mechanism, different rc. *Being a "musician" = being
+attached to a beat track with the musician tick behaviour* — the
+`context_type`-is-an-rc-bundle decomposition (`chameleon.md`): **arming is
+attaching.**
 
-The **death certificate** (a woken context that crashed/timed out/OOM'd — only
-the parent sees it) is recorded by the track on the attachment, because the track
-is the parent that wakes it. (This is myaku's `status` file, generalised.)
+The **death certificate** (a woken context that crashed/timed out — only the
+parent sees it) is recorded by the track on the attachment, because the track is
+the parent that wakes it.
 
-## Transport — MIDI idioms, now native
+## Concurrent producers — one open future, per-producer failures
+
+The score is built so **N producing contexts can contribute to one track**, and
+hyoushigi's existing invariants carry most of it. Music keeps "one *playing*
+binding at a time" as a **loadout policy** (two bass phrases on one beat clash),
+*not* a structural assumption — the kernel never forbids concurrency; the music
+rc just doesn't spawn it (an ergonomic nudge, not enforcement).
+
+- **The per-track `Timeline`'s lock is the sequencer** — synchronous, no `.await`
+  ever held under it. N producers queue at the track's lock.
+- **No conflict at the same tick.** Two producers committing at the same span
+  produce two distinct cells, each with its own `played_by`; ties are allowed
+  (`BlockId` is the unique row). Both copies persist with provenance. Concurrent
+  producers **coexist — they do not squash each other**: `cas_commit`'s basis
+  never reads the committed view, so two players landing a note at the same tick
+  is a chord (or a clash), which is correct musical behavior. Squash only
+  activates for a future resolver whose basis depends on committed state.
+- **Failures route per producer.** The failure ledger lives on the shared track
+  timeline, but each `FailureEvent` is stamped with the failing cell's
+  `played_by`, and draining is per-context — producer B's resolve failures
+  surface in **B's** conversation, never A's. Error blocks land in the
+  *producer's* conversation, not the score context.
+- **`UseLastGood` stays lane-scoped** (the track's last committed cell,
+  regardless of producer) — the listener hears the lane continue. A's fallback
+  may repeat B's last phrase; that is a decision, not a bug.
+- Ordering of same-tick cells is insertion order at the track lock —
+  deterministic per-run, not across runs; `BlockId` uniqueness keeps correctness
+  regardless.
+
+## Rotation is a gap, not an overlap
+
+An exogenous clock that doesn't pause during a page-turn must pick one: the
+parent detaches synchronously (a few *producerless* beats while the child boots —
+a GAP) or the parent lingers until the child binds (two producers
+double-scheduling — an OVERLAP). Rotation takes the **gap**: at the rotate
+horizon the track synchronously detaches the retiring context and fires `rotate`;
+the child forks, attaches to the same track, and is seeded at the track's
+*current* playhead. There is never a beat with two producing bindings.
+
+The gap is safe because it is in *live production*, not in *playback*: hyoushigi
+stages content **ahead of the playhead** (the speculation lead), so the retiring
+parent already committed the handoff beats' notation before detaching. Whatever
+consumes the score reads continuous notation across the page-turn — the producer
+gap never reaches the DAC. The gap is in *who's composing next*, not in *what's
+playing now*. (An atomic `Swap` transport command that briefly suspends the clock
+across the handoff remains a polish option for tracks whose lead is shorter than
+a child's boot time — deferred.)
+
+`detach` persists the track playhead (the durable record a zero-block child
+inherits across a crash), and the attach seed reads the *score context's*
+high-water — the durable `tracks` row plus the score's committed blocks are the
+track's memory, so a fresh child can never rewind the lane.
+
+## Transport — MIDI idioms, native
 
 Because the clock lives on the track, transport is a single operation on one
-clock domain (no fan-out walk, no `halted_tracks` set, no `track_head`):
+clock domain:
 
 ```
-kj transport stop  --track bass     # stop the track's clock; automation preserved
-kj transport play  --track bass     # start broadcast + clock; rotation resumes
-kj transport tempo --track bass 120
+kj transport attach --track bass [--wakeup N] [--rotate N]   # bind; track created stopped if new
+kj transport detach [--track bass]                           # unbind; track persists
+kj transport play|pause|stop|tempo --track bass [...]
+kj transport ooda|rotate --track bass on|off                 # separate knobs
 ```
 
-- **stop = stop the clock** for the track. Rotation (the page-turn automation) is
-  *suspended*, not cleared — the binding's `rotate` cadence is remembered.
-- **play = start broadcast + start the clock.** Whatever automation was in place
-  resumes — including rotation. (An explicit `kj transport rotate off` stays the
-  separate "permanently stop turning pages" knob.)
-- the **horizon race** that plagued the per-context design can't occur: a
-  page-turn just has the child inherit + re-bind on a clock that's either running
-  or stopped; there's no second per-context entity to arm late.
+- **stop = stop the clock**, nothing else. Rotation is *suspended*, not cleared —
+  the binding's `rotate` cadence is remembered; per-attachment OODA arming is
+  untouched (`ooda off` is the separate knob).
+- **play = start the clock**; whatever automation was in place resumes,
+  including rotation.
+- A new track arms **stopped** (no surprise token spend); `play` starts it.
+- Name the track directly (`--track <name>`); when omitted, the verb resolves the
+  track from the calling context's attachment. (*Vocabulary:* "track" is the
+  DAW-sense clock domain / durable identity; "lane" stays reserved for automation
+  *inside* a track and "voice" for ABC's `V:` field, per `chameleon.md`.)
 
-Surface convention: name the track directly (`--track <name>`); kaish does
-context→track lookups on the fly, so `kj` stays crisp. (*Vocabulary:* "track" is
-the DAW-sense clock domain / durable identity; "lane" stays reserved for automation
-*inside* a track and "voice" for ABC's `V:` field, per `chameleon.md`.)
+## Restart contract
+
+On re-attach after a restart, the committed score is **reconstructed from the
+score context's materialized ABC blocks** (`reconstruct_score_cells` →
+`Timeline::rehydrate_committed`, virgin-only — crash over corrupting a live log):
+the ABC source blocks ARE the committed cells (the MIDI sibling is derived, never
+committed), and the materialize cursor starts *past* the restored cells so they
+are never re-emitted. Persisted tempo/phrase/clock-kind are recovered from the
+`tracks` row — a restart never silently reverts to default policy. The **open
+future, squashes, and in-flight speculations do not survive restart**, and
+`KJ_PULSE`/`beat_count` reset — consistent with conversation re-hydration; full
+cross-restart counter durability lands with the deferred cold-start re-arm sweep.
+
+## Render — a wire cue, not an in-process sink
+
+Rendering the score to sound is **not the track's job**. A mime-keyed
+`RenderCue { mime, payload, lead }` is published at the materialize crossing and
+consumed by an off-box sink — the app first, which renders `text/vnd.abc` → MIDI
+and schedules into its local ALSA seq port at `receipt + lead`. The speculation
+lead IS the jitter buffer. See `docs/pcm.md` (5c) and `docs/midi.md`; `kj play
+<file.abc>` is the standalone trigger. (An in-process first cut —
+`RenderTarget`/`AlsaMidiOut`/`kj transport render` — shipped with Stage 3 M1 and
+was demolished 2026-07-02 when render moved to the wire; git history holds that
+design record. The seam's *home on the track* — render fed from the materialize
+crossing, as a score consumer, never a producer — survived the move exactly.)
+
+The ABC crate exposes the per-event stream a renderer needs:
+`kaijutsu-abc/src/midi.rs::events(tune, params) -> Vec<MidiEvent>`, with
+`generate` as the SMF-framing wrapper over the same writer.
 
 ## What this subsumes — myaku dissolves
 
 `myaku` (the pulse facility) existed because the beat was welded to the
 musician's transport, forcing "one executor, two trigger front-ends" so metrics
 could keep sampling while music paused. With the beat on the track that whole
-tension is **two tracks**. So myaku splits cleanly and stops being a facility:
-
-- its **cadence, fire-coordinate injection, and death certificate** → are what a
-  **track** does (this doc).
-- its **`/run` output substrate (`now`/`history`/`status`) and `pulse_emit`
-  helper** → are what a probe *attachment writes*, and belong to
-  **`shared-state.md`** (the VFS-is-the-namespace thesis).
-
-A probe is then just: *a context attached to a system-clock track, whose tick
-behaviour writes `/run`.* `myaku.md` is retired with a pointer here and to
-`shared-state.md` (its detailed `/run` layout + `pulse_emit` design lives in git
-history until it's migrated into `shared-state.md`).
-
-## Staging the surgery
-
-This is real surgery — the clock/playhead/heap move up a level and contexts gain
-attach/detach. Stage it:
-
-1. **Move the clock first.** The track owns the clock + playhead + transport + the
-   binding set (wakeup + rotate cadence). Contexts bind/unbind. This alone retires
-   the playhead carry and `track_head`, gives native `stop/play --track`, and kills
-   the horizon race. The score can stay per-context-but-track-tagged for this stage.
-2. **Give the track its own score (copies + back-reference).** The track takes
-   copies of its direct inputs and keeps a `played_by`/provenance back-reference to
-   the producing context; the score is the emergent view. Retired players' copies
-   persist on the track. Larger — touches the cell/`Timeline` data path.
-3. **Generalise the clock source.** Land the `ClockSource` trait + a MIDI driver +
-   the external-signal seam, plus the rare/intentional cross-track bar/beat
-   alignment between independent clocks. **The MIDI driver's shape is decided in
-   `docs/midi.md` (2026-06-29):** a `ClockSource` is a *proxy* for a clock that may
-   be *remote* and *drift-modeled* (observe → model tempo/phase/drift → regenerate
-   a tight local clock; distribute tempo/intent, not pulses). Design the trait
-   remote- and estimate-shaped from the start; MIDI is the second concrete voice
-   for it alongside the system clock. MIDI-out is a *render target* on the track
-   (a score consumer), not a clock concern.
-
-The playhead-carry code (shipped 2026-06-29) is a stage-0 stepping stone: it
-encodes the invariant (musical time is continuous across the chain) and its tests
-describe the behaviour we want; when stage 1 lands, "the clock stayed on the
-track" replaces "copy the number," same observable, less machinery.
-
-## Decided (2026-06-29 design round)
-
-- **No 'band' entity (yet); cross-track sync is rare + intentional.** Tracks are
-  independent clock domains. Aligning bars/beats between tracks is an occasional,
-  explicit operation via alignable clock types (MIDI the prime mover), not an
-  always-on conductor. (Resolves the band-clock-vs-track-clock collision: there is
-  no band clock; there is no shared `Timeline`.) See *Clock sources*.
-- **Data locality: the track holds copies of its inputs + a back-reference; the
-  score is emergent.** Not one block log contexts write into and lose on
-  retirement. `Cell`'s `track` (the copy) + `played_by` (the back-ref) already
-  carry the shape. See entity #1.
-- **The context binds; the child inherits the bind at fork.** The track stays
-  ignorant of context lifecycles. See entity #3.
-
-## Open questions (for the implementation session)
-
-> **2026-07-01:** all four were resolved by the staged implementation below —
-> concurrent producers by Stage 2's copies+`played_by` model (one *playing*
-> binding stays a loadout policy), `KJ_HEARD` re-pointed at the track score by
-> Stage 2 WI 5 (the hydration side of the seam is still deliberately open, see
-> Stage 2's open questions), the clock-source trait by Stage 3, and the
-> migration by Stage 1 (`beat_state` → `tracks`+`attachments`). Kept for the
-> reasoning:
-
-- **Concurrent producers into one track.** Music keeps one *playing* binding per
-  track (rotation swaps it); a user/observer can bind read-mostly. The copies +
-  back-reference model makes several contexts contributing copies *tractable* (each
-  copy carries its `played_by`), but the conflict story — two producers, same beats
-  — is unspecified. Music sidesteps it (one at a time); decide if/when a track wants
-  concurrent producers.
-- **Score vs context conversation seam.** The score is the track's; a context still
-  has its own conversation/hydration. Does a musician's conversation *window* onto
-  the track's score (the `$HEARD`/hydration-marker machinery re-pointed at the
-  track), and how does that interact with the copies model?
-- **Clock-source trait shape** + whether the app's existing time-sync algorithms
-  are the right substrate for the MIDI driver and for cross-track bar/beat alignment.
-- **Migration / compatibility** — the `beat_state` table, `BeatCommand`, and
-  `kj transport` all assume per-context; map each onto the track entity.
-
----
-
-# Stage 1 implementation — move the clock onto the Track
-
-> **Status:** locked 2026-06-29 (Amy + Claude), in progress. This is the *living*
-> implementation tracker — a fresh session continues from here. **No backwards
-> compat; on `main`.** Decisions below are firmer than the design sketch above
-> because they're checked against current code; where code disagrees with the
-> sketch, code wins and the divergence is noted. Tick a box and add a one-line
-> note when an item lands; record fresh decisions under *Decisions made in-flight*.
-
-## Where the code actually is (verified 2026-06-29)
-
-The doc above is the design; these are the corrections that survived a code sweep,
-and the plan is built on them:
-
-- The beat/clock lives in **`kaijutsu-server/src/beat.rs`** (2856 lines), *not* the
-  kernel. `BeatScheduler` holds `heap: BinaryHeap<(Instant, ContextId)>` (`:265`)
-  and `armed: HashMap<ContextId, BeatState>` (`:266`).
-- **The live playhead is NOT on `BeatState`.** It lives on the per-context
-  `Timeline` (`crates/kaijutsu-hyoushigi/src/engine.rs:156`), read live each beat
-  (`advance_to(playhead + STEP)`, `beat.rs:594`). `beat_state.playhead_tick` is only
-  the **SQLite recovery copy** the carry reads/writes. So "move the playhead to the
-  track" = move it off the per-context `Timeline`.
-- The fire-coordinate env vars are **un-prefixed** today: `$TICK/$PHRASE/$TEMPO/
-  $HEARD/$ROTATE_EVERY` (`beat.rs:139-156, 846-878`). The doc's `KJ_TICK/KJ_PULSE/
-  KJ_EPOCH_NS` **do not exist yet**. `KJ_PARENT_BLOCK_COUNT` is real but **fork-only**
-  (`kj/lifecycle.rs:452`), and is the precedent for the `KJ_` kernel-injection
-  convention we adopt.
-- **`track_head`, `halted_tracks`, `myaku` are docs-only** — zero code. Nothing to
-  delete there; `track_head` is retired before it was ever built.
-- **No `Track` entity, no `Attachment`, no `ClockSource`, no wakeup divisor** exist.
-  `TrackId` is a `String` newtype (`kaijutsu-types/src/track.rs:21`) carried as a
-  label on `BeatState` (`beat.rs:84`), `Cell` (`cell.rs:126`), and the block
-  (`block.rs:1334`). `ooda_every` is a single `BeatPolicy` field (`hyoushigi/
-  mod.rs:47`).
-- `BeatCommand` + `BeatPolicy` + `BeatAck` live in
-  `kaijutsu-kernel/src/hyoushigi/mod.rs:34-155`; `kj transport` in
-  `kaijutsu-kernel/src/kj/transport.rs`; `beat_state` DDL + `PersistedBeatState` +
-  CRUD + fork-copy in `kaijutsu-kernel/src/kernel_db.rs:615-681, 1466-1505,
-  3207-3336`.
-
-## The core data move
-
-| Today (per-context) | Stage 1 (per-track) |
-|---|---|
-| `heap: BinaryHeap<(Instant, ContextId)>` | `heap: BinaryHeap<(Instant, TrackId)>` — **one entry per track** |
-| `armed: HashMap<ContextId, BeatState>` | `tracks: HashMap<TrackId, TrackState>` |
-| live playhead on per-context `Timeline`; `beat_state.playhead_tick` recovery copy | playhead **owned on `TrackState`**; per-context `Timeline.playhead` slaved to it each beat (Stage-1 bridge) |
-| `beat_state` row keyed by `context_id` | new `tracks` (PK `track_id`) + `attachments` (track_id, context_id) tables; **drop `beat_state`** |
-
-```
-TrackState {                                  // runtime, in the scheduler (beat.rs)
-    clock:       ClockState,                  // period + next-fire (system clock; the ClockSource trait is Stage 3)
-    playhead:    Tick,                        // moved off the per-context Timeline
-    beat_count:  u64,
-    transport:   Playing | Stopped,
-    policy:      BeatPolicy,                   // (superseded in-flight: ooda_every → Attachment.wakeup; Stage 3 moved period into SystemClock)
-    attached:    HashMap<ContextId, Attachment>,
-    materialize_failures, failure_water,       // carried over from BeatState
-}
-Attachment { wakeup: Cadence, rotate: Option<Cadence>, ooda_armed: bool, pulse: u64 }
-```
-
-## Work items (TDD throughout — tests that can and will fail)
-
-> **All eight landed 2026-06-29** (the follow-up sections below record the
-> review fixes); boxes flipped 2026-07-01 during the docs harmonization pass.
-> As landed: `Attachment`/`Cadence` live in `kaijutsu-kernel/src/hyoushigi/mod.rs`
-> (imported by `beat.rs`), the env vars are `KJ_`-prefixed exactly as WI 7
-> specifies, and the transport surface is
-> `kj transport attach|detach|play|pause|stop|tempo|ooda|rotate` (no `arm`).
-
-- [x] **1. Types** (`kaijutsu-types` + `kernel/hyoushigi/mod.rs`). Add `Attachment`
-  + `Cadence` (a beat-divisor newtype) beside `BeatPolicy`. Reshape `BeatCommand`:
-  `Arm{…}` → **`Attach{track, ctx, attachment, policy_if_new}`** + **`Detach{track,
-  ctx}`**; `Play/Pause/Stop/SetTempo/SetOoda/SetRotate` re-key `ContextId` → **`TrackId`**.
-  *Tests:* command round-trip; attach-creates-track-once; divisor math.
-- [x] **2. Scheduler re-key** (`beat.rs`, the bulk). `armed` → `tracks`; heap →
-  `(Instant, TrackId)`. `fire_due`/`process_one`: a track beats once → advance its
-  own playhead + `beat_count` → for each attached ctx whose `wakeup` divisor is due,
-  seed that ctx's `Timeline.playhead` from the track playhead, materialize, then
-  `fire_lifecycle(tick)`; rotate-due → `fire_rotate`. *Tests:* pause freezes /
-  resume at +1 (preserve existing behaviour); two attachments with different wakeup
-  divisors fire independently; stopped track = no heap entry.
-- [x] **3. Retire the playhead-carry** (`beat.rs:295-435, 551-571`). Delete the
-  `from_log.max(carried)` seed dance, the persist-playhead-before-stop, and the
-  rotate-horizon defer. Track playhead persists once in its `tracks` row, never
-  leaves. **Preserve the carry's tests** re-pointed at "the clock stayed on the
-  track — continuity is free" (the carry is a stage-0 stepping stone whose tests
-  describe the target).
-- [x] **4. Fork inheritance + re-bind** (`kernel_db.rs:1466-1505` + fork rc). At
-  fork, copy the child's `attachments` row like `beat_state` is copied today. Child
-  re-binds via an `Attach` from create/fork rc — the track never watches forks.
-  Rotation = child attaches to the **same** track (clock never pauses) + parent
-  detaches. No persist-before-stop, no horizon race. *Test:* rotation swaps the
-  playing binding with zero playhead discontinuity.
-- [x] **5. Persistence** (`kernel_db.rs`). Drop `beat_state`; add
-  `tracks(track_id PK, period_ms, beats_per_phrase, ooda_every, playhead_tick,
-  transport)` + `attachments(track_id, context_id, wakeup_every,
-  rotate_every_phrases, ooda_armed)`. Cold-start re-arm sweep stays **deferred** (as
-  today: restart resets to stopped), but the shape supports it. *Test:* CRUD +
-  fork-copy of an attachment row.
-- [x] **6. Transport surface** (`kj/transport.rs`). `arm` → `attach --track <name>
-  [--wakeup N] [--rotate N]`; add `detach`; `play/pause/stop/tempo/rotate` take
-  `--track <name>` (kaish does ctx→track lookup so `kj` stays crisp). *Test:* `stop
-  --track` halts one domain, leaves a sibling track running.
-- [x] **7. Fire-coordinate env vars** (`beat.rs:139-156, 846-878` +
-  `assets/defaults/rc/musician/`). Rename to **`KJ_TICK/KJ_PHRASE/KJ_TEMPO/KJ_HEARD/
-  KJ_ROTATE_EVERY`**; add **`KJ_PULSE`** (per-attachment monotonic counter on
-  `Attachment.pulse`) + **`KJ_EPOCH_NS`** (one wall-clock reading shared across all
-  contexts woken on the same beat). Update `tick/S10-drive.kai` +
-  `rotate/S10-rotate.kai`. *Test:* two contexts woken on one beat see identical
-  `KJ_EPOCH_NS` and distinct monotonic `KJ_PULSE`.
-- [x] **8. Docs** — flip Stage 1 boxes here as they land; devlog entry; update the
-  `hyoushigi.md` direction note when the clock has actually moved.
-
-## Decisions made in-flight
-
-- **Env vars adopt the `KJ_` prefix** (matching `KJ_PARENT_BLOCK_COUNT`) and gain
-  `KJ_PULSE` + `KJ_EPOCH_NS` (chosen 2026-06-29). No back-compat alias for the
-  un-prefixed names; the musician rc scripts move with them.
-- **Stage-1 bridge: the per-context `Timeline` still owns committed cells**; its
-  playhead is slaved to the track playhead each beat. This is the explicit seam
-  Stage 2 removes — keep it visible so the later cut is clean.
-- **Concurrent producers:** Stage 1 keeps "one *playing* binding per track; rotation
-  swaps it." A non-rotating read-mostly attachment is allowed but produces no score
-  yet (defers the design's open question).
-- **`Attachment.wakeup` subsumes `BeatPolicy.ooda_every`** (refinement, 2026-06-29).
-  The clean split that fell out of writing the spine: `BeatPolicy` is now purely
-  *track-level* musical knobs (`period` = tempo, `beats_per_phrase` = phrase length —
-  properties of the clock domain); the former `ooda_every` moves onto the per-context
-  `Attachment` as `wakeup: Cadence` (the divisor that fires the context's tick rc).
-  `ooda_armed` stays as the on/off gate. The **per-beat materialize is the track's own
-  work** (runs every beat for each producing attachment, independent of `wakeup`);
-  `wakeup` gates *only* the rc tick behaviour. So one track can wake a musician every
-  128 beats and a conductor every 1024 with no new machinery. `Cadence` is a divisor
-  newtype reused for both `wakeup` (beats) and `rotate` (phrases), unit documented per
-  field.
-- **Transport `Stop` = stop the clock only** (MIDI idiom, per design). The old
-  `Stop(ContextId)` also disarmed OODA ("clean stopped state"); the new `Stop(TrackId)`
-  only halts the clock — rotation is *suspended/remembered*, per-attachment `ooda_armed`
-  is untouched. Re-arming OODA is the separate `SetOoda` knob. The old `Disarm(ContextId)`
-  folds into **`Detach`** (a context unbinds; rotation's parent-side + archive both use it).
-- **`TrackState` shape (from reading `beat.rs`):** the per-context materialization
-  bookkeeping — `cursor`, `materialize_failures`, `failure_water` — cannot sit flat on
-  the track once a track has >1 attached context. It moves into a per-context bundle:
-  `track.attached: HashMap<ContextId, AttachedContext>` where
-  `AttachedContext { attachment: Attachment, cursor, materialize_failures, failure_water }`.
-  The persisted `Attachment` (wakeup/rotate/ooda_armed/pulse) is the *binding contract*;
-  the materialization fields are *runtime-only*, never persisted. `TrackState` itself:
-  `{ policy: BeatPolicy, playing: bool, playhead: Tick, beat_count: u64, attached }`.
-- **Rotation never overlaps producers.** At a rotate horizon the track *synchronously*
-  detaches the retiring context (remove from `attached` + `disarm_timeline`; its
-  committed blocks persist in the store, so the app still shows them) and fires `rotate`;
-  the child forks and re-`Attach`es to the **same** track, seeded to the track's *current*
-  playhead. The clock never pauses → continuity is free and there is never a beat with two
-  producing bindings. This realizes "one playing binding; rotation swaps it" concretely.
-- **The seed/carry logic collapses (item 3 falls out of item 1).** No fork-copy of a
-  playhead number, no persist-playhead-before-stop, no horizon-race persist to get right.
-  But seeding still needs care (sharpened by the gemini review below) — there are **two**
-  playheads at attach:
-  - **TRACK playhead** (seeded only when *creating* the track's live state):
-    `max(get_track(track_id).playhead_tick, max_tick(attaching_ctx))`, fatal on DB error,
-    else `ZERO`. NOT the attaching context's `max_tick` alone — a rotation child has no
-    blocks (`max_tick`=0) and would rewind the whole lane on a restart re-create. The
-    durable `tracks` row + the lane's committed blocks are the track's memory.
-  - **Per-context Timeline playhead** (every attach): `max(max_tick(ctx), track.playhead)`.
-    `max_tick(ctx)` stops a context with its own committed history (cold-restart re-attach)
-    from re-seeding behind its log (`DuplicateBlock`); `track.playhead` puts a fresh child
-    at current musical time so the next beat is one `advance_to` step, not a giant catch-up
-    from zero.
-
-## Stage 1 review findings (gemini batch, 2026-06-29)
-
-A holistic two-prompt gemini review (whole files: tracks.md + hyoushigi.md + the spine +
-beat.rs) ahead of locking the surgery. It **confirmed** the clean parts (the
-`wakeup`/`ooda_every` decomposition; cursor + `materialize_failures` + `failure_water`
-*must* be per-attachment, not flat on the track; `KJ_EPOCH_NS` latched once per beat;
-`KJ_PULSE` per-attachment monotonic; `Stop` clock-only). It surfaced the two seed
-corrections folded in above, plus one decision:
-
-- **Rotation handoff = GAP, not OVERLAP (deliberate).** An exogenous clock that doesn't
-  pause during a page-turn must pick one: the parent detaches synchronously (a few
-  *producerless* beats while the child boots + re-binds — a GAP) or the parent lingers
-  until the child binds (two producers double-scheduling into the score — an OVERLAP).
-  Stage 1 takes the **gap** (synchronous parent-detach): never two producers, a few rest
-  beats during boot. This matches the doc's own "the band played a beat while the bass
-  player was unplugging." An **atomic `Swap`/`Rotate` transport command** that lets the
-  track briefly suspend its clock across the handoff (closing the gap) is a real future
-  option — deferred. `KJ_PULSE`/`KJ_TICK` continuity is unaffected either way (the track
-  holds the numbers).
-
-  **Why the gap is safe in practice (Amy, 2026-06-29):** the gap is in *live production*,
-  not in *playback*. Hyoushigi stages content **ahead of the playhead** (lead-time
-  derivation — `speculate_at = start − beats_for(lead_time)`): the retiring parent already
-  speculated/committed the handoff beats' notation *before* it detached, so the committed
-  score covers the rotation window. Whatever consumes the score downstream (ABC→MIDI, then
-  samples/synth) reads **continuous** notation across the page-turn — the producer gap
-  never reaches the DAC. So the rotation gap is a gap in *who's composing next*, not in
-  *what's playing now*; the speculation lead is exactly what absorbs it. (This is the
-  musician case from `hyoushigi.md` — the clock can't block, so content is staged ahead;
-  rotation is just another reason the lead exists.) This makes the atomic `Swap` a polish
-  item, not a correctness requirement, for any track whose lead ≥ the child's boot time.
-
-## Stage 1 review follow-ups (landed code, 2026-06-29)
-
-A second kaibo pass on the **landed** code (gemini-batch ×2 + a deepseek agent, whole
-files, no diff) confirmed the design (slew guard, the two seeds, borrow/iteration
-safety, fork-copy ordering, single-writer persistence all verified correct) and found
-a cluster of restart/handoff gaps. **Fixed in the follow-up commit:**
-
-- **`detach` persists the track playhead** — the rotate-horizon handoff is the durable
-  record a 0-block child inherits across a crash (the beat path deliberately does not
-  persist every beat; `detach` is rare). Without it a crash *in the rotation gap* would
-  re-seed the track from a stale row and rewind the lane.
-- **`attach` pulls a lagging track up to a joining context's committed frontier** — a
-  restart where a *thin* context (no blocks) created the track at a stale tick, then a
-  *thick* musician (committed history at tick N) attaches, no longer freezes the
-  musician's Timeline behind the track (the forward-only slew guard would otherwise pin
-  it for N beats while its OODA kept firing). This also makes the "silent pinned context
-  ahead of its track" state unreachable via `attach`.
-- **`attach` enforces one-track-per-context** (the `context_track` index is 1:1): moving
-  a context to a new track detaches it from the old (live) and deletes the stale
-  persisted attachment row, so one track's beat can't inject another's `KJ_*` facts and
-  a restart re-attach can't hit the ambiguous `many` case. `detach` guards the timeline
-  disarm so a (future) multi-lane context isn't silently killed.
-- **`attach` reads the context's `max_tick` once** (was twice) — no half-created
-  track-without-attachment state if the second read failed.
-
-**Also fixed (follow-up #2):**
-
-- **stop/pause → play within one beat period no longer double-beats.** Each `TrackState`
-  carries a monotonic `generation` bumped by every `play`; heap entries carry the
-  generation they were enlisted under, and `fire_due` drops a popped entry whose
-  generation is stale. So the pre-stop entry (re-pushed by the last beat) is invalidated
-  by `play`'s bump instead of processing alongside `play`'s fresh entry. Normal beats
-  re-push under the same generation. (Test: `stop_then_play_within_one_period_beats_once`.)
-
-**Deferred (tracked here, not blocking Stage 1):**
-
-- **`KJ_PULSE` / `beat_count` reset on a kernel restart** (not persisted). This is now
-  *documented as the contract*, not a silent gap: a restart re-hydrates the context's
-  conversation fresh, so a model never carries a stale pulse across the boundary — the
-  reset is consistent with the conversation lifecycle. Full cross-restart durability
-  lands with the **cold-start re-arm sweep** (already deferred), which is the right place
-  to persist these counters holistically rather than bolting a column on now.
-- **Track-scoped `max_tick`** — ✅ closed by Stage 2 WI 4: the seed reads
-  `max_tick(score_ctx)` (the track's own high-water), not the attaching
-  context's.
-- **Rotation gap is unbounded** if the child's boot/turn is queued behind other work; the
-  speculation lead covers the *notation*, not the *production* gap. The atomic `Swap`
-  transport command (suspend the clock across the handoff) is the eventual closer.
-
----
-
-# Stage 2 implementation — the track owns its score
-
-> **Status:** design locked 2026-06-29 (Amy + Claude), not yet coded. This is the
-> *living* implementation tracker — a fresh session continues from here, exactly as
-> Stage 1 did. **No backwards compat; on `main`.** The two scoping decisions are made
-> (below); the work items are TDD and unstarted. Tick a box + add a one-line note when
-> an item lands; record fresh decisions under *Decisions made in-flight*.
-
-## The two scoping decisions (made 2026-06-29)
-
-1. **Minimal track-keyed store first** — move the `Timeline` (clock + open future +
-   committed log) onto the **track**, and add a **track-scoped block store/query** that
-   feeds materialize + `KJ_HEARD` now. The first-class, app-synced/scrubbable track
-   *Document* (the "track is like a good instrument" render) is a **later cut** — Stage 2
-   lands the kernel-side value (continuity-by-construction, the *real* band-view HEARD,
-   one materialize cursor) without the app surface.
-2. **Design concurrent producers now — by removing the single-producer assumption, not by
-   adding machinery.** See *The concurrent-producer model* — this turns out to be the
-   same work as the minimal store, done without baking in "one producer."
-
-## Where the code actually is (verified 2026-06-29, post-Stage-1)
-
-Stage 1 moved the *clock* onto `TrackState` (`beat.rs:60-94`: playhead, beat_count,
-transport, heap, generation). The **score is still per-context**:
-
-- **`Kernel.timelines: DashMap<ContextId, SharedTimeline>`** (`kernel.rs:711`) with
-  `arm_timeline`/`timeline`/`disarm_timeline` (`kernel.rs:705-740`) — **the central cut
-  point.** The score container is keyed by `ContextId`.
-- The `Timeline` (`hyoushigi/src/engine.rs:153-612`) holds `playhead`, `future: Vec<Scheduled>`
-  (open future), **`committed: Vec<Cell>`** (the durable score, in-RAM stand-in for the
-  block log), `cas`, `squashes`, **`failures`**. Public API: `schedule(cell)` (input,
-  `:239`), `advance_to`/`pump` (drive), `committed()`/`squashes()`/`failures()` (read),
-  `seed_playhead` (virgin re-arm), `materialize(cell, block_id)` (→ `BlockSnapshot`).
-- **The data is already track-tagged; only the container is per-context.** `Cell.track`
-  (lane identity, required) + `Cell.played_by` (producer principal) — `cell.rs:113-173`,
-  in `crates/kaijutsu-hyoushigi/src/cell.rs` (**not** `kaijutsu-types`). `commit()`
-  (`engine.rs:493-531`) already stamps every emitted sibling with the committing cell's
-  `track` + `played_by` and asserts loudly on divergence. `BlockSnapshot.track` +
-  `BlockId.principal_id` carry the same two axes to the block layer (`block.rs:1322-1334`).
-- **The Stage-1 bridge** (`beat.rs:778-787`, inside `materialize_one`): each beat slews
-  the per-context timeline's playhead to the track playhead. **This is the seam Stage 2
-  deletes** (the explicit Stage-1 note, lines 392-394).
-- **Per-context materialization bookkeeping** rides each `AttachedContext`
-  (`beat.rs:101-124`): `cursor: MaterializeCursor`, `materialize_failures`,
-  `failure_water` — it exists *because each context materializes into its own timeline +
-  own block store*. Becomes track-scoped (one cursor over the track's score).
-- **`KJ_HEARD` is a per-context lie today.** `transport_env` reads
-  `self.documents.block_snapshots(ctx)` (`beat.rs:1018`, keyed by `ContextId`) — a single
-  context's log — though the comments (`beat.rs:213-214`) already *describe* a cross-track
-  band view. The aspiration becomes true once the read is track-scoped.
-- **No track-owned or cross-context-by-track aggregation exists** anywhere
-  (`block_snapshots(ctx)`/`last_block_id(ctx)` are per-context, `block_store.rs:2097, 824`).
-  This is what Stage 2 builds. (It also closes the deferred Stage-1 "track-scoped
-  `max_tick`" item above — the seed can finally ask the *track's* high-water, not the
-  context's.)
-
-## The core data move
-
-| Today (per-context) | Stage 2 (per-track) |
-|---|---|
-| `Kernel.timelines: DashMap<ContextId, SharedTimeline>` | `tracks` own the `Timeline` — keyed by `TrackId` (held on/beside `TrackState`) |
-| `arm_timeline(ctx)` / `timeline(ctx)` / `disarm_timeline(ctx)` | track-keyed: arm on track-create, read by `TrackId`, disarm on track teardown (not on detach) |
-| `schedule_abc_cell(kernel, ctx, …)` routes input to the ctx's timeline | routes to the **track's** timeline (cell already carries `track`+`played_by`) |
-| per-`AttachedContext` `cursor`/`materialize_failures`/`failure_water` | **one track-scoped** cursor + failure ledger (the `Timeline.failures()` is already per-timeline → now per-track) |
-| materialized blocks land in the **producing context's** block store | land in the **track-scoped** block store (a cell carries no `ContextId`, only `played_by`) |
-| `KJ_HEARD` ← `block_snapshots(ctx)` | `KJ_HEARD` ← **track-scoped** read (the real band view, spanning the rotation chain) |
-| Stage-1 bridge slew (`beat.rs:778-787`) | **deleted** — the playhead lives on the track; nothing to slave |
-
-## The concurrent-producer model (the load-bearing design)
-
-The store is built so **N producing contexts can contribute to one track's score**, and
-this needs *almost no new machinery* — hyoushigi's existing invariants already make it
-correct. Music keeps "one producing binding at a time" as a **loadout policy** (two bass
-phrases on one beat clash), *not* a structural assumption — the kernel never forbids
-concurrency; the music rc just doesn't spawn it (Stance: ergonomic nudge, not enforcement).
-
-- **No conflict at the same tick.** Two producers committing at the same `Span` produce
-  two distinct cells, each with its own `played_by`; the shared-coordinate doctrine
-  already allows ties (`BlockId` is the unique row). Both copies persist with provenance —
-  the doc's "copies + back-reference make several contexts contributing *tractable*."
-- **The write barrier already holds per-cell**, not per-track-tick. A committing at tick N
-  never rewrites B's committed cell at tick N — different cells. N producers don't threaten
-  "never rewrite a committed cell."
-- **Speculation isolation is already structural** — a resolver only ever gets the
-  *committed* view, so A can't read B's uncommitted speculation; A *can* read B's committed
-  cells (the payoff — A composes against what B actually landed).
-- **Misprediction handles it for free** — B committing inside A's speculate→commit window
-  shifts A's `compute_basis` → A squashes and re-speculates against B's contribution; the
-  `Squashed` ledger records it.
-- **The genuinely new mechanisms (small, but NOT zero — the deepseek review corrected the
-  "almost no machinery" claim):**
-  1. **The per-track `Timeline`'s lock is the sequencer** — the per-track analog of the
-     per-context mailbox-as-sequencer (preserves "the kernel is the sole timeline
-     sequencer" with N producers; they queue at the track's lock).
-  2. **`FailureEvent` gains `played_by`, and failure-draining becomes per-context.** This
-     is the one *correctness* addition the review found: `FailureEvent` (`engine.rs:84-93`)
-     carries no producer identity today, and `drain_failures` (`beat.rs:919-990`) drains
-     *all* new failures into the *draining* context's conversation and advances one
-     `failure_water`. With N producers on one shared track timeline that **misattributes**
-     — producer B's resolve failures surface in producer A's conversation and B never sees
-     its own. So concurrent producers require: stamp `FailureEvent.played_by` from the
-     failing cell at construction (`engine.rs:396-401`), and make `drain_failures` filter
-     to the draining context's producer. (See WI 3.)
-- **`UseLastGood`/`last_committed_content_in` stays *lane*-scoped** (the track's last
-  committed cell, regardless of producer) — for music the listener hears the lane continue;
-  a `played_by`-scoped "repeat MY last" is a future refinement if a use case needs it. This
-  is a *behavioral change* from the single-producer baseline (A's fallback may now repeat
-  B's last phrase) — a decision, not a bug.
-
-## Work items (TDD throughout — tests that can and will fail)
-
-- [x] **1. Move the `Timeline` registry onto the track.** `Kernel.timelines`
-  (`kernel.rs:711`) → `TrackId`-keyed (or hang the `SharedTimeline` on `TrackState`).
-  `arm_timeline`/`disarm_timeline` become **track**-keyed (`arm_track_timeline(track_id)` on
-  track create / first attach; `disarm_track_timeline(track_id)` on **track teardown**,
-  *not* on context detach). **`attach` must stop calling `arm_timeline(context_id)`**
-  (`beat.rs:434`) — that per-context arm is a Stage-1 artifact; a score context just joins
-  the track's `attached` set, the (already-armed) track timeline is the score target.
-  `timeline(ctx)` either goes away or becomes a convenience that does ctx→track→timeline.
-  Per-context timelines for **non-track** contexts (coders) are unaffected. **Drop timeline
-  cloning on fork (gemini):** `insert_forked_context` clones the per-context timeline today —
-  with the timeline on the track, a fork of an attached context must NOT clone it; the child
-  re-attaches and becomes a **co-producer on the existing shared track timeline** (cloning
-  would give it a disconnected open future, breaking one-timeline-per-track). *Tests:* a
-  track's timeline survives a detach; two tracks have independent timelines; rotation
-  (parent detach → child attach, same track) keeps one continuous timeline (no re-arm, no
-  seed dance); a freshly-attached score context creates **no** per-context timeline; a fork
-  of an attached context shares (does not clone) the track timeline.
-- [x] **2. Re-point score input.** `schedule_abc_cell` (`mod.rs:320`) + its caller
-  `on_turn_completed` (`beat.rs:1106-1168`) schedule into the **track's** timeline by the
-  ctx→track index; cell keeps `track`+`played_by` so provenance survives. *Tests:* a cell
-  scheduled by ctx A then committed *after* A detaches still lands in the track score
-  (rotation hand-off); two producers' cells coexist in one track's committed log,
-  distinguished by `played_by`.
-- [x] **3. Track-scoped materialize, but per-context error surfacing.** The score
-  **materialize** runs **once per track** (one cursor over the track's committed cells →
-  the track-scoped block store), retiring the per-`AttachedContext` `cursor`. **But error
-  surfacing stays per-context** — the deepseek review's key structural correction: the
-  `failures: Vec<FailureEvent>` *ledger* lives on the shared (per-track) timeline, yet
-  *draining* it (the `failure_water` cursor + inserting Error blocks, and the poison-skip
-  Error path `beat.rs:869-901`) must land in the **producing** context's conversation so a
-  model reads its *own* failures next turn. Concretely: (a) add `played_by` to
-  `FailureEvent` (`engine.rs:84-93`), stamped from the failing cell (`engine.rs:396-401`);
-  (b) materialize once per track; (c) a per-context loop drains failures **filtered by
-  `played_by`**, advancing a per-context water mark. *Needs:* a `ContextId → PrincipalId`
-  (the context's producer) mapping reachable from the drain — simplest is to store the
-  producer `played_by` on `AttachedContext` at attach. **Hoist materialize out of the
-  per-context loop (gemini):** `process_track` today loops `for each attached ctx →
-  materialize_one`; with a track-scoped cursor that would **double/triple-emit** per attached
-  context. Restructure: run `materialize_track(track_id)` **exactly once per beat**, then
-  iterate `attached` only for per-context cadence (rotate / phrase / ooda wake) + the
-  per-context failure drain. *Tests:* two producers materialize through one cursor with no
-  double-emit; a track with 3 attachments materializes each committed cell **once** per beat;
-  producer B's resolve failure surfaces in **B's** conversation, never A's; poison-skip is
-  attributed to the cell's `played_by`.
-- [x] **4. The per-track score context (DECIDED: option C — do this FIRST, it gates 1–3).**
-  Create a durable **score context** when a track is created; its Conversation document holds
-  the materialized score. Because it's a **real `ContextId`**, *all* the per-context block APIs
-  are reused unchanged — `materialize_committed` keeps taking a `ContextId`, just the **score
-  context's**, not the producer's: `reserve_block_id(score_ctx, played_by)` (per-`(score_ctx,
-  principal)` seqs — the per-`(track,principal)` the review wanted, real and restart-seeded by
-  the existing block-log seeding), `insert_from_snapshot_as(score_ctx, …)`,
-  `last_block_id(score_ctx)` as the `after` anchor, `block_snapshots(score_ctx)` /
-  `max_tick(score_ctx)`. **No `TrackId` block-store API, no `kaijutsu-index`/RPC ripple** — the
-  (C) payoff (the per-`ContextId` index trait at `lib.rs:74` already works for the score ctx).
-  Store the score `ContextId` on `TrackState` + the persisted `tracks` row. The score context
-  must be a **non-producer** (no rc lifecycle, no turn, no LLM hydration — a kind/flag). The
-  **Error-block insert stays the PRODUCER's `ContextId`** (errors go to the producer's
-  conversation, per WI 3), NOT the score context. Closes the deferred **track-scoped
-  `max_tick`**: `attach`'s seed reads `max_tick(score_ctx)` (`beat.rs:393-397, 415`) instead of
-  the producer's. *Tests:* creating a track creates its score context (+ KernelDb row);
-  materialized blocks land in the score context, not the producer's; two producers' cells share
-  the score context distinguished by `played_by`/`BlockId`; the score context is flagged
-  non-producer (never armed for a turn); legacy `track == None` blocks match no track.
-- [x] **5. Re-point `KJ_HEARD` at the track score** (`beat.rs:1013-1021`). The band view
-  becomes real — a producer hears the whole lane (all producers, across rotations) within
-  the window. *Test:* after a rotation, the child's `KJ_HEARD` includes the retired
-  parent's committed phrases; two concurrent producers each see the other's committed cells.
-- [x] **6. Delete the Stage-1 bridge** (`beat.rs:778-787`) and the per-context seed/slew
-  it serves. The playhead lives only on the track. *Test:* the existing continuity tests
-  (re-pointed from Stage 1's "the clock stayed on the track") pass with the bridge gone.
-- [x] **7. Persistence — `UseLastGood` survives a restart (approach b, chosen 2026-06-29).**
-  Rather than a separate cell-log table, the committed log is **reconstructed from the score
-  context's materialized ABC blocks on (re-)arm** (`reconstruct_score_cells` in `beat.rs`): the
-  ABC *source* blocks ARE the committed Concrete cells (the MIDI sibling is derived, never
-  committed), and a content-derived `ContentRef::of(content)` hash matches the bytes already in
-  durable CAS. `engine.rs` gained `rehydrate_committed(cells)` (virgin-only; crash over
-  corrupting a live log); `attach`'s create block rehydrates the track timeline and starts the
-  materialize cursor **past** the restored cells so they're never re-emitted. gemini called
-  reconstruction "lossy" (drops `CellState`/`Recipe`/`Span`), but those are all trivially
-  reconstructable for *committed Concrete* cells, which is exactly what `UseLastGood` needs — so
-  (b) avoids the new schema + blob-growth of (a). **Open future / squashes / in-flight
-  speculations still do NOT survive restart** (consistent with conversation re-hydration) — the
-  documented contract. *Test:* `attach_rehydrates_committed_from_persisted_score` — attach off a
-  persisted `tracks` row recovers the score context, rehydrates the prior ABC phrase into
-  `committed`, excludes the MIDI sibling, and a beat does not re-materialize it (cursor past it).
-- [x] **8. Docs** — devlog entry landed ("Tracks Stage 2 — the score moves onto the
-  track", 2026-06-29); these boxes flipped; `hyoushigi.md` already carries a forward
-  "Direction (2026-06-29)" note pointing here for the stage 1–2 move.
-- [x] **9. Test audit (the review's risk finding).** Done: the `beat.rs` tests were
-  migrated to the track model (marker tests pre-arm the *track* timeline + read the score
-  context; failure/poison tests schedule onto the track timeline); `second_context` became a
-  real two-producers-share-one-score test; and `two_producers_failures_route_to_their_own_conversations`
-  pins the concurrent-producer mechanism. Note: the at-risk `hyoushigi/mod.rs` tests stayed
-  green *unchanged* — `materialize_committed` kept its `ContextId` signature (the re-point
-  routes the score ctx from `beat.rs`), so those isolation tests still exercise the bridge
-  correctly. Original risk note kept below for the record.
-  <details><summary>(original at-risk list)</summary>
-  The suite was deeply per-context
-  coupled, so many tests would **keep passing while exercising the wrong path** after the
-  cut — at-risk: `hyoushigi/mod.rs` tests `bridge_materializes_committed_cell_into_block_and_cas`
-  (`:877`), `materialize_after_reload_mints_fresh_seq_no_duplicate` (`:945`),
-  `score_cell_commits_abc_and_derives_midi_sibling` (`:1100`),
-  `materialize_after_restart_does_not_collide` (`:1275`), `partial_insert_resumes_per_artifact`
-  (`:1655`), `arm_then_lookup_returns_some…` (`:1700`), `disarm_removes_the_timeline`
-  (`:1749`). For each, add a **track-scoped** variant that exercises the new path. Add the
-  **concurrent-producer** test: two contexts schedule into one track timeline; both cells
-  materialize once into the track store; both appear in track-scoped `KJ_HEARD`; a failure
-  from one producer surfaces **only** in that producer's Error blocks. **Specific silent-pass
-  trap (gemini):** any test asserting on `block_snapshots(ctx).len()` to confirm a note
-  materialized will break/mislead once the score lands in the *track* store — grep them out
-  and re-point at the track-scoped query.
-  </details>
-
-## Status — increments landed (2026-06-29)
-
-- **Increment 1 (`9aa280f4`):** `TrackId`-keyed timeline registry on the Kernel.
-- **Increment 2 (`9aa280f4`):** the per-track **score context** (option C) — DB column +
-  set-once persist + `ensure_score_context` mint/recover, wired into `attach`.
-- **Prereq (`e446bbe4`):** `FailureEvent.played_by`.
-- **Increment 3 — the breaking re-point — DONE + green (this commit):** WI 1, 2, 3, 4, 5, 6 all
-  landed. `schedule_abc_cell` + materialize route to the track timeline + score context;
-  materialize is **hoisted once-per-beat** out of the per-context loop; the cursor +
-  failure-water live on `TrackState`; the failure ledger drains **per producer** (routed by
-  `played_by`, single-producer fallback, orphan→score ctx); `KJ_HEARD` reads the score context
-  (the real band view); the Stage-1 per-context bridge slew is **deleted** (the track timeline's
-  `advance_to` is the legit pump); `attach` arms the track timeline (no per-ctx arm) and `detach`
-  no longer disarms it. 37 beat + 1266 kernel tests green; full workspace builds.
-- **WI 7 (`UseLastGood` restart) + WI 8 (docs) + WI 9 (test audit) — DONE.** WI 7 took approach
-  (b): reconstruct the committed log from the score context's ABC blocks on arm + a virgin
-  `rehydrate_committed`, cursor started past the restored cells. Devlog entry landed; beat tests
-  migrated; concurrent-producer + rehydrate tests added.
-- **All Stage 2 work items (1–9) are DONE.** Still ahead: **Stage 3** (`ClockSource` trait + MIDI
-  driver + cross-track bar/beat alignment) and a **real-kernel live-verify** (rebuild + restart;
-  the `tracks` table picks up `score_context_id` via the additive ALTER — should migrate clean).
-
-## Decisions made in-flight
-
-- **WI 1–4 are ONE coherent cut, not independently green (found 2026-06-29, first code
-  pass).** `materialize_committed` (`mod.rs:586`) uses `context_id` for *three* block-store
-  calls — `last_block_id` (`:597`), `reserve_block_id` (`:685`), `insert_from_snapshot_as`
-  (`:718`). The moment the timeline becomes track-keyed (WI 1), a materialized cell has no
-  `ContextId` to write to (it carries only `track` + `played_by`), so the block store MUST be
-  track-keyed in the same change (WI 4). Schedule (WI 2) and the materialize hoist (WI 3) ride
-  along. **Real dependency order: WI 4 (track-keyed block container) → WI 1 (timeline
-  registry) → WI 2/3 (re-point) → WI 5/6.** The 8-item numbering is a checklist, not a landing
-  order.
-- **WI 4 container — DECIDED 2026-06-29 (Amy): (C) a real per-track "score context."** When a
-  track is created, create a durable backing context whose Conversation document **is** the
-  track's score; producers materialize into it. *Why (C) over the alternatives:* it reuses the
-  entire per-context block machinery via a **real `ContextId`** (so `reserve_block_id`/
-  `insert_from_snapshot_as`/`last_block_id`/`block_snapshots`/`max_tick` and per-`(ctx,principal)`
-  seqs all work unchanged — no TrackId block-store API, no `kaijutsu-index`/RPC ripple), it
-  satisfies `handle_implies_row` (no synthetic id), and it embodies the design's own thesis —
-  *the track persists, producers come and go* — the score context is the durable thing they
-  rotate around, and it's browsable as the track's score. (Rejected: (A) synthetic ContextId —
-  fake-id leak + `handle_implies_row` violation; (B) parallel `track_documents` store — most new
-  code + the index/RPC ripple.) **Consequence:** the score context is *not a conversational
-  producer* — it must NOT run rc lifecycle / take turns / hydrate to an LLM; it is a score
-  holder (a new `context_type`/kind or a "no-OODA, no-hydrate" flag). `TrackState` (and the
-  persisted `tracks` row) gains the score `ContextId` so materialize/HEARD/seed resolve it.
-  This partly delivers the deferred "first-class track Document" for free (the score context
-  renders like any context) — fine, just not required; keep app surface out of Stage 2.
-- **No literal timeline-clone on fork (corrects the gemini finding).** There is no
-  timeline-cloning code in `insert_forked_context`/`lifecycle.rs`; the fork child gets its own
-  per-context timeline because its `attach` calls `arm_timeline(context_id)` (`beat.rs:434`).
-  So "drop the fork clone" = the same fix as "attach stops arming a per-context timeline" — arm
-  once per track, attach joins. (WI 1.)
-- **Score contexts are APP-VIEWABLE (Amy, 2026-06-29), not hidden.** They're real `Live`
-  contexts (`context_type="score"`, label `score-<track>`) that appear in `kj context list` and
-  the app — the "first-class Document for free" upside of (C). "Non-producer" means only that
-  they never take a turn or hydrate to a model, NOT that they're hidden. (No app-side work is in
-  scope now; viewability is a property the kernel-side mint preserves.)
-- **Foundation step (additive, safe): the Kernel gains a `TrackId`-keyed timeline registry**
-  (`arm_track_timeline`/`track_timeline`/`disarm_track_timeline`) ALONGSIDE the per-context one,
-  so coders keep their per-context timelines and the re-point can proceed incrementally before
-  the per-context score path is deleted.
-
-## Open questions carried into Stage 2 coding
-
-- **The first-class track Document** (app-synced, scrubbable in the time-well) is
-  deliberately out of this cut. Where the minimal track-keyed store and that Document meet
-  (is the store *the* Document's backing, or a separate kernel structure the Document later
-  reads?) is decided when the render lands, not now — but item 4 should not paint it into a
-  corner (prefer a shape a Document can later wrap).
-- **Score ↔ conversation seam.** Stage 2 keeps the model's *turn* (its ABC output block)
-  in the producing context's conversation and moves the committed *score* to the track;
-  `KJ_HEARD` is the context's window onto the track score. Whether the hydration-marker
-  machinery should also re-point at the track (so a re-hydrated musician reads the track
-  score directly, not just via `KJ_HEARD`) is left for when it bites.
-- **Concurrent-producer ordering at the exact same tick** is by insertion order at the
-  track lock (shared-coordinate ties; `order_key` successor-derived). Deterministic per-run,
-  **not across runs** (depends which producer takes the lock first); `BlockId` is the unique
-  row so correctness holds regardless. If a use case needs deterministic cross-producer
-  ordering, revisit then.
-
-## Stage 2 review findings (deepseek, 2026-06-29 — pre-coding)
-
-A holistic whole-file review (engine.rs/cell.rs/beat.rs/hyoushigi mod.rs + the docs, no diff)
-ahead of coding. It **validated both scoping decisions** and tested the concurrent-producer
-claim (a)-(d) individually against the code: all four hold — the per-cell write barrier
-(`engine.rs:480-495`, append-only `commit`), speculation isolation (`CommittedCtx` borrows
-only the committed slice, `engine.rs:617-621`), ties-by-`played_by` (→ `BlockId.principal_id`,
-`mod.rs:685`), and squash-on-co-commit are all structurally sound. It also confirmed the
-clean parts: the per-track lock as a natural extension of the existing per-context lock; the
-gap-not-overlap rotation with the track timeline surviving detach; the `HeardEntry` struct
-already carrying `track` so the band view is structurally ready; the materialize cursor logic
-being *simpler* with one cursor per track.
-
-The findings (folded into the claim + work items above):
-
-1. **🔴 `FailureEvent` has no producer attribution** — the one correctness *bug*. Folded into
-   the concurrent-producer model + WI 3 (add `played_by`; per-context filtered draining).
-2. **Materialize-once-per-track vs. per-context error surfacing** — folded into WI 3 (the
-   "one failure ledger per track" language was misleading; the ledger is per-track, the
-   *draining* is per-context).
-3. **block-store API surface understated** — folded into WI 4 (enumerated the TrackId-keyed
-   variants + the `kaijutsu-index`/RPC ripple; Error insert stays per-context).
-4. **`arm/disarm_timeline` + `attach` per-ctx arm** — folded into WI 1.
-5. **`seed_playhead` virgin-only vs. re-derivation** — folded into WI 7 (rehydration ctor).
-6. **`attach` seed still `max_tick(ctx)`** — folded into WI 4 (→ `max_tick_track`).
-7. **Test suite silently passes on the wrong path** — became WI 9 (test audit).
-
-**Document, not fix (sound, but worth stating so the design doesn't mislead):**
-
-- **The squash / "misprediction handles it for free" path is structurally correct but
-  *dormant* for today's only resolver — and that is *correct musical behavior*, not a gap.**
-  Both reviewers (deepseek + gemini, independently) flagged this: `CasCommitResolver::compute_basis`
-  (`mod.rs:402-408`) hashes only the recipe's `hash` param — it never reads the committed view —
-  so a co-producer's commit can't change its basis and it never squashes under concurrency.
-  **Gemini's reframe:** for absolute notation that is exactly right — if two players land a note
-  at the same tick you want *both* to commit and play (a chord/clash), not for one to cancel and
-  re-evaluate the other. So claim (d)'s machinery is ready but should NOT be expected to fire for
-  concurrent `cas_commit` producers; both committing at one tick is the feature. (Squash only
-  re-activates for a future resolver whose basis depends on committed state.) **Action: the doc
-  must not imply concurrent producers squash each other — they coexist.**
-
-## Stage 2 review findings (gemini-pro batch, 2026-06-29 — pre-coding, second voice)
-
-A gemini-pro batch pass (succeeded on batch capacity while interactive gemini was 503-overloaded
-— *batch is the resilient path for gemini-pro*). It **independently endorsed the design**
-("locked and solid; proceed exactly as planned"), confirmed the parts deepseek did (per-cell
-barrier, the synchronous `parking_lot::Mutex` sequencer with **no `.await` under the lock →
-deadlock-impossible**, lane-scoped `UseLastGood` with `fire_fallback` correctly authoring repeats
-as `PrincipalId::beat()` so no forged provenance), and **converged** on the squash-dormancy above.
-It found **three new items** beyond deepseek's set (folded into the work items):
-
-1. **🟠 Restart re-derivation from blocks is LOSSY → persist the Cell log (sharpens WI 7).**
-   `materialize` (→ `BlockSnapshot`) drops `CellState`, the `Recipe`, and full `Span`. If a track
-   re-arms with an empty `committed` Vec (or an imperfect `BlockSnapshot → Cell` round-trip),
-   `last_committed_content_in` finds nothing and the **next `UseLastGood` fallback wedges the
-   track**. Resolution: do NOT reverse-engineer `Vec<Cell>` from blocks — persist the timeline's
-   own append-only Cell log (or at least `Concrete` cells with full `Span` + `played_by`) to a
-   track-scoped row, loaded at arm. (Folded into WI 7 below.)
-2. **🟠 Hoist materialize OUT of the per-context loop (sharpens WI 3).** `process_track` today
-   loops `for each attached ctx → materialize_one`. Making the cursor track-scoped *without*
-   restructuring would **double/triple-emit** per attached context per beat. Run
-   `materialize_track` exactly ONCE per beat, then iterate `attached` only for per-context cadence
-   (rotate / phrase / ooda wake). (Folded into WI 3.)
-3. **🔴 Drop timeline cloning on fork (new — WI 1).** `insert_forked_context` clones the
-   per-context timeline today. With the timeline on the track, a fork of an attached context must
-   NOT clone it — a fork becomes a **new co-producer joining the existing shared track timeline**.
-   Cloning would give the child a disconnected open future, violating one-timeline-per-track.
-   (Folded into WI 1.)
-
-Plus it sharpened **WI 4**: the CRDT `after` anchor (`last_block_id`) and `reserve_block_id` must
-*both* go track-scoped, and the per-`(TrackId, PrincipalId)` sequence must be **seeded from the
-track-scoped log on cold start** or interleaved producers collide `BlockId`s / scramble
-`order_key` across restarts. And **WI 5/9**: re-pointing `KJ_HEARD` removes the score from the
-*context's* block store, so any test asserting on `block_snapshots(ctx).len()` silently breaks —
-and the score↔conversation hydration seam (open question) must be settled before a re-hydrated
-musician can read its own past performance (note: the score blocks are already `ephemeral`/
-hydration-silent today, so the model's memory already flows *only* via `KJ_HEARD` — re-pointing
-HEARD at the track keeps that intact; the seam question is whether hydration should *also* read
-the track store directly).
-
----
-
-# Stage 3 design lock — generalise the clock source (+ the render-target seam)
-
-> **Status:** design direction, 2026-06-29 (Amy + Claude). No code yet — this is
-> the pre-code lock for the two-cast review, the same ritual Stage 1/2 ran.
-> Companion: `docs/midi.md` decides the *network/drift* shape this trait must
-> accommodate; this section is the kernel-local trait + seam it lands behind.
-
-## What Stage 3 is (and is NOT)
-
-There are **two distinct "clocks"** in the beat path; Stage 3 generalises exactly
-one of them:
-
-- **The firing schedule** — `BeatScheduler::run`'s wall-clock arm
-  (`beat.rs` `sleep_until_opt(next)` over a heap of `now + period` `Instant`s).
-  This decides *when* a track beats. **← Stage 3 generalises this.**
-- **`TickClock`** (`BeatPolicy::clock()`, `hyoushigi/mod.rs`) — speculation-cost
-  math (`ticks_per_sec`/`safety_factor`/`commit_margin`) the engine uses to place
-  speculate/commit deadlines. **Downstream of firing; unchanged.** It is *derived*
-  from the effective period (`1.0 / period.as_secs_f64()`), so once the period
-  lives behind a `ClockSource`, `clock()` reads `source.period()`.
-
-**The decisive constraint, from `docs/midi.md`:** the kernel scheduler stays
-**purely generative-local for every clock, system and MIDI alike.** The wire never
-carries realtime pulses to the scheduler — it carries *intent* (tempo / phase /
-transport). A MIDI clock source is a **proxy** for a possibly-remote, drift-modeled
-clock: an edge node observes the master locally, fits a tempo/phase/drift model,
-and ships low-rate *estimates* over the RPC control plane; the kernel runs a tight
-**local** clock phase-locked to that estimate. **So there is no new realtime select
-arm and no pulse channel — the heap stays, the generation/stale-drop logic stays,
-zero-CPU idle stays.** The whole Stage-3 surgery is: put today's `now + period`
-behind a trait, and add an out-of-band estimate-correction hook that only modeled
-sources implement.
-
-## The `ClockSource` trait (SystemClock-only this stage; estimate/remote-shaped now)
-
-Two concrete voices at design (the `≥2 implementations` directive): the **system
-clock** (built this stage) and **midi.md's drift-modeled clock** (built at M3). The
-trait must satisfy both without rework — that is the whole point of shaping it now.
-
-```rust
-/// What drives a track's beat — a *proxy* for a clock that may be remote and
-/// drift-modeled (docs/midi.md). The kernel always runs a tight LOCAL clock; a
-/// source answers "when is the next beat?" locally and folds low-rate estimate
-/// corrections in out-of-band — NEVER on a realtime pulse path.
-pub trait ClockSource: Send {
-    /// The local instant of the next beat after `last`, consulting `now` and the
-    /// source's internal model. Heap-schedulable (generative), MONOTONIC (never
-    /// schedules into the past — a late estimate clamps forward, never rewinds).
-    /// SystemClock: `now + period` (preserves today's behaviour exactly). A
-    /// modeled clock predicts the master's next beat instant and phase-corrects.
-    fn next_fire(&mut self, last: Instant, now: Instant) -> Instant;
-
-    /// The current effective beat period — drives the BPM readback in
-    /// `transport_vars`, the persisted tempo, and the derived `TickClock`. Fixed
-    /// for SystemClock; the modeled estimate for a drift clock.
-    fn period(&self) -> Duration;
-
-    /// Human/transport tempo override (`kj transport tempo`). SystemClock sets its
-    /// period; a modeled clock MAY honour it as a manual nudge or ignore it while
-    /// slaved (decided at M3). Slaving the new period DOWN to the track's armed
-    /// `Timeline` (`Timeline::set_clock`) is the caller's job — see the
-    /// TickClock-desync amendment below.
-    fn set_period(&mut self, _period: Duration) {}
-
-    // M3 ONLY — NOT shipped in M1 (the review's "no dead-code theater"). The M1
-    // surface is exactly the three methods above. M3 adds:
-    //   fn apply_estimate(&mut self, est: ClockEstimate) -> FireMoved;
-    // where `FireMoved::Earlier` tells the scheduler to bump the track's
-    // generation token + push a fresh heap entry NOW (else it sleeps through a
-    // forward phase correction — gemini's heap-re-enlistment finding). The
-    // estimate stream rides the RPC control plane, never a realtime pulse.
-}
-```
-
-- **`SystemClock { period: Duration }`** is the only impl this stage. `next_fire`
-  returns `now + self.period` (byte-for-byte today's re-push), `period()` returns
-  it, `set_period` writes it. No `apply_estimate` ships in M1.
-- **`ClockEstimate`** is **NOT defined in M1** (review consensus: a struct with no
-  producer/consumer is dead-code theater). Its shape (observed tempo, a phase
-  reference instant, an observation timestamp, a rate-of-change term) is designed
-  in `docs/midi.md`; it lands with its producer at M3. The trait is proven
-  M3-ready by the `next_fire(last, now)` + heap-re-enlistment *design*, not by a
-  shipped no-op stub.
-- **Where it lives:** `TrackState.policy.period` moves *into* `SystemClock`;
-  `TrackState` gains `clock: ClockSourceKind` (**enum, decided** — see below).
-  `BeatPolicy` keeps `beats_per_phrase` (phrasing is not a clock concern).
-  `set_tempo` routes to `clock.set_period`; persistence reads `clock.period()`;
-  `fire_due`'s re-push and `play`'s initial push call `clock.next_fire(last, now)`.
-
-**Open trait questions — RESOLVED by the 2-cast review (deepseek + gemini-batch):**
-1. **Enum, decided (unanimous).** `enum ClockSourceKind { System(SystemClock),
-   Modeled(ModeledClock) }` with a dispatch `match`, NOT `Box<dyn>`. `TrackState`
-   already isn't `Clone`/`Debug` (it holds `HashMap`/`MaterializeCursor`), so the
-   trait-object's only upside is moot; the enum dodges a vtable + heap alloc in the
-   hot loop (two `next_fire` calls/beat) and maps 1:1 to the `clock_kind` column.
-   `Modeled` is unconstructable until M3 (panics/`unreachable!` on build). Promote
-   to a trait only if runtime-pluggable (plugin/WASM) sources ever appear — distant.
-2. **`next_fire(last, now)` — keep `now`-spacing for SystemClock (confirmed).** But
-   **document `last`'s semantics**: it is the `Instant` previously *returned* by
-   `next_fire` (the scheduler's *scheduled* fire time), NOT the jittery `now` the
-   heap popped at — so a modeled clock measures residual drift apples-to-apples.
-3. **Persistence: `clock_kind` is MUTABLE, not set-once (gemini correction; my
-   original "set-once like `score_context_id`" was wrong).** A track's *identity* is
-   durable but its clock *source* is circumstantial: you sketch on the system clock,
-   then plug in the KeyStep Pro and `kj transport slave --track bass KSP`, swapping
-   the SAME track's driver to `Modeled` (the core `midi.md` workflow). Set-once would
-   force archiving the track to sync it to hardware. So: `clock_kind TEXT DEFAULT
-   'system'` (additive ALTER, existing rows → `'system'`), **updated in
-   `persist_track` whenever the driver changes** — unlike `score_context_id`, which
-   stays set-once because the score IS the track's durable identity.
-
-## The render-target seam (M1's other half)
-
-> **⚠️ SUPERSEDED — the wire-cue move LANDED 2026-07-02 (`docs/pcm.md` 5c).** The
-> in-process `RenderTarget` trait below shipped with M1 and was then **demolished**:
-> rendering is now a mime-keyed `RenderCue { mime, payload, lead }` published at the
-> materialize crossing and consumed by an off-box sink — the app first, which renders
-> `text/vnd.abc`→MIDI and schedules into its local ALSA seq port at `receipt + lead`.
-> `AlsaMidiOut`, the trait, `render.rs`, the `kj transport render` verb, and the
-> server `alsa` dep are gone; `kj play <file.abc>` is the standalone trigger. This
-> section stands as the design record of the seam's in-process first cut; the seam's
-> *home on the track* survived exactly as predicted.
-
-`docs/midi.md` "output first": a track declares "render my committed score to ALSA
-MIDI out on node X." A **render is a consumer of the track's score, not a
-producer** — it never schedules cells, never takes a turn, never appears in the
-failure-routing. So it is NOT an `AttachedContext`. Proposed shape:
-
-- `TrackState.render_targets: Vec<Box<dyn RenderTarget>>` (a small registry,
-  parallel to `attached` but consumer-side). **On `TrackState`, decided** (both
-  casts): the scheduler already owns the materialize crossing where `emit` fires,
-  and an M4 cross-node target is just a `RenderTarget` impl that sends over
-  RTP-MIDI — the trait's *home* doesn't constrain its *transport*.
-- The trait, **as amended by the review:**
-  ```rust
-  pub trait RenderTarget: Send {
-      /// Schedule one committed cell's rendered MIDI at `at`. Takes the
-      /// PRE-RESOLVED ABC `&str` (the materialize crossing just ran the deriver),
-      /// so a render target never re-resolves a `ContentRef` from CAS.
-      fn emit(&mut self, abc: &str, at: Instant);
-      /// Transport halt (stop/pause): TRUNCATE this target's already-scheduled
-      /// events after `at` and silence sounding notes. Default no-op.
-      fn flush_scheduled_after(&mut self, at: Instant);
-  }
-  ```
-- **Fed from the materialize crossing:** when `materialize_track` advances the
-  cursor past a newly-committed `Concrete` cell into the score, it reads the cells
-  newly crossed (`committed()[hw_before..cursor.high_water]`) and hands each one's
-  resolved ABC + its local instant to every render target. Cells commit *ahead* of
-  the playhead (the speculation lead), so `at` is in the near future — scheduled
-  into the ALSA seq queue ahead of time, never just-in-time. **The speculation lead
-  IS the jitter buffer** (midi.md constraint-remover #1).
-- 🔴 **`at` must be computed from a jitter-free reference instant (deepseek).** NOT
-  `last_epoch_ns` — that's `SystemTime::now()` latched *after* the heap pop, i.e.
-  the jittery *actual* wakeup, so scheduling off it propagates per-beat scheduler
-  jitter into the output (cumulatively, ~16–32 ms over a 16-beat phrase). Add
-  `TrackState.last_fire_scheduled: Instant` — the heap entry's *scheduled* `t`, set
-  in `fire_due` right after the pop — and compute
-  `at = last_fire_scheduled + (cell.start − playhead) * clock.period()`. A 3-line
-  data addition, no design rework; **WI 6's ALSA loopback test is what exposes it.**
-- 🟠 **Transport-stop vs the ALSA queue (both casts, SEV-1).** The lead means ALSA's
-  `snd_seq` queue holds ~a phrase of future NoteOn/NoteOff. On `kj transport
-  stop`/`pause` the clock stops and no more cells materialize, **but ALSA blindly
-  plays the buffered phrase** (≈8 s of music + hanging notes). So `RenderTarget` is
-  not a pure sink: `BeatScheduler::stop`/`pause` call `flush_scheduled_after(now)`
-  on every target → `AlsaMidiOut` truncates the queue past `now` and emits
-  ALL_NOTES_OFF (CC 123) + ALL_SOUNDS_OFF (CC 120).
-- M1's one impl: `AlsaMidiOut { seq, port }` — renders the ABC via the per-event
-  path (below) and `snd_seq_event_output`s NoteOn/NoteOff at `at`.
-- 🟢 **Squash-after-render is impossible by construction (both casts — phantom
-  risk).** A cell enters the committed log only *after* its `commit_deadline` passes
-  with a matching basis; `CasCommitResolver`'s basis hashes only the recipe param,
-  never committed state, so a committed cell never squashes; `materialize_committed`
-  reads only `committed()`. The render target only ever sees finalized cells. (If a
-  squash-*capable* resolver lands post-M1, document `emit` as fire-and-forget and
-  either buffer renders until the playhead passes the cell or accept sub-perceptual
-  glitches — a deferred concern, not M1's.)
-
-## The renderer gap (mechanical, M1)
-
-`kaijutsu-abc/src/midi.rs::generate(tune, params) -> Vec<u8>` emits a whole
-**Standard MIDI File byte blob**. M1 needs the per-event stream it already builds
-internally — `MidiWriter.events: Vec<MidiEvent { tick: u32, data: Vec<u8> }>` — to
-schedule individual NoteOn/NoteOff into an ALSA seq queue. **Expose the timed event
-list** (a `pub fn events(tune, params) -> Vec<MidiEvent>` alongside `generate`, or
-make `generate` a thin SMF-framing wrapper over it) so the render target consumes
-`(relative_tick, data)` and maps each to a local instant via the track clock. The
-`alsa` crate is already in the workspace dependency graph (pawlsa).
-
-## Staging (mirrors midi.md M1; M2–M4 are midi.md's)
-
-**This stage delivers midi.md M1 only** (output, virtual MIDI, system clock). M2
-(input telemetry), M3 (drift-modeled clock-in — the real `apply_estimate` producer),
-and M4 (cross-node + edge node) are sequenced in `docs/midi.md` and out of scope here.
-
-TDD work items for M1 (revised post-review — `ClockEstimate` dropped, two folded in).
-**ALL SEVEN LANDED + green 2026-06-30** — see "Status — M1 landed" at the end of this
-section for the commits + how each shipped; the per-WI sketches below are the plan as
-locked (kept for the record).
-
-- **WI 1 — `ClockSourceKind` enum + `SystemClock`, behaviour-preserving.** Introduce
-  the enum (`System(SystemClock)` + a `Modeled` placeholder that's unconstructable
-  until M3) + the dispatch `match` for `next_fire`/`period`/`set_period`; move
-  `period` off `BeatPolicy` into `SystemClock`; route
-  `set_tempo`/persistence/`fire_due`/`play`/`clock()` through it. Attach
-  order-of-operations: construct `SystemClock` → `arm_track_timeline(clock.period())`
-  → construct `TrackState { clock, .. }`. *Test:* every existing beat test stays
-  green (pure refactor — same firing schedule); add one asserting
-  `SystemClock::next_fire(last, now)` == today's `now + period`.
-- **WI 2 — `Timeline::set_clock` (the TickClock-desync fix, gemini SEV-2).** Give
-  `Timeline` a `set_clock(TickClock)`; `set_tempo` (and, at M3, `apply_estimate`)
-  slaves the updated `TickClock` down to the armed track timeline, so the
-  speculation budget can't go stale against a changed firing period (stale → missed
-  commit deadlines → fallback wedge). *Test:* arm a track, change tempo, assert the
-  timeline's next schedule uses the NEW `ticks_per_sec` for its commit deadline.
-- **WI 3 — `clock_kind` persistence (additive, MUTABLE — corrected).** ALTER `tracks`
-  with `clock_kind TEXT DEFAULT 'system'`; re-arm reads it; `persist_track` writes
-  the current driver's kind (NOT set-once — see open-question 3). *Test:* round-trip;
-  a tempo upsert preserves `clock_kind`; a driver swap updates it.
-- **WI 4 — render-target seam + `RenderTarget` trait + jitter-free `at`.**
-  `TrackState.render_targets` + `last_fire_scheduled: Instant` (set in `fire_due`
-  from the heap entry's scheduled `t`). `materialize_track` reads newly-crossed
-  cells (`committed()[hw_before..high_water]`), resolves each to ABC, and calls
-  `emit(abc, at)` with `at = last_fire_scheduled + (cell.start − playhead)*period()`.
-  `stop`/`pause` call `flush_scheduled_after(now)` on every target. *Test:* a fake
-  `RenderTarget` records `(abc, at)`; assert one emit per committed cell in commit
-  order, `at` ahead of `now` AND jitter-free (advance the clock with a deliberately
-  *late* `now` and assert `at` tracks the scheduled instant, not the late wakeup);
-  assert `stop` calls `flush_scheduled_after`.
-- **WI 5 — expose the ABC per-event stream.** `pub fn events(tune, params) ->
-  Vec<MidiEvent>` in `kaijutsu-abc/src/midi.rs` (`MidiWriter`/`MidiEvent` go `pub`);
-  `generate` becomes a thin SMF-framing wrapper over it. *Test:* a known tune yields
-  the expected NoteOn/NoteOff ticks; `generate` output unchanged (golden).
-- **WI 6 — `AlsaMidiOut` render target (zorak, virtual port).** The one real impl:
-  open an ALSA seq client + virtual out port, schedule events at `at`,
-  `flush_scheduled_after` truncates the queue + ALL_NOTES_OFF/ALL_SOUNDS_OFF.
-  *Test:* integration-gated (needs ALSA) — open a virtual port, render a 1-bar tune,
-  read it back off a virtual in port, assert the NoteOn sequence + that a mid-phrase
-  `stop` truncates the tail. Runner-verify on zorak.
-- **WI 7 — docs + devlog.** Fold the landed shape into this section + `docs/midi.md`
-  M1 status; devlog entry.
-
-## Decided (2026-06-29, Stage 3 lock — amended by the 2-cast review)
-
-- **No realtime pulse path into the scheduler; the heap stays.** Every clock is
-  generative-local; MIDI corrects an out-of-band estimate, never streams pulses.
-- **`ClockSource` is a proxy for a possibly-remote, drift-modeled clock**, shaped
-  estimate/remote-aware now (`next_fire(last, now)` + the M3 heap-re-enlistment
-  hook), **`SystemClock`-only this stage — no `ClockEstimate` stub shipped** (review:
-  no dead-code theater).
-- **`ClockSourceKind` enum, not `Box<dyn>`** (both casts) — `TrackState` already
-  isn't Clone/Debug; enum dodges a hot-loop vtable + maps to `clock_kind`.
-- **`clock_kind` is MUTABLE** (gemini correction) — a track's clock source is
-  circumstantial (sketch on system, slave to KSP, back); only `score_context_id`
-  stays set-once. My original "set-once" line was wrong.
-- **A render is a score *consumer*, not a producer** — `RenderTarget` on the track,
-  fed from the materialize crossing, scheduled on the speculation lead off a
-  **jitter-free `last_fire_scheduled`**, with `flush_scheduled_after` on stop/pause.
-- **`emit(abc: &str)`, not `emit(&Cell)`** — the crossing already resolved the ABC;
-  the render target never re-hits CAS.
-- **Squash-after-render is impossible by construction** — committed cells never
-  squash; the render target only sees finalized cells.
-- **This stage = midi.md M1 only.** M2–M4 follow per `docs/midi.md`.
-
-## Stage 3 review findings (deepseek + gemini-batch, 2026-06-29 — pre-coding)
-
-Same two-cast ritual as Stage 1/2 (deepseek agent + gemini-pro on **batch** capacity,
-no diff, whole-repo). **Both independently endorsed the design and converged on the
-load-bearing call: there is NO rewrite-forcing trap — the `ClockSource` trait
-survives M3 intact.** They converged on: squash-after-render is a phantom risk
-(gemini: "being afraid of it means misreading `engine.rs`"); the enum over `Box<dyn>`;
-the transport-stop-vs-ALSA-queue hazard as a real SEV-1 (→ `flush_scheduled_after`);
-and M1 as the right slice with WI 6's loopback as the right verification. They split
-on two judgment calls, broken in the lock above:
-
-- **`clock_kind` mutability — gemini won.** Deepseek backed set-once (the
-  `score_context_id` analogy); gemini showed it breaks the core `midi.md` workflow
-  (slave a live track to the KeyStep Pro). → mutable.
-- **`ClockEstimate` in M1 — gemini won.** Deepseek wanted a no-op stub to "prove the
-  shape"; gemini called it dead-code theater. → design the hook, ship it at M3.
-
-Distinct contributions:
-- **deepseek** found the 🔴 `at`-has-no-jitter-free-reference-instant trap
-  (`last_epoch_ns` is the *jittery actual* wakeup; need `last_fire_scheduled`) and
-  the `emit(abc:&str)`-not-`&Cell` CAS-coupling fix.
-- **gemini** found the 🔴 heap-re-enlistment requirement (an estimate that pulls the
-  next fire *earlier* must bump the generation token + push fresh, else the scheduler
-  sleeps through the correction — M3 design-completeness) and the 🟠 `Timeline::
-  set_clock` TickClock-desync fix (Stage 3 makes tempo dynamic, so the latent
-  stale-TickClock bug becomes reachable → WI 2).
-
-### Landed-code review of WI 1 + WI 2 (gemini-pro batch, 2026-06-30)
-
-A second gemini-pro batch read the *shipped* WI 1 + WI 2 code (commits `2e3dc6c5`,
-`e5a89c38`, `4c55a5dd`). It positively confirmed the things we designed on purpose —
-the uninhabited `ModeledClock` enum is sound, already-scheduled cells are protected
-from `set_clock` re-pricing, the `set_tempo` borrow structure is correct, `phrasing()`
-is zero-cost, the `test-util` gating is best-practice — and surfaced **three real
-correctness hazards, all fixed this session (TDD, deepseek's consult had been clean):**
-
-- **🔴 SEV-1 — cold restart silently reverted persisted tempo.** `attach`'s
-  track-create path read the persisted `tracks` row only for `playhead_tick` +
-  `score_context_id`; it armed the live clock + speculation timeline from the
-  attaching context's `BeatPolicy` DTO (default 120 BPM) instead of the saved
-  `period_ms`/`beats_per_phrase`. `set_tempo` persists the tempo *precisely so a
-  restart recovers it*, so this was a silent-fallback data loss (CLAUDE.md: crash over
-  corruption). **Fix:** when a persisted row exists, build an `active_policy` from it
-  and arm/seed from that; the DTO is the seed only for a genuinely fresh track. The
-  row's fields are already validated non-zero/non-negative on read, so this can't
-  resurrect a corrupt clock. Test: `attach_recovers_persisted_tempo_not_the_dto_policy`.
-- **🔴 SEV-2 (dormant) — `commit_or_squash` validated at the wrong tick.** It passed
-  `now = self.playhead` (= the commit_deadline, earlier than `start`) into the
-  validation `CommittedCtx`, while `speculate` used `now = start`. A resolver whose
-  basis reads `ctx.now()` would see predicted ≠ actual every time and squash forever.
-  Dormant only because `CasCommitResolver` ignores `now()`. **Fix:** validate at
-  `start` (matching speculate); a separate `current_tick` carries the playhead for the
-  budget math. Test: `commit_validates_at_start_not_the_commit_deadline` (verified it
-  fails against the old code).
-- **🔴 SEV-2 (latent) — `pump`/`tick_at` was fatal under dynamic tempo.** `tick_at`
-  mapped `since_epoch × current_rate`, so once WI 2 made the rate mutable a tempo
-  change reinterpreted *all* prior elapsed time at the new rate and rocketed the
-  playhead ~decades ahead, firing every scheduled cell. Safe today only because
-  `BeatScheduler` drives `advance_to` with event-counted ticks and never calls `pump`
-  — but `pump` is a public footgun. **Fix:** removed `tick_at`; `pump` now integrates
-  phase *incrementally* (each interval converted at the rate in force during it,
-  sub-tick remainder carried), so a rate change only re-rates time after it. Existing
-  pump tests preserved; regression test: `pump_integrates_phase_across_a_tempo_change`.
-
-## Status — M1 landed (2026-06-30)
-
-All seven M1 work items shipped + green (kernel 1268, server 104 (+1 ignored ALSA),
-abc 137; full workspace builds). The track has a sound output. (⚠️ Historical note:
-the render half — the WI 4 seam, WI 6's `AlsaMidiOut`, and the later `kj transport
-render` verb — was demolished 2026-07-02 when render became a wire cue to the app
-sink, `docs/pcm.md` 5c. The clock half stands.) Commits:
-
-- **WI 1 (`2e3dc6c5`) + WI 2 (`e5a89c38`, `4c55a5dd`)** — the `ClockSourceKind` enum
-  (`System(SystemClock)` + the uninhabited `ModeledClock`), `period` moved off
-  `BeatPolicy` into `SystemClock`, and `Timeline::set_clock` re-slaving the
-  speculation `TickClock` on a tempo change. (Detail above + the landed-code-review
-  fixes in `3a385e37`.)
-- **WI 3 (`b3cd1761`) — `clock_kind` persistence, MUTABLE.** `clock_kind TEXT NOT
-  NULL DEFAULT 'system'` on `tracks` (SCHEMA + additive ALTER); in the `ON CONFLICT
-  UPDATE SET` (a driver swap persists) — the deliberate opposite of set-once
-  `score_context_id`. `attach` rebuilds the clock SOURCE from the row via
-  `ClockSourceKind::from_persisted`, which builds only `"system"` in M1 and crashes
-  loud on a `"modeled"` row (no silent downgrade) — computed before the score-context
-  mint so a corrupt row fails clean. Tests: kernel_db round-trip / tempo-upsert-
-  preserves / driver-swap-updates / pre-Stage-3-defaults-to-system; beat
-  `attach_crashes_loud_on_an_unconstructable_clock_kind`.
-- **WI 5 (`f5b7cb16`) — `pub fn events(tune, params) -> Vec<MidiEvent>`** in
-  `kaijutsu-abc/src/midi.rs` (`MidiEvent` pub). `generate` and `events` now share
-  `build_single_track_writer`; `generate`'s SMF bytes are unchanged. M1 renders the
-  format-0 single-track merge (single-voice bass). Done before WI 4/6 since they
-  consume it.
-- **WI 4 (`77f73fa1`) — the render-target seam.** New `render` module
-  (`RenderTarget { emit(abc:&str, at), flush_scheduled_after(at) }`).
-  `TrackState.render_targets` + `last_fire_scheduled`; `fire_due` latches the
-  *scheduled* heap instant before `process_track`; `materialize_track`'s Ok path calls
-  `emit_to_render_targets`, which resolves each newly-crossed ABC cell once (durable
-  CAS) and hands `(abc, render_instant(base, period, start, playhead))` to every
-  target. `stop`/`pause` call `flush_scheduled_after(now)`. Cheap no-op when a track
-  has no target. Tests: `render_instant_offsets_by_lead_and_clamps_at_zero`,
-  `render_target_gets_committed_cells_jitter_free_and_flush_on_stop`.
-- **WI 6 (`508bc0c4`) — `AlsaMidiOut`, live-verified on zorak.** ALSA seq client +
-  subscribe-readable port + started real-time queue; `emit` schedules each
-  channel-voice message **relative** to now (`(at − now) + tick × secs-per-tick`,
-  per-tick from the ABC's `Q:` tempo) via the `alsa` crate's `MidiEvent` byte→event
-  encoder; `flush_scheduled_after` drops the queue's pending OUTPUT + ALL_SOUNDS_OFF
-  / ALL_NOTES_OFF direct. `alsa = "0.9"` is a Linux-only target dep (the version
-  already in-tree via bevy_audio/cpal). The loopback test is `#[ignore]` (needs
-  `/dev/snd/seq`) and **ran live on zorak this session — passes** (four NoteOns in
-  ascending pitch order through a subscribed reader port, then flush).
-- **WI 7 — this section + the `docs/midi.md` M1 status note + the devlog entry**
-  ("Tracks Stage 3 M1 — sound out the door").
-
-**Divergences from the locked plan (small, all defensible):**
-- Only `MidiEvent` went `pub` (not `MidiWriter`): the writer isn't in the public API
-  surface; the event stream is.
-- The `at` arithmetic was extracted to a pure `render_instant` free fn so the offset
-  multiply + the never-schedule-into-the-past clamp are unit-tested directly (the
-  beat-driven test exercises the offset-0 + jitter-free path).
-- `flush_scheduled_after` removes ALL pending OUTPUT on the queue (a conservative
-  whole-tail truncation) rather than a precise `TIME_AFTER at` cut — for a stop/pause
-  we want the whole buffered phrase gone, and `at ≈ now` makes the two equivalent.
-- The `alsa` `MidiEvent` encoder isn't `Send`, so it's constructed per-`emit` (one
-  alloc per phrase, beats apart) rather than stored on `AlsaMidiOut`.
-
-**`kj transport render` — the attach/detach surface (landed 2026-06-30, after the WI
-list; live-verified on zorak; ⚠️ DEMOLISHED 2026-07-02 with the wire-cue move,
-`docs/pcm.md` 5c — the verb no longer exists; historical record).** One verb, keyed
-by the seq port name:
-
-```
-kj transport render --track <t> [--to alsa-midi] [--port <name>]  # attach (additive)
-kj transport render --track <t> --off [--port <name>]             # detach one, or all
-kj transport render --track <t> --replace [--port <name>]         # clear all, then add
-```
-
-It sends a `BeatCommand::RenderTarget { track, op }` where `op` is `Add(spec)` /
-`Replace(spec)` / `Remove { id }` (spec/op are data-only, kernel-side; the server's
-scheduler constructs the concrete `AlsaMidiOut`, so the `alsa` FFI stays out of the
-kernel crate). `apply_command` opens the seq port + registers it under its id (the port
-name) — an ALSA open failure is a loud `BeatAck` Err, never a silent no-op. Detach
-properties that matter: a removed target is **silenced** (`flush_scheduled_after` →
-truncate its queued lead-time phrase + all-notes-off) *before* it's dropped, so no
-hanging notes on subscribers; `--replace` builds the new target *before* clearing the
-old ones (a failed open leaves working output intact); removing a missing id / on an
-empty track is a loud Err; `--off`/`--replace` are clap-conflicting. `--to` is the
-forward-looking extension point (unknown kind refused loudly; `docs/pcm.md`'s PCM target
-joins via `--to pcm`); `--port` defaults to the track name (`aconnect -l` shows
-`kaijutsu:<track>`). Tests: transport dispatch for add / default-port / unknown-kind /
-`--off` (by-port + all) / `--replace`; beat `add_render_target_on_unknown_track_is_loud_err`
-+ `remove_render_targets_by_id_and_all_silences_and_reports` (CI-safe, fake targets); and
-two `#[ignore]` live ALSA tests (loopback + `add_render_target_then_beat_plays_through_alsa`)
-**verified on zorak**, plus a live walk of attach→`--off`→`--replace` against
-`/proc/asound/seq/clients`.
-
-**Still ahead (out of M1 scope):** M2 (input telemetry), M3 (the drift-modeled
-clock-in — the real `apply_estimate` producer + the heap-re-enlistment hook the trait
-is already shaped for), M4 (cross-node + edge node) per `docs/midi.md`. Also still pending
-from earlier stages: a real-kernel live-verify of the Stage 2 score-context path.
+tension is **two tracks**, and myaku stops being a facility:
+
+- its **cadence, fire-coordinate injection, and death certificate** are what a
+  **track** does (this doc);
+- its **`/run` output substrate and `pulse_emit` helper** are what a probe
+  *attachment writes* — `shared-state.md`.
+
+A probe is just: *a context attached to a system-clock track, whose tick
+behaviour writes `/run`.* `myaku.md` is retired; its detailed `/run` layout lives
+in git history until migrated into `shared-state.md`.
+
+## Where the code is
+
+- `crates/kaijutsu-server/src/beat.rs` — `BeatScheduler`, `TrackState`, attach/
+  detach/rotation, materialize crossing, `KJ_*` injection, score reconstruction.
+- `crates/kaijutsu-server/src/clock.rs` — `ClockSourceKind` + `SystemClock`.
+- `crates/kaijutsu-hyoushigi/src/engine.rs` — the `Timeline` (open future,
+  committed log, `rehydrate_committed`, `set_clock`); `cell.rs` — `Cell` with
+  `track` + `played_by`.
+- `crates/kaijutsu-kernel/src/hyoushigi/mod.rs` — `Attachment`, `Cadence`,
+  `BeatCommand`, `BeatPolicy`, materialize.
+- `crates/kaijutsu-kernel/src/kj/transport.rs` — the `kj transport` surface;
+  `kj/play.rs` — `kj play`.
+- `crates/kaijutsu-kernel/src/kernel_db.rs` — the `tracks` + `attachments`
+  tables (`score_context_id` set-once, `clock_kind` mutable).
+- `crates/kaijutsu-abc/src/midi.rs` — `events()` / `generate()`.
+- `assets/defaults/rc/musician/` — the musician tick/rotate rc bundle.
