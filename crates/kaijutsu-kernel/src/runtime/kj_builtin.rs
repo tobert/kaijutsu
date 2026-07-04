@@ -407,23 +407,14 @@ impl Tool for KjBuiltin {
                 ("Bulk synthesize keywords", "kj synth all"),
             ],
         )
+        // `with_owned_output()` also routes `--help` to kj's own dispatch (where
+        // the leaf clap parser renders subcommand help) rather than kaish's outer
+        // help router: kaish 0.11 gates `wants_help` on `!schema.owns_output`
+        // (tobert/kaish#51), so an owned-output tool is never intercepted. Older
+        // kaish needed a synthetic root `help` param to flip `schema_claims`;
+        // 0.11 made that redundant. Guarded by
+        // `owns_output_routes_leaf_help_through_kaish`.
         .with_owned_output()
-        // Claim `--help` on the root schema so kaish's outer help router does
-        // NOT intercept it. The kernel's dispatch_command short-circuits any
-        // `--help` whose *root* schema doesn't claim the flag, rendering the
-        // generic whole-tool help instead of routing — so `kj context create
-        // --help` would never reach kj's own dispatch (where clap renders the
-        // leaf's help). By advertising `help` here, `schema_claims("help")` is
-        // true, kaish passes `--help` through to execute()→dispatch(), and the
-        // leaf clap parser renders subcommand help. `kj --help` (first token)
-        // still hits the dispatch top-level help arm, unchanged. This is the
-        // local half of the fix; the general fix (make the kernel's wants_help
-        // check schema-tree-aware for owned-output tools that re-parse their
-        // own argv) is filed upstream at tobert/kaish#51.
-        .param(
-            kaish_kernel::tools::ParamSchema::new("help", "bool")
-                .with_description("Show help for this command (routed to the leaf, not the outer router)"),
-        )
     }
 
     async fn execute(&self, args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
@@ -1931,36 +1922,46 @@ mod tests {
         );
     }
 
-    /// Regression guard for the outer-help-router papercut: kaish's
-    /// `dispatch_command` intercepts `--help` (rendering the generic whole-tool
-    /// help and skipping the tool entirely) unless the tool's **root** schema
-    /// claims the `help` flag — `schema_claims("help")` in kaish-kernel's
-    /// kernel.rs. kj owns its own output and re-parses its argv with clap, so
-    /// it wants `--help` routed through to its dispatch (where the leaf clap
-    /// parser renders subcommand help). That only happens if the reflected root
-    /// schema advertises `help`. This asserts the contract kaish relies on,
-    /// using the same `matches_flag` predicate kaish does.
+    /// Regression guard for the outer-help-router papercut, end-to-end through
+    /// the kaish bridge: `kj <group> <leaf> --help` must render the *leaf's*
+    /// clap help, not the generic whole-tool help.
+    ///
+    /// History: kaish's `dispatch_command` used to intercept `--help` (render
+    /// the whole-tool help, skip the tool) unless the tool's **root** schema
+    /// claimed the `help` flag. kj re-parses its argv with clap and wants
+    /// `--help` at the leaf, so it carried a synthetic root `help` param solely
+    /// to flip `schema_claims("help")` true. kaish 0.11 landed the real fix
+    /// (tobert/kaish#51): `wants_help` is now gated on `!schema.owns_output`, so
+    /// an owned-output tool (`with_owned_output()`) is never intercepted — the
+    /// synthetic param is gone and `owns_output` alone routes `--help` through.
+    /// This drives the actual behavior so it fails if either the upstream gate
+    /// regresses or kj stops owning its output.
     #[tokio::test]
-    async fn root_schema_claims_help_flag_so_kaish_routes_it() {
+    async fn owns_output_routes_leaf_help_through_kaish() {
         let dispatcher = Arc::new(test_dispatcher().await);
-        let kj = KjBuiltin::new(
-            dispatcher,
-            session_context_map(),
-            PrincipalId::system(),
-            SessionId::new(),
-            None,
-            Arc::new(crate::kj::lifecycle::NoopBlockSource),
-            false,
-        );
-        let schema = kj.schema();
-        // Mirror kaish-kernel's `schema_claims("help")`: a root param whose
-        // name or alias matches the bare flag. If this fails, kaish's outer
-        // help router will swallow `kj <verb> --help` and show top-level help.
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("help-home"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+
+        let res = kaish
+            .execute_with_options("kj context create --help", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        let out = res.text_out();
+
+        // Leaf help reached: clap's create-subcommand usage + its positional.
         assert!(
-            schema.params.iter().any(|p| p.matches_flag("help")),
-            "kj root schema must claim `help` so kaish routes --help to the leaf \
-             instead of intercepting it; root params = {:?}",
-            schema.params.iter().map(|p| &p.name).collect::<Vec<_>>(),
+            out.contains("Usage: create [OPTIONS] [LABEL]")
+                && out.contains("Label (positional form"),
+            "`kj context create --help` must render the leaf's clap help; got:\n{out}"
+        );
+        // NOT intercepted by the outer router (which would emit the whole-tool
+        // help headed by the kj banner instead of the create leaf).
+        assert!(
+            !out.contains("# kj — kernel command interface"),
+            "outer help router intercepted `kj context create --help` — it \
+             rendered top-level help instead of the leaf; got:\n{out}"
         );
     }
 
