@@ -412,6 +412,17 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Vec<String>, CallError>>,
     },
 
+    // ── Per-client durable view state (docs/shared-state.md "Retiring KV") ──
+    SetLastContext {
+        client_id: String,
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    GetClientView {
+        client_id: String,
+        reply: oneshot::Sender<Result<Option<ContextId>, CallError>>,
+    },
+
     // ── Input Document ──────────────────────────────────────────────────
     EditInput {
         context_id: ContextId,
@@ -614,6 +625,8 @@ impl RpcCommand {
             Self::KvSet { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::KvDelete { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::KvKeys { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetLastContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetClientView { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInputState { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1033,6 +1046,31 @@ impl ActorHandle {
     pub async fn kv_keys(&self, prefix: Option<&str>) -> Result<Vec<String>, CallError> {
         self.send(|reply| RpcCommand::KvKeys {
             prefix: prefix.map(Into::into),
+            reply,
+        })
+        .await
+    }
+
+    // ── Per-client durable view state (docs/shared-state.md "Retiring KV") ──
+
+    #[tracing::instrument(skip(self))]
+    pub async fn set_last_context(
+        &self,
+        client_id: &str,
+        context_id: ContextId,
+    ) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::SetLastContext {
+            client_id: client_id.into(),
+            context_id,
+            reply,
+        })
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get_client_view(&self, client_id: &str) -> Result<Option<ContextId>, CallError> {
+        self.send(|reply| RpcCommand::GetClientView {
+            client_id: client_id.into(),
             reply,
         })
         .await
@@ -2526,6 +2564,14 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::KvKeys { prefix, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.kv_keys(prefix.as_deref()));
+        }
+
+        // ── Per-client durable view state ──
+        RpcCommand::SetLastContext { client_id, context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.set_last_context(&client_id, context_id));
+        }
+        RpcCommand::GetClientView { client_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_client_view(&client_id));
         }
 
         // ── Input Document ──

@@ -1638,6 +1638,41 @@ impl KernelHandle {
     }
 
     // =========================================================================
+    // Per-client durable view state (docs/shared-state.md "Retiring KV")
+    // =========================================================================
+
+    /// Record `context_id` as the last-viewed context for `client_id` (upsert).
+    #[tracing::instrument(skip(self), name = "rpc_client.set_last_context")]
+    pub async fn set_last_context(
+        &self,
+        client_id: &str,
+        context_id: ContextId,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.set_last_context_request();
+        request.get().set_client_id(client_id);
+        request.get().set_context_id(&context_id.to_string());
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Read back the last-viewed context for `client_id`. Returns `None` if
+    /// this client has never recorded one.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_client_view")]
+    pub async fn get_client_view(&self, client_id: &str) -> Result<Option<ContextId>, RpcError> {
+        let mut request = self.kernel.get_client_view_request();
+        request.get().set_client_id(client_id);
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        if !result.get_found() {
+            return Ok(None);
+        }
+        let context_id_str = result.get_context_id()?.to_str()?;
+        let context_id = ContextId::parse(context_id_str)
+            .map_err(|e| RpcError::ServerError(format!("invalid context id: {}", e)))?;
+        Ok(Some(context_id))
+    }
+
+    // =========================================================================
     // Input Document (CRDT compose scratchpad)
     // =========================================================================
 

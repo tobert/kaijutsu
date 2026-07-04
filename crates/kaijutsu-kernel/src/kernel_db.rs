@@ -661,6 +661,19 @@ CREATE TABLE IF NOT EXISTS attachments (
     ooda_armed            INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (track_id, context_id)
 );
+
+-- ── Client Views (docs/shared-state.md "Retiring KV") ───────────
+-- One row per app installation: "the context this client last had open,"
+-- restored on reconnect. `client_id` is the app's stable per-installation
+-- UUID (text, minted client-side — not a kernel-issued id type), so it is
+-- TEXT rather than the BLOB convention used for kernel ids. Replaces the
+-- KV-era `<client-id>.current_context` string key with a normalized row —
+-- strictly less machinery (no envelope, no journal/compaction).
+CREATE TABLE IF NOT EXISTS client_views (
+    client_id   TEXT    NOT NULL PRIMARY KEY,
+    context_id  BLOB    NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 "#;
 
 // ============================================================================
@@ -3811,6 +3824,40 @@ impl KernelDb {
             Ok(None)
         }
     }
+
+    // ========================================================================
+    // Client Views (docs/shared-state.md "Retiring KV")
+    // ========================================================================
+
+    /// Record `context_id` as the last-viewed context for `client_id`
+    /// (upsert). Called on every context switch, including the restore
+    /// itself — an idempotent re-write of the same value is harmless.
+    pub fn set_client_view(&self, client_id: &str, context_id: ContextId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO client_views (client_id, context_id, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(client_id) DO UPDATE SET
+                context_id = excluded.context_id,
+                updated_at = excluded.updated_at",
+            params![client_id, blob_param(context_id.as_bytes()), now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Read back the last-viewed context for `client_id`, or `None` if this
+    /// client has never recorded one. No data-migration from the retired KV
+    /// key (`<client_id>.current_context`) — losing the restore value once,
+    /// for a single-user early-dev install, is acceptable.
+    pub fn get_client_view(&self, client_id: &str) -> KernelDbResult<Option<ContextId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT context_id FROM client_views WHERE client_id = ?1")?;
+        let mut rows = stmt.query_map(params![client_id], |row| read_context_id(row, 0))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
 }
 
 // ============================================================================
@@ -5806,6 +5853,52 @@ mod tests {
             db.get_hydration_policy(ctx.context_id).unwrap().is_none(),
             "cleared policy reverts to hydrate-everything"
         );
+    }
+
+    // ── Client Views (docs/shared-state.md "Retiring KV") ──────────────
+
+    #[test]
+    fn client_view_unset_is_none() {
+        let db = KernelDb::in_memory().unwrap();
+        assert!(db.get_client_view("client-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn client_view_set_get_round_trip() {
+        let db = KernelDb::in_memory().unwrap();
+        let ctx = ContextId::new();
+        db.set_client_view("client-a", ctx).unwrap();
+        assert_eq!(db.get_client_view("client-a").unwrap(), Some(ctx));
+    }
+
+    #[test]
+    fn client_view_overwrite_returns_latest() {
+        // Set twice: the second write replaces the first in place (PK is
+        // client_id), matching the "one row per installation" design — not a
+        // history of every context this client ever looked at.
+        let db = KernelDb::in_memory().unwrap();
+        let first = ContextId::new();
+        let second = ContextId::new();
+        db.set_client_view("client-a", first).unwrap();
+        db.set_client_view("client-a", second).unwrap();
+        assert_eq!(
+            db.get_client_view("client-a").unwrap(),
+            Some(second),
+            "second set overwrites the first"
+        );
+    }
+
+    #[test]
+    fn client_view_is_namespaced_per_client() {
+        // Two installations don't clobber each other's view — the whole point
+        // of keying by client_id instead of a single global row.
+        let db = KernelDb::in_memory().unwrap();
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        db.set_client_view("client-a", ctx_a).unwrap();
+        db.set_client_view("client-b", ctx_b).unwrap();
+        assert_eq!(db.get_client_view("client-a").unwrap(), Some(ctx_a));
+        assert_eq!(db.get_client_view("client-b").unwrap(), Some(ctx_b));
     }
 
     // ── Tracks CRUD ───────────────────────────────────────────────────

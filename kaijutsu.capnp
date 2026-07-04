@@ -1314,6 +1314,24 @@ interface Kernel {
   editorQuit @88 (sessionId :UInt64, trace :TraceContext) -> ();
   # Push channel: server streams editor state changes (incl. future remote merges).
   subscribeEditor @89 (callback :EditorEvents);
+
+  # ==========================================================================
+  # Per-client durable view state (docs/shared-state.md "Retiring KV")
+  # ==========================================================================
+  # The kernel-managed replacement for the app's one production KV use:
+  # "reopen the context this window was last looking at" on reconnect. Backed
+  # by a small normalized `client_views` KernelDb row keyed by the app's
+  # stable per-installation client id — not a stringly KV namespace.
+
+  # Record the last-viewed context for `clientId`. Idempotent re-write on the
+  # same value is harmless (the app fires this on every context switch,
+  # including the restore itself).
+  setLastContext @90 (clientId :Text, contextId :Text);
+
+  # Read back the last-viewed context for `clientId`. `found = false` when no
+  # view is on record for this client (matches `kvGet`/`getShellVar`'s
+  # value+found shape rather than an empty-string sentinel).
+  getClientView @91 (clientId :Text) -> (contextId :Text, found :Bool);
 }
 
 # ============================================================================

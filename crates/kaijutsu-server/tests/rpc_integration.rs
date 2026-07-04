@@ -807,3 +807,80 @@ fn test_shell_var_seeds_materialized_shell() {
         );
     });
 }
+
+// ============================================================================
+// Per-client durable view state (docs/shared-state.md "Retiring KV")
+// ============================================================================
+
+/// `setLastContext` / `getClientView` round-trip over the real wire — the
+/// typed replacement for the app's one production KV use
+/// (`<client-id>.current_context`).
+#[test]
+fn test_client_view_round_trips_over_rpc() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let client_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            kernel.get_client_view(&client_id).await.unwrap(),
+            None,
+            "no view recorded yet"
+        );
+
+        let ctx_id = kernel.create_context("client-view-a").await.unwrap();
+        kernel.set_last_context(&client_id, ctx_id).await.unwrap();
+
+        assert_eq!(
+            kernel.get_client_view(&client_id).await.unwrap(),
+            Some(ctx_id),
+            "view survives write→read over the wire"
+        );
+    });
+}
+
+/// A second `setLastContext` for the same client overwrites the first — one
+/// row per installation, not a history of every context ever viewed.
+#[test]
+fn test_client_view_set_twice_returns_latest() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let client_id = uuid::Uuid::new_v4().to_string();
+        let ctx_a = kernel.create_context("client-view-b").await.unwrap();
+        let ctx_b = kernel.create_context("client-view-c").await.unwrap();
+
+        kernel.set_last_context(&client_id, ctx_a).await.unwrap();
+        kernel.set_last_context(&client_id, ctx_b).await.unwrap();
+
+        assert_eq!(
+            kernel.get_client_view(&client_id).await.unwrap(),
+            Some(ctx_b),
+            "second set overwrites the first"
+        );
+    });
+}
+
+/// Two client ids don't clobber each other's view — the whole point of
+/// keying by client_id instead of a single global row (mirrors
+/// `test_shell_var_shared_across_connections`'s isolation shape, but across
+/// distinct client ids on ONE connection rather than distinct connections).
+#[test]
+fn test_client_view_is_namespaced_per_client() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let client_a = uuid::Uuid::new_v4().to_string();
+        let client_b = uuid::Uuid::new_v4().to_string();
+        let ctx_a = kernel.create_context("client-view-d").await.unwrap();
+        let ctx_b = kernel.create_context("client-view-e").await.unwrap();
+
+        kernel.set_last_context(&client_a, ctx_a).await.unwrap();
+        kernel.set_last_context(&client_b, ctx_b).await.unwrap();
+
+        assert_eq!(kernel.get_client_view(&client_a).await.unwrap(), Some(ctx_a));
+        assert_eq!(kernel.get_client_view(&client_b).await.unwrap(), Some(ctx_b));
+    });
+}

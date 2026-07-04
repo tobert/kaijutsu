@@ -311,11 +311,12 @@ fn restore_context_on_message(
     }
 }
 
-/// Persist the active context to the kernel KV whenever it changes, so the next
-/// (re)connect can restore it. A single observer over `DocumentCache::active_id`
-/// captures every switch source — app UI, MCP-peer `switch_context`, and the
-/// restore itself (a harmless re-write of the same value). Fire-and-forget: a
-/// failed write is logged, never fatal (per-client view state is a convenience).
+/// Persist the active context to the kernel's per-client view row whenever it
+/// changes, so the next (re)connect can restore it. A single observer over
+/// `DocumentCache::active_id` captures every switch source — app UI, MCP-peer
+/// `switch_context`, and the restore itself (a harmless re-write of the same
+/// value). Fire-and-forget: a failed write is logged, never fatal (per-client
+/// view state is a convenience).
 fn persist_current_context(
     doc_cache: Res<crate::cell::DocumentCache>,
     actor: Option<Res<RpcActor>>,
@@ -334,11 +335,10 @@ fn persist_current_context(
     };
     *last_written = Some(id);
     let handle = actor.handle.clone();
-    let key = client_id.current_context_key();
-    let value = id.to_string();
+    let client_id = client_id.0.to_string();
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
-            if let Err(e) = handle.kv_set(&key, &value, None).await {
+            if let Err(e) = handle.set_last_context(&client_id, id).await {
                 log::warn!("persist current_context failed: {e}");
             }
         })
@@ -396,7 +396,7 @@ fn poll_bootstrap_results(
                 let tx = result_channel.sender();
                 let inv_tx = invocation_channel.tx.clone();
                 let ctx_id = context_id;
-                let cc_key = client_id.current_context_key();
+                let client_id = client_id.0.to_string();
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
                         let mut status_rx = h.watch_status();
@@ -527,16 +527,12 @@ fn poll_bootstrap_results(
                         }
 
                         // 3. No context specified — fetch the context list, then
-                        //    restore the last-viewed context from the kernel KV if
-                        //    it still exists (closes the reattach bug). The read is
-                        //    best-effort: any KV hiccup just falls through to the
-                        //    list and the normal first-context selection.
-                        let saved_ctx = h
-                            .kv_get(&cc_key)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|s| ContextId::parse(&s).ok());
+                        //    restore the last-viewed context from the kernel's
+                        //    per-client view row if it still exists (closes the
+                        //    reattach bug). The read is best-effort: any hiccup
+                        //    just falls through to the list and the normal
+                        //    first-context selection.
+                        let saved_ctx = h.get_client_view(&client_id).await.ok().flatten();
                         match h.list_contexts().await {
                             Ok(contexts) => {
                                 log::info!(

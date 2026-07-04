@@ -4571,6 +4571,61 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    // ========================================================================
+    // Per-client durable view state (docs/shared-state.md "Retiring KV")
+    // ========================================================================
+
+    fn set_last_context(
+        self: Rc<Self>,
+        params: kernel::SetLastContextParams,
+        _results: kernel::SetLastContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "set_last_context").entered();
+        let p = pry!(params.get());
+        let client_id = pry!(pry!(p.get_client_id()).to_str()).to_owned();
+        let context_id_str = pry!(pry!(p.get_context_id()).to_str());
+        let context_id = pry!(
+            ContextId::parse(context_id_str)
+                .map_err(|e| capnp::Error::failed(format!("invalid context id: {}", e)))
+        );
+        pry!(
+            self.kernel
+                .kernel_db
+                .lock()
+                .set_client_view(&client_id, context_id)
+                .map_err(|e| capnp::Error::failed(format!("failed to persist client view: {}", e)))
+        );
+        Promise::ok(())
+    }
+
+    fn get_client_view(
+        self: Rc<Self>,
+        params: kernel::GetClientViewParams,
+        mut results: kernel::GetClientViewResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "get_client_view").entered();
+        let client_id = pry!(pry!(pry!(params.get()).get_client_id()).to_str()).to_owned();
+        let view = pry!(
+            self.kernel
+                .kernel_db
+                .lock()
+                .get_client_view(&client_id)
+                .map_err(|e| capnp::Error::failed(format!("failed to read client view: {}", e)))
+        );
+        let mut b = results.get();
+        match view {
+            Some(context_id) => {
+                b.set_context_id(&context_id.to_string());
+                b.set_found(true);
+            }
+            None => {
+                b.set_context_id("");
+                b.set_found(false);
+            }
+        }
+        Promise::ok(())
+    }
+
     fn compact_context(
         self: Rc<Self>,
         params: kernel::CompactContextParams,

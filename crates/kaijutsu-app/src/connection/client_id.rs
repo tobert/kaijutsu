@@ -1,16 +1,17 @@
 //! Stable per-installation client id.
 //!
-//! The kernel KV namespaces per-client view state under `<client-id>.<name>`
-//! (e.g. `<client-id>.current_context`) so two app instances never clobber each
-//! other's "which context am I looking at" (docs/kernel-kv.md). That needs a
-//! stable id surviving restarts — which the app does not otherwise have
-//! (`"bevy-client"` is a fixed instance label, not unique).
+//! The kernel keys per-client view state (the `client_views` KernelDb row —
+//! see `docs/shared-state.md` "Retiring KV", `setLastContext`/`getClientView`)
+//! by this id, so two app instances never clobber each other's "which context
+//! am I looking at." That needs a stable id surviving restarts — which the
+//! app does not otherwise have (`"bevy-client"` is a fixed instance label,
+//! not unique).
 //!
 //! We seed a UUID at `~/.local/share/kaijutsu/client-id` on first run and read
 //! it thereafter. Failure mode, accepted by design: if the seed file is lost the
-//! next run mints a new UUID and the prior keys orphan under the old prefix
-//! (namespaces are just strings — they can't be enumerated as "mine"). At env
-//! scale that's tolerable.
+//! next run mints a new UUID and the prior row orphans under the old id (rows
+//! aren't enumerated as "mine" by any other means). At single-user scale
+//! that's tolerable.
 
 use std::path::{Path, PathBuf};
 
@@ -19,17 +20,10 @@ use uuid::Uuid;
 
 /// The installation's stable client id, as a Bevy resource.
 ///
-/// Seeded once at startup ([`load_or_seed`]). Used to namespace per-client KV
-/// state so two app instances don't clobber each other's view state.
+/// Seeded once at startup ([`load_or_seed`]). Used to key per-client durable
+/// view state so two app instances don't clobber each other's view state.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct ClientId(pub Uuid);
-
-impl ClientId {
-    /// The KV key this client stores its current context under.
-    pub fn current_context_key(&self) -> String {
-        format!("{}.current_context", self.0)
-    }
-}
 
 /// File name under the data dir holding the client-id UUID (hyphenated text).
 const CLIENT_ID_FILE: &str = "client-id";
