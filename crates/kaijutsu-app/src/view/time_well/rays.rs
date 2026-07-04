@@ -74,11 +74,18 @@ pub fn ray_endpoints(angle: f32) -> (Vec3, Vec3) {
 pub fn ray_transform(angle: f32) -> Transform {
     let (p0, p1) = ray_endpoints(angle);
     let dir = (p1 - p0).normalize();
-    let angular = Vec3::new(-angle.sin(), angle.cos(), 0.0);
-    let normal = dir.cross(angular).normalize();
+    let mut angular = Vec3::new(-angle.sin(), angle.cos(), 0.0);
+    let mut normal = dir.cross(angular).normalize();
     // dir × angular has +Z-dominant sign for a bowl opening toward +Z; keep it
-    // facing the mouth so the beam reads from the camera side.
-    let normal = if normal.z < 0.0 { -normal } else { normal };
+    // facing the mouth so the beam reads from the camera side. Flip BOTH axes
+    // (a 180° roll about `dir`), never just the normal — a lone flip would
+    // hand `Quat::from_mat3` a left-handed (reflected) basis and yield a
+    // garbage rotation. Dead code at today's funnel dimensions (the slope
+    // always rises outward), live the day they're re-tuned (Gemini review).
+    if normal.z < 0.0 {
+        normal = -normal;
+        angular = -angular;
+    }
     let tilt = super::card::well_tilt_quat();
     Transform {
         translation: tilt * p0.midpoint(p1),
@@ -205,7 +212,11 @@ pub fn sync_track_rays(
         return;
     }
 
-    // Despawn rays whose track is gone.
+    // Compute the diff through `&state` reads only, and bail before ANY
+    // mutable touch when there is nothing to reconcile: `ResMut`'s `DerefMut`
+    // flags the resource changed even for a no-op write, so an unconditional
+    // `get_or_insert_with` here would re-dirty `WellTracks` every run and the
+    // system would never sleep (found by the Gemini review, 2026-07-04).
     let live: std::collections::HashSet<&str> =
         state.tracks.iter().map(|t| t.id.as_str()).collect();
     let dead: Vec<String> = state
@@ -214,23 +225,31 @@ pub fn sync_track_rays(
         .filter(|id| !live.contains(id.as_str()))
         .cloned()
         .collect();
-    for id in dead {
-        if let Some(e) = state.ray_entities.remove(&id) {
-            commands.entity(e).despawn();
-        }
-    }
-
-    // Spawn rays for new tracks.
-    let mesh = state
-        .ray_mesh
-        .get_or_insert_with(|| meshes.add(Rectangle::new(ray_length(), RAY_WIDTH)))
-        .clone();
     let new: Vec<TrackInfo> = state
         .tracks
         .iter()
         .filter(|t| !state.ray_entities.contains_key(&t.id))
         .cloned()
         .collect();
+    if dead.is_empty() && new.is_empty() {
+        return;
+    }
+
+    // Despawn rays whose track is gone.
+    for id in dead {
+        if let Some(e) = state.ray_entities.remove(&id) {
+            commands.entity(e).despawn();
+        }
+    }
+
+    if new.is_empty() {
+        return;
+    }
+    // Spawn rays for new tracks (shared beam mesh, built on first use).
+    let mesh = state
+        .ray_mesh
+        .get_or_insert_with(|| meshes.add(Rectangle::new(ray_length(), RAY_WIDTH)))
+        .clone();
     for t in new {
         let angle = ray_angle(&t.id);
         let c = super::scene::accent_color(&t.id).to_linear();

@@ -657,7 +657,7 @@ mod tests {
         for i in 0..(SOUTH_TAIL_LINES + 2) {
             tails.push(
                 ctx,
-                TailLine { glyph: "✦", text: format!("event {i}") },
+                TailLine::new("✦", format!("event {i}")),
                 i as f64,
             );
         }

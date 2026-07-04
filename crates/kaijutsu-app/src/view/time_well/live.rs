@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 use bevy::prelude::*;
 use kaijutsu_audio::{BeatRef, LocalBeat, RENDER_FLUSH_MIME};
 use kaijutsu_client::ServerEvent;
-use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role};
+use kaijutsu_crdt::BlockId;
+use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role, Status};
 
 use crate::connection::actor_plugin::ServerEventMessage;
 
@@ -66,9 +67,18 @@ const PHASOR_STALE: Duration = Duration::from_secs(30);
 pub struct TailLine {
     pub glyph: &'static str,
     pub text: String,
+    /// Set on a **placeholder** line (an empty streaming insert — "⋯
+    /// composing") so the block's later `Done`/`Error` status flip can
+    /// resolve it in place ([`ContextTails::resolve`]); cleared once
+    /// resolved. `None` for lines that arrived whole.
+    pub block: Option<BlockId>,
 }
 
 impl TailLine {
+    pub fn new(glyph: &'static str, text: impl Into<String>) -> Self {
+        Self { glyph, text: text.into(), block: None }
+    }
+
     /// The display form the HUD renders: `glyph text`.
     pub fn display(&self) -> String {
         format!("{} {}", self.glyph, self.text)
@@ -118,6 +128,31 @@ impl ContextTails {
     pub fn iter_lines(&self, ctx: &ContextId) -> impl Iterator<Item = &TailLine> {
         self.tails.get(ctx).into_iter().flat_map(|t| t.lines.iter())
     }
+
+    /// Resolve a placeholder line in place when its block's turn concludes:
+    /// "⋯ composing" → "✦ replied" / "✕ turn failed". No-op for blocks the
+    /// tail never placeholdered (whole-content lines, evicted lines) and for
+    /// non-terminal flips (Running). The window is [`TAIL_LINES`] long, so
+    /// the scan is trivial.
+    pub fn resolve(&mut self, ctx: &ContextId, block: BlockId, status: Status) {
+        let Some(tail) = self.tails.get_mut(ctx) else { return };
+        let Some(line) = tail.lines.iter_mut().find(|l| l.block == Some(block)) else {
+            return;
+        };
+        match status {
+            Status::Done => {
+                line.glyph = "✦";
+                line.text = "replied".into();
+                line.block = None;
+            }
+            Status::Error => {
+                line.glyph = "✕";
+                line.text = "turn failed".into();
+                line.block = None;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Head of the first non-empty content line, truncated to
@@ -128,61 +163,59 @@ fn head_line(content: &str) -> Option<String> {
 }
 
 /// Map an inserted block to a tail line, or `None` for blocks that carry no
-/// glanceable signal (empty streaming inserts, thinking, structural kinds).
+/// glanceable signal (thinking, structural kinds).
 ///
 /// Model text usually inserts **empty** and streams in via `BlockTextOps`
-/// (CRDT deltas this module doesn't decode), so a live turn shows up as the
-/// chatter glow + running rim rather than a tail line; the tail catches the
-/// blocks that arrive whole — user prompts, tool calls, results, errors,
-/// notifications, and materialized score cells (tagged with their track).
+/// (CRDT deltas this module doesn't decode), so an empty model insert becomes
+/// a "⋯ composing" **placeholder** tagged with its block id — the block's
+/// `Done`/`Error` flip resolves it in place ([`ContextTails::resolve`]), so
+/// the tail narrates the turn without holding a CRDT replica (Gemini review,
+/// 2026-07-04). Everything else catches blocks that arrive whole — user
+/// prompts, tool calls, results, errors, notifications, and materialized
+/// score cells (tagged with their track).
 pub fn tail_line(block: &BlockSnapshot) -> Option<TailLine> {
     match block.kind {
         BlockKind::Text => {
-            let head = head_line(&block.content)?;
+            let Some(head) = head_line(&block.content) else {
+                // User text never streams — an empty user row is just noise.
+                if block.role == Role::User {
+                    return None;
+                }
+                return Some(TailLine {
+                    glyph: "✦",
+                    text: "⋯ composing".into(),
+                    block: Some(block.id),
+                });
+            };
             // A materialized score cell carries its lane — show it.
             if let Some(track) = &block.track {
-                return Some(TailLine {
-                    glyph: "♪",
-                    text: format!("{}: {}", track.as_str(), head),
-                });
+                return Some(TailLine::new("♪", format!("{}: {}", track.as_str(), head)));
             }
             let glyph = if block.role == Role::User { "❯" } else { "✦" };
-            Some(TailLine { glyph, text: head })
+            Some(TailLine::new(glyph, head))
         }
         BlockKind::ToolCall => {
             // The tool name is the signal; the input JSON body is noise.
             let name = block.tool_name.as_deref().unwrap_or("tool");
-            Some(TailLine {
-                glyph: "▸",
-                text: crate::text::truncate_chars(name, TAIL_LINE_CHARS),
-            })
+            Some(TailLine::new("▸", crate::text::truncate_chars(name, TAIL_LINE_CHARS)))
         }
         BlockKind::ToolResult => {
             let head = head_line(&block.content)?;
             let glyph = if block.is_error { "✕" } else { "◂" };
-            Some(TailLine { glyph, text: head })
+            Some(TailLine::new(glyph, head))
         }
-        BlockKind::Error => Some(TailLine {
-            glyph: "✕",
-            text: head_line(&block.content).unwrap_or_else(|| "error".into()),
-        }),
-        BlockKind::Drift => {
-            let head = head_line(&block.content)?;
-            Some(TailLine { glyph: "≈", text: head })
-        }
-        BlockKind::Notification => {
-            let head = head_line(&block.content)?;
-            Some(TailLine { glyph: "◆", text: head })
-        }
+        BlockKind::Error => Some(TailLine::new(
+            "✕",
+            head_line(&block.content).unwrap_or_else(|| "error".into()),
+        )),
+        BlockKind::Drift => Some(TailLine::new("≈", head_line(&block.content)?)),
+        BlockKind::Notification => Some(TailLine::new("◆", head_line(&block.content)?)),
         BlockKind::File => {
             let text = block
                 .file_path
                 .clone()
                 .or_else(|| head_line(&block.content))?;
-            Some(TailLine {
-                glyph: "⎘",
-                text: crate::text::truncate_chars(&text, TAIL_LINE_CHARS),
-            })
+            Some(TailLine::new("⎘", crate::text::truncate_chars(&text, TAIL_LINE_CHARS)))
         }
         // Thinking streams in empty (and is inner voice, not activity);
         // everything else is structural.
@@ -277,8 +310,9 @@ impl WellBeats {
             .fold(0.0, f32::max)
     }
 
-    /// Whether any track's clock is rolling (has a live phasor). Test-only
-    /// today; the HUD's track readout (Slice 3) is the intended consumer.
+    /// Whether any track's clock is rolling (has a live phasor). Strictly a
+    /// test helper — the HUD's transport readout uses `TrackInfo.playing`
+    /// from the `listTracks` poll, not the phasor set.
     #[cfg(test)]
     pub fn any_rolling(&self) -> bool {
         !self.phasors.is_empty()
@@ -306,6 +340,9 @@ pub fn ingest_live_events(
                 if let Some(line) = tail_line(block) {
                     tails.push(*context_id, line, now);
                 }
+            }
+            ServerEvent::BlockStatusChanged { context_id, block_id, status } => {
+                tails.resolve(context_id, *block_id, *status);
             }
             ServerEvent::BeatSync { context_id, beat_ref } => {
                 beats.observe(*context_id, *beat_ref, now_inst);
@@ -412,12 +449,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_streaming_insert_yields_no_line() {
-        // Model turns insert empty then stream via TextOps — no tail line;
-        // the chatter glow carries that signal instead.
+    fn empty_model_insert_becomes_a_placeholder_the_status_flip_resolves() {
+        // Model turns insert empty then stream via TextOps — the tail shows a
+        // tagged "composing" placeholder that the terminal status resolves.
         let empty = BlockSnapshot::text(bid(1), None, Role::Model, "");
-        assert!(tail_line(&empty).is_none());
-        let blank = BlockSnapshot::text(bid(1), None, Role::Model, "  \n\t\n");
+        let line = tail_line(&empty).expect("placeholder line");
+        assert_eq!(line.text, "⋯ composing");
+        assert_eq!(line.block, Some(bid(1)), "tagged for resolution");
+
+        let mut tails = ContextTails::default();
+        tails.push(ctx(1), line, 0.0);
+        // A non-terminal flip (Running) leaves the placeholder alone.
+        tails.resolve(&ctx(1), bid(1), kaijutsu_types::Status::Running);
+        assert_eq!(tails.iter_lines(&ctx(1)).next().unwrap().text, "⋯ composing");
+        // Done resolves it in place and clears the tag.
+        tails.resolve(&ctx(1), bid(1), kaijutsu_types::Status::Done);
+        let resolved = tails.iter_lines(&ctx(1)).next().unwrap();
+        assert_eq!(resolved.display(), "✦ replied");
+        assert_eq!(resolved.block, None, "tag cleared once resolved");
+        // A later flip for the same block is a no-op (tag gone).
+        tails.resolve(&ctx(1), bid(1), kaijutsu_types::Status::Error);
+        assert_eq!(tails.iter_lines(&ctx(1)).next().unwrap().display(), "✦ replied");
+
+        // An errored turn reads as a failure.
+        let mut tails = ContextTails::default();
+        tails.push(ctx(1), tail_line(&empty).unwrap(), 0.0);
+        tails.resolve(&ctx(1), bid(1), kaijutsu_types::Status::Error);
+        assert_eq!(tails.iter_lines(&ctx(1)).next().unwrap().display(), "✕ turn failed");
+
+        // Empty USER text stays out of the tail (it never streams).
+        let blank = BlockSnapshot::text(bid(1), None, Role::User, "  \n\t\n");
         assert!(tail_line(&blank).is_none());
     }
 
@@ -463,7 +524,7 @@ mod tests {
     fn tail_caps_at_window_evicting_oldest_line() {
         let mut tails = ContextTails::default();
         for i in 0..(TAIL_LINES + 3) {
-            tails.push(ctx(1), TailLine { glyph: "✦", text: format!("line {i}") }, i as f64);
+            tails.push(ctx(1), TailLine::new("✦", format!("line {i}")), i as f64);
         }
         let lines: Vec<_> = tails.iter_lines(&ctx(1)).collect();
         assert_eq!(lines.len(), TAIL_LINES, "window stays capped");
@@ -478,7 +539,7 @@ mod tests {
         for i in 0..TAIL_CONTEXT_CAP {
             tails.push(
                 ContextId::from_bytes([(i % 251) as u8, (i / 251) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-                TailLine { glyph: "✦", text: "x".into() },
+                TailLine::new("✦", "x"),
                 i as f64,
             );
         }
@@ -489,7 +550,7 @@ mod tests {
             .min_by(|a, b| a.1.touched.total_cmp(&b.1.touched))
             .map(|(id, _)| id)
             .unwrap();
-        tails.push(ctx(9), TailLine { glyph: "✦", text: "new".into() }, 1e9);
+        tails.push(ctx(9), TailLine::new("✦", "new"), 1e9);
         assert_eq!(tails.tails.len(), TAIL_CONTEXT_CAP, "capped");
         assert!(!tails.tails.contains_key(&oldest), "oldest-touched dropped");
         assert!(!tails.iter_lines(&ctx(9)).next().is_none(), "newcomer kept");

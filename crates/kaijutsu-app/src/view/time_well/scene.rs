@@ -454,6 +454,7 @@ pub fn enter_time_well(
 pub fn exit_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
+    mut activity: ResMut<super::activity::RingActivity>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<TimeWellRoot>>,
     cards: Query<Entity, With<Card>>,
@@ -462,6 +463,11 @@ pub fn exit_time_well(
     terrace_rings: Query<Entity, With<TerraceRing>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
+    // Drop the pulse state: the activity systems are well-gated, so energy
+    // frozen at exit would otherwise sit un-decayed and flash bright on
+    // re-entry hours later (Gemini review, 2026-07-04). Re-entering starts
+    // calm and warms from live events — matching the join reset below.
+    *activity = super::activity::RingActivity::default();
     for e in roots
         .iter()
         .chain(cards.iter())
