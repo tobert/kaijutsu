@@ -17,7 +17,7 @@ use kaijutsu_cas::ContentStore;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use serde::Serialize;
 
-use crate::block_tools::translate::{line_range_to_byte_range, line_to_byte_offset};
+use crate::block_tools::translate::{line_range_to_char_range, line_to_char_offset};
 use super::refs::resolve_context_arg;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -849,6 +849,12 @@ impl KjDispatcher {
     /// Edit a block via a single line-based operation. Mirrors a single
     /// `EditOp` from MCP `block_edit`. CAS-validated when `--expected` is
     /// provided on Replace; line indices are 0-indexed and half-open.
+    ///
+    /// Offsets are CHAR units throughout (`line_to_char_offset` /
+    /// `line_range_to_char_range`): `edit_text_as` feeds the CRDT text layer,
+    /// which bounds-checks against `chars().count()` and splices at char
+    /// positions — byte offsets from multibyte content splice at the wrong
+    /// place or trip that check spuriously (the June file-tools bug class).
     fn block_edit(&self, id_str: &str, op: EditOp, caller: &KjCaller) -> KjResult {
         let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
             Some(id) => id,
@@ -878,10 +884,10 @@ impl KjDispatcher {
         };
         let content = snap.content.clone();
 
-        // Translate the op into (pos, insert_text, delete_len) and apply.
+        // Translate the op into (pos, insert_text, delete_len) — CHAR units.
         let (pos, insert_text, delete_len, op_label) = match op {
             EditOp::Insert { line, content: text } => {
-                let pos = match line_to_byte_offset(&content, line) {
+                let pos = match line_to_char_offset(&content, line) {
                     Ok(p) => p,
                     Err(e) => return KjResult::Err(format!("kj block edit insert: {e}")),
                 };
@@ -896,7 +902,7 @@ impl KjDispatcher {
                 start_line,
                 end_line,
             } => {
-                let (start, end) = match line_range_to_byte_range(&content, start_line, end_line) {
+                let (start, end) = match line_range_to_char_range(&content, start_line, end_line) {
                     Ok(pair) => pair,
                     Err(e) => return KjResult::Err(format!("kj block edit delete: {e}")),
                 };
@@ -932,7 +938,7 @@ impl KjDispatcher {
                         ));
                     }
                 }
-                let (start, end) = match line_range_to_byte_range(&content, start_line, end_line) {
+                let (start, end) = match line_range_to_char_range(&content, start_line, end_line) {
                     Ok(pair) => pair,
                     Err(e) => return KjResult::Err(format!("kj block edit replace: {e}")),
                 };
@@ -964,20 +970,20 @@ impl KjDispatcher {
             .map(|s| s.content.len())
             .unwrap_or(0);
 
+        // Units are CHARS, matching what the splice actually did — the old
+        // `inserted_bytes`/`deleted_bytes` labels were byte counts fed to a
+        // char-indexed layer (the bug this rename rode in with).
+        let inserted_chars = insert_text.chars().count();
         let record = serde_json::json!({
             "block_id": id_str,
             "context_id": ctx_id.to_hex(),
             "op": op_label,
-            "inserted_bytes": insert_text.len(),
-            "deleted_bytes": delete_len,
+            "inserted_chars": inserted_chars,
+            "deleted_chars": delete_len,
             "content_length": new_len,
         });
         KjResult::ok_with_data(
-            format!(
-                "{op_label}: +{}/-{} bytes (total {new_len})\n",
-                insert_text.len(),
-                delete_len
-            ),
+            format!("{op_label}: +{inserted_chars}/-{delete_len} chars (total {new_len})\n"),
             record,
         )
     }
@@ -2323,6 +2329,230 @@ mod tests {
             .find(|b| b.id == bid)
             .unwrap();
         assert_eq!(snap.content, "alpha\nBETA\ngamma");
+    }
+
+    // ── block edit × multibyte content (byte-vs-char offset regression) ──
+    //
+    // The CRDT text layer is CHAR-indexed (`BlockDocument::edit_text`
+    // validates against `chars().count()` and splices at char positions;
+    // `TextContent::edit_text` likewise). Feeding it BYTE offsets computed
+    // from content with multibyte UTF-8 (改善, →, ✅ — our docs are full of
+    // them) splices at the wrong place or trips the bounds check spuriously.
+    // Exact bug class from the June file-tools corruption post-mortem
+    // (mcp/servers/file.rs `byte_to_char` is the prior art).
+
+    #[tokio::test]
+    async fn block_edit_insert_after_multibyte_line_splices_at_line_start() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // Line 0 is 10 chars but 16 bytes — a byte offset for line 1 (16)
+        // happens to equal the whole content's CHAR length (16), so the buggy
+        // path passes the bounds check and appends at the END instead of
+        // inserting before "second". The nastiest variant: silent corruption,
+        // not an error.
+        let bid = insert_text_block(&d, ctx, "改善 → done\nsecond");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("insert"),
+                    s("--line"),
+                    s("1"),
+                    s("--content"),
+                    s("INSERTED"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "insert failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(
+            snap.content, "改善 → done\nINSERTED\nsecond",
+            "insert must land at the START of line 1, got: {:?}",
+            snap.content
+        );
+    }
+
+    #[tokio::test]
+    async fn block_edit_insert_multibyte_heavy_prefix_does_not_trip_bounds() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // Line 0 is 6 chars but 18 bytes; whole content is 8 chars, 20 bytes.
+        // The buggy byte offset for line 1 (19) exceeds the CHAR length (8) —
+        // a spurious PositionOutOfBounds on a perfectly valid edit.
+        let bid = insert_text_block(&d, ctx, "改善改善改善\nx");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("insert"),
+                    s("--line"),
+                    s("1"),
+                    s("--content"),
+                    s("y"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "valid insert after a multibyte-heavy line must not trip the bounds check: {}",
+            result.message()
+        );
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "改善改善改善\ny\nx", "got: {:?}", snap.content);
+    }
+
+    #[tokio::test]
+    async fn block_edit_delete_with_multibyte_before_range() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // Content is 24 chars; the buggy byte range for line 1 is 16..26 —
+        // 26 > 24 trips PositionOutOfBounds on a valid delete.
+        let bid = insert_text_block(&d, ctx, "改善 → done\nDELETE ME\nkeep");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("delete"),
+                    s("--start"),
+                    s("1"),
+                    s("--end"),
+                    s("2"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "delete after a multibyte line must not trip the bounds check: {}",
+            result.message()
+        );
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "改善 → done\nkeep", "got: {:?}", snap.content);
+    }
+
+    #[tokio::test]
+    async fn block_edit_replace_with_multibyte_before_range() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // Line 0 is 11 chars / 15 bytes. The buggy byte range for line 1 is
+        // 15..19; char length is 19, so bounds PASS and chars 15..19 — which
+        // are "tail", NOT "old\n" — get deleted. Silent wrong-splice.
+        let bid = insert_text_block(&d, ctx, "→ arrows ✅\nold\ntail");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("replace"),
+                    s("--start"),
+                    s("1"),
+                    s("--end"),
+                    s("2"),
+                    s("--content"),
+                    s("new"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "replace failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(
+            snap.content, "→ arrows ✅\nnew\ntail",
+            "replace must swap line 1, not splice into 'tail': {:?}",
+            snap.content
+        );
+    }
+
+    /// CAS + multibyte together: `--expected` validates on LINES (unaffected
+    /// by the offset bug) but the splice itself must still land on char
+    /// boundaries. Guards the interplay: a CAS pass must not be followed by a
+    /// mis-spliced write.
+    #[tokio::test]
+    async fn block_edit_replace_cas_with_multibyte_prefix() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "改善 ✅\nstale\nkeep");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("replace"),
+                    s("--start"),
+                    s("1"),
+                    s("--end"),
+                    s("2"),
+                    s("--content"),
+                    s("fresh"),
+                    s("--expected"),
+                    s("stale"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "CAS replace failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "改善 ✅\nfresh\nkeep", "got: {:?}", snap.content);
     }
 
     #[tokio::test]

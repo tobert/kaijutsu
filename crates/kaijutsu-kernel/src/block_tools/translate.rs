@@ -90,6 +90,42 @@ pub fn line_range_to_byte_range(
     Ok((start, end))
 }
 
+/// Convert a byte offset that lies on a char boundary into a CHAR offset —
+/// the unit the CRDT text layer actually consumes (`BlockDocument::edit_text`
+/// bounds-checks against `chars().count()` and `TextContent::edit_text`
+/// splices at char positions). Same conversion as `byte_to_char` in
+/// `mcp/servers/file.rs` (the June file-tools corruption fix — the prior art
+/// for this bug class). Panics on a non-boundary byte offset — line-start
+/// offsets always sit on boundaries, so a panic here means the caller fed an
+/// offset that didn't come from the line helpers (crash over corruption).
+pub fn byte_to_char_offset(content: &str, byte: usize) -> usize {
+    content[..byte].chars().count()
+}
+
+/// [`line_to_byte_offset`]'s CHAR twin: the offset to hand to
+/// `edit_text`/`edit_text_as`. Identical line/bounds semantics — it reuses
+/// the byte walk, then projects the (boundary) offset into char units. Use
+/// THIS for CRDT text edits; the byte variant is for byte-oriented consumers
+/// (string slicing, `replace_range`).
+pub fn line_to_char_offset(content: &str, line: u32) -> Result<usize> {
+    line_to_byte_offset(content, line).map(|b| byte_to_char_offset(content, b))
+}
+
+/// [`line_range_to_byte_range`]'s CHAR twin, for `edit_text`-bound deletes and
+/// replaces: `(start, end)` in char units, so `end - start` is a valid
+/// char-count `delete` argument.
+pub fn line_range_to_char_range(
+    content: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Result<(usize, usize)> {
+    let (start, end) = line_range_to_byte_range(content, start_line, end_line)?;
+    Ok((
+        byte_to_char_offset(content, start),
+        byte_to_char_offset(content, end),
+    ))
+}
+
 /// Validate that the expected text matches the actual content at the given line range.
 ///
 /// This implements compare-and-set (CAS) semantics for safe editing.
@@ -242,6 +278,53 @@ mod tests {
         assert_eq!(start, 6); // Start of line2
         assert_eq!(end, 12); // Start of line3
         assert_eq!(&content[start..end], "line2\n");
+    }
+
+    #[test]
+    fn test_line_to_char_offset_diverges_from_bytes_on_multibyte() {
+        // "改善 → done\n" = 16 bytes but 10 chars; the two units MUST differ
+        // here or the fixture proves nothing.
+        let content = "改善 → done\nsecond";
+        let byte = line_to_byte_offset(content, 1).unwrap();
+        let ch = line_to_char_offset(content, 1).unwrap();
+        assert_eq!(byte, 16);
+        assert_eq!(ch, 10);
+        assert!(byte > ch, "fixture must exercise multibyte divergence");
+        // The char offset addresses the start of "second" in char units.
+        assert_eq!(content.chars().skip(ch).collect::<String>(), "second");
+    }
+
+    #[test]
+    fn test_line_range_to_char_range_multibyte() {
+        let content = "改善 → done\nDELETE ME\nkeep";
+        let (start, end) = line_range_to_char_range(content, 1, 2).unwrap();
+        assert_eq!((start, end), (10, 20)); // "DELETE ME\n" = 10 chars
+        let sliced: String = content.chars().skip(start).take(end - start).collect();
+        assert_eq!(sliced, "DELETE ME\n");
+    }
+
+    #[test]
+    fn test_char_helpers_match_byte_helpers_on_ascii() {
+        // Pure-ASCII content: char and byte units coincide — the char twins
+        // must not drift from the byte originals there.
+        let content = "line1\nline2\nline3\n";
+        for line in 0..=3 {
+            assert_eq!(
+                line_to_char_offset(content, line).unwrap(),
+                line_to_byte_offset(content, line).unwrap(),
+                "line {line}"
+            );
+        }
+        assert_eq!(
+            line_range_to_char_range(content, 1, 2).unwrap(),
+            line_range_to_byte_range(content, 1, 2).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_line_to_char_offset_out_of_range_still_errors() {
+        // The char twin inherits the byte helper's bounds semantics.
+        assert!(line_to_char_offset("one\ntwo\n", 10).is_err());
     }
 
     #[test]
