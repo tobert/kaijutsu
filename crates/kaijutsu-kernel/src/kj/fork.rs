@@ -3055,4 +3055,127 @@ mod tests {
             "--distill-model must override to deepseek despite the anthropic caller/default: {seed:?}"
         );
     }
+
+    /// `--distill-model provider/model` (the slash form the failure hint
+    /// recommends) must bind the NAMED provider — same grammar as `--model`
+    /// via the shared `resolve_model_choice`. Before the fix the override went
+    /// through `registry.resolve_model`, which doesn't parse the slash: the
+    /// whole string rode as a literal model name on the DEFAULT provider, so
+    /// the error message suggested a syntax that then misparsed — the same
+    /// papercut class this sweep is killing.
+    #[tokio::test]
+    async fn fork_compact_distill_model_slash_form_binds_provider() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "material to distill");
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.register(
+                "deepseek",
+                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
+            );
+            // Default + caller both anthropic: only real slash parsing can
+            // reach deepseek. The unfixed path pinned the whole spec on
+            // anthropic (which, being a mock, would even "succeed" — with the
+            // wrong provider's output).
+            reg.set_default("anthropic");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-haiku-4-5");
+        }
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--compact"),
+                    s("--name"),
+                    s("child"),
+                    s("--distill-model"),
+                    s("deepseek/deepseek-flash"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "compact fork failed: {}", result.message());
+
+        let seed = ordered_contents(&d, child_id(&d, "child"));
+        assert!(
+            seed.iter().any(|c| c.contains("DEEPSEEK-DISTILL")),
+            "slash-form --distill-model must bind the named provider: {seed:?}"
+        );
+        assert!(
+            !seed.iter().any(|c| c.contains("ANTHROPIC-DISTILL")),
+            "slash-form --distill-model must not ride the default provider: {seed:?}"
+        );
+    }
+
+    /// A slash-form `--distill-model` naming an unknown provider fails LOUD
+    /// before any mutation — same posture as `--model nonexistent/foo`. Before
+    /// the fix the unknown provider was silently swallowed: the whole spec
+    /// became a model name on the default provider and the typo only surfaced
+    /// (if at all) as a call-time provider error.
+    #[tokio::test]
+    async fn fork_compact_distill_model_unknown_provider_errors() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "material to distill");
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.set_default("anthropic");
+        }
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--compact"),
+                    s("--name"),
+                    s("child"),
+                    s("--distill-model"),
+                    s("nonexistent/foo"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            !result.is_ok(),
+            "unknown provider in --distill-model must fail: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("unknown provider"),
+            "must fail through the shared resolver, naming the provider: {}",
+            result.message()
+        );
+        // Fails before any mutation — no child context was created.
+        let found = d.kernel_db().lock().find_context_by_label("child").unwrap();
+        assert!(found.is_none(), "failed distill resolution must not create a context");
+    }
 }
