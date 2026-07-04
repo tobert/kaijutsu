@@ -1,0 +1,10 @@
+# Wall-clock re-seed on fork (docs/issues.md, "Context time awareness"). A
+# forked context starts a fresh turn cadence and may run long after its
+# parent's create-time note has gone stale, so re-seed here too. Numbered S40
+# so it runs after the shared S30-cache fork breakpoint (mirrors
+# musician/fork/S40-hydrate.kai's ordering rationale) — though ordering
+# doesn't change the outcome either way: see create/S25-datetime.kai for why a
+# Notification block never touches the cached system prefix, regardless of
+# when it's inserted.
+now="$(date '+%Y-%m-%d %A %H:%M %z')"
+kj block create --role system --kind notification --content "Current date/time: $now (contexts have no other clock — use this when dating anything you write)"
