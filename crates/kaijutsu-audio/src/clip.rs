@@ -81,9 +81,6 @@ pub enum ClipError {
     /// `mime` was empty.
     #[error("clip mime must be non-empty")]
     EmptyMime,
-    /// `media` was not a well-formed content hash.
-    #[error("clip media hash is malformed: {0}")]
-    BadMediaHash(#[from] kaijutsu_cas::HashError),
     /// `media` was well-formed but absent from CAS at schedule time. Caught
     /// here, loudly — not two phrases later at prefetch.
     #[error("clip media {0} is not present in CAS")]
@@ -127,9 +124,9 @@ impl Clip {
         if self.mime.trim().is_empty() {
             return Err(ClipError::EmptyMime);
         }
-        // `ContentHash` is serde-transparent and does NOT validate on
-        // deserialize, so the well-formedness check is explicit here.
-        ContentHash::from_str_checked(self.media.as_str())?;
+        // `media` well-formedness is enforced by `ContentHash`'s validating
+        // deserialize (CAS B0): a malformed hash fails as `ClipError::Json`
+        // during `parse`, before we ever reach here — no re-check needed.
         Ok(())
     }
 }
@@ -263,13 +260,11 @@ mod tests {
 
     #[test]
     fn malformed_media_hash_is_rejected() {
-        // Not 32 hex chars — ContentHash's transparent deserialize accepts any
-        // string, so the validator must catch this explicitly.
+        // Not 32 hex chars. `ContentHash`'s validating deserialize (CAS B0)
+        // rejects it at the serde boundary, so `parse` surfaces it as `Json`
+        // before validate_structure ever runs — still loud, still no bad clip.
         let json = r#"{ "v": 1, "media": "not-a-hash", "mime": "audio/wav", "label": "x" }"#;
-        assert!(matches!(
-            Clip::parse(json),
-            Err(ClipError::BadMediaHash(_))
-        ));
+        assert!(matches!(Clip::parse(json), Err(ClipError::Json(_))));
     }
 
     #[test]
