@@ -332,10 +332,61 @@ of six months:
 - **Docs are living, not stratified.** Chronology belongs here and in git;
   design docs state the present. `docs/issues.md` deletes entries when they
   ship. And the acceptance test for music is the ear.
+- **Shared docs get edited, never re-emitted from model memory.** Twice now a
+  stale in-context copy of issues.md has been whole-file-written over a
+  groomed HEAD (hallucinated dates included). The reconcile ritual: title-diff
+  forensics against HEAD, graft only the genuinely new entries, discard the
+  ghost.
+
+## The instrument gets kinder to its players (July 4)
+
+A player's-eye sweep of the kj surface, picked by asking one question of the
+backlog: what does a model hit mid-turn that a human wouldn't tolerate? Five
+lanes ran as parallel worktree subagents (two Opus, three Sonnet) with the
+lead context coordinating, merging, and keeping the docs honest — the first
+real test of the fan-out-and-merge shape, and it held. What shipped, and what
+the digging taught:
+
+- **`kj fork` works from kaish again.** The `--include` range parser was
+  never broken — the kaish→kj bridge had no arm for `Value::Json`, so every
+  repeatable `Vec<String>` flag arrived Debug-formatted. One general fix
+  repaired fork ranges and every other repeatable kj flag that rides through
+  kaish. Label conflicts now fail *before* the billed distill and name the
+  existing context; compact-fork distillation defaults to the caller's own
+  provider+model, and `--distill-model` speaks `--model`'s grammar — that
+  last one because the coordinator caught the new error message recommending
+  syntax the parser rejected.
+- **Contexts know what day it is.** Datetime rc seeds (kaish's `date` builtin
+  → `kj block create --kind notification`) fire at create/fork for
+  coder/director/mcp/default; musicians deliberately never — musical time is
+  their only clock. The load-bearing choice was the block kind: Notification
+  hydrates as an appended message, while System/Text would be swept into the
+  cached system prefix and invalidate it daily, and `.kai` stdout is
+  model-hidden Trace. Both mechanism halves already existed; zero kernel
+  logic changed. Motivated by three hallucinated-date incidents in durable
+  docs.
+- **Config lies less.** Unknown provider types are rejected at `kj config
+  set`/`edit` with the supported list (the boot-time drop was
+  silent-until-a-turn-hung); "missing API key?" only appears on a real auth
+  error; piped stdin works as the help always claimed (the gate was an
+  rc-only hardcode); `kj config edit` mirrors `kj rc edit`.
+- **Artifacts are one verb away.** `kj block cat` resolves a block's CAS
+  content (binary refuses the terminal; `--out` for bytes), and `--latest
+  <mime>` answers "give me this turn's rendered artifact" in one call. `kj
+  rc list` marks every script in-sync/differs/no-seed against its embedded
+  seed — detection for the stale-seed class without touching live-is-truth.
+- **A "bug" that wasn't.** The unknown-command 300 s hang closed as a proof:
+  the dispatch fall-through is bounded at every await (tests across all
+  three shell flavors, a cross-model audit, a live probe). The observed hang
+  was almost certainly the stale-FlowBus observation gap wearing a costume.
+  And `$HOME` is now seeded in every shell — the dig found `~` was broken
+  too; both read one scope var, so they agree by construction.
 
 ## Now
 
-As of 2026-07-04: subprocess exec just shipped and the first audible `kj play`
-after it is unverified; the time well carousel is in Amy's tuning hands; the
-render seam is fully on the wire with clip/PCM prefetch proven; open work is in
-`docs/issues.md` and the live handoff in `signoff.md` (ephemeral, repo root).
+As of 2026-07-04: the model-QoL sweep is merged and awaiting deploy (kernel
+rebuild + restart, `kj rc reset` for the new datetime seeds); subprocess exec
+shipped and the first audible `kj play` after it is unverified; the time well
+carousel is in Amy's tuning hands; the render seam is fully on the wire with
+clip/PCM prefetch proven; open work is in `docs/issues.md` and the live
+handoff in `signoff.md` (ephemeral, repo root).
