@@ -439,7 +439,11 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   prefer a targeted named-arg strip; (b) `wants_stdin_content` promotion means
   a forgotten `--content` on an interactive TTY blocks reading stdin until
   Ctrl+D instead of failing "missing content" — cat-like POSIX behavior, but a
-  papercut worth a TTY check if it ever bites.
+  papercut worth a TTY check if it ever bites; (c) the `{other:?}` fallback
+  arm in argv reconstruction (`:499-502`; same pattern in positionals `:450`)
+  would Debug-format a future non-Array `Value::Json` into a garbage token —
+  no trigger today (deepseek: accepted risk), but the arm should fail loud if
+  kaish ever grows a new value shape.
 - **Workspace path mount points:** `kj workspace add --mount <target>` was
   documented + parsed but silently ignored (no backing storage) — removed during
   the clap migration so it now fails loud. To implement: add a `mount` column to
@@ -1764,7 +1768,12 @@ cluster of friction in the config + shell surface:
   accepts `"claude"` as a legacy alias for `"anthropic"`, but the write-time
   validator doesn't — `[providers.claude]` boots fine but is now rejected at
   `kj config set`. No shipped config uses it; decide alias-in-both or
-  alias-nowhere (dovetails with the `type =` decision).
+  alias-nowhere (dovetails with the `type =` decision). Also (deepseek review
+  2026-07-04, LOW): the interactive `kj config edit` editor-session save path
+  writes through `blocks.edit_text()` and never calls `validate_config_write`
+  — only `set`/`edit --content` validate. Backstopped by the boot-time
+  unknown-type warn and the `config-write` gate; close it by validating at
+  editor save/flush for config-owned docs if it ever bites.
 - **Two `models.toml` files, only one is read.** The kernel loads providers from
   the **CRDT** `/etc/config/models.toml` (via `kj config`), and the legacy host
   `~/.config/kaijutsu/models.toml` is **ignored** — but it still exists, looks
