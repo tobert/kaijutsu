@@ -675,20 +675,29 @@ fn render_json_envelope(exec: ExecResult) -> ExecResult {
         .as_ref()
         .map(kaish_kernel::interpreter::value_to_json)
         .unwrap_or(serde_json::Value::Null);
+    // A confirmation latch (exit 2) rides the typed request on the control-plane
+    // `.latch` field (kaish 0.11). Emit it under a dedicated `latch` key so a
+    // `kj … --json` caller reads `latch.nonce`/`.hint` structurally instead of
+    // parsing the confirmation prose out of `message`. `null` when not latched.
+    let latch_json = serde_json::to_value(exec.latch_request()).unwrap_or(serde_json::Value::Null);
     let envelope = serde_json::json!({
         "ok": ok,
         "exit_code": exec.code,
         "message": message,
         "data": data_json,
+        "latch": latch_json,
     });
 
     let mut out = ExecResult::success(envelope.to_string());
     out.code = exec.code;
     out.content_type = Some("application/json".to_string());
     // Preserve the iteration-friendly structured payload and any baggage
-    // (e.g. the ephemeral marker) the original result carried.
+    // (e.g. the ephemeral marker) the original result carried. The latch stays
+    // on the control-plane field too, so the MCP shell layer surfaces it even
+    // after this --json wrap.
     out.data = exec.data;
     out.baggage = exec.baggage;
+    out.latch = exec.latch;
     out
 }
 
@@ -2030,5 +2039,92 @@ mod tests {
                 "`{script}` reached the parser mangled: {combined}"
             );
         }
+    }
+
+    /// A latched `kj … --json` result must carry the confirmation nonce in the
+    /// envelope's `latch` object (not buried in the prose `message`) AND keep the
+    /// typed request on the outer `ExecResult.latch` so the MCP shell layer
+    /// surfaces it too. kaish 0.11 stamps `.latch`; this checks the `--json`
+    /// wrapper both emits and preserves it. Resolves the on-hold docs/issues.md
+    /// "latch nonce on stderr" entry.
+    #[test]
+    fn json_envelope_surfaces_and_preserves_latch() {
+        let mut exec = ExecResult::failure(
+            2,
+            "kj context remove: confirmation required\n\
+             To confirm, run: kj context remove doomed --confirm zzz999",
+        );
+        exec.latch = Some(Box::new(kaish_kernel::interpreter::LatchRequest {
+            nonce: "zzz999".to_string(),
+            command: "kj context remove".to_string(),
+            paths: vec!["doomed".to_string()],
+            hint: "kj context remove doomed --confirm zzz999".to_string(),
+            tool: "kj".to_string(),
+            argv: vec!["context".into(), "remove".into(), "doomed".into()],
+            ttl: 60,
+        }));
+
+        let out = render_json_envelope(exec);
+        assert_eq!(out.code, 2, "latch exit code is preserved for `$?`");
+
+        // The nonce rides the structured envelope body, not just the prose.
+        let body: serde_json::Value =
+            serde_json::from_str(&out.text_out()).expect("envelope is JSON");
+        assert_eq!(body["ok"], serde_json::json!(false));
+        assert_eq!(body["latch"]["nonce"], serde_json::json!("zzz999"));
+        assert_eq!(
+            body["latch"]["hint"],
+            serde_json::json!("kj context remove doomed --confirm zzz999")
+        );
+
+        // The control-plane field survives the wrap so the MCP shell layer
+        // (`shell_result_to_kernel`) still reads it from the returned result.
+        assert_eq!(
+            out.latch_request().map(|l| l.nonce),
+            Some("zzz999".to_string()),
+            "render_json_envelope must preserve ExecResult.latch"
+        );
+
+        // A non-latched success carries an explicit null `latch`.
+        let plain = render_json_envelope(ExecResult::success("done"));
+        let pbody: serde_json::Value =
+            serde_json::from_str(&plain.text_out()).expect("envelope is JSON");
+        assert_eq!(pbody["latch"], serde_json::Value::Null);
+    }
+
+    /// End-to-end proof that a *real* latched kj command stamps `ExecResult.latch`
+    /// through the full kaish bridge — not just the synthetic constructions the
+    /// envelope tests use. `kj context remove <child>` without `--confirm` must
+    /// come back exit 2 with a typed request whose hint re-runs the exact command
+    /// with `--confirm`. This is what feeds the `--json`/MCP-shell surfacing.
+    #[tokio::test]
+    async fn kj_latch_stamps_exec_result_through_the_bridge() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("latch-home"), None, principal);
+        // A removable child of the shell's context.
+        let _doomed = register_context(&dispatcher, Some("doomed"), Some(home), principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+
+        let res = kaish
+            .execute_with_options("kj context remove doomed", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert_eq!(
+            res.code, 2,
+            "an unconfirmed destructive kj op latches at exit 2: out={} err={}",
+            res.text_out(),
+            res.err
+        );
+        let latch = res
+            .latch_request()
+            .expect("a latched kj result must carry ExecResult.latch through the bridge");
+        assert!(!latch.nonce.is_empty(), "latch carries a nonce");
+        assert!(
+            latch.hint.contains("--confirm") && latch.hint.contains("doomed"),
+            "hint is the ready-to-run confirmation naming the target: {}",
+            latch.hint
+        );
     }
 }

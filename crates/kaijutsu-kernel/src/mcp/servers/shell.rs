@@ -218,7 +218,8 @@ impl McpServerLike for ShellServer {
 /// successful-with-warnings command (exit 0 + stderr) still surfaces it, and a
 /// nonzero exit is both flagged (`is_error`) and labelled in the body. A
 /// structured envelope carries the exit code + raw streams for programmatic
-/// consumers.
+/// consumers, plus any confirmation-latch request so a caller can fulfill it
+/// structurally rather than parsing the prose.
 fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> KernelToolResult {
     let stdout = result.text_out().into_owned();
     let stderr = result.err.clone();
@@ -232,6 +233,13 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
         .data
         .as_ref()
         .map(kaish_kernel::interpreter::value_to_json);
+    // A confirmation latch (exit 2, e.g. `kj context remove` or `rm` under
+    // `set -o latch`) rides its typed request on the control-plane `.latch`
+    // field (kaish 0.11), distinct from the data-plane `.data`. Surface it so a
+    // batch loop reads `structured.latch.nonce`/`.hint` and re-runs with
+    // `--confirm=<nonce>`, instead of scraping the confirmation prose out of the
+    // body. `null` when the command didn't latch.
+    let latch = result.latch_request();
 
     let mut body = stdout.clone();
     let mut push_line = |s: &str| {
@@ -255,6 +263,7 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
             "stderr": stderr,
             "exit_code": exit_code,
             "data": data,
+            "latch": latch,
         })),
     }
 }
@@ -461,6 +470,55 @@ mod tests {
             }
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn conversion_surfaces_latch_request_structurally() {
+        // A latched destructive op (exit 2) carries a typed `LatchRequest` on the
+        // control-plane `.latch` field (kaish 0.11). The MCP shell envelope must
+        // surface it so a batch loop reads the nonce structurally instead of
+        // scraping the confirmation prose out of the body. Resolves the on-hold
+        // docs/issues.md "latch nonce on stderr" entry.
+        let mut r = kaish_kernel::interpreter::ExecResult::failure(
+            2,
+            "kj context remove: confirmation required\n\
+             To confirm, run: kj context remove doomed --confirm abc123",
+        );
+        r.latch = Some(Box::new(kaish_kernel::interpreter::LatchRequest {
+            nonce: "abc123".to_string(),
+            command: "kj context remove".to_string(),
+            paths: vec!["doomed".to_string()],
+            hint: "kj context remove doomed --confirm abc123".to_string(),
+            tool: "kj".to_string(),
+            argv: vec![
+                "context".to_string(),
+                "remove".to_string(),
+                "doomed".to_string(),
+            ],
+            ttl: 60,
+        }));
+        let structured = shell_result_to_kernel(r)
+            .structured
+            .expect("structured envelope");
+        assert_eq!(structured["latch"]["nonce"], serde_json::json!("abc123"));
+        assert_eq!(
+            structured["latch"]["command"],
+            serde_json::json!("kj context remove")
+        );
+        assert_eq!(
+            structured["latch"]["hint"],
+            serde_json::json!("kj context remove doomed --confirm abc123"),
+            "the ready-to-run confirmation command must ride the structured envelope"
+        );
+
+        // A non-latched result carries an explicit null — present as a key so a
+        // consumer can test `latch == null` rather than guess at omission.
+        let plain = shell_result_to_kernel(kaish_kernel::interpreter::ExecResult::success("ok"));
+        assert_eq!(
+            plain.structured.unwrap()["latch"],
+            serde_json::Value::Null,
+            "a non-latched result leaves `latch` explicitly null"
+        );
     }
 
     #[test]

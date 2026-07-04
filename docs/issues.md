@@ -411,19 +411,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Control Plane & Navigation (kj)
 
-- **Latch confirmation nonce is emitted on stderr (prose-only) — make it
-  machine-readable.** Found 2026-06-28 trying to script a batch `kj context
-  remove`. The latch is an explicit two-step *machine* protocol: the first call
-  returns a nonce you must capture and pass back via `--confirm`. But the nonce
-  is buried in human-prose **stderr** ("To confirm, run: … --confirm <nonce>",
-  exit 2), so any automation must `2>&1` and regex-scrape it — a footgun (cost us
-  a failed batch loop; nothing wrong with kaish, the prompt just wasn't on
-  stdout). Fix: surface the nonce in the result's structured `data` field
-  (`data.confirm_nonce`, per the kj structured-data convention) so a caller reads
-  it structurally. Applies to every latched verb (`context remove/archive/retag/
-  move`, …) — they share the latch helper, so it's one change at the source.
-  **ON HOLD (Amy, 2026-07-04):** don't fix now — the next kaish release rewrites
-  the latch code with proper APIs; fold this into that migration.
 - **`--out` writes bypass the VFS (`kj cas get` + `kj block cat`; gemini-pro
   review 2026-07-04).** Both verbs `std::fs::write` the `--out` path
   (`kj/cas.rs:119`, `kj/block.rs:730` — the new verb deliberately mirrored the
