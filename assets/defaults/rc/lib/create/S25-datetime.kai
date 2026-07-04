@@ -1,0 +1,20 @@
+# Wall-clock seed at context create (docs/issues.md, "Context time awareness").
+# Contexts have no wall-clock source of their own, so a model asked to date a
+# durable artifact guesses — and guesses wrong (two real incidents: hallucinated
+# dates in docs/issues.md entries, corrected 2026-07-03). Seed the actual
+# date/time once, here, at the hydrate boundary.
+#
+# MUST be a Notification block, NEVER (Role::System, BlockKind::Text): the
+# latter folds into the cached system prompt on *every* call
+# (`extract_system_prompt_sections` in llm/system_prompt.rs), so a value that
+# changes daily would silently invalidate the `--target=system` cache
+# breakpoint on every single turn. BlockKind::Notification instead hydrates as
+# a normal appended user-role turn (llm/hydrate.rs, D-34) and is never swept
+# into the system prompt — cache-safe by construction, no rc ordering trick
+# required. (`kj block create --kind notification` with no structured payload
+# falls back to plain content — see `format_notification_for_llm`.)
+#
+# kaish ships a `date` builtin (chrono-backed, TZ-aware) — no new env var or
+# Rust change needed to read the clock.
+now="$(date '+%Y-%m-%d %A %H:%M %z')"
+kj block create --role system --kind notification --content "Current date/time: $now (contexts have no other clock — use this when dating anything you write)"

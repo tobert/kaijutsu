@@ -1992,4 +1992,241 @@ esac
             "script body must not have completed; contents: {contents:?}"
         );
     }
+
+    // ── Context time awareness (docs/issues.md) ──────────────────────────
+    //
+    // These exercise the REAL embedded seed tree (assets/defaults/rc), not
+    // synthetic install_script fixtures, because the mechanism under test is
+    // the per-type `SXX-datetime.kai` seed *and* its init.d-style symlink
+    // composition (`coder/create/S25-datetime.kai` → `lib/create/S25-
+    // datetime.kai`). That composition only resolves over the CRDT-native
+    // `/etc/rc` backend (`ConfigCrdtFs::seed_from_embedded` reconstructs a
+    // real symlink from a seed body that's just a path); the plain
+    // `test_dispatcher()`'s host-disk seeding writes the path string
+    // verbatim and does not follow it (see `rc_create_follows_symlinked_md`
+    // for the same distinction). So all tests below use
+    // `test_dispatcher_crdt_rc()`.
+
+    /// The marker every rc-seeded datetime notification's content starts
+    /// with — kept in one place so a wording tweak in the seed scripts
+    /// doesn't scatter edits across every test.
+    const DATETIME_MARKER: &str = "Current date/time: ";
+
+    fn notification_blocks_with_marker(
+        dispatcher: &KjDispatcher,
+        ctx: ContextId,
+    ) -> Vec<kaijutsu_types::BlockSnapshot> {
+        dispatcher
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| b.kind == BlockKind::Notification && b.content.contains(DATETIME_MARKER))
+            .collect()
+    }
+
+    /// Parse a `YYYY-MM-DD` prefix (ASCII digits only — the shape `date
+    /// '+%Y-%m-%d'` always produces).
+    fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
+        if s.len() < 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
+            return None;
+        }
+        let y = s.get(0..4)?.parse().ok()?;
+        let m = s.get(5..7)?.parse().ok()?;
+        let d = s.get(8..10)?.parse().ok()?;
+        Some((y, m, d))
+    }
+
+    /// Howard Hinnant's `days_from_civil`: days since the 1970-01-01 epoch
+    /// for a proleptic-Gregorian `(y, m, d)`. Pure integer math — just
+    /// enough to sanity-check the rc-seeded date is "today" without pulling
+    /// in a date crate for one test.
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    }
+
+    fn days_since_epoch_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs() as i64
+            / 86400
+    }
+
+    /// coder create seeds exactly one datetime `Notification` block, it
+    /// carries today's date, it never leaks into the cached system-prompt
+    /// sections, and it actually hydrates into the conversation the model
+    /// sees. This is the full mechanism proof; the sibling tests below only
+    /// check the per-type policy matrix (which types get one, which don't).
+    #[tokio::test]
+    async fn coder_create_seeds_model_visible_datetime_notification() {
+        // `kj` is only registered inside rc `.kai` scripts once the
+        // dispatcher's self-Arc is wired (see `rc_kai_can_call_kj` above) —
+        // and the coder stance/binding/datetime scripts all call `kj`.
+        let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+        d.set_self_arc();
+        let caller = unjoined_caller();
+        let r = d
+            .dispatch(
+                &argv(&["context", "create", "c1", "--type", "coder"]),
+                &caller,
+            )
+            .await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+        let ctx = lookup_context_id(&d, "c1");
+
+        let notes = notification_blocks_with_marker(&d, ctx);
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected exactly one datetime notification at create, got: {:?}",
+            block_contents_in(&d, ctx)
+        );
+        let note = &notes[0];
+        assert_eq!(
+            note.role,
+            Role::System,
+            "datetime note should be system-authored"
+        );
+
+        // The date it carries must be "today" — within a day, to absorb the
+        // gap between the script's local-TZ render and this UTC reference.
+        let date_str = note
+            .content
+            .strip_prefix(DATETIME_MARKER)
+            .and_then(|rest| rest.get(0..10))
+            .unwrap_or_else(|| panic!("marker prefix + date substring in {:?}", note.content));
+        let (y, m, day) = parse_iso_date(date_str)
+            .unwrap_or_else(|| panic!("parseable ISO date in {date_str:?}"));
+        let got_days = days_from_civil(y, m, day);
+        assert!(
+            (got_days - days_since_epoch_now()).abs() <= 1,
+            "seeded date {date_str} is not within a day of now"
+        );
+
+        // Must NOT land in the cached system prompt (the cache-placement
+        // rule) — a BlockKind::Text system block would fold in here and
+        // invalidate the system cache breakpoint every time the date rolls.
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let sections = crate::extract_system_prompt_sections(&blocks);
+        assert!(
+            sections.iter().all(|s| !s.contains(DATETIME_MARKER)),
+            "datetime note leaked into the cached system-prompt sections: {sections:?}"
+        );
+
+        // Must actually reach the model as an appended conversation message.
+        let messages = crate::hydrate_from_blocks(&blocks);
+        assert!(
+            messages.iter().any(|m| matches!(
+                &m.content,
+                crate::llm::MessageContent::Text(t) if t.contains(DATETIME_MARKER)
+            )),
+            "datetime note did not hydrate into the conversation"
+        );
+    }
+
+    /// The per-type policy matrix, create side: coder/director/mcp/default
+    /// ("time-aware" types) each get exactly one seeded datetime note.
+    #[tokio::test]
+    async fn create_seeds_datetime_notification_for_time_aware_types() {
+        for context_type in ["coder", "director", "mcp", "default"] {
+            let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+            d.set_self_arc();
+            let caller = unjoined_caller();
+            let label = format!("c-{context_type}");
+            let r = d
+                .dispatch(
+                    &argv(&["context", "create", &label, "--type", context_type]),
+                    &caller,
+                )
+                .await;
+            assert!(r.is_ok(), "{context_type} create failed: {}", r.message());
+            let ctx = lookup_context_id(&d, &label);
+            let notes = notification_blocks_with_marker(&d, ctx);
+            assert_eq!(
+                notes.len(),
+                1,
+                "{context_type}: expected exactly one datetime notification, got: {:?}",
+                block_contents_in(&d, ctx)
+            );
+        }
+    }
+
+    /// The other half of the matrix: musician and toolie must NOT get a
+    /// wall-clock note. Musical time (`$PHRASE`/ticks/the track clock) is
+    /// the musician's only time base; a wall-clock drip is pure cache/
+    /// attention pollution for both narrow roles.
+    #[tokio::test]
+    async fn create_seeds_no_datetime_notification_for_clockless_types() {
+        for context_type in ["musician", "toolie"] {
+            let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+            d.set_self_arc();
+            let caller = unjoined_caller();
+            let label = format!("c-{context_type}");
+            let r = d
+                .dispatch(
+                    &argv(&["context", "create", &label, "--type", context_type]),
+                    &caller,
+                )
+                .await;
+            assert!(r.is_ok(), "{context_type} create failed: {}", r.message());
+            let ctx = lookup_context_id(&d, &label);
+            let notes = notification_blocks_with_marker(&d, ctx);
+            assert!(
+                notes.is_empty(),
+                "{context_type}: must stay clock-free, got: {:?}",
+                block_contents_in(&d, ctx)
+            );
+        }
+    }
+
+    /// Fork re-seeds: the child gets its own fresh datetime note on top of
+    /// whatever it inherited from the parent (the parent's create-time note
+    /// copies over too — fork copies the whole log — so the count grows by
+    /// exactly one, not to exactly one).
+    #[tokio::test]
+    async fn coder_fork_reseeds_datetime_notification() {
+        let d = std::sync::Arc::new(test_dispatcher_crdt_rc().await);
+        d.set_self_arc();
+        let caller = unjoined_caller();
+        let r = d
+            .dispatch(
+                &argv(&["context", "create", "parent", "--type", "coder"]),
+                &caller,
+            )
+            .await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+        let parent_id = lookup_context_id(&d, "parent");
+        let before = notification_blocks_with_marker(&d, parent_id).len();
+        assert_eq!(
+            before, 1,
+            "parent should carry its create-time datetime note"
+        );
+
+        // Privileged: the parent was made via `kj context create` (deny-by-
+        // default), so a plain caller would be refused by the `fork` gate.
+        // This test exercises fork mechanics, not the capability check.
+        let fork_caller = KjCaller {
+            privileged: true,
+            ..caller_with_context(parent_id)
+        };
+        let fr = d
+            .dispatch(&argv(&["fork", "--name", "child"]), &fork_caller)
+            .await;
+        assert!(fr.is_ok(), "fork failed: {}", fr.message());
+        let child_id = lookup_context_id(&d, "child");
+        let after = notification_blocks_with_marker(&d, child_id).len();
+        assert_eq!(
+            after,
+            before + 1,
+            "fork must re-seed exactly one fresh datetime note on top of the copied parent one, got: {:?}",
+            block_contents_in(&d, child_id)
+        );
+    }
 }
