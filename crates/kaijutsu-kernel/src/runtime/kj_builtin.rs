@@ -543,12 +543,22 @@ impl Tool for KjBuiltin {
             argv.push(body);
         }
 
+        // Recursion depth from the rc runner's `KJ_RC_DEPTH` overlay var (see
+        // kj/lifecycle.rs "Recursion guard"). This read is what closes the
+        // loop: without it every rc-driven `kj` reset depth to 0 and an rc
+        // create-cycle recursed unbounded past MAX_RC_DEPTH. Absent is the
+        // normal non-rc case (depth 0); present-but-garbage fails loud.
+        let rc_depth = match rc_depth_from_scope(&ctx.scope) {
+            Ok(d) => d,
+            Err(e) => return ExecResult::failure(1, format!("kj: {e}")),
+        };
+
         let mut caller = KjCaller {
             principal_id: self.principal_id,
             context_id: self.current_context_id(),
             session_id: self.session_id,
             confirmed: false,
-            rc_depth: 0,
+            rc_depth,
             privileged: self.privileged,
         };
 
@@ -689,6 +699,31 @@ fn render_json_envelope(exec: ExecResult) -> ExecResult {
     out.data = exec.data;
     out.baggage = exec.baggage;
     out
+}
+
+/// Read the rc recursion depth from the shell scope's `KJ_RC_DEPTH`.
+///
+/// The rc runner (`kj/lifecycle.rs::run_kai_script`) seeds this overlay var
+/// with `child_depth` before every rc script; the builtin reads it back here
+/// so the depth survives the script's `kj` re-entry and the `MAX_RC_DEPTH`
+/// guard actually accumulates. Absent → 0 (the normal non-rc shell). A
+/// present-but-unparsable value fails LOUD rather than defaulting: the var is
+/// kernel-seeded, so garbage means the recursion-guard control channel was
+/// corrupted or clobbered, and reading it as 0 would silently disable the
+/// guard — the exact failure mode this function exists to close. (Depth is a
+/// footgun guard under shared trust, not security — see `KjCaller::privileged`
+/// for the field that must NOT come from a scope var.)
+fn rc_depth_from_scope(scope: &kaish_kernel::interpreter::Scope) -> Result<u8, String> {
+    let Some(value) = scope.get("KJ_RC_DEPTH") else {
+        return Ok(0);
+    };
+    let raw = kaish_kernel::interpreter::value_to_string(value);
+    raw.trim().parse::<u8>().map_err(|_| {
+        format!(
+            "KJ_RC_DEPTH is set but not a valid depth (got {raw:?}); \
+             refusing to guess — the rc recursion guard depends on this value"
+        )
+    })
 }
 
 /// Whether this `kj` invocation should have piped stdin promoted to
@@ -833,6 +868,227 @@ mod tests {
             configure_tools,
         )
         .expect("EmbeddedKaish init")
+    }
+
+    /// Contents of every block in `ctx`, read from the dispatcher's store —
+    /// where rc lifecycle blocks (guard errors, .md banners) land.
+    fn block_contents_in(dispatcher: &KjDispatcher, ctx: ContextId) -> Vec<String> {
+        dispatcher
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| b.content)
+            .collect()
+    }
+
+    fn lookup_context_id(dispatcher: &KjDispatcher, label: &str) -> ContextId {
+        let db = dispatcher.kernel_db().lock();
+        db.find_context_by_label(label)
+            .expect("find_context_by_label")
+            .unwrap_or_else(|| panic!("context '{label}' should exist"))
+            .context_id
+    }
+
+    /// The parse contract for the depth read: absent → 0 (normal shells),
+    /// a numeric string or Int propagates exactly, garbage errors loud.
+    #[test]
+    fn rc_depth_from_scope_parse_contract() {
+        use kaish_kernel::interpreter::Scope;
+
+        // Absent: the ordinary non-rc shell.
+        let scope = Scope::new();
+        assert_eq!(rc_depth_from_scope(&scope), Ok(0));
+
+        // Numeric string — what run_kai_script actually seeds.
+        let mut scope = Scope::new();
+        scope.set("KJ_RC_DEPTH", Value::String("3".to_string()));
+        assert_eq!(rc_depth_from_scope(&scope), Ok(3));
+
+        // A kaish-side integer assignment coerces the same way.
+        let mut scope = Scope::new();
+        scope.set("KJ_RC_DEPTH", Value::Int(2));
+        assert_eq!(rc_depth_from_scope(&scope), Ok(2));
+
+        // Garbage: loud, and the error names the var.
+        for bad in ["banana", "-1", "300", ""] {
+            let mut scope = Scope::new();
+            scope.set("KJ_RC_DEPTH", Value::String(bad.to_string()));
+            let err = rc_depth_from_scope(&scope)
+                .expect_err(&format!("{bad:?} must not parse as a depth"));
+            assert!(
+                err.contains("KJ_RC_DEPTH"),
+                "error must name the var: {err}"
+            );
+        }
+    }
+
+    /// The rc recursion guard's missing link: `KJ_RC_DEPTH` seeded into the
+    /// shell scope (exactly what `run_kai_script` does for rc scripts) MUST
+    /// reach the `KjCaller` the builtin constructs — otherwise every rc-driven
+    /// `kj` call resets depth to 0 and an rc create-cycle recurses unbounded.
+    /// This red test asserts propagation via the guard's observable effect,
+    /// WITHOUT any self-recreating script (so a pre-fix run cannot fork-bomb):
+    /// at `KJ_RC_DEPTH == MAX_RC_DEPTH`, a `kj context create` still creates
+    /// the context, but its rc scripts are refused with the guard error block
+    /// and the inert `.md` banner never lands.
+    #[tokio::test]
+    async fn rc_depth_in_scope_reaches_recursion_guard() {
+        use crate::kj::lifecycle::MAX_RC_DEPTH;
+        use crate::kj::test_helpers::install_rc_script_file;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("rcdepth-home"), None, principal);
+        // Inert banner: proves the lifecycle ran (pre-fix) or was refused (post-fix).
+        install_rc_script_file(
+            &dispatcher,
+            "/etc/rc/rdtest/create/S00-banner.md",
+            "rdtest-would-run",
+        )
+        .await;
+
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+
+        // Seed the depth the same way the rc runner does: a scope var overlay.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "KJ_RC_DEPTH".to_string(),
+            Value::String(MAX_RC_DEPTH.to_string()),
+        );
+        let res = kaish
+            .execute_with_options(
+                "kj context create rcdepth-e2e --type rdtest",
+                ExecuteOptions::new().with_vars(vars),
+            )
+            .await
+            .expect("kaish exec");
+        assert!(
+            res.ok(),
+            "context create itself should succeed (only its rc is refused): {}",
+            res.err
+        );
+
+        let new_id = lookup_context_id(&dispatcher, "rcdepth-e2e");
+        let contents = block_contents_in(&dispatcher, new_id);
+        assert!(
+            contents.iter().any(|c| c.contains("rc depth limit exceeded")),
+            "at KJ_RC_DEPTH=MAX the recursion guard must refuse the child's rc \
+             scripts — depth from the scope never reached the caller; got: {contents:?}"
+        );
+        assert!(
+            !contents.iter().any(|c| c.contains("rdtest-would-run")),
+            "guarded run must not execute the .md script; got: {contents:?}"
+        );
+    }
+
+    /// End-to-end: a genuinely self-recreating rc chain — a create script that
+    /// creates a context of its own type — terminates at the guard instead of
+    /// recursing unbounded. Chain: test shell (depth 0) creates chain-d0; its
+    /// rc (KJ_RC_DEPTH=1) creates chain-d1; … chain-d3's rc (KJ_RC_DEPTH=4)
+    /// still *creates* chain-d4, but chain-d4's lifecycle sees caller depth
+    /// == MAX_RC_DEPTH and refuses its scripts — so chain-d5 never exists and
+    /// chain-d4 carries the guard's error block. Pre-fix this WAS the fork
+    /// bomb (depth reset to 0 at every hop), which is why the red tests above
+    /// assert propagation without self-recreation; this proof only runs green.
+    ///
+    /// The deep rc nest (each hop re-enters kaish) overflows the default 2 MiB
+    /// test stack, so the body runs on `KAISH_RC_THREAD_STACK` — the same
+    /// stack production rc-driving threads use (see transport.rs's
+    /// `run_on_rc_stack` for the pattern's origin).
+    #[test]
+    fn self_recreating_rc_chain_stops_at_guard() {
+        std::thread::Builder::new()
+            .stack_size(crate::KAISH_RC_THREAD_STACK)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build current-thread runtime")
+                    .block_on(self_recreating_rc_chain_body());
+            })
+            .expect("spawn rc-stack thread")
+            .join()
+            .expect("rc-stack thread panicked");
+    }
+
+    /// Body of [`self_recreating_rc_chain_stops_at_guard`], extracted so the
+    /// wrapper can run it on a deep stack.
+    async fn self_recreating_rc_chain_body() {
+        use crate::kj::test_helpers::install_rc_script_file;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("chain-home"), None, principal);
+        install_rc_script_file(
+            &dispatcher,
+            "/etc/rc/chaintest/create/S00-recreate.kai",
+            "kj context create \"chain-d$KJ_RC_DEPTH\" --type chaintest\n",
+        )
+        .await;
+
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+        let res = kaish
+            .execute_with_options(
+                "kj context create chain-d0 --type chaintest",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "root create should succeed: {}", res.err);
+
+        // The deepest context the chain may reach is chain-d4 (created at
+        // caller depth MAX_RC_DEPTH; its own rc is refused).
+        let deepest = lookup_context_id(&dispatcher, "chain-d4");
+        let contents = block_contents_in(&dispatcher, deepest);
+        assert!(
+            contents.iter().any(|c| c.contains("rc depth limit exceeded")),
+            "chain-d4 must carry the recursion-guard error block; got: {contents:?}"
+        );
+        let past_guard = dispatcher
+            .kernel_db()
+            .lock()
+            .find_context_by_label("chain-d5")
+            .expect("find_context_by_label");
+        assert!(
+            past_guard.is_none(),
+            "the chain must stop at the guard — chain-d5 must never be created"
+        );
+    }
+
+    /// `KJ_RC_DEPTH` is kernel-seeded (`run_kai_script` writes `child_depth`),
+    /// so a present-but-unparsable value means the recursion-guard control
+    /// channel is corrupt. Reading it as 0 would silently disable the guard —
+    /// the exact bug class this fixes — so garbage fails the invocation loud.
+    #[tokio::test]
+    async fn rc_depth_garbage_in_scope_fails_loud() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("rcdepth-garbage"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "KJ_RC_DEPTH".to_string(),
+            Value::String("banana".to_string()),
+        );
+        let res = kaish
+            .execute_with_options("kj context list", ExecuteOptions::new().with_vars(vars))
+            .await
+            .expect("kaish exec");
+        assert!(
+            !res.ok(),
+            "garbage KJ_RC_DEPTH must fail the kj invocation loudly, got ok: {}",
+            res.text_out()
+        );
+        assert!(
+            res.err.contains("KJ_RC_DEPTH"),
+            "the error must name the corrupt var: {}",
+            res.err
+        );
     }
 
     /// The headline guarantee: structured `.data` makes
