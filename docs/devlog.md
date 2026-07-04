@@ -324,9 +324,11 @@ of six months:
   objects — and the recurring fix is fail-loud verification plus a test that
   fails against the old code.
 - **Demolition as practice.** Rhai, rig-core, the config flush backend, the
-  in-process MIDI path, dead viz layout code — parity first, then delete
-  whole, never strand a transitional path. The score being durable is what
-  makes deleting renderers cheap.
+  in-process MIDI path, dead viz layout code, and the KV store (July 4: its
+  one production caller moved to a typed per-client row first, then ~1,600
+  lines deleted whole — the VFS namespace is the shared-state store) —
+  parity first, then delete whole, never strand a transitional path. The
+  score being durable is what makes deleting renderers cheap.
 - **Docs are living, not stratified.** Chronology belongs here and in git;
   design docs state the present. `docs/issues.md` deletes entries when they
   ship. And the acceptance test for music is the ear.

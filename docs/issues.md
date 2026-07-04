@@ -266,6 +266,13 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Persistence & Sync
 
+- **Phantom KV document row on pre-2026-07-04 DBs (cosmetic).** The KV store
+  deletion (`6301e033`) intentionally left live data alone, so a long-lived DB
+  keeps one `documents` row with `doc_kind='kv'` (the reserved KV doc every
+  startup used to mint). `doc_kind_from_sql`'s unknown-variant fallback loads
+  it as `Conversation` (warn-logged), and with the `DocKind::Kv` filter gone it
+  now shows as a phantom doc in `kj doc list`. Fix when it annoys: a one-time
+  row delete, or teach the fallback to hide retired kinds.
 - **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`) — slices 1+2
   shipped 2026-06-16/17 and long since exercised live** (`kj rc edit`/`kj config
   set` are the daily surface). Remaining: the deferred CRDT scratch mount.
