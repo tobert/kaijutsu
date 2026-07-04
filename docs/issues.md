@@ -417,6 +417,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   (`data.confirm_nonce`, per the kj structured-data convention) so a caller reads
   it structurally. Applies to every latched verb (`context remove/archive/retag/
   move`, …) — they share the latch helper, so it's one change at the source.
+  **ON HOLD (Amy, 2026-07-04):** don't fix now — the next kaish release rewrites
+  the latch code with proper APIs; fold this into that migration.
 - **Workspace path mount points:** `kj workspace add --mount <target>` was
   documented + parsed but silently ignored (no backing storage) — removed during
   the clap migration so it now fails loud. To implement: add a `mount` column to
@@ -489,33 +491,19 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ### kj / MCP ergonomics (UX)
 
-- **MIDI / blob readback is a two-step with no single tool.** A derived block
-  (e.g. ABC→MIDI sibling) stores a 32-hex CAS hash as its `content`, and the
-  block is `ephemeral` (won't hydrate into the conversation). Retrieving the
-  bytes is: enumerate blocks (`kj block` / `kaijutsu://docs/{doc}`) → find the
-  `audio/midi` sibling → read its hash → `kj cas get <hash> --out <file>`. There
-  is no MCP/`kj` "give me the rendered artifact for this turn" affordance. Add a
-  `kj block cat`/blob-by-block helper (and/or an MCP resource that resolves a
-  block's CAS content) so consumers don't hand-assemble the hash lookup.
-- **Stale rc seed → missing authorities (per-file upgrade is now `kj rc reset`).**
-  rc scripts live as host files under `~/.config/kaijutsu/rc/<type>/<verb>/`; the
-  deployed tree is the live source of truth and boot only bootstraps it when
-  fresh (2026-06-13 model change), so a pre-existing seed file never auto-upgrades
-  to a newer embedded default. Symptom (2026-06-13): a fresh `mcp` context had the
-  old 125-byte binding (`*` + `facade:*` only), missing the
-  `drive`/`fork`/`drift`/`transport`/`operator` authorities the current embedded
-  binding grants — so it could not run `kj transport` or self-widen (`allow` needs
-  a binding-admin/rc context). **Targeted fix: `kj rc reset
-  /etc/rc/mcp/create/S10-binding.kai`** (restore that file from its embedded
-  seed). Remaining gap: nothing *detects* a live seed has drifted behind the
-  embedded default — `reset` is a manual pull, by design (live is truth). A
-  staleness indicator (compare live body vs `seed_body()`, e.g. in `kj rc list`)
-  would surface "this file is behind its seed" without reintroducing auto-overwrite.
-  Recurred for `coder`/`genesis` 2026-06-13 (same 2-line seed). The live-context
-  half is worse than the seed half: `reset`/`reseed` only fix *future* contexts —
-  a context already created from a stale seed keeps its broken loadout and can only
-  be repaired from a binding-admin context, which the cold-start bootstrap doesn't
-  provide (see "Cold start seeds no binding-admin context" under Architecture).
+- **Stale rc seed → live contexts keep broken loadouts (detection SHIPPED
+  2026-07-04; repair gap remains).** rc is seeded-once, so a live script can
+  drift behind its embedded default; the recurring symptom was contexts created
+  from a stale `S10-binding.kai` missing newer authorities. The *detection*
+  half shipped: `kj rc list` now marks each script in-sync / differs-from-seed
+  / no-seed (live body vs `seed_body()`, seed-shape-aware for symlink seeds),
+  with per-entry records under a new `--json` flag; `kj rc reset <path>`
+  remains the manual pull (live is truth, no auto-overwrite). Remaining gap —
+  the worse half: `reset`/`reseed` only fix *future* contexts. A context
+  already created from a stale seed keeps its broken loadout and can only be
+  repaired from a binding-admin context, which the cold-start bootstrap
+  doesn't provide (see "Cold start seeds no binding-admin context" under
+  Architecture).
 - **`local` is a kaish reserved word (like `set`).** `--model local` lexes as
   the `local` builtin keyword → `found ';' expected identifier`. Same class as
   the `set` reserved-word gotcha; quote it (`--model "local"`) or pass the full
@@ -1738,15 +1726,12 @@ cluster of friction in the config + shell surface:
   startup probe that pings each enabled provider's `base_url` and warns on the dead
   ones would turn a silent config-vs-reality drift into a loud one (same class as
   the rc/source drift we watch for).
-- **`kj config set` ignores piped stdin** even though `--help` says "stdin is piped
-  here when omitted": `cat new.toml | kj config set /etc/config/models.toml` →
-  `missing content`. Had to use `--content "$(cat …)"`. Either wire stdin through
-  or fix the help text (the wrong help is the real footgun).
-- **No `kj config edit` and no set-from-path.** `kj rc` has `edit` (opens an
-  interactive vi session on the script); `kj config` has only `show`/`set`/`reset`.
-  `show` wraps the body in a `path:`/`length:` header + ```` ```toml ```` fences, but
-  `set` wants the *raw* body — so editing a 6 KB file is a clunky show→strip→edit→set
-  round-trip. Add `kj config edit` (mirror `kj rc edit`) and/or `set --from <path>`.
+- ~~`kj config set` ignores piped stdin~~ / ~~No `kj config edit`~~ — **SHIPPED
+  2026-07-04**: stdin promotion generalized from the rc-only gate
+  (`wants_stdin_content()`, `runtime/kj_builtin.rs`) so piping works as the
+  help always claimed, and `kj config edit <path>` opens a vi session via the
+  same `editor_open_signaled` path as `kj rc edit` (`ConfigCommand::Edit`;
+  `Set`'s old `edit` alias retired).
 - **The MCP/context shell is read-only for host writes** — `> file` (even
   `> /dev/null`) fails `redirect: read-only filesystem`, so you can't stage a temp
   file in-shell; the edit had to be staged via a separate host write and read back.
@@ -1757,23 +1742,20 @@ cluster of friction in the config + shell surface:
 - **(unreproduced) a `kj` shell call hung the full 300 s timeout once** mid-session;
   `kj context list --tree` and `kj model list` both return fast now, so noting it
   as a one-off to watch, not a fixable repro yet.
-- **A provider's NAME must be a built-in TYPE — and an unknown one fails silently
-  (found 2026-06-30, the real blocker for local models).** `[providers.<name>]`'s
-  `<name>` *is* the provider type, matched against a fixed set
-  (`anthropic, deepseek, openai, ollama, lemonade, local` — the last four all the
-  one OpenAI-compatible client keyed by `base_url`). A sensible-looking
-  `[providers.local-e4b]` is **silently dropped at startup** — logged as
-  `WARN failed to initialize provider (missing API key?) ... Unknown or unsupported
-  provider type: local-e4b` (the "missing API key?" is misleading; the real cause
-  is the bad type) and then skipped, so the kernel boots "fine" and you only learn
-  at `kj context create` ("unknown provider"). Two fixes: (1) **validate provider
-  names at `kj config set`** (reject/​warn on an unknown type then, not silently at
-  boot) — a config doctor; (2) **drop the "missing API key?" guess** from that warn
-  and say "unknown provider type 'X' (supported: …)". Bonus: with only the 4 fixed
-  OpenAI-compat type-names, you can't have two *distinct-named* local servers —
-  you reuse `ollama`/`lemonade`/`local`/`openai` as base_url slots, which reads
-  oddly (a llama.cpp server named `lemonade`). Consider a real `type =` field so a
-  provider can be named freely (`[providers.gemma-e4b] type = "openai"`).
+- **Provider naming: the `type =` field decision (residue of the silent
+  unknown-provider drop; the fail-loud halves SHIPPED 2026-07-04).** Shipped:
+  `kj config set`/`edit` on `models.toml` now parses the TOML and **rejects**
+  unknown `[providers.<name>]` types at write time, and the boot warn says
+  `unknown provider type 'X' (supported: anthropic, deepseek, openai, ollama,
+  lemonade, local)` — the "missing API key?" guess now appears only on actual
+  `AuthError`. Remaining design decision (human call): a real `type =` field so
+  a provider can be named freely (`[providers.gemma-e4b] type = "openai"`)
+  instead of overloading the four OpenAI-compat type-names as base_url slots.
+  **Latent skew found while implementing:** `Provider::from_config` still
+  accepts `"claude"` as a legacy alias for `"anthropic"`, but the write-time
+  validator doesn't — `[providers.claude]` boots fine but is now rejected at
+  `kj config set`. No shipped config uses it; decide alias-in-both or
+  alias-nowhere (dovetails with the `type =` decision).
 - **Two `models.toml` files, only one is read.** The kernel loads providers from
   the **CRDT** `/etc/config/models.toml` (via `kj config`), and the legacy host
   `~/.config/kaijutsu/models.toml` is **ignored** — but it still exists, looks
