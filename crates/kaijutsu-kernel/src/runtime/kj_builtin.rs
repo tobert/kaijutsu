@@ -96,13 +96,11 @@ impl KjBuiltin {
             return;
         }
         let db = self.dispatcher.kernel_db().lock();
-        if let Err(e) = db.upsert_context_shell(
-            &crate::kernel_db::ContextShellRow {
-                context_id,
-                cwd: Some(path.to_string_lossy().into_owned()),
-                updated_at: kaijutsu_types::now_millis() as i64,
-            },
-        ) {
+        if let Err(e) = db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id,
+            cwd: Some(path.to_string_lossy().into_owned()),
+            updated_at: kaijutsu_types::now_millis() as i64,
+        }) {
             tracing::warn!(
                 context = %context_id.to_hex(),
                 error = %e,
@@ -288,8 +286,7 @@ impl KjBuiltin {
                 .index_context(ctx_id, &blocks)
                 .map_err(|e| format!("index: {e}"))?;
 
-            let synth =
-                super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
+            let synth = super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
             if let Some(ref s) = synth {
                 idx.synthesis_cache().insert(ctx_id, s.clone());
@@ -492,14 +489,17 @@ impl Tool for KjBuiltin {
         let json_requested = crate::kj::parse::has_flag(&argv, &["--json"]);
         argv.retain(|a| a != "--json");
 
-        // Stdin → --content for `kj rc add` / `kj rc edit`. Lets shell
-        // pipelines author multi-line .md / .kai scripts:
+        // Stdin → --content for `kj rc add`/`edit` and `kj config set`/`edit`.
+        // Lets shell pipelines author multi-line .md / .kai scripts and load a
+        // staged TOML file without the `--content "$(cat …)"` dance:
         //   cat prompt.md | kj rc add /etc/rc/coder/create/S00-stance.md
-        // Only kicks in when --content was not given explicitly. Single
-        // consumer for now; if more kj subcommands grow stdin appetite,
-        // promote this to the dispatcher signature.
-        if argv.first().map(|s| s.as_str()) == Some("rc")
-            && matches!(argv.get(1).map(|s| s.as_str()), Some("add") | Some("edit"))
+        //   cat new.toml | kj config set /etc/config/models.toml
+        // Only kicks in when --content was not given explicitly. `kj config
+        // set`/`edit` joined `rc add`/`edit` here 2026-06-30 (config
+        // papercuts, Fix 3) — the help text already promised piped stdin;
+        // this is what makes that promise true. If more kj subcommands grow
+        // stdin appetite, promote this to the dispatcher signature.
+        if wants_stdin_content(&argv)
             && !crate::kj::parse::has_flag(&argv, &["--content"])
             && let Some(body) = ctx.read_stdin_to_string().await
             && !body.is_empty()
@@ -656,6 +656,25 @@ fn render_json_envelope(exec: ExecResult) -> ExecResult {
     out
 }
 
+/// Whether this `kj` invocation should have piped stdin promoted to
+/// `--content` when the flag was omitted. `argv` here is post-normalization
+/// (`--confirm`/`--json` already stripped). Two write surfaces want this:
+/// `kj rc add`/`edit` (scripts) and, since 2026-06-30 (config papercuts,
+/// Fix 3), `kj config set`/`edit` (`cat new.toml | kj config set
+/// /etc/config/models.toml`).
+fn wants_stdin_content(argv: &[String]) -> bool {
+    matches!(
+        (
+            argv.first().map(String::as_str),
+            argv.get(1).map(String::as_str)
+        ),
+        (Some("rc"), Some("add"))
+            | (Some("rc"), Some("edit"))
+            | (Some("config"), Some("set"))
+            | (Some("config"), Some("edit"))
+    )
+}
+
 /// Does this `kj` invocation make a blocking, in-line LLM distillation call?
 ///
 /// These are the only `kj` verbs that synchronously hold the kaish builtin on a
@@ -668,7 +687,10 @@ fn render_json_envelope(exec: ExecResult) -> ExecResult {
 /// never miscarries the command.
 fn is_distill_verb(argv: &[String]) -> bool {
     let has = |flag: &str| argv.iter().any(|a| a == flag);
-    match (argv.first().map(String::as_str), argv.get(1).map(String::as_str)) {
+    match (
+        argv.first().map(String::as_str),
+        argv.get(1).map(String::as_str),
+    ) {
         (Some("fork"), _) => has("--compact"),
         (Some("drift"), Some("pull")) | (Some("drift"), Some("merge")) => true,
         (Some("drift"), Some("push")) => has("--summarize"),
@@ -731,19 +753,16 @@ mod tests {
     //! handles instead of the rendered table.
     use super::*;
     use crate::block_store::shared_block_store;
-    use crate::kj::test_helpers::{register_context, test_dispatcher};
+    use crate::kj::test_helpers::{register_context, test_dispatcher, test_dispatcher_crdt_rc};
     use crate::runtime::context_engine::session_context_map;
     use crate::runtime::embedded_kaish::EmbeddedKaish;
-    use kaish_kernel::ExecuteOptions;
     use kaijutsu_types::SessionId;
+    use kaish_kernel::ExecuteOptions;
 
     /// Build an `EmbeddedKaish` wired to a `KjBuiltin` rooted at the given
     /// dispatcher. Mirrors the rc-lifecycle wiring in `kj/lifecycle.rs`
     /// but without the script-execution scaffolding.
-    async fn embedded_with_kj(
-        dispatcher: Arc<KjDispatcher>,
-        ctx: ContextId,
-    ) -> EmbeddedKaish {
+    async fn embedded_with_kj(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = dispatcher.kernel().clone();
         let _kernel_id = dispatcher.kernel_id();
@@ -751,19 +770,20 @@ mod tests {
         let session_contexts = session_context_map();
         session_contexts.insert(session_id, ctx);
 
-        let configure_tools = move |scm: SessionContextMap,
-                                    sid: SessionId,
-                                    tools: &mut kaish_kernel::ToolRegistry| {
-            tools.register(KjBuiltin::new(
-                dispatcher,
-                scm,
-                PrincipalId::system(),
-                sid,
-                None,
-                Arc::new(crate::kj::lifecycle::NoopBlockSource),
-                false,
-            ));
-        };
+        let configure_tools =
+            move |scm: SessionContextMap,
+                  sid: SessionId,
+                  tools: &mut kaish_kernel::ToolRegistry| {
+                tools.register(KjBuiltin::new(
+                    dispatcher,
+                    scm,
+                    PrincipalId::system(),
+                    sid,
+                    None,
+                    Arc::new(crate::kj::lifecycle::NoopBlockSource),
+                    false,
+                ));
+            };
 
         EmbeddedKaish::with_identity(
             "test-kj-data",
@@ -773,7 +793,7 @@ mod tests {
             PrincipalId::system(),
             ctx,
             session_id,
-                        session_contexts,
+            session_contexts,
             crate::runtime::embedded_kaish::ExternalExec::Deny,
             configure_tools,
         )
@@ -817,10 +837,7 @@ mod tests {
         // see lines that begin with the column header rather than just the
         // handle. Iterations must be exactly two and exactly the labels —
         // anything else means the fallback path is leaking through.
-        let got_lines: Vec<&str> = stdout
-            .lines()
-            .filter(|l| l.starts_with("got="))
-            .collect();
+        let got_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("got=")).collect();
         assert_eq!(
             got_lines.len(),
             2,
@@ -857,8 +874,8 @@ mod tests {
         assert!(res.ok(), "context list --json exit != 0: {res:?}");
 
         let stdout = res.text_out();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
         assert_eq!(parsed["ok"], serde_json::json!(true));
         assert_eq!(parsed["exit_code"], serde_json::json!(0));
         // `kj context list` emits a `data` array of context handles — it must
@@ -909,7 +926,10 @@ mod tests {
             )
             .await
             .expect("kaish exec");
-        assert!(!res.ok(), "errored command should keep nonzero exit: {res:?}");
+        assert!(
+            !res.ok(),
+            "errored command should keep nonzero exit: {res:?}"
+        );
         let parsed: serde_json::Value = serde_json::from_str(&res.text_out())
             .unwrap_or_else(|e| panic!("error envelope not JSON ({e}): {}", res.text_out()));
         assert_eq!(parsed["ok"], serde_json::json!(false));
@@ -930,7 +950,10 @@ mod tests {
         let canonical = build_command_scope(&[s("context"), s("remove"), s("victim")]);
         let aliased = build_command_scope(&[s("context"), s("rm"), s("victim")]);
         assert_eq!(canonical, "kj context remove");
-        assert_eq!(aliased, canonical, "rm alias must map to the canonical scope");
+        assert_eq!(
+            aliased, canonical,
+            "rm alias must map to the canonical scope"
+        );
         // Non-aliased verbs are untouched.
         assert_eq!(
             build_command_scope(&[s("context"), s("archive"), s("x")]),
@@ -953,10 +976,7 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
 
         let res = kaish
-            .execute_with_options(
-                "kj rc list --type default",
-                ExecuteOptions::default(),
-            )
+            .execute_with_options("kj rc list --type default", ExecuteOptions::default())
             .await
             .expect("kaish exec");
         assert!(res.ok(), "kj rc list exit != 0: {res:?}");
@@ -998,7 +1018,10 @@ mod tests {
         // clap would reject the missing required `--target` (or strand "tools"),
         // so a clean exit already proves it took the value.
         let add = kaish
-            .execute_with_options("kj cache add -t tools --ttl extended", ExecuteOptions::default())
+            .execute_with_options(
+                "kj cache add -t tools --ttl extended",
+                ExecuteOptions::default(),
+            )
             .await
             .expect("kaish exec (cache add)");
         assert!(add.ok(), "cache add -t tools (value) failed: {add:?}");
@@ -1010,7 +1033,8 @@ mod tests {
             .list_cache_breakpoints(ctx)
             .expect("list breakpoints");
         assert!(
-            bps.iter().any(|bp| matches!(bp, crate::llm::stream::CacheTarget::Tools(_))),
+            bps.iter()
+                .any(|bp| matches!(bp, crate::llm::stream::CacheTarget::Tools(_))),
             "`-t tools` must bind target=tools, got: {bps:?}"
         );
 
@@ -1323,8 +1347,7 @@ mod tests {
         );
         // Make sure the old "missing --content" error didn't leak through.
         assert!(
-            !stdout.contains("missing content")
-                && !stdout.contains("missing --content"),
+            !stdout.contains("missing content") && !stdout.contains("missing --content"),
             "rc add still reported missing content despite piped stdin: {stdout}"
         );
     }
@@ -1361,6 +1384,73 @@ mod tests {
         );
     }
 
+    /// Piped stdin populates `--content` for `kj config set` when the flag is
+    /// omitted — Fix 3 (2026-06-30 config papercuts): `--help` already
+    /// promised "stdin is piped here when omitted", but before this,
+    /// `cat new.toml | kj config set /etc/config/models.toml` failed with
+    /// "missing content" despite the promise. This is the same injection
+    /// `rc add`/`edit` already had (`pipe_stdin_provides_rc_add_content`
+    /// above), widened to `config set`/`edit` in `wants_stdin_content`.
+    #[tokio::test]
+    async fn pipe_stdin_provides_config_set_content() {
+        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("cfgstdinhost"), None, principal);
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = r#"
+            echo '[providers.ollama]' | kj config set models.toml
+            kj config show models.toml
+        "#;
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "pipe-into-config-set exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        assert!(
+            stdout.contains("providers.ollama"),
+            "stdin content didn't reach config set: {stdout}"
+        );
+        assert!(
+            !stdout.contains("missing content"),
+            "config set still reported missing content despite piped stdin: {stdout}"
+        );
+    }
+
+    /// Piped stdin ALSO populates `--content` for `kj config edit` (the
+    /// interactive-when-omitted verb from the stretch goal) when the flag is
+    /// omitted — same treatment as `set`, since `edit`'s content-given branch
+    /// is the same validate-then-write path.
+    #[tokio::test]
+    async fn pipe_stdin_provides_config_edit_content() {
+        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("cfgstdinhost2"), None, principal);
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = r#"
+            echo '[providers.lemonade]' | kj config edit models.toml
+            kj config show models.toml
+        "#;
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "pipe-into-config-edit exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        assert!(
+            stdout.contains("providers.lemonade"),
+            "stdin content didn't reach config edit: {stdout}"
+        );
+    }
+
     /// Latch regression: a confirmation nonce issued by one `EmbeddedKaish`
     /// must still validate when the *next* shell confirms it. kaish is
     /// materialized fresh per MCP `execute`, so the nonce store can't live on
@@ -1379,10 +1469,7 @@ mod tests {
         // Shell #1: issue the latch nonce (no --confirm yet → exit 2).
         let kaish_a = embedded_with_kj(dispatcher.clone(), ctx).await;
         let issue = kaish_a
-            .execute_with_options(
-                "kj context retag beta alpha",
-                ExecuteOptions::default(),
-            )
+            .execute_with_options("kj context retag beta alpha", ExecuteOptions::default())
             .await
             .expect("kaish exec (issue)");
         assert_eq!(
@@ -1444,7 +1531,9 @@ mod tests {
         // `--summarize` stages literal content; `drift flush`/`push` deliver;
         // `drive` only publishes a turn request; everything else is local.
         assert!(!is_distill_verb(&argv("fork --name x")));
-        assert!(!is_distill_verb(&argv("drift push main some literal content")));
+        assert!(!is_distill_verb(&argv(
+            "drift push main some literal content"
+        )));
         assert!(!is_distill_verb(&argv("drift flush")));
         assert!(!is_distill_verb(&argv("drift queue")));
         assert!(!is_distill_verb(&argv("drive")));
@@ -1473,9 +1562,8 @@ mod tests {
             llm_request_timeout: Duration::from_secs(10),
             ..Default::default()
         };
-        let dispatcher = Arc::new(
-            crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await,
-        );
+        let dispatcher =
+            Arc::new(crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await);
         dispatcher.set_self_arc();
 
         // A provider that takes 800ms to answer — past the 300ms watchdog, well
@@ -1541,7 +1629,10 @@ mod tests {
             res.code,
             res.text_out()
         );
-        assert_ne!(res.code, 124, "distill must not trip the script timeout (124)");
+        assert_ne!(
+            res.code, 124,
+            "distill must not trip the script timeout (124)"
+        );
         assert!(
             res.text_out().contains("staged drift"),
             "distill should have staged the summary: {}",
