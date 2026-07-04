@@ -13,6 +13,7 @@
 //! `block_read` (line numbers + range filtering).
 
 use clap::{Parser, Subcommand};
+use kaijutsu_cas::ContentStore;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use serde::Serialize;
 
@@ -122,6 +123,27 @@ enum BlockCommand {
         /// Line range "start:end" — 0-indexed, end exclusive. Omit to read all.
         #[arg(long)]
         range: Option<String>,
+    },
+    /// One-step blob readback: resolve a block's payload and print or save
+    /// it, following the CAS reference when the block is a derived/asset
+    /// sibling (e.g. an ABC→MIDI render) instead of a hand-assembled
+    /// `inspect` → `cas get` chain. Textual payloads print to stdout;
+    /// binary payloads require `--out` (refused otherwise — a terminal
+    /// should never eat raw binary).
+    Cat {
+        /// Block id to read (mutually exclusive with `--latest`)
+        block_id: Option<String>,
+        /// Select the newest block whose resolved mime matches this value
+        /// (timeline order), instead of naming a specific id — e.g.
+        /// `--latest audio/midi` for "the rendered artifact for this turn".
+        #[arg(long, conflicts_with = "block_id")]
+        latest: Option<String>,
+        /// Context to search with `--latest` (defaults to the active context)
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+        /// Write the payload to this path instead of stdout
+        #[arg(long)]
+        out: Option<String>,
     },
     /// Append text to a block (streaming-friendly). Mirrors MCP `block_append`.
     Append {
@@ -248,6 +270,18 @@ impl KjDispatcher {
                 no_line_numbers,
                 range,
             } => self.block_read(&block_id, !no_line_numbers, range.as_deref()),
+            BlockCommand::Cat {
+                block_id,
+                latest,
+                context,
+                out,
+            } => self.block_cat(
+                block_id.as_deref(),
+                latest.as_deref(),
+                context.as_deref(),
+                out.as_deref(),
+                caller,
+            ),
             BlockCommand::Append { block_id, text } => {
                 self.block_append(&block_id, &text, caller)
             }
@@ -531,6 +565,207 @@ impl KjDispatcher {
             "content_length": snap.content.len(),
         });
         KjResult::ok_with_data(out, record)
+    }
+
+    /// The CAS hash a block's content references, if it's a CAS-ref block by
+    /// the `img_block`/materialize convention (`kaijutsu-hyoushigi::materialize`,
+    /// `beat.rs::materialize_committed`): `Role::Asset` + a literal content
+    /// string that parses as a 32-hex [`kaijutsu_cas::ContentHash`]. Any other
+    /// block's `content` IS the payload, never a pointer — this returns `None`
+    /// for it even if the text happens to look hex-ish, because `Role::Asset`
+    /// is the load-bearing signal, not the string shape alone.
+    fn block_cas_hash(
+        &self,
+        snap: &kaijutsu_types::BlockSnapshot,
+    ) -> Option<kaijutsu_cas::ContentHash> {
+        if snap.role != Role::Asset {
+            return None;
+        }
+        snap.content.parse::<kaijutsu_cas::ContentHash>().ok()
+    }
+
+    /// The block's "real" mime for `--latest` matching: for a CAS-ref block,
+    /// the mime recorded in the CAS sidecar (the actual bytes' type — a
+    /// derived sibling's `content_type` is often `Plain` because
+    /// `ContentType::from_mime` has no closed variant for e.g. `audio/midi`
+    /// yet); for a literal-content block, the block's own declared
+    /// content_type mime. `None` for a dangling CAS hash — never silently
+    /// treated as a match.
+    fn block_resolved_mime(&self, snap: &kaijutsu_types::BlockSnapshot) -> Option<String> {
+        match self.block_cas_hash(snap) {
+            Some(hash) => self
+                .kernel()
+                .cas()
+                .inspect(&hash)
+                .ok()
+                .flatten()
+                .map(|r| r.mime_type),
+            None => Some(snap.content_type.as_mime().to_string()),
+        }
+    }
+
+    /// One-step blob readback (`kj block cat`). Resolves either a named block
+    /// or (with `--latest <mime>`) the newest block in `context` whose
+    /// resolved mime matches, in timeline order (`block_snapshots` already
+    /// returns `blocks_ordered()` — document/timeline order, never the
+    /// principal-major `BlockId` order). A CAS-ref block (see
+    /// [`Self::block_cas_hash`]) is resolved through CAS; everything else's
+    /// `content` IS the payload. Textual payloads (mime starting `text/`)
+    /// print directly; binary payloads refuse to dump to the terminal and
+    /// require `--out`, mirroring `kj cas get`.
+    fn block_cat(
+        &self,
+        block_id_arg: Option<&str>,
+        latest_mime: Option<&str>,
+        ctx_ref: Option<&str>,
+        out: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let (ctx_id, snap) = match (block_id_arg, latest_mime) {
+            (Some(id_str), None) => {
+                let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+                    Some(id) => id,
+                    None => {
+                        return KjResult::Err(format!(
+                            "kj block cat: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                        ));
+                    }
+                };
+                let ctx_id = block_id.context_id;
+                let snapshots = match self.blocks.block_snapshots(ctx_id) {
+                    Ok(s) => s,
+                    Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
+                };
+                let snap = match snapshots.into_iter().find(|b| b.id == block_id) {
+                    Some(s) => s,
+                    None => {
+                        return KjResult::Err(format!(
+                            "kj block cat: block '{id_str}' not found in {}",
+                            ctx_id.to_hex()
+                        ));
+                    }
+                };
+                (ctx_id, snap)
+            }
+            (None, Some(mime)) => {
+                let ctx_id = {
+                    let db = self.kernel_db().lock();
+                    match resolve_context_arg(ctx_ref, caller, &db) {
+                        Ok(id) => id,
+                        Err(e) => return KjResult::Err(format!("kj block cat --latest: {e}")),
+                    }
+                };
+                let snapshots = match self.blocks.block_snapshots(ctx_id) {
+                    Ok(s) => s,
+                    Err(e) => return KjResult::Err(format!("kj block cat --latest: {e}")),
+                };
+                // Newest-first scan over timeline order (see doc comment);
+                // stops at the first match, so a dangling-hash sibling before
+                // the match is never resolved needlessly.
+                let found = snapshots
+                    .into_iter()
+                    .rev()
+                    .find(|b| self.block_resolved_mime(b).as_deref() == Some(mime));
+                let snap = match found {
+                    Some(s) => s,
+                    None => {
+                        return KjResult::Err(format!(
+                            "kj block cat --latest: no block with resolved mime '{mime}' in {}",
+                            ctx_id.to_hex()
+                        ));
+                    }
+                };
+                (ctx_id, snap)
+            }
+            (Some(_), Some(_)) => {
+                // Unreachable in practice — clap's `conflicts_with` rejects
+                // this combination before dispatch ever calls this method.
+                return KjResult::Err(
+                    "kj block cat: a block id and --latest are mutually exclusive".to_string(),
+                );
+            }
+            (None, None) => {
+                return KjResult::Err(
+                    "kj block cat: provide a block id, or --latest <mime> (with --context)"
+                        .to_string(),
+                );
+            }
+        };
+
+        let cas_ref = self.block_cas_hash(&snap);
+        let (bytes, mime): (Vec<u8>, String) = match &cas_ref {
+            Some(hash) => {
+                let cas = self.kernel().cas();
+                let info = match cas.inspect(hash) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return KjResult::Err(format!(
+                            "kj block cat: block references CAS hash {hash} with no metadata \
+                             (corruption — refusing to guess a mime)"
+                        ));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
+                };
+                let data = match cas.retrieve(hash) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => {
+                        return KjResult::Err(format!(
+                            "kj block cat: block references CAS hash {hash} but the bytes are \
+                             missing (corruption — never a dangling-hash silent skip)"
+                        ));
+                    }
+                    Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
+                };
+                (data, info.mime_type)
+            }
+            None => (
+                snap.content.clone().into_bytes(),
+                snap.content_type.as_mime().to_string(),
+            ),
+        };
+        let is_text = mime.starts_with("text/");
+        let block_key = snap.id.to_key();
+
+        if let Some(out_path) = out {
+            return match std::fs::write(out_path, &bytes) {
+                Ok(()) => {
+                    let record = serde_json::json!({
+                        "block_id": block_key,
+                        "context_id": ctx_id.to_hex(),
+                        "cas_hash": cas_ref.as_ref().map(|h| h.to_string()),
+                        "mime": mime,
+                        "bytes": bytes.len(),
+                        "out": out_path,
+                    });
+                    // Mirrors `kj cas get --out`: the write confirmation is a
+                    // human status line, not content the model needs hydrated.
+                    KjResult::ok_ephemeral_with_data(
+                        format!("wrote {} bytes ({mime}) to {out_path}", bytes.len()),
+                        ContentType::Plain,
+                        record,
+                    )
+                }
+                Err(e) => KjResult::Err(format!("kj block cat --out: {e}")),
+            };
+        }
+
+        if !is_text {
+            return KjResult::Err(format!(
+                "kj block cat: '{block_key}' is binary ({mime}, {} bytes) — refusing to dump to \
+                 the terminal; use --out <file>",
+                bytes.len(),
+            ));
+        }
+
+        let record = serde_json::json!({
+            "block_id": block_key,
+            "context_id": ctx_id.to_hex(),
+            "cas_hash": cas_ref.as_ref().map(|h| h.to_string()),
+            "mime": mime,
+            "bytes": bytes.len(),
+        });
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        KjResult::ok_typed_with_data(text, ContentType::from_mime(&mime), record)
     }
 
     /// Append text to an existing block. Mirrors MCP `block_append`. Returns
@@ -1397,6 +1632,303 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("malformed"));
+    }
+
+    // ── New: block cat ─────────────────────────────────────────────────
+
+    /// Insert a block explicitly appended after `after` (or, when `after` is
+    /// `None`, at the very *start* of the document — `insert_block_as`'s
+    /// "no ref given" semantics prepend, they don't append, so a sequence of
+    /// bare `after: None` inserts would land in REVERSE order). Tests that
+    /// care about timeline order (the `--latest` selector) must thread this
+    /// explicitly rather than reuse the order-agnostic `insert_text_block`.
+    fn insert_block_ordered(
+        d: &crate::kj::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        role: TypesRole,
+        content: &str,
+        after: Option<kaijutsu_types::BlockId>,
+    ) -> kaijutsu_types::BlockId {
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                after.as_ref(),
+                role,
+                BlockKind::Text,
+                content,
+                Status::Done,
+                ContentType::Plain,
+                None,
+            )
+            .expect("insert_block_as (ordered)")
+    }
+
+    /// Store `data` in the dispatcher's CAS under `mime`, then insert an
+    /// `Asset`-role block whose content is the resulting hash — the
+    /// `img_block`/materialize convention `kj block cat` follows to resolve
+    /// CAS-ref blocks (`kaijutsu-hyoushigi::materialize`, `beat.rs`).
+    fn insert_cas_asset_block(
+        d: &crate::kj::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        data: &[u8],
+        mime: &str,
+        after: Option<kaijutsu_types::BlockId>,
+    ) -> (kaijutsu_types::BlockId, String) {
+        let hash = d.kernel().cas().store(data, mime).expect("cas store");
+        let id = insert_block_ordered(d, ctx, TypesRole::Asset, hash.as_str(), after);
+        (id, hash.to_string())
+    }
+
+    #[tokio::test]
+    async fn block_cat_reads_literal_text_content() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "hello from cat");
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("cat"), bid.to_key()], &c).await;
+        assert!(result.is_ok(), "cat failed: {}", result.message());
+        assert_eq!(result.message(), "hello from cat");
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert!(v["cas_hash"].is_null(), "literal content has no cas_hash: {v}");
+                assert_eq!(v["mime"], "text/plain");
+                assert_eq!(v["bytes"], "hello from cat".len());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_cat_resolves_cas_ref_and_prints_textual_payload() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let (bid, hash) =
+            insert_cas_asset_block(&d, ctx, b"X:1\nT:Test\nK:C\nC D E F|", "text/vnd.abc", None);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("cat"), bid.to_key()], &c).await;
+        assert!(result.is_ok(), "cat failed: {}", result.message());
+        // The resolved CAS bytes print — NOT the literal 32-hex hash the block
+        // stores as its `content` pointer.
+        assert_eq!(result.message(), "X:1\nT:Test\nK:C\nC D E F|");
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["cas_hash"], hash);
+                assert_eq!(v["mime"], "text/vnd.abc");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_cat_binary_payload_without_out_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let (bid, _hash) =
+            insert_cas_asset_block(&d, ctx, b"MThd fake midi bytes", "audio/midi", None);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("cat"), bid.to_key()], &c).await;
+        assert!(!result.is_ok(), "binary cat without --out must refuse: {result:?}");
+        assert!(result.message().contains("binary"), "msg: {}", result.message());
+        assert!(result.message().contains("audio/midi"), "msg: {}", result.message());
+        assert!(result.message().contains("--out"), "msg: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn block_cat_binary_payload_with_out_writes_file() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let midi_bytes = b"MThd fake midi bytes".to_vec();
+        let (bid, hash) = insert_cas_asset_block(&d, ctx, &midi_bytes, "audio/midi", None);
+        let c = caller_with_context(ctx);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let out_path = dir.path().join("out.mid");
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("cat"),
+                    bid.to_key(),
+                    s("--out"),
+                    out_path.to_string_lossy().into_owned(),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "cat --out failed: {}", result.message());
+        let written = std::fs::read(&out_path).expect("out file written");
+        assert_eq!(written, midi_bytes);
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["cas_hash"], hash);
+                assert_eq!(v["mime"], "audio/midi");
+                assert_eq!(v["bytes"], midi_bytes.len());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_cat_dangling_cas_hash_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        // A well-formed 32-hex hash that was never actually stored in CAS.
+        let dangling = kaijutsu_cas::ContentHash::from_data(b"never-stored-bytes").to_string();
+        let bid = insert_block_ordered(&d, ctx, TypesRole::Asset, &dangling, None);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("cat"), bid.to_key()], &c).await;
+        assert!(!result.is_ok(), "dangling CAS ref must error, not print the bare hash");
+        assert!(
+            result.message().contains("corruption"),
+            "msg: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_cat_malformed_id_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("cat"), s("garbage")], &c).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("malformed"));
+    }
+
+    #[tokio::test]
+    async fn block_cat_missing_block_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let phantom = kaijutsu_types::BlockId {
+            context_id: ctx,
+            principal_id: PrincipalId::new(),
+            seq: 999,
+        };
+        let result = d
+            .dispatch(&[s("block"), s("cat"), phantom.to_key()], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn block_cat_requires_id_or_latest() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("cat")], &c).await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("--latest"),
+            "msg: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_cat_id_and_latest_conflict() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("cat"),
+                    s("some-id"),
+                    s("--latest"),
+                    s("audio/midi"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "clap must reject id + --latest together");
+    }
+
+    #[tokio::test]
+    async fn block_cat_latest_selects_newest_matching_mime_in_timeline_order() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        // A deliberately non-BlockId-sorted chain: `insert_block_ordered`
+        // threads `after` explicitly so document/timeline order matches
+        // insertion order regardless of principal-major BlockId ordering.
+        let b1 = insert_block_ordered(&d, ctx, TypesRole::User, "turn one", None);
+        let (old_midi, old_hash) =
+            insert_cas_asset_block(&d, ctx, b"MThd-old", "audio/midi", Some(b1));
+        let b2 = insert_block_ordered(&d, ctx, TypesRole::User, "turn two", Some(old_midi));
+        let (new_midi, new_hash) =
+            insert_cas_asset_block(&d, ctx, b"MThd-new", "audio/midi", Some(b2));
+        assert_ne!(old_hash, new_hash, "fixture sanity: distinct bytes/hashes");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let out_path = dir.path().join("latest.mid");
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("cat"),
+                    s("--latest"),
+                    s("audio/midi"),
+                    s("--out"),
+                    out_path.to_string_lossy().into_owned(),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "cat --latest failed: {}", result.message());
+        let written = std::fs::read(&out_path).expect("out file written");
+        assert_eq!(written, b"MThd-new", "must resolve the NEWEST matching block");
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["cas_hash"], new_hash);
+                assert_eq!(v["block_id"], new_midi.to_key());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_cat_latest_no_match_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        insert_text_block(&d, ctx, "just text, no assets");
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("cat"), s("--latest"), s("audio/midi")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("audio/midi"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     // ── New: block create ─────────────────────────────────────────────
