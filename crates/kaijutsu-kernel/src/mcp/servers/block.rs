@@ -11,9 +11,12 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::block_store::SharedBlockStore;
+// The `*_char_*` twins, NOT the byte variants: `apply_op` feeds
+// `edit_text_as`, and the CRDT text layer is char-indexed (byte offsets
+// corrupt multibyte content — the June file-tools bug class).
 use crate::block_tools::translate::{
-    content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_byte_range,
-    line_to_byte_offset, validate_expected_text,
+    content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
+    line_to_char_offset, validate_expected_text,
 };
 use kaijutsu_crdt::{BlockId, BlockKind, ContentType, Role, Status};
 use kaijutsu_types::ContextId;
@@ -83,9 +86,12 @@ pub enum EditOp {
 pub struct BlockSpliceParams {
     /// Block ID to edit.
     pub block_id: String,
-    /// Byte offset.
+    /// CHARACTER offset (not bytes — the CRDT text layer is char-indexed;
+    /// the tool description has always said "character-based" but this
+    /// schema doc used to say "byte", steering callers into computing byte
+    /// offsets that corrupt multibyte content).
     pub offset: usize,
-    /// Number of bytes to delete.
+    /// Number of CHARACTERS to delete.
     pub delete_count: usize,
     /// Text to insert.
     pub insert: Option<String>,
@@ -865,7 +871,8 @@ impl BlockToolsServer {
                 line,
                 content: text,
             } => {
-                let pos = line_to_byte_offset(&content, line).map_err(|e| McpError::Protocol(e.to_string()))?;
+                let pos = line_to_char_offset(&content, line)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
                 let text_with_newline = if text.ends_with('\n') || content.is_empty() {
                     text
                 } else {
@@ -886,7 +893,8 @@ impl BlockToolsServer {
                 start_line,
                 end_line,
             } => {
-                let (start, end) = line_range_to_byte_range(&content, start_line, end_line).map_err(|e| McpError::Protocol(e.to_string()))?;
+                let (start, end) = line_range_to_char_range(&content, start_line, end_line)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
                 if start < end {
                     self.documents
                         .edit_text_as(
@@ -910,7 +918,8 @@ impl BlockToolsServer {
                     validate_expected_text(&content, start_line, end_line, &expected).map_err(|e| McpError::Protocol(e.to_string()))?;
                 }
 
-                let (start, end) = line_range_to_byte_range(&content, start_line, end_line).map_err(|e| McpError::Protocol(e.to_string()))?;
+                let (start, end) = line_range_to_char_range(&content, start_line, end_line)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
                 let text_with_newline = if text.ends_with('\n') || text.is_empty() {
                     text
                 } else {
@@ -1676,5 +1685,152 @@ mod tests {
         .await;
         assert!(res.is_error);
         assert!(text_of(&res).contains("invalid hash"), "got: {}", text_of(&res));
+    }
+
+    // ── block_edit × multibyte content (byte-vs-char offset regression) ──
+    //
+    // Same disease as the kj `block edit` fix (kj/block.rs): the CRDT text
+    // layer is CHAR-indexed (`BlockDocument::edit_text` bounds-checks against
+    // `chars().count()` and splices at char positions), so byte offsets from
+    // the translate helpers corrupt any block with multibyte UTF-8 before the
+    // edit site — silent wrong-splice or spurious PositionOutOfBounds.
+
+    fn insert_multibyte_block(
+        store: &SharedBlockStore,
+        ctx: &CallContext,
+        content: &str,
+    ) -> kaijutsu_types::BlockId {
+        store
+            .insert_block(
+                ctx.context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                content,
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap()
+    }
+
+    fn content_of(
+        store: &SharedBlockStore,
+        ctx: &CallContext,
+        id: &kaijutsu_types::BlockId,
+    ) -> String {
+        store
+            .get(ctx.context_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(id)
+            .unwrap()
+            .content
+    }
+
+    #[tokio::test]
+    async fn test_block_edit_insert_after_multibyte_line_splices_at_line_start() {
+        let (broker, ctx, _db, store) = setup().await;
+        // Line 0 is 10 chars / 16 bytes; whole content is 16 chars — the
+        // buggy byte offset (16) passes the char bounds check and appends at
+        // the END instead of inserting before "second". Silent corruption.
+        let block_id = insert_multibyte_block(&store, &ctx, "改善 → done\nsecond");
+
+        let res = call(
+            &broker,
+            &ctx,
+            "block_edit",
+            serde_json::json!({
+                "block_id": block_id.to_key(),
+                "operations": [
+                    {"op": "insert", "line": 1, "content": "INSERTED"}
+                ]
+            }),
+        )
+        .await;
+        assert!(!res.is_error, "insert failed: {}", text_of(&res));
+        assert_eq!(
+            content_of(&store, &ctx, &block_id),
+            "改善 → done\nINSERTED\nsecond",
+            "insert must land at the START of line 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_block_edit_delete_with_multibyte_before_range() {
+        let (broker, ctx, _db, store) = setup().await;
+        // Content is 24 chars; the buggy byte range for line 1 is 16..26 —
+        // 26 > 24 trips PositionOutOfBounds on a perfectly valid delete.
+        let block_id = insert_multibyte_block(&store, &ctx, "改善 → done\nDELETE ME\nkeep");
+
+        let res = call_res(
+            &broker,
+            &ctx,
+            "block_edit",
+            serde_json::json!({
+                "block_id": block_id.to_key(),
+                "operations": [
+                    {"op": "delete", "start_line": 1, "end_line": 2}
+                ]
+            }),
+        )
+        .await;
+        let res = res.expect("valid delete after a multibyte line must not trip bounds");
+        assert!(!res.is_error, "delete failed: {}", text_of(&res));
+        assert_eq!(content_of(&store, &ctx, &block_id), "改善 → done\nkeep");
+    }
+
+    #[tokio::test]
+    async fn test_block_edit_replace_with_multibyte_before_range() {
+        let (broker, ctx, _db, store) = setup().await;
+        // Line 0 is 11 chars / 15 bytes; the buggy byte range 15..19 passes
+        // the char bounds check (len 19) but deletes chars 15..19 — "tail",
+        // not "old\n". Silent wrong-splice.
+        let block_id = insert_multibyte_block(&store, &ctx, "→ arrows ✅\nold\ntail");
+
+        let res = call(
+            &broker,
+            &ctx,
+            "block_edit",
+            serde_json::json!({
+                "block_id": block_id.to_key(),
+                "operations": [
+                    {"op": "replace", "start_line": 1, "end_line": 2, "content": "new"}
+                ]
+            }),
+        )
+        .await;
+        assert!(!res.is_error, "replace failed: {}", text_of(&res));
+        assert_eq!(
+            content_of(&store, &ctx, &block_id),
+            "→ arrows ✅\nnew\ntail",
+            "replace must swap line 1, not splice into 'tail'"
+        );
+    }
+
+    /// CAS (`expected_text`) validates on LINES — unaffected by the offset
+    /// units — but the splice after a CAS pass must still land on char
+    /// boundaries. Guards the interplay.
+    #[tokio::test]
+    async fn test_block_edit_replace_cas_with_multibyte_prefix() {
+        let (broker, ctx, _db, store) = setup().await;
+        let block_id = insert_multibyte_block(&store, &ctx, "改善 ✅\nstale\nkeep");
+
+        let res = call_res(
+            &broker,
+            &ctx,
+            "block_edit",
+            serde_json::json!({
+                "block_id": block_id.to_key(),
+                "operations": [
+                    {"op": "replace", "start_line": 1, "end_line": 2,
+                     "content": "fresh", "expected_text": "stale"}
+                ]
+            }),
+        )
+        .await;
+        let res = res.expect("CAS replace after a multibyte line must not trip bounds");
+        assert!(!res.is_error, "CAS replace failed: {}", text_of(&res));
+        assert_eq!(content_of(&store, &ctx, &block_id), "改善 ✅\nfresh\nkeep");
     }
 }

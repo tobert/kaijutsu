@@ -771,7 +771,37 @@ fn apply_read_range(content: &str, range: ReadRange) -> String {
     content.to_string()
 }
 
+/// Project a WIRE byte offset onto the char index the CRDT text layer
+/// consumes. `PatchOp::Insert`/`Delete`/`Replace` offsets are BYTES by the
+/// kaish-types contract ("Insert content at byte offset", "Delete bytes …"),
+/// and this function is the single seam where that byte domain meets the
+/// char-indexed `edit_text` (`BlockDocument::edit_text` bounds-checks against
+/// `chars().count()` and splices at char positions).
+///
+/// A mid-char or out-of-range byte offset fails LOUD here, before any splice
+/// — the old path spliced the CRDT at a bogus char position and then panicked
+/// in the byte mirror's `replace_range`, leaving the durable block corrupted
+/// behind the crash.
+fn wire_byte_to_char(content: &str, byte: usize, what: &str) -> BackendResult<usize> {
+    if byte > content.len() || !content.is_char_boundary(byte) {
+        return Err(BackendError::Io(format!(
+            "patch {what}: byte offset {byte} is not a char boundary in {}-byte content",
+            content.len()
+        )));
+    }
+    Ok(crate::block_tools::translate::byte_to_char_offset(
+        content, byte,
+    ))
+}
+
 /// Apply a single patch operation to a block.
+///
+/// Two coordinate domains, deliberately: the wire offsets and the local
+/// `result` mirror ops (`insert_str`/`replace_range`) are BYTES per the
+/// PatchOp contract; the `blocks.edit_text` calls are CHARS (the CRDT text
+/// layer is char-indexed). Every CRDT call site converts through
+/// [`wire_byte_to_char`] / `byte_to_char_offset` — never feed a byte offset
+/// to `edit_text` directly (the multibyte-corruption bug class).
 fn apply_patch_op(
     blocks: &SharedBlockStore,
     ctx_id: ContextId,
@@ -781,8 +811,9 @@ fn apply_patch_op(
 ) -> BackendResult<String> {
     match op {
         PatchOp::Insert { offset, content } => {
+            let pos = wire_byte_to_char(current_content, *offset, "insert")?;
             blocks
-                .edit_text(ctx_id, block_id, *offset, content, 0)
+                .edit_text(ctx_id, block_id, pos, content, 0)
                 .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.insert_str(*offset, content);
@@ -793,6 +824,11 @@ fn apply_patch_op(
             len,
             expected,
         } => {
+            // Validate/convert BEFORE the CAS check: a bogus offset should
+            // report as the boundary error it is, not as a misleading
+            // conflict against the empty string `.get()` yields.
+            let start = wire_byte_to_char(current_content, *offset, "delete")?;
+            let end = wire_byte_to_char(current_content, *offset + *len, "delete")?;
             if let Some(exp) = expected {
                 let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
                 if actual != exp {
@@ -806,7 +842,7 @@ fn apply_patch_op(
                 }
             }
             blocks
-                .edit_text(ctx_id, block_id, *offset, "", *len)
+                .edit_text(ctx_id, block_id, start, "", end - start)
                 .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(*offset..*offset + *len, "");
@@ -818,6 +854,8 @@ fn apply_patch_op(
             content,
             expected,
         } => {
+            let start = wire_byte_to_char(current_content, *offset, "replace")?;
+            let end = wire_byte_to_char(current_content, *offset + *len, "replace")?;
             if let Some(exp) = expected {
                 let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
                 if actual != exp {
@@ -831,7 +869,7 @@ fn apply_patch_op(
                 }
             }
             blocks
-                .edit_text(ctx_id, block_id, *offset, content, *len)
+                .edit_text(ctx_id, block_id, start, content, end - start)
                 .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(*offset..*offset + *len, content);
@@ -839,8 +877,14 @@ fn apply_patch_op(
         }
         PatchOp::InsertLine { line, content } => {
             let line_offset = line_to_byte_offset(current_content, *line);
+            // Line starts always sit on char boundaries, so the projection is
+            // infallible; the mirror insert below stays in the byte domain.
+            let pos = crate::block_tools::translate::byte_to_char_offset(
+                current_content,
+                line_offset,
+            );
             blocks
-                .edit_text(ctx_id, block_id, line_offset, &format!("{}\n", content), 0)
+                .edit_text(ctx_id, block_id, pos, &format!("{}\n", content), 0)
                 .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.insert_str(line_offset, &format!("{}\n", content));
@@ -862,8 +906,11 @@ fn apply_patch_op(
                 ));
             }
 
+            let start_c =
+                crate::block_tools::translate::byte_to_char_offset(current_content, start);
+            let end_c = crate::block_tools::translate::byte_to_char_offset(current_content, end);
             blocks
-                .edit_text(ctx_id, block_id, start, "", end - start)
+                .edit_text(ctx_id, block_id, start_c, "", end_c - start_c)
                 .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(start..end, "");
@@ -890,8 +937,11 @@ fn apply_patch_op(
             }
 
             let replacement = format!("{}\n", content);
+            let start_c =
+                crate::block_tools::translate::byte_to_char_offset(current_content, start);
+            let end_c = crate::block_tools::translate::byte_to_char_offset(current_content, end);
             blocks
-                .edit_text(ctx_id, block_id, start, &replacement, end - start)
+                .edit_text(ctx_id, block_id, start_c, &replacement, end_c - start_c)
                 .map_err(|e| BackendError::Io(e.to_string()))?;
             let mut result = current_content.to_string();
             result.replace_range(start..end, &replacement);
@@ -907,6 +957,17 @@ fn apply_patch_op(
 }
 
 /// Get byte offset for a 1-indexed line number.
+///
+/// Kept LOCAL — deliberately NOT replaced by the shared
+/// `block_tools/translate` helpers — because the semantics differ in two
+/// load-bearing ways that are part of the kaish `PatchOp` line contract:
+/// this is **1-indexed** (kaish-types: "line number (1-indexed)") where
+/// translate.rs is 0-indexed, and this **clamps** a beyond-EOF line to
+/// end-of-content where translate.rs errors. Swapping would silently change
+/// the kaish patch surface. Outputs are BYTE offsets, consumed by the local
+/// byte-domain mirror ops; the CRDT call sites in `apply_patch_op` project
+/// them through `byte_to_char_offset` (the shared conversion) before any
+/// `edit_text` — that projection is the one source of truth for byte→char.
 fn line_to_byte_offset(content: &str, line: usize) -> usize {
     if line <= 1 {
         return 0;
@@ -1090,5 +1151,201 @@ mod tests {
         };
 
         assert_eq!(apply_read_range(content, range), "world");
+    }
+
+    // ── apply_patch_op × multibyte content (byte-vs-char offset regression) ──
+    //
+    // `blocks.edit_text` is CHAR-indexed (the CRDT layer bounds-checks against
+    // `chars().count()` and splices at char positions). PatchOp's wire
+    // contract is BYTES for Insert/Delete/Replace (kaish-types doc: "Insert
+    // content at byte offset", "Delete bytes") and 1-indexed lines for the
+    // *Line ops — so the byte→char projection must happen at the CRDT seam.
+    // Nastiest failure: the byte MIRROR string ops were correct while the
+    // CRDT splice was wrong, so the returned content and the durable block
+    // silently diverged.
+
+    /// A store + document + one block with the given content; returns the
+    /// pieces `apply_patch_op` needs. CRDT-side content is read back through
+    /// `crdt_content`.
+    fn patch_fixture(content: &str) -> (SharedBlockStore, ContextId, BlockId) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let ctx_id = ContextId::new();
+        blocks
+            .create_document(ctx_id, DocKind::Conversation, None)
+            .unwrap();
+        let block_id = blocks
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                content,
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+        (blocks, ctx_id, block_id)
+    }
+
+    fn crdt_content(blocks: &SharedBlockStore, ctx_id: ContextId, block_id: &BlockId) -> String {
+        blocks
+            .get_block_snapshot(ctx_id, block_id)
+            .unwrap()
+            .unwrap()
+            .content
+    }
+
+    #[test]
+    fn patch_insert_line_after_multibyte_line() {
+        let content = "改善 → done\nsecond";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        // 1-indexed: line 2 = before "second". Line 1 is 10 chars / 16 bytes;
+        // whole content is 16 chars — the buggy byte offset (16) passed the
+        // char bounds check and appended at the END of the CRDT text while the
+        // byte mirror spliced correctly: silent CRDT/mirror divergence.
+        let result = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::InsertLine { line: 2, content: "INSERTED".into() },
+            content,
+        )
+        .expect("insert line after a multibyte line must succeed");
+        assert_eq!(result, "改善 → done\nINSERTED\nsecond");
+        assert_eq!(
+            crdt_content(&blocks, ctx_id, &block_id),
+            result,
+            "CRDT content must match the returned mirror"
+        );
+    }
+
+    #[test]
+    fn patch_delete_line_with_multibyte_before() {
+        let content = "改善 → done\nDELETE ME\nkeep";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        // Buggy byte range 16..26 vs 24 chars → spurious PositionOutOfBounds.
+        let result = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::DeleteLine { line: 2, expected: Some("DELETE ME".into()) },
+            content,
+        )
+        .expect("delete line after a multibyte line must not trip bounds");
+        assert_eq!(result, "改善 → done\nkeep");
+        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+    }
+
+    #[test]
+    fn patch_replace_line_with_multibyte_before() {
+        let content = "→ arrows ✅\nold\ntail";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        // Buggy byte range 15..19 passed the char bounds check (len 19) but
+        // deleted chars 15..19 — "tail" — in the CRDT while the mirror
+        // replaced "old\n": divergence.
+        let result = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::ReplaceLine {
+                line: 2,
+                content: "new".into(),
+                expected: Some("old".into()),
+            },
+            content,
+        )
+        .expect("replace line after a multibyte line must succeed");
+        assert_eq!(result, "→ arrows ✅\nnew\ntail");
+        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+    }
+
+    /// Pins the byte-offset ruling for the positional ops: PatchOp::Replace's
+    /// wire `offset`/`len` are BYTES (kaish-types contract; the CAS check
+    /// byte-slices), converted to chars only at the CRDT seam.
+    #[test]
+    fn patch_byte_replace_with_multibyte_before() {
+        let content = "改善X";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        // Bytes 6..7 = "X" (改善 = 6 bytes); chars 2..3. Buggy: edit_text(6,…)
+        // vs 3 chars → spurious bounds error.
+        let result = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::Replace {
+                offset: 6,
+                len: 1,
+                content: "Y".into(),
+                expected: Some("X".into()),
+            },
+            content,
+        )
+        .expect("byte-offset replace after multibyte prefix must succeed");
+        assert_eq!(result, "改善Y");
+        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+    }
+
+    #[test]
+    fn patch_byte_insert_with_multibyte_before() {
+        let content = "改善X";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        let result = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::Insert { offset: 6, content: "Q".into() },
+            content,
+        )
+        .expect("byte-offset insert after multibyte prefix must succeed");
+        assert_eq!(result, "改善QX");
+        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+    }
+
+    #[test]
+    fn patch_byte_delete_with_multibyte_before() {
+        let content = "改善AB";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        let result = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::Delete { offset: 6, len: 1, expected: Some("A".into()) },
+            content,
+        )
+        .expect("byte-offset delete after multibyte prefix must succeed");
+        assert_eq!(result, "改善B");
+        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), result);
+    }
+
+    /// A wire byte offset that lands MID-CHAR is a loud error, not a panic —
+    /// the old path spliced the CRDT at a bogus char position and then
+    /// panicked in the byte mirror's `replace_range`, leaving the block
+    /// corrupted behind the crash.
+    #[test]
+    fn patch_byte_offset_mid_char_fails_loud() {
+        let content = "改善";
+        let (blocks, ctx_id, block_id) = patch_fixture(content);
+
+        let err = apply_patch_op(
+            &blocks,
+            ctx_id,
+            &block_id,
+            &PatchOp::Replace { offset: 1, len: 1, content: "z".into(), expected: None },
+            content,
+        )
+        .expect_err("mid-char byte offset must be rejected");
+        assert!(
+            err.to_string().contains("char boundary"),
+            "error should name the boundary problem: {err}"
+        );
+        // The CRDT block is untouched — the guard fired before any splice.
+        assert_eq!(crdt_content(&blocks, ctx_id, &block_id), "改善");
     }
 }
