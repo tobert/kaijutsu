@@ -262,6 +262,184 @@ mod tests {
     use crate::kj::test_helpers::*;
     use kaish_kernel::ExecuteOptions;
 
+    /// Wire a dispatcher whose kernel carries the FULL builtin MCP server set
+    /// (block/file/shell/tool_search/…) and whose broker knows the dispatcher —
+    /// the runtime shape a live context shell runs in. The bare `test_dispatcher`
+    /// leaves the broker empty, so an unknown command's fall-through to the
+    /// backend tool lookup never traverses the real registry there; this does.
+    async fn dispatcher_with_full_broker() -> Arc<KjDispatcher> {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let store = d.block_store().clone();
+        let file_cache = d.kernel().file_cache(&store);
+        d.kernel()
+            .register_builtin_mcp_servers(store, file_cache, None, d.kernel_db().clone())
+            .await
+            .expect("register builtin mcp servers");
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        d
+    }
+
+    /// Grant `ctx` a broad, `all_instances` binding in the broker's in-memory
+    /// map so the unknown-command fall-through's `list_visible_tools` actually
+    /// walks the full registered server set — the real shape a broad context
+    /// (coder/toolie) dispatches in. `exec` controls whether the shell may spawn
+    /// host subprocesses (the `mount`-wedge axis); it is never implied by `*`.
+    async fn grant_broad_binding(d: &Arc<KjDispatcher>, ctx: ContextId, exec: bool) {
+        let mut binding = crate::mcp::ContextToolBinding {
+            all_instances: true,
+            all_facades: true,
+            ..Default::default()
+        };
+        if exec {
+            binding.grant(crate::mcp::Capability::Exec);
+        }
+        d.kernel().broker().set_binding(ctx, binding).await;
+    }
+
+    /// The invariant, exec-less flavor: an unknown command in a Deny context
+    /// shell fails fast (127, command-not-found) — bounded well under a second,
+    /// never hanging to the kaish request timeout. Regression for the
+    /// 2026-07-03 `mount`-wedge report: a bare unknown command fell through to
+    /// the last-resort backend tool lookup, and something in that path was
+    /// blamed for stalling the whole shell timeout. Runs with the FULL broker so
+    /// the fall-through actually traverses the registered server set, and wraps
+    /// the exec in a short real-time bound so a wedge fails the test loudly
+    /// instead of hanging CI.
+    #[tokio::test]
+    async fn unknown_command_fails_fast_exec_denied_shell() {
+        let d = dispatcher_with_full_broker().await;
+        let principal = PrincipalId::new();
+        // register_context grants a broad loadout but NOT Exec, so this
+        // materializes a Deny shell; the broad binding makes the fall-through
+        // walk every registered server.
+        let ctx = register_context(&d, Some("deny"), None, principal);
+        grant_broad_binding(&d, ctx, false).await;
+
+        let kaish = d
+            .materialize_context_kaish(
+                "unknown-cmd-deny",
+                principal,
+                ctx,
+                SessionId::new(),
+                None,
+                Arc::new(NoopBlockSource),
+            )
+            .await
+            .expect("materialize context shell");
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            kaish.execute_with_options("mount", ExecuteOptions::default()),
+        )
+        .await
+        .expect("unknown command must fail fast, not hang the shell timeout")
+        .expect("exec returns");
+        assert_eq!(
+            res.code, 127,
+            "unknown command should be command-not-found (127): {}",
+            res.err
+        );
+    }
+
+    /// The toolie/read-only flavor: a `read_only_shell` pins `ExternalExec::Deny`
+    /// structurally, so an unknown command can never spawn and must fall through
+    /// to the backend lookup and fail fast (127) — the same invariant, exercised
+    /// through the read-only materialization the toolie actually uses.
+    #[tokio::test]
+    async fn unknown_command_fails_fast_read_only_shell() {
+        let d = dispatcher_with_full_broker().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("toolie"), None, principal);
+        grant_broad_binding(&d, ctx, false).await;
+
+        let kaish = d
+            .materialize_context_kaish_read_only(
+                "unknown-cmd-ro",
+                principal,
+                ctx,
+                SessionId::new(),
+                None,
+                Arc::new(NoopBlockSource),
+            )
+            .await
+            .expect("materialize read-only context shell");
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            kaish.execute_with_options("mount", ExecuteOptions::default()),
+        )
+        .await
+        .expect("unknown command must fail fast in a read-only shell, not hang")
+        .expect("exec returns");
+        assert_eq!(
+            res.code, 127,
+            "unknown command should be command-not-found (127): {}",
+            res.err
+        );
+    }
+
+    /// The exec-granted flavor: with `Exec` in the loadout and a real host `/`
+    /// mount (so the cwd resolves and external exec is actually attempted),
+    /// `mount` — a real host binary — resolves on PATH and spawns, so it must
+    /// return promptly; and a name on neither PATH nor the registry must fall
+    /// through and fail fast (127). Neither may hang the request timeout.
+    #[tokio::test]
+    async fn unknown_command_fails_fast_exec_granted_shell() {
+        let d = dispatcher_with_full_broker().await;
+        // Real host root so the shell's default cwd ($HOME) resolves to a real
+        // directory — the same shape as production's read-only "/" mount.
+        d.kernel()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("allow"), None, principal);
+        grant_broad_binding(&d, ctx, true).await;
+
+        let kaish = d
+            .materialize_context_kaish(
+                "unknown-cmd-allow",
+                principal,
+                ctx,
+                SessionId::new(),
+                None,
+                Arc::new(NoopBlockSource),
+            )
+            .await
+            .expect("materialize context shell");
+
+        // A real host binary resolves on PATH and spawns — must return promptly.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            kaish.execute_with_options("mount", ExecuteOptions::default()),
+        )
+        .await
+        .expect("`mount` must return promptly, not hang the shell timeout")
+        .expect("exec returns");
+        assert!(
+            res.ok(),
+            "`mount` should run and exit 0 in an exec-granted shell: {}",
+            res.err
+        );
+
+        // A name on neither PATH nor the registry falls through and must 127.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            kaish.execute_with_options(
+                "definitely_not_a_real_binary_kaijutsu_xyz",
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("unknown command must fail fast, not hang the shell timeout")
+        .expect("exec returns");
+        assert_eq!(
+            res.code, 127,
+            "unknown command should be command-not-found (127): {}",
+            res.err
+        );
+    }
+
     /// A materialized context shell must be seeded from the context's durable
     /// env (`context_env`) — that is the whole point of "shared state that
     /// evolves over the context lifetime." This test fails if materialization
