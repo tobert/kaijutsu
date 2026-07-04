@@ -48,10 +48,13 @@ pub mod translate;
 // Re-export error types
 pub use error::{EditError, Result};
 
-// Re-export translation utilities
+// Re-export translation utilities. The `*_char_*` twins are the ones to feed
+// `edit_text`/`edit_text_as` (the CRDT text layer is char-indexed); the byte
+// variants are for byte-oriented consumers (string slicing, replace_range).
 pub use translate::{
-    content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_byte_range,
-    line_to_byte_offset, validate_expected_text,
+    byte_to_char_offset, content_with_line_numbers, extract_lines_with_numbers, line_count,
+    line_range_to_byte_range, line_range_to_char_range, line_to_byte_offset, line_to_char_offset,
+    validate_expected_text,
 };
 
 #[cfg(test)]
