@@ -247,13 +247,21 @@ impl WellBeats {
     /// The beat envelope (0..1) for the phasor keyed by `ctx`; 0.0 when no
     /// track is rolling under that key.
     pub fn envelope(&self, ctx: &ContextId, now: Instant) -> f32 {
+        self.envelope_and_frac(ctx, now).0
+    }
+
+    /// The beat envelope plus the fractional position within the current beat
+    /// (0..1 — the track-ray pulse's position along the beam); `(0.0, 0.0)`
+    /// when no track is rolling under that key.
+    pub fn envelope_and_frac(&self, ctx: &ContextId, now: Instant) -> (f32, f32) {
         self.phasors
             .get(ctx)
             .map(|p| {
                 let pos = p.beat.position(now);
-                beat_envelope_at(pos - pos.floor())
+                let frac = pos - pos.floor();
+                (beat_envelope_at(frac), frac as f32)
             })
-            .unwrap_or(0.0)
+            .unwrap_or((0.0, 0.0))
     }
 
     /// The loudest envelope across every rolling track — the well's shared
@@ -320,14 +328,23 @@ fn quantize(v: f32) -> f32 {
     (v / LIVE_LANE_STEP).round() * LIVE_LANE_STEP
 }
 
+/// Steady border strength for a card on a track: the lane's hue as identity.
+/// LDR — passive structure, not action (the beat thump is the bright part).
+const TRACK_BORDER_STRENGTH: f32 = 0.55;
+
 /// Push each card's live lanes into its material: `dim.y` = chatter (the
-/// context's decaying event energy), `dim.z` = beat envelope (score-context
-/// cards while their track rolls). Values are quantized and change-guarded so
-/// a quiet card never touches `Assets<WellCardMaterial>` (same discipline as
-/// `scene::dim_nonfocused_rings`).
+/// context's decaying event energy), `dim.z` = beat envelope, and `border` =
+/// its track's hue when attached. The beat is keyed through
+/// [`super::rays::WellTracks::beat_key_of`] — every card on a lane (players
+/// and score alike) thumps with its track's phasor; a context not on the
+/// roster falls back to its own id (which still lights a score context up
+/// before the first track poll lands). Values are quantized and
+/// change-guarded so a quiet card never touches `Assets<WellCardMaterial>`
+/// (same discipline as `scene::dim_nonfocused_rings`).
 pub fn sync_card_live_uniforms(
     activity: Res<super::activity::RingActivity>,
     beats: Res<WellBeats>,
+    tracks: Res<super::rays::WellTracks>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     cards: Query<(
         &super::scene::Card,
@@ -340,16 +357,31 @@ pub fn sync_card_live_uniforms(
             (activity.context_energy(&card.context_id) / super::activity::CONTEXT_MAX)
                 .clamp(0.0, 1.0),
         );
-        let beat = quantize(beats.envelope(&card.context_id, now));
+        let beat_key = tracks
+            .beat_key_of
+            .get(&card.context_id)
+            .unwrap_or(&card.context_id);
+        let beat = quantize(beats.envelope(beat_key, now));
+        let border = match tracks.track_of.get(&card.context_id) {
+            Some(track_id) => {
+                let c = super::scene::accent_color(track_id).to_linear();
+                Vec4::new(c.red, c.green, c.blue, TRACK_BORDER_STRENGTH)
+            }
+            None => Vec4::ZERO,
+        };
         // Read via the non-dirtying `get`; only reach for `get_mut` on change.
-        let Some(cur) = materials.get(&handle.0).map(|m| (m.dim.y, m.dim.z)) else {
+        let Some(cur) = materials
+            .get(&handle.0)
+            .map(|m| (m.dim.y, m.dim.z, m.border))
+        else {
             continue;
         };
-        if cur != (chatter, beat)
+        if cur != (chatter, beat, border)
             && let Some(mat) = materials.get_mut(&handle.0)
         {
             mat.dim.y = chatter;
             mat.dim.z = beat;
+            mat.border = border;
         }
     }
 }

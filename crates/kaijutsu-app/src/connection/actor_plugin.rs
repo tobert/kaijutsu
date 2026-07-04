@@ -138,6 +138,11 @@ pub enum RpcResultMessage {
     ClustersReceived {
         clusters: Vec<kaijutsu_client::ContextCluster>,
     },
+    /// Track list received (time-well track-ray poll, `listTracks`). Drained
+    /// into `WellTracks` to drive the rays + per-card track hue/beat lanes.
+    TracksReceived {
+        tracks: Vec<kaijutsu_client::TrackInfo>,
+    },
     /// Input document state received (for initializing SyncedInput on context join).
     InputStateReceived {
         context_id: ContextId,

@@ -309,6 +309,7 @@ fn top_drop_from(
 pub fn update_well_hud(
     state: Res<TimeWellState>,
     tails: Res<super::live::ContextTails>,
+    tracks: Res<super::rays::WellTracks>,
     cards: Query<&Card>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
@@ -339,7 +340,9 @@ pub fn update_well_hud(
     for (slot, mut last, mut msdf, mat_node) in panels.iter_mut() {
         let next = match (selected, slot) {
             (Some(card), HudSlot::North) => hud_north(&card.data, card.status),
-            (Some(card), HudSlot::East) => hud_east(&card.data),
+            (Some(card), HudSlot::East) => {
+                hud_east(&card.data, tracks.track_info_of(&card.context_id))
+            }
             (Some(card), HudSlot::West) => hud_west(card.context_id, &state),
             (Some(card), HudSlot::South) => {
                 hud_south(&card.data, &tails, card.context_id)
@@ -466,7 +469,7 @@ fn hud_north(d: &super::card::CardData, status: Option<Status>) -> String {
     format!("{}\n{} · {}", d.title, kind, status_label(status))
 }
 
-fn hud_east(d: &super::card::CardData) -> String {
+fn hud_east(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
     let keys = if d.keywords.is_empty() {
         "—".to_string()
     } else {
@@ -480,6 +483,16 @@ fn hud_east(d: &super::card::CardData) -> String {
     ];
     if let Some(c) = &d.cluster_label {
         lines.push(format!("cluster  ◇ {c}"));
+    }
+    // The lane this context rides, with its live transport (docs/tracks.md).
+    if let Some(t) = track {
+        let bpm = (60_000_000f64 / t.period_us.max(1) as f64).round() as u64;
+        let transport = if t.playing {
+            format!("▶ ♩{bpm} · tick {}", t.playhead_tick)
+        } else {
+            "■ stopped".to_string()
+        };
+        lines.push(format!("track    ♪ {} {transport}", t.id));
     }
     // Longest line at the top, tapering to shortest — the block nests into the
     // top corner (label columns stay aligned; only the row order changes).
@@ -582,21 +595,44 @@ mod tests {
         c.model_badge = String::new();
         c.fork_badge = None;
         c.keywords = vec![];
-        let e = hud_east(&c);
+        let e = hud_east(&c, None);
         assert!(e.contains("model    —"), "empty model → dash: {e}");
         assert!(e.contains("fork     —"), "no fork → dash");
         assert!(e.contains("keywords —"), "no keywords → dash");
         assert!(e.contains("band     this week"), "band labeled");
         assert!(!e.contains("cluster"), "no cluster line when unclustered");
+        assert!(!e.contains("track"), "no track line when unattached");
     }
 
     #[test]
     fn east_shows_cluster_only_when_present() {
         let mut c = card(Band::Horizon);
         c.cluster_label = Some("storage".into());
-        let e = hud_east(&c);
+        let e = hud_east(&c, None);
         assert!(e.contains("cluster  ◇ storage"), "cluster line present: {e}");
         assert!(e.contains("rings, pulse"), "keywords joined");
+    }
+
+    #[test]
+    fn east_shows_the_track_line_with_live_transport() {
+        let mut t = kaijutsu_client::TrackInfo {
+            id: "bass".into(),
+            score_context_id: ContextId::from_bytes([9; 16]),
+            playing: true,
+            playhead_tick: 128,
+            period_us: 500_000, // 120 BPM
+            beats_per_phrase: 32,
+            beat_count: 128,
+            last_epoch_ns: 1,
+            clock_kind: "system".into(),
+            attached: vec![],
+        };
+        let e = hud_east(&card(Band::HotNow), Some(&t));
+        assert!(e.contains("track    ♪ bass ▶ ♩120 · tick 128"), "playing: {e}");
+
+        t.playing = false;
+        let e = hud_east(&card(Band::HotNow), Some(&t));
+        assert!(e.contains("track    ♪ bass ■ stopped"), "stopped: {e}");
     }
 
     #[test]
