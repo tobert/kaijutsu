@@ -463,13 +463,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     you wanted fork's history). Strengthens the case for (c) `kj fork --type`:
     the director's natural move is "branch this work into a coder *with* the
     working context," which neither verb currently does in one step.
-- **`$HOME` env var is empty in the context shell (minor; `~` now fixed).**
-  `~` expansion is fixed by a kaish upgrade (2026-06-17), so `~/path` resolves.
-  The remaining gap is the `$HOME` *variable*: it's still empty in both the
-  read-only and full shell, so `$HOME/path` resolves to nothing while bare `~`
-  works. Decide whether the headless `ExecContext` should seed `HOME` from the
-  context's stored cwd/user (adjacent to "Headless turn cwd is `/`" above) so the
-  variable and the tilde agree. Absolute paths always work.
 
 ### kj / MCP ergonomics (UX)
 
@@ -1428,6 +1421,9 @@ candidates, not commitments.
 - **Silent fallbacks in tool/binding lookup.** [Kernel::list_tool_defs_via_broker](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L465) maps lookup errors
   to empty vectors, silently stripping the LLM of tools. [dispatch_tool_via_broker_with_cancel](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L336) defaults to empty bindings on lookup
   failure, causing confusing `ToolNotFound` errors rather than propagating the underlying DB/resolver error.
+  Related quirk (found 2026-07-04): `Broker::list_visible_tools` reads the in-memory binding directly
+  (`unwrap_or_default`) instead of the lazy-loading `binding()`, so the FIRST dispatch in a fresh process
+  queries zero servers until `binding()` caches on that same call — self-heals, but a latent surprise.
 - **Latency overhead on visible tool scans.** [list_visible_tools](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/broker.rs#L1081) is called on **every single tool dispatch** to refresh naming resolutions, causing lock contention
   on `self.instances` and `self.bindings` and extra async hops. These resolutions should be cached per context and invalidated only when bindings change.
 - **Contradictory hook persistence documentation.** [BuiltinBindingsServer](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/servers/bindings_builtin.rs#L64) claims hooks are "in-memory only" when they are actually eagerly hydrated and written to SQLite in `broker.rs`.
@@ -1786,14 +1782,21 @@ kernel process env into exec-granted shells.
   `aconnect 128:0 129:0` app→TiMidity wire; it dies on every app restart (the
   app auto-connecting its render port when TiMidity is present is the likely
   home).
-- **Unknown-command 300 s hang (found 2026-07-03, same investigation):** a bare
-  `mount` in the context shell hung the full shell timeout instead of failing
-  fast. `mount` is not a kaish builtin, so dispatch fell through to the
-  last-resort backend tool lookup (`backend.call_tool` → kernel tool registry)
-  and something in that path wedged — compare `git` (pre-fix), which returned
-  `command not found` immediately. The unknown-command path must be
-  loud-and-fast, never a 300 s stall; find the wedge in the backend dispatch
-  fallthrough.
+- ~~Unknown-command 300 s hang~~ — **CLOSED 2026-07-04, dispatch proven
+  bounded.** The fall-through path (kaish → `call_tool` → broker →
+  `ToolNotFound` → 127) has no unbounded await — verified by unit tests in all
+  three shell flavors (deny / read-only / exec-granted, each traversing the
+  full builtin broker set), a kaibo cross-model audit, and a live-kernel probe
+  (bare `mount` ≈ 300 ms). The original "git fast / mount hang" contrast was
+  cross-regime: pre-subprocess `git` fast-failed 127; post-subprocess `mount`
+  spawns the real binary (bounded by the shell request timeout). Regression
+  tests now lock the fast-fail invariant; the likely culprit for the observed
+  300 s was the known stale-FlowBus MCP observation gap, not execution.
+- **kaish `resolve_in_path` does synchronous `std::fs` stats on the tokio
+  worker** for each `$PATH` dir when a name misses early — fine normally, but
+  a `$PATH` entry on a hung filesystem would block a worker thread.
+  (kaish-crate concern, `~/src/kaish`; found 2026-07-04 during the
+  unknown-command investigation.)
 - **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
   host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
 - **MCP-created context invisible to `kj context list` after kernel restart
