@@ -16,9 +16,13 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
   read/view with the lexical `privileged_write_denied` deny; per-operation join
   on the ambient `context_id` covers the real write surfaces. Surviving crumb:
   register SFTP connections in the participant registry (slash-v track V slice 2).
-  Hygiene note: the lexical deny sits *above* symlink resolution — verified
-  not-a-bypass (twice: `LocalBackend::resolve` re-clamps to root, and gated paths
-  are a separate mount) but the gate belongs below resolution.
+  Hygiene note (slice-4-adjacent): the lexical deny sits *above* symlink
+  resolution — verified not-a-bypass (twice: `LocalBackend::resolve`
+  canonicalizes *and* re-clamps with `canonical.starts_with(canonical_root)`,
+  `vfs/backends/local.rs:102-113`, so an escaping symlink is rejected
+  `path_escapes_root`; and gated paths are a separate `ConfigCrdtFs` mount
+  reached by VFS prefix, not OS-symlink-reachable) but the gate belongs below
+  resolution.
 - **Slice 4 — adapter limits.** Rate-limiting + traversal-depth/size caps to
   survive an editor-indexer crawl (the access-pattern-shift DoS in
   `docs/sftp.md` → Security posture). The open-handle cap (1024/session) is a
@@ -81,41 +85,23 @@ concrete:
   substrate + `pulse_emit` land here (write up the `/run/pulse/<x>/` layout when
   they do); the app `DockSparkline` rewrite-to-read-`/run` note still stands.
 
-## `/v` surfaces (design canonical in `docs/slash-v.md`; refreshed 2026-07-02)
+## `/v` surfaces (design canonical in `docs/slash-v.md`; track B landed 2026-07-02)
 
-Nothing under `/v` is built yet (the doc's earlier "already hosts `/v/blobs`"
-claim was wrong — test literals only; and `/v/docs`/`/v/input` are kaish-side
-mounts, not kernel-`MountTable`, so not SFTP-visible). Two independent tracks;
-the design details live in the doc, this entry is the backlog pointer:
+Track B (`/v/blobs` + client CAS sync) is LIVE; track V (`/v/ctx` + `/v/session`)
+is unbuilt. (`/v/docs`/`/v/input` are kaish-side mounts, not kernel-`MountTable`,
+so not SFTP-visible.) The design details live in the doc, shipped-story in
+devlog/git; this entry is the backlog pointer:
 
-- **Track B — `/v/blobs` + client CAS sync (LANDED + LIVE-VERIFIED 2026-07-02;
-  unblocks `pcm.md` 5c's clip half).** DONE: B3's `SftpClient`+`BlobResolver`
-  (`cca8ce7b`+`52d377e7`); **B0** `kaijutsu-cas` hardening (`a82c332a` — atomic
-  `store()` via staging+rename since the XDG cache is multi-process and
-  `retrieve` never re-hashes; `retrieve` TOCTOU→`NotFound`=None; `ContentHash`
-  serde `try_from` validation); **B1** `CasFs` backend + mount before the freeze
-  (`1854cbcf` — leading-byte shards, full-hash leaves, positioned reads, EROFS,
-  `real_path`=None); **B3** sharded `blob_path()` + single-flight per hash +
-  read-to-EOF (verified russh-sftp 2.3 loops past the 256 KiB cap) + live-SSH
-  e2e (`f7dcef0f`). Live-verified on the runner: stock `sftp` fetch of
-  `/v/blobs/<ab>/<hash>` returns byte-exact CAS content and lists the sharded
-  pool. **B4** the app consumer (`kaijutsu-app/src/audio.rs`): a `CuePayload::Cas`
-  audio cue resolves off a dedicated tokio runtime (Send SFTP world, off the RPC
-  actor's `!Send` bootstrap runtime) via a lazily-connected `BlobResolver`,
-  bridged back to Bevy on a crossbeam channel → `AudioPlayer`. Ingest stays `kj
-  cas put` (SFTP→`/tmp` two-step); writable staging-over-SFTP deferred; B2
-  `index` deferred (below). **B4 follow-ups (not blocking):** fetch-on-cue today
+- **Track B follow-ups (not blocking; the landing incl. the audible
+  `kj play --cas` demo is live-verified 2026-07-02):** fetch-on-cue today
   → two-phase **prepare-horizon** prefetch + precise `lead` scheduling (warm the
   cache when a cell becomes known — `docs/pcm.md` "Open questions"); the blocking
   `FileStore` cache read in the async resolve wants `spawn_blocking`; and the
   **clip-record** path (parse Shape A `Clip` → resolve `media`; the audio bytes
-  path already exists). Also: B4's live audible verify needs a CAS-audio-cue
-  trigger (`kj play` emits inline only today).
-- **Track B kaibo-review deferrals (2026-07-02, low/pre-existing).** The
-  two-model review (gemini-pro batch + deepseek) landed its real findings in
-  `95785e28` (EXDEV + metadata atomicity, the transport slot-race + a
-  reconnect-retry, the single-flight cancel/panic leak via a RAII guard, and a
-  bounded `CasFs::read` alloc). Left for later, none blocking: **(a)** `CasFs`
+  path already exists). Ingest stays `kj cas put` (SFTP→`/tmp` two-step);
+  writable staging-over-SFTP deferred; B2 `index` deferred (below).
+- **Track B kaibo-review deferrals (2026-07-02, low/pre-existing; the review's
+  real findings shipped in `95785e28`).** Left for later, none blocking: **(a)** `CasFs`
   does synchronous `std::fs` inside `async` VfsOps — a large SFTP read blocks a
   tokio worker; this matches `LocalBackend` and is a VFS-layer pattern, not a
   track-B bug (fix the whole layer with `spawn_blocking`/`tokio::fs` if RPC
@@ -599,75 +585,50 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **ABC file-header inheritance:** `M:`/`L:`/`Q:` defaults prevent proper inheritance.
 - **ABC features:** `I:linebreak`, `m:` macro expansion, `%%` directives, Unicode escapes/fonts.
 
-## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
+## Viz substrate (kaijutsu-viz) — plan in `docs/timewell.md` (substrate notes in its appendix; `viz-substrate.md` retired 2026-07-04)
 
-- **Time well evolution — plan is canonical in `docs/timewell.md` (2026-07-03).**
-  Staged: 0 tourniquet (hot sort newest-first) → 1 `last_activity_at` on the wire
-  (+ incremental liveStatus, replacing the every-poll all-blocks scan) → 2 stable
-  `0–9` rank slots (kernel-owned, mux semantics) → 3 `TrackInfo`/`listTracks` +
-  optional-cadence attachment + track decks in the well → 4 track→context→detail
-  progression → 5 event-horizon cutoff + LOD + `/` archive search → 6 polish.
-  Individual entries below fold into those stages as they ship.
-- **Stage 1 Slices E/F landed 2026-07-03** (idle-age bands + terraced vortex,
-  app side): `kaijutsu-viz/src/layout.rs`'s `Band` is now the 4-variant
-  `HotNow`/`ThisWeek`/`ThirtyDays`/`Horizon` idle-age ladder (pure per-context
-  derivation of `now − last_activity_at`, no N-most-recent window);
-  `kaijutsu-app/src/view/time_well/card.rs`'s `band_orders`/`spiral_positions`
-  terrace the vortex (per-band radius/depth envelope + visible step/gap,
-  spiral ordering continuing within each terrace, mouth-open radius floor
-  preserved). **Not done yet: the in-world terrace-edge labels** ("HOT NOW" /
-  "THIS WEEK" / "30 DAYS" / "HORIZON" floating at each band boundary, per
-  `docs/timewell.md` "The bowl, revisited"). The pure position/text helpers
-  (`card::band_label_pos`, `card::band_label_text`) exist and are tested, but
-  no entity spawns/renders them — wiring that up means an MSDF panel per band
-  (the `ReadingCard` pattern in `scene.rs`), gated on font-asset load the same
-  way `text::build_card_scenes` is, and — landmine — passing the brush
-  explicitly to `VelloFont::layout`/`collect_msdf_glyphs` or the text renders
-  black. Deferred rather than half-done because this pass had no live/runner
-  verification available to catch a black-text or mispositioned regression.
-  The three boundary constants (`HOT_NOW_MILLIS`/`THIS_WEEK_MILLIS`/
-  `THIRTY_DAYS_MILLIS` in `layout.rs`) and the two terrace-gap constants
-  (`TERRACE_RADIUS_GAP`/`TERRACE_DEPTH_GAP` in `card.rs`) are placeholders —
-  Amy tunes them live once this is on screen.
-- **Doc/code hygiene from the 2026-07-03 review** (do with timewell Stage 0):
-  trim `viz-substrate.md`'s superseded three-band layout + build order to a
-  pointer; delete dead `CompactingBandLayout`/`RadialBands`/`LayoutConfig` from
-  `kaijutsu-viz/src/layout.rs` (no consumer since the 7.8 spiral; decision
-  recorded in timewell.md); pointer atop `time-well-concepts.md`.
+- **Time well evolution — plan is canonical in `docs/timewell.md`.** Staged:
+  0 tourniquet + 1 idle-age recency (both SHIPPED 2026-07-03 — Stage 1's app
+  half landed as the four-ring carousel, not the terraced spiral; see the doc's
+  Status) → 2 stable `0–9` rank slots (kernel-owned, mux semantics) → 3
+  `TrackInfo`/`listTracks` + optional-cadence attachment + track decks in the
+  well → 4 track→context→detail progression → 5 event-horizon cutoff + LOD +
+  `/` archive search → 6 polish. Individual entries below fold into those
+  stages as they ship.
+- **In-world band labels — still TODO (Stage 1 residue, re-anchored to rings).**
+  "HOT NOW" / "THIS WEEK" / "30 DAYS" / "HORIZON" floating at each ring, per
+  `docs/timewell.md` "The bowl, revisited". The pure helpers
+  (`card::band_label_pos`, `card::band_label_text`, the `LABEL_RADIUS_OFFSET`
+  placeholder) exist and are tested, but no entity spawns/renders them — wiring
+  is an MSDF panel per band (`panel::create_msdf_panel`, the `ReadingCard`
+  pattern), gated on font-asset load the same way `text::build_card_scenes` is,
+  and — landmine — pass the brush explicitly to `VelloFont::layout`/
+  `collect_msdf_glyphs` or the text renders black. The band-boundary constants
+  (`HOT_NOW_MILLIS`/`THIS_WEEK_MILLIS`/`THIRTY_DAYS_MILLIS`, `layout.rs`) are
+  placeholders Amy tunes live once labels are on screen.
 - **HDR bloom follow-on:** drive the well cards' SDF rims/pulses to HDR (>1.0)
   so they bloom brightly (`WellCardMaterial` `params`/emissive). (The shared
   single-camera HDR+Bloom fix itself shipped 2026-06-17; devlog.)
-- **Time-well step-4 residuals:**
-  - *Fixed-pitch overlap:* a band with >24 cards wraps slots onto each other
-    (coincident cards → z-fight). Real fix for very full bands: sub-rings,
-    smaller cards, or radius LOD. Band 0 is meant for ~10, so this only bites
-    test data.
-  - *Readability:* text is small at the default framing; tune when the active
-    view (step 6) lands.
-  - *Band-1 sweep direction (cosmetic taste call):* clock-face vs the current
-    newest-first CCW sweep — one constant flip (`scene.rs` `band1_anchor`).
-  - *Hot rim fills only the top semicircle (cosmetic):* rebalance the hot start
-    angle if it bugs you.
+- **Card readability:** text is small at the default framing; tune when the
+  active view (timewell Stage 6) lands.
 - **Edge HUD follow-ups (panels shipped 2026-06-18; devlog):** the mid/lower
   E/W sides are open canvas — candidates for the drift arcs / activity layer or
   a secondary readout; the E specs panel wraps a long model badge (cosmetic).
 - **RTT follow-up (rename/split shipped 2026-06-18):** `overlay.rs` /
   `shell_dock.rs` could adopt `create_msdf_panel`/`commit_panel_glyphs` for
   their MSDF surfaces (optional, low).
-- **Time-well — deferred UI ideas (parked 2026-06-17, picking up the activity
-  layer instead).** All real, none blocking; the active iteration is the
-  base-ring kernel-activity indicator (see `viz-substrate.md` step 7.7):
+- **Time-well — deferred UI ideas.** All real, none blocking; parked on purpose
+  (see `docs/timewell.md` → Execution notes, "Parked on purpose"):
   - *JOIN dive (mockup 34):* the committing Enter currently just switches
     context + leaves. The cool version continues the camera *through* the focus
     card so it unfolds into the conversation — one continuous focus→enter
     gesture. Polish ideas: fade/dim ring cards while focused; tune focus-card
-    size/pos (it's large in the overview). See `viz-substrate.md` step 7.5/7.6.
+    size/pos (it's large in the overview).
   - *Clean Running-pulse re-check:* the per-context teal Running rim is
     mechanism-proven (identical shader path as the verified selection/lineage
     rims) but never caught in a clean live screenshot — the earlier attempt was
     blocked by the (now-fixed) MCP-shell hang + a bad mcp default model id. A
-    ~5-sec re-check once a working-model turn can be staged. NOTE: the
-    base-ring activity work below may re-tier the per-context cue anyway.
+    ~5-sec re-check once a working-model turn can be staged.
   - *Drift arcs / particle layer (gap 4):* the bigger drift visualization —
     arcs/particles *between* the source/target cards, not just the per-card
     shimmer already shipped. Needs a new context→context drift-edge *list* wire
@@ -832,13 +793,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   musicians. **What exists:** `kj transport attach` recovers a musician after a
   restart from its persisted `tracks` + `attachments` rows — real tempo/cadence
   back, attaches stopped + OODA-armed, playhead + committed log rehydrated from
-  the score context (restart-safe by construction, `tracks.md` Stage 2 WI 7).
+  the score context (restart-safe by construction, `tracks.md` § Restart
+  contract).
   **Deliberately deferred** (Amy's call): an automatic cold-start sweep that
   re-attaches every persisted attachment on boot; the natural seam is the
   recovery loop in `rpc.rs`, and it must run *after* the beat scheduler is
   wired. Adjacent to `tech_debt_peer_reattach_on_reconnect`.
   - **Follow-ups:** (a) `beat_count`/`KJ_PULSE` are NOT persisted — documented
-    as the contract (`tracks.md` Stage 1 deferred list); persist them
+    as the contract (`tracks.md` § Restart contract); persist them
     holistically when the sweep lands. (b) attachment-row cleanup on
     disarm/archive once an archive RPC lands (no row leak today).
 - **Per-type `BeatPolicy` defaults (the surviving half of "cadence settable per
@@ -934,8 +896,10 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   narrow race: a rotate rc already in flight ends in `kj transport play` and
   could restart a just-stopped track — add a scheduler-side halt check if it
   ever bites. Still open:
-  - **Rotate chains pollute the director's context tree (found 2026-07-15, DS
-    Director `019f14ba`).** Every page-turn is a thin `spawn` fork, so a song
+  - **Rotate chains pollute the director's context tree (found ~2026-06-29, DS
+    Director `019f14ba`; the entry's original "2026-07-15" was an in-app
+    hallucinated date, corrected 2026-07-03 — see Context time awareness).**
+    Every page-turn is a thin `spawn` fork, so a song
     running N phrases produces N+1 contexts in a linear chain — `kj context
     list --tree` renders the whole lineage and an operator must visually skip
     past it (a 17-deep chain observed from one song). Fix ideas (pick one):
@@ -1026,7 +990,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   reframed 2026-07-01):** the track timeline's committed `Vec` and RAM CAS grow
   without bound for a long-playing track (every phrase appends). Rotation is
   deliberately NOT the answer anymore — the track timeline *survives*
-  page-turns by design (`tracks.md` Stage 2). The durable record already lives
+  page-turns by design (`tracks.md`, the per-track score context). The durable
+  record already lives
   in the score context's blocks + CAS, and `UseLastGood`/`KJ_HEARD` only need a
   recent tail, so the fix is windowing/compacting the *in-RAM* committed log
   (drop cells older than the largest read window; rehydration-from-blocks
@@ -1202,7 +1167,8 @@ the *remaining* findings, triaged.
   `HookListener::process_event` has no arm for it (falls to `_ => {}`), so a
   compaction boundary silently produces no block. Either author a System/Trace block
   marking the compaction, or drop the mapping. (Found during the 2026-06-18 bitrot
-  pass; see `docs/mcp-hook-alignment.md`.)
+  pass; design pass in git history — `docs/mcp-hook-alignment.md`, deleted
+  2026-07-04.)
 - **LOW — `claude-hooks.json` uses a repo-relative adapter path.** `command:
   "contrib/adapters/claude.sh"` only resolves when Claude Code's cwd is the kaijutsu
   repo root. The adapter itself now resolves its own filter via `BASH_SOURCE` dir, so
@@ -1243,6 +1209,16 @@ the *remaining* findings, triaged.
 ## Testing & Tooling
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
+- **`kj` help docs predate the clap migration.** The live top-level help is
+  `crates/kaijutsu-kernel/docs/help/kj.md` (`include_str!` at `kj/mod.rs:451`)
+  but its command table is stale — it still lists the retired `kj kv`, the
+  pre-preset `fork --shallow`, and the old `transport arm|play|…` verb set
+  (no `attach`/`detach`/`rotate`/`render`, no `config`/`play`/`binding exec`).
+  Its six siblings (`kj-cache/context/drift/fork/preset/workspace.md`) have
+  **no consumer** (only a doc-comment mention of `kj-cache.md`). Reconcile with
+  the clap-reflected reality: refresh `kj.md`, decide the siblings' fate
+  (delete, or wire as `kj <cmd> help` bodies). NB `docs/kj-help` is a symlink
+  into that dir — not a docs-cleanup candidate.
 - **Capnp schema change ⇒ three binaries to bounce:** the dev runner
   only rebuilds/restarts `kaijutsu-app`; `kaijutsu-server.service`
   (systemd user unit) and `~/bin/kaijutsu-mcp` (running MCP processes
@@ -1465,7 +1441,7 @@ candidates, not commitments.
   single-session exploration constraint, surfaced to the harness via a `KjResult` variant.
 - **Socket hook vs. Hook Table alignment.** The legacy MCP socket hook (for session mirroring) has drifted from core structures, causing silent data loss
   (e.g., `agent_id` vs `principal_id` mismatch, obsolete `tool_response` key, fragile PID-based socket discovery). Details in
-  [mcp-hook-alignment.md](file:///home/atobey/src/kaijutsu/docs/mcp-hook-alignment.md).
+  the design pass in git history (`docs/mcp-hook-alignment.md`, deleted 2026-07-04).
 - **Silent fallbacks in tool/binding lookup.** [Kernel::list_tool_defs_via_broker](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L465) maps lookup errors
   to empty vectors, silently stripping the LLM of tools. [dispatch_tool_via_broker_with_cancel](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L336) defaults to empty bindings on lookup
   failure, causing confusing `ToolNotFound` errors rather than propagating the underlying DB/resolver error.
@@ -1820,10 +1796,12 @@ kernel process env into exec-granted shells.
 
 **Open remainder:**
 
-- **Deploy latch:** rc seeds are once-only — the live kernel needs `kj rc reset`
-  on `lib/create/S10-binding.kai` + `director/create/S10-binding.kai`, and
-  existing coder/director/mcp contexts need a one-time `kj binding allow "exec"`
-  from a binding-admin context (only new contexts run create-rc).
+- **Pre-slice contexts need a one-time `kj binding allow exec`** from a
+  binding-admin context. The deploy latch itself is DONE (2026-07-03: both
+  S10-binding rc seeds reset, kaijutsu-server rebuilt + restarted, verified
+  live incl. re-making the aconnect wire from a context shell) — but rc fires
+  only at lifecycle boundaries, so contexts created before slice 1 keep their
+  exec-less loadout until re-created or manually widened.
 - **`kj audio` / `kj midi` verbs still worth having** for the ALSA wiring
   operations (connect, disconnect, list-clients): the wire is kernel-owned state,
   not a shell errand, and the musician-adjacent flow shouldn't need raw
