@@ -392,26 +392,6 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Vec<(String, ShellValue)>, CallError>>,
     },
 
-    // ── Key–Value Store (docs/kernel-kv.md) ──────────────────────────────
-    KvGet {
-        key: String,
-        reply: oneshot::Sender<Result<Option<String>, CallError>>,
-    },
-    KvSet {
-        key: String,
-        value: String,
-        expires_at: Option<i64>,
-        reply: oneshot::Sender<Result<(), CallError>>,
-    },
-    KvDelete {
-        key: String,
-        reply: oneshot::Sender<Result<bool, CallError>>,
-    },
-    KvKeys {
-        prefix: Option<String>,
-        reply: oneshot::Sender<Result<Vec<String>, CallError>>,
-    },
-
     // ── Per-client durable view state (docs/shared-state.md "Retiring KV") ──
     SetLastContext {
         client_id: String,
@@ -621,10 +601,6 @@ impl RpcCommand {
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::KvGet { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::KvSet { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::KvDelete { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::KvKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetLastContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetClientView { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditInput { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1004,51 +980,6 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn list_shell_vars(&self) -> Result<Vec<(String, ShellValue)>, CallError> {
         self.send(|reply| RpcCommand::ListShellVars { reply }).await
-    }
-
-    // ── Key–Value Store (docs/kernel-kv.md) ─────────────────────────────
-
-    #[tracing::instrument(skip(self))]
-    pub async fn kv_get(&self, key: &str) -> Result<Option<String>, CallError> {
-        self.send(|reply| RpcCommand::KvGet {
-            key: key.into(),
-            reply,
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self, value))]
-    pub async fn kv_set(
-        &self,
-        key: &str,
-        value: &str,
-        expires_at: Option<i64>,
-    ) -> Result<(), CallError> {
-        self.send(|reply| RpcCommand::KvSet {
-            key: key.into(),
-            value: value.into(),
-            expires_at,
-            reply,
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn kv_delete(&self, key: &str) -> Result<bool, CallError> {
-        self.send(|reply| RpcCommand::KvDelete {
-            key: key.into(),
-            reply,
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn kv_keys(&self, prefix: Option<&str>) -> Result<Vec<String>, CallError> {
-        self.send(|reply| RpcCommand::KvKeys {
-            prefix: prefix.map(Into::into),
-            reply,
-        })
-        .await
     }
 
     // ── Per-client durable view state (docs/shared-state.md "Retiring KV") ──
@@ -2550,20 +2481,6 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::ListShellVars { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_shell_vars());
-        }
-
-        // ── Key–Value Store ──
-        RpcCommand::KvGet { key, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.kv_get(&key));
-        }
-        RpcCommand::KvSet { key, value, expires_at, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.kv_set(&key, &value, expires_at));
-        }
-        RpcCommand::KvDelete { key, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.kv_delete(&key));
-        }
-        RpcCommand::KvKeys { prefix, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.kv_keys(prefix.as_deref()));
         }
 
         // ── Per-client durable view state ──

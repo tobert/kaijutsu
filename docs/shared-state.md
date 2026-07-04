@@ -16,10 +16,10 @@ the file tools, MCP, SFTP — sees the same trees because they're ordinary
 `VfsBackend`s. This is the "instrument you play" stance made literal, and it's the
 same move `slash-v.md` already makes for context/session introspection.
 
-The corollary: **the CRDT KV store (`KvDocument`/`Kv`) is being deleted.** It has
-no production callers (test-only), and everything it was meant to hold is better
-served by files on a mount. Two stores for "durable shared" is the silent-fallback
-smell. See *Retiring KV* below for the one real tie to migrate first.
+The corollary: **the CRDT KV store (`KvDocument`/`Kv`) was deleted** (2026-07-04).
+It had no production callers beyond the one real tie — the app's durable
+context-restore — which moved to a typed per-client store first. Two stores for
+"durable shared" was the silent-fallback smell. See *KV retired* below.
 
 ## Tiers are mounts, not abstractions
 
@@ -98,46 +98,20 @@ the shared space as its **Observe surface**, built entirely from existing primit
   (kernel-side, shared, thin agent) vs the agent reducing `history` itself
   (thin-client tension). Deferred to the myaku session.
 
-## Retiring KV (delete — it has one real caller, and it splits in two)
+## KV retired (deleted 2026-07-04)
 
-> Confirmed with Amy 2026-07-04: KV retirement is the plan. The original KV
-> design record (`docs/kernel-kv.md`) is deleted — git history has it. The code
-> deletion below is still to do (tracked in issues.md, "Delete KvDocument/Kv").
+`KvDocument`/`Kv`, the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`,
+@79–83, ordinals retired not reused), and `kj kv` are gone. The one real production
+use — the app's `<client-id>.current_context` restore-on-reconnect — split in two
+first: the *live* acting context stayed in the already-ephemeral `SessionContextMap`
+(no KV needed), and the *durable* restore moved to a small typed per-client store
+(`client_views` `KernelDb` row + `setLastContext`/`getClientView` RPC, cb69a81a).
+Everything else KV might have held becomes a `/run` file.
 
-`KvDocument`/`Kv` + the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`,
-@79–83) and `kj kv` go away. The audit's "test-only" read was **too optimistic**: the
-app is a real, production caller. It persists exactly one key pattern —
-`<client-id>.current_context` (`kaijutsu-app/.../actor_plugin.rs:319` writes it on
-every switch; the reconnect bootstrap `kv_get`s it back into a `RestoreContext` at
-`:534`). That is the *entire* production use of a 64 KB-envelope, journaling,
-compacting store: **one `ContextId` per app installation — "reopen the context this
-window was last looking at."**
-
-That one job is actually **two** needs the old design blurred, and naming the split is
-what unblocks the deletion:
-
-- **Live acting context** — what `slash-v.md` renders at `/v/session/<id>/context`. It
-  is *per-session and ephemeral*: it dies with the connection, which is correct (a
-  disconnected session has no live context to show). It already lives in
-  `SessionContextMap` (`runtime/context_engine.rs:31`, an `Arc<DashMap<SessionId,
-  ContextId>>` the shell resolves per-op). **No KV.**
-- **Durable view restoration** — the app's actual KV use. It is *per-installation and
-  must survive the connection ending* — that is the whole point of writing it durably.
-  The ephemeral registries **cannot** hold it: `SessionContextMap` and `PeerRegistry`
-  (a `HashMap` with `detach()` on disconnect, `peers.rs:148`) both vanish exactly when
-  the restore value still has to exist. So "move it to the session registry" — the
-  obvious first answer — would *silently break reattach-restore*.
-
-The right home is what Amy called a "lil typed state the kernel manages on the client's
-behalf": a **small, normalized, per-client store** — a `KernelDb` row keyed by the
-stable client-id (`feedback_sql_schema`: relational, not a stringly JSON/KV blob), with
-a typed RPC (`setLastContext` / `getClientView`) replacing `kvGet("<uuid>.current_
-context")` and the hand-formatted key namespace (`client_id.rs`). This is strictly
-*more* type-safe and *less* machinery than KV — no envelope versioning, no
-overwrite-tuned journal/compaction, no stringly keys. It can be **projected read-only
-under `/v`** for introspection (the slash-v pattern: render kernel state as files, write
-via the typed path), so it honours "the VFS is the namespace" without resurrecting a
-general KV. Everything else KV might have held becomes a `/run` file.
+Open: `kvWatch`'s successor for the `/v/clients` steering surface (see *Open
+questions* below) — does a steered client poll `generation` or get a new push
+primitive? Full design history and the split rationale are in git
+(this section, pre-2026-07-04, and `docs/issues.md`).
 
 ## Open questions (deferred)
 
@@ -149,14 +123,14 @@ general KV. Everything else KV might have held becomes a `/run` file.
 - **Reduction ownership** — which summaries the kernel projects vs the agent derives
   (the thin-client tension). → myaku session.
 - **`current_context` split — settled in shape, open in surface.** The *live* render
-  reads `SessionContextMap`; the *durable* restore moves to a typed per-client
-  `KernelDb` store (see *Retiring KV*). The store's `/v` projection is sketched as
+  reads `SessionContextMap`; the *durable* restore moved to a typed per-client
+  `KernelDb` store (see *KV retired*). The store's `/v` projection is sketched as
   **`/v/clients`** (`docs/slash-v.md`, *Future*) — and it's more than read-only
   introspection: `/v/clients/<id>/context` is *writable*, so the same field is the
   client's own setter **and** a remote steering surface (drive a wall of tablets onto
   different contexts; players at them can also drive). Open: the typed RPC shape, how a
-  steered client observes the change (poll `generation` vs. a `kvWatch` successor — KV's
-  is being deleted), and which other fields (theme, layout, spotlight) join `context`.
+  steered client observes the change (poll `generation` vs. a `kvWatch` successor, now
+  that KV itself is gone), and which other fields (theme, layout, spotlight) join `context`.
 - **Append gap** — `VfsOps` has no `append()`; `write_all`/`>>` are O(n). myaku
   sidesteps it (bounded rewrite) and OODA writes are turn-cadence, but a real
   `append()` (O(1) on `MemoryBackend` via `write(offset=size)`) is worth it someday.

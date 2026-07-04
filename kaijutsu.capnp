@@ -963,17 +963,6 @@ interface LoggingEvents {
 }
 
 # ============================================================================
-# Kernel KV Events
-# ============================================================================
-
-# Callback interface for receiving kernel KV change events.
-interface KvEvents {
-  # A key changed. `deleted = true` means the key was removed (`value` empty);
-  # otherwise `value` is the new value.
-  onChange @0 (key :Text, value :Text, deleted :Bool);
-}
-
-# ============================================================================
 # Server Interfaces
 # ============================================================================
 
@@ -1274,30 +1263,20 @@ interface Kernel {
   invokePeer @78 (nick :Text, action :Text, params :Data) -> (result :Data);
 
   # ==========================================================================
-  # Kernel key–value store (persistent, synced env — docs/kernel-kv.md)
+  # @79–@83 retired (KV store deleted 2026-07-04). Cap'n Proto requires
+  # interface method ordinals to be sequential with no holes, so the slots
+  # below are stubs, not real methods — do not give them behavior or reuse
+  # the names. The default `Server` trait impl already returns
+  # "unimplemented" for any stale caller. Was: kvGet/kvSet/kvDelete/kvKeys/
+  # kvWatch, the kernel key–value store. Superseded by setLastContext/
+  # getClientView below for the one real production use
+  # (docs/shared-state.md "KV retired"); full history in git.
   # ==========================================================================
-  # A small, durable, collaborative key→string store. Keys are flat UTF-8
-  # strings (dotted namespaces are convention, not mechanism); values are
-  # strings (structured data is the caller's JSON). No per-key ACLs — a
-  # single-user shared-trust kernel.
-
-  # Read a key. `found = false` when absent, deleted, or advisory-expired.
-  kvGet @79 (key :Text) -> (value :Text, found :Bool);
-
-  # Set a key. `hasExpiresAt` gates the advisory absolute expiry (writer-clock
-  # ms). Returns an error string on the 64 KB value cap or a persistence fault.
-  kvSet @80 (key :Text, value :Text, hasExpiresAt :Bool, expiresAt :Int64) -> (success :Bool, error :Text);
-
-  # Delete a key. `existed` reports whether a live value was present.
-  kvDelete @81 (key :Text) -> (existed :Bool);
-
-  # List keys, optionally filtered by prefix. `nextCursor` is reserved for
-  # future pagination (always absent in v1).
-  kvKeys @82 (prefix :Text, hasPrefix :Bool) -> (keys :List(Text), nextCursor :Text, hasNextCursor :Bool);
-
-  # Subscribe to whole-store changes (callback fires per set/delete). The
-  # client filters by prefix; v1 streams the whole store.
-  kvWatch @83 (callback :KvEvents);
+  retired79 @79 ();
+  retired80 @80 ();
+  retired81 @81 ();
+  retired82 @82 ();
+  retired83 @83 ();
 
   # ==========================================================================
   # In-app editor sessions (the vi/edit builtin; see docs/vi.md)

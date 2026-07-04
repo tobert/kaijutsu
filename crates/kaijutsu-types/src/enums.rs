@@ -190,9 +190,10 @@ pub enum DocKind {
     /// Configuration file (theme.toml, models.toml).
     #[strum(serialize = "config")]
     Config,
-    /// Kernel key–value store (flat key→string LWW map). See `docs/kernel-kv.md`.
-    #[strum(serialize = "kv")]
-    Kv,
+    // `Kv` retired 2026-07-04 (KV store deleted). Do not reuse the `"kv"`
+    // serialize tag — a live DB may still hold document rows tagged `kv`,
+    // which now fall back to `Conversation` via `doc_kind_from_sql`'s
+    // unknown-variant handling rather than panicking.
     /// Symbolic link. Git-style: the single block's content *is* the link
     /// target path; this kind is the authoritative "mode bit" that tells a
     /// reader to follow rather than treat the content as a file body. See
@@ -208,7 +209,6 @@ impl DocKind {
             Self::Code => "code",
             Self::Text => "text",
             Self::Config => "config",
-            Self::Kv => "kv",
             Self::Symlink => "symlink",
         }
     }
@@ -474,7 +474,6 @@ mod tests {
             DocKind::Code,
             DocKind::Text,
             DocKind::Config,
-            DocKind::Kv,
             DocKind::Symlink,
         ] {
             let s = kind.as_str();

@@ -180,18 +180,6 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj doc list: {e}")),
         };
 
-        // The KV singleton is kernel infrastructure (the kernel-wide key→value
-        // store), not a user document. Hide the `kv` kind from the unfiltered
-        // listing so `kj doc list` shows what a user authored. An explicit
-        // `--kind kv` still surfaces it for introspection.
-        let docs: Vec<_> = if kind_p.is_none() {
-            docs.into_iter()
-                .filter(|d| d.doc_kind != DocKind::Kv)
-                .collect()
-        } else {
-            docs
-        };
-
         // Per-doc context lookup. Each is a single-row PK fetch so an N+1
         // walk is cheap enough for the listing surface; if this grows hot,
         // switch to a LEFT JOIN at the SQL layer.
@@ -756,39 +744,6 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn doc_list_hides_kv_singleton_by_default_but_kind_kv_surfaces_it() {
-        // `test_dispatcher` wires `init_kv`, which mints the kernel KV singleton
-        // (kind `kv`). It's infrastructure, not a user document, so the
-        // unfiltered listing must not count it — but `--kind kv` is the explicit
-        // escape hatch for introspection.
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let _conv = register_context_with_doc(&d, Some("chat"), principal);
-        let c = test_caller();
-
-        // Unfiltered: exactly the one user conversation, KV singleton hidden.
-        let result = d.dispatch(&[s("doc"), s("list"), s("--json")], &c).await;
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["count"], 1, "kv singleton must be hidden by default: {v}");
-        let kinds: Vec<&str> = v["documents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|d| d["kind"].as_str().unwrap())
-            .collect();
-        assert!(!kinds.contains(&"kv"), "unfiltered list leaked kv: {kinds:?}");
-
-        // Explicit `--kind kv` surfaces it.
-        let result = d
-            .dispatch(&[s("doc"), s("list"), s("--kind"), s("kv"), s("--json")], &c)
-            .await;
-        assert!(result.is_ok(), "kind kv failed: {}", result.message());
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["count"], 1, "explicit --kind kv must surface it: {v}");
-        assert_eq!(v["documents"][0]["kind"], "kv");
     }
 
     // ── doc tree ───────────────────────────────────────────────────

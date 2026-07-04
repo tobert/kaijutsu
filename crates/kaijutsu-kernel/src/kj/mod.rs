@@ -22,7 +22,6 @@ pub mod drift;
 pub mod drive;
 pub mod fork;
 pub mod format;
-pub mod kv;
 pub mod parse;
 pub mod play;
 pub mod policy;
@@ -412,10 +411,6 @@ impl KjDispatcher {
         if cmd == "transport" {
             return self.dispatch_transport(&argv[1..], caller).await;
         }
-        // `kj kv` is the kernel-wide key–value store — global, no context.
-        if cmd == "kv" {
-            return self.dispatch_kv(&argv[1..], caller);
-        }
         // `kj models` is pure discovery against the LLM registry — no context.
         if cmd == "models" {
             return self.dispatch_models(&argv[1..]).await;
@@ -645,7 +640,6 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(policy::PolicyArgs::command())
         .subcommand(search::SearchArgs::command())
         .subcommand(doc::DocArgs::command())
-        .subcommand(kv::KvArgs::command())
         .subcommand(attach::AttachArgs::command())
         .subcommand(transport::TransportArgs::command())
         .subcommand(model::ModelsArgs::command())
@@ -713,11 +707,6 @@ pub(crate) mod test_helpers {
         kernel
             .mount("/etc/rc", crate::vfs::LocalBackend::new(&rc_tmp))
             .await;
-        // Wire the KV store so `kj kv` (and any rc that touches it) works in
-        // tests, mirroring the server's startup init_kv.
-        kernel
-            .init_kv(kernel_db.clone())
-            .expect("init kernel KV for test dispatcher");
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 
@@ -765,9 +754,6 @@ pub(crate) mod test_helpers {
             .seed_entries(crate::config_seed::config_seed_files())
             .expect("seed config into CRDT");
         kernel.mount("/etc/config", config_fs).await;
-        kernel
-            .init_kv(kernel_db.clone())
-            .expect("init kernel KV for test dispatcher");
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 

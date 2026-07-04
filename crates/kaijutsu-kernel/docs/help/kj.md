@@ -52,7 +52,6 @@ cas             put, get, ls, info, rm — content-addressed blob storage
 context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag, hydrate
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
 drift           push, pull, merge, flush, queue, cancel, history
-kv              get, set, delete, keys — kernel key–value store (persistent, synced env)
 drive           Clock one autonomous turn on a context (--prompt)
 fork            Fork current context (--exclude, --shallow, --compact, --as, --switch)
 model           Show a context's effective model (--context <ref>)
