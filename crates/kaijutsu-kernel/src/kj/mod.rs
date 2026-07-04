@@ -564,7 +564,15 @@ impl KjDispatcher {
         let registry = self.kernel.llm().read().await;
 
         // Distillation model resolution:
-        //   1. explicit `--distill-model` → alias-aware registry resolution.
+        //   1. explicit `--distill-model` → the SAME grammar as `--model`
+        //      (`resolve_model_choice`): `provider/model` slash form with a
+        //      validated provider, `models.toml` aliases, the loud
+        //      `provider:model` colon footgun, bare name → default provider.
+        //      Before this, the override went through `resolve_model`, which
+        //      doesn't parse the slash — so the very `provider/model` form the
+        //      failure hint below recommends rode as a literal model name on
+        //      the default provider, and an unknown provider was silently
+        //      swallowed instead of failing loud.
         //   2. else the calling context's OWN provider+model (the known-good
         //      pair). This previously used only the context's *model*, re-pinned
         //      on the registry's *default provider* via `resolve_model` — so a
@@ -575,18 +583,18 @@ impl KjDispatcher {
         //   3. else the registry default.
         let (provider, provider_name, model) = match distill_model {
             Some(spec) => {
-                // An explicit override is alias-aware but still pins a *bare*
-                // model on the default provider — that can mismatch, and we
-                // can't verify a provider serves a model without calling it. The
-                // failure below names the pairing and suggests the slash form.
-                let (p, m) = registry.resolve_model(spec).ok_or_else(|| {
-                    format!(
-                        "distill model '{spec}' not found — pass an explicit \
-                         `--distill-model provider/model` or a configured alias"
-                    )
+                let (p_name, m) = parse::resolve_model_choice(&registry, spec)
+                    .map_err(|e| format!("--distill-model '{spec}': {e}"))?;
+                let (Some(p_name), Some(m)) = (p_name, m) else {
+                    return Err(format!(
+                        "--distill-model '{spec}' did not resolve to a provider/model pair \
+                         — pass `provider/model` or a configured alias"
+                    ));
+                };
+                let provider = registry.get(&p_name).ok_or_else(|| {
+                    format!("--distill-model '{spec}': provider '{p_name}' is not registered")
                 })?;
-                let name = p.name().to_string();
-                (p, name, m)
+                (provider, p_name, m)
             }
             None => match ctx_pair {
                 Some((Some(p_name), Some(m))) => {
