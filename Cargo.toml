@@ -44,9 +44,9 @@ kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 # `subprocess` compiles in host external-command execution; whether a given
 # shell may actually use it is decided per-context at materialization
 # (ExternalExec, gated on the `exec` loadout authority — deny by default).
-kaish-kernel = { version = "0.10", features = ["subprocess"] }
-kaish-glob = "0.10"
-kaish-types = "0.10"
+kaish-kernel = { version = "0.11", features = ["subprocess"] }
+kaish-glob = "0.11"
+kaish-types = "0.11"
 
 # Cap'n Proto
 capnp = "0.25"
