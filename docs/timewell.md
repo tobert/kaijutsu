@@ -42,8 +42,27 @@ What's actually built, so the staged plan below isn't mistaken for vaporware:
   fixed gate angle and up/down changing the focused ring while the camera
   dollies to frame it. `CompactingBandLayout`/`RadialBands`-layout is deleted;
   the geometry substrate for every stage below is now rings, not a spiral.
-- **Stages 2–6** — still the forward plan, unbuilt. Read them as designed
-  against ring geometry, not the spiral this doc originally described.
+- **Stages 2–6** — still the forward plan, mostly unbuilt (read them as
+  designed against ring geometry, not the spiral this doc originally
+  described) — with one exception: **Stage 3's wire slice shipped 2026-07-04**
+  (`TrackInfo` + `listTracks @92` + `ContextHandleInfo.trackId @16`, answered
+  from the beat scheduler's in-memory state), ahead of its layout half.
+- **Live-state layer** — shipped 2026-07-04 (explore-live-time-well-action),
+  a layer this plan hadn't staged: the well reacts *between* polls.
+  `view/time_well/live.rs` ingests the kernel-wide event stream ungated —
+  per-context **tail buffers** (HUD South returned as the selected card's
+  tail -f; falls back to the polled preview) and per-track **beat phasors**
+  (`LocalBeat` keyed by score context, slewed by low-rate `BeatSync`, reset on
+  RENDER_FLUSH — the multi-track cut `metronome.rs` deferred). Cards carry
+  event-driven material lanes (no texture rebuild): `dim.y` chatter (cyan rim
+  lift the instant a context talks), `dim.z` beat (gold thump), `border` =
+  track hue; the ring deck's throat glow breathes on the loudest rolling
+  track's beat (`energy.y`). `view/time_well/rays.rs` renders **tracks as
+  rays**: one beam per track down the funnel wall at an FNV-name-hashed
+  bearing (stable across restarts — a bearing you learn), pulsing mouth→throat
+  on each beat while playing; HUD East gained the lane line ("track ♪ bass ▶
+  ♩120 · tick 128"). Beat stance is docs/midi.md's *distribute tempo, not
+  pulses* applied to viz.
 
 ---
 
@@ -99,11 +118,12 @@ Ground truth from a code deep-dive, a wire/census inventory, and an external
   doc's chips/points/particle tiers were never built. Archived contexts are
   hard-filtered (`sync.rs:37`) — they vanish rather than fall in. At the throat,
   card width (88) exceeds inter-card spacing (~57): physical overlap.
-- **Tracks have zero wire surface.** `TrackState` lives only inside the server
-  process (`kaijutsu-server/src/beat.rs:86-159`; `tracks` + `attachments` tables
-  at `kernel_db.rs:630-658`). No capnp `TrackInfo`, no `listTracks`, no way for
-  the app to know tracks exist. Today's track is purely a **clock domain** —
-  attachment *requires* a wakeup cadence.
+- ~~**Tracks have zero wire surface.**~~ RESOLVED 2026-07-04: `TrackInfo` +
+  `listTracks @92` + `ContextHandleInfo.trackId @16` shipped (the Stage 3 wire
+  slice). The wire reads the scheduler's **in-memory** `TrackState` via a
+  `BeatRequest::Snapshot` query — never the persisted row, whose playhead lags
+  (written only on transport transitions). Still true: attachment *requires* a
+  wakeup cadence (`wakeup: Option<Cadence>` remains open).
 - **Solid and worth keeping:** the pure/tested band → slot-order → flatten →
   index pipeline (`card.rs`), the `Join` reconcile, two-stage Enter, the edge
   HUD, the activity-ring pulse, `haystack_order_keys` as a grouping primitive.
@@ -339,10 +359,14 @@ by the append/compact rule (nothing ever moves "by itself").
 
 The durable lane layer, per the ontology above.
 
-- **Wire**: `TrackInfo` struct (id, label, description, createdAt, clockKind,
-  playing/playhead when clocked, scoreContextId, attached context ids) +
-  `listTracks` RPC. `trackId: Option<Text>` lands on `ContextHandleInfo` (a
-  context surfaces its primary attachment).
+- **Wire** — ✅ SHIPPED 2026-07-04, leaner than drafted: `TrackInfo` (id,
+  scoreContextId, playing, playheadTick, periodUs, beatsPerPhrase, beatCount,
+  lastEpochNs, clockKind, attached ids) + `listTracks @92`; `trackId @16` on
+  `ContextHandleInfo` (empty = unattached). No label/description/createdAt —
+  the `tracks` table has no such columns; the TrackId name *is* the label
+  (add columns + fields when a track needs prose). Answered from the
+  scheduler's in-memory `TrackState` via `BeatRequest::Snapshot`, never the
+  lagging persisted row.
 - **Kernel**: `Attachment.wakeup` becomes optional (pure membership);
   track create/label/describe via `kj track` (transport verbs stay under
   `kj transport`).
@@ -556,10 +580,16 @@ a second consumer exists (the crate's standing rule).
   per context, with `forkKind`/`parentId` aboard so lineage is known at enter
   time. `getClusters`/`getNeighbors` feed the cold-band relation layer on the
   same cadence, pull-only.
-- **Data tick = subscribe.** Live status is *not* a `ContextHandleInfo` field;
-  it's inferred from `subscribeBlocksFiltered` scoped to the **currently
-  visible** contexts (`statusChanged`, `inserted`, `metadataChanged`) — status
-  is only paid for on cards that are on screen.
+- **Data tick = subscribe** — *built differently than this bullet originally
+  said* (corrected 2026-07-04). `liveStatus` **became** a `ContextHandleInfo`
+  field (Stage 1: kernel-derived, O(1) incremental cache, delivered on the
+  poll for every card), so the poll — not a subscription — carries the status
+  rim. What rides the event stream instead is the sub-poll live layer
+  (`view/time_well/live.rs` + `activity.rs`): the app's one **kernel-wide**
+  block subscription (no per-visible-context scoping — the well renders all
+  contexts anyway) feeds the deck ripples, the per-card chatter/beat lanes,
+  and the tail buffers. Scoping the filter to visible contexts remains a
+  Stage-5 scaling valve, not a correctness need.
 - Two cadences, two kernel surfaces, opposite cost profiles — why the split is
   structural in the `Join`.
 
@@ -568,10 +598,11 @@ a second consumer exists (the crate's standing rule).
 Populated from `ContextHandleInfo` via the join: `label` → title (short-id
 fallback), `contextType` → accent, `model`/`provider` → badge, `forkKind` →
 fork badge, `keywords` → chips, `topBlockPreview` → preview, `parentId` →
-lineage; the live status glyph is the data tick, not a struct field. Anything
-that writes `ContextHandleInfo` is picked up on the next poll — new ways to
-distinguish cards are new metadata fields + encoding rules, not new rendering
-code.
+lineage, `trackId` → border hue + HUD track line; the live status glyph rides
+the poll (`liveStatus`), while the chatter/beat lanes ride the event stream
+(see the corrected data-tick bullet above). Anything that writes
+`ContextHandleInfo` is picked up on the next poll — new ways to distinguish
+cards are new metadata fields + encoding rules, not new rendering code.
 
 Rendering notes (validated against Bevy 0.18):
 

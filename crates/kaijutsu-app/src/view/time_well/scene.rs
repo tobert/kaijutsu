@@ -454,6 +454,7 @@ pub fn enter_time_well(
 pub fn exit_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
+    mut activity: ResMut<super::activity::RingActivity>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<TimeWellRoot>>,
     cards: Query<Entity, With<Card>>,
@@ -462,6 +463,11 @@ pub fn exit_time_well(
     terrace_rings: Query<Entity, With<TerraceRing>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
+    // Drop the pulse state: the activity systems are well-gated, so energy
+    // frozen at exit would otherwise sit un-decayed and flash bright on
+    // re-entry hours later (Gemini review, 2026-07-04). Re-entering starts
+    // calm and warms from live events — matching the join reset below.
+    *activity = super::activity::RingActivity::default();
     for e in roots
         .iter()
         .chain(cards.iter())
@@ -786,11 +792,14 @@ pub fn accumulate_ring_activity(
 }
 
 /// Advance the well's pulse and push it into the deck material uniforms: the
-/// global `energy` (ring brightness / flow / core spin) and the packed ripple
-/// array (`[cos, sin, age_norm, intensity]`, unused slots `intensity = 0`).
+/// global `energy` (ring brightness / flow / core spin), the beat envelope
+/// (`energy.y` — the throat heartbeat from whatever track is rolling, see
+/// [`super::live::WellBeats`]), and the packed ripple array
+/// (`[cos, sin, age_norm, intensity]`, unused slots `intensity = 0`).
 pub fn tick_and_sync_rings(
     time: Res<Time>,
     mut activity: ResMut<super::activity::RingActivity>,
+    beats: Res<super::live::WellBeats>,
     mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
     deck: Query<&MeshMaterial3d<crate::shaders::WellRingsMaterial>, With<WellRingsDeck>>,
 ) {
@@ -804,6 +813,7 @@ pub fn tick_and_sync_rings(
     };
 
     mat.energy.x = activity.energy;
+    mat.energy.y = beats.global_envelope(std::time::Instant::now());
 
     let mut packed = [Vec4::ZERO; super::activity::MAX_RIPPLES];
     for (i, r) in activity

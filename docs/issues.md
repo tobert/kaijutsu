@@ -584,9 +584,24 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   half landed as the four-ring carousel, not the terraced spiral; see the doc's
   Status) → 2 stable `0–9` rank slots (kernel-owned, mux semantics) → 3
   `TrackInfo`/`listTracks` + optional-cadence attachment + track decks in the
-  well → 4 track→context→detail progression → 5 event-horizon cutoff + LOD +
-  `/` archive search → 6 polish. Individual entries below fold into those
-  stages as they ship.
+  well (wire slice SHIPPED 2026-07-04, with the live-state layer: tails,
+  beat phasors, track rays — see the doc's Status) → 4 track→context→detail
+  progression → 5 event-horizon cutoff + LOD + `/` archive search → 6 polish.
+  Individual entries below fold into those stages as they ship.
+- **Live tail misses streaming model text (found building the live layer,
+  2026-07-04).** `live::tail_line` skips empty inserts because model prose
+  streams in via CRDT `BlockTextOps` the well doesn't decode — the HUD South
+  tail shows whole-content blocks (prompts, tool calls, score cells, errors)
+  while a streaming turn only reads as chatter glow + running rim. Refinement
+  candidates: decode ops for the *selected* context only (the conversation
+  view already has the machinery), or re-fetch the block head on its
+  `Done`/`Error` status flip. Bound whichever lands to the selected card.
+- **Track rays don't organize the cards angularly (deferred by design,
+  2026-07-04).** Cards seat evenly by recency within their band ring; a
+  track's cards ignore the ray's bearing. The follow-up is the haystack
+  grammar applied to angle — same-track contexts gravitate toward their
+  track's ray (`rays::ray_angle`) within each ring, unattached trailing.
+  Needs care against the "predictable motion" bar.
 - **In-world band labels — still TODO (Stage 1 residue, re-anchored to rings).**
   "HOT NOW" / "THIS WEEK" / "30 DAYS" / "HORIZON" floating at each ring, per
   `docs/timewell.md` "The bowl, revisited". The pure helpers

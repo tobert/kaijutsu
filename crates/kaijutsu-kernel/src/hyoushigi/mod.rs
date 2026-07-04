@@ -229,20 +229,59 @@ pub enum BeatCommand {
 /// scheduler owns the `armed` map, so it is the single source of truth.
 pub type BeatAck = Result<(), String>;
 
-/// A [`BeatCommand`] plus an optional reply channel. Fire-and-forget callers
-/// leave `reply` `None`; `kj transport` attaches a `oneshot` and awaits the
-/// [`BeatAck`] so its report reflects the scheduler's actual action. Not
-/// `Clone` (a `oneshot::Sender` isn't) — and nothing clones it.
+/// Live state of one track, read from the scheduler's **in-memory** truth —
+/// the wire answer to "what tracks exist and what are they doing." The
+/// persisted `tracks` row is NOT this: its playhead lags (written only on
+/// transport transitions), so anything wire-facing must come through here.
+#[derive(Debug, Clone)]
+pub struct TrackSnapshot {
+    pub id: TrackId,
+    /// The track's durable score container (a real, browsable context).
+    pub score_context: ContextId,
+    /// Transport: whether the clock is rolling.
+    pub playing: bool,
+    /// Musical time (event-counted; freezes on pause). `i64` to match
+    /// `Tick::get()`; forward-only from 0 in practice.
+    pub playhead: i64,
+    /// Effective beat period (the tempo knob).
+    pub period: Duration,
+    pub beats_per_phrase: u64,
+    /// Beats elapsed while playing (resets on kernel restart — the documented
+    /// `KJ_PULSE`/`beat_count` contract).
+    pub beat_count: u64,
+    /// Wall clock (ns) of the most recent beat; 0 = never fired.
+    pub last_epoch_ns: u64,
+    /// The clock driver discriminator (`"system"` today, `"modeled"` at M3).
+    pub clock_kind: String,
+    /// Contexts currently bound to this track.
+    pub attached: Vec<ContextId>,
+}
+
+/// One message into the beat scheduler: a transport **command** (with an
+/// optional truthful-outcome reply) or a read-only **snapshot query** (the
+/// `listTracks` wire surface). Not `Clone` (a `oneshot::Sender` isn't) — and
+/// nothing clones it.
 #[derive(Debug)]
-pub struct BeatRequest {
-    pub command: BeatCommand,
-    pub reply: Option<tokio::sync::oneshot::Sender<BeatAck>>,
+pub enum BeatRequest {
+    /// Apply a [`BeatCommand`]. Fire-and-forget callers leave `reply` `None`;
+    /// `kj transport` attaches a `oneshot` and awaits the [`BeatAck`] so its
+    /// report reflects the scheduler's actual action.
+    Command {
+        command: BeatCommand,
+        reply: Option<tokio::sync::oneshot::Sender<BeatAck>>,
+    },
+    /// Snapshot every track's live state. Purely a read — the scheduler
+    /// answers synchronously from its in-memory `TrackState` map and replies
+    /// before yielding (same no-await contract as command handling).
+    Snapshot {
+        reply: tokio::sync::oneshot::Sender<Vec<TrackSnapshot>>,
+    },
 }
 
 impl From<BeatCommand> for BeatRequest {
     /// A bare command becomes a fire-and-forget request (no ack wanted).
     fn from(command: BeatCommand) -> Self {
-        BeatRequest { command, reply: None }
+        BeatRequest::Command { command, reply: None }
     }
 }
 

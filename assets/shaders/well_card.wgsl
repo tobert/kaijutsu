@@ -20,7 +20,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> border: vec4<f32>; // [r, g, b, strength] — steady outline (HUD); cards leave strength 0
-@group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, _, _, _] — non-focused ring dimming (1.0 = focused)
+@group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, chatter, beat, _] — focus dim ×, live chatter glow, beat envelope
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
 fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
@@ -78,16 +78,42 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let status = params.z;
 
+    // Live-action signals accumulate here and are added AFTER the focus dim:
+    // "bright = live action" must read from every ring, not just the focused
+    // one — a running/beating/chattering card on a dimmed ring is exactly the
+    // at-a-glance signal the well exists for (Gemini review, 2026-07-04).
+    // Navigation state (selection/lineage) and passive structure stay under
+    // the dim so the focused ring still pops.
+    var live = vec3<f32>(0.0, 0.0, 0.0);
+
+    // --- Live chatter (dim.y): the context's decaying event energy, pushed by
+    // the kernel-wide block stream the moment this card's context is talking —
+    // a cyan HDR lift on the rim that fades in ~2s of quiet. Sits UNDER the
+    // status/selection rims (it's ambience, not state). ---
+    let chatter = dim.y;
+    if (chatter > 0.005) {
+        live += vec3<f32>(0.45, 0.85, 1.0) * (2.2 * chatter) * band;
+        alpha = max(alpha, band * min(chatter * 2.0, 1.0));
+    }
+
+    // --- Beat (dim.z): the live beat envelope of this card's track phasor
+    // (score-context cards today; every attached card once the track roster is
+    // on the wire). A warm gold thump, HDR so it blooms on the beat. ---
+    let beat = dim.z;
+    if (beat > 0.005) {
+        live += vec3<f32>(1.0, 0.72, 0.22) * (2.8 * beat) * band;
+        alpha = max(alpha, band * min(beat * 2.0, 1.0));
+    }
+
     // --- Status rim (base layer; selection/lineage draw over it) ---
     if (status > 2.5) {
         // Error: a steady, hot red rim.
-        col = mix(col, vec3<f32>(1.0, 0.16, 0.12) * 3.5, band);
+        live += vec3<f32>(1.0, 0.16, 0.12) * 3.5 * band;
         alpha = max(alpha, band);
     } else if (status > 0.5 && status < 1.5) {
         // Running: a breathing teal rim — the "this context is thinking" pulse.
         let pulse = 0.5 + 0.5 * sin(t * 4.0);
-        let glow = vec3<f32>(0.40, 0.95, 0.80) * (1.6 + 2.6 * pulse);
-        col = mix(col, glow, band * (0.45 + 0.55 * pulse));
+        live += vec3<f32>(0.40, 0.95, 0.80) * (1.6 + 2.6 * pulse) * band * (0.45 + 0.55 * pulse);
         alpha = max(alpha, band);
     }
 
@@ -106,6 +132,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Focus dimming: recede non-focused-ring cards by scaling color only. The
     // material is alpha-masked (Mask(0.5)), so scaling alpha would clip the body
-    // below the cutoff and vanish the card instead of fading it.
-    return vec4<f32>(col * dim.x, alpha);
+    // below the cutoff and vanish the card instead of fading it. Live action
+    // (`live`) pierces the dim by design — see above.
+    return vec4<f32>(col * dim.x + live, alpha);
 }

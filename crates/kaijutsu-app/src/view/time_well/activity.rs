@@ -36,8 +36,9 @@ const ENERGY_MAX: f32 = 4.0;
 const ENERGY_DECAY: f32 = 1.6;
 
 /// Per-context activity ceiling + decay (a touch faster than global so a single
-/// card's glow tracks *its* traffic, not the whole system's afterglow).
-const CONTEXT_MAX: f32 = 3.0;
+/// card's glow tracks *its* traffic, not the whole system's afterglow). Public:
+/// `live::sync_card_live_uniforms` normalizes by this for the chatter lane.
+pub const CONTEXT_MAX: f32 = 3.0;
 const CONTEXT_DECAY: f32 = 2.2;
 /// Below this a per-context entry is dropped (keeps the map from growing).
 const CONTEXT_EPSILON: f32 = 1e-2;
@@ -121,11 +122,9 @@ impl RingActivity {
         self.ripples.retain(|r| r.age < RIPPLE_LIFETIME);
     }
 
-    /// Current activity level for one context (0.0 if quiet/unknown). The hook
-    /// for the next follow-up — driving a per-card reaction (the active card
-    /// itself brightening) on top of the localized ripple. Tested; not yet wired
-    /// into the card material (which would need a 5th uniform slot).
-    #[allow(dead_code)]
+    /// Current activity level for one context (0.0 if quiet/unknown). Drives
+    /// the per-card chatter glow: `live::sync_card_live_uniforms` normalizes
+    /// this by [`CONTEXT_MAX`] into the card material's `dim.y` lane.
     pub fn context_energy(&self, ctx: &ContextId) -> f32 {
         self.per_context.get(ctx).copied().unwrap_or(0.0)
     }

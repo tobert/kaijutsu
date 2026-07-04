@@ -841,8 +841,23 @@ impl Kernel {
     ) -> Option<tokio::sync::oneshot::Receiver<crate::hyoushigi::BeatAck>> {
         let tx = self.beat_ingress.get()?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
-        let request = crate::hyoushigi::BeatRequest { command: cmd, reply: Some(reply) };
+        let request = crate::hyoushigi::BeatRequest::Command { command: cmd, reply: Some(reply) };
         match tx.send(request) {
+            Ok(()) => Some(reply_rx),
+            Err(_) => None, // scheduler dropped its receiver
+        }
+    }
+
+    /// Ask the beat scheduler for a live snapshot of every track (the
+    /// `listTracks` wire surface reads this — the in-memory truth, not the
+    /// lagging persisted row). `None` when no scheduler is wired
+    /// (embedded/test) or it has shut down.
+    pub fn request_track_snapshot(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::hyoushigi::TrackSnapshot>>> {
+        let tx = self.beat_ingress.get()?;
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        match tx.send(crate::hyoushigi::BeatRequest::Snapshot { reply }) {
             Ok(()) => Some(reply_rx),
             Err(_) => None, // scheduler dropped its receiver
         }

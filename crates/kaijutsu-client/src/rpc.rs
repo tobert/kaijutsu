@@ -221,6 +221,35 @@ pub struct ContextInfo {
     /// never set (0 on the wire). Drives the time-well's activity-recency
     /// ordering and idle-age bands (Stage 1).
     pub last_activity_at: Option<u64>,
+    /// The track this context is attached to (docs/tracks.md), or `None` when
+    /// unattached (empty on the wire — TrackIds are never empty). Drives the
+    /// time-well's track rays + per-card beat lanes (Stage 3).
+    pub track_id: Option<String>,
+}
+
+/// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
+/// beat scheduler's in-memory truth via `listTracks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// The track's name (`[a-z0-9_-]`, never empty).
+    pub id: String,
+    /// The track's score context — a real, browsable context.
+    pub score_context_id: ContextId,
+    /// Whether the clock is rolling.
+    pub playing: bool,
+    /// Musical time (event-counted; freezes on pause).
+    pub playhead_tick: i64,
+    /// Beat period (the tempo knob), microseconds.
+    pub period_us: u64,
+    pub beats_per_phrase: u64,
+    /// Beats elapsed while playing (resets on kernel restart).
+    pub beat_count: u64,
+    /// Wall clock (ns) of the most recent beat; 0 = never fired.
+    pub last_epoch_ns: u64,
+    /// Clock driver discriminator (`"system"` today, `"modeled"` at M3).
+    pub clock_kind: String,
+    /// Contexts currently bound to this track.
+    pub attached: Vec<ContextId>,
 }
 
 /// A context returned by semantic search (`search_similar`) or neighbor lookup
@@ -339,6 +368,27 @@ impl KernelHandle {
         let mut result = Vec::with_capacity(contexts.len() as usize);
         for ctx in contexts.iter() {
             result.push(parse_context_info(&ctx)?);
+        }
+        Ok(result)
+    }
+
+    /// List every track's live state (docs/tracks.md). Empty when no tracks
+    /// exist or the kernel runs without a beat scheduler.
+    #[tracing::instrument(skip(self), name = "rpc_client.list_tracks")]
+    pub async fn list_tracks(&self) -> Result<Vec<TrackInfo>, RpcError> {
+        let mut request = self.kernel.list_tracks_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let tracks = response.get()?.get_tracks()?;
+
+        let mut result = Vec::with_capacity(tracks.len() as usize);
+        for t in tracks.iter() {
+            result.push(parse_track_info(&t)?);
         }
         Ok(result)
     }
@@ -2192,6 +2242,14 @@ fn parse_context_info(
         ts => Some(ts),
     };
 
+    // Empty on the wire = unattached (TrackIds are never empty by construction).
+    let track_id = if reader.has_track_id() {
+        let s = reader.get_track_id()?.to_str().unwrap_or("");
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    } else {
+        None
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2208,6 +2266,35 @@ fn parse_context_info(
         top_block_preview,
         live_status,
         last_activity_at,
+        track_id,
+    })
+}
+
+/// Helper to parse a TrackInfo from Cap'n Proto.
+fn parse_track_info(
+    reader: &crate::kaijutsu_capnp::track_info::Reader<'_>,
+) -> Result<TrackInfo, RpcError> {
+    let score_context_id = ContextId::try_from_slice(reader.get_score_context_id()?)
+        .ok_or_else(|| RpcError::Other("invalid score context id in TrackInfo".into()))?;
+    let attached_reader = reader.get_attached()?;
+    let mut attached = Vec::with_capacity(attached_reader.len() as usize);
+    for ctx in attached_reader.iter() {
+        attached.push(
+            ContextId::try_from_slice(ctx?)
+                .ok_or_else(|| RpcError::Other("invalid attached context id in TrackInfo".into()))?,
+        );
+    }
+    Ok(TrackInfo {
+        id: reader.get_id()?.to_string()?,
+        score_context_id,
+        playing: reader.get_playing(),
+        playhead_tick: reader.get_playhead_tick(),
+        period_us: reader.get_period_us(),
+        beats_per_phrase: reader.get_beats_per_phrase(),
+        beat_count: reader.get_beat_count(),
+        last_epoch_ns: reader.get_last_epoch_ns(),
+        clock_kind: reader.get_clock_kind()?.to_string()?,
+        attached,
     })
 }
 
@@ -3447,6 +3534,73 @@ mod tests {
             .unwrap();
         let parsed2 = parse_context_info(&reader2).unwrap();
         assert_eq!(parsed2.last_activity_at, None);
+    }
+
+    /// Stage 3 (time-well) wire spine: `trackId` on `ContextHandleInfo`
+    /// round-trips, and unset/empty normalizes to `None` (TrackIds are never
+    /// empty by construction, so the empty-string sentinel is unambiguous).
+    #[test]
+    fn test_parse_context_info_track_id_roundtrip() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder =
+            message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[7u8; 16]);
+        builder.set_track_id("bass");
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed = parse_context_info(&reader).unwrap();
+        assert_eq!(parsed.track_id.as_deref(), Some("bass"));
+
+        // Unset (old wire / unattached) must normalize to None.
+        let mut message2 = MessageBuilder::new_default();
+        let mut builder2 =
+            message2.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder2.set_id(&[7u8; 16]);
+        let reader2 = message2
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed2 = parse_context_info(&reader2).unwrap();
+        assert_eq!(parsed2.track_id, None);
+    }
+
+    /// `TrackInfo` round-trips through `parse_track_info` — every field,
+    /// including the attached-context list.
+    #[test]
+    fn test_parse_track_info_roundtrip() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::track_info::Builder>();
+        builder.set_id("bass");
+        builder.set_score_context_id(&[3u8; 16]);
+        builder.set_playing(true);
+        builder.set_playhead_tick(1234);
+        builder.set_period_us(500_000);
+        builder.set_beats_per_phrase(32);
+        builder.set_beat_count(99);
+        builder.set_last_epoch_ns(1_700_000_000_000_000_000);
+        builder.set_clock_kind("system");
+        {
+            let mut att = builder.reborrow().init_attached(2);
+            att.set(0, &[1u8; 16]);
+            att.set(1, &[2u8; 16]);
+        }
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::track_info::Reader>()
+            .unwrap();
+        let parsed = parse_track_info(&reader).unwrap();
+        assert_eq!(parsed.id, "bass");
+        assert_eq!(parsed.score_context_id, ContextId::from_bytes([3u8; 16]));
+        assert!(parsed.playing);
+        assert_eq!(parsed.playhead_tick, 1234);
+        assert_eq!(parsed.period_us, 500_000);
+        assert_eq!(parsed.beats_per_phrase, 32);
+        assert_eq!(parsed.beat_count, 99);
+        assert_eq!(parsed.last_epoch_ns, 1_700_000_000_000_000_000);
+        assert_eq!(parsed.clock_kind, "system");
+        assert_eq!(
+            parsed.attached,
+            vec![ContextId::from_bytes([1u8; 16]), ContextId::from_bytes([2u8; 16])]
+        );
     }
 }
 
