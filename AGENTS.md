@@ -36,8 +36,8 @@ one trust boundary") + `docs/chameleon.md`.
 `kaijutsu-crdt` (BlockStore/BlockDocument), `kaijutsu-kernel` (Kernel, VFS, MCP broker,
 LLM, drift, `kj` builtin), `kaijutsu-server` (SSH server, EmbeddedKaish),
 `kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.18 GUI;
-inline SVG + ABC→staff rendering). Others: abc, mcp, cas, agent-tools, index, telemetry,
-hyoushigi, viz. Wire schema: `kaijutsu.capnp`. The stdio MCP server (`kaijutsu-mcp`)
+inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, editor,
+index, telemetry, hyoushigi, viz. Wire schema: `kaijutsu.capnp`. The stdio MCP server (`kaijutsu-mcp`)
 exposes most kernel capabilities and can be called as a hook from client applications.
 
 ## Conversation vs Context
@@ -64,15 +64,26 @@ The Bevy BRP tools work directly. Take screenshots frequently.
 
 ## Working Notes
 
-Two committed markdown files carry durable work between sessions; keep them current
-**as you go**, not at the end:
+Three markdown files carry work between sessions; keep them current **as you
+go**, not at the end. They compete for context tokens in every future session,
+so compression is part of maintaining them — the day-to-day detail is always
+recoverable from each file's own git history.
 
+- **`signoff.md`** (repo root, ephemeral, never committed) — the living handoff
+  a fresh process can't reconstruct: where we are, next moves, live-environment
+  facts, parallel-work warnings. Keep it to a couple screenfuls; melt durable
+  parts into the repo docs before they go stale, and delete sections once
+  melted. It is short-term memory, not an archive.
 - **`docs/issues.md`** (committed) — the open-work backlog and side-quest valve. Record
   out-of-scope work here before moving on; **delete an entry when it ships** (melt the
   story into the devlog if it's worth keeping). Code is truth; this tracks what's *not*
   in the code yet.
-- **`docs/devlog.md`** (committed) — a durable narrative from the agent's perspective.
-  Write your story there.
+- **`docs/devlog.md`** (committed) — the evolving narrative of how kaijutsu and
+  its ideas took shape: arcs, decisions, and lessons, written oldest → newest.
+  It is a story, not a standup log. Fold new work into the chapter it belongs
+  to (or open one for a genuinely new arc) and compress chapters as they cool;
+  prefer rewriting a chapter over appending another status update to it. Commit
+  hashes, test counts, and daily blow-by-blow belong in `git log`, not here.
 
 ## Git Conventions
 

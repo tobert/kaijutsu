@@ -1,1116 +1,339 @@
 # kaijutsu devlog
 
-Narrative history of landed work and the decisions behind it — the "how we got
-here" color that doesn't belong in [issues.md](issues.md) (open work) or the
-code. This is *not* the authoritative record: `git log` (commits, SHAs) is
-canonical and the design docs under `docs/` hold the locked decisions. This is
-the story, melted out of the ephemeral session handoffs as they retire.
-
-Newest work first within each area; dates are when the work landed.
-
----
-
-## Conversation view — ordering choreography + MSDF atlas hardening (landed 2026-07-03)
-
-Two long-standing view irritations fell in one arc: error blocks that stuck to
-the bottom of the conversation until restart, and text that loaded with holes
-when a whole document hydrated at once. The investigation started with a full
-read of the view pipeline, then fanned out the way we like: a gemini-pro batch
-and a deepseek consult over the same whole-file surface (no diff), both
-converging with the lead's static trace on the same mechanisms. The fixes were
-built by two Sonnet agents in parallel worktrees — TDD, kaibo-reviewed, then
-squash-merged (`a47c9a18`, `a6734cbf`).
-
-**Ordering (`a47c9a18`).** The CRDT/wire layer was verified sound end to end —
-order_keys are minted once in the kernel and preserved through every merge —
-so the bug had to be in the Bevy choreography that turns document order into
-`Children` order. Three holes, one shape: mutations that changed *order*
-without telling `reorder_conversation_children` to re-run. (1)
-`spawn_block_cells` only bumped `LayoutGeneration` on additions/removals, so a
-pure reposition never triggered the child rewrite — fixed by
-`BlockCellContainer::resort_to_document_order` reporting whether the sort
-moved anything. (2) `track_conversation_container` reparented cells-then-
-headers after a pane split (interleave destroyed) with no bump — now bumps.
-(3) `replace_children` silently un-parents anything missing from the new list,
-leaking it as a root UI node that nothing culls, measures, or despawns — the
-best match for "pinned at the bottom, survives everything, healed by restart."
-That's now fail-loud: orphans are despawned with an `error!`, and a live block
-missing its container entry logs the upstream bug instead of vanishing. The
-gen-gate itself stayed (a full `editor.blocks()` snapshot per frame is too
-expensive); the decision was to make the *bumps* complete rather than remove
-the gate.
-
-**MSDF atlas (`a6734cbf`).** The whole-document "text doesn't fully render"
-split into a benign transient (async glyph generation → version-bump →
-re-composite, self-healing) and two silent forever-failures: a full 1024²
-atlas made `insert()` return `None`, which left the key in `pending` and
-respawned a fresh generation task *every frame* — infinite CPU churn wearing a
-missing-glyph costume — and missing font data had the same unbounded-retry
-shape. The atlas now grows (doubling to a 4096 cap, largest-first repack with
-pixel copy, a new `growth_epoch` signal because growth moves regions without
-changing their count), terminal failures land loud in a `failed` set that
-`request()` respects, font-data waits get a 120-frame budget, and the ~29k
-known-benign one-frame `target_gpu=false` warns in real logs were downgraded
-to debug unless a texture stays stuck. Kanji-heavy documents were the
-motivating capacity case — 日本語 conversations should no longer lose glyphs.
-
-The copy/paste groundwork from the same evaluation (retain byte offsets on
-`PositionedGlyph`, selection as UI overlay quads, selection model riding
-`block_ids_ordered()`) is design direction, not yet code — it stacks on the
-ordering fix.
-
-## `/v/blobs` — the CAS pool over the VFS, and client CAS sync (design: `docs/slash-v.md`, track B)
-
-### The whole track landed, reviewed, and demoed by ear (landed 2026-07-02)
-
-The substrate `docs/pcm.md` slice 5c needed to prefetch clip/sample media —
-"sync the CAS to the client" — went from design to an audible end-to-end demo in
-one arc. Bytes never ride the track; a clip names a CAS hash and the sink pulls
-the bytes out-of-band from the kernel's object pool. Track B is that pool made
-reachable, and the client that fetches from it. Five slices, each a commit.
-
-**B0 — harden `kaijutsu-cas` first** (`a82c332a`). The client cache is a
-`FileStore` at an XDG dir, shared across OS processes, and a cache-hit
-`retrieve()` never re-hashes — so a torn object would be served as truth forever.
-`store()` was a raw `fs::write` straight to the content-addressed path; rewrote it
-onto the staging + atomic-rename shape `seal_path` already had one function away.
-A red-first concurrency test — remove+re-store flicker vs. tight-spinning readers
-— caught the torn read at "0 of 2097152 bytes." `retrieve()`'s exists()-then-read
-was a TOCTOU against a concurrent remove, so it now attempts the read and maps
-NotFound to `Ok(None)`. And `ContentHash` deserialization bypassed validation
-(`serde(transparent)` over `String`) — a malformed hash decoded fine and panicked
-later in `prefix()` — so the guarantee moved into the type via `serde(try_from)`.
-
-**B1 — the `CasFs` backend** (`1854cbcf`). A read-only `VfsBackend` over the
-kernel's `FileStore`, mounted at `/v/blobs` before `MountTable::freeze()`. Sharded
-on the hash's *leading* two hex chars — deliberately unlike the UUIDv7
-*trailing*-byte rule for contexts, because BLAKE3 is uniform in every byte and
-this matches the on-disk `objects/` layout one-to-one. Immutability makes the hard
-problems trivial: O(1) getattr size from host metadata, a *constant* generation (a
-hash names one byte string forever, so a caching client never invalidates),
-positioned range reads (never materialize a whole object for a range), EROFS by
-construction. `real_path` returns None so the host path can't leak past the
-virtual abstraction.
-
-**B2 — deferred, on purpose** (`04211515`). The greppable `index` TSV was fully
-designed, but nothing consumes it (the resolver addresses blobs by exact hash,
-never by browsing) and the first cut regenerated by walking `objects/` per read
-with no cache — an ABI we'd outgrow. Amy's call: don't ship an under-designed
-surface with no consumer. It lands when it has both.
-
-**B3 — the client resolver** (`f7dcef0f`). `SftpClient` opens its *own* SSH
-connection for the standard `sftp` subsystem — SFTP futures are Send, the capnp
-RPC world is !Send and pinned to its own thread, and they must not mix.
-`BlobResolver` layers an XDG `FileStore` cache over it: hit → local bytes; miss →
-fetch → re-hash and compare to the requested address → store → return. A mismatch
-is a hard error with nothing cached — SFTP gives transport integrity, the re-hash
-gives end-to-end content integrity, crash over corruption. Single-flight per hash
-coalesces concurrent misses onto one wire transfer; verified russh-sftp's read
-loops past its 256 KiB packet cap so a large blob is reassembled whole.
-
-**B4 — the app consumer** (`46bb9476`). The Bevy sink's CAS-payload warn-skip
-became a resolve. The friction was the runtime: the RPC actor lives on a
-current-thread + LocalSet runtime (capnp is !Send), and a blocking cache read
-there would stall RPC — so the sink owns a *separate* tokio runtime for the Send
-SFTP world, lazily connecting one resolver for the session, with results crossing
-back to the Bevy main thread on a crossbeam channel to spawn `AudioPlayer`s.
-
-**The review earned its keep.** The house ritual — a two-model kaibo pass
-(gemini-pro batch + deepseek, whole files, no diff). Deepseek traced the
-single-flight strong-count pruning race-free and the reconnect correct; gemini
-caught two real concurrency bugs my own reasoning *and* deepseek had missed: a
-transport-error handler that could wipe a *fresh* connection a concurrent cue had
-just established, and a single-flight lock that leaked on task cancellation or a
-panicking fetch. Both fixed (`95785e28`) — the leak via a RAII guard with a
-red-first panic test, the race via an `Arc::ptr_eq`-guarded reset plus a
-reconnect-retry. That cross-model divergence is exactly why we don't hand the
-reviewer a diff: two models reading holistically find what one reading a change
-won't.
-
-**Live-verified twice.** Stock OpenSSH `sftp` against the running kernel fetched a
-blob byte-exact and listed the sharded pool. Then the audible demo: `kj cas put
-pawlsa-test.wav` → `kj play --cas <hash>` (a small trigger added so a CAS cue
-could be emitted at all — `63bd1d5f`, mime resolved from the blob's own CAS
-metadata) → the app opened its SFTP channel, fetched the blob over `/v/blobs`,
-hash-verified it into its XDG cache (byte-identical to the kernel object), decoded
-it, and played it out the speakers. B0 through B4, every layer, by ear.
-
-**One scar worth the telling.** During live verify, `kaish ls /v/blobs` came back
-empty while `kj cas` and the raw disk showed a full pool — an hour of "the CasFs
-sees an empty store!" before the truth: `kaish-kernel`'s `VirtualOverlayBackend`
-*reserves* `/v/blobs` as one of its own virtual paths, so a kaish op hits an empty
-overlay and never reaches the kernel `MountTable`. SFTP serves `kernel.vfs()`
-directly and bypasses the whole kaish layer — which is why the e2e and the real
-prefetch path worked all along. The clip path uses SFTP, so it's unaffected; the
-reconcile is filed in `issues.md` and the lesson is now a gotcha memory so the
-next person doesn't lose the hour.
-
----
-
-## SSH transport & RPC surface (design: `docs/sftp.md`)
-
-### Client actor connects eagerly, not on first command (landed 2026-06-26)
-
-Surfaced while flag-day-reconnecting the MCP during the named-subsystem cutover
-(below): the first call after any cold start returned `not ready: idle`, and you
-had to call twice. That was by design — the client RPC actor
-(`kaijutsu-client/src/actor.rs`) was a *lazy*-connect FSM: it rested in `Idle`
-and only dialed when the first command arrived, deliberately rejecting that
-command (`NotReady(Idle)`) rather than blocking the caller for up to ~25s through
-the SSH+capnp handshake. Reasonable for a retry-loop poller, but the MCP/app tool
-surface doesn't absorb the kick, so the `NotReady` leaked to the human/agent as a
-visible first-call failure on every reconnect.
-
-Amy's steer: a client should reach for the connection as soon as it can — the
-early connected/failed signal is worth more than the apparent efficiency of
-deferring, and it shouldn't sit in a state that bounces commands. So the `Idle`
-arm now calls `start_connecting(1)` immediately instead of waiting for a command;
-`Idle` becomes a transient bootstrap the actor never rests in. The change is
-surgical because the post-disconnect path *already* self-reconnected
-(`finish_closing` → `Cooldown` → timer → `Connecting`); only cold start waited on
-a command. Commands that race the handshake are still handled by the `Connecting`
-arm (`NotReady(Connecting)`, or served once `Connected`), and shutdown (mpsc
-closed) is observed there too — so nothing regressed. The e2e contract test was
-rewritten from `first_call_rejected_with_idle_then_actor_connects` to
-`actor_connects_eagerly_without_a_command`: it waits for `Connected` with **no
-command sent**, which hangs→times-out on the old lazy code. Live-validated over
-MCP — the first `whoami` after reconnect now reaches the kernel instead of being
-bounced.
-
-### RPC migrates from channel-ordinal to a named SSH subsystem (landed 2026-06-26)
-
-Slice 0 of the SSH-surface renovation in `docs/sftp.md`. The Cap'n Proto RPC
-transport used to ride a **positional** channel scheme: the client opened three
-session channels in a fixed order (control / rpc / events) and the server keyed
-the RPC handler purely by **ordinal** — only channel index 1 got the capnp
-handler thread. `control` and `events` were dead weight, retained client-side in
-an `Arc` only to hold the connection open; the real event stream already flows
-as capnp *over the single RPC channel*. So two of three channels existed only to
-pad the ordinal.
-
-Now the client opens **one** channel and calls `request_subsystem(true,
-"kaijutsu-rpc")` before `into_stream()`. The server stashes every opened channel
-in a per-connection `HashMap<ChannelId, Channel<Msg>>` at `channel_open_session`
-time and implements `subsystem_request`, which drains the map and dispatches by
-name: `kaijutsu-rpc` spawns the existing RPC thread (extracted into a
-`ConnectionHandler::spawn_rpc_thread` helper); an unknown name gets
-`channel_failure` + `close`. Every exit path acks (`channel_success` or
-`channel_failure`) because the client requests with `want_reply` — a silent
-return would hang it. `channel_close` also drops the channel from the pending
-map. The subsystem name lives in one shared const, `kaijutsu_types::
-SSH_RPC_SUBSYSTEM`. Client-side, `SshChannels` and `retain_ssh_channels` are
-gone; `connect()` now delegates to a generalized `connect_subsystem(name)` seam
-(the same seam a future kaijutsu-native subsystem — e.g. debug-kaish — requests
-through) and returns the one bound channel.
-
-This is the **shared retention-and-dispatch scaffold** the rest of the plan
-needs: SFTP and a debug-kaish shell become additional `match name` arms over the
-same pending-channel map. Doing RPC-named *first* proves the scaffold on the path
-we exercise constantly — the full SSH e2e suite (24 `rpc_integration` tests incl.
-subscriptions, 7 `reconnect_fsm`, 3 `editor_wire`, 8 `peer_e2e`) stayed green,
-and a new `test_unknown_subsystem_is_not_bound_to_rpc` guards against any
-ordinal-style "attach RPC to any channel" fallback. **Breaking wire change**, no
-compat shim — a flag-day cutover (early dev, single user): kernel + app + MCP all
-rebuilt together. A deepseek review via kaibo confirmed the refactor correct;
-its two notes (a misleading `connect_subsystem` doc comment — `want_reply` makes
-the *server* ack, it doesn't fail the client call early; and a defensive
-`pending_channels.remove` on the unreachable unauthenticated path) were folded in.
-
----
-
-## VFS & filesystem
-
-### `FileAttr.generation` — coherence stamp split from display mtime (landed 2026-06-25)
-
-Prework for exposing the VFS over SFTP (design: `docs/sftp.md`). A Gemini Pro
-review of that design surfaced that the cache leaned on mtime as its coherence
-signal, and Amy flagged the deeper worry: was virtual-file mtime "really a
-counter"? It wasn't — `FileAttr.mtime` is a real `SystemTime` everywhere — but
-`ConfigCrdtFs` had two footguns (seeded files reporting `UNIX_EPOCH`; a silent
-no-op `setattr(mtime)`) and a latent coherence bug: mtime was wall-clock
-`now()` on write, so two writes inside one clock tick didn't advance it, while
-`FileDocumentCache`'s staleness reload requires a strict advance.
-
-Decision (Amy, from a three-way choice): introduce a **generation counter** as
-the real coherence primitive and keep mtime purely for human display — rather
-than clamping wall-clock to monotone, or mapping a logical version into a
-`SystemTime` (which would show 1970-ish garbage in `ls -l`). So `FileAttr` gains
-`generation: u64`: `ConfigCrdtFs`/`MemoryBackend` source it from a monotonic
-per-backend counter bumped on every content mutation; `LocalBackend` derives it
-from host mtime-nanos. The cache compares generation (`loaded_generation`, the
-`d > l` check), not mtime. `setattr(mtime)` is now honored for display on the
-CRDT and memory backends but deliberately does not bump generation, so `cp -p`
-/ `touch -d` / rsync stop silently losing mtime there *and* a pure attribute
-touch never triggers a reload. (`LocalBackend::setattr` mtime is still a no-op —
-a pre-existing item in `issues.md`, untouched here.) The `UNIX_EPOCH` default is
-replaced by a real backend-creation timestamp. The same generation is what a
-future SFTP `OPEN` will capture for its TOCTOU re-verify — handle guard and
-cache share one primitive.
-
-A follow-up kaibo review pass (deepseek + chimera) then caught three real
-defects in the first cut, fixed the same day: a `ConfigCrdtFs::bump()`
-fetch-then-insert race that could *reverse* generation under concurrent writers
-to one path (now a `max`-folded DashMap `entry`); `MemoryBackend::rename`
-carrying the source's stale generation to the destination, regressing it when
-overwriting a higher-generation target (now stamps a fresh generation on every
-moved entry); and a spurious generation bump when `setattr(size=…)` hit a
-directory/symlink where the resize was a no-op. TDD throughout: same-instant
-strict-advance tests on both CRDT and memory backends, a rename-no-regress
-regression, plus epoch-default and display-only-setattr regressions; full
-workspace green.
-
----
-
-## In-app vi editor
-
-Editing as a kernel-owned session: `EditorCore` (pure modalkit vim) → kernel
-`EditorSessions` → tool-shaped surface, with the Bevy app as one renderer among
-many drivers. Design + live state: `docs/vi.md`. Memory: `project_vi_editor`.
-
-### Front doors + slice-2 groundwork (landed 2026-06-23)
-
-Slice 1 (kernel, headless) was already green; this stretch added the ergonomic
-front doors and started the app-renderer groundwork.
-
-- **`vi`/`edit` builtin + `kj rc edit` opens the editor** (`82cd5f8`). A real
-  kaish `Tool` (`ViBuiltin`, registered in `context_shell.rs` under both names)
-  and bare `kj rc edit <path>` (no `--content`) both open a session via the one
-  shared `Kernel::editor_open` primitive — three front doors, one primitive, one
-  `EditorState::to_json` shape. Decisions (Amy): a real builtin, not a `kj editor
-  open` alias; session-id-only (no peer signal until slice 2). Verified live over
-  MCP (`vi`/`edit`/`keys`/`state`/`quit`).
-- **Render-path decision: Design A** (`docs/vi.md` risk #7). The app will render
-  the editor from a kernel-served `editor_state` channel and never join the
-  editor context into `DocumentCache` — so the feared `DocKind`-discriminator
-  collision can't occur (the cache only holds *joined* contexts; ops for
-  un-joined contexts are dropped). Item "DocKind discriminator" evaporated.
-- **General Screen-transition fix** (`116ed57`). A landed context switch now
-  drives the `Screen` FSM (`screen_revealing_switched_context`), so a
-  kernel/peer-driven `switch_context` or server-pushed `ContextSwitched` while
-  the app is in the time well reveals the conversation instead of stranding the
-  user in the well — closing `tech_debt_switch_context_screen_transition`.
-  Runner-verified (in the well → `kj context switch` → pops to conversation).
-- **invoke_peer double-encoding fix** (`4614c29`). Object `params` arrived at the
-  MCP server as a JSON *string*; `normalize_peer_params` unwraps one layer.
-  Surfaced verifying the Screen fix; de-risks slice-2's editor-open signal.
-- **App-id addressing infrastructure** (decisions: submitter-aware routing with
-  principal fallback; build the infra now). Built in slices, all committed +
-  tested + single-window runner-verified:
-  - `whoami` stamps `principalId` (`55d285e`) — the canonical
-    principal-population gap (wire field existed, nobody set it; server is
-    authoritative).
-  - Peer registry keyed by per-window `instance` + server-stamped `principal` +
-    by-nick/principal/instance addressing (`41e236c`), fixing the latent "second
-    window evicts the first" clobber.
-  - Bridge-task self-detach on `conn_cancel` + `reap_closed` backstop
-    (`bdcc0b2a`) — the peer-invoke bridge previously lingered on connection drop
-    (parked on `rx.recv()` with the registry holding the sender); now it follows
-    the FlowBus bridges' cancel idiom.
-  - capnp `instance` + app mints a per-process UUID + a `same_channel`
-    self-detach **identity guard** (`63ff4d7a`) — the peer e2e caught that an old
-    task's self-detach would otherwise clobber a peer that re-attached under the
-    same key (reconnect / same nick). Verified live: the app registers under a
-    real instance and a `kj context switch` reaches it through the new registry.
-  Remaining (slice-2, with `open_editor`): capture the submitter at
-  `editor_open` and route (verify `KjCaller.principal` is populated there); live
-  2-window coexistence check.
-
-## Time-well context browser
-
-The radial 3D "well" of context cards (`docs/viz-substrate.md` build order;
-`docs/time-well-concepts.md` UX). **Ctrl+W** enters from the conversation, Esc
-leaves. Two concrete consumers (active band-0 nav, semantic haystack band-2)
-drive the substrate; `ViewSpec` extraction waits on a third (don't build
-speculatively). Memory: `project_time_well_context_browser`.
-
-### Edge HUD → in-scene MSDF panels (landed 2026-06-18)
-
-The HUD's first-cut flat Bevy `Text` nodes became in-scene **MSDF panels**: 3D
-quads parented to the well camera (screen-stable, no billboard), drawn as thin
-glowing accent-tinted borders with no body fill (`WellCardMaterial.border`
-uniform), MSDF text inside — same HDR/bloom + depth vocabulary as the cards. N
-centered top with the context name, E/W tucked into the top corners, S hidden.
-Placed via the pure unit-tested `hud_slot_offset` (aspect-adaptive, size-aware
-fit). Built on the shared `view/time_well/panel.rs` primitive (`create_msdf_panel`
-+ `commit_panel_glyphs`), also used by the rim/reading cards. Same pass renamed
-the RTT plumbing: `vello_ui_texture.rs` → `ui_rtt.rs`, `VelloUiTexture` →
-`UiRttTexture`, `VelloUiScene` → `UiVectorScene` (vello-only; pure-MSDF surfaces
-carry no vello type now).
-
-### HDR + Bloom via one shared camera (landed 2026-06-17, `9c5e831`+`4ae2f6d`)
-
-Dissolved the two-camera composite that made bloom'd cards vanish. The app's lone
-camera is now a single always-on `Camera3d` (`main::setup_camera`,
-`IsDefaultUiCamera`) with `Hdr` + thresholded additive `Bloom` +
-`Tonemapping::TonyMcMapface`. Bevy UI renders on it and the UI pass runs *after*
-tonemapping/bloom, so the conversation is visually untouched; the well's 3D card
-meshes bloom. The well no longer spawns its own camera — enter/exit repurpose the
-shared one (add/remove the `TimeWellCamera` marker + swap clear color). The
-earlier "NOT bloom / SDF-only" reframe was reverted; `well_card.wgsl` drives the
-bling to HDR (>1.0) so only it blooms (bodies stay crisp): selection = breathing
-blue rim, lineage = amber rim, status = breathing teal (running) / steady red
-(error). **Decision worth keeping:** bloom is the *right* tool here — colors are
-placeholders so app-wide HDR is fine.
-
-### Card material foundation → MSDF text → full GPU card (landed 2026-06-17)
-
-Cards moved off `StandardMaterial` onto a 3D-material foundation in three slices:
-- `4c60ce8` — `WellCardMaterial` (3D `Material`, samples the RTT texture, Mask
-  alpha; `params` uniform `[selected,in_lineage,status,time]` wired for FX).
-- `7c64cc2` — card text renders via the app's MSDF pipeline (`text::card_text_glyphs`
-  lays out each field with parley, the generic block MSDF pass composites). Crisp
-  at any zoom — the focus dolly no longer softens text. vello now draws only decor.
-- `38e2992` — `WellCardMaterial` draws the *whole* card on the GPU (accent
-  rounded-rect body + selection/lineage rings as SDF in `well_card.wgsl`, driven
-  by uniforms). vello no longer touches card textures at all (stays for SVG/ABC
-  elsewhere). Cards use `BlockRenderMethod::Msdf`.
-
-### Vortex + odometer nav + status + drift shimmer (landed 2026-06-17)
-
-The big evolution toward the concept art (`viz-substrate.md` §7.7–7.8), verified
-live on the GPU runner:
-- **Kernel-activity rings (§7.7):** a base ring deck pulses with the live
-  kernel-wide `ServerEvent` stream (zero new wire); ripples localize to the busy
-  context's angle. Re-tiered so bright = action. `activity.rs` + `well_rings.wgsl`.
-- **Vortex (§7.8):** dropped the 3 discrete rings for one continuous spiral, axis
-  tipped back (`WELL_TILT`) so the mouth opens toward you, with an accretion-disk
-  event horizon at the throat. Odometer nav: spiral index = address (←/→ = ±1,
-  ↑/↓ = ±10, digits = mouth decade). Band-positioning code deleted; `band_orders`
-  survive for slot order + label clusters.
-- **Status coverage (`df3b65b`):** kernel-derived `ContextInfo.liveStatus @14` —
-  the server reads each context's block statuses in timeline order
-  (`derive_context_live_status`: any Running→Running, else tail Error→Error, else
-  idle; non-sticky) and ships it on every `listContexts` poll; the well sets
-  `Card.status` from it for every visible card. Retired the event-based
-  `apply_block_status` (single source = the poll; breathe is continuous via
-  `globals.time`). Thin-client aligned (`feedback_thin_client_smart_kernel`).
-- **Drift shimmer (`66ad2e4`):** a card whose context is a staged-drift endpoint
-  sweeps an animated HDR diagonal sheen (`card::drift_endpoints` → `params.w`),
-  reading the staged queue already on the `DriftState` poll (no wire change). The
-  bigger drift arcs/particles *between* cards still need a context→context
-  drift-edge list wire (deferred, gap 4 — see issues.md).
-
-### Steps 1–7.6 substrate + consumers (landed through 2026-06-17)
-
-Steps 1–3 (scales / join / compacting layout) shipped pure + TDD in
-`crates/kaijutsu-viz/`. Step 4 (card consumer), step 5 (`conclude` wire/lifecycle
-— `kj context conclude`/`done`), step 6 (band-0 keyboard nav + band-1 recency
-clock keyed on `concluded_at`) shipped (`77146c3`, `ffa7f4e`, `1d3a9ab`). Step 7
-(haystack, `7a+7b+7c`) added band-2 semantic angle from `get_clusters` with
-kernel-synthesized cluster labels (`ContextCluster.label @2`,
-`pick_cluster_label`), same-cluster contexts grouped adjacent, and a fork-ancestry
-lineage overlay (`card::ancestors`, amber ring). Step 7.5 added cross-band nav, an
-in-world 3D billboarded focus card at the mouth of the well (the flat 2D bar was
-tried and rejected — "reads as a JavaScript thing"), eased camera follow, and the
-Enter-twice focus state machine (overview → focus → commit). **Next** (in
-issues.md): the JOIN dive (camera continues *through* the focus card into the
-conversation, mockup 34).
-
-## CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`)
-
-Started as "clear a footgun" (a silent-fallback bug), followed the contributing
-factors up to the real structure, and locked a design that **deletes** the whole
-silent-fallback cluster instead of patching it: make the CRDT the sole owner of
-rc + config; embedded Rust (`assets/defaults/`) seeds it once; no host
-flush/reload, so the dual-ownership bug class (stale-bytes read, append file-wipe,
-mtime no-op, stale-rc-seed drift) can't exist for these mounts. Memory:
-`project_crdt_owned_config`.
-
-### Slice 2 — config TOMLs (shipped 2026-06-17)
-
-Converged onto `ConfigCrdtFs`: the bespoke `ConfigCrdtBackend` (debounced host
-flush + watcher + dirty tracker + disk read-back) was **deleted**; a second
-`ConfigCrdtFs` mounts at `/etc/config` seeded from embedded. Kernel readers
-(models.toml, system.md) route VFS-direct; `kj config show/list/set/reset` is the
-editing surface, gated on a new `config-write` authority; the app fetches
-`theme.toml` over RPC (`get_config` + `apply_theme_from_rpc`) on connect instead
-of reading host disk. `config_dir` revived as a one-time CRDT seed source
-(production = embedded; tests inject a mock models.toml). Commits
-`93c72a7`/`fdd1c18`/`9e581aa`/`a30b266`/`6f2ce9f` (+ `3d548ca` docs).
-
-### Slice 1 — rc (shipped 2026-06-16)
-
-`ConfigCrdtFs`, the CRDT-native `VfsOps` backend: `UUIDv5(path)→DocKind::Config`
-docs, virtual dirs synthesized from descendant paths, the `documents` table *is*
-the readdir manifest (`create_document_with_path` + `documents_under_path`), an
-in-memory advancing mtime as the single version stamp. `/etc/rc` remounted on it,
-seeded from embedded on a fresh kernel only; `kj rc` + `load_rc_scripts` route
-VFS-direct (dropped `FileDocumentCache` from the rc path). The host rc tree +
-`ensure_rc_seed_files` host write + the legacy `rc_scripts` migration were
-removed; CLAUDE.md retired `vim`-the-rc-file. Commits `04ce36e` (fail-loud
-`CacheReadError` sweep), `e702ee2` (project-source residual closed), `debfb33`
-(foundation), `2b763c6`/`49c819a`/`a2c1045` (seed + cutover). Both slices boot the
-real kernel on the new mounts in integration tests; **live-runner verification of
-both is still open** (issues.md — needs a real `systemctl --user restart`).
-
-## builtin.file edit/read hardening + hashline (shipped & committed 2026-06-17)
-
-Closed the `docs/issues.md` corruption post-mortem (THE_DIRECTOR `019ed674`).
-Commits `899c340` (fix), `435a7e7` (docs/issues), `7217a3e` (hash pin); 1163
-kernel tests green + two DeepSeek/kaibo reviews + `/code-review`. Memory:
-`project_file_tools_hashline`.
-
-**Disambiguation (a real trap):** this is the *kaijutsu kernel's* `builtin.file`
-read/edit — surfaced as `kaijutsu:read` / `kaijutsu:edit`, driven by agents
-inside a context — **not** Claude Code's host-side `Read`/`Edit`.
-
-**Root cause the original post-mortem missed:** `edit` fed BYTE offsets
-(`match_indices`/`.len()`) into the CHARACTER-indexed CRDT `edit_text` — a silent
-splice/over-delete on any file with multibyte UTF-8 before the edit site, while
-honestly reporting `Replaced 1 occurrence` (the byte search *did* find a match).
-Fixed: byte→char offset conversion, char-count delete lengths, and **fail-loud
-post-write verification** (an independently-computed `expected` compared to the
-read-back — crash over corruption). Plus **hashline addressing** (per
-anthropics/claude-code #25775): `read` prints `LINE:hash→ content`; `edit` gained
-an `anchor` mode (`N:hash` / `N:hash..M:hash`) that re-verifies the line hash
-before writing (stale → fail loud). CRLF-preserving; unit + e2e broker tests. The
-forward design direction for the kaish-side build-out (two read modes; push
-`line_hash` up into the kaish crate) is recorded in issues.md.
-
-## External `mcp__kaijutsu__shell` hang root-caused + fixed (2026-06-17)
-
-After a server+app restart, *every* external shell call timed out — `echo hi` at
-20s, `kj context list --tree` at 300s — returning a `block_id` but never the
-output. **Root cause (not the network — it's localhost): executor starvation on
-the MCP client's single-threaded RPC LocalSet, made *permanent* by a too-aggressive
-server reap.** Three compounding factors: the MCP subscribed to block events
-kernel-wide (firehosed by every other context after a restart); each event woke
-the shell poll's `find_terminal` → `blocks_ordered()` re-sort under the lock; and
-`from_sync_state` replays the full op-log synchronously on the same thread.
-Stacked on one `current_thread` executor a multi-second stall is easy — and the
-server's FlowBus bridge broke the subscription *permanently* on the first 5s
-callback timeout (`if !success { break }`). Three fixes: (1) the server bridge
-tolerates transient stalls (`SubscriberHealth`, reap only after 3 consecutive
-failures); (2) the client re-subscribes on a shell-poll timeout
-(`resubscribe_blocks`); (3) the MCP's block subscription is now scoped to its
-joined context (`block_events_client_and_filter`), cutting foreign-context volume
-to zero. Verified live against a busy 24-context kernel: the 300s command returned
-in 285ms. Related memory: `project_mcp_synceddocument_sync`.
-
-## Render seam — PCM slice 5c: MIDI moves off-box onto the wire cue (2026-07-02)
-
-The convergence's payoff, landed and audible on zorak: **MIDI now renders
-through the app as a wire cue, and the server links no audio/MIDI FFI at all.**
-Three sub-slices, each live-verified, ending in a ~1000-line demolition.
-
-**5c-1 — the app is the first MIDI sink (`e4f57e24`).** A `RenderCue { mime:
-"text/vnd.abc", ... }` carries a committed score symbolically; the app renders it
-to MIDI with the *same* `kaijutsu_abc::midi::events` path the server used, and
-schedules it into a local ALSA seq port at `receipt + lead`. The design deviation
-that made this simple: I'd planned to ship pre-rendered SMF (so the sink stays
-dumb), but the app *already* depends on `kaijutsu-abc` (its staff renderer), so
-"keep the sink dumb, no ABC crate" doesn't apply — shipping ABC and rendering at
-the sink reuses the exact tested path with zero new deps. The wire stays
-mime-keyed, so a truly-dumb edge node later takes a pre-rendered `audio/midi` cue
-instead; the mime says which. `kj play *.abc` is the standalone trigger. The seq
-port opens eagerly at startup so it's `aconnect`-able before the first cue. Live:
-`kj play scale.abc` → app → `aconnect` → TiMidity → Amy heard it; `aseqdump`
-caught the NoteOns.
-
-**5c-2 — the track publishes cues (`6e378d34`).** `emit_to_render_targets` (now
-`publish_render_cues`) publishes a `RenderCue` per crossed ABC cell over the
-FlowBus, keyed by the track's score context; stop/pause publish a
-`RENDER_FLUSH_MIME` cue (the wire twin of `flush_scheduled_after`). MIDI is
-sink-dependent now (`docs/midi.md`): the track publishes, any attached app plays,
-a track with no sink is silent-but-preserved. Live: a local gemma4-e4b musician
-(`wirebass`) with **no in-process target registered** → its ABC materialized →
-kernel published cues → app played a C/G bass ostinato (Amy: "lovely harmony");
-`kj transport stop` → the app emitted all-sounds-off/all-notes-off on every
-channel → silence.
-
-**5c-3 — demolish the in-process path (`70ae8c36`).** With parity proven, deleted
-`render.rs` (the `RenderTarget` trait + `AlsaMidiOut`), the `render_targets`
-machinery + in-process emit/flush loops in `beat.rs`, the `kj transport render`
-verb, `BeatCommand::RenderTarget`/`RenderTargetOp`/`RenderTargetSpec`, and the
-server's `alsa` dependency. The kernel/server binary now links no audio/MIDI FFI
-— the goal `midi.md`/`pcm.md` set. Intended tradeoff: headless in-process MIDI-out
-is gone until the edge-node agent (tracked in `issues.md`); a headless kernel
-makes no sound, but the score is preserved and replayable. Smoke: the demolished
-kernel still plays `kj play scale.abc` through the app (`aseqdump` caught the C
-scale).
-
-Recurring operational note: after every kernel restart the MCP `shell` tool
-intermittently times out waiting for the result block (stale FlowBus
-subscription); the kernel executes fine (logs + `aseqdump` confirm). Pass
-`timeout_secs` so a flake costs seconds; `/mcp` reconnect is the clean fix.
-
-## Render seam — PCM slice 5a/5b: the mime-keyed RenderCue + Shape A clip (2026-07-02)
-
-The design pass of 2026-07-01 (`d54c001a`) converged MIDI and samples onto one
-wire cue; this session cashed the first half of it in code, TDD-first, two
-slices, both green. Architect (Opus) held the design and drove the load-bearing
-wire cut directly; the clip record's CAS-presence boundary was pinned before a
-line was written.
-
-**5a — the cue seam (`13ca4147`).** The slice-3 play-now `PlayAudio`/`AudioRef`
-pair became a mime-keyed `RenderCue { mime, payload: Inline | Cas, lead }`. We
-replaced it outright rather than side-by-side: `PlayAudio` had no other
-consumers, the docs framed 5a as "generalize," and there are no old peers to
-skew against (kernel/client/app rebuild together), so one coherent cut across
-`kaijutsu-audio` → capnp → `flows.rs` → `kj play` → both server/client rpc
-bridges → the app sink left no transient dead path. `onPlayAudio@13` became
-`onRenderCue@13` at the same ordinal; the `AudioFormatHint` *wire* enum dropped
-entirely — `mime` is a free `Text`, so the wire is content-agnostic now (MIDI,
-ABC, clip JSON, audio all ride it). `lead` is a *relative* `Duration` (nanos on
-the wire — a process-local `Instant` can't cross it); the sink re-anchors at
-`receipt + lead`. `kj play` stays play-now (`lead == ZERO`, inline payload);
-`AudioFormatHint` survives as the extension→MIME sniff helper, off the wire. The
-app sink dispatches by mime (inline `audio/*` plays; CAS payloads and non-audio
-mimes warn+skip = 5c), and the FFI-free trait is now `RenderSink::emit(&self,
-RenderCue)`. Green: audio 8, kernel 1277, server 109, client 78, app audio 3.
-
-**5b — Shape A clip record + validator (`ea83853d`).** The clip design
-(`docs/clips.md`) reached code as `kaijutsu_audio::Clip` — the render-side
-sibling of ABC's validator on the decouple-Act-from-ABC axis. Two-tier,
-fail-loud: `Clip::parse` is structural (v known, label/mime non-empty, media a
-well-formed hash), `Clip::parse_validated(json, &dyn ContentStore)` adds "media
-present in CAS" at schedule time. The design call this session: that presence
-check lives *in kaijutsu-audio*, not the kernel, because `ContentStore::exists`
-is a pure trait boundary — the crate stays FFI-free and the validator is fully
-unit-testable against a stub store (no filesystem). Two places code corrected
-the docs: `ContentHash` is `#[serde(transparent)]` and does NOT validate on
-deserialize (so well-formedness is an explicit check), and a hash is 32 hex
-chars (128-bit BLAKE3), not the "64-hex" the docs loosely said. The `ext` bag
-preserves unknown keys across round-trips (the OTIO forward-compat lesson). 8
-clip tests green.
-
-**Next: 5c** — the sinks + prefetch, the one sub-slice that needs the runner box
-+ Amy's speakers (app consumes cues by mime, SFTP `/v/blobs` prefetch under the
-lead, then demolish server-side `AlsaMidiOut`). The running kernel is now behind
-the capnp change (`onRenderCue`) — rebuild `kaijutsu-server` + restart before
-the next live jam, same as any capnp bump.
-
-## Music-stack docs harmonization — present tense, one story (2026-07-01)
-
-The music/timing docs grew organically across three intense weeks
-(hyoushigi → chameleon → tracks → midi → pcm), and after Tracks Stages 1–3 M1
-landed, four of them still taught superseded mechanisms as current. A
-review session (Amy + Fable, two Sonnet explorers verifying every claim
-against code) rewrote them to present tense so a fresh implementer lands on
-the real substrate. The choices:
-
-- **`docs/playback.md` retired** (the myaku treatment: deleted, detail in git
-  history). Its 2026-06-10 peer-pull model and pause=mute/stop=clock-freeze
-  verb remap conflicted with the landed `RenderTarget`/transport design; its
-  surviving ideas (peer capability advertisement, `TransportFlow`, routing,
-  the metronome slice, midi→pcm for dumb sinks) moved to `docs/pcm.md`
-  § Distributed listening, each marked with what superseded the rest.
-- **`docs/chameleon.md` rewritten to present tense.** The playhead-carry
-  tick-continuity story (shipped 2026-06-29, deleted by Stage 1 the same
-  week), the `arm` vocabulary, un-prefixed `$TICK`-era env vars, and the
-  closed 2026-06-11 gap analysis all melted into a "Substrate status" section
-  + devlog/git-history pointers. The decisions and their rationale stayed.
-- **`docs/hyoushigi.md`'s three chronological status blockquotes** became one
-  "as landed" block (coordinate / engine / kernel integration / barrier /
-  transport, all code-verified); the per-context-timeline sections now say
-  plainly that music timelines live on the track and coders keep their own.
-- **`docs/tracks.md`** got its never-flipped Stage 1 boxes flipped and two
-  stale deferred items (double-beat, track-scoped `max_tick`) marked fixed.
-- **`docs/pcm.md`** had a corrupted tail (a previous agent's tool-call
-  envelope leaked into the file — stray `</content></invoke>` text) — fixed,
-  plus three leftover "kernel sink" phrasings that contradicted the doc's own
-  kernel-owns-no-FFI decision, now "edge-node sink".
-- **`docs/issues.md` Hyoushigi section swept** per delete-when-shipped:
-  beat-on-track (shipped), `set_tempo`/TickClock staleness (fixed by Stage 3
-  WI 2), the `$ROTATE_EVERY` footgun (the rotate script no longer passes it),
-  rc-driven last-good rehydration (Stage 2 WI 7 made it the built-in attach
-  behavior), and the stop-a-rotate-chain gap (closed by native
-  `stop --track`) all deleted or compressed; the RAM-growth entry reframed
-  (rotation is deliberately *not* the answer anymore — the track timeline
-  survives page-turns, so the fix is windowing the in-RAM committed log).
-
-The pattern worth keeping: these docs are living notes, but "living" had come
-to mean *stratified* — direction notes on top of superseded status on top of
-good design. The fix wasn't more banners; it was moving chronology here (and
-to git history) and letting each doc state the present.
-
-**Follow-up (same day): a tri-model review of the harmonized suite.** Opus
-(docs-only whole-file read), gemini-pro on batch capacity, and a deepseek
-kaibo consult with the code lens — all three called the suite unusually
-strong and surfaced a short convergent fix list: a truncated `tracks.md`
-sentence, midi.md M2's unspecified capture mapping, the edge-node RPC model
-existing only by analogy, and pcm.md's slice-5 emit-contract ambiguity.
-Applying it, Amy's CAS-cue reframe settled the render-seam convergence as one
-direction instead of an (a)/(b) fork: **mime-keyed symbolic emit — bytes never
-ride the track.** A placed sample is a *clip cell* (CAS ref + placement);
-bytes prefetch under the speculation lead over SFTP + `/v/blobs` into a
-client-side XDG CAS cache — retired playback.md's pull-from-CAS idea reborn in
-a better home, and zero new RPC surface. The clip payload format is deferred
-to its first consumer with a prior-art shortlist (OTIO, Csound/Tidal, WebVTT,
-SMIL/TTML, QLab/MSC) recorded in pcm.md; "clip" joins track/lane/voice in the
-locked vocabulary so it never collides with chameleon's trap "cues".
-
-**Follow-up ×2 (same day): the clip design itself.** A Sonnet researcher
-surveyed seven industries' cue systems (`docs/cue-prior-art.md`, ~1000 lines,
-spec-verified where it could fetch) and the synthesis wrote itself into
-`docs/clips.md`: every industry re-invents the same six field clusters, and
-hyoushigi's `Cell` already carries half of them — so **`Cell` does not
-expand** (the substrate stays content-agnostic; placement vs source range
-split across cell vs payload, per the EDL/OTIO lesson). Shape A locked:
-`application/vnd.kaijutsu.clip+json` — media hash + mime + *required* label
-(CAS refs are opaque; the label is the anti-SCTE-35-hex repayment) + ms
-source range + dB gain, versioned record + extension bag. The survey's
-sharpest gift was what to say *out loud*: the tempo-change default (tick-
-anchored, no stretch — Reaper's "timebase: time"), span-vs-source-range
-precedence, and that trigger semantics live in the transport, never the
-committed record. Late-bound cues (Wwise-grade) turn out to be
-`Deferred(Recipe)` wearing a different hat — zero new payload fields, gated
-on the reactive `compute_basis` question. No standalone format, ever, unless
-interchange knocks: OTIO won model-first; AES31 stalled format-first.
-
-## Transport ACK review — the no-deadlock property is real but contingent (2026-06-29)
-
-A morning second-opinion pass over the day's rotate/transport fixes (the ACK fix
-`f0c3eb90`, the sub-ms-tempo + rotate-cadence-persistence fix `f4af0bba`, the
-rc-verb single-source fix `8e2a158c`) — run through codebase-aware kaibo `consult`
-rather than the prior no-repo-access batch precedent, so the reviewers read the
-live tree themselves. Two independent casts (deepseek-v4-pro, chimera/claude-haiku;
-gemini was provider-overloaded all three tries) returned **zero correctness
-findings**: RecvError on a dropped oneshot is surfaced loudly, no lock is held
-across the `.await`, the BPM ceiling and the additive `rotate_every_phrases`
-column round-trip, and `RC_VERBS` is now genuinely single-source.
-
-The one thing worth a devlog beat: the two reviewers *disagreed on the threading
-topology*, which is exactly the kind of divergence that hides a latent hazard, so
-I traced it to the source. Truth (`beat.rs:1079–1098` + `:810`): the scheduler
-owns a dedicated `"beat-scheduler"` thread with its own `current_thread` runtime +
-LocalSet, and the rc lifecycle fires `kj transport` via `spawn_local` **onto that
-same LocalSet**. So the author's "one LocalSet" mental model was right (deepseek's
-read; chimera had described the interactive-RPC path instead). That makes the
-self-referential rc path — a rotate/arm script awaiting the scheduler that spawned
-it — a *separate task on the same single-threaded executor* as the scheduler loop.
-It does not deadlock, but **only because `apply_command` is fully synchronous**:
-nothing is awaited between the ingress `recv` and the `reply.send`, so the loop
-yields back and services the waiting rc task in the same poll cycle. The day
-someone adds an `.await` inside `apply_command`, the rc-fired path self-deadlocks
-(the scheduler parks awaiting work the parked rc task can't deliver). The property
-held by structure, but nothing *enforced* it — so the fix is a documented
-invariant: a "MUST STAY FULLY SYNCHRONOUS" note on `apply_command` plus a pointer
-at the `select!` ingress arm where a future edit would be tempted to await
-(`8afbf8fe`). The lesson echoes the rotate fork-bomb retraction from the day
-before — diagnose threading from the code, not from a reviewer's summary, and when
-two competent readers model the topology differently that *is* the signal to go
-look.
-
-## Tracks Stage 3 M1 — first sound, all the way through to a synth (2026-06-30)
-
-The milestone the rest of M1 was building toward: kaijutsu *composed a line and it
-came out of a synth*, end to end on zorak. Chain, every hop real:
-
-  musician (Haiku, tool-free) → `X:1` ABC turn → `on_turn_completed` →
-  `schedule_abc_cell` onto the `synth` track timeline → beat commits the cell →
-  `materialize_track` → `emit_to_render_targets` → `AlsaMidiOut` (`kaijutsu 129:0`)
-  → `aconnect 129:0 128:0` → TiMidity 128:0 → PipeWire → speakers.
-
-Orchestrated live over MCP: `kj transport render --track synth` opened the seq port
-(confirmed in `/proc/asound/seq/clients` + `aplaymidi -l`), `aconnect` routed it to
-TiMidity, `kj transport play` + `kj drive synth --prompt "…"` produced the phrase.
-Two findings from the live run worth keeping:
-
-- **A cloud model needs a user turn.** The musician's create-time hydrate fired with
-  a system-only message and Anthropic rejected it (`invalid request`); the OODA *tick*
-  injects a `Transport: …` **user** block, so ticked turns (and `kj drive --prompt`)
-  succeed. The chameleon loop was bootstrapped on a local model that tolerates
-  system-only — Anthropic is stricter. (Use `--prompt`, or rely on the tick's user msg.)
-- **It plays sparse, not continuous — by configuration, not bug.** The musician's
-  `wakeup` cadence defaults to `8 * 16` = 128 beats (~once/minute at 120 BPM) and the
-  primers ask for "a bar or two," while the phrase window is 16 beats — so you hear a
-  short phrase then a long rest. The contiguity *mechanism* is already right (the
-  schedule lead is `phrase_delta()`, one phrase ahead); the dial-in is wakeup-=phrase +
-  telling the model the phrase-window beats + "fill it." That's the next thread.
-
-This is `midi.md` M1 reaching its real acceptance test — audible output — not just the
-unit/loopback tests. `aseqdump` captures read 0 only because the background dump kept
-getting reaped when its wrapper shell exited; the ear was the instrument.
-
-## Tracks Stage 3 M1 — sound out the door (clock_kind, render seam, AlsaMidiOut) (2026-06-30)
-
-With WI 1+2 (the `ClockSourceKind` enum + mutable tempo) and the three landed-code
-fixes (below) in, the rest of Stage 3 M1 landed in four commits
-(`b3cd1761`→`508bc0c4`) and the track grew an actual *sound output*. The arc is
-**midi.md M1**: ABC committed on a track → MIDI scheduled into an ALSA seq queue,
-system clock, output-first.
-
-**WI 3 — `clock_kind` persistence (`b3cd1761`).** The clock *source* is the
-deliberate opposite of the set-once `score_context_id`: a track's identity is
-durable, but you sketch on the system clock and later slave the *same* track to a
-MIDI master, so `clock_kind` is MUTABLE — it rides the `ON CONFLICT UPDATE SET`,
-persisted on every driver swap (gemini won that call in the lock; my original
-"set-once" line was wrong). `attach` reconstructs the source from the row, not just
-the period — and because M1 can only build `"system"` (`ModeledClock` is
-uninhabited until M3), a `"modeled"` row makes `attach` crash loud rather than
-silently downgrade the clock. Additive ALTER, so a pre-Stage-3 row backfills to
-`"system"`, never NULL.
-
-**WI 5 — the ABC per-event stream (`f5b7cb16`).** `midi.rs` already built a timed
-`MidiEvent` list internally and then framed it as an SMF blob; re-parsing that blob
-to recover the events would be backwards. So `pub fn events(tune, params)` exposes
-the sorted, absolute-tick stream, and `generate` became a thin SMF wrapper over the
-shared `build_single_track_writer` — its bytes unchanged (the whole pre-existing
-suite guards that).
-
-**WI 4 — the render-target seam (`77f73fa1`).** A render is a *consumer* of the
-score, not a producer — so `RenderTarget` hangs on `TrackState` (a small `Vec`), not
-as an `AttachedContext`, and is fed from the materialize crossing: each
-newly-committed `Concrete` ABC cell's resolved ABC + a near-future instant go to
-every target. Two review fixes are baked into the seam. The instant is computed off
-a **jitter-free** reference — `last_fire_scheduled`, the heap entry's *scheduled*
-fire `Instant` latched in `fire_due`, NOT the `SystemTime` latched after the pop (the
-jittery *actual* wakeup) — so per-beat scheduler jitter never accumulates into the
-output (deepseek). And because the speculation lead means a device queue holds ~a
-phrase of future events, `stop`/`pause` call `flush_scheduled_after(now)` to truncate
-the tail rather than let the clock-stop play it out (both casts, SEV-1). The seam is a
-zero-CAS-read no-op when a track has no targets — the common case.
-
-**WI 6 — `AlsaMidiOut`, live on zorak (`508bc0c4`).** The one real target: opens an
-ALSA seq client + a subscribe-readable port + a started real-time queue. `emit`
-resolves the ABC to the WI 5 event stream and schedules each channel-voice message
-**relative** to now — `(at − now) + within-phrase-tick × secs-per-tick` — so we never
-have to sync the kernel's monotonic clock to the ALSA queue's clock; the per-tick
-duration comes from the ABC's own `Q:` tempo. Raw MIDI bytes go through the `alsa`
-crate's `MidiEvent` encoder (no bespoke seq-event construction). `flush_scheduled_after`
-drops the queue's pending OUTPUT and fires ALL_SOUNDS_OFF/ALL_NOTES_OFF direct on every
-channel. The loopback test (a reader port subscribed to the out port, assert four
-NoteOns arrive in ascending pitch order, then flush) is `#[ignore]` so CI without ALSA
-stays green — and it **ran live on zorak this session: passes**. (The encoder isn't
-`Send`, so it's built per-emit; `AlsaMidiOut` itself is `Send` because `alsa::Seq` is.)
-
-The decisive constraint from `docs/midi.md` held all the way through: the scheduler
-stays purely generative-local. There is no realtime pulse path — the heap, the
-generation/stale-drop logic, and zero-CPU idle are all untouched. M1 ships the system
-clock only; the `ClockSource` trait is shaped (estimate/remote-aware `next_fire`,
-the M3 heap-re-enlistment hook) so the drift-modeled MIDI-*in* clock slots in at M3
-without rework — but no `ClockEstimate` stub ships now (no dead-code theater).
-
-## Tracks Stage 3 — three clock-correctness fixes from the landed-code review (2026-06-30)
-
-Stage 3 generalised the clock source behind a `ClockSourceKind` enum and made tempo
-mutable mid-flight (WI 1 + WI 2, `2e3dc6c5`→`4c55a5dd`). We ran the usual two-voice
-review on the *shipped* code: deepseek's consult came back clean, and a gemini-pro
-**batch** (the resilient path under gemini's interactive 503s) surfaced three real
-correctness hazards we'd missed. All three are now fixed TDD — each with a test that
-fails against the old code. Full record: `docs/tracks.md` ("Landed-code review of WI 1
-+ WI 2").
-
-The headline one is a **silent-fallback data loss**, exactly the class CLAUDE.md tells
-us to crash over: a cold restart reverted a saved tempo. `set_tempo` persists
-`period_ms` to the `tracks` row *precisely so a restart recovers it* — but `attach`'s
-track-create path read the row only for the playhead and the score context, and armed
-the live clock from the attaching context's `BeatPolicy` DTO (which defaults to 120
-BPM). So the first re-attach after a restart quietly threw the saved tempo away. The
-fix builds an `active_policy` from the persisted row when one exists; the DTO is the
-seed only for a genuinely fresh track.
-
-The other two are latent traps the mutable-tempo work exposed in `engine.rs`.
-`commit_or_squash` validated the basis at `self.playhead` (the commit deadline) while
-`speculate` used the cell's `start` — so any resolver reading `ctx.now()` would
-mispredict and squash forever; dormant only because `CasCommitResolver` ignores
-`now()`. And `pump`/`tick_at` mapped `since_epoch × current_rate`, so a tempo change
-reinterpreted *all* of prior elapsed time at the new rate — a 120→240 jump would
-rocket the playhead decades ahead and fire every scheduled cell. `BeatScheduler` dodges
-it (it drives `advance_to` with event-counted ticks, never `pump`), but it was a public
-footgun. We removed `tick_at` and made `pump` integrate phase incrementally, so a rate
-change only re-rates time after it.
-
-The pattern across all three: WI 2 made the tempo *dynamic*, and each bug was a place
-that had quietly assumed the tempo was constant for all time. Gemini-pro's whole-repo
-read caught what a diff-focused pass would have missed.
-
-## Tracks Stage 2 — the score moves onto the track (2026-06-29)
-
-Stage 1 (earlier the same day, `f6478bdf`→`d43fe9aa`) moved the *clock* — playhead,
-beat_count, transport, the scheduler heap — from per-context onto a per-track
-`TrackState`. Stage 2 moves the other half: the **score** (the `Timeline`'s open
-future + committed cell log) off the per-context `Kernel.timelines` map and onto the
-track, so the score never leaves when a producer detaches or rotates, and N producers
-attached to one track share one open future. Canonical plan + the two-voice review:
-`docs/tracks.md` ("Stage 2 implementation").
-
-We designed it as a co-design round, then **stress-tested the locked design with two
-independent voices before cutting code** (the Stage-1 habit): DeepSeek (agentic, reads
-the repo itself) and a gemini-pro *batch* — and a side-lesson landed there: interactive
-gemini-pro 503'd hard under load while the batch sailed through on separate capacity, so
-batch is the resilient path for a big gemini-pro review (now an auto-memory). Both voices
-endorsed the design and converged on a subtle point — the squash/misprediction path is
-dormant for today's only resolver, and that's *correct*: two players landing a note at
-one tick should both commit (a chord), not cancel each other. They also caught the one
-real new mechanism the "concurrent producers are free" claim needs, and three
-implementation gaps; all folded into the tracker before coding.
-
-The headline decision (with Amy): the score's container is a **real per-track "score
-context"** (option C) — a normal, app-viewable context (`context_type="score"`, minted
-the `lost+found` way: real row + document + drift handle) whose Conversation document
-holds the materialized score, but which never takes a turn or hydrates. This reused the
-*entire* per-context block machinery via a real `ContextId` — no `TrackId` block-store
-API, no index/RPC ripple — and it embodies the doc's own thesis: the track persists, the
-players come and go. (Rejected: a synthetic ContextId, which would violate
-`handle_implies_row`; and a parallel `track_documents` store, which was the most new code.)
-
-The cut landed in increments so the tree stayed green: (1) a `TrackId`-keyed timeline
-registry on the Kernel; (2) the score context — a set-once `score_context_id` on the
-`tracks` row (the frequent tempo/playhead upserts mustn't wipe it) minted/recovered in
-`attach`; then (3) the breaking re-point — `schedule_abc_cell` + materialize route to the
-track timeline + score context, materialize **hoisted once-per-beat** out of the
-per-context loop (or N attached contexts would re-emit each cell), the cursor + failure
-ledger moved onto `TrackState`, and the shared failure ledger drained **per producer**
-(each `FailureEvent` now carries `played_by`, routed back to the producing context's
-conversation so a player reads its *own* failures). `KJ_HEARD` finally reads the score
-context — the real band view it had only ever claimed to be. The Stage-1 per-context
-bridge slew is gone; the track timeline's `advance_to` is the legit clock pump.
-
-The biggest sweat was the test migration: ~16 tests were welded to per-context timelines
-and `block_snapshots(ctx)`. The marker/clock tests now pre-arm the *track* timeline with a
-commit-margin-0 clock (idempotent, so the later `attach` keeps it) and read the score
-context; `second_context` became a genuine two-producers-share-one-score test; and a new
-`two_producers_failures_route_to_their_own_conversations` pins the concurrent-producer
-mechanism. 37 beat + 1266 kernel tests green; full workspace builds.
-
-Deferred (in `docs/tracks.md` "Still open"): persisting the in-RAM committed `Vec<Cell>`
-so the `UseLastGood` vamp-insurance pool survives a restart (the score *blocks* persist;
-the cell pool doesn't yet), and Stage 3 (the `ClockSource` trait + a MIDI driver).
-
-## Musician beat-state persistence + manual re-arm (2026-06-28)
-
-A kernel restart silently stopped every musician: auto-arm fires only on context
-*create*, so the scheduler's `armed` map came up empty on cold start and there was
-no verb to recover — a fail-silent that taxed every iteration on the runner (which
-restarts constantly). Amy's steer was to make re-arm **possible but not automatic
-yet**: ship the recovery path and the durable state it needs, but hold off on an
-automatic boot sweep.
-
-Two halves landed together. (1) **Durable `BeatPolicy`** — a new `beat_state`
-table mirrors each musician's live policy (period/beats-per-phrase/ooda) + lane;
-the scheduler writes it through on every policy mutation (`arm`, `set_tempo`), so
-the row never drifts behind the running `BeatState`. A db-less store (embedded/
-test) no-ops; a db-backed *write failure* is loud, never silent — a musician
-silently re-arming to the default tempo after a crash is exactly the fallback we
-reject. A corrupt row (zero period, empty track) reads back as a loud `Validation`
-error, not a silent default. (2) **`kj transport arm [--context]`** reconstructs
-the `Arm` from the persisted row (real tempo/cadence restored), falls back to the
-musician default + a label-slugged lane for a never-persisted musician, and
-refuses loudly on a non-musician. It arms *stopped* + OODA-armed (no surprise
-token spend — `kj transport play` starts the clock); the playhead reseeds from the
-block log's max tick via `arm()`'s existing virgin-only seed.
-
-This **decoupled** the old "sweep + persistence land together or not at all"
-bundle: persistence + a manual recovery shipped without the automatic sweep, which
-is now the deferred piece (the `rpc.rs:1270` cold-start recovery loop is the seam,
-once it's sequenced after the beat scheduler is wired). Not persisted: `beat_count`
-(the OODA phase counter resets on re-arm — the playhead is what carries musical
-position). `clear_beat_state` exists but waits on an archive RPC to call it. Tests:
-DB round-trip + corruption-loud + clear; scheduler write-through (arm + tempo);
-verb (persisted / default-fallback / non-musician-refusal). Memory:
-`project_chameleon`, `project_composer_transport`.
-
-## context_type decomposition — the beat moved from Rust to rc (2026-06-28)
-
-Immediately after shipping `kj transport arm`, Amy asked how deep the
-`context_type == "musician"` strings ran — and whether the real answer was to
-break musician-ness into features a context_type *consumes* rather than a name
-the kernel matches. The survey (written up in `docs/chameleon.md`) found the beat
-*runtime* was already decomposed — `on_turn_completed` and friends key off
-"armed", not the name — and the literal survived only at the create-time arm
-gates. Two of those were *duplicated* Rust blocks: `create_context_inner`
-(`rpc.rs`) and the `kj context create` builtin (`context.rs`) each carried the
-same `if context_type == "musician" { derive lane; send Arm }`.
-
-`kj transport arm` was the missing rc-callable primitive, so we executed the
-decomposition: a new `musician/create/S20-arm.kai` runs `kj transport arm`, and
-both Rust arm sites deleted — one rc script replaces the duplicated pair, and the
-two create-time string checks are gone. The arm verb's own gate dropped
-`== "musician"` for "does the label yield a track lane?" — arming is the opt-in
-(shared-trust: capabilities are nudges, not security), and a type-changed context
-still re-arms from its persisted row. Net effect: a context_type is a beat
-participant exactly when its `create/` rc arms it, so `funkMusician` /
-`lyricist_in_time_with_music` are now pure rc bundles with no kernel edit — and
-the `ContextType(String)` newtype became moot (zero beat-related string checks
-left), so we declined it rather than deferring.
-
-Two integration subtleties worth recording. (1) rc `.kai` scripts run
-**privileged** (`materialize_context_kaish_rc`), so the rc `kj transport arm`
-clears the Transport cap gate under the musician's narrowed loadout. (2)
-`test_dispatcher` doesn't call `set_self_arc`, so `kj`-inside-rc falls back to
-bare kaish and silently no-ops — which is why the existing musician-create test
-passed for the *wrong* reason (it was testing the Rust arm, not the rc). Rewiring
-that test to `Arc::new(test_dispatcher()).set_self_arc()` turned it into a real
-end-to-end check: create musician → rc runs → `BeatCommand::Arm` fires. One honest
-behavior change: arming with no beat scheduler wired now surfaces a LOUD rc Error
-block instead of a quiet `log::warn` (embedded/test only; the server always wires
-a scheduler). Memory: `project_chameleon`, `project_rc_lifecycle`.
-
-## Rotate action — the page-turn lands (2026-06-28)
-
-With `kj transport arm` now an rc-callable primitive, the long-deferred rotate
-ACTION became writable. The scheduler trigger was already built (at a phrase
-horizon it stops the parent synchronously and fires the `rotate` lifecycle); what
-was missing was the lifecycle being *wired* (`rotate` wasn't in `verb_is_wired`,
-so it silently no-op'd) and the rc script itself. Both landed:
-`musician/rotate/S10-rotate.kai` = `kj fork --preset spawn --switch && kj transport
-arm && kj transport rotate --every $ROTATE_EVERY && kj transport play`. The
-`--switch` moves the rc shell onto the freshly-forked child so the bare transport
-calls target it — no context-id capture in shell. Chained with `&&` so a failed
-fork can't fall through and re-arm the parent the scheduler just stopped.
-
-Two enablers fell out of writing it. (1) A spawn-fork is *labelless*, and a
-forked player must keep the parent's **track** anyway (the lane is the durable
-identity across a fork-lineage — UseLastGood/$HEARD are per-track). So fork now
-copies `beat_state` parent→child (`insert_forked_context`, alongside the
-binding/env copy); the child's `kj transport arm` finds the inherited row and
-re-arms on the parent's exact lane + policy, not a label slug. (2) The scheduler's
-`rotate_every_phrases` is a runtime BeatState field that doesn't travel with the
-fork (re-arm starts un-rotating, like stopped/ooda), so the song would turn once
-and stop — fixed by seeding `$ROTATE_EVERY` into the transport vars when rotating,
-which the rc replays onto the child.
-
-The end-to-end test fires the `rotate` lifecycle and asserts the three child
-commands in order (Arm on the parent's track, SetRotate at the same cadence, Play)
-plus that the child is a real fork. Honest remaining gap, recorded in issues.md:
-**tick continuity** — a thin child has no committed blocks, so its playhead seeds
-from `max_tick`=0 and musical time *resets* across the page-turn. The fix is the
-chameleon retire-history-and-carry-tick invariant, still unbuilt; until then the
-page-turn restarts the timeline. Memory: `project_chameleon`,
-`project_rc_lifecycle`.
-
-## Chameleon / musician — first loop reached MIDI (2026-06-13, `da59499`)
-
-The musician (né composer) transport + OODA loop reached its headline: the first
-Chameleon loop produced MIDI end to end. Players are tool-free by design (a small
-local model handed the full palette stalls the turn); a player's turn text *is*
-the score (`on_turn_completed` eager-parses ABC). The remaining work — the
-rotate-action rc script, the `--ooda-every` cadence knob, the windowed-notation
-pull primitive (slice 5) — is parked in issues.md. Memory:
-`project_chameleon`, `project_chameleon_first_loop`, `project_composer_transport`.
-
-## Gemini-CLI cache/cost decisions + `McpHookPhase` rename (2026-06-24)
-
-A design session read the Gemini-CLI feature comparison (`docs/issues.md`) through one
-lens: **the Anthropic prompt cache is a prefix match — any byte change in `tools →
-system → messages` invalidates everything after it.** That reframes several "cheap
-wins" as cache footguns (date/cwd in the system prompt is a silent invalidator; the
-fix is *where* it lands, not whether) and several cost levers as cache costs (model
-switching is model-scoped, so classifier routing must be fork-grained). The converged
-decisions are durable in `issues.md` → *Cache & cost — decided direction*: EMA (not PID)
-for the chars→tokens calculator calibrated by provider `usage`; compression dropped
-(SQLite-on-btrfs + organic ~80% flush-to-signoff covers it); a per-turn
-`BeforeModelTurn`/`AfterModelTurn` seam with a **mechanics(Rust) / policy(data) /
-decisions(kaish-hook)** split, so "gemini retries differently" is a policy row, not a
-code fork; hook contract = `HookAction` verdict + stdout→block payload (append-only,
-so a hook physically can't rewrite the cached prefix).
-
-Landed in code: **`HookPhase` → `McpHookPhase`** (108 refs / 10 files). All five
-variants (`PreCall`/`PostCall`/`OnError`/`OnNotification`/`ListTools`) fire around the
-MCP broker, so the *enum* was scoped rather than prefixing each variant — and the
-model-turn seam becomes a clean sibling. Persistence is decoupled (`phase_to_str` maps
-to stable `pre_call`… strings), and the DB is empty anyway, so no migration. Module +
-enum docs now state the MCP scope and forward-reference the sibling surface.
-`cargo build -p kaijutsu-kernel -p kaijutsu-server` green. Remaining prep (input-limit
-table, EMA calculator, `RetryPolicy`, the sibling phase enum + its open reuse-vs-parallel
-fork) is logged in issues.md.
-
-## 2026-06-30 — kaijutsu-abc spec-conformance round (kaibo three-model audit)
-
-Ran a holistic ABC v2.1 conformance audit on the `abc` crate using kaibo: two interactive
-deepseek consults on the semantic core, plus gemini-pro and claude-opus **batches** each
-handed the full verbatim spec cache (`docs/abc-spec-cache.md`) + all 38 src/test files (no
-diff — holistic, the way we like it). High cross-model agreement. The spec-in-context paid
-off twice over: it let us *reject* a confident "SEVERE cross-octave accidental" finding —
-ABC's `%%propagate-accidentals` defaults to all-octaves, so the code was already right.
-
-Fixed 14 real bugs, strict TDD (failing test first), suite 320 → 336 green, zero regressions.
-Highlights: `Q:` tempo ignored the beat unit (half-note tempos played at half speed);
-multi-measure `Z` ignored the meter denominator (2× in 6/8); tuplets silently dropped inner
-rests/chords; `K:` explicit accidentals never reached MIDI (`K:Hp` lost its C#); sharp-minor
-keys got flats instead of sharps; chords ignored inner note durations; a tie carrying an
-accidental across a bar line left a **hung MIDI note**; and — the big one — first/second
-variant endings weren't expanded at all (`|1…:|2…` played both endings once instead of
-selecting per pass). The variant-ending fix needed the bar tokenizer normalized first
-(`|2` had been mislabeled `FirstEnding`).
-
-Remaining open items (MED/LOW) recorded in `docs/issues.md`; engrave has its own copies of
-the tuplet + key-signature bugs to revisit when we turn to rendering. Next: Round 2 — deeper
-edge-case / round-trip / malformed-input testing — then rendering.
-
-### 2026-06-30 — abc Round 2: reliability test net (+ a div-by-zero the fuzz caught)
-
-Added `tests/robustness.rs`: the parse→to_midi→to_abc→parse pipeline must never
-panic on adversarial input, NoteOns/NoteOffs must balance (no hung notes) across
-ties/slurs/chords/tuplets/repeats/endings, the SMF must be well-framed (incl.
-multi-voice format-1), and round-trips must preserve the pitch sequence. The
-adversarial corpus immediately found a real divide-by-zero: `L:1/0` (and `M:0/0`,
-`A/0`) carried a zero denominator into the tick math. Guarded all four tick-math
-sites — a parser over untrusted ABC must degrade, not panic. Also ratcheted the
-spec-fixture warning baseline 59 → 49 (the `A//` and `|2`/`:|N` fixes removed
-unknown-character warnings). Suite now 340 green.
-
-### 2026-06-30 — abc MED/LOW sweep (6 more fixes)
-
-Cleared the remaining medium/low spec items so MIDI + parse are fully aligned
-before rendering: `X` invisible multi-measure rest; broken rhythm now transparent
-to grace notes and accepts chords on either side (§4.4/4.12/4.17); inline mid-tune
-`[M:]`/`[L:]` take effect in MIDI (per-voice unit-ticks/meter made mutable, joining
-the `[K:]` handler); `%%MIDI transpose N`; short-form letter decorations H/T/u/v
-parse before their note (the old guard rejected every alphabetic follower, so they
-never fired — 4 `#[ignore]`d tests un-ignored); and the dead `ast::Note::to_midi_pitch`
-helper + its tests were aligned to the live uppercase-C=middle-C convention. Spec
-fixture warning rail ratcheted 49 → 44. Suite 345 → 349. Left for later (in
-issues.md): grace-note MIDI (needs a timing decision), tuplet default-q in compound
-meter (high-churn, rare), and the lyric-alignment items (rendering phase).
-
-### 2026-06-30 — grace notes sound in MIDI (steal-from-next)
-
-Grace notes now play (the support matrix had claimed midi all along). Each grace
-runs ~1/8 of a unit note, the run capped at half the principal's duration, and the
-time is stolen from that principal note so the beat grid is preserved — `{ga}c d`
-sounds g,a then a shortened c, with d still landing on the beat. Wired into both
-the single-track and per-voice paths via a shared `play_grace_run` helper; the
-robustness note-balance test confirms no hung notes. (User picked steal-from-next
-over an honest matrix downgrade.) Suite 349 → 350.
-
-### 2026-06-30 — rendering phase begins: the engraver's parallel bugs
-
-Started the engrave audit (kaibo over engrave/). First fixed the two bugs the
-earlier audit flagged as living in BOTH midi.rs and the engraver: (1) the
-key-signature computation in layout.rs was an exact copy of the pre-fix major-only
-table, so sharp-tonic minor/modal keys (G#m, D#m, A#m) drew the wrong accidentals —
-fixed at the root by extracting one shared `Key::signature()` on the AST that both
-the MIDI generator and the engraver call, so they can't drift again; (2) the
-layout Tuplet arm dropped inner rests and chords (same shape as the old MIDI bug) —
-it now renders notes, rests and chords at the q/p-scaled width. Suite 350 → 352.
-The broader engrave audit is still running; more rendering fixes to come.
-
-### 2026-06-30 — engrave correctness sweep (kaibo audit → 6 more fixes)
-
-The engrave audit (kaibo/deepseek) confirmed the two parallel bugs (already fixed)
-and surfaced a dozen rendering issues; verified each against the IR before acting
-(and rejected one — "redundant key-sig accidentals" — the parser doesn't stamp
-key-sig accidentals onto notes, so K:G FFFF draws exactly 1 sharp). Fixed, TDD with
-IR-level assertions in engrave_tests.rs: augmentation dots on dotted notes/rests
-(the engraver had NO dot logic — every dotted rhythm rendered as undotted); chord
-noteheads a second apart now offset to opposite sides of the stem instead of
-overlapping; invisible rests (x/X) draw nothing; whole rests hang a line higher
-than half rests; and M:none no longer draws a spurious 4/4. Suite 352 → 357.
-Remaining engrave items (tuplet bracket/number, multi-measure H-bar rest, inline
-[K:] redraw, middle=, grace notehead glyph, SourceSpans) logged in issues.md.
-
-### 2026-06-30 — engrave: multi-measure H-bar rest + tuplet bracket
-
-Two more visible rendering gaps closed. A multi-measure rest (`Z4`) now draws the
-conventional thick horizontal H-bar with vertical end-caps and the bar count
-numeral above the staff, instead of a lone single-bar rest glyph + empty space.
-Tuplets now get a bracket (a horizontal line with downward end-ticks) and the
-tuplet numeral centered above the group. Both verified visually (rsvg → PNG): the
-`Z3` H-bar with its "3" and the `(3` brackets render correctly. Suite 357 → 359.
-Noted a small title/tuplet-bracket overlap as polish. Remaining engrave items:
-inline `[K:]` staff redraw, `middle=`, the small grace-notehead glyph, SourceSpans.
-
-### 2026-06-30 — engrave: mid-staff inline [K:] clef/key change
-
-The last SEVERE engrave gap: a mid-tune [K:clef=bass] (or [K:bass]) was dropped by
-the renderer's catch-all, so the staff kept reading in treble even though MIDI had
-already switched. render_staff's ctx is now mutable; on an inline K: field the
-engraver re-parses the key, and (a) if the clef changed, updates ctx.clef, draws a
-new clef glyph, and every following note repositions automatically through pos_for;
-(b) if the value names a key root (A–G), redraws the key signature at that point.
-A bare clef change (value not starting A–G) leaves the key signature alone, so
-[K:clef=bass] doesn't wrongly wipe the current key. Verified visually: CDEF…|[K:bass]
-draws the F-clef and drops the following notes into bass-clef positions. Suite 359→360.
+How kaijutsu and its ideas took shape — an evolving narrative, not a standup
+log. `git log` is canonical for what landed and when; the design docs under
+`docs/` hold the current designs; `docs/issues.md` holds what isn't built yet.
+This file keeps the story: the arcs, the decisions, and why they went the way
+they did. It reads oldest → newest, like the story it is.
+
+Maintenance: fold new work into the chapter it belongs to; open a new chapter
+only for a genuinely new arc; compress chapters as they cool. Commit hashes,
+test counts, and day-by-day detail live in git history — including this file's
+own history, where the fine-grained entries this narrative was melted from
+survive intact.
+
+## Prologue — the first five months (January–May 2026)
+
+Kaijutsu started 2026-01-15 as "what if my agent had a Bevy frontend and its
+own shell." The first two days produced a UI shell, a Quake-style console, and
+an SSH + Cap'n Proto connection layer; kaish was embedded by day three. The
+ancestry is sshwarma — an SSH MUD that grew an equipment system for models and
+nerdsniped its author into the context problem — and hootenanny, a retired pile
+of music-model experiments. The README's developer note tells that part.
+
+The months after built the body a layer at a time:
+
+- **February** — the type system consolidated (`kaijutsu-types`, `ContextId`
+  everywhere), contexts learned to survive server restarts, and a first
+  constellation view drew contexts as a radial graph.
+- **March** — CRDT correctness (Lamport clocks, fork semantics, order keys),
+  DocumentDb + KernelDb unified into one database, and the app moved to MSDF
+  text + per-block Vello textures — the rendering stack it still rides.
+- **April** — the tool system was redesigned around the MCP broker (everything
+  routes through it, builtins included, as a virtual in-process MCP), and the
+  CAS crate landed.
+- **May** — the ABC crate's first deep spec push (lyrics, repeats, endings), a
+  Haiku-driven live-eval harness, kernel-wide timeout policy.
+
+Two demolitions shaped the toolchain along the way: the Rhai engine was removed
+outright once kaish could carry scripting alone, and rig-core was dropped for
+hand-rolled LLM providers (Claude + OpenAI-compat + DeepSeek) — the "unrig" —
+because owning the wire layer is what later made cache breakpoints, CAS image
+memoization, and per-role model routing tractable. The sibling projects matured
+alongside: kaish grew up rapidly inside kaibo, which is in many ways the
+pragmatic take on what kaijutsu explores maximally.
+
+## The stance arrived mid-flight
+
+The framing ideas weren't written first and implemented after; they
+crystallized while building, mostly once the music work made "players" stop
+being a metaphor.
+
+**Instrument, not harness.** Kaijutsu is something you play — you, a model,
+anyone with a connected app; many hands on one keyboard. The kernel is the
+instrument's body: it supplies what a turn needs without playing the turn.
+That reframe (and the composer→musician, explorer→toolie renames that came
+with it) lives in `docs/instrument-design.md`.
+
+**Shared trust, crosstalk-as-feature** (settled late June). The
+privilege-asymmetry question — should sibling contexts be defended from each
+other? — resolved as won't-fix-by-design: every player is inside the trust
+boundary; the kernel runs as one unix user and the real boundaries live
+outside it. Capabilities and loadouts are ergonomic nudges for focus and
+mistake-prevention, never security; your neighbor's wrong note is one you
+cover.
+
+**Context vs conversation** is the load-bearing invariant underneath
+everything: the context is the durable, multi-writer CRDT side; the
+conversation is the append-only live session hydrated from it at boundary
+events. `block exclude`/`edit` land at the next hydrate — remediate a poisoned
+conversation by excluding in context, then forking. The per-context mailbox is
+the atomicity gate that keeps must-travel-together blocks from being split by
+unrelated writers.
+
+**No first-class "agent."** An actor is always a Principal; agent-ness emerges
+from fork and drift, not from a noun in the schema.
+
+## The kernel becomes sole owner of itself (mid-June)
+
+A silent-fallback bug in rc loading turned into the biggest structural decision
+of June: rather than patch the dual-ownership cluster (stale-bytes reads,
+append file-wipes, mtime no-ops, stale rc seeds), we **deleted the class** —
+the CRDT became the sole owner of `/etc/rc` and `/etc/config`, seeded once from
+embedded defaults under `assets/defaults/`, with no host file and no
+write-through. There is nothing to `vim`; `kj rc edit` / `kj config set` are
+the surfaces, and `kj rc reset` restores an embedded default. The bespoke
+debounced-flush/watcher backend was deleted rather than fixed. Design:
+`docs/config-crdt-ownership.md`.
+
+The same weeks put teeth in the fail-loud posture:
+
+- **builtin.file corruption post-mortem.** The kernel's `edit` tool fed BYTE
+  offsets into the CHARACTER-indexed CRDT — a silent splice on any file with
+  multibyte UTF-8 before the edit site, while honestly reporting success.
+  Fixed with byte→char conversion, fail-loud post-write verification (crash
+  over corruption), and hashline addressing (`read` prints `LINE:hash→`,
+  `edit` re-verifies anchors before writing).
+- **The external MCP shell hang** was root-caused to executor starvation on
+  the client's single-threaded RPC LocalSet, made *permanent* by a server reap
+  that broke subscriptions on the first 5s stall. Fixes: tolerate transient
+  stalls (reap only after consecutive failures), client re-subscribes on
+  timeout, and the MCP's block subscription scoped to its joined context. A
+  300s command dropped to 285ms against a busy 24-context kernel.
+- **`FileAttr.generation`** split the cache-coherence stamp from display
+  mtime: a monotonic per-backend counter is the coherence primitive; mtime is
+  for humans. Two writes in one clock tick can no longer alias, `cp -p` stops
+  silently losing mtime, and SFTP's future TOCTOU re-verify shares the same
+  primitive.
+
+June 24's cache/cost design session added the lens that still guides prompt
+plumbing: the Anthropic prompt cache is a prefix match, so *where* a byte lands
+matters more than whether. The per-turn hook seam splits mechanics (Rust) from
+policy (data) from decisions (kaish hooks), and hook output is append-only so a
+hook physically can't rewrite the cached prefix.
+
+## The music stack — from one loop to a band on the wire (June 13 → July 3)
+
+The longest arc, and the one that forced most of the system's ideas to get
+real. Canonical designs: `docs/chameleon.md`, `docs/tracks.md`, `docs/midi.md`,
+`docs/pcm.md`, `docs/clips.md`, `docs/hyoushigi.md`.
+
+**The chameleon loop (June 13).** The first loop reached MIDI end to end:
+models playing to a beat, a player's turn text *being* the score
+(`on_turn_completed` eager-parses ABC). The hard-won constraint: players must
+be tool-free — a small local model handed the full palette stalls the turn.
+Players are rc programs; a musician is a context attached to a beat track.
+
+**Tracks: the score outlives the players (June 28–30).** Three stages moved
+the music substrate off contexts and onto a durable per-track model. Stage 1
+moved the clock (playhead, transport, scheduler heap); Stage 2 moved the score
+itself — its container is a real, app-viewable per-track **score context**
+(minted the lost+found way), which reused the entire per-context block
+machinery and embodies the thesis: *the track persists, the players come and
+go*. N producers share one open future; failures route back per-`played_by` so
+each player reads its own mistakes. Stage 3 generalized the clock behind
+`ClockSourceKind` and made tempo mutable — and the landed-code review caught
+three places that had quietly assumed tempo was constant for all time,
+including a silent-fallback restart data-loss (exactly the class we crash
+over). Along the way `context_type` decomposed into rc: musician-ness became
+"your create/ rc arms you" rather than a string the kernel matches, and the
+rotate page-turn became a five-line rc script (fork → arm → rotate → play)
+riding beat-state that now travels with a fork.
+
+**First sound (June 30).** A Haiku musician composed a line and it came out of
+a synth: ABC turn → track timeline → materialize → ALSA seq → TiMidity →
+speakers. The unit tests had been green for weeks; the acceptance test was
+audible. Then a *local* model took the chair: a gemma4-e4b bass, dialed in by
+making the prompt small-model-foolproof (`L:1/4`, one note per beat, no
+duration numbers, low register) and having the tick rc precompute bar targets
+in kaish — continuous bar-filling bass, "lovely harmony." The gig itself
+(key, register, vamp) is still hardcoded in the tick prompt; the producer's
+chart layer is future work.
+
+**The docs learned to stay present-tense (July 1).** After three intense weeks
+the music docs taught superseded mechanisms as current — "living" had come to
+mean *stratified*: direction notes on top of superseded status on top of good
+design. The fix wasn't more banners; it was moving chronology to the devlog and
+git history and letting each doc state the present. `playback.md` was retired
+outright (its surviving ideas moved to `pcm.md`, each marked with what
+superseded the rest). A tri-model review of the harmonized suite then settled
+the render question below.
+
+**Render convergence: bytes never ride the track (July 1–2).** Two decisions,
+named out loud in `docs/midi.md`: we take real time seriously by *refusing to
+chase it* — micro-batch, promise only what we can hit, a speculation lead of
+seconds; only the final sub-lead scheduling on the node that owns the gear is
+hard-realtime. And MIDI + samples converge on one mime-keyed wire cue,
+`RenderCue { mime, payload: Inline | Cas, lead }` — a placed sample is a *clip
+cell* (CAS ref + placement); bytes prefetch out-of-band. The app became the
+first MIDI sink (it already had the ABC crate, so it renders symbolic ABC at
+the sink), the materialize crossing publishes cues, stop/pause publish a flush
+cue — and once parity was proven by ear, the entire in-process render path was
+demolished (~1000 lines: `RenderTarget`, `AlsaMidiOut`, the server's `alsa`
+dep). The kernel binary links no audio FFI; a headless kernel makes no sound,
+but the score is preserved and replayable — silence-now is never lost work.
+
+**The metronome (July 2).** Built to settle a reviewer split about whether the
+per-cue anchor and a continuous timebase compose (measure, don't assume). The
+first cut sloshed — integrator wind-up in the slew — replaced by a
+feedforward-tempo P-phase controller: run at the reference tempo directly,
+correct only phase by a small bounded step. Inter-click stddev fell from 50ms
+to 0.7ms. Clicks are pre-scheduled into the ALSA queue (not fired at frame
+time), references are low-rate, and a flush cue silences the phasor on stop.
+
+**Clips (July 1).** A seven-industry survey of cue systems
+(`docs/cue-prior-art.md`) found every industry re-inventing the same six field
+clusters — half already on hyoushigi's `Cell`. So **Cell does not expand**;
+Shape A is a versioned `application/vnd.kaijutsu.clip+json` payload (media hash
++ mime + required human label + source range + gain + extension bag), tempo
+default tick-anchored/no-stretch, trigger semantics in the transport, never
+the committed record. No standalone format unless interchange knocks: OTIO won
+model-first, AES31 stalled format-first.
+
+**`/v/blobs` — the CAS pool made reachable (July 2).** The clip design needed
+"sync the CAS to the client," and track B went design → audible demo in one
+arc: harden `kaijutsu-cas` first (atomic store, TOCTOU-free retrieve,
+validating `ContentHash` deserialization — the client cache is multi-process
+and a cache hit never re-hashes, so a torn object would be truth forever);
+a read-only `CasFs` VFS backend at `/v/blobs` where immutability makes the
+hard problems trivial; a client `BlobResolver` over its own SFTP connection
+(SFTP futures are Send, the capnp world is !Send — they must not mix) that
+re-hashes every fetch and hard-errors on mismatch; and the app sink consuming
+CAS cues off a dedicated runtime. The review earned its keep: gemini caught
+two real concurrency bugs (a transport-error handler that could wipe a fresh
+connection, a single-flight lock leaked on cancellation) that both the author
+and deepseek missed. Verified by ear: `kj cas put` → `kj play --cas <hash>` →
+SFTP fetch → hash-verified XDG cache → speakers. One scar worth the telling:
+kaish's overlay *reserves* `/v/blobs`, so `kaish ls` shows an empty shadow
+while SFTP serves the real pool — an hour lost, a gotcha memory written.
+
+**Music demo #1 post-mortem (July 3).** The first attempt to run the whole
+band as a demo burned a director's turns on stale docs advertising the
+demolished `kj transport render`, then found the app's ALSA port unwired, then
+found kaish couldn't run `aconnect` at all. The docs got supersession banners;
+the deeper fix was **subprocess exec** (below).
+
+## ABC grows up (May, then June 30)
+
+The notation crate got its second, harder conformance push as a kaibo
+three-model audit with the verbatim ABC v2.1 spec in context — which paid off
+twice over, once by finding bugs and once by *rejecting* a confident wrong
+finding (the code's accidental propagation was already spec-correct). Fourteen
+real bugs fell TDD-first: tempo beat-units, compound-meter rests, tuplets
+dropping inner rests/chords, key-signature accidentals never reaching MIDI, a
+tie carrying an accidental across a bar line leaving a hung note, and variant
+endings not expanding at all. A robustness net followed (parse→midi→abc→parse
+must never panic; NoteOns/NoteOffs must balance) and immediately caught a real
+divide-by-zero (`L:1/0`) — a parser over untrusted ABC degrades, never panics.
+Grace notes now sound (steal-from-next, beat grid preserved). The engraver
+turned out to carry exact copies of two MIDI bugs, fixed at the root by
+extracting one shared `Key::signature()` both call — so they can't drift again
+— followed by a rendering sweep (augmentation dots, H-bar rests, tuplet
+brackets, mid-staff `[K:]` clef changes).
+
+## The app — text, wells, and carousels
+
+**The vi editor (June 23).** Editing is a kernel-owned session — `EditorCore`
+(pure modalkit vim) behind kernel `EditorSessions`, with the Bevy app one
+renderer among many drivers. Three front doors (`vi` builtin, `kj rc edit`,
+MCP) share one primitive. The feared render-path collision evaporated by
+decision: the app renders from a kernel-served editor-state channel and never
+joins the editor context into its document cache. The app-id addressing
+infrastructure (per-window instance, server-stamped principal, identity-guarded
+self-detach) landed as its groundwork.
+
+**The time well.** The context browser went through more visible evolution
+than anything else in the project — the constellation of February became a
+compacting spiral, then a tilted vortex with an accretion-disk throat and
+odometer navigation; cards moved off `StandardMaterial` onto a full-GPU SDF
+card material with MSDF text crisp at any zoom; HDR + bloom collapsed onto one
+shared always-on camera so only the card FX bloom. Kernel-derived live status
+rides the existing poll (thin client, smart kernel); drift endpoints shimmer.
+
+Then July 3 made it navigable in one long live-tuned day: idle-age **bands**
+keyed on a new `last_activity_at` (stamped at the one journal chokepoint;
+status reads became an O(1) cached bump instead of an every-5s full rescan) —
+resurfacing proven live by drifting a probe into the second-oldest context and
+watching it jump to the mouth. Terraces grew ornate counter-rotating
+magic-circle rings ("it looks so cool"), cards stood up as slides radiating
+from the funnel; and the terraces became a **Kodak-Carousel** the user drives:
+one ring per band, left/right spins the focused ring so the selected card eases
+face-on to a gate angle, up/down changes rings, non-focused rings dim
+("fantastic… I'm delighted"). The open design thread is ring *membership* —
+explicit hot-row promotion verbs plus coarse (days) auto-decay, replacing
+all-or-nothing idle bucketing.
+
+**Conversation view hardening (July 3).** Two long-standing irritations fell
+in one arc. Error blocks stuck to the bottom traced to Bevy child-ordering
+choreography: three mutations changed order without bumping the re-sort gate,
+and `replace_children` silently un-parented missing entries into leaked root
+nodes — now fail-loud. The "text loads with holes" bug split into a benign
+self-healing transient and two silent forever-failures: a full MSDF atlas
+respawned generation tasks every frame — infinite CPU churn wearing a
+missing-glyph costume — and missing font data retried unbounded. The atlas now
+grows to a 4096 cap, terminal failures land loud, and kanji-heavy documents
+(the motivating case — 日本語 conversations) keep their glyphs.
+
+## Wires and surfaces
+
+**One channel, named subsystems (June 26).** The RPC transport moved off a
+positional three-channel scheme (two of which existed only to pad the ordinal)
+onto a single channel requesting the `kaijutsu-rpc` subsystem by name — the
+shared retention-and-dispatch scaffold SFTP and future subsystems hang off as
+additional match arms. A flag-day cutover, no compat shim; early dev, single
+user. The client actor also stopped lazy-connecting: it dials as soon as it
+can, because the early connected/failed signal is worth more than deferring —
+the first call after a cold start no longer bounces.
+
+**SFTP + the VFS.** The full SFTP server adapter serves `kernel.vfs()`
+directly; the generation counter (above) is its coherence primitive; `/v/blobs`
+(music chapter) is its first growing pool. Track V (`/v/ctx`, `/v/session`)
+and adapter limits are the open follow-ups in `docs/slash-v.md` / issues.md.
+
+**Subprocess exec (July 3).** The music-demo post-mortem's real fix: kaish's
+`subprocess` feature turned on behind a new `exec` loadout authority
+(deny-by-default at materialization; coder/mcp/default/director seeds carry
+it, musician/toolie never), `MountBackend::resolve_real_path` made real, and
+`$PATH` seeded from the kernel env. Verified live from inside a context shell
+— including re-making the TiMidity wire with `aconnect`. The direction locked
+with Amy inverts the mount posture entirely: an *opaque host* — drop the
+read-only `/` mount, curate PATH-dir bin mounts per context_type, VFS-mediated
+resolution upstream in kaish.
+
+## How we work — the ritual and its lessons
+
+The practices that survived contact, recorded because they're the real product
+of six months:
+
+- **The house review ritual:** two models outside our family read the *whole
+  files*, no diff — typically a gemini-pro batch plus a deepseek agent over the
+  same surface — so they evaluate holistically. Cross-model divergence is the
+  point: each has caught real bugs the other and the author missed. Batch is
+  the resilient path for gemini-pro; interactive 503s under load, batch
+  capacity sails.
+- **When two competent readers model the topology differently, that is the
+  signal to go look.** The transport-ACK review's reviewers disagreed on
+  threading; tracing it found a no-deadlock property that held only because
+  one function stayed fully synchronous — now a documented invariant rather
+  than an accident. Diagnose from the code, not a reviewer's summary.
+- **Two voices at design time.** Big cuts (Tracks Stage 2, the render
+  convergence) get stress-tested by independent models *before* code; the
+  findings fold into the tracker, not a rewrite later.
+- **TDD, red-first, and crash over corruption.** The recurring bug class is
+  the silent fallback — restart tempo loss, byte/char splices, torn CAS
+  objects — and the recurring fix is fail-loud verification plus a test that
+  fails against the old code.
+- **Demolition as practice.** Rhai, rig-core, the config flush backend, the
+  in-process MIDI path, dead viz layout code — parity first, then delete
+  whole, never strand a transitional path. The score being durable is what
+  makes deleting renderers cheap.
+- **Docs are living, not stratified.** Chronology belongs here and in git;
+  design docs state the present. `docs/issues.md` deletes entries when they
+  ship. And the acceptance test for music is the ear.
+
+## Now
+
+As of 2026-07-04: subprocess exec just shipped and the first audible `kj play`
+after it is unverified; the time well carousel is in Amy's tuning hands; the
+render seam is fully on the wire with clip/PCM prefetch proven; open work is in
+`docs/issues.md` and the live handoff in `signoff.md` (ephemeral, repo root).

@@ -131,6 +131,26 @@ Parser and MIDI generator for ABC music notation. Produces a structured AST
 plus SMF format 0 MIDI bytes. Used by `abc_block` so models can compose music
 that renders as both standard staff notation and audio.
 
+### kaijutsu-audio
+
+FFI-free audio/render types: the mime-keyed `RenderCue` wire cue, the clip
+record (`docs/clips.md`), and the beat phasor/timebase used by the metronome.
+Sinks (the app, future edge nodes) own the actual hardware.
+
+### kaijutsu-hyoushigi
+
+拍子木 — the beat/timing substrate: tracks, timelines, cells, speculation and
+commit. The shared score that musicians (model contexts) play onto.
+
+### kaijutsu-editor
+
+Kernel-owned vi editing sessions (`EditorCore`, pure modalkit vim). The app is
+one renderer among many possible drivers; see `docs/vi.md`.
+
+### kaijutsu-viz
+
+Pure layout/geometry helpers for the time well context browser.
+
 ### kaijutsu-index
 
 Semantic vector indexing — local ONNX embeddings, HNSW nearest-neighbor
@@ -161,8 +181,8 @@ propagation through Cap'n Proto RPC, differentiated sampling rates via
 ### kaijutsu-app
 
 Bevy 0.18 GUI client with custom MSDF text rendering, vim-style focus-based
-input, a tiling window manager, and a constellation view for navigating
-contexts as a radial tree graph. See
+input, a tiling window manager, and the time well — a 3D ring-carousel context
+browser where contexts seat on rings by idle age. See
 [crates/kaijutsu-app/README.md](crates/kaijutsu-app/README.md) for details on
 text rendering, theming, and the UI architecture.
 
@@ -173,6 +193,7 @@ text rendering, theming, and the UI architecture.
 | Doc | Purpose |
 |-----|---------|
 | [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
+| [docs/devlog.md](docs/devlog.md) | The story of how kaijutsu took shape — arcs, decisions, lessons |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
 | [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
 | [docs/issues.md](docs/issues.md) | Live work items not yet in code |
