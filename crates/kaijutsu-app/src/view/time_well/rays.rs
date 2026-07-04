@@ -196,7 +196,12 @@ pub fn sync_track_rays(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TrackRayMaterial>>,
 ) {
-    if !state.is_changed() {
+    // Run when the roster changed OR when the entity count disagrees with it —
+    // the count fallback covers well re-entry (exit despawned the rays but the
+    // roster survived, and an unchanged re-poll won't dirty the resource) and
+    // dodges the screen-gated change-detection footgun, same as
+    // `sync::sync_time_well` (found by the DeepSeek review, 2026-07-04).
+    if !state.is_changed() && state.ray_entities.len() == state.tracks.len() {
         return;
     }
 
@@ -378,6 +383,42 @@ mod tests {
                 .map(|n| ContextId::from_bytes([*n; 16]))
                 .collect(),
         }
+    }
+
+    /// Regression (DeepSeek review, 2026-07-04): exit despawns the rays but
+    /// the roster survives in `WellTracks`; if the next poll returns the SAME
+    /// roster, nothing dirties the resource — the count fallback must still
+    /// respawn the beams on re-entry.
+    #[test]
+    fn rays_respawn_after_exit_even_with_an_unchanged_roster() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        fn ray_count(app: &mut App) -> usize {
+            app.world_mut().query::<&TrackRay>().iter(app.world()).count()
+        }
+
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<TrackRayMaterial>::default())
+            .init_resource::<WellTracks>()
+            .add_systems(Update, sync_track_rays);
+
+        app.world_mut()
+            .resource_mut::<WellTracks>()
+            .set_tracks(vec![track("bass", 9, &[1])]);
+        app.update();
+        assert_eq!(ray_count(&mut app), 1, "ray spawned for the track");
+        app.update();
+        assert_eq!(ray_count(&mut app), 1, "settled roster spawns nothing new");
+
+        // Exit the well: rays despawn, the roster stays (the real exit path).
+        app.world_mut().run_system_once(despawn_track_rays).unwrap();
+        assert_eq!(ray_count(&mut app), 0, "exit leaves no rays");
+
+        // Re-enter with no roster change (an unchanged re-poll never calls
+        // set_tracks): the count fallback alone must respawn the beam.
+        app.update();
+        assert_eq!(ray_count(&mut app), 1, "re-entry respawns from the surviving roster");
     }
 
     #[test]
