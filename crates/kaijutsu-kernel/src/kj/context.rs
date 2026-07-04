@@ -2364,10 +2364,17 @@ mod tests {
         assert!(d.kernel().set_beat_ingress(tx), "test owns the ingress");
         let (cmd_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(crate::hyoushigi::BeatRequest { command, reply }) = ingress.recv().await {
-                let _ = cmd_tx.send(command);
-                if let Some(reply) = reply {
-                    let _ = reply.send(Ok(()));
+            while let Some(req) = ingress.recv().await {
+                match req {
+                    crate::hyoushigi::BeatRequest::Command { command, reply } => {
+                        let _ = cmd_tx.send(command);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    crate::hyoushigi::BeatRequest::Snapshot { reply } => {
+                        let _ = reply.send(Vec::new());
+                    }
                 }
             }
         });

@@ -303,6 +303,9 @@ enum RpcCommand {
     ListContexts {
         reply: oneshot::Sender<Result<Vec<ContextInfo>, CallError>>,
     },
+    ListTracks {
+        reply: oneshot::Sender<Result<Vec<crate::rpc::TrackInfo>, CallError>>,
+    },
     Conclude {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
@@ -583,6 +586,7 @@ impl RpcCommand {
             Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListTracks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -742,6 +746,13 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, CallError> {
         self.send(|reply| RpcCommand::ListContexts { reply }).await
+    }
+
+    /// List every track's live state (docs/tracks.md). Empty when no tracks
+    /// exist or the kernel runs without a beat scheduler.
+    #[tracing::instrument(skip(self))]
+    pub async fn list_tracks(&self) -> Result<Vec<crate::rpc::TrackInfo>, CallError> {
+        self.send(|reply| RpcCommand::ListTracks { reply }).await
     }
 
     /// Conclude a context — the explicit "done" act (sets `concluded`/stamps
@@ -2383,6 +2394,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::ListContexts { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_contexts());
+        }
+        RpcCommand::ListTracks { reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.list_tracks());
         }
         RpcCommand::Conclude { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));

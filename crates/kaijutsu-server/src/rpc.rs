@@ -2949,6 +2949,20 @@ impl kernel::Server for KernelImpl {
                         Err(_) => HashMap::new(),
                     }
                 };
+                // Context → track binding (one query for the whole kernel). The
+                // attachments table is transactional on attach/detach, so —
+                // unlike the playhead — the persisted rows ARE current. A
+                // context attaches to at most one track (docs/tracks.md).
+                let track_of: HashMap<ContextId, String> = {
+                    let db = kernel_db_arc.lock();
+                    match db.list_all_attachments() {
+                        Ok(rows) => rows
+                            .into_iter()
+                            .map(|a| (a.context_id, a.track_id))
+                            .collect(),
+                        Err(_) => HashMap::new(),
+                    }
+                };
 
                 // Read from the kernel's drift router — runtime authority for provider/model
                 let drift = kernel_arc.drift().read();
@@ -3011,6 +3025,11 @@ impl kernel::Server for KernelImpl {
                     // op, instead of a per-poll full block scan + reduce.
                     let live = documents.live_status(ctx.id);
                     c.set_live_status(status_to_capnp(live));
+
+                    // Track binding (empty = unattached; TrackIds are never empty).
+                    if let Some(track_id) = track_of.get(&ctx.id) {
+                        c.set_track_id(track_id);
+                    }
                 }
 
                 Ok(())
@@ -4449,6 +4468,48 @@ impl kernel::Server for KernelImpl {
             }
         }
         Promise::ok(())
+    }
+
+    /// Enumerate every track's live state (docs/tracks.md; the time well's
+    /// Stage 3 wire slice). Answered by the beat scheduler from its in-memory
+    /// `TrackState` map — never the persisted row, whose playhead lags. An
+    /// unwired scheduler (embedded/test kernel) answers with an empty list
+    /// rather than an error: "no scheduler" and "no tracks" look the same to a
+    /// viewer, and the well should render either as simply trackless.
+    fn list_tracks(
+        self: Rc<Self>,
+        params: kernel::ListTracksParams,
+        mut results: kernel::ListTracksResults,
+    ) -> Promise<(), capnp::Error> {
+        let kernel_arc = self.kernel.kernel.clone();
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_tracks");
+        Promise::from_future(
+            async move {
+                let tracks = match kernel_arc.request_track_snapshot() {
+                    Some(rx) => rx.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let mut list = results.get().init_tracks(tracks.len() as u32);
+                for (i, t) in tracks.iter().enumerate() {
+                    let mut b = list.reborrow().get(i as u32);
+                    b.set_id(t.id.as_str());
+                    b.set_score_context_id(t.score_context.as_bytes());
+                    b.set_playing(t.playing);
+                    b.set_playhead_tick(t.playhead);
+                    b.set_period_us(t.period.as_micros() as u64);
+                    b.set_beats_per_phrase(t.beats_per_phrase);
+                    b.set_beat_count(t.beat_count);
+                    b.set_last_epoch_ns(t.last_epoch_ns);
+                    b.set_clock_kind(&t.clock_kind);
+                    let mut att = b.init_attached(t.attached.len() as u32);
+                    for (j, ctx) in t.attached.iter().enumerate() {
+                        att.set(j as u32, ctx.as_bytes());
+                    }
+                }
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn compact_context(

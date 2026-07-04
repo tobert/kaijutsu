@@ -39,7 +39,8 @@ use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::{BlockFlow, TurnFlow};
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ContentRef,
-    DeriverRegistry, MaterializeCursor, Span, materialize_committed, schedule_abc_cell,
+    DeriverRegistry, MaterializeCursor, Span, TrackSnapshot, materialize_committed,
+    schedule_abc_cell,
 };
 use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
 use kaijutsu_kernel::{ContentStore, Kernel, KjCaller, KjDispatcher};
@@ -1728,6 +1729,33 @@ impl BeatScheduler {
         }
     }
 
+    /// Snapshot every track's live state for the wire (`listTracks`). Reads the
+    /// in-memory `TrackState` map — the truth the persisted row lags behind
+    /// (playhead is only persisted on transport transitions). Synchronous and
+    /// allocation-proportional to track count (~handful), so it is safe inside
+    /// the ingress arm's no-await contract.
+    fn snapshot_tracks(&self) -> Vec<TrackSnapshot> {
+        let mut out: Vec<_> = self
+            .tracks
+            .iter()
+            .map(|(id, t)| TrackSnapshot {
+                id: id.clone(),
+                score_context: t.score_context,
+                playing: t.playing,
+                playhead: t.playhead.get(),
+                period: t.clock.period(),
+                beats_per_phrase: t.beats_per_phrase,
+                beat_count: t.beat_count,
+                last_epoch_ns: t.last_epoch_ns,
+                clock_kind: t.clock.kind_str().to_string(),
+                attached: t.attached.keys().copied().collect(),
+            })
+            .collect();
+        // Stable order for the wire (HashMap iteration order is arbitrary).
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
     /// `Ok` if the track has a live clock domain (so a clock-domain command landed),
     /// else a loud `Err` — none of the apply methods drop a track, so checking after
     /// the call is exact.
@@ -1772,7 +1800,7 @@ impl BeatScheduler {
             tokio::select! {
                 biased;
                 msg = ingress.recv() => match msg {
-                    Some(BeatRequest { command, reply }) => {
+                    Some(BeatRequest::Command { command, reply }) => {
                         // `apply_command` is synchronous on purpose: a rc-fired
                         // `kj transport` (spawn_local on this LocalSet) awaits the
                         // reply below, so this arm must compute + send without
@@ -1784,6 +1812,11 @@ impl BeatScheduler {
                         if let Some(reply) = reply {
                             let _ = reply.send(ack);
                         }
+                    }
+                    // Read-only track snapshot (the `listTracks` wire surface):
+                    // same synchronous compute-and-reply contract as commands.
+                    Some(BeatRequest::Snapshot { reply }) => {
+                        let _ = reply.send(self.snapshot_tracks());
                     }
                     None => break, // all senders dropped → shut down
                 },
@@ -2191,6 +2224,56 @@ mod tests {
             .into_iter()
             .map(|b| b.content)
             .collect()
+    }
+
+    /// `snapshot_tracks` (the `listTracks` wire answer) reports the scheduler's
+    /// in-memory truth: track identity, score context, transport state, live
+    /// playhead, tempo, and the attachment roster — sorted by id for a stable
+    /// wire order.
+    #[tokio::test]
+    async fn snapshot_tracks_reports_live_in_memory_state() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        assert!(sched.snapshot_tracks().is_empty(), "no tracks yet");
+
+        let base = Instant::now();
+        // Two tracks, attached out of name order to prove the sort.
+        let zither = TrackId::new("zither").unwrap();
+        let bass = TrackId::new("bass").unwrap();
+        arm_track_with_markers(&kernel, &zither, 3);
+        arm_track_with_markers(&kernel, &bass, 3);
+        sched.attach(zither.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let ctx2 = ContextId::new();
+        documents.create_document(ctx2, DocumentKind::Conversation, None).unwrap();
+        sched.attach(bass.clone(), ctx2, slow_attachment(), slow_policy()).unwrap();
+
+        let snap = sched.snapshot_tracks();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].id, bass, "sorted by id for a stable wire order");
+        assert_eq!(snap[1].id, zither);
+
+        let b = &snap[0];
+        assert_eq!(b.score_context, sched.score_context(&bass));
+        assert!(!b.playing, "a track is created stopped");
+        assert_eq!(b.playhead, 0, "no beats yet");
+        assert_eq!(b.period, Duration::from_secs(1), "slow_policy period");
+        assert_eq!(b.clock_kind, "system");
+        assert_eq!(b.attached, vec![ctx2], "the roster");
+        assert_eq!(b.last_epoch_ns, 0, "never fired");
+
+        // Play + beat: the snapshot follows the LIVE playhead (the persisted
+        // row would still say 0 here — that lag is why the wire reads memory).
+        sched.play(&bass, base);
+        sched.fire_due(base + Duration::from_secs(1));
+        let snap = sched.snapshot_tracks();
+        let b = &snap[0];
+        assert!(b.playing);
+        assert!(b.playhead > 0, "playhead advanced in memory: {}", b.playhead);
+        assert_eq!(b.beat_count, 1);
+        assert!(b.last_epoch_ns > 0, "epoch latched on the beat");
     }
 
     /// Playing drives one ticked block per beat in tick order; attaching alone

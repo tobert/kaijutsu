@@ -508,6 +508,7 @@ struct ContextHandleInfo {
   concludedAt @13 :UInt64;        # 0 = not concluded, else Unix millis of the explicit `conclude` act
   liveStatus @14 :Status;         # live activity: running (working) / error (last turn failed) / else idle
   lastActivityAt @15 :UInt64;     # Unix millis of the most recent block append/mutation; 0 = never/unknown
+  trackId @16 :Text;              # Track this context is attached to (empty = unattached; TrackIds are never empty)
 }
 
 struct PresetInfo {
@@ -528,6 +529,23 @@ struct ContextCluster {
   clusterId @0 :UInt32;
   contextIds @1 :List(Data);  # List of 16-byte ContextIds
   label @2 :Text;             # Kernel-synthesized cluster label (e.g. top shared keyword); empty if none
+}
+
+# Live state of one track (a clock domain: named cadence + score + attached
+# contexts — docs/tracks.md). Answered from the beat scheduler's IN-MEMORY
+# truth: the persisted `tracks` row's playhead lags (written only on transport
+# transitions), so the wire never reads the row. Used by listTracks.
+struct TrackInfo {
+  id @0 :Text;                    # TrackId — the human name ([a-z0-9_-], never empty)
+  scoreContextId @1 :Data;        # 16-byte ContextId of the track's score context
+  playing @2 :Bool;               # transport: whether the clock is rolling
+  playheadTick @3 :Int64;         # musical time (event-counted; freezes on pause)
+  periodUs @4 :UInt64;            # beat period (the tempo knob), microseconds
+  beatsPerPhrase @5 :UInt64;
+  beatCount @6 :UInt64;           # beats elapsed while playing (resets on kernel restart)
+  lastEpochNs @7 :UInt64;         # wall clock (ns) of the most recent beat; 0 = never fired
+  clockKind @8 :Text;             # clock driver: "system" today, "modeled" at M3
+  attached @9 :List(Data);        # 16-byte ContextIds currently bound to this track
 }
 
 struct KernelConfig {
@@ -1311,6 +1329,13 @@ interface Kernel {
   # view is on record for this client (matches `kvGet`/`getShellVar`'s
   # value+found shape rather than an empty-string sentinel).
   getClientView @91 (clientId :Text) -> (contextId :Text, found :Bool);
+
+  # ── Tracks (docs/tracks.md; the time well's Stage 3 wire slice) ──
+
+  # Enumerate every track's live state, straight from the beat scheduler's
+  # in-memory TrackState (see TrackInfo). Empty when no tracks exist or no
+  # scheduler is wired (embedded/test kernels).
+  listTracks @92 (trace :TraceContext) -> (tracks :List(TrackInfo));
 }
 
 # ============================================================================

@@ -3536,6 +3536,44 @@ impl KernelDb {
         Ok(out)
     }
 
+    /// List every attachment (all tracks, all contexts) — one query, for
+    /// callers building a whole-kernel context→track map (e.g. `listContexts`
+    /// populating `trackId` per handle) instead of N per-context lookups.
+    pub fn list_all_attachments(&self) -> KernelDbResult<Vec<PersistedAttachment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, context_id, wakeup_every, rotate_every_phrases, ooda_armed
+             FROM attachments",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (track_id, ctx_bytes, wakeup_every, rotate_every_phrases, ooda_armed) = row?;
+            let context_id = ContextId::try_from_slice(&ctx_bytes).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    "invalid ContextId bytes in attachments row".into(),
+                )
+            })?;
+            out.push(PersistedAttachment {
+                track_id,
+                context_id,
+                wakeup_every: wakeup_every as u64,
+                rotate_every_phrases: rotate_every_phrases.map(|n| n as u64),
+                ooda_armed: ooda_armed != 0,
+            });
+        }
+        Ok(out)
+    }
+
     /// List all attachments for a context (all tracks this context is attached to).
     pub fn list_attachments_for_context(
         &self,

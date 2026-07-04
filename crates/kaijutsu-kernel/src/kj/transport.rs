@@ -578,10 +578,18 @@ mod tests {
     ) -> tokio::sync::mpsc::UnboundedReceiver<BeatCommand> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(BeatRequest { command, reply }) = ingress.recv().await {
-                let _ = cmd_tx.send(command);
-                if let Some(reply) = reply {
-                    let _ = reply.send(ack.clone());
+            while let Some(req) = ingress.recv().await {
+                match req {
+                    BeatRequest::Command { command, reply } => {
+                        let _ = cmd_tx.send(command);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(ack.clone());
+                        }
+                    }
+                    // The stub schedules nothing, so it owns no tracks.
+                    BeatRequest::Snapshot { reply } => {
+                        let _ = reply.send(Vec::new());
+                    }
                 }
             }
         });

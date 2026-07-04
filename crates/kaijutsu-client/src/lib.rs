@@ -28,7 +28,7 @@ pub use rpc::{
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
     RpcClient, RpcError, ShellValue, SimilarContext, StagedDriftInfo, SubmitResult, SyncState,
-    ToolResult, ToolSchema, VersionSnapshot,
+    ToolResult, ToolSchema, TrackInfo, VersionSnapshot,
 };
 pub use document_store::{DocumentEntry, DocumentStore};
 pub use sftp::{BlobFetch, BlobResolver, SftpClient, SftpError, default_cache_dir};
