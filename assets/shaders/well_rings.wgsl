@@ -10,7 +10,9 @@
 // them into a glow (see `main::setup_camera`); the disc fades to nothing at its
 // rim so the square quad's corners melt into the well background.
 //
-// energy   = [energy, _, _, _]
+// energy   = [energy, beat, _, _] — beat = the live beat envelope (1.0 on the
+//            beat, decaying through it) of the loudest rolling track; the
+//            throat glow breathes on it (the well's heartbeat).
 // ripples  = [cos(angle), sin(angle), age_norm (0..1), intensity] × MAX_RIPPLES
 
 #import bevy_pbr::forward_io::VertexOutput
@@ -71,7 +73,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     disk = disk * (0.45 + 0.55 * arms) * (0.6 + 0.4 * doppler);
     // A small hot pinprick right at the singularity.
     let singularity = exp(-r * r / (0.02 * 0.02));
-    let core_bright = disk * (1.6 + energy * 3.0) + singularity * (1.2 + energy * 2.0);
+    // The heartbeat: while a track's clock rolls, energy.y carries its beat
+    // envelope — the disk and singularity swell on the beat (HDR, so the
+    // bloom makes the throat visibly thump).
+    let beat = energy_v.y;
+    let core_bright = disk * (1.6 + energy * 3.0 + beat * 2.2)
+        + singularity * (1.2 + energy * 2.0 + beat * 3.0);
     col += core_color.rgb * core_bright;
 
     // --- Ripples: expanding wavefronts at each context's angle ---

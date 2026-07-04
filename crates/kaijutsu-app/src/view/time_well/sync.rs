@@ -5,9 +5,10 @@
 //! Cadence: this runs off [`DriftState`], which already polls `list_contexts`
 //! every few seconds (the layout-tick source; see `docs/timewell.md`,
 //! "Appendix: substrate notes" → data flow).
-//! `Join::reconcile` here is the **layout tick**; per-block status pulses (the
-//! **data tick**) arrive separately and use `Join::touch` (see `super::status`,
-//! task 6).
+//! `Join::reconcile` here is the **layout tick**. Card `live_status` rides the
+//! same poll (kernel-derived, `ContextInfo.live_status`); the sub-poll live
+//! layer — chatter/beat uniforms + tail buffers off the event stream — lives
+//! in [`super::live`] and never relayouts.
 
 use std::collections::HashMap;
 

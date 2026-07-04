@@ -17,10 +17,14 @@
 //! - [`sync`] — the layout tick: keyed-join reconcile → spawn/despawn → layout.
 //! - [`activity`] — the well's pulse: kernel-event stream → ring energy + ripples
 //!   driving the base ring deck (unit-tested math).
+//! - [`live`] — live state beyond the poll: per-context tail buffers (the
+//!   HUD's tail -f view) and per-track beat phasors (chatter + beat card
+//!   lanes, the deck heartbeat).
 
 pub mod activity;
 pub mod card;
 pub mod hud;
+pub mod live;
 pub mod panel;
 pub mod scene;
 pub mod sync;
@@ -40,6 +44,8 @@ impl Plugin for TimeWellPlugin {
             .add_plugins(MaterialPlugin::<crate::shaders::TerraceRingMaterial>::default())
             .init_resource::<scene::TimeWellState>()
             .init_resource::<activity::RingActivity>()
+            .init_resource::<live::ContextTails>()
+            .init_resource::<live::WellBeats>()
             .add_systems(
                 OnEnter(Screen::TimeWell),
                 (scene::enter_time_well, hud::spawn_well_hud),
@@ -50,6 +56,9 @@ impl Plugin for TimeWellPlugin {
             )
             // The toggle runs in every screen (it decides based on current state).
             .add_systems(Update, scene::toggle_time_well)
+            // Live ingest runs in every screen too, so tails accumulate and
+            // beat phasors stay locked while the well is closed — it opens warm.
+            .add_systems(Update, live::ingest_live_events)
             // Well-only per-frame work.
             .add_systems(
                 Update,
@@ -70,6 +79,7 @@ impl Plugin for TimeWellPlugin {
                     scene::accumulate_ring_activity,
                     scene::tick_and_sync_rings,
                     scene::dim_nonfocused_rings,
+                    live::sync_card_live_uniforms,
                     scene::sync_focus_card_visibility,
                     hud::position_well_hud,
                     hud::update_well_hud,

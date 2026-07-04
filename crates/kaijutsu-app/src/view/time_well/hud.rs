@@ -40,16 +40,18 @@ pub enum HudSlot {
     North,
     East,
     West,
-    /// Bottom preview — formatter + tests kept, but currently **not spawned**
-    /// (hidden); add back to [`HudSlot::ALL`] to show it again.
-    #[allow(dead_code)]
+    /// Bottom: the selected context's **live tail** (tail -f of its block
+    /// stream, [`super::live::ContextTails`]), falling back to the polled
+    /// preview when the tail is empty. Re-spawned for the live-state work —
+    /// it was hidden to keep the vortex throat clear, and only lights up
+    /// while a selection exists; Amy judges the throat-clearance tradeoff.
     South,
 }
 
 impl HudSlot {
-    /// The spawned slots. South is intentionally omitted (hidden) — the open
-    /// bottom keeps the vortex throat clear; re-add it here to bring it back.
-    pub const ALL: [HudSlot; 3] = [HudSlot::North, HudSlot::East, HudSlot::West];
+    /// The spawned slots.
+    pub const ALL: [HudSlot; 4] =
+        [HudSlot::North, HudSlot::East, HudSlot::West, HudSlot::South];
 }
 
 /// Container marker for the whole HUD (despawned together on exit).
@@ -80,6 +82,13 @@ const HUD_TOP_DROP_FALLBACK: f32 = 0.15;
 const HUD_FONT_SIZE: f32 = 27.0;
 /// North's context-name (first line) is rendered this much larger than the body.
 const HUD_TITLE_SCALE: f32 = 1.667;
+/// South's tail lines render smaller than the body so more of the stream fits.
+const HUD_TAIL_SCALE: f32 = 0.75;
+/// Tail lines shown in South (the newest N of the context's tail buffer).
+const SOUTH_TAIL_LINES: usize = 5;
+/// Chars per South tail line — sized to the South texture width at the tail
+/// font so a line never wraps (wrapping would push older lines off the panel).
+const SOUTH_LINE_CHARS: usize = 48;
 /// Inner padding (texture px) — keeps the text inset from the frame so the panel
 /// has breathing room inside its border.
 const HUD_PAD: f32 = 30.0;
@@ -94,16 +103,18 @@ const HUD_BORDER_GAIN: f32 = 1.8;
 fn hud_tex_dims(slot: HudSlot) -> (u32, u32) {
     match slot {
         HudSlot::North => (660, 220),
-        HudSlot::South => (560, 150),
+        // Tall enough for ~4 tail lines at HUD_FONT_SIZE + padding.
+        HudSlot::South => (660, 200),
         HudSlot::East | HudSlot::West => (440, 340),
     }
 }
 
-/// Text alignment inside a panel.
+/// Text alignment inside a panel. South is a tail readout — left-aligned like
+/// the spec/lineage columns, not centered like North's identity line.
 fn hud_align(slot: HudSlot) -> VelloTextAlign {
     match slot {
-        HudSlot::North | HudSlot::South => VelloTextAlign::Middle,
-        HudSlot::East | HudSlot::West => VelloTextAlign::Left,
+        HudSlot::North => VelloTextAlign::Middle,
+        HudSlot::East | HudSlot::West | HudSlot::South => VelloTextAlign::Left,
     }
 }
 
@@ -297,6 +308,7 @@ fn top_drop_from(
 /// plate — when a panel's string actually changes. Nothing selected → blank.
 pub fn update_well_hud(
     state: Res<TimeWellState>,
+    tails: Res<super::live::ContextTails>,
     cards: Query<&Card>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
@@ -329,7 +341,9 @@ pub fn update_well_hud(
             (Some(card), HudSlot::North) => hud_north(&card.data, card.status),
             (Some(card), HudSlot::East) => hud_east(&card.data),
             (Some(card), HudSlot::West) => hud_west(card.context_id, &state),
-            (Some(card), HudSlot::South) => hud_south(&card.data),
+            (Some(card), HudSlot::South) => {
+                hud_south(&card.data, &tails, card.context_id)
+            }
             (None, _) => String::new(),
         };
         // Skip unchanged text — but always do the first build (version 0) even
@@ -417,8 +431,14 @@ fn layout_hud_text(
         return out;
     }
 
+    // South is the tail readout: smaller type so ~5 stream lines fit.
+    let font_size = if slot == HudSlot::South {
+        HUD_FONT_SIZE * HUD_TAIL_SCALE
+    } else {
+        HUD_FONT_SIZE
+    };
     let (glyphs, _) = layout_line(
-        text, font, HUD_FONT_SIZE, max_advance, align, (pad, pad), atlas, font_data_map,
+        text, font, font_size, max_advance, align, (pad, pad), atlas, font_data_map,
     );
     glyphs
 }
@@ -500,11 +520,26 @@ fn hud_west(selected: ContextId, state: &TimeWellState) -> String {
     out
 }
 
-fn hud_south(d: &super::card::CardData) -> String {
-    match &d.preview {
-        Some(p) => crate::text::truncate_chars(p, 161),
-        None => String::new(),
+/// South = the selected context's live tail (tail -f, oldest → newest), each
+/// line truncated so it never wraps; falls back to the polled preview when the
+/// context hasn't produced a tail line since the app started.
+fn hud_south(
+    d: &super::card::CardData,
+    tails: &super::live::ContextTails,
+    ctx: ContextId,
+) -> String {
+    let lines: Vec<String> = tails
+        .iter_lines(&ctx)
+        .map(|l| crate::text::truncate_chars(&l.display(), SOUTH_LINE_CHARS))
+        .collect();
+    if lines.is_empty() {
+        return match &d.preview {
+            Some(p) => crate::text::truncate_chars(p, 161),
+            None => String::new(),
+        };
     }
+    let newest = lines.len();
+    lines[newest.saturating_sub(SOUTH_TAIL_LINES)..].join("\n")
 }
 
 #[cfg(test)]
@@ -565,15 +600,45 @@ mod tests {
     }
 
     #[test]
-    fn south_truncates_long_preview() {
+    fn south_falls_back_to_truncated_preview_without_a_tail() {
+        let tails = super::super::live::ContextTails::default();
+        let ctx = ContextId::from_bytes([7; 16]);
         let mut c = card(Band::HotNow);
         c.preview = Some("x".repeat(300));
-        let s = hud_south(&c);
+        let s = hud_south(&c, &tails, ctx);
         assert!(s.ends_with('…'), "long preview is elided");
         assert!(s.chars().count() <= 161, "bounded length");
 
         c.preview = Some("short".into());
-        assert_eq!(hud_south(&c), "short", "short preview passes through");
+        assert_eq!(hud_south(&c, &tails, ctx), "short", "short preview passes through");
+    }
+
+    #[test]
+    fn south_shows_the_newest_tail_lines_over_the_preview() {
+        use super::super::live::{ContextTails, TailLine};
+        let ctx = ContextId::from_bytes([7; 16]);
+        let mut tails = ContextTails::default();
+        for i in 0..(SOUTH_TAIL_LINES + 2) {
+            tails.push(
+                ctx,
+                TailLine { glyph: "✦", text: format!("event {i}") },
+                i as f64,
+            );
+        }
+        let mut c = card(Band::HotNow);
+        c.preview = Some("stale preview".into());
+        let s = hud_south(&c, &tails, ctx);
+        assert!(!s.contains("stale preview"), "live tail wins over the poll preview");
+        let shown: Vec<&str> = s.lines().collect();
+        assert_eq!(shown.len(), SOUTH_TAIL_LINES, "newest N lines: {s}");
+        assert!(shown[0].contains("event 2"), "oldest shown line: {s}");
+        assert!(
+            shown.last().unwrap().contains(&format!("event {}", SOUTH_TAIL_LINES + 1)),
+            "newest line last: {s}"
+        );
+        // A different context still falls back to its preview.
+        let other = ContextId::from_bytes([8; 16]);
+        assert_eq!(hud_south(&c, &tails, other), "stale preview");
     }
 
     // ── hud_slot_offset: frustum-edge placement math ──

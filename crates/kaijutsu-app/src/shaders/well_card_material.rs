@@ -25,9 +25,10 @@ pub struct WellCardMaterial {
     #[uniform(2)]
     pub accent: Vec4,
 
-    /// `[selected, in_lineage, status, _]` — drives the rings + status pulse.
-    /// `status`: pending/none 0, running 1, done 2, error 3. Animation reads
-    /// `globals.time` in the shader, so the 4th slot is currently unused.
+    /// `[selected, in_lineage, status, drifting]` — drives the rings + status
+    /// pulse + drift sheen. `status`: pending/none 0, running 1, done 2,
+    /// error 3; `drifting` (0/1) gates the LDR sheen sweep. Animation reads
+    /// `globals.time` in the shader.
     #[uniform(3)]
     pub params: Vec4,
 
@@ -43,12 +44,17 @@ pub struct WellCardMaterial {
     #[uniform(5)]
     pub border: Vec4,
 
-    /// Focus dimming in `.x` (1.0 = full/focused, `<1.0` recedes the card so the
-    /// *focused* ring's cards pop). `.yzw` unused. Applied as a **color multiply**
-    /// in `well_card.wgsl` — this material is `AlphaMode::Mask(0.5)`, so dimming
+    /// `.x` = focus dimming (1.0 = full/focused, `<1.0` recedes the card so the
+    /// *focused* ring's cards pop). Applied as a **color multiply** in
+    /// `well_card.wgsl` — this material is `AlphaMode::Mask(0.5)`, so dimming
     /// the alpha instead would push the body under the cutoff and clip the whole
     /// card rather than fade it. Written per-frame by `scene::dim_nonfocused_rings`
     /// (rim cards only; the focus card + HUD panels stay 1.0).
+    ///
+    /// `.y` = live **chatter** (0..1) and `.z` = live **beat** envelope (0..1)
+    /// — the event-driven card lanes written by
+    /// `view::time_well::live::sync_card_live_uniforms` (cyan rim lift / gold
+    /// beat thump in the shader, no texture rebuild). `.w` unused.
     #[uniform(6)]
     pub dim: Vec4,
 }
