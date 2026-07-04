@@ -456,6 +456,29 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     you wanted fork's history). Strengthens the case for (c) `kj fork --type`:
     the director's natural move is "branch this work into a coder *with* the
     working context," which neither verb currently does in one step.
+- **`kj fork --compact` label-conflict error is unhelpful (found 2026-07-04,
+  DEMO DEMO `7566da79`).** When the target label already exists, the error is a
+  bare `label conflict: label 'X' already in use` — it doesn't surface the
+  existing context, offer to switch to it, or hint at renaming/removing. The
+  caller must manually discover whether the fork partially succeeded (the
+  context exists and is usable) vs needing a fresh name. Fix: surface the
+  existing context ID in the error and suggest `kj context switch` or a rename.
+- **`kj fork --include` range parsing rejects `end-N` and integer ranges (found
+  2026-07-04, same session).** `--include "end-2:"` and `--include "0:1"` both
+  fail with `is not a valid endpoint — expected an integer, 'end', or 'end-N'`.
+  The `end-N` form is documented in `--help` but the parser doesn't accept it;
+  even bare integer ranges fail, suggesting a deeper parsing issue (possibly
+  shell escaping interacting with the JSON array representation). Either fix
+  the parser or update the docs. Until fixed, there is no working way to fork a
+  near-empty child context via `--include`.
+- **`kj fork --compact` cross-provider model failure (found 2026-07-04, same
+  session).** `kj fork --compact --model deepseek/deepseek-v4-pro` from a haiku
+  context fails with `LLM summarization failed: invalid request:
+  not_found_error: model: deepseek-v4-pro` — the compact fork appears to use
+  the *target* model for distillation rather than the calling context's model,
+  so compact forking across providers is impossible without `--distill-model`.
+  Fix: default `--distill-model` to the calling context's model, or detect the
+  cross-provider case and fail with a clear message suggesting it.
 - **`$HOME` env var is empty in the context shell (minor; `~` now fixed).**
   `~` expansion is fixed by a kaish upgrade (2026-06-17), so `~/path` resolves.
   The remaining gap is the `$HOME` *variable*: it's still empty in both the
