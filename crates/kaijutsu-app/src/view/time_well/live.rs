@@ -162,6 +162,15 @@ fn head_line(content: &str) -> Option<String> {
     Some(crate::text::truncate_chars(line.trim(), TAIL_LINE_CHARS))
 }
 
+/// The `command` string from a tool call's input JSON, if it has one — the
+/// human-recognizable line for shell-shaped tools. `None` for other tools or
+/// unparseable input.
+fn command_arg_head(block: &BlockSnapshot) -> Option<String> {
+    let input = block.tool_input.as_deref()?;
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    head_line(v.get("command")?.as_str()?)
+}
+
 /// Map an inserted block to a tail line, or `None` for blocks that carry no
 /// glanceable signal (thinking, structural kinds).
 ///
@@ -195,9 +204,16 @@ pub fn tail_line(block: &BlockSnapshot) -> Option<TailLine> {
             Some(TailLine::new(glyph, head))
         }
         BlockKind::ToolCall => {
-            // The tool name is the signal; the input JSON body is noise.
+            // The tool name is the signal; the input JSON body is noise —
+            // except a `command` arg (shell/kaish calls), where the command
+            // IS the story: a tail of bare "▸ shell" ×4 told nothing
+            // (live-verify, 2026-07-04).
             let name = block.tool_name.as_deref().unwrap_or("tool");
-            Some(TailLine::new("▸", crate::text::truncate_chars(name, TAIL_LINE_CHARS)))
+            let text = match command_arg_head(block) {
+                Some(cmd) => format!("{name}: {cmd}"),
+                None => name.to_string(),
+            };
+            Some(TailLine::new("▸", crate::text::truncate_chars(&text, TAIL_LINE_CHARS)))
         }
         BlockKind::ToolResult => {
             let head = head_line(&block.content)?;
@@ -497,6 +513,21 @@ mod tests {
         assert_eq!(line.glyph, "▸");
         assert_eq!(line.text, "kaijutsu:read");
         assert!(!line.text.contains('{'), "input JSON stays out of the tail");
+    }
+
+    #[test]
+    fn shell_shaped_tool_call_shows_its_command() {
+        let call = BlockSnapshot::tool_call(
+            bid(1),
+            None,
+            ToolKind::Shell,
+            "shell",
+            serde_json::json!({"command": "kj transport play --track welltest"}),
+            Role::User,
+            None,
+        );
+        let line = tail_line(&call).unwrap();
+        assert_eq!(line.display(), "▸ shell: kj transport play --track welltest");
     }
 
     #[test]

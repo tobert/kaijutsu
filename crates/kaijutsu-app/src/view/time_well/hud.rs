@@ -198,14 +198,20 @@ fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32, top_drop: f32) -> Trans
     let anchor = hud_slot_offset(slot, fov_y, aspect, HUD_DEPTH, HUD_MARGIN, top_drop);
     // Fit the panel fully inside from its edge/corner anchor: pull horizontally
     // toward center by half-width (a center-anchored panel like N stays at x=0 —
-    // note `f32::signum(0.0)` is 1.0, so guard the zero case) and always down
-    // from the top anchor by half-height.
+    // note `f32::signum(0.0)` is 1.0, so guard the zero case) and vertically
+    // toward center by half-height — DOWN from the top-anchored row (N/E/W),
+    // UP from South's bottom anchor (dropping South down like the others
+    // pushed it half off-screen; caught live 2026-07-04).
     let cx = if anchor.x == 0.0 {
         0.0
     } else {
         anchor.x - anchor.x.signum() * size.x * 0.5
     };
-    let cy = anchor.y - size.y * 0.5;
+    let cy = if slot == HudSlot::South {
+        anchor.y + size.y * 0.5
+    } else {
+        anchor.y - size.y * 0.5
+    };
     Transform::from_translation(Vec3::new(cx, cy, anchor.z)).with_scale(Vec3::new(size.x, size.y, 1.0))
 }
 
@@ -700,6 +706,22 @@ mod tests {
         assert_eq!(e.y, w.y, "east/west share the dropped top row");
         assert!(e.y > 0.0, "but the row is still in the upper half");
         assert_eq!(e.x, -w.x, "east/west are symmetric");
+    }
+
+    /// Caught live 2026-07-04: South was dropped DOWN from its bottom-edge
+    /// anchor like the top-anchored panels, pushing the tail half off-screen.
+    #[test]
+    fn south_panel_pulls_up_from_its_bottom_anchor() {
+        let (fov, aspect, drop) = (FRAC_PI_4, 16.0 / 9.0, 0.15);
+        let s = hud_transform(HudSlot::South, fov, aspect, drop);
+        let s_anchor = hud_slot_offset(HudSlot::South, fov, aspect, HUD_DEPTH, HUD_MARGIN, drop);
+        assert!(s.translation.y > s_anchor.y, "south sits ABOVE its bottom-edge anchor");
+        let n = hud_transform(HudSlot::North, fov, aspect, drop);
+        let n_anchor = hud_slot_offset(HudSlot::North, fov, aspect, HUD_DEPTH, HUD_MARGIN, drop);
+        assert!(n.translation.y < n_anchor.y, "north drops BELOW its top anchor");
+        // South's bottom edge stays inside the frustum.
+        let half_h = HUD_DEPTH * (fov * 0.5).tan();
+        assert!(s.translation.y - s.scale.y * 0.5 >= -half_h, "south fully on-screen");
     }
 
     #[test]
