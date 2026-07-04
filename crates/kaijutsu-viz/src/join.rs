@@ -95,7 +95,7 @@ impl<K, V> JoinDiff<K, V> {
     /// Returns `true` iff the key set changed (any `enter` or `exit` events).
     ///
     /// This is the structural encoding of the "layout cadence vs. data cadence"
-    /// distinction from `docs/viz-substrate.md`: a status-only update must never
+    /// distinction (`docs/timewell.md`, substrate-notes appendix): a status-only update must never
     /// trigger a relayout; only a context being created or archived should.
     pub fn needs_relayout(&self) -> bool {
         !self.enter.is_empty() || !self.exit.is_empty()

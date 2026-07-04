@@ -3,7 +3,8 @@
 //! each card's target position + derived [`CardData`].
 //!
 //! Cadence: this runs off [`DriftState`], which already polls `list_contexts`
-//! every few seconds (the layout-tick source from `docs/viz-substrate.md`).
+//! every few seconds (the layout-tick source; see `docs/timewell.md`,
+//! "Appendix: substrate notes" → data flow).
 //! `Join::reconcile` here is the **layout tick**; per-block status pulses (the
 //! **data tick**) arrive separately and use `Join::touch` (see `super::status`,
 //! task 6).

@@ -223,11 +223,11 @@ impl<R: Clone + PartialEq> ScaleThreshold<R> {
 
 // ─── RadialBands ─────────────────────────────────────────────────────────────
 
-/// Equal-width radial annuli for the time-well's three lifecycle bands.
+/// Equal-width radial annuli for the time-well's idle-age bands.
 ///
 /// Each band receives the same *radial width* regardless of how much time it
-/// spans — this is the "history grows denser, not bigger" rule from the
-/// viz-substrate design. The innermost band (index 0) maps to the core; the
+/// spans — the "history grows denser, not bigger" rule (`docs/timewell.md`,
+/// substrate-notes appendix). The innermost band (index 0) maps to the core; the
 /// outermost (index `n_bands - 1`) to the rim.
 ///
 /// Given `(band_index, fraction)` where `fraction ∈ [0.0, 1.0]` is the

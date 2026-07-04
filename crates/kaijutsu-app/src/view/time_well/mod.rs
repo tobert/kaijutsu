@@ -4,9 +4,10 @@
 //! "kernel truth: activity recency" — see `docs/timewell.md`): `HotNow` (the
 //! mouth) → `ThisWeek` → `ThirtyDays` → `Horizon` (the throat), each its own
 //! radius/depth terrace with a visible step + gap at the boundary; within a
-//! terrace, angle encodes recency-ordered within-band position. See
-//! `docs/viz-substrate.md` and `docs/time-well-concepts.md` for the earlier
-//! design record (superseded on the band scheme by `docs/timewell.md`).
+//! terrace, angle encodes recency-ordered within-band position.
+//! `docs/time-well-concepts.md` holds the earlier UX record; the retired
+//! substrate design survives as the "Appendix: substrate notes" in
+//! `docs/timewell.md` (full viz-substrate.md in git history).
 //!
 //! Module map:
 //! - [`card`] — pure `ContextInfo` → card-model mapping, band assignment, layout,

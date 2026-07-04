@@ -2,9 +2,10 @@
 //! `LayoutPos → Vec3` well-lift.
 //!
 //! This is the seam between the zero-dependency `kaijutsu-viz` substrate (scales,
-//! join, layout — all pure 2D / no glam) and the Bevy app. Per `docs/viz-substrate.md`,
-//! the lift to `glam::Vec3` lives **here**, on the app side, so the substrate stays
-//! free of a `glam` version lockstep.
+//! join, layout — all pure 2D / no glam) and the Bevy app. Per the substrate
+//! notes in `docs/timewell.md` (appendix), the lift to `glam::Vec3` lives
+//! **here**, on the app side, so the substrate stays free of a `glam` version
+//! lockstep.
 //!
 //! Everything in this module is pure (no Bevy `World`, no GPU) and unit-tested.
 //! The Bevy systems in the sibling modules call these functions; the cards they
@@ -235,7 +236,7 @@ pub fn haystack_order_keys(
 /// `parent_of` maps a context to its `forked_from` parent (`None` at a root). The
 /// walk is cycle-safe — a parent already seen ends it — so a malformed lineage
 /// can't hang the overlay. Drives the on-demand lineage highlight: select a card,
-/// its ancestry lights up (`docs/viz-substrate.md`, band-0 lineage overlay).
+/// its ancestry lights up (the lineage overlay, `docs/timewell.md`).
 pub fn ancestors(
     start: ContextId,
     parent_of: impl Fn(ContextId) -> Option<ContextId>,

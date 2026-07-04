@@ -2,7 +2,8 @@
 //!
 //! A small, dependency-free substrate of D3-style scales. First and only
 //! committed consumer: the **time-well context browser** (see
-//! `docs/viz-substrate.md` and `docs/time-well-concepts.md`).
+//! `docs/timewell.md` — esp. its substrate-notes appendix — and
+//! `docs/time-well-concepts.md`).
 //!
 //! ## No-clamp stance
 //!

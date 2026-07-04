@@ -436,9 +436,9 @@ The "not another JavaScript thing" pass, once the structure is honest.
 - ✅ `docs/viz-substrate.md`: retired (2026-07-04, `git rm`). Its still-true
   content is the "Substrate notes" appendix below; the superseded sections
   (three-band layout, build order, reading-slot nav, continuous spiral) are
-  git-history only. Code comments still citing `docs/viz-substrate.md`
+  git-history only. The code comments that cited `docs/viz-substrate.md`
   (`time_well/mod.rs`, `card.rs`, `sync.rs`; `kaijutsu-viz` `join.rs`,
-  `scales.rs`, `lib.rs`) should be repointed here on next touch.
+  `scales.rs`, `lib.rs`) were repointed here 2026-07-04.
 - ✅ `CompactingBandLayout` + its config/tests — **deleted** from
   `kaijutsu-viz` (2026-07-03; decision recorded above). `RadialBands`/scales
   stay.
