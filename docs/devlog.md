@@ -381,12 +381,25 @@ the digging taught:
   was almost certainly the stale-FlowBus observation gap wearing a costume.
   And `$HOME` is now seeded in every shell — the dig found `~` was broken
   too; both read one scope var, so they agree by construction.
+- **The awaited kaish release closed two of these loose ends.** The 0.10 → 0.11
+  bump was zero-source — we ride the embedder API through low-level primitives,
+  so all four of the release's breaking changes miss us — but it carried the
+  rewrite we'd parked two papercuts against. The confirmation-latch nonce, an
+  explicit machine protocol whose token was buried in human prose (a batch loop
+  had to `2>&1` and regex-scrape it), now rides a typed `ExecResult.latch`; we
+  emit it structurally on both the MCP shell envelope and `kj --json`, so
+  automation reads `latch.nonce` and re-runs with `--confirm`. And kj's
+  synthetic root `help` param — a crutch that existed only to stop kaish's outer
+  help router from swallowing `kj <verb> --help` — retired the moment 0.11 gated
+  that router on `owns_output` (an owned-output tool re-parses its own argv and
+  is never intercepted). Same theme as the rest of the chapter: the surface a
+  model hits mid-turn stops fighting it.
 
 ## Now
 
-As of 2026-07-04: the model-QoL sweep is merged and awaiting deploy (kernel
-rebuild + restart, `kj rc reset` for the new datetime seeds); subprocess exec
-shipped and the first audible `kj play` after it is unverified; the time well
-carousel is in Amy's tuning hands; the render seam is fully on the wire with
-clip/PCM prefetch proven; open work is in `docs/issues.md` and the live
-handoff in `signoff.md` (ephemeral, repo root).
+As of 2026-07-04: the model-QoL sweep and the kaish 0.11 bump are merged and
+awaiting deploy (kernel rebuild + restart, `kj rc reset` for the new datetime
+seeds); subprocess exec shipped and the first audible `kj play` after it is
+unverified; the time well carousel is in Amy's tuning hands; the render seam is
+fully on the wire with clip/PCM prefetch proven; open work is in
+`docs/issues.md` and the live handoff in `signoff.md` (ephemeral, repo root).
