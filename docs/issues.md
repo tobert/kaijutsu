@@ -570,6 +570,21 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Viz substrate (kaijutsu-viz) — plan in `docs/timewell.md` (substrate notes in its appendix; `viz-substrate.md` retired 2026-07-04)
 
+- **Pause gating (suspend activity)** — the `z`/`kj context pause` verb ships
+  design-only (2026-07-05, `dcbb75e4`): `paused_at` persists and the card dims,
+  but nothing behavioral gates yet. The decided semantics (Amy): a paused
+  context receives **no beat/OODA wakeups** (seam: hyoushigi attachment wakeup
+  fire) and **rejects turn-starts loudly** with a resume hint (seam: kernel
+  turn-start). Both seams are documented on `ContextRow::paused_at`. Do as its
+  own slice; decide then whether human submit auto-resumes or fails loud.
+- **Ring placement residuals** (explicit-placement review, 2026-07-05; both
+  reviewers, accepted-not-fixed): promote's ring-full refusal (and other verb
+  errors) reach only the log from the app's fire-and-forget keys — a HUD
+  toast/flash slot is wanted; the 10-seat cap check is read-then-write under
+  the single KernelDb mutex (atomic enough in-contract — direct DB writers are
+  already forbidden); `conclude` RPC accepts Staging contexts (pre-existing,
+  probably fine, never decided).
+
 - **Time well evolution — plan is canonical in `docs/timewell.md`.** Staged:
   0 tourniquet + 1 idle-age recency (both SHIPPED 2026-07-03 — Stage 1's app
   half landed as the four-ring carousel, not the terraced spiral; see the doc's
