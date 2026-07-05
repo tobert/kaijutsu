@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use kaijutsu_audio::{LocalBeat, RENDER_FLUSH_MIME};
-use kaijutsu_client::ServerEvent;
+use kaijutsu_client::{ConnectionStatus, ServerEvent};
 
-use crate::connection::actor_plugin::ServerEventMessage;
+use crate::connection::actor_plugin::{ConnectionStatusMessage, ServerEventMessage};
 
 /// The click pitch — a high, short note (C6) on the sink's dedicated metronome
 /// channel. A pitched click, not a drum: GM channel-9 percussion is silent under
@@ -40,8 +40,13 @@ pub struct MetronomePlugin;
 impl Plugin for MetronomePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Metronome>();
-        // Ingest references first, then click off the (freshly corrected) phasor.
-        app.add_systems(Update, (ingest_beat_signals, click_on_beat).chain());
+        // Ingest references, halt on any loss of the live clock (flush handled in
+        // ingest; connection drop handled here — reset wins over a same-frame
+        // reference), then click off the (freshly corrected) phasor.
+        app.add_systems(
+            Update,
+            (ingest_beat_signals, halt_on_connection_loss, click_on_beat).chain(),
+        );
     }
 }
 
@@ -80,10 +85,12 @@ impl Metronome {
     }
 
     /// Halt the metronome: drop the phasor so it stops free-running (and stops
-    /// scheduling clicks). Called on a transport flush (stop/pause) — the phasor
-    /// can't distinguish "clock stopped" from "gap between low-rate references"
-    /// on its own, so the flush is the explicit stop signal. A new reference
-    /// (the next `play`) re-anchors it.
+    /// scheduling clicks). The phasor can't distinguish "clock stopped" from
+    /// "gap between low-rate references" on its own, so it needs an explicit
+    /// stop signal. Two callers provide one: a transport flush (graceful
+    /// stop/pause) and a connection drop (kernel restart/crash/network — the
+    /// kernel is *gone* and can send no flush, yet its references stop). A new
+    /// reference (the next `play`, after reconnect) re-anchors it.
     fn reset(&mut self) {
         self.beat = None;
         self.next_beat = None;
@@ -140,6 +147,29 @@ fn ingest_beat_signals(
                 metronome.reset()
             }
             _ => {}
+        }
+    }
+}
+
+/// Halt the metronome the moment the connection leaves `Connected`. A kernel
+/// restart, crash, or network drop stops the beat references *without* a
+/// `RENDER_FLUSH` — the kernel is simply gone and can send no cue — so the flush
+/// reset alone can't catch it, and the phasor would free-run, clicking onto
+/// whatever synth is wired to the render port (the "clicks forever after a
+/// kernel restart" live bug, `docs/issues.md`). Resetting on any non-`Connected`
+/// status makes the metronome silent *during* the outage, not just after the
+/// reconnect. The next `play` re-anchors it from a fresh `BeatSync`.
+///
+/// A brief blip mid-jam (Cooldown → Connected) costs at most one reference
+/// interval of clicks — `BeatSync` resumes on the re-subscribed stream — a fair
+/// trade for never emitting a phantom beat onto a live synth.
+fn halt_on_connection_loss(
+    mut status: MessageReader<ConnectionStatusMessage>,
+    mut metronome: ResMut<Metronome>,
+) {
+    for ConnectionStatusMessage(s) in status.read() {
+        if !matches!(s, ConnectionStatus::Connected { .. }) {
+            metronome.reset();
         }
     }
 }
@@ -278,5 +308,63 @@ mod tests {
         let m = app.world().resource::<Metronome>();
         assert!(m.beat.is_none(), "flush drops the phasor");
         assert!(m.next_beat.is_none(), "flush clears the schedule cursor");
+    }
+
+    /// A connection drop (kernel restart/crash/network flake) halts the
+    /// metronome even though no `RENDER_FLUSH` arrives — the kernel is gone, so
+    /// it can send no cue, and without this the phasor free-runs onto whatever
+    /// synth is wired (the "clicks forever after a kernel restart" live bug).
+    /// Any non-`Connected` status is the halt signal.
+    #[test]
+    fn a_connection_drop_stops_the_metronome() {
+        let mut m = Metronome::default();
+        let t0 = Instant::now();
+        m.observe(BeatRef::new(0.0, 2.0), t0);
+        m.schedule_due(t0, H); // running: phasor anchored, next_beat seeded
+        assert!(m.beat.is_some());
+
+        let mut app = App::new();
+        app.insert_resource(m)
+            .add_message::<ConnectionStatusMessage>()
+            .add_systems(Update, halt_on_connection_loss);
+        // The kernel goes away: the FSM reports Closing (then Cooldown/Connecting).
+        app.world_mut().write_message(ConnectionStatusMessage(ConnectionStatus::Closing {
+            cause: "kernel restart".into(),
+        }));
+        app.update();
+
+        let m = app.world().resource::<Metronome>();
+        assert!(m.beat.is_none(), "a connection drop drops the phasor");
+        assert!(m.next_beat.is_none(), "and clears the schedule cursor");
+    }
+
+    /// The healthy steady state must NOT silence the metronome: a `Connected`
+    /// status (re-seeded on every actor change) leaves a running phasor running,
+    /// so a live jam keeps clicking.
+    #[test]
+    fn a_connected_status_leaves_the_metronome_running() {
+        use kaijutsu_types::KernelId;
+
+        let mut m = Metronome::default();
+        let t0 = Instant::now();
+        m.observe(BeatRef::new(0.0, 2.0), t0);
+        m.schedule_due(t0, H);
+        assert!(m.beat.is_some());
+
+        let mut app = App::new();
+        app.insert_resource(m)
+            .add_message::<ConnectionStatusMessage>()
+            .add_systems(Update, halt_on_connection_loss);
+        app.world_mut().write_message(ConnectionStatusMessage(ConnectionStatus::Connected {
+            kernel_id: KernelId::new(),
+            context_id: None,
+            since_ms: 0,
+        }));
+        app.update();
+
+        assert!(
+            app.world().resource::<Metronome>().beat.is_some(),
+            "a Connected status must not disturb a running phasor"
+        );
     }
 }
