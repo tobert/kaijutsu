@@ -177,6 +177,11 @@ pub enum RpcResultMessage {
     /// so a restart is invisible at the connection layer). Drained by
     /// `view::editor` to drop the stale session and pop back to the conversation.
     EditorSessionLost { session: u64 },
+    /// The per-client metronome config (`/etc/client/<id>/metronome.toml`,
+    /// cascading to the shared `/etc/client/metronome.toml`), fetched over RPC on
+    /// (re)connect. Drained by [`crate::metronome::apply_metronome_config`] into
+    /// the `Metronome` resource. Carries the resolved TOML body.
+    MetronomeConfigReceived(String),
 }
 
 // ============================================================================
@@ -449,6 +454,29 @@ fn poll_bootstrap_results(
                             }
                             Err(e) => {
                                 log::warn!("theme fetch over RPC failed: {e}; keeping default theme")
+                            }
+                        }
+
+                        // 0b. Fetch the per-client metronome config (per-client
+                        // /etc/client/<id>/metronome.toml first, then the shared
+                        // /etc/client/metronome.toml default). Best-effort — a
+                        // miss keeps the compiled-in click already on the
+                        // Metronome resource. Runs before the context branches
+                        // (which can `return`) so it always fires.
+                        for path in [
+                            format!("/etc/client/{client_id}/metronome.toml"),
+                            "/etc/client/metronome.toml".to_string(),
+                        ] {
+                            match h.get_config(path.clone()).await {
+                                Ok(toml) if !toml.trim().is_empty() => {
+                                    let _ = tx
+                                        .send(RpcResultMessage::MetronomeConfigReceived(toml));
+                                    break;
+                                }
+                                // Empty body: try the next (shared) layer.
+                                Ok(_) => {}
+                                // Absent override (common) / read error: fall through.
+                                Err(e) => log::debug!("metronome config {path} unavailable: {e}"),
                             }
                         }
 

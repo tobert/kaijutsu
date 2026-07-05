@@ -268,9 +268,13 @@ vim-the-rc-file.)
 ## Per-client config — the `/etc/client/` namespace (design direction, 2026-07-05)
 
 > Captured with Amy 2026-07-05 while designing the metronome UX / patch bay.
-> **Not yet built — docs-first, by decision.** The metronome click config and
-> the patch-bay routing table are the first consumers; both are *machine-local*
-> (each client faces a different ALSA graph), which is what forces this.
+> **Namespace + first consumer SHIPPED 2026-07-05** (`feat/metronome-config`):
+> the `/etc/client` mount, the cascade-aware canonicalizers, and the metronome
+> click config. The patch-bay routing table is the intended second consumer, but
+> its storage shape is still open (likely *not* TOML — it's a relation the
+> reconciler maintains, not hand-edited config). Both consumers are
+> *machine-local* (each client faces a different ALSA graph), which is what
+> forces this namespace.
 
 ### Why a second namespace
 
@@ -337,6 +341,13 @@ overridden). Kernel-global config (`/etc/config/*`, e.g. `models.toml`) is a
 separate, always-explicit target — so `--global` here means "the shared *client*
 default," not "the kernel singleton."
 
+**Shipped so far:** the canonicalizer accepts the hierarchical `/etc/client`
+namespace, so `kj config set /etc/client/metronome.toml` (shared default) and
+`kj config set /etc/client/<id>/metronome.toml` (an explicit override) both work.
+**Deferred:** the *ergonomics* — the caller-scoped default (no `<id>` needed) and
+the `--global` flag — which need `kj` to resolve the caller's client-id. That
+resolution is the same MCP/headless-client-id prerequisite noted above.
+
 ### Seeding & orphans
 
 Per-client docs (`/etc/client/<id>/…`) are **not** compile-seeded — there is no
@@ -350,9 +361,13 @@ prune verb can GC orphans later.
 ### First consumers
 
 - `/etc/client/<id>/metronome.toml` → `{ enabled, note, channel, velocity,
-  gate_ms }` (later: downbeat accent). The app fetches its own (cascade) after
-  connect, applies to the `Metronome` resource, re-fetches on a config-changed
-  push. Replaces today's hardcoded `CLICK_NOTE`/`CH`/velocity/gate.
+  gate_ms }` — **SHIPPED**. Seeded shared default at `/etc/client/metronome.toml`
+  (`assets/defaults/metronome.toml`); the app fetches its own via the cascade
+  after connect (`actor_plugin` bootstrap) and applies to the `Metronome`
+  resource, replacing the hardcoded `CLICK_NOTE`/`CH`/velocity/gate. Config-change
+  *push* (re-apply on a live `kj config set` without reconnect) is the noted
+  follow-up; today it applies once per (re)connect. Later: downbeat accent (needs
+  meter the `BeatRef` doesn't carry).
 - `/etc/client/<id>/patchbay.toml` → the declared **symbolic** wires for this
   client's audio graph ("render out → gm-synth"); the app-side reconciler reads
   its own and drives the local ALSA seq graph toward it (resolving symbols →
