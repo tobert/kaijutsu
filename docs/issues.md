@@ -715,25 +715,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
        rejection. The absolute-tick-through-PLL shape is the *upgrade path*,
        reached for only if the metronome test shows per-cue boundary jitter
        audibly pulling away from the visual playhead.
-- **Metronome click should be configurable (found live 2026-07-02).** The 拍子木
-  click is hardcoded in the app: `CLICK_NOTE = 84` (C6) on channel 15, velocity
-  110, ~60ms gate (`kaijutsu-app/src/metronome.rs` + `MidiSink::click` in
-  `midi.rs`), and `Metronome.enabled` defaults on with no user surface. Live
-  verify surfaced the first footgun: the click was originally GM channel-9
-  percussion (note 76) which is **silent under a non-GM game soundfont** (zorak's
-  FF4 TiMidity has no drum kit) — so it moved to a gated melodic note. That
-  choice (note/channel/velocity/gate, and whether to sound at all) should be
-  user-configurable someday — a config knob or a `kj`/app toggle + a small
-  metronome settings block — rather than baked in. Downbeat accent (a different
-  note on bar-one) also wants meter info the `BeatRef` doesn't carry yet.
-  **Sharpened 2026-07-04 (second live bite):** the metronome **free-runs with
-  no clock behind it** — post-restart, kernel transport fully cold (nothing
-  attached), the app still clicked ch15/note-84 every ~2s on its render port;
-  it became audible the moment the app→TiMidity `aconnect` wire was remade,
-  and the only off switch was cutting the wire. Spec upgrade: **silent when no
-  track clock is running** (click only when following a live kernel beat), on
-  top of the toggle/config knob. No longer "defaults are fine" — an idle app
-  emits noise onto whatever synth is wired.
+- **Metronome — configurable + silence-when-idle SHIPPED 2026-07-05; residuals
+  open.** The core asks landed: silence-when-idle (`3fdf1045`,
+  `halt_on_connection_loss` resets the phasor on any non-`Connected` status — no
+  more free-running onto a wired synth after a kernel restart) and the
+  configurable click (`feat/metronome-config` merge: note/channel/velocity/gate/
+  enabled from a per-client `/etc/client/metronome.toml`, cascade + app apply).
+  **Still open:**
+    - **Downbeat accent** — a different note on bar-one needs meter info the
+      `BeatRef` doesn't carry yet.
+    - **Write ergonomics** — `--global` flag + caller-scoped write default (so a
+      client tweaks its own `/etc/client/<id>/…` without spelling the id); needs
+      `kj` to resolve the caller's client-id, the same MCP/headless durable-id
+      prereq (`docs/config-crdt-ownership.md` "Per-client config" → Open).
+    - **Config-change push** — the app applies `metronome.toml` once per
+      (re)connect; a live `kj config set` doesn't reach it without a reconnect.
+    - **`kj config list` omits `/etc/client`** — only readdirs `/etc/config`, so
+      the per-client files aren't discoverable via list.
 - **Metronome controller — graduate to PI/PID later.** The slosh was fixed
   (`d2b1f55c`, P-phase correction with feedforward tempo — diagnosis in
   `79c4b6b5`'s message). Remaining: graduate to a full PI/PID (damping + integral
