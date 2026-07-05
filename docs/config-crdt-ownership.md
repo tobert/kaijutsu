@@ -265,6 +265,109 @@ vim-the-rc-file.)
 
 ---
 
+## Per-client config — the `/etc/client/` namespace (design direction, 2026-07-05)
+
+> Captured with Amy 2026-07-05 while designing the metronome UX / patch bay.
+> **Not yet built — docs-first, by decision.** The metronome click config and
+> the patch-bay routing table are the first consumers; both are *machine-local*
+> (each client faces a different ALSA graph), which is what forces this.
+
+### Why a second namespace
+
+Everything in `/etc/config/*` today is a **kernel-wide singleton** — one
+`models.toml`, one `system.md`, read by the kernel to drive turns no matter who
+is connected. Correct for those. But client-facing config is not a singleton:
+the metronome click and the patch-bay wiring differ *per client*, because each
+client — the Bevy app on zorak, another on a laptop, an MCP producer seat, a
+future headless edge node — faces a different local audio graph. A global
+`patchbay.toml` cannot say "on **this** box, wire render → **this** synth."
+
+So config splits into namespaces (a third left for later):
+
+| Namespace | Scope | Examples | Reader |
+|---|---|---|---|
+| `/etc/config/*` | kernel-wide singleton | `models.toml`, `system.md` | kernel, no client-id |
+| `/etc/client/*` | per-client (this design) | `metronome.toml`, `patchbay.toml` | client, presents its id |
+| `/etc/principal/*` | per-player (deferred) | personal prefs someday | — |
+
+`/etc/principal/` is a **door left open**, not designed now (config-hierarchy
+thinking deferred by decision) — named so the `/etc/client/` shape doesn't paint
+it out.
+
+### The cascade
+
+A client-facing read resolves in order (gitconfig/CSS style):
+
+```
+/etc/client/<id>/metronome.toml   →  this client's override (usually absent)
+/etc/client/metronome.toml        →  the shared client default (seeded from embedded)
+<embedded seed>                   →  last-resort fallback
+```
+
+Most clients ride the shared default; a client overrides only what it cares
+about. The cascade is **opt-in by the reader**: kernel-global readers keep
+reading `/etc/config/<name>` with no id and get no cascade; a client-facing read
+passes its client-id and gets the two-level resolution. It reuses the existing
+hierarchical config store unchanged — `/etc/client/<id>/x` is just another
+`DocKind::Config` doc at a deeper path, readdir via the existing manifest prefix
+scan. **No new backend machinery** — a mount at `/etc/client`, a resolver, and a
+write-target policy.
+
+### Client identity — must generalize past the Bevy app
+
+The key is the **stable client-id the client presents** — the same string
+`client_views` already takes (`get_client_view(client_id: &str)`), so the kernel
+is already agnostic. What each client type must source:
+
+- **Bevy app** — has it: `ClientId`, a per-installation UUID at
+  `~/.local/share/kaijutsu/client-id` (survives restarts).
+- **MCP producer seat / headless clients** — do **not** have a stable per-install
+  id yet. The MCP `session_id` is per-Claude-Code-session (captured from hook
+  events), not a durable installation id. Giving MCP + headless clients a stable
+  client-id (own XDG file / config value) is a **prerequisite to-do** for their
+  per-client config to persist. Until then they ride the shared
+  `/etc/client/<name>` default — a fine degraded mode.
+
+### Write-target policy
+
+`kj config set` **defaults to the caller's own** `/etc/client/<id>/<name>` — a
+client tweaking its metronome never touches a neighbor's. `--global` writes the
+shared client default `/etc/client/<name>` (affects every client that hasn't
+overridden). Kernel-global config (`/etc/config/*`, e.g. `models.toml`) is a
+separate, always-explicit target — so `--global` here means "the shared *client*
+default," not "the kernel singleton."
+
+### Seeding & orphans
+
+Per-client docs (`/etc/client/<id>/…`) are **not** compile-seeded — there is no
+client-id at build time. They are created lazily on first per-client write;
+until then the client rides the shared/embedded default (nothing to seed). The
+shared `/etc/client/<name>` defaults *are* embedded-seeded like the rest. A lost
+client-id orphans that client's subtree — the same accepted failure mode
+`client_views` documents at single-user scale; a `kj config clients` list + a
+prune verb can GC orphans later.
+
+### First consumers
+
+- `/etc/client/<id>/metronome.toml` → `{ enabled, note, channel, velocity,
+  gate_ms }` (later: downbeat accent). The app fetches its own (cascade) after
+  connect, applies to the `Metronome` resource, re-fetches on a config-changed
+  push. Replaces today's hardcoded `CLICK_NOTE`/`CH`/velocity/gate.
+- `/etc/client/<id>/patchbay.toml` → the declared **symbolic** wires for this
+  client's audio graph ("render out → gm-synth"); the app-side reconciler reads
+  its own and drives the local ALSA seq graph toward it (resolving symbols →
+  live client numbers, which are dynamic). See the patch-bay design
+  (forthcoming).
+
+### Open (this design)
+
+- **Which existing configs migrate to `/etc/client/`?** `theme.toml` is
+  client-facing and a natural candidate; `models.toml`/`system.md` are not.
+  Decide per-file when touched — no big-bang migration.
+- **Config-changed push** so a live `kj config set` reaches the client without a
+  reconnect (the app fetches theme once on connect today). A CRDT subscription on
+  the client's config docs; scope it with the patch bay.
+
 ## Open implementation questions (remaining)
 
 1. **Durability + reseed semantics.** CRDT rc/config lives in `kernel.db`; confirm
