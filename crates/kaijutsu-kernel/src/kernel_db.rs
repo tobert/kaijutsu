@@ -95,6 +95,24 @@ pub struct ContextRow {
     /// Stamped by `touch_context_activity`, called from `BlockStore::journal_op`
     /// — the one chokepoint every mutating block op funnels through.
     pub last_activity_at: Option<i64>,
+    /// Unix-millis of the explicit ring-0 ("active") promote, or `None` if
+    /// never promoted. First-write-wins: re-promoting an already-promoted
+    /// context is a no-op that preserves this timestamp, so ring-0 order
+    /// stays append-stable. Mutually exclusive with `demoted_at` — setting
+    /// one clears the other. Cleared by `conclude_context` (gives up the
+    /// ring-0 seat) and by `archive_context`.
+    pub promoted_at: Option<i64>,
+    /// Unix-millis of the explicit push to the demoted ring, or `None` if
+    /// never demoted. Mutually exclusive with `promoted_at`. Cleared by
+    /// `archive_context`. See the demote ladder in `demote_context`.
+    pub demoted_at: Option<i64>,
+    /// Unix-millis of the explicit "suspend activity" flag, or `None` if not
+    /// paused. Design-only for now: persisted and exposed on the wire, but
+    /// not yet wired to any behavioral gating. Intended semantics once wired:
+    /// a paused context receives no beat/OODA wakeups (seam: hyoushigi
+    /// attachment wakeup fire) and rejects turn-starts loudly (seam: kernel
+    /// turn-start).
+    pub paused_at: Option<i64>,
 }
 
 impl ContextRow {
@@ -108,6 +126,46 @@ impl ContextRow {
             created_at: self.created_at as u64,
         }
     }
+}
+
+/// Hard cap on the number of contexts holding a ring-0 seat
+/// (`promoted_at IS NOT NULL AND archived_at IS NULL`) at once. Ring 0
+/// renders exactly this many slots, addressed by digit hotkeys 0-9, and is
+/// Amy's hand-curated seat row: seats must never appear or vanish without an
+/// explicit act, so [`KernelDb::promote_context`] refuses loudly instead of
+/// bumping the oldest occupant when the ring is full.
+pub const ACTIVE_RING_CAPACITY: i64 = 10;
+
+/// Outcome of one step on the demote ladder — see
+/// [`KernelDb::demote_context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemoteOutcome {
+    /// Was promoted (ring 0) → `promoted_at` cleared, back to automatic placement.
+    Unpromoted,
+    /// Was neither promoted nor demoted → `demoted_at` set (pushed to the demoted ring).
+    Demoted,
+    /// Was already demoted → archived (one step further outward, past the rim).
+    Archived,
+}
+
+/// Outcome of a promote — see [`KernelDb::promote_context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteOutcome {
+    /// Newly seated in ring 0 (`promoted_at` stamped, `demoted_at` cleared).
+    Promoted,
+    /// Already held a seat — no-op, original timestamp preserved.
+    AlreadyPromoted,
+    /// Was archived — resurrected: promote is the resurrection door (the
+    /// archive is memory to drift back from, not trash). `archived_at`
+    /// cleared, a FRESH `promoted_at` stamped (the old seat was surrendered
+    /// at archive time), `demoted_at` cleared. `concluded` reports whether
+    /// the row is still concluded — placement is orthogonal to conclusion
+    /// ("concluded but seated for review" is a legit state), and callers
+    /// need it to restore the right DriftRouter lifecycle state.
+    Resurrected {
+        /// The resurrected row's `concluded_at` is still set.
+        concluded: bool,
+    },
 }
 
 /// A persisted hook entry. Flat shape so the rusqlite row readers map
@@ -361,7 +419,10 @@ CREATE TABLE IF NOT EXISTS contexts (
     concluded_at INTEGER,
     workspace_id BLOB REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
     preset_id    BLOB REFERENCES presets(preset_id) ON DELETE SET NULL,
-    last_activity_at INTEGER
+    last_activity_at INTEGER,
+    promoted_at  INTEGER,
+    demoted_at   INTEGER,
+    paused_at    INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL;
@@ -1010,6 +1071,9 @@ impl KernelDb {
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
             "ALTER TABLE tracks ADD COLUMN clock_kind TEXT NOT NULL DEFAULT 'system'",
             "ALTER TABLE contexts ADD COLUMN last_activity_at INTEGER",
+            "ALTER TABLE contexts ADD COLUMN promoted_at INTEGER",
+            "ALTER TABLE contexts ADD COLUMN demoted_at INTEGER",
+            "ALTER TABLE contexts ADD COLUMN paused_at INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -1645,7 +1709,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at
+                    last_activity_at, promoted_at, demoted_at, paused_at
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -1755,11 +1819,13 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Archive a context (soft delete). Returns true if it was active.
+    /// Archive a context (soft delete). Returns true if it was active. Also
+    /// clears `promoted_at` and `demoted_at` — an archived context holds no
+    /// ring seat, hand-picked or otherwise.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
         let now = now_millis();
         let updated = self.conn.execute(
-            "UPDATE contexts SET archived_at = ?1
+            "UPDATE contexts SET archived_at = ?1, promoted_at = NULL, demoted_at = NULL
              WHERE context_id = ?2 AND archived_at IS NULL",
             params![now, blob_param(id.as_bytes())],
         )?;
@@ -1783,18 +1849,142 @@ impl KernelDb {
     /// `concluded_at` (first time only — idempotent re-conclude keeps the
     /// original timestamp). Only an active (non-archived) context can be
     /// concluded. Returns `true` if a row was newly concluded, `false` if the
-    /// context was unknown, archived, or already concluded.
+    /// context was unknown, archived, or already concluded. Also clears
+    /// `promoted_at` — concluding is the mux-exit that gives up the ring-0
+    /// seat.
     pub fn conclude_context(&self, id: ContextId) -> KernelDbResult<bool> {
         let now = now_millis();
         let updated = self.conn.execute(
             "UPDATE contexts
-                SET context_state = 'concluded', concluded_at = ?1
+                SET context_state = 'concluded', concluded_at = ?1, promoted_at = NULL
              WHERE context_id = ?2
                AND archived_at IS NULL
                AND concluded_at IS NULL",
             params![now, blob_param(id.as_bytes())],
         )?;
         Ok(updated > 0)
+    }
+
+    /// Promote a context into ring 0 ("active"). First-write-wins on
+    /// `promoted_at` — re-promoting an already-promoted context is a no-op
+    /// that preserves the original timestamp, so ring-0 order stays
+    /// append-stable — and clears `demoted_at`. Promoting an ARCHIVED
+    /// context resurrects it: `archived_at` cleared, a fresh `promoted_at`
+    /// stamped (the old seat was surrendered at archive time), `concluded_at`
+    /// untouched — see [`PromoteOutcome::Resurrected`]. Enforces
+    /// [`ACTIVE_RING_CAPACITY`] on every seat grant (resurrection included):
+    /// a full ring fails loudly rather than silently bumping anything —
+    /// ring-0 is a hand-curated row of seats addressed by digit hotkeys, so
+    /// seats must never appear or vanish without an explicit act. On the
+    /// ring-full error an archived context STAYS archived (no partial write).
+    pub fn promote_context(&self, id: ContextId) -> KernelDbResult<PromoteOutcome> {
+        let (promoted_at, archived_at, concluded_at): (Option<i64>, Option<i64>, Option<i64>) =
+            self.conn
+                .query_row(
+                    "SELECT promoted_at, archived_at, concluded_at
+                     FROM contexts WHERE context_id = ?1",
+                    params![blob_param(id.as_bytes())],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
+
+        if archived_at.is_none() && promoted_at.is_some() {
+            return Ok(PromoteOutcome::AlreadyPromoted);
+        }
+
+        let active_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM contexts WHERE promoted_at IS NOT NULL AND archived_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_count >= ACTIVE_RING_CAPACITY {
+            return Err(KernelDbError::Validation(format!(
+                "active ring full ({ACTIVE_RING_CAPACITY} seats) — demote something first"
+            )));
+        }
+
+        if archived_at.is_some() {
+            // Resurrection: unarchive + a FRESH promoted_at in one write.
+            // `archive_context` clears promoted_at, so an archived row
+            // shouldn't still carry one — but stamp unconditionally anyway:
+            // the old seat was surrendered at archive time either way.
+            self.conn.execute(
+                "UPDATE contexts
+                    SET archived_at = NULL, promoted_at = ?1, demoted_at = NULL
+                 WHERE context_id = ?2",
+                params![now_millis(), blob_param(id.as_bytes())],
+            )?;
+            return Ok(PromoteOutcome::Resurrected {
+                concluded: concluded_at.is_some(),
+            });
+        }
+
+        self.conn.execute(
+            "UPDATE contexts SET promoted_at = ?1, demoted_at = NULL
+             WHERE context_id = ?2 AND promoted_at IS NULL",
+            params![now_millis(), blob_param(id.as_bytes())],
+        )?;
+        Ok(PromoteOutcome::Promoted)
+    }
+
+    /// Push a context outward one step on the demote ladder (kernel-owned
+    /// policy, one place): promoted → clears `promoted_at` (back to
+    /// automatic placement); neither promoted nor demoted → sets
+    /// `demoted_at`; already demoted → archives it (reuses
+    /// [`Self::archive_context`]'s write — single context, no subtree
+    /// recursion, no latch). Each call is exactly one step outward. Errors
+    /// if the context is unknown or already archived (nothing further out to
+    /// step to).
+    pub fn demote_context(&self, id: ContextId) -> KernelDbResult<DemoteOutcome> {
+        let (promoted_at, demoted_at, archived_at): (Option<i64>, Option<i64>, Option<i64>) = self
+            .conn
+            .query_row(
+                "SELECT promoted_at, demoted_at, archived_at FROM contexts WHERE context_id = ?1",
+                params![blob_param(id.as_bytes())],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
+
+        if archived_at.is_some() {
+            return Err(KernelDbError::Validation(
+                "cannot demote an archived context".to_string(),
+            ));
+        }
+
+        if promoted_at.is_some() {
+            self.conn.execute(
+                "UPDATE contexts SET promoted_at = NULL WHERE context_id = ?1",
+                params![blob_param(id.as_bytes())],
+            )?;
+            Ok(DemoteOutcome::Unpromoted)
+        } else if demoted_at.is_none() {
+            self.conn.execute(
+                "UPDATE contexts SET demoted_at = ?1 WHERE context_id = ?2",
+                params![now_millis(), blob_param(id.as_bytes())],
+            )?;
+            Ok(DemoteOutcome::Demoted)
+        } else {
+            self.archive_context(id)?;
+            Ok(DemoteOutcome::Archived)
+        }
+    }
+
+    /// Set or clear a context's `paused_at`. Design-only for now — see the
+    /// doc on [`ContextRow::paused_at`] for the intended (not yet wired)
+    /// gating semantics. Unlike `promoted_at`'s first-write-wins, this is a
+    /// plain on/off flag: it unconditionally overwrites on every call.
+    pub fn set_context_paused(&self, id: ContextId, paused: bool) -> KernelDbResult<()> {
+        let value = if paused { Some(now_millis()) } else { None };
+        let updated = self.conn.execute(
+            "UPDATE contexts SET paused_at = ?1 WHERE context_id = ?2",
+            params![value, blob_param(id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
+        }
+        Ok(())
     }
 
     /// Stamp `last_activity_at` on a context — called from
@@ -1822,7 +2012,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at
+                    last_activity_at, promoted_at, demoted_at, paused_at
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -1839,7 +2029,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at
+                    last_activity_at, promoted_at, demoted_at, paused_at
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -1852,7 +2042,20 @@ impl KernelDb {
     ///
     /// Supports exact label, label prefix, hex prefix. For tag:prefix syntax
     /// (future), walks lineage via CTE.
+    ///
+    /// Fuzzy forms (label, prefix) resolve over the ACTIVE set only — an
+    /// archived context never shadows a live label or shows up in prefix
+    /// ambiguity. A FULL id (32-char hex or hyphenated UUID) resolves
+    /// against the whole table, archived included: the exact id is the
+    /// resurrection handle (`kj context promote <full-id>` must be able to
+    /// reach an archived context; promote is the resurrection door).
     pub fn resolve_context(&self, query: &str) -> KernelDbResult<ContextId> {
+        if let Ok(full) = ContextId::parse(query)
+            && self.get_context(full)?.is_some()
+        {
+            return Ok(full);
+        }
+
         // Load active contexts (set is small, <100)
         let contexts = self.list_active_contexts()?;
         let items = contexts.iter().map(|c| (c.context_id, c.label.as_deref()));
@@ -1877,7 +2080,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -1896,7 +2099,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -1934,7 +2137,7 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, dag.depth
+                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -1942,7 +2145,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(17)?;
+            let depth: i64 = row.get(20)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1964,7 +2167,7 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, lineage.depth
+                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -1972,7 +2175,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(17)?;
+            let depth: i64 = row.get(20)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1993,7 +2196,7 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, subtree.depth
+                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -2001,7 +2204,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(17)?;
+            let depth: i64 = row.get(20)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -3851,7 +4054,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at
+                    last_activity_at, promoted_at, demoted_at, paused_at
              FROM contexts WHERE label = ?1",
         )?;
 
@@ -3938,6 +4141,9 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         preset_id: read_opt_preset_id(row, 14)?,
         concluded_at: row.get(15)?,
         last_activity_at: row.get(16)?,
+        promoted_at: row.get(17)?,
+        demoted_at: row.get(18)?,
+        paused_at: row.get(19)?,
     })
 }
 
@@ -4015,6 +4221,9 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         preset_id: None,
         concluded_at: None,
         last_activity_at: None,
+        promoted_at: None,
+        demoted_at: None,
+        paused_at: None,
     }
 }
 
@@ -4900,6 +5109,9 @@ mod tests {
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         };
 
         let ctx = row.to_context();
@@ -4938,6 +5150,9 @@ mod tests {
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
@@ -4961,6 +5176,9 @@ mod tests {
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -5036,6 +5254,9 @@ mod tests {
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(
@@ -7094,5 +7315,315 @@ mod tests {
                 .unwrap(),
             Some(true),
         );
+    }
+
+    // ── 29. Time-well ring placement (promote/demote/pause) ────────────
+
+    #[test]
+    fn promote_context_stamps_and_is_append_stable() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("candidate"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.promoted_at, None);
+
+        assert_eq!(
+            db.promote_context(cid).unwrap(),
+            PromoteOutcome::Promoted,
+            "first promote is new"
+        );
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        let stamp = loaded.promoted_at.expect("promoted_at set");
+        assert!(stamp > 0);
+
+        // Re-promote: no-op, original timestamp preserved (append-stable).
+        assert_eq!(
+            db.promote_context(cid).unwrap(),
+            PromoteOutcome::AlreadyPromoted,
+            "re-promote is a no-op"
+        );
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.promoted_at, Some(stamp));
+    }
+
+    #[test]
+    fn promote_clears_demoted_and_demote_clears_promoted() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("seesaw"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        // Promote → demoted_at stays clear.
+        assert_eq!(db.promote_context(cid).unwrap(), PromoteOutcome::Promoted);
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert!(loaded.promoted_at.is_some());
+        assert_eq!(loaded.demoted_at, None);
+
+        // Demote a promoted context: one step in from ring 0 → unpromoted,
+        // NOT straight to demoted (each demote call is one step outward).
+        assert_eq!(
+            db.demote_context(cid).unwrap(),
+            DemoteOutcome::Unpromoted
+        );
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.promoted_at, None);
+        assert_eq!(loaded.demoted_at, None);
+
+        // Demote again from neutral → demoted.
+        assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Demoted);
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert!(loaded.demoted_at.is_some());
+
+        // Promote a demoted context → clears demoted_at.
+        assert_eq!(db.promote_context(cid).unwrap(), PromoteOutcome::Promoted);
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert!(loaded.promoted_at.is_some());
+        assert_eq!(loaded.demoted_at, None);
+    }
+
+    #[test]
+    fn demote_ladder_ends_archived() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("ladder"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert_eq!(db.promote_context(cid).unwrap(), PromoteOutcome::Promoted);
+
+        // promoted → unpromoted (back to automatic placement)
+        assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Unpromoted);
+        // neither → demoted
+        assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Demoted);
+        // already demoted → archived (one step further outward)
+        assert_eq!(db.demote_context(cid).unwrap(), DemoteOutcome::Archived);
+
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert!(loaded.archived_at.is_some());
+
+        // Further demote on an archived context is a loud error, not a
+        // silent no-op — nothing further out to step to.
+        let err = db.demote_context(cid).unwrap_err();
+        assert!(matches!(err, KernelDbError::Validation(_)));
+    }
+
+    #[test]
+    fn conclude_context_clears_promoted_seat() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("mux-exit"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert_eq!(db.promote_context(cid).unwrap(), PromoteOutcome::Promoted);
+        assert!(db.conclude_context(cid).unwrap());
+
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.promoted_at, None, "conclude gives up the ring-0 seat");
+    }
+
+    #[test]
+    fn archive_context_clears_promoted_and_demoted() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("archived-seat"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert_eq!(db.promote_context(cid).unwrap(), PromoteOutcome::Promoted);
+        assert!(db.archive_context(cid).unwrap());
+
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.promoted_at, None);
+        assert_eq!(loaded.demoted_at, None);
+    }
+
+    #[test]
+    fn set_context_paused_roundtrip() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("pausable"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.paused_at, None);
+
+        db.set_context_paused(cid, true).unwrap();
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert!(loaded.paused_at.is_some());
+
+        db.set_context_paused(cid, false).unwrap();
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.paused_at, None);
+    }
+
+    #[test]
+    fn active_ring_cap_refuses_an_eleventh_seat_until_a_demote() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let mut ids = Vec::new();
+        for i in 0..ACTIVE_RING_CAPACITY {
+            let row = make_context_row(Some(&format!("seat-{i}")));
+            let cid = row.context_id;
+            insert_context_with_doc(&db, &row, ws_id);
+            assert_eq!(
+                db.promote_context(cid).unwrap(),
+                PromoteOutcome::Promoted,
+                "seat {i} should promote"
+            );
+            ids.push(cid);
+        }
+
+        // 11th promote: ring full, fails loudly.
+        let eleventh = make_context_row(Some("overflow"));
+        let eleventh_id = eleventh.context_id;
+        insert_context_with_doc(&db, &eleventh, ws_id);
+        let err = db.promote_context(eleventh_id).unwrap_err();
+        assert!(matches!(err, KernelDbError::Validation(_)), "err: {err:?}");
+
+        // Demote one seat, freeing capacity for the 11th.
+        assert_eq!(
+            db.demote_context(ids[0]).unwrap(),
+            DemoteOutcome::Unpromoted
+        );
+        assert_eq!(
+            db.promote_context(eleventh_id).unwrap(),
+            PromoteOutcome::Promoted,
+            "11th promote should now succeed"
+        );
+    }
+
+    #[test]
+    fn promote_resurrects_an_archived_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("lazarus"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert!(db.archive_context(cid).unwrap());
+
+        // Promote is the resurrection door: unarchives + seats in one act.
+        assert_eq!(
+            db.promote_context(cid).unwrap(),
+            PromoteOutcome::Resurrected { concluded: false }
+        );
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.archived_at, None, "resurrection clears archived_at");
+        assert!(loaded.promoted_at.is_some(), "resurrection takes a seat");
+        assert_eq!(loaded.demoted_at, None);
+
+        // Back among the living: visible to list_active_contexts again.
+        let active = db.list_active_contexts().unwrap();
+        assert!(active.iter().any(|c| c.context_id == cid));
+    }
+
+    #[test]
+    fn promote_resurrects_a_concluded_context_without_unconcluding() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("done-but-back"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert!(db.conclude_context(cid).unwrap());
+        let concluded_stamp = db.get_context(cid).unwrap().unwrap().concluded_at.unwrap();
+        assert!(db.archive_context(cid).unwrap());
+
+        // Placement is orthogonal to conclusion: "concluded but seated for
+        // review" is a legit state — resurrection must NOT clear concluded_at.
+        assert_eq!(
+            db.promote_context(cid).unwrap(),
+            PromoteOutcome::Resurrected { concluded: true }
+        );
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.archived_at, None);
+        assert_eq!(loaded.concluded_at, Some(concluded_stamp));
+        assert!(loaded.promoted_at.is_some());
+    }
+
+    #[test]
+    fn ring_full_resurrection_errors_and_stays_archived() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        for i in 0..ACTIVE_RING_CAPACITY {
+            let row = make_context_row(Some(&format!("full-seat-{i}")));
+            let cid = row.context_id;
+            insert_context_with_doc(&db, &row, ws_id);
+            assert_eq!(db.promote_context(cid).unwrap(), PromoteOutcome::Promoted);
+        }
+
+        let buried = make_context_row(Some("stays-buried"));
+        let buried_id = buried.context_id;
+        insert_context_with_doc(&db, &buried, ws_id);
+        assert!(db.archive_context(buried_id).unwrap());
+
+        // Resurrection needs a free seat exactly like any promote: full ring
+        // → the same loud error, and NO partial write — the context stays
+        // archived.
+        let err = db.promote_context(buried_id).unwrap_err();
+        assert!(matches!(err, KernelDbError::Validation(_)), "err: {err:?}");
+        let loaded = db.get_context(buried_id).unwrap().unwrap();
+        assert!(loaded.archived_at.is_some(), "failed resurrection must not unarchive");
+        assert_eq!(loaded.promoted_at, None);
+    }
+
+    #[test]
+    fn resurrection_stamps_a_fresh_promoted_at() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("stale-seat"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        // Defensive shape `archive_context` can't produce (it clears
+        // promoted_at): an archived row still carrying an old seat stamp.
+        // Resurrection must stamp FRESH — the old seat was surrendered at
+        // archive time; a stale stamp would jump the append order.
+        let stale_stamp: i64 = 12_345;
+        db.conn
+            .execute(
+                "UPDATE contexts SET archived_at = ?1, promoted_at = ?2 WHERE context_id = ?3",
+                params![99_999_i64, stale_stamp, blob_param(cid.as_bytes())],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.promote_context(cid).unwrap(),
+            PromoteOutcome::Resurrected { concluded: false }
+        );
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        let fresh = loaded.promoted_at.expect("seated");
+        assert!(
+            fresh > stale_stamp,
+            "resurrection must restamp promoted_at fresh (got {fresh}, stale was {stale_stamp})"
+        );
+    }
+
+    #[test]
+    fn resolve_context_full_id_reaches_an_archived_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("ghost"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+        assert!(db.archive_context(cid).unwrap());
+
+        // Fuzzy forms stay scoped to the active set — the label is gone…
+        let err = db.resolve_context("ghost").unwrap_err();
+        assert!(matches!(err, KernelDbError::NotFound(_)));
+
+        // …but the exact full id is the resurrection handle.
+        let hyphenated = cid.to_string();
+        assert_eq!(db.resolve_context(&hyphenated).unwrap(), cid);
+        let bare_hex = hyphenated.replace('-', "");
+        assert_eq!(db.resolve_context(&bare_hex).unwrap(), cid);
     }
 }

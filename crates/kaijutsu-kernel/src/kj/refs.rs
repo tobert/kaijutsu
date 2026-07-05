@@ -175,6 +175,9 @@ mod tests {
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         };
         let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(&row, ws_id).unwrap();
@@ -223,6 +226,9 @@ mod tests {
                 preset_id: None,
                 concluded_at: None,
                 last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
             },
             ws_id,
         )
@@ -248,6 +254,9 @@ mod tests {
                 preset_id: None,
                 concluded_at: None,
                 last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
             },
             ws_id,
         )
@@ -273,6 +282,9 @@ mod tests {
                 preset_id: None,
                 concluded_at: None,
                 last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
             },
             ws_id,
         )

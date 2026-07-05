@@ -1217,6 +1217,9 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         })
         .unwrap();
     }

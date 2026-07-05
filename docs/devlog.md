@@ -259,9 +259,26 @@ magic-circle rings ("it looks so cool"), cards stood up as slides radiating
 from the funnel; and the terraces became a **Kodak-Carousel** the user drives:
 one ring per band, left/right spins the focused ring so the selected card eases
 face-on to a gate angle, up/down changes rings, non-focused rings dim
-("fantastic… I'm delighted"). The open design thread is ring *membership* —
-explicit hot-row promotion verbs plus coarse (days) auto-decay, replacing
-all-or-nothing idle bucketing.
+("fantastic… I'm delighted").
+
+Two days later (July 5) the idle-age bands themselves were replaced: **placement
+you can't control isn't an instrument.** Amy's model — two hand-curated rings
+sandwiching two automatic ones, every ring exactly ten seats, digits addressing
+the focused ring's seats — landed end-to-end in an afternoon of lead + two
+sonnet lanes: ACTIVE (promote by keystroke or by visiting; the kernel
+auto-promotes in `setLastContext`, which the app already called), RECENT and
+BUMPED (pure recency competition for ten seats each — the age constants and the
+running-forces-hot override died outright; liveness is *light*, never
+placement), DEMOTED (an explicit push-away), and past all four, a real event
+horizon: unseated cards get no entity, just a "+N" in the throat. The demote
+ladder steps one ring outward per press and archives off the end; promote on an
+archived context *resurrects* it (Amy: the archive is memory to drift back
+from, not trash — the door Stage-5 search will feed). Pause landed as designed
+state only — a `paused_at` stamp, a toggle, a dimmed card — with its real
+meaning (suspend activity: no beat wakeups, refuse turn-starts) documented on
+the column for a later slice. A legend HUD names the verbs in the well itself;
+the keys are declared provisional. Ring 0 is the Stage-2 rank arriving in ring
+clothing: append-ordered, kernel-owned, ten seats, digit-addressed.
 
 **Conversation view hardening (July 3).** Two long-standing irritations fell
 in one arc. Error blocks stuck to the bottom traced to Bevy child-ordering

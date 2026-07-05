@@ -1,12 +1,16 @@
 //! Time-well context browser — the first concrete consumer of `kaijutsu-viz`.
 //!
-//! A radial 3D "well" of context cards, terraced by idle-age band (Stage 1,
-//! "kernel truth: activity recency" — see `docs/timewell.md`): `HotNow` (the
-//! mouth) → `ThisWeek` → `ThirtyDays` → `Horizon` (the throat), each its own
-//! radius/depth terrace with a visible step + gap at the boundary; within a
-//! terrace, angle encodes recency-ordered within-band position.
-//! `docs/time-well-concepts.md` holds the earlier UX record; the retired
-//! substrate design survives as the "Appendix: substrate notes" in
+//! A radial 3D "well" of context cards, seated by **explicit ring placement**
+//! (`docs/timewell.md`, "Ring membership becomes explicit") — two hand-curated
+//! rings sandwiching two automatic ones: `Active` (mouth, `p`romoted) →
+//! `Recent` (automatic, most-recently-active) → `Bumped` (automatic overflow;
+//! concluded contexts compete only here) → `Demoted` (throat, `d`emoted).
+//! Every ring seats exactly 10 (`kaijutsu_viz::layout::RING_SLOTS`); anything
+//! past seat 9 is the event horizon — no card entity, a "+N" count at the
+//! throat. Each ring has its own radius/depth terrace with a visible step +
+//! gap at the boundary; within a terrace, angle encodes the ring's own seat
+//! order. `docs/time-well-concepts.md` holds the earlier UX record; the
+//! retired substrate design survives as the "Appendix: substrate notes" in
 //! `docs/timewell.md` (full viz-substrate.md in git history).
 //!
 //! Module map:
@@ -81,6 +85,8 @@ impl Plugin for TimeWellPlugin {
                         sync::sync_time_well,
                         text::build_card_scenes,
                         text::update_reading_card,
+                        text::build_ring_labels,
+                        text::build_horizon_label,
                     )
                         .chain(),
                     (

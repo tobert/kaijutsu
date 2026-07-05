@@ -3,7 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_types::{BlockId, ConsentMode, ContentType, ContextId, ContextState, EdgeKind};
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
+use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome};
 
 use super::format::{
     format_context_info, format_context_table, format_context_tree, format_fork_lineage,
@@ -123,6 +123,19 @@ enum ContextCommand {
     /// transition). Reversible via fork; not latched, not destructive.
     #[command(alias = "done")]
     Conclude { context: String },
+    /// Promote a context into ring 0 ("active"). Not latched, not
+    /// capability-gated (same as conclude). First promote wins the
+    /// timestamp — re-promoting an already-promoted context is a no-op.
+    Promote { context: String },
+    /// Push a context outward one step on the demote ladder: promoted →
+    /// unpromoted, unpromoted/undemoted → demoted, already demoted →
+    /// archived. Not latched (each step is reversible except the last).
+    Demote { context: String },
+    /// Set the "suspend activity" flag (design-only — no behavioral gating
+    /// yet; see the doc on `ContextRow::paused_at`).
+    Pause { context: String },
+    /// Clear the "suspend activity" flag.
+    Resume { context: String },
     /// Permanently delete a context (latched).
     #[command(alias = "rm")]
     Remove { context: String },
@@ -372,6 +385,10 @@ impl KjDispatcher {
             } => self.context_move(&context, &new_parent, caller).await,
             ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
+            ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
+            ContextCommand::Demote { context } => self.context_demote(&context, caller).await,
+            ContextCommand::Pause { context } => self.context_pause(&context, caller, true).await,
+            ContextCommand::Resume { context } => self.context_pause(&context, caller, false).await,
             ContextCommand::Remove { context } => self.context_remove(&context, caller).await,
             ContextCommand::Retag { label, context } => {
                 self.context_retag(&label, &context, caller).await
@@ -634,6 +651,9 @@ impl KjDispatcher {
                 preset_id: None,
                 concluded_at: None,
                 last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -737,6 +757,9 @@ impl KjDispatcher {
                 preset_id: None,
                 concluded_at: None,
                 last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
@@ -1119,6 +1142,127 @@ impl KjDispatcher {
         }
     }
 
+    /// `kj context promote <ctx>` — bring a context into ring 0 ("active").
+    /// Not latched, not capability-gated (same as conclude). First-write-wins
+    /// on the timestamp — re-promoting an already-promoted context is a no-op
+    /// success. Promoting an ARCHIVED context (reachable by full id only)
+    /// resurrects it — promote is the resurrection door; the archive is
+    /// memory to drift back from, not trash. Errors loudly when the active
+    /// ring is full ([`crate::kernel_db::ACTIVE_RING_CAPACITY`] seats) —
+    /// ring 0 is a hand-curated row, so seats never appear or vanish without
+    /// an explicit act.
+    async fn context_promote(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
+        let target_id = {
+            let db = self.kernel_db().lock();
+            match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context promote: {e}")),
+            }
+        };
+
+        let outcome = {
+            let db = self.kernel_db().lock();
+            match db.promote_context(target_id) {
+                Ok(v) => v,
+                Err(e) => return KjResult::Err(format!("kj context promote: {e}")),
+            }
+        };
+
+        match outcome {
+            PromoteOutcome::Promoted => KjResult::ok(format!("promoted {}", target_id.short())),
+            PromoteOutcome::AlreadyPromoted => {
+                KjResult::ok(format!("{} already promoted", target_id.short()))
+            }
+            PromoteOutcome::Resurrected { concluded } => {
+                // Mirror archive's DriftRouter sync in reverse: the router
+                // still holds Archived and would keep the context dead to
+                // sessions. Conclusion is orthogonal to placement — a
+                // resurrected concluded context comes back Concluded.
+                let state = if concluded {
+                    ContextState::Concluded
+                } else {
+                    ContextState::Live
+                };
+                {
+                    let mut drift = self.drift_router().write();
+                    let _ = drift.set_state(target_id, state);
+                }
+                KjResult::ok(format!(
+                    "resurrected {} from the archive — promoted",
+                    target_id.short()
+                ))
+            }
+        }
+    }
+
+    /// `kj context demote <ctx>` — push a context outward one step on the
+    /// demote ladder (see [`crate::kernel_db::KernelDb::demote_context`]).
+    /// Not latched. Only the ladder's terminal step (archive) touches the
+    /// drift router.
+    async fn context_demote(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
+        let target_id = {
+            let db = self.kernel_db().lock();
+            match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
+            }
+        };
+
+        let outcome = {
+            let db = self.kernel_db().lock();
+            match db.demote_context(target_id) {
+                Ok(v) => v,
+                Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
+            }
+        };
+
+        match outcome {
+            DemoteOutcome::Unpromoted => KjResult::ok(format!(
+                "{} unpromoted (automatic placement)",
+                target_id.short()
+            )),
+            DemoteOutcome::Demoted => KjResult::ok(format!("demoted {}", target_id.short())),
+            DemoteOutcome::Archived => {
+                let mut drift = self.drift_router().write();
+                let _ = drift.set_state(target_id, ContextState::Archived);
+                drop(drift);
+                KjResult::ok(format!(
+                    "{} demoted past the rim — archived",
+                    target_id.short()
+                ))
+            }
+        }
+    }
+
+    /// `kj context pause <ctx>` / `resume` — set or clear the "suspend
+    /// activity" flag. Design-only: no behavioral gating is wired yet (see
+    /// the doc on `ContextRow::paused_at`). Not latched, not
+    /// capability-gated. Unlike promote/demote this is a plain on/off flag,
+    /// not append-ordered — every call unconditionally overwrites.
+    async fn context_pause(&self, ctx_ref: &str, caller: &KjCaller, paused: bool) -> KjResult {
+        let verb = if paused { "pause" } else { "resume" };
+        let target_id = {
+            let db = self.kernel_db().lock();
+            match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context {verb}: {e}")),
+            }
+        };
+
+        {
+            let db = self.kernel_db().lock();
+            if let Err(e) = db.set_context_paused(target_id, paused) {
+                return KjResult::Err(format!("kj context {verb}: {e}"));
+            }
+        }
+
+        if paused {
+            KjResult::ok(format!("paused {}", target_id.short()))
+        } else {
+            KjResult::ok(format!("resumed {}", target_id.short()))
+        }
+    }
+
     /// `kj context remove <ctx>` — permanently delete a context (latched).
     async fn context_remove(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
@@ -1461,8 +1605,13 @@ mod tests {
         let result = d.dispatch(&[s("context"), s("--help")], &c).await;
         assert!(result.is_ok());
         assert!(
-            result.message().contains("Usage") && result.message().contains("switch"),
-            "clap help should list usage + verbs: {}",
+            result.message().contains("Usage")
+                && result.message().contains("switch")
+                && result.message().contains("promote")
+                && result.message().contains("demote")
+                && result.message().contains("pause")
+                && result.message().contains("resume"),
+            "clap help should list usage + verbs (incl. the ring-placement ones): {}",
             result.message()
         );
     }
@@ -1865,6 +2014,227 @@ mod tests {
             kaijutsu_types::ContextState::Archived,
             "drift router state should be Archived post-archive"
         );
+    }
+
+    #[tokio::test]
+    async fn context_promote_then_reprompt_is_no_op() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("risingstar"), None, principal);
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("promote"), s("risingstar")], &c)
+            .await;
+        assert!(result.is_ok(), "promote failed: {}", result.message());
+        assert!(result.message().contains("promoted"), "msg: {}", result.message());
+
+        let stamp = {
+            let db = d.kernel_db().lock();
+            db.get_context(ctx).unwrap().unwrap().promoted_at.unwrap()
+        };
+
+        // Re-promote is an honest no-op, not a restamp.
+        let result = d
+            .dispatch(&[s("context"), s("promote"), s("risingstar")], &c)
+            .await;
+        assert!(result.is_ok());
+        assert!(
+            result.message().contains("already promoted"),
+            "msg: {}",
+            result.message()
+        );
+        let db = d.kernel_db().lock();
+        assert_eq!(db.get_context(ctx).unwrap().unwrap().promoted_at, Some(stamp));
+    }
+
+    #[tokio::test]
+    async fn context_demote_ladder_via_dispatch() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("falling"), None, principal);
+        let c = caller_with_context(ctx);
+
+        d.dispatch(&[s("context"), s("promote"), s("falling")], &c)
+            .await;
+
+        // promoted → unpromoted
+        let result = d
+            .dispatch(&[s("context"), s("demote"), s("falling")], &c)
+            .await;
+        assert!(result.is_ok());
+        assert!(result.message().contains("unpromoted"), "msg: {}", result.message());
+
+        // neither → demoted
+        let result = d
+            .dispatch(&[s("context"), s("demote"), s("falling")], &c)
+            .await;
+        assert!(result.is_ok());
+        assert!(result.message().contains("demoted"), "msg: {}", result.message());
+
+        // already demoted → archived, and the drift router reflects it
+        let result = d
+            .dispatch(&[s("context"), s("demote"), s("falling")], &c)
+            .await;
+        assert!(result.is_ok());
+        assert!(result.message().contains("archived"), "msg: {}", result.message());
+
+        let router = d.drift_router().read();
+        let h = router.get(ctx).expect("still registered");
+        assert_eq!(h.state, kaijutsu_types::ContextState::Archived);
+    }
+
+    #[tokio::test]
+    async fn context_pause_and_resume_round_trip() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("napping"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("context"), s("pause"), s("napping")], &c)
+            .await;
+        assert!(result.is_ok(), "pause failed: {}", result.message());
+        assert!(result.message().contains("paused"));
+        {
+            let db = d.kernel_db().lock();
+            assert!(db.get_context(ctx).unwrap().unwrap().paused_at.is_some());
+        }
+
+        let result = d
+            .dispatch(&[s("context"), s("resume"), s("napping")], &c)
+            .await;
+        assert!(result.is_ok(), "resume failed: {}", result.message());
+        assert!(result.message().contains("resumed"));
+        let db = d.kernel_db().lock();
+        assert_eq!(db.get_context(ctx).unwrap().unwrap().paused_at, None);
+    }
+
+    #[tokio::test]
+    async fn context_promote_and_demote_are_not_capability_gated() {
+        // Same authority level as conclude: an unprivileged caller whose
+        // context binding denies everything (Operator included) can still
+        // promote/demote — unlike `archive`/`remove`, which `require_cap`
+        // would deny here. Deny-all is written straight to the DB — the
+        // authoritative store `require_cap` reads (see
+        // `drive_denied_without_drive_capability` for the same pattern).
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("plain"), None, principal);
+        d.kernel_db()
+            .lock()
+            .upsert_context_binding(ctx, &crate::mcp::ContextToolBinding::new())
+            .unwrap();
+        let c = caller_with_context(ctx); // caller_with_context: privileged = false
+
+        let result = d
+            .dispatch(&[s("context"), s("promote"), s("plain")], &c)
+            .await;
+        assert!(
+            result.is_ok(),
+            "promote should not be capability-gated: {}",
+            result.message()
+        );
+
+        let result = d
+            .dispatch(&[s("context"), s("demote"), s("plain")], &c)
+            .await;
+        assert!(
+            result.is_ok(),
+            "demote should not be capability-gated: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_promote_resurrects_an_archived_context_by_full_id() {
+        // Promote is the resurrection door. Fuzzy resolution can't reach an
+        // archived context (label lookups walk the active set), so the full
+        // id is the handle — and the drift router must come back Live, or
+        // sessions would still see the context as dead.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("lazarus"), Some(parent), principal);
+
+        let c = confirmed_caller(parent);
+        let result = d
+            .dispatch(&[s("context"), s("archive"), s("lazarus")], &c)
+            .await;
+        assert!(result.is_ok(), "archive failed: {}", result.message());
+
+        // The label no longer resolves (archived is outside the fuzzy set)…
+        let result = d
+            .dispatch(&[s("context"), s("promote"), s("lazarus")], &c)
+            .await;
+        assert!(
+            !result.is_ok(),
+            "label of an archived context should not resolve: {}",
+            result.message()
+        );
+
+        // …but the full id resurrects.
+        let result = d
+            .dispatch(&[s("context"), s("promote"), target.to_string()], &c)
+            .await;
+        assert!(result.is_ok(), "resurrect failed: {}", result.message());
+        assert!(
+            result.message().contains("resurrected"),
+            "msg: {}",
+            result.message()
+        );
+
+        {
+            let db = d.kernel_db().lock();
+            let row = db.get_context(target).unwrap().unwrap();
+            assert_eq!(row.archived_at, None);
+            assert!(row.promoted_at.is_some());
+        }
+
+        let router = d.drift_router().read();
+        let h = router.get(target).expect("still registered");
+        assert_eq!(
+            h.state,
+            kaijutsu_types::ContextState::Live,
+            "resurrection must reverse archive's drift-router sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_promote_resurrects_a_concluded_context_as_concluded() {
+        // Conclusion is orthogonal to placement: a resurrected concluded
+        // context comes back Concluded (seated for review), not Live.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("reviewed"), Some(parent), principal);
+
+        let c = confirmed_caller(parent);
+        let result = d
+            .dispatch(&[s("context"), s("conclude"), s("reviewed")], &c)
+            .await;
+        assert!(result.is_ok(), "conclude failed: {}", result.message());
+        let result = d
+            .dispatch(&[s("context"), s("archive"), s("reviewed")], &c)
+            .await;
+        assert!(result.is_ok(), "archive failed: {}", result.message());
+
+        let result = d
+            .dispatch(&[s("context"), s("promote"), target.to_string()], &c)
+            .await;
+        assert!(result.is_ok(), "resurrect failed: {}", result.message());
+
+        {
+            let db = d.kernel_db().lock();
+            let row = db.get_context(target).unwrap().unwrap();
+            assert_eq!(row.archived_at, None);
+            assert!(row.concluded_at.is_some(), "resurrection must not un-conclude");
+            assert!(row.promoted_at.is_some());
+        }
+
+        let router = d.drift_router().read();
+        let h = router.get(target).expect("still registered");
+        assert_eq!(h.state, kaijutsu_types::ContextState::Concluded);
     }
 
     #[tokio::test]

@@ -310,6 +310,23 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    PromoteContext {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    DemoteContext {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    SetContextPaused {
+        context_id: ContextId,
+        paused: bool,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    ArchiveContext {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     SearchSimilar {
         query: String,
         k: u32,
@@ -588,6 +605,10 @@ impl RpcCommand {
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListTracks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::PromoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SetContextPaused { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ArchiveContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetClusters { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -760,6 +781,42 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn conclude(&self, context_id: ContextId) -> Result<(), CallError> {
         self.send(|reply| RpcCommand::Conclude { context_id, reply }).await
+    }
+
+    /// Promote a context into the time-well's ring 0 ("active"). First-write-
+    /// wins server-side — re-promoting an already-promoted context is a no-op
+    /// success. Fails loud when the active ring is full (10 seats,
+    /// `ACTIVE_RING_CAPACITY` kernel-side) — the caller surfaces that error.
+    #[tracing::instrument(skip(self))]
+    pub async fn promote_context(&self, context_id: ContextId) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::PromoteContext { context_id, reply }).await
+    }
+
+    /// Push a context outward one step on the kernel-owned demote ladder:
+    /// promoted → automatic placement; automatic → demoted; already demoted →
+    /// archived (single context, no subtree, no latch).
+    #[tracing::instrument(skip(self))]
+    pub async fn demote_context(&self, context_id: ContextId) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::DemoteContext { context_id, reply }).await
+    }
+
+    /// Set or clear a context's "suspend activity" flag (`pausedAt`).
+    /// Design-only for now — persisted and on the wire, no behavioral gating.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_context_paused(
+        &self,
+        context_id: ContextId,
+        paused: bool,
+    ) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::SetContextPaused { context_id, paused, reply }).await
+    }
+
+    /// Archive a single context — the well's single-keystroke archive act.
+    /// Unlike the `kj context archive` builtin (latched, recurses into
+    /// structural children), this is single-context, unlatched, idempotent.
+    #[tracing::instrument(skip(self))]
+    pub async fn archive_context(&self, context_id: ContextId) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::ArchiveContext { context_id, reply }).await
     }
 
     /// Semantic search: contexts similar to a free-text query (top `k`).
@@ -2400,6 +2457,18 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::Conclude { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));
+        }
+        RpcCommand::PromoteContext { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.promote_context(context_id));
+        }
+        RpcCommand::DemoteContext { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.demote_context(context_id));
+        }
+        RpcCommand::SetContextPaused { context_id, paused, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.set_context_paused(context_id, paused));
+        }
+        RpcCommand::ArchiveContext { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.archive_context(context_id));
         }
         RpcCommand::SearchSimilar { query, k: topk, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.search_similar(&query, topk));

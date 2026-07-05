@@ -10,39 +10,28 @@
 //! layer — chatter/beat uniforms + tail buffers off the event stream — lives
 //! in [`super::live`] and never relayouts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 
 use super::card::{
-    ClusterAssignment, assign_bands, band_orders, card_base_scale, card_from, ring_seat_rotated,
+    ClusterAssignment, assign_placement, card_base_scale, card_from, ring_seat_rotated,
     spiral_positions,
 };
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, RingSeat, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use super::panel::create_msdf_panel;
 
-/// Current wall-clock time as Unix-epoch millis. Idle age (`now -
-/// last_activity_at`) is real elapsed time, not app-uptime — so this reads
-/// `SystemTime`, **not** Bevy's `Res<Time>` (which is startup-relative and
-/// would misclassify every context as ancient after any nontrivial uptime).
-/// Fails loudly on a clock set before the epoch rather than silently
-/// defaulting to 0 (which would band everything as maximally idle).
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is set before the Unix epoch")
-        .as_millis() as i64
-}
-
 /// Reconcile the well against the latest polled context list.
 ///
 /// Gated on `DriftState` changing so a static context set costs nothing. On a
-/// change: diff via the join, despawn exits, recompute the layout over the full
-/// current set, spawn enters at their target, and refresh every surviving card's
-/// target + data (so compaction motion lands on all of them).
+/// change: run the whole-set placement (seating + ordering together — see
+/// [`assign_placement`]), diff the *seated* subset against the join, despawn
+/// exits, spawn enters at their target, and refresh every surviving card's
+/// target + data (so compaction motion lands on all of them). Horizon
+/// contexts never enter the join at all — no card entity, ever.
 pub fn sync_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
@@ -54,28 +43,48 @@ pub fn sync_time_well(
     // The well shows live + concluded contexts; archived are hidden entirely.
     let visible: Vec<&ContextInfo> = drift.contexts.iter().filter(|c| !c.archived).collect();
 
-    // Run when the poll changed the resource, or when the join is out of sync
-    // with the current count. The count fallback covers first-enter (join was
-    // cleared on exit) and dodges the Bevy run-condition change-detection
+    // Run when the poll changed the resource, or when the visible count is out
+    // of sync with what we last saw. The count fallback covers first-enter
+    // (reset on exit) and dodges the Bevy run-condition change-detection
     // footgun where a screen-gated system can miss a change that happened while
-    // it was dormant.
-    if !drift.is_changed() && state.join.len() == visible.len() {
+    // it was dormant. Compared against `visible.len()`, not `state.join.len()`
+    // — horizon contexts never enter the join, so the two can legitimately differ.
+    if !drift.is_changed() && state.last_seen_visible_count == visible.len() {
         return;
     }
+    state.last_seen_visible_count = visible.len();
 
-    // ── Layout tick: diff the polled list against the join. ──
-    let snapshot = visible.iter().map(|c| (c.id, (*c).clone()));
+    // ── Whole-set placement (seating + ordering together) over the CURRENT
+    // poll — not the join, which only ever holds the seated subset. A
+    // placement-only change (a seat reordering, a new horizon arrival) can
+    // happen with no join enter/exit/update at all, so `ring_cards` /
+    // `horizon_count` are refreshed unconditionally here, ahead of the (more
+    // expensive) diff-gated spawn/refresh work below.
+    let visible_owned: Vec<ContextInfo> = visible.iter().map(|c| (*c).clone()).collect();
+    let placement = assign_placement(&visible_owned);
+    state.horizon_count = placement.horizon.len();
+    let horizon: HashSet<ContextId> = placement.horizon.into_iter().collect();
+    state.ring_cards = placement.rings;
+
+    // ── Layout tick: diff the polled list, minus the horizon, against the join. ──
+    // Horizon contexts exit like archived cards — entity despawn is free via
+    // the existing Join reconcile.
+    let snapshot = visible
+        .iter()
+        .filter(|c| !horizon.contains(&c.id))
+        .map(|c| (c.id, (*c).clone()));
     let diff = state.join.reconcile(snapshot);
     if diff.is_empty() {
         return;
     }
 
     debug!(
-        "time-well sync: +{} ~{} -{} (now {} cards)",
+        "time-well sync: +{} ~{} -{} (now {} cards, {} past the horizon)",
         diff.enter.len(),
         diff.update.len(),
         diff.exit.len(),
         state.join.len(),
+        state.horizon_count,
     );
 
     // ── Despawn exits. ──
@@ -85,33 +94,20 @@ pub fn sync_time_well(
         }
     }
 
-    // ── Recompute bands + layout over the full current set. ──
-    // Stable key order from the join (BTreeMap order); positions key on id.
-    let contexts: Vec<ContextInfo> = state
-        .join
-        .keys()
-        .filter_map(|k| state.join.get(k).cloned())
-        .collect();
-    let now = now_millis();
-    let bands = assign_bands(&contexts, now);
-    let band_by_id: HashMap<ContextId, kaijutsu_viz::layout::Band> = contexts
+    // `state.ring_cards` (just refreshed above) already carries every seated
+    // id's band + seat order; invert it for the per-id lookups the spawn/
+    // refresh loops need below.
+    let band_by_id: HashMap<ContextId, kaijutsu_viz::layout::Band> = kaijutsu_viz::layout::ALL_BANDS
         .iter()
-        .map(|c| c.id)
-        .zip(bands.iter().copied())
+        .flat_map(|&band| state.ring_cards[band.index()].iter().map(move |&id| (id, band)))
         .collect();
     // Snapshot the cluster map so we can both feed the slot ordering and read
     // labels in the spawn/refresh loops below without re-borrowing `state`
-    // (which those loops mutate). It's Horizon-sized — a cheap clone.
+    // (which those loops mutate). It's Demoted-sized — a cheap clone.
     let cluster_of = state.cluster_of.clone();
-    // The whole well as one ordered spiral (mouth → throat) plus each card's
-    // `(band, within_index)` position — the flat order is the digit-jump address;
-    // the pair is what the ring geometry (`ring_seat`/`card_base_scale`) keys on.
-    let (order, pos_of) = spiral_positions(&contexts, &bands);
-    state.spiral_order = order;
-
-    // Ring-centric layout: each band ring's cards in within-ring (recency) order.
-    // This is the nav's source of truth — `(focused_ring, ring_pos)` indexes it.
-    state.ring_cards = band_orders(&contexts, &bands);
+    // Each card's `(band, within_index)` position — what the ring geometry
+    // (`ring_seat_rotated`/`card_base_scale`) keys on.
+    let (_, pos_of) = spiral_positions(&state.ring_cards);
 
     // Snapshot per-band ring length + the eased per-ring rotation as plain locals
     // so the placement closures don't borrow `state` (which we mutate just below).
@@ -173,7 +169,7 @@ pub fn sync_time_well(
         let band = band_by_id
             .get(&id)
             .copied()
-            .unwrap_or(kaijutsu_viz::layout::Band::HotNow);
+            .unwrap_or(kaijutsu_viz::layout::Band::Active);
         let cluster_label = cluster_of.get(&id).map(|a| a.label.clone());
         let data = card_from(&info, band, cluster_label);
         let pos = target_of(&id).unwrap_or(Vec3::ZERO);

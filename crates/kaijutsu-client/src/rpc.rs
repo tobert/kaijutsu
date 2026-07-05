@@ -225,6 +225,18 @@ pub struct ContextInfo {
     /// unattached (empty on the wire — TrackIds are never empty). Drives the
     /// time-well's track rays + per-card beat lanes (Stage 3).
     pub track_id: Option<String>,
+    /// Unix-millis of the explicit ring-0 ("active") promote, or `None` if
+    /// never promoted (0 on the wire). First-write-wins server-side, so this
+    /// stays stable across re-promotes. Drives the time-well's ring-0
+    /// hand-curated seat row.
+    pub promoted_at: Option<u64>,
+    /// Unix-millis of the explicit push to the demoted ring, or `None` if
+    /// never demoted (0 on the wire).
+    pub demoted_at: Option<u64>,
+    /// Unix-millis of the explicit "suspend activity" flag, or `None` if not
+    /// paused (0 on the wire). Design-only for now — no behavioral gating is
+    /// wired yet.
+    pub paused_at: Option<u64>,
 }
 
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
@@ -1362,6 +1374,122 @@ impl KernelHandle {
         }
     }
 
+    /// Promote a context into ring 0 ("active"). First-write-wins server-side
+    /// — re-promoting an already-promoted context is a no-op success.
+    /// Promoting an ARCHIVED context resurrects it (unarchives + seats it;
+    /// promote is the resurrection door). Returns a
+    /// [`RpcError::ServerError`] when the active ring is full (10
+    /// seats) — ring 0 is a hand-curated row, so seats never appear or
+    /// vanish without an explicit act.
+    #[tracing::instrument(skip(self), name = "rpc_client.promote_context")]
+    pub async fn promote_context(&self, context_id: ContextId) -> Result<(), RpcError> {
+        let mut request = self.kernel.promote_context_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader
+                .get_error()?
+                .to_str()
+                .unwrap_or("promote_context failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
+    /// Push a context outward one step on the demote ladder (kernel-owned
+    /// policy): promoted → unpromoted (automatic placement); neither
+    /// promoted nor demoted → demoted; already demoted → archived (single
+    /// context, no subtree recursion, no latch).
+    #[tracing::instrument(skip(self), name = "rpc_client.demote_context")]
+    pub async fn demote_context(&self, context_id: ContextId) -> Result<(), RpcError> {
+        let mut request = self.kernel.demote_context_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader
+                .get_error()?
+                .to_str()
+                .unwrap_or("demote_context failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
+    /// Set or clear a context's "suspend activity" flag. Design-only for now
+    /// — persisted and exposed on the wire, but not yet wired to any
+    /// behavioral gating.
+    #[tracing::instrument(skip(self), name = "rpc_client.set_context_paused")]
+    pub async fn set_context_paused(
+        &self,
+        context_id: ContextId,
+        paused: bool,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.set_context_paused_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_paused(paused);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader
+                .get_error()?
+                .to_str()
+                .unwrap_or("set_context_paused failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
+    /// Archive a single context — the well's single-keystroke archive
+    /// action. Unlike the `kj context archive` builtin (latched, recurses
+    /// into structural children), this is single-context, not latched, no
+    /// subtree recursion. Idempotent: archiving an already-archived context
+    /// succeeds.
+    #[tracing::instrument(skip(self), name = "rpc_client.archive_context")]
+    pub async fn archive_context(&self, context_id: ContextId) -> Result<(), RpcError> {
+        let mut request = self.kernel.archive_context_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader
+                .get_error()?
+                .to_str()
+                .unwrap_or("archive_context failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
     // ========================================================================
     // LLM Configuration
     // ========================================================================
@@ -2250,6 +2378,19 @@ fn parse_context_info(
         None
     };
 
+    let promoted_at = match reader.get_promoted_at() {
+        0 => None,
+        ts => Some(ts),
+    };
+    let demoted_at = match reader.get_demoted_at() {
+        0 => None,
+        ts => Some(ts),
+    };
+    let paused_at = match reader.get_paused_at() {
+        0 => None,
+        ts => Some(ts),
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2267,6 +2408,9 @@ fn parse_context_info(
         live_status,
         last_activity_at,
         track_id,
+        promoted_at,
+        demoted_at,
+        paused_at,
     })
 }
 

@@ -509,6 +509,9 @@ struct ContextHandleInfo {
   liveStatus @14 :Status;         # live activity: running (working) / error (last turn failed) / else idle
   lastActivityAt @15 :UInt64;     # Unix millis of the most recent block append/mutation; 0 = never/unknown
   trackId @16 :Text;              # Track this context is attached to (empty = unattached; TrackIds are never empty)
+  promotedAt @17 :UInt64;         # 0 = not promoted, else Unix millis of the explicit ring-0 promote (append-ordered, never restamped)
+  demotedAt @18 :UInt64;          # 0 = not demoted, else Unix millis of the explicit push to the demoted ring
+  pausedAt @19 :UInt64;           # 0 = not paused, else Unix millis of the explicit pause; gating deferred (see setContextPaused)
 }
 
 struct PresetInfo {
@@ -1336,6 +1339,40 @@ interface Kernel {
   # in-memory TrackState (see TrackInfo). Empty when no tracks exist or no
   # scheduler is wired (embedded/test kernels).
   listTracks @92 (trace :TraceContext) -> (tracks :List(TrackInfo));
+
+  # ── Time-well ring placement (docs/timewell.md) ──
+
+  # Promote a context into the hand-picked ring 0 ("active"). Sets
+  # `promotedAt` (first time only — never restamped on re-promote, so ring-0
+  # order stays append-stable) and clears `demotedAt`. Promoting an ARCHIVED
+  # context resurrects it: `archivedAt` cleared, a FRESH `promotedAt` stamped
+  # (the old seat was surrendered at archive time), `concludedAt` untouched —
+  # promote is the resurrection door; the archive is memory to drift back
+  # from, not trash. Works from any state, not latched, not capability-gated
+  # (same as `conclude`).
+  promoteContext @93 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Push a context outward one step on the demote ladder (kernel-owned
+  # policy): promoted → clears `promotedAt` (back to automatic placement);
+  # neither promoted nor demoted → sets `demotedAt`; already demoted →
+  # archives it (single context, no subtree recursion, no latch). Not
+  # capability-gated.
+  demoteContext @94 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Set or clear a context's `pausedAt` — DESIGN-ONLY for now: persisted and
+  # exposed on the wire, but not yet wired to any behavioral gating (no
+  # scheduler/turn-start changes). A paused context will eventually receive
+  # no beat/OODA wakeups and reject turn-starts loudly; that gating is
+  # deferred.
+  setContextPaused @95 (contextId :Data, paused :Bool, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Archive a single context — the well's single-keystroke archive action.
+  # Unlike the `kj context archive` builtin (latched, recurses into
+  # structural children), this is a single context, not latched, no subtree
+  # recursion. Idempotent: archiving an already-archived context succeeds
+  # without restamping (the underlying `archived_at IS NULL` guard is
+  # already a no-op).
+  archiveContext @96 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
 }
 
 # ============================================================================

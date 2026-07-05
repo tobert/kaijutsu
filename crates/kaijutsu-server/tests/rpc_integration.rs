@@ -884,3 +884,171 @@ fn test_client_view_is_namespaced_per_client() {
         assert_eq!(kernel.get_client_view(&client_b).await.unwrap(), Some(ctx_b));
     });
 }
+
+// ============================================================================
+// Time-well ring placement (docs/timewell.md)
+// ============================================================================
+
+/// `promoteContext`/`demoteContext`/`setContextPaused` round-trip over the
+/// real wire and `listContexts` reflects the ladder as it steps: promoted →
+/// unpromoted → demoted → archived, with pause/resume independent of ring
+/// placement.
+#[test]
+fn test_promote_demote_pause_round_trip_over_rpc() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let ctx = kernel.create_context("ring-rider").await.unwrap();
+
+        let find = |contexts: &[kaijutsu_client::ContextInfo], id: kaijutsu_types::ContextId| {
+            contexts.iter().find(|c| c.id == id).cloned()
+        };
+
+        kernel.promote_context(ctx).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = find(&contexts, ctx).expect("promoted context still listed");
+        assert!(row.promoted_at.is_some());
+        assert!(row.demoted_at.is_none());
+
+        // promoted → unpromoted
+        kernel.demote_context(ctx).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = find(&contexts, ctx).unwrap();
+        assert!(row.promoted_at.is_none());
+        assert!(row.demoted_at.is_none());
+        assert!(!row.archived);
+
+        // neither → demoted
+        kernel.demote_context(ctx).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = find(&contexts, ctx).unwrap();
+        assert!(row.demoted_at.is_some());
+        assert!(!row.archived);
+
+        // already demoted → archived
+        kernel.demote_context(ctx).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = find(&contexts, ctx).unwrap();
+        assert!(row.archived, "third demote step should archive the context");
+
+        // A further demote is a loud RPC error, not a silent no-op.
+        let err = kernel.demote_context(ctx).await.unwrap_err();
+        assert!(matches!(err, kaijutsu_client::RpcError::ServerError(_)));
+
+        // Promote is the resurrection door: promoting the archived context
+        // unarchives it and seats it in ring 0.
+        kernel.promote_context(ctx).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = find(&contexts, ctx).unwrap();
+        assert!(!row.archived, "promote must resurrect an archived context");
+        assert!(row.promoted_at.is_some());
+        assert!(row.demoted_at.is_none());
+
+        // Pause/resume are independent of ring placement.
+        let ctx2 = kernel.create_context("napper").await.unwrap();
+        kernel.set_context_paused(ctx2, true).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        assert!(find(&contexts, ctx2).unwrap().paused_at.is_some());
+        kernel.set_context_paused(ctx2, false).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        assert!(find(&contexts, ctx2).unwrap().paused_at.is_none());
+    });
+}
+
+/// The well's single-keystroke archive action: `archiveContext` archives one
+/// context — no latch, no subtree recursion — and is idempotent on replay.
+#[test]
+fn test_archive_context_rpc_is_single_context_and_idempotent() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let ctx = kernel.create_context("solo-archive").await.unwrap();
+        kernel.archive_context(ctx).await.unwrap();
+
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = contexts.iter().find(|c| c.id == ctx).unwrap();
+        assert!(row.archived);
+
+        // Idempotent: archiving again still succeeds.
+        kernel.archive_context(ctx).await.unwrap();
+    });
+}
+
+/// `setLastContext` auto-promotes a context that has never had an explicit
+/// ring placement (design brief's "auto-promote on visit" rule) — but a
+/// context that's been explicitly demoted stays demoted; explicit demotion
+/// is sticky.
+#[test]
+fn test_set_last_context_auto_promotes_a_fresh_context_but_not_a_demoted_one() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+        let client_id = uuid::Uuid::new_v4().to_string();
+
+        let fresh = kernel.create_context("auto-promote-me").await.unwrap();
+        kernel.set_last_context(&client_id, fresh).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = contexts.iter().find(|c| c.id == fresh).unwrap();
+        assert!(
+            row.promoted_at.is_some(),
+            "a never-placed context should auto-promote on visit"
+        );
+
+        let demoted = kernel.create_context("stay-demoted").await.unwrap();
+        kernel.demote_context(demoted).await.unwrap();
+        kernel.set_last_context(&client_id, demoted).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = contexts.iter().find(|c| c.id == demoted).unwrap();
+        assert!(
+            row.promoted_at.is_none(),
+            "explicit demotion is sticky — a visit must not re-promote it"
+        );
+
+        // Archived is sticky too: visits never resurrect — only an explicit
+        // promote opens the resurrection door.
+        let buried = kernel.create_context("stay-buried").await.unwrap();
+        kernel.archive_context(buried).await.unwrap();
+        kernel.set_last_context(&client_id, buried).await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = contexts.iter().find(|c| c.id == buried).unwrap();
+        assert!(row.archived, "a visit must not resurrect an archived context");
+        assert!(row.promoted_at.is_none());
+    });
+}
+
+/// The active ring's hard cap (10 seats) is enforced over the real wire:
+/// promoting an 11th context fails loudly, and `setLastContext`'s
+/// auto-promote silently skips (the visit itself must still succeed) rather
+/// than erroring.
+#[test]
+fn test_active_ring_cap_enforced_over_rpc() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        for i in 0..10 {
+            let ctx = kernel.create_context(&format!("cap-seat-{i}")).await.unwrap();
+            kernel.promote_context(ctx).await.unwrap();
+        }
+
+        let overflow = kernel.create_context("cap-overflow").await.unwrap();
+        let err = kernel.promote_context(overflow).await.unwrap_err();
+        assert!(matches!(err, kaijutsu_client::RpcError::ServerError(_)));
+
+        // Auto-promote-on-visit must not fail the visit itself when the ring
+        // is full — it just silently skips the promotion.
+        let client_id = uuid::Uuid::new_v4().to_string();
+        kernel
+            .set_last_context(&client_id, overflow)
+            .await
+            .expect("set_last_context must succeed even when auto-promote is skipped");
+        let contexts = kernel.list_contexts().await.unwrap();
+        let row = contexts.iter().find(|c| c.id == overflow).unwrap();
+        assert!(
+            row.promoted_at.is_none(),
+            "auto-promote should have been skipped, not forced through"
+        );
+    });
+}

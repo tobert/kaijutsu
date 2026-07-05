@@ -84,7 +84,9 @@ use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 // test-only in this crate.
 #[cfg(test)]
 use kaijutsu_kernel::block_store::derive_context_live_status;
-use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
+use kaijutsu_kernel::kernel_db::{
+    ContextRow, ContextShellRow, DemoteOutcome, KernelDb, KernelDbError, PromoteOutcome,
+};
 use kaijutsu_kernel::{
     // FlowBus
     BlockFlow,
@@ -1233,6 +1235,9 @@ pub async fn create_shared_kernel(
                     preset_id: None,
                     concluded_at: None,
                     last_activity_at: None,
+                    promoted_at: None,
+                    demoted_at: None,
+                    paused_at: None,
                 };
                 let default_ws = db
                     .get_or_create_default_workspace(row.created_by)
@@ -1605,6 +1610,9 @@ async fn create_context_inner(
             preset_id: None,
             concluded_at: None,
             last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
         };
         let default_ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -3001,6 +3009,11 @@ impl kernel::Server for KernelImpl {
                         c.set_last_activity_at(
                             row.last_activity_at.map(|ts| ts as u64).unwrap_or(0),
                         );
+                        // Time-well ring placement (docs/timewell.md). 0 = unset,
+                        // same sentinel convention as archived_at/concluded_at.
+                        c.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
+                        c.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
+                        c.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
                     }
 
                     // Supplement with synthesis data (keywords + preview)
@@ -4439,6 +4452,48 @@ impl kernel::Server for KernelImpl {
                 .set_client_view(&client_id, context_id)
                 .map_err(|e| capnp::Error::failed(format!("failed to persist client view: {}", e)))
         );
+
+        // Auto-promote on visit: the app calls this on every context switch,
+        // and a context with no explicit ring placement yet (never promoted,
+        // demoted, concluded, or archived) rides into ring 0 automatically.
+        // Explicit demotion/conclusion are sticky — only an explicit promote
+        // brings those back. Recording the visit is the primary contract of
+        // this RPC, so a failed auto-promote must never fail the call.
+        {
+            let db = self.kernel.kernel_db.lock();
+            match db.get_context(context_id) {
+                Ok(Some(row))
+                    if row.promoted_at.is_none()
+                        && row.demoted_at.is_none()
+                        && row.concluded_at.is_none()
+                        && row.archived_at.is_none() =>
+                {
+                    match db.promote_context(context_id) {
+                        Ok(_) => {}
+                        Err(KernelDbError::Validation(_)) => {
+                            log::info!(
+                                "set_last_context: visit auto-promote skipped: active ring full (context={})",
+                                context_id.short()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "set_last_context: auto-promote failed for context={}: {e}",
+                                context_id.short()
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {} // explicit placement already set, or context unknown
+                Err(e) => {
+                    log::warn!(
+                        "set_last_context: failed to read context={} for auto-promote: {e}",
+                        context_id.short()
+                    );
+                }
+            }
+        }
+
         Promise::ok(())
     }
 
@@ -5874,6 +5929,182 @@ impl kernel::Server for KernelImpl {
         }
 
         log::info!("conclude: context={}", context_id.short());
+        results.get().set_success(true);
+        Promise::ok(())
+    }
+
+    fn promote_context(
+        self: Rc<Self>,
+        params: kernel::PromoteContextParams,
+        mut results: kernel::PromoteContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "promote_context").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        // No drift-router existence pre-check: the DB is authoritative (it
+        // errors NotFound for unknown ids), and an archived context must be
+        // promotable — resurrection — whether or not the router remembers it.
+        let outcome = {
+            let db = self.kernel.kernel_db.lock();
+            match db.promote_context(context_id) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                    return Promise::ok(());
+                }
+            }
+        };
+
+        // Resurrection reverses archive's DriftRouter sync: without this the
+        // router still holds Archived and sessions can't touch the context.
+        // Conclusion is orthogonal to placement — a resurrected concluded
+        // context comes back Concluded, not Live.
+        if let PromoteOutcome::Resurrected { concluded } = outcome {
+            let state = if concluded {
+                kaijutsu_types::ContextState::Concluded
+            } else {
+                kaijutsu_types::ContextState::Live
+            };
+            let mut drift = self.kernel.kernel.drift().write();
+            if let Err(e) = drift.set_state(context_id, state) {
+                log::error!("promote_context: drift set_state failed: {e}");
+            }
+        }
+
+        log::info!(
+            "promote_context: context={} outcome={:?}",
+            context_id.short(),
+            outcome
+        );
+        results.get().set_success(true);
+        Promise::ok(())
+    }
+
+    fn demote_context(
+        self: Rc<Self>,
+        params: kernel::DemoteContextParams,
+        mut results: kernel::DemoteContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "demote_context").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        let outcome = {
+            let db = self.kernel.kernel_db.lock();
+            match db.demote_context(context_id) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                    return Promise::ok(());
+                }
+            }
+        };
+
+        // Only the ladder's terminal step (archive) touches lifecycle state
+        // the drift router tracks; unpromote/demote are ring placement only.
+        if outcome == DemoteOutcome::Archived {
+            let mut drift = self.kernel.kernel.drift().write();
+            if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Archived) {
+                log::error!("demote_context: drift set_state failed: {e}");
+            }
+        }
+
+        log::info!(
+            "demote_context: context={} outcome={:?}",
+            context_id.short(),
+            outcome
+        );
+        results.get().set_success(true);
+        Promise::ok(())
+    }
+
+    fn set_context_paused(
+        self: Rc<Self>,
+        params: kernel::SetContextPausedParams,
+        mut results: kernel::SetContextPausedResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "set_context_paused").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let paused = p.get_paused();
+
+        let db = self.kernel.kernel_db.lock();
+        match db.set_context_paused(context_id, paused) {
+            Ok(()) => {
+                log::info!(
+                    "set_context_paused: context={} paused={}",
+                    context_id.short(),
+                    paused
+                );
+                results.get().set_success(true);
+            }
+            Err(e) => {
+                results.get().set_success(false);
+                results.get().set_error(&e.to_string());
+            }
+        }
+        Promise::ok(())
+    }
+
+    /// Archive a single context — the well's single-keystroke archive
+    /// action. Unlike the `kj context archive` builtin (latched, recurses
+    /// into structural children), this is single-context, not latched, no
+    /// subtree recursion. Idempotent: archiving an already-archived context
+    /// succeeds (the DB write's `archived_at IS NULL` guard is already a
+    /// no-op).
+    fn archive_context(
+        self: Rc<Self>,
+        params: kernel::ArchiveContextParams,
+        mut results: kernel::ArchiveContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "archive_context").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        if self.kernel.kernel.drift().read().context_state(context_id).is_none() {
+            results.get().set_success(false);
+            results.get().set_error("context not found");
+            return Promise::ok(());
+        }
+
+        {
+            let db = self.kernel.kernel_db.lock();
+            if let Err(e) = db.archive_context(context_id) {
+                results.get().set_success(false);
+                results.get().set_error(&e.to_string());
+                return Promise::ok(());
+            }
+        }
+
+        // Sync the in-memory drift router (M2-B3 pattern): without this an
+        // active session could still resurrect the context with the next op.
+        {
+            let mut drift = self.kernel.kernel.drift().write();
+            if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Archived) {
+                log::error!("archive_context: drift set_state failed: {e}");
+            }
+        }
+
+        log::info!("archive_context: context={}", context_id.short());
         results.get().set_success(true);
         Promise::ok(())
     }

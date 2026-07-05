@@ -46,12 +46,17 @@ pub enum HudSlot {
     /// it was hidden to keep the vortex throat clear, and only lights up
     /// while a selection exists; Amy judges the throat-clearance tradeoff.
     South,
+    /// Bottom-left: the static keyboard legend (`legend_text`) — visible
+    /// whenever the well is up, selection or not (unlike every other slot,
+    /// which blanks without a selection). Anchored bottom-**left** so it
+    /// doesn't collide with South's bottom-center tail.
+    Legend,
 }
 
 impl HudSlot {
     /// The spawned slots.
-    pub const ALL: [HudSlot; 4] =
-        [HudSlot::North, HudSlot::East, HudSlot::West, HudSlot::South];
+    pub const ALL: [HudSlot; 5] =
+        [HudSlot::North, HudSlot::East, HudSlot::West, HudSlot::South, HudSlot::Legend];
 }
 
 /// Container marker for the whole HUD (despawned together on exit).
@@ -106,6 +111,8 @@ fn hud_tex_dims(slot: HudSlot) -> (u32, u32) {
         // Tall enough for ~4 tail lines at HUD_FONT_SIZE + padding.
         HudSlot::South => (660, 200),
         HudSlot::East | HudSlot::West => (440, 340),
+        // Wide enough for the two-column "p promote      d demote" rows.
+        HudSlot::Legend => (460, 260),
     }
 }
 
@@ -114,7 +121,7 @@ fn hud_tex_dims(slot: HudSlot) -> (u32, u32) {
 fn hud_align(slot: HudSlot) -> VelloTextAlign {
     match slot {
         HudSlot::North => VelloTextAlign::Middle,
-        HudSlot::East | HudSlot::West | HudSlot::South => VelloTextAlign::Left,
+        HudSlot::East | HudSlot::West | HudSlot::South | HudSlot::Legend => VelloTextAlign::Left,
     }
 }
 
@@ -132,6 +139,12 @@ fn hud_quad_size(slot: HudSlot, half_w: f32, half_h: f32) -> Vec2 {
         HudSlot::East | HudSlot::West => {
             let h = half_h * 0.46;
             Vec2::new(h * aspect, h)
+        }
+        // Modest corner panel — reference material, not live data; kept
+        // narrower than North/South so it stays clear of South's tail.
+        HudSlot::Legend => {
+            let w = half_w * 0.32;
+            Vec2::new(w, w / aspect)
         }
     }
 }
@@ -167,7 +180,11 @@ pub fn hud_slot_offset(
     let top = inset - top_drop;
     match slot {
         HudSlot::North => Vec3::new(0.0, half_h * top, -depth),
+        // Bottom-anchored panels: no top_drop (there's no dock to clear down
+        // here). Legend sits at the bottom-LEFT corner, distinct from South's
+        // bottom-center anchor.
         HudSlot::South => Vec3::new(0.0, -half_h * inset, -depth),
+        HudSlot::Legend => Vec3::new(-half_w * inset, -half_h * inset, -depth),
         HudSlot::East => Vec3::new(half_w * inset, half_h * top, -depth),
         HudSlot::West => Vec3::new(-half_w * inset, half_h * top, -depth),
     }
@@ -200,14 +217,14 @@ fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32, top_drop: f32) -> Trans
     // toward center by half-width (a center-anchored panel like N stays at x=0 —
     // note `f32::signum(0.0)` is 1.0, so guard the zero case) and vertically
     // toward center by half-height — DOWN from the top-anchored row (N/E/W),
-    // UP from South's bottom anchor (dropping South down like the others
-    // pushed it half off-screen; caught live 2026-07-04).
+    // UP from the bottom-anchored row (South, Legend — dropping South down
+    // like the others pushed it half off-screen; caught live 2026-07-04).
     let cx = if anchor.x == 0.0 {
         0.0
     } else {
         anchor.x - anchor.x.signum() * size.x * 0.5
     };
-    let cy = if slot == HudSlot::South {
+    let cy = if matches!(slot, HudSlot::South | HudSlot::Legend) {
         anchor.y + size.y * 0.5
     } else {
         anchor.y - size.y * 0.5
@@ -345,6 +362,9 @@ pub fn update_well_hud(
 
     for (slot, mut last, mut msdf, mat_node) in panels.iter_mut() {
         let next = match (selected, slot) {
+            // Legend is static and selection-independent — checked first so
+            // both arms of `selected` fall through to it.
+            (_, HudSlot::Legend) => legend_text(),
             (Some(card), HudSlot::North) => hud_north(&card.data, card.status),
             (Some(card), HudSlot::East) => {
                 hud_east(&card.data, tracks.track_info_of(&card.context_id))
@@ -463,16 +483,30 @@ fn status_label(status: Option<Status>) -> &'static str {
 
 fn band_label(band: Band) -> &'static str {
     match band {
-        Band::HotNow => "hot now",
-        Band::ThisWeek => "this week",
-        Band::ThirtyDays => "30 days",
-        Band::Horizon => "horizon",
+        Band::Active => "active",
+        Band::Recent => "recent",
+        Band::Bumped => "bumped",
+        Band::Demoted => "demoted",
     }
+}
+
+/// Static keyboard legend content ([`HudSlot::Legend`]) — the verbs are
+/// provisional per the design; this listing is their source of truth in-app.
+/// Never changes, so `update_well_hud`'s change-guard means this only ever
+/// lays out once per well session.
+fn legend_text() -> String {
+    "CONTROLS\n\
+     p promote      d demote\n\
+     z pause        a archive\n\
+     c conclude     0-9 seat\n\
+     \u{23ce} enter        esc back"
+        .to_string()
 }
 
 fn hud_north(d: &super::card::CardData, status: Option<Status>) -> String {
     let kind = if d.accent.is_empty() { "—" } else { d.accent.as_str() };
-    format!("{}\n{} · {}", d.title, kind, status_label(status))
+    let paused = if d.paused { " · paused" } else { "" };
+    format!("{}\n{} · {}{}", d.title, kind, status_label(status), paused)
 }
 
 fn hud_east(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
@@ -576,12 +610,13 @@ mod tests {
             band,
             forked_from: None,
             cluster_label: None,
+            paused: false,
         }
     }
 
     #[test]
     fn north_shows_title_type_and_status() {
-        let n = hud_north(&card(Band::HotNow), Some(Status::Running));
+        let n = hud_north(&card(Band::Active), Some(Status::Running));
         assert!(n.starts_with("alpha"), "title leads");
         assert!(n.contains("coder"), "context-type shown");
         assert!(n.contains("running"), "live status shown");
@@ -589,15 +624,27 @@ mod tests {
 
     #[test]
     fn north_empty_type_falls_back_to_dash() {
-        let mut c = card(Band::HotNow);
+        let mut c = card(Band::Active);
         c.accent = String::new();
         let n = hud_north(&c, None);
         assert!(n.contains("— · idle"), "empty type → dash, no status → idle: {n}");
     }
 
     #[test]
+    fn north_shows_paused_when_set() {
+        let mut c = card(Band::Active);
+        c.paused = true;
+        let n = hud_north(&c, Some(Status::Running));
+        assert!(n.contains("running · paused"), "paused appends to the status line: {n}");
+
+        c.paused = false;
+        let n = hud_north(&c, Some(Status::Running));
+        assert!(!n.contains("paused"), "unpaused card carries no paused marker: {n}");
+    }
+
+    #[test]
     fn east_lists_specs_with_dash_fallbacks() {
-        let mut c = card(Band::ThisWeek);
+        let mut c = card(Band::Recent);
         c.model_badge = String::new();
         c.fork_badge = None;
         c.keywords = vec![];
@@ -605,14 +652,14 @@ mod tests {
         assert!(e.contains("model    —"), "empty model → dash: {e}");
         assert!(e.contains("fork     —"), "no fork → dash");
         assert!(e.contains("keywords —"), "no keywords → dash");
-        assert!(e.contains("band     this week"), "band labeled");
+        assert!(e.contains("band     recent"), "band labeled");
         assert!(!e.contains("cluster"), "no cluster line when unclustered");
         assert!(!e.contains("track"), "no track line when unattached");
     }
 
     #[test]
     fn east_shows_cluster_only_when_present() {
-        let mut c = card(Band::Horizon);
+        let mut c = card(Band::Demoted);
         c.cluster_label = Some("storage".into());
         let e = hud_east(&c, None);
         assert!(e.contains("cluster  ◇ storage"), "cluster line present: {e}");
@@ -633,11 +680,11 @@ mod tests {
             clock_kind: "system".into(),
             attached: vec![],
         };
-        let e = hud_east(&card(Band::HotNow), Some(&t));
+        let e = hud_east(&card(Band::Active), Some(&t));
         assert!(e.contains("track    ♪ bass ▶ ♩120 · tick 128"), "playing: {e}");
 
         t.playing = false;
-        let e = hud_east(&card(Band::HotNow), Some(&t));
+        let e = hud_east(&card(Band::Active), Some(&t));
         assert!(e.contains("track    ♪ bass ■ stopped"), "stopped: {e}");
     }
 
@@ -645,7 +692,7 @@ mod tests {
     fn south_falls_back_to_truncated_preview_without_a_tail() {
         let tails = super::super::live::ContextTails::default();
         let ctx = ContextId::from_bytes([7; 16]);
-        let mut c = card(Band::HotNow);
+        let mut c = card(Band::Active);
         c.preview = Some("x".repeat(300));
         let s = hud_south(&c, &tails, ctx);
         assert!(s.ends_with('…'), "long preview is elided");
@@ -667,7 +714,7 @@ mod tests {
                 i as f64,
             );
         }
-        let mut c = card(Band::HotNow);
+        let mut c = card(Band::Active);
         c.preview = Some("stale preview".into());
         let s = hud_south(&c, &tails, ctx);
         assert!(!s.contains("stale preview"), "live tail wins over the poll preview");
@@ -706,6 +753,42 @@ mod tests {
         assert_eq!(e.y, w.y, "east/west share the dropped top row");
         assert!(e.y > 0.0, "but the row is still in the upper half");
         assert_eq!(e.x, -w.x, "east/west are symmetric");
+    }
+
+    #[test]
+    fn legend_sits_bottom_left_distinct_from_south() {
+        let (fov, aspect, m, drop) = (FRAC_PI_4, 16.0 / 9.0, 0.16, 0.15);
+        let legend = hud_slot_offset(HudSlot::Legend, fov, aspect, D, m, drop);
+        let south = hud_slot_offset(HudSlot::South, fov, aspect, D, m, drop);
+        let west = hud_slot_offset(HudSlot::West, fov, aspect, D, m, drop);
+        assert!(legend.x < 0.0, "legend is left of center");
+        assert!(legend.y < 0.0, "legend is below center");
+        assert_eq!(legend.y, south.y, "legend shares south's bottom row (no top_drop)");
+        assert_ne!(legend.x, south.x, "legend doesn't sit on top of south's bottom-center anchor");
+        assert_eq!(legend.x, west.x, "legend shares west's left column");
+        assert_ne!(legend.y, west.y, "legend and west are on different (bottom vs top) rows");
+    }
+
+    #[test]
+    fn legend_panel_pulls_up_from_its_bottom_anchor_like_south() {
+        let (fov, aspect, drop) = (FRAC_PI_4, 16.0 / 9.0, 0.15);
+        let legend = hud_transform(HudSlot::Legend, fov, aspect, drop);
+        let anchor = hud_slot_offset(HudSlot::Legend, fov, aspect, HUD_DEPTH, HUD_MARGIN, drop);
+        assert!(legend.translation.y > anchor.y, "legend sits ABOVE its bottom-edge anchor");
+        let half_h = HUD_DEPTH * (fov * 0.5).tan();
+        assert!(
+            legend.translation.y - legend.scale.y * 0.5 >= -half_h,
+            "legend stays fully on-screen"
+        );
+    }
+
+    #[test]
+    fn legend_text_matches_the_documented_controls() {
+        let text = legend_text();
+        assert!(text.starts_with("CONTROLS"));
+        for verb in ["p promote", "d demote", "z pause", "a archive", "c conclude", "0-9 seat", "esc back"] {
+            assert!(text.contains(verb), "legend must mention {verb:?}: {text}");
+        }
     }
 
     /// Caught live 2026-07-04: South was dropped DOWN from its bottom-edge

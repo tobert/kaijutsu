@@ -47,6 +47,11 @@ What's actually built, so the staged plan below isn't mistaken for vaporware:
   described) — with one exception: **Stage 3's wire slice shipped 2026-07-04**
   (`TrackInfo` + `listTracks @92` + `ContextHandleInfo.trackId @16`, answered
   from the beat scheduler's in-memory state), ahead of its layout half.
+- **Ring membership** — rebuilt 2026-07-05 as **explicit placement** (see "Ring
+  membership becomes explicit" below): 10 seats per ring, ring 0 hand-curated,
+  ring 3 hand-demoted, the two middle rings automatic by recency, overflow past
+  the seats falls to the event horizon (no card). Supersedes the Stage 1
+  idle-age banding and lands the core of Stage 2's rank as ring 0.
 - **Live-state layer** — shipped 2026-07-04 (explore-live-time-well-action),
   a layer this plan hadn't staged: the well reacts *between* polls.
   `view/time_well/live.rs` ingests the kernel-wide event stream ungated —
@@ -217,6 +222,71 @@ Effort scales with coldness, as the original design said: keystroke (rank) →
 skim (rings) → search (horizon). The change is that the keystroke surface is no
 longer *derived from* the skim surface.
 
+## Ring membership becomes explicit (2026-07-05)
+
+The idle-age bands lasted two days as the sorting rule. Live use surfaced what
+the ring rebuild had deferred: **placement you can't control isn't an
+instrument.** Amy's model, designed and built this session, replaces derived
+banding with explicit placement — two hand-curated rings sandwiching two
+automatic ones, every ring exactly **10 seats** (digits `0–9` address the
+seats of the *focused* ring; jump-and-commit unchanged), the whole well ≤40
+cards:
+
+| Ring | Name | Membership |
+|---|---|---|
+| 0 | ACTIVE | explicit: `p` or visiting a context; append-ordered by `promoted_at` (stable seats); kernel-capped at 10 |
+| 1 | RECENT | automatic: the 10 most-recently-active eligible contexts |
+| 2 | BUMPED | automatic: LRU overflow from ring 1; concluded contexts compete here, never for ring 1 |
+| 3 | DEMOTED | explicit: `d`; ordered `demoted_at` descending |
+| — | event horizon | archived ∪ everything past seat 9 of rings 2/3 — **no card entity**, a "+N" count at the throat |
+
+The verbs (keys provisional; the in-well legend is their source of truth):
+
+- **`p` promote** — take a ring-0 seat. When the ring is full the explicit
+  verb **fails loud** ("active ring full — demote something first"); seats
+  never appear or vanish without a hand on them. Visiting a context
+  auto-promotes it (the kernel does this in `setLastContext`, which the app
+  already calls on every switch — zero app changes), but a *full* ring makes
+  the visit-promote skip quietly: the visit itself must succeed. Promoting an
+  **archived** context *unarchives* it (Amy, 2026-07-05): the archive is
+  memory to drift back from, not trash, and `p` is the resurrection door —
+  rare in practice (work starts fresh; memory diffuses into the code), but
+  it's the recovery path the Stage-5 search will feed. Only explicit `p`
+  resurrects; visits never do.
+- **`d` demote** — one step outward per press, kernel-owned ladder:
+  promoted → automatic placement; automatic → DEMOTED; already demoted →
+  **archived** (single context, no subtree, no latch — past the horizon).
+- **`a` archive** — straight past the horizon from anywhere (same unlatched
+  single-card semantics; `kj context archive` keeps its latched subtree form).
+- **`z` pause** — *suspend activity*, *designed now, gated later*: the
+  `paused_at` stamp, wire field, toggle, and dimmed/badged card ship today;
+  the behavioral gate (skip hyoushigi wakeups; reject turn-starts loudly) is
+  deferred, seams documented on the column.
+- **`c` conclude** — unchanged verb, new consequence: concluding clears the
+  ring-0 seat (the mux-exit). Archive clears both placement stamps.
+- **Sticky**: demoted and concluded contexts are never re-promoted by visits —
+  only an explicit `p` brings them back.
+
+What died: the `HOT_NOW`/`THIS_WEEK`/`THIRTY_DAYS` age constants, the
+running-forces-hot override, conclude-demotes-one-band, and the
+`DEV_SPREAD_RINGS` dev stand-in (its reason — everything hot — is fixed).
+Liveness shows as *light* (chatter/beat lanes, rays), never as placement.
+
+Kernel/wire state (all additive): `contexts.promoted_at/demoted_at/paused_at`;
+`ContextHandleInfo` `promotedAt @17` / `demotedAt @18` / `pausedAt @19`;
+`promoteContext @93` / `demoteContext @94` / `setContextPaused @95` /
+`archiveContext @96`; `kj context promote|demote|pause|resume`;
+`ACTIVE_RING_CAPACITY = 10` enforced kernel-side (`RING_SLOTS = 10` is the
+app-side seat count — keep them in agreement).
+
+What this absorbs from the staged plan: **Stage 1's** banding half (recency
+now only *orders* the automatic rings, it no longer defines bands); **Stage
+2's** rank core — ring 0 *is* the rank: ≤10, append-ordered, digit-addressed,
+kernel-owned (still open from Stage 2: the table-edge rail rendering, digit
+switching from the conversation view, deliberate reorder à la `kj rank move`);
+and **Stage 5's** cutoff — no-entity-past-the-seats arrived early, while
+search-at-the-horizon and the `since` payload valve remain open.
+
 ## The bowl, revisited — what mockup 27 still teaches
 
 *(The canonical image is preserved in-repo at `docs/mockups/27-time-well.png`.
@@ -284,6 +354,11 @@ in 0 keystrokes.
 
 ### Stage 1 — Kernel truth: activity recency
 
+> **2026-07-05:** the idle-age *banding* half of this stage is superseded by
+> explicit placement ("Ring membership becomes explicit" above). The kernel
+> truth half — `last_activity_at`, incremental `liveStatus` — stands and is
+> what the automatic rings now sort by.
+
 Make "recent" a real, cheap, wire-visible fact.
 
 - **`last_activity_at` on `ContextHandleInfo`** (+ `contexts` column, additive
@@ -325,6 +400,12 @@ on the next poll — and a screenshot shows four legible rings, receding into
 the throat, with an open center.
 
 ### Stage 2 — The rank (replaces the mux)
+
+> **2026-07-05:** the rank's core landed as **ring 0** ("Ring membership
+> becomes explicit" above): kernel-owned, ≤10, append-ordered by
+> `promoted_at`, compact-on-demote/conclude, digit-addressed while the ring is
+> focused. Still open from this stage: the table-edge rail rendering, digit
+> switching from the *conversation* view, and a deliberate-reorder verb.
 
 The `0–9` ordered active list, decoupled from spiral index. Semantics per "Two
 navigation surfaces": append-on-join, compact-on-conclude, rule over address.
@@ -413,6 +494,11 @@ Acceptance: skim all active work (every track, every hot context's preview) in
 under 30 seconds without touching the mouse.
 
 ### Stage 5 — The event horizon becomes real
+
+> **2026-07-05:** the cutoff arrived early — contexts past their ring's 10
+> seats (and archived ones) get no card entity, and the throat shows a "+N"
+> count. Still this stage's to-do: search at the horizon (`/`), the
+> `listContexts` `since` valve, and LOD chips for the seated-but-deep cards.
 
 Old contexts stop being geometry and become an archive.
 
@@ -511,9 +597,12 @@ won't discover until they hurt:
 1. **Rank scope** — one global rank, or per-track ranks with the global rank
    holding tracks? Start global (matches the 9-terminal reality); revisit when
    track count grows past what ten slots serve.
-2. **Auto-join policy** — which context_types auto-join the rank on creation?
-   Proposed: rc-configurable, default *only* explicitly-created user contexts
-   (never rotation children, never verify sessions spawned over MCP).
+2. ~~**Auto-join policy**~~ — RESOLVED (Amy, 2026-07-05): **visits promote**.
+   The kernel auto-promotes on `setLastContext` (the app reports every switch),
+   so the ring-0 row builds itself from where you've actually sat; demoted and
+   concluded contexts are sticky (only explicit `p` returns them), and
+   synthetic churn never visits, so it never joins. No per-context_type policy
+   needed yet.
 3. **Conclude hygiene for synthetic churn** — mostly dissolved by the idle-age
    bands (Stage 1): expiry is a pure derivation, so idle verify/mcp sessions
    sink on their own with no daemon. The residual question is only whether

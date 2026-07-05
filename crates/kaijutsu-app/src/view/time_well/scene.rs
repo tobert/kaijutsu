@@ -73,11 +73,27 @@ pub struct WellRingsDeck;
 /// concentric glyph rings, counter-rotating, receding into the funnel). One
 /// entity per band ring (see [`super::card::terrace_ring_geometry`]), driven by
 /// [`crate::shaders::TerraceRingMaterial`]. Carries its **ring index** (= band
-/// index, 0 = `HotNow` … `N_BANDS-1` = `Horizon`) so [`dim_nonfocused_rings`]
+/// index, 0 = `Active` … `N_BANDS-1` = `Demoted`) so [`dim_nonfocused_rings`]
 /// can brighten the focused ring and dim the rest. Despawned on exit alongside
 /// the rest of the well.
 #[derive(Component)]
 pub struct TerraceRing(pub usize);
+
+/// An in-world terrace-edge label for one ring (text: [`super::card::band_label_text`],
+/// position: [`super::card::band_label_pos`]), billboarded like a card. Static
+/// text — filled once by [`super::text::build_ring_labels`] (font-asset-loading
+/// gated, same pattern as [`super::text::update_reading_card`]) and never
+/// rewritten after. Despawned on exit alongside the rest of the well.
+#[derive(Component)]
+pub struct RingLabel(pub kaijutsu_viz::layout::Band);
+
+/// The event-horizon "+N" count label, parked at the funnel center beyond the
+/// deepest ring ([`super::card::horizon_label_pos`]). Unlike [`RingLabel`] its
+/// text changes (the horizon count), refreshed by
+/// [`super::text::build_horizon_label`] only when the count actually changes.
+/// Despawned on exit alongside the rest of the well.
+#[derive(Component)]
+pub struct HorizonLabel;
 
 /// Where a card wants to be. A smoothing system eases `Transform.translation`
 /// toward this each frame — the "transitions are Bevy's job" stance from the
@@ -102,30 +118,33 @@ pub struct RingSeat {
 // ============================================================================
 
 /// Live well state that survives across frames: the keyed join, the id→entity
-/// map, the spiral order, and the shared mesh / per-accent material handles built
-/// on first enter.
+/// map, the per-ring seat orders, and the shared mesh / per-accent material
+/// handles built on first enter.
 #[derive(Resource)]
 pub struct TimeWellState {
     pub join: kaijutsu_viz::join::Join<ContextId, kaijutsu_client::ContextInfo>,
     pub entities: HashMap<ContextId, Entity>,
     /// Shared quad mesh for every card (built lazily on first enter).
     pub card_mesh: Option<Handle<Mesh>>,
-    /// The whole well as one ordered spiral, **mouth → throat**: `HotNow` →
-    /// `ThisWeek` → `ThirtyDays` → `Horizon`, each band in its own recency
-    /// order — see [`super::card::spiral_order`] / [`super::card::spiral_positions`]
-    /// — rebuilt each layout tick. The single source of nav order: a card's
-    /// index here is its odometer address (Left/Right = ±1, Up/Down = ±10,
-    /// digits = the first decade at the mouth); its *world position* now comes
-    /// from the terraced `(band, within_index)` pair instead (Stage 1 Slice F).
-    pub spiral_order: Vec<ContextId>,
-    /// Each band ring's cards in within-ring (recency) order, indexed by
+    /// Each ring's seated cards in seat order, indexed by
     /// [`kaijutsu_viz::layout::Band::index`] — the ring-centric nav's source of
     /// truth. `(focused_ring, ring_pos)` indexes into `ring_cards[focused_ring]`
-    /// to resolve [`selected`](Self::selected). Rebuilt each layout tick from
-    /// [`super::card::band_orders`].
+    /// to resolve [`selected`](Self::selected), and digit keys `0-9` address
+    /// seats 0-9 of the focused ring directly. Rebuilt each layout tick from
+    /// [`super::card::assign_placement`]'s `rings`.
     pub ring_cards: [Vec<ContextId>; super::card::N_BANDS],
-    /// Which band ring is currently focused (0 = `HotNow` at the mouth …
-    /// `N_BANDS-1` = `Horizon` at the throat). Up/Down change it.
+    /// Count of contexts past seat 9 of `Recent`/`Bumped`/`Demoted` (plus
+    /// already-filtered archived contexts) — the event horizon. No card
+    /// entity ever exists for these; the throat renders this as a "+N" count.
+    /// Rebuilt each layout tick alongside `ring_cards`.
+    pub horizon_count: usize,
+    /// The `visible` (non-archived) context count as of the last layout tick
+    /// — `sync_time_well`'s change-detection dodge. Compared against
+    /// `visible.len()`, not `join.len()`, because horizon contexts never
+    /// enter the join, so the two can legitimately differ.
+    pub last_seen_visible_count: usize,
+    /// Which band ring is currently focused (0 = `Active` at the mouth …
+    /// `N_BANDS-1` = `Demoted` at the throat). Up/Down change it.
     pub focused_ring: usize,
     /// Position within the focused ring (Left/Right walk it, wrapping). Carried
     /// across Up/Down (clamped to the new ring's size).
@@ -145,7 +164,7 @@ pub struct TimeWellState {
     /// in [`ease_camera_to_selection`].
     pub focused: bool,
     /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
-    /// the `get_clusters` poll. Drives the cluster label on `Horizon` cards
+    /// the `get_clusters` poll. Drives the cluster label on `Demoted` cards
     /// (Stage 3 will extend this to cluster-grouped angle within a band; for
     /// now it's label-only — see `card::card_from`). Empty when the kernel has
     /// no semantic index.
@@ -158,8 +177,9 @@ impl Default for TimeWellState {
             join: kaijutsu_viz::join::Join::new(),
             entities: HashMap::new(),
             card_mesh: None,
-            spiral_order: Vec::new(),
             ring_cards: std::array::from_fn(|_| Vec::new()),
+            horizon_count: 0,
+            last_seen_visible_count: 0,
             focused_ring: 0,
             ring_pos: 0,
             ring_rotation: [0.0; super::card::N_BANDS],
@@ -208,6 +228,25 @@ pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
 /// Camera distance in front of the focus card when focused (larger = card fills
 /// less of the frame). Tuned a touch back so the focused card isn't oversized.
 const FOCUS_DOLLY: f32 = 430.0;
+
+/// In-world label quad size (well units) — modest, well under a rim card's
+/// [`CARD_WIDTH`]/[`CARD_HEIGHT`], so the four ring labels and the "+N" horizon
+/// count read as passive structural annotations, not competing content.
+const LABEL_QUAD_W: f32 = 120.0;
+const LABEL_QUAD_H: f32 = 38.0;
+
+/// Label texture size (logical px). Small and wide — short strings only
+/// ("ACTIVE"/"RECENT"/"BUMPED"/"DEMOTED"/"+N"). `pub` (like [`CARD_TEX_W`]/
+/// [`READING_TEX_W`]) so `text.rs`'s label-layout systems can size to it.
+pub const LABEL_TEX_W: f32 = 220.0;
+pub const LABEL_TEX_H: f32 = 70.0;
+
+/// Fixed brightness multiplier ([`crate::shaders::WellCardMaterial::dim`].x)
+/// for labels — LDR (< 1.0), never touched per-frame. The HDR-tiering rule
+/// (`docs/timewell.md` appendix) reserves bloom (> 1.0) for live action
+/// (selection rims, status pulses); a ring label is passive structural state,
+/// so it stays dim and constant rather than reactive to focus.
+const LABEL_DIM: f32 = 0.85;
 
 /// Side length of the square ring-deck quad (world units). Comfortably larger
 /// than the hot rim (`total_radius` 420) so the unit disc the shader draws fills
@@ -262,10 +301,10 @@ const DIM_EASE_RATE: f32 = 6.0;
 /// is off. Kept as a per-band knob in case a slight lean reads better. Tunable.
 fn card_tilt(band: Band) -> f32 {
     match band {
-        Band::HotNow => 0.0,
-        Band::ThisWeek => 0.0,
-        Band::ThirtyDays => 0.0,
-        Band::Horizon => 0.0,
+        Band::Active => 0.0,
+        Band::Recent => 0.0,
+        Band::Bumped => 0.0,
+        Band::Demoted => 0.0,
     }
 }
 
@@ -444,6 +483,54 @@ pub fn enter_time_well(
         Name::new("ReadingCard"),
     ));
 
+    // In-world ring labels: one per band, parked just outside its ring
+    // (`band_label_pos`), billboarded like a card. Static text — filled once
+    // by `text::build_ring_labels` once the font asset is ready.
+    let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
+    for band in kaijutsu_viz::layout::ALL_BANDS {
+        let (label_image, panel) = create_msdf_panel(&mut images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
+        let label_material = materials.add(crate::shaders::WellCardMaterial {
+            texture: label_image,
+            accent: Vec4::ZERO, // no body fill — text only, like a HUD panel
+            params: Vec4::ZERO,
+            shape: label_shape(),
+            border: Vec4::ZERO,
+            dim: Vec4::splat(LABEL_DIM), // fixed dim (LDR): passive structural state
+        });
+        commands.spawn((
+            RingLabel(band),
+            Mesh3d(label_mesh.clone()),
+            MeshMaterial3d(label_material),
+            Transform::from_translation(super::card::band_label_pos(band)),
+            Visibility::Inherited,
+            panel,
+            Name::new(format!("RingLabel({band:?})")),
+        ));
+    }
+
+    // Event-horizon "+N" count label: parked at the funnel center beyond the
+    // deepest ring. Refreshed by `text::build_horizon_label` whenever the
+    // count changes (it starts blank — nothing polled yet on first enter).
+    let (horizon_image, horizon_panel) =
+        create_msdf_panel(&mut images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
+    let horizon_material = materials.add(crate::shaders::WellCardMaterial {
+        texture: horizon_image,
+        accent: Vec4::ZERO,
+        params: Vec4::ZERO,
+        shape: label_shape(),
+        border: Vec4::ZERO,
+        dim: Vec4::splat(LABEL_DIM),
+    });
+    commands.spawn((
+        HorizonLabel,
+        Mesh3d(label_mesh),
+        MeshMaterial3d(horizon_material),
+        Transform::from_translation(super::card::horizon_label_pos()),
+        Visibility::Inherited,
+        horizon_panel,
+        Name::new("HorizonLabel"),
+    ));
+
     info!("time-well: entered (shared app camera repurposed for the well)");
 }
 
@@ -461,6 +548,8 @@ pub fn exit_time_well(
     reading: Query<Entity, With<ReadingCard>>,
     decks: Query<Entity, With<WellRingsDeck>>,
     terrace_rings: Query<Entity, With<TerraceRing>>,
+    ring_labels: Query<Entity, With<RingLabel>>,
+    horizon_label: Query<Entity, With<HorizonLabel>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
     // Drop the pulse state: the activity systems are well-gated, so energy
@@ -474,6 +563,8 @@ pub fn exit_time_well(
         .chain(reading.iter())
         .chain(decks.iter())
         .chain(terrace_rings.iter())
+        .chain(ring_labels.iter())
+        .chain(horizon_label.iter())
     {
         commands.entity(e).despawn();
     }
@@ -482,6 +573,8 @@ pub fn exit_time_well(
     state.focused = false;
     // Reset ring-centric nav so re-entering starts at the mouth ring, gate-front.
     state.ring_cards = std::array::from_fn(|_| Vec::new());
+    state.horizon_count = 0;
+    state.last_seen_visible_count = 0;
     state.focused_ring = 0;
     state.ring_pos = 0;
     state.ring_rotation = [0.0; super::card::N_BANDS];
@@ -541,13 +634,15 @@ const DIGIT_KEYS: [(KeyCode, usize); 10] = [
 /// Time-well keyboard navigation: **ring-centric**, with a Kodak-projector spin.
 /// Selection is `(focused_ring, ring_pos)`; the card at that seat is
 /// [`TimeWellState::selected`], so HUD / lineage / highlight / Enter all follow.
-/// - `0–9` — quick-jump to that flat spiral index near the mouth: select + exit.
+/// - `0–9` — quick-jump to seat `n` of the **focused** ring: select + exit.
 /// - **Left / Right / Tab** — step the position within the focused ring
 ///   (wrapping), spinning the ring so the selected card eases to the front gate.
 /// - **Up / Down** — change the focused ring (Up → shallower/mouth, Down →
 ///   deeper/throat), carrying the position index (clamped); the newly focused
 ///   ring spins its selected card to the gate and the camera retargets to it.
-/// - **Enter** focuses then commits; **`c`** concludes the selection.
+/// - **Enter** focuses then commits; **`c`** concludes the selection; **`p`**
+///   promotes, **`d`** demotes, **`z`** toggles pause, **`a`** archives — see
+///   the verb handlers below (fire-and-forget RPC, same pattern as `c`).
 ///
 /// Esc (focus-aware, back to conversation) is handled below.
 pub fn well_keyboard(
@@ -556,11 +651,13 @@ pub fn well_keyboard(
     mut switch: MessageWriter<crate::view::components::ContextSwitchRequested>,
     mut next: ResMut<NextState<Screen>>,
     actor: Option<Res<crate::connection::RpcActor>>,
+    drift: Res<crate::ui::drift::DriftState>,
 ) {
-    // `0–9`: jump straight to that mouth-end index and drop into the conversation.
+    // `0–9`: jump straight to seat `n` of the focused ring and drop into the
+    // conversation (a no-op if that seat is empty).
     for (kc, n) in DIGIT_KEYS {
         if keys.just_pressed(kc)
-            && let Some(&id) = state.spiral_order.get(n)
+            && let Some(&id) = state.ring_cards[state.focused_ring].get(n)
         {
             switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
             next.set(Screen::Conversation);
@@ -652,10 +749,10 @@ pub fn well_keyboard(
     }
 
     // `c`: conclude the selected context (fire-and-forget over RPC; the next
-    // DriftState poll re-bands its card from the hot rim to the recent ring).
+    // DriftState poll seats it in Bumped, never Recent — see `assign_placement`).
     if keys.just_pressed(KeyCode::KeyC)
         && let Some(id) = state.selected
-        && let Some(actor) = actor
+        && let Some(actor) = actor.as_ref()
     {
         let handle = actor.handle.clone();
         bevy::tasks::IoTaskPool::get()
@@ -666,6 +763,77 @@ pub fn well_keyboard(
             })
             .detach();
         info!("well: conclude {}", id.short());
+    }
+
+    // `p` / `d` / `z` / `a`: promote / demote / toggle-pause / archive the
+    // selection — fire-and-forget over RPC, same pattern as `c` above. The
+    // kernel owns the demote ladder and the active-ring cap; a failure logs a
+    // visible warning with the context short id. Promote's ring-full refusal
+    // ("active ring full (10 seats) — demote something first") surfaces
+    // through that same warn — seats never appear or vanish silently.
+    if keys.just_pressed(KeyCode::KeyP)
+        && let Some(id) = state.selected
+        && let Some(actor) = actor.as_ref()
+    {
+        let handle = actor.handle.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.promote_context(id).await {
+                    log::warn!("well: promote {} failed: {e}", id.short());
+                }
+            })
+            .detach();
+        info!("well: promote {}", id.short());
+    }
+
+    if keys.just_pressed(KeyCode::KeyD)
+        && let Some(id) = state.selected
+        && let Some(actor) = actor.as_ref()
+    {
+        let handle = actor.handle.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.demote_context(id).await {
+                    log::warn!("well: demote {} failed: {e}", id.short());
+                }
+            })
+            .detach();
+        info!("well: demote {}", id.short());
+    }
+
+    // `z` toggles `paused_at`: the RPC takes the new absolute value, so read
+    // the selection's current flag off the same poll `sync.rs` reads
+    // (`DriftState`'s ContextInfo) and send its negation.
+    if keys.just_pressed(KeyCode::KeyZ)
+        && let Some(id) = state.selected
+        && let Some(actor) = actor.as_ref()
+    {
+        let currently_paused = drift.contexts.iter().any(|c| c.id == id && c.paused_at.is_some());
+        let next_paused = !currently_paused;
+        let handle = actor.handle.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.set_context_paused(id, next_paused).await {
+                    log::warn!("well: pause {} -> {next_paused} failed: {e}", id.short());
+                }
+            })
+            .detach();
+        info!("well: pause {} -> {next_paused}", id.short());
+    }
+
+    if keys.just_pressed(KeyCode::KeyA)
+        && let Some(id) = state.selected
+        && let Some(actor) = actor.as_ref()
+    {
+        let handle = actor.handle.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.archive_context(id).await {
+                    log::warn!("well: archive {} failed: {e}", id.short());
+                }
+            })
+            .detach();
+        info!("well: archive {}", id.short());
     }
 }
 
@@ -900,11 +1068,16 @@ pub fn ease_camera_to_focused_ring(
     tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
 }
 
-/// Billboard every card to face the well camera. No built-in billboard in 0.18;
-/// this is the one-line `looking_at` per card the design doc calls for.
+/// Billboard every card (and the in-world labels — [`RingLabel`]/
+/// [`HorizonLabel`] ride the same fully-billboarded path as [`ReadingCard`],
+/// no `Card`) to face the well camera. No built-in billboard in 0.18; this is
+/// the one-line `looking_at` per card the design doc calls for.
 pub fn billboard_cards(
     camera: Query<&GlobalTransform, With<TimeWellCamera>>,
-    mut cards: Query<(&mut Transform, Option<&Card>), Or<(With<Card>, With<ReadingCard>)>>,
+    mut cards: Query<
+        (&mut Transform, Option<&Card>),
+        Or<(With<Card>, With<ReadingCard>, With<RingLabel>, With<HorizonLabel>)>,
+    >,
 ) {
     let Ok(cam) = camera.single() else {
         return;
@@ -1098,6 +1271,13 @@ pub fn accent_vec4(accent: &str) -> Vec4 {
 /// and focus cards (both 1.6 aspect).
 pub fn card_shape() -> Vec4 {
     Vec4::new(1.6, 0.06, 0.045, 0.012)
+}
+
+/// `WellCardMaterial.shape` for a [`RingLabel`]/[`HorizonLabel`] panel: its own
+/// texture aspect, no border ring (labels have no body fill or frame — see
+/// their `accent`/`border` at spawn — just the MSDF text sampled onto the quad).
+fn label_shape() -> Vec4 {
+    Vec4::new(LABEL_TEX_W / LABEL_TEX_H, 0.0, 0.0, 0.0)
 }
 
 /// Shared rim-card mesh: a thin 3D block (`CARD_WIDTH × CARD_HEIGHT ×
