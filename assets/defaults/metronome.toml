@@ -1,0 +1,30 @@
+# Metronome click — the app's audible beat.
+# (docs/midi.md "The relative-lead timebase"; docs/config-crdt-ownership.md
+# "Per-client config".)
+#
+# This is the shared client default (/etc/client/metronome.toml). A specific
+# client overrides it at /etc/client/<client-id>/metronome.toml; the app reads
+# its own first, then falls back here, then to this compiled-in default.
+#
+# Independent of these knobs, the metronome only clicks while it is following a
+# live kernel beat — it self-silences when the clock stops or the kernel goes
+# away. `enabled` is the master on/off on top of that.
+
+# Whether the click sounds at all.
+enabled = true
+
+# MIDI note for the click. 84 = C6 — a crisp 拍子木-like tick. A pitched note on a
+# normal channel (NOT GM channel-9 percussion, which is silent under the game
+# soundfonts we run).
+note = 84
+
+# MIDI channel, 0–15. 15 keeps the click off the music's channel 0 so it never
+# collides with a musician's render on the same port.
+channel = 15
+
+# Note-on velocity, 1–127.
+velocity = 110
+
+# Gate: milliseconds the note sounds before note-off. Short, so it reads as a
+# tick rather than a sustained tone.
+gate_ms = 60

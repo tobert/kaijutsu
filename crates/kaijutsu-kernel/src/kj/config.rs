@@ -24,8 +24,13 @@ use kaijutsu_types::ContentType;
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 
-/// Mount root the config files live under.
+/// Mount root the kernel-global config files live under.
 const CONFIG_ROOT: &str = "/etc/config";
+
+/// Mount root for per-client config (`docs/config-crdt-ownership.md`). Unlike
+/// `/etc/config` this namespace is hierarchical: `<root>/<file>` is a shared
+/// client default and `<root>/<client-id>/<file>` is one client's override.
+const CLIENT_ROOT: &str = "/etc/client";
 
 /// Canonical path of the one config file that gets structural validation.
 const MODELS_TOML_PATH: &str = "/etc/config/models.toml";
@@ -33,7 +38,7 @@ const MODELS_TOML_PATH: &str = "/etc/config/models.toml";
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "CRDT-owned config files at /etc/config (models.toml, system.md, theme.toml, mcp.toml)",
+    about = "CRDT-owned config: kernel-global at /etc/config (models.toml, system.md, theme.toml, mcp.toml) + per-client at /etc/client (metronome.toml)",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -95,6 +100,29 @@ enum ConfigCommand {
 /// paths and parent escapes — config is a flat namespace.
 fn config_canonical(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
+    // Per-client config namespace: hierarchical. `<root>/<file>` (shared client
+    // default) or `<root>/<client-id>/<file>` (one client's override) — at most
+    // one nesting level, no parent escapes.
+    if trimmed == CLIENT_ROOT || trimmed.starts_with(&format!("{CLIENT_ROOT}/")) {
+        let rest = trimmed
+            .strip_prefix(&format!("{CLIENT_ROOT}/"))
+            .unwrap_or("")
+            .trim_matches('/');
+        if rest.is_empty() {
+            return Err(format!(
+                "missing config file name under {CLIENT_ROOT} (e.g. metronome.toml)"
+            ));
+        }
+        let segments: Vec<&str> = rest.split('/').collect();
+        if segments.len() > 2 || segments.iter().any(|s| s.is_empty() || *s == ".." || *s == ".") {
+            return Err(format!(
+                "invalid client config path '{path}': expected \
+                 {CLIENT_ROOT}/<file> or {CLIENT_ROOT}/<client-id>/<file>"
+            ));
+        }
+        return Ok(format!("{CLIENT_ROOT}/{rest}"));
+    }
+    // Kernel-global config: a flat namespace under /etc/config.
     let name = trimmed
         .strip_prefix(&format!("{CONFIG_ROOT}/"))
         .unwrap_or(trimmed)
@@ -413,6 +441,25 @@ mod tests {
         assert!(config_canonical("sub/dir.toml").is_err());
         assert!(config_canonical("/etc/config/a/b.toml").is_err());
         assert!(config_canonical("").is_err());
+    }
+
+    #[test]
+    fn canonical_accepts_the_hierarchical_client_namespace() {
+        // Shared client default (flat under /etc/client).
+        assert_eq!(
+            config_canonical("/etc/client/metronome.toml").unwrap(),
+            "/etc/client/metronome.toml"
+        );
+        // One client's override: exactly one nesting level (<client-id>/<file>).
+        assert_eq!(
+            config_canonical("/etc/client/abc-123/metronome.toml").unwrap(),
+            "/etc/client/abc-123/metronome.toml"
+        );
+        // Deeper nesting, parent escapes, and a bare mount root are rejected.
+        assert!(config_canonical("/etc/client/a/b/c.toml").is_err());
+        assert!(config_canonical("/etc/client/../secret").is_err());
+        assert!(config_canonical("/etc/client").is_err(), "needs a file name");
+        assert!(config_canonical("/etc/client/").is_err());
     }
 
     /// `kj config show models.toml` round-trips the seeded default.

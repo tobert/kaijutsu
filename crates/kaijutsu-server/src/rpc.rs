@@ -728,10 +728,17 @@ fn create_block_store_with_kernel_db(
 /// bare name.
 fn config_canonical(path: &str) -> String {
     const ROOT: &str = "/etc/config";
+    const CLIENT_ROOT: &str = "/etc/client";
     let trimmed = path.trim();
-    if trimmed == ROOT || trimmed.starts_with(&format!("{ROOT}/")) {
+    // Already an absolute config-namespace path — the flat kernel-global
+    // `/etc/config`, or the per-client `/etc/client` (hierarchical:
+    // `<root>/<client-id>/<file>`, docs/config-crdt-ownership.md). Pass it
+    // through so per-client config is reachable through the same config RPCs.
+    let is_abs = |root: &str| trimmed == root || trimmed.starts_with(&format!("{root}/"));
+    if is_abs(ROOT) || is_abs(CLIENT_ROOT) {
         trimmed.to_string()
     } else {
+        // A bare name defaults to the kernel-global config mount.
         format!("{ROOT}/{}", trimmed.trim_start_matches('/'))
     }
 }
@@ -1144,6 +1151,29 @@ pub async fn create_shared_kernel(
         log::info!("seeded {n} config file(s) into the CRDT (fresh kernel)");
     }
     kernel.mount("/etc/config", config_fs).await;
+
+    // Per-client config at /etc/client (docs/config-crdt-ownership.md
+    // "Per-client config"): the SAME CRDT-native backend, one more mount. Seeded
+    // with the shared *client* defaults (the metronome click today) at the mount
+    // root; per-client overrides at /etc/client/<client-id>/… are written lazily
+    // and never seeded (there is no client id at build time). Seed only on a
+    // fresh (empty) namespace — new even on an already-seeded kernel, so a
+    // restart brings the shared defaults up once, then the CRDT owns them.
+    let client_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+        documents.clone(),
+        "/etc/client",
+    );
+    if client_fs.is_empty() {
+        let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::client_seed_files()
+            .into_iter()
+            .map(|(canonical, embedded)| (canonical, embedded.to_string()))
+            .collect();
+        let n = client_fs.seed_entries(seed).map_err(|e| {
+            capnp::Error::failed(format!("client config seed into CRDT failed: {e}"))
+        })?;
+        log::info!("seeded {n} client config default(s) into the CRDT (fresh kernel)");
+    }
+    kernel.mount("/etc/client", client_fs).await;
 
     // Mount the CAS object pool read-only at /v/blobs (docs/slash-v.md track B).
     // A CasFs over the kernel's FileStore renders every stored blob as an
