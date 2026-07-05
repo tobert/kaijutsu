@@ -92,7 +92,10 @@ pub const ALL_BANDS: [Band; 4] = [Band::Active, Band::Recent, Band::Bumped, Band
 // ─── assign_ring_seats ──────────────────────────────────────────────────────
 
 /// Seats per ring. Ring 0's cap is **also** enforced kernel-side
-/// (`ACTIVE_RING_CAPACITY` in `kernel_db.rs`) — keep the two in sync.
+/// (`ACTIVE_RING_CAPACITY` in `kernel_db.rs`). The canonical value is
+/// `kaijutsu_types::RING_SLOTS` — this crate is deliberately zero-dep, so it
+/// carries its own literal; a unit test in `kaijutsu-app` (which sees both
+/// crates) pins the equality.
 pub const RING_SLOTS: usize = 10;
 
 /// Context descriptor used by [`assign_ring_seats`].
@@ -379,7 +382,9 @@ mod tests {
     /// seating 11+ contexts. (In release, `debug_assert!` compiles out and the
     /// fn instead seats the first `RING_SLOTS` and spills the rest — see
     /// `active_orders_append_order_ascending_promoted_at` for the ordering
-    /// this degrade path reuses.)
+    /// this degrade path reuses.) Gated to debug: under `--release` there is
+    /// no assert to trip, so the expected panic never fires.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "ACTIVE_RING_CAPACITY")]
     fn promoted_overflow_trips_the_debug_assert() {
@@ -390,7 +395,10 @@ mod tests {
 
     /// The other documented invariant: a context should never carry both
     /// stamps. `#[should_panic]` for the same "fail loud in dev" reason as
-    /// above.
+    /// above; debug-gated for the same reason too. The release half —
+    /// demoted-wins with seat conservation — is
+    /// `props::both_stamps_degrades_to_demoted_wins_with_conservation`.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "has both promoted_at and demoted_at set")]
     fn both_stamps_set_trips_the_debug_assert() {
@@ -521,12 +529,16 @@ mod tests {
         // rule-2 debug_assert (that's exercised deliberately, and separately,
         // by `promoted_overflow_trips_the_debug_assert` above); demoted counts
         // are uncapped since Demoted has no such cap.
+        //
+        // Timestamps draw from a deliberately dense 0..10 range so equal
+        // stamps actually occur — the id-tiebreak arms of every sort are
+        // exercised by the property, not just by the hand-written tie tests.
         proptest! {
             #[test]
             fn prop_every_context_is_seated_or_horizoned_exactly_once(
-                promoted_ts in prop::collection::vec(any::<i64>(), 0..=RING_SLOTS),
+                promoted_ts in prop::collection::vec(0..10i64, 0..=RING_SLOTS),
                 others in prop::collection::vec(
-                    (any::<i64>(), prop::option::of(any::<i64>()), prop::bool::ANY, any::<i64>()),
+                    (0..10i64, prop::option::of(0..10i64), prop::bool::ANY, 0..10i64),
                     0..30,
                 ),
             ) {
@@ -566,6 +578,54 @@ mod tests {
                 }
                 prop_assert_eq!(seen.len(), contexts.len(), "every context must be seated or horizoned exactly once");
             }
+        }
+
+        /// The release-mode half of the both-stamps invariant: with
+        /// `debug_assert!` compiled out, a pathological both-stamps context
+        /// (which the proptest generator's either/or branch can never
+        /// produce) must degrade sanely — demoted wins, and seat
+        /// conservation holds. Gated to release because in a debug build
+        /// (what `cargo test` runs) the same input trips the assert instead
+        /// — that half is covered by `both_stamps_set_trips_the_debug_assert`
+        /// above. Run with `cargo test --release -p kaijutsu-viz`.
+        #[cfg(not(debug_assertions))]
+        #[test]
+        fn both_stamps_degrades_to_demoted_wins_with_conservation() {
+            let mut contexts = vec![
+                promoted_ctx(1, 5),
+                demoted_ctx(2, 5),
+                auto_ctx(3, 5, false),
+            ];
+            contexts.push(ContextLifecycle {
+                id: 4u32,
+                created_at: 0,
+                concluded_at: None,
+                last_activity_at: 0,
+                promoted_at: Some(9),
+                demoted_at: Some(9),
+            });
+
+            let placement = assign_ring_seats(&contexts);
+
+            assert!(
+                placement.rings[Band::Demoted.index()].contains(&4),
+                "demoted wins on a both-stamps row"
+            );
+            assert!(
+                !placement.rings[Band::Active.index()].contains(&4),
+                "a both-stamps row must not also take a ring-0 seat"
+            );
+
+            let mut seen: HashSet<u32> = HashSet::new();
+            for ring in &placement.rings {
+                for id in ring {
+                    assert!(seen.insert(*id), "id {id} seated twice");
+                }
+            }
+            for id in &placement.horizon {
+                assert!(seen.insert(*id), "id {id} double-counted");
+            }
+            assert_eq!(seen.len(), contexts.len(), "conservation holds despite the corrupt row");
         }
     }
 }

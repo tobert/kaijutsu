@@ -87,7 +87,7 @@ pub use block::{
 };
 pub use error_block::IntoErrorPayload;
 pub use compaction::CompactionBoundary;
-pub use context::{Context, fork_lineage};
+pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind};
 pub use ids::{ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId};
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};

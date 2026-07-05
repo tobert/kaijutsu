@@ -4489,6 +4489,9 @@ impl kernel::Server for KernelImpl {
         // Explicit demotion/conclusion are sticky — only an explicit promote
         // brings those back. Recording the visit is the primary contract of
         // this RPC, so a failed auto-promote must never fail the call.
+        // The gap between the persist-view lock above and this second lock is
+        // TOCTOU-harmless: the row is re-read here (and again inside
+        // promote_context) before anything acts on it.
         {
             let db = self.kernel.kernel_db.lock();
             match db.get_context(context_id) {
@@ -5994,16 +5997,26 @@ impl kernel::Server for KernelImpl {
         // Resurrection reverses archive's DriftRouter sync: without this the
         // router still holds Archived and sessions can't touch the context.
         // Conclusion is orthogonal to placement — a resurrected concluded
-        // context comes back Concluded, not Live.
+        // context comes back Concluded, not Live. try_write like `conclude`:
+        // the DB is authoritative and a busy router only lags, so never
+        // block the single-threaded RPC loop on it.
         if let PromoteOutcome::Resurrected { concluded } = outcome {
             let state = if concluded {
                 kaijutsu_types::ContextState::Concluded
             } else {
                 kaijutsu_types::ContextState::Live
             };
-            let mut drift = self.kernel.kernel.drift().write();
-            if let Err(e) = drift.set_state(context_id, state) {
-                log::error!("promote_context: drift set_state failed: {e}");
+            match self.kernel.kernel.drift().try_write() {
+                Some(mut drift) => {
+                    if let Err(e) = drift.set_state(context_id, state) {
+                        log::error!("promote_context: drift set_state failed: {e}");
+                    }
+                }
+                None => {
+                    log::warn!(
+                        "promote_context: drift router busy (write); DB resurrected, router state lags"
+                    );
+                }
             }
         }
 
@@ -6043,10 +6056,22 @@ impl kernel::Server for KernelImpl {
 
         // Only the ladder's terminal step (archive) touches lifecycle state
         // the drift router tracks; unpromote/demote are ring placement only.
+        // try_write like `conclude`: the DB is authoritative and a busy
+        // router only lags, so never block the single-threaded RPC loop.
         if outcome == DemoteOutcome::Archived {
-            let mut drift = self.kernel.kernel.drift().write();
-            if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Archived) {
-                log::error!("demote_context: drift set_state failed: {e}");
+            match self.kernel.kernel.drift().try_write() {
+                Some(mut drift) => {
+                    if let Err(e) =
+                        drift.set_state(context_id, kaijutsu_types::ContextState::Archived)
+                    {
+                        log::error!("demote_context: drift set_state failed: {e}");
+                    }
+                }
+                None => {
+                    log::warn!(
+                        "demote_context: drift router busy (write); DB archived, router state lags"
+                    );
+                }
             }
         }
 
@@ -6110,27 +6135,50 @@ impl kernel::Server for KernelImpl {
                 .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
         );
 
-        if self.kernel.kernel.drift().read().context_state(context_id).is_none() {
-            results.get().set_success(false);
-            results.get().set_error("context not found");
-            return Promise::ok(());
-        }
-
+        // No drift-router existence pre-check (same stance as
+        // promote_context): the DB is authoritative. Its WHERE guard makes
+        // re-archiving a no-op `Ok(false)` — distinguish that idempotent
+        // success from an unknown id, which must still fail loud.
         {
             let db = self.kernel.kernel_db.lock();
-            if let Err(e) = db.archive_context(context_id) {
-                results.get().set_success(false);
-                results.get().set_error(&e.to_string());
-                return Promise::ok(());
+            match db.archive_context(context_id) {
+                Ok(true) => {}
+                Ok(false) => match db.get_context(context_id) {
+                    Ok(Some(_)) => {} // already archived — idempotent success
+                    Ok(None) => {
+                        results.get().set_success(false);
+                        results.get().set_error("context not found");
+                        return Promise::ok(());
+                    }
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(&e.to_string());
+                        return Promise::ok(());
+                    }
+                },
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                    return Promise::ok(());
+                }
             }
         }
 
         // Sync the in-memory drift router (M2-B3 pattern): without this an
         // active session could still resurrect the context with the next op.
-        {
-            let mut drift = self.kernel.kernel.drift().write();
-            if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Archived) {
-                log::error!("archive_context: drift set_state failed: {e}");
+        // try_write like `conclude` — the DB is authoritative, never block
+        // the single-threaded RPC loop on a busy router.
+        match self.kernel.kernel.drift().try_write() {
+            Some(mut drift) => {
+                if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Archived)
+                {
+                    log::error!("archive_context: drift set_state failed: {e}");
+                }
+            }
+            None => {
+                log::warn!(
+                    "archive_context: drift router busy (write); DB archived, router state lags"
+                );
             }
         }
 

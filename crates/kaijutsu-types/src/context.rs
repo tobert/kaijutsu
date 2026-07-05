@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ContextId, PrincipalId};
 
+/// Seats per time-well ring — the canonical "10". Ring 0 renders exactly
+/// this many slots, addressed by digit hotkeys 0-9, and the kernel refuses
+/// an eleventh promotion (`ACTIVE_RING_CAPACITY` in `kernel_db.rs` derives
+/// from this). `kaijutsu_viz::layout::RING_SLOTS` carries the same value as
+/// its own literal — viz is deliberately zero-dep, so it can't import this;
+/// a unit test in `kaijutsu-app` (which sees both crates) pins the equality.
+pub const RING_SLOTS: usize = 10;
+
 /// Metadata for a context within a kernel.
 ///
 /// Used for listing, display, and constellation rendering. The actual CRDT

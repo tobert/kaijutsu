@@ -2147,6 +2147,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_promote_surfaces_the_ring_full_error() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+
+        for i in 0..10 {
+            let ctx = register_context(&d, Some(&format!("seat-{i}")), None, principal);
+            let c = caller_with_context(ctx);
+            let result = d
+                .dispatch(&[s("context"), s("promote"), s(&format!("seat-{i}"))], &c)
+                .await;
+            assert!(result.is_ok(), "seat {i} promote failed: {}", result.message());
+        }
+
+        let overflow = register_context(&d, Some("overflow"), None, principal);
+        let c = caller_with_context(overflow);
+        let result = d
+            .dispatch(&[s("context"), s("promote"), s("overflow")], &c)
+            .await;
+        assert!(!result.is_ok(), "11th promote should fail");
+        assert!(
+            result.message().contains("active ring full"),
+            "the Validation message should surface through the verb: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_demote_on_archived_errors_loudly() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("gone"), Some(parent), principal);
+
+        let c = confirmed_caller(parent);
+        let result = d
+            .dispatch(&[s("context"), s("archive"), s("gone")], &c)
+            .await;
+        assert!(result.is_ok(), "archive failed: {}", result.message());
+
+        // Reachable only by full id (fuzzy resolution skips archived), and
+        // the ladder has nothing further out to step to.
+        let result = d
+            .dispatch(&[s("context"), s("demote"), target.to_string()], &c)
+            .await;
+        assert!(!result.is_ok(), "demote of an archived context must error");
+        assert!(
+            result.message().contains("cannot demote an archived context"),
+            "msg: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
     async fn context_promote_resurrects_an_archived_context_by_full_id() {
         // Promote is the resurrection door. Fuzzy resolution can't reach an
         // archived context (label lookups walk the active set), so the full

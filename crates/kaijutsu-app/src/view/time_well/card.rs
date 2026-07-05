@@ -506,6 +506,15 @@ pub fn band_label_text(band: Band) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The one crate that sees both sides of the ring-cap constant pins them
+    /// together: `kaijutsu_types::RING_SLOTS` is canonical (the kernel's
+    /// `ACTIVE_RING_CAPACITY` derives from it), and zero-dep `kaijutsu_viz`
+    /// carries its own literal. If this fails, fix viz's literal.
+    #[test]
+    fn viz_ring_slots_matches_the_canonical_types_constant() {
+        assert_eq!(kaijutsu_viz::layout::RING_SLOTS, kaijutsu_types::RING_SLOTS);
+    }
+
     /// Build a `ContextInfo` with the fields a card cares about; the rest default.
     fn ctx(id: ContextId, label: &str) -> ContextInfo {
         ContextInfo {

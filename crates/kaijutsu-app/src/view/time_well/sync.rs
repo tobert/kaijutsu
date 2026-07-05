@@ -54,6 +54,13 @@ pub fn sync_time_well(
     }
     state.last_seen_visible_count = visible.len();
 
+    // A fresh poll landed: whatever placement verbs were in flight are now
+    // reflected (or failed with a logged warn) — release the per-context
+    // guard so the next `p`/`d`/`z`/`a` acts on what the user can see.
+    if drift.is_changed() {
+        state.placement_pending.clear();
+    }
+
     // ── Whole-set placement (seating + ordering together) over the CURRENT
     // poll — not the join, which only ever holds the seated subset. A
     // placement-only change (a seat reordering, a new horizon arrival) can

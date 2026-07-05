@@ -2,7 +2,7 @@
 //! motion. Owns everything that is *not* the keyed-join sync (which lives in
 //! [`super::sync`]) and not the pure model (which lives in [`super::card`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
@@ -169,6 +169,23 @@ pub struct TimeWellState {
     /// now it's label-only — see `card::card_from`). Empty when the kernel has
     /// no semantic index.
     pub cluster_of: HashMap<ContextId, super::card::ClusterAssignment>,
+    /// Contexts with a placement verb (`p`/`d`/`z`/`a`) in flight — fired over
+    /// RPC but not yet reflected by a `DriftState` poll. Further placement
+    /// verbs on a pending context are ignored (info-logged) until the next
+    /// poll clears the set ([`super::sync::sync_time_well`]): without this,
+    /// a double-`d` inside one poll interval walks the ladder two rungs
+    /// sight-unseen (auto → demoted → ARCHIVED). Digits/Enter/`c` stay
+    /// unguarded — navigation and conclude aren't ladder steps.
+    pub placement_pending: HashSet<ContextId>,
+}
+
+impl TimeWellState {
+    /// Try to start a placement verb on `id`: `true` marks it in flight;
+    /// `false` means one is already pending (caller skips + logs). Cleared
+    /// wholesale when the next `DriftState` poll lands.
+    pub fn begin_placement(&mut self, id: ContextId) -> bool {
+        self.placement_pending.insert(id)
+    }
 }
 
 impl Default for TimeWellState {
@@ -187,6 +204,7 @@ impl Default for TimeWellState {
             selected: None,
             focused: false,
             cluster_of: HashMap::new(),
+            placement_pending: HashSet::new(),
         }
     }
 }
@@ -579,6 +597,7 @@ pub fn exit_time_well(
     state.ring_pos = 0;
     state.ring_rotation = [0.0; super::card::N_BANDS];
     state.ring_rotation_target = [0.0; super::card::N_BANDS];
+    state.placement_pending.clear();
     // Reset the join so re-entering rebuilds from scratch (the contexts are
     // re-polled by DriftState; nothing durable is lost).
     state.join = kaijutsu_viz::join::Join::new();
@@ -771,10 +790,19 @@ pub fn well_keyboard(
     // visible warning with the context short id. Promote's ring-full refusal
     // ("active ring full (10 seats) — demote something first") surfaces
     // through that same warn — seats never appear or vanish silently.
+    //
+    // Each verb passes the `begin_placement` in-flight guard first: a second
+    // placement verb on the same context before the next poll refreshes is
+    // ignored, so a double-`d` can't walk the ladder two rungs sight-unseen
+    // (auto → demoted → ARCHIVED inside one poll interval).
     if keys.just_pressed(KeyCode::KeyP)
         && let Some(id) = state.selected
         && let Some(actor) = actor.as_ref()
     {
+        if !state.begin_placement(id) {
+            info!("well: promote {} ignored — placement already in flight", id.short());
+            return;
+        }
         let handle = actor.handle.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
@@ -790,6 +818,10 @@ pub fn well_keyboard(
         && let Some(id) = state.selected
         && let Some(actor) = actor.as_ref()
     {
+        if !state.begin_placement(id) {
+            info!("well: demote {} ignored — placement already in flight", id.short());
+            return;
+        }
         let handle = actor.handle.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
@@ -803,11 +835,18 @@ pub fn well_keyboard(
 
     // `z` toggles `paused_at`: the RPC takes the new absolute value, so read
     // the selection's current flag off the same poll `sync.rs` reads
-    // (`DriftState`'s ContextInfo) and send its negation.
+    // (`DriftState`'s ContextInfo) and send its negation. The in-flight guard
+    // matters here too — the flag read is stale until the poll lands, so an
+    // unguarded double-`z` would send the same value twice instead of
+    // toggling back.
     if keys.just_pressed(KeyCode::KeyZ)
         && let Some(id) = state.selected
         && let Some(actor) = actor.as_ref()
     {
+        if !state.begin_placement(id) {
+            info!("well: pause-toggle {} ignored — placement already in flight", id.short());
+            return;
+        }
         let currently_paused = drift.contexts.iter().any(|c| c.id == id && c.paused_at.is_some());
         let next_paused = !currently_paused;
         let handle = actor.handle.clone();
@@ -825,6 +864,10 @@ pub fn well_keyboard(
         && let Some(id) = state.selected
         && let Some(actor) = actor.as_ref()
     {
+        if !state.begin_placement(id) {
+            info!("well: archive {} ignored — placement already in flight", id.short());
+            return;
+        }
         let handle = actor.handle.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
@@ -834,6 +877,30 @@ pub fn well_keyboard(
             })
             .detach();
         info!("well: archive {}", id.short());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The in-flight guard is per-context: the first placement on an id wins,
+    /// repeats are refused until the set clears (the next poll), and a
+    /// different context is unaffected.
+    #[test]
+    fn begin_placement_guards_per_context_until_cleared() {
+        let mut state = TimeWellState::default();
+        let a = ContextId::new();
+        let b = ContextId::new();
+
+        assert!(state.begin_placement(a), "first verb on a context fires");
+        assert!(!state.begin_placement(a), "repeat before the poll is refused");
+        assert!(state.begin_placement(b), "another context is unaffected");
+
+        // The poll landing clears the set (see sync_time_well) — everything
+        // fires again.
+        state.placement_pending.clear();
+        assert!(state.begin_placement(a));
     }
 }
 

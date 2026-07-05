@@ -6,7 +6,8 @@ use crate::kernel_db::ContextRow;
 
 /// Format a context list as a flat table.
 ///
-/// Marks the current context with `*`.
+/// Marks the current context with `*` and ring-0 (promoted) contexts with a
+/// trailing `[ring0]` tag.
 pub fn format_context_table(contexts: &[ContextRow], current: Option<ContextId>) -> String {
     if contexts.is_empty() {
         return "(no contexts)".to_string();
@@ -23,7 +24,12 @@ pub fn format_context_table(contexts: &[ContextRow], current: Option<ContextId>)
         let label = ctx.label.as_deref().unwrap_or("-");
         let model = format_model(&ctx.provider, &ctx.model);
         let id_short = ctx.context_id.short();
-        lines.push(format!("{marker} {id_short}  {label:<16} {model}"));
+        let ring0 = if ctx.promoted_at.is_some() {
+            " [ring0]"
+        } else {
+            ""
+        };
+        lines.push(format!("{marker} {id_short}  {label:<16} {model}{ring0}"));
     }
 
     lines.join("\n")
@@ -105,6 +111,18 @@ pub fn format_context_info(
 
     lines.push(format!("Created: {}", format_timestamp(ctx.created_at)));
     lines.push(format!("By:      {}", ctx.created_by.short()));
+
+    // Time-well placement stamps — omitted entirely when unset, so the
+    // common (auto-placed, unpaused) context shows nothing extra.
+    if let Some(ts) = ctx.promoted_at {
+        lines.push(format!("Promoted: {}", format_timestamp(ts)));
+    }
+    if let Some(ts) = ctx.demoted_at {
+        lines.push(format!("Demoted: {}", format_timestamp(ts)));
+    }
+    if let Some(ts) = ctx.paused_at {
+        lines.push(format!("Paused:  {}", format_timestamp(ts)));
+    }
 
     if children_count > 0 {
         lines.push(format!("Children: {}", children_count));
@@ -321,6 +339,37 @@ mod tests {
         assert!(output.contains("Type:    default"));
         // No trace id passed -> no Trace line.
         assert!(!output.contains("Trace:"));
+    }
+
+    #[test]
+    fn info_shows_placement_stamps_only_when_set() {
+        let id = ContextId::new();
+        let plain = make_row(Some("auto-placed"), id);
+        let output = format_context_info(&plain, 0, 0, false, None);
+        assert!(!output.contains("Promoted:"), "output: {output}");
+        assert!(!output.contains("Demoted:"), "output: {output}");
+        assert!(!output.contains("Paused:"), "output: {output}");
+
+        let mut seated = make_row(Some("seated"), ContextId::new());
+        seated.promoted_at = Some(kaijutsu_types::now_millis() as i64);
+        seated.paused_at = Some(kaijutsu_types::now_millis() as i64);
+        let output = format_context_info(&seated, 0, 0, false, None);
+        assert!(output.contains("Promoted: just now"), "output: {output}");
+        assert!(output.contains("Paused:  just now"), "output: {output}");
+        assert!(!output.contains("Demoted:"), "output: {output}");
+    }
+
+    #[test]
+    fn table_tags_promoted_contexts() {
+        let seated_id = ContextId::new();
+        let mut seated = make_row(Some("seated"), seated_id);
+        seated.promoted_at = Some(1_000);
+        let plain = make_row(Some("plain"), ContextId::new());
+
+        let output = format_context_table(&[seated, plain], None);
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].contains("[ring0]"), "output: {output}");
+        assert!(!lines[1].contains("[ring0]"), "output: {output}");
     }
 
     #[test]
