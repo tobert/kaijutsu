@@ -57,19 +57,35 @@ pub(crate) struct MidiSink {
 impl MidiSink {
     /// Schedule one metronome click `offset` from now into the sink queue — so
     /// ALSA fires it at the phasor's predicted beat time, not at the irregular
-    /// frame that scheduled it. Opens the sink on first use. No-op without ALSA.
+    /// frame that scheduled it. Sound (`note`/`channel`/`velocity`) and `gate_ms`
+    /// come from the per-client metronome config. Opens the sink on first use.
+    /// No-op without ALSA.
     #[cfg(target_os = "linux")]
-    pub(crate) fn click_at(&mut self, note: u8, offset: std::time::Duration) {
+    pub(crate) fn click_at(
+        &mut self,
+        note: u8,
+        channel: u8,
+        velocity: u8,
+        gate_ms: u64,
+        offset: std::time::Duration,
+    ) {
         if !ensure_open(self) {
             return;
         }
         if let Some(out) = self.out.as_mut() {
-            out.click_at(note, offset);
+            out.click_at(note, channel, velocity, gate_ms, offset);
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn click_at(&mut self, _note: u8, _offset: std::time::Duration) {
+    pub(crate) fn click_at(
+        &mut self,
+        _note: u8,
+        _channel: u8,
+        _velocity: u8,
+        _gate_ms: u64,
+        _offset: std::time::Duration,
+    ) {
         ensure_open(self);
     }
 }
@@ -301,21 +317,23 @@ impl MidiOut {
     }
 
     /// Schedule a metronome click at `offset` from now: a short **gated** note
-    /// (~60 ms, NoteOn then NoteOff) on a dedicated channel, queued into the ALSA
+    /// (NoteOn then NoteOff `gate_ms` later) on `channel`, queued into the ALSA
     /// real-time queue so it fires at the precise predicted beat time. Gated and
-    /// on a *normal* (non-drum) channel so it sounds under any patch — GM
-    /// channel-9 percussion is silent under game soundfonts (the FF4 one on
+    /// (by default) on a *normal* (non-drum) channel so it sounds under any patch
+    /// — GM channel-9 percussion is silent under game soundfonts (the FF4 one on
     /// zorak has no drum kit), and a bare NoteOn on a sustaining patch would
-    /// drone. Reuses the proven render-queue path, so it's audible exactly where
-    /// the music is.
-    fn click_at(&mut self, note: u8, offset: Duration) {
-        // Channel 15: off the music's channel 0, so the click keeps its own
-        // patch and never collides with a musician's render on the same port.
-        const CH: u8 = 15;
-        let on = vec![0x90 | CH, note, 110];
-        let off = vec![0x80 | CH, note, 0];
+    /// drone. Sound + gate come from the per-client metronome config
+    /// (`docs/config-crdt-ownership.md`). Reuses the proven render-queue path, so
+    /// it's audible exactly where the music is.
+    fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
+        // Mask to the low nibble so a config typo can never corrupt the status
+        // byte (0x9n / 0x8n); default channel 15 keeps the click off the music's
+        // channel 0.
+        let ch = channel & 0x0F;
+        let on = vec![0x90 | ch, note, velocity];
+        let off = vec![0x80 | ch, note, 0];
         self.schedule(
-            &[(offset, on), (offset + Duration::from_millis(60), off)],
+            &[(offset, on), (offset + Duration::from_millis(gate_ms), off)],
             Duration::ZERO,
         );
     }

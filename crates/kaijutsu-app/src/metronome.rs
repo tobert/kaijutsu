@@ -21,11 +21,37 @@ use kaijutsu_client::{ConnectionStatus, ServerEvent};
 
 use crate::connection::actor_plugin::{ConnectionStatusMessage, ServerEventMessage};
 
-/// The click pitch — a high, short note (C6) on the sink's dedicated metronome
-/// channel. A pitched click, not a drum: GM channel-9 percussion is silent under
-/// game soundfonts (the FF4 one on zorak), so `MidiSink::click_at` gates a
-/// melodic note instead. C6 reads as a crisp 拍子木-like tick.
-const CLICK_NOTE: u8 = 84;
+/// The click's sound + gate, resolved from the per-client `metronome.toml`
+/// (`docs/config-crdt-ownership.md` "Per-client config"). Serde `default` makes
+/// every field optional in the TOML and falls back to the shipped 拍子木 click,
+/// so a partial file is valid and a missing/failed fetch keeps the default.
+///
+/// The click is a *pitched* note on a dedicated channel, not a drum: GM
+/// channel-9 percussion is silent under game soundfonts (the FF4 one on zorak),
+/// so `MidiSink::click_at` gates a melodic note instead. C6 (84) reads as a
+/// crisp tick.
+#[derive(serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetronomeConfig {
+    /// Whether the click sounds at all (on top of the always-on "only while a
+    /// live clock rolls" gate).
+    pub enabled: bool,
+    /// MIDI note number for the click.
+    pub note: u8,
+    /// MIDI channel (0–15), off the music's channel 0.
+    pub channel: u8,
+    /// Note-on velocity (1–127).
+    pub velocity: u8,
+    /// Milliseconds the note sounds before note-off.
+    pub gate_ms: u64,
+}
+
+impl Default for MetronomeConfig {
+    fn default() -> Self {
+        // Must match assets/defaults/metronome.toml (the embedded seed).
+        Self { enabled: true, note: 84, channel: 15, velocity: 110, gate_ms: 60 }
+    }
+}
 
 /// How far ahead the phasor pre-schedules clicks into the ALSA queue. Must exceed
 /// the app's frame interval so a beat is always queued *before* it sounds — the
@@ -47,6 +73,9 @@ impl Plugin for MetronomePlugin {
             Update,
             (ingest_beat_signals, halt_on_connection_loss, click_on_beat).chain(),
         );
+        // Per-client click config arrives over RPC on (re)connect; apply it
+        // independently of the beat pipeline.
+        app.add_systems(Update, apply_metronome_config);
     }
 }
 
@@ -54,23 +83,16 @@ impl Plugin for MetronomePlugin {
 /// references, plus the last position we clicked from (so a beat crossing fires
 /// exactly once). A single followed beat — the standalone slice tracks one
 /// rolling track; a later cut keys per track/score context.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct Metronome {
     /// The phasor, once a first reference has anchored it.
     beat: Option<LocalBeat>,
     /// The next integer beat not yet scheduled into the sink queue (monotonic;
     /// each beat is scheduled exactly once, ahead of time).
     next_beat: Option<i64>,
-    /// Whether the audible click sounds. Auto-emit of references is always-on in
-    /// the kernel; the click is the sink's opt-in (default on for this slice; a
-    /// keybind toggle is future work).
-    pub enabled: bool,
-}
-
-impl Default for Metronome {
-    fn default() -> Self {
-        Self { beat: None, next_beat: None, enabled: true }
-    }
+    /// Sound + gate for the click, from the per-client `metronome.toml` (applied
+    /// by [`apply_metronome_config`]; the compiled-in default until it arrives).
+    pub config: MetronomeConfig,
 }
 
 impl Metronome {
@@ -181,11 +203,36 @@ fn click_on_beat(
     mut metronome: ResMut<Metronome>,
     mut sink: NonSendMut<crate::midi::MidiSink>,
 ) {
-    if !metronome.enabled {
+    let click = metronome.config;
+    if !click.enabled {
         return;
     }
     for offset in metronome.schedule_due(Instant::now(), SCHEDULE_HORIZON) {
-        sink.click_at(CLICK_NOTE, offset);
+        sink.click_at(click.note, click.channel, click.velocity, click.gate_ms, offset);
+    }
+}
+
+/// Apply a per-client `metronome.toml` fetched over RPC (the bootstrap sends it
+/// as [`RpcResultMessage::MetronomeConfigReceived`], resolved through the
+/// `/etc/client/<id>/…` → `/etc/client/…` cascade). A parse failure keeps the
+/// current config and logs loudly — never a silent revert to the shipped click.
+/// Config-change *push* (re-applying on a live `kj config set` without a
+/// reconnect) is a follow-up; today it applies once per (re)connect.
+fn apply_metronome_config(
+    mut results: MessageReader<crate::connection::actor_plugin::RpcResultMessage>,
+    mut metronome: ResMut<Metronome>,
+) {
+    use crate::connection::actor_plugin::RpcResultMessage;
+    for result in results.read() {
+        if let RpcResultMessage::MetronomeConfigReceived(toml) = result {
+            match toml::from_str::<MetronomeConfig>(toml) {
+                Ok(cfg) => {
+                    log::info!("applied metronome config: {cfg:?}");
+                    metronome.config = cfg;
+                }
+                Err(e) => log::error!("metronome.toml is unparseable: {e}; keeping current config"),
+            }
+        }
     }
 }
 
@@ -365,6 +412,71 @@ mod tests {
         assert!(
             app.world().resource::<Metronome>().beat.is_some(),
             "a Connected status must not disturb a running phasor"
+        );
+    }
+
+    /// The shipped `metronome.toml` seed must deserialize to exactly the
+    /// compiled-in `MetronomeConfig::default()` — otherwise a fresh client and a
+    /// no-config client would click differently. Partial files fill from default.
+    #[test]
+    fn config_parses_the_shipped_default_and_fills_partials() {
+        let shipped: MetronomeConfig =
+            toml::from_str(include_str!("../../../assets/defaults/metronome.toml"))
+                .expect("shipped metronome.toml parses");
+        assert_eq!(shipped, MetronomeConfig::default(), "seed must match the Default impl");
+
+        let partial: MetronomeConfig = toml::from_str("note = 60\n").expect("partial parses");
+        assert_eq!(partial.note, 60);
+        assert_eq!(partial.channel, MetronomeConfig::default().channel);
+        assert_eq!(partial.velocity, MetronomeConfig::default().velocity);
+    }
+
+    /// A typo must fail loud, not silently default: `deny_unknown_fields` turns
+    /// `volume` (meant `velocity`) into a parse error the apply path logs.
+    #[test]
+    fn config_rejects_a_typo_rather_than_silently_defaulting() {
+        assert!(toml::from_str::<MetronomeConfig>("volume = 90\n").is_err());
+    }
+
+    /// The apply system folds a fetched `metronome.toml` into the resource.
+    #[test]
+    fn apply_metronome_config_updates_the_resource() {
+        use crate::connection::actor_plugin::RpcResultMessage;
+
+        let mut app = App::new();
+        app.init_resource::<Metronome>()
+            .add_message::<RpcResultMessage>()
+            .add_systems(Update, apply_metronome_config);
+        app.world_mut().write_message(RpcResultMessage::MetronomeConfigReceived(
+            "enabled = false\nnote = 72\nchannel = 9\nvelocity = 40\ngate_ms = 30\n".to_string(),
+        ));
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<Metronome>().config,
+            MetronomeConfig { enabled: false, note: 72, channel: 9, velocity: 40, gate_ms: 30 },
+        );
+    }
+
+    /// An unparseable body keeps the current config (loud log), never a silent
+    /// revert — per the house fail-loud posture.
+    #[test]
+    fn apply_keeps_current_config_on_unparseable_toml() {
+        use crate::connection::actor_plugin::RpcResultMessage;
+
+        let mut app = App::new();
+        app.init_resource::<Metronome>()
+            .add_message::<RpcResultMessage>()
+            .add_systems(Update, apply_metronome_config);
+        app.world_mut().write_message(RpcResultMessage::MetronomeConfigReceived(
+            "this is not valid toml =".to_string(),
+        ));
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<Metronome>().config,
+            MetronomeConfig::default(),
+            "a parse failure must not zero out the config",
         );
     }
 }
