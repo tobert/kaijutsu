@@ -268,11 +268,17 @@ pub fn spawn_well_hud(
         let (image, panel) = create_msdf_panel(&mut images, tw, th);
         let material = materials.add(WellCardMaterial {
             texture: image,
-            accent: Vec4::ZERO, // no body fill — the panel is a glowing frame
+            // Black, near-opaque body: the panel interior deliberately blots
+            // out the well behind it so HUD text stays readable. (This was
+            // accidental before the shader's mask discard was real — accent
+            // ZERO used to paint black anyway because nothing discarded.)
+            accent: Vec4::new(0.0, 0.0, 0.0, 0.94),
             params: Vec4::ZERO, // plain panel: no selection/lineage/status rings
             shape: hud_shape(slot),
             border: Vec4::ZERO, // outline driven by the selection in update_well_hud
-            dim: Vec4::ONE, // HUD panels are never dimmed (not rim Cards)
+            // dim.x = 1: never dimmed (not a rim Card). y/z are live
+            // chatter/beat lanes — 0, or the frame washes cyan+gold.
+            dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
         });
         commands
             .spawn((

@@ -481,7 +481,10 @@ pub fn enter_time_well(
         params: Vec4::ZERO,
         shape: card_shape(),
         border: Vec4::ZERO,
-        dim: Vec4::ONE, // focus card is never dimmed (not a rim Card)
+        // dim.x = 1: never dimmed (not a rim Card). y/z are the live
+        // chatter/beat lanes — MUST stay 0 (Vec4::ONE here lit both full-on:
+        // the accidental cyan+gold "cream ring" fixed 2026-07-06).
+        dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
     });
     commands.spawn((
         ReadingCard,
@@ -507,7 +510,8 @@ pub fn enter_time_well(
         params: Vec4::ZERO,
         shape: label_shape(),
         border: Vec4::ZERO,
-        dim: Vec4::splat(LABEL_DIM),
+        // dim.x only — y/z are live chatter/beat lanes, not brightness.
+        dim: Vec4::new(LABEL_DIM, 0.0, 0.0, 0.0),
     });
     commands.spawn((
         HorizonLabel,
@@ -1331,8 +1335,11 @@ fn label_shape() -> Vec4 {
 /// convention; the back face is already correct and untouched. Result: both
 /// large faces read upright + non-mirrored with culling left at its default.
 ///
-/// (The thin ±X/±Y side faces sample texture slivers — acceptable for an
-/// 8-unit-thick block; not gold-plated.)
+/// The thin ±X/±Y side faces get **sentinel UVs** (−1) instead of Bevy's
+/// default full 0..1 mapping: a squeezed texture sliver on an 8-unit edge read
+/// as noise, so `well_card.wgsl` detects the sentinel and paints those faces
+/// as the card's *cut edge* — the border/accent color, the slab edge as the
+/// card's border by design.
 ///
 /// The mesh origin is the **bottom edge** (vertices shifted +Y by half the
 /// height), not the center: a card's transform sits on its ring line
@@ -1344,9 +1351,16 @@ fn card_block_mesh() -> Mesh {
     use bevy::mesh::VertexAttributeValues;
     let mut mesh = Mesh::from(Cuboid::new(CARD_WIDTH, CARD_HEIGHT, CARD_THICKNESS));
     if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
-        // Front (+Z) face = the first four vertices in Bevy's cuboid order.
-        for uv in uvs.iter_mut().take(4) {
-            uv[1] = 1.0 - uv[1];
+        // Bevy's cuboid vertex order: front (+Z) 0..4, back (−Z) 4..8, then the
+        // four side faces 8..24 (right/left/top/bottom).
+        for (i, uv) in uvs.iter_mut().enumerate() {
+            if i < 4 {
+                // Front face: V-flip to the Rectangle convention (see above).
+                uv[1] = 1.0 - uv[1];
+            } else if i >= 8 {
+                // Side faces: sentinel — the shader renders these as the cut edge.
+                *uv = [-1.0, -1.0];
+            }
         }
     }
     mesh.translated_by(Vec3::Y * (CARD_HEIGHT * 0.5))

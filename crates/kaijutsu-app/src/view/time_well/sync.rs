@@ -195,7 +195,9 @@ pub fn sync_time_well(
             params: Vec4::ZERO,
             shape: super::scene::card_shape(),
             border: Vec4::ZERO,
-            dim: Vec4::ONE, // full brightness until dim_nonfocused_rings sets it
+            // dim.x = full brightness until dim_nonfocused_rings sets it; y/z
+            // are the live chatter/beat lanes and start quiet.
+            dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
         });
 
         let entity = commands

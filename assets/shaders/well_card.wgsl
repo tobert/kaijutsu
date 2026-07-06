@@ -30,6 +30,20 @@ fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Slab edge faces (the thin ±X/±Y sides of the card block) carry sentinel
+    // UVs (< 0, tagged in `scene::card_block_mesh`). They can't render the face
+    // design — a squeezed texture sliver — so they render the card's *cut edge*
+    // instead: the border color when one is set (track hue / accent frame),
+    // else the accent lifted a touch. The cuboid edge IS the card's border,
+    // by design (Amy, 2026-07-06). Dims with the face so non-focused rings recede.
+    if (in.uv.x < -0.5) {
+        var edge = accent.rgb * 1.15;
+        if (border.a > 0.001) {
+            edge = border.rgb;
+        }
+        return vec4<f32>(edge * dim.x, 1.0);
+    }
+
     let aspect = shape.x;
     let radius = shape.y;
     let ring_w = shape.z;
@@ -128,6 +142,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let pulse = 0.85 + 0.15 * sin(t * 3.0);
         col = mix(col, vec3<f32>(0.40, 0.68, 1.0) * (3.4 * pulse), band);
         alpha = max(alpha, band);
+    }
+
+    // The material declares AlphaMode::Mask(0.5), but a custom fragment shader
+    // must do its own masking — Bevy only injects the discard into the standard
+    // PBR fragment. Without this line the whole quad paints into the opaque
+    // pass and the rounded corners are silhouette fiction: every card ships a
+    // sharp-edged accent box around its rounded face (and those invisible
+    // corners occlude the lattice behind them). The ring band's outer half
+    // (alpha = band past d=0) deliberately survives, so the glow still spills
+    // just past the rounded edge.
+    if (alpha < 0.5) {
+        discard;
     }
 
     // Focus dimming: recede non-focused-ring cards by scaling color only. The

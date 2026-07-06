@@ -38,6 +38,13 @@ fn label_brush() -> Brush {
     bevy_color_to_brush(Color::srgba(0.75, 0.85, 0.97, 0.75))
 }
 
+/// HDR gain for the focus card's bevel frame (the `border` ring band): the
+/// selection's accent lifted so the frame reads as a deliberate beveled edge.
+/// It replaces the accidental cream ring the pre-mask-fix chatter/beat lanes
+/// used to paint. A touch under the HUD panels' 1.8 so the in-world card
+/// doesn't outshine its own HUD. **Amy-tunable.**
+const READING_BORDER_GAIN: f32 = 1.6;
+
 /// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, drifting]`.
 /// `status` is a float code the shader switches on for the rim FX: pending/none →
 /// 0, running → 1 (breathing pulse), done → 2 (no rim), error → 3 (steady red).
@@ -259,9 +266,12 @@ pub fn update_reading_card(
     {
         Some(card) => {
             if let Some(mat) = materials.get_mut(&mat_node.0) {
-                mat.accent = accent_vec4(&card.data.accent);
+                let accent = accent_vec4(&card.data.accent);
+                mat.accent = accent;
                 // The focus card is the selection — no selection/lineage ring on it.
                 mat.params = Vec4::ZERO;
+                // Beveled frame: the accent lifted into HDR on the ring band.
+                mat.border = (accent.truncate() * READING_BORDER_GAIN).extend(1.0);
             }
             match atlas.as_deref_mut() {
                 Some(atlas) => {
@@ -273,6 +283,7 @@ pub fn update_reading_card(
         None => {
             if let Some(mat) = materials.get_mut(&mat_node.0) {
                 mat.accent = Vec4::ZERO; // blank plate
+                mat.border = Vec4::ZERO; // no frame around nothing
             }
             Vec::new()
         }

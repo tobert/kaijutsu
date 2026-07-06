@@ -39,13 +39,16 @@ pub struct WellCardMaterial {
 
     /// `[r, g, b, strength]` — a steady outline drawn from the SDF ring band,
     /// independent of the `params` selection/lineage/status rings. A
-    /// deliberate **union of two purposes** on distinct material instances:
-    /// HUD panels carry the selection accent here (HDR gain, strength 1.0 — a
-    /// blooming frame around an empty interior; `hud::update_well_hud`),
-    /// while rim cards carry their **track hue** (LDR, modest strength —
-    /// passive lane identity; `live::sync_card_live_uniforms`). Unattached
-    /// cards leave it `Vec4::ZERO` (strength 0 → no border). Split into two
-    /// fields if the two ever need to animate differently.
+    /// deliberate **union of purposes** on distinct material instances:
+    /// HUD panels carry the selection accent here (HDR gain, strength 1.0 —
+    /// a blooming frame; `hud::update_well_hud`), the focus card carries its
+    /// own accent lifted as a bevel frame (`text::update_reading_card`), and
+    /// rim cards carry their **track hue** (LDR, modest strength — passive
+    /// lane identity; `live::sync_card_live_uniforms`). Unattached cards
+    /// leave it `Vec4::ZERO` (strength 0 → no border). The slab's sentinel-UV
+    /// side faces also read this as their edge color (fallback: lifted
+    /// accent) — the cuboid edge is the card's border. Split into more fields
+    /// if these ever need to animate differently.
     #[uniform(5)]
     pub border: Vec4,
 

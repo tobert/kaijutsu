@@ -646,16 +646,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     arcs/particles *between* the source/target cards, not just the per-card
     shimmer already shipped. Needs a new context→context drift-edge *list* wire
     (the per-card shimmer rode the existing staged-queue poll; arcs can't).
+  - *Ring 3-down is unreadable at the gate framing* (Amy, 2026-07-06). With
+    the camera framed on the focused ring's gate, the third ring down
+    (Bumped when focused on Active) sits too oblique/deep to read its cards.
+    Needs a different angle or framing idea — maybe steepen `RING_CAM_LIFT`
+    per focus depth, or tilt deeper rings' cards toward the camera
+    (`card_tilt` is the parked per-band knob).
 - **Time-well ring-carousel — review findings (2026-07-03, gemini-pro batch +
   deepseek).** The ring-per-band carousel (`band_ring`/`ring_seat_rotated`,
   ring-centric nav, projector spin-to-gate, focus dimming) got a two-model
   review. The safe wins (per-frame change-detection guards on the easing
   systems; dead `card_tilt` multiply gated; stale `ring_seat` gate doc) are
   **applied**. Remaining, recorded not-yet-fixed:
-  - *Cuboid front-face UV via `take(4)` is fragile* (gemini, medium). `card_block_mesh`
-    (`scene.rs`) V-flips the front face by hardcoded vertex indices `0..4`, which
-    breaks if Bevy changes its cuboid vertex order. Robust fix: identify the front
-    face by its `ATTRIBUTE_NORMAL` (≈ `[0,0,1]`) and flip those verts' V instead.
+  - *Cuboid face UVs by hardcoded vertex index are fragile* (gemini, medium).
+    `card_block_mesh` (`scene.rs`) V-flips the front face as indices `0..4` and
+    (since 2026-07-06) sentinels the side faces as `8..24`, which breaks if
+    Bevy changes its cuboid vertex order. Robust fix: classify faces by
+    `ATTRIBUTE_NORMAL` (front ≈ `[0,0,1]`, sides ⟂ Z) instead of index ranges.
   - *Redundant per-tick sort* (gemini, simplification). `sync_time_well` calls
     `spiral_positions` (sorts via `band_orders`) **and** `ring_cards =
     band_orders(...)` — the same recency sort twice per tick. Call `band_orders`
