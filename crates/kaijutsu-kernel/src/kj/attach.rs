@@ -126,7 +126,11 @@ mod tests {
     }
 
     async fn install_attach_script(d: &KjDispatcher, ctx_type: &str, content: &str, ext: &str) {
-        let path = format!("/etc/rc/{ctx_type}/attach/S00-marker.{ext}");
+        let path = kaijutsu_types::paths::rc_script_path(
+            ctx_type,
+            "attach",
+            &format!("S00-marker.{ext}"),
+        );
         install_rc_script_file(d, &path, content).await;
     }
 

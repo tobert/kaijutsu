@@ -32,8 +32,9 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/s
 pub const DEFAULT_METRONOME: &str = include_str!("../../../assets/defaults/metronome.toml");
 
 /// The VFS mount root the kernel-wide config singletons live under. Parallel to
-/// [`crate::seed_scripts::RC_VFS_ROOT`] (`/etc/rc`).
-pub const CONFIG_VFS_ROOT: &str = "/etc/config";
+/// [`crate::seed_scripts::RC_VFS_ROOT`] (`/etc/rc`). Re-exported from
+/// [`kaijutsu_types::paths::CONFIG_ROOT`] — the single source of truth.
+pub use kaijutsu_types::paths::CONFIG_ROOT as CONFIG_VFS_ROOT;
 
 /// The VFS mount root for **per-client** config (`docs/config-crdt-ownership.md`
 /// "Per-client config"). Client-facing config that is machine-local — the
@@ -41,8 +42,9 @@ pub const CONFIG_VFS_ROOT: &str = "/etc/config";
 /// `/etc/client/<client-id>/<file>` → `/etc/client/<file>` → embedded. The
 /// files seeded here (via [`client_seed_files`]) are the **shared defaults** at
 /// the mount root; per-client overrides at `<client-id>/…` are never seeded
-/// (there is no client id at build time), only written lazily.
-pub const CLIENT_VFS_ROOT: &str = "/etc/client";
+/// (there is no client id at build time), only written lazily. Re-exported
+/// from [`kaijutsu_types::paths::CLIENT_ROOT`] — the single source of truth.
+pub use kaijutsu_types::paths::CLIENT_ROOT as CLIENT_VFS_ROOT;
 
 /// The embedded config seed manifest: `(canonical /etc/config path, body)`.
 ///
@@ -51,11 +53,12 @@ pub const CLIENT_VFS_ROOT: &str = "/etc/client";
 /// Unlike rc (a directory tree), config is a fixed, flat set, so the manifest is
 /// hand-listed here rather than walked from an embedded directory.
 pub fn config_seed_files() -> Vec<(String, &'static str)> {
+    use kaijutsu_types::paths::config_path;
     vec![
-        (format!("{CONFIG_VFS_ROOT}/theme.toml"), DEFAULT_THEME),
-        (format!("{CONFIG_VFS_ROOT}/models.toml"), DEFAULT_MODELS_CONFIG),
-        (format!("{CONFIG_VFS_ROOT}/mcp.toml"), DEFAULT_MCP_CONFIG),
-        (format!("{CONFIG_VFS_ROOT}/system.md"), DEFAULT_SYSTEM_PROMPT),
+        (config_path("theme.toml"), DEFAULT_THEME),
+        (config_path("models.toml"), DEFAULT_MODELS_CONFIG),
+        (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
+        (config_path("system.md"), DEFAULT_SYSTEM_PROMPT),
     ]
 }
 
@@ -63,7 +66,10 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
 /// /etc/client path, body)`. Only the mount-root shared defaults are seeded;
 /// per-client overrides (`/etc/client/<id>/…`) carry no compiled-in default.
 pub fn client_seed_files() -> Vec<(String, &'static str)> {
-    vec![(format!("{CLIENT_VFS_ROOT}/metronome.toml"), DEFAULT_METRONOME)]
+    vec![(
+        kaijutsu_types::paths::client_config_path(None, "metronome.toml"),
+        DEFAULT_METRONOME,
+    )]
 }
 
 /// The embedded default body for a canonical config path (`/etc/config/<file>`

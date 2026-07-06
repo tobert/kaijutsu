@@ -464,8 +464,11 @@ fn poll_bootstrap_results(
                         // Metronome resource. Runs before the context branches
                         // (which can `return`) so it always fires.
                         for path in [
-                            format!("/etc/client/{client_id}/metronome.toml"),
-                            "/etc/client/metronome.toml".to_string(),
+                            kaijutsu_types::paths::client_config_path(
+                                Some(&client_id),
+                                "metronome.toml",
+                            ),
+                            kaijutsu_types::paths::client_config_path(None, "metronome.toml"),
                         ] {
                             match h.get_config(path.clone()).await {
                                 Ok(toml) if !toml.trim().is_empty() => {

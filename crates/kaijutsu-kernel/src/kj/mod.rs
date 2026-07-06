@@ -709,6 +709,7 @@ pub(crate) mod test_helpers {
     use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::drift::shared_drift_router;
     use crate::kernel_db::KernelDb;
+    use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
 
     /// Create a KjDispatcher with in-memory state for testing.
     ///
@@ -757,7 +758,7 @@ pub(crate) mod test_helpers {
         // fork tests — see test_dispatcher_crdt_rc). The CRDT-native backend is
         // covered by its own unit tests + test_dispatcher_crdt_rc.
         kernel
-            .mount("/etc/rc", crate::vfs::LocalBackend::new(&rc_tmp))
+            .mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_tmp))
             .await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
@@ -795,17 +796,17 @@ pub(crate) mod test_helpers {
                 .await
                 .with_temp_cleanup(root),
         );
-        let rc_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        let rc_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
         rc_fs.seed_from_embedded().expect("seed rc into CRDT");
-        kernel.mount("/etc/rc", rc_fs).await;
+        kernel.mount(RC_ROOT, rc_fs).await;
         // Config files live on the same CRDT-native backend type at /etc/config
         // (slice 2) — seed it too so `kj config` tests exercise the real path.
         let config_fs =
-            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/config");
+            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), CONFIG_ROOT);
         config_fs
             .seed_entries(crate::config_seed::config_seed_files())
             .expect("seed config into CRDT");
-        kernel.mount("/etc/config", config_fs).await;
+        kernel.mount(CONFIG_ROOT, config_fs).await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 

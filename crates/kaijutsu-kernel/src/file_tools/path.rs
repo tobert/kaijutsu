@@ -65,9 +65,10 @@ pub fn resolve_str(cwd: &Path, path: &str) -> Result<String, PathError> {
 /// True if the (already-canonicalized) path is under the rc tree
 /// (`/etc/rc` or `/etc/rc/...`). Writing here via the file tools is gated on
 /// the `rc-write` capability; everything else under `/etc` is denied flat.
-pub(crate) fn is_rc_path(canonical_path: &str) -> bool {
-    canonical_path == "/etc/rc" || canonical_path.starts_with("/etc/rc/")
-}
+/// Delegates to the canonical, component-boundary-correct predicate in
+/// `kaijutsu_types::paths` — the single source of truth for this check,
+/// shared with `editor::config_owned` and the SFTP gate.
+pub(crate) use kaijutsu_types::paths::is_rc_path;
 
 /// The denial returned when a context without `rc-write` tries to write an
 /// rc script via the file tools. Names the deliberate paths so the nudge is

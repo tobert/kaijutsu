@@ -12,6 +12,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
+use kaijutsu_types::paths;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -137,7 +138,8 @@ impl RcSeedStatus {
 /// context's OODA cadence); `rotate` is the page-turn verb.
 fn rc_path_pattern() -> String {
     let verbs = crate::kj::lifecycle::RC_VERBS.join("|");
-    format!(r"^/etc/rc/([a-z][a-z0-9_-]*)/({verbs})/(S\d{{1,3}})-([a-z][a-z0-9_-]*)\.(kai|md)$")
+    let root = paths::RC_ROOT;
+    format!(r"^{root}/([a-z][a-z0-9_-]*)/({verbs})/(S\d{{1,3}})-([a-z][a-z0-9_-]*)\.(kai|md)$")
 }
 
 fn rc_path_regex() -> &'static Regex {
@@ -473,10 +475,10 @@ impl KjDispatcher {
         }
 
         let mut out = Vec::new();
-        for type_e in entries(vfs, "/etc/rc").await?.into_iter().filter(|e| e.kind.is_dir()) {
-            let type_dir = format!("/etc/rc/{}", type_e.name);
+        for type_e in entries(vfs, paths::RC_ROOT).await?.into_iter().filter(|e| e.kind.is_dir()) {
+            let type_dir = format!("{}/{}", paths::RC_ROOT, type_e.name);
             for verb_e in entries(vfs, &type_dir).await?.into_iter().filter(|e| e.kind.is_dir()) {
-                let verb_dir = format!("{type_dir}/{}", verb_e.name);
+                let verb_dir = paths::rc_dir(&type_e.name, &verb_e.name);
                 for file_e in entries(vfs, &verb_dir)
                     .await?
                     .into_iter()
@@ -484,7 +486,7 @@ impl KjDispatcher {
                     .filter(|e| e.kind.is_file() || e.kind.is_symlink())
                 {
                     if file_e.name.ends_with(".kai") || file_e.name.ends_with(".md") {
-                        out.push(format!("{verb_dir}/{}", file_e.name));
+                        out.push(paths::rc_script_path(&type_e.name, &verb_e.name, &file_e.name));
                     }
                 }
             }

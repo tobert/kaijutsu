@@ -1658,6 +1658,7 @@ impl VfsOps for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaijutsu_types::paths::RC_ROOT;
 
     #[tokio::test]
     async fn test_kernel_creation() {
@@ -1684,14 +1685,14 @@ mod tests {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
-        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
         // Mount it so the resolver's mount-table query routes the path to the
         // config backend (same blocks, so it finds the seeded block).
         kernel
-            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
             .await;
         let path = "/etc/rc/coder/create/S00.kai";
 
@@ -1743,9 +1744,9 @@ mod tests {
         // Mount the rc backend on the kernel VFS (so the cache reads through it),
         // then seed a config script over the same store.
         kernel
-            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
@@ -1799,9 +1800,9 @@ mod tests {
         let blocks = shared_block_store_with_db(db, ws, creator);
 
         kernel
-            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
             .await;
-        let rc = ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
         // The block we'll edit, and a separate file we'll read into it.
         rc.write_all(Path::new("coder/create/S00.kai"), b"AB")
             .await
@@ -1846,9 +1847,9 @@ mod tests {
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
         kernel
-            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hello")
             .await
             .unwrap();
@@ -1949,9 +1950,9 @@ mod tests {
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
         kernel
-            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
             .await;
-        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
             .write_all(Path::new("coder/create/S00.kai"), b"hi")
             .await
             .unwrap();

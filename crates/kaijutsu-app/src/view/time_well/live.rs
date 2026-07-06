@@ -505,7 +505,7 @@ mod tests {
             None,
             ToolKind::Builtin,
             "kaijutsu:read",
-            serde_json::json!({"path": "/etc/rc"}),
+            serde_json::json!({"path": kaijutsu_types::paths::RC_ROOT}),
             Role::Model,
             None,
         );

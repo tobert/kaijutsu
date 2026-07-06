@@ -111,6 +111,7 @@ use kaijutsu_kernel::{
     shared_block_flow_bus,
     shared_input_doc_flow_bus,
 };
+use kaijutsu_types::paths;
 use kaijutsu_types::{ContextId, KernelId, Principal, PrincipalId, SessionId};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
 use kaijutsu_types::ToolKind as TypesToolKind;
@@ -729,19 +730,18 @@ fn create_block_store_with_kernel_db(
 /// a flat namespace, so this is just a root prepend when the caller passed a
 /// bare name.
 fn config_canonical(path: &str) -> String {
-    const ROOT: &str = "/etc/config";
-    const CLIENT_ROOT: &str = "/etc/client";
     let trimmed = path.trim();
     // Already an absolute config-namespace path — the flat kernel-global
     // `/etc/config`, or the per-client `/etc/client` (hierarchical:
     // `<root>/<client-id>/<file>`, docs/config-crdt-ownership.md). Pass it
     // through so per-client config is reachable through the same config RPCs.
-    let is_abs = |root: &str| trimmed == root || trimmed.starts_with(&format!("{root}/"));
-    if is_abs(ROOT) || is_abs(CLIENT_ROOT) {
+    // The boundary check (component-correct, not a bare prefix match) comes
+    // from the shared `kaijutsu_types::paths` predicates.
+    if paths::is_config_path(trimmed) || paths::is_client_path(trimmed) {
         trimmed.to_string()
     } else {
         // A bare name defaults to the kernel-global config mount.
-        format!("{ROOT}/{}", trimmed.trim_start_matches('/'))
+        paths::config_path(trimmed.trim_start_matches('/'))
     }
 }
 
@@ -751,7 +751,7 @@ fn config_canonical(path: &str) -> String {
 /// present. This is a bootstrap source only — never read again after seeding.
 fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<String> {
     let dir = config_dir?;
-    let name = canonical.strip_prefix("/etc/config/")?;
+    let name = canonical.strip_prefix(&format!("{}/", paths::CONFIG_ROOT))?;
     std::fs::read_to_string(dir.join(name)).ok()
 }
 
@@ -792,12 +792,12 @@ async fn initialize_kernel_models(
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
     use kaijutsu_kernel::vfs::VfsOps;
 
-    const MODELS_PATH: &str = "/etc/config/models.toml";
-    let raw = match kernel.vfs().read_all(std::path::Path::new(MODELS_PATH)).await {
+    let models_path = paths::config_path("models.toml");
+    let raw = match kernel.vfs().read_all(std::path::Path::new(&models_path)).await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => {
             log::error!(
-                "read {MODELS_PATH} from CRDT failed: {e}; booting on embedded default models"
+                "read {models_path} from CRDT failed: {e}; booting on embedded default models"
             );
             kaijutsu_kernel::config_seed::DEFAULT_MODELS_CONFIG.to_string()
         }
@@ -807,8 +807,8 @@ async fn initialize_kernel_models(
         Ok(c) => c,
         Err(parse_err) => {
             log::error!(
-                "{MODELS_PATH} in the CRDT is unparseable ({parse_err}); booting on embedded \
-                 default models — repair with `kj config reset {MODELS_PATH}`"
+                "{models_path} in the CRDT is unparseable ({parse_err}); booting on embedded \
+                 default models — repair with `kj config reset {models_path}`"
             );
             match kaijutsu_kernel::load_models_config_toml(
                 kaijutsu_kernel::config_seed::DEFAULT_MODELS_CONFIG,
@@ -825,7 +825,7 @@ async fn initialize_kernel_models(
     match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
         Ok(registry) => {
             *kernel.llm().write().await = registry;
-            log::info!("Initialized kernel LLM registry from {MODELS_PATH}");
+            log::info!("Initialized kernel LLM registry from {models_path}");
             models_config.embedding
         }
         Err(e) => {
@@ -1111,7 +1111,7 @@ pub async fn create_shared_kernel(
     // without its stance scripts must not come up pretending all is well.
     let rc_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
         documents.clone(),
-        "/etc/rc",
+        paths::RC_ROOT,
     );
     if rc_fs.is_empty() {
         let n = rc_fs.seed_from_embedded().map_err(|e| {
@@ -1119,7 +1119,7 @@ pub async fn create_shared_kernel(
         })?;
         log::info!("seeded {n} rc script(s) into the CRDT (fresh kernel)");
     }
-    kernel.mount("/etc/rc", rc_fs).await;
+    kernel.mount(paths::RC_ROOT, rc_fs).await;
 
     // Config files (theme/models/mcp.toml + system.md) at /etc/config are
     // CRDT-owned too (slice 2, docs/config-crdt-ownership.md): the SAME backend
@@ -1129,7 +1129,7 @@ pub async fn create_shared_kernel(
     // failure is fatal — a kernel without a parseable models.toml is useless.
     let config_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
         documents.clone(),
-        "/etc/config",
+        paths::CONFIG_ROOT,
     );
     if config_fs.is_empty() {
         // One-time bootstrap seed of a fresh config namespace. `config_dir`
@@ -1152,7 +1152,7 @@ pub async fn create_shared_kernel(
             .map_err(|e| capnp::Error::failed(format!("config seed into CRDT failed: {e}")))?;
         log::info!("seeded {n} config file(s) into the CRDT (fresh kernel)");
     }
-    kernel.mount("/etc/config", config_fs).await;
+    kernel.mount(paths::CONFIG_ROOT, config_fs).await;
 
     // Per-client config at /etc/client (docs/config-crdt-ownership.md
     // "Per-client config"): the SAME CRDT-native backend, one more mount. Seeded
@@ -1163,7 +1163,7 @@ pub async fn create_shared_kernel(
     // restart brings the shared defaults up once, then the CRDT owns them.
     let client_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
         documents.clone(),
-        "/etc/client",
+        paths::CLIENT_ROOT,
     );
     if client_fs.is_empty() {
         let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::client_seed_files()
@@ -1175,7 +1175,7 @@ pub async fn create_shared_kernel(
         })?;
         log::info!("seeded {n} client config default(s) into the CRDT (fresh kernel)");
     }
-    kernel.mount("/etc/client", client_fs).await;
+    kernel.mount(paths::CLIENT_ROOT, client_fs).await;
 
     // Mount the CAS object pool read-only at /v/cas (docs/slash-v.md track B).
     // A CasFs over the kernel's FileStore renders every stored object as an
@@ -1185,7 +1185,7 @@ pub async fn create_shared_kernel(
     // reach it for free (no new RPC). Read-only by construction — every write
     // returns EROFS from the backend, so it sidesteps the SFTP capability gate.
     let cas_fs = kaijutsu_kernel::vfs::CasFs::new(kernel.cas().clone());
-    kernel.mount("/v/cas", cas_fs).await;
+    kernel.mount(paths::CAS_ROOT, cas_fs).await;
 
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
@@ -3939,7 +3939,7 @@ impl kernel::Server for KernelImpl {
                 // mount holds. Bare file names, matching the old surface.
                 let names: Vec<String> = match kernel
                     .vfs()
-                    .readdir(std::path::Path::new("/etc/config"))
+                    .readdir(std::path::Path::new(paths::CONFIG_ROOT))
                     .await
                 {
                     Ok(entries) => entries

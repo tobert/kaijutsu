@@ -377,7 +377,11 @@ mod tests {
     #[test]
     fn a_failed_prefetch_plays_nothing() {
         let mut app = test_app();
-        deliver(&mut app, "audio/wav", Err("no such path: /v/cas/…".into()));
+        deliver(
+            &mut app,
+            "audio/wav",
+            Err(format!("no such path: {}/…", kaijutsu_types::paths::CAS_ROOT)),
+        );
 
         assert_eq!(app.world().resource::<Assets<AudioSource>>().len(), 0);
         assert_eq!(player_count(&mut app), 0);

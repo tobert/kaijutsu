@@ -51,6 +51,7 @@ pub mod enums;
 pub mod error_block;
 pub mod ids;
 pub mod kernel;
+pub mod paths;
 pub mod principal;
 pub mod session;
 pub mod theme;

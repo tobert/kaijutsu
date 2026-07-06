@@ -21,19 +21,9 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
+use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT};
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
-
-/// Mount root the kernel-global config files live under.
-const CONFIG_ROOT: &str = "/etc/config";
-
-/// Mount root for per-client config (`docs/config-crdt-ownership.md`). Unlike
-/// `/etc/config` this namespace is hierarchical: `<root>/<file>` is a shared
-/// client default and `<root>/<client-id>/<file>` is one client's override.
-const CLIENT_ROOT: &str = "/etc/client";
-
-/// Canonical path of the one config file that gets structural validation.
-const MODELS_TOML_PATH: &str = "/etc/config/models.toml";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -148,7 +138,7 @@ fn config_canonical(path: &str) -> Result<String, String> {
 /// (`initialize_llm_registry`) into a loud write-time rejection, per the
 /// house fail-loud posture (2026-06-30 config papercuts, Fix 2).
 fn validate_config_write(canonical: &str, content: &str) -> Result<(), String> {
-    if canonical != MODELS_TOML_PATH {
+    if canonical != kaijutsu_types::paths::config_path("models.toml") {
         return Ok(());
     }
     let value: toml::Value = toml::from_str(content).map_err(|e| format!("invalid TOML: {e}"))?;

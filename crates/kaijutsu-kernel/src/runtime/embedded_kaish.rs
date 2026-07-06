@@ -40,6 +40,7 @@ use kaish_kernel::{
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::kernel_db::KernelDb;
+use kaijutsu_types::paths::{DOCS_ROOT, INPUT_ROOT};
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use super::docs_filesystem::KaijutsuFilesystem;
@@ -334,8 +335,8 @@ impl EmbeddedKaish {
             mount_backend,
             config,
             |vfs| {
-                vfs.mount_arc("/v/docs", docs_mount);
-                vfs.mount_arc("/v/input", input_mount);
+                vfs.mount_arc(DOCS_ROOT, docs_mount);
+                vfs.mount_arc(INPUT_ROOT, input_mount);
             },
             |tools| {
                 configure_tools(ctx_for_tools, sid_for_tools, tools);
@@ -586,6 +587,7 @@ fn merge_trace_context(
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
+    use kaijutsu_types::paths::RC_ROOT;
 
     const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
     const TS: &str = "vendor=value";
@@ -692,8 +694,8 @@ mod tests {
         let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-ln").await);
         // Mount the production rc backend over the same block store the shell uses.
         let rc_fs =
-            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
-        kernel.mount("/etc/rc", rc_fs).await;
+            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
+        kernel.mount(RC_ROOT, rc_fs).await;
         let kaish = EmbeddedKaish::new("test-ln", blocks, kernel, None).unwrap();
 
         let run = |cmd: &'static str| {

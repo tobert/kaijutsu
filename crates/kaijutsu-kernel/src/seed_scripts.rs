@@ -53,16 +53,19 @@ use include_dir::{include_dir, Dir, DirEntry};
 /// under it is a seed, keyed by its path.
 static RC_SEED_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../assets/defaults/rc");
 
-/// The VFS prefix every rc canonical path lives under. The deployed tree
-/// (`~/.config/kaijutsu/rc/...`) and the embedded mirror (`assets/defaults/rc/`)
-/// drop this prefix — the host path is `root.join(relpath)`, the embedded
-/// lookup key is `relpath`.
-pub const RC_VFS_ROOT: &str = "/etc/rc/";
+/// The VFS root every rc canonical path lives under. Re-exported from
+/// [`kaijutsu_types::paths::RC_ROOT`] — the single source of truth — so this
+/// name keeps working for existing callers/doc links without redeclaring the
+/// string. The deployed tree (`~/.config/kaijutsu/rc/...`) and the embedded
+/// mirror (`assets/defaults/rc/`) drop this prefix (plus the separating `/`)
+/// — the host path is `root.join(relpath)`, the embedded lookup key is
+/// `relpath`.
+pub use kaijutsu_types::paths::RC_ROOT as RC_VFS_ROOT;
 
 /// Strip the `/etc/rc/` prefix from a canonical rc path. Returns `None`
 /// for a path that isn't under the rc root.
 fn rc_relpath(canonical: &str) -> Option<&str> {
-    canonical.strip_prefix(RC_VFS_ROOT)
+    canonical.strip_prefix(RC_VFS_ROOT)?.strip_prefix('/')
 }
 
 /// Recursively collect every embedded `.kai`/`.md` seed file as
@@ -82,7 +85,7 @@ fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str
                 let body = file
                     .contents_utf8()
                     .expect("embedded rc seed must be valid UTF-8");
-                out.push((format!("{RC_VFS_ROOT}{rel}"), body));
+                out.push((format!("{RC_VFS_ROOT}/{rel}"), body));
             }
         }
     }

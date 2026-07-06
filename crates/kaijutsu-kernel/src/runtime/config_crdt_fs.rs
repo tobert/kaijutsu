@@ -732,6 +732,7 @@ mod tests {
     use crate::block_store::shared_block_store_with_db;
     use crate::kernel_db::KernelDb;
     use kaijutsu_crdt::PrincipalId;
+    use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
     use std::sync::Arc;
 
     /// A block store with a real (in-memory) KernelDb, so the `documents`
@@ -743,7 +744,7 @@ mod tests {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws_id, creator);
-        ConfigCrdtFs::new(blocks, "/etc/rc")
+        ConfigCrdtFs::new(blocks, RC_ROOT)
     }
 
     fn p(s: &str) -> &Path {
@@ -978,7 +979,7 @@ mod tests {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws_id, creator);
-        let fs = ConfigCrdtFs::new(blocks, "/etc/config");
+        let fs = ConfigCrdtFs::new(blocks, CONFIG_ROOT);
 
         assert!(fs.is_empty(), "fresh config mount owns nothing");
         let n = fs.seed_entries(crate::config_seed::config_seed_files()).unwrap();

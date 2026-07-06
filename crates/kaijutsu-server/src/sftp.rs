@@ -27,6 +27,7 @@ use kaijutsu_kernel::{
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
 };
 use kaijutsu_types::Principal;
+use kaijutsu_types::paths;
 
 use russh_sftp::extensions::{
     self, FsyncExtension, HardlinkExtension, Statvfs, StatvfsExtension,
@@ -233,9 +234,11 @@ fn reply(err: VfsError) -> StatusReply {
 /// by the mount's own `read_only()` flag, which `VfsOps` already enforces.
 fn privileged_write_denied(path: &Path) -> Option<StatusReply> {
     let s = path.to_string_lossy();
-    let gated = |root: &str| s == root || s.starts_with(&format!("{root}/"));
-    // Component-boundary match so `/etc/rcfoo` is NOT mistaken for `/etc/rc`.
-    if gated("/etc/rc") || gated("/etc/config") {
+    // Component-boundary match (so `/etc/rcfoo` is NOT mistaken for `/etc/rc`)
+    // via the shared predicate in `kaijutsu_types::paths` — the single source
+    // of truth for this boundary check, also used by `editor::config_owned`
+    // and the file-tools `is_rc_path` gate.
+    if paths::is_rc_path(&s) || paths::is_config_path(&s) {
         Some(StatusCode::PermissionDenied.with_message(
             "SFTP writes to /etc/rc and /etc/config are not yet capability-gated; refused",
         ))
@@ -1221,9 +1224,9 @@ mod tests {
 
     #[test]
     fn privileged_deny_matches_on_component_boundary() {
-        assert!(privileged_write_denied(Path::new("/etc/rc")).is_some());
+        assert!(privileged_write_denied(Path::new(paths::RC_ROOT)).is_some());
         assert!(privileged_write_denied(Path::new("/etc/rc/coder/S10.kai")).is_some());
-        assert!(privileged_write_denied(Path::new("/etc/config")).is_some());
+        assert!(privileged_write_denied(Path::new(paths::CONFIG_ROOT)).is_some());
         assert!(privileged_write_denied(Path::new("/etc/config/models")).is_some());
         // Not gated: a sibling whose name merely starts with the gated prefix.
         assert!(privileged_write_denied(Path::new("/etc/rcfoo")).is_none());

@@ -102,7 +102,7 @@ impl SftpClient {
     /// hashes). The object pool is the one `/v` pool that grows without bound, so
     /// it is sharded 256× to keep any single `readdir` bounded.
     pub fn object_path(hash: &ContentHash) -> String {
-        format!("/v/cas/{}/{}", hash.prefix(), hash)
+        format!("{}/{}/{}", kaijutsu_types::paths::CAS_ROOT, hash.prefix(), hash)
     }
 
     /// Open an SSH connection, authenticate, and bind a channel to the `sftp`
@@ -338,10 +338,14 @@ mod tests {
         let h = ContentHash::from_data(b"whatever");
         assert_eq!(
             SftpClient::object_path(&h),
-            format!("/v/cas/{}/{}", h.prefix(), h)
+            format!("{}/{}/{}", kaijutsu_types::paths::CAS_ROOT, h.prefix(), h)
         );
         // The shard is the leaf hash's own prefix — the server maps it back.
-        assert!(SftpClient::object_path(&h).starts_with(&format!("/v/cas/{}/", h.prefix())));
+        assert!(SftpClient::object_path(&h).starts_with(&format!(
+            "{}/{}/",
+            kaijutsu_types::paths::CAS_ROOT,
+            h.prefix()
+        )));
     }
 
     #[tokio::test]

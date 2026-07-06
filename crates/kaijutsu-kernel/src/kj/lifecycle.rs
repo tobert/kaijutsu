@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 
+use kaijutsu_types::paths;
 use kaijutsu_types::{
     BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
 };
@@ -218,8 +219,10 @@ impl KjDispatcher {
                 "S00",
                 None,
                 format!(
-                    "rc depth limit exceeded ({} >= {}); refusing to run /etc/rc/{}/{}/* scripts",
-                    caller.rc_depth, MAX_RC_DEPTH, context_type, verb
+                    "rc depth limit exceeded ({} >= {}); refusing to run {}/* scripts",
+                    caller.rc_depth,
+                    MAX_RC_DEPTH,
+                    paths::rc_dir(&context_type, verb)
                 ),
                 caller.principal_id,
             );
@@ -277,7 +280,7 @@ impl KjDispatcher {
     ) -> Result<Vec<RcScript>, String> {
         use crate::vfs::{VfsError, VfsOps};
 
-        let dir = format!("/etc/rc/{context_type}/{verb}");
+        let dir = paths::rc_dir(context_type, verb);
         let vfs = self.kernel().vfs();
         let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
             Ok(e) => e,
@@ -305,7 +308,7 @@ impl KjDispatcher {
 
         let mut scripts = Vec::with_capacity(names.len());
         for name in names {
-            let path = format!("{dir}/{name}");
+            let path = paths::rc_script_path(context_type, verb, &name);
             // Read straight from the CRDT-native rc backend (no FileDocumentCache
             // mirror). Any read failure on a file we just enumerated is
             // corruption — boot WITHOUT the stance is worse than failing loud

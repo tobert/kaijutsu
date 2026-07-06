@@ -31,6 +31,8 @@
 
 use kaijutsu_crdt::{BlockId, ContextId};
 use kaijutsu_types::{PrincipalId, SessionId};
+#[cfg(test)]
+use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
 
 use crate::block_store::SharedBlockStore;
 use crate::config_doc::{config_context_id, first_block_id};
@@ -60,9 +62,7 @@ pub struct EditorTarget {
 /// a cache-coherence optimization on the sync editor-quit path where an `async`
 /// mount-table query would cascade. Tracked in `docs/issues.md`.
 pub fn config_owned(path: &str) -> bool {
-    matches!(path, "/etc/rc" | "/etc/config")
-        || path.starts_with("/etc/rc/")
-        || path.starts_with("/etc/config/")
+    kaijutsu_types::paths::is_rc_path(path) || kaijutsu_types::paths::is_config_path(path)
 }
 
 /// Resolve `path` to the `(context, block)` of the CRDT document that owns its
@@ -665,16 +665,16 @@ mod tests {
     /// production shape the resolver queries to decide config-ownership.
     async fn mounts_with_rc(blocks: &SharedBlockStore) -> Arc<crate::vfs::MountTable> {
         let mt = crate::vfs::MountTable::new();
-        mt.mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+        mt.mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
             .await;
         Arc::new(mt)
     }
 
     #[test]
     fn config_owned_covers_rc_and_config_trees_only() {
-        assert!(config_owned("/etc/rc"));
+        assert!(config_owned(RC_ROOT));
         assert!(config_owned("/etc/rc/coder/create/S00-stance.kai"));
-        assert!(config_owned("/etc/config"));
+        assert!(config_owned(CONFIG_ROOT));
         assert!(config_owned("/etc/config/model.toml"));
         // Not the config trees:
         assert!(!config_owned("/etc"));
@@ -687,7 +687,7 @@ mod tests {
     async fn resolves_rc_path_to_its_configcrdtfs_owner_block() {
         let blocks = blocks_with_db();
         // Seed an rc script through the owning backend, exactly as `kj rc` does.
-        let rc = ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(Path::new("coder/create/S00-stance.kai"), b"be kind")
             .await
             .unwrap();
@@ -722,7 +722,7 @@ mod tests {
         // one the executor reads — not the symlink's own block, or saved edits
         // land on a doc nothing else reads (docs/issues.md, fixed here).
         let blocks = blocks_with_db();
-        let rc = ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
         // The real source lives under lib/.
         rc.write_all(Path::new("lib/create/S10-binding.kai"), b"kj binding allow \"*\"")
             .await
@@ -803,13 +803,13 @@ mod session_tests {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
         let blocks = shared_block_store_with_db(db, ws, creator);
-        let rc = ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        let rc = ConfigCrdtFs::new(blocks.clone(), RC_ROOT);
         rc.write_all(Path::new("coder/create/S00.kai"), initial)
             .await
             .unwrap();
         let mounts = Arc::new({
             let mt = MountTable::new();
-            mt.mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            mt.mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
                 .await;
             mt
         });
