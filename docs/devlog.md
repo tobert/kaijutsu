@@ -190,13 +190,14 @@ default tick-anchored/no-stretch, trigger semantics in the transport, never
 the committed record. No standalone format unless interchange knocks: OTIO won
 model-first, AES31 stalled format-first.
 
-**`/v/blobs` — the CAS pool made reachable (July 2).** The clip design needed
-"sync the CAS to the client," and track B went design → audible demo in one
-arc: harden `kaijutsu-cas` first (atomic store, TOCTOU-free retrieve,
-validating `ContentHash` deserialization — the client cache is multi-process
-and a cache hit never re-hashes, so a torn object would be truth forever);
-a read-only `CasFs` VFS backend at `/v/blobs` where immutability makes the
-hard problems trivial; a client `BlobResolver` over its own SFTP connection
+**`/v/cas` — the CAS pool made reachable (July 2)** *(originally shipped as
+`/v/blobs`; renamed `/v/cas` 2026-07-06 for naming consistency).* The clip
+design needed "sync the CAS to the client," and track B went design → audible
+demo in one arc: harden `kaijutsu-cas` first (atomic store, TOCTOU-free
+retrieve, validating `ContentHash` deserialization — the client cache is
+multi-process and a cache hit never re-hashes, so a torn object would be truth
+forever); a read-only `CasFs` VFS backend at `/v/cas` where immutability makes
+the hard problems trivial; a client `BlobResolver` over its own SFTP connection
 (SFTP futures are Send, the capnp world is !Send — they must not mix) that
 re-hashes every fetch and hard-errors on mismatch; and the app sink consuming
 CAS cues off a dedicated runtime. The review earned its keep: gemini caught
@@ -204,7 +205,7 @@ two real concurrency bugs (a transport-error handler that could wipe a fresh
 connection, a single-flight lock leaked on cancellation) that both the author
 and deepseek missed. Verified by ear: `kj cas put` → `kj play --cas <hash>` →
 SFTP fetch → hash-verified XDG cache → speakers. One scar worth the telling:
-kaish's overlay *reserves* `/v/blobs`, so `kaish ls` shows an empty shadow
+kaish's overlay *reserves* `/v/cas`, so `kaish ls` shows an empty shadow
 while SFTP serves the real pool — an hour lost, a gotcha memory written.
 
 **Music demo #1 post-mortem (July 3).** The first attempt to run the whole
@@ -303,7 +304,7 @@ can, because the early connected/failed signal is worth more than deferring —
 the first call after a cold start no longer bounces.
 
 **SFTP + the VFS.** The full SFTP server adapter serves `kernel.vfs()`
-directly; the generation counter (above) is its coherence primitive; `/v/blobs`
+directly; the generation counter (above) is its coherence primitive; `/v/cas`
 (music chapter) is its first growing pool. Track V (`/v/ctx`, `/v/session`)
 and adapter limits are the open follow-ups in `docs/slash-v.md` / issues.md.
 

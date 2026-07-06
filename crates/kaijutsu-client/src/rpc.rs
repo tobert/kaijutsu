@@ -3124,13 +3124,13 @@ mod tests {
         let mut message = MessageBuilder::new_default();
         message
             .init_root::<crate::kaijutsu_capnp::shell_value::Builder>()
-            .set_blob("/v/blobs/deadbeef");
+            .set_blob("/v/cas/deadbeef");
         let reader = message
             .get_root_as_reader::<crate::kaijutsu_capnp::shell_value::Reader>()
             .unwrap();
         assert_eq!(
             read_shell_value(reader).unwrap(),
-            ShellValue::String("/v/blobs/deadbeef".into())
+            ShellValue::String("/v/cas/deadbeef".into())
         );
     }
 

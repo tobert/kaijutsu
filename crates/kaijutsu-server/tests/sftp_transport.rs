@@ -8,7 +8,7 @@
 //!
 //! The production kernel mounts host `/tmp` writable on the SFTP-served VFS
 //! (`create_shared_kernel`), so a host file under `/tmp` is readable at the same
-//! path over SFTP — the transport is provable today, before `/v/blobs` exists.
+//! path over SFTP — the transport is provable today, before `/v/cas` exists.
 
 mod common;
 
@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{run_local, start_server, start_server_with_state_dir};
 use kaijutsu_cas::{ContentStore, FileStore};
-use kaijutsu_client::{BlobResolver, KeySource, SftpClient, SftpError, SshConfig};
+use kaijutsu_client::{CasResolver, KeySource, SftpClient, SftpError, SshConfig};
 
 fn ephemeral_config(addr: std::net::SocketAddr) -> SshConfig {
     SshConfig {
@@ -78,18 +78,18 @@ fn sftp_read_of_a_missing_path_fails_loud() {
     });
 }
 
-/// The whole track-B round trip over real SSH: a blob seeded into the server's
-/// CAS is fetched by a `BlobResolver` through the `/v/blobs` mount, verified,
+/// The whole track-B round trip over real SSH: an object seeded into the server's
+/// CAS is fetched by a `CasResolver` through the `/v/cas` mount, verified,
 /// and cached. This is the first e2e exercising `CasFs` + the client resolver
 /// together (the resolver unit tests use a stub; this pins the live mount).
 #[test]
-fn blob_resolves_over_v_blobs_and_verifies() {
+fn object_resolves_over_v_cas_and_verifies() {
     run_local(async {
-        // Seed a blob into the server's CAS *before* it starts — CasFs reads the
+        // Seed an object into the server's CAS *before* it starts — CasFs reads the
         // pool live, and the resolver's sharded path maps straight onto it.
         let state = tempfile::tempdir().expect("state dir");
         let server_cas = FileStore::at_path(state.path().join("cas"));
-        let body: &[u8] = b"a clip's worth of bytes, resolved over /v/blobs\n";
+        let body: &[u8] = b"a clip's worth of bytes, resolved over /v/cas\n";
         let hash = server_cas.store(body, "audio/wav").expect("seed server CAS");
 
         let addr = start_server_with_state_dir(state.path().to_path_buf()).await;
@@ -99,28 +99,28 @@ fn blob_resolves_over_v_blobs_and_verifies() {
         let sftp = SftpClient::connect(ephemeral_config(addr))
             .await
             .expect("sftp subsystem connect");
-        let resolver = BlobResolver::new(FileStore::at_path(cache_dir.path()), sftp);
+        let resolver = CasResolver::new(FileStore::at_path(cache_dir.path()), sftp);
 
-        let got = resolver.resolve(&hash).await.expect("resolve over /v/blobs");
-        assert_eq!(got, body, "resolved bytes match the seeded blob");
+        let got = resolver.resolve(&hash).await.expect("resolve over /v/cas");
+        assert_eq!(got, body, "resolved bytes match the seeded object");
 
-        // The verified blob landed in the client cache (content-addressed), so a
+        // The verified object landed in the client cache (content-addressed), so a
         // fresh FileStore over the same dir sees it.
         let cache = FileStore::at_path(cache_dir.path());
         assert_eq!(
             cache.retrieve(&hash).expect("cache read").as_deref(),
             Some(body),
-            "the fetched blob is cached under its hash"
+            "the fetched object is cached under its hash"
         );
     });
 }
 
-/// A blob whose on-disk server bytes have been corrupted must fail the
+/// An object whose on-disk server bytes have been corrupted must fail the
 /// resolver's re-hash verification (crash over corruption) and leave the client
 /// cache clean — the CAS is self-verifying end to end, past SSH's transport
 /// integrity.
 #[test]
-fn a_corrupted_server_blob_fails_verification_and_caches_nothing() {
+fn a_corrupted_server_object_fails_verification_and_caches_nothing() {
     run_local(async {
         let state = tempfile::tempdir().expect("state dir");
         let server_cas = FileStore::at_path(state.path().join("cas"));
@@ -140,12 +140,12 @@ fn a_corrupted_server_blob_fails_verification_and_caches_nothing() {
         let sftp = SftpClient::connect(ephemeral_config(addr))
             .await
             .expect("sftp subsystem connect");
-        let resolver = BlobResolver::new(FileStore::at_path(cache_dir.path()), sftp);
+        let resolver = CasResolver::new(FileStore::at_path(cache_dir.path()), sftp);
 
         let err = resolver
             .resolve(&hash)
             .await
-            .expect_err("corrupted blob must fail verification");
+            .expect_err("corrupted object must fail verification");
         assert!(matches!(err, SftpError::HashMismatch { .. }), "got {err:?}");
 
         // Nothing corrupt entered the cache.

@@ -1177,15 +1177,15 @@ pub async fn create_shared_kernel(
     }
     kernel.mount("/etc/client", client_fs).await;
 
-    // Mount the CAS object pool read-only at /v/blobs (docs/slash-v.md track B).
-    // A CasFs over the kernel's FileStore renders every stored blob as an
+    // Mount the CAS object pool read-only at /v/cas (docs/slash-v.md track B).
+    // A CasFs over the kernel's FileStore renders every stored object as an
     // immutable file, sharded on the hash's leading two hex chars to match the
     // on-disk objects/ layout. This is the substrate for client CAS sync: once
     // mounted on the kernel MountTable, kaish, the file tools, and SFTP all
     // reach it for free (no new RPC). Read-only by construction — every write
     // returns EROFS from the backend, so it sidesteps the SFTP capability gate.
-    let blobs_fs = kaijutsu_kernel::vfs::CasFs::new(kernel.cas().clone());
-    kernel.mount("/v/blobs", blobs_fs).await;
+    let cas_fs = kaijutsu_kernel::vfs::CasFs::new(kernel.cas().clone());
+    kernel.mount("/v/cas", cas_fs).await;
 
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
@@ -8362,11 +8362,11 @@ mod shell_value_conversion_tests {
         // binary, never dropped.
         let mut msg = capnp::message::Builder::new_default();
         msg.init_root::<shell_value::Builder>()
-            .set_blob("/v/blobs/deadbeef");
+            .set_blob("/v/cas/deadbeef");
         let reader = msg.get_root_as_reader::<shell_value::Reader>().unwrap();
         assert_eq!(
             shell_value_to_value(reader).unwrap(),
-            Value::String("/v/blobs/deadbeef".into())
+            Value::String("/v/cas/deadbeef".into())
         );
     }
 }

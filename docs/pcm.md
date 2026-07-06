@@ -126,7 +126,7 @@ decouple-Act-from-ABC axis: one generalization, both sides of the barrier.
 **Sample bytes move out-of-band, prefetched under the speculation lead.** Cells
 commit ahead of the playhead, so `emit` fires with `at` in the near future —
 that lead is the transfer budget. A sink checks a client-side CAS cache (XDG
-dir), pulls a miss over **SFTP against `/v/blobs/<ab>/<hash>`** (the `/v/blobs`
+dir), pulls a miss over **SFTP against `/v/cas/<ab>/<hash>`** (the `/v/cas`
 CAS mount + the client fetcher/cache are designed in `docs/slash-v.md` track B —
 the mount does **not** exist yet; SFTP already speaks the VFS, so it's zero new
 RPC, and sshfs is the prototyping path), and fires on time. Same constraint-remover as MIDI output:
@@ -274,9 +274,9 @@ by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
      kernel/server binary links no audio/MIDI FFI (5c-3). **CAS-audio prefetch
      landed 2026-07-02 (track B B4):** a `CuePayload::Cas` `audio/*` cue in the
      app sink (`kaijutsu-app/src/audio.rs`) now resolves `media` through a
-     `BlobResolver` (XDG CAS cache, miss → SFTP `/v/blobs/<ab>/<hash>`, re-hash
+     `BlobResolver` (XDG CAS cache, miss → SFTP `/v/cas/<ab>/<hash>`, re-hash
      verify) off a dedicated tokio runtime — kept off the RPC actor's `!Send`
-     current-thread world — and plays the resolved bytes; the `/v/blobs` mount +
+     current-thread world — and plays the resolved bytes; the `/v/cas` mount +
      `BlobResolver` are `docs/slash-v.md` track B (landed + live-verified). This
      first cut is **fetch-on-cue**. **Still ahead in 5c:** the *clip-record* path
      (parse+validate the Shape A `Clip`, then resolve its `media` hash — the

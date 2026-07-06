@@ -70,7 +70,7 @@ concrete:
 
 ## `/v` surfaces (design canonical in `docs/slash-v.md`; track B landed 2026-07-02)
 
-Track B (`/v/blobs` + client CAS sync) is LIVE; track V (`/v/ctx` + `/v/session`)
+Track B (`/v/cas` + client CAS sync) is LIVE; track V (`/v/ctx` + `/v/session`)
 is unbuilt. (`/v/docs`/`/v/input` are kaish-side mounts, not kernel-`MountTable`,
 so not SFTP-visible.) The design details live in the doc, shipped-story in
 devlog/git; this entry is the backlog pointer:
@@ -96,22 +96,22 @@ devlog/git; this entry is the backlog pointer:
   drop-order regression test for `SftpClient`'s field ordering (the contract is
   commented but compiler-invisible). **(f)** client-side `spawn_blocking` for the
   blocking `FileStore` cache read in the async resolve (already an app follow-up).
-- **kaish `/v/blobs` is shadowed by kaish-kernel's `VirtualOverlayBackend`
-  (papercut, 2026-07-02).** kaish reserves `/v/blobs` (alongside `/v/jobs`) as
+- **kaish `/v/cas` is shadowed by kaish-kernel's `VirtualOverlayBackend`
+  (papercut, 2026-07-02).** kaish reserves `/v/cas` (alongside `/v/jobs`) as
   one of its own virtual paths (`kaish-kernel/src/backend/overlay.rs`
-  `is_virtual_path`), so a *kaish* file op (`ls`/`cat /v/blobs/...`) hits kaish's
+  `is_virtual_path`), so a *kaish* file op (`ls`/`cat /v/cas/...`) hits kaish's
   empty writable overlay, NOT the kernel `MountTable`'s `CasFs`. SFTP is
   unaffected — it serves `kernel.vfs()` directly, bypassing the kaish VFS — so
-  the clip-prefetch path (`SftpClient` → `/v/blobs`) and `kj cas` both work; only
-  the kaish-shell *view* of `/v/blobs` is wrong (two different `/v/blobs`
-  depending on surface). Reconcile later: either drop kaish's `/v/blobs`
+  the clip-prefetch path (`SftpClient` → `/v/cas`) and `kj cas` both work; only
+  the kaish-shell *view* of `/v/cas` is wrong (two different `/v/cas`
+  depending on surface). Reconcile later: either drop kaish's `/v/cas`
   reservation, teach its overlay to defer to `MountBackend` when the kernel has
   a real mount there, or mount `CasFs` on the kaish VFS too (like `/v/docs`).
-  Not blocking track B; the app never reads `/v/blobs` through kaish.
-- **`/v/blobs/index` TSV — DESIGNED, DEFERRED (2026-07-02, Amy).** The B2
+  Not blocking track B; the app never reads `/v/cas` through kaish.
+- **`/v/cas/index` TSV — DESIGNED, DEFERRED (2026-07-02, Amy).** The B2
   resolver file (`hash  mime  size  path`, absolute path column, mime from
   `inspect()`) is fully designed in `docs/slash-v.md` but was **not shipped**:
-  nothing consumes it (the client resolver addresses blobs by exact hash, never
+  nothing consumes it (the client resolver addresses objects by exact hash, never
   by reading `index`), and the first-cut shape — regenerate by walking
   `objects/` (O(N) `stat`+`inspect`) on *every* read, no cache — is
   under-designed and would bake a bad ABI. Build it only with (a) a real
@@ -1066,7 +1066,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **Clip cells — design DONE (`docs/clips.md`, 2026-07-01); implementation
   lands with pcm.md slice 5.** Shape A payload
   (`application/vnd.kaijutsu.clip+json`) over the mime-keyed render seam;
-  bytes out-of-band (SFTP + `/v/blobs`, client XDG CAS cache, prefetched
+  bytes out-of-band (SFTP + `/v/cas`, client XDG CAS cache, prefetched
   under the speculation lead). Research record: `docs/cue-prior-art.md`.
   Remaining work when slice 5 opens: the record type + validator in
   `kaijutsu-audio` (the validator is a voice of decouple-Act-from-ABC above),

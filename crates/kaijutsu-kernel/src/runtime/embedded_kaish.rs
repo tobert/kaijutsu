@@ -14,7 +14,7 @@
 //!             ├── kaish::Kernel (in-process)
 //!             │       │
 //!             │       ├── /v/docs → KaijutsuFilesystem (CRDT blocks)
-//!             │       ├── /v/jobs, /v/blobs → kaish builtins
+//!             │       ├── /v/jobs, /v/cas → kaish builtins
 //!             │       └── everything else → MountBackend
 //!             │               │
 //!             │               ├── File ops → MountTable → LocalBackend

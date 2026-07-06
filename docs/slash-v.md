@@ -1,9 +1,9 @@
-# The `/v` virtual filesystem: `/v/blobs`, `/v/ctx`, `/v/session`
+# The `/v` virtual filesystem: `/v/cas`, `/v/ctx`, `/v/session`
 
 *Design note. Proposed 2026-06-26 (extracted from `docs/sftp.md`); redesigned
 2026-06-27 with Amy and simplified hard — the per-session `bound` capability
 apparatus is gone (see "Capability"), navigation is a TSV `index` rather than human
-symlink farms, and the canonical pools are sharded. **Track B (`/v/blobs` + client
+symlink farms, and the canonical pools are sharded. **Track B (`/v/cas` + client
 CAS sync) shipped, live-verified 2026-07-02**; its `index` TSV (B2) was deliberately
 deferred by Amy — see track B. Track V (`/v/ctx` + `/v/session`) remains the active
 unbuilt plan. Compressed 2026-07-04: `docs/devlog.md` carries the track-B story, git
@@ -12,7 +12,7 @@ history keeps every cut line.*
 `/v` is kaijutsu's virtual / CRDT namespace. This note covers three **sysfs-style**
 surfaces under it:
 
-- **`/v/blobs`** — the kernel's CAS object pool, rendered as immutable files
+- **`/v/cas`** — the kernel's CAS object pool, rendered as immutable files
   (**shipped** — the substrate for client CAS sync).
 - **`/v/ctx`** — every context and its CRDT block log, rendered as files (planned).
 - **`/v/session`** — the live participants (app, MCP, SFTP) and, read-only, the
@@ -27,7 +27,7 @@ literal: `grep`, `less`, `ls -l` over live kernel state.
 and `/v/input` are **kaish-side** mounts (`embedded_kaish.rs:300` — objects on each
 materialized kaish's own VFS), *not* kernel-`MountTable` backends, and therefore not
 visible over SFTP. The surfaces in this doc mount on the **kernel `MountTable`**
-(like `/etc/rc`'s `ConfigCrdtFs` and the shipped `/v/blobs` `CasFs`), the table every
+(like `/etc/rc`'s `ConfigCrdtFs` and the shipped `/v/cas` `CasFs`), the table every
 surface reaches: SFTP serves it directly (`SftpSession::new(principal, vfs)`), kaish
 through `MountBackend` longest-prefix routing. Note for implementers: the kernel
 mount table **freezes** after setup (`MountTable::freeze()`) — new mounts must land
@@ -97,7 +97,11 @@ driver it was in the first draft (see "Capability").
     for the instrument: `awk -F'\t' '$6==1' /v/ctx/*/*/blocks/index` lists every
     excluded block (the `excl` column is `0`/`1`), one read per context.
 
-## `/v/blobs` — the CAS pool (read-only) + client sync — track B, SHIPPED
+## `/v/cas` — the CAS pool (read-only) + client sync — track B, SHIPPED
+
+*Renamed from `/v/blobs` to `/v/cas` on 2026-07-06 for naming consistency with the
+rest of the CAS surface (the crate, the store, `kj cas`) — no design change, same
+`CasFs` backend.*
 
 *Landed and live-verified 2026-07-02: `kj cas put` → SFTP fetch → hash-verified XDG
 cache → speakers. The driver was clips — a sink resolves a clip's `media` hash
@@ -108,7 +112,7 @@ history; `docs/devlog.md` tells the story. The landed design:*
 **`CasFs`** (`crates/kaijutsu-kernel/src/vfs/backends/cas.rs`) — a read-only
 `VfsBackend` over the kernel's `Arc<FileStore>` (`kaijutsu-cas`: 128-bit BLAKE3 as 32
 hex chars, disk layout `objects/<2-hex>/<30-hex>` plus `metadata/` and `staging/`),
-mounted at `/v/blobs` in the server bootstrap before the freeze (`rpc.rs:1167`).
+mounted at `/v/cas` in the server bootstrap before the freeze (`rpc.rs:1167`).
 Every mutating op returns `EROFS` from the backend itself — read-only by
 construction, not by mount flag. It shards on the **leading two hex chars**, matching
 the on-disk `objects/` layout one-to-one — deliberately **not** the UUIDv7
@@ -126,7 +130,7 @@ caching clients never invalidate), reads plain passthrough, no symlinks.
 connection** (`connect_subsystem`, client `ssh.rs:210` — same keys, same server, no
 new auth surface). Separate by design: the capnp RPC world is `!Send` and pinned to
 its dedicated thread, while SFTP futures are `Send` and ride the ambient runtime —
-the blob path never touches the RPC actor's `spawn_local` world. The cache is a
+fetching an object never touches the RPC actor's `spawn_local` world. The cache is a
 `kaijutsu_cas::FileStore` at the XDG cache dir (the kernel store's crate —
 layout/hashing/dedup for free), hardened for the multi-process cache: `store()`
 writes into `staging/` and atomically renames into `objects/`, and `ContentHash`
@@ -146,7 +150,7 @@ sniffing, and abandoned-upload cleanup hide in there; none blocks the read path.
 
 **B2 — the `index` TSV: designed, DEFERRED on purpose (2026-07-02, Amy).** The
 resolver file (`hash  mime  size  path`, absolute paths, mime joined from
-`metadata/`) has **no consumer** — the client resolver addresses blobs by exact
+`metadata/`) has **no consumer** — the client resolver addresses objects by exact
 hash — and the first-cut shape (an O(N) walk of `objects/` on every read, no cache)
 is under-designed: shipping it commits an ABI we'd outgrow. It lands with a real
 consumer *and* a cache keyed on a pool-version stamp (or a per-shard `index` if a
@@ -156,12 +160,12 @@ operation and serve *both* `getattr` (exact byte length) and `read`/`read_all` f
 that generation — never a placeholder size, which the default `read_all` would
 silently truncate to. Until then `kj cas ls` lists the pool for humans.
 
-**Known papercut:** kaish's overlay *reserves* `/v/blobs`, so `kaish ls /v/blobs`
+**Known papercut:** kaish's overlay *reserves* `/v/cas`, so `kaish ls /v/cas`
 shows an **empty shadow** while SFTP serves the real pool — verify over stock `sftp`,
 not kaish (`docs/devlog.md`, July 2).
 
 Residual non-blockers: CAS garbage collection (`kj cas rm` is unconditional; nothing
-refcounts blob references from clip records — a kernel CAS concern; content-addressed
+refcounts object references from clip records — a kernel CAS concern; content-addressed
 client caches never corrupt) and the inline-vs-CAS size threshold (`docs/pcm.md`,
 decided at the sink).
 
@@ -251,8 +255,8 @@ uniform random bits), so:
 Paged `readdir` (shipped in `docs/sftp.md`'s slice 2) covers any fat directory for
 correctness.
 
-(**Blobs are the stated exception:** BLAKE3 hashes are uniform in every byte, so
-`/v/blobs` shards on the *leading* two hex chars, matching the CAS disk layout — see
+(**Objects are the stated exception:** BLAKE3 hashes are uniform in every byte, so
+`/v/cas` shards on the *leading* two hex chars, matching the CAS disk layout — see
 track B. The trailing-byte rule is a UUIDv7 fact, not a house style.)
 
 ## Coherence, size, and read semantics
@@ -438,7 +442,7 @@ is canonical). Reserved as a direction now; `/v/ctx` + `/v/session` land first.
 
 ## Decisions (2026-06-27; track B 2026-07-02, landed)
 
-- **`/v/blobs` = read-only `CasFs` on the kernel `MountTable`** — leading two-hex
+- **`/v/cas` = read-only `CasFs` on the kernel `MountTable`** — leading two-hex
   shards, full-hash leaves, `staging/`+`metadata/` unexposed, constant `generation`.
   **Landed**; the `index` TSV (B2) **deferred** until it has a consumer and a cache.
 - **Client CAS sync = the `sftp` subsystem on its own SSH connection + XDG
@@ -473,7 +477,7 @@ is canonical). Reserved as a direction now; `/v/ctx` + `/v/session` land first.
 
 ## Implementation slices
 
-**Track B (`/v/blobs` + client sync) SHIPPED 2026-07-02** — B0 (cas-crate
+**Track B (`/v/cas` + client sync) SHIPPED 2026-07-02** — B0 (cas-crate
 hardening), B1 (`CasFs` + mount), B3 (client resolver + XDG cache), and B4 (the
 app-sink consumer) all landed; **B2 (the `index` TSV) is deliberately deferred** (see
 track B). What remains is **track V**, which shares nothing with track B and is
@@ -491,7 +495,7 @@ write/capability work this surface used to drive is gone — SFTP is a read cons
    `content` snapshot-at-open. Contexts from `list_all_contexts()`, blocks from each
    per-context store's `block_ids_ordered()` (naive — no ordered-id cache yet).
    Testable via `kaish ls /v/ctx` with no SFTP. Mounts on the kernel `MountTable`
-   (see "The mount-table reality"); mind the kaish `/v/blobs` shadow-overlay
+   (see "The mount-table reality"); mind the kaish `/v/cas` shadow-overlay
    papercut in track B — verify the mount is not similarly shadowed.
 2. **`/v/session` read-only roster.** View over the participant registry
    (`PeerRegistry` generalized to carry a session *kind* — `PeerInfo` has none today,
@@ -508,13 +512,13 @@ write/capability work this surface used to drive is gone — SFTP is a read cons
 
 ## File references
 
-Track B (`/v/blobs`, landed):
+Track B (`/v/cas`, landed):
 
 - `crates/kaijutsu-cas/src/{hash,store,config}.rs` — `ContentHash` (32-hex BLAKE3-128, `prefix()`/`remainder()`, validated `try_from` deserialization), `FileStore`/`ContentStore` (the backend's substrate **and** the client cache; atomic staging+rename `store()`), `objects/`+`metadata/`+`staging/` layout
 - `crates/kaijutsu-kernel/src/vfs/backends/cas.rs:59` — `CasFs` (EROFS, leading-two-hex shards, constant generation, `real_path` None)
 - `crates/kaijutsu-kernel/src/kernel.rs:164,697` — `cas_for_data_dir` (`{data_dir}/cas/`), `Kernel::cas()`; `kj/cas.rs` — `kj cas put/get/ls/info/rm` (the ingest path)
-- `crates/kaijutsu-server/src/rpc.rs:1167–1179` — server bootstrap: `/v/blobs` mount, then `freeze_mounts()` (`MountTable::freeze()`, `vfs/mount.rs:68`)
-- `crates/kaijutsu-server/src/ssh.rs:832` / `sftp.rs:121` — `SftpSession::new(principal, vfs)` serves the kernel `MountTable` (so `/v/blobs` is SFTP-visible, zero adapter work)
+- `crates/kaijutsu-server/src/rpc.rs:1167–1179` — server bootstrap: `/v/cas` mount, then `freeze_mounts()` (`MountTable::freeze()`, `vfs/mount.rs:68`)
+- `crates/kaijutsu-server/src/ssh.rs:832` / `sftp.rs:121` — `SftpSession::new(principal, vfs)` serves the kernel `MountTable` (so `/v/cas` is SFTP-visible, zero adapter work)
 - `crates/kaijutsu-client/src/ssh.rs:210` — `connect_subsystem` (the `SftpClient` transport); `sftp.rs` — `SftpClient`/`BlobFetch`/`BlobResolver` (sharded `blob_path`, single-flight, read-to-EOF, `HashMismatch`)
 - `crates/kaijutsu-app/src/audio.rs` — the B4 consumer; `Cargo.toml:63` — `russh-sftp = "2.3"` (workspace; client + server halves of one crate)
 

@@ -7,7 +7,7 @@ then **dissolved there (2026-06-27)**: the per-session `bound`/arming-symlink/TT
 apparatus was SFTP-shaped scaffolding, replaced by per-operation join on the
 ambient `context_id`. SFTP stays **read/view** and keeps its lexical deny on
 privileged paths — sections below that describe `bound` are superseded and
-marked. The first real SFTP consumer is **client CAS sync against `/v/blobs`**
+marked. The first real SFTP consumer is **client CAS sync against `/v/cas`**
 (`docs/slash-v.md` track B).*
 
 Expose the kernel's virtual filesystem over SFTP so any off-the-shelf SFTP
@@ -123,7 +123,7 @@ reuses the same binding decision SFTP raises (settle it once for both).
 ## The `/v` surfaces live in `docs/slash-v.md`
 
 Three `/v` VFS surfaces are general, every-surface backends, not SFTP details,
-so their design lives in **`docs/slash-v.md`**: **`/v/blobs`** (the CAS pool —
+so their design lives in **`docs/slash-v.md`**: **`/v/cas`** (the CAS pool —
 track B, the active work item; SFTP is how clients sync it), **`/v/ctx`**
 (context + block-log introspection), and **`/v/session`** (live participants).
 All mount on the kernel `MountTable`, which the landed SFTP adapter already
@@ -303,7 +303,7 @@ above — so the handle guard and the cache now share one primitive.
    e2e live-eval harness does.
 
 **Dependency order:** slices 0–2 + extensions + tracing are **done**; slice 3
-dissolved. The active consumer is **`/v/blobs` client CAS sync**
+dissolved. The active consumer is **`/v/cas` client CAS sync**
 (`docs/slash-v.md` track B) — kernel backend + client fetcher; the landed SFTP
 adapter needs nothing for it beyond the mount existing. Limits (4) and the
 TOCTOU guard are not optional polish. A debug-kaish `shell`/`subsystem` is a
@@ -338,4 +338,4 @@ on the host-FS RCE claim — root `/` is read-only, so it doesn't hold as stated
 per-connection arming symlink; 2026-06-27 that too dissolved — per-operation
 join on the ambient `context_id`, SFTP stays read/view. Full design in
 `docs/slash-v.md`; SFTP is a consumer of the `/v` trees, first for CAS sync
-(`/v/blobs`, track B).*
+(`/v/cas`, track B).*

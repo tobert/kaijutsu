@@ -29,9 +29,9 @@ pub(crate) struct PlayArgs {
     /// Path to the audio file to play (OS path, not a VFS path — mirrors `kj cas
     /// put`). Mutually exclusive with `--cas`; exactly one is required.
     path: Option<String>,
-    /// Play a blob already in the CAS by its content hash. The MIME is resolved
-    /// from the blob's CAS metadata, and the cue carries a `Cas` payload — so the
-    /// sink resolves the bytes from its XDG cache / SFTP `/v/blobs` (the
+    /// Play an object already in the CAS by its content hash. The MIME is resolved
+    /// from the object's CAS metadata, and the cue carries a `Cas` payload — so the
+    /// sink resolves the bytes from its XDG cache / SFTP `/v/cas` (the
     /// clip-prefetch path, docs/pcm.md 5c / docs/slash-v.md track B).
     #[arg(long, conflicts_with = "path")]
     cas: Option<String>,
@@ -62,7 +62,7 @@ impl KjDispatcher {
         };
 
         // Build the cue payload from exactly one source: a CAS hash (bytes stay
-        // out-of-band, the sink resolves them from /v/blobs) or a local file
+        // out-of-band, the sink resolves them from /v/cas) or a local file
         // (bytes inline). `mime` + `desc` + `payload` fall out of whichever.
         let (mime, payload, desc): (String, CuePayload, String) =
             match (parsed.cas.as_deref(), parsed.path.as_deref()) {
@@ -71,8 +71,8 @@ impl KjDispatcher {
                         Ok(h) => h,
                         Err(e) => return KjResult::Err(format!("kj play --cas: invalid hash: {e}")),
                     };
-                    // The MIME comes from the blob's own CAS metadata — no
-                    // extension to sniff. A blob not in the pool is a loud error.
+                    // The MIME comes from the object's own CAS metadata — no
+                    // extension to sniff. An object not in the pool is a loud error.
                     let mime = match self.kernel().cas().inspect(&hash) {
                         Ok(Some(r)) => r.mime_type,
                         Ok(None) => {
@@ -227,8 +227,8 @@ mod tests {
     }
 
     /// `kj play --cas <hash>` emits a `CuePayload::Cas` cue whose MIME comes
-    /// from the CAS metadata the blob was stored with — the clip-prefetch path:
-    /// the app sink resolves the hash from its XDG cache / SFTP `/v/blobs`.
+    /// from the CAS metadata the object was stored with — the clip-prefetch path:
+    /// the app sink resolves the hash from its XDG cache / SFTP `/v/cas`.
     #[tokio::test]
     async fn play_cas_emits_a_cas_cue_with_the_stored_mime() {
         use kaijutsu_cas::ContentStore;
@@ -239,7 +239,7 @@ mod tests {
         let ctx = register_context(&dispatcher, Some("c"), None, principal);
         let caller = crate::kj::test_helpers::caller_with_context(ctx);
 
-        // Seed a blob into the kernel CAS with a known mime.
+        // Seed an object into the kernel CAS with a known mime.
         let sample = b"RIFF....WAVE fake but hashable".to_vec();
         let hash = dispatcher
             .kernel()

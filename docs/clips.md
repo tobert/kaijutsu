@@ -18,7 +18,7 @@ CAS hash at this tick, from this offset, at this gain." The cell owns *where
 in musical time*; the payload owns *what media and how to render it*; the
 transport owns *when proposals fire* (quantization, follows); the render
 target owns *making it sound*. Bytes never ride the track — media lives in
-CAS and prefetches to sinks under the speculation lead (SFTP + `/v/blobs`,
+CAS and prefetches to sinks under the speculation lead (SFTP + `/v/cas`,
 client-side XDG cache). Models author clip records as text, the same way they
 author ABC.
 
@@ -125,7 +125,7 @@ until the first good clip, matching the locked chameleon default.
    rides the speculation lead — the transfer budget; the sink re-anchors it at
    `receipt + lead`.
 3. The sink resolves `media` from its local XDG CAS cache, pulling a miss
-   over SFTP against `/v/blobs/<ab>/<hash>` (mount + fetcher:
+   over SFTP against `/v/cas/<ab>/<hash>` (mount + fetcher:
    `docs/slash-v.md` track B); decodes per `mime` (Bevy decoders / Symphonia);
    fires at `at` with the source range and gain applied.
 4. Transport stop/pause flushes scheduled audio exactly as MIDI

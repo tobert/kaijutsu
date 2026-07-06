@@ -1,12 +1,12 @@
-//! SFTP transport + content-addressed blob resolution over the shared SSH
+//! SFTP transport + content-addressed object resolution over the shared SSH
 //! connection.
 //!
 //! The kernel already speaks SFTP (`kaijutsu-server/src/sftp.rs`) as a sibling
 //! subsystem of the Cap'n Proto RPC channel — this is the client half. A
 //! [`SftpClient`] opens its **own** SSH connection and binds a channel to the
-//! `sftp` subsystem to read VFS paths; a [`BlobResolver`] layers a local XDG CAS
+//! `sftp` subsystem to read VFS paths; a [`CasResolver`] layers a local XDG CAS
 //! cache on top so a clip's `media` hash resolves from disk on a hit and pulls
-//! the miss over the wire from `/v/blobs/<hash>` (docs/clips.md, docs/slash-v.md).
+//! the miss over the wire from `/v/cas/<hash>` (docs/clips.md, docs/slash-v.md).
 //!
 //! (Multiplexing the SFTP channel onto the *existing* RPC connection instead of
 //! dialing a second one is a later optimization — it needs `SshClient` to split
@@ -43,8 +43,8 @@ fn map_sftp_err(e: russh_sftp::client::error::Error) -> SftpError {
     }
 }
 
-/// Failures along the fetch path: the SSH transport, the SFTP protocol, a blob
-/// that failed its self-verification, or the local cache store.
+/// Failures along the fetch path: the SSH transport, the SFTP protocol, an
+/// object that failed its self-verification, or the local cache store.
 #[derive(Debug, thiserror::Error)]
 pub enum SftpError {
     #[error("SSH transport: {0}")]
@@ -55,7 +55,7 @@ pub enum SftpError {
 
     /// The path does not exist on the server (SFTP `SSH_FX_NO_SUCH_FILE`). A
     /// distinct variant so a caller can tell a genuinely-absent object from a
-    /// transport failure: `/v/blobs/<hash>` not yet replicated is a normal,
+    /// transport failure: `/v/cas/<hash>` not yet replicated is a normal,
     /// non-retryable "404", whereas a dropped connection mid-fetch is worth a
     /// retry. Flattening both into an opaque string would erase that.
     #[error("no such path: {0}")]
@@ -65,7 +65,7 @@ pub enum SftpError {
     /// self-verifying: a corrupt or substituted object crashes the resolve
     /// rather than caching a lie.
     #[error(
-        "blob {expected} failed verification: fetched bytes hash to {got} \
+        "object {expected} failed verification: fetched bytes hash to {got} \
          (corrupt or wrong object)"
     )]
     HashMismatch {
@@ -94,15 +94,15 @@ pub struct SftpClient {
 }
 
 impl SftpClient {
-    /// The canonical VFS path for a content-addressed blob.
+    /// The canonical VFS path for a content-addressed object.
     ///
     /// Sharded on the hash's **leading** two hex chars, matching the server's
-    /// `/v/blobs/<ab>/<full-hash>` layout (BLAKE3 is uniform in every byte, so
+    /// `/v/cas/<ab>/<full-hash>` layout (BLAKE3 is uniform in every byte, so
     /// the UUIDv7 trailing-byte sharding rule deliberately does NOT apply to
-    /// hashes). The blob pool is the one `/v` pool that grows without bound, so
+    /// hashes). The object pool is the one `/v` pool that grows without bound, so
     /// it is sharded 256× to keep any single `readdir` bounded.
-    pub fn blob_path(hash: &ContentHash) -> String {
-        format!("/v/blobs/{}/{}", hash.prefix(), hash)
+    pub fn object_path(hash: &ContentHash) -> String {
+        format!("/v/cas/{}/{}", hash.prefix(), hash)
     }
 
     /// Open an SSH connection, authenticate, and bind a channel to the `sftp`
@@ -127,48 +127,48 @@ impl SftpClient {
     /// and drives `read_to_end`, whose `poll_read` issues one SFTP `READ` per
     /// packet — each capped at the negotiated `max_read_len` (256 KiB
     /// server-side) — advancing the offset until EOF (verified against
-    /// russh-sftp 2.3 `client/fs/file.rs`). So a blob larger than one packet is
+    /// russh-sftp 2.3 `client/fs/file.rs`). So an object larger than one packet is
     /// reassembled whole, and the resolver's re-hash verifies the full object,
     /// not a truncated prefix.
     ///
     /// Reads the whole object into memory. Fine for the symbolic scores and
     /// small clips of the first cut; a large-media streaming path (chunked read
     /// straight into CAS staging, incremental hash) is a deferred follow-up
-    /// (`docs/issues.md` `/v` Track B — `/v/blobs` + client CAS sync).
+    /// (`docs/issues.md` `/v` Track B — `/v/cas` + client CAS sync).
     pub async fn read(&self, path: &str) -> Result<Vec<u8>, SftpError> {
         self.session.read(path).await.map_err(map_sftp_err)
     }
 
-    /// Read a blob from `/v/blobs/<hash>` (unverified — [`BlobResolver`] does
+    /// Read an object from `/v/cas/<hash>` (unverified — [`CasResolver`] does
     /// the verification before it trusts the bytes).
-    pub async fn read_blob(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
-        self.read(&Self::blob_path(hash)).await
+    pub async fn read_object(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+        self.read(&Self::object_path(hash)).await
     }
 }
 
-/// Something that can fetch blob bytes by hash. [`SftpClient`] is the production
-/// implementor; tests supply a stub so the [`BlobResolver`] cache/verify logic
+/// Something that can fetch object bytes by hash. [`SftpClient`] is the production
+/// implementor; tests supply a stub so the [`CasResolver`] cache/verify logic
 /// is exercised without a live server.
 #[async_trait]
-pub trait BlobFetch: Send + Sync {
+pub trait CasFetch: Send + Sync {
     async fn fetch(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError>;
 }
 
 #[async_trait]
-impl BlobFetch for SftpClient {
+impl CasFetch for SftpClient {
     async fn fetch(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
-        self.read_blob(hash).await
+        self.read_object(hash).await
     }
 }
 
-/// Resolves content-addressed blobs through a local XDG CAS cache, fetching
+/// Resolves content-addressed objects through a local XDG CAS cache, fetching
 /// misses over the wire and re-verifying before it trusts (and caches) them.
 ///
 /// - **hit** → local bytes, no wire traffic.
 /// - **miss** → fetch → verify the fetched bytes hash back to the requested
 ///   address → store → return. A mismatch is [`SftpError::HashMismatch`]; the
 ///   bad bytes are never cached.
-pub struct BlobResolver<F: BlobFetch> {
+pub struct CasResolver<F: CasFetch> {
     cache: FileStore,
     fetch: F,
     /// Per-hash fetch locks — the single-flight gate. Concurrent misses for one
@@ -206,7 +206,7 @@ impl Drop for FlightGuard<'_> {
     }
 }
 
-impl<F: BlobFetch> BlobResolver<F> {
+impl<F: CasFetch> CasResolver<F> {
     /// Build a resolver over an explicit cache directory (tests, custom roots).
     pub fn new(cache: FileStore, fetch: F) -> Self {
         Self {
@@ -216,7 +216,7 @@ impl<F: BlobFetch> BlobResolver<F> {
         }
     }
 
-    /// Build a resolver whose cache is the per-user XDG blob cache
+    /// Build a resolver whose cache is the per-user XDG CAS cache
     /// (`$XDG_CACHE_HOME/kaijutsu/cas`).
     ///
     /// Metadata sidecars are **off**: the cache keys on the content hash and the
@@ -232,7 +232,7 @@ impl<F: BlobFetch> BlobResolver<F> {
         Self::new(FileStore::new(config), fetch)
     }
 
-    /// Resolve a blob to its bytes, fetching + caching on a miss. Concurrent
+    /// Resolve an object to its bytes, fetching + caching on a miss. Concurrent
     /// resolves for the same hash coalesce onto a single wire transfer
     /// (single-flight).
     pub async fn resolve(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BlobFetch for StubFetch {
+    impl CasFetch for StubFetch {
         async fn fetch(&self, _hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
             *self.calls.lock().unwrap() += 1;
             Ok(self.body.clone())
@@ -334,14 +334,14 @@ mod tests {
     }
 
     #[test]
-    fn blob_path_is_sharded_on_leading_two_hex() {
+    fn object_path_is_sharded_on_leading_two_hex() {
         let h = ContentHash::from_data(b"whatever");
         assert_eq!(
-            SftpClient::blob_path(&h),
-            format!("/v/blobs/{}/{}", h.prefix(), h)
+            SftpClient::object_path(&h),
+            format!("/v/cas/{}/{}", h.prefix(), h)
         );
         // The shard is the leaf hash's own prefix — the server maps it back.
-        assert!(SftpClient::blob_path(&h).starts_with(&format!("/v/blobs/{}/", h.prefix())));
+        assert!(SftpClient::object_path(&h).starts_with(&format!("/v/cas/{}/", h.prefix())));
     }
 
     #[tokio::test]
@@ -349,12 +349,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let body = b"clip bytes".to_vec();
         let hash = ContentHash::from_data(&body);
-        let resolver = BlobResolver::new(FileStore::at_path(dir.path()), StubFetch::new(body.clone()));
+        let resolver = CasResolver::new(FileStore::at_path(dir.path()), StubFetch::new(body.clone()));
 
         let got = resolver.resolve(&hash).await.unwrap();
         assert_eq!(got, body, "returns the fetched bytes");
         assert_eq!(resolver.fetch.call_count(), 1, "fetched once");
-        assert!(resolver.cache.exists(&hash), "cached the verified blob");
+        assert!(resolver.cache.exists(&hash), "cached the verified object");
     }
 
     #[tokio::test]
@@ -362,7 +362,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let body = b"cache me once".to_vec();
         let hash = ContentHash::from_data(&body);
-        let resolver = BlobResolver::new(FileStore::at_path(dir.path()), StubFetch::new(body.clone()));
+        let resolver = CasResolver::new(FileStore::at_path(dir.path()), StubFetch::new(body.clone()));
 
         resolver.resolve(&hash).await.unwrap(); // miss → fetch + cache
         let got = resolver.resolve(&hash).await.unwrap(); // hit
@@ -378,7 +378,7 @@ mod tests {
         let hash = cache.store(&body, "application/octet-stream").unwrap();
 
         // Stub would return junk — proving the resolver serves the cache, not it.
-        let resolver = BlobResolver::new(cache, StubFetch::new(vec![0xde, 0xad]));
+        let resolver = CasResolver::new(cache, StubFetch::new(vec![0xde, 0xad]));
         let got = resolver.resolve(&hash).await.unwrap();
         assert_eq!(got, body);
         assert_eq!(resolver.fetch.call_count(), 0, "cache hit skips the wire");
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BlobFetch for SlowStub {
+    impl CasFetch for SlowStub {
         async fn fetch(&self, _hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -405,7 +405,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let body = b"repeated clip in a vamp".to_vec();
         let hash = ContentHash::from_data(&body);
-        let resolver = Arc::new(BlobResolver::new(
+        let resolver = Arc::new(CasResolver::new(
             FileStore::at_path(dir.path()),
             SlowStub {
                 body: body.clone(),
@@ -447,7 +447,7 @@ mod tests {
     async fn a_panicking_fetch_does_not_leak_the_flight_lock() {
         struct PanicFetch;
         #[async_trait]
-        impl BlobFetch for PanicFetch {
+        impl CasFetch for PanicFetch {
             async fn fetch(&self, _hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
                 panic!("fetch blew up");
             }
@@ -455,7 +455,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let hash = ContentHash::from_data(b"will panic on fetch");
-        let resolver = Arc::new(BlobResolver::new(FileStore::at_path(dir.path()), PanicFetch));
+        let resolver = Arc::new(CasResolver::new(FileStore::at_path(dir.path()), PanicFetch));
 
         // Run on a task so the panic surfaces as a JoinError, not a test abort.
         let r = resolver.clone();
@@ -475,7 +475,7 @@ mod tests {
         // Ask for the hash of the real object, but the fetch returns an impostor.
         let wanted = ContentHash::from_data(b"the real object");
         let resolver =
-            BlobResolver::new(FileStore::at_path(dir.path()), StubFetch::new(b"an impostor".to_vec()));
+            CasResolver::new(FileStore::at_path(dir.path()), StubFetch::new(b"an impostor".to_vec()));
 
         let err = resolver.resolve(&wanted).await.unwrap_err();
         assert!(matches!(err, SftpError::HashMismatch { .. }), "got {err:?}");

@@ -1,20 +1,20 @@
 //! `CasFs` — a read-only VFS backend over the kernel's content-addressed store.
 //!
-//! Mounted at `/v/blobs`, this renders the CAS object pool as immutable files so
+//! Mounted at `/v/cas`, this renders the CAS object pool as immutable files so
 //! every surface that reaches the kernel `MountTable` — kaish, the file tools,
-//! the Bevy app, **and** SFTP — can `ls`/`cat`/fetch a blob by hash without a new
+//! the Bevy app, **and** SFTP — can `ls`/`cat`/fetch an object by hash without a new
 //! RPC. It is the substrate for client CAS sync (`docs/slash-v.md` track B): a
 //! clip sink resolves media from a local XDG cache and pulls misses from here.
 //!
 //! ```text
-//! /v/blobs/
+//! /v/cas/
 //! └── <ab>/            # shard dirs — the hash's LEADING two hex chars
 //!     └── <full-hash>  # the raw bytes, immutable; leaf name is the FULL 32-hex hash
 //! ```
 //!
 //! A greppable `index` TSV (`hash  mime  size  path`) is designed in
 //! `docs/slash-v.md` but **not shipped**: nothing consumes it yet (the client
-//! resolver addresses blobs by exact hash, never by browsing), and a naive
+//! resolver addresses objects by exact hash, never by browsing), and a naive
 //! walk-the-pool-per-read index is under-designed for scale. It lands with a
 //! real consumer and a cache (keyed on a pool-version stamp, or split per
 //! shard) — see `docs/issues.md`.
@@ -28,7 +28,7 @@
 //! ## Sharding — leading two hex chars (unlike contexts)
 //!
 //! Contexts shard on the UUIDv7 *trailing* byte because v7's leading bytes are a
-//! clock. BLAKE3 output is uniform in every byte, so `/v/blobs` shards on the
+//! clock. BLAKE3 output is uniform in every byte, so `/v/cas` shards on the
 //! *leading* two hex chars — matching the on-disk `objects/<ab>/<remainder>`
 //! layout one-to-one. The leaf name is the FULL 32-hex hash (self-describing,
 //! copy-pastable); the backend maps `<ab>/<full-hash>` →
@@ -50,24 +50,24 @@ use kaijutsu_cas::{ContentHash, FileStore};
 
 use crate::vfs::{DirEntry, FileAttr, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
 
-/// Coherence stamp for every blob leaf. Objects are immutable — a hash names one
+/// Coherence stamp for every object leaf. Objects are immutable — a hash names one
 /// byte string forever — so the generation is a nonzero constant: a caching
 /// reader never needs to invalidate. (`0` conventionally means "unknown".)
 const IMMUTABLE_GENERATION: u64 = 1;
 
-/// Read-only CAS pool rendered as a VFS tree at `/v/blobs`.
+/// Read-only CAS pool rendered as a VFS tree at `/v/cas`.
 pub struct CasFs {
     store: Arc<FileStore>,
 }
 
 /// What a mount-relative path resolves to within the pool.
 enum Resolved {
-    /// The mount root (`/v/blobs`).
+    /// The mount root (`/v/cas`).
     Root,
     /// A shard directory (`<ab>`), the leading two hex chars of a hash.
     Shard(String),
-    /// A blob leaf (`<ab>/<full-hash>`), already validated shard == hash prefix.
-    Blob(ContentHash),
+    /// An object leaf (`<ab>/<full-hash>`), already validated shard == hash prefix.
+    Object(ContentHash),
 }
 
 impl CasFs {
@@ -114,7 +114,7 @@ impl CasFs {
                 if !is_two_hex(shard) || hash.prefix() != shard.as_str() {
                     return Err(VfsError::not_found(format!("{shard}/{leaf}")));
                 }
-                Ok(Resolved::Blob(hash))
+                Ok(Resolved::Object(hash))
             }
             _ => Err(VfsError::not_found(segs.join("/"))),
         }
@@ -155,7 +155,7 @@ impl VfsOps for CasFs {
                     Err(VfsError::not_found(ab))
                 }
             }
-            Resolved::Blob(hash) => {
+            Resolved::Object(hash) => {
                 let p = self.object_disk_path(&hash);
                 match std::fs::metadata(&p) {
                     Ok(m) if m.is_file() => {
@@ -209,13 +209,13 @@ impl VfsOps for CasFs {
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(entries)
             }
-            Resolved::Blob(hash) => Err(VfsError::not_a_directory(hash.to_string())),
+            Resolved::Object(hash) => Err(VfsError::not_a_directory(hash.to_string())),
         }
     }
 
     async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
         match self.resolve(path)? {
-            Resolved::Blob(hash) => {
+            Resolved::Object(hash) => {
                 use std::io::{Read, Seek, SeekFrom};
                 let p = self.object_disk_path(&hash);
                 let mut f = std::fs::File::open(&p).map_err(|e| match e.kind() {
@@ -231,7 +231,7 @@ impl VfsOps for CasFs {
                 f.seek(SeekFrom::Start(offset)).map_err(VfsError::Io)?;
                 // Positioned read of up to `want` bytes — never materialize the
                 // whole object for a range read (the SFTP path chunks a large
-                // blob at 256 KiB, so whole-file reads here would be O(n²)).
+                // object at 256 KiB, so whole-file reads here would be O(n²)).
                 let mut buf = vec![0u8; want];
                 let mut filled = 0usize;
                 while filled < buf.len() {
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_blob_is_a_file_with_exact_size_and_constant_generation() {
+    async fn stored_object_is_a_file_with_exact_size_and_constant_generation() {
         let (fs, _d) = fs();
         let data = b"the quick brown fox";
         let hash = fs.store.store(data, "text/plain").unwrap();
@@ -351,7 +351,7 @@ mod tests {
         let attr = fs.getattr(p(&vpath)).await.unwrap();
         assert!(attr.is_file());
         assert_eq!(attr.size, data.len() as u64);
-        assert_eq!(attr.perm, 0o444, "blobs are read-only");
+        assert_eq!(attr.perm, 0o444, "objects are read-only");
         assert_eq!(
             attr.generation, IMMUTABLE_GENERATION,
             "immutable object → constant generation"
@@ -407,8 +407,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_of_large_blob_spanning_chunks_round_trips() {
-        // The SFTP path chunks large blobs; the positioned read must reassemble
+    async fn read_of_large_object_spanning_chunks_round_trips() {
+        // The SFTP path chunks large objects; the positioned read must reassemble
         // byte-exactly across offsets.
         let (fs, _d) = fs();
         let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();

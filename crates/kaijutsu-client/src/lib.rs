@@ -31,7 +31,7 @@ pub use rpc::{
     ToolResult, ToolSchema, TrackInfo, VersionSnapshot,
 };
 pub use document_store::{DocumentEntry, DocumentStore};
-pub use sftp::{BlobFetch, BlobResolver, SftpClient, SftpError, default_cache_dir};
+pub use sftp::{CasFetch, CasResolver, SftpClient, SftpError, default_cache_dir};
 pub use ssh::{KeySource, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};

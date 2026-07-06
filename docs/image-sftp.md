@@ -1,7 +1,7 @@
 # Image display over SFTP CAS — primer
 
 **Status:** design, no code yet. Waiting for other work to settle; pick up after.
-**Goal:** display image blocks in the app by pulling bytes down over SFTP `/v/blobs`
+**Goal:** display image blocks in the app by pulling bytes down over SFTP `/v/cas`
 and uploading them as a Bevy texture — reusing the audio CAS-fetch path — instead of
 shipping image bytes over RPC.
 
@@ -9,7 +9,7 @@ shipping image bytes over RPC.
 
 Images already travel content-addressed end to end. Nothing about the block/wire path
 changes; we're only finishing the client-side hash → bytes → texture step that was
-stubbed out before `/v/blobs` existed.
+stubbed out before `/v/cas` existed.
 
 - Image block wire payload = **just the 32-hex CAS hash** in `BlockSnapshot.content`,
   plus a MIME hint in `contentType`. No bytes, no thumbnail on the block.
@@ -26,17 +26,17 @@ stubbed out before `/v/blobs` existed.
 ## Ignore the stub's advice
 
 `block_render.rs:509-511` says the pipeline "requires `RpcCommand::CasRead` and async
-image loading." That comment predates the `/v/blobs` SFTP work. **Do not add a
+image loading." That comment predates the `/v/cas` SFTP work. **Do not add a
 `CasRead` RPC** — that would push image bytes back onto the RPC channel, exactly what
 CAS-by-hash avoids. Use the SFTP resolver instead. Delete/replace that comment when we
 land this.
 
 ## Machinery that already exists (reuse, don't rebuild)
 
-Server side (`/v/blobs`):
+Server side (`/v/cas`):
 - `CasFs` read-only VFS backend, sharded `<ab>/<full-hash>` paths, 256 KiB read window,
   `IMMUTABLE_GENERATION = 1`: `crates/kaijutsu-kernel/src/vfs/backends/cas.rs`.
-- Mounted at `/v/blobs` by the server: `crates/kaijutsu-server/src/rpc.rs:1168-1169`.
+- Mounted at `/v/cas` by the server: `crates/kaijutsu-server/src/rpc.rs:1168-1169`.
 - SFTP subsystem bridges russh-sftp onto the MountTable: `kaijutsu-server/src/sftp.rs`.
 
 Client side (fetch + cache):
@@ -94,5 +94,5 @@ CAS hash facts (for the decode/cache step):
 
 ## Related docs
 
-`docs/slash-v.md` (Track B, the `/v/blobs` design), `docs/pcm.md`, `docs/clips.md`,
+`docs/slash-v.md` (Track B, the `/v/cas` design), `docs/pcm.md`, `docs/clips.md`,
 `docs/sftp.md`.

@@ -70,7 +70,7 @@ pub const SSH_RPC_SUBSYSTEM: &str = "kaijutsu-rpc";
 /// SSH subsystem name for the SFTP file-transfer channel — the sibling of
 /// [`SSH_RPC_SUBSYSTEM`]. The server binds it to the `russh_sftp` adapter over
 /// the kernel VFS (`kaijutsu-server/src/sftp.rs`); the client requests it on a
-/// second session channel to read blobs (`/v/blobs/<hash>`) and browse `/v`.
+/// second session channel to read objects (`/v/cas/<hash>`) and browse `/v`.
 /// Standard SSH name so off-the-shelf clients (`sftp`, `sshfs`) work too.
 pub const SSH_SFTP_SUBSYSTEM: &str = "sftp";
 
