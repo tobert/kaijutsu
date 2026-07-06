@@ -17,7 +17,7 @@ use kaijutsu_types::ContextId;
 use super::panel::commit_panel_glyphs;
 use super::scene::{
     CARD_TEX_H, CARD_TEX_W, Card, HorizonLabel, LABEL_TEX_W, READING_TEX_H, READING_TEX_W,
-    ReadingCard, RingLabel, TimeWellState, accent_vec4,
+    ReadingCard, TimeWellState, accent_vec4,
 };
 use crate::shaders::WellCardMaterial;
 use crate::text::ShapingFonts;
@@ -28,8 +28,7 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 /// Inner padding (logical px in the card-texture space).
 const PAD: f32 = 14.0;
 
-/// Font size (logical px in the label-texture space) for [`RingLabel`]/
-/// [`HorizonLabel`] text.
+/// Font size (logical px in the label-texture space) for [`HorizonLabel`] text.
 const LABEL_FONT_SIZE: f32 = 24.0;
 /// Inner padding (logical px in the label-texture space).
 const LABEL_PAD: f32 = 10.0;
@@ -281,8 +280,8 @@ pub fn update_reading_card(
     commit_panel_glyphs(&mut msdf, glyphs);
 }
 
-/// Lay out a single line of dim, LDR label text — shared by [`build_ring_labels`]
-/// and [`build_horizon_label`]. **Landmine avoided**: the brush is passed
+/// Lay out a single line of dim, LDR label text for [`build_horizon_label`].
+/// **Landmine avoided**: the brush is passed
 /// explicitly to both `layout` (registers the brush per glyph run) and
 /// `collect_msdf_glyphs` below, or the text renders black
 /// (`docs/timewell.md`, "Landmines"). Empty `text` lays out no glyphs (still a
@@ -311,37 +310,6 @@ fn layout_label_text(
         }
     }
     collect_msdf_glyphs(&layout, &[], &brush, (LABEL_PAD as f64, LABEL_PAD as f64), atlas)
-}
-
-/// Fill each [`RingLabel`]'s MSDF glyphs. Their text ([`super::card::band_label_text`])
-/// is static for a given `Band`, so this only ever does real work once per
-/// label — gated on `msdf.version == 0` (the "never built" signal;
-/// `commit_panel_glyphs` bumps it off zero) rather than `Changed<RingLabel>`,
-/// since nothing ever mutates a spawned `RingLabel` to re-trigger that. Same
-/// font-asset-loading gate as [`build_card_scenes`]/[`update_reading_card`]:
-/// if the font isn't ready yet, every label just waits for the next tick this
-/// system runs (still gated on `version == 0`, so it isn't a one-shot miss).
-pub fn build_ring_labels(
-    fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<ShapingFonts>,
-    mut atlas: Option<ResMut<MsdfAtlas>>,
-    mut font_data_map: ResMut<FontDataMap>,
-    mut query: Query<(&RingLabel, &mut MsdfBlockGlyphs)>,
-) {
-    let Some(font) = fonts.get(&font_handles.mono) else {
-        return; // font still loading; retry next tick
-    };
-    for (label, mut msdf) in query.iter_mut() {
-        if msdf.version != 0 {
-            continue; // already built — the text never changes
-        }
-        let Some(atlas) = atlas.as_deref_mut() else {
-            return; // no atlas yet; retry next tick
-        };
-        let text = super::card::band_label_text(label.0);
-        let glyphs = layout_label_text(text, font, atlas, &mut font_data_map);
-        commit_panel_glyphs(&mut msdf, glyphs);
-    }
 }
 
 /// Refresh the [`HorizonLabel`]'s "+N" text only when

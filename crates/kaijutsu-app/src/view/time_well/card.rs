@@ -453,53 +453,28 @@ pub fn spiral_order(rings: &BandOrders) -> Vec<ContextId> {
     spiral_positions(rings).0
 }
 
-// ── Band labels (in-world terrace-edge labels; spawned by `scene::enter_time_well`,
-// filled by `text::build_ring_labels`/`text::build_horizon_label`) ─────────
+// ── Horizon label (the "+N" count; spawned by `scene::enter_time_well`,
+// filled by `text::build_horizon_label`). The per-band ring labels that once
+// shared this column were removed 2026-07-06 (the HUD carries band names). ──
 
-/// Amy-tunable: how far outside a band's ring a label parks, so it doesn't
+/// Amy-tunable: how far outside a band's ring the label parks, so it doesn't
 /// collide with that ring's seated cards.
 const LABEL_RADIUS_OFFSET: f32 = 40.0;
 
-/// Amy-tunable: how far around the ring (radians) a label sits from
-/// [`GATE_ANGLE`], so the shelf's nameplate parks *beside* the gate seat
-/// rather than directly behind whatever card is eased to the gate.
+/// Amy-tunable: how far around the ring (radians) the label sits from
+/// [`GATE_ANGLE`], so it parks *beside* the gate seat rather than directly
+/// behind whatever card is eased to the gate.
 const LABEL_GATE_OFFSET: f32 = 0.45;
 
-/// World position for `band`'s floating label: parked just outside the band's
-/// ring, angularly offset from the gate ([`GATE_ANGLE`] − [`LABEL_GATE_OFFSET`])
-/// so the labels sit where the camera looks without hiding behind the selected
-/// card — a terrace-edge nameplate per shelf. Same recline as everything else
-/// ([`well_tilt_quat`]).
-pub fn band_label_pos(band: Band) -> Vec3 {
-    let (radius, depth) = band_ring(band);
-    let a = GATE_ANGLE - LABEL_GATE_OFFSET;
-    let r = radius + LABEL_RADIUS_OFFSET;
-    let local = Vec3::new(r * a.cos(), r * a.sin(), depth);
-    well_tilt_quat() * local
-}
-
-/// World position for the event-horizon "+N" label: parked at the funnel
-/// **center** (radius 0 — no ring seats there) one more depth-step beyond the
-/// deepest ring ([`Band::Demoted`]'s), same recline as everything else.
+/// World position for the event-horizon "+N" label: parked one more depth-step
+/// beyond the deepest ring ([`Band::Demoted`]'s), gate-side so it sits where
+/// the camera looks, same recline as everything else ([`well_tilt_quat`]).
 pub fn horizon_label_pos() -> Vec3 {
     let (demoted_radius, demoted_depth) = band_ring(Band::Demoted);
-    // One more shelf past DEMOTED, in the same gate-side nameplate column as
-    // `band_label_pos` (the funnel center reads right conceptually but sits
-    // outside the gate-framed camera view).
     let a = GATE_ANGLE - LABEL_GATE_OFFSET;
     let r = demoted_radius + LABEL_RADIUS_OFFSET;
     let local = Vec3::new(r * a.cos(), r * a.sin(), demoted_depth + RING_DEPTH_STEP);
     well_tilt_quat() * local
-}
-
-/// Display text for a ring's terrace-edge label.
-pub fn band_label_text(band: Band) -> &'static str {
-    match band {
-        Band::Active => "ACTIVE",
-        Band::Recent => "RECENT",
-        Band::Bumped => "BUMPED",
-        Band::Demoted => "DEMOTED",
-    }
 }
 
 #[cfg(test)]
@@ -967,17 +942,6 @@ mod tests {
         }
     }
 
-    // ── Band label groundwork ────────────────────────────────────────────────
-
-    #[test]
-    fn band_label_text_is_distinct_per_band() {
-        let labels: Vec<&str> = ALL_BANDS.iter().map(|&b| band_label_text(b)).collect();
-        let mut unique = labels.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), labels.len(), "every band gets its own label text");
-    }
-
     #[test]
     fn terrace_ring_geometry_is_one_ring_per_band() {
         let rings = terrace_ring_geometry();
@@ -1007,25 +971,18 @@ mod tests {
     }
 
     #[test]
-    fn band_label_pos_recedes_deeper_per_band() {
-        // Same recline as spiral_pos, so "deeper" reads as "lower Y" post-tilt.
-        let positions: Vec<Vec3> = ALL_BANDS.iter().map(|&b| band_label_pos(b)).collect();
-        for pair in positions.windows(2) {
-            assert!(
-                pair[1].y < pair[0].y,
-                "each successive band's label must sit lower (deeper) than the last: {:?}",
-                positions
-            );
-        }
-    }
-
-    #[test]
-    fn horizon_label_sits_deeper_than_the_demoted_ring_label() {
-        let demoted = band_label_pos(Band::Demoted);
+    fn horizon_label_sits_deeper_than_the_demoted_ring() {
+        // The +N parks one depth-step past the deepest ring in the same
+        // gate-side column; under the shared recline that extra depth must
+        // read as lower world Y (guards the tilt/depth sign conventions).
+        let (radius, depth) = band_ring(Band::Demoted);
+        let a = GATE_ANGLE - LABEL_GATE_OFFSET;
+        let r = radius + LABEL_RADIUS_OFFSET;
+        let demoted_col = well_tilt_quat() * Vec3::new(r * a.cos(), r * a.sin(), depth);
         let horizon = horizon_label_pos();
         assert!(
-            horizon.y < demoted.y,
-            "the horizon label must sit lower (deeper) than Demoted's own label: {horizon:?} vs {demoted:?}"
+            horizon.y < demoted_col.y,
+            "the horizon label must sit lower (deeper) than Demoted's ring column: {horizon:?} vs {demoted_col:?}"
         );
     }
 }

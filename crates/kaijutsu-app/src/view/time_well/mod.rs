@@ -85,7 +85,6 @@ impl Plugin for TimeWellPlugin {
                         sync::sync_time_well,
                         text::build_card_scenes,
                         text::update_reading_card,
-                        text::build_ring_labels,
                         text::build_horizon_label,
                     )
                         .chain(),

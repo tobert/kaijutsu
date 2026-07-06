@@ -79,19 +79,13 @@ pub struct WellRingsDeck;
 #[derive(Component)]
 pub struct TerraceRing(pub usize);
 
-/// An in-world terrace-edge label for one ring (text: [`super::card::band_label_text`],
-/// position: [`super::card::band_label_pos`]), billboarded like a card. Static
-/// text — filled once by [`super::text::build_ring_labels`] (font-asset-loading
-/// gated, same pattern as [`super::text::update_reading_card`]) and never
-/// rewritten after. Despawned on exit alongside the rest of the well.
-#[derive(Component)]
-pub struct RingLabel(pub kaijutsu_viz::layout::Band);
-
 /// The event-horizon "+N" count label, parked at the funnel center beyond the
-/// deepest ring ([`super::card::horizon_label_pos`]). Unlike [`RingLabel`] its
-/// text changes (the horizon count), refreshed by
-/// [`super::text::build_horizon_label`] only when the count actually changes.
-/// Despawned on exit alongside the rest of the well.
+/// deepest ring ([`super::card::horizon_label_pos`]). Its text changes (the
+/// horizon count), refreshed by [`super::text::build_horizon_label`] only when
+/// the count actually changes. Despawned on exit alongside the rest of the
+/// well. (The per-band "ACTIVE"/"RECENT" ring labels that once shared this
+/// path were removed 2026-07-06 — the HUD's SPECS `band` line + legend carry
+/// that information without cluttering the rings.)
 #[derive(Component)]
 pub struct HorizonLabel;
 
@@ -501,34 +495,10 @@ pub fn enter_time_well(
         Name::new("ReadingCard"),
     ));
 
-    // In-world ring labels: one per band, parked just outside its ring
-    // (`band_label_pos`), billboarded like a card. Static text — filled once
-    // by `text::build_ring_labels` once the font asset is ready.
-    let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
-    for band in kaijutsu_viz::layout::ALL_BANDS {
-        let (label_image, panel) = create_msdf_panel(&mut images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
-        let label_material = materials.add(crate::shaders::WellCardMaterial {
-            texture: label_image,
-            accent: Vec4::ZERO, // no body fill — text only, like a HUD panel
-            params: Vec4::ZERO,
-            shape: label_shape(),
-            border: Vec4::ZERO,
-            dim: Vec4::splat(LABEL_DIM), // fixed dim (LDR): passive structural state
-        });
-        commands.spawn((
-            RingLabel(band),
-            Mesh3d(label_mesh.clone()),
-            MeshMaterial3d(label_material),
-            Transform::from_translation(super::card::band_label_pos(band)),
-            Visibility::Inherited,
-            panel,
-            Name::new(format!("RingLabel({band:?})")),
-        ));
-    }
-
     // Event-horizon "+N" count label: parked at the funnel center beyond the
     // deepest ring. Refreshed by `text::build_horizon_label` whenever the
     // count changes (it starts blank — nothing polled yet on first enter).
+    let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
     let (horizon_image, horizon_panel) =
         create_msdf_panel(&mut images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
     let horizon_material = materials.add(crate::shaders::WellCardMaterial {
@@ -566,7 +536,6 @@ pub fn exit_time_well(
     reading: Query<Entity, With<ReadingCard>>,
     decks: Query<Entity, With<WellRingsDeck>>,
     terrace_rings: Query<Entity, With<TerraceRing>>,
-    ring_labels: Query<Entity, With<RingLabel>>,
     horizon_label: Query<Entity, With<HorizonLabel>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
@@ -581,7 +550,6 @@ pub fn exit_time_well(
         .chain(reading.iter())
         .chain(decks.iter())
         .chain(terrace_rings.iter())
-        .chain(ring_labels.iter())
         .chain(horizon_label.iter())
     {
         commands.entity(e).despawn();
@@ -1135,15 +1103,15 @@ pub fn ease_camera_to_focused_ring(
     tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
 }
 
-/// Billboard every card (and the in-world labels — [`RingLabel`]/
-/// [`HorizonLabel`] ride the same fully-billboarded path as [`ReadingCard`],
-/// no `Card`) to face the well camera. No built-in billboard in 0.18; this is
-/// the one-line `looking_at` per card the design doc calls for.
+/// Billboard every card (and the in-world "+N" label — [`HorizonLabel`] rides
+/// the same fully-billboarded path as [`ReadingCard`], no `Card`) to face the
+/// well camera. No built-in billboard in 0.18; this is the one-line
+/// `looking_at` per card the design doc calls for.
 pub fn billboard_cards(
     camera: Query<&GlobalTransform, With<TimeWellCamera>>,
     mut cards: Query<
         (&mut Transform, Option<&Card>),
-        Or<(With<Card>, With<ReadingCard>, With<RingLabel>, With<HorizonLabel>)>,
+        Or<(With<Card>, With<ReadingCard>, With<HorizonLabel>)>,
     >,
 ) {
     let Ok(cam) = camera.single() else {
@@ -1340,9 +1308,9 @@ pub fn card_shape() -> Vec4 {
     Vec4::new(1.6, 0.06, 0.045, 0.012)
 }
 
-/// `WellCardMaterial.shape` for a [`RingLabel`]/[`HorizonLabel`] panel: its own
-/// texture aspect, no border ring (labels have no body fill or frame — see
-/// their `accent`/`border` at spawn — just the MSDF text sampled onto the quad).
+/// `WellCardMaterial.shape` for the [`HorizonLabel`] panel: its own texture
+/// aspect, no border ring (the label has no body fill or frame — see its
+/// `accent`/`border` at spawn — just the MSDF text sampled onto the quad).
 fn label_shape() -> Vec4 {
     Vec4::new(LABEL_TEX_W / LABEL_TEX_H, 0.0, 0.0, 0.0)
 }
@@ -1365,6 +1333,13 @@ fn label_shape() -> Vec4 {
 ///
 /// (The thin ±X/±Y side faces sample texture slivers — acceptable for an
 /// 8-unit-thick block; not gold-plated.)
+///
+/// The mesh origin is the **bottom edge** (vertices shifted +Y by half the
+/// height), not the center: a card's transform sits on its ring line
+/// (`card::ring_seat_rotated`) with local +Y up the funnel axis
+/// (`billboard_cards`), so the card *stands on* the ring — and the selection
+/// pop (`highlight_selection`'s scale tween) grows it upward off the ring
+/// instead of through it.
 fn card_block_mesh() -> Mesh {
     use bevy::mesh::VertexAttributeValues;
     let mut mesh = Mesh::from(Cuboid::new(CARD_WIDTH, CARD_HEIGHT, CARD_THICKNESS));
@@ -1374,7 +1349,7 @@ fn card_block_mesh() -> Mesh {
             uv[1] = 1.0 - uv[1];
         }
     }
-    mesh
+    mesh.translated_by(Vec3::Y * (CARD_HEIGHT * 0.5))
 }
 
 pub fn accent_color(accent: &str) -> Color {

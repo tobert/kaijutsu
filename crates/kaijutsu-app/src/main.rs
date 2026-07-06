@@ -236,9 +236,15 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
         // bodies stay crisp and the well's HDR "bling" (selection rim, status
         // pulse — see `well_card.wgsl`) reads as a deliberate glow signal rather
         // than an all-over wash. (`OLD_SCHOOL` is already additive + thresholded;
-        // we just raise the threshold above the body brightness and lift intensity.)
+        // we raise the threshold above the body brightness.) The low-frequency
+        // shelf is pulled way down from the preset's 0.7/0.95: that shelf is the
+        // wide sideways scatter — the "fuzzy halo" — and the well wants a tight
+        // rim glow, not a fog. **Amy-tunable** (intensity = overall strength,
+        // low_frequency_boost = halo spread).
         Bloom {
-            intensity: 0.30,
+            intensity: 0.12,
+            low_frequency_boost: 0.25,
+            low_frequency_boost_curvature: 0.7,
             prefilter: BloomPrefilter {
                 threshold: 1.0,
                 threshold_softness: 0.3,
