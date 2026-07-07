@@ -1882,6 +1882,36 @@ impl KernelHandle {
         Ok(SubmitResult { block_id })
     }
 
+    /// Commit a captured-MIDI batch (`docs/midi.md` M2 — the ear's push half,
+    /// the structural reverse of a `RenderCue`). `payload` is a
+    /// `MIDI_CAPTURE_MIME` JSON batch record; the kernel quantizes it to the
+    /// grid of whatever track `context_id` is attached to and returns the
+    /// score-context block id it landed. The CAS payload arm is reserved
+    /// (`casHash` rides empty until the client→kernel CAS write surface
+    /// lands — docs/issues.md).
+    #[tracing::instrument(skip(self, payload), name = "rpc_client.commit_capture")]
+    pub async fn commit_capture(
+        &self,
+        context_id: ContextId,
+        mime: &str,
+        payload: &[u8],
+    ) -> Result<BlockId, RpcError> {
+        let mut request = self.kernel.commit_capture_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_mime(mime);
+        request.get().set_payload(payload);
+        request.get().set_cas_hash("");
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        parse_block_id(&result.get_block_id()?)
+    }
+
     /// Clear the input document for a context (discard draft).
     ///
     /// The server clears the CRDT input doc and emits `InputCleared` to all

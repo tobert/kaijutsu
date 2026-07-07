@@ -316,6 +316,17 @@ real KSP / loft node in later.
   distinct, relocatable micro-batch phase (kernel-side for now). Sink-dependency
   is intended — the track is preserved and replayable. See the section of that
   name; supersedes M1's in-process emit.
+- **The ear is the sink's twin (2026-07-06).** MIDI-in capture lives in the app
+  (later the headless edge sink), never the server — ring buffer at the device,
+  the app's musical timer cuts phrase-aligned batches, a `commitCapture` verb
+  (reverse `RenderCue`, `Inline | Cas` payload) pushes them to the kernel, which
+  quantizes to the track grid and commits data-only cells. Client push, not
+  kernel pull: once the cell commits, every consumer reads kernel-local state on
+  its own schedule; the kernel never fetches from a client that can disconnect
+  mid-jam. Score first, perception later — `KJ_HEARD` untouched in M2. Bonus by
+  construction: the loft works with the app on a laptop over WiFi (batched
+  telemetry is exactly what WiFi is allowed to carry) — no edge node needed to
+  jam.
 
 ## Staging
 
@@ -340,19 +351,49 @@ real KSP / loft node in later.
   the in-process pieces above — `AlsaMidiOut`, the `RenderTarget` trait, the
   `kj transport render` verb, the server `alsa` dep — were demolished. The attach
   surface described in this bullet is a historical record, not a live verb.
-- **M2 — Input telemetry, batched.** Capture a local (virtual then real) MIDI in,
-  timestamp with ALSA, batch into a MIDI-in track as score blocks over RPC.
-  Snapshot = the track-scoped windowed read. The capture spec (written
-  2026-07-01 so the session doesn't rediscover it): captured events commit as
-  `audio/midi` cells; each ALSA timestamp **quantizes to the nearest `Tick` on
-  the track's grid, keeping the raw offset as block metadata** (the M3 drift
-  model's food, and the explicit micro-timing data chameleon's
-  groove-as-data decision wants). The capture loop is a new
-  `crates/kaijutsu-server/src/midi_in.rs` (sibling of `clock.rs`; the `render.rs`
-  it was first sketched against was demolished 2026-07-02), opened via
-  a data-only spec variant, reading an ALSA seq
-  port with capture caps (`WRITE | SUBS_WRITE`). The MIDI-in context attaches as a probe
-  (`ooda_armed: false`) — a producer that never takes a turn.
+- **M2 — Input telemetry, batched. (Re-speced 2026-07-06; the 2026-07-01 spec's
+  server placement predated the 5c demolition and is void.)** The ear lives in
+  the *sink*, not the server — the app is the first MIDI ear, exactly as it is
+  the first MIDI sink; the server keeps zero audio FFI. Shape (hear → collate →
+  commit, the render pipeline run backwards, each phase its own micro-batch):
+  - **Hear (app):** a dedicated capture thread owns its *own* ALSA seq client
+    (separate from the render client — no `!Send` sharing across the frame
+    loop, and echo-exclusion by construction), input port with capture caps
+    (`WRITE | SUBS_WRITE`), ambient subscribe policy: all external source
+    ports, own clients + Midi Through excluded, System Announce driving
+    hotplug auto-subscribe. Events are stamped epoch-ns at receipt and
+    appended to a **ring buffer**; realtime spam (`F8` clock, `FE` active
+    sensing) is dropped at ingest.
+  - **Collate (app, pure data in `kaijutsu-audio`):** the app's musical timer
+    — the same `LocalBeat` phasor that drives metronome + sample scheduling —
+    **cuts snapshots** from the ring and advances per-consumer **trackers**
+    (independent read cursors): the score batcher per phrase (wall-clock
+    cadence fallback while the transport is stopped; slice 1 ships
+    wall-clock-only — phrase-aligned cuts are a recorded residual), analysis
+    windows (beat-tracking models over longer overlapping clips) later, a
+    time-well live spray later. One producer, N consumers, nothing chases
+    realtime.
+  - **Commit (kernel):** a cut batch crosses the control plane as
+    `commitCapture` — the structural reverse of `RenderCue`, payload enum
+    `Inline | Cas(hash)` mirroring `CuePayload`. Phrase-scale MIDI is
+    score-scale data and **rides inline**; the CAS *write* surface (client→
+    kernel put — `/v/cas` is read-only by construction today) is deferred to
+    the first heavy payload (audio windows, recorded clips) and slots in
+    without changing the verb's shape. The **kernel quantizes** epoch-ns →
+    the track grid at commit (thin client — the app never computes ticks),
+    **keeping the raw offset as block metadata** (the M3 drift model's food,
+    and chameleon's groove-as-data micro-timing). Cells are **data-only**
+    (`DeriverRegistry::empty()` — no derived sibling), versioned-JSON event
+    lists per the clip-record precedent (jq-able, model-readable) under a
+    capture mime (not `audio/midi`, which implies SMF), with
+    `played_by` mapped per source port so KSP / Eurorack / the audio2midi mic
+    land as distinct lanes. The MIDI-in context attaches as a probe
+    (`ooda_armed: false`) — a producer that never takes a turn.
+  - **Perception is deliberately out of scope for M2.** Capture lands in the
+    *score* first, available to every later stage; `KJ_HEARD` stays ABC-only
+    for now. Expanding perception (a `MidiToAbcDeriver` notation sibling, new
+    heartbeat vars, a coder-context "the room is playing" whisper) is
+    follow-on work — `docs/issues.md`.
 - **M3 — Drift-modeled clock-in.** Observe the virtual clock (then KSP over USB),
   fit the tempo/phase/drift model, phase-lock a local `ClockSource`. This is the
   real Stage 3 MIDI driver, built remote- and estimate-shaped from the start.

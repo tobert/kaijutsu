@@ -6187,6 +6187,75 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    fn commit_capture(
+        self: Rc<Self>,
+        params: kernel::CommitCaptureParams,
+        mut results: kernel::CommitCaptureResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "commit_capture").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let mime = pry!(pry!(p.get_mime()).to_str()).to_string();
+        let cas_hash = pry!(pry!(p.get_cas_hash()).to_str()).to_string();
+        let payload = pry!(p.get_payload()).to_vec();
+        // played_by = the authenticated caller shipping the batch (a probe
+        // context never produces via turns, so the attachment carries no
+        // producer principal to borrow).
+        let played_by = self.connection.borrow().principal.id;
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            // Same facade gate as the other context-injecting verbs (shell /
+            // edit_input / submit_input): deny-by-default, granted by the
+            // loadout. Broad seats carry `facade:*` (lib binding) so the
+            // ambient ear works from any coder/default/mcp context; narrow
+            // seats (musician, toolie) stay capture-mute by construction.
+            kernel
+                .kernel
+                .broker()
+                .check_facade(&context_id, "commit_capture")
+                .await
+                .map_err(|e| capnp::Error::failed(format!("commitCapture denied: {e}")))?;
+
+            if !cas_hash.is_empty() {
+                return Err(capnp::Error::failed(
+                    "commitCapture: CAS payloads are not built yet (docs/issues.md \
+                     'CAS write surface') — send the batch inline"
+                        .into(),
+                ));
+            }
+            if mime != kaijutsu_audio::MIDI_CAPTURE_MIME {
+                return Err(capnp::Error::failed(format!(
+                    "commitCapture: unsupported mime {mime} (this build accepts {})",
+                    kaijutsu_audio::MIDI_CAPTURE_MIME
+                )));
+            }
+            let rx = kernel
+                .kernel
+                .send_capture_commit(context_id, payload, played_by)
+                .ok_or_else(|| capnp::Error::failed("no beat scheduler is running".into()))?;
+            let block_id = rx
+                .await
+                .map_err(|_| {
+                    capnp::Error::failed("beat scheduler dropped the capture commit".into())
+                })?
+                .map_err(capnp::Error::failed)?;
+
+            log::info!(
+                "commit_capture: context={} block={}",
+                context_id.short(),
+                block_id
+            );
+            let mut b = results.get().init_block_id();
+            set_block_id_builder(&mut b, &block_id);
+            Ok(())
+        })
+    }
+
     fn set_block_excluded(
         self: Rc<Self>,
         params: kernel::SetBlockExcludedParams,

@@ -3,7 +3,7 @@ name = "kaijutsu-audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "FFI-free render seam: RenderSink trait + RenderCue wire type + Shape A clip record"
+description = "FFI-free render + capture seam: RenderCue out, CaptureBatch in, LocalBeat timebase, Shape A clip record"
 
 [dependencies]
 kaijutsu-cas = { workspace = true }

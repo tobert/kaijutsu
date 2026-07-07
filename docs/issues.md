@@ -712,6 +712,57 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   story in `docs/tracks.md` + devlog): M2–M4 (input telemetry, drift-modeled
   clock-in, edge node) sequenced in `docs/midi.md`; external-signal clock sources
   (solar/compute-availability) ride the same `ClockSourceKind` seam.
+- **MIDI-in follow-ons (deferred by decision 2026-07-06 — score first, perceive
+  later; M2 capture design is canonical in `docs/midi.md`):**
+    1. **Perception.** Captured cells are data-only and invisible to `KJ_HEARD`
+       (`heard_json` filters `ContentType::Abc`; the capture mime projects to
+       `Plain`). Candidates when we want musicians/coders to hear the room: a
+       `MidiToAbcDeriver` notation sibling at the write barrier (mirror of
+       `AbcToMidiDeriver` — keeps `KJ_HEARD` unchanged and notation-pure; costs
+       a crude quantized transcriber), extending `heard_json` with a MIDI
+       digest, or new heartbeat vars. Plus the fun one: a small system
+       whisper into coder contexts when the room is playing ("the band is on —
+       eurorack on track X") — `BlockKind::Notification` shaped, never the
+       cached system prefix (per the datetime-seed lesson).
+    2. **CAS write surface (client→kernel put).** `/v/cas` is read-only by
+       construction (`vfs/backends/cas.rs`) and the sftp client has no put;
+       `commitCapture`'s `Cas(hash)` payload arm is dormant until this lands.
+       Needed at the first heavy payload: audio capture windows, client-recorded
+       clips. Two shapes to weigh then: capnp `casPut(bytes)→hash` vs teaching
+       the sftp/VFS seam write-with-verify (only content matching its address —
+       plain `sftp` could seed objects; but it breaks the backend's
+       read-only-by-construction stance deliberately).
+    3. **Analysis trackers.** Beat-tracking models (Beat This! et al.) run on
+       ring windows as just-another-tracker; note Beat This! is *audio*-native
+       (fits the audio2midi mic upstream; MIDI windows need render-to-audio or
+       a symbolic tracker). Their tempo/phase/downbeat output is
+       `Timebase`-shaped corrections — i.e. a second concrete M3 estimator
+       candidate (clocked case: pulse-interval filter; unclocked case: beat
+       tracker on what Amy actually played).
+    4. **Ear slice-1 residuals** (shipped 2026-07-06, `app/src/midi_in.rs`):
+       cuts are wall-clock (4 s) — phrase-aligned cuts want the metronome
+       phasor + phrase length app-side (`BeatRef` carries no
+       `beats_per_phrase`); a kernel-refused batch is warned-and-dropped, not
+       requeued; the commit target is the app's *current* context (an
+       explicit per-client `midi_in.toml` — capture context + source
+       allowlist, the third `/etc/client` consumer — replaces that when
+       ambient-vs-seat needs separating); `played_by` is the shipping caller,
+       not per-source lanes (sources ride inside the record). And the
+       **third-party-thru echo**: the ear excludes kaijutsu's own clients,
+       but a synth/DAW/hardware soft-thru re-emitting the render port's
+       output IS an external source the ambient ear subscribes — dirty
+       capture today, model-hears-itself feedback once perception lands.
+       Fixes when it matters: the `midi_in.toml` source allowlist, and/or
+       MIDI echo cancellation (the app knows every event it emitted — the
+       cutter can fingerprint-subtract captures matching recently-rendered
+       (note, channel, ≈time) before shipping). Also deferred by decision
+       (2026-07-06): a **payload size cap** on `commitCapture` (a runaway ear
+       could land a giant block in the score context; honest worst case
+       today ≈2 MB — a loud refuse-over-N-MB in the RPC handler is the cheap
+       nudge), and **filter placement** (`keep_at_ingest` drops `F8` clock
+       pulses pre-ring, so the M3 clock observer can't be a ring tracker —
+       either move filtering to per-tracker cut time or give the observer a
+       pre-ring tap in the capture thread; pick deliberately at M3).
 - **Relative-lead timing — open findings from the 2026-07-02 analysis** (the
   substrate verdict + resolved findings live in `docs/midi.md` "The relative-lead
   timebase, analyzed" and `docs/pcm.md`; this is the still-open remainder):

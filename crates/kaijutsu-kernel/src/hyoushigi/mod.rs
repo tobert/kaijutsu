@@ -276,6 +276,23 @@ pub enum BeatRequest {
     Snapshot {
         reply: tokio::sync::oneshot::Sender<Vec<TrackSnapshot>>,
     },
+    /// Commit a captured-MIDI batch (`docs/midi.md` M2, "the ear is the
+    /// sink's twin") onto the track the capture context is attached to. The
+    /// scheduler owns the quantization anchor (playhead + last beat's
+    /// wallclock + live period), so the commit happens here: parse loud,
+    /// quantize epoch-ns → the track grid, land ONE data-only block in the
+    /// track's score context. Reply is the inserted block id or a refusal
+    /// (unattached context, malformed batch) — never a silent drop.
+    CommitCapture {
+        context_id: ContextId,
+        /// A `kaijutsu_audio::MIDI_CAPTURE_MIME` batch record (JSON bytes).
+        payload: Vec<u8>,
+        /// The authenticated caller shipping the batch — stamped as the
+        /// block's `played_by` (a probe context never produces via turns, so
+        /// its attachment's `producer_principal` stays `None`).
+        played_by: PrincipalId,
+        reply: tokio::sync::oneshot::Sender<Result<BlockId, String>>,
+    },
 }
 
 impl From<BeatCommand> for BeatRequest {

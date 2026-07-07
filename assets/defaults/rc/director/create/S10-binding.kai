@@ -35,3 +35,6 @@ kj binding allow "exec"
 kj binding allow "facade:shell"
 kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
+# The app's MIDI ear commits capture batches against its seat (docs/midi.md
+# M2); a director seat can host the ear. Musician/toolie stay capture-mute.
+kj binding allow "facade:commit_capture"

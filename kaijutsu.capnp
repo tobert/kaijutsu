@@ -1373,6 +1373,17 @@ interface Kernel {
   # without restamping (the underlying `archived_at IS NULL` guard is
   # already a no-op).
   archiveContext @96 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Commit a captured-MIDI batch onto the track `contextId` is attached to
+  # (docs/midi.md M2, "the ear is the sink's twin" — the structural reverse
+  # of RenderCue: the app hears, collates on its musical timer, and pushes;
+  # the kernel quantizes to the track grid and lands one data-only block in
+  # the score context). `mime` must be the MIDI_CAPTURE_MIME batch record.
+  # `casHash` "" = `payload` carries the record inline (the only form built
+  # today; a non-empty casHash is the reserved CAS arm, mirroring
+  # RenderCue's union — rejected until the client→kernel CAS write surface
+  # lands, docs/issues.md).
+  commitCapture @97 (contextId :Data, mime :Text, payload :Data, casHash :Text, trace :TraceContext) -> (blockId :BlockId);
 }
 
 # ============================================================================

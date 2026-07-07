@@ -1077,6 +1077,114 @@ impl BeatScheduler {
         None
     }
 
+    /// Land a captured-MIDI batch (`docs/midi.md` M2) as ONE data-only block in
+    /// the score context of the track `context_id` is attached to.
+    ///
+    /// Synchronous compute-and-reply like `apply_command` (no awaits). The
+    /// batch is parsed loud (a bad batch is a refusal, never a silent drop),
+    /// annotated with the quantization anchor (`ext.quantize`) so every
+    /// event's grid residual stays derivable from the record forever, and
+    /// inserted ephemeral (a durable score record, not a conversation turn —
+    /// same hydration-silent stance as materialized score blocks). Captured
+    /// events are *past*-stamped, so they bypass the speculation timeline and
+    /// its no-backdating write barrier entirely: this is an observation log
+    /// landing beside the score, not a cell crossing it. Invisible by design
+    /// to `heard_json` and `reconstruct_score_cells` (both filter
+    /// `ContentType::Abc`) — score first, perception later.
+    fn commit_capture(
+        &mut self,
+        context_id: ContextId,
+        payload: Vec<u8>,
+        played_by: PrincipalId,
+    ) -> Result<BlockId, String> {
+        let mut batch = kaijutsu_audio::CaptureBatch::parse(&payload)
+            .map_err(|e| format!("capture batch rejected: {e}"))?;
+
+        // Exactly one track may claim the capture context. Zero is the
+        // not-attached refusal. More than one is structurally impossible —
+        // `attach` enforces the 1:1 `context_track` reverse index by MOVING a
+        // re-attached context — so the multi-claim branch below is a
+        // defensive invariant guard (loud refusal, never a HashMap coin flip
+        // over which grid quantizes), same stance as materialize's
+        // non-concrete-cell bail.
+        let mut claims = self
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.attached.contains_key(&context_id));
+        let (track_id, score_ctx, period, anchor_ns, playhead, playing) = claims
+            .next()
+            .map(|(id, t)| {
+                (id.clone(), t.score_context, t.clock.period(), t.last_epoch_ns, t.playhead, t.playing)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "capture context {context_id} is not attached to any track — \
+                     `kj transport attach` first"
+                )
+            })?;
+        if let Some((other, _)) = claims.next() {
+            return Err(format!(
+                "capture context {context_id} is attached to multiple tracks \
+                 ({}, {}, …) — capture needs exactly one",
+                track_id.as_str(),
+                other.as_str()
+            ));
+        }
+        drop(claims);
+
+        // Quantize against the track's live anchor: the last beat latched
+        // (playhead, last_epoch_ns) as a (tick, wallclock) pair and 1 tick ==
+        // 1 beat (STEP). Before the first beat, or while stopped/paused, there
+        // is no rolling grid — the whole batch lands at the frozen playhead
+        // (ties at a tick are structurally allowed) and the events' raw
+        // epochs stay the only time truth. The anchor is recorded on the
+        // record itself so consumers (the M3 drift model, a future deriver)
+        // can recompute every event's exact grid residual without us storing
+        // per-event ticks.
+        let period_ns = period.as_nanos() as i64;
+        let rolling = playing && anchor_ns > 0 && period_ns > 0;
+        let window_tick = if rolling {
+            let offset_ns = batch.window_start_ns as i64 - anchor_ns as i64;
+            let beats = (offset_ns as f64 / period_ns as f64).round() as i64;
+            playhead + TickDelta::new(beats)
+        } else {
+            playhead
+        };
+        batch.ext.insert(
+            "quantize".into(),
+            serde_json::json!({
+                "anchor_epoch_ns": anchor_ns,
+                "anchor_tick": playhead.get(),
+                "period_ns": period_ns,
+                "ticks_per_beat": STEP.0,
+                "rolling": rolling,
+            }),
+        );
+        let content = String::from_utf8(
+            batch
+                .to_json_bytes()
+                .map_err(|e| format!("capture batch re-serialize: {e}"))?,
+        )
+        .map_err(|e| format!("capture batch is not UTF-8 JSON: {e}"))?;
+
+        let block_id = self
+            .documents
+            .reserve_block_id(score_ctx, played_by)
+            .map_err(|e| format!("capture commit reserve: {e}"))?;
+        let snapshot = kaijutsu_types::BlockSnapshotBuilder::new(block_id, kaijutsu_types::BlockKind::Text)
+            .tick(window_tick)
+            .role(kaijutsu_types::Role::Asset)
+            .content(content)
+            .content_type(ContentType::from_mime(kaijutsu_audio::MIDI_CAPTURE_MIME))
+            .track(track_id)
+            .ephemeral(true)
+            .build();
+        let after = self.documents.last_block_id(score_ctx);
+        self.documents
+            .insert_from_snapshot_as(score_ctx, snapshot, after.as_ref(), Some(played_by))
+            .map_err(|e| format!("capture commit insert: {e}"))
+    }
+
     /// Materialize the TRACK's newly-committed score this beat: pump the track
     /// timeline to the playhead (firing speculate/commit/squash), then run the
     /// CAS+block bridge ONCE into the track's score context with the track's single
@@ -1821,6 +1929,12 @@ impl BeatScheduler {
                     Some(BeatRequest::Snapshot { reply }) => {
                         let _ = reply.send(self.snapshot_tracks());
                     }
+                    // Captured-MIDI batch commit (`docs/midi.md` M2): same
+                    // synchronous compute-and-reply contract — parse, quantize
+                    // against the track's in-memory anchor, insert, no awaits.
+                    Some(BeatRequest::CommitCapture { context_id, payload, played_by, reply }) => {
+                        let _ = reply.send(self.commit_capture(context_id, payload, played_by));
+                    }
                     None => break, // all senders dropped → shut down
                 },
                 msg = completed.recv(), if turn_bus_open => match msg {
@@ -2277,6 +2391,172 @@ mod tests {
         assert!(b.playhead > 0, "playhead advanced in memory: {}", b.playhead);
         assert_eq!(b.beat_count, 1);
         assert!(b.last_epoch_ns > 0, "epoch latched on the beat");
+    }
+
+    fn capture_batch(window_start_ns: u64, window_end_ns: u64, epochs: &[u64]) -> Vec<u8> {
+        let batch = kaijutsu_audio::CaptureBatch {
+            v: kaijutsu_audio::MIDI_CAPTURE_VERSION,
+            window_start_ns,
+            window_end_ns,
+            events: epochs
+                .iter()
+                .map(|&e| kaijutsu_audio::CaptureEvent {
+                    epoch_ns: e,
+                    source: "24:0".into(),
+                    bytes: vec![0x90, 60, 100],
+                })
+                .collect(),
+            lost: 0,
+            ext: serde_json::Map::new(),
+        };
+        batch.to_json_bytes().unwrap()
+    }
+
+    /// `commit_capture` (docs/midi.md M2): a batch from an attached capture
+    /// context lands ONE data-only block in the track's score context —
+    /// frozen-playhead tick while stopped, ephemeral, capture mime, annotated
+    /// with the quantization anchor — and stays invisible to the notation
+    /// consumers (`heard_json`, `reconstruct_score_cells`) by design.
+    #[tokio::test]
+    async fn commit_capture_lands_annotated_block_in_score_context() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track_id = TrackId::new("ear").unwrap();
+        arm_track_with_markers(&kernel, &track_id, 3);
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track_id);
+        let played_by = PrincipalId::new();
+
+        let payload = capture_batch(1_000, 2_000, &[1_100, 1_500]);
+        let id = sched.commit_capture(ctx, payload, played_by).unwrap();
+
+        let blocks = documents.block_snapshots(score).unwrap();
+        assert_eq!(blocks.len(), 1, "one block per batch");
+        let b = &blocks[0];
+        assert_eq!(b.id, id, "reply carries the landed block id");
+        assert_eq!(b.id.principal_id, played_by, "played_by = the shipping caller");
+        assert_eq!(b.tick, Some(Tick::new(0)), "stopped track → frozen playhead");
+        assert_eq!(b.track.as_ref(), Some(&track_id));
+        assert!(b.ephemeral, "a score record, not a conversation turn");
+        assert_ne!(b.content_type, ContentType::Abc, "not notation");
+
+        // The stored record parses back and carries its quantization anchor.
+        let back = kaijutsu_audio::CaptureBatch::parse(b.content.as_bytes()).unwrap();
+        assert_eq!(back.events.len(), 2, "events survive the annotate round-trip");
+        let q = &back.ext["quantize"];
+        assert_eq!(q["rolling"], serde_json::json!(false), "no rolling grid yet");
+        assert_eq!(q["anchor_tick"], serde_json::json!(0));
+        assert_eq!(q["ticks_per_beat"], serde_json::json!(1));
+
+        // Invisible to the notation consumers — score first, perception later.
+        let heard = heard_json(&blocks, Tick::new(10), TickDelta::new(100));
+        assert_eq!(heard, "[]", "KJ_HEARD stays notation-pure: {heard}");
+        assert!(
+            sched.reconstruct_score_cells(score, &track_id).is_empty(),
+            "timeline reconstruction ignores capture blocks"
+        );
+    }
+
+    /// While the clock rolls, the batch's window quantizes against the live
+    /// anchor: the last beat's (playhead, wallclock) pair + the period.
+    #[tokio::test]
+    async fn commit_capture_quantizes_against_the_rolling_anchor() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track_id = TrackId::new("ear").unwrap();
+        arm_track_with_markers(&kernel, &track_id, 3);
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track_id);
+
+        // One real beat: playhead 0→1, last_epoch_ns latched from wallclock.
+        let base = Instant::now();
+        sched.play(&track_id, base);
+        sched.fire_due(base + Duration::from_secs(1));
+        let snap = sched.snapshot_tracks();
+        let anchor_ns = snap[0].last_epoch_ns;
+        assert!(anchor_ns > 0, "the beat latched an epoch anchor");
+        assert_eq!(snap[0].playhead, 1);
+
+        // Window opens 2.4 beats after the anchor (period = 1s): rounds to +2.
+        let start = anchor_ns + 2_400_000_000;
+        let payload = capture_batch(start, start + 1_000_000_000, &[start + 1_000]);
+        let played_by = PrincipalId::new();
+        let id = sched.commit_capture(ctx, payload, played_by).unwrap();
+
+        // Find by the returned id — the beat also materialized marker cells
+        // into this score context, so content-type sniffing is ambiguous.
+        let blocks = documents.block_snapshots(score).unwrap();
+        let b = blocks.iter().find(|b| b.id == id).expect("the capture block");
+        assert_eq!(b.tick, Some(Tick::new(3)), "playhead 1 + round(2.4) beats");
+        let back = kaijutsu_audio::CaptureBatch::parse(b.content.as_bytes()).unwrap();
+        let q = &back.ext["quantize"];
+        assert_eq!(q["rolling"], serde_json::json!(true));
+        assert_eq!(q["anchor_tick"], serde_json::json!(1));
+        assert_eq!(q["anchor_epoch_ns"], serde_json::json!(anchor_ns));
+    }
+
+    /// Refusals are loud and land nothing: an unattached context, a malformed
+    /// batch, and an unknown record version each return `Err` with the reason.
+    #[tokio::test]
+    async fn commit_capture_refuses_unattached_and_malformed() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let played_by = PrincipalId::new();
+
+        // Not attached to any track.
+        let err = sched
+            .commit_capture(ctx, capture_batch(0, 10, &[5]), played_by)
+            .unwrap_err();
+        assert!(err.contains("not attached"), "names the refusal: {err}");
+
+        // Attached, but the payload is garbage.
+        let track_id = TrackId::new("ear").unwrap();
+        arm_track_with_markers(&kernel, &track_id, 3);
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let err = sched
+            .commit_capture(ctx, b"not json".to_vec(), played_by)
+            .unwrap_err();
+        assert!(err.contains("rejected"), "malformed batch is refused: {err}");
+
+        // Nothing landed in the score context either way.
+        let score = sched.score_context(&track_id);
+        assert!(documents.block_snapshots(score).unwrap().is_empty());
+    }
+
+    /// Multi-track attach is impossible by construction — `attach` enforces
+    /// the 1:1 `context_track` reverse index by MOVING a re-attached context
+    /// to the new track. Capture follows the move: the batch lands on the
+    /// NEW track's score context, and the old track receives nothing. (The
+    /// multi-claim refusal inside `commit_capture` stays as a defensive
+    /// guard on that invariant; this pins the invariant itself.)
+    #[tokio::test]
+    async fn commit_capture_follows_a_reattach_move() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let a = TrackId::new("ear-a").unwrap();
+        let b = TrackId::new("ear-b").unwrap();
+        arm_track_with_markers(&kernel, &a, 3);
+        arm_track_with_markers(&kernel, &b, 3);
+        sched.attach(a.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.attach(b.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let id = sched
+            .commit_capture(ctx, capture_batch(0, 10, &[5]), PrincipalId::new())
+            .expect("capture commits against the moved-to track");
+        let on_b = documents.block_snapshots(sched.score_context(&b)).unwrap();
+        assert!(on_b.iter().any(|blk| blk.id == id), "lands on the NEW track's score");
+        assert!(
+            documents.block_snapshots(sched.score_context(&a)).unwrap().is_empty(),
+            "the old track's score receives nothing"
+        );
     }
 
     /// Playing drives one ticked block per beat in tick order; attaching alone

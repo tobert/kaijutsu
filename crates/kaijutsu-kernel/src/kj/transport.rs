@@ -590,6 +590,10 @@ mod tests {
                     BeatRequest::Snapshot { reply } => {
                         let _ = reply.send(Vec::new());
                     }
+                    // …and holds no attachments, so a capture commit refuses.
+                    BeatRequest::CommitCapture { reply, .. } => {
+                        let _ = reply.send(Err("beat stub: no tracks".into()));
+                    }
                 }
             }
         });

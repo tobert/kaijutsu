@@ -2798,6 +2798,10 @@ mod tests {
                     crate::hyoushigi::BeatRequest::Snapshot { reply } => {
                         let _ = reply.send(Vec::new());
                     }
+                    // The stub holds no attachments; a capture commit refuses.
+                    crate::hyoushigi::BeatRequest::CommitCapture { reply, .. } => {
+                        let _ = reply.send(Err("beat stub: no tracks".into()));
+                    }
                 }
             }
         });

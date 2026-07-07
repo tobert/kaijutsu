@@ -49,6 +49,7 @@ mod input;
 mod kaish;
 mod metronome;
 mod midi;
+mod midi_in;
 mod peers;
 mod shaders;
 mod text;
@@ -161,6 +162,9 @@ fn main() {
         // dispatched by mime — audio/* → AudioPlayer, text/vnd.abc → ALSA MIDI.
         .add_plugins(audio::AudioOutPlugin)
         .add_plugins(midi::MidiOutPlugin)
+        // The ear (docs/midi.md M2): device MIDI → ring → windowed batches →
+        // commitCapture, landing as data-only cells on the current context's track.
+        .add_plugins(midi_in::MidiInPlugin)
         // The metronome: the app's continuous local timebase made audible —
         // a phasor slaved to ServerEvent::BeatSync, clicking through midi's port.
         .add_plugins(metronome::MetronomePlugin)

@@ -848,6 +848,31 @@ impl Kernel {
         }
     }
 
+    /// Ship a captured-MIDI batch to the beat scheduler for commit onto the
+    /// capture context's track (`docs/midi.md` M2 — the `commitCapture` wire
+    /// verb). The scheduler owns the quantization anchor, so the work happens
+    /// there; the receiver yields the landed block id or a loud refusal.
+    /// `None` when no scheduler is wired (embedded/test) or it has shut down.
+    pub fn send_capture_commit(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        payload: Vec<u8>,
+        played_by: kaijutsu_types::PrincipalId,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<kaijutsu_crdt::BlockId, String>>> {
+        let tx = self.beat_ingress.get()?;
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let request = crate::hyoushigi::BeatRequest::CommitCapture {
+            context_id,
+            payload,
+            played_by,
+            reply,
+        };
+        match tx.send(request) {
+            Ok(()) => Some(reply_rx),
+            Err(_) => None, // scheduler dropped its receiver
+        }
+    }
+
     /// Ask the beat scheduler for a live snapshot of every track (the
     /// `listTracks` wire surface reads this — the in-memory truth, not the
     /// lagging persisted row). `None` when no scheduler is wired

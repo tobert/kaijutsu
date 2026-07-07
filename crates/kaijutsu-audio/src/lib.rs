@@ -1,13 +1,22 @@
-//! FFI-free render seam (see `docs/pcm.md` "The seam", `docs/midi.md` "Render
-//! is a wire cue").
+//! FFI-free render + capture seam (see `docs/pcm.md` "The seam",
+//! `docs/midi.md` "Render is a wire cue" / M2 "the ear is the sink's twin").
 //!
-//! This crate is pure data + one trait: no `alsa`/`pipewire`/`symphonia`, no
-//! `tokio`, no kernel-ward crates. The kernel depends on it for
-//! orchestration; hardware emission lives in the consuming binaries
-//! (`kaijutsu-app`'s Bevy sink today, an edge-node ALSA agent later).
+//! Both directions of the app↔kernel media boundary live here as pure data:
+//! `RenderCue` rides kernel→sink (score out), `CaptureBatch` rides ear→kernel
+//! (room in), and `timebase` is the local phasor both sides keep musical time
+//! with. No `alsa`/`pipewire`/`symphonia`, no `tokio`, no kernel-ward crates.
+//! The kernel depends on it for orchestration; hardware emission *and
+//! audition* live in the consuming binaries (`kaijutsu-app`'s Bevy sink + ear
+//! today, an edge-node ALSA agent later).
 
 use kaijutsu_cas::ContentHash;
 use std::time::Duration;
+
+pub mod capture;
+pub use capture::{
+    keep_at_ingest, CaptureBatch, CaptureError, CaptureEvent, CaptureRing, Tracker,
+    MIDI_CAPTURE_MIME, MIDI_CAPTURE_VERSION,
+};
 
 pub mod clip;
 pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};

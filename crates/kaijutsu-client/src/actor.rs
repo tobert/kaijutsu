@@ -449,6 +449,12 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    CommitCapture {
+        context_id: ContextId,
+        mime: String,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<BlockId, CallError>>,
+    },
 
     // ── Editor (vi) ──────────────────────────────────────────────────────
     EditorKeys {
@@ -633,6 +639,7 @@ impl RpcCommand {
             Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::CommitCapture { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1133,6 +1140,26 @@ impl ActorHandle {
     pub async fn clear_input(&self, context_id: ContextId) -> Result<(), CallError> {
         self.send(|reply| RpcCommand::ClearInput { context_id, reply })
             .await
+    }
+
+    /// Commit a captured-MIDI batch onto the capture context's track
+    /// (`docs/midi.md` M2). Returns the score-context block id the kernel
+    /// landed.
+    #[tracing::instrument(skip(self, payload))]
+    pub async fn commit_capture(
+        &self,
+        context_id: ContextId,
+        mime: impl Into<String> + std::fmt::Debug,
+        payload: Vec<u8>,
+    ) -> Result<BlockId, CallError> {
+        let mime = mime.into();
+        self.send(|reply| RpcCommand::CommitCapture {
+            context_id,
+            mime,
+            payload,
+            reply,
+        })
+        .await
     }
 
     // ── Editor (vi) ──────────────────────────────────────────────────────
@@ -2609,6 +2636,12 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::ClearInput { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.clear_input(context_id));
+        }
+        RpcCommand::CommitCapture { context_id, mime, payload, reply } => {
+            dispatch!(
+                kernel, reply, close_tx, k,
+                k.commit_capture(context_id, &mime, &payload)
+            );
         }
 
         // ── Editor (vi) ──
