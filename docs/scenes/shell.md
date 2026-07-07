@@ -5,10 +5,11 @@ one continuous room that holds the stations (`docs/scenes/README.md`,
 "Topology: shell + dives"). It is **not a station** — it has no data shape of
 its own; its job is orientation, ambient awareness, and travel. Canonical
 concept: `docs/scenes/concepts/01-shell-atrium.png` (Amy: "the atrium
-*rules*") and `05-shell-floorflows-nano.png` (the assembled room:
-bearings occupied, engraved nameplates, the rainbow trace floor bowing
-around the console). Other companion mockups live in the story archive;
-everything they taught is prose in this doc.
+*rules*") and `06-shell-radiators-nano.png` (the assembled room: bearings
+occupied, engraved nameplates, the rainbow trace floor bowing around the
+console, violet information radiators between stations — one actively
+drawing). Other companion mockups live in the story archive; everything
+they taught is prose in this doc.
 
 ## The Tardis reading
 
@@ -88,6 +89,19 @@ budget discipline:
 - All ambience rides the **existing kernel-wide event stream** the well
   already ingests (`view/time_well/live.rs`) — the shell adds renderers,
   not wire.
+- **The walls between bearings are information radiators** (Amy,
+  2026-07-07): tall slim panels of dark glass carrying live telemetry —
+  sparklines, scrolling model output, status readouts — all in a single
+  **violet** hue family reserved for radiators (crimson = MIDI, cyan =
+  PCM, gold = the well, violet = information). A radiator that is
+  actively drawing shows it the HDR way: the newest data point drags a
+  bright bloom trail; idle radiators dim to calm LDR etchings. (The
+  canonical render exaggerates the trail into a comet leaving the glass —
+  in-scene the trail stays on the panel; the bloom is the tell, not a
+  projectile.) Content
+  rides the same kernel-wide event stream as everything else — candidates:
+  per-track beat/token sparklines, the selected context's tail, a model's
+  output streaming as it generates.
 - The shell never loads station detail. Dives cut to dedicated scenes
   (charter dive-through rule); Esc returns to the room, camera continuity
   both ways.
@@ -137,12 +151,12 @@ identical prompt — and settled several things:
   bay should be *restrained* (a few elegant threads over jack fields),
   with the routing story moved down into the floor traces instead. That
   dial produced the floor-is-the-wiring direction above — and the kept
-  render (mockup 05) confirmed it composes: the patch panel's wall
-  threads drop and *become* floor traces (wall-to-floor continuity worth
-  building literally), and the model volunteered engraved station
-  nameplates with names good enough to steal — "PATCH BAY WEST",
-  "DATA HORIZON NORTH", "RHYTHM GATE EAST" (naming candidates, not
-  decisions).
+  render (mockup 06, after a radiator-wall dial) confirmed it composes:
+  the patch panel's wall threads drop and *become* floor traces
+  (wall-to-floor continuity worth building literally), and the model
+  volunteered engraved station nameplates with names good enough to
+  steal — "PATCH BAY WEST", "DATA HORIZON NORTH", "RHYTHM GATE EAST"
+  (naming candidates, not decisions).
 
 ## Build path
 
