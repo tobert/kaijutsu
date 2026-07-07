@@ -125,7 +125,7 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 | `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the CRDT block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. **Async** since `:r` — sync-lock, release, await the fetch, sync-lock again; `EditorCore` never crosses the await, only the fetched `String` does. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty (what a renderer draws). |
 | `editor_save(session)` | `ZZ` / `:w` — flush the CRDT doc to its owner; advance the checkpoint. |
-| `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback), drop the session. |
+| `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. |
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`) +
@@ -271,10 +271,22 @@ editor_save / ZZ  →  checkpoint = (saved_text, version())   // session holds s
 editor_quit / ZQ  →  diff(current, saved_text) → edit ops   // forward "undo" edit
 ```
 
-Cheap, restart-safe, collaboration-safe (peers see an undo edit land). Pass-1
-semantics: the inverse edit resets to `saved_text` (last-writer); scoping it to
-*our* delta via `ops_since(checkpoint)` when collaborators edited after our
-save is a known refinement.
+Cheap, restart-safe, collaboration-safe (peers see an undo edit land).
+
+**Entanglement guard — detach, don't retract (Amy, 2026-07-07).** The rollback
+runs only when the session was provably *alone* with the block since its
+checkpoint. `EditorSessions::quit` skips it — dropping the session, leaving the
+block's merged truth — when a sibling session is still bound to the block **or**
+a peer's write merged into this session since the checkpoint (a sticky
+`peer_wrote` flag: set by `reconcile_block` on any non-self merge, reset when
+`save` advances the checkpoint, which folds the peer work in). So in a shared
+session `ZQ`/`:q!` mean "quit *me* out of the doc, leave the others playing" —
+never "undo everyone back to my checkpoint". Your own unsaved keystrokes stay in
+the shared score; they were already part of the ensemble the moment they
+mirrored. Residual race: a peer who writes and closes within the reconciler's
+bus latency (flag not yet set, no sibling left to see) can still be clobbered —
+the complete guard is the frontier-based changed-under-us detection that `:w!`'s
+`force` is reserved for.
 
 The session also keeps the block's trailing terminator aside
 (`EditorSession.terminator`), so a newline-terminated block opens clean and

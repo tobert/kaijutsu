@@ -241,6 +241,13 @@ struct EditorSession {
     /// the opener's `(principal, context_id, session_id)`. `None` for a headless
     /// open (test / wire `editorOpen` — no caller to capture).
     opener: Option<EditorOpener>,
+    /// Whether a **peer's** write merged into this session since the last
+    /// open/save checkpoint — set by [`EditorSessions::reconcile_block`] (a
+    /// non-self merge), reset when the checkpoint advances ([`EditorSessions::save`]).
+    /// A `ZQ` rollback to the checkpoint would revert that peer work along with
+    /// ours, so [`EditorSessions::quit`] skips the rollback when this is set:
+    /// detach, don't retract (see the entanglement guard in `docs/vi.md`).
+    peer_wrote: bool,
 }
 
 /// The kernel's registry of open editor sessions.
@@ -288,6 +295,7 @@ impl EditorSessions {
                 saved_content,
                 terminator,
                 opener,
+                peer_wrote: false,
             },
         );
         Ok((id, state))
@@ -483,6 +491,10 @@ impl EditorSessions {
         for id in bound {
             let session = self.sessions.get_mut(&id).expect("just collected");
             if session.core.apply_remote_text(merged) {
+                // A non-self write merged in: this session's checkpoint no longer
+                // owns the block's delta, so a ZQ rollback would clobber peer
+                // work. Sticky until the checkpoint advances (save).
+                session.peer_wrote = true;
                 let saved = session.saved_content.clone();
                 changed.push((id, state_of(&mut session.core, &saved)));
             }
@@ -554,16 +566,30 @@ impl EditorSessions {
     pub fn save(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         session.saved_content = session.core.text();
+        // The checkpoint now contains every merged peer edit, so a rollback to
+        // it can no longer clobber them — the entanglement resets.
+        session.peer_wrote = false;
         let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
     }
 
     /// `ZQ` — discard changes since the last checkpoint by writing the saved
     /// text back onto the block (an inverse forward edit — the CRDT has no
-    /// history erasure), then drop the session. Pass 1 restores the whole
-    /// checkpoint (last-writer w.r.t. concurrent peer edits — see `docs/vi.md`).
+    /// history erasure), then drop the session.
+    ///
+    /// **Entanglement guard: detach, don't retract.** The rollback runs only
+    /// when this session was provably alone with the block since its checkpoint.
+    /// If a sibling session is still bound to it, or a peer's write merged in
+    /// since the checkpoint ([`EditorSession::peer_wrote`]), the merged text is
+    /// shared work — rolling it back would clobber them. A shared-session `ZQ`
+    /// therefore just quits *this* player out of the doc and leaves the block's
+    /// merged truth for the others (Amy, 2026-07-07; `docs/vi.md` → Rollback).
     pub fn quit(&mut self, id: EditorSessionId, blocks: &SharedBlockStore) -> Result<(), String> {
         let session = self.sessions.remove(&id).ok_or_else(|| no_session(id))?;
+        let sibling_bound = self.sessions.values().any(|s| s.target == session.target);
+        if sibling_bound || session.peer_wrote {
+            return Ok(());
+        }
         // Restore the normalized checkpoint *plus* the block's terminator, so a
         // rollback never strips a trailing newline the block opened with.
         let restore = format!("{}{}", session.saved_content, session.terminator);
@@ -977,6 +1003,78 @@ mod session_tests {
         // for everyone (both buffers now match the block).
         let again = sessions.reconcile_block(target.context_id, target.block_id, &blocks);
         assert!(again.is_empty(), "nothing stale → no reconcile");
+    }
+
+    // ── Entanglement guard: detach, don't retract (shared-session ZQ) ────────
+
+    #[tokio::test]
+    async fn zq_with_a_live_sibling_detaches_without_rollback() {
+        // Amy's shared-session semantics (2026-07-07): ZQ quits THIS player out
+        // of the doc and leaves the others going. A's own unsaved edit stays in
+        // the merged truth — no rollback yanks the block out from under B.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+
+        sessions.keys(a, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(a, ":q!<CR>", &blocks).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Closed(_)), ":q! closes A");
+        assert!(!sessions.is_open(a), "A is out of the doc");
+        assert!(sessions.is_open(b), "B keeps playing");
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "Xhello",
+            "a shared-session quit must NOT roll the block back"
+        );
+    }
+
+    #[tokio::test]
+    async fn zq_after_a_departed_peers_write_keeps_their_work() {
+        // The clobber scenario: B edits, saves (ZZ), and LEAVES; A then ZQs.
+        // No sibling is present, but B's write merged into A (peer_wrote), so
+        // the rollback is skipped — B's saved work survives A's abort.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+
+        sessions.keys(b, "iB<Esc>", &blocks).unwrap(); // -> "Bhello"
+        // The server's reconciler drives this off the block flow; simulate it.
+        sessions.reconcile_block(target.context_id, target.block_id, &blocks);
+        let outcome = sessions.keys(b, "ZZ", &blocks).unwrap(); // B saves + leaves
+        assert!(matches!(outcome, KeysOutcome::Closed(_)));
+
+        sessions.quit(a, &blocks).unwrap(); // A aborts
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "Bhello",
+            "A's ZQ must not erase the departed peer's saved work"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_resets_entanglement_so_a_later_solo_zq_rolls_back_to_it() {
+        // A's save folds B's merged work into A's checkpoint; once B is gone
+        // and A is alone again, ZQ reverts only A's post-save edits — landing
+        // on the checkpoint that already contains B's work.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+
+        sessions.keys(b, "iB<Esc>", &blocks).unwrap(); // -> "Bhello"
+        sessions.reconcile_block(target.context_id, target.block_id, &blocks);
+        sessions.save(a).unwrap(); // A's checkpoint = "Bhello"; entanglement resets
+        sessions.keys(b, "ZZ", &blocks).unwrap(); // B leaves
+
+        sessions.keys(a, "iA<Esc>", &blocks).unwrap(); // -> "ABhello"
+        sessions.quit(a, &blocks).unwrap(); // alone + untangled → real rollback
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "Bhello",
+            "solo ZQ reverts to A's checkpoint, which keeps B's merged work"
+        );
     }
 
     #[tokio::test]
