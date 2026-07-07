@@ -1912,6 +1912,35 @@ impl KernelHandle {
         parse_block_id(&result.get_block_id()?)
     }
 
+    /// Ship one clock reference from the local observer (`docs/midi.md` M3
+    /// — the reverse of the `BeatSync` push). Fire-and-forget semantics on
+    /// a ~2 Hz stream; the kernel slaves the sender's track only when its
+    /// clock is `modeled`.
+    #[tracing::instrument(skip(self), name = "rpc_client.report_clock_estimate")]
+    pub async fn report_clock_estimate(
+        &self,
+        context_id: ContextId,
+        beat: f64,
+        tempo_bps: f64,
+        epoch_ns: u64,
+        source: &str,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.report_clock_estimate_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_beat(beat);
+        request.get().set_tempo_bps(tempo_bps);
+        request.get().set_epoch_ns(epoch_ns);
+        request.get().set_source(source);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
     /// Clear the input document for a context (discard draft).
     ///
     /// The server clears the CRDT input doc and emits `InputCleared` to all

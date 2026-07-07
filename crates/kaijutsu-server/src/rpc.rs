@@ -6256,6 +6256,43 @@ impl kernel::Server for KernelImpl {
         })
     }
 
+    fn report_clock_estimate(
+        self: Rc<Self>,
+        params: kernel::ReportClockEstimateParams,
+        _results: kernel::ReportClockEstimateResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "report_clock_estimate").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let beat = p.get_beat();
+        let tempo_bps = p.get_tempo_bps();
+        let epoch_ns = p.get_epoch_ns();
+        let source = pry!(pry!(p.get_source()).to_str()).to_string();
+
+        // No facade gate, on purpose (contrast commit_capture): an estimate
+        // is inert sensor data unless the track was *slaved*, and the
+        // authority moment is that slaving — `kj transport clock`, gated on
+        // the Transport capability. Gate the decision, not the sensor.
+        //
+        // Fire-and-forget into the beat scheduler (a ~2 Hz reference stream;
+        // the scheduler decides whether the sender's track is slaved). The
+        // only wire error is "no scheduler at all" — a dropped single
+        // reference is jitter the model rides out, but a missing scheduler
+        // means every reference is going nowhere, which the observer should
+        // hear about once per connection rather than silently.
+        if !self.kernel.kernel.send_clock_estimate(context_id, beat, tempo_bps, epoch_ns, source)
+        {
+            return Promise::err(capnp::Error::failed(
+                "no beat scheduler is running".into(),
+            ));
+        }
+        Promise::ok(())
+    }
+
     fn set_block_excluded(
         self: Rc<Self>,
         params: kernel::SetBlockExcludedParams,

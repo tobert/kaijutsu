@@ -1384,6 +1384,15 @@ interface Kernel {
   # RenderCue's union — rejected until the client→kernel CAS write surface
   # lands, docs/issues.md).
   commitCapture @97 (contextId :Data, mime :Text, payload :Data, casHash :Text, trace :TraceContext) -> (blockId :BlockId);
+
+  # One clock reference from an edge observer (docs/midi.md M3, "distribute
+  # tempo, not pulses" — the reverse of the BeatSync push, third mirror in
+  # the set): the observed master's beat coordinate + tempo, stamped with
+  # the observer's wallclock. ~2 Hz fire-and-forget; the kernel resolves the
+  # sender's track and slaves it only when that track's clock is `modeled`
+  # (`kj transport clock <track> modeled`). `source` is the observed ALSA
+  # port ("client:port"), for logs/attribution.
+  reportClockEstimate @98 (contextId :Data, beat :Float64, tempoBps :Float64, epochNs :UInt64, source :Text, trace :TraceContext) -> ();
 }
 
 # ============================================================================

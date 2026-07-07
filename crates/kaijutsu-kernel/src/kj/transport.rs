@@ -19,7 +19,7 @@ use kaijutsu_types::{ContentType, ContextId, TrackId};
 
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
-use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence};
+use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence, ClockKind};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -125,6 +125,21 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
+    /// Switch the track's beat driver: `system` (local fixed-tempo timer) or
+    /// `modeled` (phase-locked to an observed external MIDI master via the
+    /// edge estimator — docs/midi.md M3). The current period carries over;
+    /// a modeled clock free-runs at it until the first reference arrives.
+    Clock {
+        /// `system` or `modeled`
+        kind: Option<String>,
+        /// Target context (used for track lookup when --track is absent).
+        #[arg(long)]
+        context: Option<String>,
+        /// Track whose clock to switch. Omit to resolve from the context's
+        /// attachment.
+        #[arg(long)]
+        track: Option<String>,
+    },
     /// Set (or clear) the self-fork rotate cadence — the page-turn. At every
     /// phrase horizon where `phrase % N == 0` the scheduler retires this context
     /// and fires the `rotate` rc lifecycle (fork a `spawn` child + attach it). The
@@ -157,6 +172,7 @@ impl TransportCommand {
             | TransportCommand::Stop { context, .. }
             | TransportCommand::Tempo { context, .. }
             | TransportCommand::Ooda { context, .. }
+            | TransportCommand::Clock { context, .. }
             | TransportCommand::Rotate { context, .. } => context.as_deref(),
         }
     }
@@ -171,6 +187,7 @@ impl TransportCommand {
             | TransportCommand::Stop { track, .. }
             | TransportCommand::Tempo { track, .. }
             | TransportCommand::Ooda { track, .. }
+            | TransportCommand::Clock { track, .. }
             | TransportCommand::Rotate { track, .. } => track.as_deref(),
         }
     }
@@ -185,6 +202,7 @@ impl TransportCommand {
             TransportCommand::Stop { .. } => "stop",
             TransportCommand::Tempo { .. } => "tempo",
             TransportCommand::Ooda { .. } => "ooda",
+            TransportCommand::Clock { .. } => "clock",
             TransportCommand::Rotate { .. } => "rotate",
         }
     }
@@ -331,6 +349,28 @@ impl KjDispatcher {
                         format!("OODA {}", if armed { "armed" } else { "disarmed" }),
                         Some(tid),
                     )
+                }
+
+                TransportCommand::Clock { kind, .. } => {
+                    let kind = match kind.as_deref() {
+                        Some("system") => ClockKind::System,
+                        Some("modeled") => ClockKind::Modeled,
+                        _ => {
+                            return KjResult::Err(
+                                "kj transport clock: expected `system` or `modeled`".to_string(),
+                            );
+                        }
+                    };
+                    let track = match self.resolve_track_for_ctx(track_name, ctx) {
+                        Ok(t) => t,
+                        Err(e) => return KjResult::Err(e),
+                    };
+                    let tid = track.as_str().to_string();
+                    let verb = format!(
+                        "clock → {}",
+                        if kind == ClockKind::Modeled { "modeled" } else { "system" }
+                    );
+                    (BeatCommand::SetClock { track, kind }, verb, Some(tid))
                 }
 
                 TransportCommand::Rotate { every, state, .. } => {
@@ -594,6 +634,8 @@ mod tests {
                     BeatRequest::CommitCapture { reply, .. } => {
                         let _ = reply.send(Err("beat stub: no tracks".into()));
                     }
+                    // Fire-and-forget; the stub has no clocks to slave.
+                    BeatRequest::ClockEstimate { .. } => {}
                 }
             }
         });

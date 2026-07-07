@@ -455,6 +455,14 @@ enum RpcCommand {
         payload: Vec<u8>,
         reply: oneshot::Sender<Result<BlockId, CallError>>,
     },
+    ReportClockEstimate {
+        context_id: ContextId,
+        beat: f64,
+        tempo_bps: f64,
+        epoch_ns: u64,
+        source: String,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
 
     // ── Editor (vi) ──────────────────────────────────────────────────────
     EditorKeys {
@@ -640,6 +648,7 @@ impl RpcCommand {
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CommitCapture { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ReportClockEstimate { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1157,6 +1166,28 @@ impl ActorHandle {
             context_id,
             mime,
             payload,
+            reply,
+        })
+        .await
+    }
+
+    /// Ship one observer clock reference (`docs/midi.md` M3, ~2 Hz stream).
+    #[tracing::instrument(skip(self))]
+    pub async fn report_clock_estimate(
+        &self,
+        context_id: ContextId,
+        beat: f64,
+        tempo_bps: f64,
+        epoch_ns: u64,
+        source: impl Into<String> + std::fmt::Debug,
+    ) -> Result<(), CallError> {
+        let source = source.into();
+        self.send(|reply| RpcCommand::ReportClockEstimate {
+            context_id,
+            beat,
+            tempo_bps,
+            epoch_ns,
+            source,
             reply,
         })
         .await
@@ -2641,6 +2672,12 @@ async fn dispatch_kernel_command(
             dispatch!(
                 kernel, reply, close_tx, k,
                 k.commit_capture(context_id, &mime, &payload)
+            );
+        }
+        RpcCommand::ReportClockEstimate { context_id, beat, tempo_bps, epoch_ns, source, reply } => {
+            dispatch!(
+                kernel, reply, close_tx, k,
+                k.report_clock_estimate(context_id, beat, tempo_bps, epoch_ns, &source)
             );
         }
 

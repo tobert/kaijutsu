@@ -38,8 +38,8 @@ use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::{BlockFlow, TurnFlow};
 use kaijutsu_kernel::hyoushigi::{
-    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ContentRef,
-    DeriverRegistry, MaterializeCursor, Span, TrackSnapshot, materialize_committed,
+    Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ClockKind,
+    ContentRef, DeriverRegistry, MaterializeCursor, Span, TrackSnapshot, materialize_committed,
     schedule_abc_cell,
 };
 use kaijutsu_kernel::kernel_db::{ContextRow, PersistedAttachment, PersistedTrack};
@@ -838,6 +838,101 @@ impl BeatScheduler {
         }
         // Persist the new tempo so a restart recovers it (not the default).
         let _ = self.persist_track(track_id);
+    }
+
+    /// Switch the track's beat driver (`docs/midi.md` M3). The current period
+    /// carries over — a track slaved mid-song keeps its tempo until the first
+    /// reference arrives, and un-slaving freezes the last modeled tempo into
+    /// the system clock. Persisted (`clock_kind` is mutable over a track's
+    /// life, Stage 3 lock); a same-kind set is an idempotent no-op.
+    pub fn set_clock(&mut self, track_id: &TrackId, kind: ClockKind) {
+        if let Some(track) = self.tracks.get_mut(track_id) {
+            let period = track.clock.period();
+            let already = matches!(
+                (&track.clock, kind),
+                (ClockSourceKind::System(_), ClockKind::System)
+                    | (ClockSourceKind::Modeled(_), ClockKind::Modeled)
+            );
+            if !already {
+                track.clock = match kind {
+                    ClockKind::System => ClockSourceKind::system(period),
+                    ClockKind::Modeled => ClockSourceKind::modeled(period),
+                };
+                log::info!(
+                    "beat: track {} clock → {}",
+                    track_id.as_str(),
+                    track.clock.kind_str()
+                );
+            }
+        }
+        let _ = self.persist_track(track_id);
+    }
+
+    /// Apply one observer clock reference (M3) to the sender's track.
+    /// Ambient-lenient where `commit_capture` is strict: references flow
+    /// before anyone decides to slave, so an unattached sender or a
+    /// system-clock track drops the reference at debug — only a *stale*
+    /// stamp is loud (it means the pipe is backed up or a clock is skewed).
+    fn apply_clock_estimate(
+        &mut self,
+        context_id: ContextId,
+        beat: f64,
+        tempo_bps: f64,
+        epoch_ns: u64,
+        source: &str,
+    ) {
+        let Some(track_id) = self
+            .tracks
+            .iter()
+            .find(|(_, t)| t.attached.contains_key(&context_id))
+            .map(|(id, _)| id.clone())
+        else {
+            log::debug!("beat: clock estimate from unattached {context_id} ({source}); dropped");
+            return;
+        };
+        // Re-anchor the observer's wallclock stamp at receipt into the local
+        // Instant domain (the RenderCue receipt+lead move, run backwards; a
+        // cross-node wallclock offset lands here — the recorded NTP caveat).
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let age_ns = now_ns.saturating_sub(epoch_ns);
+        if age_ns > 5_000_000_000 {
+            log::warn!(
+                "beat: clock estimate from {source} is {} ms stale; dropped",
+                age_ns / 1_000_000
+            );
+            return;
+        }
+        let at = Instant::now() - Duration::from_nanos(age_ns);
+
+        let Some(track) = self.tracks.get_mut(&track_id) else {
+            return;
+        };
+        match &mut track.clock {
+            ClockSourceKind::Modeled(m) => {
+                m.apply_estimate(beat, tempo_bps, at);
+                // Re-slave the speculation TickClock to the slewed period
+                // (the set_tempo pattern; cheap per ~2 Hz reference).
+                let tick_clock = track.phrasing().clock();
+                match self.kernel.track_timeline(&track_id) {
+                    Some(tl) => tl.lock().set_clock(tick_clock),
+                    None => log::warn!(
+                        "beat: clock estimate updated track {} but found no armed \
+                         timeline to re-slave; speculation lead may be stale",
+                        track_id.as_str()
+                    ),
+                }
+            }
+            ClockSourceKind::System(_) => {
+                log::debug!(
+                    "beat: clock estimate from {source} at system-clock track {}; \
+                     ignored (not slaved)",
+                    track_id.as_str()
+                );
+            }
+        }
     }
 
     /// Arm or disarm one attached context's OODA loop, without touching the clock.
@@ -1837,6 +1932,10 @@ impl BeatScheduler {
                 self.set_rotate(&track, context_id, every);
                 self.attached_ack(&track, context_id)
             }
+            BeatCommand::SetClock { track, kind } => {
+                self.set_clock(&track, kind);
+                self.track_ack(&track)
+            }
         }
     }
 
@@ -1935,6 +2034,12 @@ impl BeatScheduler {
                     Some(BeatRequest::CommitCapture { context_id, payload, played_by, reply }) => {
                         let _ = reply.send(self.commit_capture(context_id, payload, played_by));
                     }
+                    // One clock reference from an edge observer (M3):
+                    // fire-and-forget, applied to the sender's track when its
+                    // clock is modeled.
+                    Some(BeatRequest::ClockEstimate { context_id, beat, tempo_bps, epoch_ns, source }) => {
+                        self.apply_clock_estimate(context_id, beat, tempo_bps, epoch_ns, &source);
+                    }
                     None => break, // all senders dropped → shut down
                 },
                 msg = completed.recv(), if turn_bus_open => match msg {
@@ -2028,7 +2133,7 @@ mod tests {
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind, SharedBlockStore};
     use kaijutsu_kernel::flows::{BlockFlow, FlowBus, SharedBlockFlowBus};
     use kaijutsu_kernel::kernel_db::{PersistedAttachment, PersistedTrack};
-    use kaijutsu_kernel::hyoushigi::{Attachment, BeatPolicy, Cadence};
+    use kaijutsu_kernel::hyoushigi::{Attachment, BeatPolicy, Cadence, ClockKind};
     use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
 
@@ -2559,6 +2664,76 @@ mod tests {
         );
     }
 
+    fn epoch_now_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    /// `kj transport clock`: switching drivers preserves the period, reports
+    /// through the snapshot, is idempotent, and estimates only bite when the
+    /// track is modeled.
+    #[tokio::test]
+    async fn set_clock_switches_driver_and_estimates_slave_it() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track_id = TrackId::new("slaved").unwrap();
+        arm_track_with_markers(&kernel, &track_id, 3);
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        // System clock: an estimate is ignored (ambient sense, not slaved).
+        sched.apply_clock_estimate(ctx, 8.0, 2.4, epoch_now_ns(), "24:0");
+        let snap = sched.snapshot_tracks();
+        assert_eq!(snap[0].clock_kind, "system");
+        assert_eq!(snap[0].period, Duration::from_secs(1), "unchanged");
+
+        // Switch to modeled: period carries over, kind flips + persists.
+        sched.set_clock(&track_id, ClockKind::Modeled);
+        let snap = sched.snapshot_tracks();
+        assert_eq!(snap[0].clock_kind, "modeled");
+        assert_eq!(snap[0].period, Duration::from_secs(1), "period carried over");
+
+        // Now an estimate bites — slew-limited (max 5% per reference).
+        sched.apply_clock_estimate(ctx, 8.0, 2.4, epoch_now_ns(), "24:0");
+        let snap = sched.snapshot_tracks();
+        assert_eq!(snap[0].period, Duration::from_millis(950), "1000 ms − 5%");
+
+        // Idempotent same-kind set keeps the slewed state.
+        sched.set_clock(&track_id, ClockKind::Modeled);
+        assert_eq!(sched.snapshot_tracks()[0].period, Duration::from_millis(950));
+
+        // Back to system: the last modeled tempo freezes in.
+        sched.set_clock(&track_id, ClockKind::System);
+        let snap = sched.snapshot_tracks();
+        assert_eq!(snap[0].clock_kind, "system");
+        assert_eq!(snap[0].period, Duration::from_millis(950));
+    }
+
+    /// Estimate hygiene: unattached senders and stale stamps are dropped
+    /// without panic or effect.
+    #[tokio::test]
+    async fn clock_estimates_from_strangers_and_the_past_are_dropped() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+
+        // Unattached sender: nothing to resolve, no panic.
+        sched.apply_clock_estimate(ContextId::new(), 1.0, 2.0, epoch_now_ns(), "24:0");
+
+        let track_id = TrackId::new("slaved").unwrap();
+        arm_track_with_markers(&kernel, &track_id, 3);
+        sched.attach(track_id.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        sched.set_clock(&track_id, ClockKind::Modeled);
+
+        // A stamp 10 s in the past is stale — dropped, period untouched.
+        sched.apply_clock_estimate(ctx, 8.0, 2.4, epoch_now_ns() - 10_000_000_000, "24:0");
+        assert_eq!(sched.snapshot_tracks()[0].period, Duration::from_secs(1));
+    }
+
     /// Playing drives one ticked block per beat in tick order; attaching alone
     /// produces nothing (track created stopped); detach halts.
     #[tokio::test]
@@ -2872,9 +3047,11 @@ mod tests {
     #[tokio::test]
     async fn attach_crashes_loud_on_an_unconstructable_clock_kind() {
         let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
-        let track = TrackId::new("bass").unwrap();
 
-        // A row that claims a MIDI-slaved (modeled) clock — a future M3 driver.
+        // A persisted "modeled" row is legal since M3: it reconstructs a
+        // free-running modeled clock at the persisted tempo (the anchor is
+        // process-local; the observer re-locks it). This was the M1-era
+        // crash case — its premise dissolved when ModeledClock got a body.
         db.lock()
             .upsert_track(&PersistedTrack {
                 track_id: "bass".to_string(),
@@ -2886,17 +3063,39 @@ mod tests {
                 clock_kind: "modeled".to_string(),
             })
             .unwrap();
-
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let bass = TrackId::new("bass").unwrap();
+        sched
+            .attach(bass.clone(), ctx, slow_attachment(), slow_policy())
+            .expect("a persisted modeled clock reconstructs free-running");
+        let snap = sched.snapshot_tracks();
+        assert_eq!(snap[0].clock_kind, "modeled");
+        assert_eq!(snap[0].period, Duration::from_millis(250), "persisted tempo, not the DTO");
+
+        // An UNKNOWN kind still crashes loud — no silent downgrade.
+        db.lock()
+            .upsert_track(&PersistedTrack {
+                track_id: "keys".to_string(),
+                period_ms: 250,
+                beats_per_phrase: 4,
+                playhead_tick: None,
+                playing: false,
+                score_context_id: None,
+                clock_kind: "quantum-flux".to_string(),
+            })
+            .unwrap();
+        let keys = TrackId::new("keys").unwrap();
+        let ctx2 = ContextId::new();
+        documents.create_document(ctx2, DocumentKind::Conversation, None).unwrap();
         let err = sched
-            .attach(track.clone(), ctx, slow_attachment(), slow_policy())
-            .expect_err("M1 cannot construct a modeled clock — attach must fail loud");
+            .attach(keys.clone(), ctx2, slow_attachment(), slow_policy())
+            .expect_err("an unknown clock_kind must fail loud");
         assert!(
-            err.contains("clock_kind") && err.contains("modeled"),
-            "the error names the unconstructable clock_kind, got: {err}"
+            err.contains("clock_kind") && err.contains("quantum-flux"),
+            "the error names the unknown clock_kind, got: {err}"
         );
         assert!(
-            sched.tracks.get(&track).is_none(),
+            sched.tracks.get(&keys).is_none(),
             "a failed clock reconstruction leaves no half-armed track"
         );
     }

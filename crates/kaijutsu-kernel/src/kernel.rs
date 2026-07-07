@@ -848,6 +848,33 @@ impl Kernel {
         }
     }
 
+    /// Forward one clock reference to the beat scheduler (`docs/midi.md` M3
+    /// — the `reportClockEstimate` wire verb). Fire-and-forget: returns
+    /// whether it was delivered, same contract as [`send_beat_command`].
+    ///
+    /// [`send_beat_command`]: Self::send_beat_command
+    pub fn send_clock_estimate(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        beat: f64,
+        tempo_bps: f64,
+        epoch_ns: u64,
+        source: String,
+    ) -> bool {
+        match self.beat_ingress.get() {
+            Some(tx) => tx
+                .send(crate::hyoushigi::BeatRequest::ClockEstimate {
+                    context_id,
+                    beat,
+                    tempo_bps,
+                    epoch_ns,
+                    source,
+                })
+                .is_ok(),
+            None => false,
+        }
+    }
+
     /// Ship a captured-MIDI batch to the beat scheduler for commit onto the
     /// capture context's track (`docs/midi.md` M2 — the `commitCapture` wire
     /// verb). The scheduler owns the quantization anchor, so the work happens

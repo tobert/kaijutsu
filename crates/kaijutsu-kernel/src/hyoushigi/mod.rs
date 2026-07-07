@@ -220,6 +220,22 @@ pub enum BeatCommand {
     /// the rotate *action* (fork + re-bind child) stays rc. `Some(Cadence{every:0})`
     /// is treated as `None`.
     SetRotate { track: TrackId, context_id: ContextId, every: Option<Cadence> },
+    /// Switch the track's beat driver (`docs/midi.md` M3): the local system
+    /// clock, or the drift-modeled clock slaved to an observed external
+    /// master's estimate stream. The current period carries over; a modeled
+    /// clock free-runs at it until the first reference arrives.
+    SetClock { track: TrackId, kind: ClockKind },
+}
+
+/// Which driver beats a track (the `clock_kind` persisted discriminator's
+/// wire face — `docs/tracks.md` Stage 3, `docs/midi.md` M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockKind {
+    /// One local timer at a fixed tempo.
+    System,
+    /// Phase-locked to low-rate `{beat, tempo}` references from an edge
+    /// observer ("distribute tempo, not pulses").
+    Modeled,
 }
 
 /// What the scheduler reports back for a transport command: `Ok(())` when it
@@ -275,6 +291,24 @@ pub enum BeatRequest {
     /// before yielding (same no-await contract as command handling).
     Snapshot {
         reply: tokio::sync::oneshot::Sender<Vec<TrackSnapshot>>,
+    },
+    /// One clock reference from an edge observer (`docs/midi.md` M3): the
+    /// master's beat coordinate + tempo, stamped with the observer's
+    /// wallclock. Fire-and-forget (a ~2 Hz stream; a dropped reference is
+    /// just jitter the model rides out). The scheduler resolves the sending
+    /// context's track and, when that track's clock is `Modeled`, applies
+    /// the estimate; references at a system-clock track are ignored at
+    /// debug (ambient sense without slaving is legal).
+    ClockEstimate {
+        context_id: ContextId,
+        /// Master beat coordinate at `epoch_ns`.
+        beat: f64,
+        /// Master tempo, beats per second.
+        tempo_bps: f64,
+        /// Observer wallclock (ns since UNIX epoch) the reference was true at.
+        epoch_ns: u64,
+        /// Observed source port ("client:port"), for logs/attribution.
+        source: String,
     },
     /// Commit a captured-MIDI batch (`docs/midi.md` M2, "the ear is the
     /// sink's twin") onto the track the capture context is attached to. The

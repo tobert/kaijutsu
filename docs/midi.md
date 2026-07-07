@@ -394,9 +394,44 @@ real KSP / loft node in later.
     for now. Expanding perception (a `MidiToAbcDeriver` notation sibling, new
     heartbeat vars, a coder-context "the room is playing" whisper) is
     follow-on work — `docs/issues.md`.
-- **M3 — Drift-modeled clock-in.** Observe the virtual clock (then KSP over USB),
-  fit the tempo/phase/drift model, phase-lock a local `ClockSource`. This is the
-  real Stage 3 MIDI driver, built remote- and estimate-shaped from the start.
+- **M3 — Drift-modeled clock-in. Substrate SHIPPED 2026-07-06 (same-day session
+  as M2; live virtual-clock verify pending, KSP-over-USB pending Amy-near-gear).**
+  Observe the clock master locally, fit tempo/phase/drift, phase-lock a local
+  `ClockSource`. As landed:
+  - **Estimator = EMA candidate** (`kaijutsu-audio/src/clockin.rs`), chosen over
+    the two-state Kalman with the Kalman recorded as the drop-in upgrade if real
+    playing shows EMA lag on tempo ramps (the consumer only sees
+    `ClockEstimate`s, so the swap is contained; `residual_ns` is the health
+    signal that makes the call). The gift that shaped it: **MIDI clock phase is
+    a count, not an estimate** — pulse *n* is beat *n/24* by definition, so
+    only the count→wallclock mapping is learned. Intervals classify by ratio
+    to the learned period: ~1× learns, ~integer 2–4× is dropout inference
+    (count += k, phase never slips), >4.5× is a loud discontinuity, short is
+    jitter (count, don't learn). Start/Continue/Stop/SongPosition follow the
+    MIDI spec (position frozen on Stop while tempo keeps learning).
+  - **The tap is pre-ring** (`midi_in.rs` capture thread, per-source
+    estimators keyed on ALSA `EventType`, not bytes): `F8` never enters the
+    ring; Start/Stop/Continue/SPP feed the tap AND fall through as score
+    capture. This resolved the filter-placement question the ear left open.
+  - **Wire = `reportClockEstimate @98`** — the reverse of the `BeatSync` push,
+    third mirror in the set (RenderCue↔CaptureBatch, BeatSync↔ClockEstimate).
+    ~2 Hz fire-and-forget from the app (`ClockSense` latest-wins shipping);
+    ungated on purpose: an estimate is inert sensor data unless the track was
+    slaved, and the slaving (`kj transport clock <track> modeled|system`) is
+    the gated authority moment.
+  - **`ModeledClock` got its body** (`server/clock.rs`; the variant sat
+    uninhabited from Stage 3 until its producer existed): free-runs like
+    SystemClock until anchored, then fires on the *master's* integer beats.
+    PLL guards from the 2026-07-02 analysis are one line each: tempo step
+    ≤5%/reference, phase slew ≤0.05 beat with ≥0.5-beat seeks stepping
+    outright, starvation (>10 s silent) warns once and free-runs. Estimates
+    re-slave the speculation TickClock per reference (the set_tempo pattern);
+    a persisted `"modeled"` row reconstructs free-running (anchor is
+    process-local). `kj transport tempo` while slaved is an honored manual
+    nudge the next reference re-corrects.
+  - **Dev loop:** `cargo run -p kaijutsu-app --example midi_clock -- --bpm 120
+    --drift 1.0 --jitter-ms 2` — a virtual master with the exact drift/jitter
+    shapes the estimator tests synthesize, on a real ALSA bus.
 - **M4 — Cross-node + the edge node.** Stand up the loft Lenovo as a kaijutsu
   compute node owning the Eurorack's USB-MIDI; RTP-MIDI for any realtime hop;
   KSP-on-laptop hosts the clock observer and ships the model to the kernel.
@@ -412,21 +447,11 @@ real KSP / loft node in later.
 
 ## Open questions (for the implementation sessions)
 
-- **Drift-model shape.** Only the *estimator* is open (the phasor + slew is
-  hyoushigi's `Timebase`/local-phasor, reused — see "2. Clock-in"): tempo-EMA +
-  phase-correction vs a lightweight Kalman over the observed pulse intervals,
-  emitting `Timebase`-shaped corrections. What observability we want (the model's
-  residual is a great health signal — a probe could write it to `/run`). Decide
-  when M3 starts; M1/M2 don't need it. The kernel-side hook it feeds
-  (`apply_estimate` + heap re-enlistment) is already designed into the
-  `ClockSource` shape — `tracks.md` Stage 3 — but deliberately not stubbed.
-  Two contract facts for that session, already fixed by the landed trait
-  (`crates/kaijutsu-server/src/clock.rs`): `next_fire(last, now)`'s `last` is
-  the previously *scheduled* fire instant (not the jittery pop time), so the
-  model measures residual drift apples-to-apples; and `period()` must return
-  the *instantaneous effective* period — `KJ_TEMPO` readback and the
-  speculation `TickClock` both derive from it, so a curve-holding estimator
-  snapshots its current point there.
+- **Drift-model shape — RESOLVED 2026-07-06 (M3 substrate).** EMA + exact
+  pulse-count phase landed (`kaijutsu-audio/src/clockin.rs`; decision record
+  in the M3 staging bullet). Still open from the original question:
+  *observability placement* — `residual_ns` rides every estimate and the app
+  logs it, but nothing writes it to `/run` yet for sibling probes to read.
 - **Where the clock observer process lives** when KSP is on the WiFi laptop — a
   kaijutsu node agent on the laptop is fine (it ships a model, not pulses), but
   confirm the laptop runs a node agent vs. moving KSP's USB to a wired node.

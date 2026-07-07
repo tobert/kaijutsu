@@ -21,6 +21,9 @@ pub use capture::{
 pub mod clip;
 pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};
 
+pub mod clockin;
+pub use clockin::{ClockEstimate, ClockEstimator, ClockEvent, PULSES_PER_BEAT};
+
 pub mod timebase;
 pub use timebase::{beat_onsets_in, BeatRef, LocalBeat};
 

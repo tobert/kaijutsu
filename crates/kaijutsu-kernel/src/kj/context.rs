@@ -2802,6 +2802,8 @@ mod tests {
                     crate::hyoushigi::BeatRequest::CommitCapture { reply, .. } => {
                         let _ = reply.send(Err("beat stub: no tracks".into()));
                     }
+                    // Fire-and-forget; the stub has no clocks to slave.
+                    crate::hyoushigi::BeatRequest::ClockEstimate { .. } => {}
                 }
             }
         });
