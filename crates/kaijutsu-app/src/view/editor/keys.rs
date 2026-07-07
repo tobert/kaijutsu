@@ -52,8 +52,9 @@ pub fn is_modifier_key(key_code: KeyCode) -> bool {
 /// navigates with `hjkl`; `docs/issues.md` tracks widening this).
 ///
 /// `ctrl` is the live control-modifier state (a chord becomes `<C-x>`). Note
-/// `ZZ`/`ZQ` are handled by the caller *before* this — they are app-level
-/// save/quit RPCs, not buffer keystrokes.
+/// `Z` is an ordinary keystroke here — the app forwards every key, including
+/// `Z`; it's the kernel's `EditorCore` (the mode owner) that recognizes a real
+/// `ZZ`/`ZQ` and closes the session, pushing `EditorClosed`.
 pub fn bevy_to_vi_notation(event: &KeyboardInput, ctrl: bool) -> Option<String> {
     // Named keys resolve from the physical key_code (layout-independent) so a
     // synthetic event with `logical_key = Unidentified` (e.g. bevy_brp send_keys)

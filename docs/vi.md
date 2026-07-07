@@ -22,8 +22,14 @@ issues are fixed.
 **Open** (only in this doc; the backlog proper is `docs/issues.md`):
 
 - **Selection rects** on the editor panel — the cursor quad ships; selection is
-  the editor specialization still to wire (`view/editor/render.rs` notes it).
-  `Selection::geometry(layout)` is off-the-shelf in parley 0.7.
+  more than render wiring. It needs, in order: (1) a selection range on the
+  kernel's `EditorState` (`kaijutsu-kernel/src/editor.rs`) *and* the capnp
+  `EditorState` struct (`kaijutsu.capnp`) — the wire carries only a cursor
+  today, no selection anchor; (2) a `BlockFxMaterial`/shader extension — the
+  material has one `selection_params` rect today, and multi-line selection
+  needs multi-rect support; (3) only then the parley
+  `Selection::geometry(layout)` render wiring, which *is* off-the-shelf in
+  parley 0.7.
 - **`/`·`?` search and `.` dot-repeat** — safe no-ops today (the command-bar
   suppression guard makes them inert, not corrupting). Real search needs the
   bar submit wired to a search action; real `.` needs modalkit's
@@ -157,11 +163,17 @@ scope):
   `handle_editor_events` keeps `ActiveEditor.state` fresh off the
   `subscribeEditor` push (own keystrokes, peer merges) and pops to Conversation
   on close.
-- The panel reuses the time-well MSDF primitive (`create_msdf_panel` +
-  `commit_panel_glyphs`), mono font, with a `:`-strip appended at the bottom
-  when `command_line` or `message` is set. The **cursor quad** derives from
-  parley geometry (`Cursor::from_byte_index(..).geometry`) through the shared
-  `cursor_selection_uniforms` shader path.
+- The editor gets its **own dedicated 2D full-screen surface**, superseding
+  the earlier time-well reuse (commit 49e1163e): `EditorSurfaceRoot`/
+  `EditorSurface` in `view/editor/render.rs` are a full-window dark "page" node
+  with an MSDF text child on `BlockFxMaterial` — the same material the
+  conversation/compose surfaces use, so the cursor/selection shader path is
+  shared via `shaders::cursor_selection_uniforms`.
+- Text is laid out with the mono font at the conversation's `cell_font_size`;
+  the `:`-strip (command line or transient message) is appended to the same
+  glyph buffer near the page bottom.
+- Cursor geometry is computed via parley (`Cursor::from_byte_index(..).geometry`)
+  into `OverlayCursorGeometry`, pushed to the material by `sync_editor_cursor`.
 - `editor_dispatch_keys` (gated `in_state(Screen::Editor)`) drains
   `KeyboardInput`, translates to modalkit key notation, and ships *every* key
   to `editor_keys`. The push subscription returns the new state.
@@ -208,10 +220,15 @@ The same surface a test drives is what a model plays.
    explicitly joins, block ops for an un-joined context are dropped
    (`view/sync.rs`), so no `DocKind` discriminator is needed on the wire.
    (Rejected Design B: joining the editor context into the cache.)
-5. **Surface: MSDF panel on `Screen::Editor`** (decided 2026-06-22), reusing
-   the time-well substrate. Rejected: a flat 2D vello overlay (doesn't share
-   the 3D scene) and editing the time-well `ReadingCard` in place (couples vi
-   to the well).
+5. **Surface: dedicated full-screen `EditorSurface`** (superseded 2026-06-24,
+   commit 49e1163e). Originally decided (2026-06-22) to reuse the time-well's
+   MSDF panel substrate; that didn't survive contact with the editor's actual
+   needs — full-screen layout, the conversation-matched font, and a real
+   cursor quad, none of which the time-well's 3D card could give it — so the
+   editor got its own `Screen::Editor` surface (`view/editor/render.rs`). The
+   originally-rejected alternatives still hold: a flat 2D vello overlay
+   (doesn't share the 3D scene) and editing the time-well `ReadingCard` in
+   place (couples vi to the well).
 6. **Mode lives kernel-side, period.** The app forwards every key, including
    `:`. `ZZ`/`ZQ` and command mode are recognized in `EditorCore`; an app-side
    input surface would race the mode push and split input ownership.
@@ -339,10 +356,11 @@ push channel; the app renders it read-only.
   materializes a kaish in the **opener's** `(principal, context_id,
   session_id)` (the same `materialize_context_kaish` helper the model shell +
   rc lifecycle use) and splices the command's stdout — both **at the cursor**
-  (not vim's linewise-below; simpler, refine later). These are the async
-  intents (`EditorIo::{ReadFile, ReadShell}` via `take_io()`); a missing file,
-  denied/failed command, or unfulfilled intent fails loud **on the `:` status
-  line** (the session stays open), never a silent no-op.
+  (not vim's linewise-below; simpler, refine later). Accepted spellings also
+  include `:read <file>`, `:read !cmd`, and the adjacent-bang `:r!cmd`. These
+  are the async intents (`EditorIo::{ReadFile, ReadShell}` via `take_io()`); a
+  missing file, denied/failed command, or unfulfilled intent fails loud **on
+  the `:` status line** (the session stays open), never a silent no-op.
 - **No `:!`, deliberately.** It was the entire source of complexity — nested
   editor sessions, a return stack, ephemeral-block lifecycle. The **shell is
   already a surface a keystroke away**: **Ctrl+Z** (a local app intercept —
@@ -386,7 +404,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @84` … `subscribeEditor @89`) |
 | Wire e2e | `kaijutsu-server/tests/editor_wire.rs` |
 | App renderer | `kaijutsu-app/src/view/editor/` (`mod.rs`, `render.rs`, `keys.rs`); screen FSM `ui/screen.rs` |
-| MSDF panel primitive | `kaijutsu-app/src/view/time_well/panel.rs` |
+| Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `sync_editor_cursor`) |
 | Precedent: input-doc surface | `kaijutsu-kernel/src/input_doc.rs` |
 | Compose vim (untouched) | `kaijutsu-app/src/input/vim/` (`mod.rs`, `dispatch.rs`) |
 | Config doc owner | `kaijutsu-kernel/src/config_doc.rs` (`config_context_id`, `first_block_id`) |

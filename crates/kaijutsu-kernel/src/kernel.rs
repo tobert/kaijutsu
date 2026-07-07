@@ -1197,13 +1197,6 @@ impl Kernel {
         Ok(())
     }
 
-    /// Drop the shared [`FileDocumentCache`] shadow for an editor-written
-    /// **config** path, so a kaish `cat` / file tool re-reads the just-edited
-    /// `ConfigCrdtFs` block instead of a stale copy. Config paths get a separate
-    /// `file_context_id` shadow document; a direct editor block write (keyed by
-    /// `config_context_id`) leaves it stale, and the symlink-lstat mtime can't
-    /// self-heal it. Regular-file editors bind the cache's own block, so they
-    /// need no invalidation (a `None`/non-config path is a no-op).
     /// Invalidate the shared [`FileDocumentCache`] shadow for a **config** path
     /// after a write that touched the `ConfigCrdtFs` block **directly** (the vi
     /// editor's block mirror, `kj rc edit/reset/add/rm`, `kj config set/reset`).

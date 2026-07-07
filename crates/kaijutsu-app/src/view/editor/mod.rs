@@ -2,10 +2,11 @@
 //!
 //! The kernel owns the editor session; the app is one *renderer* of it. The
 //! `open_editor` peer signal lands here as [`EditorOpenRequested`], drives
-//! `Screen::Editor`, and stores the live session in [`ActiveEditor`]. The MSDF
-//! panel renderer (fed by the `editor_state` subscription) and key forwarding to
-//! `editor_keys` land in later slices (docs/vi.md steps 4–5); this is the
-//! screen/landing foundation.
+//! `Screen::Editor`, and stores the live session in [`ActiveEditor`]. This
+//! module is also home to the dedicated editor surface renderer (`render`,
+//! fed by the `editor_state` subscription) and key forwarding to
+//! `editor_keys` (`keys`, `editor_dispatch_keys`) — the screen/landing
+//! foundation plus its renderer and forwarder.
 
 use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
@@ -231,8 +232,8 @@ fn editor_dispatch_keys(
     }
 }
 
-/// Wires the editor's screen/landing foundation. The MSDF renderer + key
-/// forwarding are added by later slices (docs/vi.md steps 4–5).
+/// Wires the editor's screen/landing foundation, its dedicated surface
+/// renderer, and key forwarding.
 pub struct EditorPlugin;
 
 impl Plugin for EditorPlugin {
