@@ -763,6 +763,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
        pulses pre-ring, so the M3 clock observer can't be a ring tracker —
        either move filtering to per-tracker cut time or give the observer a
        pre-ring tap in the capture thread; pick deliberately at M3).
+    5. **Estimator re-lock after a tempo step is slow and stall-spammy**
+       (observed 2026-07-07): the EMA `ClockEstimator` keys on the ALSA
+       address, so a restarted master at the same client:port inherits the
+       old regime's state — a 540→100 BPM step took minutes of convergence
+       with "stall observed" warns at ~2 Hz the whole way. A stall episode
+       is strong evidence the source restarted: use it to reseed (or widen
+       alpha on) the estimator instead of easing out of stale state. Real
+       case: a player switching/restarting master clocks mid-session.
 - **Relative-lead timing — open findings from the 2026-07-02 analysis** (the
   substrate verdict + resolved findings live in `docs/midi.md` "The relative-lead
   timebase, analyzed" and `docs/pcm.md`; this is the still-open remainder):
