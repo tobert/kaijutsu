@@ -11,14 +11,24 @@
 use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 use bevy::tasks::IoTaskPool;
-use kaijutsu_client::{EditorState, ServerEvent};
+use kaijutsu_client::{ActorHandle, EditorState, ServerEvent};
 
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
 use crate::input::focus::{ActiveSurface, FocusArea};
 use crate::ui::screen::Screen;
 
 mod keys;
+mod pipe;
 pub mod render;
+
+use pipe::{FailureVerdict, KeyPipe};
+
+/// The ordered outbound keystroke pipe for the active editor session (see
+/// [`pipe`]): one `editor_keys` batch on the wire at a time, everything typed
+/// meanwhile queued behind it in keyboard order, one retry before a reported
+/// drop. Cleared whenever the session ends (close, loss, replacement).
+#[derive(Resource, Default)]
+pub struct EditorKeyPipe(KeyPipe);
 
 /// A kernel `open_editor` signal landed: the submitter ran `vi <path>` and the
 /// kernel opened session `session`. Written by the peer dispatcher
@@ -61,6 +71,7 @@ pub struct EditorSessionView {
 fn handle_editor_open(
     mut events: MessageReader<EditorOpenRequested>,
     mut active: ResMut<ActiveEditor>,
+    mut key_pipe: ResMut<EditorKeyPipe>,
     mut next_screen: ResMut<NextState<Screen>>,
 ) {
     for ev in events.read() {
@@ -68,6 +79,9 @@ fn handle_editor_open(
             "open_editor: session {} on {}",
             ev.state.session, ev.path
         );
+        // A new session replaces the old one; keystrokes queued for the old
+        // session must not leak into it.
+        key_pipe.0.clear();
         active.session = Some(EditorSessionView {
             session: ev.state.session,
             path: ev.path.clone(),
@@ -84,6 +98,7 @@ fn handle_editor_open(
 fn handle_editor_events(
     mut server_events: MessageReader<ServerEventMessage>,
     mut active: ResMut<ActiveEditor>,
+    mut key_pipe: ResMut<EditorKeyPipe>,
     mut next_screen: ResMut<NextState<Screen>>,
 ) {
     for ServerEventMessage(event) in server_events.read() {
@@ -103,6 +118,7 @@ fn handle_editor_events(
                 {
                     info!("editor session {session_id} closed by server");
                     active.session = None;
+                    key_pipe.0.clear();
                     next_screen.set(Screen::Conversation);
                 }
             }
@@ -132,6 +148,7 @@ fn is_session_lost_error(err: &str) -> bool {
 fn handle_editor_session_lost(
     mut results: MessageReader<RpcResultMessage>,
     mut active: ResMut<ActiveEditor>,
+    mut key_pipe: ResMut<EditorKeyPipe>,
     mut next_screen: ResMut<NextState<Screen>>,
 ) {
     for result in results.read() {
@@ -145,16 +162,20 @@ fn handle_editor_session_lost(
         {
             warn!("editor session {session} lost (kernel restarted?); returning to conversation");
             active.session = None;
+            key_pipe.0.clear();
             next_screen.set(Screen::Conversation);
         }
     }
 }
 
-/// Forward keystrokes on `Screen::Editor` to the kernel's `editor_keys`. The app
-/// is a pure key forwarder: it ships one keystroke per call in vi notation and
-/// lets the kernel's `EditorCore` (the real VimMachine) interpret it. The push
-/// channel echoes the resulting state back to [`ActiveEditor`], so the panel
-/// re-renders as you type.
+/// Forward keystrokes on `Screen::Editor` toward the kernel's `editor_keys`.
+/// The app is a pure key forwarder: each keystroke becomes vi notation and
+/// joins the ordered [`EditorKeyPipe`]; [`editor_pump_keys`] ships one batch at
+/// a time so keystrokes can never reorder in flight (burst input — key repeat,
+/// BRP `send_keys` — lands as one coalesced batch). The kernel's `EditorCore`
+/// (the real VimMachine) interprets the keys; the push channel echoes the
+/// resulting state back to [`ActiveEditor`], so the panel re-renders as you
+/// type.
 ///
 /// This replaces the provisional Esc-exits-screen hatch. `Esc` is now an
 /// ordinary key (→ normal mode). `ZZ`/`ZQ` also travel as ordinary keys: the
@@ -166,21 +187,15 @@ fn editor_dispatch_keys(
     mut keyboard: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
     active: Res<ActiveEditor>,
-    actor: Option<Res<RpcActor>>,
-    results: Res<RpcResultChannel>,
+    mut key_pipe: ResMut<EditorKeyPipe>,
     mut next_screen: ResMut<NextState<Screen>>,
     mut focus: ResMut<FocusArea>,
     mut surface: ResMut<ActiveSurface>,
 ) {
-    let Some(view) = active.session.as_ref() else {
+    if active.session.is_none() {
         keyboard.clear();
         return;
-    };
-    let Some(actor) = actor.as_ref() else {
-        keyboard.clear();
-        return;
-    };
-    let session = view.session;
+    }
 
     for event in keyboard.read() {
         if !event.state.is_pressed() {
@@ -199,7 +214,9 @@ fn editor_dispatch_keys(
         // intercept (no kernel round-trip), so it also frees a frozen editor when
         // the kernel is unreachable — the escape hatch. (The Action-system
         // Ctrl+Z↔ToggleSurface is suppressed on `Screen::Editor`, so there is no
-        // double-handling.) The buffer isn't forwarded `<C-z>`.
+        // double-handling.) The buffer isn't forwarded `<C-z>`. Keys queued
+        // before the suspend stay in the pipe — the pump runs ungated, so they
+        // still deliver to the live (suspended) session.
         if ctrl && event.key_code == KeyCode::KeyZ {
             next_screen.set(Screen::Conversation);
             *focus = FocusArea::Compose;
@@ -207,29 +224,113 @@ fn editor_dispatch_keys(
             return;
         }
 
-        let Some(notation) = keys::bevy_to_vi_notation(event, ctrl) else {
+        if let Some(notation) = keys::bevy_to_vi_notation(event, ctrl) {
+            key_pipe.0.push(&notation);
+        }
+    }
+}
+
+/// Ship one `editor_keys` batch from the pipe, if the wire is free. Runs
+/// ungated (not `Screen::Editor`-only) so keystrokes queued just before a
+/// Ctrl+Z suspend still deliver; it no-ops with no session or an empty pipe.
+fn editor_pump_keys(
+    active: Res<ActiveEditor>,
+    mut key_pipe: ResMut<EditorKeyPipe>,
+    actor: Option<Res<RpcActor>>,
+    results: Res<RpcResultChannel>,
+) {
+    let Some(view) = active.session.as_ref() else {
+        return;
+    };
+    let Some(actor) = actor.as_ref() else {
+        return;
+    };
+    if let Some(batch) = key_pipe.0.take_batch() {
+        ship_batch(actor.handle.clone(), view.session, batch, &results);
+    }
+}
+
+/// Advance the pipe on an in-flight batch's outcome: success releases the next
+/// batch (the pump ships it next frame); a transient failure retries the same
+/// batch once, then drops it loudly. Session-lost failures arrive as
+/// [`RpcResultMessage::EditorSessionLost`] instead and clear the pipe via
+/// [`handle_editor_session_lost`].
+fn handle_editor_keys_outcome(
+    mut messages: MessageReader<RpcResultMessage>,
+    active: Res<ActiveEditor>,
+    mut key_pipe: ResMut<EditorKeyPipe>,
+    actor: Option<Res<RpcActor>>,
+    results: Res<RpcResultChannel>,
+) {
+    for message in messages.read() {
+        let RpcResultMessage::EditorKeysOutcome { session, ok } = message else {
             continue;
         };
-        let handle = actor.handle.clone();
-        let tx = results.sender();
-        IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.editor_keys(session, &notation).await {
+        // A stale outcome from a replaced session must not advance the new
+        // session's pipe (the open handler already cleared it).
+        if !active.session.as_ref().is_some_and(|v| v.session == *session) {
+            continue;
+        }
+        if *ok {
+            key_pipe.0.on_success();
+            continue;
+        }
+        match key_pipe.0.on_failure() {
+            FailureVerdict::Retry(batch) => {
+                if let Some(actor) = actor.as_ref() {
+                    info!("editor_keys({session}): retrying failed batch {batch:?}");
+                    ship_batch(actor.handle.clone(), *session, batch, &results);
+                } else {
+                    // No actor to retry on (mid-reconnect); the batch is gone.
+                    key_pipe.0.clear();
+                    warn!("editor_keys({session}): dropped batch {batch:?} — no connection");
+                }
+            }
+            FailureVerdict::Dropped(batch) => {
+                // Never a silent drop: the keystrokes are lost, say so. An
+                // in-editor surface for this (the strip is kernel-owned) is
+                // part of the transient-error UX in docs/issues.md.
+                warn!(
+                    "editor_keys({session}): dropped batch {batch:?} after retry — \
+                     keystrokes lost; buffer state re-syncs on the next push"
+                );
+            }
+        }
+    }
+}
+
+/// Spawn the async send of one keystroke batch. The outcome comes back over the
+/// [`RpcResultChannel`]: `EditorKeysOutcome` for success/transient failure, or
+/// `EditorSessionLost` when the kernel disowned the session (a restart) — the
+/// "frozen editor" trap, which pops the editor instead of retrying.
+fn ship_batch(
+    handle: ActorHandle,
+    session: u64,
+    batch: String,
+    results: &RpcResultChannel,
+) {
+    let tx = results.sender();
+    IoTaskPool::get()
+        .spawn(async move {
+            match handle.editor_keys(session, &batch).await {
+                Ok(_state) => {
+                    // The new state arrives via the editor push subscription; a
+                    // `ZZ`/`ZQ` instead arrives as an `EditorClosed` push.
+                    let _ = tx.send(RpcResultMessage::EditorKeysOutcome { session, ok: true });
+                }
+                Err(e) => {
                     let msg = e.to_string();
-                    warn!("editor_keys({session}, {notation:?}) failed: {msg}");
-                    // A `no such session` verdict means the kernel restarted out
-                    // from under us — report it so the main thread drops the dead
-                    // editor and pops to the conversation (the "frozen editor"
-                    // trap). A transient error leaves the editor in place.
+                    warn!("editor_keys({session}, {batch:?}) failed: {msg}");
                     if is_session_lost_error(&msg) {
                         let _ = tx.send(RpcResultMessage::EditorSessionLost { session });
+                    } else {
+                        let _ =
+                            tx.send(RpcResultMessage::EditorKeysOutcome { session, ok: false });
                     }
                 }
-                // The new state arrives via the editor push subscription; a
-                // `ZZ`/`ZQ` instead arrives as an `EditorClosed` push.
-            })
-            .detach();
-    }
+            }
+        })
+        .detach();
 }
 
 /// Wires the editor's screen/landing foundation, its dedicated surface
@@ -240,6 +341,7 @@ impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<EditorOpenRequested>()
             .init_resource::<ActiveEditor>()
+            .init_resource::<EditorKeyPipe>()
             .add_systems(
                 Update,
                 (
@@ -250,9 +352,18 @@ impl Plugin for EditorPlugin {
             )
             .add_systems(OnEnter(Screen::Editor), render::spawn_editor_panel)
             .add_systems(OnExit(Screen::Editor), render::despawn_editor_panel)
+            // Chained so one frame can consume an outcome, enqueue fresh keys,
+            // and ship the next batch. Only dispatch is editor-screen-gated:
+            // the outcome/pump pair runs ungated so keys queued right before a
+            // Ctrl+Z suspend still deliver (they no-op when idle).
             .add_systems(
                 Update,
-                editor_dispatch_keys.run_if(in_state(Screen::Editor)),
+                (
+                    handle_editor_keys_outcome,
+                    editor_dispatch_keys.run_if(in_state(Screen::Editor)),
+                    editor_pump_keys,
+                )
+                    .chain(),
             )
             // The surface build needs ComputedNode, so it runs post-layout; the
             // cursor sync reads the geometry the build just computed.

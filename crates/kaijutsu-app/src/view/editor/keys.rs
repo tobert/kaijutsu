@@ -3,9 +3,10 @@
 //! The app is a *key forwarder*: it does not run a VimMachine (the kernel's
 //! `EditorCore` does). Each keystroke becomes a notation string that
 //! `EditorCore::apply_keys` / `parse_keys` understands — a literal char, or a
-//! named/chorded token like `<Esc>`, `<CR>`, `<BS>`, `<Tab>`, `<C-w>`. We send
-//! one keystroke per `editor_keys` call and rely on the editor push channel to
-//! echo the resulting state back to the renderer.
+//! named/chorded token like `<Esc>`, `<CR>`, `<BS>`, `<Tab>`, `<C-w>`.
+//! Keystrokes ride the ordered `EditorKeyPipe` (one `editor_keys` batch on the
+//! wire at a time — see `super::pipe`), and the editor push channel echoes the
+//! resulting state back to the renderer.
 //!
 //! This is deliberately distinct from `input::vim::keyconv` (which builds a
 //! modalkit `TerminalKey` for the *local* compose VimMachine): here the target

@@ -177,6 +177,12 @@ pub enum RpcResultMessage {
     /// so a restart is invisible at the connection layer). Drained by
     /// `view::editor` to drop the stale session and pop back to the conversation.
     EditorSessionLost { session: u64 },
+    /// An in-flight `editor_keys` batch resolved: `ok` on a normal return,
+    /// `!ok` on a *transient* failure (a session-lost failure sends
+    /// [`EditorSessionLost`](Self::EditorSessionLost) instead). Drained by
+    /// `view::editor` to advance its ordered keystroke pipe — ship the next
+    /// batch, or retry/drop the failed one.
+    EditorKeysOutcome { session: u64, ok: bool },
     /// The per-client metronome config (`/etc/client/<id>/metronome.toml`,
     /// cascading to the shared `/etc/client/metronome.toml`), fetched over RPC on
     /// (re)connect. Drained by [`crate::metronome::apply_metronome_config`] into
