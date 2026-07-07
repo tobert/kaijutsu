@@ -51,10 +51,13 @@ reality** ("distribute intent, not pulses" applied to routing):
 
 ## The scene (decided direction, waves 1–3)
 
-Canonical references: `docs/scenes/concepts/14-patchbay-circle.png` (the
-form) and `18-patchbay-circle-vr.png` (the UI grammar — a VR frame, but
-everything in it except the hand carries over). The wall-of-jacks
-(`11-patchbay-wall.png`) is the *shell-bearing* read, not the dive scene.
+Canonical reference: `docs/scenes/concepts/14-patchbay-circle.png` (the
+form — Amy's pick). Two culled mockups live on in prose: a VR frame
+contributed the dive scene's UI grammar (specified below — everything
+carried over except the hand), and a wall-of-jacks mockup set the
+*shell-bearing* read: brass jack fields under sigil labels, strung with a
+living thread-web — mood at distance, never the dive interface
+(`docs/scenes/shell.md`, bearings table).
 
 - **A circle matrix on a round table.** Brass endpoint sockets around the
   rim, short ALL-CAPS holographic labels (RENDER, METRONOME, GM SYNTH,
@@ -71,15 +74,22 @@ everything in it except the hand carries over). The wall-of-jacks
     hand patch, rendered *warm*, never as an alarm.
   - Slice 0 has no declared layer, so every wire renders observed-solid.
 - **Selection**: a chord highlights and a small inspection card blooms at
-  the chord itself (source → dest, port details, activity). Edge HUD in the
-  well's grammar: breadcrumb ribbon top (`HOME > STUDIO > PATCH BAY > …`),
-  smoked-glass detail panel right, legend strip bottom.
+  the chord itself — source → dest plus live facts, e.g.
+  `SYNTH → RENDER · clip SYNTH_01 · 4s · −3 dB`. Edge HUD in the well's
+  grammar: breadcrumb ribbon top (`HOME > STUDIO > PATCH BAY > SYNTH`),
+  smoked-glass detail panel right, legend strip bottom — all curved
+  world-space glass at comfortable angles, never flat screen-space
+  overlays.
 - **No hands** (charter, post-wave-3): interaction animates the wire itself —
   a wire being connected draws itself socket-to-socket; disconnection
   dissolves it.
 - **In the shell**: the patch bay's bearing shows the wall-of-threads as
   ambient telemetry — threads flicker when MIDI flows, even unvisited.
-  Diving cuts to the circle scene (charter dive-through rule).
+  Diving cuts to the circle scene (charter dive-through rule). The routing
+  state also reaches the shell **floor**: live wires render as
+  circuit-board traces inlaid in the room floor, bowing around the central
+  well — this station's open-center rule at room scale (`shell.md`, "The
+  floor is the wiring").
 - **Live activity**: traffic pulses travel the chord when events flow
   (same event-driven material-lane trick as the well's chatter/beat lanes —
   no texture rebuilds).
@@ -125,9 +135,9 @@ note). Additive only: never disconnects anything. No scene dependency.
 
 ### Slice 3 — PipeWire fabric
 
-The PCM/audio graph joins, as the cyan ring — mockup
-`16-patchbay-topology-tworing.png` (inner MIDI ring, outer audio ring,
-ember bridge-chords where a synth converts) is the layout candidate.
+The PCM/audio graph joins, as the cyan ring — the layout candidate is a
+two-ring matrix: inner MIDI ring, outer audio ring, ember bridge-chords
+crossing between them where a synth turns MIDI into sound.
 pawlsa overlap noted: it's an existing *imperative* PipeWire surface with no
 owner/reconciler; slice 3 is where ownership questions get real.
 

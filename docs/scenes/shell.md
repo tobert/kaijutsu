@@ -5,8 +5,10 @@ one continuous room that holds the stations (`docs/scenes/README.md`,
 "Topology: shell + dives"). It is **not a station** — it has no data shape of
 its own; its job is orientation, ambient awareness, and travel. Canonical
 concept: `docs/scenes/concepts/01-shell-atrium.png` (Amy: "the atrium
-*rules*"), with `02-shell-overhead.png` as the map reading and
-`04-shell-palette.png` holding the hand-free tool-tray framing.
+*rules*") and `05-shell-floorflows-nano.png` (the assembled room:
+bearings occupied, engraved nameplates, the rainbow trace floor bowing
+around the console). Other companion mockups live in the story archive;
+everything they taught is prose in this doc.
 
 ## The Tardis reading
 
@@ -48,16 +50,30 @@ shell is built:
 | Bearing | Occupant | Shell rendering (ambient) |
 |---|---|---|
 | center | Time well (station #1) | itself — the console |
-| W | Patch bay | the wall-of-threads (mockup 11): thread-web flickers as MIDI/PCM flows |
-| E | Track transport | the vertical beat highway (mockup 33) seen side-on; notes fall while tracks play |
+| W | Patch bay | the wall-of-threads: brass jack fields under sigil labels, strung with a living web of crimson (MIDI) and cyan (PCM) threads that flicker as traffic flows |
+| E | Track transport | the vertical beat highway (mockup 33) seen side-on; notes fall toward the strike bar only while a track plays |
 | N | VFS / rc library | an **archway** opening onto the fsn landscape (mockup 43), dimmed to horizon glow |
 | S | *(reserved)* | future: MCP broker switchboard / LLM engine room |
-| overhead | Drift / mailboxes | not a bearing — **the air**: particle arcs over the well rim (mockup 22) |
+| overhead | Drift / mailboxes | not a bearing — **the air**: slow aurora-like particle arcs high over the well rim, one arc per block in flight |
 
 The conversation view (station #0) has **no bearing**: it is reached by
 diving *through a context card* (the Join transition, mockup 34 of the
 time-well set) — conversations live inside contexts, and the geometry says
 so.
+
+## The floor is the wiring (Amy, 2026-07-07)
+
+The floor's inscribed geometry is **functional, not decorative**:
+station-to-station flows render as glowing circuit-board traces inlaid in
+the black floor — a rainbow board, one hue family per fabric (crimson
+MIDI, cyan PCM, more hues as new flow types earn them) — every trace
+routed *around* the central well, never under it: the patch bay's
+open-center rule at room scale. The two flow layers never mix (the
+time-well's oldest visual-grammar rule): **the air carries drift**
+(context-to-context blocks, sparse aurora arcs), **the floor carries
+plumbing** (station-to-station system flows — audio routing first,
+broker/tool traffic later if it earns a hue). At rest a trace is an LDR
+engraving; it lights HDR and runs only while its flow is live.
 
 ## Ambient telemetry rules
 
@@ -87,8 +103,46 @@ budget discipline:
 - **Travel by intent** (charter): arrows/tab cycle bearings, Enter dives;
   the camera dollies continuously so spatial relationships register. No
   free-flight, no walking.
-- The overhead map (mockup 02) is the future minimap/orientation reading of
-  the same geometry — a rendering, not a second model.
+- A future minimap/orientation surface renders the same geometry as an
+  overhead compass-rose floor plan — station markers at their bearings,
+  the well glowing at center, the player's position a dot. A rendering of
+  the one model, never a second model.
+
+## Learnings from the combined-composition wave (2026-07-07)
+
+A four-model shootout rendered the full room — every bearing occupied, one
+identical prompt — and settled several things:
+
+- **The composition works.** Well-as-console at center, thread-wall W,
+  highway E, archway N with the data-city horizon, aurora overhead: all
+  four models produced a coherent, legible room from that spec. The
+  bearings table above is buildable as written.
+- **Drift is aurora, not web.** The air layer reads right as a few slow,
+  high arcs; one model rendered it as a spidery mid-air web and the room
+  immediately felt haunted rather than alive. Keep drift sparse, high,
+  and slow.
+- **Station signage, adopted as an idea**: one model spontaneously hung
+  in-world nameplates over the bearings ("BEAT HIGHWAY"). Nameplates at
+  each bearing — instrument-engraved, not floating UI — are the cheap
+  learnability device for a first-time visitor, and they match the well's
+  existing nameplate grammar. Fold into slice A.
+- **The rank rail keeps being rediscovered.** Multiple models, unprompted,
+  furnished the well table's edge with control panels — external
+  confirmation that the table-edge control ring (mockup 27's insight, the
+  Stage-2 rank rail in `docs/timewell.md`) is where hands expect controls
+  to live.
+- **The dial on the kept frame** (Amy): the Imagen render of the combined
+  room was "otherwise perfect" except an overgrown modular-synth cable
+  jungle dominating the west wall — the shell-bearing read of the patch
+  bay should be *restrained* (a few elegant threads over jack fields),
+  with the routing story moved down into the floor traces instead. That
+  dial produced the floor-is-the-wiring direction above — and the kept
+  render (mockup 05) confirmed it composes: the patch panel's wall
+  threads drop and *become* floor traces (wall-to-floor continuity worth
+  building literally), and the model volunteered engraved station
+  nameplates with names good enough to steal — "PATCH BAY WEST",
+  "DATA HORIZON NORTH", "RHYTHM GATE EAST" (naming candidates, not
+  decisions).
 
 ## Build path
 

@@ -9,10 +9,12 @@ IRIX — the "It's a UNIX system! I know this!" scene in Jurassic Park. A
 flying view over a dark plane where directories are pedestals, files are
 blocks standing on them, and luminous avenues connect parent to child.
 The homage is deliberate; the palette is ours (Arcane Techmage). Canonical
-concepts: `docs/scenes/concepts/43-vfs-fsn-landscape.png` (the landscape),
-`44-vfs-fsn-node.png` (one directory up close), `46-vfs-fsn-diorama-vr.png`
-(kept for its LOD-as-interaction reading — the pinch-to-upgrade moment,
-minus the hand per the charter's presence rule).
+concept: `docs/scenes/concepts/43-vfs-fsn-landscape.png`. Two culled
+companions live on in prose: a close-up of one directory platform — full
+slabs, brass trim, a floating glyph label, avenues arcing down to child
+platforms — is the near-LOD tier made concrete; and a diorama frame whose
+lesson is LOD-as-interaction: the selected platform blooms upward into
+full detail while the rest of the city stays cheap translucent blocks.
 
 ## What the station shows
 
@@ -46,7 +48,8 @@ is unbounded: **near is rich, far is cheap, approach upgrades.**
   simple glowing blocks; far ones are points on the grid. Same instancing
   strategy as the well's aspirational tiers (`MeshTag` + shared material).
 - Detail upgrade is driven by camera distance *and* by attention: the
-  selected platform blooms regardless of distance (mockup 46's moment).
+  selected platform blooms regardless of distance — swelling into full
+  slabs and label while its neighbors stay blocks.
 - Budget rule inherited from the charter: the landscape must idle cheap on
   a battery laptop — the grid, avenues, and far tiers are the whole scene
   until the player moves.
@@ -65,7 +68,7 @@ rc edits, mounts appearing). Diving steps through the arch onto the plane.
 - **Select** a slab → floating hologram preview (the existing file read
   surfaces); **dive** → the vi editor session on that file (`docs/vi.md`)
   — the landscape is plausibly vi's spatial front door.
-- The overview/diorama reading (46) may become the dive's entry framing:
+- The overview/diorama reading may become the dive's entry framing:
   arrive above the whole plane, then descend. Undecided.
 
 ## Open questions

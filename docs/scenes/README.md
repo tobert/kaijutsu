@@ -77,7 +77,9 @@ ghost-hand variants: **no hands**. Manipulations animate the *thing itself*
 (the wire plugs itself in, the card blooms), never a disembodied limb.
 
 - **Tilt-Brush-style tool palette** stays open as a *hand-free* floating
-  tray (mockup 04's framing), diegetic rather than HUD.
+  tray: a diegetic tool tray of implements floating low in the player's
+  view — each tool seated in its own inscribed socket — never a
+  screen-space HUD.
 - **VR is shelved for now** (wave 3 verdict). Durable findings kept from the
   wave: the edge-HUD grammar translates cleanly to curved world-space glass,
   and at VR scale the grand atrium naturally shrinks to a Tardis
@@ -157,11 +159,12 @@ when that doc exists.
   upgrades as the viewer approaches. This is also the budget-discipline rule
   made concrete for the one station whose population is unbounded.
 - **VR wave verdict** (wave 3): declined for now — the hands metaphor in
-  particular (see Presence). What survived the wave: mockup 18's UI grammar
-  (open-center table, breadcrumb ribbon, detail panel, inspection card at
-  the wire) is the patch bay reference *minus the hand*; LOD-as-interaction
-  (mockup 46) read perfectly; and the console-room scale finding is kept
-  for a future VR return.
+  particular (see Presence). What survived the wave, now specified in
+  prose: the patch bay's dive-scene UI grammar (open-center table,
+  breadcrumb ribbon, detail panel, inspection card at the wire — see
+  `patchbay.md`, minus the hand); LOD-as-interaction (a touched platform
+  blooming to full detail while the rest stays cheap — see `vfs.md`); and
+  the console-room scale finding, kept for a future VR return.
 
 ## Concepting process
 
@@ -172,9 +175,12 @@ Banana Pro), browse, argue, keep the winners. Concepts land in
 
 - `0x` shell room · `1x` patch bay · `2x` drift/mailboxes · `3x` tracks
   dais · `4x` VFS library · `5x+` new stations as inventoried
-- Non-keepers get culled from the repo once a direction is decided (the
-  time-well set kept only the canonical winner); record keeper prompts in
-  the station's design doc.
+- **The repo keeps one canonical image per decided station** (the
+  time-well precedent — it kept only mockup 27). Everything a culled
+  mockup taught must be carried by the design docs' *prose* before it
+  goes: the docs are what guide the builder models. Culled mockups move
+  to Amy's story archive (`~/kj-junk`), not the trash; keeper prompts are
+  recorded in the station's design doc for regeneration.
 
 ## Relationship to the other docs
 
