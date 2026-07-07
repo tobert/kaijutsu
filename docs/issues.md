@@ -345,7 +345,9 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **Vi editor command mode (Slice 3, `docs/vi.md`) — steps 1–3 shipped; open
   remainders:** runner-verify the slice-3 polish (capnp `@6` ⇒ kernel+app
   rebuild+restart; eyeball `:r !cmd` splice, bad-`:cmd` E492 on the strip, `fg`
-  from a second window); **step 4 `:e <path>`** (rebind the session to another
+  from a second window; also the 2026-07-07 error-channel unification —
+  dirty-`:q` E37 and a failed `:r` must show on the strip, not vanish);
+  **step 4 `:e <path>`** (rebind the session to another
   block) deferred; the Ctrl+Z shell may become a **shadow context** (its own
   design pass; `project_shadow_context_shell` memory).
 - **Vi editor — residual `config_owned` prefix on the cache-invalidation path.**
