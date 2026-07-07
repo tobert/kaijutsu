@@ -14,7 +14,7 @@ use crate::editor::{EditorSessionId, EditorState};
 #[derive(Parser, Debug)]
 #[command(
     name = "editor",
-    about = "Drive kernel-owned vi editor sessions (open/keys/state/save/quit)",
+    about = "Drive kernel-owned vi editor sessions (open/keys/state/save/quit/list)",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -52,6 +52,8 @@ enum EditorCommand {
         /// Session handle.
         session: u64,
     },
+    /// List open editor sessions (session, path, dirty, mode, opener).
+    List,
 }
 
 /// Structured `.data` for one session's state — an object (inspect-style), so
@@ -156,15 +158,47 @@ impl KjDispatcher {
                     Err(e) => KjResult::Err(format!("kj editor quit: {e}")),
                 }
             }
+            EditorCommand::List => {
+                let sessions = kernel.editor_list();
+                let line = if sessions.is_empty() {
+                    "no open editor sessions".to_string()
+                } else {
+                    sessions
+                        .iter()
+                        .map(|s| {
+                            let modified = if s.dirty { " [modified]" } else { "" };
+                            let opener = s
+                                .opener
+                                .as_deref()
+                                .map(|o| format!(" (opener {o})"))
+                                .unwrap_or_default();
+                            format!(
+                                "session {}: {}{modified} {}{opener}",
+                                s.session,
+                                s.path,
+                                mode_label_of(s.mode.as_deref()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let data = serde_json::to_value(&sessions)
+                    .expect("EditorSessionInfo serializes");
+                KjResult::ok_with_data(line, data)
+            }
         }
     }
 }
 
 /// Human label for the vim mode banner (`None` == normal).
 fn mode_label(st: &EditorState) -> &str {
-    st.mode
-        .as_deref()
-        .map(str::trim)
+    mode_label_of(st.mode.as_deref())
+}
+
+/// Shared mode-word formatting for anything carrying an `Option<String>` mode
+/// (an [`EditorState`] or a listed [`crate::editor::EditorSessionInfo`]).
+fn mode_label_of(mode: Option<&str>) -> &str {
+    mode.map(str::trim)
         .map(|s| s.trim_matches('-').trim())
         .unwrap_or("NORMAL")
 }
@@ -242,5 +276,30 @@ mod tests {
             Some("hello"),
             "kj editor quit must roll the rc doc back to the checkpoint"
         );
+    }
+
+    /// `kj editor list` is the census: an open session, however it was
+    /// opened, must show up with its session id and path.
+    #[tokio::test]
+    async fn kj_editor_list_reports_the_open_session() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c)
+            .await;
+        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let id = session_of(&opened);
+
+        let listed = d.dispatch(&[s("editor"), s("list")], &c).await;
+        match listed {
+            KjResult::Ok { data: Some(dd), .. } => {
+                let arr = dd.as_array().expect("list data is a JSON array");
+                assert_eq!(arr.len(), 1, "one open session");
+                assert_eq!(arr[0]["path"], P);
+                assert_eq!(arr[0]["session"], id);
+            }
+            other => panic!("expected ok-with-data, got {other:?}"),
+        }
     }
 }

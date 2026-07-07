@@ -124,6 +124,25 @@ use std::collections::HashMap;
 
 use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo};
 
+/// A one-line census entry for an open session — what `kj editor list` shows.
+/// Full ids (never truncated), matching the `.data` convention every other
+/// `kj` list surface uses (`kj block list`, `kj doc list`, …) so a driver can
+/// round-trip these back into other kj commands without re-resolving.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EditorSessionInfo {
+    pub session: u64,
+    pub path: String,
+    /// Full id string of the target document (`ContextId::to_hex`).
+    pub context_id: String,
+    /// Full id string of the target block (`BlockId::to_key`).
+    pub block_id: String,
+    /// Whether the buffer differs from the last open/save checkpoint.
+    pub dirty: bool,
+    pub mode: Option<String>,
+    /// Full id string of the opener's principal, `None` for a headless open.
+    pub opener: Option<String>,
+}
+
 /// The result of feeding a key batch to a session via [`EditorSessions::keys`].
 #[derive(Debug)]
 pub enum KeysOutcome {
@@ -616,6 +635,29 @@ impl EditorSessions {
     /// Whether a session is still open.
     pub fn is_open(&self, id: EditorSessionId) -> bool {
         self.sessions.contains_key(&id)
+    }
+
+    /// A census of every open session — `kj editor list`'s data. A session
+    /// whose opener walked away (a model that opened and never quit, a dead
+    /// headless driver) is otherwise invisible and immortal; this makes it
+    /// visible. No GC/eviction here — observability first, judgment later.
+    /// Sorted by session id ascending (open order).
+    pub fn list(&self) -> Vec<EditorSessionInfo> {
+        let mut out: Vec<EditorSessionInfo> = self
+            .sessions
+            .iter()
+            .map(|(id, s)| EditorSessionInfo {
+                session: id.as_u64(),
+                path: s.path.clone(),
+                context_id: s.target.context_id.to_hex(),
+                block_id: s.target.block_id.to_key(),
+                dirty: s.core.text() != s.saved_content,
+                mode: s.core.mode(),
+                opener: s.opener.map(|o| o.principal.to_hex()),
+            })
+            .collect();
+        out.sort_by_key(|info| info.session);
+        out
     }
 }
 
@@ -1335,6 +1377,60 @@ mod session_tests {
             sessions.latest_session_for(me).map(|(id, _)| id),
             Some(b),
             "a None-opener session doesn't become anyone's fg target"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_censuses_every_open_session_by_id_dirty_and_opener() {
+        // `kj editor list`'s data source: a leaked session (an opener who
+        // walked away) must show up here, since there is no other way to see
+        // it. Two sessions on the same block, only one dirtied — and without
+        // a reconcile the sibling's own buffer stays untouched (that's the
+        // reconcile-is-a-separate-step invariant `reconcile_skips_self_write_
+        // and_merges_a_sibling` covers; here we're only checking `list()`).
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+
+        sessions.keys(a, "iX<Esc>", &blocks).unwrap(); // -> "Xhello", dirties A only
+
+        let list = sessions.list();
+        assert_eq!(list.len(), 2, "both sessions are open");
+        assert_eq!(list[0].session, a.as_u64(), "sorted by session id ascending");
+        assert_eq!(list[1].session, b.as_u64());
+        assert_eq!(list[0].path, RC_PATH);
+        assert_eq!(list[1].path, RC_PATH);
+        assert!(list[0].dirty, "A diverged from its checkpoint");
+        assert!(
+            !list[1].dirty,
+            "B's stale buffer hasn't been reconciled, but it hasn't been \
+             touched either — dirty compares B's own buffer to B's own \
+             checkpoint, both still \"hello\""
+        );
+
+        sessions.quit(a, &blocks).unwrap();
+        let list = sessions.list();
+        assert_eq!(list.len(), 1, "quitting A leaves only B");
+        assert_eq!(list[0].session, b.as_u64());
+
+        // Opener round-trips into the record; a headless (None) session
+        // reports no opener.
+        assert!(list[0].opener.is_none(), "B was opened headless");
+        let opener = Some(EditorOpener {
+            principal: PrincipalId::system(),
+            context_id: ContextId::new(),
+            session_id: SessionId::new(),
+        });
+        let (c, _) = sessions.open(RC_PATH, target, &blocks, opener).unwrap();
+        let c_info = sessions
+            .list()
+            .into_iter()
+            .find(|s| s.session == c.as_u64())
+            .expect("the just-opened session is in the census");
+        assert!(
+            c_info.opener.is_some(),
+            "an opened-with-opener session reports one"
         );
     }
 }

@@ -1163,6 +1163,11 @@ impl Kernel {
         self.editor_sessions.lock().0.state(id)
     }
 
+    /// A census of every open editor session — `kj editor list`'s data source.
+    pub fn editor_list(&self) -> Vec<crate::editor::EditorSessionInfo> {
+        self.editor_sessions.lock().0.list()
+    }
+
     /// `ZZ` — checkpoint the session's buffer as saved. Publishes the now-clean
     /// state (dirty flips false) so renderers reflect the save.
     pub fn editor_save(
