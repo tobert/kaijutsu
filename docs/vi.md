@@ -323,9 +323,10 @@ push channel; the app renders it read-only.
 ### The dialect
 
 - **Core verbs:** `:w :q :wq :q! :x :w!`. `:q` on a dirty buffer **refuses**
-  (vim "No write since last change"); `:q!` discards and rolls the block back;
-  `:wq`/`:x` save-then-close; `:w` saves and stays. `:w!` == `:w` (force is
-  reserved — see Open).
+  on the status line (vim's E37 "No write since last change"); `:q!` discards
+  and rolls the block back (when provably alone — see Rollback's entanglement
+  guard); `:wq`/`:x` save-then-close; `:w` saves and stays. `:w!` == `:w`
+  (force is reserved — see Open).
 - **Substitute:** `:s/old/new/`, `:%s/…/…/`, `:N,Ms/…/…/`. Hand-rolled
   (modalkit's `vim_cmd_substitute` is an explicit stub). **The dialect is Rust
   regex + Rust replacement syntax** (`$1` capture refs) — a deliberate choice
@@ -340,8 +341,8 @@ push channel; the app renders it read-only.
   rc lifecycle use) and splices the command's stdout — both **at the cursor**
   (not vim's linewise-below; simpler, refine later). These are the async
   intents (`EditorIo::{ReadFile, ReadShell}` via `take_io()`); a missing file,
-  denied/failed command, or unfulfilled intent fails loud, never a silent
-  no-op.
+  denied/failed command, or unfulfilled intent fails loud **on the `:` status
+  line** (the session stays open), never a silent no-op.
 - **No `:!`, deliberately.** It was the entire source of complexity — nested
   editor sessions, a return stack, ephemeral-block lifecycle. The **shell is
   already a surface a keystroke away**: **Ctrl+Z** (a local app intercept —
@@ -352,10 +353,16 @@ push channel; the app renders it read-only.
   existing `open_editor` signal). vim only grew `:!` because it had nowhere
   else to go; kaijutsu does. (`:%!filter` is also out of scope; the shell
   filters.)
-- **Errors report on the `:` line.** An unknown command or bad `:s` regex sets
-  the transient `EditorState.message` (vim's E492) and keeps the session open,
-  instead of erroring `editor_keys` out from under the renderer; it clears on
-  the next keystroke batch.
+- **Errors report on the `:` line.** Every **dialect-level** failure — an
+  unknown command (E492), a bad `:s` regex, a dirty-buffer `:q` refusal (E37),
+  a failed `:r` (missing file, denied/failed command, no opener) — sets the
+  transient `EditorState.message` and keeps the session open; it clears on the
+  next keystroke batch. Hard `editor_keys` errors are **reserved for
+  session/infrastructure failures** (no such session, a CRDT mirror failure) —
+  the app's session-lost detection keys on exactly that distinction, and a
+  dialect failure surfaced as an RPC error never reached the GUI at all (the
+  app only logs it) while the un-pushed state left the `:`-strip showing the
+  stale submitted line (unified 2026-07-07).
 
 Related separate thread (not part of this): the Ctrl+Z shell may become a
 **shadow context** whose blocks are excluded from the conversation until

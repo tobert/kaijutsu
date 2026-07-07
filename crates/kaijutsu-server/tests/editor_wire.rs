@@ -298,6 +298,36 @@ fn unknown_colon_command_reports_on_the_status_line_over_the_wire() {
 }
 
 #[test]
+fn dirty_quit_refusal_reports_on_the_status_line_over_the_wire() {
+    // The error-channel unification (2026-07-07): `:q` on a dirty buffer refuses
+    // on the STATUS LINE (vim E37), not as an RPC error — a hard error never
+    // reached the GUI, and with no state push the `:`-strip kept the stale `:q`.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+
+        kernel.editor_keys(session, "iZ<Esc>").await.unwrap(); // dirty
+        let after = kernel
+            .editor_keys(session, ":q<CR>")
+            .await
+            .expect("a dirty :q does not error the RPC");
+        let msg = after.message.expect("the refusal rode the state");
+        assert!(msg.contains("No write since last change"), "got: {msg}");
+        assert_eq!(after.command_line, None, "the stale :q line is gone");
+
+        // Session alive; `:q!` discards (rolls back — sole session) and closes.
+        kernel
+            .editor_keys(session, ":q!<CR>")
+            .await
+            .expect(":q! closes the refused session");
+    });
+}
+
+#[test]
 fn colon_r_reads_a_file_into_the_buffer_over_the_wire() {
     // Slice 3: `:r <file>` fetches content (VFS) inside the now-async editor_keys
     // and splices it at the cursor. Read the editor's own seeded file into itself

@@ -412,7 +412,8 @@ impl EditorSessions {
 
     /// Act on a parsed `:`-command batch (`docs/vi.md` → *Command mode*). `Write`
     /// checkpoints and stays open; `Quit` closes — refusing a dirty buffer
-    /// without `!` (vim's "No write since last change"). `[Write, Quit]` (`:wq`)
+    /// without `!` (vim's E37 "No write since last change", reported on the
+    /// status line like every dialect-level failure). `[Write, Quit]` (`:wq`)
     /// saves-clean then closes. Returns [`KeysOutcome::Closed`] if a `Quit` ran,
     /// else [`KeysOutcome::Updated`] with the post-save state.
     fn run_commands(
@@ -432,11 +433,15 @@ impl EditorSessions {
                     saved_state = Some(self.save(id)?);
                 }
                 CommandRequest::Quit { force } => {
-                    let state = self.state(id)?;
+                    let mut state = self.state(id)?;
                     if !force && state.dirty {
-                        return Err(
-                            "No write since last change (add ! to override)".to_string()
-                        );
+                        // A dialect-level refusal, not an RPC failure: ride the
+                        // status line (like E492) and keep the session open. A
+                        // hard error here never reaches the GUI and leaves the
+                        // renderer's `:`-strip showing the stale submitted line.
+                        state.message =
+                            Some("No write since last change (add ! to override)".to_string());
+                        return Ok(KeysOutcome::Updated(state));
                     }
                     self.quit(id, blocks)?;
                     return Ok(KeysOutcome::Closed(state));
@@ -1117,17 +1122,38 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn colon_q_refuses_a_dirty_buffer() {
-        // Plain `:q` on unsaved changes must fail loud (vim's "No write since
-        // last change"), not silently lose the edit.
+    async fn colon_q_refuses_a_dirty_buffer_on_the_status_line() {
+        // Plain `:q` on unsaved changes refuses (vim's E37 "No write since last
+        // change") — reported on the STATUS LINE like E492, not as an RPC error:
+        // a hard error never reaches the GUI, and with no state push the
+        // renderer's `:`-strip kept showing the stale submitted `:q`.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // dirty
-        let err = sessions.keys(id, ":q<CR>", &blocks).unwrap_err();
-        assert!(err.contains("No write since last change"), "got: {err}");
+        let outcome = sessions.keys(id, ":q<CR>", &blocks).unwrap();
+        assert!(
+            matches!(outcome, KeysOutcome::Updated(_)),
+            "the refusal keeps the session open, not an error"
+        );
+        let msg = outcome
+            .state()
+            .message
+            .as_deref()
+            .expect("the refusal reports on the status line");
+        assert!(msg.contains("No write since last change"), "got: {msg}");
         assert!(sessions.is_open(id), ":q must not drop a dirty session");
+        assert!(
+            outcome.state().command_line.is_none(),
+            "the submitted :q line is gone — the strip shows the message instead"
+        );
+
+        // The message is transient and `:q!` still gets you out.
+        let outcome = sessions.keys(id, "l", &blocks).unwrap();
+        assert!(outcome.state().message.is_none(), "message clears on the next batch");
+        let outcome = sessions.keys(id, ":q!<CR>", &blocks).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Closed(_)));
     }
 
     #[tokio::test]

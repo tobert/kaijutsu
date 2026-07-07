@@ -106,14 +106,20 @@ impl KjDispatcher {
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_keys(id, &keys, blocks).await {
-                    Ok(st) => KjResult::ok_with_data(
-                        format!(
+                    Ok(st) => {
+                        // A dialect-level failure (bad `:cmd`, dirty-`:q` refusal,
+                        // failed `:r`) rides the status line, not the error path —
+                        // surface it in the human line so a driver can't miss it.
+                        let mut line = format!(
                             "session {session}: {} mode, {} chars",
                             mode_label(&st),
                             st.text.chars().count()
-                        ),
-                        state_json(id, &st),
-                    ),
+                        );
+                        if let Some(msg) = &st.message {
+                            line.push_str(&format!(" — {msg}"));
+                        }
+                        KjResult::ok_with_data(line, state_json(id, &st))
+                    }
                     Err(e) => KjResult::Err(format!("kj editor keys: {e}")),
                 }
             }

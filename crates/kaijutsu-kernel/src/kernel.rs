@@ -1046,18 +1046,34 @@ impl Kernel {
         };
 
         // Fulfill a `:r` read: fetch the content, then splice it at the cursor
-        // captured above (not the live cursor, which may have moved).
+        // captured above (not the live cursor, which may have moved). A failed
+        // fetch (missing file, failed/denied command, no opener) is a
+        // dialect-level failure: it reports on the `:` status line and keeps
+        // the session open — same channel as an unknown command or a bad `:s`
+        // regex. Hard errors out of here stay reserved for session and
+        // infrastructure failures (no such session, a CRDT mirror failure);
+        // the app's session-lost detection keys on exactly that distinction.
         if let Some(io) = io {
-            let content = self.fetch_editor_io(io, io_opener, blocks).await?;
-            let at = io_cursor.unwrap_or(0);
-            let state = {
-                let mut sessions = self.editor_sessions.lock();
-                sessions.0.insert_text(id, &content, at, blocks)?
+            let state = match self.fetch_editor_io(io, io_opener, blocks).await {
+                Ok(content) => {
+                    let at = io_cursor.unwrap_or(0);
+                    let state = {
+                        let mut sessions = self.editor_sessions.lock();
+                        sessions.0.insert_text(id, &content, at, blocks)?
+                    };
+                    // The block changed; drop the file-cache shadow of the
+                    // *edited* path.
+                    if let Some(path) = path.as_deref() {
+                        self.invalidate_config_file_cache(path);
+                    }
+                    state
+                }
+                Err(msg) => {
+                    let mut state = self.editor_sessions.lock().0.state(id)?;
+                    state.message = Some(msg);
+                    state
+                }
             };
-            // The block changed; drop the file-cache shadow of the *edited* path.
-            if let Some(path) = path.as_deref() {
-                self.invalidate_config_file_cache(path);
-            }
             self.publish_editor_state(id, &state);
             return Ok(state);
         }
@@ -1985,9 +2001,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editor_colon_r_shell_without_opener_fails_loud() {
+    async fn editor_colon_r_shell_without_opener_reports_on_the_status_line() {
         // A headless open (no opener) has no context to shell out in — `:r !cmd`
         // must fail loud pointing at the interactive shell, never silently no-op.
+        // "Loud" means the `:` status line (the dialect-level channel), NOT an
+        // RPC error: the session stays open and the message rides the state.
         use crate::block_store::shared_block_store_with_db;
         use crate::file_tools::FileDocumentCache;
         use crate::kernel_db::KernelDb;
@@ -2016,11 +2034,63 @@ mod tests {
             .editor_open("/etc/rc/coder/create/S00.kai", &blocks)
             .await
             .unwrap();
-        let err = kernel
+        let state = kernel
             .editor_keys(id, ":r !date<CR>", &blocks)
             .await
-            .unwrap_err();
-        assert!(err.contains("needs an opener context"), "got: {err}");
+            .expect("a failed :r does not error the RPC");
+        let msg = state.message.as_deref().expect("the failure reports on the status line");
+        assert!(msg.contains("needs an opener context"), "got: {msg}");
+        assert_eq!(state.text, "hi", "the buffer is untouched");
+        assert!(
+            kernel.editor_state(id).is_ok(),
+            "the session survives a failed :r"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_colon_r_missing_file_reports_on_the_status_line() {
+        // `:r <missing>` is a dialect-level failure: the fetch error rides the
+        // `:` status line and the session stays open — never a silent no-op,
+        // never an RPC error the GUI can't display.
+        use crate::block_store::shared_block_store_with_db;
+        use crate::file_tools::FileDocumentCache;
+        use crate::kernel_db::KernelDb;
+        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::vfs::VfsOps as _;
+        use kaijutsu_crdt::PrincipalId;
+        use std::path::Path;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws, creator);
+        kernel
+            .mount(RC_ROOT, ConfigCrdtFs::new(blocks.clone(), RC_ROOT))
+            .await;
+        ConfigCrdtFs::new(blocks.clone(), RC_ROOT)
+            .write_all(Path::new("coder/create/S00.kai"), b"hi")
+            .await
+            .unwrap();
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        kernel.set_file_cache(cache);
+
+        let (id, _) = kernel
+            .editor_open("/etc/rc/coder/create/S00.kai", &blocks)
+            .await
+            .unwrap();
+        let state = kernel
+            .editor_keys(id, ":r /nope/missing.txt<CR>", &blocks)
+            .await
+            .expect("a missing :r file does not error the RPC");
+        assert!(
+            state.message.is_some(),
+            "the fetch failure reports on the status line"
+        );
+        assert_eq!(state.text, "hi", "the buffer is untouched");
+        // The session is alive and the message is transient.
+        let state = kernel.editor_keys(id, "l", &blocks).await.unwrap();
+        assert!(state.message.is_none(), "message clears on the next batch");
     }
 
     #[tokio::test]
