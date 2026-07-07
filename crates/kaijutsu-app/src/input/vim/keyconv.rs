@@ -114,7 +114,14 @@ fn logical_key_to_crossterm(key: &Key) -> Option<CtKeyCode> {
             if chars.next().is_some() {
                 return None;
             }
-            Some(CtKeyCode::Char(c))
+            // Synthetic senders (bevy_brp_extras send_keys/type_text) ship
+            // Enter as a printable Character("\n"). A lone newline char in a
+            // key event IS the Enter key — map it so submit_on_enter sees
+            // <Enter> instead of inserting a stray newline into the buffer.
+            match c {
+                '\n' | '\r' => Some(CtKeyCode::Enter),
+                _ => Some(CtKeyCode::Char(c)),
+            }
         }
 
         // Keys we don't map
@@ -194,6 +201,20 @@ mod tests {
         let result = bevy_to_terminal_key(&event, &no_modifiers()).unwrap();
         let expected = TerminalKey::from(KeyEvent::new(CtKeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn char_newline_maps_to_enter() {
+        // bevy_brp_extras ships Enter as a printable Character("\n") (and a
+        // terminal-style sender may use "\r"). Both must land as the Enter
+        // key so submit_on_enter fires — not as a literal newline insert.
+        for lk in ["\n", "\r"] {
+            let event = make_event(KeyCode::Enter, Key::Character(lk.into()));
+            let result = bevy_to_terminal_key(&event, &no_modifiers()).unwrap();
+            let expected =
+                TerminalKey::from(KeyEvent::new(CtKeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(result, expected, "logical Character({lk:?})");
+        }
     }
 
     #[test]
