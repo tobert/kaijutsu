@@ -117,11 +117,29 @@ Each shippable alone, in order; 1 is independent and can land any time.
   `aconnect -d` changes appear on the next poll; the metronome click makes
   the RENDER chord pulse.
 
-### Slice 1 — auto-connect on startup (independent cheap win)
+### Slice 1 — auto-connect on startup ✓ shipped (independent cheap win)
 
-The app auto-connects its render port to a detected GM synth (by name
-match) on startup — kills the restart papercut for good (`docs/mounts.md`
-note). Additive only: never disconnects anything. No scene dependency.
+On startup the app auto-connects its render port to a detected GM synth,
+killing the re-`aconnect`-after-restart papercut (`docs/mounts.md` note).
+Lives in `crates/kaijutsu-app/src/midi.rs` beside `MidiOut`; no scene
+dependency either way. Semantics:
+
+- **Detect by name, never by number** — case-insensitive substring match on
+  the ALSA client name against a hardcoded `SYNTH_PATTERNS`
+  (`["timidity", "fluidsynth"]`), the one obvious config seam (open question
+  #2 stays open — no config surface yet). Never matches our own clients
+  (`kaijutsu-app`/`-ear`/`-patchview`).
+- **Additive and deferential** — only wires when the render port has *zero*
+  outbound subscriptions; if anything already feeds from render (a human
+  hand-patch), it does nothing. Never disconnects.
+- **One-shot with patient retry** — retries on the 2 s poll cadence until the
+  first connect (or an already-wired / ALSA-less stand-down), then stops for
+  the life of the process. Startup-once on purpose: the metronome click rides
+  the render port with no off-switch yet, so Amy sometimes cuts the wire with
+  `aconnect -d`; a continuously-reconciling ensure would make it uncuttable.
+  Continuous declared-wire reconciliation is slice 2's job (kernel-owned).
+- Pure decision core (`decide_autoconnect`) is unit-tested; the ALSA write is
+  a single `Seq::subscribe_port` on the render handle.
 
 ### Slice 2 — declared intent (the backend, when it's time)
 

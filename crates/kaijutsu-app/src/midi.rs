@@ -19,6 +19,7 @@ use kaijutsu_audio::{CuePayload, ABC_MIME, RENDER_FLUSH_MIME};
 use kaijutsu_client::ServerEvent;
 
 use crate::connection::actor_plugin::ServerEventMessage;
+use crate::patch_graph::{EndpointInfo, WireInfo};
 
 /// Bridges `ServerEvent::RenderCue` ABC cues into scheduled ALSA seq MIDI.
 pub struct MidiOutPlugin;
@@ -28,12 +29,17 @@ impl Plugin for MidiOutPlugin {
         // NonSend: the ALSA `Seq` handle lives on the main thread with the sink
         // system (a render sink is single-consumer; no cross-thread sharing).
         app.insert_non_send_resource(MidiSink::default());
+        app.init_resource::<RenderAutoConnect>();
         // Open the seq port eagerly at startup so it shows up in `aconnect -l`
         // and can be wired to a synth *before* the first cue fires (the queue
         // schedules ~now for a play-now cue, so a lazily-created port would miss
         // its own first notes). Graceful on failure — no ALSA just means no MIDI.
         app.add_systems(Startup, open_midi_sink);
         app.add_systems(Update, play_midi_cues);
+        // Patch-bay slice 1: one-shot, patient-retry auto-connect of the render
+        // port to a detected GM synth — kills the re-`aconnect`-after-restart
+        // papercut (`docs/scenes/patchbay.md`). Additive and startup-once.
+        app.add_systems(Update, auto_connect_render);
     }
 }
 
@@ -88,6 +94,172 @@ impl MidiSink {
     ) {
         ensure_open(self);
     }
+
+    /// Patch-bay slice 1: observe the local seq graph through the render port's
+    /// own handle, decide (purely) whether/where to auto-connect, and — only if
+    /// there's a target — subscribe render → synth. Additive; never disconnects.
+    /// Assumes the caller has already opened the sink.
+    #[cfg(target_os = "linux")]
+    fn try_auto_connect(&self, patterns: &[&str]) -> AutoConnectOutcome {
+        let Some(out) = self.out.as_ref() else {
+            return AutoConnectOutcome::Unavailable;
+        };
+        let render = out.addr();
+        let (endpoints, wires) = out.observe();
+        match decide_autoconnect(&endpoints, &wires, render, patterns) {
+            Some((client, port)) => {
+                let name = endpoints
+                    .iter()
+                    .find(|e| (e.client_id, e.port_id) == (client, port))
+                    .map(|e| e.client_name.clone())
+                    .unwrap_or_else(|| "synth".into());
+                match out.connect_render_to(client, port) {
+                    Ok(()) => AutoConnectOutcome::Connected { name, client, port },
+                    Err(e) => AutoConnectOutcome::Failed(e),
+                }
+            }
+            // No target: separate "already wired → defer" (stop) from "no synth
+            // yet" (keep waiting) so the caller latches the one-shot correctly.
+            None if render_has_outbound_wire(&wires, render) => AutoConnectOutcome::AlreadyWired,
+            None => AutoConnectOutcome::NoSynth,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn try_auto_connect(&self, _patterns: &[&str]) -> AutoConnectOutcome {
+        AutoConnectOutcome::Unavailable
+    }
+}
+
+// ── Patch-bay slice 1: render-port auto-connect ─────────────────────────────
+
+/// Case-insensitive substring patterns for a GM synth's ALSA client name. The
+/// one obvious config seam: symbolic-endpoint naming (a named-endpoint registry
+/// vs a substring list) is an open question in `docs/scenes/patchbay.md` —
+/// slice 1 deliberately keeps it a bare const, not a config surface.
+const SYNTH_PATTERNS: [&str; 2] = ["timidity", "fluidsynth"];
+
+/// Our own ALSA seq clients — never an auto-connect target even if a pattern
+/// somehow matched one (the render's own output, the ear, the patch-view
+/// reader). Matched by exact client name.
+const OWN_CLIENTS: [&str; 3] = ["kaijutsu-app", "kaijutsu-ear", "kaijutsu-patchview"];
+
+/// Retry cadence — the patch-bay's 2 s poll idiom, reused.
+const AUTOCONNECT_POLL_SECS: f32 = 2.0;
+
+/// One-shot latch for the render-port auto-connect. `done` latches for the life
+/// of the process once the decision settles — connected, found already-wired, or
+/// ALSA-less — and is never re-armed. That "startup-once" stance is the whole
+/// point: the metronome click rides the render port and has no off-switch yet,
+/// so Amy sometimes cuts this wire with `aconnect -d`; a continuously
+/// reconciling ensure would make the wire uncuttable. Continuous declared-wire
+/// reconciliation is slice 2's job (kernel-owned).
+#[derive(Resource)]
+struct RenderAutoConnect {
+    done: bool,
+    timer: Timer,
+}
+
+impl Default for RenderAutoConnect {
+    fn default() -> Self {
+        Self {
+            done: false,
+            timer: Timer::from_seconds(AUTOCONNECT_POLL_SECS, TimerMode::Repeating),
+        }
+    }
+}
+
+/// The outcome of one auto-connect attempt. `Connected` / `AlreadyWired` /
+/// `Unavailable` settle the one-shot for good; `NoSynth` / `Failed` retry.
+enum AutoConnectOutcome {
+    Connected { name: String, client: i32, port: i32 },
+    AlreadyWired,
+    NoSynth,
+    Failed(String),
+    Unavailable,
+}
+
+/// Tick the one-shot: on a slow cadence, until it settles, try to auto-connect
+/// the render port to a GM synth. Loud once on the connect, quiet while waiting.
+#[cfg(target_os = "linux")]
+fn auto_connect_render(
+    time: Res<Time>,
+    mut sink: NonSendMut<MidiSink>,
+    mut latch: ResMut<RenderAutoConnect>,
+) {
+    if latch.done {
+        return;
+    }
+    if !latch.timer.tick(time.delta()).just_finished() {
+        return;
+    }
+    // No ALSA seq → `ensure_open` warns once and we stand down: no synth will
+    // ever appear on a machine without a sequencer, so retrying is pure spam.
+    if !ensure_open(&mut sink) {
+        latch.done = true;
+        return;
+    }
+    match sink.try_auto_connect(&SYNTH_PATTERNS) {
+        AutoConnectOutcome::Connected { name, client, port } => {
+            info!("patch-bay slice 1: auto-connected render → {name}:{port} (client {client})");
+            latch.done = true;
+        }
+        AutoConnectOutcome::AlreadyWired => {
+            // A hand-patch already owns the render port's routing. Stand down —
+            // never fight a deliberate wiring, and never reverse a later cut.
+            debug!("patch-bay slice 1: render already wired; standing down");
+            latch.done = true;
+        }
+        AutoConnectOutcome::NoSynth => {
+            debug!("patch-bay slice 1: no GM synth yet; will retry");
+        }
+        AutoConnectOutcome::Failed(e) => {
+            debug!("patch-bay slice 1: connect failed, will retry: {e}");
+        }
+        AutoConnectOutcome::Unavailable => {
+            latch.done = true;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn auto_connect_render(mut latch: ResMut<RenderAutoConnect>) {
+    // No ALSA off Linux — nothing to connect, ever.
+    latch.done = true;
+}
+
+/// True if the render port already feeds anyone. The deferential guard: if a
+/// human (or anything) has already wired render outbound, slice 1 does nothing.
+fn render_has_outbound_wire(wires: &[WireInfo], render: (i32, i32)) -> bool {
+    wires.iter().any(|w| w.src == render)
+}
+
+/// Pure decision core: the synth port the render port should auto-connect to,
+/// or `None`. `None` means either render is already wired outbound (defer) or no
+/// non-self synth matches. Additive only — this never considers a disconnect.
+///
+/// The target is the first writable-subscribable ("sink") port of the first
+/// matching synth; with `endpoints` sorted by `(client_id, port_id)` (as
+/// `MidiOut::observe` delivers them) that is the lowest-numbered synth's port 0.
+/// Own clients are excluded by name regardless of pattern; a pattern matches as
+/// a case-insensitive substring of the client name.
+fn decide_autoconnect(
+    endpoints: &[EndpointInfo],
+    wires: &[WireInfo],
+    render: (i32, i32),
+    patterns: &[&str],
+) -> Option<(i32, i32)> {
+    if render_has_outbound_wire(wires, render) {
+        return None;
+    }
+    endpoints.iter().find_map(|e| {
+        if !e.is_sink || OWN_CLIENTS.contains(&e.client_name.as_str()) {
+            return None;
+        }
+        let name = e.client_name.to_lowercase();
+        let matched = patterns.iter().any(|p| name.contains(&p.to_lowercase()));
+        matched.then_some((e.client_id, e.port_id))
+    })
 }
 
 /// Render ABC → a flat list of `(offset-from-phrase-start, raw channel-voice
@@ -251,6 +423,61 @@ impl MidiOut {
 
     fn addr(&self) -> (i32, i32) {
         (self.seq.client_id().unwrap_or(-1), self.port)
+    }
+
+    /// Snapshot the local seq graph through the render port's own handle: every
+    /// client/port as an `EndpointInfo` (sorted by `(client, port)`), plus the
+    /// render port's *own* outbound subscriptions as `WireInfo`s — all the
+    /// decision core needs. Read-only; reuses `patch_graph`'s flattened types
+    /// and enumeration idiom (no second ALSA client just to observe).
+    fn observe(&self) -> (Vec<EndpointInfo>, Vec<WireInfo>) {
+        use alsa::seq::{self, Addr, PortCap, QuerySubsType};
+
+        let mut endpoints = Vec::new();
+        for client in seq::ClientIter::new(&self.seq) {
+            let client_id = client.get_client();
+            let client_name = client.get_name().unwrap_or("?").to_string();
+            for port in seq::PortIter::new(&self.seq, client_id) {
+                let addr = port.addr();
+                let caps = port.get_capability();
+                endpoints.push(EndpointInfo {
+                    client_id,
+                    port_id: addr.port,
+                    client_name: client_name.clone(),
+                    port_name: port.get_name().unwrap_or("?").to_string(),
+                    is_source: caps.contains(PortCap::READ | PortCap::SUBS_READ),
+                    is_sink: caps.contains(PortCap::WRITE | PortCap::SUBS_WRITE),
+                });
+            }
+        }
+        endpoints.sort_by_key(|e| (e.client_id, e.port_id));
+
+        let (rc, rp) = self.addr();
+        let mut wires = Vec::new();
+        let render_addr = Addr { client: rc, port: rp };
+        for sub in seq::PortSubscribeIter::new(&self.seq, render_addr, QuerySubsType::READ) {
+            let src = sub.get_sender();
+            let dst = sub.get_dest();
+            wires.push(WireInfo {
+                src: (src.client, src.port),
+                dst: (dst.client, dst.port),
+            });
+        }
+        (endpoints, wires)
+    }
+
+    /// Subscribe the render port → `(dst_client, dst_port)` — the one write this
+    /// module makes. Additive: it only ever *creates* a subscription, never
+    /// removes one. Errors bubble so the caller can retry on the next tick.
+    fn connect_render_to(&self, dst_client: i32, dst_port: i32) -> Result<(), String> {
+        use alsa::seq::{Addr, PortSubscribe};
+
+        let map = |e: alsa::Error| format!("{e}");
+        let subs = PortSubscribe::empty().map_err(map)?;
+        subs.set_sender(Addr { client: self.seq.client_id().map_err(map)?, port: self.port });
+        subs.set_dest(Addr { client: dst_client, port: dst_port });
+        self.seq.subscribe_port(&subs).map_err(map)?;
+        Ok(())
     }
 
     /// Schedule each event at `lead + offset` relative to now (real-time queue),
@@ -437,5 +664,143 @@ mod tests {
         }
         assert_eq!(note_ons.len(), 4, "four NoteOns through the loopback: {note_ons:?}");
         assert!(note_ons.windows(2).all(|w| w[0] < w[1]), "ascending: {note_ons:?}");
+    }
+
+    // -- patch-bay slice 1: auto-connect decision core --------------------
+
+    /// The app's render port address for these tests (a plausible app client id).
+    const RENDER: (i32, i32) = (129, 0);
+
+    fn sink(client_id: i32, port_id: i32, client_name: &str) -> EndpointInfo {
+        EndpointInfo {
+            client_id,
+            port_id,
+            client_name: client_name.into(),
+            port_name: "port".into(),
+            is_source: false,
+            is_sink: true,
+        }
+    }
+
+    fn source(client_id: i32, port_id: i32, client_name: &str) -> EndpointInfo {
+        EndpointInfo {
+            is_source: true,
+            is_sink: false,
+            ..sink(client_id, port_id, client_name)
+        }
+    }
+
+    fn wire(src: (i32, i32), dst: (i32, i32)) -> WireInfo {
+        WireInfo { src, dst }
+    }
+
+    #[test]
+    fn picks_the_first_synth_sink_port_when_render_is_unwired() {
+        let endpoints = vec![sink(128, 0, "TiMidity"), sink(128, 1, "TiMidity")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &["timidity"]),
+            Some((128, 0)),
+            "TiMidity's port 0 is the target"
+        );
+    }
+
+    #[test]
+    fn picks_the_lowest_numbered_of_several_matching_synths() {
+        // Sorted as `observe` delivers them: the lowest client wins.
+        let endpoints = vec![sink(128, 0, "TiMidity"), sink(140, 0, "FluidSynth")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &SYNTH_PATTERNS),
+            Some((128, 0))
+        );
+    }
+
+    #[test]
+    fn skips_when_the_render_port_already_has_an_outbound_wire() {
+        let endpoints = vec![sink(128, 0, "TiMidity")];
+        let wires = vec![wire(RENDER, (128, 0))];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &wires, RENDER, &["timidity"]),
+            None,
+            "a hand-patch on render → defer, do nothing"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_wire_does_not_block_the_autoconnect() {
+        // A wire that doesn't originate at the render port is none of our business.
+        let endpoints = vec![sink(128, 0, "TiMidity")];
+        let wires = vec![wire((14, 0), (128, 0))];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &wires, RENDER, &["timidity"]),
+            Some((128, 0))
+        );
+    }
+
+    #[test]
+    fn never_returns_an_own_client_port_even_when_a_pattern_matches_it() {
+        // The ear is a sink; a pattern that matches our own name must not win.
+        let endpoints = vec![sink(200, 0, "kaijutsu-ear")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &["kaijutsu"]),
+            None
+        );
+    }
+
+    #[test]
+    fn matches_the_synth_name_case_insensitively() {
+        let endpoints = vec![sink(140, 0, "FLUIDSynth")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &["fluidsynth"]),
+            Some((140, 0))
+        );
+    }
+
+    #[test]
+    fn ignores_a_synths_source_only_port_and_wires_to_none() {
+        // A read-only source port is not something to feed MIDI into.
+        let endpoints = vec![source(128, 0, "TiMidity")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &["timidity"]),
+            None
+        );
+    }
+
+    #[test]
+    fn returns_none_on_an_empty_graph() {
+        assert_eq!(decide_autoconnect(&[], &[], RENDER, &SYNTH_PATTERNS), None);
+    }
+
+    #[test]
+    fn returns_none_when_no_client_matches_a_pattern() {
+        let endpoints = vec![sink(64, 0, "Midi Through"), sink(80, 0, "Some DAW")];
+        assert_eq!(
+            decide_autoconnect(&endpoints, &[], RENDER, &SYNTH_PATTERNS),
+            None
+        );
+    }
+
+    #[test]
+    fn render_has_outbound_wire_is_true_only_for_a_render_sender() {
+        assert!(render_has_outbound_wire(&[wire(RENDER, (128, 0))], RENDER));
+        assert!(!render_has_outbound_wire(&[wire((14, 0), (128, 0))], RENDER));
+        assert!(!render_has_outbound_wire(&[], RENDER));
+    }
+
+    /// Live ALSA (needs `/dev/snd/seq`; `#[ignore]`d like `alsa_smoke` in
+    /// `patch_graph.rs`). Opens the render sink and asserts its own port shows up
+    /// in the observed graph — exercises `observe` without wiring anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a live ALSA sequencer (/dev/snd/seq); run on the zorak runner"]
+    fn observe_sees_the_render_port_on_a_live_sequencer() {
+        let out = MidiOut::open().expect("open ALSA sink");
+        let render = out.addr();
+        let (endpoints, _wires) = out.observe();
+        assert!(
+            endpoints
+                .iter()
+                .any(|e| (e.client_id, e.port_id) == render && e.client_name == "kaijutsu-app"),
+            "the render port should appear in its own observed graph: {endpoints:#?}"
+        );
     }
 }
