@@ -534,6 +534,7 @@ pub fn exit_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     mut activity: ResMut<super::activity::RingActivity>,
+    mut edge_bump: ResMut<crate::view::room::WellEdgeBump>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<TimeWellRoot>>,
     cards: Query<Entity, With<Card>>,
@@ -573,6 +574,14 @@ pub fn exit_time_well(
     // Reset the join so re-entering rebuilds from scratch (the contexts are
     // re-polled by DriftState; nothing durable is lost).
     state.join = kaijutsu_viz::join::Join::new();
+
+    // Reset the well-edge speedbump on every exit, not just the Up-Up that
+    // normally fires it. `WellEdgeBump` is a Resource shared with the room —
+    // an Esc exit (or any other) must not leave it armed, or a quick re-entry
+    // (Ctrl+W) followed by a single Up at the mouth ring would fire the exit
+    // to Room immediately instead of arming first (the "first Up never
+    // ejects you" promise this guards).
+    edge_bump.0.reset();
 
     // Hand the shared camera back to the conversation: drop the well marker (so
     // the well's camera systems stop driving it) and restore the theme clear.

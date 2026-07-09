@@ -218,11 +218,22 @@ const EDGE_BUMP_WINDOW_MS: u128 = 500;
 #[derive(Resource)]
 pub struct RoomState {
     pub carousel: StationCarousel,
+    /// Re-lay-out the nameplates on the next frame (the patch bay's
+    /// `text_dirty` shape — `view/patch_bay/mod.rs`). `StationPlate` entities
+    /// live for ONE room visit: `exit_room` despawns `RoomRoot` (cascading to
+    /// every plate), `enter_room` respawns fresh, glyph-less ones — but this
+    /// `RoomState` resource survives every visit. A process-lifetime "done"
+    /// latch (the shape this flag replaced) fills the *first* visit's plates
+    /// and then leaves every later visit blank forever, because the entities
+    /// it thinks it already filled are long gone. The arm has to be
+    /// per-entry: set by [`arm_on_enter`], cleared by [`room_plate_text`]
+    /// only once it actually commits glyphs.
+    plates_dirty: bool,
 }
 
 impl Default for RoomState {
     fn default() -> Self {
-        Self { carousel: StationCarousel::new(Station::TimeWell) }
+        Self { carousel: StationCarousel::new(Station::TimeWell), plates_dirty: true }
     }
 }
 
@@ -300,15 +311,34 @@ impl Plugin for RoomPlugin {
 
 // ── Enter / exit ──────────────────────────────────────────────────────────────
 
+/// Force a fresh nameplate layout for the plates this call to `enter_room` is
+/// about to spawn. `RoomState` is a `Resource` — it survives `exit_room`,
+/// which only despawns `RoomRoot` (and with it every `StationPlate`);
+/// without re-arming `plates_dirty` here, a second (or later) visit finds it
+/// already cleared from the first and `room_plate_text` never fills the
+/// fresh, glyph-less plates just spawned — the blank-nameplate-on-re-entry
+/// bug this arm fixes. Mirrors patch_bay's `arm_on_enter`.
+fn arm_on_enter(room: &mut RoomState) {
+    room.plates_dirty = true;
+}
+
 fn enter_room(
     mut commands: Commands,
-    room: Res<RoomState>,
+    mut room: ResMut<RoomState>,
+    mut edge_bump: ResMut<WellEdgeBump>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     mut card_mats: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
 ) {
+    arm_on_enter(&mut room);
+    // Belt-and-braces: a fresh room entry must never inherit an armed
+    // well-edge speedbump. `exit_time_well` resets it on the way out of the
+    // well, but that only covers exits *through* the well's own teardown —
+    // this is the room's own guarantee, independent of how we got here.
+    edge_bump.0.reset();
+
     // Claim the shared app camera (the well-marker convention: insert to claim,
     // remove + restore clear color to release) and place it facing the entering
     // focus so there's no first-frame snap before the ease takes over.
@@ -519,17 +549,23 @@ fn room_keyboard(
     }
 }
 
-/// Fill the nameplates once the mono font is ready (the same async-font gate as
-/// the well's label builders).
+/// Fill the nameplates whenever [`RoomState::plates_dirty`] is armed (the same
+/// async-font gate as the well's label builders). A per-entry dirty flag, not
+/// a process-lifetime latch — see the comment on `plates_dirty` for why a
+/// `Local<bool>` "done, never again" latch is wrong here: `StationPlate`
+/// entities die with `RoomRoot` on every `exit_room`, but a `Local` survives
+/// the whole app run. `enter_room`'s `arm_on_enter` re-arms the flag on every
+/// entry; this is the one system that clears it, and only once it actually
+/// commits glyphs.
 fn room_plate_text(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     mut atlas: Option<ResMut<MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
+    mut room: ResMut<RoomState>,
     mut plates: Query<(&StationPlate, &mut MsdfBlockGlyphs)>,
-    mut done: Local<bool>,
 ) {
-    if *done {
+    if !room.plates_dirty {
         return;
     }
     let Some(font) = fonts.get(&font_handles.mono) else {
@@ -545,9 +581,14 @@ fn room_plate_text(
         commit_panel_glyphs(&mut msdf, glyphs);
         any = true;
     }
-    // Plates spawn via Commands the frame before they're queryable — only latch
-    // once we actually filled something.
-    *done = any;
+    // Plates spawn via Commands the same frame `enter_room` runs, and
+    // OnEnter's commands are applied before Update — so querying them here on
+    // entry is normally fine. Still: only clear the arm once we actually
+    // filled something, so a scheduling surprise can't eat it and leave the
+    // plates blank with nothing left to re-trigger a fill.
+    if any {
+        room.plates_dirty = false;
+    }
 }
 
 /// Focus presentation for the plates: brighten + grow the focused plate,
@@ -823,6 +864,42 @@ fn plate_shape() -> Vec4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- RoomState::plates_dirty / arm_on_enter -------------------------
+
+    /// The shape `RoomState` is left in after a visit: the carousel focus
+    /// (Resource) survives `exit_room` untouched, but `plates_dirty` has
+    /// already been cleared by `room_plate_text` filling that visit's
+    /// plates — and nothing has re-armed it for the next entry yet.
+    fn persisted_after_a_visit() -> RoomState {
+        RoomState { carousel: StationCarousel::new(Station::PatchBay), plates_dirty: false }
+    }
+
+    #[test]
+    fn fresh_room_state_starts_with_plates_dirty() {
+        // The very first-ever visit also needs its plates filled — there is
+        // no prior `arm_on_enter` call to have done it.
+        assert!(RoomState::default().plates_dirty);
+    }
+
+    #[test]
+    fn arm_on_enter_forces_plates_dirty_true() {
+        let mut room = persisted_after_a_visit();
+        arm_on_enter(&mut room);
+        assert!(
+            room.plates_dirty,
+            "re-entry must force a nameplate relayout even though the plates \
+             were already filled once, on a previous visit's now-despawned entities"
+        );
+    }
+
+    #[test]
+    fn arm_on_enter_leaves_the_carousel_focus_untouched() {
+        let mut room = persisted_after_a_visit();
+        let before = room.carousel.focused;
+        arm_on_enter(&mut room);
+        assert_eq!(room.carousel.focused, before, "arm_on_enter only touches plates_dirty");
+    }
 
     #[test]
     fn desired_camera_frames_console_from_the_overview() {
