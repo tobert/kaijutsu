@@ -803,8 +803,11 @@ fn fill_patch_text(
     state.text_dirty = false;
 }
 
-/// "sender:port -> receiver:port" for the inspection plate; empty when no
-/// wires exist (a cleared plate, not a placeholder).
+/// "SENDER -> RECEIVER" for the inspection plate, run through the SAME
+/// `socket_label` heuristic the rim pegs render — the card names a wire end
+/// exactly the way its peg glyph reads (`RENDER -> TIMIDITY 0`), one visual
+/// language instead of a second, more-verbose name for the same socket.
+/// Empty when no wires exist (a cleared plate, not a placeholder).
 fn describe_selection(snapshot: &PatchGraphSnapshot, selected: usize) -> String {
     let Some(wire) = snapshot.wires.get(selected) else {
         return if snapshot.endpoints.is_empty() {
@@ -814,12 +817,16 @@ fn describe_selection(snapshot: &PatchGraphSnapshot, selected: usize) -> String 
         };
     };
     let name = |addr: (i32, i32)| -> String {
-        snapshot
-            .endpoints
-            .iter()
-            .find(|e| (e.client_id, e.port_id) == addr)
-            .map(|e| format!("{}:{}", e.client_name, e.port_name))
-            .unwrap_or_else(|| format!("{}:{}", addr.0, addr.1))
+        let Some(ep) = snapshot.endpoints.iter().find(|e| (e.client_id, e.port_id) == addr) else {
+            // The endpoint vanished from the snapshot between the wire's poll
+            // and this frame — a transient gap, not a client worth labeling.
+            return format!("{}:{}", addr.0, addr.1);
+        };
+        // Same client_id-keyed count `rebuild_patch_scene` feeds its pegs
+        // (client_id, not client_name — two clients can share a name), so the
+        // card's label matches the peg's glyph exactly, not a near-miss.
+        let count = snapshot.endpoints.iter().filter(|e| e.client_id == ep.client_id).count();
+        socket_label(&ep.client_name, &ep.port_name, count, ep.port_id)
     };
     format!("{} -> {}", name(wire.src), name(wire.dst))
 }
@@ -1273,6 +1280,62 @@ mod tests {
         assert!(is_port_shaped("PORT_3"));
         assert!(!is_port_shaped("render"));
         assert!(!is_port_shaped("portland"));
+    }
+
+    // -- describe_selection (uses socket_label — same language as the pegs) --
+
+    fn render_to_multi_port_timidity_snapshot() -> PatchGraphSnapshot {
+        // TiMidity seats two ports here (unlike `render_to_synth_snapshot`'s
+        // single port), so its end exercises socket_label's port-shaped
+        // multi-port fallback instead of the single-port case.
+        PatchGraphSnapshot {
+            endpoints: vec![
+                EndpointInfo {
+                    client_id: 128,
+                    port_id: 0,
+                    client_name: "TiMidity".into(),
+                    port_name: "port 0".into(),
+                    is_source: false,
+                    is_sink: true,
+                },
+                EndpointInfo {
+                    client_id: 128,
+                    port_id: 1,
+                    client_name: "TiMidity".into(),
+                    port_name: "port 1".into(),
+                    is_source: false,
+                    is_sink: true,
+                },
+                EndpointInfo {
+                    client_id: 129,
+                    port_id: 0,
+                    client_name: "kaijutsu-app".into(),
+                    port_name: "render".into(),
+                    is_source: true,
+                    is_sink: false,
+                },
+            ],
+            wires: vec![WireInfo { src: (129, 0), dst: (128, 0) }],
+        }
+    }
+
+    #[test]
+    fn describe_selection_speaks_the_same_language_as_the_socket_pegs() {
+        // A meaningful port name on one end (RENDER) and a port-shaped
+        // multi-port fallback on the other (TIMIDITY 0) — the exact string a
+        // pair of socket_label-driven pegs would show, not a second,
+        // more-verbose name for the same wire.
+        let text = describe_selection(&render_to_multi_port_timidity_snapshot(), 0);
+        assert_eq!(text, "RENDER -> TIMIDITY 0");
+    }
+
+    #[test]
+    fn describe_selection_falls_back_to_raw_ids_for_a_vanished_endpoint() {
+        // `wire.src` in `non_empty_snapshot` names client_id 14, which isn't
+        // in `endpoints` — a transient gap between the ALSA event and the
+        // next poll's snapshot, not a client to invent a label for.
+        let text = describe_selection(&non_empty_snapshot(), 0);
+        assert_eq!(text, "14:0 -> TIMIDITY");
     }
 
     // -- is_render_port -------------------------------------------------
