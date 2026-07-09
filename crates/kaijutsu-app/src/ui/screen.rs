@@ -41,6 +41,17 @@ pub enum Screen {
     PatchBay,
 }
 
+/// True while the camera is inside the shared shell scene graph — the room
+/// chamber *or* a patch-bay dive within it (`docs/scenes/shell.md`, slice B:
+/// "one shared scene graph"). Diving into the patch bay is continuous camera
+/// travel inside the persistent room, not a scene cut, so the systems that keep
+/// the W furniture's chords live (poll/rebuild/selection/pulse), the shell
+/// camera dolly, and the room/dive LOD toggles all run across *both* screens.
+/// Systems that belong only to the dedicated dived view stay `in_state(PatchBay)`.
+pub fn in_shell(screen: Res<State<Screen>>) -> bool {
+    matches!(*screen.get(), Screen::Room | Screen::PatchBay)
+}
+
 /// Plugin that registers the Screen state and its transition systems.
 pub struct ScreenPlugin;
 

@@ -183,10 +183,20 @@ well scene**, not a new world. Slices, each shippable alone:
   live well (shared vs separate scene graph, open question 3, stays deferred to
   slice B). Acceptance met: a jam breathes the tracks bearing without visiting
   it.
-- **Slice B — first real bearing**: the patch-bay thread-wall ambient at W,
-  diving to the patch-bay slice-0 scene (`docs/scenes/patchbay.md`). This
-  pairs the first station dive with the first bearing — the whole grammar
-  proven end to end.
+- **Slice B — first real bearing** (built 2026-07-09): the patch-bay circle
+  stands at W as **room furniture** (Tardis reading #3), and diving is a
+  *continuous camera descent* onto it — no scene cut, one camera, one clear
+  colour (open question 3, decided). The furniture rides ONE Amy-tunable
+  placement transform (`STATION_W_PLACEMENT` in `view/patch_bay/mod.rs`:
+  translation to W, uniform scale, yaw) so re-placing it — Amy's **pending
+  alternative, the table as the room floor** — is a transform edit, not a
+  rebuild. The dive dims the room chrome and shows the patch bay's own label/
+  tick/card LOD; at room scale the bare chords over the socket rings are the W
+  ambient. For now that live-chord glow **absorbs** the bearings-table's
+  wall-of-threads read — the elegant thread-wall over jack fields is deferred
+  and may return later as pure backdrop mood behind the table. This pairs the
+  first station dive with the first bearing — the whole grammar proven end to
+  end.
 - **Slice C+ — bearings accrete**: highway ambient at E when tracks-station
   work starts; the N archway when the fsn scene exists. No fixed order.
 
@@ -200,9 +210,14 @@ well scene**, not a new world. Slices, each shippable alone:
 2. Entry key for the room (Esc-from-well is decided; a direct binding is
    not), and whether the app's `Screen` formalization (timewell.md appendix,
    "ViewSpec + the kj→app seam") should land with slice A.
-3. One scene graph or separate Bevy worlds for shell vs dives? (Budget
-   argues separate — only one station's detail exists at a time; camera
-   continuity argues shared. Decide at slice B.)
+3. **DECIDED (Amy, 2026-07-09): one shared scene graph.** Diving is continuous
+   camera travel inside the persistent room, not a scene cut — the room and its
+   station furniture never despawn/respawn on a dive. Camera continuity won over
+   the budget argument because a bounded station (the patch-bay circle) is cheap
+   to hold resident as furniture (Tardis reading #3), and the budget discipline
+   is recovered instead through **LOD**: the dive's detail layer (labels, ticks,
+   the inspection card) hides at room scale and the room chrome dims on the dive,
+   so only one station's *detail* is ever drawn. Built in slice B (below).
 4. The vault itself: what does the dome show? (Starfield is the lazy
    default; a slowly rotating glyph firmament could carry kernel-wide state
    — deferred, taste call.)

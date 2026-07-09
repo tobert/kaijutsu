@@ -25,9 +25,17 @@
 //!   HDR emission only on live activity; all decoration stays LDR.
 //!
 //! The console is the **slice-A stand-in** for the live well: an emblematic
-//! gold ring-stack, *not* the well scene. Whether shell + dives share one scene
-//! graph or run separate Bevy worlds (shell.md open question 3) is deferred to
-//! slice B; the emblem keeps camera continuity cheap either way.
+//! gold ring-stack, *not* the well scene (unifying the well is a later slice).
+//!
+//! **Slice B (2026-07-09): one shared scene graph** (shell.md open question 3,
+//! DECIDED). The patch bay is not a separate Bevy world reached by a scene cut —
+//! it is **room furniture at the W bearing**, spawned when the room spawns
+//! (`patch_bay::spawn_furniture`, under a placement entity) and alive as long as
+//! `RoomRoot`. Diving is a *continuous camera descent* onto it: `enter_room` /
+//! `exit_room` no longer despawn on the Room↔PatchBay hop (only leaving the shell
+//! for Conversation/the well tears down), one camera + one clear colour carry
+//! both screens, and the dived view earns its focus by dimming the room and
+//! showing the patch bay's own LOD, not by being a different world.
 //!
 //! Materials are all built-in [`StandardMaterial`] with `unlit: true`, carrying
 //! brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR (> 1.0)
@@ -55,7 +63,8 @@ use crate::text::msdf::{
     FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs,
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::ui::screen::Screen;
+use crate::ui::screen::{Screen, in_shell};
+use crate::view::patch_bay;
 use crate::view::time_well::live::WellBeats;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use vello::peniko::Brush;
@@ -278,6 +287,14 @@ pub struct BearingMarker {
 #[derive(Component)]
 pub struct ConsoleEmblem;
 
+/// Room chrome that **fades when you dive** into a station (`docs/scenes/shell.md`,
+/// slice B): the bearing pylons, station nameplates, console emblem, and violet
+/// radiators. `apply_room_dive_visibility` hides these while `Screen::PatchBay`
+/// so the dived station owns the eye; the floor, its traces, the vault dome, and
+/// the dived station itself stay — they are the chamber, not distractions.
+#[derive(Component)]
+pub struct RoomDistraction;
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct RoomPlugin;
@@ -296,15 +313,17 @@ impl Plugin for RoomPlugin {
             .add_systems(Update, ingest_room_activity)
             .add_systems(
                 Update,
-                (
-                    room_keyboard,
-                    room_plate_text,
-                    room_focus_visuals,
-                    ease_room_camera,
-                    sync_room_glow,
-                )
+                (room_keyboard, room_plate_text, room_focus_visuals, sync_room_glow)
                     .chain()
                     .run_if(in_state(Screen::Room)),
+            )
+            // Shell-wide (room OR patch-bay dive): the camera dolly retargets on
+            // the state flip so diving/surfacing reads as one continuous move, and
+            // the dive dims the room chrome. Both run across BOTH shell screens
+            // (`docs/scenes/shell.md`, slice B — one shared scene graph).
+            .add_systems(
+                Update,
+                (ease_shell_camera, apply_room_dive_visibility).run_if(in_shell),
             );
     }
 }
@@ -325,13 +344,24 @@ fn arm_on_enter(room: &mut RoomState) {
 fn enter_room(
     mut commands: Commands,
     mut room: ResMut<RoomState>,
+    mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut edge_bump: ResMut<WellEdgeBump>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     mut card_mats: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    existing: Query<Entity, With<RoomRoot>>,
 ) {
+    // Surfacing from a patch-bay dive (`exit_room` kept the room, its W furniture,
+    // and the shared camera alive when the target was PatchBay). Nothing to build
+    // or claim — `ease_shell_camera` glides the camera back to the W focus, the
+    // LOD systems restore the room chrome. Only a *fresh* room arrival (from the
+    // well or conversation) falls through to spawn.
+    if !existing.is_empty() {
+        return;
+    }
+
     arm_on_enter(&mut room);
     // Belt-and-braces: a fresh room entry must never inherit an armed
     // well-edge speedbump. `exit_time_well` resets it on the way out of the
@@ -394,6 +424,7 @@ fn enter_room(
             Transform::from_xyz(0.0, *y, 0.0),
             Visibility::Inherited,
             ConsoleEmblem,
+            RoomDistraction,
             Name::new(format!("ConsoleRing{i}")),
             ChildOf(root),
         ));
@@ -439,6 +470,7 @@ fn enter_room(
             MeshMaterial3d(marker_mat),
             Transform::from_translation(marker_pos),
             BearingMarker { bearing: wp.bearing, hue, station: wp.station },
+            RoomDistraction,
             Visibility::Inherited,
             Name::new(format!("BearingMarker-{:?}", wp.bearing)),
             ChildOf(root),
@@ -466,6 +498,7 @@ fn enter_room(
             let outward = Vec3::new(plate_pos.x * 2.0, PLATE_HEIGHT, plate_pos.z * 2.0);
             commands.spawn((
                 StationPlate(idx),
+                RoomDistraction,
                 Mesh3d(plate_mesh),
                 MeshMaterial3d(material),
                 Transform::from_translation(plate_pos).looking_at(outward, Vec3::Y),
@@ -493,21 +526,49 @@ fn enter_room(
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::from_translation(pos).looking_at(outward, Vec3::Y),
+            RoomDistraction,
             Visibility::Inherited,
             Name::new(format!("Radiator{i}")),
             ChildOf(root),
         ));
     }
 
-    info!("room: entered (Tardis chamber, slice A)");
+    // Re-root the patch bay into the room as furniture at the W bearing (slice B,
+    // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
+    // the room; `arm_scene` primes the first observed-graph poll so its chords —
+    // the W ambient — build straight away without a dive.
+    patch_bay::spawn_furniture(
+        &mut commands,
+        root,
+        &mut meshes,
+        &mut mats,
+        &mut card_mats,
+        &mut images,
+    );
+    patch_bay::arm_scene(&mut pb_state);
+
+    info!("room: entered (Tardis chamber, slice B — patch bay stationed at W)");
 }
 
 fn exit_room(
     mut commands: Commands,
+    screen: Res<State<Screen>>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<RoomRoot>>,
     mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
 ) {
+    // Diving into the patch bay is travel WITHIN the shared shell scene graph,
+    // not a scene cut: the room chamber, the W furniture, and the shared camera
+    // all survive; `ease_shell_camera` dollies down and this teardown is skipped.
+    // `State<Screen>` already holds the *target* here — the transition updates it
+    // before OnExit runs (bevy_state `internal_apply_state_transition`, in the
+    // DependentTransitions set ahead of the exit schedules). Only leaving the
+    // shell entirely (Conversation, the well, the editor…) tears the room down;
+    // and because OnExit always precedes the next OnEnter, releasing the camera
+    // here lets the destination's own OnEnter (e.g. the well) re-claim it cleanly.
+    if *screen.get() == Screen::PatchBay {
+        return;
+    }
     for e in roots.iter() {
         commands.entity(e).despawn();
     }
@@ -626,22 +687,54 @@ fn room_focus_visuals(
     }
 }
 
-/// Ease the room camera toward the focused station's bearing pose — travel by
-/// intent, the same exponentially-smoothed tween idiom as the well's
-/// `ease_camera_to_focused_ring` (no cuts within a level).
-fn ease_room_camera(
+/// Ease the shared shell camera toward its target pose — travel by intent, the
+/// same exponentially-smoothed tween as the well's `ease_camera_to_focused_ring`
+/// (no cuts). Runs across BOTH shell screens and reads the target from the state:
+/// in the room it faces the focused station's bearing; on a patch-bay dive it
+/// descends to [`patch_bay::dive_camera_pose`] (the standalone scene's pose
+/// mapped through the W placement). One system, one camera — so diving and
+/// surfacing are the SAME continuous glide, just retargeted the frame the state
+/// flips (no snap either way).
+fn ease_shell_camera(
     time: Res<Time>,
     room: Res<RoomState>,
+    screen: Res<State<Screen>>,
     mut cam: Query<&mut Transform, With<RoomCamera>>,
 ) {
     let Ok(mut tf) = cam.single_mut() else {
         return;
     };
-    let (pos, look) = desired_camera(room.carousel.focused_station());
+    let (pos, look) = match *screen.get() {
+        Screen::PatchBay => patch_bay::dive_camera_pose(),
+        _ => desired_camera(room.carousel.focused_station()),
+    };
     let desired = Transform::from_translation(pos).looking_at(look, Vec3::Y);
     let alpha = 1.0 - (-CAMERA_EASE_RATE * time.delta_secs()).exp();
     tf.translation = tf.translation.lerp(desired.translation, alpha);
     tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
+}
+
+/// Fade the room chrome on a dive: hide the [`RoomDistraction`] chrome (bearing
+/// pylons, nameplates, console emblem, radiators) while `Screen::PatchBay` so the
+/// dived station owns the eye, and restore it in the room. The floor, its traces,
+/// the vault dome, and the dived station itself stay — they are the chamber, not
+/// distractions. One mechanism (Visibility), change-guarded so settled chrome
+/// never re-dirties (`docs/scenes/shell.md`, slice B — the dived view earns its
+/// focus by hiding distractions and showing the labels).
+fn apply_room_dive_visibility(
+    screen: Res<State<Screen>>,
+    mut chrome: Query<&mut Visibility, With<RoomDistraction>>,
+) {
+    let want = if *screen.get() == Screen::PatchBay {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut vis in chrome.iter_mut() {
+        if *vis != want {
+            *vis = want;
+        }
+    }
 }
 
 /// Ingest the kernel-wide event stream into per-bearing activity, **ungated**

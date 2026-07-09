@@ -95,10 +95,12 @@ living thread-web — mood at distance, never the dive interface
 - **No hands** (charter, post-wave-3): interaction animates the wire itself —
   a wire being connected draws itself socket-to-socket; disconnection
   dissolves it.
-- **In the shell**: the patch bay's bearing shows the wall-of-threads as
-  ambient telemetry — threads flicker when MIDI flows, even unvisited.
-  Diving cuts to the circle scene (charter dive-through rule). The routing
-  state also reaches the shell **floor**: live wires render as
+- **In the shell**: the circle stands at the W bearing as **furniture**
+  (slice B), its live chords the ambient telemetry — they flicker when MIDI
+  flows, even unvisited. Diving *descends onto* that same table within the
+  persistent room (no scene cut — open question 3 in `shell.md`, decided);
+  the wall-of-threads read is deferred, absorbed by the table's own chords for
+  now. The routing state also reaches the shell **floor**: live wires render as
   circuit-board traces inlaid in the room floor, bowing around the central
   well — this station's open-center rule at room scale (`shell.md`, "The
   floor is the wiring").
@@ -117,13 +119,16 @@ Each shippable alone, in order; 1 is independent and can land any time.
   seq announce events can tighten latency later.
 - The circle scene renders observed wires only; selection + inspection card
   + edge HUD; no write path of any kind.
-- **Entry** (updated 2026-07-08): slice 0 ships *with* the nav skeleton —
-  a blockout room level (station carousel: nameplates at bearings, no
-  full shell art yet). Up-Up from the well's top ring (speedbumped)
-  reaches the room; Left/Right focuses PATCH BAY; Down/Enter dives to the
-  circle scene; Up/Esc returns to the room. In-scene: Left/Right cycle
-  wire selection. The full shell room (slice A of `shell.md`) replaces
-  the blockout later without changing the keys.
+- **Entry** (updated 2026-07-09): the nav keys are frozen — Up-Up from the
+  well's top ring (speedbumped) reaches the room; Left/Right focuses PATCH
+  BAY; Down/Enter dives; Up/Esc surfaces to the room; in-scene Left/Right
+  cycle wire selection. What changed with the shell's slice B: the circle is
+  now **room furniture at the W bearing**, so a dive is a *continuous camera
+  descent* onto the table within the persistent room — **no scene cut**, the
+  room floor and dome stay as backdrop. At room scale the table's live chords
+  are the W ambient; the dive dims the room chrome and reveals the
+  port-label/tick/inspection-card LOD. (See `shell.md`, slice B + open
+  question 3, decided.)
 - Acceptance: with TiMidity up and the render port wired, the scene shows
   `RENDER → <synth>` and `<synth> ↔ system` wires; hand-run `aconnect`/
   `aconnect -d` changes appear on the next poll; the metronome click makes

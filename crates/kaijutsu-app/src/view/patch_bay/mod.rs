@@ -7,8 +7,18 @@
 //! appear on the next poll. No write path of any kind (patching stays
 //! CLI-only for a long time — the scene is a viewer).
 //!
-//! Keys: Left/Right cycle the selected wire (the inspection plate follows),
-//! Up or Esc returns to the room, `r` forces a poll.
+//! **The circle is room furniture at the W bearing** (`docs/scenes/shell.md`,
+//! Tardis reading #3 + slice B: "one shared scene graph"). The whole subtree
+//! rides ONE Amy-tunable placement transform ([`STATION_W_PLACEMENT`]) that
+//! sits it near W at waist height and uniform scale — internal coordinates are
+//! untouched. It is spawned when the room spawns ([`spawn_furniture`], called
+//! from `room::enter_room`) and lives as long as the room; diving is a
+//! *continuous camera descent* onto it, never a despawn/respawn scene cut. At
+//! room scale the chords are the W ambient; the dived view earns its focus by
+//! hiding room distractions and showing the label/tick/card LOD ([`PatchBayLod`]).
+//!
+//! Keys (dived only): Left/Right cycle the selected wire (the inspection plate
+//! follows), Up or Esc surfaces to the room, `r` forces a poll.
 
 pub mod geometry;
 
@@ -21,7 +31,7 @@ use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::ui::screen::Screen;
+use crate::ui::screen::{Screen, in_shell};
 use crate::view::room::nav::Station;
 use crate::view::room::{
     PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text,
@@ -30,9 +40,55 @@ use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use crate::view::room::nav::StationCarousel;
 use geometry::{chord_points, layout_sockets};
 
-// ── Scene constants (Amy-tunable) ───────────────────────────────────────────
+// ── Station placement seam (Amy-tunable — the ONE knob) ──────────────────────
+// Where the patch-bay circle stands as room furniture at the W bearing. This is
+// the single seam the slice-B decision (`docs/scenes/shell.md`, open question 3,
+// DECIDED 2026-07-09) rides on: the whole `PatchBayRoot` subtree is a child of a
+// placement entity carrying this transform, so all positioning/scaling happens
+// HERE and the patch bay's internal coordinates never change. Amy is still
+// weighing an alternative — the table as the room *floor* — so this stays a
+// transform edit (retune the three fields, or swap in a floor pose), never a
+// rebuild. The dive camera is the local `PB_CAM_POS/LOOK` mapped through this
+// same transform (`dive_camera_pose`), so the dived view frames the table
+// exactly as the standalone scene did.
 
-const PB_BG: Color = Color::srgb(0.028, 0.034, 0.055);
+/// A rigid-plus-uniform-scale placement of a scene into room space.
+struct StationPlacement {
+    /// Room-space translation of the scene's local origin.
+    translation: Vec3,
+    /// Uniform scale (table outer radius is ~348 patch-bay units; the room's
+    /// wall radius is 620 and the W pylon stands there — this reads the table
+    /// as a waist-height instrument stationed near W, not touching the pylon).
+    scale: f32,
+    /// Yaw about +Y (radians). `FRAC_PI_2` turns the scene's local +Z (the
+    /// standalone camera's side) toward world +X — the same side the room's
+    /// W-focus camera studies the table from — so the dive is a lean-in, not a
+    /// jump to the far side.
+    yaw: f32,
+}
+
+/// The patch bay's placement at W. **Amy-tunable — flagged for the lead's
+/// visual pass** (translation/scale/yaw are a computed first guess, not
+/// eyeballed in-scene). West is −X; the table floats at waist height between
+/// the console keep-out and the W wall.
+const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
+    translation: Vec3::new(-380.0, 130.0, 0.0),
+    scale: 0.22,
+    yaw: std::f32::consts::FRAC_PI_2,
+};
+
+/// The patch-bay point light re-tuned for the *placed* (room-scale) furniture.
+/// A light's brightness falls off inverse-square in WORLD units, and Bevy does
+/// NOT scale a `PointLight`'s intensity or range by its transform's scale (it
+/// *does* scale the light's position) — so the standalone value (60M lumens /
+/// 4000 range, tuned for the full-size table) would blow out the shrunken table
+/// sitting ~`scale`× as far from the lamp. Scaled to the placement: intensity ≈
+/// 60M·scale², range ≈ 4000·scale. **FLAG FOR VISUAL PASS** — computed, the lead
+/// live-tunes the exact exposure.
+const PB_PLACED_LIGHT_INTENSITY: f32 = 3_000_000.0;
+const PB_PLACED_LIGHT_RANGE: f32 = 900.0;
+
+// ── Scene constants (Amy-tunable) ───────────────────────────────────────────
 
 /// Rim radius where sockets seat; the open center the chords bow around.
 const RIM_R: f32 = 300.0;
@@ -48,7 +104,10 @@ const TABLE_INNER_R: f32 = HOLE_R * 0.92;
 const TABLE_OUTER_R: f32 = RIM_R * 1.16;
 const TABLE_DEPTH: f32 = 12.0;
 
-/// Camera pose: tilted look down onto the table.
+/// Camera pose (patch-bay LOCAL space): tilted look down onto the table. Under
+/// the standalone scene this was the room-space pose; now it is mapped through
+/// [`STATION_W_PLACEMENT`] to place the dive camera in room space
+/// ([`dive_camera_pose`]) so the dived framing is identical to the old scene.
 const PB_CAM_POS: Vec3 = Vec3::new(0.0, 470.0, 590.0);
 const PB_CAM_LOOK: Vec3 = Vec3::new(0.0, 0.0, -40.0);
 
@@ -131,6 +190,38 @@ const GROUP_PLATE_R: f32 = RIM_R * 1.32;
 const GROUP_PLATE_Y: f32 = 16.0;
 const GROUP_PLATE_DIM: f32 = 0.5;
 
+// ── Placement math (pure; the room-furniture seam) ───────────────────────────
+
+/// The `Transform` for the placement entity that re-roots the whole patch-bay
+/// subtree into room space — translation, yaw about +Y, and uniform scale.
+/// `room::enter_room` hangs `PatchBayRoot` under an entity carrying this.
+fn placement_transform(p: &StationPlacement) -> Transform {
+    Transform::from_translation(p.translation)
+        .with_rotation(Quat::from_rotation_y(p.yaw))
+        .with_scale(Vec3::splat(p.scale))
+}
+
+/// Map a patch-bay-LOCAL point to room space through a placement — the same
+/// similarity transform [`placement_transform`] applies to the subtree, but as
+/// a point mapping the camera dolly can read without touching an entity. Pure;
+/// unit-tested.
+fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
+    p.translation + Quat::from_rotation_y(p.yaw) * (local * p.scale)
+}
+
+/// The dive camera's room-space `(eye, look-at)` — the local [`PB_CAM_POS`] /
+/// [`PB_CAM_LOOK`] carried through [`STATION_W_PLACEMENT`]. `ease_shell_camera`
+/// glides to this while `Screen::PatchBay`, so descending onto the W furniture
+/// frames the table exactly as the standalone scene did (a similarity transform
+/// preserves the camera→scene angles, so the baked `face_camera` plate facing
+/// still points at the world eye).
+pub(crate) fn dive_camera_pose() -> (Vec3, Vec3) {
+    (
+        placement_to_room(&STATION_W_PLACEMENT, PB_CAM_POS),
+        placement_to_room(&STATION_W_PLACEMENT, PB_CAM_LOOK),
+    )
+}
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 /// Main-thread-only ALSA handle (the `Seq` is not Send — same NonSend stance
@@ -179,11 +270,23 @@ impl Default for PatchBayState {
 
 // ── Components ──────────────────────────────────────────────────────────────
 
+/// The placement entity that re-roots the patch bay into room space at the W
+/// bearing (child of `RoomRoot`; carries [`STATION_W_PLACEMENT`]). `PatchBayRoot`
+/// is its child, so the whole scene moves as one.
+#[derive(Component)]
+pub struct StationWPlacement;
+
 #[derive(Component)]
 pub struct PatchBayRoot;
 
+/// The dived view's LOD layer — port labels, radial etch ticks, group/title/info
+/// plates: the "dedicated view" text+tick detail that appears only on the dive
+/// (`docs/scenes/shell.md`, slice B). `apply_patch_lod` shows these while
+/// `Screen::PatchBay` and hides them at room scale, where the bare chords over
+/// the socket rings are the W ambient. Spawned `Visibility::Hidden` so the
+/// room-scale default is correct with no first-frame flash.
 #[derive(Component)]
-pub struct PatchBayCamera;
+pub struct PatchBayLod;
 
 /// A chord entity; the index into `PatchBayState.snapshot.wires`.
 #[derive(Component)]
@@ -235,20 +338,30 @@ impl Plugin for PatchBayPlugin {
             .add_systems(
                 Update,
                 (
-                    patch_bay_keyboard,
-                    poll_patch_graph,
-                    rebuild_patch_scene,
-                    update_wire_selection,
-                    position_info_plate,
-                    // Before `fill_patch_text`: it owns the `text_dirty` clear,
-                    // so filling port labels first keeps them on the same armed
-                    // flag as the other plates.
-                    fill_port_labels,
-                    fill_patch_text,
-                    pulse_render_chords,
+                    // Dived-only input; first so a Left/Right selection lands
+                    // before the rebuild/fill it feeds.
+                    patch_bay_keyboard.run_if(in_state(Screen::PatchBay)),
+                    // Ambient truth: the observed graph, its chords, the
+                    // selection glow, and traffic pulses stay live across BOTH
+                    // shell screens — the chords ARE the W ambient even seen
+                    // from room scale (the bearing's promise), so these can't be
+                    // gated behind the dive.
+                    poll_patch_graph.run_if(in_shell),
+                    rebuild_patch_scene.run_if(in_shell),
+                    update_wire_selection.run_if(in_shell),
+                    // Dived-only detail: the inspection card pose and the text
+                    // layer (fills after rebuild spawns the plates it reads;
+                    // `fill_patch_text` owns the `text_dirty` clear, so port
+                    // labels fill first on the same armed flag).
+                    position_info_plate.run_if(in_state(Screen::PatchBay)),
+                    fill_port_labels.run_if(in_state(Screen::PatchBay)),
+                    fill_patch_text.run_if(in_state(Screen::PatchBay)),
+                    pulse_render_chords.run_if(in_shell),
+                    // LOD visibility last, so a label/tick rebuild spawned this
+                    // frame gets its room-vs-dive visibility set before render.
+                    apply_patch_lod.run_if(in_shell),
                 )
-                    .chain()
-                    .run_if(in_state(Screen::PatchBay)),
+                    .chain(),
             );
     }
 }
@@ -256,42 +369,72 @@ impl Plugin for PatchBayPlugin {
 // ── Enter / exit ────────────────────────────────────────────────────────────
 
 /// Arm a fresh poll + full scene/text rebuild for the next frame. `PatchBayState`
-/// (and its `snapshot`) is a `Resource` — it survives `exit_patch_bay`, which
-/// only despawns `PatchBayRoot` and its children. Without forcing `scene_dirty`
-/// here, a re-entry where the ALSA graph hasn't changed since the last visit
-/// produces an empty `diff` in `poll_patch_graph`, and `rebuild_patch_scene`
-/// never runs: a bare table forever, even though `state.snapshot` is valid.
-fn arm_on_enter(state: &mut PatchBayState) {
+/// (and its `snapshot`) is a `Resource` — it outlives the entities `RoomRoot`
+/// carries. Called from `room::enter_room` when the room (and the W furniture)
+/// first spawns, so the observed graph is polled and its chords built straight
+/// away. Without forcing `scene_dirty`, a room re-entry where the ALSA graph
+/// hasn't changed since last time produces an empty `diff` in `poll_patch_graph`
+/// and `rebuild_patch_scene` never runs — a bare table forever, even though
+/// `state.snapshot` is valid.
+pub(crate) fn arm_scene(state: &mut PatchBayState) {
     let full = state.timer.duration();
     state.timer.set_elapsed(full);
     state.text_dirty = true;
     state.scene_dirty = true;
 }
 
-fn enter_patch_bay(
-    mut commands: Commands,
-    mut state: ResMut<PatchBayState>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut std_materials: ResMut<Assets<StandardMaterial>>,
-    mut card_materials: ResMut<Assets<WellCardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+/// Dive into the patch bay. The furniture already stands at W as part of the
+/// room ([`spawn_furniture`]), so this is **not** a spawn and claims no camera:
+/// the shared camera dollies down onto the table (`ease_shell_camera` retargets
+/// the moment the state flips) and the LOD layer appears (`apply_patch_lod`).
+/// Re-arm the text so the labels fill on this dive even when the graph is
+/// unchanged since the last one (the fill systems run only while dived).
+fn enter_patch_bay(mut state: ResMut<PatchBayState>) {
+    state.text_dirty = true;
+    info!("patch-bay: dived");
+}
+
+/// Surface from the dive back to the room. Nothing to tear down — the room and
+/// its W furniture survived the whole dive. `ease_shell_camera` glides the
+/// camera back to the W-approach pose and `apply_patch_lod` hides the LOD; the
+/// wire selection is left intact so re-diving resumes where it was.
+fn exit_patch_bay() {
+    info!("patch-bay: surfaced");
+}
+
+/// Spawn the patch-bay circle as **room furniture at the W bearing** — the
+/// static half of the scene (the placement anchor, the table, the etched guide
+/// rings, the point light, and the title/legend/inspection plates). The
+/// seat-driven sockets, ticks, chords, and per-client plates are rebuilt from
+/// the observed graph by `rebuild_patch_scene`. Called once from
+/// `room::enter_room`; the whole subtree lives as long as `RoomRoot`.
+pub(crate) fn spawn_furniture(
+    commands: &mut Commands,
+    room_root: Entity,
+    meshes: &mut Assets<Mesh>,
+    std_materials: &mut Assets<StandardMaterial>,
+    card_materials: &mut Assets<WellCardMaterial>,
+    images: &mut Assets<Image>,
 ) {
-    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
-        commands.entity(cam_entity).insert(PatchBayCamera);
-        cam.clear_color = ClearColorConfig::Custom(PB_BG);
-        *tf = Transform::from_translation(PB_CAM_POS).looking_at(PB_CAM_LOOK, Vec3::Y);
-    }
-
-    // Force a fresh poll + rebuild on every entry.
-    arm_on_enter(&mut state);
-
+    // Re-root the whole circle into room space at W: the placement entity holds
+    // the ONE Amy-tunable transform, `PatchBayRoot` rides under it, and every
+    // child below keeps its untouched local coordinates (the seam).
+    let placement = commands
+        .spawn((
+            StationWPlacement,
+            placement_transform(&STATION_W_PLACEMENT),
+            Visibility::Inherited,
+            Name::new("StationWPlacement"),
+            ChildOf(room_root),
+        ))
+        .id();
     let root = commands
         .spawn((
             PatchBayRoot,
             Transform::default(),
             Visibility::Inherited,
             Name::new("PatchBayRoot"),
+            ChildOf(placement),
         ))
         .id();
 
@@ -341,12 +484,16 @@ fn enter_patch_bay(
         ));
     }
 
-    // StandardMaterial needs light (the well's custom shaders don't; this
-    // scene has real metal). One warm point light high over the table.
+    // StandardMaterial needs light (the room's own materials are all unlit, so
+    // this lamp only touches the table + pegs). Intensity/range are the placed
+    // (room-scale) values — see `PB_PLACED_LIGHT_*`: a light does not scale with
+    // the placement's transform, so the full-size numbers would blow out the
+    // shrunken table. Its POSITION does scale (it rides the placement), so the
+    // local pose keeps the lamp proportionally over the table.
     commands.spawn((
         PointLight {
-            intensity: 60_000_000.0,
-            range: 4000.0,
+            intensity: PB_PLACED_LIGHT_INTENSITY,
+            range: PB_PLACED_LIGHT_RANGE,
             shadows_enabled: false,
             color: Color::srgb(1.0, 0.92, 0.78),
             ..default()
@@ -356,25 +503,34 @@ fn enter_patch_bay(
         ChildOf(root),
     ));
 
-    // Title, legend, inspection plates (MSDF; filled by `fill_patch_text`).
+    // Title, legend, inspection plates (MSDF; filled by `fill_patch_text` only
+    // while dived). All three are the dive LOD — tagged `PatchBayLod` and spawned
+    // hidden by `plate_bundle`, so the room-scale ambient stays text-free.
     let title = plate_bundle(
-        &mut meshes,
-        &mut card_materials,
-        &mut images,
+        meshes,
+        card_materials,
+        images,
         Vec3::new(0.0, 150.0, -TABLE_OUTER_R - 60.0),
         1.4,
     );
-    commands.spawn((TitlePlate("PATCH BAY"), title, Name::new("PatchBayTitle"), ChildOf(root)));
+    commands.spawn((
+        TitlePlate("PATCH BAY"),
+        PatchBayLod,
+        title,
+        Name::new("PatchBayTitle"),
+        ChildOf(root),
+    ));
 
     let legend = plate_bundle(
-        &mut meshes,
-        &mut card_materials,
-        &mut images,
+        meshes,
+        card_materials,
+        images,
         Vec3::new(0.0, 8.0, TABLE_OUTER_R + 90.0),
         0.9,
     );
     commands.spawn((
         TitlePlate("<- -> WIRE   UP/ESC ROOM   R RESCAN"),
+        PatchBayLod,
         legend,
         Name::new("PatchBayLegend"),
         ChildOf(root),
@@ -382,26 +538,38 @@ fn enter_patch_bay(
 
     // Spawn the inspection plate at the empty-state edge pose; `position_info_plate`
     // blooms it onto the selected chord's apex once a wire is selected.
-    let info = plate_bundle(&mut meshes, &mut card_materials, &mut images, INFO_EDGE_POS, 1.2);
-    commands.spawn((InfoPlate, info, Name::new("PatchBayInfo"), ChildOf(root)));
+    let info = plate_bundle(meshes, card_materials, images, INFO_EDGE_POS, 1.2);
+    commands.spawn((
+        InfoPlate,
+        PatchBayLod,
+        info,
+        Name::new("PatchBayInfo"),
+        ChildOf(root),
+    ));
 
-    info!("patch-bay: entered");
+    info!("patch-bay: stationed as room furniture at W");
 }
 
-fn exit_patch_bay(
-    mut commands: Commands,
-    theme: Res<crate::ui::theme::Theme>,
-    roots: Query<Entity, With<PatchBayRoot>>,
-    mut app_camera: Query<(Entity, &mut Camera), With<PatchBayCamera>>,
+/// The dive LOD: show the label/tick/card layer while `Screen::PatchBay`, hide
+/// it at room scale (`docs/scenes/shell.md`, slice B — the dived view earns its
+/// focus by *showing the labels*, the room ambient is the bare chords over the
+/// socket rings). Change-guarded so a settled entity never re-dirties; it also
+/// corrects the labels/ticks `rebuild_patch_scene` spawns this frame (they spawn
+/// `Hidden`, so the room-scale default needs no fix — only the dive shows them).
+fn apply_patch_lod(
+    screen: Res<State<Screen>>,
+    mut lod: Query<&mut Visibility, With<PatchBayLod>>,
 ) {
-    for e in roots.iter() {
-        commands.entity(e).despawn();
+    let want = if *screen.get() == Screen::PatchBay {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut vis in lod.iter_mut() {
+        if *vis != want {
+            *vis = want;
+        }
     }
-    if let Ok((cam_entity, mut cam)) = app_camera.single_mut() {
-        commands.entity(cam_entity).remove::<PatchBayCamera>();
-        cam.clear_color = ClearColorConfig::Custom(theme.bg);
-    }
-    info!("patch-bay: exited");
 }
 
 // ── Systems ─────────────────────────────────────────────────────────────────
@@ -589,10 +757,11 @@ fn rebuild_patch_scene(
         let tick_mesh = meshes.add(ribbon_mesh(&[tick_in.to_array(), tick_out.to_array()], ETCH_TICK_WIDTH));
         commands.spawn((
             EtchTick,
+            PatchBayLod,
             Mesh3d(tick_mesh),
             MeshMaterial3d(tick_material.clone()),
             Transform::default(),
-            Visibility::Inherited,
+            Visibility::Hidden,
             Name::new("EtchTick"),
             ChildOf(root),
         ));
@@ -625,10 +794,11 @@ fn rebuild_patch_scene(
             });
             commands.spawn((
                 PortLabel(text),
+                PatchBayLod,
                 Mesh3d(mesh),
                 MeshMaterial3d(material),
                 face_camera(pos),
-                Visibility::Inherited,
+                Visibility::Hidden,
                 panel,
                 Name::new("PortLabel"),
                 ChildOf(root),
@@ -676,10 +846,11 @@ fn rebuild_patch_scene(
         });
         commands.spawn((
             GroupPlate(label.client_name.clone()),
+            PatchBayLod,
             Mesh3d(mesh),
             MeshMaterial3d(material),
             face_camera(pos),
-            Visibility::Inherited,
+            Visibility::Hidden,
             panel,
             Name::new(format!("GroupPlate-{}", label.client_name)),
             ChildOf(root),
@@ -1136,7 +1307,10 @@ fn face_camera(pos: Vec3) -> Transform {
 }
 
 /// A floating MSDF text plate facing the patch-bay camera (borderless,
-/// label-style; text committed later by [`fill_patch_text`]).
+/// label-style; text committed later by [`fill_patch_text`]). Spawned
+/// `Visibility::Hidden`: every caller (title/legend/info) is the dive LOD, shown
+/// only while dived by `apply_patch_lod`, so the room-scale ambient stays
+/// text-free.
 fn plate_bundle(
     meshes: &mut Assets<Mesh>,
     card_materials: &mut Assets<WellCardMaterial>,
@@ -1167,7 +1341,7 @@ fn plate_bundle(
         Mesh3d(mesh),
         MeshMaterial3d(material),
         face_camera(pos),
-        Visibility::Inherited,
+        Visibility::Hidden,
         panel,
     )
 }
@@ -1241,9 +1415,9 @@ mod tests {
         }
     }
 
-    /// The shape `PatchBayState` is left in by `exit_patch_bay`: the resource
-    /// (and its snapshot) survive the despawn untouched, but nothing has
-    /// re-armed the dirty flags for the next entry yet.
+    /// The shape `PatchBayState` is left in after a room session: the resource
+    /// (and its snapshot) outlive the entities `RoomRoot` carried, but nothing
+    /// has re-armed the dirty flags for the next room entry yet.
     fn persisted_after_exit() -> PatchBayState {
         PatchBayState {
             snapshot: non_empty_snapshot(),
@@ -1254,36 +1428,72 @@ mod tests {
         }
     }
 
-    // -- arm_on_enter --------------------------------------------------
+    // -- arm_scene (armed from room::enter_room) -----------------------
 
     #[test]
-    fn arm_on_enter_forces_both_dirty_flags_true() {
+    fn arm_scene_forces_both_dirty_flags_true() {
         let mut state = persisted_after_exit();
-        arm_on_enter(&mut state);
+        arm_scene(&mut state);
         assert!(
             state.scene_dirty,
-            "re-entry must force a rebuild even when the graph hasn't changed since the last visit"
+            "room re-entry must force a rebuild even when the graph hasn't changed since the last visit"
         );
         assert!(state.text_dirty);
     }
 
     #[test]
-    fn arm_on_enter_primes_the_timer_to_fire_on_the_next_tick() {
+    fn arm_scene_primes_the_timer_to_fire_on_the_next_tick() {
         let mut state = persisted_after_exit();
-        arm_on_enter(&mut state);
+        arm_scene(&mut state);
         assert!(!state.timer.just_finished(), "not finished until it's ticked");
         assert!(state.timer.tick(Duration::from_millis(1)).just_finished());
     }
 
     #[test]
-    fn arm_on_enter_leaves_the_persisted_snapshot_untouched() {
+    fn arm_scene_leaves_the_persisted_snapshot_untouched() {
         let mut state = persisted_after_exit();
         let before = state.snapshot.clone();
-        arm_on_enter(&mut state);
+        arm_scene(&mut state);
         assert_eq!(
             state.snapshot, before,
-            "rebuild_patch_scene reads the persisted snapshot; arm_on_enter must not touch it"
+            "rebuild_patch_scene reads the persisted snapshot; arm_scene must not touch it"
         );
+    }
+
+    // -- placement seam (the room-furniture transform) -----------------
+
+    #[test]
+    fn the_placement_seam_lands_the_patch_bay_origin_at_its_room_station() {
+        // The scene's local origin maps to exactly the station translation — the
+        // one knob that puts the whole circle at W.
+        let at = placement_to_room(&STATION_W_PLACEMENT, Vec3::ZERO);
+        assert_eq!(at, STATION_W_PLACEMENT.translation);
+    }
+
+    #[test]
+    fn the_placement_seam_shrinks_a_local_height_by_the_scale_alone() {
+        // A point straight up in patch-bay-local space rises `scale`× as high
+        // above the station and moves nowhere in XZ (yaw is about +Y, so it
+        // can't tilt a vertical) — the uniform-scale-plus-rigid seam.
+        let p = &STATION_W_PLACEMENT;
+        let up = placement_to_room(p, Vec3::new(0.0, 100.0, 0.0));
+        assert!((up.y - (p.translation.y + 100.0 * p.scale)).abs() < 1e-3, "{up:?}");
+        assert!((up.x - p.translation.x).abs() < 1e-3, "{up:?}");
+        assert!((up.z - p.translation.z).abs() < 1e-3, "{up:?}");
+    }
+
+    #[test]
+    fn the_dive_camera_leans_down_onto_the_table_from_the_approach_side() {
+        // The dive pose is the local look-down camera carried through the seam:
+        // the eye rides above the table's waist height and above its own look
+        // point (tilting down onto the top face), and it stands on the +X
+        // (console) side of the table center — the same side the room's W-focus
+        // camera studies it from, so the descent is a lean-in, not a jump across.
+        let (eye, look) = dive_camera_pose();
+        let t = STATION_W_PLACEMENT.translation;
+        assert!(eye.y > t.y, "dive eye sits above the table waist: {eye:?}");
+        assert!(eye.y > look.y, "camera tilts down onto the table: eye={eye:?} look={look:?}");
+        assert!(eye.x > t.x, "dive eye is on the approach (+X) side of the table: {eye:?}");
     }
 
     // -- PatchBayAlsa::clear_failed_open --------------------------------
