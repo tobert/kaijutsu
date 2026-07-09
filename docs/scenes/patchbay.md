@@ -51,6 +51,18 @@ reality** ("distribute intent, not pulses" applied to routing):
 
 ## The scene (decided direction, waves 1–3)
 
+**Built as of 2026-07-09** (slice 0 + the visual wave; live-verified): the
+circle table with etched gold guide rings and radial seat ticks; brass pegs
+with short ALL-CAPS port labels from a *display* heuristic (`socket_label` —
+deliberately not the endpoint registry, open question #2 below); client
+nameplates receded to a dim outer tier; all text faces the fixed camera;
+selection's inspection card blooms at the chord's apex, shrink-to-fit, in
+the same label language as the pegs; and render-port traffic rides chords
+as a GPU-animated packet (one uniform write per pulse). **Still future**:
+ghost/amber wire states (slice 2+), wire draw/dissolve animation, chord
+bundling + staggered heights, and the full curved-glass edge-HUD grammar
+(today: flat title/legend plates).
+
 Canonical reference: `docs/scenes/concepts/14-patchbay-circle.png` (the
 form — Amy's pick). Two culled mockups live on in prose: a VR frame
 contributed the dive scene's UI grammar (specified below — everything
@@ -98,7 +110,7 @@ living thread-web — mood at distance, never the dive interface
 
 Each shippable alone, in order; 1 is independent and can land any time.
 
-### Slice 0 — observed ALSA graph, read-only (the viz)
+### Slice 0 — observed ALSA graph, read-only (the viz) ✓ shipped
 
 - App-side ALSA seq **graph reader** beside the existing `MidiOut`: clients,
   ports, subscriptions — polled (the well's poll/layout-tick pattern);
@@ -115,7 +127,9 @@ Each shippable alone, in order; 1 is independent and can land any time.
 - Acceptance: with TiMidity up and the render port wired, the scene shows
   `RENDER → <synth>` and `<synth> ↔ system` wires; hand-run `aconnect`/
   `aconnect -d` changes appear on the next poll; the metronome click makes
-  the RENDER chord pulse.
+  the RENDER chord pulse. **Verified 2026-07-09** — wires, poll add/remove,
+  and the pulse (driven live via `kj play`; the click path is the same
+  send seam, its pulse awaits the next jam with the metronome armed).
 
 ### Slice 1 — auto-connect on startup ✓ shipped (independent cheap win)
 

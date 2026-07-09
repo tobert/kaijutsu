@@ -413,11 +413,78 @@ the digging taught:
   is never intercepted). Same theme as the rest of the chapter: the surface a
   model hits mid-turn stops fighting it.
 
+## The kernel gets an interior (July 7–9)
+
+The time well had proven that kernel state could be a *place*; the scenes
+charter (`docs/scenes/`) asked what building the rest of the place would
+mean. Two days of design — 28 image-model mockups culled to one canonical
+image per decided surface, every discarded lesson melted into prose — then
+three days that took the first station from spec to a finished instrument.
+
+- **The room exists, and the arrows just keep going.** Navigation grew one
+  level up without a new grammar: Up/Down move between detail levels,
+  Left/Right within one, Esc always walks up — and the well's mouth ring
+  exits upward through a *speedbump* (double-tap, the app's existing 500ms
+  pattern pointed at a new axis) so habitual ring nav never ejects you.
+  Slice A made the blockout a chamber: vault, trace floor bowed around the
+  console emblem, bearing pylons with engraved nameplates, violet radiator
+  placeholders, and per-bearing activity glow fed by the same event stream
+  the well already ingests — the shell adds renderers, not wire.
+- **The camera taught us the room's first hard lesson.** The focused-station
+  pose originally stood diametrically across the chamber — and cardinal
+  bearings are colinear through the center, so the opposite pylon and the
+  console stacked on the sight line and hid the very station being focused.
+  The fix is an *approach* pose: stand on the focused station's side,
+  looking outward. Same family: the reserved South marker shrank to a stub
+  because the overview camera lives at South. In a radial room, every
+  camera pose is a claim about what may stand between you and the center.
+- **The patch bay went from black blob to instrument.** Slice 0 (observed
+  ALSA graph on a round table, read-only) shipped with the nav skeleton;
+  the visual wave made it parseable: etched gold guide rings and seat
+  ticks, short ALL-CAPS port labels from a display heuristic that
+  deliberately is *not* the symbolic-endpoint registry (that question
+  stays open), nameplates receded to a supporting tier, and the
+  inspection card blooming at the selected chord's apex with
+  shrink-to-fit text, speaking the same label language as the pegs.
+- **Slice 1 killed the oldest papercut.** The app auto-connects its render
+  port to a name-matched GM synth on startup — deferential (any existing
+  outbound wire means stand down) and one-shot with patient retry, so a
+  human's later `aconnect -d` stays cut: the metronome click rides that
+  port with no off-switch yet, and a continuously-reconciling ensure would
+  have made the wire uncuttable. Continuous reconciliation stays slice 2's
+  kernel-owned job. Names, never client numbers.
+- **Live traffic is light.** The render port's send seams raise one message
+  per frame-with-traffic; chords the app can observe carry a GPU-animated
+  packet (one uniform write per pulse, `globals.time` does the rest).
+  The two-hour hunt for the "missing" pulse ended in the best possible
+  verdict: staged shader probes (stamp-arrival, age-window, UV paint)
+  proved every layer correct — nothing was broken. The 0.42s default is
+  just faster than screenshot sampling, and the only chord was always
+  selected, masking the band in its own glow. Lesson: distinguish "the
+  mechanism is broken" from "my observation can't see it" *before*
+  touching the mechanism.
+- **The fan-out held on a single file.** Two opus lanes built the
+  instrument face and the live layer in the same `mod.rs` under explicit
+  region ownership; the merge was three keep-both conflicts. Every lane
+  got a kaibo round (gemini batch + deepseek, whole files, no diff) —
+  which caught two real moderates (a cold retry timer; unmasked MIDI data
+  bytes in the pre-existing click path) and one real HIGH (room nameplates
+  blank on re-entry: a process-lifetime latch guarding per-visit
+  entities — the same bug family as the patch bay's own re-entry fix that
+  morning). It also produced confident "criticals" asserting pre-0.12
+  Bevy folklore — non-recursive despawn, no sync points between chained
+  systems. Bevy source is checked out locally; reviewer claims about
+  engine scheduling get verified there before any code moves.
+
 ## Now
 
-As of 2026-07-04: the model-QoL sweep and the kaish 0.11 bump are merged and
-awaiting deploy (kernel rebuild + restart, `kj rc reset` for the new datetime
-seeds); subprocess exec shipped and the first audible `kj play` after it is
-unverified; the time well carousel is in Amy's tuning hands; the render seam is
-fully on the wire with clip/PCM prefetch proven; open work is in
-`docs/issues.md` and the live handoff in `signoff.md` (ephemeral, repo root).
+As of 2026-07-09: the kernel-interior scene family is live — the Tardis room
+(slice A) with ambient bearing glow, and the patch bay complete as an
+instrument (observed graph, auto-connect, etched face, port labels, traffic
+pulses, card-at-chord). The tracks bearing's breathe-on-jam acceptance and
+the metronome-click chord pulse await the next live jam. Amy is sitting with
+a reframe: the patch bay table may *be* the room floor (one geometry, two
+readings — dive as descent, labels as LOD); the bearings table waits on that.
+Next station candidates: shell slice B (thread-wall ambient at W + the
+scene-graph decision) or the tracks highway. Open work is in
+`docs/issues.md`; the live handoff in `signoff.md` (ephemeral, repo root).
