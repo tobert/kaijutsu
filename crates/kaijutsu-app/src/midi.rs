@@ -40,6 +40,31 @@ impl Plugin for MidiOutPlugin {
         // port to a detected GM synth — kills the re-`aconnect`-after-restart
         // papercut (`docs/scenes/patchbay.md`). Additive and startup-once.
         app.add_systems(Update, auto_connect_render);
+        // Patch-bay live layer: announce every render-port send so the scene can
+        // pulse the RENDER chord. Additive — the sink stamps a flag on send, this
+        // drains it into a message the patch bay reads (`docs/scenes/patchbay.md`).
+        app.add_message::<RenderPortTraffic>();
+        app.add_systems(Update, emit_render_traffic);
+    }
+}
+
+/// A render-port send just happened — the patch bay lights the RENDER chord. The
+/// app can only observe its OWN traffic (`docs/scenes/patchbay.md`, the live
+/// layer): every send out the render seq port — an ABC cue or a 拍子木 click — is
+/// one edge-observable event. Emitted here; consumed only by the patch bay.
+#[derive(Message)]
+pub struct RenderPortTraffic;
+
+/// Drain the sink's send flag into one `RenderPortTraffic` per frame that saw
+/// traffic — a burst of pre-scheduled clicks collapses to a single packet, which
+/// is the right read (one travelling pulse, not a strobe). Ungated: MIDI flows on
+/// every screen; the patch bay reads this only while it's up.
+fn emit_render_traffic(
+    mut sink: NonSendMut<MidiSink>,
+    mut traffic: MessageWriter<RenderPortTraffic>,
+) {
+    if std::mem::take(&mut sink.traffic) {
+        traffic.write(RenderPortTraffic);
     }
 }
 
@@ -58,6 +83,10 @@ pub(crate) struct MidiSink {
     #[cfg(target_os = "linux")]
     out: Option<MidiOut>,
     failed: bool,
+    /// Set whenever a send is actually issued out the render port (an ABC cue or
+    /// a metronome click); drained once per frame into a [`RenderPortTraffic`]
+    /// message by [`emit_render_traffic`]. The patch-bay live layer's only hook.
+    traffic: bool,
 }
 
 impl MidiSink {
@@ -80,6 +109,7 @@ impl MidiSink {
         }
         if let Some(out) = self.out.as_mut() {
             out.click_at(note, channel, velocity, gate_ms, offset);
+            self.traffic = true; // a click left the render port — pulse the chord
         }
     }
 
@@ -370,6 +400,7 @@ fn schedule(sink: &mut MidiSink, events: Vec<(Duration, Vec<u8>)>, lead: Duratio
     }
     if let Some(out) = sink.out.as_mut() {
         out.schedule(&events, lead);
+        sink.traffic = true; // a cue left the render port — pulse the chord
     }
 }
 

@@ -4,6 +4,7 @@
 //! post-processing (SDF border glow, animation, text halo, cursor beam).
 
 pub mod block_fx_material;
+pub mod chord_material;
 pub mod terrace_ring_material;
 pub mod track_ray_material;
 pub mod well_card_material;
@@ -12,6 +13,7 @@ pub mod well_rings_material;
 use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
+pub use chord_material::ChordMaterial;
 pub use terrace_ring_material::TerraceRingMaterial;
 pub use track_ray_material::TrackRayMaterial;
 pub use well_card_material::WellCardMaterial;
