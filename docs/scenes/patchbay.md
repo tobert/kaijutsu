@@ -105,9 +105,13 @@ Each shippable alone, in order; 1 is independent and can land any time.
   seq announce events can tighten latency later.
 - The circle scene renders observed wires only; selection + inspection card
   + edge HUD; no write path of any kind.
-- **Entry, pre-shell**: the shell room doesn't exist yet, so slice 0 lands
-  as its own view/Screen on a keybinding (the well's Ctrl+W precedent); it
-  slots into the shell when the shell exists.
+- **Entry** (updated 2026-07-08): slice 0 ships *with* the nav skeleton —
+  a blockout room level (station carousel: nameplates at bearings, no
+  full shell art yet). Up-Up from the well's top ring (speedbumped)
+  reaches the room; Left/Right focuses PATCH BAY; Down/Enter dives to the
+  circle scene; Up/Esc returns to the room. In-scene: Left/Right cycle
+  wire selection. The full shell room (slice A of `shell.md`) replaces
+  the blockout later without changing the keys.
 - Acceptance: with TiMidity up and the render port wired, the scene shows
   `RENDER → <synth>` and `<synth> ↔ system` wires; hand-run `aconnect`/
   `aconnect -d` changes appear on the next poll; the metronome click makes

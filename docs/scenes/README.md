@@ -107,6 +107,21 @@ interior as a techmage's studio. Guidance for concepting and building:
   legibility wins. Bright = live action (the well's HDR tiering rule);
   decoration stays LDR and calm.
 
+## Assets: procedural-first (decided 2026-07-08)
+
+Anything whose **count or position comes from kernel state is procedural**
+— sockets, chords, cards, traces, notes are data-driven geometry on the
+well's proven pipeline (procedural mesh + custom WGSL + MSDF text + HDR
+bloom). Sourced assets are welcome where they don't fight that rule, in
+value order: (1) a dark-interior **HDRI/environment map** so metal reads
+as metal, (2) tiling **detail textures** (brushed metal normal/roughness,
+dark stone, smoked glass), (3) an **engraved-caps font** for
+nameplates/labels (rendered via MSDF), (4) **hero props** (GLTF: jack,
+table trim, archway) only after a procedural blockout proves the layout —
+fixed furniture only, always re-graded through our palette materials.
+Track licenses beside the assets. The failure mode to refuse:
+mixed-provenance asset-pack soup.
+
 ## Station inventory
 
 Each station earns its place by having a genuinely different **data shape**

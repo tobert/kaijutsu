@@ -108,15 +108,21 @@ budget discipline:
 
 ## Navigation
 
-- **Levels**: the shell extends the well's progression one level *upward* —
-  shell (room overview) → well levels (rings → detail → conversation) or
-  → a station dive. Esc always walks up one level; from the well's overview,
-  Esc reaches the room.
-- **Entry**: Ctrl+W keeps meaning *the well* (muscle memory is sacred); the
-  shell is one Esc above it, plus (open) a direct key of its own.
-- **Travel by intent** (charter): arrows/tab cycle bearings, Enter dives;
-  the camera dollies continuously so spatial relationships register. No
-  free-flight, no walking.
+- **Levels — the arrows continue** (Amy, 2026-07-08): the room extends the
+  well's existing arrow grammar one level upward. **Up/Down move between
+  detail levels; Left/Right move within a level.** From the well's top
+  (mouth) ring, Up exits to the room — through a **speedbump**: the first
+  Up at the edge arms the exit, a second Up within the double-tap window
+  fires it (the existing 500ms InterruptState pattern, pointed upward), so
+  a habitual Up during ring nav never ejects you. In the room, Left/Right
+  cycle the stations — well, patch bay, tracks, radiators, … (unbuilt
+  stations ride the carousel as dimmed nameplates) — and Down/Enter dives
+  into the focused one. Esc always walks up one level, everywhere.
+- **Entry**: Ctrl+W keeps meaning *the well* (muscle memory is sacred);
+  the room sits one speedbumped Up above it.
+- **Travel by intent** (charter): the camera dollies continuously between
+  stations and levels so spatial relationships register. No free-flight,
+  no walking.
 - A future minimap/orientation surface renders the same geometry as an
   overhead compass-rose floor plan — station markers at their bearings,
   the well glowing at center, the player's position a dot. A rendering of
