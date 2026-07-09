@@ -94,6 +94,12 @@ const KEEPOUT_RADIUS: f32 = 150.0;
 /// Marker pylon dimensions (a slim square post standing on the floor).
 const MARKER_WIDTH: f32 = 26.0;
 const MARKER_HEIGHT: f32 = 260.0;
+/// Reserved-bearing (South) marker height — roughly a third of a built
+/// station's pylon, so the empty plot reads as a low waymarker post rather
+/// than a monolith standing in the overview shot's near foreground (the
+/// south-marker-blocks-the-overview bug, `shell.md` open question 1). Still
+/// tall enough to read as "reserved, not vanished."
+const MARKER_HEIGHT_RESERVED: f32 = MARKER_HEIGHT / 3.0;
 
 /// Nameplate quad (world units) and its texture (logical px) — the well's plate
 /// grammar, kept API-compatible for the patch bay's own plates.
@@ -165,13 +171,16 @@ const PLATE_ACCENT: Vec4 = Vec4::new(0.075, 0.085, 0.125, 1.0);
 
 // ── Camera (travel by intent — the well's tween idiom) ───────────────────────
 
-/// Back-off distance and lift for the orbit camera facing a wall station.
-const ROOM_CAM_ORBIT: f32 = 780.0;
-const ROOM_CAM_HEIGHT: f32 = 260.0;
-/// How far past the console toward the station the look-point leads, and at what
-/// height — frames console + station together.
-const ROOM_CAM_LOOK_LEAD: f32 = 200.0;
-const ROOM_CAM_LOOK_HEIGHT: f32 = 120.0;
+/// Approach-pose eye radius: how far out from center the camera stands when
+/// facing a wall station — between the console and the wall, on the SAME
+/// side as the focus ("walk toward the station you're studying", not sit
+/// across the room staring back through the console and the diametrically
+/// opposite pylon — the occlusion bug this constant fixes). Roughly a
+/// quarter of the wall radius the markers actually stand at (`ROOM_RADIUS`).
+const ROOM_CAM_APPROACH_R: f32 = 160.0;
+/// Approach-pose eye height — the old orbit camera's focused-pose lift,
+/// carried over unchanged (a comfortable "person standing" height).
+const ROOM_CAM_APPROACH_HEIGHT: f32 = 260.0;
 /// The console (TimeWell) overview pose — elevated and pulled back from the
 /// south, framing the *whole* room so every bearing's ambient glow reads at
 /// once (the tracks (E) marker must breathe here without diving — the slice-A
@@ -388,10 +397,13 @@ fn enter_room(
     // at the labeled ones (the reserved South bearing gets a dim marker only).
     for wp in bearing::wall_placements() {
         let hue = Vec3::from_array(wp.hue);
-        let marker_mesh = meshes.add(Cuboid::new(MARKER_WIDTH, MARKER_HEIGHT, MARKER_WIDTH));
+        // The reserved South bearing (no station) gets a low stub — tall
+        // enough to read as "reserved", short enough to stop standing in the
+        // overview shot's near foreground (MARKER_HEIGHT_RESERVED).
+        let marker_h = if wp.station.is_some() { MARKER_HEIGHT } else { MARKER_HEIGHT_RESERVED };
+        let marker_mesh = meshes.add(Cuboid::new(MARKER_WIDTH, marker_h, MARKER_WIDTH));
         let marker_mat = mats.add(unlit(lin_v(hue * MARKER_LDR)));
-        let marker_pos =
-            Vec3::new(wp.dir[0] * ROOM_RADIUS, MARKER_HEIGHT * 0.5, wp.dir[2] * ROOM_RADIUS);
+        let marker_pos = Vec3::new(wp.dir[0] * ROOM_RADIUS, marker_h * 0.5, wp.dir[2] * ROOM_RADIUS);
         commands.spawn((
             Mesh3d(marker_mesh),
             MeshMaterial3d(marker_mat),
@@ -650,13 +662,27 @@ fn sync_room_glow(
 // ── Camera pose helper ────────────────────────────────────────────────────────
 
 /// The desired `(position, look-at)` for the room camera facing `station` —
-/// overview for the console, an orbit facing the wall for everything else.
+/// overview for the console; for a wall station, an **approach** pose: the
+/// camera stands on the same side of the room as the focus, between the
+/// console and the wall, looking outward at the station's marker/nameplate.
+/// Never sits on the opposite wall staring back through the console and the
+/// diametrically opposite pylon — both used to sit *in front of* the camera,
+/// fully occluding the focused station (the bug this pose replaces). The
+/// `Radiators` focus (the NE diagonal, `bearing::RADIATOR_FOCUS_DIR`) rides
+/// this same math unchanged.
 fn desired_camera(station: Station) -> (Vec3, Vec3) {
     match bearing::focus_dir(station) {
         None => (OVERVIEW_POS, OVERVIEW_LOOK),
         Some(d) => (
-            Vec3::from_array(bearing::orbit_camera(d, ROOM_CAM_ORBIT, ROOM_CAM_HEIGHT)),
-            Vec3::from_array(bearing::orbit_look(d, ROOM_CAM_LOOK_LEAD, ROOM_CAM_LOOK_HEIGHT)),
+            Vec3::from_array(bearing::approach_camera(
+                d,
+                ROOM_CAM_APPROACH_R,
+                ROOM_CAM_APPROACH_HEIGHT,
+            )),
+            // Look at the marker's own wall radius (ROOM_RADIUS — the same
+            // radius the pylons spawn at) held at nameplate height, so the
+            // plate is framed square-on.
+            Vec3::from_array(bearing::approach_look(d, ROOM_RADIUS, PLATE_HEIGHT)),
         ),
     }
 }
@@ -806,12 +832,41 @@ mod tests {
     }
 
     #[test]
-    fn desired_camera_faces_the_tracks_wall_from_across_the_room() {
-        // Tracks is East (+X); the camera should sit west (−X) and look east.
+    fn desired_camera_approaches_the_tracks_wall_from_the_same_side() {
+        // Tracks is East (+X). The camera now stands on the SAME side as the
+        // focus — walking toward the station, not sitting on the opposite
+        // wall staring back through the console and the (occluding) west
+        // pylon.
         let (pos, look) = desired_camera(Station::Tracks);
-        assert!(pos.x < 0.0, "camera orbits to the west side: {pos:?}");
-        assert!(look.x > 0.0, "looking toward the east station: {look:?}");
-        assert_eq!(pos.y, ROOM_CAM_HEIGHT);
+        assert!(pos.x > 0.0, "camera stands on the same (east) side: {pos:?}");
+        assert!(pos.x < ROOM_RADIUS, "the eye stops well short of the wall: {pos:?}");
+        assert!(look.x > pos.x, "looks further east, out toward the wall: {look:?}");
+        assert_eq!(pos.y, ROOM_CAM_APPROACH_HEIGHT);
+    }
+
+    #[test]
+    fn every_wall_station_approach_clears_the_console_with_the_look_point_farther_out() {
+        // The core of the fix: eye and look both sit on the focus side, past
+        // the console keep-out, with the look point farther out than the eye
+        // — the console can never fall in the sight line between them (the
+        // occlusion bug this pose replaces).
+        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
+            let (pos, look) = desired_camera(s);
+            let d = bearing::focus_dir(s).expect("wall station has a bearing");
+            let eye_r = pos.x * d[0] + pos.z * d[2];
+            let look_r = look.x * d[0] + look.z * d[2];
+            assert!(eye_r > KEEPOUT_RADIUS, "{s:?} eye clears the console keep-out: {eye_r}");
+            assert!(look_r > eye_r, "{s:?} look point sits farther out than the eye: eye={eye_r} look={look_r}");
+        }
+    }
+
+    #[test]
+    fn reserved_marker_height_is_a_low_stub_a_third_of_a_station_pylon() {
+        assert!(
+            (MARKER_HEIGHT_RESERVED - MARKER_HEIGHT / 3.0).abs() < 1e-4,
+            "reserved marker is roughly a third the height of a built station's pylon"
+        );
+        assert!(MARKER_HEIGHT_RESERVED < MARKER_HEIGHT, "still shorter than a station pylon");
     }
 
     #[test]

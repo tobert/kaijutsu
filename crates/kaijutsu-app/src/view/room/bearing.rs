@@ -136,20 +136,25 @@ pub fn wall_placements() -> [WallPlacement; 4] {
     ]
 }
 
-// ── Camera orbit ──────────────────────────────────────────────────────────────
+// ── Camera approach ────────────────────────────────────────────────────────────
 
-/// Camera position that faces `dir`'s wall from the **opposite** side of the
-/// room, elevated, so the console anchors the foreground and the focused
-/// station rises beyond it. `orbit` is the back-off distance along the bearing
-/// axis; `height` the world-Y lift.
-pub fn orbit_camera(dir: [f32; 3], orbit: f32, height: f32) -> [f32; 3] {
-    [-dir[0] * orbit, height, -dir[2] * orbit]
+/// Camera position for the **approach** pose: standing on the SAME side of
+/// the room as the focused bearing, between the console and the wall — "walk
+/// toward the station you're studying" (`shell.md`'s travel-by-intent dolly).
+/// Replaces the old across-the-room orbit, whose opposite-side eye put the
+/// console *and* the diametrically opposite pylon in the sight line, fully
+/// occluding the focused station. `r` is the distance out from center along
+/// the bearing axis; `height` the world-Y eye lift.
+pub fn approach_camera(dir: [f32; 3], r: f32, height: f32) -> [f32; 3] {
+    [dir[0] * r, height, dir[2] * r]
 }
 
-/// The look-at point when facing `dir`: a touch past the console toward the
-/// station, at `look_h` height — frames console + station together.
-pub fn orbit_look(dir: [f32; 3], lead: f32, look_h: f32) -> [f32; 3] {
-    [dir[0] * lead, look_h, dir[2] * lead]
+/// The look-at point for the approach pose: the bearing's marker at the wall
+/// (`wall_r` — the same radius the marker pylons stand at), held at `look_h`
+/// (nameplate height) — frames the plate square-on, straight ahead of the eye
+/// on the same side of the room (never back through the console).
+pub fn approach_look(dir: [f32; 3], wall_r: f32, look_h: f32) -> [f32; 3] {
+    [dir[0] * wall_r, look_h, dir[2] * wall_r]
 }
 
 // ── Procedural-mesh vertex helpers ─────────────────────────────────────────────
@@ -310,22 +315,22 @@ mod tests {
         assert_eq!(south.station, None, "South is reserved — a dim marker, no label");
     }
 
-    // ── camera orbit ──
+    // ── camera approach ──
 
     #[test]
-    fn facing_east_puts_the_camera_on_the_west_side_looking_east() {
+    fn facing_east_puts_the_camera_on_the_east_side_approaching_the_wall() {
         let d = Bearing::East.dir();
-        let cam = orbit_camera(d, 700.0, 250.0);
-        assert!(cam[0] < 0.0, "camera sits west of center: {cam:?}");
-        assert_eq!(cam[1], 250.0, "lifted to the given height");
-        let look = orbit_look(d, 180.0, 120.0);
-        assert!(look[0] > 0.0, "looks toward the east station: {look:?}");
+        let cam = approach_camera(d, 160.0, 190.0);
+        assert!(cam[0] > 0.0, "camera stands on the same (east) side: {cam:?}");
+        assert_eq!(cam[1], 190.0, "lifted to the given eye height");
+        let look = approach_look(d, 620.0, 150.0);
+        assert!(look[0] > cam[0], "looks further east, out toward the wall: {look:?}");
     }
 
     #[test]
     fn facing_west_mirrors_facing_east() {
-        let cam_e = orbit_camera(Bearing::East.dir(), 700.0, 250.0);
-        let cam_w = orbit_camera(Bearing::West.dir(), 700.0, 250.0);
+        let cam_e = approach_camera(Bearing::East.dir(), 160.0, 190.0);
+        let cam_w = approach_camera(Bearing::West.dir(), 160.0, 190.0);
         assert_eq!(cam_e[0], -cam_w[0], "mirror across the room");
         assert_eq!(cam_e[2], cam_w[2]);
     }
