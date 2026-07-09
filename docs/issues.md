@@ -331,6 +331,13 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Procedural ribbon meshes wind CW; normals point −Y** (gemini review,
+  2026-07-09): `ribbon_mesh` in both `view/room/mod.rs` and
+  `view/patch_bay/mod.rs` emits clockwise triangles, so Bevy flips the top
+  face's normal; invisible today only because both users are emissive with
+  `cull_mode: None`. Swap to CCW (`[l0, l1, r0, r0, l1, r1]`) before any
+  *lit* material rides a ribbon; consider extracting the two copies into a
+  shared helper while at it.
 - **Patch bay: inspection plate overflows its quad** (found live 2026-07-09):
   `kaijutsu-app:render → TiMidity port 0` runs past the plate edge and clips.
   `fill_patch_text` / `layout_plate_text` need wrap-or-shrink (the room
@@ -568,6 +575,13 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **MCP `progress` → `StreamingBlockHandle` bridge.**
 
 ## Domain-Specific (ABC Parser & Engraving, Index)
+
+- **kaijutsu-abc MidiWriter leaves pitch/velocity unmasked** (gemini review
+  fallout, 2026-07-09): `note_on`/`note_on_channel` build raw channel-voice
+  bytes without the `& 0x7F` data-byte mask that `kaijutsu-app::midi::click_bytes`
+  now applies. Safe today — the app's only caller uses
+  `MidiParams::default()` (fixed velocity 80), nothing config-sourced. Mask
+  at the writer if `MidiParams` ever becomes config-driven.
 
 - **`hnsw_rs` reverse-edge quirk:** Reverse edges written at neighbour's assigned layer.
 - **ABC multi-tune files vs blocks:** Split tunes across sibling blocks or stack inside one block.
