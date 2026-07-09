@@ -67,6 +67,18 @@ pub struct PatchBayAlsa {
     reader: Option<Option<PatchGraphReader>>,
 }
 
+impl PatchBayAlsa {
+    /// Clear a latched failed open (`Some(None)`) so the next poll retries
+    /// `PatchGraphReader::open()`. A healthy reader (`Some(Some(_))`) is left
+    /// alone — closing and reopening a working handle would churn its ALSA
+    /// client id for no reason. `None` (never opened) is already a no-op.
+    fn clear_failed_open(&mut self) {
+        if matches!(self.reader, Some(None)) {
+            self.reader = None;
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct PatchBayState {
     pub snapshot: PatchGraphSnapshot,
@@ -144,6 +156,19 @@ impl Plugin for PatchBayPlugin {
 
 // ── Enter / exit ────────────────────────────────────────────────────────────
 
+/// Arm a fresh poll + full scene/text rebuild for the next frame. `PatchBayState`
+/// (and its `snapshot`) is a `Resource` — it survives `exit_patch_bay`, which
+/// only despawns `PatchBayRoot` and its children. Without forcing `scene_dirty`
+/// here, a re-entry where the ALSA graph hasn't changed since the last visit
+/// produces an empty `diff` in `poll_patch_graph`, and `rebuild_patch_scene`
+/// never runs: a bare table forever, even though `state.snapshot` is valid.
+fn arm_on_enter(state: &mut PatchBayState) {
+    let full = state.timer.duration();
+    state.timer.set_elapsed(full);
+    state.text_dirty = true;
+    state.scene_dirty = true;
+}
+
 fn enter_patch_bay(
     mut commands: Commands,
     mut state: ResMut<PatchBayState>,
@@ -160,9 +185,7 @@ fn enter_patch_bay(
     }
 
     // Force a fresh poll + rebuild on every entry.
-    let full = state.timer.duration();
-    state.timer.set_elapsed(full);
-    state.text_dirty = true;
+    arm_on_enter(&mut state);
 
     let root = commands
         .spawn((
@@ -266,6 +289,7 @@ fn exit_patch_bay(
 fn patch_bay_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<PatchBayState>,
+    mut alsa: NonSendMut<PatchBayAlsa>,
     mut room: ResMut<RoomState>,
     mut next: ResMut<NextState<Screen>>,
 ) {
@@ -283,6 +307,10 @@ fn patch_bay_keyboard(
     if keys.just_pressed(KeyCode::KeyR) {
         let elapsed = state.timer.duration();
         state.timer.set_elapsed(elapsed);
+        // A failed open otherwise latches forever (`poll_patch_graph`'s
+        // `get_or_insert_with` never runs its closure again); an explicit
+        // rescan is the one path allowed to retry it.
+        alsa.clear_failed_open();
     }
 
     if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::Escape) {
@@ -632,4 +660,96 @@ fn ribbon_mesh(points: &[[f32; 3]], width: f32) -> Mesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
         .with_inserted_indices(Indices::U32(indices))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::patch_graph::{EndpointInfo, WireInfo};
+
+    use super::*;
+
+    fn non_empty_snapshot() -> PatchGraphSnapshot {
+        PatchGraphSnapshot {
+            endpoints: vec![EndpointInfo {
+                client_id: 128,
+                port_id: 0,
+                client_name: "TiMidity".into(),
+                port_name: "port 0".into(),
+                is_source: true,
+                is_sink: false,
+            }],
+            wires: vec![WireInfo { src: (14, 0), dst: (128, 0) }],
+        }
+    }
+
+    /// The shape `PatchBayState` is left in by `exit_patch_bay`: the resource
+    /// (and its snapshot) survive the despawn untouched, but nothing has
+    /// re-armed the dirty flags for the next entry yet.
+    fn persisted_after_exit() -> PatchBayState {
+        PatchBayState {
+            snapshot: non_empty_snapshot(),
+            selected: 0,
+            scene_dirty: false,
+            text_dirty: false,
+            timer: Timer::from_seconds(POLL_SECS, TimerMode::Repeating),
+        }
+    }
+
+    // -- arm_on_enter --------------------------------------------------
+
+    #[test]
+    fn arm_on_enter_forces_both_dirty_flags_true() {
+        let mut state = persisted_after_exit();
+        arm_on_enter(&mut state);
+        assert!(
+            state.scene_dirty,
+            "re-entry must force a rebuild even when the graph hasn't changed since the last visit"
+        );
+        assert!(state.text_dirty);
+    }
+
+    #[test]
+    fn arm_on_enter_primes_the_timer_to_fire_on_the_next_tick() {
+        let mut state = persisted_after_exit();
+        arm_on_enter(&mut state);
+        assert!(!state.timer.just_finished(), "not finished until it's ticked");
+        assert!(state.timer.tick(Duration::from_millis(1)).just_finished());
+    }
+
+    #[test]
+    fn arm_on_enter_leaves_the_persisted_snapshot_untouched() {
+        let mut state = persisted_after_exit();
+        let before = state.snapshot.clone();
+        arm_on_enter(&mut state);
+        assert_eq!(
+            state.snapshot, before,
+            "rebuild_patch_scene reads the persisted snapshot; arm_on_enter must not touch it"
+        );
+    }
+
+    // -- PatchBayAlsa::clear_failed_open --------------------------------
+
+    #[test]
+    fn clear_failed_open_resets_a_latched_failure_to_unopened() {
+        let mut alsa = PatchBayAlsa { reader: Some(None) };
+        alsa.clear_failed_open();
+        assert!(
+            alsa.reader.is_none(),
+            "must go back to None so poll_patch_graph's get_or_insert_with retries the open"
+        );
+    }
+
+    #[test]
+    fn clear_failed_open_is_a_no_op_when_never_opened() {
+        let mut alsa = PatchBayAlsa { reader: None };
+        alsa.clear_failed_open();
+        assert!(alsa.reader.is_none());
+    }
+
+    // The healthy `Some(Some(_))` arm (left alone by `clear_failed_open`) needs
+    // a real `PatchGraphReader`, which needs a live ALSA sequencer — it's
+    // exercised by the `#[ignore]`d `alsa_smoke` path in `patch_graph.rs`, not
+    // here.
 }
