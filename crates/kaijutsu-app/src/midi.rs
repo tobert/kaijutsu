@@ -162,10 +162,15 @@ struct RenderAutoConnect {
 
 impl Default for RenderAutoConnect {
     fn default() -> Self {
-        Self {
-            done: false,
-            timer: Timer::from_seconds(AUTOCONNECT_POLL_SECS, TimerMode::Repeating),
-        }
+        // Prime the timer to fire on the very next Update tick (the patch-bay's
+        // `arm_on_enter` idiom): the render port opens eagerly at Startup so a
+        // cue in the first couple seconds isn't dropped into an unwired port —
+        // but a cold `elapsed=0` repeating timer would still leave that exact
+        // window unwired by making the *first* attempt wait a full cadence. The
+        // 2 s cadence then governs retries only.
+        let mut timer = Timer::from_seconds(AUTOCONNECT_POLL_SECS, TimerMode::Repeating);
+        timer.set_elapsed(timer.duration());
+        Self { done: false, timer }
     }
 }
 
@@ -385,6 +390,20 @@ fn flush(sink: &mut MidiSink) {
 #[cfg(not(target_os = "linux"))]
 fn flush(_sink: &mut MidiSink) {}
 
+/// Build the (NoteOn, NoteOff) byte triples for one metronome click, masking
+/// every byte to its valid MIDI range first: channel to the low nibble (keeps
+/// the status byte `0x9n`/`0x8n` intact) and note/velocity to 7 bits each — a
+/// data byte ≥ 0x80 (e.g. velocity=200/0xC8 from a config typo) IS a MIDI
+/// status byte, so unmasked it would inject a rogue Program Change mid-stream
+/// rather than just mis-sounding the click. Pure and platform-independent (no
+/// ALSA) so the masking is unit-testable without a live sequencer.
+fn click_bytes(note: u8, channel: u8, velocity: u8) -> (Vec<u8>, Vec<u8>) {
+    let ch = channel & 0x0F;
+    let note = note & 0x7F;
+    let velocity = velocity & 0x7F;
+    (vec![0x90 | ch, note, velocity], vec![0x80 | ch, note, 0])
+}
+
 /// An ALSA-sequencer MIDI-out sink: a subscribe-readable source port + a started
 /// real-time queue. Other clients (`aconnect` → TiMidity, a DAW, `aseqdump`)
 /// connect to `addr()`. Ported from the server's `AlsaMidiOut` but consuming
@@ -553,12 +572,10 @@ impl MidiOut {
     /// (`docs/config-crdt-ownership.md`). Reuses the proven render-queue path, so
     /// it's audible exactly where the music is.
     fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
-        // Mask to the low nibble so a config typo can never corrupt the status
-        // byte (0x9n / 0x8n); default channel 15 keeps the click off the music's
+        // Byte-masking lives in `click_bytes` (config-typo hazard, unit-tested
+        // without ALSA); default channel 15 keeps the click off the music's
         // channel 0.
-        let ch = channel & 0x0F;
-        let on = vec![0x90 | ch, note, velocity];
-        let off = vec![0x80 | ch, note, 0];
+        let (on, off) = click_bytes(note, channel, velocity);
         self.schedule(
             &[(offset, on), (offset + Duration::from_millis(gate_ms), off)],
             Duration::ZERO,
@@ -784,6 +801,36 @@ mod tests {
         assert!(render_has_outbound_wire(&[wire(RENDER, (128, 0))], RENDER));
         assert!(!render_has_outbound_wire(&[wire((14, 0), (128, 0))], RENDER));
         assert!(!render_has_outbound_wire(&[], RENDER));
+    }
+
+    // -- RenderAutoConnect::default timer priming --------------------------
+
+    #[test]
+    fn default_render_auto_connect_timer_fires_on_the_first_tick() {
+        let mut latch = RenderAutoConnect::default();
+        assert!(!latch.done);
+        assert!(
+            latch.timer.tick(Duration::from_millis(1)).just_finished(),
+            "the cold-start attempt must not wait a full retry cadence"
+        );
+    }
+
+    // -- click_bytes: metronome click byte masking --------------------------
+
+    #[test]
+    fn click_bytes_masks_channel_to_the_low_nibble() {
+        let (on, off) = click_bytes(60, 0xFF, 100);
+        assert_eq!(on[0], 0x9F, "status byte keeps NoteOn nibble + masked channel");
+        assert_eq!(off[0], 0x8F, "status byte keeps NoteOff nibble + masked channel");
+    }
+
+    #[test]
+    fn click_bytes_masks_note_and_velocity_to_seven_bits() {
+        // A config typo like velocity=200 (0xC8) must never ride through as a
+        // stray status byte (0xC8 & 0xF0 == 0xC0, Program Change).
+        let (on, off) = click_bytes(0xFF, 0, 200);
+        assert_eq!(on, vec![0x90, 0x7F, 0x48], "note clamped to 7 bits, 200 & 0x7F == 0x48");
+        assert_eq!(off, vec![0x80, 0x7F, 0x00], "note-off pitch clamped the same way");
     }
 
     /// Live ALSA (needs `/dev/snd/seq`; `#[ignore]`d like `alsa_smoke` in
