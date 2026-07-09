@@ -750,7 +750,9 @@ pub fn update_mode(
         // The well / editor own the viewport; the conversation dock is hidden,
         // but keep the mode indicator coherent rather than panicking. (The
         // editor's own vim mode renders on its panel — docs/vi.md steps 4–5.)
-        Screen::TimeWell | Screen::Editor => (theme.mode_normal, &theme.mode_label_normal),
+        Screen::TimeWell | Screen::Editor | Screen::Room | Screen::PatchBay => {
+            (theme.mode_normal, &theme.mode_label_normal)
+        }
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -997,6 +999,8 @@ pub fn update_hints(
         },
         Screen::TimeWell => "Esc: back to conversation \u{2502} (time well)",
         Screen::Editor => "Esc: back to conversation \u{2502} (editor)",
+        Screen::Room => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: dive \u{2502} Esc: conversation",
+        Screen::PatchBay => "\u{2190}\u{2192}: wire \u{2502} \u{2191}/Esc: room \u{2502} r: rescan",
     };
 
     if dock.hints.text != hints {

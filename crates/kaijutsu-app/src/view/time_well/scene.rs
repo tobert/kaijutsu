@@ -643,6 +643,8 @@ pub fn well_keyboard(
     mut next: ResMut<NextState<Screen>>,
     actor: Option<Res<crate::connection::RpcActor>>,
     drift: Res<crate::ui::drift::DriftState>,
+    mut room: ResMut<crate::view::room::RoomState>,
+    mut edge_bump: ResMut<crate::view::room::WellEdgeBump>,
 ) {
     // `0–9`: jump straight to seat `n` of the focused ring and drop into the
     // conversation (a no-op if that seat is empty).
@@ -692,6 +694,20 @@ pub fn well_keyboard(
     if ud != 0 {
         let fr = state.focused_ring as i32;
         let new_ring = (fr + ud).clamp(0, super::card::N_BANDS as i32 - 1) as usize;
+        // Up at the mouth ring is the speedbumped edge to the room level
+        // (docs/scenes/shell.md, "Levels — the arrows continue"): the first
+        // press arms, a second within the double-tap window exits upward.
+        if ud < 0 && new_ring == state.focused_ring && !state.focused {
+            if edge_bump.0.press() >= 2 {
+                room.carousel = crate::view::room::nav::StationCarousel::new(
+                    crate::view::room::nav::Station::TimeWell,
+                );
+                next.set(Screen::Room);
+                return;
+            }
+        } else {
+            edge_bump.0.reset();
+        }
         if new_ring != state.focused_ring {
             let new_len = state.ring_cards.get(new_ring).map(|v| v.len()).unwrap_or(0);
             let pos = super::card::carry_ring_pos(state.ring_pos, new_len);

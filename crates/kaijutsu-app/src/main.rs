@@ -50,6 +50,7 @@ mod kaish;
 mod metronome;
 mod midi;
 mod midi_in;
+mod patch_graph;
 mod peers;
 mod shaders;
 mod text;
@@ -182,6 +183,10 @@ fn main() {
         .add_plugins(ui::drift::DriftPlugin)
         // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
         .add_plugins(view::time_well::TimeWellPlugin)
+        // Room level + patch bay station (docs/scenes/: Up-Up from the well's
+        // mouth ring → room carousel; dive into the observed-ALSA circle scene)
+        .add_plugins(view::room::RoomPlugin)
+        .add_plugins(view::patch_bay::PatchBayPlugin)
         // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
         .add_plugins(view::editor::EditorPlugin)
         // Timeline navigation - temporal scrubbing through history

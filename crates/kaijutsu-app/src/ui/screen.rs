@@ -32,6 +32,13 @@ pub enum Screen {
     /// Full-viewport; conversation chrome is hidden while it is active. Entered
     /// by the `open_editor` peer signal (see `view::editor`).
     Editor,
+    /// The room level above the well — the shell's station carousel
+    /// (`docs/scenes/shell.md`). Reached by Up-Up at the well's mouth ring;
+    /// Left/Right cycle stations, Enter/Down dives, Esc drops to Conversation.
+    Room,
+    /// Patch bay station — the observed ALSA-graph circle scene
+    /// (`docs/scenes/patchbay.md`, slice 0). Reached from the room.
+    PatchBay,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -69,6 +76,19 @@ impl Plugin for ScreenPlugin {
         // double-apply every keystroke to the hidden chat overlay.
         app.add_systems(
             OnEnter(Screen::Editor),
+            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+        );
+
+        // ── Room + PatchBay ──
+        // The scenes-charter views (docs/scenes/): full-viewport 3D like the
+        // well, reading raw keys — hide the chrome and park focus off Compose
+        // (same reasoning as the editor above).
+        app.add_systems(
+            OnEnter(Screen::Room),
+            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+        );
+        app.add_systems(
+            OnEnter(Screen::PatchBay),
             (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
     }
