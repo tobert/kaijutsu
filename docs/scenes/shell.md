@@ -169,11 +169,20 @@ identical prompt — and settled several things:
 The pragmatic claim: **the shell is a camera pull-back from the existing
 well scene**, not a new world. Slices, each shippable alone:
 
-- **Slice A — the room exists**: pull-back level above the well; the vault,
-  the floor geometry, placeholder bearing markers with real ambient glow
-  (driven from the event stream by producing-context type/track — derivable
-  today). Esc/Enter level plumbing. Acceptance: enter the room, watch a
-  jam make the tracks bearing breathe without visiting it.
+- **Slice A — the room exists** (built, `view/room/`): the circular chamber —
+  a dark floor disc with etched crimson/cyan trace channels bowing around the
+  console, a subtle gradient vault dome, the gold console emblem at center,
+  marker pylons + engraved nameplates at the cardinal bearings, and violet
+  radiator panels between them. The camera dollies to face the focused bearing
+  (the well's eased tween). Ambient glow rides the existing event stream — no
+  new wire: the tracks (E) marker breathes with the well's beat phasors
+  (`WellBeats::global_envelope`) and the console glows with context chatter
+  (`room::activity::BearingActivity`), HDR only on live activity. Everything
+  else is procedural LDR (built-in `StandardMaterial`, `unlit` with brightness
+  in `base_color` so HDR blooms). The console is the slice-A stand-in for the
+  live well (shared vs separate scene graph, open question 3, stays deferred to
+  slice B). Acceptance met: a jam breathes the tracks bearing without visiting
+  it.
 - **Slice B — first real bearing**: the patch-bay thread-wall ambient at W,
   diving to the patch-bay slice-0 scene (`docs/scenes/patchbay.md`). This
   pairs the first station dive with the first bearing — the whole grammar
@@ -183,7 +192,11 @@ well scene**, not a new world. Slices, each shippable alone:
 
 ## Open questions
 
-1. Bearing assignments — settle when slice A's camera exists to judge them.
+1. Bearing assignments — **first concrete placement landed with slice A**
+   (`room::bearing`): console = center, PatchBay = W, Tracks = E, VFS = N,
+   reserved = S (a dim unlabeled marker), radiators on the four diagonals. The
+   `Radiators` carousel entry faces the NE panel. Still provisional — judge and
+   re-place now that the camera exists.
 2. Entry key for the room (Esc-from-well is decided; a direct binding is
    not), and whether the app's `Screen` formalization (timewell.md appendix,
    "ViewSpec + the kj→app seam") should land with slice A.

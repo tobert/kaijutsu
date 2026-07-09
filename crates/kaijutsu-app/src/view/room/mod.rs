@@ -1,19 +1,53 @@
-//! Room level — the station-carousel blockout (`docs/scenes/shell.md`).
+//! Room level — the shell's **Tardis chamber** (`docs/scenes/shell.md`, slice A:
+//! "the room exists"). A circular vaulted room that holds the stations at
+//! stable compass **bearings** around a central **console** (an emblem of the
+//! time well). This is the pull-back level above the well: Up-Up at the well's
+//! mouth ring enters it (the speedbumped edge, [`WellEdgeBump`]); Left/Right
+//! cycle the station carousel, Enter/Down dive into a built station, Esc drops
+//! to the conversation. Diving into a station **cuts** to its dedicated scene;
+//! the shell never renders a station's detail.
 //!
-//! Slice 0 of the shell: not the Tardis room yet, just its *navigation
-//! skeleton* — a row of engraved-style station nameplates on the shared 3D
-//! camera. Left/Right cycle the focus, Enter/Down dives into a built station
-//! (well, patch bay), Esc drops back to the conversation. Reached from the
-//! well by Up-Up at the mouth ring (the speedbumped edge —
-//! [`WellEdgeBump`]). The full room (bearings, trace floor, radiators)
-//! replaces these visuals later without changing the keys.
+//! What slice A builds:
+//! - **Geometry**: a dark floor disc inscribed with etched trace channels that
+//!   bow *around* the center (never under it — the open-center rule), a subtle
+//!   dark vault dome overhead, and the console emblem at center.
+//! - **Bearings**: stations at their compass placement (`bearing::focus_dir`) —
+//!   PatchBay W, Tracks E, VFS N, reserved S; the console is the center. The
+//!   camera **dollies to face** the focused bearing (travel by intent — the
+//!   same eased tween idiom as the well's `ease_camera_to_focused_ring`).
+//! - **Nameplates**: engraved MSDF plates at the labeled bearings (the well's
+//!   plate pipeline). Unbuilt stations stay dimmed.
+//! - **Information radiators**: violet dark-glass panels between bearings
+//!   (idle/LDR placeholders for slice A).
+//! - **Ambient telemetry = light**: the tracks (E) marker *breathes* with the
+//!   beat (the well's [`WellBeats`] phasors, read — not re-wired), and the
+//!   console emblem glows with context chatter ([`activity::BearingActivity`]).
+//!   HDR emission only on live activity; all decoration stays LDR.
+//!
+//! The console is the **slice-A stand-in** for the live well: an emblematic
+//! gold ring-stack, *not* the well scene. Whether shell + dives share one scene
+//! graph or run separate Bevy worlds (shell.md open question 3) is deferred to
+//! slice B; the emblem keeps camera continuity cheap either way.
+//!
+//! Materials are all built-in [`StandardMaterial`] with `unlit: true`, carrying
+//! brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR (> 1.0)
+//! blooms through the app camera's threshold-1.0 bloom (`main::setup_camera`).
+//! No new WGSL, no image assets, no new fonts (the charter's procedural-first
+//! budget rule).
 
+pub mod activity;
+pub mod bearing;
 pub mod nav;
+
+use std::time::Instant;
 
 use bevy::prelude::*;
 
+use activity::BearingActivity;
+use bearing::Bearing;
 use nav::{DoubleTap, Station, StationCarousel};
 
+use crate::connection::actor_plugin::ServerEventMessage;
 use crate::shaders::WellCardMaterial;
 use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
@@ -22,32 +56,104 @@ use crate::text::msdf::{
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::Screen;
+use crate::view::time_well::live::WellBeats;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use vello::peniko::Brush;
 
-// ── Blockout constants (Amy-tunable) ───────────────────────────────────────
+// ── Room palette + geometry (Amy-tunable) ───────────────────────────────────
 
-/// Room background — a shade darker than the well's, so leaving the well
+/// Room background clear — a shade darker than the well's, so leaving the well
 /// upward reads as stepping back into the larger dark of the room.
-const ROOM_BG: Color = Color::srgb(0.030, 0.036, 0.058);
+const ROOM_BG: Color = Color::srgb(0.020, 0.026, 0.044);
 
-/// Nameplate quad (world units) and its texture (logical px).
+/// Floor disc radius (world units); comfortably past the wall stations so the
+/// room reads as a chamber, not a platform.
+const FLOOR_RADIUS: f32 = 1100.0;
+/// Dark floor colour (linear rgb).
+const FLOOR_COLOR: [f32; 3] = [0.016, 0.020, 0.032];
+
+/// Enclosing vault-dome radius. Must exceed **every** camera distance (the
+/// pulled-back overview sits ~1630 out) so the camera stays *inside* the dome
+/// and its far inner surface reads as the vault; the lower hemisphere hides
+/// under the floor disc.
+const DOME_RADIUS: f32 = 2000.0;
+
+/// Radius of the wall stations' marker pylons.
+const ROOM_RADIUS: f32 = 620.0;
+/// Radius of the nameplates — a touch inside the pylons so a plate floats in
+/// front of its station.
+const PLATE_RADIUS: f32 = 560.0;
+/// Radius of the information-radiator panels (the between-station walls).
+const RADIATOR_RADIUS: f32 = 660.0;
+
+/// Central keep-out radius — every floor trace stays outside it, so no trace
+/// crosses the console (the open-center rule, `shell.md`). Enforced by a
+/// `debug_assert` as each trace spawns.
+const KEEPOUT_RADIUS: f32 = 150.0;
+
+/// Marker pylon dimensions (a slim square post standing on the floor).
+const MARKER_WIDTH: f32 = 26.0;
+const MARKER_HEIGHT: f32 = 260.0;
+
+/// Nameplate quad (world units) and its texture (logical px) — the well's plate
+/// grammar, kept API-compatible for the patch bay's own plates.
 const PLATE_QUAD_W: f32 = 210.0;
 const PLATE_QUAD_H: f32 = 62.0;
 pub(crate) const PLATE_TEX_W: f32 = 340.0;
 pub(crate) const PLATE_TEX_H: f32 = 100.0;
 pub(crate) const PLATE_PAD: f32 = 10.0;
 pub(crate) const PLATE_FONT_SIZE: f32 = 30.0;
+/// Height (world-Y) the nameplates float at.
+const PLATE_HEIGHT: f32 = 150.0;
 
-/// Row layout: plates on a shallow arc facing the camera.
-const PLATE_SPACING: f32 = 250.0;
-const PLATE_Y: f32 = 60.0;
-/// Camera pose for the room blockout.
-const ROOM_CAM_POS: Vec3 = Vec3::new(0.0, 110.0, 640.0);
-const ROOM_CAM_LOOK: Vec3 = Vec3::new(0.0, 55.0, 0.0);
+// ── Console emblem (gold — the well's reserved hue) ──────────────────────────
 
-/// Focus presentation: focused plates brighten + grow; unbuilt stations stay
-/// dim even when focused (they're placeholders on the carousel).
+/// The console: a stack of gold rings at center — the slice-A stand-in for the
+/// live well. `(y, major_radius, minor_radius)` per ring, apex smallest.
+const CONSOLE_RINGS: [(f32, f32, f32); 3] =
+    [(14.0, 96.0, 7.0), (36.0, 68.0, 6.0), (56.0, 42.0, 5.0)];
+/// Console gold hue (linear rgb identity).
+const CONSOLE_GOLD_HUE: [f32; 3] = [1.00, 0.78, 0.34];
+/// Console rest brightness (LDR — a soft steady glow, no bloom).
+const CONSOLE_LDR: f32 = 0.60;
+/// Chatter gain: `activity(Center)` (0..1) → this much HDR lift on the console.
+const CONSOLE_CHATTER_GAIN: f32 = 2.2;
+
+// ── Information radiators (violet — reserved for information) ─────────────────
+
+/// Radiator panel dimensions (a tall slim slab of dark glass).
+const RADIATOR_WIDTH: f32 = 92.0;
+const RADIATOR_HEIGHT: f32 = 430.0;
+const RADIATOR_DEPTH: f32 = 10.0;
+const RADIATOR_HEIGHT_OFFSET: f32 = 40.0;
+/// Idle radiator colour (linear rgb) — a dim violet dark-glass, LDR only for
+/// slice A (no live content yet).
+const RADIATOR_COLOR: [f32; 3] = [0.090, 0.040, 0.150];
+
+// ── Floor traces (the wiring — static LDR engravings for slice A) ────────────
+
+/// Trace ribbon height above the floor (avoids z-fighting) and base width.
+const TRACE_Y: f32 = 0.6;
+const TRACE_WIDTH: f32 = 7.0;
+/// Etched fabric hues (linear rgb, dim): crimson = MIDI, cyan = PCM. At rest a
+/// trace is a dark engraving; it lights HDR only when its flow runs (later
+/// slices). One hue family per fabric (the charter's rainbow-board rule).
+const TRACE_CRIMSON: [f32; 3] = [0.24, 0.055, 0.070];
+const TRACE_CYAN: [f32; 3] = [0.050, 0.170, 0.210];
+
+/// Trace arcs: `(radius, start_deg, end_deg, hue, width_scale)`. Every radius is
+/// outside [`KEEPOUT_RADIUS`], so each concentric arc bows around the console.
+const TRACE_ARCS: [(f32, f32, f32, [f32; 3], f32); 5] = [
+    (470.0, 200.0, 344.0, TRACE_CRIMSON, 1.0),
+    (360.0, 22.0, 168.0, TRACE_CYAN, 1.0),
+    (250.0, 250.0, 340.0, TRACE_CYAN, 0.7),
+    (300.0, 40.0, 130.0, TRACE_CRIMSON, 0.7),
+    (410.0, 10.0, 70.0, TRACE_CRIMSON, 0.6),
+];
+
+// ── Focus presentation ───────────────────────────────────────────────────────
+
+/// Plate brightness ([`WellCardMaterial::dim`].x) by focus/built state.
 const PLATE_DIM_FOCUSED: f32 = 1.0;
 const PLATE_DIM_IDLE: f32 = 0.45;
 const PLATE_DIM_UNBUILT: f32 = 0.22;
@@ -57,15 +163,49 @@ const PLATE_BORDER_FOCUSED: Vec4 = Vec4::new(0.85, 0.65, 0.25, 1.0);
 /// Plate body fill.
 const PLATE_ACCENT: Vec4 = Vec4::new(0.075, 0.085, 0.125, 1.0);
 
+// ── Camera (travel by intent — the well's tween idiom) ───────────────────────
+
+/// Back-off distance and lift for the orbit camera facing a wall station.
+const ROOM_CAM_ORBIT: f32 = 780.0;
+const ROOM_CAM_HEIGHT: f32 = 260.0;
+/// How far past the console toward the station the look-point leads, and at what
+/// height — frames console + station together.
+const ROOM_CAM_LOOK_LEAD: f32 = 200.0;
+const ROOM_CAM_LOOK_HEIGHT: f32 = 120.0;
+/// The console (TimeWell) overview pose — elevated and pulled back from the
+/// south, framing the *whole* room so every bearing's ambient glow reads at
+/// once (the tracks (E) marker must breathe here without diving — the slice-A
+/// acceptance). **Amy-tunable** (the lead live-tunes the exact framing).
+const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 640.0, 1500.0);
+const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 40.0, 0.0);
+/// Camera follow rate (exponential smoothing) — matches the well's weighty
+/// glide so the shell and the well feel like one instrument.
+const CAMERA_EASE_RATE: f32 = 4.0;
+
+// ── Ambient glow gains ───────────────────────────────────────────────────────
+
+/// Marker rest brightness (LDR multiplier on the marker's identity hue).
+const MARKER_LDR: f32 = 0.42;
+/// Tracks (E) beat gain: `global_envelope` (0..1) → this much HDR lift on the
+/// tracks marker each beat — the acceptance "breathe" (`shell.md` slice A).
+const TRACKS_BEAT_GAIN: f32 = 2.8;
+/// Sustained lift under the beat while a track is rolling (`activity(East)`).
+const TRACKS_ACTIVE_GAIN: f32 = 0.5;
+/// Steady brightness lift on the focused station's marker/console.
+const FOCUS_LIFT: f32 = 0.35;
+/// Quantization step for the glow lanes — coarse enough that a settled marker
+/// stops re-extracting its material (the well's `LIVE_LANE_STEP` discipline).
+const GLOW_STEP: f32 = 1.0 / 64.0;
+
 /// The well-edge speedbump window (ms) — same 500ms as the app's other
 /// double-tap gestures (`input/interrupt.rs`, `input/vim/dismiss.rs`).
 const EDGE_BUMP_WINDOW_MS: u128 = 500;
 
-// ── State ───────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 
-/// Which station the room carousel focuses. Whoever *enters* the room sets
-/// the focus first (the well focuses TIME WELL; the patch bay focuses PATCH
-/// BAY), so arriving always faces where you came from.
+/// Which station the room carousel focuses. Whoever *enters* the room sets the
+/// focus first (the well focuses TIME WELL; the patch bay focuses PATCH BAY),
+/// so arriving always faces where you came from.
 #[derive(Resource)]
 pub struct RoomState {
     pub carousel: StationCarousel,
@@ -89,9 +229,9 @@ impl Default for WellEdgeBump {
     }
 }
 
-// ── Components ──────────────────────────────────────────────────────────────
+// ── Components ────────────────────────────────────────────────────────────────
 
-/// Root of all room blockout entities (despawn is recursive).
+/// Root of all room entities (despawn is recursive).
 #[derive(Component)]
 pub struct RoomRoot;
 
@@ -103,7 +243,22 @@ pub struct RoomCamera;
 #[derive(Component)]
 pub struct StationPlate(pub usize);
 
-// ── Plugin ──────────────────────────────────────────────────────────────────
+/// A wall bearing's marker pylon: its bearing, its identity hue (linear rgb),
+/// and the station standing there (if any). The glow system lifts the tracks
+/// (E) marker with the beat and lifts whichever is focused.
+#[derive(Component)]
+pub struct BearingMarker {
+    pub bearing: Bearing,
+    pub hue: Vec3,
+    pub station: Option<Station>,
+}
+
+/// A ring of the central console emblem. All rings share one material, glow-lit
+/// together with context chatter.
+#[derive(Component)]
+pub struct ConsoleEmblem;
+
+// ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct RoomPlugin;
 
@@ -111,72 +266,198 @@ impl Plugin for RoomPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RoomState>()
             .init_resource::<WellEdgeBump>()
+            .init_resource::<BearingActivity>()
             .add_systems(OnEnter(Screen::Room), enter_room)
             .add_systems(OnExit(Screen::Room), exit_room)
+            // Ambient ingest runs on **every** screen so the room opens warm —
+            // the same rationale as `time_well::live::ingest_live_events` (both
+            // resources stay current while you're elsewhere). Bounded to five
+            // bearings.
+            .add_systems(Update, ingest_room_activity)
             .add_systems(
                 Update,
-                (room_keyboard, room_plate_text, room_focus_visuals)
+                (
+                    room_keyboard,
+                    room_plate_text,
+                    room_focus_visuals,
+                    ease_room_camera,
+                    sync_room_glow,
+                )
                     .chain()
                     .run_if(in_state(Screen::Room)),
             );
     }
 }
 
-// ── Enter / exit ────────────────────────────────────────────────────────────
+// ── Enter / exit ──────────────────────────────────────────────────────────────
 
 fn enter_room(
     mut commands: Commands,
+    room: Res<RoomState>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<WellCardMaterial>>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+    mut card_mats: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
 ) {
-    // Claim the shared app camera (the well-marker convention: insert to
-    // claim, remove + restore clear color to release).
+    // Claim the shared app camera (the well-marker convention: insert to claim,
+    // remove + restore clear color to release) and place it facing the entering
+    // focus so there's no first-frame snap before the ease takes over.
     if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
         commands.entity(cam_entity).insert(RoomCamera);
         cam.clear_color = ClearColorConfig::Custom(ROOM_BG);
-        *tf = Transform::from_translation(ROOM_CAM_POS).looking_at(ROOM_CAM_LOOK, Vec3::Y);
+        let (pos, look) = desired_camera(room.carousel.focused_station());
+        *tf = Transform::from_translation(pos).looking_at(look, Vec3::Y);
     }
 
     let root = commands
         .spawn((RoomRoot, Transform::default(), Visibility::Inherited, Name::new("RoomRoot")))
         .id();
 
-    let half = (Station::ALL.len() as f32 - 1.0) / 2.0;
-    for (i, station) in Station::ALL.iter().enumerate() {
-        let x = (i as f32 - half) * PLATE_SPACING;
-        // Shallow arc: outer plates sit slightly deeper.
-        let z = -0.06 * x.abs();
-        let mesh = meshes.add(Rectangle::new(PLATE_QUAD_W, PLATE_QUAD_H));
-        let (image, panel) =
-            create_msdf_panel(&mut images, PLATE_TEX_W as u32, PLATE_TEX_H as u32);
-        let material = materials.add(WellCardMaterial {
-            texture: image,
-            accent: PLATE_ACCENT,
-            params: Vec4::ZERO,
-            shape: plate_shape(),
-            border: Vec4::ZERO,
-            // dim.x only — .y/.z are the live chatter/beat lanes (leaving
-            // them nonzero paints the accidental cyan+gold ring).
-            dim: Vec4::new(PLATE_DIM_IDLE, 0.0, 0.0, 0.0),
-        });
-        let pos = Vec3::new(x, PLATE_Y, z);
-        // Face the camera: look from the plate *away* from the camera point
-        // (Rectangle faces +Z, looking_at points -Z at the target).
+    // Floor disc — dark, flat (Circle meshes in XY facing +Z; tip it to lie in
+    // the XZ floor plane facing up).
+    let floor_mesh = meshes.add(Circle::new(FLOOR_RADIUS));
+    let floor_mat = mats.add(unlit(lin(FLOOR_COLOR)));
+    commands.spawn((
+        Mesh3d(floor_mesh),
+        MeshMaterial3d(floor_mat),
+        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        Visibility::Inherited,
+        Name::new("RoomFloor"),
+        ChildOf(root),
+    ));
+
+    // Vault dome — an enclosing sphere with a subtle vertical vertex-colour
+    // gradient (calm darkness overhead; `shell.md` open question 4 defers the
+    // dome's content — no starfield). Viewed from inside → no back-face cull.
+    let dome_mat = mats.add(StandardMaterial {
+        base_color: Color::WHITE, // vertex colours carry the gradient
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(dome_mesh(DOME_RADIUS))),
+        MeshMaterial3d(dome_mat),
+        Transform::default(),
+        Visibility::Inherited,
+        Name::new("RoomVault"),
+        ChildOf(root),
+    ));
+
+    // Console emblem — a stack of gold rings at center (the well's stand-in).
+    // One shared material so the chatter glow lifts them together.
+    let console_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, CONSOLE_LDR)));
+    for (i, (y, major, minor)) in CONSOLE_RINGS.iter().enumerate() {
         commands.spawn((
-            StationPlate(i),
-            Mesh3d(mesh),
-            MeshMaterial3d(material),
-            Transform::from_translation(pos).looking_at(pos * 2.0 - ROOM_CAM_POS, Vec3::Y),
+            Mesh3d(meshes.add(Torus { minor_radius: *minor, major_radius: *major })),
+            MeshMaterial3d(console_mat.clone()),
+            Transform::from_xyz(0.0, *y, 0.0),
             Visibility::Inherited,
-            panel,
-            Name::new(format!("StationPlate-{}", station.label())),
+            ConsoleEmblem,
+            Name::new(format!("ConsoleRing{i}")),
             ChildOf(root),
         ));
     }
 
-    info!("room: entered (blockout carousel)");
+    // Floor traces — static LDR engravings that bow around the console.
+    for (radius, a0, a1, hue, wscale) in TRACE_ARCS {
+        debug_assert!(
+            radius > KEEPOUT_RADIUS,
+            "trace radius {radius} must clear the console keep-out ({KEEPOUT_RADIUS})"
+        );
+        let pts = bearing::arc_points(radius, a0.to_radians(), a1.to_radians(), 48, TRACE_Y);
+        let mesh = meshes.add(ribbon_mesh(&pts, TRACE_WIDTH * wscale));
+        let mat = mats.add(StandardMaterial {
+            base_color: lin(hue),
+            unlit: true,
+            cull_mode: None,
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            Visibility::Inherited,
+            Name::new("FloorTrace"),
+            ChildOf(root),
+        ));
+    }
+
+    // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
+    // at the labeled ones (the reserved South bearing gets a dim marker only).
+    for wp in bearing::wall_placements() {
+        let hue = Vec3::from_array(wp.hue);
+        let marker_mesh = meshes.add(Cuboid::new(MARKER_WIDTH, MARKER_HEIGHT, MARKER_WIDTH));
+        let marker_mat = mats.add(unlit(lin_v(hue * MARKER_LDR)));
+        let marker_pos =
+            Vec3::new(wp.dir[0] * ROOM_RADIUS, MARKER_HEIGHT * 0.5, wp.dir[2] * ROOM_RADIUS);
+        commands.spawn((
+            Mesh3d(marker_mesh),
+            MeshMaterial3d(marker_mat),
+            Transform::from_translation(marker_pos),
+            BearingMarker { bearing: wp.bearing, hue, station: wp.station },
+            Visibility::Inherited,
+            Name::new(format!("BearingMarker-{:?}", wp.bearing)),
+            ChildOf(root),
+        ));
+
+        if let Some(station) = wp.station {
+            let idx = Station::ALL.iter().position(|&s| s == station).unwrap_or(0);
+            let plate_mesh = meshes.add(Rectangle::new(PLATE_QUAD_W, PLATE_QUAD_H));
+            let (image, panel) =
+                create_msdf_panel(&mut images, PLATE_TEX_W as u32, PLATE_TEX_H as u32);
+            let material = card_mats.add(WellCardMaterial {
+                texture: image,
+                accent: PLATE_ACCENT,
+                params: Vec4::ZERO,
+                shape: plate_shape(),
+                border: Vec4::ZERO,
+                // dim.x only — .y/.z are the well's live chatter/beat lanes;
+                // leaving them nonzero paints the accidental cyan+gold ring.
+                dim: Vec4::new(PLATE_DIM_IDLE, 0.0, 0.0, 0.0),
+            });
+            let plate_pos =
+                Vec3::new(wp.dir[0] * PLATE_RADIUS, PLATE_HEIGHT, wp.dir[2] * PLATE_RADIUS);
+            // Face inward: aim -Z outward (2·pos − center at plate height) so the
+            // visible +Z face points at the console — toward the orbiting camera.
+            let outward = Vec3::new(plate_pos.x * 2.0, PLATE_HEIGHT, plate_pos.z * 2.0);
+            commands.spawn((
+                StationPlate(idx),
+                Mesh3d(plate_mesh),
+                MeshMaterial3d(material),
+                Transform::from_translation(plate_pos).looking_at(outward, Vec3::Y),
+                Visibility::Inherited,
+                panel,
+                Name::new(format!("StationPlate-{}", station.label())),
+                ChildOf(root),
+            ));
+        }
+    }
+
+    // Information radiators — tall violet dark-glass panels between bearings,
+    // idle placeholders (no live content in slice A).
+    for (i, d) in bearing::RADIATOR_DIRS.iter().enumerate() {
+        let mesh = meshes.add(Cuboid::new(RADIATOR_WIDTH, RADIATOR_HEIGHT, RADIATOR_DEPTH));
+        let mat = mats.add(unlit(lin(RADIATOR_COLOR)));
+        let pos = Vec3::new(
+            d[0] * RADIATOR_RADIUS,
+            RADIATOR_HEIGHT * 0.5 + RADIATOR_HEIGHT_OFFSET,
+            d[2] * RADIATOR_RADIUS,
+        );
+        // Present the broad face inward (the cuboid's ±Z face is width×height).
+        let outward = Vec3::new(pos.x * 2.0, pos.y, pos.z * 2.0);
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::from_translation(pos).looking_at(outward, Vec3::Y),
+            Visibility::Inherited,
+            Name::new(format!("Radiator{i}")),
+            ChildOf(root),
+        ));
+    }
+
+    info!("room: entered (Tardis chamber, slice A)");
 }
 
 fn exit_room(
@@ -195,10 +476,11 @@ fn exit_room(
     info!("room: exited");
 }
 
-// ── Systems ─────────────────────────────────────────────────────────────────
+// ── Systems ───────────────────────────────────────────────────────────────────
 
 /// Room keys: Left/Right cycle the carousel, Enter/Down dive into a built
-/// station, Esc drops to the conversation (the room is the top level).
+/// station, Esc drops to the conversation (the room is the top level). The nav
+/// contract is frozen — this is unchanged from the blockout.
 fn room_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut room: ResMut<RoomState>,
@@ -225,8 +507,8 @@ fn room_keyboard(
     }
 }
 
-/// Fill the nameplates once the mono font is ready (the same async-font gate
-/// as the well's label builders).
+/// Fill the nameplates once the mono font is ready (the same async-font gate as
+/// the well's label builders).
 fn room_plate_text(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
@@ -251,13 +533,13 @@ fn room_plate_text(
         commit_panel_glyphs(&mut msdf, glyphs);
         any = true;
     }
-    // Plates spawn via Commands the frame before they're queryable — only
-    // latch once we actually filled something.
+    // Plates spawn via Commands the frame before they're queryable — only latch
+    // once we actually filled something.
     *done = any;
 }
 
-/// Focus presentation: brighten + grow the focused plate, brass-frame it;
-/// unbuilt stations stay dim even focused.
+/// Focus presentation for the plates: brighten + grow the focused plate,
+/// brass-frame it; unbuilt stations stay dim even focused.
 fn room_focus_visuals(
     room: Res<RoomState>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
@@ -276,15 +558,201 @@ fn room_focus_visuals(
             PLATE_DIM_UNBUILT
         };
         let scale = if focused { PLATE_SCALE_FOCUSED } else { 1.0 };
-        tf.scale = Vec3::splat(scale);
-        if let Some(mat) = materials.get_mut(&mat_handle.0) {
-            mat.dim.x = dim;
-            mat.border = if focused { PLATE_BORDER_FOCUSED } else { Vec4::ZERO };
+        if tf.scale.x != scale {
+            tf.scale = Vec3::splat(scale);
+        }
+        // Guarded write: only dirty the material when focus actually flips, so a
+        // settled plate stops re-extracting (the well's asset discipline).
+        let border = if focused { PLATE_BORDER_FOCUSED } else { Vec4::ZERO };
+        if materials.get(&mat_handle.0).is_some_and(|m| m.dim.x != dim || m.border != border) {
+            if let Some(mat) = materials.get_mut(&mat_handle.0) {
+                mat.dim.x = dim;
+                mat.border = border;
+            }
         }
     }
 }
 
-// ── Shared plate-text helper (also used by the patch bay's plates) ─────────
+/// Ease the room camera toward the focused station's bearing pose — travel by
+/// intent, the same exponentially-smoothed tween idiom as the well's
+/// `ease_camera_to_focused_ring` (no cuts within a level).
+fn ease_room_camera(
+    time: Res<Time>,
+    room: Res<RoomState>,
+    mut cam: Query<&mut Transform, With<RoomCamera>>,
+) {
+    let Ok(mut tf) = cam.single_mut() else {
+        return;
+    };
+    let (pos, look) = desired_camera(room.carousel.focused_station());
+    let desired = Transform::from_translation(pos).looking_at(look, Vec3::Y);
+    let alpha = 1.0 - (-CAMERA_EASE_RATE * time.delta_secs()).exp();
+    tf.translation = tf.translation.lerp(desired.translation, alpha);
+    tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
+}
+
+/// Ingest the kernel-wide event stream into per-bearing activity, **ungated**
+/// (every screen) so the room opens warm. The freshest source, no re-wire:
+/// beat syncs warm the tracks (E) bearing, block chatter warms the console.
+fn ingest_room_activity(
+    mut events: MessageReader<ServerEventMessage>,
+    mut room_activity: ResMut<BearingActivity>,
+    time: Res<Time>,
+) {
+    for ServerEventMessage(ev) in events.read() {
+        if let Some((b, w)) = activity::event_bearing(ev) {
+            room_activity.record(b, w);
+        }
+    }
+    room_activity.tick(time.delta_secs());
+}
+
+/// Push ambient telemetry into the markers + console as light: the tracks (E)
+/// marker breathes with the well's beat phasor (HDR pulse decaying to LDR), the
+/// console emblem glows with context chatter, and the focused element takes a
+/// steady lift. Change-guarded + quantized so a settled marker never touches
+/// `Assets<StandardMaterial>` (the well's `sync_card_live_uniforms` discipline).
+fn sync_room_glow(
+    room_activity: Res<BearingActivity>,
+    beats: Res<WellBeats>,
+    room: Res<RoomState>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+    markers: Query<(&BearingMarker, &MeshMaterial3d<StandardMaterial>)>,
+    console: Query<&MeshMaterial3d<StandardMaterial>, With<ConsoleEmblem>>,
+) {
+    let now = Instant::now();
+    let beat = beats.global_envelope(now);
+    let focused = room.carousel.focused_station();
+
+    for (marker, handle) in markers.iter() {
+        let mut lift = 0.0;
+        if marker.bearing == Bearing::East {
+            lift += beat * TRACKS_BEAT_GAIN
+                + room_activity.normalized(Bearing::East) * TRACKS_ACTIVE_GAIN;
+        }
+        if marker.station == Some(focused) {
+            lift += FOCUS_LIFT;
+        }
+        let brightness = quantize(MARKER_LDR + lift);
+        set_glow(&mut mats, &handle.0, marker.hue * brightness);
+    }
+
+    let mut c_lift = room_activity.normalized(Bearing::Center) * CONSOLE_CHATTER_GAIN;
+    if focused == Station::TimeWell {
+        c_lift += FOCUS_LIFT;
+    }
+    let c_target = Vec3::from_array(CONSOLE_GOLD_HUE) * quantize(CONSOLE_LDR + c_lift);
+    for handle in console.iter() {
+        set_glow(&mut mats, &handle.0, c_target);
+    }
+}
+
+// ── Camera pose helper ────────────────────────────────────────────────────────
+
+/// The desired `(position, look-at)` for the room camera facing `station` —
+/// overview for the console, an orbit facing the wall for everything else.
+fn desired_camera(station: Station) -> (Vec3, Vec3) {
+    match bearing::focus_dir(station) {
+        None => (OVERVIEW_POS, OVERVIEW_LOOK),
+        Some(d) => (
+            Vec3::from_array(bearing::orbit_camera(d, ROOM_CAM_ORBIT, ROOM_CAM_HEIGHT)),
+            Vec3::from_array(bearing::orbit_look(d, ROOM_CAM_LOOK_LEAD, ROOM_CAM_LOOK_HEIGHT)),
+        ),
+    }
+}
+
+// ── Material + colour helpers ──────────────────────────────────────────────────
+
+/// An unlit [`StandardMaterial`] carrying its brightness in `base_color` — the
+/// room's one emission channel (HDR blooms, LDR reads crisp).
+fn unlit(base_color: Color) -> StandardMaterial {
+    StandardMaterial { base_color, unlit: true, ..default() }
+}
+
+/// A linear-rgb [`Color`] from an `[f32; 3]` (values may exceed 1.0 for HDR).
+fn lin(c: [f32; 3]) -> Color {
+    Color::LinearRgba(LinearRgba::rgb(c[0], c[1], c[2]))
+}
+
+/// [`lin`] scaled by a brightness multiplier.
+fn lin_scaled(c: [f32; 3], k: f32) -> Color {
+    Color::LinearRgba(LinearRgba::rgb(c[0] * k, c[1] * k, c[2] * k))
+}
+
+/// A linear-rgb [`Color`] from a [`Vec3`].
+fn lin_v(v: Vec3) -> Color {
+    Color::LinearRgba(LinearRgba::rgb(v.x, v.y, v.z))
+}
+
+/// Snap a glow value to the [`GLOW_STEP`] grid so a settled marker stops
+/// touching `Assets<StandardMaterial>`.
+fn quantize(v: f32) -> f32 {
+    (v / GLOW_STEP).round() * GLOW_STEP
+}
+
+/// Write a material's `base_color` only when it actually changes (read via the
+/// non-dirtying `get`, reach for `get_mut` on change) — the well's per-frame
+/// asset-write discipline.
+fn set_glow(mats: &mut Assets<StandardMaterial>, handle: &Handle<StandardMaterial>, target: Vec3) {
+    let Some(cur) = mats.get(handle).map(|m| m.base_color.to_linear()) else {
+        return;
+    };
+    if (cur.red - target.x).abs() > 1e-4
+        || (cur.green - target.y).abs() > 1e-4
+        || (cur.blue - target.z).abs() > 1e-4
+    {
+        if let Some(m) = mats.get_mut(handle) {
+            m.base_color = lin_v(target);
+        }
+    }
+}
+
+// ── Procedural meshes ──────────────────────────────────────────────────────────
+
+/// A flat floor ribbon (up-normal) along `points`, `width` across — a trace
+/// channel. Vertex math lives in [`bearing::ribbon_vertices`] (unit-tested);
+/// this wraps it into a `Mesh` with up-normals.
+fn ribbon_mesh(points: &[[f32; 3]], width: f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let (positions, indices) = bearing::ribbon_vertices(points, width);
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
+/// The vault dome: a UV sphere with a per-vertex vertical gradient
+/// ([`bearing::dome_color`]). Unlit + vertex-colours → the gradient is the
+/// output; the material's `base_color` is left white.
+fn dome_mesh(radius: f32) -> Mesh {
+    use bevy::mesh::VertexAttributeValues;
+
+    let mut mesh = Sphere::new(radius).mesh().uv(48, 24);
+    // Compute the gradient into an owned buffer first, so the immutable
+    // position borrow ends before the mutable `insert_attribute`.
+    let colors: Option<Vec<[f32; 4]>> =
+        if let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        {
+            Some(
+                positions
+                    .iter()
+                    .map(|p| bearing::dome_color((p[1] / radius) * 0.5 + 0.5))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+    if let Some(colors) = colors {
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    }
+    mesh
+}
+
+// ── Shared plate-text helper (also used by the patch bay's plates) ────────────
 
 fn plate_brush() -> Brush {
     bevy_color_to_brush(Color::srgba(0.82, 0.88, 0.97, 0.9))
@@ -320,8 +788,96 @@ pub(crate) fn layout_plate_text(
     collect_msdf_glyphs(&layout, &[], &brush, (PLATE_PAD as f64, PLATE_PAD as f64), atlas)
 }
 
-/// `WellCardMaterial.shape` for a nameplate: texture aspect, soft corner,
-/// thin border channel (drawn only when `border` is nonzero).
+/// `WellCardMaterial.shape` for a nameplate: texture aspect, soft corner, thin
+/// border channel (drawn only when `border` is nonzero).
 fn plate_shape() -> Vec4 {
     Vec4::new(PLATE_TEX_W / PLATE_TEX_H, 0.10, 0.05, 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desired_camera_frames_console_from_the_overview() {
+        let (pos, look) = desired_camera(Station::TimeWell);
+        assert_eq!(pos, OVERVIEW_POS);
+        assert_eq!(look, OVERVIEW_LOOK);
+    }
+
+    #[test]
+    fn desired_camera_faces_the_tracks_wall_from_across_the_room() {
+        // Tracks is East (+X); the camera should sit west (−X) and look east.
+        let (pos, look) = desired_camera(Station::Tracks);
+        assert!(pos.x < 0.0, "camera orbits to the west side: {pos:?}");
+        assert!(look.x > 0.0, "looking toward the east station: {look:?}");
+        assert_eq!(pos.y, ROOM_CAM_HEIGHT);
+    }
+
+    #[test]
+    fn every_camera_pose_stays_inside_the_vault_dome() {
+        // Outside the dome the camera would face its near inner wall, occluding
+        // the room. Every focus (overview + each bearing) must orbit within it.
+        for s in Station::ALL {
+            let (pos, _) = desired_camera(s);
+            assert!(
+                pos.length() < DOME_RADIUS,
+                "{s:?} camera at {} escapes the dome ({DOME_RADIUS})",
+                pos.length()
+            );
+        }
+    }
+
+    #[test]
+    fn every_floor_trace_bows_around_the_console_keepout() {
+        for (radius, _, _, _, _) in TRACE_ARCS {
+            assert!(radius > KEEPOUT_RADIUS, "trace at r={radius} would cross the console");
+        }
+    }
+
+    #[test]
+    fn ribbon_mesh_has_matching_position_and_normal_counts() {
+        let line = [[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [100.0, 0.0, 0.0]];
+        let mesh = ribbon_mesh(&line, 8.0);
+        use bevy::mesh::VertexAttributeValues;
+        let pos = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len();
+        let nrm = mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap().len();
+        assert_eq!(pos, 6, "2 verts × 3 points");
+        assert_eq!(nrm, pos, "one up-normal per vertex");
+        if let Some(VertexAttributeValues::Float32x3(ns)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+            assert!(ns.iter().all(|n| *n == [0.0, 1.0, 0.0]), "all up");
+        }
+    }
+
+    #[test]
+    fn dome_mesh_carries_a_vertex_colour_gradient() {
+        let mesh = dome_mesh(100.0);
+        assert!(
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some(),
+            "the vault gradient rides on vertex colours"
+        );
+    }
+
+    #[test]
+    fn a_beat_sync_warms_the_east_tracks_bearing_through_the_ingest_system() {
+        // The acceptance path end-to-end at the resource level: a jam's BeatSync
+        // event, ingested ungated, lifts the East (tracks) bearing's activity —
+        // what `sync_room_glow` then turns into the marker's breath.
+        let mut app = App::new();
+        app.add_plugins(bevy::time::TimePlugin)
+            .init_resource::<BearingActivity>()
+            .add_message::<ServerEventMessage>()
+            .add_systems(Update, ingest_room_activity);
+
+        app.world_mut()
+            .write_message(ServerEventMessage(kaijutsu_client::ServerEvent::BeatSync {
+                context_id: kaijutsu_types::ContextId::from_bytes([7; 16]),
+                beat_ref: kaijutsu_audio::BeatRef::new(0.0, 2.0),
+            }));
+        app.update();
+
+        let act = app.world().resource::<BearingActivity>();
+        assert!(act.level(Bearing::East) > 0.0, "the tracks bearing warmed");
+        assert_eq!(act.level(Bearing::Center), 0.0, "console stayed dark");
+    }
 }
