@@ -338,10 +338,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `cull_mode: None`. Swap to CCW (`[l0, l1, r0, r0, l1, r1]`) before any
   *lit* material rides a ribbon; consider extracting the two copies into a
   shared helper while at it.
-- **Patch bay: inspection plate overflows its quad** (found live 2026-07-09):
-  `kaijutsu-app:render → TiMidity port 0` runs past the plate edge and clips.
-  `fill_patch_text` / `layout_plate_text` need wrap-or-shrink (the room
-  nameplates already fit-to-width; reuse that). Cosmetic; slice-0 polish.
 - **Rename `BlockScene` → `BlockContent`:** the component no longer holds a
   scene (scene + `built_*` live on `VelloUiScene`); it's now pure build-
   bookkeeping (`content_version`/`last_built_version`/`scene_version`/`text`/
