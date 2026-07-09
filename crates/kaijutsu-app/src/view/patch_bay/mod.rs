@@ -56,6 +56,42 @@ const WIRE_EMISSIVE_SELECTED: LinearRgba = LinearRgba::rgb(5.5, 0.9, 1.1);
 /// Poll cadence for the observed graph.
 const POLL_SECS: f32 = 2.0;
 
+// ── Etched instrument face (Amy-tunable; strictly LDR — etching never blooms) ─
+
+/// The etched gold ring/tick geometry lies this far above the table's top face
+/// (a small +Y like the chords, to clear z-fighting with the flat annulus).
+const ETCH_Y: f32 = 0.8;
+/// Faint brass for the etched rings and seat ticks — LDR (< 1.0 linear) so it
+/// reads as an engraving and never blooms through the HDR camera (the
+/// charter's decoration-stays-LDR budget rule).
+const ETCH_GOLD: Color = Color::srgb(0.42, 0.34, 0.16);
+/// Concentric guide-ring radii (world units): a few rings between the center
+/// hole and the rim, plus the ring AT the socket-seat radius (`RIM_R`) the
+/// pegs sit on — "legible like a well-designed instrument" (mockup 14).
+const ETCH_RING_RADII: [f32; 4] = [150.0, 205.0, 260.0, RIM_R];
+const ETCH_RING_WIDTH: f32 = 2.0;
+/// Radial seat tick: a short mark reaching inward from the rim at each socket
+/// angle (the seats come from `layout_sockets`, so ticks rebuild with them).
+const ETCH_TICK_LEN: f32 = 20.0;
+const ETCH_TICK_WIDTH: f32 = 2.4;
+
+// ── Rim text layers ──────────────────────────────────────────────────────────
+
+/// Per-socket port labels — the PRIMARY rim text: bright, inner, floating just
+/// above each peg (`docs/scenes/patchbay.md` socket grammar: RENDER, SYNTH…).
+const PORT_LABEL_R: f32 = RIM_R * 1.02;
+const PORT_LABEL_Y: f32 = 50.0;
+const PORT_LABEL_W: f32 = 108.0;
+/// Height keeps the shared plate texture's aspect so the glyphs don't stretch.
+const PORT_LABEL_H: f32 =
+    PORT_LABEL_W * crate::view::room::PLATE_TEX_H / crate::view::room::PLATE_TEX_W;
+const PORT_LABEL_DIM: f32 = 1.0;
+/// Client group nameplates — the SUPPORTING layer: dimmer and further out than
+/// the port labels, so the two text tiers read as hierarchy, not noise.
+const GROUP_PLATE_R: f32 = RIM_R * 1.22;
+const GROUP_PLATE_Y: f32 = 34.0;
+const GROUP_PLATE_DIM: f32 = 0.5;
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 /// Main-thread-only ALSA handle (the `Seq` is not Send — same NonSend stance
@@ -129,6 +165,17 @@ pub struct InfoPlate;
 #[derive(Component)]
 pub struct TitlePlate(pub &'static str);
 
+/// A floating ALL-CAPS holographic label above one socket peg. Holds the
+/// derived display string; `fill_port_labels` commits its glyphs once the font
+/// loads (the same async-font gate the other plates use).
+#[derive(Component)]
+pub struct PortLabel(String);
+
+/// A radial etch tick at a socket seat angle. Seat-driven, so it rebuilds with
+/// the sockets (unlike the static concentric rings spawned in `enter_patch_bay`).
+#[derive(Component)]
+pub struct EtchTick;
+
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
 pub struct PatchBayPlugin;
@@ -146,6 +193,10 @@ impl Plugin for PatchBayPlugin {
                     poll_patch_graph,
                     rebuild_patch_scene,
                     update_wire_selection,
+                    // Before `fill_patch_text`: it owns the `text_dirty` clear,
+                    // so filling port labels first keeps them on the same armed
+                    // flag as the other plates.
+                    fill_port_labels,
                     fill_patch_text,
                 )
                     .chain()
@@ -215,6 +266,32 @@ fn enter_patch_bay(
         Name::new("PatchBayTable"),
         ChildOf(root),
     ));
+
+    // Etched instrument face: faint gold concentric guide rings lying just
+    // above the table's top face — the static half of mockup 14's "concentric
+    // guide rings and radial ticks etched in faint gold." The per-seat radial
+    // ticks are seat-driven and spawn with the sockets in `rebuild_patch_scene`.
+    // One shared unlit LDR material so the etching reads at rest and never
+    // blooms; `cull_mode: None` keeps the up-facing annulus visible either side.
+    let etch_material = std_materials.add(StandardMaterial {
+        base_color: ETCH_GOLD,
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    for &r in &ETCH_RING_RADII {
+        let ring = meshes.add(Annulus::new(r - ETCH_RING_WIDTH * 0.5, r + ETCH_RING_WIDTH * 0.5));
+        commands.spawn((
+            Mesh3d(ring),
+            MeshMaterial3d(etch_material.clone()),
+            // Annulus lies in XY facing +Z; rotate it flat so its face points up.
+            Transform::from_xyz(0.0, ETCH_Y, 0.0)
+                .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+            Visibility::Inherited,
+            Name::new("PatchBayEtchRing"),
+            ChildOf(root),
+        ));
+    }
 
     // StandardMaterial needs light (the well's custom shaders don't; this
     // scene has real metal). One warm point light high over the table.
@@ -379,7 +456,10 @@ fn rebuild_patch_scene(
     mut card_materials: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     roots: Query<Entity, With<PatchBayRoot>>,
-    old: Query<Entity, Or<(With<ChordWire>, With<SocketPeg>, With<GroupPlate>)>>,
+    old: Query<
+        Entity,
+        Or<(With<ChordWire>, With<SocketPeg>, With<GroupPlate>, With<EtchTick>, With<PortLabel>)>,
+    >,
 ) {
     if !state.scene_dirty {
         return;
@@ -406,13 +486,27 @@ fn rebuild_patch_scene(
     // endpoint index → rim angle.
     let angle_of: Vec<f32> = seats.iter().map(|s| s.angle).collect();
 
-    // Sockets: brass pegs at each seat.
+    // Per-client port counts drive the label heuristic's multi-port fallback
+    // (keyed by client_id, the true identity — two clients can share a name).
+    let mut port_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for ep in &state.snapshot.endpoints {
+        *port_counts.entry(ep.client_id).or_default() += 1;
+    }
+
+    // Sockets: brass pegs at each seat, each with its etched radial seat tick
+    // and its ALL-CAPS holographic port label floating above.
     let peg_mesh = meshes.add(Cylinder::new(7.0, 12.0));
     let peg_material = std_materials.add(StandardMaterial {
         base_color: Color::srgb(0.72, 0.55, 0.25),
         metallic: 0.9,
         perceptual_roughness: 0.3,
         emissive: LinearRgba::rgb(0.10, 0.07, 0.02),
+        ..default()
+    });
+    let tick_material = std_materials.add(StandardMaterial {
+        base_color: ETCH_GOLD,
+        unlit: true,
+        cull_mode: None,
         ..default()
     });
     for seat in &seats {
@@ -426,12 +520,66 @@ fn rebuild_patch_scene(
             Name::new("SocketPeg"),
             ChildOf(root),
         ));
+
+        // Etched radial tick: a short gold mark reaching inward from the rim at
+        // this seat angle (a fresh flat ribbon per seat — cheap at ~10 sockets).
+        let tick_in = Vec3::new((RIM_R - ETCH_TICK_LEN) * c, ETCH_Y, (RIM_R - ETCH_TICK_LEN) * s);
+        let tick_out = Vec3::new(RIM_R * c, ETCH_Y, RIM_R * s);
+        let tick_mesh = meshes.add(ribbon_mesh(&[tick_in.to_array(), tick_out.to_array()], ETCH_TICK_WIDTH));
+        commands.spawn((
+            EtchTick,
+            Mesh3d(tick_mesh),
+            MeshMaterial3d(tick_material.clone()),
+            Transform::default(),
+            Visibility::Inherited,
+            Name::new("EtchTick"),
+            ChildOf(root),
+        ));
+
+        // Port label: the primary rim text, bright and inner, floating above
+        // the peg and facing the fixed camera. Text is committed once the font
+        // loads by `fill_port_labels`.
+        if let Some(ep) = state.snapshot.endpoints.get(seat.endpoint_index) {
+            let count = port_counts.get(&ep.client_id).copied().unwrap_or(1);
+            let text = socket_label(&ep.client_name, &ep.port_name, count, ep.port_id);
+            let pos = Vec3::new(PORT_LABEL_R * c, PORT_LABEL_Y, PORT_LABEL_R * s);
+            let mesh = meshes.add(Rectangle::new(PORT_LABEL_W, PORT_LABEL_H));
+            let (image, panel) = create_msdf_panel(
+                &mut images,
+                crate::view::room::PLATE_TEX_W as u32,
+                crate::view::room::PLATE_TEX_H as u32,
+            );
+            let material = card_materials.add(WellCardMaterial {
+                texture: image,
+                accent: Vec4::ZERO,
+                params: Vec4::ZERO,
+                shape: Vec4::new(
+                    crate::view::room::PLATE_TEX_W / crate::view::room::PLATE_TEX_H,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+                border: Vec4::ZERO,
+                dim: Vec4::new(PORT_LABEL_DIM, 0.0, 0.0, 0.0),
+            });
+            commands.spawn((
+                PortLabel(text),
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                face_camera(pos),
+                Visibility::Inherited,
+                panel,
+                Name::new("PortLabel"),
+                ChildOf(root),
+            ));
+        }
     }
 
-    // Group nameplates just outside the rim, facing the camera.
+    // Group nameplates: the supporting layer — dimmer and further out than the
+    // port labels, facing the fixed camera.
     for label in &labels {
         let (s, c) = label.angle.sin_cos();
-        let pos = Vec3::new(RIM_R * 1.22 * c, 34.0, RIM_R * 1.22 * s);
+        let pos = Vec3::new(GROUP_PLATE_R * c, GROUP_PLATE_Y, GROUP_PLATE_R * s);
         let mesh = meshes.add(Rectangle::new(150.0, 44.0));
         let (image, panel) = create_msdf_panel(
             &mut images,
@@ -449,13 +597,13 @@ fn rebuild_patch_scene(
                 0.0,
             ),
             border: Vec4::ZERO,
-            dim: Vec4::new(0.8, 0.0, 0.0, 0.0),
+            dim: Vec4::new(GROUP_PLATE_DIM, 0.0, 0.0, 0.0),
         });
         commands.spawn((
             GroupPlate(label.client_name.clone()),
             Mesh3d(mesh),
             MeshMaterial3d(material),
-            Transform::from_translation(pos).looking_at(pos * 2.0 - PB_CAM_POS, Vec3::Y),
+            face_camera(pos),
             Visibility::Inherited,
             panel,
             Name::new(format!("GroupPlate-{}", label.client_name)),
@@ -581,7 +729,110 @@ fn describe_selection(snapshot: &PatchGraphSnapshot, selected: usize) -> String 
     format!("{} -> {}", name(wire.src), name(wire.dst))
 }
 
+/// Commit glyphs for the per-socket port labels once the font is ready — the
+/// same async-font gate as [`fill_patch_text`], but for the primary rim-text
+/// layer. Runs just before `fill_patch_text` in the chain, and never clears
+/// `text_dirty` (that's `fill_patch_text`'s job), so an early frame with no
+/// font yet retries both together on the next tick.
+fn fill_port_labels(
+    fonts: Res<Assets<VelloFont>>,
+    font_handles: Res<ShapingFonts>,
+    mut atlas: Option<ResMut<MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
+    state: Res<PatchBayState>,
+    mut labels: Query<(&PortLabel, &mut MsdfBlockGlyphs)>,
+) {
+    if !state.text_dirty {
+        return;
+    }
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return;
+    };
+    let Some(atlas) = atlas.as_deref_mut() else {
+        return;
+    };
+    for (label, mut msdf) in labels.iter_mut() {
+        let glyphs = layout_plate_text(&label.0, font, atlas, &mut font_data_map);
+        commit_panel_glyphs(&mut msdf, glyphs);
+    }
+}
+
+// ── Socket label heuristic (display-only; NOT the endpoint registry) ─────────
+
+/// Longest label, in characters, a socket plate shows; longer names truncate.
+const LABEL_MAX: usize = 14;
+
+/// Derive the short ALL-CAPS holographic label for a socket peg from its
+/// endpoint.
+///
+/// This is a **display** heuristic — a legibility shortening for the scene,
+/// deliberately *not* the symbolic-endpoint registry that
+/// `docs/scenes/patchbay.md` open question #2 leaves open (still open: nothing
+/// here feeds routing, it only names a floating glyph over a peg).
+///
+/// - A *meaningful* port name — not "port"/"Port-N"-shaped, not just the
+///   client name again — wins, uppercased: `render` → `RENDER`,
+///   `capture` → `CAPTURE`.
+/// - Otherwise fall back to the shortened client name, plus the port id when
+///   the client seats more than one port: TiMidity port 0 → `TIMIDITY 0`;
+///   a lone `Midi Through Port-0` → `MIDI THROUGH`.
+fn socket_label(client_name: &str, port_name: &str, client_port_count: usize, port_id: i32) -> String {
+    let pn = port_name.trim();
+    // ALSA often prefixes a port with its client's name ("TiMidity port 0");
+    // strip that copy before judging whether what's left carries information.
+    let stripped = pn.strip_prefix(client_name).unwrap_or(pn).trim();
+    let meaningful = !pn.is_empty()
+        && pn != "?"
+        && !pn.eq_ignore_ascii_case(client_name)
+        && !stripped.is_empty()
+        && !is_port_shaped(pn)
+        && !is_port_shaped(stripped);
+    if meaningful {
+        return truncate_chars(&pn.to_uppercase(), LABEL_MAX);
+    }
+
+    let client = client_name.to_uppercase();
+    if client_port_count > 1 {
+        // Keep the disambiguating id even when the client name is long: reserve
+        // its width so truncation eats the name, never the number (two ports of
+        // one long-named client must not collapse to the same label).
+        let id = port_id.to_string();
+        let room = LABEL_MAX.saturating_sub(id.len() + 1);
+        format!("{} {id}", truncate_chars(&client, room))
+    } else {
+        truncate_chars(&client, LABEL_MAX)
+    }
+}
+
+/// True when `s` is an uninformative "port"/"Port-N" name: the literal word
+/// `port` (any case) at the start, optionally followed by separators and a
+/// number. `portland` and `render` are not port-shaped.
+fn is_port_shaped(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("port") else {
+        return false;
+    };
+    let rest = rest.trim_start_matches([' ', '-', '_', ':', '#']);
+    rest.is_empty() || rest.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// First `max` characters of `s` (char-safe: ALSA names are ASCII, but a stray
+/// unicode name must never panic on a byte-boundary slice).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 // ── Plate + ribbon helpers ──────────────────────────────────────────────────
+
+/// Orient a plate at `pos` so its readable face points at the **fixed**
+/// patch-bay camera. `PB_CAM_POS` never moves in this scene, so we bake the
+/// facing once at spawn — no per-frame billboard system. A `Rectangle` faces
+/// +Z; aiming its forward (-Z) at `2·pos − PB_CAM_POS` swings +Z back toward
+/// the eye, keeping every rim plate square-on instead of edge-on at tangent
+/// angles (the unreadable-nameplate fix, `docs/scenes/patchbay.md`).
+fn face_camera(pos: Vec3) -> Transform {
+    Transform::from_translation(pos).looking_at(pos * 2.0 - PB_CAM_POS, Vec3::Y)
+}
 
 /// A floating MSDF text plate facing the patch-bay camera (borderless,
 /// label-style; text committed later by [`fill_patch_text`]).
@@ -614,7 +865,7 @@ fn plate_bundle(
     (
         Mesh3d(mesh),
         MeshMaterial3d(material),
-        Transform::from_translation(pos).looking_at(pos * 2.0 - PB_CAM_POS, Vec3::Y),
+        face_camera(pos),
         Visibility::Inherited,
         panel,
     )
@@ -752,4 +1003,60 @@ mod tests {
     // a real `PatchGraphReader`, which needs a live ALSA sequencer — it's
     // exercised by the `#[ignore]`d `alsa_smoke` path in `patch_graph.rs`, not
     // here.
+
+    // -- socket_label (display heuristic — patchbay.md open question #2 stays open) --
+
+    #[test]
+    fn a_meaningful_port_name_becomes_its_own_uppercase_label() {
+        // The port name carries the information; the client name is redundant.
+        assert_eq!(socket_label("kaijutsu-app", "render", 1, 0), "RENDER");
+        assert_eq!(socket_label("kaijutsu-app", "capture", 2, 1), "CAPTURE");
+    }
+
+    #[test]
+    fn a_port_shaped_name_falls_back_to_client_plus_id_on_a_multiport_client() {
+        // TiMidity seats four "port N" ports: the name says nothing, so the id
+        // has to disambiguate. Both the bare "port 0" and the ALSA-prefixed
+        // "TiMidity port 3" resolve the same way.
+        assert_eq!(socket_label("TiMidity", "port 0", 4, 0), "TIMIDITY 0");
+        assert_eq!(socket_label("TiMidity", "TiMidity port 3", 4, 3), "TIMIDITY 3");
+    }
+
+    #[test]
+    fn a_client_prefixed_port_on_a_single_port_client_drops_the_redundant_id() {
+        // A lone "Midi Through Port-0": the "Port-0" is noise and there is only
+        // one port, so the client name alone reads cleanest.
+        assert_eq!(socket_label("Midi Through", "Midi Through Port-0", 1, 0), "MIDI THROUGH");
+    }
+
+    #[test]
+    fn a_port_named_after_its_own_client_falls_back_to_the_client() {
+        assert_eq!(socket_label("FLUID Synth", "FLUID Synth", 1, 0), "FLUID SYNTH");
+    }
+
+    #[test]
+    fn a_long_meaningful_label_is_truncated_to_fit_the_plate() {
+        let label = socket_label("app", "a-very-long-descriptive-port", 1, 0);
+        assert!(label.chars().count() <= LABEL_MAX, "{label:?} exceeds {LABEL_MAX}");
+        assert!(label.starts_with("A-VERY"), "{label:?}");
+    }
+
+    #[test]
+    fn a_long_client_fallback_sacrifices_the_name_but_keeps_the_id() {
+        // Truncation eats the name, never the number — otherwise two ports of
+        // one long-named client would collapse to the same label.
+        let label = socket_label("a-very-long-synth-name", "port 2", 3, 2);
+        assert!(label.chars().count() <= LABEL_MAX, "{label:?} exceeds {LABEL_MAX}");
+        assert!(label.ends_with(" 2"), "{label:?} lost its id");
+    }
+
+    #[test]
+    fn is_port_shaped_matches_only_the_uninformative_port_names() {
+        assert!(is_port_shaped("port"));
+        assert!(is_port_shaped("port 0"));
+        assert!(is_port_shaped("Port-12"));
+        assert!(is_port_shaped("PORT_3"));
+        assert!(!is_port_shaped("render"));
+        assert!(!is_port_shaped("portland"));
+    }
 }
