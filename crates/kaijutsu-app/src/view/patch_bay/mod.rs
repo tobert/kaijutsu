@@ -111,7 +111,12 @@ const ETCH_TICK_WIDTH: f32 = 2.4;
 /// Per-socket port labels — the PRIMARY rim text: bright, inner, floating just
 /// above each peg (`docs/scenes/patchbay.md` socket grammar: RENDER, SYNTH…).
 const PORT_LABEL_R: f32 = RIM_R * 1.02;
-const PORT_LABEL_Y: f32 = 50.0;
+/// Amy-tunable: raised from 50.0 — a rim-edge seat (tangent nearly radial to
+/// `PB_CAM_POS`) let this collide with the group nameplate below it. The two
+/// text tiers must not overlap in projection from the fixed camera at any
+/// seat angle; nudge this (and `GROUP_PLATE_Y`/`GROUP_PLATE_R` below) if they
+/// still do.
+const PORT_LABEL_Y: f32 = 64.0;
 const PORT_LABEL_W: f32 = 108.0;
 /// Height keeps the shared plate texture's aspect so the glyphs don't stretch.
 const PORT_LABEL_H: f32 =
@@ -119,8 +124,11 @@ const PORT_LABEL_H: f32 =
 const PORT_LABEL_DIM: f32 = 1.0;
 /// Client group nameplates — the SUPPORTING layer: dimmer and further out than
 /// the port labels, so the two text tiers read as hierarchy, not noise.
-const GROUP_PLATE_R: f32 = RIM_R * 1.22;
-const GROUP_PLATE_Y: f32 = 34.0;
+/// Amy-tunable: pushed further out (1.22 → 1.32) and lower (34.0 → 16.0) for
+/// the same reason as `PORT_LABEL_Y` above — the two text tiers must not
+/// overlap in projection from the fixed camera at any seat angle.
+const GROUP_PLATE_R: f32 = RIM_R * 1.32;
+const GROUP_PLATE_Y: f32 = 16.0;
 const GROUP_PLATE_DIM: f32 = 0.5;
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -523,6 +531,22 @@ fn rebuild_patch_scene(
     // endpoint index → rim angle.
     let angle_of: Vec<f32> = seats.iter().map(|s| s.angle).collect();
 
+    // First endpoint index of each group (groups are exact consecutive runs
+    // over `state.snapshot.endpoints`, so a prefix sum over the port counts
+    // lands on it) — used below to find a single-port group's lone endpoint
+    // for the nameplate-redundancy check.
+    let group_starts: Vec<usize> = {
+        let mut cursor = 0usize;
+        groups
+            .iter()
+            .map(|(_, n)| {
+                let start = cursor;
+                cursor += n;
+                start
+            })
+            .collect()
+    };
+
     // Per-client port counts drive the label heuristic's multi-port fallback
     // (keyed by client_id, the true identity — two clients can share a name).
     let mut port_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
@@ -613,8 +637,22 @@ fn rebuild_patch_scene(
     }
 
     // Group nameplates: the supporting layer — dimmer and further out than the
-    // port labels, facing the fixed camera.
-    for label in &labels {
+    // port labels, facing the fixed camera. `layout_sockets` emits exactly one
+    // label per group, same order as `groups`.
+    debug_assert_eq!(labels.len(), groups.len(), "layout_sockets: one label per group");
+    for (i, label) in labels.iter().enumerate() {
+        // A single-port client whose lone port label already reads the same
+        // as this nameplate (mod case — e.g. port "MIDI THROUGH" under
+        // nameplate "Midi Through") gets no nameplate: it would add nothing
+        // over the port label already floating on that one seat.
+        if groups[i].1 == 1 {
+            let ep = &state.snapshot.endpoints[group_starts[i]];
+            let count = port_counts.get(&ep.client_id).copied().unwrap_or(1);
+            let port_label = socket_label(&ep.client_name, &ep.port_name, count, ep.port_id);
+            if nameplate_redundant(&label.client_name, &port_label) {
+                continue;
+            }
+        }
         let (s, c) = label.angle.sin_cos();
         let pos = Vec3::new(GROUP_PLATE_R * c, GROUP_PLATE_Y, GROUP_PLATE_R * s);
         let mesh = meshes.add(Rectangle::new(150.0, 44.0));
@@ -924,6 +962,19 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// True when a single-port client's group nameplate would just repeat its
+/// lone port's label in a different case — e.g. port label `MIDI THROUGH`
+/// under nameplate `Midi Through` (live-observed rim-edge collision,
+/// `docs/scenes/patchbay.md`). `rebuild_patch_scene` skips spawning the
+/// nameplate in that case; the caller scopes the call to
+/// `client_port_count == 1` — a multi-port client's nameplate names the
+/// WHOLE group, which no single port label speaks for. Exact-length compare
+/// (via `eq_ignore_ascii_case`) means a truncated port label never
+/// false-positives against a longer, untruncated client name.
+fn nameplate_redundant(client_name: &str, port_label: &str) -> bool {
+    port_label.eq_ignore_ascii_case(client_name.trim())
+}
+
 // ── Live layer + apex helpers ───────────────────────────────────────────────
 
 /// The app's own render port (`kaijutsu-app:render`) — the source of any chord
@@ -996,12 +1047,44 @@ fn pulse_band(u: f32, age: f32, travel: f32, band_width: f32) -> f32 {
 /// Font sizes to try for the inspection plate, largest first (shrink-to-fit).
 const INFO_PLATE_SIZES: [f32; 5] = [PLATE_FONT_SIZE, 26.0, 22.0, 18.0, 15.0];
 
+/// The size-choosing predicate `layout_info_text` drives, pulled out so it's
+/// testable without a real font. Two passes over `sizes`, largest first:
+///   1. any size whose whole text fits ONE unwrapped line (`unwrapped_width`,
+///      probed with no wrap constraint at all). Requiring only the widest
+///      *word* to fit (the old, single-pass behavior) let a short string like
+///      `RENDER -> TIMIDITY 0` land on a size just barely too big for the
+///      plate — the trailing "0" wrapped onto its own line even though the
+///      whole string would have fit one step down (`docs/issues.md`).
+///   2. only if no size clears pass 1, the old wrap-allowed fit
+///      (`wrapped_metrics`: `(content_widths.min, height)`) — a genuinely
+///      long multi-hop wire name still wraps rather than truncating.
+/// Falls back to the smallest size (the floor) if nothing fits either pass.
+fn choose_info_plate_size(
+    sizes: &[f32],
+    max_w: f32,
+    max_h: f32,
+    mut unwrapped_width: impl FnMut(f32) -> f32,
+    mut wrapped_metrics: impl FnMut(f32) -> (f32, f32),
+) -> f32 {
+    if let Some(&size) = sizes.iter().find(|&&size| unwrapped_width(size) <= max_w) {
+        return size;
+    }
+    if let Some(&size) = sizes.iter().find(|&&size| {
+        let (content_min, height) = wrapped_metrics(size);
+        content_min <= max_w && height <= max_h
+    }) {
+        return size;
+    }
+    sizes.last().copied().unwrap_or(0.0)
+}
+
 /// Shrink-to-fit MSDF layout for the inspection plate (`PLATE_TEX_W`×`PLATE_TEX_H`):
-/// steps the font size down until the shaped `client:port -> client:port` fits the
-/// plate's usable box, then collects glyphs at that size. Same machinery as
-/// `room::layout_plate_text` (brush, atlas, MSDF collect) — it only adds the fit
-/// loop the fixed-size helper can't do, so a long wire name no longer overflows
-/// the frame (`docs/issues.md`).
+/// steps the font size down via [`choose_info_plate_size`] until the shaped
+/// `client:port -> client:port` fits the plate's usable box, then collects
+/// glyphs at that size. Same machinery as `room::layout_plate_text` (brush,
+/// atlas, MSDF collect) — it only adds the fit loop the fixed-size helper
+/// can't do, so a long wire name no longer overflows the frame
+/// (`docs/issues.md`).
 fn layout_info_text(
     text: &str,
     font: &VelloFont,
@@ -1016,17 +1099,18 @@ fn layout_info_text(
     let max_h = PLATE_TEX_H - 2.0 * PLATE_PAD;
     let style = |size: f32| VelloTextStyle { font_size: size, line_height: 1.1, ..default() };
 
-    // Largest size whose shaped text fits both the width (no unbreakable word
-    // wider than the box — `content_widths.min`) and the height (no spilling past
-    // the last line); the smallest is the floor.
-    let mut chosen = *INFO_PLATE_SIZES.last().unwrap();
-    for &size in &INFO_PLATE_SIZES {
-        let probe = font.layout(text, &style(size), VelloTextAlign::Middle, Some(max_w));
-        if probe.calculate_content_widths().min <= max_w && probe.height() <= max_h {
-            chosen = size;
-            break;
-        }
-    }
+    let chosen = choose_info_plate_size(
+        &INFO_PLATE_SIZES,
+        max_w,
+        max_h,
+        // No wrap constraint at all: `.width()` is the text's true one-line
+        // width, so this only accepts a size that needs no wrapping.
+        |size| font.layout(text, &style(size), VelloTextAlign::Middle, None).width(),
+        |size| {
+            let probe = font.layout(text, &style(size), VelloTextAlign::Middle, Some(max_w));
+            (probe.calculate_content_widths().min, probe.height())
+        },
+    );
 
     let layout = font.layout(text, &style(chosen), VelloTextAlign::Middle, Some(max_w));
     for line in layout.lines() {
@@ -1282,6 +1366,33 @@ mod tests {
         assert!(!is_port_shaped("portland"));
     }
 
+    // -- nameplate_redundant (single-port nameplate suppression) --------
+
+    #[test]
+    fn nameplate_redundant_true_for_the_live_observed_collision() {
+        // The exact reported case: port label "MIDI THROUGH" floating right
+        // over a nameplate that just spells the same client name lowercase.
+        assert!(nameplate_redundant("Midi Through", "MIDI THROUGH"));
+    }
+
+    #[test]
+    fn nameplate_redundant_false_when_the_port_label_names_something_else() {
+        // A meaningful port name (RENDER) says something the client name
+        // (kaijutsu-app) doesn't — the nameplate still earns its keep.
+        assert!(!nameplate_redundant("kaijutsu-app", "RENDER"));
+    }
+
+    #[test]
+    fn nameplate_redundant_false_when_truncation_breaks_the_match() {
+        // socket_label truncates to LABEL_MAX; a truncated port label must
+        // never false-positive against the longer, untruncated client name
+        // eq_ignore_ascii_case would otherwise reject on length alone, but
+        // spell it out so the invariant stays visible here too.
+        let client = "a-very-long-synth-name-that-is-long";
+        let truncated = truncate_chars(&client.to_uppercase(), LABEL_MAX);
+        assert!(!nameplate_redundant(client, &truncated));
+    }
+
     // -- describe_selection (uses socket_label — same language as the pegs) --
 
     fn render_to_multi_port_timidity_snapshot() -> PatchGraphSnapshot {
@@ -1444,5 +1555,70 @@ mod tests {
         assert!(selected_chord_apex(&PatchGraphSnapshot::default(), 0).is_none());
         // A selection past the end of the wire list ⇒ likewise.
         assert!(selected_chord_apex(&render_to_synth_snapshot(), 9).is_none());
+    }
+
+    // -- choose_info_plate_size (the wrap-avoidance fix) -----------------
+    //
+    // `layout_info_text` needs a real shaped font to probe widths, so these
+    // drive the extracted picker with synthetic per-size metrics instead —
+    // no font fixture required.
+
+    #[test]
+    fn choose_info_plate_size_picks_the_largest_size_that_fits_one_line_unwrapped() {
+        let sizes = [30.0_f32, 20.0, 10.0];
+        // Every size fits unwrapped; the largest should win, and the
+        // wrap-allowed fallback must never even be consulted.
+        let chosen = choose_info_plate_size(
+            &sizes,
+            100.0,
+            50.0,
+            |_size| 90.0,
+            |_size| panic!("pass 1 already found a fit; pass 2 must not run"),
+        );
+        assert_eq!(chosen, 30.0);
+    }
+
+    #[test]
+    fn choose_info_plate_size_rejects_a_size_that_only_fits_after_wrapping() {
+        // The reported bug, reproduced directly: "RENDER -> TIMIDITY 0" at
+        // the largest size only fits the plate if a word is allowed to wrap
+        // onto its own line — that's the OLD algorithm's `content_widths.min`
+        // check passing at 30.0. The new picker must skip 30.0 (its unwrapped
+        // width overflows the box) and land on 20.0, which fits unwrapped.
+        let sizes = [30.0_f32, 20.0];
+        let chosen = choose_info_plate_size(
+            &sizes,
+            100.0,
+            50.0,
+            |size| if size == 30.0 { 120.0 } else { 90.0 },
+            // Old wrap-allowed check would happily accept 30.0 here (a lone
+            // word is narrower than the whole string) — proof the fix no
+            // longer lets this pass win.
+            |_size| (40.0, 45.0),
+        );
+        assert_eq!(chosen, 20.0, "must prefer the unwrapped fit over a wrap-allowed one");
+    }
+
+    #[test]
+    fn choose_info_plate_size_falls_back_to_wrap_allowed_when_nothing_fits_unwrapped() {
+        // A genuinely long multi-hop wire name: no size fits on one line, so
+        // the picker must fall back to the old wrap-allowed fit rather than
+        // flooring straight to the smallest size.
+        let sizes = [30.0_f32, 20.0, 10.0];
+        let chosen = choose_info_plate_size(
+            &sizes,
+            50.0,
+            40.0,
+            |_size| 200.0, // never fits unwrapped at any size
+            |size| if size == 30.0 { (60.0, 999.0) } else { (40.0, 30.0) },
+        );
+        assert_eq!(chosen, 20.0);
+    }
+
+    #[test]
+    fn choose_info_plate_size_floors_at_the_smallest_size_when_nothing_fits_either_pass() {
+        let sizes = [30.0_f32, 20.0, 10.0];
+        let chosen = choose_info_plate_size(&sizes, 10.0, 10.0, |_size| 999.0, |_size| (999.0, 999.0));
+        assert_eq!(chosen, 10.0, "the smallest size is the floor, even unfit");
     }
 }

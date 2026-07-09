@@ -331,6 +331,11 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Patch bay: extract shared wire-geometry helper** (deepseek review,
+  2026-07-09): `selected_chord_apex` re-derives the group→seat→angle→chord
+  pipeline that `rebuild_patch_scene` also computes (identical today,
+  verified). A future edit to one side floats the inspection card off its
+  chord. One pure `wire_geometry(snapshot, wire_idx)` helper, both callers.
 - **Procedural ribbon meshes wind CW; normals point −Y** (gemini review,
   2026-07-09): `ribbon_mesh` in both `view/room/mod.rs` and
   `view/patch_bay/mod.rs` emits clockwise triangles, so Bevy flips the top
