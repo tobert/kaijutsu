@@ -150,10 +150,11 @@ pub(crate) const STATION_W_PROUD: f32 = 10.0;
 /// framed, not cramped, against the wall's width at the time (≈663, apothem
 /// 800).
 ///
-/// **Not re-tuned for the 2026-07-10 evening apothem bump** (800 → 1200, the
-/// fullscreen-panel pivot): the panel is now ≈954 wide
-/// (`bearing::octagon_panel_width(WALL_APOTHEM) - room::WALL_PANEL_GAP`), so
-/// the wheel now reads smaller against its wall than it did — left for the
-/// lead's live tune rather than guessed here (`docs/scenes/shell.md`'s build
-/// path has the open framing note).
-pub(crate) const STATION_W_SCALE: f32 = 0.42;
+/// **Re-tuned for the fullscreen-panel pivot** (2026-07-10 eve, live over
+/// BRP): at the old 0.42 the fullscreened W panel read as a big empty
+/// screen with a small wheel floating on it — the content must OWN its
+/// panel. At 0.66 the wheel spans ≈459 of the panel's 560 height (~82%),
+/// and the outermost text ring (group nameplates, `GROUP_PLATE_R` ≈ 396
+/// local → ≈523 placed) still clears the panel edge. Push toward ~0.76
+/// only if the nameplate ring is allowed to kiss the mullions.
+pub(crate) const STATION_W_SCALE: f32 = 0.66;
