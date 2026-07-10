@@ -17,8 +17,8 @@
 //!   same eased tween idiom as the well's `ease_camera_to_focused_ring`).
 //! - **Nameplates**: engraved MSDF plates at the labeled bearings (the well's
 //!   plate pipeline). Unbuilt stations stay dimmed.
-//! - **Information radiators**: violet dark-glass panels between bearings
-//!   (idle/LDR placeholders for slice A).
+//! - **Information radiators**: violet dark-glass content — now the diagonal
+//!   faces of the octagon wall shell (below), not free-floating slabs.
 //! - **Ambient telemetry = light**: the tracks (E) marker *breathes* with the
 //!   beat (the well's [`WellBeats`] phasors, read — not re-wired), and the
 //!   console emblem glows with context chatter ([`activity::BearingActivity`]).
@@ -36,6 +36,17 @@
 //! for Conversation/the well tears down), one camera + one clear colour carry
 //! both screens, and the dived view earns its focus by dimming the room and
 //! showing the patch bay's own LOD, not by being a different world.
+//!
+//! **Slice B, retuned (2026-07-10): the octagon shell + the wheel-as-station**
+//! (`docs/scenes/palette.rs`'s station-W contract). The room is now enclosed by
+//! eight single-sided wall panels ([`bearing::octagon_panels`]) standing on the
+//! floor — the camera orbits OUTSIDE them for the overview pose, and the near
+//! panel(s) cull away (default back-face culling on an inward-facing quad),
+//! the dollhouse-cutaway read. The four diagonal faces carry the migrated
+//! violet information threads (the old free-floating radiators). The W
+//! bearing spawns no marker/plinth/cap/nameplate at all — [`spawn_w_dais`]
+//! builds a dais there instead, and the patch bay's own placement (untouched
+//! here) seats the wheel on it: the wheel **is** the station.
 //!
 //! Materials are all built-in [`StandardMaterial`] with `unlit: true`, carrying
 //! brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR (> 1.0)
@@ -64,6 +75,7 @@ use crate::text::msdf::{
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::{Screen, in_shell};
+use crate::view::palette;
 use crate::view::patch_bay;
 use crate::view::time_well::live::WellBeats;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
@@ -95,8 +107,6 @@ const ROOM_RADIUS: f32 = 620.0;
 /// Radius of the nameplates — a touch inside the pylons so a plate floats in
 /// front of its station.
 const PLATE_RADIUS: f32 = 560.0;
-/// Radius of the information-radiator panels (the between-station walls).
-const RADIATOR_RADIUS: f32 = 660.0;
 
 /// Central keep-out radius — every floor trace stays outside it, so no trace
 /// crosses the console (the open-center rule, `shell.md`). Enforced by a
@@ -188,38 +198,78 @@ const TABLE_COLOR: [f32; 3] = [0.032, 0.036, 0.050];
 /// Gold trim brightness (rim torus): the same LDR weight as the console rings.
 const TABLE_GOLD_LDR: f32 = 0.50;
 
-// ── Information radiators (violet — reserved for information) ─────────────────
+// ── Station W dais (the wheel IS the west station; `docs/scenes/palette.rs`'s
+// station-W contract) ────────────────────────────────────────────────────────
+// No marker pylon stands at W any more — the patch bay's own wheel is the
+// station ([`spawn_w_dais`]). Position/scale of the wheel itself lives in
+// `patch_bay.rs`'s `STATION_W_PLACEMENT` (untouched here); the two files agree
+// only through the shared `palette::STATION_W_*` constants, so neither can
+// drift without the other noticing.
 
-/// Radiator panel dimensions (a tall slim slab of dark glass).
-const RADIATOR_WIDTH: f32 = 92.0;
-const RADIATOR_HEIGHT: f32 = 430.0;
-const RADIATOR_DEPTH: f32 = 10.0;
-/// Panel bottom-edge lift off the floor — near-grounded (Amy: "more
-/// solidness"; the old 40 read as glass floating in mid-air).
-const RADIATOR_HEIGHT_OFFSET: f32 = 10.0;
-/// Idle radiator colour (linear rgb) — a dim violet dark-glass, LDR only for
-/// slice A (no live content yet).
-const RADIATOR_COLOR: [f32; 3] = [0.090, 0.040, 0.150];
+/// Foot plinth radius — a touch wider than the dais top, grounding it (the
+/// well table's plinth-wider-than-tabletop read, [`spawn_table`]).
+const W_DAIS_FOOT_R: f32 = palette::STATION_W_DAIS_R + 22.0;
+/// Foot plinth height — the table plinth's own weight.
+const W_DAIS_FOOT_HEIGHT: f32 = TABLE_PLINTH_HEIGHT;
+/// Gold rim torus at the dais top edge — the table rim's weight and hue.
+const W_DAIS_RIM_MINOR: f32 = TABLE_RIM_MINOR;
 
-/// A thin brass/dark-gold frame along each radiator's four edges — the
-/// concept-06 read of an idle panel as a *framed* instrument, not a bare slab.
-const RADIATOR_FRAME_THICKNESS: f32 = 8.0;
-const RADIATOR_FRAME_DEPTH: f32 = 14.0;
-const RADIATOR_FRAME_COLOR: [f32; 3] = [0.220, 0.170, 0.080];
-/// Vertical thread-strips on the inward face, floating just proud of the
-/// glass — idle radiators read as etched thread-columns (concept 06's side
-/// panels), each strip a random height/brightness so the panel reads as a
-/// held instrument, not a barcode.
-const RADIATOR_THREAD_COUNT: usize = 8;
-const RADIATOR_THREAD_WIDTH: f32 = 4.0;
-const RADIATOR_THREAD_DEPTH: f32 = 2.0;
-const RADIATOR_THREAD_PROUD: f32 = 1.6;
-/// Brighter violet than the dim glass ([`RADIATOR_COLOR`]) — still LDR; the
-/// thread-strips are the panel's foreground detail, the glass its backdrop.
-const RADIATOR_THREAD_HUE: [f32; 3] = [0.550, 0.180, 0.750];
-/// `(min, max)` thread height as a fraction of [`RADIATOR_HEIGHT`].
-const RADIATOR_THREAD_HEIGHT_RANGE: (f32, f32) = (0.35, 0.85);
-const RADIATOR_THREAD_BRIGHTNESS_RANGE: (f32, f32) = (0.3, 0.9);
+// ── Octagon wall shell (the enclosing chamber; `shell.md`'s cutaway
+// centerpiece) ──────────────────────────────────────────────────────────────
+// Eight flat single-sided panels forming a wall around the room — faces on
+// the four cardinals plus the four `bearing::RADIATOR_DIRS` diagonals,
+// `WALL_APOTHEM` out from center ([`bearing::octagon_panels`]). Every
+// panel/mullion/trim/thread quad MUST stay single-sided (default
+// `cull_mode`, no `Cuboid`, no `cull_mode: None`): a camera outside the
+// octagon sees a near panel's back face — culled — and the chamber shows
+// through (the dollhouse cutaway; see `bearing`'s own module comment for the
+// exact mechanics).
+
+/// Apothem (center-to-face distance): clears the old radiator radius (660)
+/// and the wall-station radius the pylons/markers stand at (`ROOM_RADIUS`,
+/// 620), so the shell encloses everything already standing in the room.
+const WALL_APOTHEM: f32 = 800.0;
+/// Panel height, standing on the floor (`y = 0` to `WALL_HEIGHT`).
+const WALL_HEIGHT: f32 = 560.0;
+/// Reveal subtracted from [`bearing::octagon_panel_width`]'s full (corner-
+/// touching) width so a corner mullion has room to stand without z-fighting
+/// its neighbours' trimmed edges.
+const WALL_PANEL_GAP: f32 = 40.0;
+/// Corner mullion strip width — the old marker pylons' own post scale
+/// ([`MARKER_WIDTH`]), so the shell's architecture and the furniture standing
+/// in front of it read as one family.
+const WALL_MULLION_WIDTH: f32 = MARKER_WIDTH;
+/// Dark glass base — a hair lighter than the dome's rim
+/// ([`bearing::dome_color`]`(0.0)`, `[0.050, 0.048, 0.086]`) so a panel reads
+/// as a surface catching the vault's glow, not a hole in it.
+const WALL_BASE_COLOR: [f32; 3] = [0.062, 0.060, 0.094];
+/// Mullion colour — a shade darker than the panel base: unlit structure
+/// between faces of different hues, no identity hue of its own.
+const WALL_MULLION_COLOR: [f32; 3] = [0.040, 0.040, 0.058];
+/// Edge-trim strip thickness, and how far it floats proud of the panel base
+/// (inward, along the panel's own local +Z — the "proud" idiom the old
+/// radiator thread-strips used, now needed for the trim too since both are
+/// now zero-thickness quads that would otherwise share a plane).
+const WALL_TRIM_THICKNESS: f32 = 12.0;
+const WALL_TRIM_PROUD: f32 = 2.2;
+/// Trim brightness — restrained neon, not a blown highlight (mission's
+/// "LDR ~0.5-0.7 of hue"; stays LDR).
+const WALL_TRIM_LDR: f32 = 0.60;
+
+/// Diagonal-panel content: the violet information threads migrated in from
+/// the old free-floating radiators (`shell.md`, "the walls between bearings
+/// are information radiators") — now rendered directly on the diagonal wall
+/// panel's inward face. Jitter ranges and hue carry over from the old
+/// `RADIATOR_THREAD_*` constants (deleted), just retargeted from a slab's
+/// local size to the wall's, and a few more strips for the bigger surface.
+const WALL_THREAD_COUNT: usize = 12;
+const WALL_THREAD_WIDTH: f32 = 5.0;
+/// Proud offset for the content threads — a touch more than the trim's, so
+/// threads read as the panel's foreground detail over the trimmed frame.
+const WALL_THREAD_PROUD: f32 = 2.6;
+/// `(min, max)` thread height as a fraction of [`WALL_HEIGHT`].
+const WALL_THREAD_HEIGHT_RANGE: (f32, f32) = (0.30, 0.80);
+const WALL_THREAD_BRIGHTNESS_RANGE: (f32, f32) = (0.3, 0.9);
 
 // ── Circuit-board floor (the wiring — static LDR engravings; Amy-tunable) ───
 
@@ -232,7 +282,7 @@ const TRACE_WIDTH: f32 = 7.0;
 /// headroom), gold = the well (used sparingly — gold is the console's hue).
 /// At rest a trace is a dark engraving; it lights HDR only when its flow runs
 /// (later slices). One hue family per fabric (the charter's rainbow-board
-/// rule); the violet stubs reuse [`RADIATOR_COLOR`] directly.
+/// rule); the violet stubs reuse [`palette::VIOLET_GLASS`] directly.
 const TRACE_CRIMSON: [f32; 3] = [0.24, 0.055, 0.070];
 const TRACE_CYAN: [f32; 3] = [0.050, 0.170, 0.210];
 const TRACE_GREEN: [f32; 3] = [0.100, 0.260, 0.150];
@@ -525,7 +575,14 @@ fn enter_room(
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
     // at the labeled ones (the reserved South bearing gets a dim marker only).
+    // A furnished bearing (`bearing::station_is_room_furniture` — today just
+    // PatchBay/W, "the wheel IS the west station") gets neither: no marker, no
+    // plate — `spawn_w_dais` below builds its own furniture instead.
     for wp in bearing::wall_placements() {
+        if wp.station.is_some_and(bearing::station_is_room_furniture) {
+            continue;
+        }
+
         let hue = Vec3::from_array(wp.hue);
         // The reserved South bearing (no station) gets a low stub — tall
         // enough to read as "reserved", short enough to stop standing in the
@@ -581,13 +638,20 @@ fn enter_room(
 
     // Pylon plinths + gold caps — the plain marker posts get grounded furniture
     // (`shell.md`'s "the atrium rules" read); the reserved South stub stays
-    // plinth-only ([`wants_gold_cap`]).
+    // plinth-only ([`wants_gold_cap`]). Skips the furnished W bearing same as
+    // the marker/plate loop above.
     spawn_pylons(&mut commands, root, &mut meshes, &mut mats);
 
-    // Information radiators — framed violet dark-glass panels between
-    // bearings, idle placeholders (no live content in slice A) but reading as
-    // held instruments: a brass/dark-gold frame and vertical thread-strips.
-    spawn_radiators(&mut commands, root, &mut meshes, &mut mats);
+    // The W dais — the wheel IS the west station (`shell.md` slice B, retuned
+    // 2026-07-10). Not RoomDistraction: it's the station's own furniture, so
+    // it stays lit through the dive same as the wheel itself.
+    spawn_w_dais(&mut commands, root, &mut meshes, &mut mats);
+
+    // The octagon wall shell: eight single-sided panels enclosing the room,
+    // corner mullions, hue-coded edge trim, and — on the four diagonals — the
+    // violet information threads that used to stand as free-floating
+    // radiators. The chamber, not room chrome (no RoomDistraction).
+    spawn_walls(&mut commands, root, &mut meshes, &mut mats);
 
     // Re-root the patch bay into the room as furniture at the W bearing (slice B,
     // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
@@ -668,6 +732,12 @@ pub(crate) fn teardown_room(
 /// expands each bundle's `count`). Angles are read straight off
 /// [`Bearing::dir`] via [`bearing::dir_theta`] so a re-placed bearing can't
 /// silently drift out of sync with its floor traces. **Amy-tunable.**
+///
+/// The W bundle's `pad_range` was retuned 2026-07-10 (`shell.md`, "the wheel
+/// IS the west station"): its terminal pads now cluster just past the dais
+/// foot ([`palette::STATION_W_DAIS_R`]) instead of out toward the old wall
+/// radius, so the crimson wiring visibly flows INTO the station instead of
+/// past it.
 fn route_bundles() -> [bearing::RouteBundle; 9] {
     use bearing::{Bearing, RouteBundle, dir_theta};
     let west = dir_theta(Bearing::West.dir());
@@ -682,7 +752,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 7,
             lane_range: (280.0, 620.0),
             arc_range: (0.25, 0.9),
-            pad_range: (420.0, 900.0),
+            pad_range: (palette::STATION_W_DAIS_R + 120.0, 420.0),
             hue: TRACE_CRIMSON,
             brightness_range: (0.7, 1.15),
         },
@@ -723,7 +793,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (240.0, 320.0),
             arc_range: (0.0, 0.12),
             pad_range: (300.0, 420.0),
-            hue: RADIATOR_COLOR,
+            hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -733,7 +803,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (240.0, 320.0),
             arc_range: (0.0, 0.12),
             pad_range: (300.0, 420.0),
-            hue: RADIATOR_COLOR,
+            hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -743,7 +813,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (240.0, 320.0),
             arc_range: (0.0, 0.12),
             pad_range: (300.0, 420.0),
-            hue: RADIATOR_COLOR,
+            hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -753,7 +823,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (240.0, 320.0),
             arc_range: (0.0, 0.12),
             pad_range: (300.0, 420.0),
-            hue: RADIATOR_COLOR,
+            hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -935,100 +1005,185 @@ fn spawn_table(
     ));
 }
 
-/// Information radiators: idle violet dark-glass panels framed in dark gold,
-/// with vertical thread-strips on the inward face reading as etched
-/// thread-columns at rest (concept 06's side panels). `RoomDistraction` on
-/// every part (`shell.md`: radiators are room chrome, not the chamber).
-fn spawn_radiators(
+/// The dais at the W bearing — the wheel IS the west station (`shell.md`
+/// slice B, retuned 2026-07-10): a low wide cylinder at the palette
+/// contract's coordinates, a foot plinth grounding it, and a gold rim ring —
+/// the same furniture language as the well table ([`spawn_table`]). NOT
+/// [`RoomDistraction`]: it is the station's OWN furniture (the patch wheel
+/// stands on it), so it stays lit through a dive same as the wheel itself.
+fn spawn_w_dais(
     commands: &mut Commands,
     root: Entity,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) {
-    let glass_mesh = meshes.add(Cuboid::new(RADIATOR_WIDTH, RADIATOR_HEIGHT, RADIATOR_DEPTH));
-    let glass_mat = mats.add(unlit(lin(RADIATOR_COLOR)));
-    let frame_mat = mats.add(unlit(lin(RADIATOR_FRAME_COLOR)));
-    let h_frame_mesh = meshes.add(Cuboid::new(
-        RADIATOR_WIDTH + 2.0 * RADIATOR_FRAME_THICKNESS,
-        RADIATOR_FRAME_THICKNESS,
-        RADIATOR_FRAME_DEPTH,
-    ));
-    let v_frame_mesh =
-        meshes.add(Cuboid::new(RADIATOR_FRAME_THICKNESS, RADIATOR_HEIGHT, RADIATOR_FRAME_DEPTH));
+    let dais_mat = mats.add(unlit(lin(palette::DARK_SURFACE)));
+    let rim_mat = mats.add(unlit(lin_scaled(palette::GOLD_HUE, palette::GOLD_LDR_TRIM)));
 
-    for (i, d) in bearing::RADIATOR_DIRS.iter().enumerate() {
-        let pos = Vec3::new(
-            d[0] * RADIATOR_RADIUS,
-            RADIATOR_HEIGHT * 0.5 + RADIATOR_HEIGHT_OFFSET,
-            d[2] * RADIATOR_RADIUS,
-        );
-        // Present the broad face inward (the cuboid's ±Z face is width×height).
-        // `looking_at` aims local −Z at `outward`, so local +Z — where the
-        // frame/thread offsets below land — is the physical surface facing
-        // the console; `panel_tf` maps every local offset into room space.
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(W_DAIS_FOOT_R, W_DAIS_FOOT_HEIGHT))),
+        MeshMaterial3d(dais_mat.clone()),
+        Transform::from_xyz(palette::STATION_W_X, W_DAIS_FOOT_HEIGHT * 0.5, 0.0),
+        Visibility::Inherited,
+        Name::new("StationWDaisFoot"),
+        ChildOf(root),
+    ));
+
+    let body_height = palette::STATION_W_DAIS_TOP_Y - W_DAIS_FOOT_HEIGHT;
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(palette::STATION_W_DAIS_R, body_height))),
+        MeshMaterial3d(dais_mat),
+        Transform::from_xyz(palette::STATION_W_X, W_DAIS_FOOT_HEIGHT + body_height * 0.5, 0.0),
+        Visibility::Inherited,
+        Name::new("StationWDais"),
+        ChildOf(root),
+    ));
+
+    commands.spawn((
+        Mesh3d(meshes.add(Torus {
+            minor_radius: W_DAIS_RIM_MINOR,
+            major_radius: palette::STATION_W_DAIS_R,
+        })),
+        MeshMaterial3d(rim_mat),
+        Transform::from_xyz(palette::STATION_W_X, palette::STATION_W_DAIS_TOP_Y, 0.0),
+        Visibility::Inherited,
+        Name::new("StationWDaisRim"),
+        ChildOf(root),
+    ));
+}
+
+/// The octagon wall shell: eight single-sided, inward-facing panels enclosing
+/// the room (`bearing`'s own module comment has the culling mechanics), their
+/// corner mullions, a hue-coded neon edge-trim per panel, and — on the four
+/// diagonals — the violet information threads that used to stand as
+/// free-floating radiators (now the panel's own content). Every part here is
+/// the CHAMBER (no [`RoomDistraction`]): it stays lit through a station dive
+/// the same as the floor and the dome.
+fn spawn_walls(
+    commands: &mut Commands,
+    root: Entity,
+    meshes: &mut Assets<Mesh>,
+    mats: &mut Assets<StandardMaterial>,
+) {
+    let panel_width = bearing::octagon_panel_width(WALL_APOTHEM) - WALL_PANEL_GAP;
+
+    let base_mesh = meshes.add(Rectangle::new(panel_width, WALL_HEIGHT));
+    let base_mat = mats.add(unlit(lin(WALL_BASE_COLOR)));
+    let h_trim_mesh = meshes.add(Rectangle::new(panel_width, WALL_TRIM_THICKNESS));
+    let v_trim_mesh = meshes.add(Rectangle::new(WALL_TRIM_THICKNESS, WALL_HEIGHT));
+    let mullion_mesh = meshes.add(Rectangle::new(WALL_MULLION_WIDTH, WALL_HEIGHT));
+    let mullion_mat = mats.add(unlit(lin(WALL_MULLION_COLOR)));
+
+    // One trim material per identity hue: the four cardinal bearing hues
+    // (read straight off `wall_placements`, so a re-tuned marker hue can't
+    // drift out of sync with its wall) plus one shared violet for every
+    // diagonal face.
+    let placements = bearing::wall_placements();
+    let hue_for = |b: Bearing| -> [f32; 3] {
+        placements
+            .iter()
+            .find(|wp| wp.bearing == b)
+            .map(|wp| wp.hue)
+            .expect("wall_placements always covers all four cardinal bearings")
+    };
+    let trim_mat_n = mats.add(unlit(lin_scaled(hue_for(Bearing::North), WALL_TRIM_LDR)));
+    let trim_mat_e = mats.add(unlit(lin_scaled(hue_for(Bearing::East), WALL_TRIM_LDR)));
+    let trim_mat_s = mats.add(unlit(lin_scaled(hue_for(Bearing::South), WALL_TRIM_LDR)));
+    let trim_mat_w = mats.add(unlit(lin_scaled(hue_for(Bearing::West), WALL_TRIM_LDR)));
+    let trim_mat_violet = mats.add(unlit(lin_scaled(palette::VIOLET_THREAD, WALL_TRIM_LDR)));
+
+    for (i, panel) in bearing::octagon_panels(WALL_APOTHEM).iter().enumerate() {
+        let pos = Vec3::new(panel.center[0], WALL_HEIGHT * 0.5, panel.center[2]);
+        // Inward-facing single-sided quad: aim local −Z further out along the
+        // same ray so local +Z — the mesh's front normal, and where the trim/
+        // thread proud-offsets below land — points at the console (the
+        // `spawn_radiators` trick this replaces, now the wall's own).
         let outward = Vec3::new(pos.x * 2.0, pos.y, pos.z * 2.0);
         let panel_tf = Transform::from_translation(pos).looking_at(outward, Vec3::Y);
 
         commands.spawn((
-            Mesh3d(glass_mesh.clone()),
-            MeshMaterial3d(glass_mat.clone()),
+            Mesh3d(base_mesh.clone()),
+            MeshMaterial3d(base_mat.clone()),
             panel_tf,
-            RoomDistraction,
             Visibility::Inherited,
-            Name::new(format!("Radiator{i}")),
+            Name::new(format!("WallPanel{i}")),
             ChildOf(root),
         ));
 
-        let half_h = RADIATOR_HEIGHT * 0.5 + RADIATOR_FRAME_THICKNESS * 0.5;
-        let half_w = RADIATOR_WIDTH * 0.5 + RADIATOR_FRAME_THICKNESS * 0.5;
+        let trim_mat = match panel.bearing {
+            Some(Bearing::North) => trim_mat_n.clone(),
+            Some(Bearing::East) => trim_mat_e.clone(),
+            Some(Bearing::South) => trim_mat_s.clone(),
+            Some(Bearing::West) => trim_mat_w.clone(),
+            Some(Bearing::Center) => unreachable!("octagon panels never carry the center bearing"),
+            None => trim_mat_violet.clone(),
+        };
+        let half_h = WALL_HEIGHT * 0.5 - WALL_TRIM_THICKNESS * 0.5;
+        let half_w = panel_width * 0.5 - WALL_TRIM_THICKNESS * 0.5;
         for (edge, mesh, local) in [
-            ("Top", h_frame_mesh.clone(), Vec3::new(0.0, half_h, 0.0)),
-            ("Bottom", h_frame_mesh.clone(), Vec3::new(0.0, -half_h, 0.0)),
-            ("Left", v_frame_mesh.clone(), Vec3::new(-half_w, 0.0, 0.0)),
-            ("Right", v_frame_mesh.clone(), Vec3::new(half_w, 0.0, 0.0)),
+            ("Top", h_trim_mesh.clone(), Vec3::new(0.0, half_h, WALL_TRIM_PROUD)),
+            ("Bottom", h_trim_mesh.clone(), Vec3::new(0.0, -half_h, WALL_TRIM_PROUD)),
+            ("Left", v_trim_mesh.clone(), Vec3::new(-half_w, 0.0, WALL_TRIM_PROUD)),
+            ("Right", v_trim_mesh.clone(), Vec3::new(half_w, 0.0, WALL_TRIM_PROUD)),
         ] {
             commands.spawn((
                 Mesh3d(mesh),
-                MeshMaterial3d(frame_mat.clone()),
+                MeshMaterial3d(trim_mat.clone()),
                 Transform::from_translation(panel_tf.transform_point(local))
                     .with_rotation(panel_tf.rotation),
-                RoomDistraction,
                 Visibility::Inherited,
-                Name::new(format!("Radiator{i}Frame{edge}")),
+                Name::new(format!("WallPanel{i}Trim{edge}")),
                 ChildOf(root),
             ));
         }
 
-        for j in 0..RADIATOR_THREAD_COUNT {
-            let seed = i as u32 * 251 + j as u32 * 17;
-            let t = if RADIATOR_THREAD_COUNT > 1 {
-                j as f32 / (RADIATOR_THREAD_COUNT - 1) as f32
-            } else {
-                0.5
-            };
-            let x = (t - 0.5) * RADIATOR_WIDTH * 0.82;
-            let h = bearing::lerp(
-                RADIATOR_HEIGHT * RADIATOR_THREAD_HEIGHT_RANGE.0,
-                RADIATOR_HEIGHT * RADIATOR_THREAD_HEIGHT_RANGE.1,
-                bearing::hash01(seed),
-            );
-            let brightness = bearing::lerp(
-                RADIATOR_THREAD_BRIGHTNESS_RANGE.0,
-                RADIATOR_THREAD_BRIGHTNESS_RANGE.1,
-                bearing::hash01(seed + 1),
-            );
-            let local = Vec3::new(x, 0.0, RADIATOR_DEPTH * 0.5 + RADIATOR_THREAD_PROUD);
-            commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(RADIATOR_THREAD_WIDTH, h, RADIATOR_THREAD_DEPTH))),
-                MeshMaterial3d(mats.add(unlit(lin_scaled(RADIATOR_THREAD_HUE, brightness)))),
-                Transform::from_translation(panel_tf.transform_point(local))
-                    .with_rotation(panel_tf.rotation),
-                RoomDistraction,
-                Visibility::Inherited,
-                Name::new(format!("Radiator{i}Thread{j}")),
-                ChildOf(root),
-            ));
+        // Diagonal faces only: the migrated violet content threads (the old
+        // free-floating radiators' foreground detail).
+        if panel.bearing.is_none() {
+            for j in 0..WALL_THREAD_COUNT {
+                let seed = i as u32 * 251 + j as u32 * 17;
+                let t = if WALL_THREAD_COUNT > 1 {
+                    j as f32 / (WALL_THREAD_COUNT - 1) as f32
+                } else {
+                    0.5
+                };
+                let x = (t - 0.5) * panel_width * 0.82;
+                let h = bearing::lerp(
+                    WALL_HEIGHT * WALL_THREAD_HEIGHT_RANGE.0,
+                    WALL_HEIGHT * WALL_THREAD_HEIGHT_RANGE.1,
+                    bearing::hash01(seed),
+                );
+                let brightness = bearing::lerp(
+                    WALL_THREAD_BRIGHTNESS_RANGE.0,
+                    WALL_THREAD_BRIGHTNESS_RANGE.1,
+                    bearing::hash01(seed + 1),
+                );
+                let local = Vec3::new(x, 0.0, WALL_THREAD_PROUD);
+                commands.spawn((
+                    Mesh3d(meshes.add(Rectangle::new(WALL_THREAD_WIDTH, h))),
+                    MeshMaterial3d(mats.add(unlit(lin_scaled(palette::VIOLET_THREAD, brightness)))),
+                    Transform::from_translation(panel_tf.transform_point(local))
+                        .with_rotation(panel_tf.rotation),
+                    Visibility::Inherited,
+                    Name::new(format!("WallPanel{i}Thread{j}")),
+                    ChildOf(root),
+                ));
+            }
         }
+    }
+
+    for (i, (pos, _theta)) in bearing::octagon_corners(WALL_APOTHEM).iter().enumerate() {
+        let center = Vec3::new(pos[0], WALL_HEIGHT * 0.5, pos[2]);
+        let outward = Vec3::new(center.x * 2.0, center.y, center.z * 2.0);
+        let tf = Transform::from_translation(center).looking_at(outward, Vec3::Y);
+        commands.spawn((
+            Mesh3d(mullion_mesh.clone()),
+            MeshMaterial3d(mullion_mat.clone()),
+            tf,
+            Visibility::Inherited,
+            Name::new(format!("WallMullion{i}")),
+            ChildOf(root),
+        ));
     }
 }
 
@@ -1043,7 +1198,9 @@ fn wants_gold_cap(wp: &bearing::WallPlacement) -> bool {
 
 /// Pylon furniture: a wide low plinth grounding every marker to the floor,
 /// and a gold cap slab on top of every built station's pylon
-/// ([`wants_gold_cap`] gates the reserved South stub out).
+/// ([`wants_gold_cap`] gates the reserved South stub out). Skips the
+/// furnished W bearing entirely ([`bearing::station_is_room_furniture`]) —
+/// [`spawn_w_dais`] builds its own foot/rim instead.
 fn spawn_pylons(
     commands: &mut Commands,
     root: Entity,
@@ -1057,6 +1214,10 @@ fn spawn_pylons(
     let cap_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, PYLON_CAP_GOLD_LDR)));
 
     for wp in bearing::wall_placements() {
+        if wp.station.is_some_and(bearing::station_is_room_furniture) {
+            continue;
+        }
+
         let marker_h = if wp.station.is_some() { MARKER_HEIGHT } else { MARKER_HEIGHT_RESERVED };
         let base = Vec3::new(wp.dir[0] * ROOM_RADIUS, 0.0, wp.dir[2] * ROOM_RADIUS);
 
@@ -1160,7 +1321,10 @@ fn room_plate_text(
 }
 
 /// Focus presentation for the plates: brighten + grow the focused plate,
-/// brass-frame it; unbuilt stations stay dim even focused.
+/// brass-frame it; unbuilt stations stay dim even focused. PatchBay spawns no
+/// plate at all now (the wheel is the station) — the query below simply never
+/// yields one for it, so focusing PatchBay brightens nothing here and that's
+/// fine: the camera's approach onto the dais is the feedback instead.
 fn room_focus_visuals(
     room: Res<RoomState>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
@@ -1314,18 +1478,27 @@ fn sync_room_glow(
 fn desired_camera(station: Station) -> (Vec3, Vec3) {
     match bearing::focus_dir(station) {
         None => (OVERVIEW_POS, OVERVIEW_LOOK),
-        Some(d) => (
-            Vec3::from_array(bearing::approach_camera(
-                d,
-                ROOM_CAM_APPROACH_R,
-                ROOM_CAM_APPROACH_HEIGHT,
-            )),
+        Some(d) => {
             // Look at the marker's own wall radius (ROOM_RADIUS — the same
             // radius the pylons spawn at) held at furniture height
             // (APPROACH_LOOK_HEIGHT): the station's instrument is the
-            // subject; its plate hangs above it in the frame.
-            Vec3::from_array(bearing::approach_look(d, ROOM_RADIUS, APPROACH_LOOK_HEIGHT)),
-        ),
+            // subject; its plate hangs above it in the frame. Radiators is
+            // the one exception (2026-07-10): its NE panel is now the
+            // octagon wall shell's own diagonal face, standing at
+            // `WALL_APOTHEM` (800) — well past the old radiator radius (660)
+            // this look-point used to target. Left at ROOM_RADIUS (620) the
+            // camera would look at empty air short of the wall; every other
+            // wall station still has its marker at ROOM_RADIUS, unchanged.
+            let wall_r = if station == Station::Radiators { WALL_APOTHEM } else { ROOM_RADIUS };
+            (
+                Vec3::from_array(bearing::approach_camera(
+                    d,
+                    ROOM_CAM_APPROACH_R,
+                    ROOM_CAM_APPROACH_HEIGHT,
+                )),
+                Vec3::from_array(bearing::approach_look(d, wall_r, APPROACH_LOOK_HEIGHT)),
+            )
+        }
     }
 }
 
@@ -1560,6 +1733,30 @@ mod tests {
     }
 
     #[test]
+    fn radiators_focus_looks_at_the_new_wall_apothem_not_the_old_room_radius() {
+        // 2026-07-10: the NE radiator panel is now the octagon shell's own
+        // diagonal wall face at WALL_APOTHEM (800), not the old free-floating
+        // slab at 660 — the look point must have moved out to meet it, and
+        // every OTHER wall station's look point must be untouched.
+        let (_, look) = desired_camera(Station::Radiators);
+        let d = bearing::focus_dir(Station::Radiators).unwrap();
+        let look_r = look.x * d[0] + look.z * d[2];
+        assert!(
+            (look_r - WALL_APOTHEM).abs() < 1e-3,
+            "Radiators should look at the wall apothem: {look_r}"
+        );
+        for s in [Station::PatchBay, Station::Tracks, Station::Vfs] {
+            let (_, look) = desired_camera(s);
+            let d = bearing::focus_dir(s).unwrap();
+            let look_r = look.x * d[0] + look.z * d[2];
+            assert!(
+                (look_r - ROOM_RADIUS).abs() < 1e-3,
+                "{s:?} should still look at the unchanged marker radius: {look_r}"
+            );
+        }
+    }
+
+    #[test]
     fn reserved_marker_height_is_a_low_stub_a_third_of_a_station_pylon() {
         assert!(
             (MARKER_HEIGHT_RESERVED - MARKER_HEIGHT / 3.0).abs() < 1e-4,
@@ -1583,6 +1780,27 @@ mod tests {
     }
 
     // ── circuit-board routes (real production config) ──
+
+    #[test]
+    fn w_bundle_terminal_pads_cluster_near_the_dais_foot() {
+        // The wiring must visibly flow INTO the station: pads land just past
+        // the dais foot radius, well short of the old wall-radius pad range.
+        let w_bundle = &route_bundles()[0];
+        assert!(
+            (w_bundle.pad_range.0 - (palette::STATION_W_DAIS_R + 120.0)).abs() < 1e-3,
+            "W pad range should start just past the dais foot: {:?}",
+            w_bundle.pad_range
+        );
+        assert!(
+            w_bundle.pad_range.1 < ROOM_RADIUS,
+            "W pads should stop well short of the wall, clustering near the station: {:?}",
+            w_bundle.pad_range
+        );
+        assert!(
+            w_bundle.pad_range.0 > KEEPOUT_RADIUS,
+            "even the nearest W pad clears the console keep-out"
+        );
+    }
 
     #[test]
     fn route_bundle_total_count_is_within_the_target_board_density() {
@@ -1706,6 +1924,72 @@ mod tests {
         for (y, _, _) in CONSOLE_RINGS {
             assert!(y + TABLE_TOP_Y > TABLE_TOP_Y, "every ring sits above the table's top face");
         }
+    }
+
+    // ── the W dais ──
+
+    #[test]
+    fn the_dais_body_has_a_positive_height_above_its_foot() {
+        // spawn_w_dais builds the body cylinder as
+        // (STATION_W_DAIS_TOP_Y - W_DAIS_FOOT_HEIGHT) tall — a palette tweak
+        // that let the foot swallow the whole dais height would spawn a
+        // zero/negative-height cylinder.
+        let body_height = palette::STATION_W_DAIS_TOP_Y - W_DAIS_FOOT_HEIGHT;
+        assert!(body_height > 0.0, "dais body must stand above its own foot: {body_height}");
+    }
+
+    #[test]
+    fn the_dais_foot_is_wider_than_the_dais_top() {
+        assert!(
+            W_DAIS_FOOT_R > palette::STATION_W_DAIS_R,
+            "the foot should ground the dais the way the table plinth grounds the table"
+        );
+    }
+
+    // ── octagon wall shell (room-level constants) ──
+
+    #[test]
+    fn wall_apothem_clears_the_old_radiator_radius_and_the_marker_radius() {
+        assert!(WALL_APOTHEM > ROOM_RADIUS, "the shell must enclose the wall stations: {WALL_APOTHEM}");
+        assert!(WALL_APOTHEM > 660.0, "the shell must enclose the old radiator radius (660)");
+        assert!(WALL_APOTHEM < FLOOR_RADIUS, "the shell must stand on the floor disc");
+    }
+
+    #[test]
+    fn wall_panel_width_stays_positive_after_the_mullion_gap() {
+        let width = bearing::octagon_panel_width(WALL_APOTHEM) - WALL_PANEL_GAP;
+        assert!(width > 0.0, "the mullion gap must not eat the whole panel: {width}");
+    }
+
+    #[test]
+    fn wall_trim_brightness_stays_in_the_restrained_neon_range() {
+        // Mission spec: "LDR ~0.5-0.7 of hue" — restrained neon, not a blown
+        // highlight, and never HDR (decoration stays < 1.0).
+        assert!((0.5..=0.7).contains(&WALL_TRIM_LDR), "trim LDR out of the restrained range: {WALL_TRIM_LDR}");
+    }
+
+    #[test]
+    fn wall_base_and_mullion_colours_stay_ldr() {
+        let lum = |c: [f32; 3]| c[0] + c[1] + c[2];
+        assert!(lum(WALL_BASE_COLOR) < 1.0, "panel base must stay LDR (decoration, not live activity)");
+        assert!(lum(WALL_MULLION_COLOR) < 1.0, "mullion must stay LDR");
+    }
+
+    #[test]
+    fn wall_base_is_a_hair_lighter_than_the_dome_rim() {
+        let dome_rim = bearing::dome_color(0.0);
+        let lum = |c: [f32; 3]| c[0] + c[1] + c[2];
+        assert!(
+            lum(WALL_BASE_COLOR) > dome_rim[0] + dome_rim[1] + dome_rim[2],
+            "the panel base should read a hair lighter than the dome's own rim"
+        );
+    }
+
+    #[test]
+    fn wall_thread_jitter_ranges_stay_within_the_panel_and_ldr() {
+        assert!(WALL_THREAD_HEIGHT_RANGE.0 > 0.0 && WALL_THREAD_HEIGHT_RANGE.1 <= 1.0);
+        assert!(WALL_THREAD_HEIGHT_RANGE.0 < WALL_THREAD_HEIGHT_RANGE.1);
+        assert!(WALL_THREAD_BRIGHTNESS_RANGE.1 < 1.0, "thread brightness must stay LDR");
     }
 
     #[test]

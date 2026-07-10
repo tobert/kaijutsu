@@ -136,6 +136,103 @@ pub fn wall_placements() -> [WallPlacement; 4] {
     ]
 }
 
+/// Whether `station`'s wall bearing is occupied by the station's OWN
+/// furniture rather than a marker pylon + nameplate — true for
+/// [`Station::PatchBay`] (`shell.md` slice B, retuned 2026-07-10: "the wheel
+/// IS the west station"). `enter_room`'s wall-placement loop reads this to
+/// skip the marker/plinth/cap/plate for a furnished bearing and build its
+/// dais instead; a future in-room station rides the same gate. Pure — no
+/// Bevy types — so the gating is unit-testable without spawning anything
+/// (mirrors `super::wants_gold_cap`'s shape).
+pub fn station_is_room_furniture(station: Station) -> bool {
+    matches!(station, Station::PatchBay)
+}
+
+// ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
+//
+// Eight flat wall panels enclosing the room: faces on the four cardinals and
+// the four `RADIATOR_DIRS` diagonals, `apothem` out from center. Every panel
+// is a SINGLE-SIDED, inward-facing quad: `octagon_panels`' `yaw` is the
+// outward angle (the `dir_theta` convention) `super`'s Bevy glue feeds into
+// the same `looking_at(2×pos, Y)` trick `spawn_radiators` proved — local +Z
+// (the mesh's front normal) ends up pointing at the console, so a camera
+// standing beyond the panel (outside the octagon) sees its BACK — culled, by
+// `StandardMaterial`'s default `cull_mode` — and the chamber shows through.
+// A `Cuboid` or an explicit `cull_mode: None` on any wall part defeats this.
+
+/// One octagon wall face. `center` is room-space, `y = 0` (the caller picks
+/// the panel's vertical placement); `yaw` is the outward-facing angle the
+/// face points along (`super` turns this into a `looking_at` transform, not
+/// a raw rotation, so no Bevy `Quat` convention needs matching here); and
+/// `bearing` names the cardinal identity hue the face's edge trim reads —
+/// `None` on the four diagonals, which dress in the violet information
+/// family instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OctagonPanel {
+    pub center: [f32; 3],
+    pub yaw: f32,
+    pub bearing: Option<Bearing>,
+}
+
+/// The eight octagon faces, `apothem` out from center: N, NE, E, SE, S, SW,
+/// W, NW in order. The diagonals are literally [`RADIATOR_DIRS`] (the same
+/// four directions the floor's violet stub routes already fan toward), so a
+/// re-placed diagonal can't drift out of sync between the wall and the
+/// floor. Each face sits exactly 45° from its neighbours by construction.
+pub fn octagon_panels(apothem: f32) -> [OctagonPanel; 8] {
+    let faces: [([f32; 3], Option<Bearing>); 8] = [
+        (Bearing::North.dir(), Some(Bearing::North)),
+        (RADIATOR_DIRS[0], None), // NE
+        (Bearing::East.dir(), Some(Bearing::East)),
+        (RADIATOR_DIRS[1], None), // SE
+        (Bearing::South.dir(), Some(Bearing::South)),
+        (RADIATOR_DIRS[2], None), // SW
+        (Bearing::West.dir(), Some(Bearing::West)),
+        (RADIATOR_DIRS[3], None), // NW
+    ];
+    let mut out = [OctagonPanel { center: [0.0; 3], yaw: 0.0, bearing: None }; 8];
+    for (i, (dir, bearing)) in faces.into_iter().enumerate() {
+        out[i] = OctagonPanel {
+            center: [apothem * dir[0], 0.0, apothem * dir[2]],
+            yaw: dir_theta(dir),
+            bearing,
+        };
+    }
+    out
+}
+
+/// A regular octagon's flat-side width at `apothem` (the standard n-gon
+/// relation, `n = 8`: side `= 2·apothem·tan(π/n)`) — the panel's FULL width,
+/// touching its neighbours at the corners; `super` trims a small gap off
+/// this for the corner mullions to stand in.
+pub fn octagon_panel_width(apothem: f32) -> f32 {
+    2.0 * apothem * core::f32::consts::FRAC_PI_8.tan()
+}
+
+/// Distance from center to an octagon vertex (where two panels meet) at
+/// `apothem` — the standard n-gon relation `circumradius = apothem / cos(π/n)`.
+/// Always a touch past `apothem` itself (`cos(π/8) < 1`).
+pub fn octagon_circumradius(apothem: f32) -> f32 {
+    apothem / core::f32::consts::FRAC_PI_8.cos()
+}
+
+/// The eight corner-mullion placements: one between every adjacent pair of
+/// [`octagon_panels`] faces, sitting on the circumradius, facing outward
+/// along the bisector of its two neighbours (`yaw + π/8` past the panel it
+/// follows — cos/sin are periodic, so this needs no unwrapping at the
+/// West→NW seam where the raw `atan2` values jump). The same inward-facing,
+/// single-sided recipe applies.
+pub fn octagon_corners(apothem: f32) -> [([f32; 3], f32); 8] {
+    let panels = octagon_panels(apothem);
+    let r = octagon_circumradius(apothem);
+    let mut out = [([0.0; 3], 0.0); 8];
+    for (i, p) in panels.iter().enumerate() {
+        let theta = p.yaw + core::f32::consts::FRAC_PI_8;
+        out[i] = ([r * theta.cos(), 0.0, r * theta.sin()], theta);
+    }
+    out
+}
+
 // ── Camera approach ────────────────────────────────────────────────────────────
 
 /// Camera position for the **approach** pose: standing on the SAME side of
@@ -518,6 +615,122 @@ mod tests {
         let placements = wall_placements();
         let south = placements.iter().find(|p| p.bearing == Bearing::South).unwrap();
         assert_eq!(south.station, None, "South is reserved — a dim marker, no label");
+    }
+
+    // ── station-furniture gate ──
+
+    #[test]
+    fn only_patch_bay_is_room_furniture_today() {
+        for s in Station::ALL {
+            assert_eq!(
+                station_is_room_furniture(s),
+                s == Station::PatchBay,
+                "{s:?}: only the wheel stands as its own furniture today"
+            );
+        }
+    }
+
+    // ── octagon wall shell ──
+
+    #[test]
+    fn octagon_panels_diagonals_are_literally_the_radiator_dirs() {
+        let apothem = 800.0;
+        let panels = octagon_panels(apothem);
+        for (slot, k) in [1usize, 3, 5, 7].iter().enumerate() {
+            let expect = RADIATOR_DIRS[slot];
+            assert_eq!(
+                panels[*k].center,
+                [apothem * expect[0], 0.0, apothem * expect[2]],
+                "octagon face {k} should be RADIATOR_DIRS[{slot}]"
+            );
+            assert_eq!(panels[*k].bearing, None, "diagonal faces carry no cardinal identity");
+        }
+    }
+
+    #[test]
+    fn octagon_panels_cardinals_match_their_bearings() {
+        let apothem = 800.0;
+        let panels = octagon_panels(apothem);
+        for (i, b) in [
+            (0usize, Bearing::North),
+            (2, Bearing::East),
+            (4, Bearing::South),
+            (6, Bearing::West),
+        ] {
+            let d = b.dir();
+            assert_eq!(panels[i].center, [apothem * d[0], 0.0, apothem * d[2]]);
+            assert_eq!(panels[i].bearing, Some(b));
+        }
+    }
+
+    #[test]
+    fn octagon_panels_all_sit_on_the_apothem_circle() {
+        for p in octagon_panels(800.0) {
+            let r = (p.center[0] * p.center[0] + p.center[2] * p.center[2]).sqrt();
+            assert!((r - 800.0).abs() < 1e-3, "panel at r={r}, expected apothem 800");
+        }
+    }
+
+    #[test]
+    fn octagon_panels_yaw_matches_its_own_center_direction() {
+        for p in octagon_panels(800.0) {
+            assert!(
+                (dir_theta(p.center) - p.yaw).abs() < 1e-5,
+                "yaw should be the outward angle of its own position: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn octagon_panels_are_evenly_spaced_45_degrees_apart() {
+        let panels = octagon_panels(800.0);
+        for i in 0..8 {
+            let a = panels[i].yaw;
+            let b = panels[(i + 1) % 8].yaw;
+            // Unwrap the one seam where the raw atan2 values jump backwards
+            // (West, θ=π → NW, θ=−3π/4): every other neighbour pair already
+            // steps forward by +π/4.
+            let mut step = b - a;
+            if step < 0.0 {
+                step += core::f32::consts::TAU;
+            }
+            assert!(
+                (step - core::f32::consts::FRAC_PI_4).abs() < 1e-4,
+                "panels {i}->{} should be 45 degrees apart, got {step}",
+                (i + 1) % 8
+            );
+        }
+    }
+
+    #[test]
+    fn octagon_panel_width_matches_the_regular_octagon_side_formula() {
+        let apothem = 800.0;
+        let expected = 2.0 * apothem * (std::f32::consts::PI / 8.0).tan();
+        assert!((octagon_panel_width(apothem) - expected).abs() < 1e-3);
+        assert!(octagon_panel_width(apothem) > 0.0);
+    }
+
+    #[test]
+    fn octagon_circumradius_is_a_touch_past_the_apothem() {
+        let apothem = 800.0;
+        let r = octagon_circumradius(apothem);
+        assert!(r > apothem, "the vertex sits farther out than the flat face: {r}");
+        assert!((r - apothem / (std::f32::consts::PI / 8.0).cos()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn octagon_corners_sit_on_the_circumradius_bisecting_their_two_panels() {
+        let apothem = 800.0;
+        let panels = octagon_panels(apothem);
+        let circumradius = octagon_circumradius(apothem);
+        for (i, (pos, theta)) in octagon_corners(apothem).into_iter().enumerate() {
+            let r = (pos[0] * pos[0] + pos[2] * pos[2]).sqrt();
+            assert!((r - circumradius).abs() < 1e-3, "corner {i} at r={r}");
+            assert!(
+                (theta - (panels[i].yaw + core::f32::consts::FRAC_PI_8)).abs() < 1e-5,
+                "corner {i} bisects panel {i} and its next neighbour"
+            );
+        }
     }
 
     // ── camera approach ──
