@@ -41,21 +41,37 @@ stations, walls of one chamber. Desktop keeps the grand scale.
 
 ## Geometry and bearings
 
-A circular vaulted room. Center: the well, on its table (the table edge is
-already spoken for — the Stage-2 rank rail, `docs/timewell.md`). Around the
-walls, stations at **hand-assigned, stable compass bearings** — few enough
-to hand-place, permanent enough to learn (the track-rays lesson: a bearing
-you learn is an address). Provisional assignment, to be settled when the
-shell is built:
+**An octagonal chamber** (Amy, 2026-07-10 — superseding the circular-room
+draft): eight flat wall panels, faces centered on the four cardinals and
+four diagonals, under the vault dome. The walls are **content surfaces,
+not architecture for its own sake** — each panel is taken over by what it
+carries (a bearing's ambient at the cardinals, information radiators on
+the diagonals), with a thin neon edge-trim in the face's identity hue and
+dark glass beneath — the room leans **cyberpunk**: emissive-on-dark,
+restrained LDR at rest. The camera orbits *outside* the shell and sees in
+through a **cutaway**: every wall element is a single-sided inward-facing
+mesh with back-face culling, so the near walls simply vanish from any
+outside angle (dollhouse render, no shaders). Anything added to the shell
+must keep that rule — a solid cuboid or `cull_mode: None` in the wall
+breaks the cutaway.
 
-| Bearing | Occupant | Shell rendering (ambient) |
+Center: the well, on its table (the table edge is already spoken for — the
+Stage-2 rank rail, `docs/timewell.md`). Around the walls, stations at
+**hand-assigned, stable compass bearings** — few enough to hand-place,
+permanent enough to learn (the track-rays lesson: a bearing you learn is
+an address). A bearing whose station stands *in the room* as furniture
+carries **no marker pylon and no nameplate** — the instrument is the
+station (Amy: boring labels, plates recede; the wheel proved it first):
+
+| Bearing | Occupant | Shell rendering (as built / planned) |
 |---|---|---|
-| center | Time well (station #1) | itself — the console |
-| W | Patch bay | the wall-of-threads: brass jack fields under sigil labels, strung with a living web of crimson (MIDI) and cyan (PCM) threads that flicker as traffic flows |
-| E | Track transport | the vertical beat highway (mockup 33) seen side-on; notes fall toward the strike bar only while a track plays |
-| N | VFS / rc library | an **archway** opening onto the fsn landscape (mockup 43), dimmed to horizon glow |
+| center | Time well (station #1) | itself — the console, on its table |
+| W | Patch bay | **the wheel itself, on a dais** (built 2026-07-10): the live circle at 0.34 scale, gold bezel, its chords the W ambient; floor traces terminate at the dais foot; no pylon, no plate |
+| E | Track transport | the vertical beat highway (mockup 33) on/before the E panel; notes fall toward the strike bar only while a track plays |
+| N | VFS / rc library | an **archway** opening onto the fsn landscape (mockup 43), dimmed to horizon glow — returns when the fsn scene exists |
 | S | *(reserved)* | future: MCP broker switchboard / LLM engine room |
-| overhead | Drift / mailboxes | not a bearing — **the air**: slow aurora-like particle arcs high over the well rim, one arc per block in flight |
+| diagonals | Information radiators | **the four diagonal wall panels themselves** (built 2026-07-10): violet thread-columns on the glass — the free-floating slabs retired into the walls |
+| overhead | Drift / mailboxes | not a bearing — **the air**. PAUSED (Amy, 2026-07-10): decide what information rides it before building; a kernel-activity-responsive point cloud is the live candidate vs the aurora arcs below |
 
 The conversation view (station #0) has **no bearing**: it is reached by
 diving *through a context card* (the Join transition, mockup 34 of the
@@ -197,6 +213,17 @@ well scene**, not a new world. Slices, each shippable alone:
   and may return later as pure backdrop mood behind the table. This pairs the
   first station dive with the first bearing — the whole grammar proven end to
   end.
+- **Furnishing + enclosure (built 2026-07-10)**: the concept-approach wave —
+  the ~35-route deterministic circuit-board floor with inscribed gold ring
+  (the floor-is-the-wiring made literal), the well table under the console
+  rings, pylon plinths/caps, and then the **octagon shell** (geometry
+  section above): eight content-surface wall panels with the camera
+  cutaway, radiators retired into the diagonal panels, and the patch wheel
+  seated on a dais as the W station itself — sign and pylon gone. One
+  style across the family: `view/palette.rs` holds the shared hues and the
+  room↔patch-bay dais contract, and the **all-unlit discipline** went
+  scene-family-wide (the patch bay's point light + lit metals deleted; a
+  ~1%-albedo metallic surface swallows any lamp — the tuning-pass lesson).
 - **Slice C+ — bearings accrete**: highway ambient at E when tracks-station
   work starts; the N archway when the fsn scene exists. No fixed order.
 

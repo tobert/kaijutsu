@@ -503,7 +503,26 @@ three days that took the first station from spec to a finished instrument.
   albedo** — pixel-sampled screenshots proved no point-light intensity
   lifts a near-black metallic surface; the material's diffuse response,
   not the lamp, was the knob. The dived table stays gold-etch-on-black
-  by choice; the light buys room-scale presence.
+  by choice.
+- **The room closes over (July 10, afternoon).** Amy asked for enclosure
+  and a camera cutaway, and both turned out to be one rendering rule:
+  build the wall shell single-sided, facing inward, back-faces culled —
+  near walls vanish from any outside camera, the dollhouse cut for free.
+  Her shape call made the walls *mean* something: an octagon of eight
+  content-surface panels ("the surface gets taken over by its content"),
+  neon-trimmed in each bearing's hue, the free-floating radiators
+  retiring into the diagonal panels. In the same wave the patch wheel
+  stopped being a labeled exhibit and became the west station itself —
+  sign and pylon deleted, the live circle seated on a dais at furniture
+  scale, floor traces terminating at its foot — and the whole scene
+  family unified on one palette module and the all-unlit discipline (the
+  patch bay's point light and lit metals deleted outright; the albedo
+  lesson made them dead weight). First light found the honest bugs taste
+  can't: the wheel's tabletop seated exactly coplanar with its dais
+  (full-surface z-fighting starburst) and a "one shade up" surface that
+  washed the gold etch grey. Both are contract fixes now, not tweaks —
+  the dais agreement lives in the palette module where neither file can
+  drift from the other silently.
 
 ## Now
 
