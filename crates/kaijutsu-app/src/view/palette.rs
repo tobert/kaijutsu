@@ -31,9 +31,13 @@ pub(crate) const BRASS_LDR: f32 = 0.55;
 /// Dark furniture surface (tabletops, pedestals, plinths, daises) — a shade
 /// lighter than the room floor so mass reads against it.
 pub(crate) const DARK_SURFACE: [f32; 3] = [0.032, 0.036, 0.050];
-/// Instrument working surface (the patch wheel's top): one more shade up, so
-/// a dived instrument face reads against its own furniture.
-pub(crate) const DARK_SURFACE_LIFT: [f32; 3] = [0.055, 0.060, 0.078];
+/// Instrument working surface (the patch wheel's top): near-black on purpose
+/// — the dived face reads through its gold etch and brass hardware (mockup
+/// 14's gold-on-black), not through surface brightness. Only a hair above
+/// [`DARK_SURFACE`]'s value so the silhouette still separates from its own
+/// dais at room scale. (First cut was 0.055/0.060/0.078 — live check showed
+/// a washed grey table that killed the etch contrast.)
+pub(crate) const DARK_SURFACE_LIFT: [f32; 3] = [0.012, 0.013, 0.019];
 
 /// The violet family — reserved for **information** (radiators; now the
 /// octagon's diagonal wall panels). Glass backdrop + thread/content strips.

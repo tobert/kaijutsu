@@ -74,12 +74,19 @@ struct StationPlacement {
 /// station now — no pylon, no separate nameplate (this supersedes the earlier
 /// "pending floor-placement alternative" note the comment here used to carry;
 /// the alternative was decided). The room builds a dais at `palette::STATION_W_X`
-/// / `_DAIS_TOP_Y` / `_DAIS_R`; this seats the wheel's local origin (its
-/// tabletop plane) flush on the dais top, at `palette::STATION_W_SCALE`. Scale
-/// math: `TABLE_OUTER_R` (348 local units) × 0.34 ≈ 118 world — a peer to the
-/// well table's 120, not a miniature.
+/// / `_DAIS_TOP_Y` / `_DAIS_R`; this rests the wheel's table — which hangs
+/// `TABLE_DEPTH` *below* the local origin (the tabletop plane) — ON the dais
+/// top, so the translation lifts by the placed table thickness. Seating the
+/// origin AT the dais top instead makes the two top faces exactly coplanar —
+/// a full-surface z-fighting starburst (found live, 2026-07-10). Scale math:
+/// `TABLE_OUTER_R` (348 local units) × 0.34 ≈ 118 world — a peer to the well
+/// table's 120, not a miniature.
 const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
-    translation: Vec3::new(palette::STATION_W_X, palette::STATION_W_DAIS_TOP_Y, 0.0),
+    translation: Vec3::new(
+        palette::STATION_W_X,
+        palette::STATION_W_DAIS_TOP_Y + TABLE_DEPTH * palette::STATION_W_SCALE,
+        0.0,
+    ),
     scale: palette::STATION_W_SCALE,
     yaw: std::f32::consts::FRAC_PI_2,
 };
