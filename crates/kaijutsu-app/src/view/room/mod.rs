@@ -550,7 +550,7 @@ fn enter_room(
     info!("room: entered (Tardis chamber, slice B — patch bay stationed at W)");
 }
 
-fn exit_room(
+pub(crate) fn exit_room(
     mut commands: Commands,
     screen: Res<State<Screen>>,
     theme: Res<crate::ui::theme::Theme>,
@@ -569,6 +569,29 @@ fn exit_room(
     if *screen.get() == Screen::PatchBay {
         return;
     }
+    teardown_room(&mut commands, &theme, &roots, &mut app_camera);
+    info!("room: exited");
+}
+
+/// Tear the room down: despawn `RoomRoot` (recursively — the chamber and all
+/// its furniture, the W patch bay included) and release the shared camera
+/// (drop the [`RoomCamera`] claim, restore the conversation clear colour).
+///
+/// Shared by [`exit_room`] and the patch bay's `exit_patch_bay`: with one
+/// shared scene graph, a transition can leave the shell FROM the dived screen
+/// (a context switch landing while dived reveals the conversation,
+/// `view/sync.rs`; an `open_editor` peer signal jumps to the editor). On that
+/// path `OnExit(Screen::Room)` never fires — the state being left is
+/// `PatchBay` — so the dive's own exit must run this same teardown, or
+/// `RoomRoot`, the camera claim, and the room clear colour all leak into the
+/// next screen, and `enter_room`'s surfacing early-return later finds the
+/// stale root and never rebuilds (the broken-view cascade).
+pub(crate) fn teardown_room(
+    commands: &mut Commands,
+    theme: &crate::ui::theme::Theme,
+    roots: &Query<Entity, With<RoomRoot>>,
+    app_camera: &mut Query<(Entity, &mut Camera), With<RoomCamera>>,
+) {
     for e in roots.iter() {
         commands.entity(e).despawn();
     }
@@ -576,7 +599,6 @@ fn exit_room(
         commands.entity(cam_entity).remove::<RoomCamera>();
         cam.clear_color = ClearColorConfig::Custom(theme.bg);
     }
-    info!("room: exited");
 }
 
 // ── Systems ───────────────────────────────────────────────────────────────────

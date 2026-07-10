@@ -34,7 +34,8 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::{Screen, in_shell};
 use crate::view::room::nav::Station;
 use crate::view::room::{
-    PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text,
+    PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomCamera, RoomRoot, RoomState,
+    layout_plate_text, teardown_room,
 };
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use crate::view::room::nav::StationCarousel;
@@ -394,12 +395,33 @@ fn enter_patch_bay(mut state: ResMut<PatchBayState>) {
     info!("patch-bay: dived");
 }
 
-/// Surface from the dive back to the room. Nothing to tear down — the room and
-/// its W furniture survived the whole dive. `ease_shell_camera` glides the
-/// camera back to the W-approach pose and `apply_patch_lod` hides the LOD; the
-/// wire selection is left intact so re-diving resumes where it was.
-fn exit_patch_bay() {
-    info!("patch-bay: surfaced");
+/// Leave the dive. Two very different exits share this `OnExit`:
+///
+/// - **Surfacing to the room** (Esc/Up): nothing to tear down — the room and
+///   its W furniture survive, `ease_shell_camera` glides back up,
+///   `apply_patch_lod` hides the detail layer; the wire selection is left
+///   intact so re-diving resumes where it was.
+/// - **Leaving the shell from the dive**: a context switch landing while dived
+///   reveals the conversation (`view/sync.rs`), an `open_editor` peer signal
+///   jumps to the editor. `OnExit(Screen::Room)` will NOT fire on that path —
+///   the state being left is `PatchBay` — so the room teardown falls to us
+///   ([`teardown_room`]), or the room leaks into every later screen.
+///
+/// `State<Screen>` already holds the *target* during OnExit (the bevy_state
+/// ordering guarantee documented at `room::exit_room`).
+fn exit_patch_bay(
+    mut commands: Commands,
+    screen: Res<State<Screen>>,
+    theme: Res<crate::ui::theme::Theme>,
+    roots: Query<Entity, With<RoomRoot>>,
+    mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
+) {
+    if *screen.get() == Screen::Room {
+        info!("patch-bay: surfaced");
+        return;
+    }
+    teardown_room(&mut commands, &theme, &roots, &mut app_camera);
+    info!("patch-bay: left the shell from the dive (room torn down)");
 }
 
 /// Spawn the patch-bay circle as **room furniture at the W bearing** — the
@@ -1830,5 +1852,93 @@ mod tests {
         let sizes = [30.0_f32, 20.0, 10.0];
         let chosen = choose_info_plate_size(&sizes, 10.0, 10.0, |_size| 999.0, |_size| (999.0, 999.0));
         assert_eq!(chosen, 10.0, "the smallest size is the floor, even unfit");
+    }
+
+    // -- shell lifecycle: leaving from a dive (shared scene graph) -------
+    //
+    // With one shared scene graph, `OnExit(Screen::Room)` does NOT fire on a
+    // transition that leaves the shell FROM the dived screen (PatchBay →
+    // Conversation/Editor — a context switch revealing the conversation, an
+    // `open_editor` peer signal). These app-level tests drive the real state
+    // machine with only the two exit systems registered (the enter systems
+    // need the full render stack; the lifecycle contract is what's under
+    // test) and a hand-stood room: RoomRoot + a claimed camera.
+
+    fn shell_lifecycle_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy::state::app::StatesPlugin)
+            .insert_resource(crate::ui::theme::Theme::default())
+            .init_state::<Screen>()
+            .add_systems(OnExit(Screen::Room), crate::view::room::exit_room)
+            .add_systems(OnExit(Screen::PatchBay), exit_patch_bay);
+        app
+    }
+
+    fn set_screen(app: &mut App, s: Screen) {
+        app.world_mut().resource_mut::<NextState<Screen>>().set(s);
+        app.update();
+    }
+
+    fn room_root_count(app: &mut App) -> usize {
+        app.world_mut()
+            .query_filtered::<Entity, With<RoomRoot>>()
+            .iter(app.world())
+            .count()
+    }
+
+    #[test]
+    fn leaving_the_shell_from_a_dive_tears_the_room_down() {
+        let mut app = shell_lifecycle_app();
+        app.world_mut().spawn(RoomRoot);
+        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
+
+        set_screen(&mut app, Screen::Room);
+        set_screen(&mut app, Screen::PatchBay);
+        assert_eq!(room_root_count(&mut app), 1, "the dive keeps the room alive");
+
+        // The leak path: a context switch / open_editor yanks the screen
+        // straight out of the dive, bypassing OnExit(Room).
+        set_screen(&mut app, Screen::Conversation);
+        assert_eq!(room_root_count(&mut app), 0, "exit_patch_bay must tear the room down");
+        assert!(
+            app.world().get::<RoomCamera>(cam).is_none(),
+            "the camera claim must be released"
+        );
+        let theme_bg = app.world().resource::<crate::ui::theme::Theme>().bg;
+        let clear = app.world().get::<Camera>(cam).unwrap().clear_color;
+        assert!(
+            matches!(clear, ClearColorConfig::Custom(c) if c == theme_bg),
+            "the conversation clear colour must be restored: {clear:?}"
+        );
+    }
+
+    #[test]
+    fn surfacing_from_a_dive_keeps_the_room_and_the_camera_claim() {
+        let mut app = shell_lifecycle_app();
+        app.world_mut().spawn(RoomRoot);
+        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
+
+        set_screen(&mut app, Screen::Room);
+        set_screen(&mut app, Screen::PatchBay);
+        set_screen(&mut app, Screen::Room);
+        assert_eq!(room_root_count(&mut app), 1, "surfacing is travel, not teardown");
+        assert!(
+            app.world().get::<RoomCamera>(cam).is_some(),
+            "the shared camera stays claimed across the whole shell visit"
+        );
+    }
+
+    #[test]
+    fn leaving_the_room_itself_still_tears_down() {
+        // The pre-existing exit_room path — locked so the refactor into
+        // `teardown_room` can't have changed it.
+        let mut app = shell_lifecycle_app();
+        app.world_mut().spawn(RoomRoot);
+        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
+
+        set_screen(&mut app, Screen::Room);
+        set_screen(&mut app, Screen::Conversation);
+        assert_eq!(room_root_count(&mut app), 0);
+        assert!(app.world().get::<RoomCamera>(cam).is_none());
     }
 }
