@@ -475,16 +475,47 @@ three days that took the first station from spec to a finished instrument.
   Bevy folklore — non-recursive despawn, no sync points between chained
   systems. Bevy source is checked out locally; reviewer claims about
   engine scheduling get verified there before any code moves.
+- **One scene graph, and the lifecycle bill for it (July 9–10).** Amy
+  settled the shell's biggest open question — shared, not separate: the
+  patch bay is room furniture behind one placement transform, and diving
+  is a continuous camera descent inside the persistent room, with LOD
+  (room chrome hides on dive, the label/card layer shows only dived)
+  recovering the budget the scene-cut used to provide. The review round
+  on that slice earned its keep once: with `OnExit(Room)` no longer
+  firing on a dive-first exit, a context switch landing mid-dive leaked
+  the whole room into the next screen. The fix made the dive's own exit
+  share the room's teardown — and the *same* round re-asserted the same
+  pre-0.12 scheduling folklore as last time, now formally a pattern:
+  engine claims get checked against the local Bevy checkout first.
+- **Furnishing day (July 10).** With the grammar proven, one sonnet lane
+  moved the room from blockout toward the concept renders: a ~35-route
+  deterministic circuit-board floor (pure generators, keepout locked by
+  tests against the production route table — "the floor is the wiring"
+  made literal), an inscribed gold ring the routes depart from, the well
+  emblem grounded on a real table whose plinth physically fills the trace
+  keep-out, framed radiators with thread-strips, pylons with plinths and
+  caps. Amy's dials: boring labels (TRACKER, not RHYTHM GATE — plates
+  should *recede* as real detail arrives), more solidness, aurora paused
+  until the drift layer knows what information it carries. The lead's
+  live tuning pass then earned two lessons worth keeping: **inhabitable
+  is mostly camera height** (dropping the overview from bird's-eye to
+  human-eye did more than any geometry), and **you cannot light a 1%
+  albedo** — pixel-sampled screenshots proved no point-light intensity
+  lifts a near-black metallic surface; the material's diffuse response,
+  not the lamp, was the knob. The dived table stays gold-etch-on-black
+  by choice; the light buys room-scale presence.
 
 ## Now
 
-As of 2026-07-09: the kernel-interior scene family is live — the Tardis room
-(slice A) with ambient bearing glow, and the patch bay complete as an
-instrument (observed graph, auto-connect, etched face, port labels, traffic
-pulses, card-at-chord). The tracks bearing's breathe-on-jam acceptance and
-the metronome-click chord pulse await the next live jam. Amy is sitting with
-a reframe: the patch bay table may *be* the room floor (one geometry, two
-readings — dive as descent, labels as LOD); the bearings table waits on that.
-Next station candidates: shell slice B (thread-wall ambient at W + the
-scene-graph decision) or the tracks highway. Open work is in
-`docs/issues.md`; the live handoff in `signoff.md` (ephemeral, repo root).
+As of 2026-07-10: the kernel-interior scene family is live and furnished —
+the Tardis room reads as a place (circuit-board floor, well table, framed
+radiators, signage hung high), with the patch bay standing at W as
+furniture inside one shared scene graph, dive-as-descent proven end to end
+including its lifecycle edge (leaving the shell from a dive, live-verified).
+The tracks bearing's breathe-on-jam acceptance and the metronome-click
+chord pulse await the next live jam. Deferred by choice: the N archway
+(returns with the fsn scene), the drift-layer air (paused until it knows
+what information it carries — point cloud vs aurora arcs is open). Next
+station candidates: the tracks highway (TRACKER, E) or patchbay slice 2
+(declared wires, kernel-owned). Open work is in `docs/issues.md`; the live
+handoff in `signoff.md` (ephemeral, repo root).
