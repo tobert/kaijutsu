@@ -86,7 +86,14 @@ const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
 /// sitting ~`scale`× as far from the lamp. Scaled to the placement: intensity ≈
 /// 60M·scale², range ≈ 4000·scale. **FLAG FOR VISUAL PASS** — computed, the lead
 /// live-tunes the exact exposure.
-const PB_PLACED_LIGHT_INTENSITY: f32 = 3_000_000.0;
+// Eyeballed 2026-07-10 (pixel-sampled over BRP screenshots). The table's
+// ~1% linear albedo means NO intensity fully lifts it — and that's the look:
+// the dived table stays gold-etch-on-black (mockup 14). What this bump buys
+// is presence at ROOM scale: a warm sheen + brass-peg glints that read as
+// "an instrument stands at W" instead of a black hole. Paired with the table
+// material's metallic drop (0.85 → 0.40), which is what let light matter at
+// all. Lift the table's `base_color` (not this) to brighten the surface.
+const PB_PLACED_LIGHT_INTENSITY: f32 = 40_000_000.0;
 const PB_PLACED_LIGHT_RANGE: f32 = 900.0;
 
 // ── Scene constants (Amy-tunable) ───────────────────────────────────────────
@@ -464,10 +471,15 @@ pub(crate) fn spawn_furniture(
     // rule, built into the furniture. Extrusions extrude along Z; rotate to
     // lie flat with the top face up.
     let table_mesh = meshes.add(Extrusion::new(Annulus::new(TABLE_INNER_R, TABLE_OUTER_R), TABLE_DEPTH));
+    // Mostly-dielectric on purpose (eyeballed 2026-07-10): at metallic 0.85
+    // the dark surface had almost no diffuse response, so no point-light
+    // intensity could lift it out of near-black — the "table reads dark at
+    // room scale" nit. Lower metallic lets the base colour actually diffuse
+    // under the placed light while the roughness keeps a soft sheen.
     let table_material = std_materials.add(StandardMaterial {
-        base_color: Color::srgb(0.085, 0.09, 0.11),
-        metallic: 0.85,
-        perceptual_roughness: 0.42,
+        base_color: Color::srgb(0.11, 0.115, 0.14),
+        metallic: 0.40,
+        perceptual_roughness: 0.55,
         ..default()
     });
     commands.spawn((

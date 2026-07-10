@@ -136,15 +136,25 @@ pub(crate) const PLATE_TEX_W: f32 = 340.0;
 pub(crate) const PLATE_TEX_H: f32 = 100.0;
 pub(crate) const PLATE_PAD: f32 = 10.0;
 pub(crate) const PLATE_FONT_SIZE: f32 = 30.0;
-/// Height (world-Y) the nameplates float at.
-const PLATE_HEIGHT: f32 = 150.0;
+/// Height (world-Y) the nameplates float at — hung high near the pylon tops
+/// (concept 06's signage grammar: plates over the stations, furniture below;
+/// also clears the W approach's sight line to the patch-bay table).
+const PLATE_HEIGHT: f32 = 200.0;
+/// Where the approach pose *looks* (world-Y at the wall): furniture height,
+/// not plate height — the station's instrument is the subject, the plate
+/// hangs above it in frame (the W-approach used to aim at the plate and crop
+/// the table's bottom out of the shot).
+const APPROACH_LOOK_HEIGHT: f32 = 130.0;
 
 // ── Console emblem (gold — the well's reserved hue) ──────────────────────────
 
 /// The console: a stack of gold rings at center — the slice-A stand-in for the
 /// live well. `(y, major_radius, minor_radius)` per ring, apex smallest.
+/// Thin and widely spaced on purpose: over the tabletop the original chunky
+/// close-set tori (minor 5–7, y 14/36/56) overlapped into a solid "gold cake"
+/// from the overview; airy rings read as hologram, not pastry. **Amy-tunable.**
 const CONSOLE_RINGS: [(f32, f32, f32); 3] =
-    [(14.0, 96.0, 7.0), (36.0, 68.0, 6.0), (56.0, 42.0, 5.0)];
+    [(30.0, 100.0, 3.5), (64.0, 76.0, 3.0), (98.0, 52.0, 2.5)];
 /// Console gold hue (linear rgb identity).
 const CONSOLE_GOLD_HUE: [f32; 3] = [1.00, 0.78, 0.34];
 /// Console rest brightness (LDR — a soft steady glow, no bloom).
@@ -184,7 +194,9 @@ const TABLE_GOLD_LDR: f32 = 0.50;
 const RADIATOR_WIDTH: f32 = 92.0;
 const RADIATOR_HEIGHT: f32 = 430.0;
 const RADIATOR_DEPTH: f32 = 10.0;
-const RADIATOR_HEIGHT_OFFSET: f32 = 40.0;
+/// Panel bottom-edge lift off the floor — near-grounded (Amy: "more
+/// solidness"; the old 40 read as glass floating in mid-air).
+const RADIATOR_HEIGHT_OFFSET: f32 = 10.0;
 /// Idle radiator colour (linear rgb) — a dim violet dark-glass, LDR only for
 /// slice A (no live content yet).
 const RADIATOR_COLOR: [f32; 3] = [0.090, 0.040, 0.150];
@@ -269,12 +281,15 @@ const ROOM_CAM_APPROACH_R: f32 = 160.0;
 /// Approach-pose eye height — the old orbit camera's focused-pose lift,
 /// carried over unchanged (a comfortable "person standing" height).
 const ROOM_CAM_APPROACH_HEIGHT: f32 = 260.0;
-/// The console (TimeWell) overview pose — elevated and pulled back from the
-/// south, framing the *whole* room so every bearing's ambient glow reads at
-/// once (the tracks (E) marker must breathe here without diving — the slice-A
-/// acceptance). **Amy-tunable** (the lead live-tunes the exact framing).
-const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 640.0, 1500.0);
-const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 40.0, 0.0);
+/// The console (TimeWell) overview pose — pulled back from the south, framing
+/// the *whole* room so every bearing's ambient glow reads at once (the tracks
+/// (E) marker must breathe here without diving — the slice-A acceptance).
+/// Lowered 2026-07-10 from the original (0, 640, 1500) high shot toward the
+/// concepts' human-eye framing (06 stands *in* the room, not above it): the
+/// table + ring stack sit mid-frame with the stations standing around them.
+/// **Amy-tunable** (the lead live-tunes the exact framing).
+const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 340.0, 1380.0);
+const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 90.0, 0.0);
 /// Camera follow rate (exponential smoothing) — matches the well's weighty
 /// glide so the shell and the well feel like one instrument.
 const CAMERA_EASE_RATE: f32 = 4.0;
@@ -1306,9 +1321,10 @@ fn desired_camera(station: Station) -> (Vec3, Vec3) {
                 ROOM_CAM_APPROACH_HEIGHT,
             )),
             // Look at the marker's own wall radius (ROOM_RADIUS — the same
-            // radius the pylons spawn at) held at nameplate height, so the
-            // plate is framed square-on.
-            Vec3::from_array(bearing::approach_look(d, ROOM_RADIUS, PLATE_HEIGHT)),
+            // radius the pylons spawn at) held at furniture height
+            // (APPROACH_LOOK_HEIGHT): the station's instrument is the
+            // subject; its plate hangs above it in the frame.
+            Vec3::from_array(bearing::approach_look(d, ROOM_RADIUS, APPROACH_LOOK_HEIGHT)),
         ),
     }
 }
