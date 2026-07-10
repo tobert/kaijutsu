@@ -22,7 +22,12 @@
 //! - **Ambient telemetry = light**: the tracks (E) marker *breathes* with the
 //!   beat (the well's [`WellBeats`] phasors, read — not re-wired), and the
 //!   console emblem glows with context chatter ([`activity::BearingActivity`]).
-//!   HDR emission only on live activity; all decoration stays LDR.
+//!   Strong sustained HDR is reserved for live activity; decoration may also
+//!   carry its own FAINT, slowly moving glow (the circuit board, the wall
+//!   trim — below), capped at [`palette::GLOW_CREST`] and LDR on
+//!   time-average (Amy, 2026-07-10 — "make the circuit patterns and border
+//!   glow faintly like the concepts... a lil bloom or some other shader;
+//!   something faintly moving might be interesting").
 //!
 //! The console is the **slice-A stand-in** for the live well: an emblematic
 //! gold ring-stack, *not* the well scene (unifying the well is a later slice).
@@ -48,11 +53,16 @@
 //! builds a dais there instead, and the patch bay's own placement (untouched
 //! here) seats the wheel on it: the wheel **is** the station.
 //!
-//! Materials are all built-in [`StandardMaterial`] with `unlit: true`, carrying
-//! brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR (> 1.0)
-//! blooms through the app camera's threshold-1.0 bloom (`main::setup_camera`).
-//! No new WGSL, no image assets, no new fonts (the charter's procedural-first
-//! budget rule).
+//! Materials are mostly built-in [`StandardMaterial`] with `unlit: true`,
+//! carrying brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR
+//! (> 1.0) blooms through the app camera's threshold-1.0 bloom
+//! (`main::setup_camera`). The circuit-board traces, terminal pads, the
+//! inscribed gold ring, the wall trim, and the W dais bezel instead carry
+//! [`crate::shaders::TraceGlowMaterial`] (`assets/shaders/trace_glow.wgsl`)
+//! — a small GPU-animated shader, the one exception to the charter's
+//! procedural-first budget rule, needed because a faint MOVING glow can't be
+//! baked into a static `base_color` or vertex colour. No image assets, no
+//! new fonts.
 
 pub mod activity;
 pub mod bearing;
@@ -67,7 +77,7 @@ use bearing::Bearing;
 use nav::{DoubleTap, Station, StationCarousel};
 
 use crate::connection::actor_plugin::ServerEventMessage;
-use crate::shaders::WellCardMaterial;
+use crate::shaders::{TraceGlowMaterial, WellCardMaterial};
 use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
 use crate::text::msdf::{
@@ -252,9 +262,18 @@ const WALL_MULLION_COLOR: [f32; 3] = [0.040, 0.040, 0.058];
 /// now zero-thickness quads that would otherwise share a plane).
 const WALL_TRIM_THICKNESS: f32 = 12.0;
 const WALL_TRIM_PROUD: f32 = 2.2;
-/// Trim brightness — restrained neon, not a blown highlight (mission's
-/// "LDR ~0.5-0.7 of hue"; stays LDR).
-const WALL_TRIM_LDR: f32 = 0.60;
+/// Trim glow trough — restrained neon at rest, not a blown highlight
+/// (mission's "LDR ~0.5-0.7 of hue"; `trough * palette::GLOW_CREST` stays
+/// under 1.0). The trim now carries a [`TraceGlowMaterial`] traveling wave
+/// (mode 0, `spawn_walls`) whose crest renormalizes to
+/// [`palette::GLOW_CREST`] — this is its RESTING level between passes, the
+/// old flat brightness's role.
+const WALL_TRIM_GLOW_TROUGH: f32 = 0.60;
+/// One crest crosses a whole trim strip roughly every this many seconds
+/// (mode 0 period, `rate = 1 / WALL_TRIM_GLOW_PERIOD`) — long and slow, per
+/// panel (`spawn_walls`'s per-panel phase keeps the eight panels from
+/// pulsing in lockstep).
+const WALL_TRIM_GLOW_PERIOD: f32 = 10.0;
 
 /// Diagonal-panel content: the violet information threads migrated in from
 /// the old free-floating radiators (`shell.md`, "the walls between bearings
@@ -295,17 +314,46 @@ const RING_OUTER_R: f32 = 230.0;
 const RING_INNER_R: f32 = 190.0;
 const RING_BAND_WIDTH: f32 = 10.0;
 const RING_GOLD_HUE: [f32; 3] = [1.00, 0.80, 0.36];
-const RING_LDR: f32 = 0.50;
+/// Shared slow breathing rate (mode 1, rad/s) for the room's calmest gold
+/// glow accents — the inscribed double-ring and the W dais bezel
+/// ([`spawn_w_dais`]) both use this: subtle, architectural, unhurried.
+const GOLD_GLOW_RATE: f32 = 0.15;
 
 /// Route-generation shared geometry ([`bearing::expand_bundle`]): the radial
 /// length each 45°-ish bend cuts off the lane radius, and the arc's sample
 /// density.
 const ROUTE_CHAMFER: f32 = 18.0;
 const ROUTE_ARC_SEGMENTS: usize = 14;
-/// Terminal-pad disc radius range (world units) — "slightly brighter than
-/// their trace."
+/// Terminal-pad disc radius range (world units).
 const ROUTE_PAD_RADIUS_RANGE: (f32, f32) = (6.0, 14.0);
-const ROUTE_PAD_BRIGHTNESS_GAIN: f32 = 1.35;
+
+// ── Faint moving glow (`TraceGlowMaterial`; Amy, 2026-07-10) ────────────────
+// "make the circuit patterns and border glow faintly like the concepts... a
+// lil bloom or some other shader; something faintly moving might be
+// interesting." Every crest renormalizes to `palette::GLOW_CREST`
+// (`crest_color`); these constants are each element's RESTING trough and
+// its wave/breath rate — the knobs that make one glowing thing read subtler
+// or livelier than another. SLOW and FAINT is the target across the board —
+// the room must not read as an arcade.
+
+/// Floor-trace glow trough (mode 0, `spawn_floor`): the resting brightness
+/// fraction of a route's crest colour between the traveling crest's passes —
+/// a clear step down so the crest's transit reads as motion, not a flicker.
+const TRACE_GLOW_TROUGH: f32 = 0.55;
+/// Terminal-pad glow trough (mode 1, `spawn_floor`) — a hair brighter than
+/// [`TRACE_GLOW_TROUGH`] (the old `ROUTE_PAD_BRIGHTNESS_GAIN`'s "slightly
+/// brighter than their trace" read, now expressed as a higher resting floor
+/// rather than a colour scale, since every crest shares the same
+/// [`palette::GLOW_CREST`] ceiling regardless of gain).
+const PAD_GLOW_TROUGH: f32 = 0.65;
+/// `(min, max)` seconds for one crest to cross a whole route (mode 0 period,
+/// `rate = 1 / period`) — jittered per-route from `bearing::BoardRoute`'s
+/// `glow_phase01` so the board doesn't pulse in lockstep.
+const TRACE_GLOW_PERIOD_RANGE: (f32, f32) = (8.0, 14.0);
+/// Terminal-pad breathing rate (mode 1, rad/s) — slow and uniform; pads
+/// don't jitter their rate the way traces jitter their period; only phase
+/// (from the same hash stream as their trace) varies pad-to-pad.
+const PAD_GLOW_RATE: f32 = 0.25;
 
 // ── Focus presentation ───────────────────────────────────────────────────────
 
@@ -448,6 +496,7 @@ impl Plugin for RoomPlugin {
         app.init_resource::<RoomState>()
             .init_resource::<WellEdgeBump>()
             .init_resource::<BearingActivity>()
+            .add_plugins(MaterialPlugin::<TraceGlowMaterial>::default())
             .add_systems(OnEnter(Screen::Room), enter_room)
             .add_systems(OnExit(Screen::Room), exit_room)
             // Ambient ingest runs on **every** screen so the room opens warm —
@@ -492,6 +541,7 @@ fn enter_room(
     mut edge_bump: ResMut<WellEdgeBump>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
+    mut glow_mats: ResMut<Assets<TraceGlowMaterial>>,
     mut card_mats: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
@@ -530,7 +580,7 @@ fn enter_room(
     // Floor disc, inscribed gold ring, and circuit-board routes — one cohesive
     // helper (`shell.md`, "the floor is the wiring": the disc, its rings, and
     // its traces are the chamber, not room chrome).
-    spawn_floor(&mut commands, root, &mut meshes, &mut mats);
+    spawn_floor(&mut commands, root, &mut meshes, &mut mats, &mut glow_mats);
 
     // Vault dome — an enclosing sphere with a subtle vertical vertex-colour
     // gradient (calm darkness overhead; `shell.md` open question 4 defers the
@@ -656,13 +706,13 @@ fn enter_room(
     // The W dais — the wheel IS the west station (`shell.md` slice B, retuned
     // 2026-07-10). Not RoomDistraction: it's the station's own furniture, so
     // it stays lit through the dive same as the wheel itself.
-    spawn_w_dais(&mut commands, root, &mut meshes, &mut mats);
+    spawn_w_dais(&mut commands, root, &mut meshes, &mut mats, &mut glow_mats);
 
     // The octagon wall shell: eight single-sided panels enclosing the room,
     // corner mullions, hue-coded edge trim, and — on the four diagonals — the
     // violet information threads that used to stand as free-floating
     // radiators. The chamber, not room chrome (no RoomDistraction).
-    spawn_walls(&mut commands, root, &mut meshes, &mut mats);
+    spawn_walls(&mut commands, root, &mut meshes, &mut mats, &mut glow_mats);
 
     // Re-root the patch bay into the room as furniture at the W bearing (slice B,
     // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
@@ -879,6 +929,7 @@ fn spawn_floor(
     root: Entity,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
+    glow_mats: &mut Assets<TraceGlowMaterial>,
 ) {
     // Floor disc — a radial vertex-colour gradient (warm charcoal pooling
     // under the table's glow, fading to near-black at the rim) replaces the
@@ -899,8 +950,13 @@ fn spawn_floor(
 
     // Inscribed gold double-ring (concept 06's gold circle band): a thin
     // annulus at RING_OUTER_R and another at RING_INNER_R; routes depart from
-    // the outer one.
-    let ring_mat = mats.add(unlit(lin_scaled(RING_GOLD_HUE, RING_LDR)));
+    // the outer one. Mode 1 (breathing) — Annulus ignores uv, so mode 0
+    // would be safe too, but the ring reads as ONE calm architectural body,
+    // not wiring, so it breathes (`palette::GLOW_TROUGH_SUBTLE`).
+    let ring_mat = glow_mats.add(TraceGlowMaterial {
+        color: crest_color(RING_GOLD_HUE, palette::GLOW_CREST),
+        params: Vec4::new(0.0, GOLD_GLOW_RATE, palette::GLOW_TROUGH_SUBTLE, 1.0),
+    });
     for r in [RING_OUTER_R, RING_INNER_R] {
         commands.spawn((
             Mesh3d(meshes.add(Annulus::new(r - RING_BAND_WIDTH * 0.5, r + RING_BAND_WIDTH * 0.5))),
@@ -914,7 +970,10 @@ fn spawn_floor(
     }
 
     // Circuit-board routes: each bundle expands to several routes; every
-    // route gets a ribbon + a slightly brighter terminal pad.
+    // route gets a traveling-wave ribbon (mode 0) + a breathing terminal pad
+    // (mode 1) sharing its crest colour and its glow_phase01 hash draw ("the
+    // same hash stream" — the pad's breath and the trace's wave start from
+    // the same per-route random offset).
     for (bi, bundle) in route_bundles().iter().enumerate() {
         let seed_base = bi as u32 * 10_007;
         for route in bearing::expand_bundle(
@@ -930,38 +989,58 @@ fn spawn_floor(
                 route.points.iter().all(|p| (p[0] * p[0] + p[2] * p[2]).sqrt() > KEEPOUT_RADIUS),
                 "every generated route must clear the console keep-out ({KEEPOUT_RADIUS})"
             );
-            let color = [
+            let identity = [
                 route.hue[0] * route.brightness_scale,
                 route.hue[1] * route.brightness_scale,
                 route.hue[2] * route.brightness_scale,
             ];
-            debug_assert!(color.iter().all(|c| *c < 1.0), "floor trace must stay LDR");
+            let crest = crest_color(identity, palette::GLOW_CREST);
+            debug_assert!(
+                crest.x.max(crest.y).max(crest.z) <= palette::GLOW_CREST + 1e-4,
+                "floor trace crest must stay capped at GLOW_CREST: {crest:?}"
+            );
+            debug_assert!(
+                TRACE_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+                "floor trace trough must stay LDR even against the crest cap"
+            );
 
-            let mesh = meshes.add(ribbon_mesh(&route.points, TRACE_WIDTH * route.width_scale));
-            let mat = mats.add(StandardMaterial {
-                base_color: lin(color),
-                unlit: true,
-                cull_mode: None,
-                ..default()
+            // Period jitter and phase both ride the route's one spare hash
+            // draw (`glow_phase01` — see `bearing::expand_bundle`'s doc on
+            // why there's only one to spare); this correlates a route's
+            // phase with its period, a minor, deliberately-accepted trade
+            // for staying inside the existing seed stride.
+            let period =
+                bearing::lerp(TRACE_GLOW_PERIOD_RANGE.0, TRACE_GLOW_PERIOD_RANGE.1, route.glow_phase01);
+            let trace_mat = glow_mats.add(TraceGlowMaterial {
+                color: crest,
+                params: Vec4::new(route.glow_phase01, 1.0 / period, TRACE_GLOW_TROUGH, 0.0),
             });
+            let mesh = meshes.add(ribbon_mesh(&route.points, TRACE_WIDTH * route.width_scale));
             commands.spawn((
                 Mesh3d(mesh),
-                MeshMaterial3d(mat),
+                MeshMaterial3d(trace_mat),
                 Transform::default(),
                 Visibility::Inherited,
                 Name::new("FloorTrace"),
                 ChildOf(root),
             ));
 
-            let pad_color = [
-                color[0] * ROUTE_PAD_BRIGHTNESS_GAIN,
-                color[1] * ROUTE_PAD_BRIGHTNESS_GAIN,
-                color[2] * ROUTE_PAD_BRIGHTNESS_GAIN,
-            ];
-            debug_assert!(pad_color.iter().all(|c| *c < 1.0), "floor trace pad must stay LDR");
+            debug_assert!(
+                PAD_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+                "floor trace pad trough must stay LDR even against the crest cap"
+            );
+            let pad_mat = glow_mats.add(TraceGlowMaterial {
+                color: crest,
+                params: Vec4::new(
+                    route.glow_phase01 * std::f32::consts::TAU,
+                    PAD_GLOW_RATE,
+                    PAD_GLOW_TROUGH,
+                    1.0,
+                ),
+            });
             commands.spawn((
                 Mesh3d(meshes.add(Circle::new(route.pad_radius))),
-                MeshMaterial3d(mats.add(unlit(lin(pad_color)))),
+                MeshMaterial3d(pad_mat),
                 Transform::from_translation(Vec3::new(
                     route.pad_pos[0],
                     TRACE_Y + 0.15,
@@ -1047,9 +1126,16 @@ fn spawn_w_dais(
     root: Entity,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
+    glow_mats: &mut Assets<TraceGlowMaterial>,
 ) {
     let dais_mat = mats.add(unlit(lin(palette::DARK_SURFACE)));
-    let rim_mat = mats.add(unlit(lin_scaled(palette::GOLD_HUE, palette::GOLD_LDR_TRIM)));
+    // The rim bezel breathes faintly (mode 1 — Torus ignores uv, so this is
+    // safe) at the same subtle gold tier as the inscribed floor ring
+    // (`spawn_floor`): the room's calmest glow accents share one read.
+    let rim_mat = glow_mats.add(TraceGlowMaterial {
+        color: crest_color(palette::GOLD_HUE, palette::GLOW_CREST),
+        params: Vec4::new(0.0, GOLD_GLOW_RATE, palette::GLOW_TROUGH_SUBTLE, 1.0),
+    });
 
     commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(W_DAIS_FOOT_R, W_DAIS_FOOT_HEIGHT))),
@@ -1095,20 +1181,27 @@ fn spawn_walls(
     root: Entity,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
+    glow_mats: &mut Assets<TraceGlowMaterial>,
 ) {
     let panel_width = bearing::octagon_panel_width(WALL_APOTHEM) - WALL_PANEL_GAP;
 
     let base_mesh = meshes.add(Rectangle::new(panel_width, WALL_HEIGHT));
     let base_mat = mats.add(unlit(lin(WALL_BASE_COLOR)));
-    let h_trim_mesh = meshes.add(Rectangle::new(panel_width, WALL_TRIM_THICKNESS));
-    let v_trim_mesh = meshes.add(Rectangle::new(WALL_TRIM_THICKNESS, WALL_HEIGHT));
+    // `glow_quad_mesh` (not a plain `Rectangle`) so `uv.x` tracks each trim
+    // strip's own REAL length: the top/bottom strips are wide-and-short, the
+    // left/right strips are narrow-and-tall, and `TraceGlowMaterial`'s
+    // mode-0 wave needs `uv.x` to run along whichever that is (`glow_quad_mesh`'s
+    // own doc has the why).
+    let h_trim_mesh = meshes.add(glow_quad_mesh(panel_width, WALL_TRIM_THICKNESS));
+    let v_trim_mesh = meshes.add(glow_quad_mesh(WALL_TRIM_THICKNESS, WALL_HEIGHT));
     let mullion_mesh = meshes.add(Rectangle::new(WALL_MULLION_WIDTH, WALL_HEIGHT));
     let mullion_mat = mats.add(unlit(lin(WALL_MULLION_COLOR)));
 
-    // One trim material per identity hue: the four cardinal bearing hues
-    // (read straight off `wall_placements`, so a re-tuned marker hue can't
-    // drift out of sync with its wall) plus one shared violet for every
-    // diagonal face.
+    // Identity hue per bearing (read straight off `wall_placements`, so a
+    // re-tuned marker hue can't drift out of sync with its wall) plus one
+    // shared violet for every diagonal face — fed to `crest_color` per panel
+    // below (each panel needs its OWN `TraceGlowMaterial` instance for its
+    // own phase, so hue lookup stays a closure rather than pre-built handles).
     let placements = bearing::wall_placements();
     let hue_for = |b: Bearing| -> [f32; 3] {
         placements
@@ -1117,11 +1210,6 @@ fn spawn_walls(
             .map(|wp| wp.hue)
             .expect("wall_placements always covers all four cardinal bearings")
     };
-    let trim_mat_n = mats.add(unlit(lin_scaled(hue_for(Bearing::North), WALL_TRIM_LDR)));
-    let trim_mat_e = mats.add(unlit(lin_scaled(hue_for(Bearing::East), WALL_TRIM_LDR)));
-    let trim_mat_s = mats.add(unlit(lin_scaled(hue_for(Bearing::South), WALL_TRIM_LDR)));
-    let trim_mat_w = mats.add(unlit(lin_scaled(hue_for(Bearing::West), WALL_TRIM_LDR)));
-    let trim_mat_violet = mats.add(unlit(lin_scaled(palette::VIOLET_THREAD, WALL_TRIM_LDR)));
 
     for (i, panel) in bearing::octagon_panels(WALL_APOTHEM).iter().enumerate() {
         let pos = Vec3::new(panel.center[0], WALL_HEIGHT * 0.5, panel.center[2]);
@@ -1141,14 +1229,23 @@ fn spawn_walls(
             ChildOf(root),
         ));
 
-        let trim_mat = match panel.bearing {
-            Some(Bearing::North) => trim_mat_n.clone(),
-            Some(Bearing::East) => trim_mat_e.clone(),
-            Some(Bearing::South) => trim_mat_s.clone(),
-            Some(Bearing::West) => trim_mat_w.clone(),
+        let identity_hue = match panel.bearing {
+            Some(b @ (Bearing::North | Bearing::East | Bearing::South | Bearing::West)) => {
+                hue_for(b)
+            }
             Some(Bearing::Center) => unreachable!("octagon panels never carry the center bearing"),
-            None => trim_mat_violet.clone(),
+            None => palette::VIOLET_THREAD,
         };
+        // Per-panel material (not a shared handle): each panel needs its OWN
+        // phase (`bearing::hash01`, namespaced well away from the thread
+        // jitter seeds below — `i*90_001` vs. the threads' `i*251+j*17` — so
+        // neither draw can replay the other's) so the eight panels shimmer
+        // asynchronously rather than in lockstep.
+        let phase = bearing::hash01(i as u32 * 90_001 + 4242);
+        let trim_mat = glow_mats.add(TraceGlowMaterial {
+            color: crest_color(identity_hue, palette::GLOW_CREST),
+            params: Vec4::new(phase, 1.0 / WALL_TRIM_GLOW_PERIOD, WALL_TRIM_GLOW_TROUGH, 0.0),
+        });
         let half_h = WALL_HEIGHT * 0.5 - WALL_TRIM_THICKNESS * 0.5;
         let half_w = panel_width * 0.5 - WALL_TRIM_THICKNESS * 0.5;
         for (edge, mesh, local) in [
@@ -1558,6 +1655,20 @@ fn lin_v(v: Vec3) -> Color {
     Color::LinearRgba(LinearRgba::rgb(v.x, v.y, v.z))
 }
 
+/// Renormalize an identity hue×brightness colour so its brightest channel
+/// lands exactly at `crest` — every [`TraceGlowMaterial`] element's crest
+/// shares the same ceiling ([`palette::GLOW_CREST`]) regardless of how bright
+/// its raw identity colour happens to be; the element's `trough` (baked into
+/// `params.z` at the call site) then sets how far the resting brightness
+/// sits below it. Degenerate all-zero input maps to itself (a black trace
+/// stays black — `scale` would otherwise divide by zero). `.w` is unused
+/// (every `TraceGlowMaterial` element is opaque).
+fn crest_color(identity: [f32; 3], crest: f32) -> Vec4 {
+    let max_c = identity[0].max(identity[1]).max(identity[2]);
+    let scale = if max_c > 1e-6 { crest / max_c } else { 0.0 };
+    Vec4::new(identity[0] * scale, identity[1] * scale, identity[2] * scale, 0.0)
+}
+
 /// Snap a glow value to the [`GLOW_STEP`] grid so a settled marker stops
 /// touching `Assets<StandardMaterial>`.
 fn quantize(v: f32) -> f32 {
@@ -1585,17 +1696,54 @@ fn set_glow(mats: &mut Assets<StandardMaterial>, handle: &Handle<StandardMateria
 
 /// A flat floor ribbon (up-normal) along `points`, `width` across — a trace
 /// channel. Vertex math lives in [`bearing::ribbon_vertices`] (unit-tested);
-/// this wraps it into a `Mesh` with up-normals.
+/// this wraps it into a `Mesh` with up-normals and UVs (`uv.x` the
+/// cumulative-arclength fraction along the route, which
+/// [`TraceGlowMaterial`]'s mode-0 traveling wave rides).
 fn ribbon_mesh(points: &[[f32; 3]], width: f32) -> Mesh {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::{Indices, PrimitiveTopology};
 
-    let (positions, indices) = bearing::ribbon_vertices(points, width);
+    let (positions, uvs, indices) = bearing::ribbon_vertices(points, width);
     let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
         .with_inserted_indices(Indices::U32(indices))
+}
+
+/// A flat quad (`w`×`h`, centered at origin, XY-plane, +Z normal — Bevy's
+/// `Rectangle` mesh convention) whose UV is assigned so `uv.x` always tracks
+/// the LONGER of the two dimensions and `uv.y` the shorter — unlike
+/// `Rectangle::mesh()`, which always ties `uv.x` to the local X axis
+/// regardless of which side is actually longer. [`TraceGlowMaterial`]'s
+/// mode-0 traveling wave reads `uv.x` as "along the element's length"; a
+/// wall-trim strip is wide-and-short on a panel's top/bottom edge but
+/// narrow-and-tall on its left/right edge (`spawn_walls`), and the wave must
+/// glide along whichever is the strip's REAL length, not always its local X
+/// — a plain `Rectangle` mesh on the tall strips would key `uv.x` off the
+/// thin thickness axis, and the wave would read as the whole strip pulsing
+/// in unison rather than a crest traveling top-to-bottom.
+fn glow_quad_mesh(w: f32, h: f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let positions = vec![[hw, hh, 0.0], [-hw, hh, 0.0], [-hw, -hh, 0.0], [hw, -hh, 0.0]];
+    let normals = vec![[0.0, 0.0, 1.0]; 4];
+    let uvs: Vec<[f32; 2]> = if w >= h {
+        // `Rectangle::mesh()`'s own corner UVs: u along X, v along Y.
+        vec![[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+    } else {
+        // Swapped: u along Y (the long side here), v along X.
+        vec![[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]
+    };
+    let indices = Indices::U32(vec![0, 1, 2, 0, 2, 3]);
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_indices(indices)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
 }
 
 /// The vault dome: a UV sphere with a per-vertex vertical gradient
@@ -1888,7 +2036,14 @@ mod tests {
     }
 
     #[test]
-    fn every_generated_board_route_stays_ldr_including_its_pad() {
+    fn every_generated_board_route_crest_is_capped_and_trough_stays_ldr() {
+        // The new invariant (2026-07-10, the faint-moving-glow slice) in
+        // place of the old flat "< 1.0" check: every route's crest
+        // renormalizes to AT MOST `palette::GLOW_CREST` regardless of its
+        // raw identity hue, and both the trace's and the pad's RESTING
+        // trough level stay LDR even measured against the crest cap itself
+        // (`trough * GLOW_CREST < 1.0`) — the element only ever reads loud
+        // at the crest's instantaneous peak, never sustained.
         for (bi, bundle) in route_bundles().iter().enumerate() {
             let seed_base = bi as u32 * 10_007;
             for route in bearing::expand_bundle(
@@ -1900,16 +2055,27 @@ mod tests {
                 ROUTE_PAD_RADIUS_RANGE,
                 seed_base,
             ) {
-                let color = [
+                let identity = [
                     route.hue[0] * route.brightness_scale,
                     route.hue[1] * route.brightness_scale,
                     route.hue[2] * route.brightness_scale,
                 ];
-                assert!(color.iter().all(|c| *c < 1.0), "bundle {bi} trace must stay LDR: {color:?}");
-                let pad = color.map(|c| c * ROUTE_PAD_BRIGHTNESS_GAIN);
-                assert!(pad.iter().all(|c| *c < 1.0), "bundle {bi} pad must stay LDR: {pad:?}");
+                let crest = crest_color(identity, palette::GLOW_CREST);
+                let max_channel = crest.x.max(crest.y).max(crest.z);
+                assert!(
+                    max_channel <= palette::GLOW_CREST + 1e-4,
+                    "bundle {bi} crest exceeds the cap: {crest:?}"
+                );
             }
         }
+        assert!(
+            TRACE_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+            "trace trough must stay LDR even against the crest cap"
+        );
+        assert!(
+            PAD_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+            "pad trough must stay LDR even against the crest cap"
+        );
     }
 
     #[test]
@@ -2002,10 +2168,20 @@ mod tests {
     }
 
     #[test]
-    fn wall_trim_brightness_stays_in_the_restrained_neon_range() {
-        // Mission spec: "LDR ~0.5-0.7 of hue" — restrained neon, not a blown
-        // highlight, and never HDR (decoration stays < 1.0).
-        assert!((0.5..=0.7).contains(&WALL_TRIM_LDR), "trim LDR out of the restrained range: {WALL_TRIM_LDR}");
+    fn wall_trim_glow_trough_stays_in_the_restrained_neon_range_and_ldr_at_the_crest() {
+        // Mission spec: "LDR ~0.5-0.7 of hue" for the trim's resting level —
+        // still true now that the trim breathes/waves between this trough
+        // and a crest capped at `palette::GLOW_CREST`; also lock the new
+        // invariant that even AT the crest cap, the trough reads LDR.
+        assert!(
+            (0.5..=0.7).contains(&WALL_TRIM_GLOW_TROUGH),
+            "trim trough out of the restrained range: {WALL_TRIM_GLOW_TROUGH}"
+        );
+        assert!(
+            WALL_TRIM_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+            "trim trough must stay LDR even against the crest cap"
+        );
+        assert!(WALL_TRIM_GLOW_PERIOD > 0.0, "trim wave period must be positive");
     }
 
     #[test]
@@ -2033,16 +2209,46 @@ mod tests {
     }
 
     #[test]
-    fn ribbon_mesh_has_matching_position_and_normal_counts() {
+    fn ribbon_mesh_has_matching_position_normal_and_uv_counts() {
         let line = [[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [100.0, 0.0, 0.0]];
         let mesh = ribbon_mesh(&line, 8.0);
         use bevy::mesh::VertexAttributeValues;
         let pos = mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len();
         let nrm = mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap().len();
+        let uv = mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap().len();
         assert_eq!(pos, 6, "2 verts × 3 points");
         assert_eq!(nrm, pos, "one up-normal per vertex");
+        assert_eq!(uv, pos, "one uv per vertex — TraceGlowMaterial's mode-0 wave rides it");
         if let Some(VertexAttributeValues::Float32x3(ns)) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
             assert!(ns.iter().all(|n| *n == [0.0, 1.0, 0.0]), "all up");
+        }
+    }
+
+    #[test]
+    fn glow_quad_mesh_puts_uv_x_on_the_longer_dimension() {
+        use bevy::mesh::VertexAttributeValues;
+
+        // Wide-and-short (a panel's top/bottom trim): uv.x should track the
+        // wide axis (X, matching `Rectangle::mesh()`'s own convention).
+        let wide = glow_quad_mesh(100.0, 10.0);
+        if let Some(VertexAttributeValues::Float32x2(uvs)) = wide.attribute(Mesh::ATTRIBUTE_UV_0) {
+            // Corner 0 sits at (+hw, +hh); its u should be 1 (max X).
+            assert_eq!(uvs[0][0], 1.0, "wide quad: uv.x tracks X: {uvs:?}");
+        } else {
+            panic!("expected Float32x2 uvs");
+        }
+
+        // Narrow-and-tall (a panel's left/right trim): uv.x should track Y
+        // instead — the long axis here — not X (the thin thickness).
+        let tall = glow_quad_mesh(10.0, 100.0);
+        if let Some(VertexAttributeValues::Float32x2(uvs)) = tall.attribute(Mesh::ATTRIBUTE_UV_0) {
+            // Corner 0 sits at (+hw, +hh); its u should still be 1 (max Y now).
+            assert_eq!(uvs[0][0], 1.0, "tall quad: uv.x tracks Y: {uvs:?}");
+            // Corner 3 sits at (+hw, -hh): same X as corner 0, different Y —
+            // its u must differ from corner 0's if u truly tracks Y not X.
+            assert_ne!(uvs[0][0], uvs[3][0], "u must vary along the long (Y) axis: {uvs:?}");
+        } else {
+            panic!("expected Float32x2 uvs");
         }
     }
 
