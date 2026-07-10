@@ -567,6 +567,10 @@ fn enter_room(
             Transform::from_xyz(0.0, *y + TABLE_TOP_Y, 0.0),
             Visibility::Inherited,
             ConsoleEmblem,
+            // RoomDistraction = the rings dim on a *station* dive today. If a
+            // future slice makes the console itself divable by camera descent
+            // (the way PatchBay is), this tag would hide the very thing being
+            // dived into — re-judge it then (kaibo, 2026-07-10).
             RoomDistraction,
             Name::new(format!("ConsoleRing{i}")),
             ChildOf(root),
@@ -590,7 +594,14 @@ fn enter_room(
         let marker_h = if wp.station.is_some() { MARKER_HEIGHT } else { MARKER_HEIGHT_RESERVED };
         let marker_mesh = meshes.add(Cuboid::new(MARKER_WIDTH, marker_h, MARKER_WIDTH));
         let marker_mat = mats.add(unlit(lin_v(hue * MARKER_LDR)));
-        let marker_pos = Vec3::new(wp.dir[0] * ROOM_RADIUS, marker_h * 0.5, wp.dir[2] * ROOM_RADIUS);
+        // Seated ON the plinth (spawn_pylons), not interpenetrating it — the
+        // shared-family dark colours hid the old overlap, but a contrasting
+        // plinth tune would have exposed z-fighting (kaibo, 2026-07-10).
+        let marker_pos = Vec3::new(
+            wp.dir[0] * ROOM_RADIUS,
+            PYLON_PLINTH_HEIGHT + marker_h * 0.5,
+            wp.dir[2] * ROOM_RADIUS,
+        );
         commands.spawn((
             Mesh3d(marker_mesh),
             MeshMaterial3d(marker_mat),
@@ -790,8 +801,13 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             center_theta: ne,
             spread: 0.22,
             count: 3,
-            lane_range: (240.0, 320.0),
-            arc_range: (0.0, 0.12),
+            // Lane floor ≥ RING_OUTER_R + ROUTE_CHAMFER (248): a lower lane
+            // puts the bend's `lane_r − chamfer` point INSIDE the 230
+            // departure ring — a backward zig-zag spike. The arc floor keeps
+            // one unlucky hash draw from collapsing the stub to a dead-zero
+            // span (kaibo review, 2026-07-10).
+            lane_range: (252.0, 320.0),
+            arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
             hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
@@ -800,8 +816,13 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             center_theta: se,
             spread: 0.20,
             count: 2,
-            lane_range: (240.0, 320.0),
-            arc_range: (0.0, 0.12),
+            // Lane floor ≥ RING_OUTER_R + ROUTE_CHAMFER (248): a lower lane
+            // puts the bend's `lane_r − chamfer` point INSIDE the 230
+            // departure ring — a backward zig-zag spike. The arc floor keeps
+            // one unlucky hash draw from collapsing the stub to a dead-zero
+            // span (kaibo review, 2026-07-10).
+            lane_range: (252.0, 320.0),
+            arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
             hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
@@ -810,8 +831,13 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             center_theta: sw,
             spread: 0.20,
             count: 2,
-            lane_range: (240.0, 320.0),
-            arc_range: (0.0, 0.12),
+            // Lane floor ≥ RING_OUTER_R + ROUTE_CHAMFER (248): a lower lane
+            // puts the bend's `lane_r − chamfer` point INSIDE the 230
+            // departure ring — a backward zig-zag spike. The arc floor keeps
+            // one unlucky hash draw from collapsing the stub to a dead-zero
+            // span (kaibo review, 2026-07-10).
+            lane_range: (252.0, 320.0),
+            arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
             hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
@@ -820,8 +846,13 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             center_theta: nw,
             spread: 0.22,
             count: 3,
-            lane_range: (240.0, 320.0),
-            arc_range: (0.0, 0.12),
+            // Lane floor ≥ RING_OUTER_R + ROUTE_CHAMFER (248): a lower lane
+            // puts the bend's `lane_r − chamfer` point INSIDE the 230
+            // departure ring — a backward zig-zag spike. The arc floor keeps
+            // one unlucky hash draw from collapsing the stub to a dead-zero
+            // span (kaibo review, 2026-07-10).
+            lane_range: (252.0, 320.0),
+            arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
             hue: palette::VIOLET_GLASS,
             brightness_range: (0.8, 1.2),
@@ -1235,8 +1266,10 @@ fn spawn_pylons(
             commands.spawn((
                 Mesh3d(cap_mesh.clone()),
                 MeshMaterial3d(cap_mat.clone()),
+                // Rides the plinth-seated marker (see the marker spawn in
+                // `enter_room`): plinth + pylon + cap stack cleanly.
                 Transform::from_translation(
-                    base + Vec3::Y * (marker_h + PYLON_CAP_HEIGHT * 0.5),
+                    base + Vec3::Y * (PYLON_PLINTH_HEIGHT + marker_h + PYLON_CAP_HEIGHT * 0.5),
                 ),
                 RoomDistraction,
                 Visibility::Inherited,
@@ -1581,7 +1614,14 @@ fn dome_mesh(radius: f32) -> Mesh {
             Some(
                 positions
                     .iter()
-                    .map(|p| bearing::dome_color((p[1] / radius) * 0.5 + 0.5))
+                    // t = 0 at the horizon (y = 0), 1 at the apex: the whole
+                    // VISIBLE upper hemisphere spans the gradient. The old
+                    // `y/r * 0.5 + 0.5` remap put dome_color's documented
+                    // "rim" at the hidden south pole and handed the horizon
+                    // only the gradient midpoint — the vault read darker and
+                    // more void-like than the tuned RIM intends (kaibo,
+                    // 2026-07-10).
+                    .map(|p| bearing::dome_color((p[1] / radius).max(0.0)))
                     .collect(),
             )
         } else {

@@ -348,13 +348,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   pipeline that `rebuild_patch_scene` also computes (identical today,
   verified). A future edit to one side floats the inspection card off its
   chord. One pure `wire_geometry(snapshot, wire_idx)` helper, both callers.
-- **Procedural ribbon meshes wind CW; normals point −Y** (gemini review,
-  2026-07-09): `ribbon_mesh` in both `view/room/mod.rs` and
-  `view/patch_bay/mod.rs` emits clockwise triangles, so Bevy flips the top
-  face's normal; invisible today only because both users are emissive with
-  `cull_mode: None`. Swap to CCW (`[l0, l1, r0, r0, l1, r1]`) before any
-  *lit* material rides a ribbon; consider extracting the two copies into a
-  shared helper while at it.
 - **Rename `BlockScene` → `BlockContent`:** the component no longer holds a
   scene (scene + `built_*` live on `VelloUiScene`); it's now pure build-
   bookkeeping (`content_version`/`last_built_version`/`scene_version`/`text`/

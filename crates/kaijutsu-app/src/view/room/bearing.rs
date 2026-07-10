@@ -303,7 +303,11 @@ pub fn ribbon_vertices(points: &[[f32; 3]], width: f32) -> (Vec<[f32; 3]>, Vec<u
     for i in 0..(n - 1) {
         let a = (i * 2) as u32;
         let (l0, r0, l1, r1) = (a, a + 1, a + 2, a + 3);
-        indices.extend_from_slice(&[l0, r0, l1, r0, r1, l1]);
+        // CCW viewed from +Y, matching the injected up-normals — the old
+        // `[l0, r0, l1, …]` order wound clockwise, so the geometric normal
+        // faced −Y and only `unlit + cull_mode: None` hid it (issues.md
+        // ribbon-winding entry, shipped 2026-07-10).
+        indices.extend_from_slice(&[l0, l1, r0, r0, l1, r1]);
     }
     (positions, indices)
 }
@@ -346,12 +350,18 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// board must render identically every run, so its keepout invariant is
 /// checkable in a unit test against the actual production seeds: the same
 /// `seed` always yields the same value, in `[0, 1)`.
+///
+/// The mix's top 24 bits become the mantissa: `(z >> 8) / 2^24` is exact in
+/// f32 and tops out at `(2^24 − 1)/2^24 < 1.0`. Dividing the full 32 bits by
+/// `2^32` instead looks equivalent but is NOT — for `z` near `u32::MAX` the
+/// f32 quotient rounds up to exactly 1.0, violating the half-open contract
+/// (kaibo review, 2026-07-10).
 pub fn hash01(seed: u32) -> f32 {
     let mut z = seed.wrapping_add(0x9E37_79B9);
     z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
     z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
     z ^= z >> 16;
-    (z as f32) / (u32::MAX as f32 + 1.0)
+    ((z >> 8) as f32) / ((1u32 << 24) as f32)
 }
 
 // ── Circuit-board floor routes (`shell.md`, "the floor is the wiring") ──────
@@ -386,7 +396,16 @@ pub fn route_points(
 
     let at = |r: f32, a: f32| [r * a.cos(), y, r * a.sin()];
     let mut pts = vec![at(ring_r, theta), at(lane_r - c, theta)];
-    pts.extend(arc_points(lane_r, a0, a1, arc_segments.max(1), y));
+    // A near-zero span degenerates the arc into `arc_segments + 1` identical
+    // points; `ribbon_vertices` then hits its zero-length-tangent fallback and
+    // snaps the ribbon's width onto the world X axis — a visible pinched twist
+    // at the lane radius (both kaibo reviewers, 2026-07-10). Emit one clean
+    // waypoint instead: the route reads as a straight radial stub.
+    if (a1 - a0).abs() > 1e-4 {
+        pts.extend(arc_points(lane_r, a0, a1, arc_segments.max(1), y));
+    } else {
+        pts.push(at(lane_r, theta + arc_span * 0.5));
+    }
     pts.push(at(lane_r + c, end_theta));
     pts.push(at(pad_r, end_theta));
     pts
