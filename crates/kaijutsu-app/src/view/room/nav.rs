@@ -25,7 +25,7 @@ impl Station {
         match self {
             Station::TimeWell => "TIME WELL",
             Station::PatchBay => "PATCH BAY",
-            Station::Tracks => "TRACKS",
+            Station::Tracks => "TRACKER",
             Station::Vfs => "DATA HORIZON",
             Station::Radiators => "RADIATORS",
         }
@@ -134,7 +134,7 @@ mod tests {
     fn label_table() {
         assert_eq!(Station::TimeWell.label(), "TIME WELL");
         assert_eq!(Station::PatchBay.label(), "PATCH BAY");
-        assert_eq!(Station::Tracks.label(), "TRACKS");
+        assert_eq!(Station::Tracks.label(), "TRACKER");
         assert_eq!(Station::Vfs.label(), "DATA HORIZON");
         assert_eq!(Station::Radiators.label(), "RADIATORS");
     }

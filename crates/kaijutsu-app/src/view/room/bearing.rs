@@ -229,6 +229,211 @@ pub fn dome_color(t: f32) -> [f32; 4] {
     ]
 }
 
+/// The world angle (radians, `arc_points`' convention: 0 = +X, +π/2 = +Z) a
+/// floor-plane direction points at — ties the circuit-board route bundles to
+/// the same [`Bearing::dir`] every other bearing placement reads, so a
+/// re-placed bearing can't silently drift out of sync with its floor traces.
+pub fn dir_theta(dir: [f32; 3]) -> f32 {
+    dir[2].atan2(dir[0])
+}
+
+/// Linear interpolation, `t` typically in `[0, 1]` — shared by the board's
+/// jitter ([`expand_bundle`]) and the radiator thread-strip variation
+/// (`super`).
+pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Deterministic pseudo-random unit float from an integer seed (a
+/// Murmur3-finalizer-style bit mix — no external RNG crate). The circuit
+/// board must render identically every run, so its keepout invariant is
+/// checkable in a unit test against the actual production seeds: the same
+/// `seed` always yields the same value, in `[0, 1)`.
+pub fn hash01(seed: u32) -> f32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9);
+    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
+    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
+    z ^= z >> 16;
+    (z as f32) / (u32::MAX as f32 + 1.0)
+}
+
+// ── Circuit-board floor routes (`shell.md`, "the floor is the wiring") ──────
+
+/// One route on the circuit-board floor: a radial run from the inscribed ring
+/// at angle `theta` out to a lane radius, a chamfered bend onto a concentric
+/// arc that sweeps `arc_span` radians (bowing around the console — the
+/// open-center rule, never crossing it), a mirrored bend, and a final radial
+/// run out to a terminal pad at `pad_r`. `chamfer` is a radial length (world
+/// units): both bends cut the corner this far in from the lane radius,
+/// converted to an angular offset at `lane_r` so the cut stays proportionate
+/// at any radius — a near-zero `arc_span` collapses the bends and the arc
+/// into a single straight radial spike (the violet "short stubs"). `arc_span`'s
+/// sign picks the sweep direction (the `arc_points` convention); `arc_segments`
+/// is the arc's sample density. All points sit at height `y`.
+pub fn route_points(
+    theta: f32,
+    ring_r: f32,
+    lane_r: f32,
+    arc_span: f32,
+    pad_r: f32,
+    chamfer: f32,
+    arc_segments: usize,
+    y: f32,
+) -> Vec<[f32; 3]> {
+    let dir = if arc_span >= 0.0 { 1.0 } else { -1.0 };
+    let c = chamfer.min(lane_r * 0.5).max(0.0);
+    let dtheta = (c / lane_r).min(arc_span.abs() * 0.25);
+    let a0 = theta + dir * dtheta;
+    let end_theta = theta + arc_span;
+    let a1 = end_theta - dir * dtheta;
+
+    let at = |r: f32, a: f32| [r * a.cos(), y, r * a.sin()];
+    let mut pts = vec![at(ring_r, theta), at(lane_r - c, theta)];
+    pts.extend(arc_points(lane_r, a0, a1, arc_segments.max(1), y));
+    pts.push(at(lane_r + c, end_theta));
+    pts.push(at(pad_r, end_theta));
+    pts
+}
+
+/// A cluster of routes fanning from the inscribed ring toward one compass
+/// direction, sharing a hue family and a radius/angle band — the authoring
+/// unit the rainbow board is built from (Amy, `shell.md`: "crimson toward
+/// W/E, green/cyan toward N, violet short stubs toward the diagonals").
+/// [`expand_bundle`] turns one bundle into `count` distinct routes.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteBundle {
+    /// Center departure angle (radians) the bundle fans around.
+    pub center_theta: f32,
+    /// How far the fan spreads either side of `center_theta` (radians).
+    pub spread: f32,
+    /// How many routes this bundle expands to.
+    pub count: usize,
+    /// `(min, max)` lane radius the routes' arc sweeps land at.
+    pub lane_range: (f32, f32),
+    /// `(min, max)` arc-span magnitude (radians); near-zero reads as a short
+    /// radial stub rather than a bowed sweep.
+    pub arc_range: (f32, f32),
+    /// `(min, max)` terminal-pad radius.
+    pub pad_range: (f32, f32),
+    /// Etched hue family (linear rgb, dim — LDR; `mod.rs`'s `TRACE_*` /
+    /// `RADIATOR_COLOR` constants).
+    pub hue: [f32; 3],
+    /// `(min, max)` brightness multiplier on `hue`.
+    pub brightness_range: (f32, f32),
+}
+
+/// One generated circuit-board route: the floor-plane polyline (feed straight
+/// to `ribbon_vertices`), its terminal-pad position/radius, and the etched
+/// colour (hue × brightness) — everything `mod.rs` needs to spawn the ribbon
+/// and its pad.
+#[derive(Debug, Clone)]
+pub struct BoardRoute {
+    pub points: Vec<[f32; 3]>,
+    pub pad_pos: [f32; 3],
+    pub pad_radius: f32,
+    pub hue: [f32; 3],
+    pub width_scale: f32,
+    pub brightness_scale: f32,
+}
+
+/// Expand a [`RouteBundle`] into its `count` routes — deterministic per
+/// `(bundle, seed_base)`: route `i` draws its jitter from
+/// `hash01(seed_base + i*8 + {0..=6})`, so re-running with the same inputs
+/// always produces the same board (no runtime randomness — the floor is
+/// procedural, not decorative). Sweep direction alternates by index so a
+/// bundle fans both ways around its center, not just one way. `ring_r` (the
+/// inscribed-ring departure radius), `chamfer`, `arc_segments`, `y`, and
+/// `pad_disc_range` are board-wide and shared across every bundle.
+pub fn expand_bundle(
+    bundle: &RouteBundle,
+    ring_r: f32,
+    chamfer: f32,
+    arc_segments: usize,
+    y: f32,
+    pad_disc_range: (f32, f32),
+    seed_base: u32,
+) -> Vec<BoardRoute> {
+    (0..bundle.count)
+        .map(|i| {
+            let s = seed_base.wrapping_add(i as u32 * 8);
+            let theta = bundle.center_theta + (hash01(s) * 2.0 - 1.0) * bundle.spread;
+            let lane = lerp(bundle.lane_range.0, bundle.lane_range.1, hash01(s + 1));
+            let arc_mag = lerp(bundle.arc_range.0, bundle.arc_range.1, hash01(s + 2));
+            let arc_span = if i % 2 == 0 { arc_mag } else { -arc_mag };
+            let pad_r = lerp(bundle.pad_range.0, bundle.pad_range.1, hash01(s + 3));
+            let width_scale = lerp(0.5, 1.2, hash01(s + 4));
+            let brightness_scale =
+                lerp(bundle.brightness_range.0, bundle.brightness_range.1, hash01(s + 5));
+            let pad_radius = lerp(pad_disc_range.0, pad_disc_range.1, hash01(s + 6));
+            let points =
+                route_points(theta, ring_r, lane, arc_span, pad_r, chamfer, arc_segments, y);
+            let pad_pos = *points.last().expect("route_points always yields >= 2 points");
+            BoardRoute { points, pad_pos, pad_radius, hue: bundle.hue, width_scale, brightness_scale }
+        })
+        .collect()
+}
+
+// ── Floor gradient mesh ──────────────────────────────────────────────────────
+
+/// Flat disc mesh vertices in mesh-local XY, `[0,0,1]`-normal convention (the
+/// same local space Bevy's own `Circle` mesh builds in — `mod.rs` rotates it
+/// into the room's XZ floor plane, the same trick the old flat floor used): a
+/// center point plus `rings` concentric rings of `segments` points, and the
+/// fan/strip triangle indices between them (CCW winding, matching Bevy's
+/// `Circle`/`Ellipse` mesh convention, so the front face keeps pointing +Z
+/// pre-rotation). Geometry only — [`floor_color`] turns a vertex's radius
+/// fraction into the radial gradient `mod.rs` bakes into
+/// `Mesh::ATTRIBUTE_COLOR` (the `dome_mesh`/`dome_color` idiom, applied to the
+/// floor).
+pub fn disc_vertices(radius: f32, rings: usize, segments: usize) -> (Vec<[f32; 3]>, Vec<u32>) {
+    let rings = rings.max(1);
+    let segments = segments.max(3);
+    let mut positions = vec![[0.0, 0.0, 0.0]];
+    for ring in 1..=rings {
+        let r = radius * ring as f32 / rings as f32;
+        for seg in 0..segments {
+            let a = seg as f32 / segments as f32 * core::f32::consts::TAU;
+            positions.push([r * a.cos(), r * a.sin(), 0.0]);
+        }
+    }
+    let mut indices = Vec::new();
+    // Center fan → first ring.
+    for seg in 0..segments {
+        let a = 1 + seg;
+        let b = 1 + (seg + 1) % segments;
+        indices.extend_from_slice(&[0, a as u32, b as u32]);
+    }
+    // Quad strips between consecutive rings.
+    for ring in 1..rings {
+        let base0 = 1 + (ring - 1) * segments;
+        let base1 = 1 + ring * segments;
+        for seg in 0..segments {
+            let a0 = (base0 + seg) as u32;
+            let a1 = (base0 + (seg + 1) % segments) as u32;
+            let b0 = (base1 + seg) as u32;
+            let b1 = (base1 + (seg + 1) % segments) as u32;
+            indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+        }
+    }
+    (positions, indices)
+}
+
+/// Floor radial gradient: linear-rgba vertex colour for a floor vertex whose
+/// radius fraction is `t` (0 = center, under the table's glow; 1 = the rim).
+/// A warm charcoal pool at center fades to the near-black rim — all LDR, the
+/// floor never blooms. **Amy-tunable.**
+pub fn floor_color(t: f32) -> [f32; 4] {
+    const CENTER: [f32; 3] = [0.055, 0.042, 0.030];
+    const RIM: [f32; 3] = [0.012, 0.015, 0.024];
+    let t = t.clamp(0.0, 1.0);
+    [
+        CENTER[0] + (RIM[0] - CENTER[0]) * t,
+        CENTER[1] + (RIM[1] - CENTER[1]) * t,
+        CENTER[2] + (RIM[2] - CENTER[2]) * t,
+        1.0,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +578,171 @@ mod tests {
         assert!(lum(apex) < lum(rim), "apex overhead is the darkest");
         assert!(lum(rim) < 1.0, "never blooms — the vault stays calm LDR");
         assert_eq!(rim[3], 1.0, "opaque");
+    }
+
+    // ── dir_theta / lerp / hash01 ──
+
+    #[test]
+    fn dir_theta_matches_the_cardinal_bearings() {
+        assert!(dir_theta(Bearing::East.dir()).abs() < 1e-6);
+        assert!(
+            (dir_theta(Bearing::North.dir()) - (-core::f32::consts::FRAC_PI_2)).abs() < 1e-6
+        );
+        assert!((dir_theta(Bearing::South.dir()) - core::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert!((dir_theta(Bearing::West.dir()).abs() - core::f32::consts::PI).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lerp_interpolates_between_endpoints() {
+        assert_eq!(lerp(10.0, 20.0, 0.0), 10.0);
+        assert_eq!(lerp(10.0, 20.0, 1.0), 20.0);
+        assert_eq!(lerp(10.0, 20.0, 0.5), 15.0);
+    }
+
+    #[test]
+    fn hash01_is_deterministic_and_stays_in_unit_range() {
+        for seed in [0u32, 1, 42, 1000, u32::MAX] {
+            let a = hash01(seed);
+            let b = hash01(seed);
+            assert_eq!(a, b, "same seed, same value");
+            assert!((0.0..1.0).contains(&a), "hash01({seed}) = {a} out of [0,1)");
+        }
+    }
+
+    #[test]
+    fn hash01_varies_across_seeds() {
+        let vals: Vec<f32> = (0..8).map(hash01).collect();
+        let all_same = vals.windows(2).all(|w| w[0] == w[1]);
+        assert!(!all_same, "distinct seeds should not all collide: {vals:?}");
+    }
+
+    // ── route_points ──
+
+    #[test]
+    fn route_points_starts_at_the_ring_and_ends_at_the_pad() {
+        let pts = route_points(0.0, 230.0, 400.0, 0.6, 700.0, 18.0, 12, 0.6);
+        let first = pts.first().unwrap();
+        let last = pts.last().unwrap();
+        let r = |p: &[f32; 3]| (p[0] * p[0] + p[2] * p[2]).sqrt();
+        assert!((r(first) - 230.0).abs() < 1e-3, "starts on the ring: {first:?}");
+        assert!((r(last) - 700.0).abs() < 1e-3, "ends on the pad: {last:?}");
+        assert!(pts.iter().all(|p| p[1] == 0.6), "every point at the given height");
+    }
+
+    #[test]
+    fn route_points_stays_outside_the_keepout_when_ring_and_lane_clear_it() {
+        const KEEPOUT: f32 = 150.0;
+        for arc_span in [-0.8, -0.1, 0.0, 0.1, 0.8] {
+            let pts = route_points(0.4, 230.0, 350.0, arc_span, 600.0, 18.0, 10, 0.6);
+            for p in &pts {
+                let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+                assert!(
+                    r > KEEPOUT,
+                    "route point at r={r} crosses the console keep-out (arc_span={arc_span})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn route_points_positive_and_negative_arc_span_sweep_opposite_ways() {
+        let pos = route_points(0.0, 230.0, 400.0, 0.8, 700.0, 18.0, 8, 0.0);
+        let neg = route_points(0.0, 230.0, 400.0, -0.8, 700.0, 18.0, 8, 0.0);
+        assert!(pos.last().unwrap()[2] > 0.0, "positive arc_span sweeps toward +Z");
+        assert!(neg.last().unwrap()[2] < 0.0, "negative arc_span sweeps toward -Z");
+    }
+
+    // ── RouteBundle / expand_bundle ──
+
+    fn sample_bundle() -> RouteBundle {
+        RouteBundle {
+            center_theta: 0.7,
+            spread: 0.5,
+            count: 9,
+            lane_range: (240.0, 700.0),
+            arc_range: (0.0, 0.9),
+            pad_range: (300.0, 950.0),
+            hue: [0.3, 0.05, 0.1],
+            brightness_range: (0.7, 1.2),
+        }
+    }
+
+    #[test]
+    fn expand_bundle_yields_the_requested_count() {
+        let routes = expand_bundle(&sample_bundle(), 230.0, 18.0, 10, 0.6, (6.0, 14.0), 1000);
+        assert_eq!(routes.len(), 9);
+    }
+
+    #[test]
+    fn expand_bundle_is_deterministic() {
+        let a = expand_bundle(&sample_bundle(), 230.0, 18.0, 10, 0.6, (6.0, 14.0), 42);
+        let b = expand_bundle(&sample_bundle(), 230.0, 18.0, 10, 0.6, (6.0, 14.0), 42);
+        assert_eq!(a.len(), b.len());
+        for (ra, rb) in a.iter().zip(b.iter()) {
+            assert_eq!(ra.points, rb.points, "same seed, same board");
+            assert_eq!(ra.pad_radius, rb.pad_radius);
+            assert_eq!(ra.brightness_scale, rb.brightness_scale);
+        }
+    }
+
+    #[test]
+    fn expand_bundle_pad_radius_stays_in_the_requested_disc_range() {
+        for r in expand_bundle(&sample_bundle(), 230.0, 18.0, 10, 0.6, (6.0, 14.0), 7) {
+            assert!(
+                (6.0..=14.0).contains(&r.pad_radius),
+                "pad radius {} out of range",
+                r.pad_radius
+            );
+        }
+    }
+
+    #[test]
+    fn expand_bundle_every_generated_route_clears_the_keepout() {
+        // The concrete invariant the whole board leans on: no matter how the
+        // per-route jitter lands, every point of every generated route stays
+        // outside the console keep-out (`shell.md`'s open-center rule).
+        const KEEPOUT: f32 = 150.0;
+        for route in expand_bundle(&sample_bundle(), 230.0, 18.0, 10, 0.6, (6.0, 14.0), 99) {
+            for p in &route.points {
+                let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+                assert!(r > KEEPOUT, "route point at r={r} crosses the console keep-out");
+            }
+        }
+    }
+
+    // ── disc_vertices / floor_color ──
+
+    #[test]
+    fn disc_vertices_counts_match_rings_and_segments() {
+        let (pos, idx) = disc_vertices(500.0, 6, 24);
+        assert_eq!(pos.len(), 1 + 6 * 24, "center + rings*segments");
+        assert_eq!(idx.len(), 3 * 24 * (2 * 6 - 1), "fan + strip triangles");
+        assert!(idx.iter().all(|&i| (i as usize) < pos.len()), "every index in range");
+    }
+
+    #[test]
+    fn disc_vertices_outer_ring_sits_on_the_radius() {
+        let (pos, _) = disc_vertices(500.0, 4, 16);
+        for p in pos.iter().skip(1 + 3 * 16) {
+            let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            assert!((r - 500.0).abs() < 1e-2, "outer ring point at r={r}");
+        }
+    }
+
+    #[test]
+    fn disc_vertices_rejects_degenerate_inputs_by_flooring_them() {
+        let (pos, idx) = disc_vertices(100.0, 0, 1);
+        assert_eq!(pos.len(), 1 + 3, "rings floored to 1, segments floored to 3");
+        assert!(!idx.is_empty());
+    }
+
+    #[test]
+    fn floor_color_pools_warm_at_center_and_fades_to_near_black_at_the_rim() {
+        let center = floor_color(0.0);
+        let rim = floor_color(1.0);
+        let lum = |c: [f32; 4]| c[0] + c[1] + c[2];
+        assert!(lum(center) > lum(rim), "center pools brighter than the rim");
+        assert!(lum(center) < 1.0, "never blooms — the floor stays calm LDR");
+        assert_eq!(center[3], 1.0, "opaque");
     }
 }
