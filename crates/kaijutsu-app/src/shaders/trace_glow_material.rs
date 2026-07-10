@@ -13,10 +13,11 @@
 //!   glides along `uv.x` (`bearing::ribbon_vertices`'s cumulative-arclength
 //!   parametrization, or a length-tracking quad UV — `room::glow_quad_mesh`)
 //!   while the rest of the element rests at `trough`.
-//! - **mode 1 — breathing** (terminal pads, the inscribed ring, the W dais
-//!   bezel): a slow uniform sine breath, ignoring `uv` entirely — safe on
-//!   primitives with their own UV convention (`Torus`, `Annulus`) that this
-//!   material never has to match.
+//! - **mode 1 — breathing** (terminal pads, the inscribed ring): a slow
+//!   uniform sine breath, ignoring `uv` entirely — safe on primitives with
+//!   their own UV convention (`Torus`, `Annulus`) that this material never
+//!   has to match. (The W dais bezel was a user until the wheel wall-mounted
+//!   and the dais retired, 2026-07-10.)
 //!
 //! `color` may carry brightness above 1.0 at the crest/breath's peak — the
 //! app camera's threshold-1.0 bloom pass (`main::setup_camera`) haloes it
@@ -31,8 +32,7 @@ use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
 /// Material for one glowing decoration element: a floor-trace ribbon, a
-/// terminal pad disc, an inscribed-ring annulus, a wall-trim strip, or the W
-/// dais bezel torus.
+/// terminal pad disc, an inscribed-ring annulus, or a wall-trim strip.
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct TraceGlowMaterial {
     /// Crest hue: linear rgb in `.xyz`, renormalized so its brightest channel
