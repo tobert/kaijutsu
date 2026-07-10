@@ -524,6 +524,23 @@ three days that took the first station from spec to a finished instrument.
   the dais agreement lives in the palette module where neither file can
   drift from the other silently.
 
+- **Walls become screens, and a state dies (July 10, evening).** Amy kept
+  pulling the same thread: mount the patch wheel ON the wall instead of in
+  front of it (a transform edit — the placement seam's third re-placement,
+  though typography taught us the one thing a similarity transform can't
+  right is which way text reads); then "we could almost drop the dive if
+  the walls were 16:9 and you could fullscreen them." She was right, and
+  the payoff was structural: with fullscreen as a camera pose plus a zoom
+  field inside the one Room state, `Screen::PatchBay` dissolved — and with
+  it the entire dive-exit lifecycle machinery, including the leak fix
+  built that same morning. The careful teardown special-casing lived one
+  day, replaced by a design in which the bug cannot exist. Bounded
+  stations are now panel content (the wheel owns the W panel at 82% of
+  its height; the tracker's falling notes and the radiators' message
+  walls are born screens); only worlds too big for the room — the fsn
+  landscape — keep a true dive-through door. Deleting a state to delete
+  a bug class is the day's best trade.
+
 ## Now
 
 As of 2026-07-10: the kernel-interior scene family is live and furnished —
