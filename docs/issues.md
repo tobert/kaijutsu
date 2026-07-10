@@ -331,6 +331,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Shell: drift-layer representation — design question** (Amy, 2026-07-10):
+  the aurora placeholder is PAUSED. shell.md's "air carries drift" stands,
+  but before building anything decide *what information* rides the air and
+  whether the render is aurora arcs at all — Amy is weighing a point cloud
+  with behavior responsive to kernel activity ("lots of cool options") over
+  a scripted-pretty arc. Revisit with a couple of concrete candidates
+  (blocks in flight, mailbox depth, drift routes?) before spawning geometry.
+- **Shell: nameplates fade toward tooltip/debug over time** (Amy,
+  2026-07-10): labels stay boring on purpose (TRACKER, not RHYTHM GATE) —
+  the intent is that as real detail fills the stations in, the engraved
+  plates recede: dimmer with familiarity, eventually maybe tooltip-only or a
+  debug toggle. Keep this in mind before investing further in plate polish.
 - **Patch bay: extract shared wire-geometry helper** (deepseek review,
   2026-07-09): `selected_chord_apex` re-derives the group→seat→angle→chord
   pipeline that `rebuild_patch_scene` also computes (identical today,
