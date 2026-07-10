@@ -19,6 +19,7 @@ pub mod fieldset;
 pub mod format;
 pub mod lifecycle;
 pub mod overlay;
+pub mod palette;
 pub mod patch_bay;
 pub mod render;
 pub mod room;
