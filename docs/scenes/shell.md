@@ -92,6 +92,14 @@ plumbing** (station-to-station system flows — audio routing first,
 broker/tool traffic later if it earns a hue). At rest a trace is an LDR
 engraving; it lights HDR and runs only while its flow is live.
 
+**Faint-glow amendment (Amy, 2026-07-10):** decoration may carry a *faint,
+slowly moving* glow — a traveling crest or slow breath whose peak just
+crosses the bloom threshold (capped at `palette::GLOW_CREST`) while the
+time-average stays comfortably LDR. The concepts' boards shimmer; a
+dead-static etching read as unfinished, not calm. Strong *sustained* HDR
+remains reserved for live activity — the tiering rule still holds, the
+floor just breathes under it.
+
 ## Ambient telemetry rules
 
 The shell's entire job at rest is glanceable truth, under the charter's
@@ -117,7 +125,20 @@ budget discipline:
   projectile.) Content
   rides the same kernel-wide event stream as everything else — candidates:
   per-track beat/token sparklines, the selected context's tail, a model's
-  output streaming as it generates.
+  output streaming as it generates. Since the octagon rebuild the radiators
+  ARE the four diagonal wall panels ("the surface gets taken over by its
+  content").
+- **First real radiator content candidate — a message wall** (Amy,
+  2026-07-10): one diagonal panel renders **MSDF text, messages flowing
+  through** — recent block/drift traffic as a scrolling violet ticker, the
+  newest line carrying the HDR bloom trail. Everything it needs exists:
+  the MSDF panel pipeline (`create_msdf_panel`/`MsdfBlockGlyphs` — plates,
+  cards, and the editor already render text-to-texture on 3D quads; a wall
+  panel is just a bigger quad), the kernel-wide event stream (already
+  ingested by `ingest_room_activity`), and cheap motion (commit glyphs
+  event-driven, scroll UVs in the shader — no per-frame relayout). A
+  natural next wave after the trace-glow layer proves the moving-shader
+  idiom on the walls.
 - The shell never loads station detail. Dives cut to dedicated scenes
   (charter dive-through rule); Esc returns to the room, camera continuity
   both ways.

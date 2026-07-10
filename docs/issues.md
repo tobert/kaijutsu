@@ -331,6 +331,11 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Shell: message-wall radiator** (Amy, 2026-07-10): one diagonal octagon
+  panel renders MSDF text — messages flowing through (block/drift traffic
+  as a scrolling violet ticker, newest line blooms). Design + buildability
+  notes in shell.md "Ambient telemetry rules"; rides the existing MSDF
+  panel pipeline + event stream. Good next wave after trace-glow ships.
 - **Shell: drift-layer representation — design question** (Amy, 2026-07-10):
   the aurora placeholder is PAUSED. shell.md's "air carries drift" stands,
   but before building anything decide *what information* rides the air and
