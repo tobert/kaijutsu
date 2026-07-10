@@ -243,12 +243,24 @@ const ETCH_TICK_WIDTH: f32 = 2.4;
 
 /// Per-socket port labels — the PRIMARY rim text: bright, inner, floating just
 /// above each peg (`docs/scenes/patchbay.md` socket grammar: RENDER, SYNTH…).
-const PORT_LABEL_R: f32 = RIM_R * 1.02;
-/// Amy-tunable: raised from 50.0 — a rim-edge seat (tangent nearly radial to
-/// `PB_CAM_POS`) let this collide with the group nameplate below it. The two
-/// text tiers must not overlap in projection from the fixed camera at any
-/// seat angle; nudge this (and `GROUP_PLATE_Y`/`GROUP_PLATE_R` below) if they
-/// still do.
+/// Amy-tunable: nudged out from the pre-wall-mount `RIM_R * 1.02` (2026-07-10,
+/// wall-mount text fix) — every label now shares ONE fixed rotation
+/// ([`upright_wall_facing`]) instead of a per-seat camera billboard, so its
+/// width runs along the SAME world axis at every seat instead of always
+/// tangent to the rim. At the two seats where that shared axis happens to
+/// line up with the radius rather than the rim's tangent, a label centered
+/// right at the rim would hang roughly half its width back over the pegs and
+/// etch ticks; parking it a label-half-width-plus-margin past `RIM_R` clears
+/// that worst case (`PORT_LABEL_W`'s own half-width folds straight into the
+/// constant so the two stay in lockstep). `GROUP_PLATE_R` below already
+/// cleared this same worst case at its old value, so it's untouched — only
+/// its margin against this now-wider ring is a residual, seat-dependent risk
+/// worth a visual check.
+const PORT_LABEL_R: f32 = RIM_R + PORT_LABEL_W / 2.0 + 20.0;
+/// How far this floats proud of the wall face (local Y — the wall's own
+/// depth axis once mounted, [`STATION_W_PLACEMENT`]'s doc). Raised from 50.0
+/// pre-mount so it never sits flush with the group nameplate at the same
+/// depth.
 const PORT_LABEL_Y: f32 = 64.0;
 const PORT_LABEL_W: f32 = 108.0;
 /// Height keeps the shared plate texture's aspect so the glyphs don't stretch.
@@ -257,9 +269,12 @@ const PORT_LABEL_H: f32 =
 const PORT_LABEL_DIM: f32 = 1.0;
 /// Client group nameplates — the SUPPORTING layer: dimmer and further out than
 /// the port labels, so the two text tiers read as hierarchy, not noise.
-/// Amy-tunable: pushed further out (1.22 → 1.32) and lower (34.0 → 16.0) for
-/// the same reason as `PORT_LABEL_Y` above — the two text tiers must not
-/// overlap in projection from the fixed camera at any seat angle.
+const GROUP_PLATE_W: f32 = 150.0;
+const GROUP_PLATE_H: f32 = 44.0;
+/// Pushed out (1.22 → 1.32, pre-wall-mount) and never re-tuned for the
+/// wall-mount text fix: at 1.32 it already clears `RIM_R` by more than its own
+/// half-width even at a worst-case radial-aligned seat, the same bar
+/// `PORT_LABEL_R` above was nudged to meet.
 const GROUP_PLATE_R: f32 = RIM_R * 1.32;
 const GROUP_PLATE_Y: f32 = 16.0;
 const GROUP_PLATE_DIM: f32 = 0.5;
@@ -287,10 +302,15 @@ fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
 /// The dive camera's room-space `(eye, look-at)` — the local [`PB_CAM_POS`] /
 /// [`PB_CAM_LOOK`] carried through [`STATION_W_PLACEMENT`]. `ease_shell_camera`
 /// glides to this while `Screen::PatchBay`, so descending onto the
-/// wall-mounted wheel frames it exactly as the standalone scene did (a
-/// similarity transform preserves the camera→scene angles, so the baked
-/// `face_camera` plate facing still points at the world eye) — the dive
-/// reads as walking up to a wall instrument, not floating over a tabletop.
+/// wall-mounted wheel frames it exactly as the standalone scene did — the
+/// dive reads as walking up to a wall instrument, not floating over a
+/// tabletop. Text plates no longer chase this eye at all (the live-found
+/// regression this superseded: a rotation baked to face `PB_CAM_POS` in the
+/// scene's PRE-mount local frame reads sideways/upside-down once the mount
+/// pitches and yaws that frame onto the wall, because local "up" no longer
+/// survives the mount) — every plate now bakes the single fixed
+/// [`upright_wall_facing`] rotation instead, which reads square and upright
+/// from any eye standing out along the wall's normal, this one included.
 pub(crate) fn dive_camera_pose() -> (Vec3, Vec3) {
     (
         placement_to_room(&STATION_W_PLACEMENT, PB_CAM_POS),
@@ -848,8 +868,10 @@ fn rebuild_patch_scene(
         ));
 
         // Port label: the primary rim text, bright and inner, floating above
-        // the peg and facing the fixed camera. Text is committed once the font
-        // loads by `fill_port_labels`.
+        // the peg with the shared upright wall-facing (`upright_wall_facing`),
+        // never rotated to its seat angle — reads like a numeral painted
+        // upright on a clock face, not laid along the radius. Text is
+        // committed once the font loads by `fill_port_labels`.
         if let Some(ep) = state.snapshot.endpoints.get(seat.endpoint_index) {
             let count = port_counts.get(&ep.client_id).copied().unwrap_or(1);
             let text = socket_label(&ep.client_name, &ep.port_name, count, ep.port_id);
@@ -878,7 +900,7 @@ fn rebuild_patch_scene(
                 PatchBayLod,
                 Mesh3d(mesh),
                 MeshMaterial3d(material),
-                face_camera(pos),
+                upright_plate(pos),
                 Visibility::Hidden,
                 panel,
                 Name::new("PortLabel"),
@@ -888,8 +910,9 @@ fn rebuild_patch_scene(
     }
 
     // Group nameplates: the supporting layer — dimmer and further out than the
-    // port labels, facing the fixed camera. `layout_sockets` emits exactly one
-    // label per group, same order as `groups`.
+    // port labels, sharing the SAME upright wall-facing as every other wheel
+    // plate (never rotated to its seat angle). `layout_sockets` emits exactly
+    // one label per group, same order as `groups`.
     debug_assert_eq!(labels.len(), groups.len(), "layout_sockets: one label per group");
     for (i, label) in labels.iter().enumerate() {
         // A single-port client whose lone port label already reads the same
@@ -906,7 +929,7 @@ fn rebuild_patch_scene(
         }
         let (s, c) = label.angle.sin_cos();
         let pos = Vec3::new(GROUP_PLATE_R * c, GROUP_PLATE_Y, GROUP_PLATE_R * s);
-        let mesh = meshes.add(Rectangle::new(150.0, 44.0));
+        let mesh = meshes.add(Rectangle::new(GROUP_PLATE_W, GROUP_PLATE_H));
         let (image, panel) = create_msdf_panel(
             &mut images,
             crate::view::room::PLATE_TEX_W as u32,
@@ -930,7 +953,7 @@ fn rebuild_patch_scene(
             PatchBayLod,
             Mesh3d(mesh),
             MeshMaterial3d(material),
-            face_camera(pos),
+            upright_plate(pos),
             Visibility::Hidden,
             panel,
             Name::new(format!("GroupPlate-{}", label.client_name)),
@@ -1029,9 +1052,10 @@ fn pulse_render_chords(
 }
 
 /// Bloom the inspection card onto the selected chord's apex (its arc midpoint,
-/// lifted), facing the fixed camera — recomputed whenever the selection or the
-/// graph changes. With no drawable chord (no wires, or an endpoint filtered
-/// away) it falls back to the edge pose the "NO WIRES" text lives at.
+/// lifted), with the shared upright wall-facing — recomputed whenever the
+/// selection or the graph changes. With no drawable chord (no wires, or an
+/// endpoint filtered away) it falls back to the edge pose the "NO WIRES" text
+/// lives at.
 fn position_info_plate(
     state: Res<PatchBayState>,
     mut plate: Query<&mut Transform, With<InfoPlate>>,
@@ -1045,10 +1069,7 @@ fn position_info_plate(
     let target = selected_chord_apex(&state.snapshot, state.selected)
         .map(|apex| apex + Vec3::Y * INFO_PLATE_LIFT)
         .unwrap_or(INFO_EDGE_POS);
-    // Camera is static — orient once here, no per-frame billboarding. `looking_at`
-    // a point mirrored past the plate turns its +Z face toward the camera (same
-    // idiom as `plate_bundle`).
-    *tf = Transform::from_translation(target).looking_at(target * 2.0 - PB_CAM_POS, Vec3::Y);
+    *tf = upright_plate(target);
 }
 
 /// Fill/refresh every text plate when dirty (same async-font gate as the
@@ -1377,17 +1398,39 @@ fn layout_info_text(
 
 // ── Plate + ribbon helpers ──────────────────────────────────────────────────
 
-/// Orient a plate at `pos` so its readable face points at the **fixed**
-/// patch-bay camera. `PB_CAM_POS` never moves in this scene, so we bake the
-/// facing once at spawn — no per-frame billboard system. A `Rectangle` faces
-/// +Z; aiming its forward (-Z) at `2·pos − PB_CAM_POS` swings +Z back toward
-/// the eye, keeping every rim plate square-on instead of edge-on at tangent
-/// angles (the unreadable-nameplate fix, `docs/scenes/patchbay.md`).
-fn face_camera(pos: Vec3) -> Transform {
-    Transform::from_translation(pos).looking_at(pos * 2.0 - PB_CAM_POS, Vec3::Y)
+/// The shared rotation every wheel text plate bakes at spawn (or re-pose,
+/// [`position_info_plate`]) instead of the old per-position camera billboard
+/// (`face_camera`, deleted 2026-07-10 — the live-found regression: a rotation
+/// baked to face `PB_CAM_POS` in the scene's PRE-mount local frame reads
+/// sideways/upside-down once [`STATION_W_PLACEMENT`] pitches and yaws that
+/// frame onto the wall, because local "up" no longer survives the mount).
+/// Constant, not position-dependent: the wheel is one flat mounted plane, so
+/// every plate on it shares a single facing — unlike the old horizontal
+/// table, where a fixed off-axis camera needed a per-position billboard to
+/// square each label toward the eye.
+///
+/// A `Rectangle` mesh lies flat in the local XY-plane, its readable face
+/// toward local +Z and its texture-up along local +Y (the same convention
+/// `face_camera` used to name). This sends that face to the wheel's own local
+/// +Y — which [`placement_rotation`] carries to world +X, out of the wall and
+/// into the room, the SAME target [`STATION_W_PLACEMENT`]'s doc derives for
+/// the table's own normal — and the texture-up to the wheel's local +Z, which
+/// placement carries to world +Y, screen-up. Locked ±1e-5 by the axis tests
+/// below (trust the tests over this prose if the two ever disagree).
+fn upright_wall_facing() -> Quat {
+    Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_y(std::f32::consts::PI)
 }
 
-/// A floating MSDF text plate facing the patch-bay camera (borderless,
+/// A plate transform at `pos` using the shared [`upright_wall_facing`]
+/// rotation — the direct replacement for the old `face_camera(pos)` at every
+/// text-bearing site on the wheel (port labels, group nameplates, title,
+/// legend, the inspection card). Position is untouched by the wall-mount text
+/// fix; only the in-plane rotation changed.
+fn upright_plate(pos: Vec3) -> Transform {
+    Transform::from_translation(pos).with_rotation(upright_wall_facing())
+}
+
+/// A floating MSDF text plate with the shared upright wall-facing (borderless,
 /// label-style; text committed later by [`fill_patch_text`]). Spawned
 /// `Visibility::Hidden`: every caller (title/legend/info) is the dive LOD, shown
 /// only while dived by `apply_patch_lod`, so the room-scale ambient stays
@@ -1421,7 +1464,7 @@ fn plate_bundle(
     (
         Mesh3d(mesh),
         MeshMaterial3d(material),
-        face_camera(pos),
+        upright_plate(pos),
         Visibility::Hidden,
         panel,
     )
@@ -1595,6 +1638,48 @@ mod tests {
         // face — never world −Y (which would hang the wheel upside down).
         let mapped = placement_to_room(&w_rotation_only(), Vec3::Z);
         assert!((mapped - Vec3::Y).length() < 1e-5, "{mapped:?}");
+    }
+
+    // -- upright_wall_facing (the shared text-orientation recipe) -------
+    //
+    // The live-found regression this fixes: every wheel text plate baked its
+    // facing against the scene's PRE-mount local frame (`face_camera`,
+    // deleted), so mounting the wheel on the wall left every label sideways,
+    // diagonal, or upside down. These tests carry the plate rotation THROUGH
+    // `placement_rotation(&STATION_W_PLACEMENT)`, the same way a real plate's
+    // world orientation is built (root's own transform is identity, so a
+    // plate's world rotation is exactly `placement_rotation * plate_rotation`).
+
+    #[test]
+    fn upright_wall_facing_sends_the_plate_normal_toward_the_room() {
+        // The mesh's readable face (local +Z, `face_camera`'s old convention)
+        // must land on world +X once the mount carries it off the wall — the
+        // SAME target `STATION_W_PLACEMENT`'s own doc derives for the table's
+        // normal, so a plate reads square-on to a viewer standing in the room.
+        let world_normal = placement_rotation(&STATION_W_PLACEMENT) * (upright_wall_facing() * Vec3::Z);
+        assert!((world_normal - Vec3::X).length() < 1e-5, "{world_normal:?}");
+    }
+
+    #[test]
+    fn upright_wall_facing_sends_the_text_up_axis_to_world_up() {
+        // The mesh's texture-up (local +Y) must land on world +Y — screen-
+        // upright text, the whole point of the fix.
+        let world_up = placement_rotation(&STATION_W_PLACEMENT) * (upright_wall_facing() * Vec3::Y);
+        assert!((world_up - Vec3::Y).length() < 1e-5, "{world_up:?}");
+    }
+
+    #[test]
+    fn upright_wall_facing_sends_the_plate_width_axis_into_the_wheels_own_horizontal() {
+        // The mesh's own width axis (local +X, the direction text reads
+        // across) lands back on the wheel's own local X (sign aside — a
+        // label's width is symmetric about its center) — the SAME local axis
+        // every rim socket's `RIM_R * cos(angle)` position is built from.
+        // `PORT_LABEL_R`'s doc leans on this: a label's width always runs
+        // along this one fixed axis, so at the two seats where it happens to
+        // be the RADIUS rather than the rim's tangent, the label overhangs
+        // toward the center instead of sliding along the rim.
+        let mapped = upright_wall_facing() * Vec3::X;
+        assert!((mapped.abs() - Vec3::X).length() < 1e-5, "{mapped:?}");
     }
 
     #[test]
