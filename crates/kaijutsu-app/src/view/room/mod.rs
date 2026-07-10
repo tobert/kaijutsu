@@ -78,8 +78,11 @@ const ROOM_BG: Color = Color::srgb(0.020, 0.026, 0.044);
 /// Floor disc radius (world units); comfortably past the wall stations so the
 /// room reads as a chamber, not a platform.
 const FLOOR_RADIUS: f32 = 1100.0;
-/// Dark floor colour (linear rgb).
-const FLOOR_COLOR: [f32; 3] = [0.016, 0.020, 0.032];
+/// Floor mesh resolution ([`bearing::disc_vertices`]): concentric rings ×
+/// angular segments. Coarse enough to stay cheap, fine enough that the radial
+/// gradient ([`bearing::floor_color`]) reads smooth, not banded.
+const FLOOR_RINGS: usize = 14;
+const FLOOR_SEGMENTS: usize = 64;
 
 /// Enclosing vault-dome radius. Must exceed **every** camera distance (the
 /// pulled-back overview sits ~1630 out) so the camera stays *inside* the dome
@@ -110,6 +113,21 @@ const MARKER_HEIGHT: f32 = 260.0;
 /// tall enough to read as "reserved, not vanished."
 const MARKER_HEIGHT_RESERVED: f32 = MARKER_HEIGHT / 3.0;
 
+// ── Pylon furniture (Amy-tunable) ────────────────────────────────────────────
+
+/// Every bearing pylon gets a wider low plinth grounding it to the floor.
+const PYLON_PLINTH_WIDTH: f32 = MARKER_WIDTH * 2.4;
+const PYLON_PLINTH_HEIGHT: f32 = 18.0;
+/// A gold cap slab crowns every BUILT station's pylon ([`wants_gold_cap`]).
+/// The reserved South marker gets a plinth only — it stays humble, a stub for
+/// a station that doesn't exist yet, not dressed like one that does.
+const PYLON_CAP_WIDTH: f32 = MARKER_WIDTH * 1.6;
+const PYLON_CAP_HEIGHT: f32 = 14.0;
+const PYLON_PLINTH_COLOR: [f32; 3] = TABLE_COLOR;
+/// Cap brightness — the same gold family/weight as the table rim and console
+/// rings, so every gold accent in the room reads as one hue.
+const PYLON_CAP_GOLD_LDR: f32 = 0.50;
+
 /// Nameplate quad (world units) and its texture (logical px) — the well's plate
 /// grammar, kept API-compatible for the patch bay's own plates.
 const PLATE_QUAD_W: f32 = 210.0;
@@ -134,6 +152,32 @@ const CONSOLE_LDR: f32 = 0.60;
 /// Chatter gain: `activity(Center)` (0..1) → this much HDR lift on the console.
 const CONSOLE_CHATTER_GAIN: f32 = 2.2;
 
+// ── Well table (Amy: "MORE SOLIDNESS" — heavy furniture, not hologram) ──────
+
+/// The table the console rings hover above: a chunky tabletop, a gold rim,
+/// a narrower pedestal, and a wide low plinth grounding it all to the floor.
+/// `enter_room` shifts every [`CONSOLE_RINGS`] entry up by `TABLE_TOP_Y` so
+/// the ring stack floats above the top face — the rings' material,
+/// [`ConsoleEmblem`], and the chatter glow are untouched.
+const TABLE_TOP_Y: f32 = 70.0;
+const TABLE_RADIUS: f32 = 120.0;
+const TABLE_THICKNESS: f32 = 14.0;
+/// Gold rim torus at the tabletop's edge.
+const TABLE_RIM_MINOR: f32 = 7.0;
+/// Pedestal — narrower than the tabletop, rising from the plinth.
+const TABLE_PEDESTAL_RADIUS: f32 = 55.0;
+/// Plinth — wider than the tabletop, grounding it to the floor. Sized to
+/// just clear [`KEEPOUT_RADIUS`] from the inside: the table's foot fills
+/// almost exactly the circle the floor traces are forbidden from crossing —
+/// the traces stay clear of the console because the table is *physically
+/// standing there*, not by an arbitrary rule.
+const TABLE_PLINTH_RADIUS: f32 = 145.0;
+const TABLE_PLINTH_HEIGHT: f32 = 16.0;
+/// Dark tabletop/pedestal/plinth colour — a shade lighter than the floor.
+const TABLE_COLOR: [f32; 3] = [0.032, 0.036, 0.050];
+/// Gold trim brightness (rim torus): the same LDR weight as the console rings.
+const TABLE_GOLD_LDR: f32 = 0.50;
+
 // ── Information radiators (violet — reserved for information) ─────────────────
 
 /// Radiator panel dimensions (a tall slim slab of dark glass).
@@ -145,26 +189,61 @@ const RADIATOR_HEIGHT_OFFSET: f32 = 40.0;
 /// slice A (no live content yet).
 const RADIATOR_COLOR: [f32; 3] = [0.090, 0.040, 0.150];
 
-// ── Floor traces (the wiring — static LDR engravings for slice A) ────────────
+/// A thin brass/dark-gold frame along each radiator's four edges — the
+/// concept-06 read of an idle panel as a *framed* instrument, not a bare slab.
+const RADIATOR_FRAME_THICKNESS: f32 = 8.0;
+const RADIATOR_FRAME_DEPTH: f32 = 14.0;
+const RADIATOR_FRAME_COLOR: [f32; 3] = [0.220, 0.170, 0.080];
+/// Vertical thread-strips on the inward face, floating just proud of the
+/// glass — idle radiators read as etched thread-columns (concept 06's side
+/// panels), each strip a random height/brightness so the panel reads as a
+/// held instrument, not a barcode.
+const RADIATOR_THREAD_COUNT: usize = 8;
+const RADIATOR_THREAD_WIDTH: f32 = 4.0;
+const RADIATOR_THREAD_DEPTH: f32 = 2.0;
+const RADIATOR_THREAD_PROUD: f32 = 1.6;
+/// Brighter violet than the dim glass ([`RADIATOR_COLOR`]) — still LDR; the
+/// thread-strips are the panel's foreground detail, the glass its backdrop.
+const RADIATOR_THREAD_HUE: [f32; 3] = [0.550, 0.180, 0.750];
+/// `(min, max)` thread height as a fraction of [`RADIATOR_HEIGHT`].
+const RADIATOR_THREAD_HEIGHT_RANGE: (f32, f32) = (0.35, 0.85);
+const RADIATOR_THREAD_BRIGHTNESS_RANGE: (f32, f32) = (0.3, 0.9);
 
-/// Trace ribbon height above the floor (avoids z-fighting) and base width.
+// ── Circuit-board floor (the wiring — static LDR engravings; Amy-tunable) ───
+
+/// Trace ribbon height above the floor (avoids z-fighting) and base width
+/// (each route scales this by its own `width_scale`, 0.5–1.2).
 const TRACE_Y: f32 = 0.6;
 const TRACE_WIDTH: f32 = 7.0;
-/// Etched fabric hues (linear rgb, dim): crimson = MIDI, cyan = PCM. At rest a
-/// trace is a dark engraving; it lights HDR only when its flow runs (later
-/// slices). One hue family per fabric (the charter's rainbow-board rule).
+/// Etched fabric hues (linear rgb, dim): crimson = MIDI, cyan = PCM, green =
+/// VFS (dimmed from the [0.40, 0.85, 0.52] marker identity for etching
+/// headroom), gold = the well (used sparingly — gold is the console's hue).
+/// At rest a trace is a dark engraving; it lights HDR only when its flow runs
+/// (later slices). One hue family per fabric (the charter's rainbow-board
+/// rule); the violet stubs reuse [`RADIATOR_COLOR`] directly.
 const TRACE_CRIMSON: [f32; 3] = [0.24, 0.055, 0.070];
 const TRACE_CYAN: [f32; 3] = [0.050, 0.170, 0.210];
+const TRACE_GREEN: [f32; 3] = [0.100, 0.260, 0.150];
+const TRACE_GOLD: [f32; 3] = [0.300, 0.220, 0.100];
 
-/// Trace arcs: `(radius, start_deg, end_deg, hue, width_scale)`. Every radius is
-/// outside [`KEEPOUT_RADIUS`], so each concentric arc bows around the console.
-const TRACE_ARCS: [(f32, f32, f32, [f32; 3], f32); 5] = [
-    (470.0, 200.0, 344.0, TRACE_CRIMSON, 1.0),
-    (360.0, 22.0, 168.0, TRACE_CYAN, 1.0),
-    (250.0, 250.0, 340.0, TRACE_CYAN, 0.7),
-    (300.0, 40.0, 130.0, TRACE_CRIMSON, 0.7),
-    (410.0, 10.0, 70.0, TRACE_CRIMSON, 0.6),
-];
+/// Inscribed gold double-ring routes depart from (concept 06's gold circle
+/// band): outer/inner center radius and band width per ring. Both clear
+/// [`KEEPOUT_RADIUS`] with room to spare.
+const RING_OUTER_R: f32 = 230.0;
+const RING_INNER_R: f32 = 190.0;
+const RING_BAND_WIDTH: f32 = 10.0;
+const RING_GOLD_HUE: [f32; 3] = [1.00, 0.80, 0.36];
+const RING_LDR: f32 = 0.50;
+
+/// Route-generation shared geometry ([`bearing::expand_bundle`]): the radial
+/// length each 45°-ish bend cuts off the lane radius, and the arc's sample
+/// density.
+const ROUTE_CHAMFER: f32 = 18.0;
+const ROUTE_ARC_SEGMENTS: usize = 14;
+/// Terminal-pad disc radius range (world units) — "slightly brighter than
+/// their trace."
+const ROUTE_PAD_RADIUS_RANGE: (f32, f32) = (6.0, 14.0);
+const ROUTE_PAD_BRIGHTNESS_GAIN: f32 = 1.35;
 
 // ── Focus presentation ───────────────────────────────────────────────────────
 
@@ -383,18 +462,10 @@ fn enter_room(
         .spawn((RoomRoot, Transform::default(), Visibility::Inherited, Name::new("RoomRoot")))
         .id();
 
-    // Floor disc — dark, flat (Circle meshes in XY facing +Z; tip it to lie in
-    // the XZ floor plane facing up).
-    let floor_mesh = meshes.add(Circle::new(FLOOR_RADIUS));
-    let floor_mat = mats.add(unlit(lin(FLOOR_COLOR)));
-    commands.spawn((
-        Mesh3d(floor_mesh),
-        MeshMaterial3d(floor_mat),
-        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-        Visibility::Inherited,
-        Name::new("RoomFloor"),
-        ChildOf(root),
-    ));
+    // Floor disc, inscribed gold ring, and circuit-board routes — one cohesive
+    // helper (`shell.md`, "the floor is the wiring": the disc, its rings, and
+    // its traces are the chamber, not room chrome).
+    spawn_floor(&mut commands, root, &mut meshes, &mut mats);
 
     // Vault dome — an enclosing sphere with a subtle vertical vertex-colour
     // gradient (calm darkness overhead; `shell.md` open question 4 defers the
@@ -414,42 +485,25 @@ fn enter_room(
         ChildOf(root),
     ));
 
-    // Console emblem — a stack of gold rings at center (the well's stand-in).
-    // One shared material so the chatter glow lifts them together.
+    // The well table — heavy furniture, not hologram (Amy). Spawned before the
+    // ring stack it stands under; render order doesn't matter (depth-tested),
+    // this just keeps "table, then what stands on it" readable in the diff.
+    spawn_table(&mut commands, root, &mut meshes, &mut mats);
+
+    // Console emblem — a stack of gold rings hovering above the tabletop (the
+    // well's stand-in). One shared material so the chatter glow lifts them
+    // together; only the Y offset changed from the bare-floating-stack
+    // original — [`ConsoleEmblem`] and the glow system are untouched.
     let console_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, CONSOLE_LDR)));
     for (i, (y, major, minor)) in CONSOLE_RINGS.iter().enumerate() {
         commands.spawn((
             Mesh3d(meshes.add(Torus { minor_radius: *minor, major_radius: *major })),
             MeshMaterial3d(console_mat.clone()),
-            Transform::from_xyz(0.0, *y, 0.0),
+            Transform::from_xyz(0.0, *y + TABLE_TOP_Y, 0.0),
             Visibility::Inherited,
             ConsoleEmblem,
             RoomDistraction,
             Name::new(format!("ConsoleRing{i}")),
-            ChildOf(root),
-        ));
-    }
-
-    // Floor traces — static LDR engravings that bow around the console.
-    for (radius, a0, a1, hue, wscale) in TRACE_ARCS {
-        debug_assert!(
-            radius > KEEPOUT_RADIUS,
-            "trace radius {radius} must clear the console keep-out ({KEEPOUT_RADIUS})"
-        );
-        let pts = bearing::arc_points(radius, a0.to_radians(), a1.to_radians(), 48, TRACE_Y);
-        let mesh = meshes.add(ribbon_mesh(&pts, TRACE_WIDTH * wscale));
-        let mat = mats.add(StandardMaterial {
-            base_color: lin(hue),
-            unlit: true,
-            cull_mode: None,
-            ..default()
-        });
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(mat),
-            Transform::default(),
-            Visibility::Inherited,
-            Name::new("FloorTrace"),
             ChildOf(root),
         ));
     }
@@ -510,28 +564,15 @@ fn enter_room(
         }
     }
 
-    // Information radiators — tall violet dark-glass panels between bearings,
-    // idle placeholders (no live content in slice A).
-    for (i, d) in bearing::RADIATOR_DIRS.iter().enumerate() {
-        let mesh = meshes.add(Cuboid::new(RADIATOR_WIDTH, RADIATOR_HEIGHT, RADIATOR_DEPTH));
-        let mat = mats.add(unlit(lin(RADIATOR_COLOR)));
-        let pos = Vec3::new(
-            d[0] * RADIATOR_RADIUS,
-            RADIATOR_HEIGHT * 0.5 + RADIATOR_HEIGHT_OFFSET,
-            d[2] * RADIATOR_RADIUS,
-        );
-        // Present the broad face inward (the cuboid's ±Z face is width×height).
-        let outward = Vec3::new(pos.x * 2.0, pos.y, pos.z * 2.0);
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(mat),
-            Transform::from_translation(pos).looking_at(outward, Vec3::Y),
-            RoomDistraction,
-            Visibility::Inherited,
-            Name::new(format!("Radiator{i}")),
-            ChildOf(root),
-        ));
-    }
+    // Pylon plinths + gold caps — the plain marker posts get grounded furniture
+    // (`shell.md`'s "the atrium rules" read); the reserved South stub stays
+    // plinth-only ([`wants_gold_cap`]).
+    spawn_pylons(&mut commands, root, &mut meshes, &mut mats);
+
+    // Information radiators — framed violet dark-glass panels between
+    // bearings, idle placeholders (no live content in slice A) but reading as
+    // held instruments: a brass/dark-gold frame and vertical thread-strips.
+    spawn_radiators(&mut commands, root, &mut meshes, &mut mats);
 
     // Re-root the patch bay into the room as furniture at the W bearing (slice B,
     // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
@@ -577,6 +618,435 @@ fn exit_room(
         cam.clear_color = ClearColorConfig::Custom(theme.bg);
     }
     info!("room: exited");
+}
+
+// ── Spawn helpers (called from `enter_room`) ─────────────────────────────────
+
+/// The circuit-board route bundles — the rainbow-board authoring table
+/// (`shell.md`, "the floor is the wiring"): crimson (MIDI) toward the W/E
+/// patch-bay↔tracks axis, VFS green and cyan (PCM) toward N, violet short
+/// stubs fanning the four radiator diagonals, and a couple of well-gold
+/// routes sparingly toward the reserved S quadrant (gold is the console's
+/// hue, not the floor's). ~24–36 total routes ([`bearing::expand_bundle`]
+/// expands each bundle's `count`). Angles are read straight off
+/// [`Bearing::dir`] via [`bearing::dir_theta`] so a re-placed bearing can't
+/// silently drift out of sync with its floor traces. **Amy-tunable.**
+fn route_bundles() -> [bearing::RouteBundle; 9] {
+    use bearing::{Bearing, RouteBundle, dir_theta};
+    let west = dir_theta(Bearing::West.dir());
+    let east = dir_theta(Bearing::East.dir());
+    let north = dir_theta(Bearing::North.dir());
+    let south = dir_theta(Bearing::South.dir());
+    let [ne, se, sw, nw] = bearing::RADIATOR_DIRS.map(dir_theta);
+    [
+        RouteBundle {
+            center_theta: west,
+            spread: 0.50,
+            count: 7,
+            lane_range: (280.0, 620.0),
+            arc_range: (0.25, 0.9),
+            pad_range: (420.0, 900.0),
+            hue: TRACE_CRIMSON,
+            brightness_range: (0.7, 1.15),
+        },
+        RouteBundle {
+            center_theta: east,
+            spread: 0.50,
+            count: 7,
+            lane_range: (300.0, 650.0),
+            arc_range: (0.25, 0.9),
+            pad_range: (450.0, 900.0),
+            hue: TRACE_CRIMSON,
+            brightness_range: (0.7, 1.15),
+        },
+        RouteBundle {
+            center_theta: north,
+            spread: 0.42,
+            count: 5,
+            lane_range: (270.0, 560.0),
+            arc_range: (0.2, 0.75),
+            pad_range: (400.0, 820.0),
+            hue: TRACE_GREEN,
+            brightness_range: (0.75, 1.15),
+        },
+        RouteBundle {
+            center_theta: north,
+            spread: 0.55,
+            count: 4,
+            lane_range: (340.0, 660.0),
+            arc_range: (0.2, 0.8),
+            pad_range: (460.0, 850.0),
+            hue: TRACE_CYAN,
+            brightness_range: (0.7, 1.1),
+        },
+        RouteBundle {
+            center_theta: ne,
+            spread: 0.22,
+            count: 3,
+            lane_range: (240.0, 320.0),
+            arc_range: (0.0, 0.12),
+            pad_range: (300.0, 420.0),
+            hue: RADIATOR_COLOR,
+            brightness_range: (0.8, 1.2),
+        },
+        RouteBundle {
+            center_theta: se,
+            spread: 0.20,
+            count: 2,
+            lane_range: (240.0, 320.0),
+            arc_range: (0.0, 0.12),
+            pad_range: (300.0, 420.0),
+            hue: RADIATOR_COLOR,
+            brightness_range: (0.8, 1.2),
+        },
+        RouteBundle {
+            center_theta: sw,
+            spread: 0.20,
+            count: 2,
+            lane_range: (240.0, 320.0),
+            arc_range: (0.0, 0.12),
+            pad_range: (300.0, 420.0),
+            hue: RADIATOR_COLOR,
+            brightness_range: (0.8, 1.2),
+        },
+        RouteBundle {
+            center_theta: nw,
+            spread: 0.22,
+            count: 3,
+            lane_range: (240.0, 320.0),
+            arc_range: (0.0, 0.12),
+            pad_range: (300.0, 420.0),
+            hue: RADIATOR_COLOR,
+            brightness_range: (0.8, 1.2),
+        },
+        RouteBundle {
+            center_theta: south,
+            spread: 0.9,
+            count: 2,
+            lane_range: (300.0, 500.0),
+            arc_range: (0.15, 0.4),
+            pad_range: (380.0, 600.0),
+            hue: TRACE_GOLD,
+            brightness_range: (0.8, 1.0),
+        },
+    ]
+}
+
+/// The floor disc (gradient), the inscribed gold double-ring routes depart
+/// from, and every circuit-board route + terminal pad (`shell.md`, "the
+/// floor is the wiring"). The disc, ring, and traces are **the chamber** —
+/// no [`RoomDistraction`] — so they stay lit through a station dive.
+fn spawn_floor(
+    commands: &mut Commands,
+    root: Entity,
+    meshes: &mut Assets<Mesh>,
+    mats: &mut Assets<StandardMaterial>,
+) {
+    // Floor disc — a radial vertex-colour gradient (warm charcoal pooling
+    // under the table's glow, fading to near-black at the rim) replaces the
+    // old flat fill; `disc_vertices` matches `Circle`'s mesh convention (XY
+    // plane, +Z normal), so the same tip-to-XZ rotation applies.
+    commands.spawn((
+        Mesh3d(meshes.add(floor_mesh(FLOOR_RADIUS, FLOOR_RINGS, FLOOR_SEGMENTS))),
+        MeshMaterial3d(mats.add(StandardMaterial {
+            base_color: Color::WHITE, // vertex colours carry the gradient
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        Visibility::Inherited,
+        Name::new("RoomFloor"),
+        ChildOf(root),
+    ));
+
+    // Inscribed gold double-ring (concept 06's gold circle band): a thin
+    // annulus at RING_OUTER_R and another at RING_INNER_R; routes depart from
+    // the outer one.
+    let ring_mat = mats.add(unlit(lin_scaled(RING_GOLD_HUE, RING_LDR)));
+    for r in [RING_OUTER_R, RING_INNER_R] {
+        commands.spawn((
+            Mesh3d(meshes.add(Annulus::new(r - RING_BAND_WIDTH * 0.5, r + RING_BAND_WIDTH * 0.5))),
+            MeshMaterial3d(ring_mat.clone()),
+            Transform::from_xyz(0.0, TRACE_Y, 0.0)
+                .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+            Visibility::Inherited,
+            Name::new("ConsoleRingInlay"),
+            ChildOf(root),
+        ));
+    }
+
+    // Circuit-board routes: each bundle expands to several routes; every
+    // route gets a ribbon + a slightly brighter terminal pad.
+    for (bi, bundle) in route_bundles().iter().enumerate() {
+        let seed_base = bi as u32 * 10_007;
+        for route in bearing::expand_bundle(
+            bundle,
+            RING_OUTER_R,
+            ROUTE_CHAMFER,
+            ROUTE_ARC_SEGMENTS,
+            TRACE_Y,
+            ROUTE_PAD_RADIUS_RANGE,
+            seed_base,
+        ) {
+            debug_assert!(
+                route.points.iter().all(|p| (p[0] * p[0] + p[2] * p[2]).sqrt() > KEEPOUT_RADIUS),
+                "every generated route must clear the console keep-out ({KEEPOUT_RADIUS})"
+            );
+            let color = [
+                route.hue[0] * route.brightness_scale,
+                route.hue[1] * route.brightness_scale,
+                route.hue[2] * route.brightness_scale,
+            ];
+            debug_assert!(color.iter().all(|c| *c < 1.0), "floor trace must stay LDR");
+
+            let mesh = meshes.add(ribbon_mesh(&route.points, TRACE_WIDTH * route.width_scale));
+            let mat = mats.add(StandardMaterial {
+                base_color: lin(color),
+                unlit: true,
+                cull_mode: None,
+                ..default()
+            });
+            commands.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
+                Transform::default(),
+                Visibility::Inherited,
+                Name::new("FloorTrace"),
+                ChildOf(root),
+            ));
+
+            let pad_color = [
+                color[0] * ROUTE_PAD_BRIGHTNESS_GAIN,
+                color[1] * ROUTE_PAD_BRIGHTNESS_GAIN,
+                color[2] * ROUTE_PAD_BRIGHTNESS_GAIN,
+            ];
+            debug_assert!(pad_color.iter().all(|c| *c < 1.0), "floor trace pad must stay LDR");
+            commands.spawn((
+                Mesh3d(meshes.add(Circle::new(route.pad_radius))),
+                MeshMaterial3d(mats.add(unlit(lin(pad_color)))),
+                Transform::from_translation(Vec3::new(
+                    route.pad_pos[0],
+                    TRACE_Y + 0.15,
+                    route.pad_pos[2],
+                ))
+                .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+                Visibility::Inherited,
+                Name::new("FloorTracePad"),
+                ChildOf(root),
+            ));
+        }
+    }
+}
+
+/// The well table the console rings hover above — heavy furniture, not
+/// hologram (Amy: "MORE SOLIDNESS"): a chunky dark tabletop, a gold rim torus
+/// at its edge, a narrower pedestal, and a wide low plinth grounding it to the
+/// floor. Every part is [`RoomDistraction`] (like the console rings today).
+fn spawn_table(
+    commands: &mut Commands,
+    root: Entity,
+    meshes: &mut Assets<Mesh>,
+    mats: &mut Assets<StandardMaterial>,
+) {
+    let table_mat = mats.add(unlit(lin(TABLE_COLOR)));
+    let gold_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, TABLE_GOLD_LDR)));
+
+    // Plinth — wide and low, grounding the table to the floor.
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(TABLE_PLINTH_RADIUS, TABLE_PLINTH_HEIGHT))),
+        MeshMaterial3d(table_mat.clone()),
+        Transform::from_xyz(0.0, TABLE_PLINTH_HEIGHT * 0.5, 0.0),
+        RoomDistraction,
+        Visibility::Inherited,
+        Name::new("ConsoleTablePlinth"),
+        ChildOf(root),
+    ));
+
+    // Pedestal — narrower, rising from the plinth to the tabletop's underside.
+    let pedestal_top = TABLE_TOP_Y - TABLE_THICKNESS * 0.5;
+    let pedestal_height = pedestal_top - TABLE_PLINTH_HEIGHT;
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(TABLE_PEDESTAL_RADIUS, pedestal_height))),
+        MeshMaterial3d(table_mat.clone()),
+        Transform::from_xyz(0.0, TABLE_PLINTH_HEIGHT + pedestal_height * 0.5, 0.0),
+        RoomDistraction,
+        Visibility::Inherited,
+        Name::new("ConsoleTablePedestal"),
+        ChildOf(root),
+    ));
+
+    // Tabletop — the chunky slab the console rings float above.
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(TABLE_RADIUS, TABLE_THICKNESS))),
+        MeshMaterial3d(table_mat),
+        Transform::from_xyz(0.0, TABLE_TOP_Y - TABLE_THICKNESS * 0.5, 0.0),
+        RoomDistraction,
+        Visibility::Inherited,
+        Name::new("ConsoleTableTop"),
+        ChildOf(root),
+    ));
+
+    // Gold rim torus at the tabletop's edge.
+    commands.spawn((
+        Mesh3d(meshes.add(Torus { minor_radius: TABLE_RIM_MINOR, major_radius: TABLE_RADIUS })),
+        MeshMaterial3d(gold_mat),
+        Transform::from_xyz(0.0, TABLE_TOP_Y, 0.0),
+        RoomDistraction,
+        Visibility::Inherited,
+        Name::new("ConsoleTableRim"),
+        ChildOf(root),
+    ));
+}
+
+/// Information radiators: idle violet dark-glass panels framed in dark gold,
+/// with vertical thread-strips on the inward face reading as etched
+/// thread-columns at rest (concept 06's side panels). `RoomDistraction` on
+/// every part (`shell.md`: radiators are room chrome, not the chamber).
+fn spawn_radiators(
+    commands: &mut Commands,
+    root: Entity,
+    meshes: &mut Assets<Mesh>,
+    mats: &mut Assets<StandardMaterial>,
+) {
+    let glass_mesh = meshes.add(Cuboid::new(RADIATOR_WIDTH, RADIATOR_HEIGHT, RADIATOR_DEPTH));
+    let glass_mat = mats.add(unlit(lin(RADIATOR_COLOR)));
+    let frame_mat = mats.add(unlit(lin(RADIATOR_FRAME_COLOR)));
+    let h_frame_mesh = meshes.add(Cuboid::new(
+        RADIATOR_WIDTH + 2.0 * RADIATOR_FRAME_THICKNESS,
+        RADIATOR_FRAME_THICKNESS,
+        RADIATOR_FRAME_DEPTH,
+    ));
+    let v_frame_mesh =
+        meshes.add(Cuboid::new(RADIATOR_FRAME_THICKNESS, RADIATOR_HEIGHT, RADIATOR_FRAME_DEPTH));
+
+    for (i, d) in bearing::RADIATOR_DIRS.iter().enumerate() {
+        let pos = Vec3::new(
+            d[0] * RADIATOR_RADIUS,
+            RADIATOR_HEIGHT * 0.5 + RADIATOR_HEIGHT_OFFSET,
+            d[2] * RADIATOR_RADIUS,
+        );
+        // Present the broad face inward (the cuboid's ±Z face is width×height).
+        // `looking_at` aims local −Z at `outward`, so local +Z — where the
+        // frame/thread offsets below land — is the physical surface facing
+        // the console; `panel_tf` maps every local offset into room space.
+        let outward = Vec3::new(pos.x * 2.0, pos.y, pos.z * 2.0);
+        let panel_tf = Transform::from_translation(pos).looking_at(outward, Vec3::Y);
+
+        commands.spawn((
+            Mesh3d(glass_mesh.clone()),
+            MeshMaterial3d(glass_mat.clone()),
+            panel_tf,
+            RoomDistraction,
+            Visibility::Inherited,
+            Name::new(format!("Radiator{i}")),
+            ChildOf(root),
+        ));
+
+        let half_h = RADIATOR_HEIGHT * 0.5 + RADIATOR_FRAME_THICKNESS * 0.5;
+        let half_w = RADIATOR_WIDTH * 0.5 + RADIATOR_FRAME_THICKNESS * 0.5;
+        for (edge, mesh, local) in [
+            ("Top", h_frame_mesh.clone(), Vec3::new(0.0, half_h, 0.0)),
+            ("Bottom", h_frame_mesh.clone(), Vec3::new(0.0, -half_h, 0.0)),
+            ("Left", v_frame_mesh.clone(), Vec3::new(-half_w, 0.0, 0.0)),
+            ("Right", v_frame_mesh.clone(), Vec3::new(half_w, 0.0, 0.0)),
+        ] {
+            commands.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(frame_mat.clone()),
+                Transform::from_translation(panel_tf.transform_point(local))
+                    .with_rotation(panel_tf.rotation),
+                RoomDistraction,
+                Visibility::Inherited,
+                Name::new(format!("Radiator{i}Frame{edge}")),
+                ChildOf(root),
+            ));
+        }
+
+        for j in 0..RADIATOR_THREAD_COUNT {
+            let seed = i as u32 * 251 + j as u32 * 17;
+            let t = if RADIATOR_THREAD_COUNT > 1 {
+                j as f32 / (RADIATOR_THREAD_COUNT - 1) as f32
+            } else {
+                0.5
+            };
+            let x = (t - 0.5) * RADIATOR_WIDTH * 0.82;
+            let h = bearing::lerp(
+                RADIATOR_HEIGHT * RADIATOR_THREAD_HEIGHT_RANGE.0,
+                RADIATOR_HEIGHT * RADIATOR_THREAD_HEIGHT_RANGE.1,
+                bearing::hash01(seed),
+            );
+            let brightness = bearing::lerp(
+                RADIATOR_THREAD_BRIGHTNESS_RANGE.0,
+                RADIATOR_THREAD_BRIGHTNESS_RANGE.1,
+                bearing::hash01(seed + 1),
+            );
+            let local = Vec3::new(x, 0.0, RADIATOR_DEPTH * 0.5 + RADIATOR_THREAD_PROUD);
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(RADIATOR_THREAD_WIDTH, h, RADIATOR_THREAD_DEPTH))),
+                MeshMaterial3d(mats.add(unlit(lin_scaled(RADIATOR_THREAD_HUE, brightness)))),
+                Transform::from_translation(panel_tf.transform_point(local))
+                    .with_rotation(panel_tf.rotation),
+                RoomDistraction,
+                Visibility::Inherited,
+                Name::new(format!("Radiator{i}Thread{j}")),
+                ChildOf(root),
+            ));
+        }
+    }
+}
+
+/// Whether a wall bearing's pylon earns a gold cap slab — every built station
+/// does; the reserved South marker stays humble (a plinth only): `shell.md`'s
+/// "future MCP broker switchboard" placeholder shouldn't out-dress the
+/// stations that actually exist yet. Pure — no Bevy types — so the gating is
+/// unit-testable without spawning anything.
+fn wants_gold_cap(wp: &bearing::WallPlacement) -> bool {
+    wp.station.is_some()
+}
+
+/// Pylon furniture: a wide low plinth grounding every marker to the floor,
+/// and a gold cap slab on top of every built station's pylon
+/// ([`wants_gold_cap`] gates the reserved South stub out).
+fn spawn_pylons(
+    commands: &mut Commands,
+    root: Entity,
+    meshes: &mut Assets<Mesh>,
+    mats: &mut Assets<StandardMaterial>,
+) {
+    let plinth_mesh =
+        meshes.add(Cuboid::new(PYLON_PLINTH_WIDTH, PYLON_PLINTH_HEIGHT, PYLON_PLINTH_WIDTH));
+    let plinth_mat = mats.add(unlit(lin(PYLON_PLINTH_COLOR)));
+    let cap_mesh = meshes.add(Cuboid::new(PYLON_CAP_WIDTH, PYLON_CAP_HEIGHT, PYLON_CAP_WIDTH));
+    let cap_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, PYLON_CAP_GOLD_LDR)));
+
+    for wp in bearing::wall_placements() {
+        let marker_h = if wp.station.is_some() { MARKER_HEIGHT } else { MARKER_HEIGHT_RESERVED };
+        let base = Vec3::new(wp.dir[0] * ROOM_RADIUS, 0.0, wp.dir[2] * ROOM_RADIUS);
+
+        commands.spawn((
+            Mesh3d(plinth_mesh.clone()),
+            MeshMaterial3d(plinth_mat.clone()),
+            Transform::from_translation(base + Vec3::Y * (PYLON_PLINTH_HEIGHT * 0.5)),
+            RoomDistraction,
+            Visibility::Inherited,
+            Name::new(format!("BearingPlinth-{:?}", wp.bearing)),
+            ChildOf(root),
+        ));
+
+        if wants_gold_cap(&wp) {
+            commands.spawn((
+                Mesh3d(cap_mesh.clone()),
+                MeshMaterial3d(cap_mat.clone()),
+                Transform::from_translation(
+                    base + Vec3::Y * (marker_h + PYLON_CAP_HEIGHT * 0.5),
+                ),
+                RoomDistraction,
+                Visibility::Inherited,
+                Name::new(format!("BearingCap-{:?}", wp.bearing)),
+                ChildOf(root),
+            ));
+        }
+    }
 }
 
 // ── Systems ───────────────────────────────────────────────────────────────────
@@ -912,6 +1382,27 @@ fn dome_mesh(radius: f32) -> Mesh {
     mesh
 }
 
+/// The floor disc: [`bearing::disc_vertices`]' geometry (mesh-local XY,
+/// `Circle`'s convention — `spawn_floor` rotates it flat), coloured by
+/// [`bearing::floor_color`]'s radial gradient — the `dome_mesh`/`dome_color`
+/// idiom applied to the floor.
+fn floor_mesh(radius: f32, rings: usize, segments: usize) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let (positions, indices) = bearing::disc_vertices(radius, rings, segments);
+    let normals = vec![[0.0, 0.0, 1.0]; positions.len()];
+    let colors: Vec<[f32; 4]> = positions
+        .iter()
+        .map(|p| bearing::floor_color((p[0] * p[0] + p[1] * p[1]).sqrt() / radius))
+        .collect();
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
 // ── Shared plate-text helper (also used by the patch bay's plates) ────────────
 
 fn plate_brush() -> Brush {
@@ -1053,10 +1544,129 @@ mod tests {
         }
     }
 
+    // ── circuit-board routes (real production config) ──
+
     #[test]
-    fn every_floor_trace_bows_around_the_console_keepout() {
-        for (radius, _, _, _, _) in TRACE_ARCS {
-            assert!(radius > KEEPOUT_RADIUS, "trace at r={radius} would cross the console");
+    fn route_bundle_total_count_is_within_the_target_board_density() {
+        let total: usize = route_bundles().iter().map(|b| b.count).sum();
+        assert!(
+            (24..=36).contains(&total),
+            "board density should read dense like concept 06: {total} routes"
+        );
+    }
+
+    #[test]
+    fn every_route_bundle_departs_from_outside_the_console_keepout() {
+        assert!(RING_OUTER_R > KEEPOUT_RADIUS, "the ring itself clears the keep-out");
+        assert!(
+            RING_INNER_R - RING_BAND_WIDTH * 0.5 > KEEPOUT_RADIUS,
+            "even the inner ring's inner edge clears the keep-out"
+        );
+    }
+
+    #[test]
+    fn every_generated_board_route_clears_the_console_keepout() {
+        // The concrete lock the old `TRACE_ARCS` debug_assert covered, applied
+        // to the real bundle table + the real ring/chamfer/pad constants
+        // `spawn_floor` calls `expand_bundle` with.
+        for (bi, bundle) in route_bundles().iter().enumerate() {
+            let seed_base = bi as u32 * 10_007;
+            for route in bearing::expand_bundle(
+                bundle,
+                RING_OUTER_R,
+                ROUTE_CHAMFER,
+                ROUTE_ARC_SEGMENTS,
+                TRACE_Y,
+                ROUTE_PAD_RADIUS_RANGE,
+                seed_base,
+            ) {
+                for p in &route.points {
+                    let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+                    assert!(
+                        r > KEEPOUT_RADIUS,
+                        "bundle {bi} route point at r={r} crosses the console keep-out"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_generated_board_route_stays_ldr_including_its_pad() {
+        for (bi, bundle) in route_bundles().iter().enumerate() {
+            let seed_base = bi as u32 * 10_007;
+            for route in bearing::expand_bundle(
+                bundle,
+                RING_OUTER_R,
+                ROUTE_CHAMFER,
+                ROUTE_ARC_SEGMENTS,
+                TRACE_Y,
+                ROUTE_PAD_RADIUS_RANGE,
+                seed_base,
+            ) {
+                let color = [
+                    route.hue[0] * route.brightness_scale,
+                    route.hue[1] * route.brightness_scale,
+                    route.hue[2] * route.brightness_scale,
+                ];
+                assert!(color.iter().all(|c| *c < 1.0), "bundle {bi} trace must stay LDR: {color:?}");
+                let pad = color.map(|c| c * ROUTE_PAD_BRIGHTNESS_GAIN);
+                assert!(pad.iter().all(|c| *c < 1.0), "bundle {bi} pad must stay LDR: {pad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn floor_mesh_carries_a_vertex_colour_gradient() {
+        let mesh = floor_mesh(FLOOR_RADIUS, 6, 24);
+        assert!(
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some(),
+            "the floor gradient rides on vertex colours"
+        );
+    }
+
+    // ── pylon plinths + gold caps ──
+
+    #[test]
+    fn every_built_station_wants_a_gold_cap() {
+        for wp in bearing::wall_placements() {
+            assert_eq!(
+                wants_gold_cap(&wp),
+                wp.station.is_some(),
+                "{:?}: cap gating must track whether a station stands there",
+                wp.bearing
+            );
+        }
+    }
+
+    #[test]
+    fn the_reserved_south_marker_stays_plinth_only() {
+        let south = bearing::wall_placements()
+            .into_iter()
+            .find(|wp| wp.bearing == Bearing::South)
+            .expect("south has a wall placement");
+        assert!(!wants_gold_cap(&south), "the reserved bearing stays humble — no gold cap");
+    }
+
+    // ── the well table ──
+
+    #[test]
+    fn the_table_plinth_sits_inside_the_console_keepout() {
+        // "MORE SOLIDNESS": the table's foot should read as *why* the floor
+        // traces can't cross the console, not just coincide with it.
+        assert!(TABLE_PLINTH_RADIUS <= KEEPOUT_RADIUS, "the plinth fills the keep-out, not past it");
+    }
+
+    #[test]
+    fn the_table_pedestal_is_narrower_than_the_tabletop_and_the_plinth_is_wider() {
+        assert!(TABLE_PEDESTAL_RADIUS < TABLE_RADIUS, "pedestal narrower than the tabletop");
+        assert!(TABLE_PLINTH_RADIUS > TABLE_RADIUS, "plinth wider than the tabletop");
+    }
+
+    #[test]
+    fn console_rings_float_above_the_tabletop() {
+        for (y, _, _) in CONSOLE_RINGS {
+            assert!(y + TABLE_TOP_Y > TABLE_TOP_Y, "every ring sits above the table's top face");
         }
     }
 
