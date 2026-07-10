@@ -63,10 +63,7 @@ pub fn sync_input_context(
     // contexts are active — otherwise keystrokes leak into the compose layer (the
     // well pops its prompt modal over Space/i; the editor double-applies keys to
     // the hidden chat buffer). Only `Global` survives.
-    if matches!(
-        screen.get(),
-        Screen::TimeWell | Screen::Editor | Screen::Room | Screen::PatchBay
-    ) {
+    if matches!(screen.get(), Screen::TimeWell | Screen::Editor | Screen::Room) {
         return;
     }
 

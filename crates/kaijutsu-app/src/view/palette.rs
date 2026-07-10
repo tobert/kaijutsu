@@ -102,10 +102,21 @@ pub(crate) const GLOW_TROUGH_SUBTLE: f32 = 0.75;
 /// cross-file architectural datum: `room::spawn_walls` still builds the
 /// panel geometry (untouched) at this radius, and `patch_bay`'s placement now
 /// reads the SAME number to seat the wheel flush against the W panel it
-/// stands on. Clears the old radiator radius (660) and the wall-station
-/// radius the pylons/markers stand at (`room::ROOM_RADIUS`, 620), so the
-/// shell encloses everything already standing in the room.
-pub(crate) const WALL_APOTHEM: f32 = 800.0;
+/// stands on.
+///
+/// Bumped 800 → 1200 (2026-07-10 evening, the fullscreen-panel pivot — Amy:
+/// "the walls are 16:9 screens, and diving IS fullscreening a panel"): at
+/// 1200 a panel's FULL width (`bearing::octagon_panel_width`) is
+/// `2·1200·tan(π/8) ≈ 994`, against the unchanged `room::WALL_HEIGHT` (560) —
+/// a 994:560 ≈ 16:9 frame, so `room::fullscreen_pose` fills the camera's
+/// vertical frustum with exactly one panel, edge to edge. Clears the old
+/// radiator radius (660) and the wall-station radius the pylons/markers
+/// stand at (`room::ROOM_RADIUS`, 620) same as before; the new binding
+/// constraint is the octagon's own circumradius
+/// (`bearing::octagon_circumradius`, ≈1299 at this apothem), which must stay
+/// under `room::FLOOR_RADIUS` (1300) so the walls stand ON the floor disc,
+/// not past its edge.
+pub(crate) const WALL_APOTHEM: f32 = 1200.0;
 
 /// Wheel-center height on the W panel — the panel's own vertical center
 /// (`room::WALL_HEIGHT` 560 / 2 = 280): the mounted face reads centered on
@@ -133,9 +144,16 @@ pub(crate) const STATION_W_MOUNT_Y: f32 = 280.0;
 pub(crate) const STATION_W_PROUD: f32 = 10.0;
 
 /// Uniform scale of the placed wheel. `TABLE_OUTER_R` is 348 local units →
-/// 348 × 0.42 ≈ 146 world, on a wall panel ≈ 663 wide
-/// (`bearing::octagon_panel_width(WALL_APOTHEM)`) — bumped from the
-/// dais-era 0.34: the wall has room a floor dais didn't, and the wall-mount
-/// read wants the instrument generous, not a miniature bolted to a big blank
-/// panel. Tuned to read framed, not cramped, against that width.
+/// 348 × 0.42 ≈ 146 world — bumped from the dais-era 0.34: the wall has room
+/// a floor dais didn't, and the wall-mount read wants the instrument
+/// generous, not a miniature bolted to a big blank panel. Tuned to read
+/// framed, not cramped, against the wall's width at the time (≈663, apothem
+/// 800).
+///
+/// **Not re-tuned for the 2026-07-10 evening apothem bump** (800 → 1200, the
+/// fullscreen-panel pivot): the panel is now ≈954 wide
+/// (`bearing::octagon_panel_width(WALL_APOTHEM) - room::WALL_PANEL_GAP`), so
+/// the wheel now reads smaller against its wall than it did — left for the
+/// lead's live tune rather than guessed here (`docs/scenes/shell.md`'s build
+/// path has the open framing note).
 pub(crate) const STATION_W_SCALE: f32 = 0.42;

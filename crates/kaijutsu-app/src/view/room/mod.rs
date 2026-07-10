@@ -93,7 +93,7 @@ use crate::text::msdf::{
     FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs,
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::ui::screen::{Screen, in_shell};
+use crate::ui::screen::Screen;
 use crate::view::palette;
 use crate::view::patch_bay;
 use crate::view::time_well::live::WellBeats;
@@ -107,8 +107,14 @@ use vello::peniko::Brush;
 const ROOM_BG: Color = Color::srgb(0.020, 0.026, 0.044);
 
 /// Floor disc radius (world units); comfortably past the wall stations so the
-/// room reads as a chamber, not a platform.
-const FLOOR_RADIUS: f32 = 1100.0;
+/// room reads as a chamber, not a platform. Bumped 1100 → 1300 alongside
+/// `palette::WALL_APOTHEM`'s 800 → 1200 (2026-07-10 evening, the
+/// fullscreen-panel pivot): must clear the octagon's own circumradius
+/// (`bearing::octagon_circumradius(palette::WALL_APOTHEM)` ≈ 1299) so the
+/// walls stand ON the floor disc rather than past its edge —
+/// `floor_radius_clears_the_octagon_circumradius_so_the_walls_stand_on_the_floor`
+/// locks the margin.
+const FLOOR_RADIUS: f32 = 1300.0;
 /// Floor mesh resolution ([`bearing::disc_vertices`]): concentric rings ×
 /// angular segments. Coarse enough to stay cheap, fine enough that the radial
 /// gradient ([`bearing::floor_color`]) reads smooth, not banded.
@@ -116,10 +122,11 @@ const FLOOR_RINGS: usize = 14;
 const FLOOR_SEGMENTS: usize = 64;
 
 /// Enclosing vault-dome radius. Must exceed **every** camera distance (the
-/// pulled-back overview sits ~1630 out) so the camera stays *inside* the dome
-/// and its far inner surface reads as the vault; the lower hemisphere hides
-/// under the floor disc.
-const DOME_RADIUS: f32 = 2000.0;
+/// pulled-back overview sits ~2093 out, since `OVERVIEW_POS` was pulled back
+/// alongside the 2026-07-10 evening apothem bump) so the camera stays
+/// *inside* the dome and its far inner surface reads as the vault; the lower
+/// hemisphere hides under the floor disc.
+const DOME_RADIUS: f32 = 2600.0;
 
 /// Radius of the wall stations' marker pylons.
 const ROOM_RADIUS: f32 = 620.0;
@@ -379,8 +386,15 @@ const ROOM_CAM_APPROACH_HEIGHT: f32 = 260.0;
 /// Lowered 2026-07-10 from the original (0, 640, 1500) high shot toward the
 /// concepts' human-eye framing (06 stands *in* the room, not above it): the
 /// table + ring stack sit mid-frame with the stations standing around them.
-/// **Amy-tunable** (the lead live-tunes the exact framing).
-const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 340.0, 1380.0);
+///
+/// Pulled back again the same evening (340,1380 → 420,2050) alongside the
+/// apothem bump (800 → 1200): the octagon itself grew, so the overview has to
+/// stand farther out to keep the *whole* shell in frame from outside it (the
+/// cutaway rule needs the camera outside the octagon for this pose — see
+/// `docs/scenes/shell.md`'s cutaway paragraph). Framing is still an eyeball
+/// call, not a solved layout — **Amy-tunable**, flagged for the lead's live
+/// tune once the bigger room is on screen.
+const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 420.0, 2050.0);
 const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 90.0, 0.0);
 /// Camera follow rate (exponential smoothing) — matches the well's weighty
 /// glide so the shell and the well feel like one instrument.
@@ -413,6 +427,16 @@ const EDGE_BUMP_WINDOW_MS: u128 = 500;
 #[derive(Resource)]
 pub struct RoomState {
     pub carousel: StationCarousel,
+    /// The station the camera is fullscreened onto, or `None` at room scale
+    /// (2026-07-10 evening, the fullscreen-panel pivot — supersedes the old
+    /// `Screen::PatchBay` state entirely: "diving" is now a camera pose plus
+    /// this field, not a screen). Only [`station_is_zoomable`] stations ever
+    /// occupy it; `room_keyboard` sets it on Enter/Down, clears it on Esc/Up,
+    /// and `exit_room` clears it unconditionally on the way out of the room
+    /// so a later re-entry always starts unzoomed. Reading this (not a
+    /// `State<Screen>`) is what `ease_shell_camera`, `apply_room_dive_visibility`,
+    /// and the patch bay's own LOD/keyboard gates key off now.
+    pub zoomed: Option<Station>,
     /// Re-lay-out the nameplates on the next frame (the patch bay's
     /// `text_dirty` shape — `view/patch_bay/mod.rs`). `StationPlate` entities
     /// live for ONE room visit: `exit_room` despawns `RoomRoot` (cascading to
@@ -428,7 +452,7 @@ pub struct RoomState {
 
 impl Default for RoomState {
     fn default() -> Self {
-        Self { carousel: StationCarousel::new(Station::TimeWell), plates_dirty: true }
+        Self { carousel: StationCarousel::new(Station::TimeWell), zoomed: None, plates_dirty: true }
     }
 }
 
@@ -473,11 +497,12 @@ pub struct BearingMarker {
 #[derive(Component)]
 pub struct ConsoleEmblem;
 
-/// Room chrome that **fades when you dive** into a station (`docs/scenes/shell.md`,
-/// slice B): the bearing pylons, station nameplates, console emblem, and violet
-/// radiators. `apply_room_dive_visibility` hides these while `Screen::PatchBay`
-/// so the dived station owns the eye; the floor, its traces, the vault dome, and
-/// the dived station itself stay — they are the chamber, not distractions.
+/// Room chrome that **fades when you zoom** into a station (`docs/scenes/shell.md`,
+/// slice B; the fullscreen-panel pivot, 2026-07-10 evening): the bearing pylons,
+/// station nameplates, console emblem, and violet radiators. `apply_room_dive_visibility`
+/// hides these while [`RoomState::zoomed`] is `Some` so the fullscreened station
+/// owns the eye; the floor, its traces, the vault dome, and the zoomed station
+/// itself stay — they are the chamber, not distractions.
 #[derive(Component)]
 pub struct RoomDistraction;
 
@@ -504,13 +529,15 @@ impl Plugin for RoomPlugin {
                     .chain()
                     .run_if(in_state(Screen::Room)),
             )
-            // Shell-wide (room OR patch-bay dive): the camera dolly retargets on
-            // the state flip so diving/surfacing reads as one continuous move, and
-            // the dive dims the room chrome. Both run across BOTH shell screens
-            // (`docs/scenes/shell.md`, slice B — one shared scene graph).
+            // The camera dolly retargets the moment `RoomState::zoomed` flips so
+            // diving/surfacing reads as one continuous move, and the dive dims the
+            // room chrome. Both read `zoomed` rather than a separate screen now
+            // (`docs/scenes/shell.md`'s "one shared scene graph" decision, taken
+            // one step further 2026-07-10 evening: there's no second screen left
+            // to run across).
             .add_systems(
                 Update,
-                (ease_shell_camera, apply_room_dive_visibility).run_if(in_shell),
+                (ease_shell_camera, apply_room_dive_visibility).run_if(in_state(Screen::Room)),
             );
     }
 }
@@ -541,11 +568,13 @@ fn enter_room(
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
-    // Surfacing from a patch-bay dive (`exit_room` kept the room, its W furniture,
-    // and the shared camera alive when the target was PatchBay). Nothing to build
-    // or claim — `ease_shell_camera` glides the camera back to the W focus, the
-    // LOD systems restore the room chrome. Only a *fresh* room arrival (from the
-    // well or conversation) falls through to spawn.
+    // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`
+    // only fires on an actual `Screen` transition into `Room` (Bevy states
+    // no-op a `set()` to the state already active), and diving/surfacing no
+    // longer touches `Screen` at all since `RoomState::zoomed` replaced
+    // `Screen::PatchBay` — so nothing should ever call this while `RoomRoot`
+    // is still standing. Kept anyway so a stale root can never get a second
+    // one spawned on top of it.
     if !existing.is_empty() {
         return;
     }
@@ -728,23 +757,23 @@ fn enter_room(
 
 pub(crate) fn exit_room(
     mut commands: Commands,
-    screen: Res<State<Screen>>,
+    mut room: ResMut<RoomState>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<RoomRoot>>,
     mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
 ) {
-    // Diving into the patch bay is travel WITHIN the shared shell scene graph,
-    // not a scene cut: the room chamber, the W furniture, and the shared camera
-    // all survive; `ease_shell_camera` dollies down and this teardown is skipped.
-    // `State<Screen>` already holds the *target* here — the transition updates it
-    // before OnExit runs (bevy_state `internal_apply_state_transition`, in the
-    // DependentTransitions set ahead of the exit schedules). Only leaving the
-    // shell entirely (Conversation, the well, the editor…) tears the room down;
-    // and because OnExit always precedes the next OnEnter, releasing the camera
-    // here lets the destination's own OnEnter (e.g. the well) re-claim it cleanly.
-    if *screen.get() == Screen::PatchBay {
-        return;
-    }
+    // Unconditional (2026-07-10 evening, the fullscreen-panel pivot): diving
+    // used to be a second screen (`Screen::PatchBay`) sharing this scene
+    // graph, so leaving the shell FROM a dive could bypass this very
+    // `OnExit(Screen::Room)` — the state being left was `PatchBay`, not
+    // `Room` — and the dive's own exit had to duplicate this teardown or leak
+    // the room. Dissolving that state removes the whole class of bug: diving
+    // is now a `RoomState::zoomed` write, not a screen, so `Screen::Room` is
+    // the ONLY state this scene graph ever occupies, and every way out of it
+    // runs this one exit. Clear the zoom too, so a later re-entry always
+    // starts unzoomed rather than inheriting a stale target from a
+    // long-despawned visit.
+    room.zoomed = None;
     teardown_room(&mut commands, &theme, &roots, &mut app_camera);
     info!("room: exited");
 }
@@ -752,16 +781,9 @@ pub(crate) fn exit_room(
 /// Tear the room down: despawn `RoomRoot` (recursively — the chamber and all
 /// its furniture, the W patch bay included) and release the shared camera
 /// (drop the [`RoomCamera`] claim, restore the conversation clear colour).
-///
-/// Shared by [`exit_room`] and the patch bay's `exit_patch_bay`: with one
-/// shared scene graph, a transition can leave the shell FROM the dived screen
-/// (a context switch landing while dived reveals the conversation,
-/// `view/sync.rs`; an `open_editor` peer signal jumps to the editor). On that
-/// path `OnExit(Screen::Room)` never fires — the state being left is
-/// `PatchBay` — so the dive's own exit must run this same teardown, or
-/// `RoomRoot`, the camera claim, and the room clear colour all leak into the
-/// next screen, and `enter_room`'s surfacing early-return later finds the
-/// stale root and never rebuilds (the broken-view cascade).
+/// Kept as its own helper for readability even though [`exit_room`] is its
+/// only caller now (`docs/scenes/shell.md`'s "one shared scene graph" no
+/// longer has a second exit to share it with).
 pub(crate) fn teardown_room(
     commands: &mut Commands,
     theme: &crate::ui::theme::Theme,
@@ -789,13 +811,21 @@ pub(crate) fn teardown_room(
 /// [`Bearing::dir`] via [`bearing::dir_theta`] so a re-placed bearing can't
 /// silently drift out of sync with its floor traces. **Amy-tunable.**
 ///
-/// The W bundle's `pad_range` was retuned twice on 2026-07-10 (`shell.md`,
+/// The W bundle's `pad_range` was retuned three times on 2026-07-10 (`shell.md`,
 /// "the wheel IS the west station"): first to cluster just past the W dais's
-/// foot, then again for the wall-mount retune — the dais is gone, and the
-/// wiring now flows all the way to the wall the wheel hangs on, terminating
-/// at the panel's base (just short of [`palette::WALL_APOTHEM`]) instead of
-/// the old floor-furniture foot, so the crimson wiring visibly flows INTO
-/// the station instead of past it.
+/// foot, then for the wall-mount retune (the dais is gone, and the wiring
+/// flows all the way to the wall the wheel hangs on, terminating at the
+/// panel's base instead of the old floor-furniture foot), then again that
+/// evening when the octagon itself grew (`palette::WALL_APOTHEM` 800 → 1200,
+/// the fullscreen-panel pivot) — expressed as `WALL_APOTHEM` minus a fixed
+/// gap (160/30) rather than a re-guessed literal, so the pads stay the SAME
+/// distance short of the wall regardless of how far out the wall itself
+/// stands. The other wall-reaching bundles (E crimson, N green, N cyan, S
+/// gold) stretch their `pad_range` by the same ratio the floor itself grew
+/// (`FLOOR_RADIUS` 1100 → 1300, ×13/11) so the whole board still reaches
+/// proportionally toward the bigger room — the violet diagonal stubs don't
+/// reach a wall at all (they depart and land near the inscribed ring) and are
+/// untouched.
 fn route_bundles() -> [bearing::RouteBundle; 9] {
     use bearing::{Bearing, RouteBundle, dir_theta};
     let west = dir_theta(Bearing::West.dir());
@@ -810,11 +840,11 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 7,
             lane_range: (280.0, 620.0),
             arc_range: (0.25, 0.9),
-            // Terminates at the wall base under the mounted wheel (the
-            // 2026-07-10 wall-mount retune) — past the old marker radius
-            // (`ROOM_RADIUS`, 620) and clustered short of the panel itself
-            // (`palette::WALL_APOTHEM`, 800).
-            pad_range: (640.0, 770.0),
+            // Terminates at the wall base under the mounted wheel — clustered
+            // a fixed 160/30 units short of the panel itself
+            // (`palette::WALL_APOTHEM`), so the gap from the wall stays the
+            // same size the 2026-07-10 evening apothem bump moved the wall.
+            pad_range: (palette::WALL_APOTHEM - 160.0, palette::WALL_APOTHEM - 30.0),
             hue: TRACE_CRIMSON,
             brightness_range: (0.7, 1.15),
         },
@@ -824,7 +854,12 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 7,
             lane_range: (300.0, 650.0),
             arc_range: (0.25, 0.9),
-            pad_range: (450.0, 900.0),
+            // Stretched ×13/11 from (450, 900) with `FLOOR_RADIUS` (1100 →
+            // 1300, the same evening apothem bump) — this bundle doesn't
+            // terminate AT a wall (Tracks keeps its floor marker, not a
+            // wall-mounted instrument), so it scales with the floor's own
+            // growth rather than `WALL_APOTHEM`'s fixed gap.
+            pad_range: (532.0, 1064.0),
             hue: TRACE_CRIMSON,
             brightness_range: (0.7, 1.15),
         },
@@ -834,7 +869,8 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 5,
             lane_range: (270.0, 560.0),
             arc_range: (0.2, 0.75),
-            pad_range: (400.0, 820.0),
+            // Stretched ×13/11 from (400, 820) — see the E bundle's comment.
+            pad_range: (473.0, 969.0),
             hue: TRACE_GREEN,
             brightness_range: (0.75, 1.15),
         },
@@ -844,7 +880,8 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 4,
             lane_range: (340.0, 660.0),
             arc_range: (0.2, 0.8),
-            pad_range: (460.0, 850.0),
+            // Stretched ×13/11 from (460, 850) — see the E bundle's comment.
+            pad_range: (544.0, 1005.0),
             hue: TRACE_CYAN,
             brightness_range: (0.7, 1.1),
         },
@@ -914,7 +951,8 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 2,
             lane_range: (300.0, 500.0),
             arc_range: (0.15, 0.4),
-            pad_range: (380.0, 600.0),
+            // Stretched ×13/11 from (380, 600) — see the E bundle's comment.
+            pad_range: (449.0, 709.0),
             hue: TRACE_GOLD,
             brightness_range: (0.8, 1.0),
         },
@@ -1326,14 +1364,45 @@ fn spawn_pylons(
 
 // ── Systems ───────────────────────────────────────────────────────────────────
 
-/// Room keys: Left/Right cycle the carousel, Enter/Down dive into a built
-/// station, Esc drops to the conversation (the room is the top level). The nav
-/// contract is frozen — this is unchanged from the blockout.
+/// Whether Enter/Down on a focused station fullscreens the camera onto it
+/// (`RoomState::zoomed`) rather than diving to a dedicated `Screen` — only
+/// the wheel earns this today (2026-07-10 evening, the fullscreen-panel
+/// pivot: "diving IS fullscreening a panel" for a *bounded* station; the well
+/// still cuts to its own screen, and N stays a future dive-THROUGH door onto
+/// an unbounded world, not a panel to fill the frame with). A future
+/// in-room station with content of its own — the highway, the archway — adds
+/// itself here as that content lands. Pure — no Bevy types — unit-tested like
+/// `bearing::station_is_room_furniture`, which this pairs with (same station,
+/// same reasoning: the wheel IS its own furniture AND its own zoom target).
+fn station_is_zoomable(station: Station) -> bool {
+    matches!(station, Station::PatchBay)
+}
+
+/// Room keys: Left/Right cycle the carousel, Enter/Down dives, Esc drops to
+/// the conversation (the room is the top level) — the nav contract is frozen,
+/// unchanged from the blockout. "Dive" now means two different things
+/// depending on the target: `TimeWell` still cuts to its own `Screen`; a
+/// [`station_is_zoomable`] station instead sets `RoomState::zoomed` — a
+/// camera pose, not a screen (2026-07-10 evening, the fullscreen-panel pivot,
+/// superseding `Screen::PatchBay`).
+///
+/// While zoomed, this system steps back almost entirely: Left/Right and
+/// Esc/Up belong to the zoomed station's OWN keyboard system now (patch_bay's
+/// `patch_bay_keyboard`, gated on `patch_bay_zoomed`) — "the zoomed station's
+/// own keys own them," the same reasoning `bearing::station_is_room_furniture`
+/// already applies to the wheel's geometry. The one thing this system still
+/// owns while zoomed is nothing at all; it simply returns, so there's no
+/// double-handling between the two systems.
 fn room_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut room: ResMut<RoomState>,
+    mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut next: ResMut<NextState<Screen>>,
 ) {
+    if room.zoomed.is_some() {
+        return;
+    }
+
     if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
         room.carousel.step(1);
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
@@ -1341,10 +1410,22 @@ fn room_keyboard(
     }
 
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::ArrowDown) {
-        match room.carousel.focused_station() {
+        let station = room.carousel.focused_station();
+        match station {
             Station::TimeWell => next.set(Screen::TimeWell),
-            Station::PatchBay => next.set(Screen::PatchBay),
-            // Unbuilt stations: stay put (the dimmed plate says why).
+            _ if station_is_zoomable(station) => {
+                room.zoomed = Some(station);
+                // Arm the newly-zoomed station's text layer — the old
+                // `enter_patch_bay`'s job, moved to the zoom-in site since
+                // there's no more `OnEnter(Screen::PatchBay)` to hang it on.
+                // Only one zoomable station exists today; a second one adds
+                // its own arm beside this (documented, not hidden behind an
+                // abstraction the codebase doesn't need yet).
+                if station == Station::PatchBay {
+                    pb_state.arm_text();
+                }
+            }
+            // Unbuilt, non-zoomable stations: stay put (the dimmed plate says why).
             _ => {}
         }
         return;
@@ -1435,26 +1516,33 @@ fn room_focus_visuals(
     }
 }
 
-/// Ease the shared shell camera toward its target pose — travel by intent, the
-/// same exponentially-smoothed tween as the well's `ease_camera_to_focused_ring`
-/// (no cuts). Runs across BOTH shell screens and reads the target from the state:
-/// in the room it faces the focused station's bearing; on a patch-bay dive it
-/// descends to [`patch_bay::dive_camera_pose`] (the standalone scene's pose
-/// mapped through the W placement). One system, one camera — so diving and
-/// surfacing are the SAME continuous glide, just retargeted the frame the state
-/// flips (no snap either way).
+/// Ease the shell camera toward its target pose — travel by intent, the same
+/// exponentially-smoothed tween as the well's `ease_camera_to_focused_ring`
+/// (no cuts). Reads the target from [`RoomState::zoomed`] now, not a second
+/// `Screen` (2026-07-10 evening, the fullscreen-panel pivot): at room scale it
+/// faces the focused station's bearing ([`desired_camera`]); zoomed, it fills
+/// the frame with that station's panel ([`fullscreen_pose`]). One system, one
+/// camera — diving and surfacing are the SAME continuous glide, just
+/// retargeted the frame `zoomed` flips (no snap either way).
 fn ease_shell_camera(
     time: Res<Time>,
     room: Res<RoomState>,
-    screen: Res<State<Screen>>,
     mut cam: Query<&mut Transform, With<RoomCamera>>,
 ) {
     let Ok(mut tf) = cam.single_mut() else {
         return;
     };
-    let (pos, look) = match *screen.get() {
-        Screen::PatchBay => patch_bay::dive_camera_pose(),
-        _ => desired_camera(room.carousel.focused_station()),
+    let (pos, look) = match room.zoomed {
+        Some(station) => {
+            let dir = bearing::focus_dir(station)
+                .expect("a zoomable station always has a wall bearing to fill the frame with");
+            // Every panel shares the same vertical center (`WALL_HEIGHT * 0.5`
+            // — `palette::STATION_W_MOUNT_Y` is this same number, named for
+            // the wheel's own placement contract); a future second zoomable
+            // station reads this general height too, not a station-specific one.
+            fullscreen_pose(Vec3::from_array(dir), WALL_HEIGHT * 0.5)
+        }
+        None => desired_camera(room.carousel.focused_station()),
     };
     let desired = Transform::from_translation(pos).looking_at(look, Vec3::Y);
     let alpha = 1.0 - (-CAMERA_EASE_RATE * time.delta_secs()).exp();
@@ -1462,22 +1550,20 @@ fn ease_shell_camera(
     tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
 }
 
-/// Fade the room chrome on a dive: hide the [`RoomDistraction`] chrome (bearing
-/// pylons, nameplates, console emblem, radiators) while `Screen::PatchBay` so the
-/// dived station owns the eye, and restore it in the room. The floor, its traces,
-/// the vault dome, and the dived station itself stay — they are the chamber, not
-/// distractions. One mechanism (Visibility), change-guarded so settled chrome
-/// never re-dirties (`docs/scenes/shell.md`, slice B — the dived view earns its
-/// focus by hiding distractions and showing the labels).
+/// Fade the room chrome on a zoom: hide the [`RoomDistraction`] chrome (bearing
+/// pylons, nameplates, console emblem, radiators) while [`RoomState::zoomed`]
+/// is `Some` so the fullscreened station owns the eye, and restore it at room
+/// scale. The floor, its traces, the vault dome, and the zoomed station itself
+/// stay — they are the chamber, not distractions. One mechanism (Visibility),
+/// change-guarded so settled chrome never re-dirties (`docs/scenes/shell.md`
+/// — the zoomed view earns its focus by hiding distractions and showing the
+/// labels, same effect as the old dive, now keyed on the resource instead of
+/// a second `Screen`).
 fn apply_room_dive_visibility(
-    screen: Res<State<Screen>>,
+    room: Res<RoomState>,
     mut chrome: Query<&mut Visibility, With<RoomDistraction>>,
 ) {
-    let want = if *screen.get() == Screen::PatchBay {
-        Visibility::Hidden
-    } else {
-        Visibility::Inherited
-    };
+    let want = if room.zoomed.is_some() { Visibility::Hidden } else { Visibility::Inherited };
     for mut vis in chrome.iter_mut() {
         if *vis != want {
             *vis = want;
@@ -1554,10 +1640,10 @@ fn sync_room_glow(
 /// Two documented per-station exceptions retarget the look point away from
 /// the default marker radius/height (`ROOM_RADIUS`, `APPROACH_LOOK_HEIGHT`):
 /// - `Radiators` (2026-07-10): its NE panel is now the octagon wall shell's
-///   own diagonal face, standing at [`palette::WALL_APOTHEM`] (800) — well
-///   past the old free-floating radiator radius (660) this look-point used
-///   to target. Left at `ROOM_RADIUS` (620) the camera would look at empty
-///   air short of the wall.
+///   own diagonal face, standing at [`palette::WALL_APOTHEM`] — well past
+///   the old free-floating radiator radius (660) this look-point used to
+///   target. Left at `ROOM_RADIUS` (620) the camera would look at empty air
+///   short of the wall.
 /// - `PatchBay` (2026-07-10, the wall-mount retune): the wheel itself moved
 ///   from a floor dais to the W wall panel, at [`palette::WALL_APOTHEM`] and
 ///   [`palette::STATION_W_MOUNT_Y`] (280, the panel's vertical center) — the
@@ -1584,6 +1670,39 @@ fn desired_camera(station: Station) -> (Vec3, Vec3) {
             )
         }
     }
+}
+
+/// The camera's vertical field of view — mirrors `main::setup_camera`'s
+/// `Camera3d::default()` projection (Bevy's own `PerspectiveProjection`
+/// default, `fov: PI / 4.0`). [`fullscreen_pose`] derives its standoff
+/// distance from this; if the app camera's FOV ever changes, this constant
+/// must follow it or the fullscreen pose stops framing a panel edge-to-edge.
+/// `fullscreen_pose_fills_the_frame_with_the_panel_height` locks the
+/// relationship instead of trusting two hand-written copies to agree.
+const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
+
+/// The room-space `(eye, look-at)` that fills the camera's vertical frustum
+/// with exactly one wall panel — "diving IS fullscreening a panel" (Amy,
+/// 2026-07-10 evening). `bearing_dir` is the panel's bearing (unit XZ,
+/// pointing from center OUT to the wall, e.g. [`bearing::Bearing::West`]'s);
+/// `mount_y` is the panel's own vertical center (every panel shares
+/// `WALL_HEIGHT * 0.5` — see `ease_shell_camera`'s call site).
+///
+/// The eye stands on the panel's inward normal — i.e. back toward center,
+/// along `-bearing_dir` — at the pinhole distance `d` that makes the panel's
+/// full height exactly subtend the frustum: the standard "fit height in
+/// frame" relation `tan(FOV_Y / 2) = (height / 2) / d`, solved for `d`. Pure;
+/// unit-tested against that formula, against standing inside the octagon
+/// (not through the wall), and against looking at the panel's own center.
+fn fullscreen_pose(bearing_dir: Vec3, mount_y: f32) -> (Vec3, Vec3) {
+    let d = (WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+    let panel = Vec3::new(
+        bearing_dir.x * palette::WALL_APOTHEM,
+        mount_y,
+        bearing_dir.z * palette::WALL_APOTHEM,
+    );
+    let eye = panel - bearing_dir * d;
+    (eye, panel)
 }
 
 // ── Material + colour helpers ──────────────────────────────────────────────────
@@ -1807,9 +1926,15 @@ mod tests {
     /// The shape `RoomState` is left in after a visit: the carousel focus
     /// (Resource) survives `exit_room` untouched, but `plates_dirty` has
     /// already been cleared by `room_plate_text` filling that visit's
-    /// plates — and nothing has re-armed it for the next entry yet.
+    /// plates — and nothing has re-armed it for the next entry yet. `zoomed`
+    /// is always `None` here: `exit_room` clears it unconditionally on the
+    /// way out, so no visit can ever persist a lingering zoom.
     fn persisted_after_a_visit() -> RoomState {
-        RoomState { carousel: StationCarousel::new(Station::PatchBay), plates_dirty: false }
+        RoomState {
+            carousel: StationCarousel::new(Station::PatchBay),
+            zoomed: None,
+            plates_dirty: false,
+        }
     }
 
     #[test]
@@ -1836,6 +1961,128 @@ mod tests {
         let before = room.carousel.focused;
         arm_on_enter(&mut room);
         assert_eq!(room.carousel.focused, before, "arm_on_enter only touches plates_dirty");
+    }
+
+    // -- station_is_zoomable / RoomState::zoomed (2026-07-10 evening,
+    //    the fullscreen-panel pivot: `zoomed` replaces `Screen::PatchBay`) --
+
+    #[test]
+    fn only_patch_bay_is_zoomable_today() {
+        for s in Station::ALL {
+            assert_eq!(
+                station_is_zoomable(s),
+                s == Station::PatchBay,
+                "{s:?}: only the wheel earns a fullscreen zoom today"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_round_trip_never_touches_the_carousel_or_plates_dirty() {
+        // Zooming in/out is a plain `RoomState` field write now — there is no
+        // `OnEnter`/`OnExit` hook attached to it at all (unlike the old
+        // `Screen::PatchBay` transition), so nothing can possibly despawn or
+        // rebuild anything on a zoom toggle. A resource-level check is the
+        // whole proof; no Bevy `App` is needed to demonstrate "the room stays
+        // alive" when there's no teardown wired to this write in the first
+        // place.
+        let mut room = persisted_after_a_visit();
+        let carousel_before = room.carousel.focused;
+        let plates_dirty_before = room.plates_dirty;
+
+        room.zoomed = Some(Station::PatchBay);
+        assert_eq!(room.zoomed, Some(Station::PatchBay));
+        room.zoomed = None;
+
+        assert_eq!(room.carousel.focused, carousel_before, "zooming never touches the carousel");
+        assert_eq!(room.plates_dirty, plates_dirty_before, "zooming never touches plates_dirty");
+    }
+
+    // -- fullscreen_pose (the "diving IS fullscreening a panel" math) --
+
+    #[test]
+    fn fullscreen_pose_stands_the_pinhole_distance_back_from_the_panel() {
+        let dir = Vec3::from_array(bearing::Bearing::West.dir());
+        let (eye, look) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
+        let d = (WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+        assert!(
+            ((look - eye).length() - d).abs() < 1e-3,
+            "eye should stand exactly d={d} back from the panel, got {}",
+            (look - eye).length()
+        );
+        assert!((look.y - palette::STATION_W_MOUNT_Y).abs() < 1e-5, "looks at the given mount height");
+    }
+
+    #[test]
+    fn fullscreen_pose_looks_squarely_at_the_panel_center() {
+        let dir = Vec3::from_array(bearing::Bearing::West.dir());
+        let (_, look) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
+        let look_r = look.x * dir.x + look.z * dir.z;
+        assert!(
+            (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
+            "look point should sit exactly on the wall apothem: {look_r}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_pose_stands_inside_the_octagon_not_through_the_wall() {
+        let dir = Vec3::from_array(bearing::Bearing::West.dir());
+        let (eye, _) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
+        let eye_r = eye.x * dir.x + eye.z * dir.z;
+        assert!(eye_r > 0.0, "eye stands on the room side of center: {eye_r}");
+        assert!(eye_r < palette::WALL_APOTHEM, "eye stands short of the wall, inside the octagon: {eye_r}");
+    }
+
+    // -- exit_room lifecycle (2026-07-10 evening: unconditional, no more
+    //    `Screen::PatchBay` branch to get wrong) --
+
+    fn zoom_lifecycle_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(bevy::state::app::StatesPlugin)
+            .insert_resource(crate::ui::theme::Theme::default())
+            .init_resource::<RoomState>()
+            .init_state::<Screen>()
+            .add_systems(OnExit(Screen::Room), exit_room);
+        app
+    }
+
+    fn set_screen(app: &mut App, s: Screen) {
+        app.world_mut().resource_mut::<NextState<Screen>>().set(s);
+        app.update();
+    }
+
+    fn room_root_count(app: &mut App) -> usize {
+        app.world_mut().query_filtered::<Entity, With<RoomRoot>>().iter(app.world()).count()
+    }
+
+    #[test]
+    fn exit_room_always_tears_down_and_clears_any_lingering_zoom() {
+        // The old leak class this replaces: `Screen::PatchBay` had its own
+        // `OnExit` (`exit_patch_bay`, deleted) because a transition leaving
+        // the shell FROM the dive bypassed `OnExit(Screen::Room)` entirely.
+        // With `zoomed` a resource field, `Screen::Room` is the only state
+        // this scene graph ever occupies — every way out runs THIS exit, and
+        // there is no more per-target branch for it to skip.
+        let mut app = zoom_lifecycle_app();
+        app.world_mut().spawn(RoomRoot);
+        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
+        app.world_mut().resource_mut::<RoomState>().zoomed = Some(Station::PatchBay);
+
+        set_screen(&mut app, Screen::Room);
+        set_screen(&mut app, Screen::Conversation);
+
+        assert_eq!(room_root_count(&mut app), 0, "leaving the room always tears it down");
+        assert!(app.world().get::<RoomCamera>(cam).is_none(), "the camera claim is released");
+        assert!(
+            app.world().resource::<RoomState>().zoomed.is_none(),
+            "exit_room clears any lingering zoom so a later re-entry starts unzoomed"
+        );
+        let theme_bg = app.world().resource::<crate::ui::theme::Theme>().bg;
+        let clear = app.world().get::<Camera>(cam).unwrap().clear_color;
+        assert!(
+            matches!(clear, ClearColorConfig::Custom(c) if c == theme_bg),
+            "the conversation clear colour must be restored: {clear:?}"
+        );
     }
 
     #[test]
@@ -1878,8 +2125,8 @@ mod tests {
     fn radiators_and_patch_bay_focus_look_at_the_wall_apothem_not_the_room_radius() {
         // Two documented exceptions read WALL_APOTHEM instead of ROOM_RADIUS:
         // Radiators (2026-07-10, the NE panel is the octagon shell's own
-        // diagonal wall face at 800, not the old free-floating slab at 660)
-        // and PatchBay (2026-07-10, the wall-mount retune: the wheel itself
+        // diagonal wall face, not the old free-floating slab at 660) and
+        // PatchBay (2026-07-10, the wall-mount retune: the wheel itself
         // moved from a floor dais to the wall panel). Every OTHER wall
         // station's look point must be untouched.
         for s in [Station::Radiators, Station::PatchBay] {
@@ -2123,6 +2370,21 @@ mod tests {
         );
         assert!(palette::WALL_APOTHEM > 660.0, "the shell must enclose the old radiator radius (660)");
         assert!(palette::WALL_APOTHEM < FLOOR_RADIUS, "the shell must stand on the floor disc");
+    }
+
+    #[test]
+    fn floor_radius_clears_the_octagon_circumradius_so_the_walls_stand_on_the_floor() {
+        // The binding constraint the 2026-07-10 evening apothem bump (800 →
+        // 1200) introduced: the octagon's own VERTEX (where two panels meet)
+        // sits a touch past the apothem itself (`octagon_circumradius`), so
+        // the weaker `WALL_APOTHEM < FLOOR_RADIUS` check above isn't enough —
+        // the floor has to reach past every corner, or the walls stand past
+        // the disc's edge instead of on it.
+        let circumradius = bearing::octagon_circumradius(palette::WALL_APOTHEM);
+        assert!(
+            FLOOR_RADIUS > circumradius,
+            "the floor disc must reach past every octagon vertex ({circumradius}) so the walls stand ON it: {FLOOR_RADIUS}"
+        );
     }
 
     #[test]

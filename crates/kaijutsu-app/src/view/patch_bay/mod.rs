@@ -33,12 +33,11 @@ use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::ui::screen::{Screen, in_shell};
+use crate::ui::screen::Screen;
 use crate::view::palette;
-use crate::view::room::nav::{Station, StationCarousel};
+use crate::view::room::nav::Station;
 use crate::view::room::{
-    PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomCamera, RoomRoot, RoomState,
-    layout_plate_text, teardown_room,
+    PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text,
 };
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use geometry::{chord_points, layout_sockets};
@@ -57,12 +56,16 @@ use geometry::{chord_points, layout_sockets};
 // (the chamber's architecture, not this station's furniture); this placement
 // reads the SAME `palette::STATION_W_*`/`WALL_APOTHEM` numbers to seat the
 // wheel flush against it (`palette.rs`'s "Station W contract" — room and
-// patch bay agree there, never by eyeballing each other). The dive camera is
-// the local `PB_CAM_POS/LOOK` mapped through this same transform
-// (`dive_camera_pose`), so the dived view frames the wheel exactly as the
-// standalone scene did — one seam: edit this constant (or the shared
-// contract it reads) and everything, including the dive camera, follows via
-// the similarity transform.
+// patch bay agree there, never by eyeballing each other).
+//
+// The dive camera is NO LONGER derived from this placement (2026-07-10
+// evening, the fullscreen-panel pivot): `room::fullscreen_pose` computes the
+// zoomed pose straight from `palette::WALL_APOTHEM`/`room::WALL_HEIGHT` and
+// the station's own bearing direction, independent of this transform. Editing
+// `STATION_W_PLACEMENT` moves the wheel itself but no longer moves the
+// camera — the two were deliberately decoupled once the camera pose stopped
+// needing to know anything about the wheel's own local geometry (`PB_CAM_POS`/
+// `PB_CAM_LOOK`/`dive_camera_pose`, all deleted this slice).
 
 /// A rigid-plus-uniform-scale placement of a scene into room space.
 struct StationPlacement {
@@ -86,9 +89,10 @@ struct StationPlacement {
 /// The pure rotation half of a placement: pitch about local +X, then yaw
 /// about world +Y (`Ry(yaw) * Rx(pitch)`, pitch applied first — Bevy/glam
 /// quaternion composition applies the right-hand factor to the vector
-/// first). The one seam [`placement_transform`] (spawns the subtree) and
-/// [`placement_to_room`] (maps a bare point, for the dive camera) both build
-/// on, so the two paths can never disagree about which way the scene faces.
+/// first). [`placement_transform`] builds the subtree's spawn transform on
+/// this; the test-only [`placement_to_room`] below builds the same
+/// derivation's checks on it too, so the tests can never drift from what
+/// actually gets spawned.
 fn placement_rotation(p: &StationPlacement) -> Quat {
     Quat::from_rotation_y(p.yaw) * Quat::from_rotation_x(p.pitch)
 }
@@ -111,9 +115,9 @@ fn placement_rotation(p: &StationPlacement) -> Quat {
 /// `−π/2`.
 ///
 /// **The roll** (which candidate): the standalone scene's local +Z was the
-/// camera-side edge of the table (the old approach camera studied it from
-/// +Z, `PB_CAM_POS`'s docs). Mounted on the wall, that edge should read as
-/// the TOP of the instrument's face, never its bottom — local Z ↦ world Y,
+/// camera-side edge of the table (the old approach camera, before the
+/// wall-mount, studied it from +Z). Mounted on the wall, that edge should
+/// read as the TOP of the instrument's face, never its bottom — local Z ↦ world Y,
 /// not world −Y. Working the same composition through both candidates:
 /// `(pitch, yaw) = (+π/2, +π/2)` sends local Z to world −Y (upside down);
 /// `(−π/2, −π/2)` sends it to world +Y (right side up) — the tie-breaker.
@@ -171,23 +175,6 @@ const TABLE_INNER_R: f32 = HOLE_R * 0.92;
 const TABLE_OUTER_R: f32 = RIM_R * 1.16;
 const TABLE_DEPTH: f32 = 12.0;
 
-/// Camera pose (patch-bay LOCAL space): the wall-mount dive pose
-/// (2026-07-10), standing OUT along the wheel's own table normal — local +Y,
-/// which [`STATION_W_PLACEMENT`]'s rotation sends into the room (world +X) —
-/// with a touch of local +Z, which that same rotation sends to world +Y: a
-/// little above the mounted center, after the roll. Replaces the old
-/// horizontal-table pose (`(0, 470, 590)`, tuned for a flat tabletop and
-/// `ease_shell_camera`'s world-up righting; mapped through the new pitch it
-/// gave an awkward high-side view of the mounted face instead of a
-/// stand-before-the-wall one). Under the standalone scene this was the
-/// room-space pose; now it is mapped through [`STATION_W_PLACEMENT`] to
-/// place the dive camera in room space ([`dive_camera_pose`]) so the dived
-/// framing still reads as walking up to the instrument, not floating over a
-/// tabletop. `ease_shell_camera` rights the mapped camera with world-up
-/// automatically, so this pose only has to get the STANDING position right,
-/// not the on-screen roll.
-const PB_CAM_POS: Vec3 = Vec3::new(0.0, 560.0, 130.0);
-const PB_CAM_LOOK: Vec3 = Vec3::new(0.0, 0.0, -20.0);
 
 /// Wire hue — crimson = MIDI fabric (`docs/scenes/patchbay.md`, wire grammar).
 /// Already HDR (>1.0) so a live wire blooms; the selected chord multiplies it.
@@ -293,29 +280,16 @@ fn placement_transform(p: &StationPlacement) -> Transform {
 
 /// Map a patch-bay-LOCAL point to room space through a placement — the same
 /// similarity transform [`placement_transform`] applies to the subtree, but as
-/// a point mapping the camera dolly can read without touching an entity. Pure;
-/// unit-tested.
+/// a point mapping a test can check without spawning an entity. Test-only:
+/// the fullscreen dive camera no longer reads this placement at all
+/// (`room::fullscreen_pose` computes it straight from the station's bearing
+/// and the shared wall constants, decoupled from the wheel's own local
+/// geometry — 2026-07-10 evening, the fullscreen-panel pivot); this helper
+/// survives purely to let the `placement_*` tests below check the rotation
+/// derivation against concrete points instead of raw quaternion algebra.
+#[cfg(test)]
 fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
     p.translation + placement_rotation(p) * (local * p.scale)
-}
-
-/// The dive camera's room-space `(eye, look-at)` — the local [`PB_CAM_POS`] /
-/// [`PB_CAM_LOOK`] carried through [`STATION_W_PLACEMENT`]. `ease_shell_camera`
-/// glides to this while `Screen::PatchBay`, so descending onto the
-/// wall-mounted wheel frames it exactly as the standalone scene did — the
-/// dive reads as walking up to a wall instrument, not floating over a
-/// tabletop. Text plates no longer chase this eye at all (the live-found
-/// regression this superseded: a rotation baked to face `PB_CAM_POS` in the
-/// scene's PRE-mount local frame reads sideways/upside-down once the mount
-/// pitches and yaws that frame onto the wall, because local "up" no longer
-/// survives the mount) — every plate now bakes the single fixed
-/// [`upright_wall_facing`] rotation instead, which reads square and upright
-/// from any eye standing out along the wall's normal, this one included.
-pub(crate) fn dive_camera_pose() -> (Vec3, Vec3) {
-    (
-        placement_to_room(&STATION_W_PLACEMENT, PB_CAM_POS),
-        placement_to_room(&STATION_W_PLACEMENT, PB_CAM_LOOK),
-    )
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -364,6 +338,17 @@ impl Default for PatchBayState {
     }
 }
 
+impl PatchBayState {
+    /// Arm the text layer alone (not the full scene rebuild [`arm_scene`]
+    /// forces) — the old `enter_patch_bay`'s one job, called now from the
+    /// zoom-in site (`room::room_keyboard`) since there's no more
+    /// `OnEnter(Screen::PatchBay)` to hang it on. `text_dirty` is private so
+    /// this method, not a raw field write, is the cross-module seam.
+    pub(crate) fn arm_text(&mut self) {
+        self.text_dirty = true;
+    }
+}
+
 // ── Components ──────────────────────────────────────────────────────────────
 
 /// The placement entity that re-roots the patch bay into room space at the W
@@ -375,10 +360,10 @@ pub struct StationWPlacement;
 #[derive(Component)]
 pub struct PatchBayRoot;
 
-/// The dived view's LOD layer — port labels, radial etch ticks, group/title/info
-/// plates: the "dedicated view" text+tick detail that appears only on the dive
+/// The zoomed view's LOD layer — port labels, radial etch ticks, group/title/info
+/// plates: the "dedicated view" text+tick detail that appears only when zoomed
 /// (`docs/scenes/shell.md`, slice B). `apply_patch_lod` shows these while
-/// `Screen::PatchBay` and hides them at room scale, where the bare chords over
+/// [`patch_bay_zoomed`] and hides them at room scale, where the bare chords over
 /// the socket rings are the W ambient. Spawned `Visibility::Hidden` so the
 /// room-scale default is correct with no first-frame flash.
 #[derive(Component)]
@@ -416,7 +401,7 @@ pub struct TitlePlate(pub &'static str);
 pub struct PortLabel(String);
 
 /// A radial etch tick at a socket seat angle. Seat-driven, so it rebuilds with
-/// the sockets (unlike the static concentric rings spawned in `enter_patch_bay`).
+/// the sockets (unlike the static concentric rings spawned once in `spawn_furniture`).
 #[derive(Component)]
 pub struct EtchTick;
 
@@ -429,40 +414,67 @@ impl Plugin for PatchBayPlugin {
         app.init_resource::<PatchBayState>()
             .insert_non_send_resource(PatchBayAlsa::default())
             .add_plugins(MaterialPlugin::<ChordMaterial>::default())
-            .add_systems(OnEnter(Screen::PatchBay), enter_patch_bay)
-            .add_systems(OnExit(Screen::PatchBay), exit_patch_bay)
+            // No `OnEnter`/`OnExit(Screen::PatchBay)` any more (2026-07-10
+            // evening, the fullscreen-panel pivot): there is no second screen
+            // to hang them on. The old `enter_patch_bay`'s one job — arming
+            // `text_dirty` on the way in — moved to the zoom-in site
+            // (`room::room_keyboard`); the old `exit_patch_bay`'s teardown
+            // duty was already `room::teardown_room`, which `room::exit_room`
+            // now runs unconditionally on its own.
             .add_systems(
                 Update,
                 (
                     // Dived-only input; first so a Left/Right selection lands
                     // before the rebuild/fill it feeds.
-                    patch_bay_keyboard.run_if(in_state(Screen::PatchBay)),
+                    patch_bay_keyboard.run_if(patch_bay_zoomed),
                     // Ambient truth: the observed graph, its chords, the
-                    // selection glow, and traffic pulses stay live across BOTH
-                    // shell screens — the chords ARE the W ambient even seen
-                    // from room scale (the bearing's promise), so these can't be
-                    // gated behind the dive.
-                    poll_patch_graph.run_if(in_shell),
-                    rebuild_patch_scene.run_if(in_shell),
-                    update_wire_selection.run_if(in_shell),
-                    // Dived-only detail: the inspection card pose and the text
+                    // selection glow, and traffic pulses stay live at room
+                    // scale AND zoomed — the chords ARE the W ambient even
+                    // seen from room scale (the bearing's promise), so these
+                    // can't be gated behind the zoom. `Screen::Room` is now
+                    // the only screen this scene graph occupies at all.
+                    poll_patch_graph.run_if(in_state(Screen::Room)),
+                    rebuild_patch_scene.run_if(in_state(Screen::Room)),
+                    update_wire_selection.run_if(in_state(Screen::Room)),
+                    // Zoomed-only detail: the inspection card pose and the text
                     // layer (fills after rebuild spawns the plates it reads;
                     // `fill_patch_text` owns the `text_dirty` clear, so port
                     // labels fill first on the same armed flag).
-                    position_info_plate.run_if(in_state(Screen::PatchBay)),
-                    fill_port_labels.run_if(in_state(Screen::PatchBay)),
-                    fill_patch_text.run_if(in_state(Screen::PatchBay)),
-                    pulse_render_chords.run_if(in_shell),
+                    position_info_plate.run_if(patch_bay_zoomed),
+                    fill_port_labels.run_if(patch_bay_zoomed),
+                    fill_patch_text.run_if(patch_bay_zoomed),
+                    pulse_render_chords.run_if(in_state(Screen::Room)),
                     // LOD visibility last, so a label/tick rebuild spawned this
-                    // frame gets its room-vs-dive visibility set before render.
-                    apply_patch_lod.run_if(in_shell),
+                    // frame gets its room-vs-zoom visibility set before render.
+                    apply_patch_lod.run_if(in_state(Screen::Room)),
                 )
                     .chain(),
             );
     }
 }
 
-// ── Enter / exit ────────────────────────────────────────────────────────────
+// ── Zoom gate (2026-07-10 evening, the fullscreen-panel pivot) ──────────────
+
+/// Pure predicate: is `station` the room's current zoom target? The Bevy
+/// system-param wrapper below ([`patch_bay_zoomed`]) is what the plugin
+/// actually registers as a `run_if` condition; this is its testable core.
+fn is_zoomed_into(zoomed: Option<Station>, station: Station) -> bool {
+    zoomed == Some(station)
+}
+
+/// The `run_if` condition every dived-only patch-bay system gates on now —
+/// the direct replacement for `in_state(Screen::PatchBay)`: diving is a
+/// `RoomState::zoomed` write, not a screen, so the gate reads the resource
+/// instead. `RoomState::zoomed` can only ever be `Some(PatchBay)` while
+/// actually inside `Screen::Room` (`room::room_keyboard` sets it, and
+/// `room::exit_room` unconditionally clears it on the way out), so checking
+/// `zoomed` alone is sufficient — no separate `in_state(Screen::Room)` guard
+/// needed alongside it.
+fn patch_bay_zoomed(room: Res<RoomState>) -> bool {
+    is_zoomed_into(room.zoomed, Station::PatchBay)
+}
+
+// ── Scene lifecycle ──────────────────────────────────────────────────────────
 
 /// Arm a fresh poll + full scene/text rebuild for the next frame. `PatchBayState`
 /// (and its `snapshot`) is a `Resource` — it outlives the entities `RoomRoot`
@@ -477,46 +489,6 @@ pub(crate) fn arm_scene(state: &mut PatchBayState) {
     state.timer.set_elapsed(full);
     state.text_dirty = true;
     state.scene_dirty = true;
-}
-
-/// Dive into the patch bay. The furniture already stands at W as part of the
-/// room ([`spawn_furniture`]), so this is **not** a spawn and claims no camera:
-/// the shared camera dollies down onto the table (`ease_shell_camera` retargets
-/// the moment the state flips) and the LOD layer appears (`apply_patch_lod`).
-/// Re-arm the text so the labels fill on this dive even when the graph is
-/// unchanged since the last one (the fill systems run only while dived).
-fn enter_patch_bay(mut state: ResMut<PatchBayState>) {
-    state.text_dirty = true;
-    info!("patch-bay: dived");
-}
-
-/// Leave the dive. Two very different exits share this `OnExit`:
-///
-/// - **Surfacing to the room** (Esc/Up): nothing to tear down — the room and
-///   its W furniture survive, `ease_shell_camera` glides back up,
-///   `apply_patch_lod` hides the detail layer; the wire selection is left
-///   intact so re-diving resumes where it was.
-/// - **Leaving the shell from the dive**: a context switch landing while dived
-///   reveals the conversation (`view/sync.rs`), an `open_editor` peer signal
-///   jumps to the editor. `OnExit(Screen::Room)` will NOT fire on that path —
-///   the state being left is `PatchBay` — so the room teardown falls to us
-///   ([`teardown_room`]), or the room leaks into every later screen.
-///
-/// `State<Screen>` already holds the *target* during OnExit (the bevy_state
-/// ordering guarantee documented at `room::exit_room`).
-fn exit_patch_bay(
-    mut commands: Commands,
-    screen: Res<State<Screen>>,
-    theme: Res<crate::ui::theme::Theme>,
-    roots: Query<Entity, With<RoomRoot>>,
-    mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
-) {
-    if *screen.get() == Screen::Room {
-        info!("patch-bay: surfaced");
-        return;
-    }
-    teardown_room(&mut commands, &theme, &roots, &mut app_camera);
-    info!("patch-bay: left the shell from the dive (room torn down)");
 }
 
 /// Spawn the patch-bay wheel as **the west station itself** — the static half
@@ -653,17 +625,15 @@ pub(crate) fn spawn_furniture(
     info!("patch-bay: stationed as the west station");
 }
 
-/// The dive LOD: show the label/tick/card layer while `Screen::PatchBay`, hide
-/// it at room scale (`docs/scenes/shell.md`, slice B — the dived view earns its
-/// focus by *showing the labels*, the room ambient is the bare chords over the
-/// socket rings). Change-guarded so a settled entity never re-dirties; it also
-/// corrects the labels/ticks `rebuild_patch_scene` spawns this frame (they spawn
-/// `Hidden`, so the room-scale default needs no fix — only the dive shows them).
-fn apply_patch_lod(
-    screen: Res<State<Screen>>,
-    mut lod: Query<&mut Visibility, With<PatchBayLod>>,
-) {
-    let want = if *screen.get() == Screen::PatchBay {
+/// The zoom LOD: show the label/tick/card layer while [`patch_bay_zoomed`],
+/// hide it at room scale (`docs/scenes/shell.md`, slice B — the zoomed view
+/// earns its focus by *showing the labels*, the room ambient is the bare
+/// chords over the socket rings). Change-guarded so a settled entity never
+/// re-dirties; it also corrects the labels/ticks `rebuild_patch_scene` spawns
+/// this frame (they spawn `Hidden`, so the room-scale default needs no fix —
+/// only the zoom shows them).
+fn apply_patch_lod(room: Res<RoomState>, mut lod: Query<&mut Visibility, With<PatchBayLod>>) {
+    let want = if is_zoomed_into(room.zoomed, Station::PatchBay) {
         Visibility::Inherited
     } else {
         Visibility::Hidden
@@ -677,13 +647,16 @@ fn apply_patch_lod(
 
 // ── Systems ─────────────────────────────────────────────────────────────────
 
-/// Keys: Left/Right cycle wires; Up/Esc go up to the room; `r` rescans now.
+/// Keys, zoomed-only (`run_if(patch_bay_zoomed)`): Left/Right cycle wires;
+/// Up/Esc surface to the room — clearing `RoomState::zoomed` directly now,
+/// no `Screen` transition to make any more (`room::room_keyboard`'s own doc
+/// on why it steps back entirely while zoomed and leaves these keys to this
+/// system); `r` rescans.
 fn patch_bay_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<PatchBayState>,
     mut alsa: NonSendMut<PatchBayAlsa>,
     mut room: ResMut<RoomState>,
-    mut next: ResMut<NextState<Screen>>,
 ) {
     let n = state.snapshot.wires.len();
     if n > 0 {
@@ -706,8 +679,7 @@ fn patch_bay_keyboard(
     }
 
     if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::Escape) {
-        room.carousel = StationCarousel::new(Station::PatchBay);
-        next.set(Screen::Room);
+        room.zoomed = None;
     }
 }
 
@@ -1682,25 +1654,9 @@ mod tests {
         assert!((mapped.abs() - Vec3::X).length() < 1e-5, "{mapped:?}");
     }
 
-    #[test]
-    fn the_dive_camera_stands_inside_the_octagon_at_a_human_height_facing_the_wall() {
-        // The wall-mount dive pose (2026-07-10), mapped to world space: the
-        // camera stands well clear of the W panel (inside the octagon, not
-        // buried in the wall it's mounted on), at a comfortable standing
-        // height, and looks back toward the wall (world −X) — "walking up
-        // to a wall instrument," not floating over a tabletop.
-        let (eye, look) = dive_camera_pose();
-        const MARGIN: f32 = 100.0;
-        assert!(
-            eye.x > -palette::WALL_APOTHEM + MARGIN,
-            "dive eye stands inside the octagon, clear of the W wall: {eye:?}"
-        );
-        assert!((200.0..420.0).contains(&eye.y), "dive eye sits at a human-ish height: {eye:?}");
-        assert!(
-            look.x < eye.x,
-            "the dive looks back toward the wall (−X): eye={eye:?} look={look:?}"
-        );
-    }
+    // The old dive-camera-pose test (dive_camera_pose, PB_CAM_POS/LOOK, all
+    // deleted this slice) moved to `room::mod`'s `fullscreen_pose_*` tests —
+    // the camera pose is computed there now, decoupled from this placement.
 
     // -- PatchBayAlsa::clear_failed_open --------------------------------
 
@@ -2038,91 +1994,20 @@ mod tests {
         assert_eq!(chosen, 10.0, "the smallest size is the floor, even unfit");
     }
 
-    // -- shell lifecycle: leaving from a dive (shared scene graph) -------
+    // -- zoom gate (2026-07-10 evening, the fullscreen-panel pivot) -----
     //
-    // With one shared scene graph, `OnExit(Screen::Room)` does NOT fire on a
-    // transition that leaves the shell FROM the dived screen (PatchBay →
-    // Conversation/Editor — a context switch revealing the conversation, an
-    // `open_editor` peer signal). These app-level tests drive the real state
-    // machine with only the two exit systems registered (the enter systems
-    // need the full render stack; the lifecycle contract is what's under
-    // test) and a hand-stood room: RoomRoot + a claimed camera.
-
-    fn shell_lifecycle_app() -> App {
-        let mut app = App::new();
-        app.add_plugins(bevy::state::app::StatesPlugin)
-            .insert_resource(crate::ui::theme::Theme::default())
-            .init_state::<Screen>()
-            .add_systems(OnExit(Screen::Room), crate::view::room::exit_room)
-            .add_systems(OnExit(Screen::PatchBay), exit_patch_bay);
-        app
-    }
-
-    fn set_screen(app: &mut App, s: Screen) {
-        app.world_mut().resource_mut::<NextState<Screen>>().set(s);
-        app.update();
-    }
-
-    fn room_root_count(app: &mut App) -> usize {
-        app.world_mut()
-            .query_filtered::<Entity, With<RoomRoot>>()
-            .iter(app.world())
-            .count()
-    }
+    // The old "shell lifecycle: leaving from a dive" tests lived here because
+    // `Screen::PatchBay` had its own `OnExit` that could be bypassed —
+    // `exit_patch_bay`, deleted along with the state itself. That whole class
+    // of test moved to `room::mod`'s `exit_room_always_tears_down_and_clears_any_lingering_zoom`:
+    // there is only one screen (`Screen::Room`) left for this scene graph to
+    // occupy, so there is only one exit left to test. What's left here is the
+    // gate itself.
 
     #[test]
-    fn leaving_the_shell_from_a_dive_tears_the_room_down() {
-        let mut app = shell_lifecycle_app();
-        app.world_mut().spawn(RoomRoot);
-        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
-
-        set_screen(&mut app, Screen::Room);
-        set_screen(&mut app, Screen::PatchBay);
-        assert_eq!(room_root_count(&mut app), 1, "the dive keeps the room alive");
-
-        // The leak path: a context switch / open_editor yanks the screen
-        // straight out of the dive, bypassing OnExit(Room).
-        set_screen(&mut app, Screen::Conversation);
-        assert_eq!(room_root_count(&mut app), 0, "exit_patch_bay must tear the room down");
-        assert!(
-            app.world().get::<RoomCamera>(cam).is_none(),
-            "the camera claim must be released"
-        );
-        let theme_bg = app.world().resource::<crate::ui::theme::Theme>().bg;
-        let clear = app.world().get::<Camera>(cam).unwrap().clear_color;
-        assert!(
-            matches!(clear, ClearColorConfig::Custom(c) if c == theme_bg),
-            "the conversation clear colour must be restored: {clear:?}"
-        );
-    }
-
-    #[test]
-    fn surfacing_from_a_dive_keeps_the_room_and_the_camera_claim() {
-        let mut app = shell_lifecycle_app();
-        app.world_mut().spawn(RoomRoot);
-        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
-
-        set_screen(&mut app, Screen::Room);
-        set_screen(&mut app, Screen::PatchBay);
-        set_screen(&mut app, Screen::Room);
-        assert_eq!(room_root_count(&mut app), 1, "surfacing is travel, not teardown");
-        assert!(
-            app.world().get::<RoomCamera>(cam).is_some(),
-            "the shared camera stays claimed across the whole shell visit"
-        );
-    }
-
-    #[test]
-    fn leaving_the_room_itself_still_tears_down() {
-        // The pre-existing exit_room path — locked so the refactor into
-        // `teardown_room` can't have changed it.
-        let mut app = shell_lifecycle_app();
-        app.world_mut().spawn(RoomRoot);
-        let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
-
-        set_screen(&mut app, Screen::Room);
-        set_screen(&mut app, Screen::Conversation);
-        assert_eq!(room_root_count(&mut app), 0);
-        assert!(app.world().get::<RoomCamera>(cam).is_none());
+    fn is_zoomed_into_matches_only_the_given_station() {
+        assert!(is_zoomed_into(Some(Station::PatchBay), Station::PatchBay));
+        assert!(!is_zoomed_into(Some(Station::Tracks), Station::PatchBay));
+        assert!(!is_zoomed_into(None, Station::PatchBay));
     }
 }

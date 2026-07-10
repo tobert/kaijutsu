@@ -747,12 +747,12 @@ pub fn update_mode(
             }
             FocusArea::Conversation => (theme.mode_normal, &theme.mode_label_normal),
         },
-        // The well / editor own the viewport; the conversation dock is hidden,
-        // but keep the mode indicator coherent rather than panicking. (The
-        // editor's own vim mode renders on its panel — docs/vi.md steps 4–5.)
-        Screen::TimeWell | Screen::Editor | Screen::Room | Screen::PatchBay => {
-            (theme.mode_normal, &theme.mode_label_normal)
-        }
+        // The well / editor / room own the viewport; the conversation dock is
+        // hidden, but keep the mode indicator coherent rather than panicking.
+        // (The editor's own vim mode renders on its panel — docs/vi.md steps
+        // 4–5. `Room` covers a station zoom too now — no second screen left
+        // for that to be.)
+        Screen::TimeWell | Screen::Editor | Screen::Room => (theme.mode_normal, &theme.mode_label_normal),
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -977,12 +977,18 @@ pub fn update_contexts(
 }
 
 /// Update hints widget based on FocusArea and Screen.
+///
+/// `Screen::Room` now shows one of two hint lines depending on
+/// `RoomState::zoomed` (2026-07-10 evening, the fullscreen-panel pivot: the
+/// old `Screen::PatchBay` hint line moved here, since diving no longer
+/// changes `Screen` at all).
 pub fn update_hints(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
+    room: Res<crate::view::room::RoomState>,
     mut dock: ResMut<DockState>,
 ) {
-    if !focus_area.is_changed() && !screen.is_changed() {
+    if !focus_area.is_changed() && !screen.is_changed() && !room.is_changed() {
         return;
     }
 
@@ -999,8 +1005,13 @@ pub fn update_hints(
         },
         Screen::TimeWell => "Esc: back to conversation \u{2502} (time well)",
         Screen::Editor => "Esc: back to conversation \u{2502} (editor)",
-        Screen::Room => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: dive \u{2502} Esc: conversation",
-        Screen::PatchBay => "\u{2190}\u{2192}: wire \u{2502} \u{2191}/Esc: room \u{2502} r: rescan",
+        Screen::Room => {
+            if room.zoomed.is_some() {
+                "\u{2190}\u{2192}: wire \u{2502} \u{2191}/Esc: room \u{2502} r: rescan"
+            } else {
+                "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: dive \u{2502} Esc: conversation"
+            }
+        }
     };
 
     if dock.hints.text != hints {

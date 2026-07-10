@@ -55,6 +55,21 @@ outside angle (dollhouse render, no shaders). Anything added to the shell
 must keep that rule — a solid cuboid or `cull_mode: None` in the wall
 breaks the cutaway.
 
+**The panels are 16:9 screens** (Amy, 2026-07-10 evening — "the walls are
+16:9 screens, and diving IS fullscreening a panel"): the octagon apothem is
+tuned (`palette::WALL_APOTHEM`, 1200) so a panel's own width against the
+fixed wall height reads as a 994:560 ≈ 16:9 frame. This reframes what
+"diving" means for a **bounded** station — one whose whole instrument
+already stands in the room as furniture (the patch-bay wheel, Tardis
+reading #3): Enter/Down no longer cuts to a dedicated screen, it eases the
+camera to a pose that fills the vertical frustum with exactly that
+station's panel, edge to edge (`room::fullscreen_pose`) — the room's own
+camera, not a scene cut, so the cutaway and the chamber never leave the
+picture. **N stays a dive-THROUGH door**, not a panel to fill the frame
+with: an unbounded world (the fsn landscape) is too big to stand as
+furniture, so Tardis reading #3's *other* half — the archway you step
+through — is still the future shape for it.
+
 Center: the well, on its table (the table edge is already spoken for — the
 Stage-2 rank rail, `docs/timewell.md`). Around the walls, stations at
 **hand-assigned, stable compass bearings** — few enough to hand-place,
@@ -66,7 +81,7 @@ station (Amy: boring labels, plates recede; the wheel proved it first):
 | Bearing | Occupant | Shell rendering (as built / planned) |
 |---|---|---|
 | center | Time well (station #1) | itself — the console, on its table |
-| W | Patch bay | **the wheel itself, mounted ON the W panel** (built 2026-07-10, wall-mount retune same day): the live circle at 0.42 scale, re-oriented face-out into the room, its chords the W ambient; floor traces terminate at the wall base under it; no pylon, no plate |
+| W | Patch bay | **the wheel itself, mounted ON the W panel** (built 2026-07-10, wall-mount retune same day): the live circle at 0.42 scale, re-oriented face-out into the room, its chords the W ambient; floor traces terminate at the wall base under it; no pylon, no plate. **Fullscreens** on Enter/Down (the fullscreen-panel pivot, same evening) instead of cutting to a dedicated screen |
 | E | Track transport | the vertical beat highway (mockup 33) on/before the E panel; notes fall toward the strike bar only while a track plays |
 | N | VFS / rc library | an **archway** opening onto the fsn landscape (mockup 43), dimmed to horizon glow — returns when the fsn scene exists |
 | S | *(reserved)* | future: MCP broker switchboard / LLM engine room |
@@ -154,7 +169,20 @@ budget discipline:
   a habitual Up during ring nav never ejects you. In the room, Left/Right
   cycle the stations — well, patch bay, tracks, radiators, … (unbuilt
   stations ride the carousel as dimmed nameplates) — and Down/Enter dives
-  into the focused one. Esc always walks up one level, everywhere.
+  into the focused one. Esc always walks up one level, everywhere. The
+  grammar is unchanged by the fullscreen-panel pivot below — only what a
+  *bounded* station's own dive/surface pair DOES changed, not the arrows
+  that reach it.
+- **Enter fullscreens, Esc pulls back** (2026-07-10 evening, superseding the
+  earlier `Screen::PatchBay` state): for a bounded station
+  (`station_is_zoomable`), Enter/Down eases the camera to fill the frame
+  with that station's own panel — a camera pose plus a
+  `RoomState::zoomed` write, not a screen transition — and Esc/Up eases it
+  back out to the room-scale approach pose. The zoomed station's own keys
+  (the wheel's Left/Right wire-cycling, `r` rescan) own the keyboard while
+  zoomed; Left/Right at room scale still steps the carousel underneath, but
+  not while zoomed. The well still cuts to its own dedicated screen — only a
+  bounded, furnished station fullscreens in place.
 - **Entry**: Ctrl+W keeps meaning *the well* (muscle memory is sacred);
   the room sits one speedbumped Up above it.
 - **Travel by intent** (charter): the camera dollies continuously between
@@ -256,6 +284,22 @@ well scene**, not a new world. Slices, each shippable alone:
   contract now holds `WALL_APOTHEM` (moved there — a cross-file datum) plus
   the mount height/proudness/scale; the room side needs no furniture for W
   at all any more.
+- **The fullscreen-panel pivot (2026-07-10 evening)**: "the walls are 16:9
+  screens, and diving IS fullscreening a panel." The octagon apothem grew
+  800 → 1200 so a panel's own aspect reads 16:9 (Geometry section above);
+  `Screen::PatchBay` — the second screen slice B introduced to hold the
+  dive — is **dissolved entirely**: `view::room::RoomState` gained a
+  `zoomed: Option<Station>` field, `room::room_keyboard` sets/clears it on
+  Enter/Down and Esc/Up, and `room::fullscreen_pose` computes the camera
+  pose that fills the frame with the zoomed station's panel, independent of
+  the station's own local placement transform. This deletes the whole
+  dive-exit special-casing slice B needed (the `OnExit(Screen::PatchBay)`
+  branch reading the *target* state during `OnExit(Screen::Room)`, and its
+  mirror in `exit_patch_bay`): `exit_room`'s teardown is now
+  **unconditional** — there is only one screen left for this scene graph to
+  occupy, so there is only one way out of it to get right. The patch bay's
+  own LOD and keyboard gate on `RoomState::zoomed` instead of
+  `in_state(Screen::PatchBay)`.
 - **Slice C+ — bearings accrete**: highway ambient at E when tracks-station
   work starts; the N archway when the fsn scene exists. No fixed order.
 
@@ -277,6 +321,12 @@ well scene**, not a new world. Slices, each shippable alone:
    is recovered instead through **LOD**: the dive's detail layer (labels, ticks,
    the inspection card) hides at room scale and the room chrome dims on the dive,
    so only one station's *detail* is ever drawn. Built in slice B (below).
+   **Taken one step further (2026-07-10 evening):** the "one shared scene
+   graph" decision made the second screen (`Screen::PatchBay`) it was built
+   alongside redundant — diving was already continuous camera travel with
+   nothing to cut to, so a `RoomState` field does the same job as the
+   screen did, without a second exit path to keep in sync (the fullscreen-panel
+   pivot, Build path above).
 4. The vault itself: what does the dome show? (Starfield is the lazy
    default; a slowly rotating glyph firmament could carry kernel-wide state
    — deferred, taste call.)

@@ -35,21 +35,12 @@ pub enum Screen {
     /// The room level above the well — the shell's station carousel
     /// (`docs/scenes/shell.md`). Reached by Up-Up at the well's mouth ring;
     /// Left/Right cycle stations, Enter/Down dives, Esc drops to Conversation.
+    /// A bounded station (the patch bay wheel) is reached and left WITHOUT a
+    /// further screen transition — "diving" into it is a camera pose plus a
+    /// `view::room::RoomState::zoomed` write, all still `Screen::Room`
+    /// (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
+    /// fullscreening a panel," superseding the earlier `Screen::PatchBay`).
     Room,
-    /// Patch bay station — the observed ALSA-graph circle scene
-    /// (`docs/scenes/patchbay.md`, slice 0). Reached from the room.
-    PatchBay,
-}
-
-/// True while the camera is inside the shared shell scene graph — the room
-/// chamber *or* a patch-bay dive within it (`docs/scenes/shell.md`, slice B:
-/// "one shared scene graph"). Diving into the patch bay is continuous camera
-/// travel inside the persistent room, not a scene cut, so the systems that keep
-/// the W furniture's chords live (poll/rebuild/selection/pulse), the shell
-/// camera dolly, and the room/dive LOD toggles all run across *both* screens.
-/// Systems that belong only to the dedicated dived view stay `in_state(PatchBay)`.
-pub fn in_shell(screen: Res<State<Screen>>) -> bool {
-    matches!(*screen.get(), Screen::Room | Screen::PatchBay)
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -90,16 +81,14 @@ impl Plugin for ScreenPlugin {
             (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
 
-        // ── Room + PatchBay ──
-        // The scenes-charter views (docs/scenes/): full-viewport 3D like the
+        // ── Room ──
+        // The scenes-charter view (docs/scenes/): full-viewport 3D like the
         // well, reading raw keys — hide the chrome and park focus off Compose
-        // (same reasoning as the editor above).
+        // (same reasoning as the editor above). Covers the whole shell,
+        // zoomed into a station or not (`view::room::RoomState::zoomed`) —
+        // there is no second screen for a station dive to enter any more.
         app.add_systems(
             OnEnter(Screen::Room),
-            (hide_conversation_root, hide_cell_text, set_focus_conversation),
-        );
-        app.add_systems(
-            OnEnter(Screen::PatchBay),
             (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
     }
