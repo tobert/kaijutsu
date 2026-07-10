@@ -11,14 +11,32 @@
 //! metals: the 2026-07-10 tuning pass proved a ~1%-albedo metallic surface
 //! swallows any lamp — emissive-on-dark is the concepts' look anyway.
 //!
+//! **Amendment (Amy, 2026-07-10 — "make the circuit patterns and border glow
+//! faintly like the concepts... something faintly moving might be
+//! interesting"):** decoration may now ALSO carry a faint, slowly moving
+//! glow on top of that discipline — a traveling-wave crest (circuit traces,
+//! wall trim) or a slow uniform breath (terminal pads, the inscribed ring,
+//! the W dais bezel), rendered by [`crate::shaders::TraceGlowMaterial`]
+//! instead of `StandardMaterial`. The crest may exceed 1.0 up to
+//! [`GLOW_CREST`] (the bloom pass haloes it softly), but the element's
+//! resting `trough` level times the crest stays under 1.0 — LDR on
+//! time-average. Strong SUSTAINED HDR (a marker at full activity lift, the
+//! console under chatter) stays reserved for live activity; the difference
+//! from the faint glow is duration and cause, not the bloom threshold
+//! itself.
+//!
 //! Hues are linear-rgb `[f32; 3]` identity colours; multiply by an LDR tier
 //! before handing them to a material (`room::lin_scaled` et al.).
 
 /// The gold — the well's reserved hue, and the room's one metal trim colour
-/// (console rings, table rim, inlay rings, pylon caps, patch-bay etch).
+/// (console rings, table rim, inlay rings, pylon caps, patch-bay etch, the W
+/// dais bezel). Most gold trim sites tune their own flat brightness constant
+/// close to their spawn site (`TABLE_GOLD_LDR`, `PYLON_CAP_GOLD_LDR`,
+/// `RING_GOLD_HUE`'s glow trough…); the W dais bezel instead breathes via
+/// [`crate::shaders::TraceGlowMaterial`] at [`GLOW_TROUGH_SUBTLE`]
+/// (2026-07-10, the faint-moving-glow slice — it had been the sole user of a
+/// now-removed flat `GOLD_LDR_TRIM` tier).
 pub(crate) const GOLD_HUE: [f32; 3] = [1.00, 0.78, 0.34];
-/// Gold trim tier: rims, caps, inlay bands.
-pub(crate) const GOLD_LDR_TRIM: f32 = 0.50;
 /// Gold etch tier: engraved guide rings, ticks — dimmer than trim so etched
 /// detail supports rather than competes.
 pub(crate) const GOLD_LDR_ETCH: f32 = 0.28;
@@ -43,6 +61,23 @@ pub(crate) const DARK_SURFACE_LIFT: [f32; 3] = [0.012, 0.013, 0.019];
 /// octagon's diagonal wall panels). Glass backdrop + thread/content strips.
 pub(crate) const VIOLET_GLASS: [f32; 3] = [0.090, 0.040, 0.150];
 pub(crate) const VIOLET_THREAD: [f32; 3] = [0.550, 0.180, 0.750];
+
+// ── Faint moving glow (`TraceGlowMaterial`; Amy, 2026-07-10) ────────────────
+// Shared across every glowing decoration element so one cap and one "how
+// subtle is subtle" tier live in a single place, not re-guessed per site.
+
+/// Crest ceiling: the brightest a traveling-wave crest or a breath's peak may
+/// read, for ANY glowing decoration element — every element renormalizes its
+/// identity hue so its brightest channel lands exactly here (`room::mod`'s
+/// `crest_color`). Above 1.0 on purpose (the app's threshold-1.0 bloom pass
+/// haloes it softly) but capped so decoration never reads as loud as live
+/// activity.
+pub(crate) const GLOW_CREST: f32 = 1.25;
+/// Trough tier shared by the room's most subtle breathing elements (the
+/// inscribed gold ring, the W dais bezel): resting brightness stays a gentle
+/// breath, never a strobe. Floor traces, terminal pads, and wall trim each
+/// tune their own (livelier) trough in `room/mod.rs`, close to their site.
+pub(crate) const GLOW_TROUGH_SUBTLE: f32 = 0.75;
 
 // ── Station W contract (the patch wheel AS the west station) ────────────────
 // Amy, 2026-07-10: the sign and the pylon are gone — the wheel itself is the

@@ -274,17 +274,42 @@ pub fn arc_points(radius: f32, a0: f32, a1: f32, segments: usize, y: f32) -> Vec
 }
 
 /// Expand a floor polyline into a flat ribbon of `width` (in the XZ plane):
-/// two vertices per input point offset ±half-width along the path's XZ normal,
-/// plus the triangle indices. Returns `(positions, indices)` — the Bevy `Mesh`
-/// wrapper adds up-normals and hands it to `Assets<Mesh>`. Degenerate input
-/// (< 2 points) yields empty buffers.
-pub fn ribbon_vertices(points: &[[f32; 3]], width: f32) -> (Vec<[f32; 3]>, Vec<u32>) {
+/// two vertices per input point offset ±half-width along the path's XZ
+/// normal, each carrying a UV — `uv.x` the CUMULATIVE ARCLENGTH fraction
+/// along the polyline (0 at the first point, 1 at the last), `uv.y` 0/1
+/// across the ribbon's width (matching the L/R vertex order below) — plus
+/// the triangle indices. Returns `(positions, uvs, indices)` — the Bevy
+/// `Mesh` wrapper adds up-normals and hands it to `Assets<Mesh>`. Degenerate
+/// input (< 2 points) yields empty buffers.
+///
+/// Arclength, not point INDEX, because a route's own sample density is wildly
+/// uneven: a straight radial run is two points, a bowed arc bend is a dozen
+/// (`route_points`' `arc_segments`). An index-based `t = i/(n-1)` would speed
+/// a `TraceGlowMaterial` traveling-wave crest (`shaders::TraceGlowMaterial`,
+/// mode 0) through the densely-sampled arc and crawl it through the sparse
+/// straight runs — arclength keeps the crest's world-space speed constant
+/// along the whole route regardless of how it was sampled (2026-07-10, the
+/// faint-moving-glow slice).
+pub fn ribbon_vertices(points: &[[f32; 3]], width: f32) -> (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
     if points.len() < 2 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let half = width * 0.5;
     let n = points.len();
+
+    // Cumulative XZ arclength up to each point, normalized to [0, 1] — the
+    // room floor is XZ, +Y up (this file's module doc), so the length that
+    // matters for a constant-speed crest lives entirely in XZ.
+    let mut cum = vec![0.0f32; n];
+    for i in 1..n {
+        let dx = points[i][0] - points[i - 1][0];
+        let dz = points[i][2] - points[i - 1][2];
+        cum[i] = cum[i - 1] + (dx * dx + dz * dz).sqrt();
+    }
+    let total = cum[n - 1];
+
     let mut positions = Vec::with_capacity(n * 2);
+    let mut uvs = Vec::with_capacity(n * 2);
     for i in 0..n {
         // Tangent via central difference (forward/backward at the ends).
         let prev = points[i.saturating_sub(1)];
@@ -296,8 +321,11 @@ pub fn ribbon_vertices(points: &[[f32; 3]], width: f32) -> (Vec<[f32; 3]>, Vec<u
         // 90° rotation in XZ → the ribbon's half-width normal.
         let (nx, nz) = (-tz, tx);
         let p = points[i];
+        let u = if total > 1e-6 { cum[i] / total } else { 0.0 };
         positions.push([p[0] + nx * half, p[1], p[2] + nz * half]);
         positions.push([p[0] - nx * half, p[1], p[2] - nz * half]);
+        uvs.push([u, 0.0]);
+        uvs.push([u, 1.0]);
     }
     let mut indices = Vec::with_capacity((n - 1) * 6);
     for i in 0..(n - 1) {
@@ -309,7 +337,7 @@ pub fn ribbon_vertices(points: &[[f32; 3]], width: f32) -> (Vec<[f32; 3]>, Vec<u
         // ribbon-winding entry, shipped 2026-07-10).
         indices.extend_from_slice(&[l0, l1, r0, r0, l1, r1]);
     }
-    (positions, indices)
+    (positions, uvs, indices)
 }
 
 /// Vault gradient: linear-rgba vertex colour for a dome vertex whose height
@@ -450,11 +478,19 @@ pub struct BoardRoute {
     pub hue: [f32; 3],
     pub width_scale: f32,
     pub brightness_scale: f32,
+    /// Raw `hash01` draw in `[0, 1)`, this route's one slot in the faint
+    /// moving-glow slice (2026-07-10): `mod.rs` derives BOTH the route's
+    /// `TraceGlowMaterial` phase and its traveling-wave period from this
+    /// single value (the route's 8-wide seed stride has exactly one spare
+    /// slot — see [`expand_bundle`]), and the route's terminal pad reuses it
+    /// too ("the same hash stream" — the pad breathes on its trace's own
+    /// random draw, not a fresh one).
+    pub glow_phase01: f32,
 }
 
 /// Expand a [`RouteBundle`] into its `count` routes — deterministic per
 /// `(bundle, seed_base)`: route `i` draws its jitter from
-/// `hash01(seed_base + i*8 + {0..=6})`, so re-running with the same inputs
+/// `hash01(seed_base + i*8 + {0..=7})`, so re-running with the same inputs
 /// always produces the same board (no runtime randomness — the floor is
 /// procedural, not decorative). Sweep direction alternates by index so a
 /// bundle fans both ways around its center, not just one way. `ring_r` (the
@@ -481,10 +517,22 @@ pub fn expand_bundle(
             let brightness_scale =
                 lerp(bundle.brightness_range.0, bundle.brightness_range.1, hash01(s + 5));
             let pad_radius = lerp(pad_disc_range.0, pad_disc_range.1, hash01(s + 6));
+            // The stride's one spare slot (`i*8` leaves 0..=6 taken above;
+            // `s+8` would collide with route `i+1`'s own `theta` draw) — do
+            // NOT shift the existing 0..=6 draws above, this must stay last.
+            let glow_phase01 = hash01(s + 7);
             let points =
                 route_points(theta, ring_r, lane, arc_span, pad_r, chamfer, arc_segments, y);
             let pad_pos = *points.last().expect("route_points always yields >= 2 points");
-            BoardRoute { points, pad_pos, pad_radius, hue: bundle.hue, width_scale, brightness_scale }
+            BoardRoute {
+                points,
+                pad_pos,
+                pad_radius,
+                hue: bundle.hue,
+                width_scale,
+                brightness_scale,
+                glow_phase01,
+            }
         })
         .collect()
 }
@@ -788,8 +836,9 @@ mod tests {
     #[test]
     fn ribbon_vertices_are_two_per_point_and_six_indices_per_segment() {
         let line = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [200.0, 0.0, 0.0]];
-        let (pos, idx) = ribbon_vertices(&line, 10.0);
+        let (pos, uvs, idx) = ribbon_vertices(&line, 10.0);
         assert_eq!(pos.len(), 6, "2 verts × 3 points");
+        assert_eq!(uvs.len(), 6, "one uv per vertex");
         assert_eq!(idx.len(), 12, "6 indices × 2 segments");
         // Straight line along +X → the ±width offset is along ±Z.
         assert!((pos[0][2] - 5.0).abs() < 1e-4 || (pos[0][2] + 5.0).abs() < 1e-4);
@@ -798,8 +847,47 @@ mod tests {
 
     #[test]
     fn ribbon_vertices_reject_degenerate_input() {
-        let (pos, idx) = ribbon_vertices(&[[0.0, 0.0, 0.0]], 10.0);
-        assert!(pos.is_empty() && idx.is_empty());
+        let (pos, uvs, idx) = ribbon_vertices(&[[0.0, 0.0, 0.0]], 10.0);
+        assert!(pos.is_empty() && uvs.is_empty() && idx.is_empty());
+    }
+
+    #[test]
+    fn ribbon_vertices_uv_x_is_monotonic_and_spans_0_to_1() {
+        let line = [[0.0, 0.0, 0.0], [30.0, 0.0, 0.0], [100.0, 0.0, 0.0], [100.0, 0.0, 50.0]];
+        let (_, uvs, _) = ribbon_vertices(&line, 10.0);
+        let u_at = |i: usize| uvs[i * 2][0];
+        assert!(u_at(0).abs() < 1e-6, "starts at 0: {}", u_at(0));
+        assert!((u_at(line.len() - 1) - 1.0).abs() < 1e-6, "ends at 1: {}", u_at(line.len() - 1));
+        for i in 0..line.len() - 1 {
+            assert!(u_at(i) <= u_at(i + 1) + 1e-6, "uv.x must be monotonic along the polyline");
+        }
+    }
+
+    #[test]
+    fn ribbon_vertices_uv_x_tracks_arclength_not_point_index() {
+        // Three points, very unevenly spaced: the first hop is 10x the
+        // second. An index-based `t` would put the middle point at 0.5;
+        // arclength puts it at 100/110 instead — the whole point of tying
+        // the traveling-wave crest's speed to real distance, not sample
+        // density (`ribbon_vertices`'s own doc).
+        let line = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [110.0, 0.0, 0.0]];
+        let (_, uvs, _) = ribbon_vertices(&line, 10.0);
+        let mid_u = uvs[2][0];
+        assert!(
+            (mid_u - 100.0 / 110.0).abs() < 1e-4,
+            "uv.x should reflect distance traveled, not index position: {mid_u}"
+        );
+    }
+
+    #[test]
+    fn ribbon_vertices_uv_y_is_0_and_1_across_the_l_r_pair() {
+        let line = [[0.0, 0.0, 0.0], [50.0, 0.0, 0.0]];
+        let (_, uvs, _) = ribbon_vertices(&line, 10.0);
+        for pair in uvs.chunks(2) {
+            assert_eq!(pair[0][1], 0.0, "L side at v=0");
+            assert_eq!(pair[1][1], 1.0, "R side at v=1");
+            assert_eq!(pair[0][0], pair[1][0], "L/R share the same uv.x");
+        }
     }
 
     #[test]
@@ -914,7 +1002,22 @@ mod tests {
             assert_eq!(ra.points, rb.points, "same seed, same board");
             assert_eq!(ra.pad_radius, rb.pad_radius);
             assert_eq!(ra.brightness_scale, rb.brightness_scale);
+            assert_eq!(ra.glow_phase01, rb.glow_phase01, "same seed, same glow phase");
         }
+    }
+
+    #[test]
+    fn expand_bundle_glow_phase01_stays_in_unit_range_and_varies_across_routes() {
+        let routes = expand_bundle(&sample_bundle(), 230.0, 18.0, 10, 0.6, (6.0, 14.0), 123);
+        for r in &routes {
+            assert!(
+                (0.0..1.0).contains(&r.glow_phase01),
+                "glow_phase01 out of range: {}",
+                r.glow_phase01
+            );
+        }
+        let all_same = routes.windows(2).all(|w| w[0].glow_phase01 == w[1].glow_phase01);
+        assert!(!all_same, "distinct routes should get distinct glow phases: {routes:?}");
     }
 
     #[test]
