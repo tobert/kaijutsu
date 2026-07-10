@@ -10,10 +10,11 @@
 //! **The circle IS the west station** (`docs/scenes/shell.md`, Tardis reading
 //! #3 + slice B: "one shared scene graph"; Amy, 2026-07-10 — the wheel stands
 //! in for the sign and pylon a station used to need). The whole subtree rides
-//! ONE Amy-tunable placement transform ([`STATION_W_PLACEMENT`]) that seats it
-//! on the room-built W dais at station scale — internal coordinates are
-//! untouched. It is spawned when the room spawns ([`spawn_furniture`], called
-//! from `room::enter_room`) and lives as long as the room; diving is a
+//! ONE Amy-tunable placement transform ([`STATION_W_PLACEMENT`]) that MOUNTS
+//! it on the room's W wall panel, re-oriented face-out by a pitch+yaw
+//! composition — internal coordinates are untouched. It is spawned when the
+//! room spawns ([`spawn_furniture`], called from `room::enter_room`) and
+//! lives as long as the room; diving is a
 //! *continuous camera descent* onto it, never a despawn/respawn scene cut. At
 //! room scale the chords are the W ambient; the dived view earns its focus by
 //! hiding room distractions and showing the label/tick/card LOD ([`PatchBayLod`]).
@@ -43,19 +44,25 @@ use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use geometry::{chord_points, layout_sockets};
 
 // ── Station placement seam (Amy-tunable — the ONE knob) ──────────────────────
-// Where the patch-bay wheel stands as the west station itself. This is the
-// single seam the slice-B decision (`docs/scenes/shell.md`, open question 3,
-// DECIDED 2026-07-09) rides on: the whole `PatchBayRoot` subtree is a child of
-// a placement entity carrying this transform, so all positioning/scaling
-// happens HERE and the patch bay's internal coordinates never change. The
-// room builds a dais at the W bearing sized to the SAME `palette::STATION_W_*`
-// numbers this placement reads (`palette.rs`'s "Station W contract" — room
-// and patch bay agree there, never by eyeballing each other). The dive camera
-// is the local `PB_CAM_POS/LOOK` mapped through this same transform
-// (`dive_camera_pose`), so the dived view frames the table exactly as the
-// standalone scene did — one seam: edit this constant (or the shared contract
-// it reads) and everything, including the dive camera, follows via the
-// similarity transform.
+// Where the patch-bay wheel stands as the west station itself — MOUNTED ON
+// the W wall panel now, part of the wall rather than furniture standing in
+// front of it (Amy, 2026-07-10: "the surface gets taken over by its
+// content"; studio patch bays are wall panels; concept 06 draws the W
+// station wall-mounted with threads dropping into the floor traces). This is
+// the single seam the slice-B decision (`docs/scenes/shell.md`, open
+// question 3, DECIDED 2026-07-09) rides on: the whole `PatchBayRoot` subtree
+// is a child of a placement entity carrying this transform, so all
+// positioning/scaling/orienting happens HERE and the patch bay's internal
+// coordinates never change. `room::spawn_walls` builds the W panel itself
+// (the chamber's architecture, not this station's furniture); this placement
+// reads the SAME `palette::STATION_W_*`/`WALL_APOTHEM` numbers to seat the
+// wheel flush against it (`palette.rs`'s "Station W contract" — room and
+// patch bay agree there, never by eyeballing each other). The dive camera is
+// the local `PB_CAM_POS/LOOK` mapped through this same transform
+// (`dive_camera_pose`), so the dived view frames the wheel exactly as the
+// standalone scene did — one seam: edit this constant (or the shared
+// contract it reads) and everything, including the dive camera, follows via
+// the similarity transform.
 
 /// A rigid-plus-uniform-scale placement of a scene into room space.
 struct StationPlacement {
@@ -63,32 +70,74 @@ struct StationPlacement {
     translation: Vec3,
     /// Uniform scale applied to the scene's local coordinates.
     scale: f32,
-    /// Yaw about +Y (radians). `FRAC_PI_2` turns the scene's local +Z (the
-    /// standalone camera's side) toward world +X — the same side the room's
-    /// W-focus camera studies the table from — so the dive is a lean-in, not a
-    /// jump to the far side.
+    /// Pitch about local +X (radians), applied BEFORE yaw
+    /// ([`placement_rotation`]: `Ry(yaw) * Rx(pitch)`) — stands the wheel up
+    /// off its original horizontal orientation so it can hang on a vertical
+    /// wall. [`STATION_W_PLACEMENT`]'s doc derives why W's value is
+    /// `-FRAC_PI_2`.
+    pitch: f32,
+    /// Yaw about world +Y (radians), applied AFTER pitch. No longer a
+    /// standalone horizontal turn now that W mounts vertically — composed
+    /// WITH `pitch` to complete the change of basis; see
+    /// [`STATION_W_PLACEMENT`]'s doc.
     yaw: f32,
 }
 
-/// The patch bay's placement at W. Amy, 2026-07-10: the wheel IS the west
-/// station now — no pylon, no separate nameplate (this supersedes the earlier
-/// "pending floor-placement alternative" note the comment here used to carry;
-/// the alternative was decided). The room builds a dais at `palette::STATION_W_X`
-/// / `_DAIS_TOP_Y` / `_DAIS_R`; this rests the wheel's table — which hangs
-/// `TABLE_DEPTH` *below* the local origin (the tabletop plane) — ON the dais
-/// top, so the translation lifts by the placed table thickness. Seating the
-/// origin AT the dais top instead makes the two top faces exactly coplanar —
-/// a full-surface z-fighting starburst (found live, 2026-07-10). Scale math:
-/// `TABLE_OUTER_R` (348 local units) × 0.34 ≈ 118 world — a peer to the well
-/// table's 120, not a miniature.
+/// The pure rotation half of a placement: pitch about local +X, then yaw
+/// about world +Y (`Ry(yaw) * Rx(pitch)`, pitch applied first — Bevy/glam
+/// quaternion composition applies the right-hand factor to the vector
+/// first). The one seam [`placement_transform`] (spawns the subtree) and
+/// [`placement_to_room`] (maps a bare point, for the dive camera) both build
+/// on, so the two paths can never disagree about which way the scene faces.
+fn placement_rotation(p: &StationPlacement) -> Quat {
+    Quat::from_rotation_y(p.yaw) * Quat::from_rotation_x(p.pitch)
+}
+
+/// The patch bay's placement at W — mounted ON the wall panel (Amy,
+/// 2026-07-10: the wheel is the west station's wall instrument now, not a
+/// tabletop on a dais; supersedes the 2026-07-09/-10 dais placement —
+/// `STATION_W_X`/`_DAIS_TOP_Y`/`_DAIS_R`, all deleted from `palette.rs`).
+///
+/// **The rotation.** The standalone scene is a horizontal table: local +Y is
+/// the table's upward normal (everything the wheel draws — sockets, chords,
+/// labels — sits at local y ≥ 0; only the table's own solid thickness,
+/// `TABLE_DEPTH`, occupies y < 0). Mounted on the wall, that normal must
+/// point OUT of the wall and INTO the room: world +X, since the W panel
+/// faces the room from −X. [`placement_rotation`]'s composition
+/// (`Ry(yaw) * Rx(pitch)`) sends local Y to
+/// `(sin(pitch)·sin(yaw), cos(pitch), sin(pitch)·cos(yaw))` — wanting
+/// `(1, 0, 0)` forces `cos(pitch) = 0` (pitch = ±π/2) and then
+/// `cos(yaw) = 0` too (yaw = ±π/2): two candidate pairs, both `+π/2` or both
+/// `−π/2`.
+///
+/// **The roll** (which candidate): the standalone scene's local +Z was the
+/// camera-side edge of the table (the old approach camera studied it from
+/// +Z, `PB_CAM_POS`'s docs). Mounted on the wall, that edge should read as
+/// the TOP of the instrument's face, never its bottom — local Z ↦ world Y,
+/// not world −Y. Working the same composition through both candidates:
+/// `(pitch, yaw) = (+π/2, +π/2)` sends local Z to world −Y (upside down);
+/// `(−π/2, −π/2)` sends it to world +Y (right side up) — the tie-breaker.
+/// Locked ±1e-5 by the `placement_*` tests below.
+///
+/// **The placement.** `translation.x` sets the tabletop plane (the
+/// placement's local origin) [`palette::STATION_W_PROUD`] world-units proud
+/// of the panel ([`palette::WALL_APOTHEM`] out); `translation.y` centers it
+/// on the panel ([`palette::STATION_W_MOUNT_Y`], the panel's own vertical
+/// center). No thickness lift (the old dais needed one —
+/// `palette::STATION_W_PROUD`'s doc has why the wall-mount doesn't): the
+/// table's solid backing extrudes local −Y (`TABLE_DEPTH`), which now maps
+/// to world −X — toward and through the invisible, single-sided far side of
+/// the panel, not onto a load-bearing surface whose top face the table's
+/// underside had to land on exactly.
 const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
     translation: Vec3::new(
-        palette::STATION_W_X,
-        palette::STATION_W_DAIS_TOP_Y + TABLE_DEPTH * palette::STATION_W_SCALE,
+        -(palette::WALL_APOTHEM - palette::STATION_W_PROUD),
+        palette::STATION_W_MOUNT_Y,
         0.0,
     ),
     scale: palette::STATION_W_SCALE,
-    yaw: std::f32::consts::FRAC_PI_2,
+    pitch: -std::f32::consts::FRAC_PI_2,
+    yaw: -std::f32::consts::FRAC_PI_2,
 };
 
 // ── Palette helpers (this scene's own copy — `room::lin`/`lin_scaled` are
@@ -122,12 +171,23 @@ const TABLE_INNER_R: f32 = HOLE_R * 0.92;
 const TABLE_OUTER_R: f32 = RIM_R * 1.16;
 const TABLE_DEPTH: f32 = 12.0;
 
-/// Camera pose (patch-bay LOCAL space): tilted look down onto the table. Under
-/// the standalone scene this was the room-space pose; now it is mapped through
-/// [`STATION_W_PLACEMENT`] to place the dive camera in room space
-/// ([`dive_camera_pose`]) so the dived framing is identical to the old scene.
-const PB_CAM_POS: Vec3 = Vec3::new(0.0, 470.0, 590.0);
-const PB_CAM_LOOK: Vec3 = Vec3::new(0.0, 0.0, -40.0);
+/// Camera pose (patch-bay LOCAL space): the wall-mount dive pose
+/// (2026-07-10), standing OUT along the wheel's own table normal — local +Y,
+/// which [`STATION_W_PLACEMENT`]'s rotation sends into the room (world +X) —
+/// with a touch of local +Z, which that same rotation sends to world +Y: a
+/// little above the mounted center, after the roll. Replaces the old
+/// horizontal-table pose (`(0, 470, 590)`, tuned for a flat tabletop and
+/// `ease_shell_camera`'s world-up righting; mapped through the new pitch it
+/// gave an awkward high-side view of the mounted face instead of a
+/// stand-before-the-wall one). Under the standalone scene this was the
+/// room-space pose; now it is mapped through [`STATION_W_PLACEMENT`] to
+/// place the dive camera in room space ([`dive_camera_pose`]) so the dived
+/// framing still reads as walking up to the instrument, not floating over a
+/// tabletop. `ease_shell_camera` rights the mapped camera with world-up
+/// automatically, so this pose only has to get the STANDING position right,
+/// not the on-screen roll.
+const PB_CAM_POS: Vec3 = Vec3::new(0.0, 560.0, 130.0);
+const PB_CAM_LOOK: Vec3 = Vec3::new(0.0, 0.0, -20.0);
 
 /// Wire hue — crimson = MIDI fabric (`docs/scenes/patchbay.md`, wire grammar).
 /// Already HDR (>1.0) so a live wire blooms; the selected chord multiplies it.
@@ -207,11 +267,12 @@ const GROUP_PLATE_DIM: f32 = 0.5;
 // ── Placement math (pure; the room-furniture seam) ───────────────────────────
 
 /// The `Transform` for the placement entity that re-roots the whole patch-bay
-/// subtree into room space — translation, yaw about +Y, and uniform scale.
-/// `room::enter_room` hangs `PatchBayRoot` under an entity carrying this.
+/// subtree into room space — translation, the pitch+yaw rotation
+/// ([`placement_rotation`]), and uniform scale. `room::enter_room` hangs
+/// `PatchBayRoot` under an entity carrying this.
 fn placement_transform(p: &StationPlacement) -> Transform {
     Transform::from_translation(p.translation)
-        .with_rotation(Quat::from_rotation_y(p.yaw))
+        .with_rotation(placement_rotation(p))
         .with_scale(Vec3::splat(p.scale))
 }
 
@@ -220,15 +281,16 @@ fn placement_transform(p: &StationPlacement) -> Transform {
 /// a point mapping the camera dolly can read without touching an entity. Pure;
 /// unit-tested.
 fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
-    p.translation + Quat::from_rotation_y(p.yaw) * (local * p.scale)
+    p.translation + placement_rotation(p) * (local * p.scale)
 }
 
 /// The dive camera's room-space `(eye, look-at)` — the local [`PB_CAM_POS`] /
 /// [`PB_CAM_LOOK`] carried through [`STATION_W_PLACEMENT`]. `ease_shell_camera`
-/// glides to this while `Screen::PatchBay`, so descending onto the W furniture
-/// frames the table exactly as the standalone scene did (a similarity transform
-/// preserves the camera→scene angles, so the baked `face_camera` plate facing
-/// still points at the world eye).
+/// glides to this while `Screen::PatchBay`, so descending onto the
+/// wall-mounted wheel frames it exactly as the standalone scene did (a
+/// similarity transform preserves the camera→scene angles, so the baked
+/// `face_camera` plate facing still points at the world eye) — the dive
+/// reads as walking up to a wall instrument, not floating over a tabletop.
 pub(crate) fn dive_camera_pose() -> (Vec3, Vec3) {
     (
         placement_to_room(&STATION_W_PLACEMENT, PB_CAM_POS),
@@ -479,8 +541,8 @@ pub(crate) fn spawn_furniture(
     let table_mesh = meshes.add(Extrusion::new(Annulus::new(TABLE_INNER_R, TABLE_OUTER_R), TABLE_DEPTH));
     // Unlit, palette-driven (Amy, 2026-07-10 — "unify materials with the
     // room"): `DARK_SURFACE_LIFT` is one shade up from the room's own
-    // furniture surface, so the instrument's working face reads against its
-    // dais with no lamp needed.
+    // furniture surface, so the instrument's working face reads against the
+    // wall panel behind it with no lamp needed.
     let table_material = std_materials.add(StandardMaterial {
         base_color: lin(palette::DARK_SURFACE_LIFT),
         unlit: true,
@@ -1490,29 +1552,69 @@ mod tests {
     }
 
     #[test]
-    fn the_placement_seam_shrinks_a_local_height_by_the_scale_alone() {
-        // A point straight up in patch-bay-local space rises `scale`× as high
-        // above the station and moves nowhere in XZ (yaw is about +Y, so it
-        // can't tilt a vertical) — the uniform-scale-plus-rigid seam.
+    fn the_placement_seam_sends_a_local_height_into_a_world_east_offset() {
+        // A point straight up in patch-bay-local space (the table's own
+        // normal) no longer rises: the wall-mount pitch+yaw sends local +Y
+        // into world +X — into the room — scaled by `scale`, and leaves Y/Z
+        // untouched. The rotated seam's version of the old
+        // "scale-alone" invariant.
         let p = &STATION_W_PLACEMENT;
-        let up = placement_to_room(p, Vec3::new(0.0, 100.0, 0.0));
-        assert!((up.y - (p.translation.y + 100.0 * p.scale)).abs() < 1e-3, "{up:?}");
-        assert!((up.x - p.translation.x).abs() < 1e-3, "{up:?}");
-        assert!((up.z - p.translation.z).abs() < 1e-3, "{up:?}");
+        let out = placement_to_room(p, Vec3::new(0.0, 100.0, 0.0));
+        assert!((out.x - (p.translation.x + 100.0 * p.scale)).abs() < 1e-3, "{out:?}");
+        assert!((out.y - p.translation.y).abs() < 1e-3, "{out:?}");
+        assert!((out.z - p.translation.z).abs() < 1e-3, "{out:?}");
+    }
+
+    // -- rotation composition (locks `STATION_W_PLACEMENT`'s derivation) --
+
+    /// W's pitch/yaw with the translation/scale zeroed out — isolates the
+    /// pure rotation `STATION_W_PLACEMENT`'s doc derives, the same way its
+    /// comment works the math.
+    fn w_rotation_only() -> StationPlacement {
+        StationPlacement {
+            translation: Vec3::ZERO,
+            scale: 1.0,
+            pitch: STATION_W_PLACEMENT.pitch,
+            yaw: STATION_W_PLACEMENT.yaw,
+        }
     }
 
     #[test]
-    fn the_dive_camera_leans_down_onto_the_table_from_the_approach_side() {
-        // The dive pose is the local look-down camera carried through the seam:
-        // the eye rides above the dais-top height and above its own look
-        // point (tilting down onto the top face), and it stands on the +X
-        // (console) side of the table center — the same side the room's W-focus
-        // camera studies it from, so the descent is a lean-in, not a jump across.
+    fn placement_rotation_sends_local_up_into_the_room_along_world_east() {
+        // The rotation derivation's first target, locked: local +Y (the
+        // table's own normal) must land on world +X — off the W wall, into
+        // the room.
+        let mapped = placement_to_room(&w_rotation_only(), Vec3::Y);
+        assert!((mapped - Vec3::X).length() < 1e-5, "{mapped:?}");
+    }
+
+    #[test]
+    fn placement_rotation_sends_the_old_camera_edge_to_the_top_of_the_mounted_face() {
+        // The roll tie-breaker, locked: local +Z (the standalone scene's
+        // camera-side edge) must land on world +Y — the TOP of the mounted
+        // face — never world −Y (which would hang the wheel upside down).
+        let mapped = placement_to_room(&w_rotation_only(), Vec3::Z);
+        assert!((mapped - Vec3::Y).length() < 1e-5, "{mapped:?}");
+    }
+
+    #[test]
+    fn the_dive_camera_stands_inside_the_octagon_at_a_human_height_facing_the_wall() {
+        // The wall-mount dive pose (2026-07-10), mapped to world space: the
+        // camera stands well clear of the W panel (inside the octagon, not
+        // buried in the wall it's mounted on), at a comfortable standing
+        // height, and looks back toward the wall (world −X) — "walking up
+        // to a wall instrument," not floating over a tabletop.
         let (eye, look) = dive_camera_pose();
-        let t = STATION_W_PLACEMENT.translation;
-        assert!(eye.y > t.y, "dive eye sits above the dais top: {eye:?}");
-        assert!(eye.y > look.y, "camera tilts down onto the table: eye={eye:?} look={look:?}");
-        assert!(eye.x > t.x, "dive eye is on the approach (+X) side of the table: {eye:?}");
+        const MARGIN: f32 = 100.0;
+        assert!(
+            eye.x > -palette::WALL_APOTHEM + MARGIN,
+            "dive eye stands inside the octagon, clear of the W wall: {eye:?}"
+        );
+        assert!((200.0..420.0).contains(&eye.y), "dive eye sits at a human-ish height: {eye:?}");
+        assert!(
+            look.x < eye.x,
+            "the dive looks back toward the wall (−X): eye={eye:?} look={look:?}"
+        );
     }
 
     // -- PatchBayAlsa::clear_failed_open --------------------------------

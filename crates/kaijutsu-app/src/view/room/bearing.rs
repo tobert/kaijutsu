@@ -137,13 +137,14 @@ pub fn wall_placements() -> [WallPlacement; 4] {
 }
 
 /// Whether `station`'s wall bearing is occupied by the station's OWN
-/// furniture rather than a marker pylon + nameplate — true for
+/// instrument rather than a marker pylon + nameplate — true for
 /// [`Station::PatchBay`] (`shell.md` slice B, retuned 2026-07-10: "the wheel
-/// IS the west station"). `enter_room`'s wall-placement loop reads this to
-/// skip the marker/plinth/cap/plate for a furnished bearing and build its
-/// dais instead; a future in-room station rides the same gate. Pure — no
-/// Bevy types — so the gating is unit-testable without spawning anything
-/// (mirrors `super::wants_gold_cap`'s shape).
+/// IS the west station", then wall-mounted the same day). `enter_room`'s
+/// wall-placement loop reads this to skip the marker/plinth/cap/plate for a
+/// furnished bearing — the wheel mounts directly on the wall panel instead,
+/// no separate furniture builder needed; a future in-room station rides the
+/// same gate. Pure — no Bevy types — so the gating is unit-testable without
+/// spawning anything (mirrors `super::wants_gold_cap`'s shape).
 pub fn station_is_room_furniture(station: Station) -> bool {
     matches!(station, Station::PatchBay)
 }

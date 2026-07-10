@@ -66,7 +66,7 @@ station (Amy: boring labels, plates recede; the wheel proved it first):
 | Bearing | Occupant | Shell rendering (as built / planned) |
 |---|---|---|
 | center | Time well (station #1) | itself — the console, on its table |
-| W | Patch bay | **the wheel itself, on a dais** (built 2026-07-10): the live circle at 0.34 scale, gold bezel, its chords the W ambient; floor traces terminate at the dais foot; no pylon, no plate |
+| W | Patch bay | **the wheel itself, mounted ON the W panel** (built 2026-07-10, wall-mount retune same day): the live circle at 0.42 scale, re-oriented face-out into the room, its chords the W ambient; floor traces terminate at the wall base under it; no pylon, no plate |
 | E | Track transport | the vertical beat highway (mockup 33) on/before the E panel; notes fall toward the strike bar only while a track plays |
 | N | VFS / rc library | an **archway** opening onto the fsn landscape (mockup 43), dimmed to horizon glow — returns when the fsn scene exists |
 | S | *(reserved)* | future: MCP broker switchboard / LLM engine room |
@@ -239,12 +239,23 @@ well scene**, not a new world. Slices, each shippable alone:
   (the floor-is-the-wiring made literal), the well table under the console
   rings, pylon plinths/caps, and then the **octagon shell** (geometry
   section above): eight content-surface wall panels with the camera
-  cutaway, radiators retired into the diagonal panels, and the patch wheel
-  seated on a dais as the W station itself — sign and pylon gone. One
-  style across the family: `view/palette.rs` holds the shared hues and the
-  room↔patch-bay dais contract, and the **all-unlit discipline** went
-  scene-family-wide (the patch bay's point light + lit metals deleted; a
-  ~1%-albedo metallic surface swallows any lamp — the tuning-pass lesson).
+  cutaway, radiators retired into the diagonal panels, and (first cut) the
+  patch wheel seated on a floor dais as the W station itself — sign and
+  pylon gone. One style across the family: `view/palette.rs` holds the
+  shared hues, and the **all-unlit discipline** went scene-family-wide (the
+  patch bay's point light + lit metals deleted; a ~1%-albedo metallic
+  surface swallows any lamp — the tuning-pass lesson).
+- **Wall-mount retune (same day, 2026-07-10)**: the dais was a first cut —
+  Amy's call, later that day, was to mount the wheel ON the W panel itself
+  ("the surface gets taken over by its content"; studio patch bays are wall
+  panels, not tables; concept 06 draws the station wall-mounted with
+  threads dropping into the floor traces). The dais and its furniture
+  builder are gone; `patch_bay::STATION_W_PLACEMENT` gained a pitch+yaw
+  composition that re-orients the wheel face-out and seats it flush against
+  the panel `spawn_walls` already builds. `view/palette.rs`'s station-W
+  contract now holds `WALL_APOTHEM` (moved there — a cross-file datum) plus
+  the mount height/proudness/scale; the room side needs no furniture for W
+  at all any more.
 - **Slice C+ — bearings accrete**: highway ambient at E when tracks-station
   work starts; the N archway when the fsn scene exists. No fixed order.
 

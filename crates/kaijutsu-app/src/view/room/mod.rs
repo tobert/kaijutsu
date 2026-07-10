@@ -49,15 +49,24 @@
 //! panel(s) cull away (default back-face culling on an inward-facing quad),
 //! the dollhouse-cutaway read. The four diagonal faces carry the migrated
 //! violet information threads (the old free-floating radiators). The W
-//! bearing spawns no marker/plinth/cap/nameplate at all — [`spawn_w_dais`]
-//! builds a dais there instead, and the patch bay's own placement (untouched
-//! here) seats the wheel on it: the wheel **is** the station.
+//! bearing spawns no marker/plinth/cap/nameplate at all — the wheel occupies
+//! it directly.
+//!
+//! **Wall-mount retune (same day): the wheel hangs ON the W panel.** A first
+//! pass stood the wheel on a floor dais at the W bearing; Amy's call, later
+//! the same day, was to mount it flush on the wall panel itself instead
+//! ("the surface gets taken over by its content" — studio patch bays are
+//! wall panels, not tables). The dais and its furniture builder are gone;
+//! the patch bay's own placement (untouched here beyond reading
+//! `palette::WALL_APOTHEM`) re-orients the wheel face-out with a pitch+yaw
+//! composition and seats it flush against the panel `spawn_walls` already
+//! builds — no new room-side furniture at all.
 //!
 //! Materials are mostly built-in [`StandardMaterial`] with `unlit: true`,
 //! carrying brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR
 //! (> 1.0) blooms through the app camera's threshold-1.0 bloom
 //! (`main::setup_camera`). The circuit-board traces, terminal pads, the
-//! inscribed gold ring, the wall trim, and the W dais bezel instead carry
+//! inscribed gold ring, and the wall trim instead carry
 //! [`crate::shaders::TraceGlowMaterial`] (`assets/shaders/trace_glow.wgsl`)
 //! — a small GPU-animated shader, the one exception to the charter's
 //! procedural-first budget rule, needed because a faint MOVING glow can't be
@@ -208,37 +217,21 @@ const TABLE_COLOR: [f32; 3] = [0.032, 0.036, 0.050];
 /// Gold trim brightness (rim torus): the same LDR weight as the console rings.
 const TABLE_GOLD_LDR: f32 = 0.50;
 
-// ── Station W dais (the wheel IS the west station; `docs/scenes/palette.rs`'s
-// station-W contract) ────────────────────────────────────────────────────────
-// No marker pylon stands at W any more — the patch bay's own wheel is the
-// station ([`spawn_w_dais`]). Position/scale of the wheel itself lives in
-// `patch_bay.rs`'s `STATION_W_PLACEMENT` (untouched here); the two files agree
-// only through the shared `palette::STATION_W_*` constants, so neither can
-// drift without the other noticing.
-
-/// Foot plinth radius — a touch wider than the dais top, grounding it (the
-/// well table's plinth-wider-than-tabletop read, [`spawn_table`]).
-const W_DAIS_FOOT_R: f32 = palette::STATION_W_DAIS_R + 22.0;
-/// Foot plinth height — the table plinth's own weight.
-const W_DAIS_FOOT_HEIGHT: f32 = TABLE_PLINTH_HEIGHT;
-/// Gold rim torus at the dais top edge — the table rim's weight and hue.
-const W_DAIS_RIM_MINOR: f32 = TABLE_RIM_MINOR;
-
 // ── Octagon wall shell (the enclosing chamber; `shell.md`'s cutaway
 // centerpiece) ──────────────────────────────────────────────────────────────
 // Eight flat single-sided panels forming a wall around the room — faces on
 // the four cardinals plus the four `bearing::RADIATOR_DIRS` diagonals,
-// `WALL_APOTHEM` out from center ([`bearing::octagon_panels`]). Every
-// panel/mullion/trim/thread quad MUST stay single-sided (default
+// `palette::WALL_APOTHEM` out from center ([`bearing::octagon_panels`]).
+// Every panel/mullion/trim/thread quad MUST stay single-sided (default
 // `cull_mode`, no `Cuboid`, no `cull_mode: None`): a camera outside the
 // octagon sees a near panel's back face — culled — and the chamber shows
 // through (the dollhouse cutaway; see `bearing`'s own module comment for the
-// exact mechanics).
+// exact mechanics). No W-bearing dais stands here any more (the 2026-07-10
+// wall-mount retune, `palette.rs`'s "Station W contract"): the wheel mounts
+// directly on the W panel below via `patch_bay::STATION_W_PLACEMENT`, which
+// is why `WALL_APOTHEM` itself now lives in `palette.rs` — both files read
+// the same number, this one just for the panel geometry.
 
-/// Apothem (center-to-face distance): clears the old radiator radius (660)
-/// and the wall-station radius the pylons/markers stand at (`ROOM_RADIUS`,
-/// 620), so the shell encloses everything already standing in the room.
-const WALL_APOTHEM: f32 = 800.0;
 /// Panel height, standing on the floor (`y = 0` to `WALL_HEIGHT`).
 const WALL_HEIGHT: f32 = 560.0;
 /// Reveal subtracted from [`bearing::octagon_panel_width`]'s full (corner-
@@ -314,9 +307,10 @@ const RING_OUTER_R: f32 = 230.0;
 const RING_INNER_R: f32 = 190.0;
 const RING_BAND_WIDTH: f32 = 10.0;
 const RING_GOLD_HUE: [f32; 3] = [1.00, 0.80, 0.36];
-/// Shared slow breathing rate (mode 1, rad/s) for the room's calmest gold
-/// glow accents — the inscribed double-ring and the W dais bezel
-/// ([`spawn_w_dais`]) both use this: subtle, architectural, unhurried.
+/// Slow breathing rate (mode 1, rad/s) for the room's calmest gold glow
+/// accent — the inscribed floor double-ring: subtle, architectural,
+/// unhurried. (Once shared with the W dais bezel, retired in the 2026-07-10
+/// wall-mount slice along with the dais itself.)
 const GOLD_GLOW_RATE: f32 = 0.15;
 
 /// Route-generation shared geometry ([`bearing::expand_bundle`]): the radial
@@ -631,7 +625,8 @@ fn enter_room(
     // at the labeled ones (the reserved South bearing gets a dim marker only).
     // A furnished bearing (`bearing::station_is_room_furniture` — today just
     // PatchBay/W, "the wheel IS the west station") gets neither: no marker, no
-    // plate — `spawn_w_dais` below builds its own furniture instead.
+    // plate — the wheel mounts directly on the wall panel instead (no
+    // room-side furniture builder needed for it at all any more).
     for wp in bearing::wall_placements() {
         if wp.station.is_some_and(bearing::station_is_room_furniture) {
             continue;
@@ -703,10 +698,10 @@ fn enter_room(
     // the marker/plate loop above.
     spawn_pylons(&mut commands, root, &mut meshes, &mut mats);
 
-    // The W dais — the wheel IS the west station (`shell.md` slice B, retuned
-    // 2026-07-10). Not RoomDistraction: it's the station's own furniture, so
-    // it stays lit through the dive same as the wheel itself.
-    spawn_w_dais(&mut commands, root, &mut meshes, &mut mats, &mut glow_mats);
+    // No W-bearing furniture spawns here any more (the 2026-07-10 wall-mount
+    // retune): the wheel mounts directly on the W wall panel `spawn_walls`
+    // builds below, via `patch_bay::STATION_W_PLACEMENT` — nothing for the
+    // room side to build or ground.
 
     // The octagon wall shell: eight single-sided panels enclosing the room,
     // corner mullions, hue-coded edge trim, and — on the four diagonals — the
@@ -794,11 +789,13 @@ pub(crate) fn teardown_room(
 /// [`Bearing::dir`] via [`bearing::dir_theta`] so a re-placed bearing can't
 /// silently drift out of sync with its floor traces. **Amy-tunable.**
 ///
-/// The W bundle's `pad_range` was retuned 2026-07-10 (`shell.md`, "the wheel
-/// IS the west station"): its terminal pads now cluster just past the dais
-/// foot ([`palette::STATION_W_DAIS_R`]) instead of out toward the old wall
-/// radius, so the crimson wiring visibly flows INTO the station instead of
-/// past it.
+/// The W bundle's `pad_range` was retuned twice on 2026-07-10 (`shell.md`,
+/// "the wheel IS the west station"): first to cluster just past the W dais's
+/// foot, then again for the wall-mount retune — the dais is gone, and the
+/// wiring now flows all the way to the wall the wheel hangs on, terminating
+/// at the panel's base (just short of [`palette::WALL_APOTHEM`]) instead of
+/// the old floor-furniture foot, so the crimson wiring visibly flows INTO
+/// the station instead of past it.
 fn route_bundles() -> [bearing::RouteBundle; 9] {
     use bearing::{Bearing, RouteBundle, dir_theta};
     let west = dir_theta(Bearing::West.dir());
@@ -813,7 +810,11 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             count: 7,
             lane_range: (280.0, 620.0),
             arc_range: (0.25, 0.9),
-            pad_range: (palette::STATION_W_DAIS_R + 120.0, 420.0),
+            // Terminates at the wall base under the mounted wheel (the
+            // 2026-07-10 wall-mount retune) — past the old marker radius
+            // (`ROOM_RADIUS`, 620) and clustered short of the panel itself
+            // (`palette::WALL_APOTHEM`, 800).
+            pad_range: (640.0, 770.0),
             hue: TRACE_CRIMSON,
             brightness_range: (0.7, 1.15),
         },
@@ -1115,60 +1116,6 @@ fn spawn_table(
     ));
 }
 
-/// The dais at the W bearing — the wheel IS the west station (`shell.md`
-/// slice B, retuned 2026-07-10): a low wide cylinder at the palette
-/// contract's coordinates, a foot plinth grounding it, and a gold rim ring —
-/// the same furniture language as the well table ([`spawn_table`]). NOT
-/// [`RoomDistraction`]: it is the station's OWN furniture (the patch wheel
-/// stands on it), so it stays lit through a dive same as the wheel itself.
-fn spawn_w_dais(
-    commands: &mut Commands,
-    root: Entity,
-    meshes: &mut Assets<Mesh>,
-    mats: &mut Assets<StandardMaterial>,
-    glow_mats: &mut Assets<TraceGlowMaterial>,
-) {
-    let dais_mat = mats.add(unlit(lin(palette::DARK_SURFACE)));
-    // The rim bezel breathes faintly (mode 1 — Torus ignores uv, so this is
-    // safe) at the same subtle gold tier as the inscribed floor ring
-    // (`spawn_floor`): the room's calmest glow accents share one read.
-    let rim_mat = glow_mats.add(TraceGlowMaterial {
-        color: crest_color(palette::GOLD_HUE, palette::GLOW_CREST),
-        params: Vec4::new(0.0, GOLD_GLOW_RATE, palette::GLOW_TROUGH_SUBTLE, 1.0),
-    });
-
-    commands.spawn((
-        Mesh3d(meshes.add(Cylinder::new(W_DAIS_FOOT_R, W_DAIS_FOOT_HEIGHT))),
-        MeshMaterial3d(dais_mat.clone()),
-        Transform::from_xyz(palette::STATION_W_X, W_DAIS_FOOT_HEIGHT * 0.5, 0.0),
-        Visibility::Inherited,
-        Name::new("StationWDaisFoot"),
-        ChildOf(root),
-    ));
-
-    let body_height = palette::STATION_W_DAIS_TOP_Y - W_DAIS_FOOT_HEIGHT;
-    commands.spawn((
-        Mesh3d(meshes.add(Cylinder::new(palette::STATION_W_DAIS_R, body_height))),
-        MeshMaterial3d(dais_mat),
-        Transform::from_xyz(palette::STATION_W_X, W_DAIS_FOOT_HEIGHT + body_height * 0.5, 0.0),
-        Visibility::Inherited,
-        Name::new("StationWDais"),
-        ChildOf(root),
-    ));
-
-    commands.spawn((
-        Mesh3d(meshes.add(Torus {
-            minor_radius: W_DAIS_RIM_MINOR,
-            major_radius: palette::STATION_W_DAIS_R,
-        })),
-        MeshMaterial3d(rim_mat),
-        Transform::from_xyz(palette::STATION_W_X, palette::STATION_W_DAIS_TOP_Y, 0.0),
-        Visibility::Inherited,
-        Name::new("StationWDaisRim"),
-        ChildOf(root),
-    ));
-}
-
 /// The octagon wall shell: eight single-sided, inward-facing panels enclosing
 /// the room (`bearing`'s own module comment has the culling mechanics), their
 /// corner mullions, a hue-coded neon edge-trim per panel, and — on the four
@@ -1183,7 +1130,7 @@ fn spawn_walls(
     mats: &mut Assets<StandardMaterial>,
     glow_mats: &mut Assets<TraceGlowMaterial>,
 ) {
-    let panel_width = bearing::octagon_panel_width(WALL_APOTHEM) - WALL_PANEL_GAP;
+    let panel_width = bearing::octagon_panel_width(palette::WALL_APOTHEM) - WALL_PANEL_GAP;
 
     let base_mesh = meshes.add(Rectangle::new(panel_width, WALL_HEIGHT));
     let base_mat = mats.add(unlit(lin(WALL_BASE_COLOR)));
@@ -1211,7 +1158,7 @@ fn spawn_walls(
             .expect("wall_placements always covers all four cardinal bearings")
     };
 
-    for (i, panel) in bearing::octagon_panels(WALL_APOTHEM).iter().enumerate() {
+    for (i, panel) in bearing::octagon_panels(palette::WALL_APOTHEM).iter().enumerate() {
         let pos = Vec3::new(panel.center[0], WALL_HEIGHT * 0.5, panel.center[2]);
         // Inward-facing single-sided quad: aim local −Z further out along the
         // same ray so local +Z — the mesh's front normal, and where the trim/
@@ -1300,7 +1247,7 @@ fn spawn_walls(
         }
     }
 
-    for (i, (pos, _theta)) in bearing::octagon_corners(WALL_APOTHEM).iter().enumerate() {
+    for (i, (pos, _theta)) in bearing::octagon_corners(palette::WALL_APOTHEM).iter().enumerate() {
         let center = Vec3::new(pos[0], WALL_HEIGHT * 0.5, pos[2]);
         let outward = Vec3::new(center.x * 2.0, center.y, center.z * 2.0);
         let tf = Transform::from_translation(center).looking_at(outward, Vec3::Y);
@@ -1328,7 +1275,7 @@ fn wants_gold_cap(wp: &bearing::WallPlacement) -> bool {
 /// and a gold cap slab on top of every built station's pylon
 /// ([`wants_gold_cap`] gates the reserved South stub out). Skips the
 /// furnished W bearing entirely ([`bearing::station_is_room_furniture`]) —
-/// [`spawn_w_dais`] builds its own foot/rim instead.
+/// the wheel mounts on the wall panel itself, no pylon/plinth/cap of its own.
 fn spawn_pylons(
     commands: &mut Commands,
     root: Entity,
@@ -1454,7 +1401,7 @@ fn room_plate_text(
 /// brass-frame it; unbuilt stations stay dim even focused. PatchBay spawns no
 /// plate at all now (the wheel is the station) — the query below simply never
 /// yields one for it, so focusing PatchBay brightens nothing here and that's
-/// fine: the camera's approach onto the dais is the feedback instead.
+/// fine: the camera's approach on the mounted wheel is the feedback instead.
 fn room_focus_visuals(
     room: Res<RoomState>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
@@ -1602,31 +1549,38 @@ fn sync_room_glow(
 /// console and the wall, looking outward at the station's marker/nameplate.
 /// Never sits on the opposite wall staring back through the console and the
 /// diametrically opposite pylon — both used to sit *in front of* the camera,
-/// fully occluding the focused station (the bug this pose replaces). The
-/// `Radiators` focus (the NE diagonal, `bearing::RADIATOR_FOCUS_DIR`) rides
-/// this same math unchanged.
+/// fully occluding the focused station (the bug this pose replaces).
+///
+/// Two documented per-station exceptions retarget the look point away from
+/// the default marker radius/height (`ROOM_RADIUS`, `APPROACH_LOOK_HEIGHT`):
+/// - `Radiators` (2026-07-10): its NE panel is now the octagon wall shell's
+///   own diagonal face, standing at [`palette::WALL_APOTHEM`] (800) — well
+///   past the old free-floating radiator radius (660) this look-point used
+///   to target. Left at `ROOM_RADIUS` (620) the camera would look at empty
+///   air short of the wall.
+/// - `PatchBay` (2026-07-10, the wall-mount retune): the wheel itself moved
+///   from a floor dais to the W wall panel, at [`palette::WALL_APOTHEM`] and
+///   [`palette::STATION_W_MOUNT_Y`] (280, the panel's vertical center) — the
+///   approach now has to rise to meet it, not look at furniture height on
+///   the floor.
+///
+/// Every other wall station's look point is untouched.
 fn desired_camera(station: Station) -> (Vec3, Vec3) {
     match bearing::focus_dir(station) {
         None => (OVERVIEW_POS, OVERVIEW_LOOK),
         Some(d) => {
-            // Look at the marker's own wall radius (ROOM_RADIUS — the same
-            // radius the pylons spawn at) held at furniture height
-            // (APPROACH_LOOK_HEIGHT): the station's instrument is the
-            // subject; its plate hangs above it in the frame. Radiators is
-            // the one exception (2026-07-10): its NE panel is now the
-            // octagon wall shell's own diagonal face, standing at
-            // `WALL_APOTHEM` (800) — well past the old radiator radius (660)
-            // this look-point used to target. Left at ROOM_RADIUS (620) the
-            // camera would look at empty air short of the wall; every other
-            // wall station still has its marker at ROOM_RADIUS, unchanged.
-            let wall_r = if station == Station::Radiators { WALL_APOTHEM } else { ROOM_RADIUS };
+            let (wall_r, look_h) = match station {
+                Station::Radiators => (palette::WALL_APOTHEM, APPROACH_LOOK_HEIGHT),
+                Station::PatchBay => (palette::WALL_APOTHEM, palette::STATION_W_MOUNT_Y),
+                _ => (ROOM_RADIUS, APPROACH_LOOK_HEIGHT),
+            };
             (
                 Vec3::from_array(bearing::approach_camera(
                     d,
                     ROOM_CAM_APPROACH_R,
                     ROOM_CAM_APPROACH_HEIGHT,
                 )),
-                Vec3::from_array(bearing::approach_look(d, wall_r, APPROACH_LOOK_HEIGHT)),
+                Vec3::from_array(bearing::approach_look(d, wall_r, look_h)),
             )
         }
     }
@@ -1921,19 +1875,23 @@ mod tests {
     }
 
     #[test]
-    fn radiators_focus_looks_at_the_new_wall_apothem_not_the_old_room_radius() {
-        // 2026-07-10: the NE radiator panel is now the octagon shell's own
-        // diagonal wall face at WALL_APOTHEM (800), not the old free-floating
-        // slab at 660 — the look point must have moved out to meet it, and
-        // every OTHER wall station's look point must be untouched.
-        let (_, look) = desired_camera(Station::Radiators);
-        let d = bearing::focus_dir(Station::Radiators).unwrap();
-        let look_r = look.x * d[0] + look.z * d[2];
-        assert!(
-            (look_r - WALL_APOTHEM).abs() < 1e-3,
-            "Radiators should look at the wall apothem: {look_r}"
-        );
-        for s in [Station::PatchBay, Station::Tracks, Station::Vfs] {
+    fn radiators_and_patch_bay_focus_look_at_the_wall_apothem_not_the_room_radius() {
+        // Two documented exceptions read WALL_APOTHEM instead of ROOM_RADIUS:
+        // Radiators (2026-07-10, the NE panel is the octagon shell's own
+        // diagonal wall face at 800, not the old free-floating slab at 660)
+        // and PatchBay (2026-07-10, the wall-mount retune: the wheel itself
+        // moved from a floor dais to the wall panel). Every OTHER wall
+        // station's look point must be untouched.
+        for s in [Station::Radiators, Station::PatchBay] {
+            let (_, look) = desired_camera(s);
+            let d = bearing::focus_dir(s).unwrap();
+            let look_r = look.x * d[0] + look.z * d[2];
+            assert!(
+                (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
+                "{s:?} should look at the wall apothem: {look_r}"
+            );
+        }
+        for s in [Station::Tracks, Station::Vfs] {
             let (_, look) = desired_camera(s);
             let d = bearing::focus_dir(s).unwrap();
             let look_r = look.x * d[0] + look.z * d[2];
@@ -1942,6 +1900,22 @@ mod tests {
                 "{s:?} should still look at the unchanged marker radius: {look_r}"
             );
         }
+    }
+
+    #[test]
+    fn patch_bay_focus_looks_at_the_mounted_wheel_height_not_furniture_height() {
+        // The second half of the PatchBay exception: the look point's height
+        // rises to the wall-mounted wheel's own center
+        // (`palette::STATION_W_MOUNT_Y`, 280), not the floor-furniture height
+        // every other wall station's look point uses (`APPROACH_LOOK_HEIGHT`).
+        let (_, look) = desired_camera(Station::PatchBay);
+        assert!(
+            (look.y - palette::STATION_W_MOUNT_Y).abs() < 1e-3,
+            "PatchBay should look at the mounted wheel's own height: {}",
+            look.y
+        );
+        let (_, tracks_look) = desired_camera(Station::Tracks);
+        assert_eq!(tracks_look.y, APPROACH_LOOK_HEIGHT, "other stations are unaffected");
     }
 
     #[test]
@@ -1970,23 +1944,25 @@ mod tests {
     // ── circuit-board routes (real production config) ──
 
     #[test]
-    fn w_bundle_terminal_pads_cluster_near_the_dais_foot() {
-        // The wiring must visibly flow INTO the station: pads land just past
-        // the dais foot radius, well short of the old wall-radius pad range.
+    fn w_bundle_terminal_pads_cluster_at_the_wall_base_under_the_wheel() {
+        // The wall-mount retune (2026-07-10): the W wiring now flows all the
+        // way to the wall the wheel hangs on, not to a floor dais foot — pads
+        // land past the old marker radius, just short of the panel itself.
         let w_bundle = &route_bundles()[0];
         assert!(
-            (w_bundle.pad_range.0 - (palette::STATION_W_DAIS_R + 120.0)).abs() < 1e-3,
-            "W pad range should start just past the dais foot: {:?}",
+            w_bundle.pad_range.0 > ROOM_RADIUS,
+            "W pads now reach past the old marker radius, toward the wall: {:?}",
             w_bundle.pad_range
         );
         assert!(
-            w_bundle.pad_range.1 < ROOM_RADIUS,
-            "W pads should stop well short of the wall, clustering near the station: {:?}",
+            w_bundle.pad_range.1 < palette::WALL_APOTHEM,
+            "W pads stop just short of the wall panel itself: {:?}",
             w_bundle.pad_range
         );
         assert!(
-            w_bundle.pad_range.0 > KEEPOUT_RADIUS,
-            "even the nearest W pad clears the console keep-out"
+            w_bundle.pad_range.0 < w_bundle.pad_range.1,
+            "a valid, non-empty pad radius range: {:?}",
+            w_bundle.pad_range
         );
     }
 
@@ -2132,38 +2108,26 @@ mod tests {
         }
     }
 
-    // ── the W dais ──
-
-    #[test]
-    fn the_dais_body_has_a_positive_height_above_its_foot() {
-        // spawn_w_dais builds the body cylinder as
-        // (STATION_W_DAIS_TOP_Y - W_DAIS_FOOT_HEIGHT) tall — a palette tweak
-        // that let the foot swallow the whole dais height would spawn a
-        // zero/negative-height cylinder.
-        let body_height = palette::STATION_W_DAIS_TOP_Y - W_DAIS_FOOT_HEIGHT;
-        assert!(body_height > 0.0, "dais body must stand above its own foot: {body_height}");
-    }
-
-    #[test]
-    fn the_dais_foot_is_wider_than_the_dais_top() {
-        assert!(
-            W_DAIS_FOOT_R > palette::STATION_W_DAIS_R,
-            "the foot should ground the dais the way the table plinth grounds the table"
-        );
-    }
-
     // ── octagon wall shell (room-level constants) ──
 
     #[test]
     fn wall_apothem_clears_the_old_radiator_radius_and_the_marker_radius() {
-        assert!(WALL_APOTHEM > ROOM_RADIUS, "the shell must enclose the wall stations: {WALL_APOTHEM}");
-        assert!(WALL_APOTHEM > 660.0, "the shell must enclose the old radiator radius (660)");
-        assert!(WALL_APOTHEM < FLOOR_RADIUS, "the shell must stand on the floor disc");
+        // WALL_APOTHEM moved to `palette.rs` (2026-07-10, the wall-mount
+        // slice) — a cross-file datum now that `patch_bay`'s placement reads
+        // it too, but `room::spawn_walls` still builds the panel geometry at
+        // this same radius.
+        assert!(
+            palette::WALL_APOTHEM > ROOM_RADIUS,
+            "the shell must enclose the wall stations: {}",
+            palette::WALL_APOTHEM
+        );
+        assert!(palette::WALL_APOTHEM > 660.0, "the shell must enclose the old radiator radius (660)");
+        assert!(palette::WALL_APOTHEM < FLOOR_RADIUS, "the shell must stand on the floor disc");
     }
 
     #[test]
     fn wall_panel_width_stays_positive_after_the_mullion_gap() {
-        let width = bearing::octagon_panel_width(WALL_APOTHEM) - WALL_PANEL_GAP;
+        let width = bearing::octagon_panel_width(palette::WALL_APOTHEM) - WALL_PANEL_GAP;
         assert!(width > 0.0, "the mullion gap must not eat the whole panel: {width}");
     }
 
