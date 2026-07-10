@@ -7,10 +7,11 @@
 //! appear on the next poll. No write path of any kind (patching stays
 //! CLI-only for a long time — the scene is a viewer).
 //!
-//! **The circle is room furniture at the W bearing** (`docs/scenes/shell.md`,
-//! Tardis reading #3 + slice B: "one shared scene graph"). The whole subtree
-//! rides ONE Amy-tunable placement transform ([`STATION_W_PLACEMENT`]) that
-//! sits it near W at waist height and uniform scale — internal coordinates are
+//! **The circle IS the west station** (`docs/scenes/shell.md`, Tardis reading
+//! #3 + slice B: "one shared scene graph"; Amy, 2026-07-10 — the wheel stands
+//! in for the sign and pylon a station used to need). The whole subtree rides
+//! ONE Amy-tunable placement transform ([`STATION_W_PLACEMENT`]) that seats it
+//! on the room-built W dais at station scale — internal coordinates are
 //! untouched. It is spawned when the room spawns ([`spawn_furniture`], called
 //! from `room::enter_room`) and lives as long as the room; diving is a
 //! *continuous camera descent* onto it, never a despawn/respawn scene cut. At
@@ -32,34 +33,35 @@ use crate::text::components::bevy_color_to_brush;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::{Screen, in_shell};
-use crate::view::room::nav::Station;
+use crate::view::palette;
+use crate::view::room::nav::{Station, StationCarousel};
 use crate::view::room::{
     PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomCamera, RoomRoot, RoomState,
     layout_plate_text, teardown_room,
 };
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
-use crate::view::room::nav::StationCarousel;
 use geometry::{chord_points, layout_sockets};
 
 // ── Station placement seam (Amy-tunable — the ONE knob) ──────────────────────
-// Where the patch-bay circle stands as room furniture at the W bearing. This is
-// the single seam the slice-B decision (`docs/scenes/shell.md`, open question 3,
-// DECIDED 2026-07-09) rides on: the whole `PatchBayRoot` subtree is a child of a
-// placement entity carrying this transform, so all positioning/scaling happens
-// HERE and the patch bay's internal coordinates never change. Amy is still
-// weighing an alternative — the table as the room *floor* — so this stays a
-// transform edit (retune the three fields, or swap in a floor pose), never a
-// rebuild. The dive camera is the local `PB_CAM_POS/LOOK` mapped through this
-// same transform (`dive_camera_pose`), so the dived view frames the table
-// exactly as the standalone scene did.
+// Where the patch-bay wheel stands as the west station itself. This is the
+// single seam the slice-B decision (`docs/scenes/shell.md`, open question 3,
+// DECIDED 2026-07-09) rides on: the whole `PatchBayRoot` subtree is a child of
+// a placement entity carrying this transform, so all positioning/scaling
+// happens HERE and the patch bay's internal coordinates never change. The
+// room builds a dais at the W bearing sized to the SAME `palette::STATION_W_*`
+// numbers this placement reads (`palette.rs`'s "Station W contract" — room
+// and patch bay agree there, never by eyeballing each other). The dive camera
+// is the local `PB_CAM_POS/LOOK` mapped through this same transform
+// (`dive_camera_pose`), so the dived view frames the table exactly as the
+// standalone scene did — one seam: edit this constant (or the shared contract
+// it reads) and everything, including the dive camera, follows via the
+// similarity transform.
 
 /// A rigid-plus-uniform-scale placement of a scene into room space.
 struct StationPlacement {
     /// Room-space translation of the scene's local origin.
     translation: Vec3,
-    /// Uniform scale (table outer radius is ~348 patch-bay units; the room's
-    /// wall radius is 620 and the W pylon stands there — this reads the table
-    /// as a waist-height instrument stationed near W, not touching the pylon).
+    /// Uniform scale applied to the scene's local coordinates.
     scale: f32,
     /// Yaw about +Y (radians). `FRAC_PI_2` turns the scene's local +Z (the
     /// standalone camera's side) toward world +X — the same side the room's
@@ -68,33 +70,34 @@ struct StationPlacement {
     yaw: f32,
 }
 
-/// The patch bay's placement at W. **Amy-tunable — flagged for the lead's
-/// visual pass** (translation/scale/yaw are a computed first guess, not
-/// eyeballed in-scene). West is −X; the table floats at waist height between
-/// the console keep-out and the W wall.
+/// The patch bay's placement at W. Amy, 2026-07-10: the wheel IS the west
+/// station now — no pylon, no separate nameplate (this supersedes the earlier
+/// "pending floor-placement alternative" note the comment here used to carry;
+/// the alternative was decided). The room builds a dais at `palette::STATION_W_X`
+/// / `_DAIS_TOP_Y` / `_DAIS_R`; this seats the wheel's local origin (its
+/// tabletop plane) flush on the dais top, at `palette::STATION_W_SCALE`. Scale
+/// math: `TABLE_OUTER_R` (348 local units) × 0.34 ≈ 118 world — a peer to the
+/// well table's 120, not a miniature.
 const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
-    translation: Vec3::new(-380.0, 130.0, 0.0),
-    scale: 0.22,
+    translation: Vec3::new(palette::STATION_W_X, palette::STATION_W_DAIS_TOP_Y, 0.0),
+    scale: palette::STATION_W_SCALE,
     yaw: std::f32::consts::FRAC_PI_2,
 };
 
-/// The patch-bay point light re-tuned for the *placed* (room-scale) furniture.
-/// A light's brightness falls off inverse-square in WORLD units, and Bevy does
-/// NOT scale a `PointLight`'s intensity or range by its transform's scale (it
-/// *does* scale the light's position) — so the standalone value (60M lumens /
-/// 4000 range, tuned for the full-size table) would blow out the shrunken table
-/// sitting ~`scale`× as far from the lamp. Scaled to the placement: intensity ≈
-/// 60M·scale², range ≈ 4000·scale. **FLAG FOR VISUAL PASS** — computed, the lead
-/// live-tunes the exact exposure.
-// Eyeballed 2026-07-10 (pixel-sampled over BRP screenshots). The table's
-// ~1% linear albedo means NO intensity fully lifts it — and that's the look:
-// the dived table stays gold-etch-on-black (mockup 14). What this bump buys
-// is presence at ROOM scale: a warm sheen + brass-peg glints that read as
-// "an instrument stands at W" instead of a black hole. Paired with the table
-// material's metallic drop (0.85 → 0.40), which is what let light matter at
-// all. Lift the table's `base_color` (not this) to brighten the surface.
-const PB_PLACED_LIGHT_INTENSITY: f32 = 40_000_000.0;
-const PB_PLACED_LIGHT_RANGE: f32 = 900.0;
+// ── Palette helpers (this scene's own copy — `room::lin`/`lin_scaled` are
+// private to that module, so the scene-family material discipline gets a
+// second small implementation here rather than a cross-module reach) ────────
+
+/// A linear-rgb [`Color`] from an `[f32; 3]` palette value.
+fn lin(c: [f32; 3]) -> Color {
+    Color::LinearRgba(LinearRgba::rgb(c[0], c[1], c[2]))
+}
+
+/// [`lin`] scaled by a brightness tier — the palette's hue × LDR/HDR-tier
+/// convention (`palette.rs` header).
+fn lin_scaled(c: [f32; 3], k: f32) -> Color {
+    Color::LinearRgba(LinearRgba::rgb(c[0] * k, c[1] * k, c[2] * k))
+}
 
 // ── Scene constants (Amy-tunable) ───────────────────────────────────────────
 
@@ -159,10 +162,6 @@ const POLL_SECS: f32 = 2.0;
 /// The etched gold ring/tick geometry lies this far above the table's top face
 /// (a small +Y like the chords, to clear z-fighting with the flat annulus).
 const ETCH_Y: f32 = 0.8;
-/// Faint brass for the etched rings and seat ticks — LDR (< 1.0 linear) so it
-/// reads as an engraving and never blooms through the HDR camera (the
-/// charter's decoration-stays-LDR budget rule).
-const ETCH_GOLD: Color = Color::srgb(0.42, 0.34, 0.16);
 /// Concentric guide-ring radii (world units): a few rings between the center
 /// hole and the rim, plus the ring AT the socket-seat radius (`RIM_R`) the
 /// pegs sit on — "legible like a well-designed instrument" (mockup 14).
@@ -431,12 +430,12 @@ fn exit_patch_bay(
     info!("patch-bay: left the shell from the dive (room torn down)");
 }
 
-/// Spawn the patch-bay circle as **room furniture at the W bearing** — the
-/// static half of the scene (the placement anchor, the table, the etched guide
-/// rings, the point light, and the title/legend/inspection plates). The
-/// seat-driven sockets, ticks, chords, and per-client plates are rebuilt from
-/// the observed graph by `rebuild_patch_scene`. Called once from
-/// `room::enter_room`; the whole subtree lives as long as `RoomRoot`.
+/// Spawn the patch-bay wheel as **the west station itself** — the static half
+/// of the scene (the placement anchor, the table, the etched guide rings, and
+/// the title/legend/inspection plates). The seat-driven sockets, ticks,
+/// chords, and per-client plates are rebuilt from the observed graph by
+/// `rebuild_patch_scene`. Called once from `room::enter_room`; the whole
+/// subtree lives as long as `RoomRoot`.
 pub(crate) fn spawn_furniture(
     commands: &mut Commands,
     room_root: Entity,
@@ -471,15 +470,13 @@ pub(crate) fn spawn_furniture(
     // rule, built into the furniture. Extrusions extrude along Z; rotate to
     // lie flat with the top face up.
     let table_mesh = meshes.add(Extrusion::new(Annulus::new(TABLE_INNER_R, TABLE_OUTER_R), TABLE_DEPTH));
-    // Mostly-dielectric on purpose (eyeballed 2026-07-10): at metallic 0.85
-    // the dark surface had almost no diffuse response, so no point-light
-    // intensity could lift it out of near-black — the "table reads dark at
-    // room scale" nit. Lower metallic lets the base colour actually diffuse
-    // under the placed light while the roughness keeps a soft sheen.
+    // Unlit, palette-driven (Amy, 2026-07-10 — "unify materials with the
+    // room"): `DARK_SURFACE_LIFT` is one shade up from the room's own
+    // furniture surface, so the instrument's working face reads against its
+    // dais with no lamp needed.
     let table_material = std_materials.add(StandardMaterial {
-        base_color: Color::srgb(0.11, 0.115, 0.14),
-        metallic: 0.40,
-        perceptual_roughness: 0.55,
+        base_color: lin(palette::DARK_SURFACE_LIFT),
+        unlit: true,
         ..default()
     });
     commands.spawn((
@@ -496,10 +493,12 @@ pub(crate) fn spawn_furniture(
     // above the table's top face — the static half of mockup 14's "concentric
     // guide rings and radial ticks etched in faint gold." The per-seat radial
     // ticks are seat-driven and spawn with the sockets in `rebuild_patch_scene`.
-    // One shared unlit LDR material so the etching reads at rest and never
-    // blooms; `cull_mode: None` keeps the up-facing annulus visible either side.
+    // One shared unlit material, `palette::GOLD_HUE` at the etch tier (dimmer
+    // than trim so etched detail supports rather than competes) — reads at
+    // rest and never blooms; `cull_mode: None` keeps the up-facing annulus
+    // visible either side.
     let etch_material = std_materials.add(StandardMaterial {
-        base_color: ETCH_GOLD,
+        base_color: lin_scaled(palette::GOLD_HUE, palette::GOLD_LDR_ETCH),
         unlit: true,
         cull_mode: None,
         ..default()
@@ -517,25 +516,6 @@ pub(crate) fn spawn_furniture(
             ChildOf(root),
         ));
     }
-
-    // StandardMaterial needs light (the room's own materials are all unlit, so
-    // this lamp only touches the table + pegs). Intensity/range are the placed
-    // (room-scale) values — see `PB_PLACED_LIGHT_*`: a light does not scale with
-    // the placement's transform, so the full-size numbers would blow out the
-    // shrunken table. Its POSITION does scale (it rides the placement), so the
-    // local pose keeps the lamp proportionally over the table.
-    commands.spawn((
-        PointLight {
-            intensity: PB_PLACED_LIGHT_INTENSITY,
-            range: PB_PLACED_LIGHT_RANGE,
-            shadows_enabled: false,
-            color: Color::srgb(1.0, 0.92, 0.78),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 700.0, 200.0),
-        Name::new("PatchBayLight"),
-        ChildOf(root),
-    ));
 
     // Title, legend, inspection plates (MSDF; filled by `fill_patch_text` only
     // while dived). All three are the dive LOD — tagged `PatchBayLod` and spawned
@@ -581,7 +561,7 @@ pub(crate) fn spawn_furniture(
         ChildOf(root),
     ));
 
-    info!("patch-bay: stationed as room furniture at W");
+    info!("patch-bay: stationed as the west station");
 }
 
 /// The dive LOD: show the label/tick/card layer while `Screen::PatchBay`, hide
@@ -760,14 +740,12 @@ fn rebuild_patch_scene(
     // and its ALL-CAPS holographic port label floating above.
     let peg_mesh = meshes.add(Cylinder::new(7.0, 12.0));
     let peg_material = std_materials.add(StandardMaterial {
-        base_color: Color::srgb(0.72, 0.55, 0.25),
-        metallic: 0.9,
-        perceptual_roughness: 0.3,
-        emissive: LinearRgba::rgb(0.10, 0.07, 0.02),
+        base_color: lin_scaled(palette::BRASS_HUE, palette::BRASS_LDR),
+        unlit: true,
         ..default()
     });
     let tick_material = std_materials.add(StandardMaterial {
-        base_color: ETCH_GOLD,
+        base_color: lin_scaled(palette::GOLD_HUE, palette::GOLD_LDR_ETCH),
         unlit: true,
         cull_mode: None,
         ..default()
@@ -1519,13 +1497,13 @@ mod tests {
     #[test]
     fn the_dive_camera_leans_down_onto_the_table_from_the_approach_side() {
         // The dive pose is the local look-down camera carried through the seam:
-        // the eye rides above the table's waist height and above its own look
+        // the eye rides above the dais-top height and above its own look
         // point (tilting down onto the top face), and it stands on the +X
         // (console) side of the table center — the same side the room's W-focus
         // camera studies it from, so the descent is a lean-in, not a jump across.
         let (eye, look) = dive_camera_pose();
         let t = STATION_W_PLACEMENT.translation;
-        assert!(eye.y > t.y, "dive eye sits above the table waist: {eye:?}");
+        assert!(eye.y > t.y, "dive eye sits above the dais top: {eye:?}");
         assert!(eye.y > look.y, "camera tilts down onto the table: eye={eye:?} look={look:?}");
         assert!(eye.x > t.x, "dive eye is on the approach (+X) side of the table: {eye:?}");
     }
