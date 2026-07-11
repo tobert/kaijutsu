@@ -331,6 +331,23 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Well: a single Enter from the room overview dives AND focuses when a
+  selection persists** (found live-verifying the freeze-fix slice,
+  2026-07-11): `room_keyboard`'s Enter dives (`zoomed = Some(TimeWell)`),
+  and because the dived-only chain's `run_if(well_zoomed)` is evaluated
+  after that same-frame write, `well_keyboard` runs in the SAME frame,
+  sees the same `just_pressed(Enter)`, and — `state.selected` persisting
+  across dives by design — treats it as a focus-Enter, jumping straight
+  to the reading card and skipping the ring-overview stop. The Enter
+  analog of the Escape double-fire Slice F hardened (see
+  `well_keyboard`'s `.after(room_keyboard)` doc). Pre-existing behavior,
+  NOT introduced by the freeze-fix (neither keyboard handler changed);
+  only fires when a prior dive left a selection. Fix shape: give
+  `well_keyboard` the same freshly-dived guard the Escape fix reasoned
+  through — e.g. skip Enter handling on the frame `zoomed` flipped, or
+  latch the dive keypress so one press can't be consumed twice. Decide
+  first whether "Enter resumes where you were" is accidentally *good*
+  (it skips a hop of the skim ladder) — Amy's call before hardening.
 - **Shell: message-wall radiator** (Amy, 2026-07-10): one diagonal octagon
   panel renders MSDF text — messages flowing through (block/drift traffic
   as a scrolling violet ticker, newest line blooms). Design + buildability
