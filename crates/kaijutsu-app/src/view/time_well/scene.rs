@@ -313,7 +313,8 @@ const TERRACE_RING_QUAD_SCALE: f32 = 2.8;
 
 /// Half-width (fraction of the quad half-extent) of the visible annulus band,
 /// centered on the ring radius. Widened for the ornate grid (concentric
-/// sub-rings + two-tier spokes + hexagram need room to read). **Amy-tunable.**
+/// sub-rings + two-tier spokes + dashed inner arc need room to read).
+/// **Amy-tunable.**
 const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 
 /// Base spin rate (radians/sec-ish, tune by eye) for terrace ring `k`; each

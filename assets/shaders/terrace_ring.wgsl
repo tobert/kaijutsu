@@ -10,8 +10,9 @@
 //   • N_CONCENTRIC evenly-spaced sub-rings inside the band (a radial grid),
 //   • a two-tier radial spoke grid — N_MAJOR bright/long spokes + N_MINOR
 //     dim/short spokes — so the band reads as grid cells,
-//   • an inscribed HEXAGRAM (two overlaid equilateral triangles) inside the
-//     inner circle — the classic summoning-glyph centerpiece.
+//   • a dashed inner ARC RING inside the inner circle — a segmented dial
+//     line (etched instrument graduations) spinning with the same motion as
+//     the rest of the glyph. Placeholder centerpiece pending a later glow-up.
 // Bright parts are emitted **HDR** (>1.0) so the single-camera bloom pass
 // blooms them into a glow (see `main::setup_camera`).
 //
@@ -21,7 +22,6 @@
 #import bevy_pbr::forward_io::VertexOutput
 #import bevy_pbr::mesh_view_bindings::globals
 
-const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318530;
 
 // ── Grid-density knobs (tunable) ────────────────────────────────────────────
@@ -31,28 +31,15 @@ const N_CONCENTRIC: f32 = 3.0;
 const N_MAJOR: f32 = 12.0;   // 12 → every 30°
 // Minor radial spokes: dim + short (every 360/N_MINOR degrees).
 const N_MINOR: f32 = 48.0;   // 48 → every 7.5°
+// Dashed inner arc ring: number of dash segments around the circle, and the
+// fraction of each segment that's "on" (the rest is the gap).
+const N_DASH_ARC: f32 = 16.0;
+const DASH_DUTY: f32 = 0.6;
 // HDR emissive multiplier so the glyph blooms.
 const HDR_SCALE: f32 = 3.0;
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> color: vec4<f32>;
-
-// One equilateral triangle centered at the origin, circumradius `tri_r`
-// (center→vertex), rotated by `rot`. Returns a bright-on-edge mask. Built from
-// its three edges: each edge is the chord perpendicular to a vertex direction,
-// at the incircle distance from center (incircle = circumradius / 2 for an
-// equilateral triangle). We take the nearest edge.
-fn triangle_edges(p: vec2<f32>, tri_r: f32, rot: f32, width: f32) -> f32 {
-    let incircle = tri_r * 0.5;
-    var best = 1e9;
-    for (var i = 0u; i < 3u; i = i + 1u) {
-        let a = rot + f32(i) * TAU / 3.0;
-        let n = vec2<f32>(cos(a), sin(a));      // outward edge normal
-        let d = abs(dot(p, n) - incircle);      // distance to this edge line
-        best = min(best, d);
-    }
-    return 1.0 - smoothstep(0.0, width, best);
-}
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -73,7 +60,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Rotate the angular coordinate over time — the whole "spin": every
-    // angle-dependent feature (spokes, hexagram) sweeps around the ring.
+    // angle-dependent feature (spokes, dashed arc) sweeps around the ring.
     let spin = globals.time * spin_rate * spin_dir;
     let theta = atan2(p.y, p.x) + spin;
 
@@ -113,16 +100,23 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let minor_band = band * (1.0 - smoothstep(mid_r, outer, r));
     let minor = (1.0 - smoothstep(0.0, minor_w, min(nw, 1.0 - nw))) * minor_band;
 
-    // --- Inscribed hexagram: two overlaid triangles inside the inner circle ---
-    var hexagram = 0.0;
+    // --- Dashed inner arc: a segmented dial ring inside the inner circle ---
+    // A thin circle at the same radius the old centerpiece occupied, broken
+    // into N_DASH_ARC dashes by an angular duty-cycle mask — no straight
+    // chords, so it can't read as star topology. Spins with the same `spin`
+    // (baked into `theta` above) as the rest of the glyph.
+    var dashed_arc = 0.0;
     if (r < inner) {
-        let hex_r = inner * 0.9;                    // circumradius, just inside `inner`
-        let hex_line = 0.02 * inner;                // line width, scaled to ring size
-        // Two triangles 60° apart form the Star of David / summoning hexagram.
-        hexagram += triangle_edges(p, hex_r, spin, hex_line);
-        hexagram += triangle_edges(p, hex_r, spin + PI / 3.0, hex_line);
-        // Clip to the inner circle so edges don't leak into the band.
-        hexagram *= 1.0 - smoothstep(inner - edge_soft, inner, r);
+        let arc_r = inner * 0.9;                     // same radius the old glyph occupied
+        let dash_line = 0.02 * inner;                // line width, scaled to ring size
+        let ring_line = 1.0 - smoothstep(0.0, dash_line, abs(r - arc_r));
+        // Segment-local phase in [-0.5, 0.5), centered on each dash so both
+        // dash/gap transitions are softened (no hard edge at the wrap point).
+        let dash_phase = fract(theta / TAU * N_DASH_ARC) - 0.5;
+        let dash_edge = 0.04;
+        let half_duty = DASH_DUTY * 0.5;
+        let dash_mask = 1.0 - smoothstep(half_duty - dash_edge, half_duty + dash_edge, abs(dash_phase));
+        dashed_arc = ring_line * dash_mask;
     }
 
     // --- Composite + HDR scale so it blooms ---
@@ -132,7 +126,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         + minor * 0.35
         + inner_rim
         + outer_rim * 0.85
-        + hexagram * 0.9;
+        + dashed_arc * 0.9;
     let col = color.rgb * glyph * HDR_SCALE;
 
     let alpha_raw = band * 0.35
@@ -141,7 +135,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         + minor * 0.5
         + inner_rim
         + outer_rim
-        + hexagram;
+        + dashed_arc;
     let alpha = clamp(alpha_raw, 0.0, 1.0) * color.w;
     return vec4<f32>(col, alpha);
 }
