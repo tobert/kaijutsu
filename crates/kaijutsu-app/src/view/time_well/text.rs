@@ -38,6 +38,77 @@ fn label_brush() -> Brush {
     bevy_color_to_brush(Color::srgba(0.75, 0.85, 0.97, 0.75))
 }
 
+/// Font size for the card-face gist line, ~0.75× the smallest badge (fork
+/// badge, 12.0 — see `card_text_glyphs`) so it reads smaller than every badge
+/// above it, not just the biggest.
+const GIST_FONT_SIZE: f32 = 9.0;
+/// Heuristic characters-per-wrapped-line budget for the gist line — same
+/// "approximate width, not measured" idiom as HUD south's `SOUTH_LINE_CHARS`
+/// (`view::time_well::hud`). Deliberately conservative: parley's real glyph
+/// widths drive the actual on-screen wrap ([`VelloFont::layout`]'s
+/// `break_all_lines`), so `wrap_gist` just needs each pre-wrapped line to be
+/// safely short enough that parley never wraps it a second time.
+const GIST_LINE_CHARS: usize = 40;
+/// Hard cap on wrapped gist lines; content beyond this is ellipsized.
+const GIST_MAX_LINES: usize = 2;
+
+/// Dim brush for the gist line — dimmer than every badge brush above it
+/// (title ~1.0 alpha, model badge 0.85, fork badge 0.65): this is the least
+/// important line on the card face, a hint rather than a spec.
+fn gist_brush() -> Brush {
+    bevy_color_to_brush(Color::srgba(0.80, 0.86, 0.97, 0.55))
+}
+
+/// Greedy word-wrap: split `text` into lines of at most `line_chars`
+/// characters each, never breaking a word mid-way. A single word longer than
+/// `line_chars` still gets its own (overlong) line rather than being split —
+/// simplicity over exactness, since this only has to bound the *count* of
+/// lines, not lay out pixel-perfect ones (parley does that at render time).
+fn word_wrap(text: &str, line_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current = word.to_string();
+        } else if current.chars().count() + 1 + word.chars().count() <= line_chars {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Wrap `text` to at most `max_lines` lines of at most `line_chars` characters
+/// each, ellipsizing the final kept line when content overflows beyond that.
+/// Pure and font-free — a heuristic pre-wrap, not a substitute for parley's
+/// real per-glyph wrap, just a worst-case line-count bound. Returns `None` for
+/// blank input so callers can skip the whole line box (no reserved blank
+/// space) rather than render an empty line.
+fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || line_chars == 0 || max_lines == 0 {
+        return None;
+    }
+    let mut lines = word_wrap(text, line_chars);
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            if last.chars().count() >= line_chars {
+                *last = crate::text::truncate_chars(last, line_chars);
+            } else {
+                last.push('…');
+            }
+        }
+    }
+    if lines.is_empty() { None } else { Some(lines.join("\n")) }
+}
+
 /// HDR gain for the focus card's bevel frame (the `border` ring band): the
 /// selection's accent lifted so the frame reads as a deliberate beveled edge.
 /// It replaces the accidental cream ring the pre-mask-fix chatter/beat lanes
@@ -161,12 +232,30 @@ fn card_text_glyphs(
         y += lh + 4.0 * s;
     }
 
-    // ── Keywords or preview. ──
-    let tail = if !data.keywords.is_empty() {
-        data.keywords.join(" · ")
-    } else {
-        data.preview.clone().unwrap_or_default()
-    };
+    // ── Gist line(s). ── Sentence-level extractive summary (Tier 2,
+    // `kaijutsu-kernel::runtime::synthesis::compute_gist`), riding the same
+    // `CardData.preview` field the old 80-char block-head preview used — no
+    // wire change, just richer content landing here (and in HUD south's
+    // fallback) for free. Smaller and dimmer than the badges above it; skips
+    // cleanly (no reserved space) when there's nothing to show.
+    if let Some(preview) = data.preview.as_deref()
+        && let Some(wrapped) = wrap_gist(preview, GIST_LINE_CHARS, GIST_MAX_LINES)
+        && y < h - pad
+    {
+        let brush = gist_brush();
+        let l = font.layout(
+            &wrapped,
+            &VelloTextStyle { font_size: GIST_FONT_SIZE * s, line_height: 1.15, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let lh = l.height();
+        collect_field(&l, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        y += lh + 4.0 * s;
+    }
+
+    // ── Keywords. ──
+    let tail = data.keywords.join(" · ");
     if !tail.is_empty() && y < h - pad {
         let brush = bevy_color_to_brush(Color::srgba(0.92, 0.95, 1.0, 0.72));
         let l = font.layout(
@@ -380,4 +469,53 @@ pub fn build_horizon_label(
         None => Vec::new(),
     };
     commit_panel_glyphs(&mut msdf, glyphs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_gist_none_for_blank_input() {
+        assert_eq!(wrap_gist("", 20, 2), None);
+        assert_eq!(wrap_gist("   ", 20, 2), None);
+    }
+
+    #[test]
+    fn wrap_gist_short_text_passes_through_on_one_line() {
+        let w = wrap_gist("a short gist", 40, 2).unwrap();
+        assert_eq!(w, "a short gist");
+        assert!(!w.contains('…'), "fits on one line, no ellipsis: {w}");
+    }
+
+    #[test]
+    fn wrap_gist_wraps_to_two_lines_within_budget() {
+        // "one two three four" (18 chars) / "five six seven eight" (20 chars)
+        // — exactly two lines at line_chars=20, no overflow.
+        let text = "one two three four five six seven eight";
+        let w = wrap_gist(text, 20, 2).unwrap();
+        let lines: Vec<&str> = w.lines().collect();
+        assert_eq!(lines.len(), 2, "wraps to exactly two lines: {w:?}");
+        for line in &lines {
+            assert!(line.chars().count() <= 20, "line over budget: {line:?}");
+        }
+        assert!(!w.contains('…'), "content fit in two lines, no ellipsis: {w}");
+    }
+
+    #[test]
+    fn wrap_gist_ellipsizes_when_content_overflows_two_lines() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let w = wrap_gist(text, 15, 2).unwrap();
+        let lines: Vec<&str> = w.lines().collect();
+        assert_eq!(lines.len(), 2, "never exceeds max_lines: {w:?}");
+        assert!(lines[1].ends_with('…'), "overflow past line 2 is elided: {w:?}");
+    }
+
+    #[test]
+    fn wrap_gist_respects_max_lines_of_one() {
+        let text = "one two three four five six";
+        let w = wrap_gist(text, 15, 1).unwrap();
+        assert_eq!(w.lines().count(), 1);
+        assert!(w.ends_with('…'), "overflow past line 1 is elided: {w:?}");
+    }
 }
