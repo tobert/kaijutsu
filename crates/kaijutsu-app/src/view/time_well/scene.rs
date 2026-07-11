@@ -47,8 +47,17 @@ pub struct Card {
     pub base_scale: f32,
 }
 
-/// Parent entity owning all card entities + the well camera. Despawned (with its
-/// descendants) on exit so the well leaves no residue.
+/// The placement/root entity that re-roots the well's whole subtree into room
+/// space (Slice B, mirrors patch bay's `StationWPlacement` + `PatchBayRoot`
+/// folded into one entity — the well needs no separate placement/content
+/// split since, unlike the wall-mounted wheel, it has no change-of-basis
+/// rotation to compose). Carries [`placement_transform`] (identity this
+/// slice — see [`IDENTITY_PLACEMENT`]); every card/ring/ray/label is its
+/// `ChildOf` descendant, so [`exit_time_well`] despawning this ONE entity
+/// (recursively) is the whole teardown — no per-type queries, no leaked
+/// entity. Does NOT own the well camera: that's the app's one shared
+/// `Camera3d`, repurposed via marker component, never a child of anything
+/// well-specific.
 #[derive(Component)]
 pub struct TimeWellRoot;
 
@@ -56,9 +65,11 @@ pub struct TimeWellRoot;
 #[derive(Component)]
 pub struct TimeWellCamera;
 
-/// The center-bottom reading slot: a single large card, parented to the camera
-/// (HUD-stable), that renders the current selection at readable size. Updated by
-/// `text::update_reading_card` on selection change.
+/// The center-bottom reading slot: a single large card floating at a fixed
+/// position at the well's mouth ([`FOCUS_CARD_POS`]), billboarded like every
+/// other card — `ChildOf` the well's placement root (Slice B), not the
+/// camera, despite this doc's old claim. Renders the current selection at
+/// readable size; updated by `text::update_reading_card` on selection change.
 #[derive(Component)]
 pub struct ReadingCard;
 
@@ -351,6 +362,58 @@ const RING_ALIGN: f32 = 1.0;
 const CAMERA_EASE_RATE: f32 = 4.0;
 
 // ============================================================================
+// PLACEMENT (Slice B seam, `lovely-swimming-prism.md` — mirrors patch bay's
+// `StationPlacement`, `patch_bay/mod.rs:71-98,275-293`)
+// ============================================================================
+
+/// A rigid-plus-uniform-scale placement of the well into room space — the same
+/// shape as patch bay's `StationPlacement`, minus the pitch/yaw pair: the well
+/// needs no wall-mount change-of-basis (its recline already lives in the
+/// geometry itself, [`super::card::well_tilt_quat`]), so a single `Quat`
+/// covers whatever rotation a later slice needs.
+pub struct StationCenterPlacement {
+    /// Room-space translation of the well's local origin.
+    pub translation: Vec3,
+    /// Uniform scale applied to the well's local coordinates.
+    pub scale: f32,
+    /// Placement rotation. Identity for this slice; a later slice may need a
+    /// real one to re-seat the well non-trivially at the room's center.
+    pub rotation: Quat,
+}
+
+/// Slice B's placement: identity — no visual change. Every well spawn site
+/// re-roots under this so the mechanical reparenting (this slice's whole job)
+/// is proven safe before a LATER slice replaces these *values* (never this
+/// shape) to seat the well at the room's center.
+pub const IDENTITY_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
+    translation: Vec3::ZERO,
+    scale: 1.0,
+    rotation: Quat::IDENTITY,
+};
+
+/// The `Transform` for the placement/root entity that re-roots the well's
+/// whole subtree into room space — mirrors patch bay's `placement_transform`
+/// (`patch_bay/mod.rs:275-279`). [`enter_time_well`] spawns [`TimeWellRoot`]
+/// with this; every card/ring/ray/label hangs off it via `ChildOf`.
+pub fn placement_transform(p: &StationCenterPlacement) -> Transform {
+    Transform::from_translation(p.translation)
+        .with_rotation(p.rotation)
+        .with_scale(Vec3::splat(p.scale))
+}
+
+/// Map a well-LOCAL point to room space through a placement — the same
+/// similarity transform [`placement_transform`] applies to the subtree, as a
+/// point mapping a caller can use without spawning an entity. Unlike patch
+/// bay's `#[cfg(test)]`-only twin (`patch_bay/mod.rs:290-293`), this one is
+/// NOT test-only: a later slice's camera-shot resolver composes the well's
+/// local camera poses (today's `ease_camera_to_focused_ring` math) through
+/// this placement, so it has to be a real, callable function from the start.
+#[allow(dead_code)] // Slice C's camera-shot resolver is the first real caller
+pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3 {
+    p.translation + p.rotation * (local * p.scale)
+}
+
+// ============================================================================
 // ENTER / EXIT
 // ============================================================================
 
@@ -360,10 +423,11 @@ const WELL_BG: Color = Color::srgb(0.04, 0.05, 0.07);
 
 /// Build the well: repurpose the shared app camera (mark it `TimeWellCamera`,
 /// swap its clear color to the well background, and frame the rings) and spawn
-/// the root + focus card. There is no second camera — the conversation UI and the
-/// well's 3D meshes share the one always-on `Camera3d` (see `main::setup_camera`),
-/// so the old 3D-background / 2D-overlay composite is gone. The shared card mesh
-/// is built once.
+/// the placement/root (identity transform, Slice B — see [`IDENTITY_PLACEMENT`])
+/// + focus card, with every furniture entity spawned `ChildOf` it. There is no
+/// second camera — the conversation UI and the well's 3D meshes share the one
+/// always-on `Camera3d` (see `main::setup_camera`), so the old 3D-background /
+/// 2D-overlay composite is gone. The shared card mesh is built once.
 pub fn enter_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
@@ -394,12 +458,19 @@ pub fn enter_time_well(
         *tf = Transform::from_translation(CAM_BASE_POS).looking_at(CAM_BASE_LOOK, Vec3::Y);
     }
 
-    commands.spawn((
-        TimeWellRoot,
-        Transform::default(),
-        Visibility::Inherited,
-        Name::new("TimeWellRoot"),
-    ));
+    // The placement/root entity (Slice B): identity transform today, so every
+    // child's existing local coordinates ARE its world coordinates — no
+    // visual change. `Name` says "Placement" (not "Root") for debuggability,
+    // matching patch bay's naming; the `TimeWellRoot` marker is what the
+    // per-frame systems below (and `exit_time_well`) query for.
+    let root = commands
+        .spawn((
+            TimeWellRoot,
+            placement_transform(&IDENTITY_PLACEMENT),
+            Visibility::Inherited,
+            Name::new("TimeWellPlacement"),
+        ))
+        .id();
 
     // Base ring deck: a flat disc behind the cards that renders the well's pulse
     // (concentric rings + spiral core + activity ripples). Driven per-frame by
@@ -427,6 +498,7 @@ pub fn enter_time_well(
         },
         Visibility::Inherited,
         Name::new("WellRingsDeck"),
+        ChildOf(root),
     ));
 
     // Band magic-circle rings: one annulus quad per band ring (the
@@ -465,6 +537,7 @@ pub fn enter_time_well(
             },
             Visibility::Inherited,
             Name::new(format!("TerraceRing{k}")),
+            ChildOf(root),
         ));
     }
 
@@ -496,6 +569,7 @@ pub fn enter_time_well(
         // shader draws the body. No vello — pure MSDF, no UiVectorScene.
         panel,
         Name::new("ReadingCard"),
+        ChildOf(root),
     ));
 
     // Event-horizon "+N" count label: parked at the funnel center beyond the
@@ -521,15 +595,17 @@ pub fn enter_time_well(
         Visibility::Inherited,
         horizon_panel,
         Name::new("HorizonLabel"),
+        ChildOf(root),
     ));
 
     info!("time-well: entered (shared app camera repurposed for the well)");
 }
 
-/// Tear the well down: despawn the root + all cards, clear the id→entity map and
-/// join state, and hand the shared app camera back to the conversation (drop the
-/// well marker, restore the theme background clear). The camera itself is *not*
-/// despawned — it is the app's one always-on camera.
+/// Tear the well down: despawn the placement root (recursively — every well
+/// entity, including track rays, is its descendant now, Slice B), clear the
+/// id→entity map and join state, and hand the shared app camera back to the
+/// conversation (drop the well marker, restore the theme background clear).
+/// The camera itself is *not* despawned — it is the app's one always-on camera.
 pub fn exit_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
@@ -537,11 +613,6 @@ pub fn exit_time_well(
     mut edge_bump: ResMut<crate::view::room::WellEdgeBump>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<TimeWellRoot>>,
-    cards: Query<Entity, With<Card>>,
-    reading: Query<Entity, With<ReadingCard>>,
-    decks: Query<Entity, With<WellRingsDeck>>,
-    terrace_rings: Query<Entity, With<TerraceRing>>,
-    horizon_label: Query<Entity, With<HorizonLabel>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
     // Drop the pulse state: the activity systems are well-gated, so energy
@@ -549,14 +620,15 @@ pub fn exit_time_well(
     // re-entry hours later (Gemini review, 2026-07-04). Re-entering starts
     // calm and warms from live events — matching the join reset below.
     *activity = super::activity::RingActivity::default();
-    for e in roots
-        .iter()
-        .chain(cards.iter())
-        .chain(reading.iter())
-        .chain(decks.iter())
-        .chain(terrace_rings.iter())
-        .chain(horizon_label.iter())
-    {
+
+    // The ONE despawn site (Slice B): every card/ring/ray/label is now a
+    // `ChildOf` descendant of this placement/root entity, and `despawn`
+    // recurses through `Children` by default — the old per-type queries
+    // (`Card`/`ReadingCard`/`WellRingsDeck`/`TerraceRing`/`HorizonLabel`, each
+    // despawned separately) are gone, and with them the leak they were blind
+    // to: a bare placement entity carries none of those markers, so it would
+    // otherwise survive every well visit.
+    for e in roots.iter() {
         commands.entity(e).despawn();
     }
 
@@ -899,6 +971,24 @@ mod tests {
         state.placement_pending.clear();
         assert!(state.begin_placement(a));
     }
+
+    // -- placement (Slice B seam) — mirrors patch bay's `placement_*` tests --
+
+    #[test]
+    fn identity_placement_transform_is_the_identity() {
+        let tf = placement_transform(&IDENTITY_PLACEMENT);
+        assert_eq!(tf.translation, Vec3::ZERO);
+        assert_eq!(tf.rotation, Quat::IDENTITY);
+        assert_eq!(tf.scale, Vec3::ONE);
+    }
+
+    #[test]
+    fn identity_placement_to_room_is_a_no_op() {
+        // No visual change at Slice B: mapping any well-local point through
+        // the identity placement must return that exact point.
+        let p = Vec3::new(12.0, -34.0, 56.0);
+        assert_eq!(placement_to_room(&IDENTITY_PLACEMENT, p), p);
+    }
 }
 
 // ============================================================================
@@ -1139,7 +1229,7 @@ pub fn ease_camera_to_focused_ring(
 pub fn billboard_cards(
     camera: Query<&GlobalTransform, With<TimeWellCamera>>,
     mut cards: Query<
-        (&mut Transform, Option<&Card>),
+        (&mut Transform, &GlobalTransform, Option<&Card>),
         Or<(With<Card>, With<ReadingCard>, With<HorizonLabel>)>,
     >,
 ) {
@@ -1147,12 +1237,28 @@ pub fn billboard_cards(
         return;
     };
     let cam_pos = cam.translation();
-    for (mut tf, card) in cards.iter_mut() {
+    for (mut tf, global, card) in cards.iter_mut() {
         // Orient the quad's visible (+Z) face toward the camera, keeping world-up
         // so text stays upright. `looking_at` points -Z at its target, so aim it
         // at the point opposite the camera (the quad mirror of the camera ray).
-        let away = tf.translation * 2.0 - cam_pos;
-        let billboard_rot = Transform::from_translation(tf.translation)
+        //
+        // Uses the card's WORLD position (`global.translation()`), NOT its local
+        // `tf.translation` — the two only coincide while this entity's ancestor
+        // chain carries an identity transform. Once reparented under the well's
+        // placement (Slice B, `IDENTITY_PLACEMENT`/`placement_transform`), local
+        // and world diverge the moment that placement stops being identity, and
+        // `cam_pos` (from the camera's `GlobalTransform`) is always world-space —
+        // mixing the two here was a real bug (`lovely-swimming-prism.md`, Slice
+        // B), invisible today only because the identity placement makes local ==
+        // world. The result is still written into the LOCAL `Transform.rotation`
+        // (that's what actually renders under the parent) — correct ONLY
+        // because the placement carries no rotation yet (identity today). If a
+        // later slice gives the placement a real rotation, re-verify this still
+        // holds — it should, since every direction below is now derived from
+        // `GlobalTransform`, but that slice should check, not assume.
+        let world_pos = global.translation();
+        let away = world_pos * 2.0 - cam_pos;
+        let billboard_rot = Transform::from_translation(world_pos)
             .looking_at(away, Vec3::Y)
             .rotation;
 
@@ -1165,6 +1271,13 @@ pub fn billboard_cards(
         // Rim cards: ring-align them so they stand around their ring like a
         // carousel — face-normal radial-outward, up along the funnel axis —
         // blended against the billboard by `RING_ALIGN`.
+        //
+        // Deliberately LOCAL (`tf.translation`, not `global`/world) below: this
+        // is resolving the card's position back into the well's OWN tilted
+        // funnel frame (`well_tilt_quat().inverse()`), never relating it to the
+        // camera's world position — no frame-mixing, so reparenting under the
+        // placement doesn't touch its correctness the way `billboard_rot` above
+        // needed fixing.
         let tilt = super::card::well_tilt_quat();
         let local = tilt.inverse() * tf.translation; // back into funnel-local space
         let radial_local = Vec3::new(local.x, local.y, 0.0).normalize_or_zero();

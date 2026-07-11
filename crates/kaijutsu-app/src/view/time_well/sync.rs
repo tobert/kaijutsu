@@ -20,18 +20,20 @@ use super::card::{
     ClusterAssignment, assign_placement, card_base_scale, card_from, ring_seat_rotated,
     spiral_positions,
 };
-use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, RingSeat, TimeWellState};
+use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, RingSeat, TimeWellRoot, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use super::panel::create_msdf_panel;
 
 /// Reconcile the well against the latest polled context list.
 ///
 /// Gated on `DriftState` changing so a static context set costs nothing. On a
-/// change: run the whole-set placement (seating + ordering together — see
-/// [`assign_placement`]), diff the *seated* subset against the join, despawn
-/// exits, spawn enters at their target, and refresh every surviving card's
-/// target + data (so compaction motion lands on all of them). Horizon
-/// contexts never enter the join at all — no card entity, ever.
+/// change: run the whole-set seat placement (seating + ordering together — see
+/// [`assign_placement`]; NOT `scene::StationCenterPlacement`, an unrelated use
+/// of the same word for the room-space seam), diff the *seated* subset against
+/// the join, despawn exits, spawn enters at their target (`ChildOf` the well's
+/// placement/root, `scene::TimeWellRoot` — Slice B), and refresh every
+/// surviving card's target + data (so compaction motion lands on all of them).
+/// Horizon contexts never enter the join at all — no card entity, ever.
 pub fn sync_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
@@ -39,6 +41,7 @@ pub fn sync_time_well(
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut cards: Query<(&mut Card, &mut CardTarget, &mut RingSeat)>,
+    roots: Query<Entity, With<TimeWellRoot>>,
 ) {
     // The well shows live + concluded contexts; archived are hidden entirely.
     let visible: Vec<&ContextInfo> = drift.contexts.iter().filter(|c| !c.archived).collect();
@@ -163,6 +166,16 @@ pub fn sync_time_well(
         .card_mesh
         .clone()
         .expect("card_mesh built on enter_time_well");
+    // Same "must exist by now" invariant as `card_mesh` above: `enter_time_well`
+    // (`OnEnter`) always spawns the placement/root before this system's
+    // `Update` schedule can run for the well (state-transition sync point runs
+    // first), so a missing root here means that invariant broke — surface it
+    // loudly rather than silently spawn a card with no parent (which would
+    // also silently orphan this join entry: `reconcile` above already committed
+    // it as seated, so a skipped spawn would never be retried).
+    let root = roots
+        .single()
+        .expect("TimeWellRoot placement spawned by enter_time_well before sync_time_well runs");
 
     // Collect enters first to avoid holding an immutable borrow of the diff while
     // mutating `state`.
@@ -226,6 +239,7 @@ pub fn sync_time_well(
                 Visibility::Inherited,
                 panel,
                 Name::new(format!("Card({})", id.short())),
+                ChildOf(root),
             ))
             .id();
 

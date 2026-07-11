@@ -202,6 +202,7 @@ pub fn sync_track_rays(
     mut state: ResMut<WellTracks>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TrackRayMaterial>>,
+    roots: Query<Entity, With<super::scene::TimeWellRoot>>,
 ) {
     // Run when the roster changed OR when the entity count disagrees with it —
     // the count fallback covers well re-entry (exit despawned the rays but the
@@ -245,6 +246,16 @@ pub fn sync_track_rays(
     if new.is_empty() {
         return;
     }
+    // The placement/root (Slice B): every ray becomes its `ChildOf` descendant
+    // below. Unlike `sync_time_well`'s equivalent lookup, a missing root here
+    // is NOT a broken invariant worth panicking over — nothing above this
+    // point committed `new` anywhere durable (it's re-derived fresh from
+    // `state.ray_entities` every call), so skipping the spawn just leaves
+    // these tracks in `new` again next frame; self-healing once the well
+    // actually enters.
+    let Ok(root) = roots.single() else {
+        return;
+    };
     // Spawn rays for new tracks (shared beam mesh, built on first use).
     let mesh = state
         .ray_mesh
@@ -267,22 +278,21 @@ pub fn sync_track_rays(
                 ray_transform(angle),
                 Visibility::Inherited,
                 Name::new(format!("TrackRay({})", t.id)),
+                ChildOf(root),
             ))
             .id();
         state.ray_entities.insert(t.id, entity);
     }
 }
 
-/// Despawn every ray on exit (the well leaves no residue) and drop the join
-/// so re-entering respawns from the next poll.
-pub fn despawn_track_rays(
-    mut commands: Commands,
-    mut state: ResMut<WellTracks>,
-    rays: Query<Entity, With<TrackRay>>,
-) {
-    for e in rays.iter() {
-        commands.entity(e).despawn();
-    }
+/// Reset the ray roster's id→entity map on exit. The `TrackRay` entities
+/// themselves now die with the placement root's own recursive despawn
+/// (`scene::exit_time_well`, Slice B reparenting — every ray is its `ChildOf`
+/// descendant); despawning them again here would just be racing/duplicating
+/// that command. This only clears the stale map, so re-entry's count fallback
+/// (`sync_track_rays`'s `state.ray_entities.len() == state.tracks.len()`
+/// guard) doesn't compare against dangling entity ids and skip the respawn.
+pub fn despawn_track_rays(mut state: ResMut<WellTracks>) {
     state.ray_entities.clear();
 }
 
@@ -408,6 +418,14 @@ mod tests {
     /// the roster survives in `WellTracks`; if the next poll returns the SAME
     /// roster, nothing dirties the resource — the count fallback must still
     /// respawn the beams on re-entry.
+    ///
+    /// Updated for Slice B (`ChildOf` reparenting): `sync_track_rays` now
+    /// requires a `TimeWellRoot` placement entity to spawn rays under (a real
+    /// well entry always has one, from `enter_time_well`), and the real exit
+    /// path despawns rays via the ROOT's own recursive despawn
+    /// (`scene::exit_time_well`), not `despawn_track_rays` directly anymore —
+    /// this test stands in both: spawns a bare placement entity, then
+    /// despawns it to simulate the real exit.
     #[test]
     fn rays_respawn_after_exit_even_with_an_unchanged_roster() {
         use bevy::ecs::system::RunSystemOnce;
@@ -422,6 +440,8 @@ mod tests {
             .init_resource::<WellTracks>()
             .add_systems(Update, sync_track_rays);
 
+        let root = app.world_mut().spawn(super::super::scene::TimeWellRoot).id();
+
         app.world_mut()
             .resource_mut::<WellTracks>()
             .set_tracks(vec![track("bass", 9, &[1])]);
@@ -430,12 +450,18 @@ mod tests {
         app.update();
         assert_eq!(ray_count(&mut app), 1, "settled roster spawns nothing new");
 
-        // Exit the well: rays despawn, the roster stays (the real exit path).
+        // Exit the well: the placement root's recursive despawn removes every
+        // ray (the real exit path, `scene::exit_time_well`); `despawn_track_rays`
+        // only resets the roster's id→entity map now (see its doc comment) so
+        // the count fallback below doesn't compare against dangling ids.
+        app.world_mut().despawn(root);
         app.world_mut().run_system_once(despawn_track_rays).unwrap();
         assert_eq!(ray_count(&mut app), 0, "exit leaves no rays");
 
-        // Re-enter with no roster change (an unchanged re-poll never calls
-        // set_tracks): the count fallback alone must respawn the beam.
+        // Re-enter: a fresh placement root, no roster change (an unchanged
+        // re-poll never calls set_tracks) — the count fallback alone must
+        // respawn the beam.
+        app.world_mut().spawn(super::super::scene::TimeWellRoot);
         app.update();
         assert_eq!(ray_count(&mut app), 1, "re-entry respawns from the surviving roster");
     }
