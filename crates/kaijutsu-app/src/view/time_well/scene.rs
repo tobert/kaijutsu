@@ -11,6 +11,7 @@ use kaijutsu_viz::layout::Band;
 
 use super::card::CardData;
 use crate::ui::screen::Screen;
+use crate::view::palette;
 use super::panel::create_msdf_panel;
 
 // ============================================================================
@@ -322,12 +323,36 @@ const TERRACE_RING_SPIN_BASE: f32 = 0.10;
 const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 
 /// Overall alpha/intensity for the terrace rings — kept low for the first cut
-/// so the driver tunes up from a subtle starting point. **Amy-tunable.**
+/// so the driver tunes up from a subtle starting point. **Amy-tunable.** Left
+/// as-is by the room-palette re-skin (2026-07-11): [`TERRACE_RING_COLOR`]'s new
+/// max channel is in the same ballpark as the old icy-cyan it replaced, so the
+/// composited brightness at this alpha reads about the same — re-tune live if
+/// the new hue reads dim/loud against the deck.
 const TERRACE_RING_ALPHA: f32 = 0.35;
 
-/// Glyph color for the terrace rings: an icy cyan-white that reads against
-/// the well's dark background (the concept-art magic-circle palette). **Amy-tunable.**
-const TERRACE_RING_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
+/// The well's neon hue — an indigo/blue-violet bridging the old saturated
+/// cyan-blue (`WellRingsMaterial`'s `ring_color`, formerly `[0.35, 0.62,
+/// 1.0]`, and this ring's own formerly icy cyan-white) toward
+/// [`palette::VIOLET_THREAD`] (`[0.550, 0.180, 0.750]`, the room's
+/// information/radiator violet) — the room-palette re-skin (2026-07-11,
+/// "bring the well's colors into the room's dark gold/neon family"). Landed
+/// short of `VIOLET_THREAD` itself on purpose: a straight swap read too
+/// pink/magenta next to the gold core, where this reads as "the room's
+/// violet, but electric" — one hue language, not a rote find-replace of blue
+/// with violet. Shared by the ring deck's `ring_color` and the terrace glyph
+/// rings ([`TERRACE_RING_COLOR`]) so the well's two neon layers read as one
+/// family, the way the gold core and the room's own gold trim already do.
+/// **Amy-tunable — a judgment call; live-tune if it reads too blue or too
+/// violet next to `VIOLET_THREAD` on the radiator walls.**
+const WELL_NEON_HUE: Vec3 = Vec3::new(0.42, 0.30, 0.90);
+
+/// Glyph color for the terrace rings: a lighter, softer tint of
+/// [`WELL_NEON_HUE`] — was an icy cyan-white before the re-skin (matched the
+/// old deck's cyan-blue family); now a paler version of the same indigo-violet
+/// so the terrace glyphs still read a shade lighter than the deck's ring
+/// pulse, the relative-brightness relationship the old cyan-white/cyan-blue
+/// pair had. **Amy-tunable.**
+const TERRACE_RING_COLOR: Vec3 = Vec3::new(0.55, 0.45, 0.95);
 
 /// Brightness multiplier for rings + cards **not** on the focused ring, so the
 /// focused ring clearly pops (a card parked in front by a neighbor ring no
@@ -562,10 +587,15 @@ pub(crate) fn spawn_well_furniture(
     // `tick_and_sync_rings`. Not billboarded — it faces the camera (+Z) as a
     // fixed floor; the shader fades its square corners to nothing.
     let deck_mesh = meshes.add(Rectangle::new(RING_DECK_SIZE, RING_DECK_SIZE));
-    // Warm gold core + cyan-blue rings (the concept-art palette, mockups 27/33).
+    // Warm gold core (`palette::GOLD_HUE` — was `[1.0, 0.62, 0.20]`, the
+    // concept-art palette's own warm gold; leaned the rest of the way onto the
+    // room's shared gold) + indigo-violet neon rings (`WELL_NEON_HUE` — was
+    // `[0.35, 0.62, 1.0]`, a saturated cyan-blue). Room-palette re-skin,
+    // 2026-07-11: HDR-on-activity behavior (`energy`/ripples in
+    // `well_rings.wgsl`) is untouched — only these RESTING identity hues moved.
     let deck_material = ring_materials.add(crate::shaders::WellRingsMaterial::new(
-        Vec4::new(1.0, 0.62, 0.20, 1.0),
-        Vec4::new(0.35, 0.62, 1.0, 1.0),
+        Vec4::new(palette::GOLD_HUE[0], palette::GOLD_HUE[1], palette::GOLD_HUE[2], 1.0),
+        WELL_NEON_HUE.extend(1.0),
     ));
     // Tilt + place the deck on the same reclined funnel axis as the cards: its
     // center rides to the throat (lifted depth) and its face tips up toward the
@@ -1713,6 +1743,22 @@ fn card_block_mesh() -> Mesh {
     mesh.translated_by(Vec3::Y * (CARD_HEIGHT * 0.5))
 }
 
+/// Saturation/lightness for [`accent_color`]'s per-context hue — room-palette
+/// re-skin (2026-07-11). The old `(0.55, 0.55)` put the max channel at ~0.80
+/// and the min at ~0.30 for every hue: full-neon, "bright arbitrary rainbow,"
+/// at odds with the room's LDR-at-rest jewel tones (`BRASS_HUE`'s max channel
+/// 0.72, `VIOLET_THREAD`'s 0.75). These land the max channel at ~0.68 and the
+/// min at ~0.22 for every hue — restrained enough to sit in that family, still
+/// saturated enough that distinct context buckets stay visually distinct
+/// (this only changes the S/L the hash plugs into `Color::hsl`, not the
+/// FNV→hue hashing itself). Shared by the rim cards' body/track-hue border
+/// (`accent_vec4`, [`super::live::sync_card_live_uniforms`]), the track rays
+/// (`super::rays::sync_track_rays`), and — incidentally, not a target of this
+/// re-skin — the retiring HUD's panel border (`super::hud::update_well_hud`).
+/// **Amy-tunable.**
+const ACCENT_SATURATION: f32 = 0.42;
+const ACCENT_LIGHTNESS: f32 = 0.45;
+
 pub fn accent_color(accent: &str) -> Color {
     // FNV-1a over the bytes → hue. Stable, dependency-free.
     let mut h: u32 = 2166136261;
@@ -1721,5 +1767,5 @@ pub fn accent_color(accent: &str) -> Color {
         h = h.wrapping_mul(16777619);
     }
     let hue = (h % 360) as f32;
-    Color::hsl(hue, 0.55, 0.55)
+    Color::hsl(hue, ACCENT_SATURATION, ACCENT_LIGHTNESS)
 }
