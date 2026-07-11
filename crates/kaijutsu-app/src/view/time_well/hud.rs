@@ -234,38 +234,42 @@ fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32, top_drop: f32) -> Trans
 
 /// Read `(fov_y, aspect)` off a camera projection, falling back to sane defaults
 /// for a non-perspective projection (the well always uses perspective).
-fn read_perspective(projection: &Projection) -> (f32, f32) {
+pub(crate) fn read_perspective(projection: &Projection) -> (f32, f32) {
     match projection {
         Projection::Perspective(p) => (p.fov, p.aspect_ratio),
         _ => (FRAC_PI_4, 16.0 / 9.0),
     }
 }
 
-/// Spawn the four edge HUD panels as children of the well camera (empty until a
-/// selection drives them). The app camera always exists, so this queries
-/// `With<Camera3d>` directly — no ordering dependency on `enter_time_well`.
-pub fn spawn_well_hud(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<WellCardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    camera: Query<(Entity, &Projection), With<Camera3d>>,
-    windows: Query<&Window>,
-    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
+/// Spawn the four edge HUD panels as children of the well camera (empty until
+/// a selection drives them). Not a Bevy system — a plain function so
+/// `room::enter_room` can call it directly alongside its own furniture spawns
+/// (Slice C: the HUD now also spawns with the room, not only on
+/// `OnEnter(Screen::TimeWell)` — see [`spawn_well_hud`]'s own doc for why
+/// that registration stays wired but calls through to this same body). Takes
+/// `cam_entity`/`fov_y`/`aspect` as plain values rather than its own
+/// `Query<(Entity, &Projection), …>` — `room::enter_room` already has these
+/// off its OWN camera query (merged into one to stay under Bevy's 16-param
+/// system-function ceiling), so re-querying here would just be redundant.
+pub(crate) fn spawn_well_hud_furniture(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<WellCardMaterial>,
+    images: &mut Assets<Image>,
+    cam_entity: Entity,
+    fov_y: f32,
+    aspect: f32,
+    windows: &Query<&Window>,
+    dock: &Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
 ) {
-    let Ok((cam_entity, projection)) = camera.single() else {
-        warn!("well HUD: no Camera3d to parent panels to");
-        return;
-    };
-    let (fov_y, aspect) = read_perspective(projection);
-    let top_drop = top_drop_from(&windows, &dock);
+    let top_drop = top_drop_from(windows, dock);
 
     // Shared unit quad; per-panel size rides on Transform.scale.
     let quad = meshes.add(Rectangle::new(1.0, 1.0));
 
     for slot in HudSlot::ALL {
         let (tw, th) = hud_tex_dims(slot);
-        let (image, panel) = create_msdf_panel(&mut images, tw, th);
+        let (image, panel) = create_msdf_panel(images, tw, th);
         let material = materials.add(WellCardMaterial {
             texture: image,
             // Black, near-opaque body: the panel interior deliberately blots
@@ -280,6 +284,10 @@ pub fn spawn_well_hud(
             // chatter/beat lanes — 0, or the frame washes cyan+gold.
             dim: Vec4::new(1.0, 0.0, 0.0, 0.0),
         });
+        // Room-scale default (Slice C): the panel starts hidden — the same
+        // "spawned Hidden, only the zoom shows them" contract patch bay's own
+        // LOD layer uses — and `apply_well_hud_lod` corrects it every frame
+        // from `RoomState::zoomed`.
         commands
             .spawn((
                 WellHud,
@@ -288,7 +296,7 @@ pub fn spawn_well_hud(
                 Mesh3d(quad.clone()),
                 MeshMaterial3d(material),
                 hud_transform(slot, fov_y, aspect, top_drop),
-                Visibility::Inherited,
+                Visibility::Hidden,
                 panel,
                 Name::new("WellHudPanel"),
             ))
@@ -296,10 +304,65 @@ pub fn spawn_well_hud(
     }
 }
 
-/// Despawn the whole HUD on exit (the camera, their parent, survives).
+/// `OnEnter(Screen::TimeWell)` handler — wired per this slice's own boundary
+/// (Slice D removes the `Screen::TimeWell` variant + this registration
+/// cleanly), unreachable dead code by construction now that nothing sets
+/// `Screen::TimeWell` any more (see `scene::enter_time_well`'s doc). Delegates
+/// to [`spawn_well_hud_furniture`], which `room::enter_room` ALSO calls now
+/// (Slice C: the HUD spawns with the room, camera-parented as always, so it
+/// exists once the room does rather than waiting for a dive).
+pub fn spawn_well_hud(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<WellCardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    camera: Query<(Entity, &Projection), With<Camera3d>>,
+    windows: Query<&Window>,
+    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
+) {
+    let Ok((cam_entity, projection)) = camera.single() else {
+        warn!("well HUD: no Camera3d to parent panels to");
+        return;
+    };
+    let (fov_y, aspect) = read_perspective(projection);
+    spawn_well_hud_furniture(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut images,
+        cam_entity,
+        fov_y,
+        aspect,
+        &windows,
+        &dock,
+    );
+}
+
+/// Despawn the whole HUD (the camera, their parent, survives). Still
+/// registered on `OnExit(Screen::TimeWell)` (dead, per this slice's
+/// boundary) and ALSO called explicitly from `room::exit_room` (Slice C):
+/// the HUD is a `Camera3d` child, not a `RoomRoot` child, so it would
+/// otherwise survive `RoomRoot`'s despawn and leak across room visits.
 pub fn despawn_well_hud(mut commands: Commands, hud: Query<Entity, With<WellHud>>) {
     for e in hud.iter() {
         commands.entity(e).despawn();
+    }
+}
+
+/// The HUD's LOD gate (Slice C): show the panels while
+/// [`super::scene::well_zoomed`], hide them at room scale — mirrors
+/// `patch_bay::apply_patch_lod` exactly (same reasoning: this must run in the
+/// AMBIENT tier, not dived-only, so it reacts to a zoom-OUT transition too,
+/// not just zoom-in). Change-guarded so a settled panel never re-dirties.
+pub fn apply_well_hud_lod(
+    room: Res<crate::view::room::RoomState>,
+    mut panels: Query<&mut Visibility, With<WellHud>>,
+) {
+    let want = if super::scene::well_zoomed(&room) { Visibility::Inherited } else { Visibility::Hidden };
+    for mut vis in panels.iter_mut() {
+        if *vis != want {
+            *vis = want;
+        }
     }
 }
 

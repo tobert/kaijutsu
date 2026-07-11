@@ -198,37 +198,60 @@ fn card_text_glyphs(
 
 /// Rebuild a rim card's MSDF text glyphs + sync its material when its data
 /// changes. No vello — the shader draws the body; MSDF owns the text texture.
+///
+/// Dived-only (Slice C, `lovely-swimming-prism.md`): at room scale the card
+/// text is unreadably small pixels, so this system doesn't even run while
+/// ambient — no point rasterizing MSDF glyphs no one can read. That means a
+/// card's data can change several times while ambient with this system never
+/// observing it; `TimeWellState::card_text_dirty` (armed by `scene::arm_dive`
+/// on every zoom-in) forces a full rebuild of every rim card once dived, not
+/// just the ones `Changed<Card>` would happen to catch — belt-and-braces
+/// alongside Bevy's own per-system change-tick tracking, which mirrors patch
+/// bay's `text_dirty` idiom rather than leaning on a subtler assumption about
+/// how long a gap in this system's own execution can safely be.
 pub fn build_card_scenes(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     mut atlas: Option<ResMut<MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
-    mut query: Query<
-        (
-            &Card,
-            &mut MsdfBlockGlyphs,
-            &MeshMaterial3d<WellCardMaterial>,
-        ),
-        Changed<Card>,
-    >,
+    mut state: ResMut<TimeWellState>,
+    mut query: Query<(
+        Entity,
+        &Card,
+        &mut MsdfBlockGlyphs,
+        &MeshMaterial3d<WellCardMaterial>,
+    )>,
+    changed: Query<Entity, Changed<Card>>,
 ) {
     let Some(font) = fonts.get(&font_handles.mono) else {
-        return; // font still loading; retry next change
+        return; // font still loading; retry next change, `card_text_dirty` untouched
     };
-    for (card, mut msdf, mat_node) in query.iter_mut() {
+    let Some(atlas) = atlas.as_deref_mut() else {
+        return; // atlas not ready yet; same retry contract
+    };
+    // Only clear the arm once glyphs are actually about to be committed for
+    // every card (below) — same "don't eat the flag on a scheduling surprise"
+    // discipline as `room::room_plate_text`'s `any` guard.
+    let rebuild_all = state.card_text_dirty;
+    let changed_set: std::collections::HashSet<Entity> = changed.iter().collect();
+    for (entity, card, mut msdf, mat_node) in query.iter_mut() {
+        if !rebuild_all && !changed_set.contains(&entity) {
+            continue;
+        }
         // Pure MSDF surface: the build size lives on the card's `UiRttTexture`
         // (set once at spawn); the MSDF pass clears and owns the texture. No
         // vello scene — the shader draws the body.
-        if let Some(atlas) = atlas.as_deref_mut() {
-            let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
-            commit_panel_glyphs(&mut msdf, glyphs);
-        }
+        let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
+        commit_panel_glyphs(&mut msdf, glyphs);
 
         if let Some(mat) = materials.get_mut(&mat_node.0) {
             mat.accent = accent_vec4(&card.data.accent);
             mat.params = card_params(card);
         }
+    }
+    if rebuild_all {
+        state.card_text_dirty = false;
     }
 }
 

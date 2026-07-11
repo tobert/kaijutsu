@@ -74,6 +74,14 @@ impl StationCarousel {
 /// Generic double-tap window (the third copy of this shape in the app —
 /// `input/interrupt.rs` and `input/vim/dismiss.rs` predate it; folding all
 /// three onto this one is recorded in docs/issues.md, not done here).
+///
+/// `#[allow(dead_code)]`: unused as of the time-well/room integration plan's
+/// Slice C, which retired this type's one consumer (`room::WellEdgeBump` —
+/// the well's old Up-Up speedbump, gone now that leaving the well is just
+/// `room.zoomed = None`). Kept rather than deleted: it's the still-open
+/// consolidation target `docs/issues.md` already points `interrupt.rs`/
+/// `dismiss.rs` at, not dead weight from an abandoned idea.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DoubleTap {
     window_ms: u128,
@@ -81,6 +89,7 @@ pub struct DoubleTap {
     last: Option<Instant>,
 }
 
+#[allow(dead_code)] // see the struct's own doc
 impl DoubleTap {
     pub fn new(window_ms: u128) -> Self {
         Self {

@@ -139,14 +139,22 @@ pub fn wall_placements() -> [WallPlacement; 4] {
 /// Whether `station`'s wall bearing is occupied by the station's OWN
 /// instrument rather than a marker pylon + nameplate — true for
 /// [`Station::PatchBay`] (`shell.md` slice B, retuned 2026-07-10: "the wheel
-/// IS the west station", then wall-mounted the same day). `enter_room`'s
-/// wall-placement loop reads this to skip the marker/plinth/cap/plate for a
-/// furnished bearing — the wheel mounts directly on the wall panel instead,
-/// no separate furniture builder needed; a future in-room station rides the
-/// same gate. Pure — no Bevy types — so the gating is unit-testable without
-/// spawning anything (mirrors `super::wants_gold_cap`'s shape).
+/// IS the west station", then wall-mounted the same day) and, since the
+/// time-well/room integration plan's Slice C, [`Station::TimeWell`] too — the
+/// well's own ring-carousel furniture now occupies the room's center bearing
+/// directly, the same "the instrument IS the station" contract the wheel
+/// established (there is no wall placement for `TimeWell` in
+/// [`wall_placements`] to skip in the first place — center has no wall — so
+/// this row matters for callers reasoning generically over "does this station
+/// have its own room-furniture," not for `enter_room`'s wall-placement loop
+/// specifically). `enter_room`'s wall-placement loop reads this to skip the
+/// marker/plinth/cap/plate for a furnished bearing — the wheel mounts
+/// directly on the wall panel instead, no separate furniture builder needed;
+/// a future in-room station rides the same gate. Pure — no Bevy types — so
+/// the gating is unit-testable without spawning anything (mirrors
+/// `super::wants_gold_cap`'s shape).
 pub fn station_is_room_furniture(station: Station) -> bool {
-    matches!(station, Station::PatchBay)
+    matches!(station, Station::PatchBay | Station::TimeWell)
 }
 
 // ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
@@ -693,7 +701,7 @@ mod tests {
     /// need to edit (restructured 2026-07-11, time-well/room integration
     /// plan, ahead of the parallel Tracker lane).
     const EXPECTED_ROOM_FURNITURE: &[(Station, bool)] = &[
-        (Station::TimeWell, false),
+        (Station::TimeWell, true),
         (Station::PatchBay, true),
         (Station::Tracks, false),
         (Station::Vfs, false),

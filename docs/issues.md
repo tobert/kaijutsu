@@ -331,6 +331,20 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Shell: `BearingActivity(Center)` has no reader left** (found during the
+  time-well/room integration plan's Slice C, 2026-07-11): `room::sync_room_glow`
+  used to turn the Center bearing's accumulated chatter into the slice-A
+  `ConsoleEmblem` placeholder's glow lift; that placeholder (and the glow
+  branch reading it) is gone now that the real time well stands at the
+  console bearing with its own energy model
+  (`time_well::activity::RingActivity`, fed by `time_well::scene::
+  accumulate_ring_activity`). `room::ingest_room_activity` still accumulates
+  Center's activity level every frame with nothing consuming it — either wire
+  it into the well's own ambient glow (giving room-wide kernel chatter a
+  SECOND lift on the well distinct from the well's own event stream) or drop
+  the Center bearing from `BearingActivity`'s accumulation entirely. Out of
+  Slice C's scope (not one of its 10 wiring steps); noted rather than
+  silently deleted or hastily rewired.
 - **Shell: message-wall radiator** (Amy, 2026-07-10): one diagonal octagon
   panel renders MSDF text — messages flowing through (block/drift traffic
   as a scrolling violet ticker, newest line blooms). Design + buildability

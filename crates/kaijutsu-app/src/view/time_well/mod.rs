@@ -42,6 +42,23 @@ use bevy::prelude::*;
 use crate::ui::screen::Screen;
 
 /// Wires the time-well browser into the app.
+///
+/// Slice C (`lovely-swimming-prism.md`, time-well/room integration) split the
+/// old single `run_if(in_state(Screen::TimeWell))` tuple into three tiers,
+/// mirroring `patch_bay`'s own ambient/`PatchBayLod` split:
+/// - **fully ungated** — runs on every screen, `live::ingest_live_events`'s
+///   existing pattern ("the well opens warm"). [`scene::tick_ring_activity`]
+///   joins it this slice: the `RingActivity` decay tick must not freeze
+///   outside the room (see its own doc for the bug that guards against).
+/// - **ambient** (`run_if(in_state(Screen::Room))`) — the well IS room
+///   furniture now; everything that keeps its cards/rings/rays live and
+///   correct at room scale runs here, cards included (the "opens warm"
+///   property extends to the well's own contents, not just tails/beats).
+/// - **dived-only** (`run_if(well_zoomed)`) — keyboard, highlight overlays,
+///   the HUD, and the card/reading/horizon TEXT builders: room-scale card
+///   text is unreadable pixels, so text rasterization stays gated to the
+///   dive (`text::build_card_scenes`'s own doc has the reasoning + the
+///   `card_text_dirty` catch-up arm).
 pub struct TimeWellPlugin;
 
 impl Plugin for TimeWellPlugin {
@@ -55,6 +72,13 @@ impl Plugin for TimeWellPlugin {
             .init_resource::<live::ContextTails>()
             .init_resource::<live::WellBeats>()
             .init_resource::<rays::WellTracks>()
+            // `OnEnter`/`OnExit(Screen::TimeWell)` — left wired per this
+            // slice's own boundary (Slice D removes the `Screen::TimeWell`
+            // variant and these registrations cleanly); nothing sets
+            // `Screen::TimeWell` any more after this slice's changes to
+            // `room_keyboard`/`toggle_time_well`, so these are unreachable
+            // dead code by construction now, not by omission. See
+            // `scene::enter_time_well`/`scene::exit_time_well`'s own docs.
             .add_systems(
                 OnEnter(Screen::TimeWell),
                 (scene::enter_time_well, hud::spawn_well_hud),
@@ -65,49 +89,62 @@ impl Plugin for TimeWellPlugin {
             )
             // The toggle runs in every screen (it decides based on current state).
             .add_systems(Update, scene::toggle_time_well)
-            // Live ingest runs in every screen too, so tails accumulate and
-            // beat phasors stay locked while the well is closed — it opens warm.
-            .add_systems(Update, live::ingest_live_events)
-            // Well-only per-frame work. One long sequence, split into two
-            // chained groups only because Bevy's tuple impls cap out at 20:
-            // input + polls + reconcile first, then the per-frame render sync.
+            // Fully ungated: opens warm on every screen, well included.
+            .add_systems(Update, (live::ingest_live_events, scene::tick_ring_activity))
+            // Ambient: room-scale truth. The well breathes here whether
+            // you're dived into it or just walking past its bearing.
             .add_systems(
                 Update,
                 (
-                    (
-                        scene::well_keyboard,
-                        sync::poll_clusters,
-                        sync::apply_clusters,
-                        rays::poll_tracks,
-                        rays::apply_tracks,
-                        rays::sync_track_rays,
-                        rays::animate_track_rays,
-                        sync::sync_time_well,
-                        text::build_card_scenes,
-                        text::update_reading_card,
-                        text::build_horizon_label,
-                    )
-                        .chain(),
-                    (
-                        scene::spin_rings,
-                        scene::move_cards_toward_target,
-                        scene::ease_camera_to_focused_ring,
-                        scene::billboard_cards,
-                        scene::highlight_selection,
-                        scene::highlight_lineage,
-                        scene::highlight_drift,
-                        scene::accumulate_ring_activity,
-                        scene::tick_and_sync_rings,
-                        scene::dim_nonfocused_rings,
-                        live::sync_card_live_uniforms,
-                        scene::sync_focus_card_visibility,
-                        hud::position_well_hud,
-                        hud::update_well_hud,
-                    )
-                        .chain(),
+                    sync::poll_clusters,
+                    sync::apply_clusters,
+                    rays::poll_tracks,
+                    rays::apply_tracks,
+                    rays::sync_track_rays,
+                    rays::animate_track_rays,
+                    sync::sync_time_well,
+                    scene::spin_rings,
+                    scene::move_cards_toward_target,
+                    scene::billboard_cards,
+                    // Ambient, not ungated (unlike its sibling
+                    // `tick_ring_activity`): needs live `Card`/`CardTarget`
+                    // entities to resolve an event's ring angle, and those
+                    // only exist while the well's furniture is spawned
+                    // (Screen::Room).
+                    scene::accumulate_ring_activity,
+                    scene::sync_deck_material,
+                    live::sync_card_live_uniforms,
+                    // The HUD's LOD gate lives in the ambient tier, not
+                    // dived-only, like `patch_bay::apply_patch_lod` — it must
+                    // react to BOTH transitions (hiding the panels again on
+                    // zoom-OUT, not just showing them on zoom-in), so it has
+                    // to keep running at room scale even while unzoomed.
+                    hud::apply_well_hud_lod,
                 )
                     .chain()
-                    .run_if(in_state(Screen::TimeWell)),
+                    .run_if(in_state(Screen::Room)),
+            )
+            // Dived-only: keyboard, focus/lineage/drift overlays, the HUD's
+            // per-frame content, and the text builders (rasterizing MSDF
+            // glyphs no one can read at room scale would be pure waste — see
+            // `text::build_card_scenes`).
+            .add_systems(
+                Update,
+                (
+                    scene::well_keyboard,
+                    scene::dim_nonfocused_rings,
+                    scene::sync_focus_card_visibility,
+                    scene::highlight_selection,
+                    scene::highlight_lineage,
+                    scene::highlight_drift,
+                    hud::position_well_hud,
+                    hud::update_well_hud,
+                    text::build_card_scenes,
+                    text::update_reading_card,
+                    text::build_horizon_label,
+                )
+                    .chain()
+                    .run_if(|room: Res<crate::view::room::RoomState>| scene::well_zoomed(&room)),
             );
     }
 }

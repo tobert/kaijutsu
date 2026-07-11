@@ -15,15 +15,22 @@
 //! at all (`bearing::focus_dir(Station::TimeWell) == None`), so it can never
 //! resolve through [`RoomShot::Fullscreen`] the way a wall station's panel
 //! does — that variant's `.expect()` would panic. [`RoomShot::WellOverview`]
-//! is the stub a later slice fills with the well's own dolly-to-ring math;
-//! for now it just returns the room overview, so the variant can be wired up
-//! ahead of time without ever routing the well through `Fullscreen`.
+//! was Slice A's stub (returning the bare room overview); Slice C
+//! (`lovely-swimming-prism.md`, 2026-07-11) fills it with the well's own
+//! dolly-to-focused-ring / dolly-to-focus-card math, migrated unchanged from
+//! `time_well::scene::ease_camera_to_focused_ring` (deleted as a Bevy system
+//! once its math moved here) and composed into room space through
+//! [`STATION_CENTER_PLACEMENT`] — the well's own local camera math never
+//! needs to know it now sits at the room's center instead of the world
+//! origin.
 
 use bevy::prelude::Vec3;
 
 use super::bearing;
 use super::nav::Station;
 use crate::view::palette;
+use crate::view::time_well::card;
+use crate::view::time_well::scene::{FOCUS_CARD_POS, STATION_CENTER_PLACEMENT, placement_to_room};
 
 // ── Camera-framing constants (Amy-tunable) ──────────────────────────────────
 // `super::ROOM_RADIUS` / `super::WALL_HEIGHT` stay in `room/mod.rs` — they're
@@ -61,7 +68,43 @@ const APPROACH_LOOK_HEIGHT: f32 = 130.0;
 /// relationship instead of trusting two hand-written copies to agree.
 const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 
+// ── The well's own camera-framing constants (Slice C — moved unchanged from
+// `time_well/scene.rs`'s old `ease_camera_to_focused_ring`, deleted as a
+// system once this math moved here) ─────────────────────────────────────────
+
+/// Camera distance in front of the well's focus card when focused (larger =
+/// card fills less of the frame). Tuned a touch back so the focused card
+/// isn't oversized.
+const FOCUS_DOLLY: f32 = 430.0;
+
+/// Back-off distance along the funnel axis for the well's ring-overview shot,
+/// **as a multiple of the focused ring's radius**, so a bigger ring is framed
+/// from proportionally further back (neighbor rings bleed off the top/bottom
+/// edges).
+const RING_CAM_BACK: f32 = 1.8;
+/// World-Y lift of the well's ring-overview camera. With the gate-normal
+/// framing the gate card's face points down-and-forward, so the normal
+/// back-off pulls the camera below the gate; this lift raises it back to
+/// roughly level / gently looking down. Higher = steeper look-down onto the
+/// ring. **Amy-tunable.**
+const RING_CAM_LIFT: f32 = 450.0;
+/// How far in front of the focused ring's center (along the axis, × radius)
+/// the well's ring-overview look-point leads — 0 looks straight at the ring
+/// plane.
+const RING_CAM_LOOK_LEAD: f32 = 0.0;
+
 // ── The shot table ───────────────────────────────────────────────────────────
+
+/// Pure inputs the well's own camera-shot math needs ([`well_local_shot`]) —
+/// the same two fields `time_well::scene::TimeWellState` carries, handed in
+/// explicitly rather than this module reading a Bevy `Res` (keeping it pure,
+/// same stance as `bearing.rs`): whether focused on the reading card (a
+/// head-on dolly), or which ring to frame at the gate otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WellShotInput {
+    pub focused: bool,
+    pub focused_ring: usize,
+}
 
 /// One named camera shot the room can resolve a pose for — the "predefined,
 /// tunable camera positions" table. [`resolve`] is the single entry point;
@@ -69,8 +112,7 @@ const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomShot {
     /// Pulled-back console view, framing the whole octagon — where the camera
-    /// rests for any station with no wall bearing (today only
-    /// [`Station::TimeWell`]).
+    /// rests when no station is focused/zoomed onto a pose of its own.
     RoomOverview,
     /// Room-scale pose for a wall station: standing on the SAME side of the
     /// room as its bearing, between the console and the wall, looking out at
@@ -78,16 +120,16 @@ pub enum RoomShot {
     Approach(Station),
     /// Camera fills the frame with `station`'s wall panel — "diving IS
     /// fullscreening a panel." Only valid for a station with a wall bearing;
-    /// [`resolve`] panics otherwise. Today the sole zoomable station,
+    /// [`resolve`] panics otherwise. Today the sole such station,
     /// `Station::PatchBay`, is the only one ever passed here.
     Fullscreen(Station),
-    /// TODO(slice C): stub. The well has no wall bearing at all — that's the
-    /// whole reason this table exists rather than reusing `Fullscreen` — so
-    /// its own dolly-to-focused-ring pose needs a dedicated variant. For now
-    /// resolves identically to [`RoomShot::RoomOverview`] until the real math
-    /// (migrated from the well's `ease_camera_to_focused_ring`) lands.
-    #[allow(dead_code)] // Slice C wires a real construction site; only tests build it today.
-    WellOverview,
+    /// The well's own dolly pose (Slice C) — composed through
+    /// [`STATION_CENTER_PLACEMENT`] since the well has no wall bearing at all
+    /// (that's the whole reason this variant exists rather than reusing
+    /// `Fullscreen`, which would panic for it). See [`well_local_shot`] for
+    /// the local (pre-placement) math, migrated from the old
+    /// `ease_camera_to_focused_ring`.
+    WellOverview(WellShotInput),
 }
 
 impl RoomShot {
@@ -121,10 +163,46 @@ pub fn resolve(shot: RoomShot) -> (Vec3, Vec3) {
             // station-specific one.
             fullscreen_pose(Vec3::from_array(dir), super::WALL_HEIGHT * 0.5)
         }
-        // TODO(slice C): replace with the well's real dolly-to-focused-ring
-        // pose, composed through its center placement (`placement_to_room`).
-        RoomShot::WellOverview => (OVERVIEW_POS, OVERVIEW_LOOK),
+        RoomShot::WellOverview(input) => {
+            let (local_eye, local_look) = well_local_shot(input);
+            (
+                placement_to_room(&STATION_CENTER_PLACEMENT, local_eye),
+                placement_to_room(&STATION_CENTER_PLACEMENT, local_look),
+            )
+        }
     }
+}
+
+/// The well's own local (pre-placement) camera pose — migrated unchanged
+/// from `time_well::scene`'s old `ease_camera_to_focused_ring` system
+/// (deleted once this math moved here): a head-on dolly onto the focus card
+/// when [`WellShotInput::focused`], else a frame of the focused ring's gate
+/// seat. Pure; [`resolve`] composes the result into room space through
+/// `placement_to_room` — the well's own funnel math never needs to know it
+/// now sits at the room's center instead of the world origin.
+fn well_local_shot(input: WellShotInput) -> (Vec3, Vec3) {
+    if input.focused {
+        // Dolly to a head-on framing of the focus card so it dominates the view.
+        return (FOCUS_CARD_POS + Vec3::new(0.0, 0.0, FOCUS_DOLLY), FOCUS_CARD_POS);
+    }
+
+    // Frame the focused ring. Its center rides the tilted funnel axis at the
+    // ring's depth; the axis (tilt·+Z) points up-and-toward the camera.
+    let band = kaijutsu_viz::layout::ALL_BANDS[input.focused_ring.min(card::N_BANDS - 1)];
+    let (radius, depth) = card::band_ring(band);
+    let tilt = card::well_tilt_quat();
+    // Frame the GATE card face-on: sit out along the outward face-normal of
+    // the seat the selected slide spins to (`card::GATE_ANGLE`), backed off ∝
+    // radius and lifted, looking at the gate point. Whatever card is at the
+    // gate reads face-on and roughly centered; the ring curves away behind it
+    // (relief), and the shallower/deeper rings sit above/below by depth and
+    // bleed off the edges.
+    let a = card::GATE_ANGLE;
+    let gate = tilt * Vec3::new(radius * a.cos(), radius * a.sin(), depth);
+    let normal = tilt * Vec3::new(-a.sin(), a.cos(), 0.0); // gate slide's face normal
+    let pos = gate + normal * (radius * RING_CAM_BACK) + Vec3::Y * RING_CAM_LIFT;
+    let look = gate + Vec3::Y * RING_CAM_LOOK_LEAD;
+    (pos, look)
 }
 
 /// The **approach** pose for a wall station: standing on the SAME side of
@@ -352,11 +430,55 @@ mod tests {
         }
     }
 
+    // -- RoomShot::WellOverview (Slice C: real math replaces the Slice A stub) --
+    //
+    // The old canary here (`well_overview_stub_matches_the_room_overview_
+    // until_slice_c`) asserted equality with `RoomShot::RoomOverview` and
+    // documented that Slice C landing real math should make it start
+    // FAILING — it now does; these tests replace it.
+
     #[test]
-    fn well_overview_stub_matches_the_room_overview_until_slice_c() {
-        // TODO(slice C): once the well's real dolly-to-ring math lands, this
-        // test should start FAILING — that's the signal to replace it with
-        // real `WellOverview` assertions instead of loosening it.
-        assert_eq!(resolve(RoomShot::WellOverview), resolve(RoomShot::RoomOverview));
+    fn well_overview_no_longer_matches_the_bare_room_overview() {
+        let input = WellShotInput { focused: false, focused_ring: 0 };
+        assert_ne!(
+            resolve(RoomShot::WellOverview(input)),
+            resolve(RoomShot::RoomOverview),
+            "Slice C's real well math must diverge from the old stub"
+        );
+    }
+
+    #[test]
+    fn well_overview_focused_dollies_onto_the_focus_card_through_the_placement() {
+        let input = WellShotInput { focused: true, focused_ring: 0 };
+        let (eye, look) = resolve(RoomShot::WellOverview(input));
+        let local_eye = FOCUS_CARD_POS + Vec3::new(0.0, 0.0, FOCUS_DOLLY);
+        assert_eq!(eye, placement_to_room(&STATION_CENTER_PLACEMENT, local_eye));
+        assert_eq!(look, placement_to_room(&STATION_CENTER_PLACEMENT, FOCUS_CARD_POS));
+    }
+
+    #[test]
+    fn well_overview_unfocused_frames_the_focused_rings_gate_through_the_placement() {
+        // The real production path (`room::ease_shell_camera`, which builds
+        // `RoomShot::WellOverview` straight from `TimeWellState`) must match
+        // the pure primitive it composes, the same "via_shot == via_primitive"
+        // lock `fullscreen_shot_resolves_through_the_patch_bay_bearing` uses.
+        for ring in 0..card::N_BANDS {
+            let input = WellShotInput { focused: false, focused_ring: ring };
+            let (eye, look) = resolve(RoomShot::WellOverview(input));
+            let (local_eye, local_look) = well_local_shot(input);
+            assert_eq!(eye, placement_to_room(&STATION_CENTER_PLACEMENT, local_eye));
+            assert_eq!(look, placement_to_room(&STATION_CENTER_PLACEMENT, local_look));
+        }
+    }
+
+    #[test]
+    fn well_overview_composes_through_a_non_identity_placement() {
+        // Confirms the composition is real (not accidentally bypassed): the
+        // placement's translation/scale must actually show up in the result,
+        // not just pass the local pose straight through.
+        let input = WellShotInput { focused: true, focused_ring: 0 };
+        let (eye, _) = resolve(RoomShot::WellOverview(input));
+        let unplaced = FOCUS_CARD_POS + Vec3::new(0.0, 0.0, FOCUS_DOLLY);
+        assert_ne!(eye, unplaced, "the placement must translate/scale the well's local pose");
     }
 }

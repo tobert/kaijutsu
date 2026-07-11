@@ -148,6 +148,24 @@ impl WellTracks {
         let id = self.track_of.get(ctx)?;
         self.tracks.iter().find(|t| &t.id == id)
     }
+
+    /// Reset the id→entity map alone (the roster itself is untouched). Called
+    /// by [`despawn_track_rays`] (the well's own, now-unreachable
+    /// `OnExit(Screen::TimeWell)` teardown) and by
+    /// `scene::arm_well` (Slice C: `room::enter_room`'s re-arm, so
+    /// `sync_track_rays`'s re-entry count fallback doesn't compare against a
+    /// stale roster of dead entity ids left over from the previous room
+    /// visit — a design-review correction to the time-well/room integration
+    /// plan, since without this the fallback can match by COUNT ALONE and
+    /// silently never respawn a single ray).
+    pub fn clear_ray_entities(&mut self) {
+        self.ray_entities.clear();
+    }
+
+    #[cfg(test)]
+    fn ray_entity_count(&self) -> usize {
+        self.ray_entities.len()
+    }
 }
 
 /// Poll `listTracks` while the well is open (mirrors `sync::poll_clusters`).
@@ -293,7 +311,7 @@ pub fn sync_track_rays(
 /// (`sync_track_rays`'s `state.ray_entities.len() == state.tracks.len()`
 /// guard) doesn't compare against dangling entity ids and skip the respawn.
 pub fn despawn_track_rays(mut state: ResMut<WellTracks>) {
-    state.ray_entities.clear();
+    state.clear_ray_entities();
 }
 
 /// Quantization step for ray uniforms — same discipline as the card lanes:
@@ -464,6 +482,19 @@ mod tests {
         app.world_mut().spawn(super::super::scene::TimeWellRoot);
         app.update();
         assert_eq!(ray_count(&mut app), 1, "re-entry respawns from the surviving roster");
+    }
+
+    #[test]
+    fn clear_ray_entities_empties_the_map_without_touching_the_roster() {
+        let mut wt = WellTracks::default();
+        wt.set_tracks(vec![track("bass", 9, &[1])]);
+        wt.ray_entities.insert("bass".into(), bevy::prelude::Entity::PLACEHOLDER);
+        assert_eq!(wt.ray_entity_count(), 1);
+
+        wt.clear_ray_entities();
+
+        assert_eq!(wt.ray_entity_count(), 0, "the stale id->entity map clears");
+        assert_eq!(wt.tracks.len(), 1, "the roster itself is untouched");
     }
 
     #[test]

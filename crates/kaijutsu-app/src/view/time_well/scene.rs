@@ -182,6 +182,14 @@ pub struct TimeWellState {
     /// sight-unseen (auto → demoted → ARCHIVED). Digits/Enter/`c` stay
     /// unguarded — navigation and conclude aren't ladder steps.
     pub placement_pending: HashSet<ContextId>,
+    /// Force [`super::text::build_card_scenes`] to rebuild EVERY rim card's
+    /// MSDF text on its next run, not just the ones `Changed<Card>` would
+    /// catch (Slice C: that system is now dived-only — room-scale text is
+    /// unreadably small pixels, so it doesn't run at all while ambient). Set
+    /// by [`arm_dive`] on every zoom-in; cleared by `build_card_scenes` once
+    /// it actually rebuilds. Mirrors `patch_bay::PatchBayState::arm_text`'s
+    /// dirty-flag shape.
+    pub card_text_dirty: bool,
 }
 
 impl TimeWellState {
@@ -210,6 +218,10 @@ impl Default for TimeWellState {
             focused: false,
             cluster_of: HashMap::new(),
             placement_pending: HashSet::new(),
+            // The very first dive also needs its card text built — there is
+            // no prior `arm_dive` call to have armed it (mirrors
+            // `RoomState::plates_dirty`'s "fresh state starts dirty" stance).
+            card_text_dirty: true,
         }
     }
 }
@@ -247,10 +259,6 @@ pub const FOCUS_QUAD_H: f32 = 237.5;
 /// World position of the focus card: lower-center and forward (+Z, toward the
 /// camera) so it floats in front of the rings at the mouth of the well.
 pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
-
-/// Camera distance in front of the focus card when focused (larger = card fills
-/// less of the frame). Tuned a touch back so the focused card isn't oversized.
-const FOCUS_DOLLY: f32 = 430.0;
 
 /// In-world label quad size (well units) — modest, well under a rim card's
 /// [`CARD_WIDTH`]/[`CARD_HEIGHT`], so the four ring labels and the "+N" horizon
@@ -357,9 +365,11 @@ const RING_SPIN_EASE_RATE: f32 = 6.0;
 /// billboarded). **Amy-tunable.**
 const RING_ALIGN: f32 = 1.0;
 
-/// Exponential-smoothing rate for the camera follow (lower = a slower, weightier
-/// glide than the cards, so the view leans rather than snaps).
-const CAMERA_EASE_RATE: f32 = 4.0;
+// The well's own `CAMERA_EASE_RATE` (and `ease_camera_to_focused_ring`, the
+// system it drove) is gone (Slice C): the well no longer has its own camera
+// — `room::ease_shell_camera` eases the ONE shared camera toward whatever
+// `shot::resolve` returns, at `room::CAMERA_EASE_RATE`, for every screen the
+// shell can be in, well included.
 
 // ============================================================================
 // PLACEMENT (Slice B seam, `lovely-swimming-prism.md` — mirrors patch bay's
@@ -384,10 +394,57 @@ pub struct StationCenterPlacement {
 /// Slice B's placement: identity — no visual change. Every well spawn site
 /// re-roots under this so the mechanical reparenting (this slice's whole job)
 /// is proven safe before a LATER slice replaces these *values* (never this
-/// shape) to seat the well at the room's center.
+/// shape) to seat the well at the room's center. Superseded as the
+/// PRODUCTION placement by [`STATION_CENTER_PLACEMENT`] (Slice C) — kept
+/// alive for its own `placement_*` no-op tests below, the same role
+/// `IDENTITY_PLACEMENT`-shaped constants play as a baseline proof elsewhere.
+/// `#[allow(dead_code)]`: its only reachable caller now is `#[cfg(test)]`
+/// code, which a plain `cargo build` doesn't compile — not unused in
+/// `cargo test`.
+#[allow(dead_code)]
 pub const IDENTITY_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
     translation: Vec3::ZERO,
     scale: 1.0,
+    rotation: Quat::IDENTITY,
+};
+
+/// Uniform scale from the well's native ~500-unit mouth radius
+/// (`super::card::SPIRAL_R_MOUTH`, private to `card` — see its
+/// `band_ring`) down to roughly match the room's existing
+/// `room::TABLE_PLINTH_RADIUS` (145): 500 × 0.3 = 150. **First guess —
+/// live-tune over BRP** (lovely-swimming-prism.md, Slice C: correctness of
+/// the wiring matters far more than this exact number right now).
+const STATION_CENTER_SCALE: f32 = 0.3;
+
+/// Extra lift stacked on top of [`crate::view::room::TABLE_TOP_Y`] (the
+/// room table's top face) for [`STATION_CENTER_PLACEMENT`]'s translation.
+/// Needed because the mouth ring's *center of rotation* sits at local y=0
+/// (band 0's `depth` is 0 in [`super::card::band_ring`]), but its actual
+/// seated cards do NOT — the funnel recline ([`super::card::well_tilt_quat`],
+/// `WELL_TILT ≈ -0.95` rad) tips the ring so its seats swing roughly
+/// `±(mouth_radius × cos(WELL_TILT))` ≈ ±290 world-units in **local y** around
+/// that center (verified by hand against `ring_seat_rotated`'s rotation
+/// matrix), not just sitting flat at y=0. Scaled by
+/// [`STATION_CENTER_SCALE`] that dip is ≈ ∓87 units — left unlifted, the
+/// bottom of the mouth ring would clip a little way into the tabletop.
+/// **First guess — live-tune over BRP**, same as the scale above; this
+/// isn't meant to be derived to the millimeter here, just kept in the right
+/// ballpark with the reasoning written down for whoever tunes it next.
+const STATION_CENTER_LIFT: f32 = 90.0;
+
+/// The well's production placement (Slice C, `lovely-swimming-prism.md`):
+/// seats the ring-carousel at the room's center, hovering above the existing
+/// `room::spawn_table`'s top face — the well's rings ride the room's own
+/// table furniture rather than replacing it (see `room::mod.rs`'s
+/// `spawn_table` doc + this plan's step 9 on `RoomDistraction`). No rotation
+/// — the well's own recline already lives in its geometry
+/// ([`super::card::well_tilt_quat`]), so the room-space seam only needs to
+/// translate + scale it, same reasoning [`StationCenterPlacement`]'s own doc
+/// gives for skipping a pitch/yaw pair. Both constants above are explicitly
+/// first guesses for the lead to live-tune over BRP, not finished numbers.
+pub const STATION_CENTER_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
+    translation: Vec3::new(0.0, crate::view::room::TABLE_TOP_Y + STATION_CENTER_LIFT, 0.0),
+    scale: STATION_CENTER_SCALE,
     rotation: Quat::IDENTITY,
 };
 
@@ -421,23 +478,31 @@ pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3
 /// paints the viewport before the UI composites on top).
 const WELL_BG: Color = Color::srgb(0.04, 0.05, 0.07);
 
-/// Build the well: repurpose the shared app camera (mark it `TimeWellCamera`,
-/// swap its clear color to the well background, and frame the rings) and spawn
-/// the placement/root (identity transform, Slice B — see [`IDENTITY_PLACEMENT`])
-/// + focus card, with every furniture entity spawned `ChildOf` it. There is no
-/// second camera — the conversation UI and the well's 3D meshes share the one
-/// always-on `Camera3d` (see `main::setup_camera`), so the old 3D-background /
-/// 2D-overlay composite is gone. The shared card mesh is built once.
-pub fn enter_time_well(
-    mut commands: Commands,
-    mut state: ResMut<TimeWellState>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
-    mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
-    mut terrace_ring_materials: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
-) {
+/// Spawn the well's furniture — the placement/root
+/// ([`STATION_CENTER_PLACEMENT`], Slice C's room-center seat) + ring deck +
+/// terrace rings + focus card + horizon label, every entity `ChildOf` the
+/// placement. This is the room-furniture half of the old `enter_time_well`
+/// (see that function, below, for the OTHER half it kept: repurposing the
+/// shared camera). `parent`, when given, re-parents the placement root under
+/// it — `room::enter_room` passes `RoomRoot` (Slice C: the well is now room
+/// furniture, spawned once per room visit alongside the patch bay); `None`
+/// spawns it unparented, the shape `enter_time_well`'s own (now unreachable
+/// via the room's own nav, but still-registered per this slice's boundary —
+/// see that function's doc) direct-entry path needs.
+///
+/// Not a Bevy system — a plain function taking `&mut Commands`/`&mut Assets`,
+/// the same shape `patch_bay::spawn_furniture` uses, so `room::enter_room`
+/// can call it directly alongside its own furniture spawns.
+pub(crate) fn spawn_well_furniture(
+    commands: &mut Commands,
+    parent: Option<Entity>,
+    state: &mut TimeWellState,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<crate::shaders::WellCardMaterial>,
+    ring_materials: &mut Assets<crate::shaders::WellRingsMaterial>,
+    terrace_ring_materials: &mut Assets<crate::shaders::TerraceRingMaterial>,
+    images: &mut Assets<Image>,
+) -> Entity {
     // Fresh entry always starts in the overview (not focused).
     state.focused = false;
 
@@ -447,30 +512,21 @@ pub fn enter_time_well(
         state.card_mesh = Some(meshes.add(card_block_mesh()));
     }
 
-    // Repurpose the one app camera for the well: mark it so the well's per-frame
-    // camera systems (`ease_camera_to_selection`, `billboard_cards`) find it, swap
-    // its clear color to the well background, and set the base framing — pulled
-    // back and tilted up so the full hot rim (radius ≈ 420) sits in the top
-    // ~two-thirds, with the colder bands receding behind it.
-    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
-        commands.entity(cam_entity).insert(TimeWellCamera);
-        cam.clear_color = ClearColorConfig::Custom(WELL_BG);
-        *tf = Transform::from_translation(CAM_BASE_POS).looking_at(CAM_BASE_LOOK, Vec3::Y);
+    // The placement/root entity (Slice C: seated at the room's center via
+    // `STATION_CENTER_PLACEMENT`, no longer the identity placement Slice B
+    // proved the reparenting with). `Name` says "Placement" (not "Root") for
+    // debuggability, matching patch bay's naming; the `TimeWellRoot` marker is
+    // what the per-frame systems below (and teardown) query for.
+    let mut root_entity = commands.spawn((
+        TimeWellRoot,
+        placement_transform(&STATION_CENTER_PLACEMENT),
+        Visibility::Inherited,
+        Name::new("TimeWellPlacement"),
+    ));
+    if let Some(p) = parent {
+        root_entity.insert(ChildOf(p));
     }
-
-    // The placement/root entity (Slice B): identity transform today, so every
-    // child's existing local coordinates ARE its world coordinates — no
-    // visual change. `Name` says "Placement" (not "Root") for debuggability,
-    // matching patch bay's naming; the `TimeWellRoot` marker is what the
-    // per-frame systems below (and `exit_time_well`) query for.
-    let root = commands
-        .spawn((
-            TimeWellRoot,
-            placement_transform(&IDENTITY_PLACEMENT),
-            Visibility::Inherited,
-            Name::new("TimeWellPlacement"),
-        ))
-        .id();
+    let root = root_entity.id();
 
     // Base ring deck: a flat disc behind the cards that renders the well's pulse
     // (concentric rings + spiral core + activity ripples). Driven per-frame by
@@ -547,7 +603,7 @@ pub fn enter_time_well(
     // `update_reading_card` fills its texture (blank until a selection exists).
     let focus_mesh = meshes.add(Rectangle::new(FOCUS_QUAD_W, FOCUS_QUAD_H));
     let (focus_image, panel) =
-        create_msdf_panel(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
+        create_msdf_panel(images, READING_TEX_W as u32, READING_TEX_H as u32);
     let focus_material = materials.add(crate::shaders::WellCardMaterial {
         texture: focus_image,
         accent: Vec4::ZERO, // filled by update_reading_card on the first selection
@@ -577,7 +633,7 @@ pub fn enter_time_well(
     // count changes (it starts blank — nothing polled yet on first enter).
     let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
     let (horizon_image, horizon_panel) =
-        create_msdf_panel(&mut images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
+        create_msdf_panel(images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
     let horizon_material = materials.add(crate::shaders::WellCardMaterial {
         texture: horizon_image,
         accent: Vec4::ZERO,
@@ -598,28 +654,133 @@ pub fn enter_time_well(
         ChildOf(root),
     ));
 
+    info!("time-well: furniture spawned (room-center placement)");
+    root
+}
+
+/// `OnEnter(Screen::TimeWell)` handler. Per this slice's boundary (Slice D
+/// removes the `Screen::TimeWell` variant and this registration cleanly —
+/// `lovely-swimming-prism.md`'s "Constraints"), the hook stays wired, but
+/// nothing sets `Screen::TimeWell` any more after this slice's changes to
+/// `room_keyboard`/`toggle_time_well` — so this is now unreachable dead code
+/// by construction, not by omission. Kept functionally complete rather than
+/// half-migrated: repurposes the shared app camera exactly as it always did
+/// (mark it `TimeWellCamera`, swap the clear color, frame the base pose), then
+/// spawns the SAME furniture `room::enter_room` spawns via
+/// [`spawn_well_furniture`] (unparented, since there's no `RoomRoot` in this
+/// path), so a direct entry — if anything ever did reach it again — wouldn't
+/// leave a half-built well.
+pub fn enter_time_well(
+    mut commands: Commands,
+    mut state: ResMut<TimeWellState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
+    mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
+    mut terrace_ring_materials: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+) {
+    // Repurpose the one app camera for the well: mark it so the well's per-frame
+    // camera systems find it, swap its clear color to the well background, and
+    // set the base framing — pulled back and tilted up so the full hot rim
+    // (radius ≈ 420) sits in the top ~two-thirds, with the colder bands
+    // receding behind it.
+    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
+        commands.entity(cam_entity).insert(TimeWellCamera);
+        cam.clear_color = ClearColorConfig::Custom(WELL_BG);
+        *tf = Transform::from_translation(CAM_BASE_POS).looking_at(CAM_BASE_LOOK, Vec3::Y);
+    }
+
+    spawn_well_furniture(
+        &mut commands,
+        None,
+        &mut state,
+        &mut meshes,
+        &mut materials,
+        &mut ring_materials,
+        &mut terrace_ring_materials,
+        &mut images,
+    );
+
     info!("time-well: entered (shared app camera repurposed for the well)");
+}
+
+/// Re-arm [`TimeWellState`]/[`super::rays::WellTracks`] for a fresh room
+/// entry, called from `room::enter_room` right after [`spawn_well_furniture`]
+/// (mirrors `patch_bay::arm_scene`). `spawn_well_furniture` just built
+/// brand-new (empty) furniture, but `state.entities`/`state.join` and
+/// `tracks`' own id→entity map are Resources that survive across room
+/// visits — without clearing them here, `sync_time_well`/`sync_track_rays`
+/// would think the entities from the PREVIOUS visit (long since despawned
+/// with the old `RoomRoot`) are still current and never rebuild a single
+/// card or ray. Deliberately narrow: ring-centric nav state (`ring_cards`,
+/// `focused_ring`, `ring_pos`, `ring_rotation*`, `selected`,
+/// `placement_pending`) is untouched — it isn't tied to any specific entity,
+/// so it persists naturally across a room round-trip (the "resume where you
+/// left off" stance this plan also takes for [`arm_dive`]).
+pub fn arm_well(state: &mut TimeWellState, tracks: &mut super::rays::WellTracks) {
+    state.entities.clear();
+    state.join = kaijutsu_viz::join::Join::new();
+    state.last_seen_visible_count = 0;
+    // Correction from a design review of this plan: without ALSO clearing
+    // this, `sync_track_rays`'s re-entry count fallback
+    // (`ray_entities.len() == tracks.len()`) can match by COUNT ALONE against
+    // a stale roster of dead entity ids left over from the previous visit,
+    // and silently never respawn a single ray.
+    tracks.clear_ray_entities();
+}
+
+/// Re-arm [`TimeWellState`] for a fresh dive (zoom-in), called from
+/// `room_keyboard`'s Enter-on-`TimeWell` branch (mirrors
+/// `patch_bay::PatchBayState::arm_text`, one field at a time rather than a
+/// single dirty bit, since the well has more per-dive state to reset).
+/// Resets `focused` (a fresh dive always starts at the ring overview, not
+/// mid-focus-on-a-card) and `placement_pending` (a stale in-flight guard from
+/// a much earlier visit shouldn't block this dive's first placement verb).
+/// Deliberately does **not** reset `ring_rotation`/`ring_rotation_target` —
+/// ring focus/position persists across zoom out/in ("resume where you left
+/// off"); resetting only one of that pair would cause a spurious spin on
+/// every dive, worse than resetting neither (a design-review correction to
+/// this plan's first pass). Also arms [`TimeWellState::card_text_dirty`] so
+/// `text::build_card_scenes` — dived-only, since room-scale card text is
+/// unreadable pixels — rebuilds every rim card's glyphs on the way in, not
+/// just the ones `Changed<Card>` would happen to catch.
+pub fn arm_dive(state: &mut TimeWellState) {
+    state.focused = false;
+    state.placement_pending.clear();
+    state.card_text_dirty = true;
+}
+
+/// Whether the room is currently zoomed onto the time well — the well's
+/// dived-only `run_if` gate. A plain, directly-testable predicate (mirrors
+/// `patch_bay::is_zoomed_into`'s pure half) rather than a `Res`-taking
+/// system, since every call site here already holds a plain `&RoomState`.
+pub fn well_zoomed(room: &crate::view::room::RoomState) -> bool {
+    room.zoomed == Some(crate::view::room::nav::Station::TimeWell)
 }
 
 /// Tear the well down: despawn the placement root (recursively — every well
 /// entity, including track rays, is its descendant now, Slice B), clear the
 /// id→entity map and join state, and hand the shared app camera back to the
 /// conversation (drop the well marker, restore the theme background clear).
-/// The camera itself is *not* despawned — it is the app's one always-on camera.
+/// The camera itself is *not* despawned — it is the app's one always-on
+/// camera. Per this slice's boundary, unreachable dead code alongside
+/// [`enter_time_well`] (see its doc) — `OnExit(Screen::TimeWell)` never fires
+/// once nothing sets `Screen::TimeWell` — kept functionally complete rather
+/// than half-migrated.
 pub fn exit_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
-    mut activity: ResMut<super::activity::RingActivity>,
-    mut edge_bump: ResMut<crate::view::room::WellEdgeBump>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<TimeWellRoot>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
-    // Drop the pulse state: the activity systems are well-gated, so energy
-    // frozen at exit would otherwise sit un-decayed and flash bright on
-    // re-entry hours later (Gemini review, 2026-07-04). Re-entering starts
-    // calm and warms from live events — matching the join reset below.
-    *activity = super::activity::RingActivity::default();
+    // The pulse state (`RingActivity`) is NOT reset here any more (Slice C):
+    // its decay tick now runs fully ungated (`tick_ring_activity`), so energy
+    // already decays toward zero while you're away instead of freezing —
+    // resetting it here on top of that would just be redundant, and reset was
+    // never right for a room-furniture well anyway (the room's own systems
+    // keep running around it).
 
     // The ONE despawn site (Slice B): every card/ring/ray/label is now a
     // `ChildOf` descendant of this placement/root entity, and `despawn`
@@ -647,14 +808,6 @@ pub fn exit_time_well(
     // re-polled by DriftState; nothing durable is lost).
     state.join = kaijutsu_viz::join::Join::new();
 
-    // Reset the well-edge speedbump on every exit, not just the Up-Up that
-    // normally fires it. `WellEdgeBump` is a Resource shared with the room —
-    // an Esc exit (or any other) must not leave it armed, or a quick re-entry
-    // (Ctrl+W) followed by a single Up at the mouth ring would fire the exit
-    // to Room immediately instead of arming first (the "first Up never
-    // ejects you" promise this guards).
-    edge_bump.0.reset();
-
     // Hand the shared camera back to the conversation: drop the well marker (so
     // the well's camera systems stop driving it) and restore the theme clear.
     if let Ok((cam_entity, mut cam)) = app_camera.single_mut() {
@@ -669,23 +822,49 @@ pub fn exit_time_well(
 // TOGGLE
 // ============================================================================
 
-/// Enter the well with Ctrl+W (when not typing). Leaving is Esc, handled in
-/// [`well_keyboard`] so it can be focus-aware (Esc backs out of focus first,
-/// then leaves the well).
+/// Ctrl+W as a **symmetric room toggle** (Slice C, `lovely-swimming-prism.md`
+/// — a fable-review-proposed redesign of the plan's own first pass, which
+/// would have accepted a Screen::Room "one more Esc hop" before reaching
+/// Conversation). Reads only the CURRENT screen, never how it was reached —
+/// no exit-path special-casing, the same anti-pattern Design C's
+/// `Screen::TimeWell`-retirement reasoning rejects elsewhere in this plan:
+/// - From `Screen::Conversation` → `Screen::Room`, focused on `TimeWell` and
+///   already zoomed onto it (arming the dive) — the well replaces its old
+///   direct scene-cut with "dive straight into the room's center furniture."
+/// - From `Screen::Room` (zoomed on anything, or not) → straight back to
+///   `Screen::Conversation` — the other half of the one-keystroke round trip.
+/// - Any other screen: untouched (there's no evidence for a new case here).
+///
+/// Esc keeps its own strict well → room → conversation grammar everywhere
+/// else ([`well_keyboard`]'s Escape branch, `room_keyboard`'s) — this binding
+/// only ever short-circuits that with a direct hop, both ways.
 pub fn toggle_time_well(
     keys: Res<ButtonInput<KeyCode>>,
     focus_area: Res<crate::input::focus::FocusArea>,
     screen: Res<State<Screen>>,
     mut next: ResMut<NextState<Screen>>,
+    mut room: ResMut<crate::view::room::RoomState>,
+    mut state: ResMut<TimeWellState>,
 ) {
-    if *screen.get() == Screen::Conversation {
-        if focus_area.is_text_input() {
-            return;
+    if focus_area.is_text_input() {
+        return;
+    }
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if !(ctrl && keys.just_pressed(KeyCode::KeyW)) {
+        return;
+    }
+
+    match *screen.get() {
+        Screen::Conversation => {
+            room.carousel = crate::view::room::nav::StationCarousel::new(
+                crate::view::room::nav::Station::TimeWell,
+            );
+            room.zoomed = Some(crate::view::room::nav::Station::TimeWell);
+            arm_dive(&mut state);
+            next.set(Screen::Room);
         }
-        let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-        if ctrl && keys.just_pressed(KeyCode::KeyW) {
-            next.set(Screen::TimeWell);
-        }
+        Screen::Room => next.set(Screen::Conversation),
+        _ => {}
     }
 }
 
@@ -716,7 +895,12 @@ const DIGIT_KEYS: [(KeyCode, usize); 10] = [
 ///   promotes, **`d`** demotes, **`z`** toggles pause, **`a`** archives — see
 ///   the verb handlers below (fire-and-forget RPC, same pattern as `c`).
 ///
-/// Esc (focus-aware, back to conversation) is handled below.
+/// Esc (focus-aware) is handled below: from focus it backs out to the ring
+/// overview; from the overview it leaves the well — `room.zoomed = None`,
+/// the same generic zoom-out every `station_is_zoomable` station uses now
+/// (Slice C — the well is no longer a screen cut sitting BELOW the room, so
+/// "leave the well" surfaces to the room's own ambient view, not straight to
+/// Conversation the way the old `Screen::TimeWell` scene cut did).
 pub fn well_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<TimeWellState>,
@@ -725,7 +909,6 @@ pub fn well_keyboard(
     actor: Option<Res<crate::connection::RpcActor>>,
     drift: Res<crate::ui::drift::DriftState>,
     mut room: ResMut<crate::view::room::RoomState>,
-    mut edge_bump: ResMut<crate::view::room::WellEdgeBump>,
 ) {
     // `0–9`: jump straight to seat `n` of the focused ring and drop into the
     // conversation (a no-op if that seat is empty).
@@ -764,7 +947,12 @@ pub fn well_keyboard(
 
     // Up/Down: change the focused ring (clamp 0..N_BANDS-1), carry the position
     // onto the new ring, spin the new ring to the gate. The camera follows
-    // because `ease_camera_to_focused_ring` keys on `focused_ring`.
+    // because `ease_shell_camera` keys on `focused_ring` via `shot::WellShotInput`.
+    // Up at the mouth ring (already the shallowest) is now simply a no-op — the
+    // old speedbumped double-tap-to-Room edge (`WellEdgeBump`) is retired
+    // entirely (Slice C): the well is room furniture now, so "leave the well"
+    // is just `room.zoomed = None` (see Esc below), not a second screen to
+    // double-tap out of.
     let ud = if keys.just_pressed(KeyCode::ArrowUp) {
         -1
     } else if keys.just_pressed(KeyCode::ArrowDown) {
@@ -775,20 +963,6 @@ pub fn well_keyboard(
     if ud != 0 {
         let fr = state.focused_ring as i32;
         let new_ring = (fr + ud).clamp(0, super::card::N_BANDS as i32 - 1) as usize;
-        // Up at the mouth ring is the speedbumped edge to the room level
-        // (docs/scenes/shell.md, "Levels — the arrows continue"): the first
-        // press arms, a second within the double-tap window exits upward.
-        if ud < 0 && new_ring == state.focused_ring && !state.focused {
-            if edge_bump.0.press() >= 2 {
-                room.carousel = crate::view::room::nav::StationCarousel::new(
-                    crate::view::room::nav::Station::TimeWell,
-                );
-                next.set(Screen::Room);
-                return;
-            }
-        } else {
-            edge_bump.0.reset();
-        }
         if new_ring != state.focused_ring {
             let new_len = state.ring_cards.get(new_ring).map(|v| v.len()).unwrap_or(0);
             let pos = super::card::carry_ring_pos(state.ring_pos, new_len);
@@ -825,13 +999,16 @@ pub fn well_keyboard(
         return;
     }
 
-    // Esc backs out: from focus it returns to the overview; from the overview it
-    // leaves the well. (This is why Esc lives here, not in `toggle_time_well`.)
+    // Esc backs out: from focus it returns to the ring overview; from the
+    // overview it leaves the well — `room.zoomed = None`, the same generic
+    // zoom-out every zoomable station uses (not a `Screen` transition; see
+    // this function's own doc for why the well no longer jumps straight to
+    // Conversation here).
     if keys.just_pressed(KeyCode::Escape) {
         if state.focused {
             state.focused = false;
         } else {
-            next.set(Screen::Conversation);
+            room.zoomed = None;
         }
         return;
     }
@@ -989,6 +1166,134 @@ mod tests {
         let p = Vec3::new(12.0, -34.0, 56.0);
         assert_eq!(placement_to_room(&IDENTITY_PLACEMENT, p), p);
     }
+
+    // -- STATION_CENTER_PLACEMENT (Slice C's production placement) --
+
+    #[test]
+    fn station_center_placement_shrinks_the_mouth_toward_the_table_plinth() {
+        // 500 (SPIRAL_R_MOUTH) × 0.3 ≈ 150, close to room::TABLE_PLINTH_RADIUS
+        // (145) — the first-guess target this const's own doc derives.
+        assert!(
+            (STATION_CENTER_PLACEMENT.scale - 0.3).abs() < 1e-6,
+            "scale should be the documented first guess"
+        );
+    }
+
+    #[test]
+    fn station_center_placement_seats_above_the_room_table_with_no_rotation() {
+        assert_eq!(STATION_CENTER_PLACEMENT.rotation, Quat::IDENTITY);
+        assert_eq!(STATION_CENTER_PLACEMENT.translation.x, 0.0);
+        assert_eq!(STATION_CENTER_PLACEMENT.translation.z, 0.0);
+        assert!(
+            STATION_CENTER_PLACEMENT.translation.y > crate::view::room::TABLE_TOP_Y,
+            "the placement must lift the well above the table's own top face, not just to it"
+        );
+    }
+
+    // -- well_zoomed (Slice C's dived-only run_if gate) --
+
+    #[test]
+    fn well_zoomed_true_only_when_the_room_is_zoomed_onto_the_well() {
+        let mut room = crate::view::room::RoomState::default();
+        assert!(!well_zoomed(&room), "unzoomed room is not well-zoomed");
+        room.zoomed = Some(crate::view::room::nav::Station::PatchBay);
+        assert!(!well_zoomed(&room), "zoomed on a different station is not well-zoomed");
+        room.zoomed = Some(crate::view::room::nav::Station::TimeWell);
+        assert!(well_zoomed(&room), "zoomed on TimeWell IS well-zoomed");
+    }
+
+    // -- arm_well / arm_dive reset semantics (mirrors patch_bay's `arm_scene`) --
+
+    /// A minimal `ContextInfo` sufficient to seat a join entry — the rest of
+    /// the fields don't matter for these reset-semantics tests.
+    fn minimal_ctx(id: ContextId) -> kaijutsu_client::ContextInfo {
+        kaijutsu_client::ContextInfo {
+            id,
+            label: "x".into(),
+            forked_from: None,
+            provider: String::new(),
+            model: String::new(),
+            created_at: 0,
+            trace_id: [0u8; 16],
+            fork_kind: None,
+            context_type: String::new(),
+            archived: false,
+            concluded_at: None,
+            keywords: Vec::new(),
+            top_block_preview: None,
+            live_status: kaijutsu_types::Status::Pending,
+            last_activity_at: None,
+            track_id: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+        }
+    }
+
+    /// The shape `TimeWellState`/`WellTracks` are left in after a room visit:
+    /// both resources survive `RoomRoot`'s despawn, but their id→entity maps
+    /// now dangle (the real entities died with it) and nothing has re-armed
+    /// them for the next `enter_room` yet.
+    fn persisted_after_a_room_visit() -> (TimeWellState, super::super::rays::WellTracks) {
+        let mut state = TimeWellState::default();
+        let id = ContextId::new();
+        state.entities.insert(id, Entity::PLACEHOLDER);
+        state.join.reconcile(std::iter::once((id, minimal_ctx(id))));
+        state.last_seen_visible_count = 3;
+        (state, super::super::rays::WellTracks::default())
+    }
+
+    #[test]
+    fn arm_well_clears_the_dangling_entity_map_and_join() {
+        let (mut state, mut tracks) = persisted_after_a_room_visit();
+        assert!(!state.entities.is_empty());
+        assert_eq!(state.join.len(), 1);
+
+        arm_well(&mut state, &mut tracks);
+
+        assert!(state.entities.is_empty(), "the stale entity map must clear");
+        assert_eq!(state.join.len(), 0, "the join resets so sync_time_well rebuilds from scratch");
+        assert_eq!(
+            state.last_seen_visible_count, 0,
+            "forces sync_time_well to re-run even if the visible count hasn't changed"
+        );
+    }
+
+    #[test]
+    fn arm_well_leaves_ring_centric_nav_state_untouched() {
+        // Deliberately narrow (this function's own doc): ring focus/position
+        // isn't tied to any entity, so it should survive a room round-trip
+        // the same way `arm_dive` leaves ring rotation alone.
+        let (mut state, mut tracks) = persisted_after_a_room_visit();
+        state.focused_ring = 2;
+        state.ring_pos = 5;
+        let before = (state.focused_ring, state.ring_pos);
+
+        arm_well(&mut state, &mut tracks);
+
+        assert_eq!((state.focused_ring, state.ring_pos), before);
+    }
+
+    #[test]
+    fn arm_dive_resets_focus_and_placement_pending_but_not_ring_rotation() {
+        let mut state = TimeWellState::default();
+        state.focused = true;
+        state.placement_pending.insert(ContextId::new());
+        state.ring_rotation[0] = 1.23;
+        state.ring_rotation_target[0] = 4.56;
+        state.card_text_dirty = false;
+
+        arm_dive(&mut state);
+
+        assert!(!state.focused, "a fresh dive starts at the ring overview, not mid-focus");
+        assert!(state.placement_pending.is_empty(), "a stale in-flight guard must not block this dive");
+        assert_eq!(state.ring_rotation[0], 1.23, "ring position persists across zoom out/in");
+        assert_eq!(
+            state.ring_rotation_target[0], 4.56,
+            "the target must NOT be reset alone — an unpaired reset would spin the ring on every dive"
+        );
+        assert!(state.card_text_dirty, "arm_dive must arm a card-text rebuild for the dived-only text system");
+    }
 }
 
 // ============================================================================
@@ -1113,20 +1418,37 @@ pub fn accumulate_ring_activity(
     }
 }
 
-/// Advance the well's pulse and push it into the deck material uniforms: the
-/// global `energy` (ring brightness / flow / core spin), the beat envelope
+/// The `RingActivity` decay tick alone — split out of the old
+/// `tick_and_sync_rings` (Slice C, `lovely-swimming-prism.md`) so it can run
+/// **fully ungated**, mirroring `live::ingest_live_events`'s own ungated
+/// system. This must NOT freeze outside the room: a design-review correction
+/// caught that putting this in the room-gated ambient tier alongside
+/// [`accumulate_ring_activity`] would reintroduce the exact
+/// frozen-then-flashes-bright-on-reentry bug the old `exit_time_well`'s
+/// `RingActivity::default()` reset used to guard against — energy now decays
+/// toward zero in real time while you're away (Conversation, or any other
+/// screen), so by the time you return it's already calmed down instead of
+/// snapping back to a stale, high value. [`sync_deck_material`] (ambient —
+/// room-gated) is the half that actually WRITES the decayed value into the
+/// deck's material; nothing to draw, nothing gated here.
+pub fn tick_ring_activity(time: Res<Time>, mut activity: ResMut<super::activity::RingActivity>) {
+    activity.tick(time.delta_secs());
+}
+
+/// Push the well's pulse into the deck material uniforms: the global
+/// `energy` (ring brightness / flow / core spin), the beat envelope
 /// (`energy.y` — the throat heartbeat from whatever track is rolling, see
 /// [`super::live::WellBeats`]), and the packed ripple array
-/// (`[cos, sin, age_norm, intensity]`, unused slots `intensity = 0`).
-pub fn tick_and_sync_rings(
-    time: Res<Time>,
-    mut activity: ResMut<super::activity::RingActivity>,
+/// (`[cos, sin, age_norm, intensity]`, unused slots `intensity = 0`). The
+/// visual-write half of the old `tick_and_sync_rings` — ambient (room-gated),
+/// since there's nothing to draw outside the room; the decay tick itself
+/// moved to [`tick_ring_activity`] (ungated).
+pub fn sync_deck_material(
+    activity: Res<super::activity::RingActivity>,
     beats: Res<super::live::WellBeats>,
     mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
     deck: Query<&MeshMaterial3d<crate::shaders::WellRingsMaterial>, With<WellRingsDeck>>,
 ) {
-    activity.tick(time.delta_secs());
-
     let Ok(handle) = deck.single() else {
         return;
     };
@@ -1150,84 +1472,30 @@ pub fn tick_and_sync_rings(
     mat.ripples = packed;
 }
 
-/// Base camera framing. The well's recline now lives in the *geometry* (the
-/// funnel is tipped back about X, see [`super::card::WELL_TILT`]), so the camera
-/// only needs a gentle downward look *into* the flared mouth. Aiming a little
-/// above the origin drops the low throat toward bottom-center of the frame, with
-/// the mouth opening up toward the camera (the concept well, mockups 27/31). Both
-/// the recline angle and this pose are the two knobs we tune together.
+/// Base camera framing for the (now unreachable, see [`enter_time_well`])
+/// direct-entry path only — the room's own shot table
+/// (`view/room/shot.rs::RoomShot::WellOverview`) is what actually frames the
+/// well once it's room furniture (Slice C); this pose has no more callers
+/// than that one dead path. The well's recline lives in the *geometry* (the
+/// funnel is tipped back about X, see [`super::card::WELL_TILT`]), so the
+/// camera only needs a gentle downward look *into* the flared mouth.
 const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 240.0, 900.0);
 const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 40.0, -150.0);
 
-/// Camera framing of the focused ring (first cut — Amy live-tunes on the runner).
-/// Back-off distance along the funnel axis, **as a multiple of the ring radius**,
-/// so a bigger ring is framed from proportionally further back (neighbor rings
-/// bleed off the top/bottom edges).
-const RING_CAM_BACK: f32 = 1.8;
-/// World-Y lift of the camera. With the gate-normal framing the gate card's face
-/// points down-and-forward, so the normal back-off pulls the camera below the
-/// gate; this lift raises it back to roughly level / gently looking down. Higher
-/// = steeper look-down onto the ring. Amy-tunable.
-const RING_CAM_LIFT: f32 = 450.0;
-/// How far in front of the ring center (along the axis, × radius) the look-point
-/// leads — 0 looks straight at the ring plane.
-const RING_CAM_LOOK_LEAD: f32 = 0.0;
-
-/// Ease the well camera, exponentially smoothed (slower than the cards, so the
-/// view glides):
-/// - **focused** (Enter-to-focus) → dolly straight in front of the focus card so
-///   it fills the view; Esc backs out.
-/// - **overview** → frame the **focused ring** ([`TimeWellState::focused_ring`]):
-///   look at its center (its tilted depth plane), backed off along the funnel
-///   axis by [`RING_CAM_BACK`]×radius and lifted, so that ring roughly fills the
-///   view with the neighbor rings bleeding off. Up/Down retarget it.
-///
-/// The full dive *through* the card into the conversation is the later JOIN
-/// transition; here Enter-focus only zooms to the pedestal.
-pub fn ease_camera_to_focused_ring(
-    time: Res<Time>,
-    state: Res<TimeWellState>,
-    mut cam: Query<&mut Transform, With<TimeWellCamera>>,
-) {
-    let Ok(mut tf) = cam.single_mut() else {
-        return;
-    };
-
-    let (desired_pos, desired_look) = if state.focused {
-        // Dolly to a head-on framing of the focus card so it dominates the view.
-        (FOCUS_CARD_POS + Vec3::new(0.0, 0.0, FOCUS_DOLLY), FOCUS_CARD_POS)
-    } else {
-        // Frame the focused ring. Its center rides the tilted funnel axis at the
-        // ring's depth; the axis (tilt·+Z) points up-and-toward the camera.
-        let band = kaijutsu_viz::layout::ALL_BANDS
-            [state.focused_ring.min(super::card::N_BANDS - 1)];
-        let (radius, depth) = super::card::band_ring(band);
-        let tilt = super::card::well_tilt_quat();
-        // Frame the GATE card face-on: sit out along the outward face-normal of the
-        // seat the selected slide spins to (`card::GATE_ANGLE`), backed off ∝ radius
-        // and lifted, looking at the gate point. Whatever card is at the gate reads
-        // face-on and roughly centered; the ring curves away behind it (relief), and
-        // the shallower/deeper rings sit above/below by depth and bleed off the edges.
-        let a = super::card::GATE_ANGLE;
-        let gate = tilt * Vec3::new(radius * a.cos(), radius * a.sin(), depth);
-        let normal = tilt * Vec3::new(-a.sin(), a.cos(), 0.0); // gate slide's face normal
-        let pos = gate + normal * (radius * RING_CAM_BACK) + Vec3::Y * RING_CAM_LIFT;
-        let look = gate + Vec3::Y * RING_CAM_LOOK_LEAD;
-        (pos, look)
-    };
-
-    let desired = Transform::from_translation(desired_pos).looking_at(desired_look, Vec3::Y);
-    let alpha = 1.0 - (-CAMERA_EASE_RATE * time.delta_secs()).exp();
-    tf.translation = tf.translation.lerp(desired.translation, alpha);
-    tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
-}
-
 /// Billboard every card (and the in-world "+N" label — [`HorizonLabel`] rides
 /// the same fully-billboarded path as [`ReadingCard`], no `Card`) to face the
-/// well camera. No built-in billboard in 0.18; this is the one-line
-/// `looking_at` per card the design doc calls for.
+/// camera. No built-in billboard in 0.18; this is the one-line `looking_at`
+/// per card the design doc calls for.
+///
+/// Reads the shared room camera ([`crate::view::room::RoomCamera`]), not
+/// [`TimeWellCamera`] (Slice C: this system is now ambient — it runs at room
+/// scale, where the room, not the well, owns the shared `Camera3d`; the well
+/// is only ever a *screen cut* — reachable via the now-dead
+/// [`enter_time_well`] — while `TimeWellCamera` would apply, and that path
+/// never runs this ambient system in the first place since it isn't inside
+/// `Screen::Room`).
 pub fn billboard_cards(
-    camera: Query<&GlobalTransform, With<TimeWellCamera>>,
+    camera: Query<&GlobalTransform, With<crate::view::room::RoomCamera>>,
     mut cards: Query<
         (&mut Transform, &GlobalTransform, Option<&Card>),
         Or<(With<Card>, With<ReadingCard>, With<HorizonLabel>)>,

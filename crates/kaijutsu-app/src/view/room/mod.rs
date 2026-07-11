@@ -1,11 +1,8 @@
 //! Room level — the shell's **Tardis chamber** (`docs/scenes/shell.md`, slice A:
 //! "the room exists"). A circular vaulted room that holds the stations at
-//! stable compass **bearings** around a central **console** (an emblem of the
-//! time well). This is the pull-back level above the well: Up-Up at the well's
-//! mouth ring enters it (the speedbumped edge, [`WellEdgeBump`]); Left/Right
-//! cycle the station carousel, Enter/Down dive into a built station, Esc drops
-//! to the conversation. Diving into a station **cuts** to its dedicated scene;
-//! the shell never renders a station's detail.
+//! stable compass **bearings** around a central **console**. Left/Right cycle
+//! the station carousel, Enter/Down dives (a camera zoom now, not a scene cut
+//! — see Slice C below), Esc drops to the conversation.
 //!
 //! What slice A builds:
 //! - **Geometry**: a dark floor disc inscribed with etched trace channels that
@@ -62,6 +59,25 @@
 //! composition and seats it flush against the panel `spawn_walls` already
 //! builds — no new room-side furniture at all.
 //!
+//! **Slice C (2026-07-11): the time well becomes the console.** The
+//! slice-A gold-ring-stack placeholder (`CONSOLE_RINGS`, the module's own old
+//! "emblem of the time well" stand-in) is gone; the real well
+//! (`time_well::scene::spawn_well_furniture`) now IS the console — room
+//! furniture at the Center bearing, seated above the existing
+//! `spawn_table` via `time_well::scene::STATION_CENTER_PLACEMENT`, the same
+//! "one placement transform seats the content" contract the wheel's
+//! `STATION_W_PLACEMENT` established at W. Unzoomed, the well's rings/cards
+//! sit ambient and dim (matching the wheel's chords-at-rest read); Enter/Down
+//! on the TimeWell carousel entry zooms the shared camera into the well's
+//! mouth via [`shot::RoomShot::WellOverview`] — no scene cut — and the
+//! well's own keyboard/HUD/nav take over while zoomed, exactly like the
+//! wheel's dive. Ctrl+W is now a **symmetric room toggle**
+//! (`time_well::scene::toggle_time_well`): Conversation → dive straight into
+//! the well; Room (any station, zoomed or not) → straight back to
+//! Conversation — reading only the current screen, never how it was
+//! reached. `Screen::TimeWell` itself is untouched this slice (a later slice
+//! deletes the now-unreachable variant cleanly).
+//!
 //! Materials are mostly built-in [`StandardMaterial`] with `unlit: true`,
 //! carrying brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR
 //! (> 1.0) blooms through the app camera's threshold-1.0 bloom
@@ -84,7 +100,7 @@ use bevy::prelude::*;
 
 use activity::BearingActivity;
 use bearing::Bearing;
-use nav::{DoubleTap, Station, StationCarousel};
+use nav::{Station, StationCarousel};
 
 use crate::connection::actor_plugin::ServerEventMessage;
 use crate::shaders::{TraceGlowMaterial, WellCardMaterial};
@@ -180,30 +196,25 @@ const PLATE_HEIGHT: f32 = 200.0;
 // `APPROACH_LOOK_HEIGHT` (where the approach pose *looks*, world-Y at the
 // wall) moved to `shot.rs` — pure camera framing, no longer read here.
 
-// ── Console emblem (gold — the well's reserved hue) ──────────────────────────
+// ── Console gold hue (Slice C: the real well now stands where the
+// slice-A CONSOLE_RINGS placeholder used to; this hue survives only because
+// the table rim/pylon caps still share the room's one gold family) ─────────
 
-/// The console: a stack of gold rings at center — the slice-A stand-in for the
-/// live well. `(y, major_radius, minor_radius)` per ring, apex smallest.
-/// Thin and widely spaced on purpose: over the tabletop the original chunky
-/// close-set tori (minor 5–7, y 14/36/56) overlapped into a solid "gold cake"
-/// from the overview; airy rings read as hologram, not pastry. **Amy-tunable.**
-const CONSOLE_RINGS: [(f32, f32, f32); 3] =
-    [(30.0, 100.0, 3.5), (64.0, 76.0, 3.0), (98.0, 52.0, 2.5)];
-/// Console gold hue (linear rgb identity).
+/// Gold hue (linear rgb identity) shared by the table rim, the pylon caps,
+/// and (before Slice C) the retired `CONSOLE_RINGS` placeholder — "every gold
+/// accent in the room reads as one hue" (`spawn_table`'s own doc).
 const CONSOLE_GOLD_HUE: [f32; 3] = [1.00, 0.78, 0.34];
-/// Console rest brightness (LDR — a soft steady glow, no bloom).
-const CONSOLE_LDR: f32 = 0.60;
-/// Chatter gain: `activity(Center)` (0..1) → this much HDR lift on the console.
-const CONSOLE_CHATTER_GAIN: f32 = 2.2;
 
 // ── Well table (Amy: "MORE SOLIDNESS" — heavy furniture, not hologram) ──────
 
 /// The table the console rings hover above: a chunky tabletop, a gold rim,
 /// a narrower pedestal, and a wide low plinth grounding it all to the floor.
-/// `enter_room` shifts every [`CONSOLE_RINGS`] entry up by `TABLE_TOP_Y` so
-/// the ring stack floats above the top face — the rings' material,
-/// [`ConsoleEmblem`], and the chatter glow are untouched.
-const TABLE_TOP_Y: f32 = 70.0;
+/// `pub(crate)` since Slice C (time-well/room integration plan): the well's
+/// own `STATION_CENTER_PLACEMENT` (`time_well/scene.rs`) reads this to seat
+/// its ring stack above the same table face, the same cross-module contract
+/// `palette::STATION_W_MOUNT_Y`/`WALL_APOTHEM` already establish for the
+/// patch bay's wall placement.
+pub(crate) const TABLE_TOP_Y: f32 = 70.0;
 const TABLE_RADIUS: f32 = 120.0;
 const TABLE_THICKNESS: f32 = 14.0;
 /// Gold rim torus at the tabletop's edge.
@@ -394,10 +405,6 @@ const FOCUS_LIFT: f32 = 0.35;
 /// stops re-extracting its material (the well's `LIVE_LANE_STEP` discipline).
 const GLOW_STEP: f32 = 1.0 / 64.0;
 
-/// The well-edge speedbump window (ms) — same 500ms as the app's other
-/// double-tap gestures (`input/interrupt.rs`, `input/vim/dismiss.rs`).
-const EDGE_BUMP_WINDOW_MS: u128 = 500;
-
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// Which station the room carousel focuses. Whoever *enters* the room sets the
@@ -435,17 +442,11 @@ impl Default for RoomState {
     }
 }
 
-/// The Up-Up speedbump at the well's mouth ring (`docs/scenes/shell.md`,
-/// "Levels — the arrows continue"). Fed by `well_keyboard`; firing exits the
-/// well to the room.
-#[derive(Resource)]
-pub struct WellEdgeBump(pub DoubleTap);
-
-impl Default for WellEdgeBump {
-    fn default() -> Self {
-        Self(DoubleTap::new(EDGE_BUMP_WINDOW_MS))
-    }
-}
+// `WellEdgeBump` (the Up-Up speedbump at the well's mouth ring) is retired
+// entirely (Slice C, `lovely-swimming-prism.md`): it only existed because the
+// well was a separate screen BELOW the room; now that the well IS the room's
+// center furniture, "leave the well" is just `room.zoomed = None`, the same
+// generic zoom-out every `station_is_zoomable` station uses.
 
 // ── Components ────────────────────────────────────────────────────────────────
 
@@ -471,10 +472,10 @@ pub struct BearingMarker {
     pub station: Option<Station>,
 }
 
-/// A ring of the central console emblem. All rings share one material, glow-lit
-/// together with context chatter.
-#[derive(Component)]
-pub struct ConsoleEmblem;
+// `ConsoleEmblem` (the slice-A gold-ring placeholder's marker component) is
+// retired alongside `CONSOLE_RINGS` (Slice C) — the real time well now stands
+// at the console bearing; its own components (`time_well::scene::Card`,
+// `TerraceRing`, …) carry whatever chatter-glow the well itself wires up.
 
 /// Room chrome that **fades when you zoom** into a station (`docs/scenes/shell.md`,
 /// slice B; the fullscreen-panel pivot, 2026-07-10 evening): the bearing pylons,
@@ -492,7 +493,6 @@ pub struct RoomPlugin;
 impl Plugin for RoomPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RoomState>()
-            .init_resource::<WellEdgeBump>()
             .init_resource::<BearingActivity>()
             .add_plugins(MaterialPlugin::<TraceGlowMaterial>::default())
             .add_systems(OnEnter(Screen::Room), enter_room)
@@ -538,13 +538,23 @@ fn enter_room(
     mut commands: Commands,
     mut room: ResMut<RoomState>,
     mut pb_state: ResMut<patch_bay::PatchBayState>,
-    mut edge_bump: ResMut<WellEdgeBump>,
+    mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
+    mut well_tracks: ResMut<crate::view::time_well::rays::WellTracks>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     mut glow_mats: ResMut<Assets<TraceGlowMaterial>>,
     mut card_mats: ResMut<Assets<WellCardMaterial>>,
+    mut ring_mats: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
+    mut terrace_mats: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    // Camera + Transform + Projection folded into ONE query (not a separate
+    // `Query<(Entity, &Projection), _>` alongside it) to stay under Bevy's
+    // 16-param ceiling for a function-as-system — `enter_room` was the first
+    // system in this codebase to actually hit it (Slice C added enough new
+    // room-furniture params to tip it over).
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &Projection), With<Camera3d>>,
+    windows: Query<&Window>,
+    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`
@@ -559,20 +569,22 @@ fn enter_room(
     }
 
     arm_on_enter(&mut room);
-    // Belt-and-braces: a fresh room entry must never inherit an armed
-    // well-edge speedbump. `exit_time_well` resets it on the way out of the
-    // well, but that only covers exits *through* the well's own teardown —
-    // this is the room's own guarantee, independent of how we got here.
-    edge_bump.0.reset();
 
     // Claim the shared app camera (the well-marker convention: insert to claim,
     // remove + restore clear color to release) and place it facing the entering
-    // focus so there's no first-frame snap before the ease takes over.
-    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
+    // focus so there's no first-frame snap before the ease takes over. Also
+    // captures `(cam_entity, fov_y, aspect)` as plain values for the well HUD
+    // spawn below (`crate::view::time_well::hud::spawn_well_hud_furniture`
+    // takes these directly rather than its own camera query — see that
+    // function's doc for why).
+    let mut well_hud_camera: Option<(Entity, f32, f32)> = None;
+    if let Ok((cam_entity, mut cam, mut tf, projection)) = app_camera.single_mut() {
         commands.entity(cam_entity).insert(RoomCamera);
         cam.clear_color = ClearColorConfig::Custom(ROOM_BG);
         let (pos, look) = shot::resolve(shot::RoomShot::focused(room.carousel.focused_station()));
         *tf = Transform::from_translation(pos).looking_at(look, Vec3::Y);
+        let (fov_y, aspect) = crate::view::time_well::hud::read_perspective(projection);
+        well_hud_camera = Some((cam_entity, fov_y, aspect));
     }
 
     let root = commands
@@ -607,26 +619,40 @@ fn enter_room(
     // this just keeps "table, then what stands on it" readable in the diff.
     spawn_table(&mut commands, root, &mut meshes, &mut mats);
 
-    // Console emblem — a stack of gold rings hovering above the tabletop (the
-    // well's stand-in). One shared material so the chatter glow lifts them
-    // together; only the Y offset changed from the bare-floating-stack
-    // original — [`ConsoleEmblem`] and the glow system are untouched.
-    let console_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, CONSOLE_LDR)));
-    for (i, (y, major, minor)) in CONSOLE_RINGS.iter().enumerate() {
-        commands.spawn((
-            Mesh3d(meshes.add(Torus { minor_radius: *minor, major_radius: *major })),
-            MeshMaterial3d(console_mat.clone()),
-            Transform::from_xyz(0.0, *y + TABLE_TOP_Y, 0.0),
-            Visibility::Inherited,
-            ConsoleEmblem,
-            // RoomDistraction = the rings dim on a *station* dive today. If a
-            // future slice makes the console itself divable by camera descent
-            // (the way PatchBay is), this tag would hide the very thing being
-            // dived into — re-judge it then (kaibo, 2026-07-10).
-            RoomDistraction,
-            Name::new(format!("ConsoleRing{i}")),
-            ChildOf(root),
-        ));
+    // The time well itself — room furniture at the Center bearing (Slice C,
+    // `lovely-swimming-prism.md`), replacing the slice-A `CONSOLE_RINGS`
+    // placeholder this loop used to spawn. Seated above the table's top face
+    // via `STATION_CENTER_PLACEMENT`; `arm_well` re-arms the per-visit join
+    // state the same frame (the `patch_bay::arm_scene` analog just below).
+    crate::view::time_well::scene::spawn_well_furniture(
+        &mut commands,
+        Some(root),
+        &mut well_state,
+        &mut meshes,
+        &mut card_mats,
+        &mut ring_mats,
+        &mut terrace_mats,
+        &mut images,
+    );
+    crate::view::time_well::scene::arm_well(&mut well_state, &mut well_tracks);
+    // The well's edge HUD: camera-parented (not `RoomRoot`-parented — see
+    // `exit_room`'s explicit despawn), spawned once per room visit so it
+    // exists whether or not you've dived, gated to `well_zoomed` visibility
+    // by `time_well::hud::apply_well_hud_lod`.
+    if let Some((cam_entity, fov_y, aspect)) = well_hud_camera {
+        crate::view::time_well::hud::spawn_well_hud_furniture(
+            &mut commands,
+            &mut meshes,
+            &mut card_mats,
+            &mut images,
+            cam_entity,
+            fov_y,
+            aspect,
+            &windows,
+            &dock,
+        );
+    } else {
+        warn!("well HUD: no Camera3d to parent panels to");
     }
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
@@ -731,7 +757,7 @@ fn enter_room(
     );
     patch_bay::arm_scene(&mut pb_state);
 
-    info!("room: entered (Tardis chamber, slice B — patch bay stationed at W)");
+    info!("room: entered (Tardis chamber — patch bay at W, the time well at center)");
 }
 
 pub(crate) fn exit_room(
@@ -740,6 +766,7 @@ pub(crate) fn exit_room(
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<RoomRoot>>,
     mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
+    well_hud: Query<Entity, With<crate::view::time_well::hud::WellHud>>,
 ) {
     // Unconditional (2026-07-10 evening, the fullscreen-panel pivot): diving
     // used to be a second screen (`Screen::PatchBay`) sharing this scene
@@ -754,6 +781,13 @@ pub(crate) fn exit_room(
     // long-despawned visit.
     room.zoomed = None;
     teardown_room(&mut commands, &theme, &roots, &mut app_camera);
+    // The well's edge HUD is a `Camera3d` child (Slice C: `enter_room` now
+    // spawns it too), NOT a `RoomRoot` child — `teardown_room`'s recursive
+    // despawn above never touches it, so it must be despawned explicitly here
+    // or it survives across room visits, doubling up on the next `enter_room`.
+    for e in well_hud.iter() {
+        commands.entity(e).despawn();
+    }
     info!("room: exited");
 }
 
@@ -1073,10 +1107,15 @@ fn spawn_floor(
     }
 }
 
-/// The well table the console rings hover above — heavy furniture, not
+/// The well table the time well's rings hover above — heavy furniture, not
 /// hologram (Amy: "MORE SOLIDNESS"): a chunky dark tabletop, a gold rim torus
 /// at its edge, a narrower pedestal, and a wide low plinth grounding it to the
-/// floor. Every part is [`RoomDistraction`] (like the console rings today).
+/// floor. **No [`RoomDistraction`]** (Slice C, `lovely-swimming-prism.md`,
+/// step 9 — a deliberate change from the slice-A placeholder era, when this
+/// was just the console rings' stand, tagged as chrome alongside them): the
+/// well now stands ON this table and diving IS diving into the well, so the
+/// table it's physically standing on has to stay visible through the dive
+/// too, the same way the wheel's own wall panel stays lit through ITS dive.
 fn spawn_table(
     commands: &mut Commands,
     root: Entity,
@@ -1091,7 +1130,6 @@ fn spawn_table(
         Mesh3d(meshes.add(Cylinder::new(TABLE_PLINTH_RADIUS, TABLE_PLINTH_HEIGHT))),
         MeshMaterial3d(table_mat.clone()),
         Transform::from_xyz(0.0, TABLE_PLINTH_HEIGHT * 0.5, 0.0),
-        RoomDistraction,
         Visibility::Inherited,
         Name::new("ConsoleTablePlinth"),
         ChildOf(root),
@@ -1104,7 +1142,6 @@ fn spawn_table(
         Mesh3d(meshes.add(Cylinder::new(TABLE_PEDESTAL_RADIUS, pedestal_height))),
         MeshMaterial3d(table_mat.clone()),
         Transform::from_xyz(0.0, TABLE_PLINTH_HEIGHT + pedestal_height * 0.5, 0.0),
-        RoomDistraction,
         Visibility::Inherited,
         Name::new("ConsoleTablePedestal"),
         ChildOf(root),
@@ -1115,7 +1152,6 @@ fn spawn_table(
         Mesh3d(meshes.add(Cylinder::new(TABLE_RADIUS, TABLE_THICKNESS))),
         MeshMaterial3d(table_mat),
         Transform::from_xyz(0.0, TABLE_TOP_Y - TABLE_THICKNESS * 0.5, 0.0),
-        RoomDistraction,
         Visibility::Inherited,
         Name::new("ConsoleTableTop"),
         ChildOf(root),
@@ -1126,7 +1162,6 @@ fn spawn_table(
         Mesh3d(meshes.add(Torus { minor_radius: TABLE_RIM_MINOR, major_radius: TABLE_RADIUS })),
         MeshMaterial3d(gold_mat),
         Transform::from_xyz(0.0, TABLE_TOP_Y, 0.0),
-        RoomDistraction,
         Visibility::Inherited,
         Name::new("ConsoleTableRim"),
         ChildOf(root),
@@ -1344,38 +1379,43 @@ fn spawn_pylons(
 // ── Systems ───────────────────────────────────────────────────────────────────
 
 /// Whether Enter/Down on a focused station fullscreens the camera onto it
-/// (`RoomState::zoomed`) rather than diving to a dedicated `Screen` — only
-/// the wheel earns this today (2026-07-10 evening, the fullscreen-panel
-/// pivot: "diving IS fullscreening a panel" for a *bounded* station; the well
-/// still cuts to its own screen, and N stays a future dive-THROUGH door onto
-/// an unbounded world, not a panel to fill the frame with). A future
-/// in-room station with content of its own — the highway, the archway — adds
-/// itself here as that content lands. Pure — no Bevy types — unit-tested like
-/// `bearing::station_is_room_furniture`, which this pairs with (same station,
-/// same reasoning: the wheel IS its own furniture AND its own zoom target).
+/// (`RoomState::zoomed`) rather than diving to a dedicated `Screen` — the
+/// wheel (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
+/// fullscreening a panel" for a *bounded* station) and, since the
+/// time-well/room integration plan's Slice C, the time well too (its own
+/// "diving IS the room's shot table zooming into the well's mouth" pose,
+/// `view/room/shot.rs::RoomShot::WellOverview`) — N stays a future
+/// dive-THROUGH door onto an unbounded world, not a panel/pose to fill the
+/// frame with. A future in-room station with content of its own — the
+/// highway, the archway — adds itself here as that content lands. Pure — no
+/// Bevy types — unit-tested like `bearing::station_is_room_furniture`, which
+/// this pairs with (same stations, same reasoning: each IS its own furniture
+/// AND its own zoom target).
 fn station_is_zoomable(station: Station) -> bool {
-    matches!(station, Station::PatchBay)
+    matches!(station, Station::PatchBay | Station::TimeWell)
 }
 
 /// Room keys: Left/Right cycle the carousel, Enter/Down dives, Esc drops to
 /// the conversation (the room is the top level) — the nav contract is frozen,
-/// unchanged from the blockout. "Dive" now means two different things
-/// depending on the target: `TimeWell` still cuts to its own `Screen`; a
-/// [`station_is_zoomable`] station instead sets `RoomState::zoomed` — a
-/// camera pose, not a screen (2026-07-10 evening, the fullscreen-panel pivot,
-/// superseding `Screen::PatchBay`).
+/// unchanged from the blockout. Since Slice C every zoomable station
+/// (including `TimeWell` now) shares ONE dive mechanism: Enter/Down sets
+/// `RoomState::zoomed` — a camera pose, not a screen — and arms whatever
+/// per-station text/dive-state that station needs (`pb_state.arm_text()` for
+/// the wheel, `time_well::scene::arm_dive` for the well).
 ///
 /// While zoomed, this system steps back almost entirely: Left/Right and
 /// Esc/Up belong to the zoomed station's OWN keyboard system now (patch_bay's
-/// `patch_bay_keyboard`, gated on `patch_bay_zoomed`) — "the zoomed station's
-/// own keys own them," the same reasoning `bearing::station_is_room_furniture`
-/// already applies to the wheel's geometry. The one thing this system still
-/// owns while zoomed is nothing at all; it simply returns, so there's no
-/// double-handling between the two systems.
+/// `patch_bay_keyboard` gated on `patch_bay_zoomed`; the well's
+/// `time_well::scene::well_keyboard` gated on `time_well::scene::well_zoomed`)
+/// — "the zoomed station's own keys own them," the same reasoning
+/// `bearing::station_is_room_furniture` already applies to their geometry.
+/// The one thing this system still owns while zoomed is nothing at all; it
+/// simply returns, so there's no double-handling between the systems.
 fn room_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut room: ResMut<RoomState>,
     mut pb_state: ResMut<patch_bay::PatchBayState>,
+    mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
     mut next: ResMut<NextState<Screen>>,
 ) {
     if room.zoomed.is_some() {
@@ -1390,23 +1430,19 @@ fn room_keyboard(
 
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::ArrowDown) {
         let station = room.carousel.focused_station();
-        match station {
-            Station::TimeWell => next.set(Screen::TimeWell),
-            _ if station_is_zoomable(station) => {
-                room.zoomed = Some(station);
-                // Arm the newly-zoomed station's text layer — the old
-                // `enter_patch_bay`'s job, moved to the zoom-in site since
-                // there's no more `OnEnter(Screen::PatchBay)` to hang it on.
-                // Only one zoomable station exists today; a second one adds
-                // its own arm beside this (documented, not hidden behind an
-                // abstraction the codebase doesn't need yet).
-                if station == Station::PatchBay {
-                    pb_state.arm_text();
-                }
+        if station_is_zoomable(station) {
+            room.zoomed = Some(station);
+            // Arm the newly-zoomed station's own per-dive state — the old
+            // `enter_patch_bay`'s job for the wheel, moved to the zoom-in site
+            // since there's no more `OnEnter(Screen::PatchBay)` to hang it on;
+            // the well's `arm_dive` (Slice C) follows the same shape.
+            match station {
+                Station::PatchBay => pb_state.arm_text(),
+                Station::TimeWell => crate::view::time_well::scene::arm_dive(&mut well_state),
+                _ => {}
             }
-            // Unbuilt, non-zoomable stations: stay put (the dimmed plate says why).
-            _ => {}
         }
+        // Unbuilt, non-zoomable stations: stay put (the dimmed plate says why).
         return;
     }
 
@@ -1496,24 +1532,34 @@ fn room_focus_visuals(
 }
 
 /// Ease the shell camera toward its target pose — travel by intent, the same
-/// exponentially-smoothed tween as the well's `ease_camera_to_focused_ring`
-/// (no cuts). Reads the target from [`RoomState::zoomed`] now, not a second
-/// `Screen` (2026-07-10 evening, the fullscreen-panel pivot): at room scale it
-/// faces the focused station's bearing ([`shot::RoomShot::focused`]); zoomed,
-/// it fills the frame with that station's panel ([`shot::RoomShot::Fullscreen`]).
-/// One system, one camera — diving and surfacing are the SAME continuous
-/// glide, just retargeted the frame `zoomed` flips (no snap either way). The
-/// "what pose do we want" question is [`shot::resolve`]'s job (2026-07-11,
-/// Slice A); this system only owns the ease itself.
+/// exponentially-smoothed tween the well used to run on its own separate
+/// camera (`time_well::scene::ease_camera_to_focused_ring`, deleted once the
+/// well became room furniture — see `shot::WellOverview`'s doc). Reads the
+/// target from [`RoomState::zoomed`] now, not a second `Screen` (2026-07-10
+/// evening, the fullscreen-panel pivot): at room scale it faces the focused
+/// station's bearing ([`shot::RoomShot::focused`]); zoomed onto a wall
+/// station it fills the frame with that station's panel
+/// ([`shot::RoomShot::Fullscreen`]); zoomed onto the well (Slice C, no wall
+/// bearing to fill a frame with) it dollies onto the well's own focused ring
+/// or focus card ([`shot::RoomShot::WellOverview`]). One system, one camera —
+/// diving and surfacing are the SAME continuous glide, just retargeted the
+/// frame `zoomed` flips (no snap either way). The "what pose do we want"
+/// question is [`shot::resolve`]'s job; this system only owns the ease
+/// itself.
 fn ease_shell_camera(
     time: Res<Time>,
     room: Res<RoomState>,
+    well_state: Res<crate::view::time_well::scene::TimeWellState>,
     mut cam: Query<&mut Transform, With<RoomCamera>>,
 ) {
     let Ok(mut tf) = cam.single_mut() else {
         return;
     };
     let want = match room.zoomed {
+        Some(Station::TimeWell) => shot::RoomShot::WellOverview(shot::WellShotInput {
+            focused: well_state.focused,
+            focused_ring: well_state.focused_ring,
+        }),
         Some(station) => shot::RoomShot::Fullscreen(station),
         None => shot::RoomShot::focused(room.carousel.focused_station()),
     };
@@ -1561,18 +1607,28 @@ fn ingest_room_activity(
     room_activity.tick(time.delta_secs());
 }
 
-/// Push ambient telemetry into the markers + console as light: the tracks (E)
-/// marker breathes with the well's beat phasor (HDR pulse decaying to LDR), the
-/// console emblem glows with context chatter, and the focused element takes a
-/// steady lift. Change-guarded + quantized so a settled marker never touches
-/// `Assets<StandardMaterial>` (the well's `sync_card_live_uniforms` discipline).
+/// Push ambient telemetry into the wall-bearing markers as light: the tracks
+/// (E) marker breathes with the well's beat phasor (HDR pulse decaying to
+/// LDR), and the focused station's marker takes a steady lift. Change-guarded
+/// + quantized so a settled marker never touches `Assets<StandardMaterial>`
+/// (the well's `sync_card_live_uniforms` discipline).
+///
+/// The console-emblem glow branch this used to carry (`ConsoleEmblem`,
+/// `CONSOLE_CHATTER_GAIN`) is gone with the slice-A placeholder it lit (Slice
+/// C, `lovely-swimming-prism.md`) — the real time well now stands at the
+/// console bearing and owns its own chatter/energy glow entirely through
+/// `time_well::activity::RingActivity` (fed by the well's own
+/// `accumulate_ring_activity`, not this system). Left un-migrated:
+/// `BearingActivity(Center)` still accumulates chatter from
+/// `ingest_room_activity` with no reader left for it — noted as a loose end
+/// for a later slice/issue rather than silently deleted or hastily rewired
+/// here (out of this slice's scope, see `docs/issues.md`).
 fn sync_room_glow(
     room_activity: Res<BearingActivity>,
     beats: Res<WellBeats>,
     room: Res<RoomState>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     markers: Query<(&BearingMarker, &MeshMaterial3d<StandardMaterial>)>,
-    console: Query<&MeshMaterial3d<StandardMaterial>, With<ConsoleEmblem>>,
 ) {
     let now = Instant::now();
     let beat = beats.global_envelope(now);
@@ -1589,15 +1645,6 @@ fn sync_room_glow(
         }
         let brightness = quantize(MARKER_LDR + lift);
         set_glow(&mut mats, &handle.0, marker.hue * brightness);
-    }
-
-    let mut c_lift = room_activity.normalized(Bearing::Center) * CONSOLE_CHATTER_GAIN;
-    if focused == Station::TimeWell {
-        c_lift += FOCUS_LIFT;
-    }
-    let c_target = Vec3::from_array(CONSOLE_GOLD_HUE) * quantize(CONSOLE_LDR + c_lift);
-    for handle in console.iter() {
-        set_glow(&mut mats, &handle.0, c_target);
     }
 }
 
@@ -1873,7 +1920,7 @@ mod tests {
     /// a line to is not. `Station::ALL.len()` guard below catches a station
     /// added to the enum without a row here.
     const EXPECTED_ZOOMABLE: &[(Station, bool)] = &[
-        (Station::TimeWell, false),
+        (Station::TimeWell, true),
         (Station::PatchBay, true),
         (Station::Tracks, false),
         (Station::Vfs, false),
@@ -2137,12 +2184,11 @@ mod tests {
         assert!(TABLE_PLINTH_RADIUS > TABLE_RADIUS, "plinth wider than the tabletop");
     }
 
-    #[test]
-    fn console_rings_float_above_the_tabletop() {
-        for (y, _, _) in CONSOLE_RINGS {
-            assert!(y + TABLE_TOP_Y > TABLE_TOP_Y, "every ring sits above the table's top face");
-        }
-    }
+    // `console_rings_float_above_the_tabletop` (the old `CONSOLE_RINGS`
+    // placeholder's own test) is retired along with the const it tested
+    // (Slice C) — the equivalent claim for the real well now lives in
+    // `time_well::scene`'s `station_center_placement_seats_above_the_room_
+    // table_with_no_rotation`.
 
     // ── octagon wall shell (room-level constants) ──
 
