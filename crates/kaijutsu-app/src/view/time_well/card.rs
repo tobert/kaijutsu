@@ -453,7 +453,7 @@ pub fn spiral_order(rings: &BandOrders) -> Vec<ContextId> {
     spiral_positions(rings).0
 }
 
-// ── Horizon label (the "+N" count; spawned by `scene::enter_time_well`,
+// ── Horizon label (the "+N" count; spawned by `scene::spawn_well_furniture`,
 // filled by `text::build_horizon_label`). The per-band ring labels that once
 // shared this column were removed 2026-07-06 (the HUD carries band names). ──
 

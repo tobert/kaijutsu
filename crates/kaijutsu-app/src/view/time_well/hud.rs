@@ -244,9 +244,9 @@ pub(crate) fn read_perspective(projection: &Projection) -> (f32, f32) {
 /// Spawn the four edge HUD panels as children of the well camera (empty until
 /// a selection drives them). Not a Bevy system — a plain function so
 /// `room::enter_room` can call it directly alongside its own furniture spawns
-/// (Slice C: the HUD now also spawns with the room, not only on
-/// `OnEnter(Screen::TimeWell)` — see [`spawn_well_hud`]'s own doc for why
-/// that registration stays wired but calls through to this same body). Takes
+/// (the HUD spawns with the room, camera-parented as always, once per room
+/// visit rather than waiting for a dive — `Screen::TimeWell`'s own
+/// `OnEnter`/`OnExit` registrations are gone as of Slice D). Takes
 /// `cam_entity`/`fov_y`/`aspect` as plain values rather than its own
 /// `Query<(Entity, &Projection), …>` — `room::enter_room` already has these
 /// off its OWN camera query (merged into one to stay under Bevy's 16-param
@@ -301,51 +301,6 @@ pub(crate) fn spawn_well_hud_furniture(
                 Name::new("WellHudPanel"),
             ))
             .insert(ChildOf(cam_entity));
-    }
-}
-
-/// `OnEnter(Screen::TimeWell)` handler — wired per this slice's own boundary
-/// (Slice D removes the `Screen::TimeWell` variant + this registration
-/// cleanly), unreachable dead code by construction now that nothing sets
-/// `Screen::TimeWell` any more (see `scene::enter_time_well`'s doc). Delegates
-/// to [`spawn_well_hud_furniture`], which `room::enter_room` ALSO calls now
-/// (Slice C: the HUD spawns with the room, camera-parented as always, so it
-/// exists once the room does rather than waiting for a dive).
-pub fn spawn_well_hud(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<WellCardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    camera: Query<(Entity, &Projection), With<Camera3d>>,
-    windows: Query<&Window>,
-    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
-) {
-    let Ok((cam_entity, projection)) = camera.single() else {
-        warn!("well HUD: no Camera3d to parent panels to");
-        return;
-    };
-    let (fov_y, aspect) = read_perspective(projection);
-    spawn_well_hud_furniture(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        &mut images,
-        cam_entity,
-        fov_y,
-        aspect,
-        &windows,
-        &dock,
-    );
-}
-
-/// Despawn the whole HUD (the camera, their parent, survives). Still
-/// registered on `OnExit(Screen::TimeWell)` (dead, per this slice's
-/// boundary) and ALSO called explicitly from `room::exit_room` (Slice C):
-/// the HUD is a `Camera3d` child, not a `RoomRoot` child, so it would
-/// otherwise survive `RoomRoot`'s despawn and leak across room visits.
-pub fn despawn_well_hud(mut commands: Commands, hud: Query<Entity, With<WellHud>>) {
-    for e in hud.iter() {
-        commands.entity(e).despawn();
     }
 }
 

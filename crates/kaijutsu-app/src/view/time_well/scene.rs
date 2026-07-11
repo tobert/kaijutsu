@@ -53,17 +53,15 @@ pub struct Card {
 /// split since, unlike the wall-mounted wheel, it has no change-of-basis
 /// rotation to compose). Carries [`placement_transform`] (identity this
 /// slice — see [`IDENTITY_PLACEMENT`]); every card/ring/ray/label is its
-/// `ChildOf` descendant, so [`exit_time_well`] despawning this ONE entity
-/// (recursively) is the whole teardown — no per-type queries, no leaked
-/// entity. Does NOT own the well camera: that's the app's one shared
-/// `Camera3d`, repurposed via marker component, never a child of anything
-/// well-specific.
+/// `ChildOf` descendant, so `RoomRoot`'s own recursive despawn (Slice D: the
+/// well only ever enters as room furniture now, `spawn_well_furniture`
+/// parents this under `RoomRoot`) despawning this ONE entity (recursively)
+/// is the whole teardown — no per-type queries, no leaked entity. Does NOT
+/// own the well camera: that's the app's one shared `Camera3d`, repurposed
+/// via marker component (`crate::view::room::RoomCamera`), never a child of
+/// anything well-specific.
 #[derive(Component)]
 pub struct TimeWellRoot;
-
-/// The well's 3D camera.
-#[derive(Component)]
-pub struct TimeWellCamera;
 
 /// The center-bottom reading slot: a single large card floating at a fixed
 /// position at the well's mouth ([`FOCUS_CARD_POS`]), billboarded like every
@@ -315,7 +313,7 @@ const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 const TERRACE_RING_ALPHA: f32 = 0.35;
 
 /// Glyph color for the terrace rings: an icy cyan-white that reads against
-/// [`WELL_BG`] (the concept-art magic-circle palette). **Amy-tunable.**
+/// the well's dark background (the concept-art magic-circle palette). **Amy-tunable.**
 const TERRACE_RING_COLOR: Vec3 = Vec3::new(0.55, 0.85, 1.0);
 
 /// Brightness multiplier for rings + cards **not** on the focused ring, so the
@@ -450,8 +448,9 @@ pub const STATION_CENTER_PLACEMENT: StationCenterPlacement = StationCenterPlacem
 
 /// The `Transform` for the placement/root entity that re-roots the well's
 /// whole subtree into room space — mirrors patch bay's `placement_transform`
-/// (`patch_bay/mod.rs:275-279`). [`enter_time_well`] spawns [`TimeWellRoot`]
-/// with this; every card/ring/ray/label hangs off it via `ChildOf`.
+/// (`patch_bay/mod.rs:275-279`). [`spawn_well_furniture`] spawns
+/// [`TimeWellRoot`] with this; every card/ring/ray/label hangs off it via
+/// `ChildOf`.
 pub fn placement_transform(p: &StationCenterPlacement) -> Transform {
     Transform::from_translation(p.translation)
         .with_rotation(p.rotation)
@@ -474,21 +473,15 @@ pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3
 // ENTER / EXIT
 // ============================================================================
 
-/// Background clear color for the well (kept opaque so the 3D camera fully
-/// paints the viewport before the UI composites on top).
-const WELL_BG: Color = Color::srgb(0.04, 0.05, 0.07);
-
 /// Spawn the well's furniture — the placement/root
 /// ([`STATION_CENTER_PLACEMENT`], Slice C's room-center seat) + ring deck +
 /// terrace rings + focus card + horizon label, every entity `ChildOf` the
-/// placement. This is the room-furniture half of the old `enter_time_well`
-/// (see that function, below, for the OTHER half it kept: repurposing the
-/// shared camera). `parent`, when given, re-parents the placement root under
-/// it — `room::enter_room` passes `RoomRoot` (Slice C: the well is now room
-/// furniture, spawned once per room visit alongside the patch bay); `None`
-/// spawns it unparented, the shape `enter_time_well`'s own (now unreachable
-/// via the room's own nav, but still-registered per this slice's boundary —
-/// see that function's doc) direct-entry path needs.
+/// placement. `parent`, when given, re-parents the placement root under it —
+/// `room::enter_room` passes `RoomRoot` (the well is room furniture, spawned
+/// once per room visit alongside the patch bay). `None` has no live caller
+/// left now that `Screen::TimeWell`'s direct-entry path is gone (Slice D);
+/// the parameter stays `Option` rather than dropping to a bare `Entity`
+/// since that's a signature change beyond this cleanup's scope.
 ///
 /// Not a Bevy system — a plain function taking `&mut Commands`/`&mut Assets`,
 /// the same shape `patch_bay::spawn_furniture` uses, so `room::enter_room`
@@ -658,53 +651,6 @@ pub(crate) fn spawn_well_furniture(
     root
 }
 
-/// `OnEnter(Screen::TimeWell)` handler. Per this slice's boundary (Slice D
-/// removes the `Screen::TimeWell` variant and this registration cleanly —
-/// `lovely-swimming-prism.md`'s "Constraints"), the hook stays wired, but
-/// nothing sets `Screen::TimeWell` any more after this slice's changes to
-/// `room_keyboard`/`toggle_time_well` — so this is now unreachable dead code
-/// by construction, not by omission. Kept functionally complete rather than
-/// half-migrated: repurposes the shared app camera exactly as it always did
-/// (mark it `TimeWellCamera`, swap the clear color, frame the base pose), then
-/// spawns the SAME furniture `room::enter_room` spawns via
-/// [`spawn_well_furniture`] (unparented, since there's no `RoomRoot` in this
-/// path), so a direct entry — if anything ever did reach it again — wouldn't
-/// leave a half-built well.
-pub fn enter_time_well(
-    mut commands: Commands,
-    mut state: ResMut<TimeWellState>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
-    mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
-    mut terrace_ring_materials: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
-) {
-    // Repurpose the one app camera for the well: mark it so the well's per-frame
-    // camera systems find it, swap its clear color to the well background, and
-    // set the base framing — pulled back and tilted up so the full hot rim
-    // (radius ≈ 420) sits in the top ~two-thirds, with the colder bands
-    // receding behind it.
-    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
-        commands.entity(cam_entity).insert(TimeWellCamera);
-        cam.clear_color = ClearColorConfig::Custom(WELL_BG);
-        *tf = Transform::from_translation(CAM_BASE_POS).looking_at(CAM_BASE_LOOK, Vec3::Y);
-    }
-
-    spawn_well_furniture(
-        &mut commands,
-        None,
-        &mut state,
-        &mut meshes,
-        &mut materials,
-        &mut ring_materials,
-        &mut terrace_ring_materials,
-        &mut images,
-    );
-
-    info!("time-well: entered (shared app camera repurposed for the well)");
-}
-
 /// Re-arm [`TimeWellState`]/[`super::rays::WellTracks`] for a fresh room
 /// entry, called from `room::enter_room` right after [`spawn_well_furniture`]
 /// (mirrors `patch_bay::arm_scene`). `spawn_well_furniture` just built
@@ -757,65 +703,6 @@ pub fn arm_dive(state: &mut TimeWellState) {
 /// system, since every call site here already holds a plain `&RoomState`.
 pub fn well_zoomed(room: &crate::view::room::RoomState) -> bool {
     room.zoomed == Some(crate::view::room::nav::Station::TimeWell)
-}
-
-/// Tear the well down: despawn the placement root (recursively — every well
-/// entity, including track rays, is its descendant now, Slice B), clear the
-/// id→entity map and join state, and hand the shared app camera back to the
-/// conversation (drop the well marker, restore the theme background clear).
-/// The camera itself is *not* despawned — it is the app's one always-on
-/// camera. Per this slice's boundary, unreachable dead code alongside
-/// [`enter_time_well`] (see its doc) — `OnExit(Screen::TimeWell)` never fires
-/// once nothing sets `Screen::TimeWell` — kept functionally complete rather
-/// than half-migrated.
-pub fn exit_time_well(
-    mut commands: Commands,
-    mut state: ResMut<TimeWellState>,
-    theme: Res<crate::ui::theme::Theme>,
-    roots: Query<Entity, With<TimeWellRoot>>,
-    mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
-) {
-    // The pulse state (`RingActivity`) is NOT reset here any more (Slice C):
-    // its decay tick now runs fully ungated (`tick_ring_activity`), so energy
-    // already decays toward zero while you're away instead of freezing —
-    // resetting it here on top of that would just be redundant, and reset was
-    // never right for a room-furniture well anyway (the room's own systems
-    // keep running around it).
-
-    // The ONE despawn site (Slice B): every card/ring/ray/label is now a
-    // `ChildOf` descendant of this placement/root entity, and `despawn`
-    // recurses through `Children` by default — the old per-type queries
-    // (`Card`/`ReadingCard`/`WellRingsDeck`/`TerraceRing`/`HorizonLabel`, each
-    // despawned separately) are gone, and with them the leak they were blind
-    // to: a bare placement entity carries none of those markers, so it would
-    // otherwise survive every well visit.
-    for e in roots.iter() {
-        commands.entity(e).despawn();
-    }
-
-    state.entities.clear();
-    state.focused = false;
-    // Reset ring-centric nav so re-entering starts at the mouth ring, gate-front.
-    state.ring_cards = std::array::from_fn(|_| Vec::new());
-    state.horizon_count = 0;
-    state.last_seen_visible_count = 0;
-    state.focused_ring = 0;
-    state.ring_pos = 0;
-    state.ring_rotation = [0.0; super::card::N_BANDS];
-    state.ring_rotation_target = [0.0; super::card::N_BANDS];
-    state.placement_pending.clear();
-    // Reset the join so re-entering rebuilds from scratch (the contexts are
-    // re-polled by DriftState; nothing durable is lost).
-    state.join = kaijutsu_viz::join::Join::new();
-
-    // Hand the shared camera back to the conversation: drop the well marker (so
-    // the well's camera systems stop driving it) and restore the theme clear.
-    if let Ok((cam_entity, mut cam)) = app_camera.single_mut() {
-        commands.entity(cam_entity).remove::<TimeWellCamera>();
-        cam.clear_color = ClearColorConfig::Custom(theme.bg);
-    }
-
-    info!("time-well: exited");
 }
 
 // ============================================================================
@@ -1472,28 +1359,17 @@ pub fn sync_deck_material(
     mat.ripples = packed;
 }
 
-/// Base camera framing for the (now unreachable, see [`enter_time_well`])
-/// direct-entry path only — the room's own shot table
-/// (`view/room/shot.rs::RoomShot::WellOverview`) is what actually frames the
-/// well once it's room furniture (Slice C); this pose has no more callers
-/// than that one dead path. The well's recline lives in the *geometry* (the
-/// funnel is tipped back about X, see [`super::card::WELL_TILT`]), so the
-/// camera only needs a gentle downward look *into* the flared mouth.
-const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 240.0, 900.0);
-const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 40.0, -150.0);
-
 /// Billboard every card (and the in-world "+N" label — [`HorizonLabel`] rides
 /// the same fully-billboarded path as [`ReadingCard`], no `Card`) to face the
 /// camera. No built-in billboard in 0.18; this is the one-line `looking_at`
 /// per card the design doc calls for.
 ///
-/// Reads the shared room camera ([`crate::view::room::RoomCamera`]), not
-/// [`TimeWellCamera`] (Slice C: this system is now ambient — it runs at room
-/// scale, where the room, not the well, owns the shared `Camera3d`; the well
-/// is only ever a *screen cut* — reachable via the now-dead
-/// [`enter_time_well`] — while `TimeWellCamera` would apply, and that path
-/// never runs this ambient system in the first place since it isn't inside
-/// `Screen::Room`).
+/// Reads the shared room camera ([`crate::view::room::RoomCamera`]) — this
+/// system is ambient, running at room scale, where the room (not a
+/// well-specific camera marker) owns the shared `Camera3d`
+/// (`view/room/shot.rs::RoomShot::WellOverview` is what actually frames the
+/// well once it's room furniture, Slice C; `Screen::TimeWell` and its own
+/// camera marker are gone entirely as of Slice D).
 pub fn billboard_cards(
     camera: Query<&GlobalTransform, With<crate::view::room::RoomCamera>>,
     mut cards: Query<

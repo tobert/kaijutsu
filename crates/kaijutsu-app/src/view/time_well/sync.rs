@@ -165,17 +165,18 @@ pub fn sync_time_well(
     let card_mesh = state
         .card_mesh
         .clone()
-        .expect("card_mesh built on enter_time_well");
-    // Same "must exist by now" invariant as `card_mesh` above: `enter_time_well`
-    // (`OnEnter`) always spawns the placement/root before this system's
-    // `Update` schedule can run for the well (state-transition sync point runs
-    // first), so a missing root here means that invariant broke — surface it
-    // loudly rather than silently spawn a card with no parent (which would
-    // also silently orphan this join entry: `reconcile` above already committed
-    // it as seated, so a skipped spawn would never be retried).
+        .expect("card_mesh built on spawn_well_furniture");
+    // Same "must exist by now" invariant as `card_mesh` above: `enter_room`
+    // always calls `spawn_well_furniture` (which spawns the placement/root)
+    // before this system's `Update` schedule can run for the well
+    // (state-transition sync point runs first), so a missing root here means
+    // that invariant broke — surface it loudly rather than silently spawn a
+    // card with no parent (which would also silently orphan this join entry:
+    // `reconcile` above already committed it as seated, so a skipped spawn
+    // would never be retried).
     let root = roots
         .single()
-        .expect("TimeWellRoot placement spawned by enter_time_well before sync_time_well runs");
+        .expect("TimeWellRoot placement spawned by spawn_well_furniture before sync_time_well runs");
 
     // Collect enters first to avoid holding an immutable borrow of the diff while
     // mutating `state`.

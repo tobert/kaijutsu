@@ -72,21 +72,6 @@ impl Plugin for TimeWellPlugin {
             .init_resource::<live::ContextTails>()
             .init_resource::<live::WellBeats>()
             .init_resource::<rays::WellTracks>()
-            // `OnEnter`/`OnExit(Screen::TimeWell)` — left wired per this
-            // slice's own boundary (Slice D removes the `Screen::TimeWell`
-            // variant and these registrations cleanly); nothing sets
-            // `Screen::TimeWell` any more after this slice's changes to
-            // `room_keyboard`/`toggle_time_well`, so these are unreachable
-            // dead code by construction now, not by omission. See
-            // `scene::enter_time_well`/`scene::exit_time_well`'s own docs.
-            .add_systems(
-                OnEnter(Screen::TimeWell),
-                (scene::enter_time_well, hud::spawn_well_hud),
-            )
-            .add_systems(
-                OnExit(Screen::TimeWell),
-                (scene::exit_time_well, hud::despawn_well_hud, rays::despawn_track_rays),
-            )
             // The toggle runs in every screen (it decides based on current state).
             .add_systems(Update, scene::toggle_time_well)
             // Fully ungated: opens warm on every screen, well included.

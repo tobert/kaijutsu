@@ -75,8 +75,9 @@
 //! (`time_well::scene::toggle_time_well`): Conversation → dive straight into
 //! the well; Room (any station, zoomed or not) → straight back to
 //! Conversation — reading only the current screen, never how it was
-//! reached. `Screen::TimeWell` itself is untouched this slice (a later slice
-//! deletes the now-unreachable variant cleanly).
+//! reached. `Screen::TimeWell` itself — left unreachable-but-wired by this
+//! slice — is deleted cleanly by Slice D, along with its now-dead
+//! `OnEnter`/`OnExit` handlers and every other call site that matched on it.
 //!
 //! Materials are mostly built-in [`StandardMaterial`] with `unlit: true`,
 //! carrying brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR

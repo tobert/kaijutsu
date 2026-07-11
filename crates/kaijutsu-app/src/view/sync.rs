@@ -17,18 +17,19 @@ use kaijutsu_client::ServerEvent;
 /// current screen already shows the active context.
 ///
 /// A context's conversation lives on [`Screen::Conversation`]. Any full-viewport
-/// screen that hides it — the time well today, the editor later — must yield to
-/// Conversation when a context switch lands, so the user actually sees the
-/// context they (or the kernel) switched to. This is the *general* fix for the
-/// switch-doesn't-drive-Screen gap: it keys on the screen being left, not on
-/// which writer requested the switch, so every switch path (peer `switch_context`,
-/// server-pushed `ContextSwitched` from fork / `kj context switch`, the dock, …)
-/// reveals the context uniformly. The editor-open signal is the mirror of this:
-/// it drives `Screen::Editor` from its *own* landing handler, not through here.
+/// screen that hides it — the room (which owns the time well as furniture) and
+/// the editor — must yield to Conversation when a context switch lands, so the
+/// user actually sees the context they (or the kernel) switched to. This is the
+/// *general* fix for the switch-doesn't-drive-Screen gap: it keys on the screen
+/// being left, not on which writer requested the switch, so every switch path
+/// (peer `switch_context`, server-pushed `ContextSwitched` from fork / `kj
+/// context switch`, the dock, …) reveals the context uniformly. The editor-open
+/// signal is the mirror of this: it drives `Screen::Editor` from its *own*
+/// landing handler, not through here.
 fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
     match current {
         Screen::Conversation => None,
-        // Time well (and future editor) hide the conversation; reveal it.
+        // Room (well or not) and Editor hide the conversation; reveal it.
         _ => Some(Screen::Conversation),
     }
 }
@@ -569,15 +570,17 @@ mod tests {
         );
     }
 
-    /// The bug this fixes: a switch landing while the time well owns the
-    /// viewport must reveal the conversation, not leave the user staring at the
-    /// well. Covers both the peer `switch_context` action and the server-pushed
+    /// The bug this fixes: a switch landing while the room (which owns the
+    /// time well as furniture, zoomed in or not — `Screen::TimeWell` retired
+    /// in Slice D, `lovely-swimming-prism.md`) owns the viewport must reveal
+    /// the conversation, not leave the user staring at the room. Covers both
+    /// the peer `switch_context` action and the server-pushed
     /// `ContextSwitched` (fork / `kj context switch`) — both funnel through
     /// `handle_context_switch`, which is where this decision is applied.
     #[test]
-    fn switching_while_in_time_well_reveals_conversation() {
+    fn switching_while_in_room_reveals_conversation() {
         assert_eq!(
-            screen_revealing_switched_context(Screen::TimeWell),
+            screen_revealing_switched_context(Screen::Room),
             Some(Screen::Conversation)
         );
     }

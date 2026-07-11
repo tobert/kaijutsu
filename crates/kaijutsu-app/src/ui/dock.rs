@@ -747,12 +747,12 @@ pub fn update_mode(
             }
             FocusArea::Conversation => (theme.mode_normal, &theme.mode_label_normal),
         },
-        // The well / editor / room own the viewport; the conversation dock is
+        // The editor / room own the viewport; the conversation dock is
         // hidden, but keep the mode indicator coherent rather than panicking.
         // (The editor's own vim mode renders on its panel — docs/vi.md steps
-        // 4–5. `Room` covers a station zoom too now — no second screen left
-        // for that to be.)
-        Screen::TimeWell | Screen::Editor | Screen::Room => (theme.mode_normal, &theme.mode_label_normal),
+        // 4–5. `Room` covers a station zoom too now — including the well,
+        // which has no second screen left of its own since Slice D.)
+        Screen::Editor | Screen::Room => (theme.mode_normal, &theme.mode_label_normal),
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -1003,15 +1003,21 @@ pub fn update_hints(
             }
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
-        Screen::TimeWell => "Esc: back to conversation \u{2502} (time well)",
         Screen::Editor => "Esc: back to conversation \u{2502} (editor)",
-        Screen::Room => {
-            if room.zoomed.is_some() {
+        Screen::Room => match room.zoomed {
+            None => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: dive \u{2502} Esc: conversation",
+            Some(crate::view::room::nav::Station::PatchBay) => {
                 "\u{2190}\u{2192}: wire \u{2502} \u{2191}/Esc: room \u{2502} r: rescan"
-            } else {
-                "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: dive \u{2502} Esc: conversation"
             }
-        }
+            Some(crate::view::room::nav::Station::TimeWell) => {
+                "0-9/\u{2190}\u{2192}\u{2191}\u{2193}: seat & ring \u{2502} Enter: focus/commit \u{2502} c/p/d/z/a: act \u{2502} Esc: room"
+            }
+            // Other stations aren't zoomable yet (`station_is_zoomable`,
+            // `room/mod.rs`) — `room.zoomed` can't actually be `Some` for
+            // them today, but the match must stay exhaustive as new stations
+            // gain their own zoomed dive.
+            Some(_) => "\u{2191}/Esc: room",
+        },
     };
 
     if dock.hints.text != hints {

@@ -150,14 +150,15 @@ impl WellTracks {
     }
 
     /// Reset the id→entity map alone (the roster itself is untouched). Called
-    /// by [`despawn_track_rays`] (the well's own, now-unreachable
-    /// `OnExit(Screen::TimeWell)` teardown) and by
-    /// `scene::arm_well` (Slice C: `room::enter_room`'s re-arm, so
+    /// by `scene::arm_well` (`room::enter_room`'s re-arm, so
     /// `sync_track_rays`'s re-entry count fallback doesn't compare against a
     /// stale roster of dead entity ids left over from the previous room
     /// visit — a design-review correction to the time-well/room integration
     /// plan, since without this the fallback can match by COUNT ALONE and
-    /// silently never respawn a single ray).
+    /// silently never respawn a single ray). [`despawn_track_rays`] also
+    /// calls this directly; its own registration on `Screen::TimeWell`'s
+    /// `OnExit` is gone as of Slice D (`lovely-swimming-prism.md`), but a
+    /// test still exercises it standalone (see its own doc).
     pub fn clear_ray_entities(&mut self) {
         self.ray_entities.clear();
     }
@@ -304,12 +305,20 @@ pub fn sync_track_rays(
 }
 
 /// Reset the ray roster's id→entity map on exit. The `TrackRay` entities
-/// themselves now die with the placement root's own recursive despawn
-/// (`scene::exit_time_well`, Slice B reparenting — every ray is its `ChildOf`
-/// descendant); despawning them again here would just be racing/duplicating
-/// that command. This only clears the stale map, so re-entry's count fallback
-/// (`sync_track_rays`'s `state.ray_entities.len() == state.tracks.len()`
-/// guard) doesn't compare against dangling entity ids and skip the respawn.
+/// themselves die with the placement root's own recursive despawn (Slice B
+/// reparenting — every ray is its `ChildOf` descendant; the room's own
+/// `RoomRoot` teardown cascades to it as of Slice C); despawning them again
+/// here would just be racing/duplicating that command. This only clears the
+/// stale map, so re-entry's count fallback (`sync_track_rays`'s
+/// `state.ray_entities.len() == state.tracks.len()` guard) doesn't compare
+/// against dangling entity ids and skip the respawn.
+///
+/// No production caller left as of Slice D (`Screen::TimeWell`'s `OnExit`
+/// registration, its only caller, is gone — `arm_well` covers the same
+/// clearing duty on room re-entry via `clear_ray_entities` directly); kept
+/// for the `rays_respawn_after_exit_even_with_an_unchanged_roster` test
+/// below, which calls it directly to simulate the old exit path.
+#[allow(dead_code)] // only reachable from the test below (see doc above)
 pub fn despawn_track_rays(mut state: ResMut<WellTracks>) {
     state.clear_ray_entities();
 }
@@ -439,11 +448,11 @@ mod tests {
     ///
     /// Updated for Slice B (`ChildOf` reparenting): `sync_track_rays` now
     /// requires a `TimeWellRoot` placement entity to spawn rays under (a real
-    /// well entry always has one, from `enter_time_well`), and the real exit
-    /// path despawns rays via the ROOT's own recursive despawn
-    /// (`scene::exit_time_well`), not `despawn_track_rays` directly anymore —
-    /// this test stands in both: spawns a bare placement entity, then
-    /// despawns it to simulate the real exit.
+    /// room visit always has one, from `spawn_well_furniture`), and the real
+    /// exit path despawns rays via the ROOT's own recursive despawn
+    /// (`RoomRoot`'s teardown, Slice C), not `despawn_track_rays` directly
+    /// anymore — this test stands in both: spawns a bare placement entity,
+    /// then despawns it to simulate the real exit.
     #[test]
     fn rays_respawn_after_exit_even_with_an_unchanged_roster() {
         use bevy::ecs::system::RunSystemOnce;
@@ -468,8 +477,8 @@ mod tests {
         app.update();
         assert_eq!(ray_count(&mut app), 1, "settled roster spawns nothing new");
 
-        // Exit the well: the placement root's recursive despawn removes every
-        // ray (the real exit path, `scene::exit_time_well`); `despawn_track_rays`
+        // Exit the room: the placement root's recursive despawn removes every
+        // ray (the real exit path, `RoomRoot`'s own teardown); `despawn_track_rays`
         // only resets the roster's id→entity map now (see its doc comment) so
         // the count fallback below doesn't compare against dangling ids.
         app.world_mut().despawn(root);
