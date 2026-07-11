@@ -1,13 +1,20 @@
-//! Track rays — tracks as beams down the funnel wall of the well.
+//! Track rays — tracks as vortex-spiral ribbons down the funnel wall of the
+//! well.
 //!
 //! A track is the durable lane (docs/tracks.md); contexts churn around it.
-//! Each track renders as one thin [`TrackRayMaterial`] beam lying on the
-//! funnel wall — from the vortex throat out through the magic rings to the
-//! mouth — at an angle **hashed stably from the track's name** (same FNV
-//! recipe as the card accents): the angle never moves across restarts or
-//! track churn, so a lane lives at a learnable bearing. While the track's
-//! clock rolls, a pulse rides the beam mouth→throat each beat, driven by the
-//! same per-track phasors the cards use ([`super::live::WellBeats`]).
+//! Each track renders as one thin [`TrackRayMaterial`] ribbon spiraling down
+//! the funnel wall — from the vortex throat out through the magic rings to
+//! the mouth — at a bearing **hashed stably from the track's name** (same FNV
+//! recipe as the card accents): the bearing never moves across restarts or
+//! track churn, so a lane lives at a learnable address. Every ray winds the
+//! SAME rotational direction (drain-swirl), which is why this is a spiral and
+//! not a straight beam: a room-scale view looking down into the mouth once
+//! read several straight chords as an inscribed pentagram, and same-direction
+//! spirals can never cross into a star chord the way independent straight
+//! beams could (placeholder aesthetic — geometry swap only, "we'll glow up
+//! later"). While the track's clock rolls, a pulse rides the ribbon
+//! mouth→throat each beat, driven by the same per-track phasors the cards use
+//! ([`super::live::WellBeats`]).
 //!
 //! Data flow mirrors the cluster poll: [`poll_tracks`] ships `listTracks`
 //! every few seconds while the well is open; [`apply_tracks`] drains the
@@ -31,15 +38,29 @@ use crate::shaders::TrackRayMaterial;
 /// are few and churn slowly; the *beat* rides `BeatSync` push, not this poll.
 const TRACK_POLL_INTERVAL: f64 = 5.0;
 
-/// Ray beam width (well units) — a filament, not a wall.
+/// Ray ribbon width (well units) — a filament, not a wall.
 const RAY_WIDTH: f32 = 14.0;
 
-/// Funnel-local endpoints of every ray: from just above the throat floor
-/// (the ring deck sits at −850; the beam melts into its glow) out to just
-/// past the mouth ring. Radii bracket the ring stack (mouth ring radius 500,
-/// vortex core well inside 70).
+/// Funnel-local stations every ray's spiral interpolates between: from just
+/// above the throat floor (the ring deck sits at −850; the ribbon melts into
+/// its glow) out to just past the mouth ring. Radii bracket the ring stack
+/// (mouth ring radius 500, vortex core well inside 70).
 const RAY_INNER: (f32, f32) = (70.0, -840.0); // (radius, depth) at the throat
 const RAY_OUTER: (f32, f32) = (520.0, 10.0); // (radius, depth) past the mouth
+
+/// How far (radians) the spiral ribbon winds from the mouth back to the
+/// throat. `0.0` would be a straight radial beam (the retired pentagram
+/// look); every ray winds this SAME amount, in this SAME direction — the sign
+/// is picked once, here, and never varies per-ray — so no two rays' spirals
+/// can ever cross into a straight-chord star the way independent straight
+/// beams did. ~2.0 (a bit over a third of a turn) reads as a drain-swirl
+/// without disguising which bearing the ray addresses. **Amy-tunable, first
+/// guess — glow-up later.**
+const SPIRAL_SWEEP: f32 = 2.0;
+
+/// Segment count for the baked spiral ribbon mesh — enough to read as a
+/// smooth curl rather than a faceted polygon.
+const SPIRAL_SEGMENTS: usize = 28;
 
 /// Stable angle for a track's ray: FNV-1a over the name → [0, TAU). The same
 /// recipe as [`super::scene::accent_color`] so a track's bearing is as stable
@@ -56,48 +77,136 @@ pub fn ray_angle(track_id: &str) -> f32 {
     (h % 4096) as f32 / 4096.0 * TAU
 }
 
-/// A ray's funnel-local endpoints at `angle`: `(throat_end, mouth_end)`.
-pub fn ray_endpoints(angle: f32) -> (Vec3, Vec3) {
+/// A point on the spiral ribbon's centerline at `t` ∈ `[0, 1]` (0 = throat, 1
+/// = mouth), baked at bearing **0**: the mesh's mouth end (`t = 1`) sits on
+/// the +X axis — the address [`ray_angle`] names, since that's the track's
+/// visible bearing — and the throat end (`t = 0`) trails around behind it by
+/// [`SPIRAL_SWEEP`]. Radius and depth interpolate linearly between
+/// [`RAY_INNER`]/[`RAY_OUTER`]; the angle interpolates linearly from
+/// `SPIRAL_SWEEP` down to `0`, so the curve winds one direction the whole
+/// way, never reversing.
+fn spiral_point(t: f32) -> Vec3 {
     let (r0, z0) = RAY_INNER;
     let (r1, z1) = RAY_OUTER;
-    (
-        Vec3::new(r0 * angle.cos(), r0 * angle.sin(), z0),
-        Vec3::new(r1 * angle.cos(), r1 * angle.sin(), z1),
-    )
+    let r = r0 + (r1 - r0) * t;
+    let z = z0 + (z1 - z0) * t;
+    let a = SPIRAL_SWEEP * (1.0 - t);
+    Vec3::new(r * a.cos(), r * a.sin(), z)
 }
 
-/// The world transform of a ray quad at `angle`: a `Rectangle(len, RAY_WIDTH)`
-/// laid along the funnel wall — local +X runs throat→mouth (matching the
-/// shader's uv.x), local +Y is the angular (width) direction, local +Z the
-/// cone-surface normal (faces up out of the bowl) — then reclined into world
-/// space by the shared funnel tilt.
+/// Exact analytic tangent (d/dt) of [`spiral_point`] at `t` — unnormalized,
+/// callers normalize. Used instead of a finite difference so the ribbon's
+/// width direction (perpendicular to the path, lying in the cone surface) is
+/// exact at every sample.
+fn spiral_tangent_raw(t: f32) -> Vec3 {
+    let (r0, z0) = RAY_INNER;
+    let (r1, z1) = RAY_OUTER;
+    let dr = r1 - r0;
+    let dz = z1 - z0;
+    let r = r0 + dr * t;
+    let a = SPIRAL_SWEEP * (1.0 - t);
+    let da_dt = -SPIRAL_SWEEP;
+    Vec3::new(dr * a.cos() - r * da_dt * a.sin(), dr * a.sin() + r * da_dt * a.cos(), dz)
+}
+
+/// The funnel wall's own surface normal at `t`, oriented up-out-of-the-bowl:
+/// `cross(radial_direction, angular_direction)` at the point's own angle —
+/// this is a property of the CONE surface the ribbon rides (independent of
+/// which curve is traced across it), not the ribbon curve's own tangent.
+/// Always faces up at today's dims (`RAY_OUTER.0 > RAY_INNER.0` keeps the
+/// cross product's z-component `= RAY_OUTER.0 - RAY_INNER.0` positive for
+/// every angle, by construction); the flip guard mirrors the old
+/// `ray_transform`'s same dead-code caution for the day the funnel's slope
+/// gets re-tuned (Gemini review, 2026-07-04, carried forward).
+fn spiral_normal(t: f32) -> Vec3 {
+    let (r0, z0) = RAY_INNER;
+    let (r1, z1) = RAY_OUTER;
+    let dr = r1 - r0;
+    let dz = z1 - z0;
+    let a = SPIRAL_SWEEP * (1.0 - t);
+    let radial = Vec3::new(dr * a.cos(), dr * a.sin(), dz);
+    let angular = Vec3::new(-a.sin(), a.cos(), 0.0);
+    let mut n = radial.cross(angular).normalize();
+    if n.z < 0.0 {
+        n = -n;
+    }
+    n
+}
+
+/// Build the shared spiral ribbon's raw vertex buffers, baked at bearing
+/// angle 0 (see [`spiral_point`]): `(positions, normals, uvs, indices)`.
+/// `uv.x` is cumulative 3D arclength, 0 at the throat end → 1 at the mouth
+/// end — `track_ray.wgsl`'s contract, so the beat pulse rides at uniform
+/// speed along the curve, not sample density; `uv.y` is 0..1 across the
+/// ribbon's [`RAY_WIDTH`]. Every ray shares this ONE mesh; per-ray placement
+/// is a pure rotation ([`ray_transform`]).
+fn spiral_ribbon_vertices() -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+    let n = SPIRAL_SEGMENTS;
+    let half = RAY_WIDTH * 0.5;
+
+    let points: Vec<Vec3> = (0..=n).map(|i| spiral_point(i as f32 / n as f32)).collect();
+
+    // Cumulative 3D arclength (the curve leaves the throat/mouth radii via
+    // depth AND angle at once), normalized to [0, 1].
+    let mut cum = vec![0.0f32; n + 1];
+    for i in 1..=n {
+        cum[i] = cum[i - 1] + points[i].distance(points[i - 1]);
+    }
+    let total = cum[n].max(1e-6);
+
+    let mut positions = Vec::with_capacity((n + 1) * 2);
+    let mut normals = Vec::with_capacity((n + 1) * 2);
+    let mut uvs = Vec::with_capacity((n + 1) * 2);
+    for (i, &p) in points.iter().enumerate() {
+        let t = i as f32 / n as f32;
+        let tangent = spiral_tangent_raw(t).normalize();
+        let normal = spiral_normal(t);
+        // Perpendicular to the path, lying IN the cone surface (⊥ normal) —
+        // the ribbon's width direction. `tangent × normal` (not the reverse)
+        // is the order that keeps the [l0, l1, r0, r0, l1, r1] index winding
+        // below front-facing toward `normal`, the same recipe
+        // `bearing::ribbon_vertices` proved for its own flat ribbon.
+        let width = tangent.cross(normal).normalize();
+        let u = cum[i] / total;
+        positions.push((p + width * half).to_array());
+        positions.push((p - width * half).to_array());
+        normals.push(normal.to_array());
+        normals.push(normal.to_array());
+        uvs.push([u, 0.0]);
+        uvs.push([u, 1.0]);
+    }
+
+    let mut indices = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let a = (i * 2) as u32;
+        let (l0, r0, l1, r1) = (a, a + 1, a + 2, a + 3);
+        indices.extend_from_slice(&[l0, l1, r0, r0, l1, r1]);
+    }
+    (positions, normals, uvs, indices)
+}
+
+/// Wrap [`spiral_ribbon_vertices`] into a `Mesh` — the shared shape every
+/// ray's entity points at ([`sync_track_rays`]).
+fn spiral_ribbon_mesh() -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let (positions, normals, uvs, indices) = spiral_ribbon_vertices();
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
+/// The world transform of a ray's ribbon at `angle`: a pure rotation about
+/// the funnel's Z axis (placing the mesh's baked bearing-0 mouth end at this
+/// bearing), composed with the shared funnel recline (`well_tilt_quat`). The
+/// cone-surface orientation now lives in the baked mesh itself
+/// ([`spiral_ribbon_vertices`]), so placement no longer needs a per-ray
+/// basis/translation — one quaternion, not a `Mat3` + midpoint.
 pub fn ray_transform(angle: f32) -> Transform {
-    let (p0, p1) = ray_endpoints(angle);
-    let dir = (p1 - p0).normalize();
-    let mut angular = Vec3::new(-angle.sin(), angle.cos(), 0.0);
-    let mut normal = dir.cross(angular).normalize();
-    // dir × angular has +Z-dominant sign for a bowl opening toward +Z; keep it
-    // facing the mouth so the beam reads from the camera side. Flip BOTH axes
-    // (a 180° roll about `dir`), never just the normal — a lone flip would
-    // hand `Quat::from_mat3` a left-handed (reflected) basis and yield a
-    // garbage rotation. Dead code at today's funnel dimensions (the slope
-    // always rises outward), live the day they're re-tuned (Gemini review).
-    if normal.z < 0.0 {
-        normal = -normal;
-        angular = -angular;
-    }
-    let tilt = super::card::well_tilt_quat();
-    Transform {
-        translation: tilt * p0.midpoint(p1),
-        rotation: tilt * Quat::from_mat3(&Mat3::from_cols(dir, angular, normal)),
-        scale: Vec3::ONE,
-    }
-}
-
-/// Length of every ray beam (all rays share one endpoint recipe → one mesh).
-pub fn ray_length() -> f32 {
-    let (p0, p1) = ray_endpoints(0.0);
-    p0.distance(p1)
+    Transform::from_rotation(super::card::well_tilt_quat() * Quat::from_rotation_z(angle))
 }
 
 /// One track's beam in the scene. Carries the track's id + its beat key (the
@@ -123,7 +232,7 @@ pub struct WellTracks {
     pub track_of: HashMap<ContextId, String>,
     /// track id → live ray entity (the rays' own little join).
     ray_entities: HashMap<String, Entity>,
-    /// Shared beam mesh, built on first use.
+    /// Shared spiral ribbon mesh, built on first use.
     ray_mesh: Option<Handle<Mesh>>,
 }
 
@@ -275,11 +384,8 @@ pub fn sync_track_rays(
     let Ok(root) = roots.single() else {
         return;
     };
-    // Spawn rays for new tracks (shared beam mesh, built on first use).
-    let mesh = state
-        .ray_mesh
-        .get_or_insert_with(|| meshes.add(Rectangle::new(ray_length(), RAY_WIDTH)))
-        .clone();
+    // Spawn rays for new tracks (shared spiral ribbon mesh, built on first use).
+    let mesh = state.ray_mesh.get_or_insert_with(|| meshes.add(spiral_ribbon_mesh())).clone();
     for t in new {
         let angle = ray_angle(&t.id);
         let c = super::scene::accent_color(&t.id).to_linear();
@@ -396,31 +502,113 @@ mod tests {
     }
 
     #[test]
-    fn ray_endpoints_run_throat_to_mouth_at_the_angle() {
-        let angle = 1.2f32;
-        let (p0, p1) = ray_endpoints(angle);
-        assert!(p0.z < p1.z, "throat end is deeper");
-        assert!(p0.xy().length() < p1.xy().length(), "throat end is inner");
-        // Both ends sit on the ray's bearing.
-        assert!((p0.y.atan2(p0.x) - angle).abs() < 1e-4);
-        assert!((p1.y.atan2(p1.x) - angle).abs() < 1e-4);
+    fn spiral_point_endpoints_land_on_ray_inner_and_outer() {
+        let throat = spiral_point(0.0);
+        let mouth = spiral_point(1.0);
+        let (r0, z0) = RAY_INNER;
+        let (r1, z1) = RAY_OUTER;
+        assert!((throat.xy().length() - r0).abs() < 1e-3, "throat radius: {throat:?}");
+        assert!((throat.z - z0).abs() < 1e-3, "throat depth: {throat:?}");
+        assert!((mouth.xy().length() - r1).abs() < 1e-3, "mouth radius: {mouth:?}");
+        assert!((mouth.z - z1).abs() < 1e-3, "mouth depth: {mouth:?}");
     }
 
     #[test]
-    fn ray_transform_maps_local_x_from_throat_to_mouth() {
+    fn spiral_point_depth_rises_monotonically_from_throat_to_mouth() {
+        let depths: Vec<f32> = (0..=20).map(|i| spiral_point(i as f32 / 20.0).z).collect();
+        for w in depths.windows(2) {
+            assert!(w[1] > w[0], "depth should climb toward the mouth: {depths:?}");
+        }
+    }
+
+    #[test]
+    fn spiral_point_swirls_one_direction_the_whole_way() {
+        // Bearing (atan2) at each sample should keep moving the same way —
+        // the drain-swirl invariant that keeps two rays from ever crossing
+        // into a straight-chord star.
+        let bearings: Vec<f32> = (0..=20)
+            .map(|i| {
+                let p = spiral_point(i as f32 / 20.0);
+                p.y.atan2(p.x)
+            })
+            .collect();
+        let mut sign = None;
+        for w in bearings.windows(2) {
+            let d = w[1] - w[0];
+            assert!(d.abs() > 1e-6, "bearing should keep moving: {bearings:?}");
+            match sign {
+                None => sign = Some(d.signum()),
+                Some(s) => assert_eq!(d.signum(), s, "swirl reversed direction: {bearings:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn spiral_mouth_end_sits_at_bearing_zero_in_the_baked_mesh() {
+        // `ray_angle` addresses a track by where its ray meets the MOUTH, so
+        // the baked (bearing-0) mesh's mouth end must sit exactly on the +X
+        // axis for `ray_transform`'s single Z-rotation to place it correctly.
+        let mouth = spiral_point(1.0);
+        assert!(mouth.y.atan2(mouth.x).abs() < 1e-4, "mouth end bakes at angle 0: {mouth:?}");
+        assert!(mouth.x > 0.0, "…specifically on +X: {mouth:?}");
+    }
+
+    #[test]
+    fn spiral_ribbon_uvs_are_monotonic_arclength_ending_at_the_mouth() {
+        let (_, _, uvs, _) = spiral_ribbon_vertices();
+        let u_at = |i: usize| uvs[i * 2][0];
+        assert!(u_at(0).abs() < 1e-6, "throat end starts at uv.x = 0: {}", u_at(0));
+        assert!(
+            (u_at(SPIRAL_SEGMENTS) - 1.0).abs() < 1e-6,
+            "mouth end ends at uv.x = 1: {}",
+            u_at(SPIRAL_SEGMENTS)
+        );
+        for i in 0..SPIRAL_SEGMENTS {
+            assert!(u_at(i) <= u_at(i + 1) + 1e-6, "uv.x must be monotonic along the ribbon");
+        }
+    }
+
+    #[test]
+    fn spiral_ribbon_vertices_are_two_per_sample_and_six_indices_per_segment() {
+        let (positions, normals, uvs, indices) = spiral_ribbon_vertices();
+        assert_eq!(positions.len(), (SPIRAL_SEGMENTS + 1) * 2, "2 verts per sample");
+        assert_eq!(normals.len(), positions.len(), "one normal per vertex");
+        assert_eq!(uvs.len(), positions.len(), "one uv per vertex");
+        assert_eq!(indices.len(), SPIRAL_SEGMENTS * 6, "6 indices per segment");
+        assert!(indices.iter().all(|&i| (i as usize) < positions.len()), "every index in range");
+    }
+
+    #[test]
+    fn spiral_ribbon_width_matches_ray_width_at_every_sample() {
+        let (positions, _, _, _) = spiral_ribbon_vertices();
+        for pair in positions.chunks(2) {
+            let l = Vec3::from_array(pair[0]);
+            let r = Vec3::from_array(pair[1]);
+            let width = l.distance(r);
+            assert!((width - RAY_WIDTH).abs() < 1e-2, "ribbon width drifted: {width}");
+        }
+    }
+
+    #[test]
+    fn ray_transform_places_the_baked_mouth_and_throat_at_the_ray_bearing() {
         let angle = 0.7f32;
-        let (p0, p1) = ray_endpoints(angle);
         let tilt = super::super::card::well_tilt_quat();
         let tf = ray_transform(angle);
-        let half = ray_length() * 0.5;
-        // The quad's -X end lands on the (tilted) throat endpoint, +X on the mouth.
-        let world_p0 = tf.translation + tf.rotation * Vec3::new(-half, 0.0, 0.0);
-        let world_p1 = tf.translation + tf.rotation * Vec3::new(half, 0.0, 0.0);
-        assert!(world_p0.distance(tilt * p0) < 1e-3, "-X = throat end");
-        assert!(world_p1.distance(tilt * p1) < 1e-3, "+X = mouth end");
-        // The face normal points out of the bowl (toward the mouth side).
-        let n = tf.rotation * Vec3::Z;
-        assert!((tilt.inverse() * n).z > 0.0, "faces up out of the funnel");
+
+        let mouth = tf.translation + tf.rotation * spiral_point(1.0);
+        let throat = tf.translation + tf.rotation * spiral_point(0.0);
+
+        let (r0, z0) = RAY_INNER;
+        let (r1, z1) = RAY_OUTER;
+        let expect_mouth = tilt * Vec3::new(r1 * angle.cos(), r1 * angle.sin(), z1);
+        // The throat trails the mouth's bearing by SPIRAL_SWEEP (the baked
+        // mesh's own throat angle), rotated by the same `angle`.
+        let throat_bearing = angle + SPIRAL_SWEEP;
+        let expect_throat =
+            tilt * Vec3::new(r0 * throat_bearing.cos(), r0 * throat_bearing.sin(), z0);
+
+        assert!(mouth.distance(expect_mouth) < 1e-3, "mouth end addresses the ray's bearing: {mouth:?}");
+        assert!(throat.distance(expect_throat) < 1e-3, "throat trails by SPIRAL_SWEEP: {throat:?}");
     }
 
     fn track(id: &str, score: u8, attached: &[u8]) -> TrackInfo {
