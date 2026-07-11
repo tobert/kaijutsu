@@ -362,6 +362,19 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   the intent is that as real detail fills the stations in, the engraved
   plates recede: dimmer with familiarity, eventually maybe tooltip-only or a
   debug toggle. Keep this in mind before investing further in plate polish.
+- **Well: the edge HUD should probably retire** (Amy, 2026-07-11, first look
+  at the new hero shot — `RoomShot::WellHero`, time-well/room integration
+  plan): the four camera-parented panels (LINEAGE/SPECS/CONTROLS/title,
+  `time_well::hud`) read as floating flat UI over the well's own hero
+  establishing shot, at odds with the room's diegetic, instrument-engraved
+  ethos the same way the boring-nameplates entry above is already steering
+  away from floating labels. No replacement designed yet — this is a
+  direction to design toward, not a today task: whatever replaces the
+  selection-detail readout (a diegetic in-scene panel? folded into the
+  focused/reading card itself? gone entirely, relying on the card body?)
+  needs its own pass. Until then, leave the HUD as-is (including its Slice E
+  palette re-skin, deliberately skipped — no sense re-coloring chrome that's
+  slated to retire); don't invest further polish in its current form.
 - **Patch bay: extract shared wire-geometry helper** (deepseek review,
   2026-07-09): `selected_chord_apex` re-derives the group→seat→angle→chord
   pipeline that `rebuild_patch_scene` also computes (identical today,
