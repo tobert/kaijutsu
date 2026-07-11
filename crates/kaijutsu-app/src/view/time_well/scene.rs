@@ -410,10 +410,12 @@ pub const IDENTITY_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
 /// Uniform scale from the well's native ~500-unit mouth radius
 /// (`super::card::SPIRAL_R_MOUTH`, private to `card` — see its
 /// `band_ring`) down to roughly match the room's existing
-/// `room::TABLE_PLINTH_RADIUS` (145): 500 × 0.3 = 150. **First guess —
-/// live-tune over BRP** (lovely-swimming-prism.md, Slice C: correctness of
-/// the wiring matters far more than this exact number right now).
-const STATION_CENTER_SCALE: f32 = 0.3;
+/// `room::TABLE_PLINTH_RADIUS` (145): 500 × 0.3 = 150, bumped to 0.5 (250)
+/// after Amy's live look — the console read as too small a presence next to
+/// the room's other furniture at the first guess. **Still a live-tuning
+/// value** (lovely-swimming-prism.md, Slice C), same spirit as
+/// `patch_bay::STATION_W_SCALE`'s own 0.34 → 0.66 retune.
+const STATION_CENTER_SCALE: f32 = 0.5;
 
 /// Extra lift stacked on top of [`crate::view::room::TABLE_TOP_Y`] (the
 /// room table's top face) for [`STATION_CENTER_PLACEMENT`]'s translation.
