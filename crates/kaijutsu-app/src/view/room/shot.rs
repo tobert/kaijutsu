@@ -59,6 +59,22 @@ const ROOM_CAM_APPROACH_HEIGHT: f32 = 260.0;
 /// (see [`approach_pose`]).
 const APPROACH_LOOK_HEIGHT: f32 = 130.0;
 
+/// The well's **hero pose** (Amy: "a final up arrow took the camera to focus
+/// on the well from a bit above looking down... esp with the room to give it
+/// perspective") — an elevated, pulled-back establishing shot of the well
+/// framed against the room around it, reached by pressing Up at the mouth
+/// ring (nowhere further inward to focus, `TimeWellState::hero`). Deliberately
+/// a fixed ROOM-space pose, not composed through [`STATION_CENTER_PLACEMENT`]'s
+/// rotation the way [`well_local_shot`] is — the point is a stable, room-
+/// oriented 3/4 view that reads the same regardless of how the well's own
+/// internal geometry is tuned, catching the octagon's walls/floor behind it
+/// for context the tight ring-gate dive can't give. Height/back-off are
+/// offsets from [`STATION_CENTER_PLACEMENT`]'s own translation, so retuning
+/// where the well sits doesn't silently stale this shot. **First guess — live
+/// -tune over BRP**, same as every other Amy-tunable constant here.
+const WELL_HERO_HEIGHT: f32 = 540.0;
+const WELL_HERO_BACK: f32 = 900.0;
+
 /// The camera's vertical field of view — mirrors `main::setup_camera`'s
 /// `Camera3d::default()` projection (Bevy's own `PerspectiveProjection`
 /// default, `fov: PI / 4.0`). [`fullscreen_pose`] derives its standoff
@@ -130,6 +146,9 @@ pub enum RoomShot {
     /// the local (pre-placement) math, migrated from the old
     /// `ease_camera_to_focused_ring`.
     WellOverview(WellShotInput),
+    /// The well's elevated establishing shot (`TimeWellState::hero`) — see
+    /// [`WELL_HERO_HEIGHT`]/[`WELL_HERO_BACK`]'s own doc.
+    WellHero,
 }
 
 impl RoomShot {
@@ -169,6 +188,11 @@ pub fn resolve(shot: RoomShot) -> (Vec3, Vec3) {
                 placement_to_room(&STATION_CENTER_PLACEMENT, local_eye),
                 placement_to_room(&STATION_CENTER_PLACEMENT, local_look),
             )
+        }
+        RoomShot::WellHero => {
+            let look = STATION_CENTER_PLACEMENT.translation;
+            let eye = look + Vec3::new(0.0, WELL_HERO_HEIGHT, WELL_HERO_BACK);
+            (eye, look)
         }
     }
 }

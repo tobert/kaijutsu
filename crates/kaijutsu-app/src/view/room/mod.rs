@@ -1557,6 +1557,7 @@ fn ease_shell_camera(
         return;
     };
     let want = match room.zoomed {
+        Some(Station::TimeWell) if well_state.hero => shot::RoomShot::WellHero,
         Some(Station::TimeWell) => shot::RoomShot::WellOverview(shot::WellShotInput {
             focused: well_state.focused,
             focused_ring: well_state.focused_ring,

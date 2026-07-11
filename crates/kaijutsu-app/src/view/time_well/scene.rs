@@ -181,6 +181,17 @@ pub struct TimeWellState {
     /// sight-unseen (auto → demoted → ARCHIVED). Digits/Enter/`c` stay
     /// unguarded — navigation and conclude aren't ladder steps.
     pub placement_pending: HashSet<ContextId>,
+    /// Whether the camera is parked in the **hero pose** — Up at the mouth
+    /// ring (already the shallowest; nowhere further inward to focus) rises
+    /// into an elevated, looking-down establishing shot of the well *within
+    /// the room* instead of a dead-end no-op (Amy: "a final up arrow took
+    /// the camera to focus on the well from a bit above looking down...
+    /// esp with the room to give it perspective"). A look-only dead end
+    /// while active — [`well_keyboard`] ignores everything except Down
+    /// (returns to the mouth ring's normal framing) and Esc (leaves the well,
+    /// same as from any ring-overview). Drives
+    /// [`crate::view::room::shot::RoomShot::WellHero`] in `ease_shell_camera`.
+    pub hero: bool,
     /// Force [`super::text::build_card_scenes`] to rebuild EVERY rim card's
     /// MSDF text on its next run, not just the ones `Changed<Card>` would
     /// catch (Slice C: that system is now dived-only — room-scale text is
@@ -217,6 +228,7 @@ impl Default for TimeWellState {
             focused: false,
             cluster_of: HashMap::new(),
             placement_pending: HashSet::new(),
+            hero: false,
             // The very first dive also needs its card text built — there is
             // no prior `arm_dive` call to have armed it (mirrors
             // `RoomState::plates_dirty`'s "fresh state starts dirty" stance).
@@ -821,6 +833,20 @@ pub fn well_keyboard(
     drift: Res<crate::ui::drift::DriftState>,
     mut room: ResMut<crate::view::room::RoomState>,
 ) {
+    // The hero pose is a look-only dead end (see `TimeWellState::hero`'s own
+    // doc): Down returns to the mouth ring's normal gate framing, Esc leaves
+    // the well entirely (the same generic zoom-out as below) — everything
+    // else is inert while parked here, since this pose frames the well as a
+    // whole, not any one ring or card.
+    if state.hero {
+        if keys.just_pressed(KeyCode::ArrowDown) {
+            state.hero = false;
+        } else if keys.just_pressed(KeyCode::Escape) {
+            room.zoomed = None;
+        }
+        return;
+    }
+
     // `0–9`: jump straight to seat `n` of the focused ring and drop into the
     // conversation (a no-op if that seat is empty).
     for (kc, n) in DIGIT_KEYS {
@@ -859,11 +885,11 @@ pub fn well_keyboard(
     // Up/Down: change the focused ring (clamp 0..N_BANDS-1), carry the position
     // onto the new ring, spin the new ring to the gate. The camera follows
     // because `ease_shell_camera` keys on `focused_ring` via `shot::WellShotInput`.
-    // Up at the mouth ring (already the shallowest) is now simply a no-op — the
-    // old speedbumped double-tap-to-Room edge (`WellEdgeBump`) is retired
-    // entirely (Slice C): the well is room furniture now, so "leave the well"
-    // is just `room.zoomed = None` (see Esc below), not a second screen to
-    // double-tap out of.
+    // Up at the mouth ring (already the shallowest — nothing to clamp INTO)
+    // rises into the hero pose instead of a dead-end no-op (`TimeWellState::hero`'s
+    // own doc). The old speedbumped double-tap-to-Room edge (`WellEdgeBump`) stays
+    // retired (Slice C): "leave the well" from anywhere in this ladder is still
+    // just `room.zoomed = None` (see Esc below), never a second screen.
     let ud = if keys.just_pressed(KeyCode::ArrowUp) {
         -1
     } else if keys.just_pressed(KeyCode::ArrowDown) {
@@ -883,6 +909,8 @@ pub fn well_keyboard(
             state.ring_rotation_target[new_ring] =
                 super::card::spin_target_to_gate(cur, pos, new_len.max(1));
             nav_changed = true;
+        } else if ud == -1 && state.focused_ring == 0 {
+            state.hero = true;
         }
     }
 
@@ -1081,13 +1109,16 @@ mod tests {
     // -- STATION_CENTER_PLACEMENT (Slice C's production placement) --
 
     #[test]
-    fn station_center_placement_shrinks_the_mouth_toward_the_table_plinth() {
-        // 500 (SPIRAL_R_MOUTH) × 0.3 ≈ 150, close to room::TABLE_PLINTH_RADIUS
-        // (145) — the first-guess target this const's own doc derives.
-        assert!(
-            (STATION_CENTER_PLACEMENT.scale - 0.3).abs() < 1e-6,
-            "scale should be the documented first guess"
-        );
+    fn station_center_placement_scale_shrinks_the_mouth_not_grows_it() {
+        // Deliberately NOT pinned to a specific value — `STATION_CENTER_SCALE`
+        // is an explicit live-tuning knob (its own doc has the retune
+        // history) and a test asserting one exact number just breaks on
+        // every retune without protecting against anything real. The actual
+        // invariant: positive (a zero/negative scale would collapse or
+        // invert the well's geometry) and shrinking the well's native
+        // ~500-unit mouth radius, not growing past it.
+        assert!(STATION_CENTER_PLACEMENT.scale > 0.0, "scale must be positive");
+        assert!(STATION_CENTER_PLACEMENT.scale < 1.0, "scale should shrink the well, not grow it");
     }
 
     #[test]
