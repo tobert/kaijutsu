@@ -93,6 +93,49 @@ pub fn extract_ngrams(text: &str, min_n: usize, max_n: usize) -> Vec<String> {
     result
 }
 
+/// Shortest sentence candidate [`split_sentences`] keeps — fragments below
+/// this carry no signal ("Yes.", "Ok then").
+pub const MIN_SENTENCE_CHARS: usize = 15;
+/// Longest sentence candidate [`split_sentences`] keeps — beyond this it's
+/// probably code or a paragraph the splitter failed to break up further.
+pub const MAX_SENTENCE_CHARS: usize = 300;
+
+/// Split `text` into deterministic sentence candidates for gist scoring.
+///
+/// Splits on `.`/`!`/`?`/newlines, trims whitespace off each piece, and keeps
+/// only candidates within `[MIN_SENTENCE_CHARS, MAX_SENTENCE_CHARS]`. Pure and
+/// synchronous — no locale/NLP sentence-boundary detection, just the cheap
+/// deterministic split the extractive gist needs.
+pub fn split_sentences(text: &str) -> Vec<String> {
+    text.split(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|s| {
+            let len = s.chars().count();
+            (MIN_SENTENCE_CHARS..=MAX_SENTENCE_CHARS).contains(&len)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Index of the sentence embedding closest (cosine similarity) to `centroid`.
+///
+/// `None` when `sentence_embeds` is empty. Ties keep the earliest index —
+/// deterministic, no dependence on sort stability elsewhere.
+pub fn best_sentence(sentence_embeds: &[&[f32]], centroid: &[f32]) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, emb) in sentence_embeds.iter().enumerate() {
+        let score = cosine_similarity(emb, centroid);
+        let replace = match best {
+            Some((_, best_score)) => score > best_score,
+            None => true,
+        };
+        if replace {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 // ============================================================================
 // Synthesis result + cache
 // ============================================================================
@@ -104,6 +147,12 @@ pub struct SynthesisResult {
     pub keywords: Vec<(String, f32)>,
     /// (block_id_short, score, preview) — most representative blocks.
     pub top_blocks: Vec<(String, f32, String)>,
+    /// Sentence-level extractive gist: the single sentence (drawn from the
+    /// top-scored blocks) closest to the context centroid, capped at 200
+    /// chars. `None` when no sentence candidate cleared the bar (e.g. every
+    /// block was one giant unbroken line) — callers fall back to
+    /// `top_blocks`' block-head preview.
+    pub gist: Option<String>,
     /// Content hash at the time of synthesis (for invalidation).
     pub content_hash: String,
 }
@@ -277,6 +326,68 @@ mod tests {
     }
 
     #[test]
+    fn test_split_sentences_basic() {
+        let text = "Hello there, this is sentence one. Is this sentence two? Yes! And a newline break\nhere is another sentence for good measure.";
+        let sentences = split_sentences(text);
+        assert!(sentences.iter().any(|s| s.starts_with("Hello there")));
+        assert!(sentences.iter().any(|s| s.starts_with("Is this sentence two")));
+        assert!(sentences.iter().any(|s| s.starts_with("here is another")));
+        // Fragments trimmed of surrounding whitespace, no leading/trailing space.
+        for s in &sentences {
+            assert_eq!(s.trim(), s);
+        }
+    }
+
+    #[test]
+    fn test_split_sentences_drops_short_fragments() {
+        // "Yes!" -> "Yes" is 3 chars, well under MIN_SENTENCE_CHARS.
+        let text = "Yes! No. Ok then.";
+        let sentences = split_sentences(text);
+        assert!(sentences.is_empty(), "all fragments too short: {sentences:?}");
+    }
+
+    #[test]
+    fn test_split_sentences_drops_overlong_fragments() {
+        let long = "a".repeat(MAX_SENTENCE_CHARS + 1);
+        let text = format!("{long}. This one is a normal-length sentence for the test.");
+        let sentences = split_sentences(&text);
+        assert!(!sentences.iter().any(|s| s.len() > MAX_SENTENCE_CHARS));
+        assert!(sentences.iter().any(|s| s.starts_with("This one is")));
+    }
+
+    #[test]
+    fn test_split_sentences_empty_input() {
+        assert!(split_sentences("").is_empty());
+        assert!(split_sentences("   ").is_empty());
+        assert!(split_sentences("...???!!!").is_empty());
+    }
+
+    #[test]
+    fn test_best_sentence_picks_closest_to_centroid() {
+        let centroid = [1.0, 0.0, 0.0];
+        let a = [1.0, 0.0, 0.0]; // identical -> score 1.0
+        let b = [0.0, 1.0, 0.0]; // orthogonal -> score 0.0
+        let c = [0.7, 0.7, 0.0]; // partial match
+        let embeds: Vec<&[f32]> = vec![&b, &c, &a];
+        assert_eq!(best_sentence(&embeds, &centroid), Some(2), "index 2 (a) is the closest match");
+    }
+
+    #[test]
+    fn test_best_sentence_empty_is_none() {
+        let centroid = [1.0, 0.0];
+        assert_eq!(best_sentence(&[], &centroid), None);
+    }
+
+    #[test]
+    fn test_best_sentence_ties_keep_earliest() {
+        let centroid = [1.0, 0.0];
+        let a = [1.0, 0.0];
+        let b = [1.0, 0.0]; // identical score to a
+        let embeds: Vec<&[f32]> = vec![&a, &b];
+        assert_eq!(best_sentence(&embeds, &centroid), Some(0), "earliest index wins a tie");
+    }
+
+    #[test]
     fn test_synthesis_cache_basic() {
         let cache = SynthesisCache::new();
         let ctx = ContextId::new();
@@ -288,6 +399,7 @@ mod tests {
             SynthesisResult {
                 keywords: vec![("test".into(), 0.9)],
                 top_blocks: vec![],
+                gist: None,
                 content_hash: "abc123".into(),
             },
         );
