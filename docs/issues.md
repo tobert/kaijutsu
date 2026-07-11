@@ -331,6 +331,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Well: dim/selection/lineage state freezes at room scale after zooming out
+  without a full room exit** (found by a kaibo review round + verified against
+  the code, 2026-07-11, time-well/room integration plan): `dim_nonfocused_rings`,
+  `highlight_selection`, and `highlight_lineage` (`time_well/scene.rs`) are all
+  registered dived-only (`run_if(well_zoomed)`, `time_well/mod.rs`) — they write
+  `WellCardMaterial.dim.x` / `TerraceRingMaterial.color.w` / `Transform.scale`
+  based on the currently focused ring and selected card. Esc-ing out of the well
+  (`room.zoomed = None`) does NOT despawn/respawn the cards or rings — that only
+  happens on a full `Screen::Room` exit/re-entry (`RoomRoot`'s teardown) — so
+  whatever dimming/selection-pop was active on the frame you zoomed out just
+  stops updating and stays visually frozen at room scale: non-focused rings/
+  cards stay dimmed, a selected card stays popped at 1.35× scale, until the next
+  dive re-triggers these systems. Confirmed no ambient-tier system resets these
+  fields (`sync_card_live_uniforms`, the one ambient system touching
+  `WellCardMaterial`, only writes `dim.y`/`dim.z`/`border` — chatter/beat/track
+  hue — never `dim.x` or `Transform.scale`). Fix shape (not yet built): move
+  these three systems to the ambient tier and give each a zoomed/unzoomed
+  branch — full brightness/base scale/no lineage-highlight when NOT zoomed,
+  today's focus-based behavior when zoomed — mirroring how `apply_well_hud_lod`
+  already needs to run ambient to react to BOTH zoom directions. Left for a
+  follow-up slice rather than reworked during sign-off.
 - **Shell: `BearingActivity(Center)` has no reader left** (found during the
   time-well/room integration plan's Slice C, 2026-07-11): `room::sync_room_glow`
   used to turn the Center bearing's accumulated chatter into the slice-A

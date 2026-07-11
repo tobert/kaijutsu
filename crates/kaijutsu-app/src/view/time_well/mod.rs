@@ -116,7 +116,12 @@ impl Plugin for TimeWellPlugin {
             .add_systems(
                 Update,
                 (
-                    scene::well_keyboard,
+                    // `.after(room_keyboard)` (kaibo review, 2026-07-11): must
+                    // observe `RoomState::zoomed` from BEFORE this system's own
+                    // Esc handler can clear it this frame, or a same-frame
+                    // Escape double-fires through both handlers and skips the
+                    // room-overview stop — see `room::room_keyboard`'s own doc.
+                    scene::well_keyboard.after(crate::view::room::room_keyboard),
                     scene::dim_nonfocused_rings,
                     scene::sync_focus_card_visibility,
                     scene::highlight_selection,

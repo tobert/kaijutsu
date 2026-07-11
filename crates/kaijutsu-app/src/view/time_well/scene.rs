@@ -525,7 +525,6 @@ pub fn placement_transform(p: &StationCenterPlacement) -> Transform {
 /// NOT test-only: a later slice's camera-shot resolver composes the well's
 /// local camera poses (today's `ease_camera_to_focused_ring` math) through
 /// this placement, so it has to be a real, callable function from the start.
-#[allow(dead_code)] // Slice C's camera-shot resolver is the first real caller
 pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3 {
     p.translation + p.rotation * (local * p.scale)
 }
@@ -747,13 +746,18 @@ pub fn arm_well(state: &mut TimeWellState, tracks: &mut super::rays::WellTracks)
 /// `patch_bay::PatchBayState::arm_text`, one field at a time rather than a
 /// single dirty bit, since the well has more per-dive state to reset).
 /// Resets `focused` (a fresh dive always starts at the ring overview, not
-/// mid-focus-on-a-card) and `placement_pending` (a stale in-flight guard from
-/// a much earlier visit shouldn't block this dive's first placement verb).
-/// Deliberately does **not** reset `ring_rotation`/`ring_rotation_target` —
-/// ring focus/position persists across zoom out/in ("resume where you left
-/// off"); resetting only one of that pair would cause a spurious spin on
-/// every dive, worse than resetting neither (a design-review correction to
-/// this plan's first pass). Also arms [`TimeWellState::card_text_dirty`] so
+/// mid-focus-on-a-card), `placement_pending` (a stale in-flight guard from
+/// a much earlier visit shouldn't block this dive's first placement verb),
+/// and `hero` (found by a kaibo review round, 2026-07-11: unlike ring
+/// position/rotation, the hero pose has no visual anchor a user would
+/// recognize as "where I left off" — leaving it set stuck every re-dive
+/// after a hero visit in the elevated establishing shot, ignoring all input
+/// but Down/Esc, until they pressed Down once to escape it). Deliberately
+/// does **not** reset `ring_rotation`/`ring_rotation_target` — ring focus/
+/// position persists across zoom out/in ("resume where you left off");
+/// resetting only one of that pair would cause a spurious spin on every
+/// dive, worse than resetting neither (a design-review correction to this
+/// plan's first pass). Also arms [`TimeWellState::card_text_dirty`] so
 /// `text::build_card_scenes` — dived-only, since room-scale card text is
 /// unreadable pixels — rebuilds every rim card's glyphs on the way in, not
 /// just the ones `Changed<Card>` would happen to catch.
@@ -761,6 +765,7 @@ pub fn arm_dive(state: &mut TimeWellState) {
     state.focused = false;
     state.placement_pending.clear();
     state.card_text_dirty = true;
+    state.hero = false;
 }
 
 /// Whether the room is currently zoomed onto the time well — the well's
@@ -1276,6 +1281,23 @@ mod tests {
         );
         assert!(state.card_text_dirty, "arm_dive must arm a card-text rebuild for the dived-only text system");
     }
+
+    #[test]
+    fn arm_dive_resets_hero_so_a_re_dive_never_starts_stuck_in_the_hero_pose() {
+        // Found by a kaibo review round, 2026-07-11: leaving a stale `hero`
+        // unset here means Esc-then-re-dive lands back in the elevated
+        // establishing shot, which ignores all input but Down/Esc, until the
+        // user presses Down once to escape it — a stuck-state bug, not a
+        // crash, but a real one. Unlike ring position/rotation, hero has no
+        // visual anchor a user would recognize as "where I left off," so
+        // every fresh dive should start OUT of it.
+        let mut state = TimeWellState::default();
+        state.hero = true;
+
+        arm_dive(&mut state);
+
+        assert!(!state.hero, "a fresh dive must never start parked in the hero pose");
+    }
 }
 
 // ============================================================================
@@ -1483,18 +1505,22 @@ pub fn billboard_cards(
         //
         // Uses the card's WORLD position (`global.translation()`), NOT its local
         // `tf.translation` — the two only coincide while this entity's ancestor
-        // chain carries an identity transform. Once reparented under the well's
-        // placement (Slice B, `IDENTITY_PLACEMENT`/`placement_transform`), local
-        // and world diverge the moment that placement stops being identity, and
-        // `cam_pos` (from the camera's `GlobalTransform`) is always world-space —
-        // mixing the two here was a real bug (`lovely-swimming-prism.md`, Slice
-        // B), invisible today only because the identity placement makes local ==
-        // world. The result is still written into the LOCAL `Transform.rotation`
-        // (that's what actually renders under the parent) — correct ONLY
-        // because the placement carries no rotation yet (identity today). If a
-        // later slice gives the placement a real rotation, re-verify this still
-        // holds — it should, since every direction below is now derived from
-        // `GlobalTransform`, but that slice should check, not assume.
+        // chain carries an identity transform. Reparented under the well's
+        // placement (Slice B), local and world diverge once that placement
+        // stops being identity, and `cam_pos` (from the camera's
+        // `GlobalTransform`) is always world-space — mixing the two here was a
+        // real bug (`lovely-swimming-prism.md`, Slice B), invisible under
+        // Slice B's own identity placement. The result is still written into
+        // the LOCAL `Transform.rotation` (what actually renders under the
+        // parent) — correct even under `STATION_CENTER_PLACEMENT`'s real
+        // rotation (Slice C, no longer identity): every direction feeding
+        // `billboard_rot` below is derived from `GlobalTransform`, so the
+        // computed world-space orientation is right regardless of the
+        // parent's rotation, and Bevy's own transform propagation composes
+        // the placement's rotation back on top of whatever local rotation
+        // gets written here. Confirmed by a kaibo review round, 2026-07-11,
+        // after this comment's first draft under-claimed the fix (said it
+        // only held for an identity placement).
         let world_pos = global.translation();
         let away = world_pos * 2.0 - cam_pos;
         let billboard_rot = Transform::from_translation(world_pos)

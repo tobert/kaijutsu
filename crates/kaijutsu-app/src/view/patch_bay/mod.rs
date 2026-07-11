@@ -425,8 +425,15 @@ impl Plugin for PatchBayPlugin {
                 Update,
                 (
                     // Dived-only input; first so a Left/Right selection lands
-                    // before the rebuild/fill it feeds.
-                    patch_bay_keyboard.run_if(patch_bay_zoomed),
+                    // before the rebuild/fill it feeds. `.after(room_keyboard)`
+                    // (kaibo review, 2026-07-11): must observe `RoomState::zoomed`
+                    // from BEFORE this system's own Esc handler can clear it this
+                    // frame, or a same-frame Escape double-fires through both
+                    // handlers and skips the room-overview stop — see
+                    // `room::room_keyboard`'s own doc for the full mechanics.
+                    patch_bay_keyboard
+                        .run_if(patch_bay_zoomed)
+                        .after(crate::view::room::room_keyboard),
                     // Ambient truth: the observed graph, its chords, the
                     // selection glow, and traffic pulses stay live at room
                     // scale AND zoomed — the chords ARE the W ambient even

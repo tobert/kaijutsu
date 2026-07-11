@@ -1412,7 +1412,18 @@ fn station_is_zoomable(station: Station) -> bool {
 /// `bearing::station_is_room_furniture` already applies to their geometry.
 /// The one thing this system still owns while zoomed is nothing at all; it
 /// simply returns, so there's no double-handling between the systems.
-fn room_keyboard(
+///
+/// **Must run before `well_keyboard`/`patch_bay_keyboard` in the same tick**
+/// (a kaibo review round, 2026-07-11, hardening what plugin registration
+/// order in `main.rs` already relied on implicitly): if a zoomed station's
+/// own Esc handler clears `RoomState::zoomed` to `None` BEFORE this system's
+/// own early-return check runs, this system would see the just-cleared
+/// `zoomed` in the SAME frame and fire ITS OWN Escape-to-Conversation branch
+/// too, skipping the room-overview stop entirely. `pub(crate)` so
+/// `time_well`/`patch_bay`'s plugins can declare `.after(room_keyboard)`
+/// explicitly instead of leaning on `main.rs`'s plugin-addition order (which
+/// is real today but easy to silently break by reordering plugins later).
+pub(crate) fn room_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut room: ResMut<RoomState>,
     mut pb_state: ResMut<patch_bay::PatchBayState>,
