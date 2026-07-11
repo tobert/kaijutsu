@@ -689,6 +689,10 @@ pub(crate) fn spawn_well_furniture(
     // Event-horizon "+N" count label: parked at the funnel center beyond the
     // deepest ring. Refreshed by `text::build_horizon_label` whenever the
     // count changes (it starts blank — nothing polled yet on first enter).
+    // Spawns `Visibility::Inherited`, but the ambient `apply_horizon_label_lod`
+    // corrects it to Hidden at room scale every frame (freeze-fix slice,
+    // 2026-07-11) — left ungated it stood as an unreadable dark chip
+    // floating over the well outside the dive (live-observed).
     let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
     let (horizon_image, horizon_panel) =
         create_msdf_panel(images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
@@ -1298,23 +1302,98 @@ mod tests {
 
         assert!(!state.hero, "a fresh dive must never start parked in the hero pose");
     }
+
+    // -- freeze-fix slice (2026-07-11): zoom-gated overlay helpers --
+
+    #[test]
+    fn ring_dim_factor_is_full_bright_everywhere_at_room_scale() {
+        // Room scale has no "focused ring" — every band, whatever
+        // `focused_ring` happens to hold, reads full brightness.
+        for band in 0..super::super::card::N_BANDS {
+            assert_eq!(
+                ring_dim_factor(false, 2, band),
+                1.0,
+                "band {band} must be full-bright when unzoomed"
+            );
+        }
+    }
+
+    #[test]
+    fn ring_dim_factor_dims_only_the_unfocused_bands_when_zoomed() {
+        let focused = 1;
+        assert_eq!(ring_dim_factor(true, focused, focused), 1.0, "the focused band stays full-bright");
+        assert_eq!(ring_dim_factor(true, focused, 0), DIM_NONFOCUSED, "a different band dims");
+        assert_eq!(ring_dim_factor(true, focused, 3), DIM_NONFOCUSED, "and another");
+    }
+
+    #[test]
+    fn effective_selection_passes_through_while_zoomed() {
+        let id = ContextId::new();
+        assert_eq!(effective_selection(true, Some(id)), Some(id), "zoomed: the real selection shows");
+        assert_eq!(effective_selection(true, None), None, "zoomed with nothing selected stays None");
+    }
+
+    #[test]
+    fn effective_selection_is_none_at_room_scale_even_with_a_persisted_selection() {
+        // The freeze this slice fixes: `state.selected` is deliberately left
+        // set across a zoom-out (so a re-dive re-pops the same card — see
+        // `arm_dive`'s own doc), but the overlays must not treat it as active
+        // while unzoomed.
+        let id = ContextId::new();
+        assert_eq!(
+            effective_selection(false, Some(id)),
+            None,
+            "a persisted selection must not leak into room-scale overlays"
+        );
+    }
+
+    #[test]
+    fn selection_scale_target_pops_only_when_selected() {
+        assert_eq!(selection_scale_target(2.0, true), 2.0 * 1.35, "selected pops by 1.35x its base");
+        assert_eq!(selection_scale_target(2.0, false), 2.0, "unselected settles at its own base scale");
+    }
 }
 
 // ============================================================================
 // PER-FRAME SYSTEMS
 // ============================================================================
 
+/// The selection the overlays should treat as active, folding the well's zoom
+/// gate into it (freeze-fix slice, 2026-07-11): at room scale (`!zoomed`)
+/// there is no selection pop/lineage highlight — `None` regardless of
+/// `state.selected`. `state.selected` itself is left untouched by every
+/// caller — it persists across the zoom so a re-dive re-pops the same card
+/// (see `arm_dive`'s own doc + tests: nav state deliberately survives a room
+/// round-trip). Shared by [`highlight_selection`] and [`highlight_lineage`].
+fn effective_selection(zoomed: bool, selected: Option<ContextId>) -> Option<ContextId> {
+    if zoomed { selected } else { None }
+}
+
+/// Target `Transform.scale` for a rim card given its *effective* selection —
+/// popped by 1.35× when selected, its own spiral base size otherwise.
+fn selection_scale_target(base: f32, is_selected: bool) -> f32 {
+    if is_selected { base * 1.35 } else { base }
+}
+
 /// Scale each card toward its spiral base size (set in `sync` from
 /// [`super::card::spiral_scale`] — full at the mouth, shrinking toward the
 /// throat), popping the selected one. The `selected` flag is written only when it
 /// flips so the selection ring rebuilds on select/deselect without re-rasterizing
 /// every frame; the scale tween itself runs every frame (eased) for a soft feel.
+///
+/// Ambient, not dived-only (freeze-fix slice, 2026-07-11): must react to a
+/// zoom-OUT too, not just zoom-in, or a card left popped/selected on the last
+/// dived frame stays frozen that way at room scale. [`effective_selection`]
+/// folds the zoom gate in — at room scale every card eases back to
+/// unselected/base-scale, while `state.selected` itself is left untouched.
 pub fn highlight_selection(
+    room: Res<crate::view::room::RoomState>,
     state: Res<TimeWellState>,
     mut cards: Query<(&mut Card, &mut Transform)>,
 ) {
+    let selected = effective_selection(well_zoomed(&room), state.selected);
     for (mut card, mut tf) in cards.iter_mut() {
-        let is_sel = Some(card.context_id) == state.selected;
+        let is_sel = Some(card.context_id) == selected;
 
         // Ring flag: write through the `Mut` only on a real change so we don't
         // trip `Changed<Card>` (the scene-rebuild trigger) every frame.
@@ -1322,12 +1401,10 @@ pub fn highlight_selection(
             card.selected = is_sel;
         }
 
-        // Target = the card's spiral base size, popped by 1.35× while selected.
         // Snap-and-hold: while easing, write the eased scale; once within
         // SETTLE_EPS snap to the exact target once, then stop writing so a static
         // selection no longer fires `Changed<Transform>` every frame.
-        let base = card.base_scale;
-        let target = if is_sel { base * 1.35 } else { base };
+        let target = selection_scale_target(card.base_scale, is_sel);
         let s = tf.scale.x;
         if (s - target).abs() > SETTLE_EPS {
             let eased = s + (target - s) * 0.25;
@@ -1346,9 +1423,18 @@ pub fn highlight_selection(
 /// [`highlight_selection`], the flag is written only when it flips, so the
 /// lineage ring rebuilds on select-change without re-rasterizing every frame.
 /// Nothing selected → no lineage.
-pub fn highlight_lineage(state: Res<TimeWellState>, mut cards: Query<&mut Card>) {
+///
+/// Ambient, not dived-only (freeze-fix slice, 2026-07-11): same reasoning as
+/// [`highlight_selection`], and shares its [`effective_selection`] helper —
+/// at room scale the lineage set is always empty, every `in_lineage` flag
+/// clears, regardless of a persisted `state.selected`.
+pub fn highlight_lineage(
+    room: Res<crate::view::room::RoomState>,
+    state: Res<TimeWellState>,
+    mut cards: Query<&mut Card>,
+) {
     use std::collections::HashSet;
-    let lineage: HashSet<ContextId> = match state.selected {
+    let lineage: HashSet<ContextId> = match effective_selection(well_zoomed(&room), state.selected) {
         Some(sel) => super::card::ancestors(sel, |id| {
             state.join.get(&id).and_then(|c| c.forked_from)
         }),
@@ -1368,6 +1454,13 @@ pub fn highlight_lineage(state: Res<TimeWellState>, mut cards: Query<&mut Card>)
 /// [`DriftState`] poll — no extra wire. Like [`highlight_lineage`], the flag is
 /// written only when it flips, so the shimmer turns on/off without re-rasterizing
 /// every card every poll. Empty staged queue → nothing shimmers.
+///
+/// Ambient, moved alongside its four siblings above (freeze-fix slice,
+/// 2026-07-11) — but deliberately carries **no zoom branch**, unlike them:
+/// [`DriftState`] is polled ungated on every screen (`ui/drift.rs`'s own
+/// plugin wiring), so a staged drift's shimmer at room scale is truthful live
+/// info, not stale frozen state, and it clears naturally the moment the next
+/// poll lands — nothing here can freeze.
 pub fn highlight_drift(drift: Res<crate::ui::drift::DriftState>, mut cards: Query<&mut Card>) {
     let drifting = super::card::drift_endpoints(&drift.staged);
     for mut card in cards.iter_mut() {
@@ -1383,16 +1476,41 @@ pub fn highlight_drift(drift: Res<crate::ui::drift::DriftState>, mut cards: Quer
 /// activity rings — is the open browser space and the selected card's detail
 /// reads off the edge HUD instead (see [`super::hud`]). Also sidesteps the
 /// blank-white empty-selection state, which only the focus card ever showed.
+///
+/// Ambient, not dived-only (freeze-fix slice, 2026-07-11): visibility now
+/// derives from BOTH `well_zoomed` and `state.focused` — belt-and-braces,
+/// since `focused` shouldn't survive an unzoom on its own, but deriving from
+/// the zoom gate too means a stale/leftover `focused` can never leak the
+/// focus card into room scale.
 pub fn sync_focus_card_visibility(
+    room: Res<crate::view::room::RoomState>,
     state: Res<TimeWellState>,
     mut card: Query<&mut Visibility, With<ReadingCard>>,
 ) {
-    let want = if state.focused {
+    let want = if well_zoomed(&room) && state.focused {
         Visibility::Inherited
     } else {
         Visibility::Hidden
     };
     if let Ok(mut vis) = card.single_mut()
+        && *vis != want
+    {
+        *vis = want;
+    }
+}
+
+/// Show/hide the [`HorizonLabel`] with the well's zoom state — mirrors
+/// [`super::hud::apply_well_hud_lod`] exactly: ambient, not dived-only, so it
+/// reacts to a zoom-OUT too, not just zoom-in. At room scale the in-world
+/// "+N" event-horizon count stands as an unreadable dark chip floating over
+/// the well (live-observed, freeze-fix slice, 2026-07-11) — hidden until the
+/// next dive. Change-guarded like every other LOD gate here.
+pub fn apply_horizon_label_lod(
+    room: Res<crate::view::room::RoomState>,
+    mut label: Query<&mut Visibility, With<HorizonLabel>>,
+) {
+    let want = if well_zoomed(&room) { Visibility::Inherited } else { Visibility::Hidden };
+    if let Ok(mut vis) = label.single_mut()
         && *vis != want
     {
         *vis = want;
@@ -1613,20 +1731,38 @@ pub fn spin_rings(
     }
 }
 
+/// Target dim factor for a ring/card at band index `band`, given the well's
+/// focus state and zoom — extracted so the room-scale/dived branch is
+/// unit-testable (freeze-fix slice, 2026-07-11). At room scale (`!zoomed`)
+/// there is no "focused ring" concept — every band reads full brightness, no
+/// dimming. Dived, the focused band is full brightness and every other band
+/// dims to [`DIM_NONFOCUSED`], same as before this slice.
+fn ring_dim_factor(zoomed: bool, focused_ring: usize, band: usize) -> f32 {
+    if !zoomed || band == focused_ring { 1.0 } else { DIM_NONFOCUSED }
+}
+
 /// Dim everything **not** on the focused ring so the focused ring pops. Eases
 /// each `TerraceRing`'s material alpha and each rim `Card`'s color-dim toward its
 /// target — full for the focused band, × [`DIM_NONFOCUSED`] otherwise — so
 /// Up/Down fades between rings. Ring alpha resets from [`TERRACE_RING_ALPHA`]
 /// each frame (no compounding). The focus [`ReadingCard`] + HUD panels are not
 /// rim `Card`s, so they're untouched and stay full brightness.
+///
+/// Ambient, not dived-only (freeze-fix slice, 2026-07-11): must react to a
+/// zoom-OUT too, not just zoom-in, or whatever dim state was live on the last
+/// dived frame stays frozen at room scale — see [`ring_dim_factor`] for the
+/// room-scale branch (everything full-bright there; there is no focused ring
+/// outside the dive).
 pub fn dim_nonfocused_rings(
     time: Res<Time>,
+    room: Res<crate::view::room::RoomState>,
     state: Res<TimeWellState>,
     mut ring_materials: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
     rings: Query<(&TerraceRing, &MeshMaterial3d<crate::shaders::TerraceRingMaterial>)>,
     mut card_materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     cards: Query<(&Card, &MeshMaterial3d<crate::shaders::WellCardMaterial>)>,
 ) {
+    let zoomed = well_zoomed(&room);
     let focused = state.focused_ring;
     let alpha = 1.0 - (-DIM_EASE_RATE * time.delta_secs()).exp();
 
@@ -1638,7 +1774,7 @@ pub fn dim_nonfocused_rings(
 
     // Rings: target = base alpha × the focus factor (reset each frame, no compound).
     for (ring, handle) in rings.iter() {
-        let factor = if ring.0 == focused { 1.0 } else { DIM_NONFOCUSED };
+        let factor = ring_dim_factor(zoomed, focused, ring.0);
         let target = TERRACE_RING_ALPHA * factor;
         let Some(cur) = ring_materials.get(&handle.0).map(|m| m.color.w) else {
             continue;
@@ -1654,11 +1790,7 @@ pub fn dim_nonfocused_rings(
 
     // Rim cards: dim the color (not alpha — the material is alpha-masked).
     for (card, handle) in cards.iter() {
-        let target = if card.data.band.index() == focused {
-            1.0
-        } else {
-            DIM_NONFOCUSED
-        };
+        let target = ring_dim_factor(zoomed, focused, card.data.band.index());
         let Some(cur) = card_materials.get(&handle.0).map(|m| m.dim.x) else {
             continue;
         };

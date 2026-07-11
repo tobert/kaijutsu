@@ -5,22 +5,26 @@
 //! thin room-owned consumer that routes events to *bearings* instead of
 //! contexts.
 //!
-//! Two live signals for slice A (everything else stays static LDR):
-//! - **beat/track events** ([`ServerEvent::BeatSync`]) → the **East** tracks
-//!   bearing, so a jam warms the tracks marker. The rhythmic *breathing* on
-//!   top of this comes from the well's beat phasors
-//!   ([`super::super::time_well::live::WellBeats::global_envelope`]) read
-//!   directly by the glow system — this decaying level is the sustained "a
-//!   track is rolling" warmth under the pulse.
-//! - **context chatter** (block inserts / text ops / status) → the **Center**
-//!   console, so the well emblem glows when contexts are talking (the optional
-//!   console-chatter tell in the brief).
+//! One live signal today: **beat/track events** ([`ServerEvent::BeatSync`]) →
+//! the **East** tracks bearing, so a jam warms the tracks marker. The
+//! rhythmic *breathing* on top of this comes from the well's beat phasors
+//! ([`super::super::time_well::live::WellBeats::global_envelope`]) read
+//! directly by the glow system — this decaying level is the sustained "a
+//! track is rolling" warmth under the pulse.
+//!
+//! Slice A also routed context chatter (block inserts / text ops / status) to
+//! a **Center** console bearing, warming the slice-A `ConsoleEmblem`
+//! placeholder. That placeholder — and the glow branch reading it — is gone
+//! now that the real time well stands at the console bearing with its own
+//! (richer) energy model, so [`event_bearing`] dropped the Center mapping
+//! entirely (freeze-fix slice, 2026-07-11) rather than keep accumulating
+//! activity nothing reads. [`Bearing::Center`] itself stays — room geometry
+//! still uses it — only this event mapping stopped feeding it.
 //!
 //! The math is pure and unit-tested; only [`event_bearing`] touches client
 //! types. The Bevy ingest + glow live in [`super`].
 
 use kaijutsu_client::ServerEvent;
-use kaijutsu_types::Status;
 
 use super::bearing::Bearing;
 
@@ -79,26 +83,23 @@ impl BearingActivity {
 }
 
 /// Map a kernel event to `(bearing, weight)`, or `None` for events that aren't
-/// room-ambient signal. Beat syncs are the tracks bearing (a clock is rolling);
-/// block activity is the console (contexts talking). Weights mirror the well's
-/// [`super::super::time_well::activity::event_signal`] so the two ambiences
-/// agree on what "loud" means.
+/// room-ambient signal. Only beat syncs feed room-ambient activity today (the
+/// tracks/East bearing — a clock is rolling).
+///
+/// Block/chatter events are deliberately NOT mapped here (freeze-fix slice,
+/// 2026-07-11): they used to warm a `Center` bearing for the slice-A
+/// `ConsoleEmblem` placeholder, but that placeholder — and the glow branch
+/// reading it — is gone now that the real time well stands at the console
+/// bearing with its own richer chatter/energy model
+/// ([`super::super::time_well::activity::event_signal`] → per-context
+/// ripples + global energy, a model this mapping never had). Dropped the
+/// Center arms rather than leave them accumulating into a resource with no
+/// reader (`docs/issues.md`'s now-resolved "`BearingActivity(Center)` has no
+/// reader left" entry). [`Bearing::Center`] itself stays (room geometry still
+/// uses it) — only this event mapping stops feeding it.
 pub fn event_bearing(ev: &ServerEvent) -> Option<(Bearing, f32)> {
     match ev {
         ServerEvent::BeatSync { .. } => Some((Bearing::East, 1.0)),
-        ServerEvent::BlockTextOps { .. } => Some((Bearing::Center, 1.0)),
-        ServerEvent::BlockInserted { .. } => Some((Bearing::Center, 0.8)),
-        ServerEvent::BlockOutputChanged { .. } => Some((Bearing::Center, 0.6)),
-        ServerEvent::BlockStatusChanged { status, .. } => {
-            let w = match status {
-                Status::Running => 0.5,
-                Status::Error => 0.9,
-                _ => 0.2,
-            };
-            Some((Bearing::Center, w))
-        }
-        ServerEvent::BlockMetadataChanged { .. } => Some((Bearing::Center, 0.25)),
-        ServerEvent::BlockMoved { .. } => Some((Bearing::Center, 0.2)),
         _ => None,
     }
 }
@@ -107,7 +108,7 @@ pub fn event_bearing(ev: &ServerEvent) -> Option<(Bearing, f32)> {
 mod tests {
     use super::*;
     use kaijutsu_crdt::BlockId;
-    use kaijutsu_types::{ContextId, PrincipalId};
+    use kaijutsu_types::{ContextId, PrincipalId, Status};
 
     fn ctx(n: u8) -> ContextId {
         ContextId::from_bytes([n; 16])
@@ -170,7 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn block_chatter_lands_on_the_center_console() {
+    fn block_inserts_are_no_longer_room_ambient_signal() {
+        // Freeze-fix slice, 2026-07-11: block/chatter events used to warm the
+        // Center bearing for the retired `ConsoleEmblem` placeholder. The
+        // real time well now owns chatter/energy entirely through its own
+        // richer model — this locks in the drop so a future edit doesn't
+        // quietly resurrect a write with no reader (`docs/issues.md`'s
+        // now-resolved "`BearingActivity(Center)` has no reader left" entry).
         let block = kaijutsu_types::BlockSnapshot::text(
             BlockId::new(ctx(1), PrincipalId::nil(), 0),
             None,
@@ -182,12 +189,11 @@ mod tests {
             block: Box::new(block),
             ops: vec![],
         };
-        let (b, _) = event_bearing(&ev).expect("a block insert is chatter");
-        assert_eq!(b, Bearing::Center, "contexts talking glow the console");
+        assert!(event_bearing(&ev).is_none(), "block inserts no longer feed room-ambient activity");
     }
 
     #[test]
-    fn error_status_weighs_more_than_a_plain_flip() {
+    fn block_status_changes_are_no_longer_room_ambient_signal() {
         let bid = BlockId::new(ctx(1), PrincipalId::nil(), 0);
         let err = ServerEvent::BlockStatusChanged {
             context_id: ctx(1),
@@ -199,8 +205,7 @@ mod tests {
             block_id: bid,
             status: Status::Done,
         };
-        let (_, ew) = event_bearing(&err).unwrap();
-        let (_, dw) = event_bearing(&done).unwrap();
-        assert!(ew > dw, "an error is louder than a quiet completion");
+        assert!(event_bearing(&err).is_none(), "not even an error status feeds room-ambient activity");
+        assert!(event_bearing(&done).is_none());
     }
 }
