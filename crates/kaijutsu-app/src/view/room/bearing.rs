@@ -687,14 +687,28 @@ mod tests {
 
     // ── station-furniture gate ──
 
+    /// Expected `station_is_room_furniture` result, one row per station — see
+    /// `room/mod.rs`'s `EXPECTED_ZOOMABLE` for why this is a table to append
+    /// a row to, not a boolean expression two concurrent lanes would both
+    /// need to edit (restructured 2026-07-11, time-well/room integration
+    /// plan, ahead of the parallel Tracker lane).
+    const EXPECTED_ROOM_FURNITURE: &[(Station, bool)] = &[
+        (Station::TimeWell, false),
+        (Station::PatchBay, true),
+        (Station::Tracks, false),
+        (Station::Vfs, false),
+        (Station::Radiators, false),
+    ];
+
     #[test]
-    fn only_patch_bay_is_room_furniture_today() {
-        for s in Station::ALL {
-            assert_eq!(
-                station_is_room_furniture(s),
-                s == Station::PatchBay,
-                "{s:?}: only the wheel stands as its own furniture today"
-            );
+    fn room_furniture_stations_match_the_expected_table() {
+        assert_eq!(
+            EXPECTED_ROOM_FURNITURE.len(),
+            Station::ALL.len(),
+            "every station needs a row in EXPECTED_ROOM_FURNITURE"
+        );
+        for (s, expected) in EXPECTED_ROOM_FURNITURE {
+            assert_eq!(station_is_room_furniture(*s), *expected, "{s:?}: room-furniture mismatch");
         }
     }
 

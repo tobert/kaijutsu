@@ -76,6 +76,7 @@
 pub mod activity;
 pub mod bearing;
 pub mod nav;
+mod shot;
 
 use std::time::Instant;
 
@@ -122,8 +123,8 @@ const FLOOR_RINGS: usize = 14;
 const FLOOR_SEGMENTS: usize = 64;
 
 /// Enclosing vault-dome radius. Must exceed **every** camera distance (the
-/// pulled-back overview sits ~2093 out, since `OVERVIEW_POS` was pulled back
-/// alongside the 2026-07-10 evening apothem bump) so the camera stays
+/// pulled-back overview sits ~2093 out, since `shot::OVERVIEW_POS` was pulled
+/// back alongside the 2026-07-10 evening apothem bump) so the camera stays
 /// *inside* the dome and its far inner surface reads as the vault; the lower
 /// hemisphere hides under the floor disc.
 const DOME_RADIUS: f32 = 2600.0;
@@ -176,11 +177,8 @@ pub(crate) const PLATE_FONT_SIZE: f32 = 30.0;
 /// (concept 06's signage grammar: plates over the stations, furniture below;
 /// also clears the W approach's sight line to the patch-bay table).
 const PLATE_HEIGHT: f32 = 200.0;
-/// Where the approach pose *looks* (world-Y at the wall): furniture height,
-/// not plate height — the station's instrument is the subject, the plate
-/// hangs above it in frame (the W-approach used to aim at the plate and crop
-/// the table's bottom out of the shot).
-const APPROACH_LOOK_HEIGHT: f32 = 130.0;
+// `APPROACH_LOOK_HEIGHT` (where the approach pose *looks*, world-Y at the
+// wall) moved to `shot.rs` — pure camera framing, no longer read here.
 
 // ── Console emblem (gold — the well's reserved hue) ──────────────────────────
 
@@ -369,33 +367,14 @@ const PLATE_BORDER_FOCUSED: Vec4 = Vec4::new(0.85, 0.65, 0.25, 1.0);
 const PLATE_ACCENT: Vec4 = Vec4::new(0.075, 0.085, 0.125, 1.0);
 
 // ── Camera (travel by intent — the well's tween idiom) ───────────────────────
+//
+// The pose math itself (approach-pose eye radius/height, the console
+// overview position, the fullscreen-panel geometry) moved to `shot.rs`
+// (2026-07-11, Slice A of the time-well/room integration — a pure
+// `RoomShot`/`resolve` table, unit-tested there instead of here). This
+// section keeps only what's still genuinely `ease_shell_camera`'s own: the
+// tween rate.
 
-/// Approach-pose eye radius: how far out from center the camera stands when
-/// facing a wall station — between the console and the wall, on the SAME
-/// side as the focus ("walk toward the station you're studying", not sit
-/// across the room staring back through the console and the diametrically
-/// opposite pylon — the occlusion bug this constant fixes). Roughly a
-/// quarter of the wall radius the markers actually stand at (`ROOM_RADIUS`).
-const ROOM_CAM_APPROACH_R: f32 = 160.0;
-/// Approach-pose eye height — the old orbit camera's focused-pose lift,
-/// carried over unchanged (a comfortable "person standing" height).
-const ROOM_CAM_APPROACH_HEIGHT: f32 = 260.0;
-/// The console (TimeWell) overview pose — pulled back from the south, framing
-/// the *whole* room so every bearing's ambient glow reads at once (the tracks
-/// (E) marker must breathe here without diving — the slice-A acceptance).
-/// Lowered 2026-07-10 from the original (0, 640, 1500) high shot toward the
-/// concepts' human-eye framing (06 stands *in* the room, not above it): the
-/// table + ring stack sit mid-frame with the stations standing around them.
-///
-/// Pulled back again the same evening (340,1380 → 420,2050) alongside the
-/// apothem bump (800 → 1200): the octagon itself grew, so the overview has to
-/// stand farther out to keep the *whole* shell in frame from outside it (the
-/// cutaway rule needs the camera outside the octagon for this pose — see
-/// `docs/scenes/shell.md`'s cutaway paragraph). Framing is still an eyeball
-/// call, not a solved layout — **Amy-tunable**, flagged for the lead's live
-/// tune once the bigger room is on screen.
-const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 420.0, 2050.0);
-const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 90.0, 0.0);
 /// Camera follow rate (exponential smoothing) — matches the well's weighty
 /// glide so the shell and the well feel like one instrument.
 const CAMERA_EASE_RATE: f32 = 4.0;
@@ -592,7 +571,7 @@ fn enter_room(
     if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
         commands.entity(cam_entity).insert(RoomCamera);
         cam.clear_color = ClearColorConfig::Custom(ROOM_BG);
-        let (pos, look) = desired_camera(room.carousel.focused_station());
+        let (pos, look) = shot::resolve(shot::RoomShot::focused(room.carousel.focused_station()));
         *tf = Transform::from_translation(pos).looking_at(look, Vec3::Y);
     }
 
@@ -1520,10 +1499,12 @@ fn room_focus_visuals(
 /// exponentially-smoothed tween as the well's `ease_camera_to_focused_ring`
 /// (no cuts). Reads the target from [`RoomState::zoomed`] now, not a second
 /// `Screen` (2026-07-10 evening, the fullscreen-panel pivot): at room scale it
-/// faces the focused station's bearing ([`desired_camera`]); zoomed, it fills
-/// the frame with that station's panel ([`fullscreen_pose`]). One system, one
-/// camera — diving and surfacing are the SAME continuous glide, just
-/// retargeted the frame `zoomed` flips (no snap either way).
+/// faces the focused station's bearing ([`shot::RoomShot::focused`]); zoomed,
+/// it fills the frame with that station's panel ([`shot::RoomShot::Fullscreen`]).
+/// One system, one camera — diving and surfacing are the SAME continuous
+/// glide, just retargeted the frame `zoomed` flips (no snap either way). The
+/// "what pose do we want" question is [`shot::resolve`]'s job (2026-07-11,
+/// Slice A); this system only owns the ease itself.
 fn ease_shell_camera(
     time: Res<Time>,
     room: Res<RoomState>,
@@ -1532,18 +1513,11 @@ fn ease_shell_camera(
     let Ok(mut tf) = cam.single_mut() else {
         return;
     };
-    let (pos, look) = match room.zoomed {
-        Some(station) => {
-            let dir = bearing::focus_dir(station)
-                .expect("a zoomable station always has a wall bearing to fill the frame with");
-            // Every panel shares the same vertical center (`WALL_HEIGHT * 0.5`
-            // — `palette::STATION_W_MOUNT_Y` is this same number, named for
-            // the wheel's own placement contract); a future second zoomable
-            // station reads this general height too, not a station-specific one.
-            fullscreen_pose(Vec3::from_array(dir), WALL_HEIGHT * 0.5)
-        }
-        None => desired_camera(room.carousel.focused_station()),
+    let want = match room.zoomed {
+        Some(station) => shot::RoomShot::Fullscreen(station),
+        None => shot::RoomShot::focused(room.carousel.focused_station()),
     };
+    let (pos, look) = shot::resolve(want);
     let desired = Transform::from_translation(pos).looking_at(look, Vec3::Y);
     let alpha = 1.0 - (-CAMERA_EASE_RATE * time.delta_secs()).exp();
     tf.translation = tf.translation.lerp(desired.translation, alpha);
@@ -1625,84 +1599,6 @@ fn sync_room_glow(
     for handle in console.iter() {
         set_glow(&mut mats, &handle.0, c_target);
     }
-}
-
-// ── Camera pose helper ────────────────────────────────────────────────────────
-
-/// The desired `(position, look-at)` for the room camera facing `station` —
-/// overview for the console; for a wall station, an **approach** pose: the
-/// camera stands on the same side of the room as the focus, between the
-/// console and the wall, looking outward at the station's marker/nameplate.
-/// Never sits on the opposite wall staring back through the console and the
-/// diametrically opposite pylon — both used to sit *in front of* the camera,
-/// fully occluding the focused station (the bug this pose replaces).
-///
-/// Two documented per-station exceptions retarget the look point away from
-/// the default marker radius/height (`ROOM_RADIUS`, `APPROACH_LOOK_HEIGHT`):
-/// - `Radiators` (2026-07-10): its NE panel is now the octagon wall shell's
-///   own diagonal face, standing at [`palette::WALL_APOTHEM`] — well past
-///   the old free-floating radiator radius (660) this look-point used to
-///   target. Left at `ROOM_RADIUS` (620) the camera would look at empty air
-///   short of the wall.
-/// - `PatchBay` (2026-07-10, the wall-mount retune): the wheel itself moved
-///   from a floor dais to the W wall panel, at [`palette::WALL_APOTHEM`] and
-///   [`palette::STATION_W_MOUNT_Y`] (280, the panel's vertical center) — the
-///   approach now has to rise to meet it, not look at furniture height on
-///   the floor.
-///
-/// Every other wall station's look point is untouched.
-fn desired_camera(station: Station) -> (Vec3, Vec3) {
-    match bearing::focus_dir(station) {
-        None => (OVERVIEW_POS, OVERVIEW_LOOK),
-        Some(d) => {
-            let (wall_r, look_h) = match station {
-                Station::Radiators => (palette::WALL_APOTHEM, APPROACH_LOOK_HEIGHT),
-                Station::PatchBay => (palette::WALL_APOTHEM, palette::STATION_W_MOUNT_Y),
-                _ => (ROOM_RADIUS, APPROACH_LOOK_HEIGHT),
-            };
-            (
-                Vec3::from_array(bearing::approach_camera(
-                    d,
-                    ROOM_CAM_APPROACH_R,
-                    ROOM_CAM_APPROACH_HEIGHT,
-                )),
-                Vec3::from_array(bearing::approach_look(d, wall_r, look_h)),
-            )
-        }
-    }
-}
-
-/// The camera's vertical field of view — mirrors `main::setup_camera`'s
-/// `Camera3d::default()` projection (Bevy's own `PerspectiveProjection`
-/// default, `fov: PI / 4.0`). [`fullscreen_pose`] derives its standoff
-/// distance from this; if the app camera's FOV ever changes, this constant
-/// must follow it or the fullscreen pose stops framing a panel edge-to-edge.
-/// `fullscreen_pose_fills_the_frame_with_the_panel_height` locks the
-/// relationship instead of trusting two hand-written copies to agree.
-const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
-
-/// The room-space `(eye, look-at)` that fills the camera's vertical frustum
-/// with exactly one wall panel — "diving IS fullscreening a panel" (Amy,
-/// 2026-07-10 evening). `bearing_dir` is the panel's bearing (unit XZ,
-/// pointing from center OUT to the wall, e.g. [`bearing::Bearing::West`]'s);
-/// `mount_y` is the panel's own vertical center (every panel shares
-/// `WALL_HEIGHT * 0.5` — see `ease_shell_camera`'s call site).
-///
-/// The eye stands on the panel's inward normal — i.e. back toward center,
-/// along `-bearing_dir` — at the pinhole distance `d` that makes the panel's
-/// full height exactly subtend the frustum: the standard "fit height in
-/// frame" relation `tan(FOV_Y / 2) = (height / 2) / d`, solved for `d`. Pure;
-/// unit-tested against that formula, against standing inside the octagon
-/// (not through the wall), and against looking at the panel's own center.
-fn fullscreen_pose(bearing_dir: Vec3, mount_y: f32) -> (Vec3, Vec3) {
-    let d = (WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
-    let panel = Vec3::new(
-        bearing_dir.x * palette::WALL_APOTHEM,
-        mount_y,
-        bearing_dir.z * palette::WALL_APOTHEM,
-    );
-    let eye = panel - bearing_dir * d;
-    (eye, panel)
 }
 
 // ── Material + colour helpers ──────────────────────────────────────────────────
@@ -1966,14 +1862,33 @@ mod tests {
     // -- station_is_zoomable / RoomState::zoomed (2026-07-10 evening,
     //    the fullscreen-panel pivot: `zoomed` replaces `Screen::PatchBay`) --
 
+    /// Expected `station_is_zoomable` result, one row per station — a table
+    /// to APPEND a row to (not restructure a boolean expression) as new
+    /// stations earn a fullscreen zoom. Restructured 2026-07-11 (time-well/
+    /// room integration plan, ahead of the parallel Tracker lane) from a
+    /// single `s == Station::PatchBay` comparison specifically because two
+    /// concurrent lanes were both about to need to edit that same expression
+    /// (TimeWell for this lane, Tracks for the Tracker lane) — a shared
+    /// boolean expression is a merge-conflict magnet; a table both lanes add
+    /// a line to is not. `Station::ALL.len()` guard below catches a station
+    /// added to the enum without a row here.
+    const EXPECTED_ZOOMABLE: &[(Station, bool)] = &[
+        (Station::TimeWell, false),
+        (Station::PatchBay, true),
+        (Station::Tracks, false),
+        (Station::Vfs, false),
+        (Station::Radiators, false),
+    ];
+
     #[test]
-    fn only_patch_bay_is_zoomable_today() {
-        for s in Station::ALL {
-            assert_eq!(
-                station_is_zoomable(s),
-                s == Station::PatchBay,
-                "{s:?}: only the wheel earns a fullscreen zoom today"
-            );
+    fn zoomable_stations_match_the_expected_table() {
+        assert_eq!(
+            EXPECTED_ZOOMABLE.len(),
+            Station::ALL.len(),
+            "every station needs a row in EXPECTED_ZOOMABLE"
+        );
+        for (s, expected) in EXPECTED_ZOOMABLE {
+            assert_eq!(station_is_zoomable(*s), *expected, "{s:?}: zoomable mismatch");
         }
     }
 
@@ -1998,40 +1913,8 @@ mod tests {
         assert_eq!(room.plates_dirty, plates_dirty_before, "zooming never touches plates_dirty");
     }
 
-    // -- fullscreen_pose (the "diving IS fullscreening a panel" math) --
-
-    #[test]
-    fn fullscreen_pose_stands_the_pinhole_distance_back_from_the_panel() {
-        let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (eye, look) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
-        let d = (WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
-        assert!(
-            ((look - eye).length() - d).abs() < 1e-3,
-            "eye should stand exactly d={d} back from the panel, got {}",
-            (look - eye).length()
-        );
-        assert!((look.y - palette::STATION_W_MOUNT_Y).abs() < 1e-5, "looks at the given mount height");
-    }
-
-    #[test]
-    fn fullscreen_pose_looks_squarely_at_the_panel_center() {
-        let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (_, look) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
-        let look_r = look.x * dir.x + look.z * dir.z;
-        assert!(
-            (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
-            "look point should sit exactly on the wall apothem: {look_r}"
-        );
-    }
-
-    #[test]
-    fn fullscreen_pose_stands_inside_the_octagon_not_through_the_wall() {
-        let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (eye, _) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
-        let eye_r = eye.x * dir.x + eye.z * dir.z;
-        assert!(eye_r > 0.0, "eye stands on the room side of center: {eye_r}");
-        assert!(eye_r < palette::WALL_APOTHEM, "eye stands short of the wall, inside the octagon: {eye_r}");
-    }
+    // -- fullscreen_pose / desired_camera math moved to `shot.rs`'s own test
+    //    module (2026-07-11, Slice A of the time-well/room integration) --
 
     // -- exit_room lifecycle (2026-07-10 evening: unconditional, no more
     //    `Screen::PatchBay` branch to get wrong) --
@@ -2086,106 +1969,12 @@ mod tests {
     }
 
     #[test]
-    fn desired_camera_frames_console_from_the_overview() {
-        let (pos, look) = desired_camera(Station::TimeWell);
-        assert_eq!(pos, OVERVIEW_POS);
-        assert_eq!(look, OVERVIEW_LOOK);
-    }
-
-    #[test]
-    fn desired_camera_approaches_the_tracks_wall_from_the_same_side() {
-        // Tracks is East (+X). The camera now stands on the SAME side as the
-        // focus — walking toward the station, not sitting on the opposite
-        // wall staring back through the console and the (occluding) west
-        // pylon.
-        let (pos, look) = desired_camera(Station::Tracks);
-        assert!(pos.x > 0.0, "camera stands on the same (east) side: {pos:?}");
-        assert!(pos.x < ROOM_RADIUS, "the eye stops well short of the wall: {pos:?}");
-        assert!(look.x > pos.x, "looks further east, out toward the wall: {look:?}");
-        assert_eq!(pos.y, ROOM_CAM_APPROACH_HEIGHT);
-    }
-
-    #[test]
-    fn every_wall_station_approach_clears_the_console_with_the_look_point_farther_out() {
-        // The core of the fix: eye and look both sit on the focus side, past
-        // the console keep-out, with the look point farther out than the eye
-        // — the console can never fall in the sight line between them (the
-        // occlusion bug this pose replaces).
-        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
-            let (pos, look) = desired_camera(s);
-            let d = bearing::focus_dir(s).expect("wall station has a bearing");
-            let eye_r = pos.x * d[0] + pos.z * d[2];
-            let look_r = look.x * d[0] + look.z * d[2];
-            assert!(eye_r > KEEPOUT_RADIUS, "{s:?} eye clears the console keep-out: {eye_r}");
-            assert!(look_r > eye_r, "{s:?} look point sits farther out than the eye: eye={eye_r} look={look_r}");
-        }
-    }
-
-    #[test]
-    fn radiators_and_patch_bay_focus_look_at_the_wall_apothem_not_the_room_radius() {
-        // Two documented exceptions read WALL_APOTHEM instead of ROOM_RADIUS:
-        // Radiators (2026-07-10, the NE panel is the octagon shell's own
-        // diagonal wall face, not the old free-floating slab at 660) and
-        // PatchBay (2026-07-10, the wall-mount retune: the wheel itself
-        // moved from a floor dais to the wall panel). Every OTHER wall
-        // station's look point must be untouched.
-        for s in [Station::Radiators, Station::PatchBay] {
-            let (_, look) = desired_camera(s);
-            let d = bearing::focus_dir(s).unwrap();
-            let look_r = look.x * d[0] + look.z * d[2];
-            assert!(
-                (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
-                "{s:?} should look at the wall apothem: {look_r}"
-            );
-        }
-        for s in [Station::Tracks, Station::Vfs] {
-            let (_, look) = desired_camera(s);
-            let d = bearing::focus_dir(s).unwrap();
-            let look_r = look.x * d[0] + look.z * d[2];
-            assert!(
-                (look_r - ROOM_RADIUS).abs() < 1e-3,
-                "{s:?} should still look at the unchanged marker radius: {look_r}"
-            );
-        }
-    }
-
-    #[test]
-    fn patch_bay_focus_looks_at_the_mounted_wheel_height_not_furniture_height() {
-        // The second half of the PatchBay exception: the look point's height
-        // rises to the wall-mounted wheel's own center
-        // (`palette::STATION_W_MOUNT_Y`, 280), not the floor-furniture height
-        // every other wall station's look point uses (`APPROACH_LOOK_HEIGHT`).
-        let (_, look) = desired_camera(Station::PatchBay);
-        assert!(
-            (look.y - palette::STATION_W_MOUNT_Y).abs() < 1e-3,
-            "PatchBay should look at the mounted wheel's own height: {}",
-            look.y
-        );
-        let (_, tracks_look) = desired_camera(Station::Tracks);
-        assert_eq!(tracks_look.y, APPROACH_LOOK_HEIGHT, "other stations are unaffected");
-    }
-
-    #[test]
     fn reserved_marker_height_is_a_low_stub_a_third_of_a_station_pylon() {
         assert!(
             (MARKER_HEIGHT_RESERVED - MARKER_HEIGHT / 3.0).abs() < 1e-4,
             "reserved marker is roughly a third the height of a built station's pylon"
         );
         assert!(MARKER_HEIGHT_RESERVED < MARKER_HEIGHT, "still shorter than a station pylon");
-    }
-
-    #[test]
-    fn every_camera_pose_stays_inside_the_vault_dome() {
-        // Outside the dome the camera would face its near inner wall, occluding
-        // the room. Every focus (overview + each bearing) must orbit within it.
-        for s in Station::ALL {
-            let (pos, _) = desired_camera(s);
-            assert!(
-                pos.length() < DOME_RADIUS,
-                "{s:?} camera at {} escapes the dome ({DOME_RADIUS})",
-                pos.length()
-            );
-        }
     }
 
     // ── circuit-board routes (real production config) ──
