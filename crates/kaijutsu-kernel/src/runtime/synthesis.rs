@@ -5,9 +5,30 @@
 
 use std::sync::Arc;
 
-use kaijutsu_index::synthesis::{SynthesisCache, SynthesisResult, centroid, cosine_similarity, extract_ngrams};
+use kaijutsu_index::synthesis::{
+    SynthesisCache, SynthesisResult, best_sentence, centroid, cosine_similarity, extract_ngrams,
+    split_sentences,
+};
 use kaijutsu_index::{BlockSource, Embedder};
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{BlockSnapshot, ContextId};
+
+/// How many of the top-scored blocks feed the block-head `top_blocks` preview
+/// (unchanged from before the gist landed — the card face's fresher line is
+/// the sentence-level `gist` below, this stays the coarse fallback).
+const TOP_BLOCKS_FOR_PREVIEW: usize = 3;
+
+/// How many of the top-scored blocks contribute *sentence* candidates to the
+/// gist — wider net than the 3-block preview since a good sentence can live
+/// in the 4th- or 5th-best block even when that block isn't the single best
+/// match as a whole.
+const GIST_TOP_BLOCKS: usize = 5;
+
+/// Hard cap on sentence candidates sent to the embedder in one batch — bounds
+/// embed cost regardless of how verbose the top-5 blocks are.
+const GIST_MAX_CANDIDATES: usize = 64;
+
+/// Max stored gist length (chars, not bytes — see `chars().take` below).
+const GIST_MAX_CHARS: usize = 200;
 
 /// Run synthesis for a context: extract keywords and representative blocks.
 ///
@@ -51,17 +72,19 @@ pub fn run_synthesis(
     let embed_refs: Vec<&[f32]> = embeds.iter().map(|v| v.as_slice()).collect();
     let doc = centroid(&embed_refs);
 
-    // 4. Score blocks by cosine similarity to centroid, take top 3
+    // 4. Score blocks by cosine similarity to centroid, best-first. Kept
+    // un-truncated here so the gist (step 4b) can draw sentence candidates
+    // from a wider top-K than the 3-block preview below.
     let mut scored_blocks: Vec<(usize, f32)> = embeds
         .iter()
         .enumerate()
         .map(|(i, emb)| (i, cosine_similarity(emb, &doc)))
         .collect();
     scored_blocks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored_blocks.truncate(3);
 
     let top_blocks: Vec<(String, f32, String)> = scored_blocks
         .iter()
+        .take(TOP_BLOCKS_FOR_PREVIEW)
         .map(|(i, score)| {
             let snap = &text_blocks[*i];
             let preview = if snap.content.len() > 80 {
@@ -73,6 +96,11 @@ pub fn run_synthesis(
         })
         .collect();
 
+    // 4b. Sentence-level gist: extractive (the embedder can't generate prose),
+    // scored the same way as everything else here — cosine similarity to the
+    // doc centroid, just at sentence granularity instead of block granularity.
+    let gist = compute_gist(&scored_blocks, &text_blocks, &doc, embedder.as_ref());
+
     // 5. Extract ngram candidates, cap at 50
     let all_text: String = texts.join(" ");
     let mut candidates = extract_ngrams(&all_text, 1, 3);
@@ -82,6 +110,7 @@ pub fn run_synthesis(
         return Some(SynthesisResult {
             keywords: Vec::new(),
             top_blocks,
+            gist,
             content_hash: String::new(),
         });
     }
@@ -94,6 +123,7 @@ pub fn run_synthesis(
             return Some(SynthesisResult {
                 keywords: Vec::new(),
                 top_blocks,
+                gist,
                 content_hash: String::new(),
             });
         }
@@ -112,13 +142,57 @@ pub fn run_synthesis(
         ctx = %ctx_id.short(),
         keywords = scored_kw.len(),
         blocks = top_blocks.len(),
+        gist = gist.is_some(),
         "synthesis complete"
     );
 
     Some(SynthesisResult {
         keywords: scored_kw,
         top_blocks,
+        gist,
         content_hash: String::new(),
+    })
+}
+
+/// Sentence-level extractive gist: split the top-`GIST_TOP_BLOCKS` scored
+/// blocks' content into sentence candidates (capped at `GIST_MAX_CANDIDATES`
+/// total to bound embed cost), embed them in one batch with the same
+/// embedder, and keep the sentence closest to `doc_centroid`.
+///
+/// `None` on any soft failure — no sentence candidates, or the embed batch
+/// didn't come back the right shape — callers fall back to the block-head
+/// `top_blocks` preview.
+fn compute_gist(
+    scored_blocks: &[(usize, f32)],
+    text_blocks: &[BlockSnapshot],
+    doc_centroid: &[f32],
+    embedder: &dyn Embedder,
+) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    'blocks: for (i, _) in scored_blocks.iter().take(GIST_TOP_BLOCKS) {
+        for sentence in split_sentences(&text_blocks[*i].content) {
+            candidates.push(sentence);
+            if candidates.len() >= GIST_MAX_CANDIDATES {
+                break 'blocks;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let cand_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+    let embeds = match embedder.embed_batch(&cand_refs) {
+        Ok(e) if e.len() == candidates.len() => e,
+        _ => return None,
+    };
+    let embed_refs: Vec<&[f32]> = embeds.iter().map(|v| v.as_slice()).collect();
+    let winner = best_sentence(&embed_refs, doc_centroid)?;
+    let sentence = &candidates[winner];
+    Some(if sentence.chars().count() > GIST_MAX_CHARS {
+        sentence.chars().take(GIST_MAX_CHARS).collect()
+    } else {
+        sentence.clone()
     })
 }
 
@@ -273,6 +347,61 @@ mod tests {
         assert_eq!(result.top_blocks.len(), 1);
         // Self-similarity should be ~1.0
         assert!(result.top_blocks[0].1 > 0.9);
+    }
+
+    #[test]
+    fn test_synthesis_includes_gist() {
+        let ctx = ContextId::new();
+        let blocks = vec![
+            make_block(
+                ctx,
+                1,
+                "This is the first sentence of the block. Here is a second sentence with different words.",
+            ),
+            make_block(
+                ctx,
+                2,
+                "A completely unrelated block about neural networks and machine learning models.",
+            ),
+        ];
+        let embedder = Arc::new(MockEmbedder { dims: 32 });
+        let source = Arc::new(MockBlockSource::with_blocks(blocks));
+
+        let result = run_synthesis(ctx, embedder, source).unwrap();
+        let gist = result.gist.expect("sentence-worthy content should yield a gist");
+        assert!(gist.chars().count() <= GIST_MAX_CHARS);
+        assert!(!gist.is_empty());
+    }
+
+    #[test]
+    fn test_synthesis_gist_none_without_sentence_candidates() {
+        let ctx = ContextId::new();
+        // Long enough to pass the block-length filter (> 10 chars) but every
+        // "." fragment is under MIN_SENTENCE_CHARS once split.
+        let blocks = vec![make_block(ctx, 1, "Hi. Ok. Go. Now. Yes. No. Sure. Meh.")];
+        let embedder = Arc::new(MockEmbedder { dims: 32 });
+        let source = Arc::new(MockBlockSource::with_blocks(blocks));
+
+        let result = run_synthesis(ctx, embedder, source).unwrap();
+        assert!(result.gist.is_none(), "no fragment clears MIN_SENTENCE_CHARS: {:?}", result.gist);
+    }
+
+    #[test]
+    fn test_compute_gist_caps_at_200_chars() {
+        // Direct unit test (not through the full pipeline) so the single
+        // candidate deterministically wins regardless of the mock embedder's
+        // hash-based scoring — isolates the truncation branch.
+        let long_sentence = "word ".repeat(45); // 225 chars, under MAX_SENTENCE_CHARS (300)
+        assert!(long_sentence.chars().count() > GIST_MAX_CHARS);
+        let ctx = ContextId::new();
+        let block = make_block(ctx, 1, &format!("{long_sentence}."));
+        let embedder = MockEmbedder { dims: 16 };
+        let doc = embedder.embed(&long_sentence).unwrap();
+        let scored_blocks = vec![(0usize, 1.0f32)];
+        let blocks = vec![block];
+
+        let gist = compute_gist(&scored_blocks, &blocks, &doc, &embedder).expect("one candidate");
+        assert_eq!(gist.chars().count(), GIST_MAX_CHARS, "225-char sentence truncated to exactly 200");
     }
 
     #[test]

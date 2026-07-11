@@ -459,6 +459,16 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   (`text/msdf/renderer.rs:425`) hardcodes `1024` duplicating the atlas's
   initial size — harmless (pre-first-extract only) but now that the atlas
   grows at runtime the magic number is worth deleting.
+- **Pre-existing clippy deny blocks `kaijutsu-kernel --tests`/`--all-targets`
+  too (found 2026-07-11, gist-line lane):** `llm/splice.rs:267` builds a test
+  fixture range `3..1` (deliberately reversed, exercising `plan_splice`'s
+  edge-case handling) which now trips `deny(clippy::reversed_empty_ranges)`.
+  `cargo clippy -p kaijutsu-kernel` (lib only) is clean; adding `--tests` or
+  `--all-targets` fails the whole crate before reaching anything else. Same
+  shape as the `kaijutsu-app`/sparkline entry above — rewrite the fixture to
+  express "empty range" without triggering the lint (e.g. `#[allow]` on the
+  test, or a helper that constructs the range without a literal clippy can
+  reverse-detect) rather than changing `plan_splice`'s actual behavior.
 - **Auto-follow on local submit:** the conversation only re-engages
   scroll-follow when already at the bottom
   (`view/sync.rs:200-206`); a shell-dock submit is a strong signal of
