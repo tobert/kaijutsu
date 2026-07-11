@@ -24,6 +24,16 @@ use super::nav::Station;
 /// reserved = S.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bearing {
+    /// `#[allow(dead_code)]`: the freeze-fix slice (2026-07-11) dropped
+    /// `activity::event_bearing`'s Center arms (the only production site
+    /// that ever constructed this variant — see that fn's own doc), so
+    /// `cargo build` now sees it as never constructed outside
+    /// `#[cfg(test)]`. Kept, not removed: `index()`/`dir()`'s match arms and
+    /// `wall_placements()`'s Center-exclusion comment ("center has no wall")
+    /// both still lean on the variant existing, and room geometry may
+    /// construct a real `Center` value again if room-wide chatter ever gets
+    /// wired into the well's own glow.
+    #[allow(dead_code)]
     Center,
     North,
     East,

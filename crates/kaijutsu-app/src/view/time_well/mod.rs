@@ -54,11 +54,21 @@ use crate::ui::screen::Screen;
 ///   furniture now; everything that keeps its cards/rings/rays live and
 ///   correct at room scale runs here, cards included (the "opens warm"
 ///   property extends to the well's own contents, not just tails/beats).
-/// - **dived-only** (`run_if(well_zoomed)`) — keyboard, highlight overlays,
-///   the HUD, and the card/reading/horizon TEXT builders: room-scale card
-///   text is unreadable pixels, so text rasterization stays gated to the
-///   dive (`text::build_card_scenes`'s own doc has the reasoning + the
-///   `card_text_dirty` catch-up arm).
+///   The dim/selection/lineage/drift overlays and the focus-card/horizon-
+///   label LOD gates joined this tier in the freeze-fix slice (2026-07-11):
+///   each must react to BOTH zoom directions — clearing/hiding on zoom-OUT,
+///   not just applying on zoom-in — the same reasoning
+///   `hud::apply_well_hud_lod` already needed to justify running here
+///   rather than dived-only. Left dived-only, they froze whatever
+///   dim/pop/lineage state was live on the last dived frame, visible at
+///   room scale until the next dive re-ran them.
+/// - **dived-only** (`run_if(well_zoomed)`) — keyboard and the card/reading/
+///   horizon TEXT builders: room-scale card text is unreadable pixels, so
+///   text rasterization stays gated to the dive (`text::build_card_scenes`'s
+///   own doc has the reasoning + the `card_text_dirty` catch-up arm). The
+///   HUD's own per-frame content builders (`hud::position_well_hud`,
+///   `hud::update_well_hud`) stay dived-only too — only its LOD gate
+///   (`hud::apply_well_hud_lod`) needs the ambient tier.
 pub struct TimeWellPlugin;
 
 impl Plugin for TimeWellPlugin {
@@ -99,6 +109,20 @@ impl Plugin for TimeWellPlugin {
                     scene::accumulate_ring_activity,
                     scene::sync_deck_material,
                     live::sync_card_live_uniforms,
+                    // Moved here from dived-only (freeze-fix slice,
+                    // 2026-07-11): each must react to BOTH zoom directions —
+                    // see this file's own doc comment above for the full
+                    // reasoning, and each system's own doc for its specific
+                    // zoom branch. `highlight_drift` is the one exception: no
+                    // zoom branch at all (see its doc) — `DriftState` polls
+                    // ungated on every screen, so its shimmer is truthful
+                    // live info even at room scale.
+                    scene::dim_nonfocused_rings,
+                    scene::sync_focus_card_visibility,
+                    scene::apply_horizon_label_lod,
+                    scene::highlight_selection,
+                    scene::highlight_lineage,
+                    scene::highlight_drift,
                     // The HUD's LOD gate lives in the ambient tier, not
                     // dived-only, like `patch_bay::apply_patch_lod` — it must
                     // react to BOTH transitions (hiding the panels again on
@@ -109,10 +133,9 @@ impl Plugin for TimeWellPlugin {
                     .chain()
                     .run_if(in_state(Screen::Room)),
             )
-            // Dived-only: keyboard, focus/lineage/drift overlays, the HUD's
-            // per-frame content, and the text builders (rasterizing MSDF
-            // glyphs no one can read at room scale would be pure waste — see
-            // `text::build_card_scenes`).
+            // Dived-only: keyboard, the HUD's per-frame content, and the
+            // text builders (rasterizing MSDF glyphs no one can read at room
+            // scale would be pure waste — see `text::build_card_scenes`).
             .add_systems(
                 Update,
                 (
@@ -122,11 +145,6 @@ impl Plugin for TimeWellPlugin {
                     // Escape double-fires through both handlers and skips the
                     // room-overview stop — see `room::room_keyboard`'s own doc.
                     scene::well_keyboard.after(crate::view::room::room_keyboard),
-                    scene::dim_nonfocused_rings,
-                    scene::sync_focus_card_visibility,
-                    scene::highlight_selection,
-                    scene::highlight_lineage,
-                    scene::highlight_drift,
                     hud::position_well_hud,
                     hud::update_well_hud,
                     text::build_card_scenes,

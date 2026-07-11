@@ -1631,11 +1631,11 @@ fn ingest_room_activity(
 /// C, `lovely-swimming-prism.md`) — the real time well now stands at the
 /// console bearing and owns its own chatter/energy glow entirely through
 /// `time_well::activity::RingActivity` (fed by the well's own
-/// `accumulate_ring_activity`, not this system). Left un-migrated:
-/// `BearingActivity(Center)` still accumulates chatter from
-/// `ingest_room_activity` with no reader left for it — noted as a loose end
-/// for a later slice/issue rather than silently deleted or hastily rewired
-/// here (out of this slice's scope, see `docs/issues.md`).
+/// `accumulate_ring_activity`, not this system). `BearingActivity(Center)`
+/// used to keep accumulating chatter from `ingest_room_activity` with no
+/// reader left for it — closed in the freeze-fix slice (2026-07-11) by
+/// dropping the Center mapping from `activity::event_bearing` entirely
+/// (`Bearing::Center` itself stays for room geometry, just unfed).
 fn sync_room_glow(
     room_activity: Res<BearingActivity>,
     beats: Res<WellBeats>,
