@@ -3,6 +3,7 @@
 //! [`super::sync`]) and not the pure model (which lives in [`super::card`]).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
@@ -440,11 +441,32 @@ const STATION_CENTER_LIFT: f32 = 90.0;
 /// translate + scale it, same reasoning [`StationCenterPlacement`]'s own doc
 /// gives for skipping a pitch/yaw pair. Both constants above are explicitly
 /// first guesses for the lead to live-tune over BRP, not finished numbers.
-pub const STATION_CENTER_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
+/// `LazyLock`, not `const`: [`Quat::from_rotation_x`] below isn't a `const
+/// fn` (it calls `sin`/`cos`, not yet const on stable) — a plain `const`
+/// declaration can't call it. `Deref` makes every existing `&STATION_CENTER_PLACEMENT`/
+/// `STATION_CENTER_PLACEMENT.field` call site work unchanged.
+pub static STATION_CENTER_PLACEMENT: LazyLock<StationCenterPlacement> = LazyLock::new(|| StationCenterPlacement {
     translation: Vec3::new(0.0, crate::view::room::TABLE_TOP_Y + STATION_CENTER_LIFT, 0.0),
     scale: STATION_CENTER_SCALE,
-    rotation: Quat::IDENTITY,
-};
+    // Amy (live, first look at Slice C): "needs to be realigned with the
+    // room... I think the magic rings can be parallel to the floor." With
+    // `Quat::IDENTITY` here the deck/terrace-ring quads (local normal +Z,
+    // tipped back by `super::card::WELL_TILT` ≈ -0.95 rad about X before
+    // this placement ever touches them) sit at a ~54° lean off the floor —
+    // the room's own horizontal read (floor/table are level; only the
+    // wheel's WALL mount and this console lean at all). Countering with an
+    // X rotation of `-FRAC_PI_2 - WELL_TILT` composes with that baked-in
+    // tilt (same-axis rotations add: net angle = this + WELL_TILT) to land
+    // the net rotation at exactly `-FRAC_PI_2` — local +Z all the way to
+    // world +Y, the deck flat and face-up toward the overview camera sitting
+    // above it. First live-tuning pass, not a final answer: this ALSO
+    // re-reads each band's depth step (`card::RING_DEPTH_STEP`, along local
+    // Z) as a vertical stack rather than a receding tilt-plane depth — watch
+    // for whether that reads as "concentric flat rings" or "a tiered stack"
+    // once it's on screen, and back off the angle (partial recline instead
+    // of full flatten) if the stacking reads wrong.
+    rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2 - super::card::WELL_TILT),
+});
 
 /// The `Transform` for the placement/root entity that re-roots the well's
 /// whole subtree into room space — mirrors patch bay's `placement_transform`
@@ -1067,8 +1089,18 @@ mod tests {
     }
 
     #[test]
-    fn station_center_placement_seats_above_the_room_table_with_no_rotation() {
-        assert_eq!(STATION_CENTER_PLACEMENT.rotation, Quat::IDENTITY);
+    fn station_center_placement_seats_above_the_room_table() {
+        // Rotation counters the well's own baked-in recline (`card::WELL_TILT`)
+        // so the net X rotation lands at exactly -FRAC_PI_2 (Amy, live: "the
+        // magic rings can be parallel to the floor") — assert the COMPOSED
+        // angle, not identity, since the placement's own rotation is only half
+        // of what the deck/rings actually end up rotated by.
+        let net_x_angle = STATION_CENTER_PLACEMENT.rotation.to_euler(EulerRot::XYZ).0
+            + super::super::card::WELL_TILT;
+        assert!(
+            (net_x_angle - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-5,
+            "net rotation (placement + the well's own tilt) should land the deck flat: {net_x_angle}"
+        );
         assert_eq!(STATION_CENTER_PLACEMENT.translation.x, 0.0);
         assert_eq!(STATION_CENTER_PLACEMENT.translation.z, 0.0);
         assert!(
