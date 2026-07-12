@@ -541,17 +541,52 @@ three days that took the first station from spec to a finished instrument.
   landscape — keep a true dive-through door. Deleting a state to delete
   a bug class is the day's best trade.
 
+## The app learns to mean its colors
+
+The terrace glyphs came first (2026-07-12): the placeholder dashed dial
+became a per-ring variant family — barcode graduations, braided rosettes,
+a Fibonacci moiré dial, orbiting motes — with hash-seeded gem glints
+twinkling gold on every ring. Amy looked at it and named the real problem:
+"I see it, but it's muted like the rest of the octagon… maybe the goal for
+the vibe overall is more synthwave than anything." The mutedness turned
+out to be structural, not aesthetic: palette.rs governed hues and the
+glow-discipline caps, but *brightness* was thirty scattered per-site
+constants, and the tonemapper had never been chosen — the app's look was
+the accidental sum of local decisions.
+
+The color pass made color a decision again. One CRDT theme.toml now
+carries both color lanes — the sRGB post-tonemap UI lane (the old Tokyo
+Night token system, kept) and a new linear-HDR scene lane (`[scene]`:
+identity hues, a named brightness ladder, live-signal gains, and a
+`[scene.post]` camera chain that hot-applies). App-side, a `ScenePalette`
+resource absorbed every scene constant; palette.rs shrank to geometry
+contracts. The synthwave skin shipped as the default across file, data
+layer, and compiled fallback (Tokyo Night retired to contrib/themes/),
+and a live tonemapper A/B over BRP picked ACES + raised bloom — the muted
+look was literally TonyMcMapface. docs/color.md is the contract: one
+identity, two lanes, threshold 1.0 stays the line between decoration and
+live activity.
+
+Two lessons worth the ink. The mirror test between compiled defaults and
+file defaults caught a real sRGB-as-linear bug on its first run — the
+palette had been quietly 13× off on one channel family. And when a
+round-tripped `kj config show` poisoned the live theme with its own
+decoration, the app's refuse-loudly parse path (toast + keep current
+theme) turned what could have been a silent skin corruption into a
+ten-minute diagnosis — the observable-write-failures discipline paying
+for itself.
+
 ## Now
 
-As of 2026-07-10: the kernel-interior scene family is live and furnished —
-the Tardis room reads as a place (circuit-board floor, well table, framed
-radiators, signage hung high), with the patch bay standing at W as
-furniture inside one shared scene graph, dive-as-descent proven end to end
-including its lifecycle edge (leaving the shell from a dive, live-verified).
-The tracks bearing's breathe-on-jam acceptance and the metronome-click
-chord pulse await the next live jam. Deferred by choice: the N archway
-(returns with the fsn scene), the drift-layer air (paused until it knows
-what information it carries — point cloud vs aurora arcs is open). Next
-station candidates: the tracks highway (TRACKER, E) or patchbay slice 2
-(declared wires, kernel-owned). Open work is in `docs/issues.md`; the live
+As of 2026-07-12: the Tardis room is furnished AND lit — synthwave
+identity end to end, conversation view and scenes speaking one violet/gold
+family, every color and brightness decision named in theme.toml and
+docs/color.md. The terrace glyph mix gives the well per-ring character
+with gold sparkle. The tracks bearing's breathe-on-jam acceptance and the
+metronome-click chord pulse await the next live jam. Deferred by choice:
+the N archway (returns with the fsn scene), the drift-layer air (paused
+until it knows what information it carries), theme push-on-change and the
+remaining compiled-only color families (issues.md). Next station
+candidates: the tracks highway (TRACKER, E), patchbay slice 2, or the fsn
+world after Amy's wave-2 cull. Open work is in `docs/issues.md`; the live
 handoff in `signoff.md` (ephemeral, repo root).
