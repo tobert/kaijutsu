@@ -77,17 +77,24 @@ fn gist_brush() -> Brush {
 /// is 3) since the reading card is the surface Enter dollies to for an actual
 /// look, not a passing glance; proportionate to its larger face
 /// ([`READING_TEX_H`] is 2× [`CARD_TEX_H`]). **Amy-tunable.**
-const READING_TAIL_LINES: usize = 8;
+const READING_TAIL_LINES: usize = 6;
 
 /// Font size (logical px, scaled by the card's own `s` like every other
 /// field) for a reading-card block's section label ("SPECS"/"LINEAGE") — one
 /// notch above the dim body so the label reads as a header, not more body
 /// text.
-const READING_BLOCK_HEADER_SIZE: f32 = 11.0;
+///
+/// Budget note (live-verified 2026-07-12): the reading card shares the rim
+/// card's proportional scale (`s = h / CARD_TEX_H`), so these sizes spend the
+/// same face-fraction budget as rim fields. At the original 11/10 the specs
+/// block alone reached `y_limit` and the overflow guard silently dropped
+/// ancestry + tail — the content slice 3 exists to show. 8/7 fits
+/// title + specs + a short chain + the tail cut with slack. **Amy-tunable.**
+const READING_BLOCK_HEADER_SIZE: f32 = 8.0;
 /// Font size for a reading-card block's body lines — smaller than the gist
 /// line above it (this is reference material, denser and further down the
 /// hierarchy than the card's own summary).
-const READING_BLOCK_BODY_SIZE: f32 = 10.0;
+const READING_BLOCK_BODY_SIZE: f32 = 7.0;
 
 /// Dim, slightly-brighter-than-body brush for a reading-card block's section
 /// label — one step up from [`gist_brush`]'s dimness, the same alpha-taper
@@ -173,6 +180,41 @@ pub fn specs_text(d: &super::card::CardData, track: Option<&kaijutsu_client::Tra
     let mut lines = vec![
         format!("model    {}", if d.model_badge.is_empty() { "—" } else { &d.model_badge }),
         format!("fork     {}", d.fork_badge.as_deref().unwrap_or("—")),
+        format!("band     {}", band_label(d.band)),
+        format!("keywords {keys}"),
+    ];
+    if let Some(c) = &d.cluster_label {
+        lines.push(format!("cluster  ◇ {c}"));
+    }
+    if let Some(t) = track {
+        let bpm = (60_000_000f64 / t.period_us.max(1) as f64).round() as u64;
+        let transport = if t.playing {
+            format!("▶ ♩{bpm} · tick {}", t.playhead_tick)
+        } else {
+            "■ stopped".to_string()
+        };
+        lines.push(format!("track    ♪ {} {transport}", t.id));
+    }
+    lines.sort_by_key(|l| std::cmp::Reverse(l.chars().count()));
+    format!("SPECS\n{}", lines.join("\n"))
+}
+
+/// The reading card's specs block: [`specs_text`] minus the model and fork
+/// lines — the card's own header (title, model badge, fork badge) sits
+/// directly above the block on that face, and repeating them spent vertical
+/// budget the ancestry chain + tail cut need (live-verified 2026-07-12: the
+/// duplicated lines pushed both past `y_limit` on typical content). HUD East
+/// keeps the full [`specs_text`] — it has no header to lean on.
+pub fn reading_specs_text(
+    d: &super::card::CardData,
+    track: Option<&kaijutsu_client::TrackInfo>,
+) -> String {
+    let keys = if d.keywords.is_empty() {
+        "—".to_string()
+    } else {
+        d.keywords.join(", ")
+    };
+    let mut lines = vec![
         format!("band     {}", band_label(d.band)),
         format!("keywords {keys}"),
     ];
@@ -373,7 +415,9 @@ fn card_header_glyphs(
     // ── Fork badge. ──
     if let Some(fork) = &data.fork_badge {
         let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.65));
-        let label = format!("⑂ {fork}");
+        // Plain word, not U+2442 ⑂ — the shaping font has no glyph for it
+        // and renders tofu (live-verified 2026-07-12).
+        let label = format!("fork {fork}");
         let l = font.layout(
             &label,
             &VelloTextStyle { font_size: 12.0 * s, ..default() },
@@ -580,7 +624,7 @@ fn reading_card_glyphs(
     let mut out = Vec::new();
     let mut y = card_header_glyphs(card, font, max_advance, s, pad, atlas, font_data_map, &mut out);
 
-    let specs = specs_text(&card.data, track);
+    let specs = reading_specs_text(&card.data, track);
     y = layout_reading_block(
         &specs, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
     );
@@ -896,6 +940,19 @@ mod tests {
         assert!(s.contains("band     recent"), "band labeled: {s}");
         assert!(!s.contains("cluster"), "no cluster line when unclustered: {s}");
         assert!(!s.contains("track"), "no track line when unattached: {s}");
+    }
+
+    #[test]
+    fn reading_specs_text_omits_the_header_duplicated_lines() {
+        let mut d = card_data(Band::Recent);
+        d.cluster_label = Some("storage".into());
+        let s = reading_specs_text(&d, None);
+        assert!(s.starts_with("SPECS\n"), "headed block: {s}");
+        assert!(!s.contains("model"), "model lives in the card header: {s}");
+        assert!(!s.contains("fork"), "fork lives in the card header: {s}");
+        assert!(s.contains("band     recent"), "band kept: {s}");
+        assert!(s.contains("keywords rings, pulse"), "keywords kept: {s}");
+        assert!(s.contains("cluster  ◇ storage"), "cluster kept: {s}");
     }
 
     #[test]
