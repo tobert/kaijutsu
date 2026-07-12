@@ -7,6 +7,7 @@ repository.workspace = true
 description = "D3-inspired scales and layout primitives for kaijutsu's bespoke data-driven views"
 
 [dependencies]
+voronator = { version = "0.2.1", default-features = false }
 
 [dev-dependencies]
 proptest = "1"
