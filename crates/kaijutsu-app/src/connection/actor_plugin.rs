@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::{
-    ActorHandle, ContextMembership, Identity, KernelInfo, ServerEvent, SshConfig,
+    ActorHandle, ContextMembership, Identity, KernelInfo, ServerEvent, SnapshotResult, SshConfig,
 };
 use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
@@ -142,6 +142,15 @@ pub enum RpcResultMessage {
     /// into `WellTracks` to drive the rays + per-card track hue/beat lanes.
     TracksReceived {
         tracks: Vec<kaijutsu_client::TrackInfo>,
+    },
+    /// A `vfs_snapshot` reply landed (`view::fsn::sync`'s poll — the FSN
+    /// world's enumeration-on-demand scheduler, `docs/scenes/vfs.md` claim
+    /// 3). `path` is the query's own path (not necessarily the node's own
+    /// path if the kernel normalizes it), so the drain site can match the
+    /// reply back to whichever cell requested it.
+    VfsSnapshotReceived {
+        path: String,
+        result: SnapshotResult,
     },
     /// Input document state received (for initializing SyncedInput on context join).
     InputStateReceived {

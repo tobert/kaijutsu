@@ -190,6 +190,9 @@ table = "#32353f"          # structural near-blacks
 wall_base = "#464556"
 wall_mullion = "#383844"
 dark_surface = "#1d1e26"
+fsn_edge = "#8a5cff"       # fsn landscape: prism wireframe edges (frame 45)
+fsn_vertex = "#ff2fd0"     # fsn landscape: prism-top vertex points
+fsn_seam = "#4a3568"       # fsn landscape: faint quad-seam grid lines
 
 [scene.tiers]
 etch = 0.28          # engraved detail

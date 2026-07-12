@@ -418,6 +418,16 @@ pub struct SceneHuesData {
     pub wall_base: String,
     pub wall_mullion: String,
     pub dark_surface: String,
+    /// FSN landscape (`docs/scenes/vfs.md`, slice 0): prism wireframe edges —
+    /// neon violet (frame 45's edge-line hue, a distinct lane from
+    /// `neon`/`violet_*` so the landscape can be retuned independently of
+    /// the well/radiators).
+    pub fsn_edge: String,
+    /// FSN landscape: prism-top vertex points — magenta (frame 45).
+    pub fsn_vertex: String,
+    /// FSN landscape: quad-seam grid lines — a faint, dimmer violet than
+    /// `fsn_edge` (frame 45's "faint dotted boundaries").
+    pub fsn_seam: String,
 }
 
 impl Default for SceneHuesData {
@@ -441,6 +451,9 @@ impl Default for SceneHuesData {
             wall_base: "#464556".into(),
             wall_mullion: "#383844".into(),
             dark_surface: "#1d1e26".into(),
+            fsn_edge: "#8a5cff".into(),
+            fsn_vertex: "#ff2fd0".into(),
+            fsn_seam: "#4a3568".into(),
         }
     }
 }
