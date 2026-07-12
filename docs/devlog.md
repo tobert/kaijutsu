@@ -576,6 +576,42 @@ theme) turned what could have been a silent skin corruption into a
 ten-minute diagnosis — the observable-write-failures discipline paying
 for itself.
 
+## The index learns to keep itself honest
+
+The semantic index — bge-small over ONNX, an HNSW graph, a SQLite sidecar —
+had grown real consumers (well-card gists, constellation clusters, kj
+synth) on top of three quiet debts: HNSW can't delete points so eviction
+left dead vectors forever (`rebuild()` was a TODO), nothing noticed when
+the embedding model changed under an existing index, and every synthesized
+gist evaporated at kernel restart because nothing re-warms a memory-only
+cache when content hashes say "unchanged." One afternoon (2026-07-12)
+retired all three, plus a live ABBA deadlock between search and indexing
+that a stress test could summon on demand.
+
+The design decision that made rebuild tractable: **slots are never
+renumbered**. A rebuild re-inserts only live slots into a fresh graph at
+their existing numbers, so SQLite is never touched and crash-consistency
+collapses to atomic file publication (dump `.new` → fsync files, marker,
+and directory → rename → recover idempotently at boot). The corollary took
+a red test to believe: slot numbers must also never be *reused*, because
+MAX+1 allocation regresses when the highest slot is evicted and the dead
+vector still in the graph would answer for the new context. A monotonic
+allocator table closed the class. First boot on the live kernel vindicated
+the whole shape immediately — the real index was carrying 51 graph points
+against 43 metadata rows, and startup auto-rebuild silently reclaimed all
+eight dead slots.
+
+Live verification earned its keep twice more. `kj synth all` on real data
+blew ort's never-shrinking arena past 9 GB — one BatchLongest-padded
+embed_batch of every block in a large context — fixed by chunking at the
+embedder seam, where every call site inherits the bound. And the
+whole-file kaibo ritual (deepseek consult + gemini-pro deliberate, no
+diff) caught what unit tests hadn't: eviction cleared persisted synthesis
+but left the memory cache serving ghosts, and the rename dance fsynced
+files but not the directory. Sonnet lanes wrote the code; the lead's
+review, the outside models, and the running kernel each found bugs the
+other two missed. That triangle is the lesson.
+
 ## Now
 
 As of 2026-07-12: the Tardis room is furnished AND lit — synthwave

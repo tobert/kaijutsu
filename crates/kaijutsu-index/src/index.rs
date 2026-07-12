@@ -181,6 +181,7 @@ impl HnswIndex {
                 std::fs::rename(&new_data, &real_data)?;
             }
             std::fs::remove_file(&marker)?;
+            Self::sync_dir(data_dir);
             tracing::info!(
                 path = %data_dir.display(),
                 "recovered interrupted HNSW index dump"
@@ -347,16 +348,31 @@ impl HnswIndex {
             let f = std::fs::File::create(&marker)?;
             let _ = f.sync_all();
         }
+        // The marker's directory entry must be durable before the renames —
+        // and the renames durable before the marker's removal — or a power
+        // loss can reorder them on disk (file fsync doesn't cover the
+        // directory). gemini review catch, 2026-07-12.
+        Self::sync_dir(&self.data_dir);
 
         let real_graph = self.data_dir.join("index.hnsw.graph");
         let real_data = self.data_dir.join("index.hnsw.data");
         std::fs::rename(&new_graph, &real_graph)?;
         std::fs::rename(&new_data, &real_data)?;
+        Self::sync_dir(&self.data_dir);
 
         std::fs::remove_file(&marker)?;
 
         tracing::debug!(path = %self.data_dir.display(), "saved HNSW index to disk");
         Ok(())
+    }
+
+    /// fsync a directory so renames/creates/removes inside it are durable.
+    /// Best-effort: not every filesystem supports opening a directory for
+    /// sync, and recovery converges from any ordering anyway.
+    fn sync_dir(dir: &std::path::Path) {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
     }
 
     /// Save the index to disk. Atomic — see `dump_atomic`.

@@ -660,6 +660,43 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   at the writer if `MidiParams` ever becomes config-driven.
 
 - **`hnsw_rs` reverse-edge quirk:** Reverse edges written at neighbour's assigned layer.
+- **Embedder: BERT-only I/O contract** (2026-07-12 index review): `OnnxEmbedder`
+  hardcodes `input_ids`/`attention_mask`/`token_type_ids` and mean-pools
+  `outputs[0]` (`kaijutsu-index/src/embedder.rs`). E5/jina-style models (no
+  token_type_ids, CLS pooling, or a ready pooled output) won't load. Growth
+  path: introspect `session.inputs` for the input set + a small per-model
+  manifest (pooling strategy) in models.toml. The `Embedder` trait is the seam;
+  nothing structural blocks this.
+- **Embedder: serialized CPU-only inference** (2026-07-12): one ONNX session
+  behind a `Mutex` with `intra_threads(1)`; no execution-provider plumbing
+  despite the GPU box. Live data point: `kj synth all` over 54 real contexts =
+  ~8 min wall clock (memory now bounded by embed_batch chunking, but the FLOPs
+  are all one thread). When it cracks, the reviewed playbook (gemini
+  deliberate 2026-07-12) is two-phase indexing: reserve slot under the
+  metadata lock, embed lock-free, re-take the lock, re-verify content_hash,
+  write — plus intra_threads / EP selection in `[embedding]`.
+- **Index: slot-space vacuum watermark** (gemini deliberate, 2026-07-12):
+  slots are monotonic-never-reused by design, so max-slot-ever grows with
+  lifetime churn — the embeddings cache is `Vec<Option<…>>` sized by it (~24B
+  per dead slot; harmless at human scale, unbounded in principle). When
+  warranted: watermark trigger (e.g. `next_slot > 2 × live rows`) → offline
+  compaction that renumbers into a fresh generation (new graph + one SQLite
+  transaction rewriting slots). Deliberately NOT built now.
+- **Index: synthesis child tables lack FK cascades** (gemini deliberate,
+  2026-07-12): cleanup is manual transactional DELETEs across three tables;
+  correct today, but a future fourth synthesis-adjacent table that someone
+  forgets to add to `delete_synthesis_rows` silently leaks ghost rows that
+  re-hydrate. `PRAGMA foreign_keys=ON` + `ON DELETE CASCADE` needs a
+  table-rebuild migration (SQLite can't add constraints in place) — do it
+  next time the schema changes anyway.
+- **Index: unopenable index_meta.db disables the index** (deepseek review,
+  2026-07-12): if SQLite itself won't open (true corruption), SemanticIndex
+  errs → kernel degrades to no-index, and recovery is a manual file delete.
+  Arguably should treat unopenable-like-mismatched: wipe + start fresh (it's
+  a derived cache). Low likelihood (WAL), low cost to leave.
+- **ort 2.0 stable watch** (2026-07-12): pinned `2.0.0-rc.12` (latest; no
+  stable 2.0 published). Re-check occasionally; rc-series has broken API
+  before. ort arena never shrinks — chunked embed_batch keeps its peak ~1GB.
 - **ABC multi-tune files vs blocks:** Split tunes across sibling blocks or stack inside one block.
 - **ABC file-header inheritance:** `M:`/`L:`/`Q:` defaults prevent proper inheritance.
 - **ABC features:** `I:linebreak`, `m:` macro expansion, `%%` directives, Unicode escapes/fonts.
