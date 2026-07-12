@@ -412,6 +412,18 @@ the digging taught:
   that router on `owns_output` (an owned-output tool re-parses its own argv and
   is never intercepted). Same theme as the rest of the chapter: the surface a
   model hits mid-turn stops fighting it.
+- **0.12 (July 12) closed the third.** Zero-source again — `LatchRequest`
+  picked up a `job_id` back-reference we don't construct, everything else
+  landed on surface we don't touch — but it fixed the `/v/cas` scar from the
+  CAS chapter above: kaish's `VirtualOverlayBackend` used to reserve the whole
+  `/v` tree for itself regardless of what an embedder had actually mounted
+  there, so `kaish ls`/`cat /v/cas/...` saw an empty shadow while SFTP and `kj
+  cas` (which bypass the kaish VFS) saw the real pool. Routing is now purely
+  mount-coverage based — an unclaimed `/v/*` path falls through to the
+  embedder's backend — so kaish's view of `/v/cas` finally agrees with
+  everyone else's. Pinned by a new regression test
+  (`kaish_ls_and_cat_reach_the_real_cas_mount_at_v_cas`) so a future bump
+  can't quietly reopen it.
 
 ## The kernel gets an interior (July 7–9)
 

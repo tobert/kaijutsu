@@ -96,18 +96,6 @@ devlog/git; this entry is the backlog pointer:
   drop-order regression test for `SftpClient`'s field ordering (the contract is
   commented but compiler-invisible). **(f)** client-side `spawn_blocking` for the
   blocking `FileStore` cache read in the async resolve (already an app follow-up).
-- **kaish `/v/cas` is shadowed by kaish-kernel's `VirtualOverlayBackend`
-  (papercut, 2026-07-02).** kaish reserves `/v/cas` (alongside `/v/jobs`) as
-  one of its own virtual paths (`kaish-kernel/src/backend/overlay.rs`
-  `is_virtual_path`), so a *kaish* file op (`ls`/`cat /v/cas/...`) hits kaish's
-  empty writable overlay, NOT the kernel `MountTable`'s `CasFs`. SFTP is
-  unaffected — it serves `kernel.vfs()` directly, bypassing the kaish VFS — so
-  the clip-prefetch path (`SftpClient` → `/v/cas`) and `kj cas` both work; only
-  the kaish-shell *view* of `/v/cas` is wrong (two different `/v/cas`
-  depending on surface). Reconcile later: either drop kaish's `/v/cas`
-  reservation, teach its overlay to defer to `MountBackend` when the kernel has
-  a real mount there, or mount `CasFs` on the kaish VFS too (like `/v/docs`).
-  Not blocking track B; the app never reads `/v/cas` through kaish.
 - **`/v/cas/index` TSV — DESIGNED, DEFERRED (2026-07-02, Amy).** The B2
   resolver file (`hash  mime  size  path`, absolute path column, mime from
   `inspect()`) is fully designed in `docs/slash-v.md` but was **not shipped**:

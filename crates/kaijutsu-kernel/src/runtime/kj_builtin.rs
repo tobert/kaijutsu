@@ -2105,6 +2105,7 @@ mod tests {
             tool: "kj".to_string(),
             argv: vec!["context".into(), "remove".into(), "doomed".into()],
             ttl: 60,
+            job_id: None,
         }));
 
         let out = render_json_envelope(exec);

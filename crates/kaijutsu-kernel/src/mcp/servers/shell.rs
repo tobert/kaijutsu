@@ -496,6 +496,7 @@ mod tests {
                 "doomed".to_string(),
             ],
             ttl: 60,
+            job_id: None,
         }));
         let structured = shell_result_to_kernel(r)
             .structured

@@ -587,7 +587,7 @@ fn merge_trace_context(
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use kaijutsu_types::paths::RC_ROOT;
+    use kaijutsu_types::paths::{CAS_ROOT, RC_ROOT};
 
     const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
     const TS: &str = "vendor=value";
@@ -722,6 +722,50 @@ mod tests {
         // `readlink` reports the raw target.
         let r = run("readlink /etc/rc/coder/create/S10-binding.kai").await;
         assert_eq!(r.text_out().trim(), "/etc/rc/lib/create/binding.kai");
+    }
+
+    /// `/v/cas` regression (docs/issues.md "kaish `/v/cas` is shadowed"). kaish
+    /// 0.11's `VirtualOverlayBackend` reserved every `/v/*` path for its own
+    /// (always-empty here) overlay regardless of whether the embedder had a
+    /// real mount there, so `ls`/`cat /v/cas/...` through kaish silently saw
+    /// nothing even with a live `CasFs` mount on the kernel `MountTable` — SFTP
+    /// and `kj cas`, which bypass kaish's VFS, were unaffected, so the bug was
+    /// kaish-shell-only. kaish 0.12 made `is_virtual_path` purely mount-coverage
+    /// based, so an unclaimed `/v/*` path now falls through to the embedder's
+    /// backend. This pins the fix so a future kaish bump can't silently
+    /// reintroduce the shadow.
+    #[tokio::test]
+    async fn kaish_ls_and_cat_reach_the_real_cas_mount_at_v_cas() {
+        use kaijutsu_cas::{ContentStore, FileStore};
+        use tempfile::TempDir;
+
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-cas").await);
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(FileStore::at_path(dir.path()));
+        let hash = store.store(b"the quick brown fox", "text/plain").unwrap();
+        kernel.mount(CAS_ROOT, crate::vfs::CasFs::new(store)).await;
+
+        let kaish = EmbeddedKaish::new("test-cas", blocks, kernel, None).unwrap();
+        let run = |cmd: String| {
+            let k = &kaish;
+            async move {
+                k.execute_with_options(&cmd, ExecuteOptions::default())
+                    .await
+                    .unwrap_or_else(|e| panic!("`{cmd}` failed: {e}"))
+            }
+        };
+
+        let ls = run(format!("ls {CAS_ROOT}/{}", hash.prefix())).await;
+        assert!(
+            ls.text_out().contains(&hash.to_string()),
+            "ls should list the stored object through kaish, got: {}",
+            ls.text_out()
+        );
+
+        let cat = run(format!("cat {CAS_ROOT}/{}/{}", hash.prefix(), hash)).await;
+        assert_eq!(cat.text_out(), "the quick brown fox");
     }
 
     /// The external-exec policy end to end: `Allow` + a Local-mounted cwd runs
