@@ -28,6 +28,11 @@ pub struct SparklineColors {
     pub fill: Option<Color>,
 }
 
+/// Mirrors the `sparkline_line_color`/`sparkline_fill_color` fields of
+/// `Theme::default()` (`ui::theme::Theme`) — kept in sync by
+/// `sparkline_colors_default_matches_theme_default` below. Production always
+/// builds `SparklineColors` from the live theme (`view/block_render.rs`);
+/// this default only serves tests and standalone use of this module.
 impl Default for SparklineColors {
     fn default() -> Self {
         Self {
@@ -423,5 +428,16 @@ mod tests {
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
         assert_golden("sparkline_flat", &svg);
+    }
+
+    /// `SparklineColors::default()` mirrors `Theme::default()`'s sparkline_*
+    /// fields (see `view/block_render.rs` for the production construction
+    /// path). If this fails, one side drifted — update whichever is stale.
+    #[test]
+    fn sparkline_colors_default_matches_theme_default() {
+        let colors = SparklineColors::default();
+        let theme = crate::ui::theme::Theme::default();
+        assert_eq!(colors.line, theme.sparkline_line_color);
+        assert_eq!(colors.fill, theme.sparkline_fill_color);
     }
 }

@@ -27,6 +27,11 @@ pub struct MarkdownColors {
     pub code_block: Color,
 }
 
+/// Mirrors the `md_heading_color`/`md_code_fg`/`md_code_block_fg`/`md_strong_color`
+/// fields of `Theme::default()` (`ui::theme::Theme`) — kept in sync by
+/// `markdown_colors_default_matches_theme_default` below. Production always
+/// builds `MarkdownColors` from the live theme (`view/block_render.rs`); this
+/// default only serves tests and standalone use of this module.
 impl Default for MarkdownColors {
     fn default() -> Self {
         Self {
@@ -348,5 +353,32 @@ mod tests {
         assert_ne!(colors.code, Color::BLACK);
         assert!(colors.strong.is_none());
         assert_ne!(colors.code_block, Color::BLACK);
+    }
+
+    /// `srgb_u8` (this file) and `srgb` with a rounded 3-decimal literal
+    /// (`Theme::default()`) round-trip the same color to slightly different
+    /// floats, so compare channel-wise within a tolerance rather than by
+    /// exact equality.
+    fn color_approx_eq(a: Color, b: Color) -> bool {
+        let a = a.to_srgba();
+        let b = b.to_srgba();
+        const EPS: f32 = 0.001;
+        (a.red - b.red).abs() < EPS
+            && (a.green - b.green).abs() < EPS
+            && (a.blue - b.blue).abs() < EPS
+            && (a.alpha - b.alpha).abs() < EPS
+    }
+
+    /// `MarkdownColors::default()` mirrors `Theme::default()`'s md_* fields
+    /// (see `view/block_render.rs` for the production construction path).
+    /// If this fails, one side drifted — update whichever is stale.
+    #[test]
+    fn markdown_colors_default_matches_theme_default() {
+        let colors = MarkdownColors::default();
+        let theme = crate::ui::theme::Theme::default();
+        assert!(color_approx_eq(colors.heading, theme.md_heading_color));
+        assert!(color_approx_eq(colors.code, theme.md_code_fg));
+        assert!(color_approx_eq(colors.code_block, theme.md_code_block_fg));
+        assert_eq!(colors.strong, theme.md_strong_color);
     }
 }

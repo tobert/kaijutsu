@@ -156,7 +156,7 @@ pub struct Theme {
     pub mode_visual: Color,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Mode labels (dock HUD text, Rhai-scriptable)
+    // Mode labels (dock HUD text, overridable via theme.toml)
     // ═══════════════════════════════════════════════════════════════════════
     pub mode_label_normal: String,
     pub mode_label_insert: String,
@@ -256,13 +256,9 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Markdown Rendering Colors — Phase 4: per-span styling via Parley
     // ═══════════════════════════════════════════════════════════════════════
-    #[allow(dead_code)]
     pub md_heading_color: Color,
-    #[allow(dead_code)]
     pub md_code_fg: Color,
-    #[allow(dead_code)]
     pub md_code_block_fg: Color,
-    #[allow(dead_code)]
     pub md_strong_color: Option<Color>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -453,7 +449,7 @@ impl Default for Theme {
             mode_shell: Color::srgb(0.878, 0.686, 0.404),  // #e0af68 amber
             mode_visual: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
 
-            // Mode labels (dock HUD, Rhai-scriptable)
+            // Mode labels (dock HUD, overridable via theme.toml)
             mode_label_normal: "NORMAL".into(),
             mode_label_insert: "INSERT".into(),
             mode_label_visual: "VISUAL".into(),
@@ -857,83 +853,4 @@ pub fn agent_color_for_provider(theme: &Theme, provider: Option<&str>) -> Color 
     } else {
         theme.agent_color_default
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Config Status (Phase 2: Config as CRDT)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Source of a loaded config file.
-#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConfigLoadSource {
-    /// Loaded from disk file (~/.config/kaijutsu/).
-    #[default]
-    Disk,
-    /// Loaded from CRDT document (synced from server).
-    Crdt,
-    /// Using embedded default (fallback).
-    Default,
-}
-
-impl std::fmt::Display for ConfigLoadSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Disk => write!(f, "disk"),
-            Self::Crdt => write!(f, "crdt"),
-            Self::Default => write!(f, "default"),
-        }
-    }
-}
-
-/// Status of a single config file.
-#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
-#[derive(Debug, Clone, Default)]
-pub struct ConfigFileStatus {
-    /// Where the config was loaded from.
-    pub source: ConfigLoadSource,
-    /// Error message if there was a problem loading/parsing.
-    pub error: Option<String>,
-    /// Version counter (increments on changes).
-    pub version: u64,
-    /// Whether the config has pending CRDT changes not yet applied.
-    pub pending_changes: bool,
-}
-
-#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
-impl ConfigFileStatus {
-    /// Create a successful status.
-    pub fn success(source: ConfigLoadSource, version: u64) -> Self {
-        Self {
-            source,
-            error: None,
-            version,
-            pending_changes: false,
-        }
-    }
-
-    /// Create an error status.
-    pub fn with_error(source: ConfigLoadSource, error: impl Into<String>) -> Self {
-        Self {
-            source,
-            error: Some(error.into()),
-            version: 0,
-            pending_changes: false,
-        }
-    }
-}
-
-/// Resource tracking the status of all config files.
-///
-/// Used for:
-/// - Showing config status in UI (loaded, errors, pending changes)
-/// - Triggering theme reloads when config changes
-/// - Debugging config issues
-#[allow(dead_code)] // Scaffolding for Phase 3 live-reload
-#[derive(Resource, Default)]
-pub struct ConfigStatus {
-    /// Status of the base theme (theme.toml).
-    pub theme: ConfigFileStatus,
-    /// Whether live reload is enabled (Phase 3+).
-    pub live_reload_enabled: bool,
 }
