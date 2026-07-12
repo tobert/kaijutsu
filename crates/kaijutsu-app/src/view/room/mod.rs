@@ -1685,7 +1685,11 @@ fn lin_v(v: Vec3) -> Color {
 /// sits below it. Degenerate all-zero input maps to itself (a black trace
 /// stays black — `scale` would otherwise divide by zero). `.w` is unused
 /// (every `TraceGlowMaterial` element is opaque).
-fn crest_color(identity: [f32; 3], crest: f32) -> Vec4 {
+///
+/// `pub(crate)`: also the crest-normalization the time well's lineage drapes
+/// share (`time_well::drape::lineage_drape_material`) — same
+/// `TraceGlowMaterial` binding idiom, one normalization helper.
+pub(crate) fn crest_color(identity: [f32; 3], crest: f32) -> Vec4 {
     let max_c = identity[0].max(identity[1]).max(identity[2]);
     let scale = if max_c > 1e-6 { crest / max_c } else { 0.0 };
     Vec4::new(identity[0] * scale, identity[1] * scale, identity[2] * scale, 0.0)

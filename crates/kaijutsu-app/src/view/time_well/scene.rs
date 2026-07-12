@@ -47,6 +47,15 @@ pub struct Card {
     /// the mouth, shrinking toward the throat — see [`super::card::spiral_scale`]).
     /// [`highlight_selection`] eases toward this, popping the selection.
     pub base_scale: f32,
+    /// The selected card's live-tail band content (the last few tail lines,
+    /// pre-shaped by [`super::live::tail_lines`]), `None` for every
+    /// non-selected card. Written by [`super::live::sync_selected_card_tail`]
+    /// **only when it actually changes** — the same guarded-write discipline
+    /// as `selected`/`in_lineage`/`drifting` above, which rides the existing
+    /// `Changed<Card>` gate `text::build_card_scenes` already has rather than
+    /// adding a second rebuild path (`docs/timewell.md`'s HUD melt, replacing
+    /// the South HUD panel's job on the card face itself).
+    pub tail: Option<String>,
 }
 
 /// The placement/root entity that re-roots the well's whole subtree into room
@@ -201,6 +210,11 @@ pub struct TimeWellState {
     /// it actually rebuilds. Mirrors `patch_bay::PatchBayState::arm_text`'s
     /// dirty-flag shape.
     pub card_text_dirty: bool,
+    /// The one shared material every [`super::drape::LineageDrape`] ribbon
+    /// reuses — built lazily on first use by
+    /// [`super::drape::sync_lineage_drapes`], same "build once, cache the
+    /// handle" shape as [`Self::card_mesh`].
+    pub lineage_drape_material: Option<Handle<crate::shaders::TraceGlowMaterial>>,
 }
 
 impl TimeWellState {
@@ -234,6 +248,7 @@ impl Default for TimeWellState {
             // no prior `arm_dive` call to have armed it (mirrors
             // `RoomState::plates_dirty`'s "fresh state starts dirty" stance).
             card_text_dirty: true,
+            lineage_drape_material: None,
         }
     }
 }
@@ -1356,8 +1371,11 @@ mod tests {
 /// `state.selected`. `state.selected` itself is left untouched by every
 /// caller — it persists across the zoom so a re-dive re-pops the same card
 /// (see `arm_dive`'s own doc + tests: nav state deliberately survives a room
-/// round-trip). Shared by [`highlight_selection`] and [`highlight_lineage`].
-fn effective_selection(zoomed: bool, selected: Option<ContextId>) -> Option<ContextId> {
+/// round-trip). Shared by [`highlight_selection`], [`highlight_lineage`], and
+/// [`super::drape::sync_lineage_drapes`] (`pub(super)` for that third,
+/// sibling-module caller — same zoom-gate reasoning applies to the drapes as
+/// to the ring highlight they were derived from).
+pub(super) fn effective_selection(zoomed: bool, selected: Option<ContextId>) -> Option<ContextId> {
     if zoomed { selected } else { None }
 }
 

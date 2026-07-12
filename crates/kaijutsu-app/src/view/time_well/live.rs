@@ -155,6 +155,31 @@ impl ContextTails {
     }
 }
 
+/// Pick + truncate the newest `n_lines` of `ctx`'s live tail buffer, each
+/// capped at `line_chars`, oldest → newest, joined with `\n`. `None` when the
+/// context hasn't produced a tail line since the app started — the caller
+/// decides what "nothing yet" means: [`super::hud::hud_south`] falls back to
+/// the polled preview; the card face's own gist line
+/// (`text::card_text_glyphs`) already shows that same preview, so its tail
+/// band ([`super::scene::Card::tail`], via [`sync_selected_card_tail`]) skips
+/// entirely rather than repeating it.
+///
+/// Shared pure text-shaping — [`super::hud::hud_south`]'s own logic before
+/// this extraction, now the one place both the HUD South panel and the card
+/// face's live-tail band pick their lines from (`docs/timewell.md`'s HUD
+/// melt, slice 2).
+pub fn tail_lines(tails: &ContextTails, ctx: ContextId, n_lines: usize, line_chars: usize) -> Option<String> {
+    let lines: Vec<String> = tails
+        .iter_lines(&ctx)
+        .map(|l| crate::text::truncate_chars(&l.display(), line_chars))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let newest = lines.len();
+    Some(lines[newest.saturating_sub(n_lines)..].join("\n"))
+}
+
 /// Head of the first non-empty content line, truncated to
 /// [`TAIL_LINE_CHARS`]. `None` when there is no visible text at all.
 fn head_line(content: &str) -> Option<String> {
@@ -439,6 +464,43 @@ pub fn sync_card_live_uniforms(
     }
 }
 
+/// Tail lines shown in the selected card's live-tail band — fewer than the
+/// HUD South panel's [`super::hud::hud_south`] ([`SOUTH_TAIL_LINES`] there is
+/// 5, wider panel) since the card face is smaller and the band is meant to
+/// stay small and dim under the title/badge/gist area, not dominate it.
+const CARD_TAIL_LINES: usize = 3;
+
+/// Selected-card-ONLY, dived-only live-tail sync: writes [`super::scene::Card::tail`]
+/// **only when its content actually changed** (same guarded-write discipline
+/// as `scene::highlight_selection`/`highlight_lineage` — the change guard the
+/// mission brief asked to find and reuse), so it rides the EXISTING
+/// `Changed<Card>` gate `text::build_card_scenes` already has instead of
+/// adding a second rebuild path. Every non-selected card's tail clears to
+/// `None` the same way (one pass over every card, same shape as the
+/// selection/lineage overlays — not a special-cased single-entity lookup).
+///
+/// Dived-only, like every other card-TEXT builder (`text::build_card_scenes`'s
+/// own doc has the "unreadable pixels at room scale" reasoning this system
+/// shares) — `ingest_live_events` keeps filling [`ContextTails`] ungated
+/// regardless of screen/zoom, so nothing is missed: the next dive recomputes
+/// fresh from whatever accumulated while ambient.
+pub fn sync_selected_card_tail(
+    state: Res<super::scene::TimeWellState>,
+    tails: Res<ContextTails>,
+    mut cards: Query<&mut super::scene::Card>,
+) {
+    for mut card in cards.iter_mut() {
+        let next = if Some(card.context_id) == state.selected {
+            tail_lines(&tails, card.context_id, CARD_TAIL_LINES, super::text::GIST_LINE_CHARS)
+        } else {
+            None
+        };
+        if card.tail != next {
+            card.tail = next;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +649,44 @@ mod tests {
         assert!(!tails.iter_lines(&ctx(9)).next().is_none(), "newcomer kept");
     }
 
+    // ── tail_lines ──
+
+    #[test]
+    fn tail_lines_is_none_for_an_untouched_context() {
+        let tails = ContextTails::default();
+        assert_eq!(tail_lines(&tails, ctx(1), 3, 40), None);
+    }
+
+    #[test]
+    fn tail_lines_returns_the_newest_n_oldest_to_newest() {
+        let mut tails = ContextTails::default();
+        for i in 0..6 {
+            tails.push(ctx(1), TailLine::new("✦", format!("event {i}")), i as f64);
+        }
+        let joined = tail_lines(&tails, ctx(1), 3, 40).unwrap();
+        let shown: Vec<&str> = joined.lines().collect();
+        assert_eq!(shown.len(), 3, "newest 3 lines: {joined:?}");
+        assert!(shown[0].contains("event 3"), "oldest of the kept window first: {joined:?}");
+        assert!(shown[2].contains("event 5"), "newest line last: {joined:?}");
+    }
+
+    #[test]
+    fn tail_lines_requesting_more_than_available_returns_them_all() {
+        let mut tails = ContextTails::default();
+        tails.push(ctx(1), TailLine::new("✦", "only one"), 0.0);
+        let joined = tail_lines(&tails, ctx(1), 5, 40).unwrap();
+        assert_eq!(joined, "✦ only one");
+    }
+
+    #[test]
+    fn tail_lines_truncates_each_line_to_the_char_budget() {
+        let mut tails = ContextTails::default();
+        tails.push(ctx(1), TailLine::new("✦", "x".repeat(100)), 0.0);
+        let joined = tail_lines(&tails, ctx(1), 3, 20).unwrap();
+        assert!(joined.chars().count() <= 20, "line over budget: {joined:?}");
+        assert!(joined.ends_with('…'), "elided: {joined:?}");
+    }
+
     // ── beats ──
 
     #[test]
@@ -696,5 +796,94 @@ mod tests {
         }));
         app.update();
         assert!(!app.world().resource::<WellBeats>().any_rolling(), "flush drops the phasor");
+    }
+
+    fn minimal_card(id: ContextId) -> super::super::scene::Card {
+        super::super::scene::Card {
+            context_id: id,
+            data: super::super::card::CardData {
+                title: "t".into(),
+                accent: "coder".into(),
+                model_badge: String::new(),
+                fork_badge: None,
+                keywords: vec![],
+                preview: None,
+                band: kaijutsu_viz::layout::Band::Active,
+                forked_from: None,
+                cluster_label: None,
+                paused: false,
+            },
+            status: None,
+            selected: false,
+            in_lineage: false,
+            drifting: false,
+            base_scale: 1.0,
+            tail: None,
+        }
+    }
+
+    #[test]
+    fn sync_selected_card_tail_tracks_selection_and_only_the_selected_card() {
+        let mut app = App::new();
+        app.init_resource::<ContextTails>()
+            .init_resource::<super::super::scene::TimeWellState>()
+            .add_systems(Update, sync_selected_card_tail);
+
+        let sel = ctx(1);
+        let other = ctx(2);
+        app.world_mut().resource_mut::<ContextTails>().push(sel, TailLine::new("✦", "hello"), 0.0);
+        app.world_mut().resource_mut::<super::super::scene::TimeWellState>().selected = Some(sel);
+
+        let sel_entity = app.world_mut().spawn(minimal_card(sel)).id();
+        let other_entity = app.world_mut().spawn(minimal_card(other)).id();
+
+        app.update();
+        assert_eq!(
+            app.world().get::<super::super::scene::Card>(sel_entity).unwrap().tail.as_deref(),
+            Some("✦ hello"),
+            "selected card gets the tail"
+        );
+        assert_eq!(
+            app.world().get::<super::super::scene::Card>(other_entity).unwrap().tail,
+            None,
+            "non-selected card stays untouched"
+        );
+
+        // Deselecting clears the previously-tailed card's band — the same
+        // guarded-write pass runs over every card, not a special-cased
+        // single-entity lookup, so "nothing selected" naturally clears it.
+        app.world_mut().resource_mut::<super::super::scene::TimeWellState>().selected = None;
+        app.update();
+        assert_eq!(
+            app.world().get::<super::super::scene::Card>(sel_entity).unwrap().tail,
+            None,
+            "deselecting clears the tail"
+        );
+    }
+
+    #[test]
+    fn sync_selected_card_tail_updates_as_new_lines_arrive() {
+        let mut app = App::new();
+        app.init_resource::<ContextTails>()
+            .init_resource::<super::super::scene::TimeWellState>()
+            .add_systems(Update, sync_selected_card_tail);
+
+        let sel = ctx(1);
+        app.world_mut().resource_mut::<super::super::scene::TimeWellState>().selected = Some(sel);
+        let entity = app.world_mut().spawn(minimal_card(sel)).id();
+
+        // No tail content yet — and no fallback to `data.preview` either
+        // (the card face's own gist line already shows that; see
+        // `tail_lines`'s own doc for why the card path skips the fallback
+        // `hud_south` uses).
+        app.update();
+        assert_eq!(app.world().get::<super::super::scene::Card>(entity).unwrap().tail, None);
+
+        app.world_mut().resource_mut::<ContextTails>().push(sel, TailLine::new("▸", "shell: ls"), 1.0);
+        app.update();
+        assert_eq!(
+            app.world().get::<super::super::scene::Card>(entity).unwrap().tail.as_deref(),
+            Some("▸ shell: ls")
+        );
     }
 }

@@ -48,7 +48,10 @@ const GIST_FONT_SIZE: f32 = 9.0;
 /// widths drive the actual on-screen wrap ([`VelloFont::layout`]'s
 /// `break_all_lines`), so `wrap_gist` just needs each pre-wrapped line to be
 /// safely short enough that parley never wraps it a second time.
-const GIST_LINE_CHARS: usize = 40;
+///
+/// `pub(super)`: also the per-line budget the selected card's live-tail band
+/// uses (`live::sync_selected_card_tail`) — same card width, same tuning.
+pub(super) const GIST_LINE_CHARS: usize = 40;
 /// Hard cap on wrapped gist lines; content beyond this is ellipsized.
 const GIST_MAX_LINES: usize = 2;
 
@@ -159,6 +162,16 @@ fn collect_field(
 
 /// Lay out the card's text fields and collect MSDF glyphs (crisp at any zoom).
 /// Each field lands at the same `(pad, y)` origin and color the card used before.
+///
+/// `show_tail`: whether to render [`Card::tail`]'s live-tail band (HUD-melt
+/// slice 2). `true` from the rim-card path ([`build_card_scenes`]), `false`
+/// from the reading/focus-card path ([`update_reading_card`]) — that system's
+/// own change-guard only fires on a *selection* change, so a tail that keeps
+/// updating while the selection stays put would go stale on the bigger focus
+/// card; the rim card's path has no such gap (it rides `Changed<Card>`
+/// directly, which the tail's own guarded write already trips). HUD South
+/// only ever showed the rim-selection's tail too, so this keeps the same
+/// scope its job is replacing.
 fn card_text_glyphs(
     card: &Card,
     font: &VelloFont,
@@ -166,6 +179,7 @@ fn card_text_glyphs(
     h: f32,
     atlas: &mut MsdfAtlas,
     font_data_map: &mut FontDataMap,
+    show_tail: bool,
 ) -> Vec<PositionedGlyph> {
     let s = h / CARD_TEX_H;
     let pad = PAD * s;
@@ -254,6 +268,28 @@ fn card_text_glyphs(
         y += lh + 4.0 * s;
     }
 
+    // ── Live-tail band (selected card ONLY, `show_tail` gate — HUD-melt
+    // slice 2, replacing the South HUD panel's job on the card face itself:
+    // `docs/timewell.md`, "Lineage drapes down the bowl wall" 's sibling
+    // slice). `card.tail` is `None` for every non-selected card and for a
+    // selected card with no live lines yet — same style as the gist line
+    // above it (small, dim), one row lower. ──
+    if show_tail
+        && let Some(tail_text) = card.tail.as_deref()
+        && y < h - pad
+    {
+        let brush = gist_brush();
+        let l = font.layout(
+            tail_text,
+            &VelloTextStyle { font_size: GIST_FONT_SIZE * s, line_height: 1.15, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let lh = l.height();
+        collect_field(&l, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        y += lh + 4.0 * s;
+    }
+
     // ── Keywords. ──
     let tail = data.keywords.join(" · ");
     if !tail.is_empty() && y < h - pad {
@@ -331,7 +367,8 @@ pub fn build_card_scenes(
         // Pure MSDF surface: the build size lives on the card's `UiRttTexture`
         // (set once at spawn); the MSDF pass clears and owns the texture. No
         // vello scene — the shader draws the body.
-        let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
+        let glyphs =
+            card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map, true);
         commit_panel_glyphs(&mut msdf, glyphs);
 
         if let Some(mat) = materials.get_mut(&mat_node.0) {
@@ -387,9 +424,19 @@ pub fn update_reading_card(
                 mat.border = (accent.truncate() * palette.gain_reading_border).extend(1.0);
             }
             match atlas.as_deref_mut() {
-                Some(atlas) => {
-                    card_text_glyphs(card, font, READING_TEX_W, READING_TEX_H, atlas, &mut font_data_map)
-                }
+                Some(atlas) => card_text_glyphs(
+                    card,
+                    font,
+                    READING_TEX_W,
+                    READING_TEX_H,
+                    atlas,
+                    &mut font_data_map,
+                    // No tail band here — see `card_text_glyphs`'s own doc on
+                    // `show_tail` for why (this system's change-guard only
+                    // fires on selection change, so a live-updating tail
+                    // would go stale on the bigger focus card).
+                    false,
+                ),
                 None => Vec::new(),
             }
         }
