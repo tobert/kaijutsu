@@ -201,6 +201,11 @@ fn main() {
         .add_plugins(view::patch_bay::PatchBayPlugin)
         // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
         .add_plugins(view::time_well::TimeWellPlugin)
+        // The FSN landscape (VFS-as-terrain world; N-dive from the room, Esc
+        // to surface) — a genuine `Screen::Fsn` transition, not a
+        // `RoomState::zoomed` station, so it has no ordering dependency on
+        // `RoomPlugin` the way the zoomable stations above do.
+        .add_plugins(view::fsn::FsnPlugin)
         // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
         .add_plugins(view::editor::EditorPlugin)
         // Timeline navigation - temporal scrubbing through history
