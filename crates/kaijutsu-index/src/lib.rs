@@ -145,6 +145,15 @@ fn pick_cluster_label<'a>(
 ///
 /// Combines an embedder, HNSW index, and SQLite metadata store.
 /// Thread-safe — wrap in Arc for sharing.
+///
+/// # Lock order
+///
+/// Writers (`index_context`) take `metadata` then `hnsw` — the metadata lock
+/// is deliberately held across embed + insert so concurrent callers can't
+/// embed the same context twice. Everyone else must **never hold `hnsw` while
+/// acquiring `metadata`**: collect what you need from the graph, drop the
+/// guard, then touch metadata (`neighbors`/`clusters` show the pattern).
+/// Holding both in the opposite order inverts the writer order and deadlocks.
 pub struct SemanticIndex {
     embedder: Arc<dyn Embedder>,
     hnsw: RwLock<index::HnswIndex>,
@@ -261,8 +270,11 @@ impl SemanticIndex {
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<SearchResult>, IndexError> {
         let embedding = self.embedder.embed(query)?;
 
-        let hnsw = self.hnsw.read().unwrap();
-        let neighbors = hnsw.search(&embedding, k)?;
+        // Lock order: drop the hnsw guard before taking metadata (see struct docs).
+        let neighbors = {
+            let hnsw = self.hnsw.read().unwrap();
+            hnsw.search(&embedding, k)?
+        };
 
         let meta = self.metadata.lock().unwrap();
         let mut results = Vec::with_capacity(neighbors.len());
@@ -674,6 +686,61 @@ mod tests {
 
             let neighbors = idx.neighbors(ctx1, 5).unwrap();
             assert!(!neighbors.is_empty(), "neighbors should work after reload");
+        }
+    }
+
+    /// Regression: `search()` used to hold the hnsw read guard while acquiring
+    /// the metadata lock, while `index_context()` acquires metadata then the
+    /// hnsw write lock — an ABBA deadlock under concurrency. One indexer plus
+    /// two searchers hammering the same index trips the inversion within a few
+    /// iterations; the channel timeout converts a hang into a test failure.
+    #[test]
+    fn test_concurrent_search_and_index_no_deadlock() {
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let idx =
+            Arc::new(SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap());
+        seed_filler(&idx, 10);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let mut handles = Vec::new();
+
+        // Indexer thread: metadata → hnsw.write
+        {
+            let idx = idx.clone();
+            let done = done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..200 {
+                    let ctx = ContextId::new();
+                    let blocks = make_blocks(ctx, &format!("stress indexer content {i}"));
+                    idx.index_context(ctx, &blocks).unwrap();
+                }
+                let _ = done.send(());
+            }));
+        }
+
+        // Searcher threads: hnsw.read → metadata (the inverted order pre-fix)
+        for t in 0..2 {
+            let idx = idx.clone();
+            let done = done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..200 {
+                    idx.search(&format!("stress query {t} {i}"), 3).unwrap();
+                }
+                let _ = done.send(());
+            }));
+        }
+        drop(done_tx);
+
+        for _ in 0..3 {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("deadlock: a worker thread did not finish within 30s");
+        }
+        for h in handles {
+            h.join().unwrap();
         }
     }
 
