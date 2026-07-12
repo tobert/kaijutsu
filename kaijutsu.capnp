@@ -835,6 +835,10 @@ struct SnapshotNode {
   generation @6 :UInt64;       # Per-directory listing-generation stamp; 0 for files
   children @7 :List(SnapshotNode);
   truncatedHere @8 :Bool;      # This node's children were cut (depth or entry cap)
+  denied @9 :Bool;             # The walk was REFUSED here (permission denied on the
+                               # listing/attributes) — distinct from truncatedHere: a cut
+                               # is the walker's budget, a denial is the filesystem saying
+                               # no, rendered as a seam rather than failing the walk
 }
 
 # ============================================================================

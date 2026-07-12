@@ -245,6 +245,7 @@ mod tests {
             ignored: false,
             generation: 1,
             truncated_here: false,
+            denied: false,
             children,
         }
     }

@@ -72,6 +72,21 @@ pub enum VfsError {
 }
 
 impl VfsError {
+    /// Whether this error means "the caller may not look here" — either the
+    /// VFS's own [`VfsError::PermissionDenied`] or a host-backend
+    /// [`VfsError::Io`] carrying `EACCES`/`EPERM`. The snapshot walker
+    /// (`MountTable::snapshot`) branches on this: an unreadable directory is
+    /// real information to *render* (a denied seam, `docs/scenes/vfs.md`
+    /// "truth seams"), not a reason to fail a whole walk — host `/etc` alone
+    /// carries a dozen root-only directories.
+    pub fn is_permission_denied(&self) -> bool {
+        match self {
+            VfsError::PermissionDenied(_) => true,
+            VfsError::Io(e) => e.kind() == io::ErrorKind::PermissionDenied,
+            _ => false,
+        }
+    }
+
     /// Create a NotFound error.
     pub fn not_found(path: impl Into<String>) -> Self {
         Self::NotFound(path.into())

@@ -8350,6 +8350,7 @@ fn set_snapshot_node(
     builder.set_ignored(node.ignored);
     builder.set_generation(node.generation);
     builder.set_truncated_here(node.truncated_here);
+    builder.set_denied(node.denied);
     let mut children = builder.reborrow().init_children(node.children.len() as u32);
     for (i, child) in node.children.iter().enumerate() {
         let mut child_builder = children.reborrow().get(i as u32);

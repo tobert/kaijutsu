@@ -212,6 +212,14 @@ pub struct SnapshotNode {
     /// `true` when this node's real children were cut short by depth or the
     /// entry cap — the real count is still in [`Self::child_count`].
     pub truncated_here: bool,
+    /// `true` when the walk was *refused* here: the node's listing (or, for
+    /// a stubbed child, its attributes) came back permission-denied. Distinct
+    /// from [`Self::truncated_here`] — a cut is the walker's own budget, a
+    /// denial is the filesystem saying no, and the world renders that seam
+    /// (`docs/scenes/vfs.md` "truth seams") rather than the whole walk
+    /// failing over one root-only directory. `child_count` stays 0
+    /// (unknowable behind the refusal).
+    pub denied: bool,
 }
 
 /// Result of [`MountTable::snapshot`](super::mount::MountTable::snapshot) —

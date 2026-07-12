@@ -312,6 +312,7 @@ impl MountTable {
                 generation,
                 children: Vec::new(),
                 truncated_here: false,
+                denied: false,
             };
 
             // Symlinks are never expanded, even when they target a
@@ -322,7 +323,21 @@ impl MountTable {
                 return Ok(node);
             }
 
-            let mut entries = self.readdir(&vfs_path).await?;
+            // A refused listing marks the node and stops descending, rather
+            // than failing the whole walk: host /etc alone carries a dozen
+            // root-only directories, and an unreadable directory is real
+            // information the world renders as a seam (docs/scenes/vfs.md
+            // "truth seams"). Every OTHER error still fails the call — only
+            // "you may not look" is a fact about the tree; an I/O fault is a
+            // fault.
+            let mut entries = match self.readdir(&vfs_path).await {
+                Ok(entries) => entries,
+                Err(e) if e.is_permission_denied() => {
+                    node.denied = true;
+                    return Ok(node);
+                }
+                Err(e) => return Err(e),
+            };
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             node.child_count = entries.len() as u32;
 
@@ -349,16 +364,41 @@ impl MountTable {
                     break;
                 }
                 let child_path = vfs_path.join(&entry.name);
-                let child = self
+                let child = match self
                     .snapshot_node(
-                        child_path,
-                        entry.name,
+                        child_path.clone(),
+                        entry.name.clone(),
                         depth_remaining - 1,
                         budget,
                         any_truncated,
                         child_ignore_levels.clone(),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(child) => child,
+                    // A child whose own `getattr` is refused (its readdir
+                    // refusal is already handled inside the recursion) still
+                    // gets a seat as a denied stub — same truth-seam
+                    // reasoning as the readdir arm above; `readdir` gave us
+                    // its name and kind, which is all a seam needs.
+                    Err(e) if e.is_permission_denied() => SnapshotNode {
+                        name: entry.name,
+                        kind: entry.kind,
+                        size: 0,
+                        mtime_secs: 0,
+                        child_count: 0,
+                        ignored: Self::ignore_stack_matches(
+                            &child_ignore_levels,
+                            &child_path,
+                            entry.kind.is_dir(),
+                        ),
+                        generation: 0,
+                        children: Vec::new(),
+                        truncated_here: false,
+                        denied: true,
+                    },
+                    Err(e) => return Err(e),
+                };
                 node.children.push(child);
             }
 
@@ -383,7 +423,16 @@ impl MountTable {
     /// `truncated_here` exists precisely so an INTENTIONAL cut is visible;
     /// silently returning a half-tree on an I/O error would look identical
     /// to a deliberate depth/cap cut, which is exactly the ambiguity this
-    /// avoids.
+    /// avoids. The ONE carve-out is permission denial
+    /// ([`VfsError::is_permission_denied`]): "you may not look" is a fact
+    /// about the tree, not a fault — the refused node is included with
+    /// `denied: true` and the walk continues past it (live-caught 2026-07-12:
+    /// host `/etc`'s root-only directories made the whole tree
+    /// un-snapshottable under the pure fail-whole-call policy). The walk
+    /// ROOT itself: a refused *listing* still returns (a denied root node —
+    /// the caller learns the target exists and is refused); refused
+    /// *attributes* error, since there is nothing at all to say about the
+    /// caller's own named target.
     ///
     /// **Generation policy** (stage-1 groundwork): directory generations
     /// track STRUCTURE (name-set) changes only —
@@ -618,6 +667,34 @@ impl MountTable {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
+
+    /// The synthetic children an **intermediate mount directory** owes its
+    /// existence to: the next path component of every mount point strictly
+    /// under `prefix` (mounts `/v/cas` + `/v/docs` give `/v` the children
+    /// `cas` and `docs`). Empty when `prefix` is not an ancestor of any
+    /// mount. Such directories exist only in the mount table — the backend
+    /// that happens to own the prefix (e.g. a host-`/` root mount under
+    /// `/v`) may know nothing about them, so `getattr`/`readdir` must answer
+    /// from here first (live-caught 2026-07-12: the snapshot walker ENOENTed
+    /// on `/v` because host `/v` doesn't exist).
+    async fn mount_children(&self, prefix: &Path) -> Vec<DirEntry> {
+        let mounts = self.mounts.read().await;
+        let mut names = std::collections::BTreeSet::new();
+        for mount_path in mounts.keys() {
+            if mount_path == prefix {
+                continue;
+            }
+            if let Ok(rest) = mount_path.strip_prefix(prefix)
+                && let Some(first) = rest.components().next()
+            {
+                names.insert(first.as_os_str().to_string_lossy().into_owned());
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| DirEntry { name, kind: FileType::Directory })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -637,6 +714,12 @@ impl VfsOps for MountTable {
                 return Ok(FileAttr::directory(0o755));
             }
         }
+        // An intermediate mount directory (an ancestor of some mount point,
+        // e.g. `/v` under mounts `/v/cas`…) exists only in the mount table —
+        // the backend owning the prefix may ENOENT it. See [`Self::mount_children`].
+        if !self.mount_children(&normalized).await.is_empty() {
+            return Ok(FileAttr::directory(0o755));
+        }
 
         let (fs, relative) = self.find_mount(path).await?;
         fs.getattr(&relative).await
@@ -649,8 +732,42 @@ impl VfsOps for MountTable {
             return self.list_root().await;
         }
 
-        let (fs, relative) = self.find_mount(path).await?;
-        fs.readdir(&relative).await
+        // Merge the backend's own listing with any synthetic mount children
+        // (see [`Self::mount_children`]) — a directory can be both real on
+        // its backend AND the parent of deeper mounts. Backend misses are
+        // tolerated only when synthetic children exist AND the miss is
+        // NotFound (the intermediate dir has no real backing); any other
+        // backend error still surfaces.
+        let normalized = Self::normalize_mount_path(path.to_path_buf());
+        let synthetic = self.mount_children(&normalized).await;
+        let backend_entries = match self.find_mount(path).await {
+            Ok((fs, relative)) => match fs.readdir(&relative).await {
+                Ok(entries) => entries,
+                Err(VfsError::NotFound(_)) if !synthetic.is_empty() => Vec::new(),
+                Err(e)
+                    if !synthetic.is_empty()
+                        && matches!(&e, VfsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            },
+            Err(_) if !synthetic.is_empty() => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        if synthetic.is_empty() {
+            return Ok(backend_entries);
+        }
+        let mut seen: std::collections::HashSet<String> =
+            backend_entries.iter().map(|e| e.name.clone()).collect();
+        let mut entries = backend_entries;
+        for entry in synthetic {
+            if seen.insert(entry.name.clone()) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 
     async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
@@ -1457,5 +1574,192 @@ mod tests {
         let result = table.snapshot(Path::new("/scratch"), 3, SNAPSHOT_MAX_ENTRIES).await.unwrap();
         let target = result.root.children.iter().find(|c| c.name == "target").unwrap();
         assert!(!target.ignored);
+    }
+
+    // ── snapshot: permission denial is a seam, not a failure ──
+    // (live-caught 2026-07-12: host /etc's root-only directories made the
+    // whole tree un-snapshottable under the pure fail-whole-call policy)
+
+    /// A backend that refuses inspection. `MountTable::getattr` answers for a
+    /// mount POINT itself without consulting the backend, so the refusals
+    /// live one level in: `deny_readdir: true` refuses the root listing
+    /// (exercising the walker's readdir-denied arm); `deny_readdir: false`
+    /// lists one child ("secret") whose own `getattr` then refuses
+    /// (exercising the denied-stub arm in the parent loop).
+    struct DenyBackend {
+        deny_readdir: bool,
+    }
+
+    #[async_trait]
+    impl VfsOps for DenyBackend {
+        async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
+            if path.as_os_str().is_empty() || path == Path::new("/") {
+                return Ok(FileAttr::directory(0o700));
+            }
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn readdir(&self, path: &Path) -> VfsResult<Vec<DirEntry>> {
+            if self.deny_readdir {
+                return Err(VfsError::permission_denied(path.display().to_string()));
+            }
+            Ok(vec![DirEntry { name: "secret".into(), kind: FileType::Directory }])
+        }
+        async fn read(&self, path: &Path, _offset: u64, _size: u32) -> VfsResult<Vec<u8>> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn write(&self, path: &Path, _offset: u64, _data: &[u8]) -> VfsResult<u32> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn create(&self, path: &Path, _mode: u32) -> VfsResult<FileAttr> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn mkdir(&self, path: &Path, _mode: u32) -> VfsResult<FileAttr> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn unlink(&self, path: &Path) -> VfsResult<()> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn rmdir(&self, path: &Path) -> VfsResult<()> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn rename(&self, from: &Path, _to: &Path) -> VfsResult<()> {
+            Err(VfsError::permission_denied(from.display().to_string()))
+        }
+        async fn truncate(&self, path: &Path, _size: u64) -> VfsResult<()> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn setattr(&self, path: &Path, _attr: SetAttr) -> VfsResult<FileAttr> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn symlink(&self, path: &Path, _target: &Path) -> VfsResult<FileAttr> {
+            Err(VfsError::permission_denied(path.display().to_string()))
+        }
+        async fn link(&self, oldpath: &Path, _newpath: &Path) -> VfsResult<FileAttr> {
+            Err(VfsError::permission_denied(oldpath.display().to_string()))
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        async fn statfs(&self) -> VfsResult<StatFs> {
+            Ok(StatFs::default())
+        }
+        async fn real_path(&self, _path: &Path) -> VfsResult<Option<PathBuf>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_denied_readdir_becomes_a_seam_not_an_error() {
+        let table = setup_snapshot_tree().await;
+        // The underlay dir must exist for the parent's readdir to list it;
+        // the deny mount then shadows it (longest-prefix routing).
+        table.mkdir(Path::new("/scratch/locked"), 0o700).await.unwrap();
+        table.mount("/scratch/locked", DenyBackend { deny_readdir: true }).await;
+
+        let result =
+            table.snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES).await.unwrap();
+
+        let locked = result.root.children.iter().find(|c| c.name == "locked").unwrap();
+        assert!(locked.denied, "refused listing must mark the node denied");
+        assert!(locked.children.is_empty());
+        assert_eq!(locked.child_count, 0, "a denied listing's child count is unknowable");
+        assert!(!locked.truncated_here, "denial is not the walker's own cut");
+        assert!(!result.truncated, "denial must not roll up as truncation");
+
+        // The refusal is contained: siblings still walk fully.
+        let sub = result.root.children.iter().find(|c| c.name == "sub").unwrap();
+        assert!(!sub.denied);
+        assert_eq!(sub.children.len(), 2, "denied sibling must not stop sub's own walk");
+    }
+
+    #[tokio::test]
+    async fn snapshot_denied_child_getattr_becomes_a_denied_stub() {
+        let table = setup_snapshot_tree().await;
+        table.mkdir(Path::new("/scratch/vault"), 0o700).await.unwrap();
+        table.mount("/scratch/vault", DenyBackend { deny_readdir: false }).await;
+
+        let result =
+            table.snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES).await.unwrap();
+
+        // vault itself lists fine (one child, "secret"); secret's own
+        // getattr is refused, so it seats as a denied stub with the name and
+        // kind its parent's readdir supplied.
+        let vault = result.root.children.iter().find(|c| c.name == "vault").unwrap();
+        assert!(!vault.denied);
+        let secret = vault.children.iter().find(|c| c.name == "secret").unwrap();
+        assert!(secret.denied, "refused attributes must stub the child as denied");
+        assert!(secret.kind.is_dir(), "the stub keeps readdir's kind");
+        assert!(secret.children.is_empty());
+        assert_eq!(secret.generation, 0);
+    }
+
+    // ── intermediate mount directories (live-caught 2026-07-12: the
+    // snapshot walker ENOENTed on /v — an ancestor of mounts that exists
+    // only in the mount table, not on the backend owning the prefix) ──
+
+    #[tokio::test]
+    async fn intermediate_mount_dir_getattr_and_readdir_are_synthesized() {
+        let table = MountTable::new();
+        table.mount("/v/cas", MemoryBackend::new()).await;
+        table.mount("/v/docs", MemoryBackend::new()).await;
+
+        let attr = table.getattr(Path::new("/v")).await.unwrap();
+        assert!(attr.kind.is_dir(), "/v exists as a synthetic directory");
+
+        let entries = table.readdir(Path::new("/v")).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["cas", "docs"], "next components of the mounts under /v");
+    }
+
+    #[tokio::test]
+    async fn intermediate_mount_dir_merges_with_a_real_backing_dir() {
+        // A directory can be real on its backend AND the parent of a deeper
+        // mount — both listings merge, backend entries winning name ties.
+        let table = setup_snapshot_tree().await;
+        table.mount("/scratch/sub/extra", MemoryBackend::new()).await;
+
+        let entries = table.readdir(Path::new("/scratch/sub")).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["b.txt", "c.txt", "extra"], "real entries + the synthetic mount child");
+    }
+
+    #[tokio::test]
+    async fn snapshot_walks_through_an_intermediate_mount_dir() {
+        let table = setup_snapshot_tree().await;
+        let cas = MemoryBackend::new();
+        cas.create(Path::new("blob.bin"), 0o644).await.unwrap();
+        table.mount("/v/cas", cas).await;
+
+        let result = table.snapshot(Path::new("/"), 3, SNAPSHOT_MAX_ENTRIES).await.unwrap();
+        let v = result.root.children.iter().find(|c| c.name == "v").unwrap();
+        assert!(v.kind.is_dir());
+        assert!(!v.denied);
+        let cas = v.children.iter().find(|c| c.name == "cas").unwrap();
+        assert_eq!(cas.children.len(), 1, "the walk reaches through /v into the mount");
+        assert_eq!(cas.children[0].name, "blob.bin");
+    }
+
+    #[tokio::test]
+    async fn snapshot_root_denial_semantics() {
+        let table = setup_snapshot_tree().await;
+        table.mkdir(Path::new("/scratch/locked"), 0o700).await.unwrap();
+        table.mount("/scratch/locked", DenyBackend { deny_readdir: true }).await;
+
+        // A root whose LISTING is refused still returns — as a denied node
+        // (the caller learns the path exists and is refused, same seam
+        // semantics as a mid-walk child).
+        let result = table.snapshot(Path::new("/scratch/locked"), 3, 100).await.unwrap();
+        assert!(result.root.denied);
+        assert!(result.root.children.is_empty());
+
+        // A root whose ATTRIBUTES are refused errors — there is nothing at
+        // all to say about the caller's own named target. (Not reachable
+        // through a mount point — MountTable::getattr answers for those
+        // itself — so exercised via the deny backend's own interior.)
+        let result = table.snapshot(Path::new("/scratch/locked/secret"), 3, 100).await;
+        assert!(result.unwrap_err().is_permission_denied());
     }
 }

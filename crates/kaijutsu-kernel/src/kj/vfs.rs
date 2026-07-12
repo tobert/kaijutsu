@@ -111,6 +111,9 @@ fn render_snapshot_node(node: &SnapshotNode, indent: usize, out: &mut Vec<String
     if node.truncated_here {
         suffix.push_str(" [cut]");
     }
+    if node.denied {
+        suffix.push_str(" [denied]");
+    }
     if node.ignored {
         suffix.push_str(" [ignored]");
     }

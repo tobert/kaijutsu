@@ -2027,6 +2027,10 @@ pub struct SnapshotNode {
     pub generation: u64,
     pub children: Vec<SnapshotNode>,
     pub truncated_here: bool,
+    /// The walk was refused here (permission denied) — a fact about the
+    /// tree, rendered as a seam; distinct from `truncated_here` (the
+    /// walker's own budget cut).
+    pub denied: bool,
 }
 
 /// Result of [`KernelHandle::vfs_snapshot`].
@@ -2065,6 +2069,7 @@ fn parse_snapshot_node(
         generation: reader.get_generation(),
         children,
         truncated_here: reader.get_truncated_here(),
+        denied: reader.get_denied(),
     })
 }
 
