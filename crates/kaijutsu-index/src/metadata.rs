@@ -8,6 +8,7 @@ use kaijutsu_types::ContextId;
 use rusqlite::Connection;
 
 use crate::IndexError;
+use crate::synthesis::SynthesisResult;
 
 /// SQLite-backed metadata store for the semantic index.
 pub struct MetadataStore {
@@ -57,6 +58,35 @@ impl MetadataStore {
                 VALUES (0, COALESCE((SELECT MAX(hnsw_slot) + 1 FROM index_entries), 0));",
         )
         .map_err(|e| IndexError::Database(format!("create slot_allocator: {}", e)))?;
+
+        // Synthesis results (keywords/top_blocks/gist), persisted so app well
+        // cards don't go blank after a kernel restart — previously only lived
+        // in SynthesisCache's in-memory RwLock<HashMap>. Normalized (no JSON
+        // blob columns): keywords/top_blocks are one row per entry, ordered by
+        // `rank` (the index they held in the source Vec).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS synthesis (
+                context_id BLOB PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                gist TEXT
+            );
+            CREATE TABLE IF NOT EXISTS synthesis_keywords (
+                context_id BLOB NOT NULL,
+                rank INTEGER NOT NULL,
+                term TEXT NOT NULL,
+                score REAL NOT NULL,
+                PRIMARY KEY (context_id, rank)
+            );
+            CREATE TABLE IF NOT EXISTS synthesis_top_blocks (
+                context_id BLOB NOT NULL,
+                rank INTEGER NOT NULL,
+                block_short TEXT NOT NULL,
+                score REAL NOT NULL,
+                preview TEXT NOT NULL,
+                PRIMARY KEY (context_id, rank)
+            );",
+        )
+        .map_err(|e| IndexError::Database(format!("create synthesis tables: {}", e)))?;
 
         Ok(Self { conn })
     }
@@ -193,15 +223,174 @@ impl MetadataStore {
         Ok(next_slot)
     }
 
-    /// Remove a context from the index metadata.
+    /// Remove a context from the index metadata, including any persisted
+    /// synthesis result — one transaction across all four tables so a crash
+    /// mid-remove can't leave orphaned synthesis rows behind.
     pub fn remove(&mut self, ctx: ContextId) -> Result<(), IndexError> {
-        self.conn
-            .execute(
-                "DELETE FROM index_entries WHERE context_id = ?1",
-                [ctx.as_bytes().as_slice()],
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
+        let ctx_bytes = ctx.as_bytes().as_slice();
+
+        tx.execute(
+            "DELETE FROM index_entries WHERE context_id = ?1",
+            [ctx_bytes],
+        )
+        .map_err(|e| IndexError::Database(e.to_string()))?;
+        delete_synthesis_rows(&tx, ctx_bytes)?;
+
+        tx.commit()
+            .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
+        Ok(())
+    }
+
+    /// Persist a synthesis result for `ctx`, replacing any prior result.
+    ///
+    /// One transaction: clears this context's rows from all three synthesis
+    /// tables, then inserts the new ones. `rank` is the entry's index in the
+    /// source `Vec`, which is how `load_all_synthesis` restores ordering
+    /// without an extra sort column.
+    pub fn save_synthesis(
+        &mut self,
+        ctx: ContextId,
+        result: &SynthesisResult,
+    ) -> Result<(), IndexError> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
+        let ctx_bytes = ctx.as_bytes().as_slice();
+
+        delete_synthesis_rows(&tx, ctx_bytes)?;
+
+        tx.execute(
+            "INSERT INTO synthesis (context_id, content_hash, gist) VALUES (?1, ?2, ?3)",
+            rusqlite::params![ctx_bytes, result.content_hash, result.gist],
+        )
+        .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        for (rank, (term, score)) in result.keywords.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO synthesis_keywords (context_id, rank, term, score) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![ctx_bytes, rank as i64, term, score],
             )
             .map_err(|e| IndexError::Database(e.to_string()))?;
+        }
+
+        for (rank, (block_short, score, preview)) in result.top_blocks.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO synthesis_top_blocks (context_id, rank, block_short, score, preview) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![ctx_bytes, rank as i64, block_short, score, preview],
+            )
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
         Ok(())
+    }
+
+    /// Delete a persisted synthesis result for `ctx` (all three tables).
+    pub fn delete_synthesis(&mut self, ctx: ContextId) -> Result<(), IndexError> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
+        delete_synthesis_rows(&tx, ctx.as_bytes().as_slice())?;
+        tx.commit()
+            .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
+        Ok(())
+    }
+
+    /// Load every persisted synthesis result, reassembled with
+    /// `keywords`/`top_blocks` ordered by `rank`.
+    ///
+    /// Contexts are human-scale (dozens to low thousands), so loading
+    /// everything into memory at startup is fine — this is only ever called
+    /// once, to hydrate `SynthesisCache`.
+    pub fn load_all_synthesis(&self) -> Result<Vec<(ContextId, SynthesisResult)>, IndexError> {
+        let mut results: Vec<(ContextId, SynthesisResult)> = Vec::new();
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT context_id, content_hash, gist FROM synthesis")
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let bytes: Vec<u8> = row.get(0)?;
+                    let content_hash: String = row.get(1)?;
+                    let gist: Option<String> = row.get(2)?;
+                    Ok((bytes, content_hash, gist))
+                })
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+
+            for row in rows {
+                let (bytes, content_hash, gist) =
+                    row.map_err(|e| IndexError::Database(e.to_string()))?;
+                if bytes.len() != 16 {
+                    continue;
+                }
+                let arr: [u8; 16] = bytes.try_into().unwrap();
+                let ctx = ContextId::from_bytes(arr);
+                results.push((
+                    ctx,
+                    SynthesisResult {
+                        keywords: Vec::new(),
+                        top_blocks: Vec::new(),
+                        gist,
+                        content_hash,
+                    },
+                ));
+            }
+        }
+
+        for (ctx, result) in &mut results {
+            let ctx_bytes = ctx.as_bytes().as_slice();
+
+            let mut kw_stmt = self
+                .conn
+                .prepare(
+                    "SELECT term, score FROM synthesis_keywords WHERE context_id = ?1 ORDER BY rank",
+                )
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            let kw_rows = kw_stmt
+                .query_map([ctx_bytes], |row| {
+                    let term: String = row.get(0)?;
+                    let score: f32 = row.get(1)?;
+                    Ok((term, score))
+                })
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            for row in kw_rows {
+                result
+                    .keywords
+                    .push(row.map_err(|e| IndexError::Database(e.to_string()))?);
+            }
+
+            let mut tb_stmt = self
+                .conn
+                .prepare(
+                    "SELECT block_short, score, preview FROM synthesis_top_blocks \
+                     WHERE context_id = ?1 ORDER BY rank",
+                )
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            let tb_rows = tb_stmt
+                .query_map([ctx_bytes], |row| {
+                    let block_short: String = row.get(0)?;
+                    let score: f32 = row.get(1)?;
+                    let preview: String = row.get(2)?;
+                    Ok((block_short, score, preview))
+                })
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            for row in tb_rows {
+                result
+                    .top_blocks
+                    .push(row.map_err(|e| IndexError::Database(e.to_string()))?);
+            }
+        }
+
+        Ok(results)
     }
 
     /// List all (hnsw_slot, context_id) pairs, ordered by slot.
@@ -314,16 +503,35 @@ impl MetadataStore {
             .transaction()
             .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
 
-        let slots: Vec<u32> = {
+        // Select both columns: slots drive the index_entries delete (and are
+        // what the caller needs to clear the HNSW embeddings cache), while
+        // context_ids are needed to clean up the synthesis tables, which are
+        // keyed by context_id, not slot.
+        let evicted: Vec<(u32, ContextId)> = {
             let mut stmt = tx
-                .prepare("SELECT hnsw_slot FROM index_entries ORDER BY embedded_at ASC LIMIT ?1")
+                .prepare(
+                    "SELECT hnsw_slot, context_id FROM index_entries \
+                     ORDER BY embedded_at ASC LIMIT ?1",
+                )
                 .map_err(|e| IndexError::Database(e.to_string()))?;
             let rows = stmt
-                .query_map([n as i64], |row| row.get::<_, u32>(0))
+                .query_map([n as i64], |row| {
+                    let slot: u32 = row.get(0)?;
+                    let bytes: Vec<u8> = row.get(1)?;
+                    Ok((slot, bytes))
+                })
                 .map_err(|e| IndexError::Database(e.to_string()))?;
-            rows.collect::<Result<Vec<u32>, _>>()
-                .map_err(|e| IndexError::Database(e.to_string()))?
+            let mut out = Vec::new();
+            for row in rows {
+                let (slot, bytes) = row.map_err(|e| IndexError::Database(e.to_string()))?;
+                if bytes.len() == 16 {
+                    let arr: [u8; 16] = bytes.try_into().unwrap();
+                    out.push((slot, ContextId::from_bytes(arr)));
+                }
+            }
+            out
         };
+        let slots: Vec<u32> = evicted.iter().map(|(slot, _)| *slot).collect();
 
         // Delete exactly the slots selected above — re-running the ORDER BY
         // subquery could pick a different set when embedded_at ties (same
@@ -342,11 +550,37 @@ impl MetadataStore {
             .map_err(|e| IndexError::Database(format!("evict_oldest: {}", e)))?;
         }
 
+        for (_, ctx) in &evicted {
+            delete_synthesis_rows(&tx, ctx.as_bytes().as_slice())?;
+        }
+
         tx.commit()
             .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
 
         Ok(slots)
     }
+}
+
+/// Delete a context's rows from all three synthesis tables, within an
+/// already-open transaction. Shared by `save_synthesis` (clear-before-insert),
+/// `delete_synthesis`, `remove`, and `evict_oldest`.
+fn delete_synthesis_rows(
+    tx: &rusqlite::Transaction,
+    ctx_bytes: &[u8],
+) -> Result<(), IndexError> {
+    tx.execute("DELETE FROM synthesis WHERE context_id = ?1", [ctx_bytes])
+        .map_err(|e| IndexError::Database(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM synthesis_keywords WHERE context_id = ?1",
+        [ctx_bytes],
+    )
+    .map_err(|e| IndexError::Database(e.to_string()))?;
+    tx.execute(
+        "DELETE FROM synthesis_top_blocks WHERE context_id = ?1",
+        [ctx_bytes],
+    )
+    .map_err(|e| IndexError::Database(e.to_string()))?;
+    Ok(())
 }
 
 fn now_millis() -> i64 {
@@ -588,5 +822,162 @@ mod tests {
         store.remove(ctx).unwrap();
         assert_eq!(store.count().unwrap(), 0);
         assert_eq!(store.get_slot(ctx).unwrap(), None);
+    }
+
+    fn sample_synthesis(hash: &str) -> SynthesisResult {
+        SynthesisResult {
+            keywords: vec![
+                ("rust".to_string(), 0.9),
+                ("async".to_string(), 0.7),
+                ("hnsw".to_string(), 0.5),
+            ],
+            top_blocks: vec![
+                ("blk1".to_string(), 0.95, "the best block".to_string()),
+                ("blk2".to_string(), 0.6, "a decent block".to_string()),
+            ],
+            gist: Some("a representative sentence".to_string()),
+            content_hash: hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_save_and_load_synthesis_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx = ContextId::new();
+        let result = sample_synthesis("hash-a");
+        store.save_synthesis(ctx, &result).unwrap();
+
+        let all = store.load_all_synthesis().unwrap();
+        assert_eq!(all.len(), 1);
+        let (loaded_ctx, loaded) = &all[0];
+        assert_eq!(*loaded_ctx, ctx);
+        assert_eq!(loaded.content_hash, "hash-a");
+        assert_eq!(loaded.gist.as_deref(), Some("a representative sentence"));
+        // Order preserved (rank == source Vec index).
+        assert_eq!(
+            loaded.keywords,
+            vec![
+                ("rust".to_string(), 0.9),
+                ("async".to_string(), 0.7),
+                ("hnsw".to_string(), 0.5),
+            ]
+        );
+        assert_eq!(
+            loaded.top_blocks,
+            vec![
+                ("blk1".to_string(), 0.95, "the best block".to_string()),
+                ("blk2".to_string(), 0.6, "a decent block".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_save_synthesis_none_gist_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx = ContextId::new();
+        let mut result = sample_synthesis("hash-b");
+        result.gist = None;
+        store.save_synthesis(ctx, &result).unwrap();
+
+        let all = store.load_all_synthesis().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.gist, None);
+    }
+
+    #[test]
+    fn test_save_synthesis_overwrite_no_duplicate_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx = ContextId::new();
+        store.save_synthesis(ctx, &sample_synthesis("hash-1")).unwrap();
+
+        let mut second = sample_synthesis("hash-2");
+        second.keywords = vec![("only-one".to_string(), 0.42)];
+        store.save_synthesis(ctx, &second).unwrap();
+
+        let all = store.load_all_synthesis().unwrap();
+        assert_eq!(all.len(), 1, "overwrite must not duplicate the context row");
+        let (_, loaded) = &all[0];
+        assert_eq!(loaded.content_hash, "hash-2");
+        assert_eq!(loaded.keywords, vec![("only-one".to_string(), 0.42)]);
+    }
+
+    #[test]
+    fn test_delete_synthesis_removes_all_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx = ContextId::new();
+        store.save_synthesis(ctx, &sample_synthesis("hash-c")).unwrap();
+        assert_eq!(store.load_all_synthesis().unwrap().len(), 1);
+
+        store.delete_synthesis(ctx).unwrap();
+        assert!(store.load_all_synthesis().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_load_all_synthesis_multiple_contexts() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        store.save_synthesis(ctx1, &sample_synthesis("h1")).unwrap();
+        store.save_synthesis(ctx2, &sample_synthesis("h2")).unwrap();
+
+        let all = store.load_all_synthesis().unwrap();
+        assert_eq!(all.len(), 2);
+        let hashes: std::collections::HashSet<_> =
+            all.iter().map(|(_, r)| r.content_hash.clone()).collect();
+        assert_eq!(
+            hashes,
+            std::collections::HashSet::from(["h1".to_string(), "h2".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_remove_also_deletes_synthesis() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx = ContextId::new();
+        store.assign_slot(ctx, "h", "model", 384).unwrap();
+        store.save_synthesis(ctx, &sample_synthesis("h")).unwrap();
+
+        store.remove(ctx).unwrap();
+
+        assert_eq!(store.count().unwrap(), 0);
+        assert!(
+            store.load_all_synthesis().unwrap().is_empty(),
+            "remove() must also clear the context's synthesis rows"
+        );
+    }
+
+    #[test]
+    fn test_evict_oldest_also_deletes_synthesis() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+
+        store.assign_slot(ctx1, "h1", "model", 384).unwrap();
+        store.save_synthesis(ctx1, &sample_synthesis("h1")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.assign_slot(ctx2, "h2", "model", 384).unwrap();
+        store.save_synthesis(ctx2, &sample_synthesis("h2")).unwrap();
+
+        // Evict the oldest (ctx1).
+        let evicted = store.evict_oldest(1).unwrap();
+        assert_eq!(evicted.len(), 1);
+
+        let remaining = store.load_all_synthesis().unwrap();
+        assert_eq!(remaining.len(), 1, "only ctx2's synthesis should survive eviction");
+        assert_eq!(remaining[0].0, ctx2);
     }
 }

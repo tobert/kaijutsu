@@ -238,6 +238,22 @@ impl SemanticIndex {
             );
         }
 
+        // Hydrate the in-memory synthesis cache from SQLite so app well cards
+        // (gist/keywords) aren't blank after a restart — the watcher's
+        // on_indexed callback only fires on content *change*, so an unchanged
+        // context would otherwise never re-populate the memory-only cache.
+        let persisted = this.metadata.lock().unwrap().load_all_synthesis()?;
+        let persisted_count = persisted.len();
+        for (ctx, result) in persisted {
+            this.synthesis_cache.insert(ctx, result);
+        }
+        if persisted_count > 0 {
+            tracing::info!(
+                count = persisted_count,
+                "hydrated synthesis cache from index_meta.db"
+            );
+        }
+
         Ok(this)
     }
 
@@ -588,6 +604,28 @@ impl SemanticIndex {
     /// Access the synthesis cache.
     pub fn synthesis_cache(&self) -> &synthesis::SynthesisCache {
         &self.synthesis_cache
+    }
+
+    /// Persist a synthesis result and update the in-memory cache.
+    ///
+    /// DB-first: writes to `index_meta.db` before touching the memory cache,
+    /// so a persistence failure returns `Err` without the cache and the DB
+    /// disagreeing (see the "observable write failures" convention — no
+    /// swallowed warn on a write-through failure). The metadata lock is held
+    /// only for the DB write, then dropped before the memory-cache insert —
+    /// `SynthesisCache` has its own internal lock and is deliberately outside
+    /// the struct's hnsw/metadata lock order.
+    pub fn store_synthesis(
+        &self,
+        ctx: ContextId,
+        result: synthesis::SynthesisResult,
+    ) -> Result<(), IndexError> {
+        {
+            let mut meta = self.metadata.lock().unwrap();
+            meta.save_synthesis(ctx, &result)?;
+        }
+        self.synthesis_cache.insert(ctx, result);
+        Ok(())
     }
 }
 
@@ -1350,5 +1388,121 @@ mod tests {
         idx.index_context(ctx, &make_blocks(ctx, "works after dump cleanup"))
             .unwrap();
         assert_eq!(idx.len(), 1, "index should work after the wipe");
+    }
+
+    #[test]
+    fn test_synthesis_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let ctx = ContextId::new();
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            let result = synthesis::SynthesisResult {
+                keywords: vec![("rust".to_string(), 0.9), ("async".to_string(), 0.7)],
+                top_blocks: vec![("blk1".to_string(), 0.95, "preview text".to_string())],
+                gist: Some("a representative sentence".to_string()),
+                content_hash: "hash-xyz".to_string(),
+            };
+            idx.store_synthesis(ctx, result).unwrap();
+        }
+
+        // Reopen the same dir with the same model — no re-synthesis happens
+        // (no index_context/embed call between construction and the check
+        // below), so a non-empty result here can only have come from hydration.
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+        let cached = idx
+            .synthesis_cache()
+            .get_any(ctx)
+            .expect("synthesis should survive reopen via hydration");
+        assert_eq!(cached.content_hash, "hash-xyz");
+        assert_eq!(cached.gist.as_deref(), Some("a representative sentence"));
+        assert_eq!(
+            cached.keywords,
+            vec![("rust".to_string(), 0.9), ("async".to_string(), 0.7)]
+        );
+        assert_eq!(
+            cached.top_blocks,
+            vec![("blk1".to_string(), 0.95, "preview text".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_synthesis_hash_invalidation_still_works() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let ctx = ContextId::new();
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            let result = synthesis::SynthesisResult {
+                keywords: vec![],
+                top_blocks: vec![],
+                gist: None,
+                content_hash: "hash-abc".to_string(),
+            };
+            idx.store_synthesis(ctx, result).unwrap();
+        }
+
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+        // Existing SynthesisCache::get semantics, now exercised over hydrated
+        // (not freshly-inserted) data: a hash mismatch is a miss, get_any isn't.
+        assert!(
+            idx.synthesis_cache().get(ctx, Some("different-hash")).is_none(),
+            "hash mismatch must still be a cache miss after hydration"
+        );
+        assert!(idx.synthesis_cache().get_any(ctx).is_some());
+    }
+
+    #[test]
+    fn test_eviction_removes_persisted_synthesis() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_contexts = Some(2);
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        let synth_for = |tag: &str| synthesis::SynthesisResult {
+            keywords: vec![(tag.to_string(), 0.5)],
+            top_blocks: vec![],
+            gist: Some(format!("{tag} gist")),
+            content_hash: tag.to_string(),
+        };
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+            idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+                .unwrap();
+            idx.store_synthesis(ctx1, synth_for("alpha")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+                .unwrap();
+            idx.store_synthesis(ctx2, synth_for("beta")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            // Indexing a third context evicts ctx1 (oldest) down to
+            // max_contexts = 2 — evict_oldest must also drop ctx1's synthesis.
+            idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+                .unwrap();
+            idx.store_synthesis(ctx3, synth_for("gamma")).unwrap();
+
+            assert_eq!(idx.len(), 2);
+        }
+
+        // Reopen: hydration must only pick up the survivors.
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+        assert!(
+            idx.synthesis_cache().get_any(ctx1).is_none(),
+            "evicted ctx1's synthesis must not survive reopen"
+        );
+        assert!(idx.synthesis_cache().get_any(ctx2).is_some());
+        assert!(idx.synthesis_cache().get_any(ctx3).is_some());
     }
 }

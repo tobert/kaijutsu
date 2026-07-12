@@ -1371,7 +1371,7 @@ pub async fn create_shared_kernel(
                                         ctx_id,
                                         idx_clone.embedder_arc(),
                                         blocks_clone,
-                                        idx_clone.synthesis_cache(),
+                                        &idx_clone,
                                     );
                                 });
                             });

@@ -229,9 +229,13 @@ impl KjBuiltin {
                     }
                     if let Some(synth) = synth_result {
                         if let Some(ref si) = self.semantic_index {
-                            si.synthesis_cache().insert(ctx_id, synth);
+                            match si.store_synthesis(ctx_id, synth) {
+                                Ok(()) => synthesized += 1,
+                                Err(e) => {
+                                    errors.push(format!("{}: store synthesis: {e}", ctx_id.short()))
+                                }
+                            }
                         }
-                        synthesized += 1;
                     }
                 }
                 Ok(Ok(None)) => {
@@ -314,7 +318,8 @@ impl KjBuiltin {
             let synth = super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
             if let Some(ref s) = synth {
-                idx.synthesis_cache().insert(ctx_id, s.clone());
+                idx.store_synthesis(ctx_id, s.clone())
+                    .map_err(|e| format!("store synthesis: {e}"))?;
             }
 
             Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((

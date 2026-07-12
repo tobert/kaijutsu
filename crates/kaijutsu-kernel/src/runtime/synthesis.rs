@@ -6,10 +6,9 @@
 use std::sync::Arc;
 
 use kaijutsu_index::synthesis::{
-    SynthesisCache, SynthesisResult, best_sentence, centroid, cosine_similarity, extract_ngrams,
-    split_sentences,
+    SynthesisResult, best_sentence, centroid, cosine_similarity, extract_ngrams, split_sentences,
 };
-use kaijutsu_index::{BlockSource, Embedder};
+use kaijutsu_index::{BlockSource, Embedder, SemanticIndex};
 use kaijutsu_types::{BlockSnapshot, ContextId};
 
 /// How many of the top-scored blocks feed the block-head `top_blocks` preview
@@ -196,15 +195,26 @@ fn compute_gist(
     })
 }
 
-/// Run synthesis and cache the result.
+/// Run synthesis and persist the result through the index (DB + memory
+/// cache — see `SemanticIndex::store_synthesis`).
+///
+/// Fire-and-forget background path (called from the index watcher's
+/// on_indexed callback, off the tokio runtime) — there's no caller to bubble
+/// a persistence failure to, so it's logged loudly instead of swallowed.
 pub fn run_synthesis_and_cache(
     ctx_id: ContextId,
     embedder: Arc<dyn Embedder>,
     block_source: Arc<dyn BlockSource>,
-    cache: &SynthesisCache,
+    index: &SemanticIndex,
 ) {
-    if let Some(synth) = run_synthesis(ctx_id, embedder, block_source) {
-        cache.insert(ctx_id, synth);
+    if let Some(synth) = run_synthesis(ctx_id, embedder, block_source)
+        && let Err(e) = index.store_synthesis(ctx_id, synth)
+    {
+        tracing::error!(
+            context = %ctx_id.short(),
+            error = %e,
+            "failed to persist synthesis result"
+        );
     }
 }
 
@@ -404,19 +414,64 @@ mod tests {
         assert_eq!(gist.chars().count(), GIST_MAX_CHARS, "225-char sentence truncated to exactly 200");
     }
 
+    /// `run_synthesis_and_cache` now persists through a real `SemanticIndex`
+    /// (DB + memory cache), not a bare `SynthesisCache` — same MockEmbedder
+    /// pattern used by kaijutsu-index's own tests, over a TempDir.
+    fn test_index(dir: &std::path::Path) -> kaijutsu_index::SemanticIndex {
+        let config = kaijutsu_index::IndexConfig {
+            model_dir: dir.to_path_buf(),
+            dimensions: 32,
+            data_dir: dir.to_path_buf(),
+            hnsw_max_nb_connection: 8,
+            hnsw_ef_construction: 50,
+            max_tokens: 512,
+            max_contexts: None,
+        };
+        kaijutsu_index::SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap()
+    }
+
     #[test]
     fn test_synthesis_and_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index = test_index(dir.path());
+
         let ctx = ContextId::new();
         let blocks = vec![
             make_block(ctx, 1, "Enough content for the synthesis algorithm to process correctly."),
         ];
         let embedder = Arc::new(MockEmbedder { dims: 32 });
         let source = Arc::new(MockBlockSource::with_blocks(blocks));
-        let cache = SynthesisCache::new();
 
-        run_synthesis_and_cache(ctx, embedder, source, &cache);
+        run_synthesis_and_cache(ctx, embedder, source, &index);
 
-        let cached = cache.get(ctx, None);
-        assert!(cached.is_some());
+        let cached = index.synthesis_cache().get(ctx, None);
+        assert!(cached.is_some(), "result should land in the index's synthesis cache");
+    }
+
+    #[test]
+    fn test_synthesis_and_cache_persists_to_disk() {
+        // The point of run_synthesis_and_cache going through SemanticIndex
+        // instead of a bare SynthesisCache: the result must survive a reopen.
+        let dir = tempfile::TempDir::new().unwrap();
+        let ctx = ContextId::new();
+        let blocks = vec![make_block(
+            ctx,
+            1,
+            "Enough content for the synthesis algorithm to process correctly.",
+        )];
+
+        {
+            let index = test_index(dir.path());
+            let embedder = Arc::new(MockEmbedder { dims: 32 });
+            let source = Arc::new(MockBlockSource::with_blocks(blocks));
+            run_synthesis_and_cache(ctx, embedder, source, &index);
+            assert!(index.synthesis_cache().get_any(ctx).is_some());
+        }
+
+        let reopened = test_index(dir.path());
+        assert!(
+            reopened.synthesis_cache().get_any(ctx).is_some(),
+            "synthesis result should be hydrated from disk on reopen"
+        );
     }
 }
