@@ -536,11 +536,8 @@ fn enter_room(
     // `Query<(Entity, &Projection), _>` alongside it) to stay under Bevy's
     // 16-param ceiling for a function-as-system — `enter_room` was the first
     // system in this codebase to actually hit it (Slice C added enough new
-    // room-furniture params to tip it over); windows+dock folded into a
-    // second tuple param (feat/scene-palette-migration) to make room for
-    // `palette` without exceeding the ceiling a second time.
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &Projection), With<Camera3d>>,
-    (windows, dock): (Query<&Window>, Query<&ComputedNode, With<crate::ui::dock::NorthDock>>),
+    // room-furniture params to tip it over).
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`
@@ -558,19 +555,12 @@ fn enter_room(
 
     // Claim the shared app camera (the well-marker convention: insert to claim,
     // remove + restore clear color to release) and place it facing the entering
-    // focus so there's no first-frame snap before the ease takes over. Also
-    // captures `(cam_entity, fov_y, aspect)` as plain values for the well HUD
-    // spawn below (`crate::view::time_well::hud::spawn_well_hud_furniture`
-    // takes these directly rather than its own camera query — see that
-    // function's doc for why).
-    let mut well_hud_camera: Option<(Entity, f32, f32)> = None;
-    if let Ok((cam_entity, mut cam, mut tf, projection)) = app_camera.single_mut() {
+    // focus so there's no first-frame snap before the ease takes over.
+    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
         commands.entity(cam_entity).insert(RoomCamera);
         cam.clear_color = ClearColorConfig::Custom(Color::LinearRgba(palette.bg));
         let (pos, look) = shot::resolve(shot::RoomShot::focused(room.carousel.focused_station()));
         *tf = Transform::from_translation(pos).looking_at(look, Vec3::Y);
-        let (fov_y, aspect) = crate::view::time_well::hud::read_perspective(projection);
-        well_hud_camera = Some((cam_entity, fov_y, aspect));
     }
 
     let root = commands
@@ -622,25 +612,6 @@ fn enter_room(
         &mut images,
     );
     crate::view::time_well::scene::arm_well(&mut well_state, &mut well_tracks);
-    // The well's edge HUD: camera-parented (not `RoomRoot`-parented — see
-    // `exit_room`'s explicit despawn), spawned once per room visit so it
-    // exists whether or not you've dived, gated to `well_zoomed` visibility
-    // by `time_well::hud::apply_well_hud_lod`.
-    if let Some((cam_entity, fov_y, aspect)) = well_hud_camera {
-        crate::view::time_well::hud::spawn_well_hud_furniture(
-            &mut commands,
-            &mut meshes,
-            &mut card_mats,
-            &mut images,
-            cam_entity,
-            fov_y,
-            aspect,
-            &windows,
-            &dock,
-        );
-    } else {
-        warn!("well HUD: no Camera3d to parent panels to");
-    }
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
     // at the labeled ones (the reserved South bearing gets a dim marker only).
@@ -754,7 +725,7 @@ pub(crate) fn exit_room(
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<RoomRoot>>,
     mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
-    well_hud: Query<Entity, With<crate::view::time_well::hud::WellHud>>,
+    well_legend: Query<Entity, With<crate::view::time_well::legend::WellLegend>>,
 ) {
     // Unconditional (2026-07-10 evening, the fullscreen-panel pivot): diving
     // used to be a second screen (`Screen::PatchBay`) sharing this scene
@@ -769,11 +740,12 @@ pub(crate) fn exit_room(
     // long-despawned visit.
     room.zoomed = None;
     teardown_room(&mut commands, &theme, &roots, &mut app_camera);
-    // The well's edge HUD is a `Camera3d` child (Slice C: `enter_room` now
-    // spawns it too), NOT a `RoomRoot` child — `teardown_room`'s recursive
-    // despawn above never touches it, so it must be despawned explicitly here
-    // or it survives across room visits, doubling up on the next `enter_room`.
-    for e in well_hud.iter() {
+    // The transient legend, when up, is a `Camera3d` child, NOT a `RoomRoot`
+    // child — `teardown_room`'s recursive despawn above never touches it, so
+    // it must be despawned explicitly here or it survives across room visits,
+    // doubling up on the next `enter_room` (well, it would toggle instead,
+    // but living past its own room visit is still a leak).
+    for e in well_legend.iter() {
         commands.entity(e).despawn();
     }
     info!("room: exited");

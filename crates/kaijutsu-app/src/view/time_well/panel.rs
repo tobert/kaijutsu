@@ -2,9 +2,10 @@
 //!
 //! An "MSDF panel" is the shared shape behind every in-scene text surface in the
 //! well: a `Mesh3d` quad whose material samples a [`UiRttTexture`] that the MSDF
-//! pass rasterizes glyphs into. Rim cards, the reading/focus card, and the edge
-//! HUD all build on it — they differ only in mesh size, material params, and what
-//! text they lay out, never in the texture/MSDF plumbing.
+//! pass rasterizes glyphs into. Rim cards, the reading/focus card, and the
+//! transient keyboard legend all build on it — they differ only in mesh size,
+//! material params, and what text they lay out, never in the texture/MSDF
+//! plumbing.
 //!
 //! The primitive owns exactly two things:
 //! - allocation: [`create_msdf_panel`] makes the RTT texture and the component
@@ -14,7 +15,8 @@
 //!   set in and bumps the MSDF version so the render pass re-rasterizes.
 //!
 //! The caller owns the rest — the mesh, the material (`WellCardMaterial`), and
-//! the glyph layout (cards carry fields + rings; the HUD lays out readout text).
+//! the glyph layout (cards carry fields + rings; the legend lays out readout
+//! text).
 
 use bevy::prelude::*;
 

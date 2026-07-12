@@ -3071,8 +3071,8 @@ impl kernel::Server for KernelImpl {
                         // Prefer the sentence-level gist (extractive, scored
                         // across the top-K blocks) over the old 80-char
                         // block-head preview; same wire field either way — no
-                        // schema change, just richer content for hud_south's
-                        // fallback and the well card face's new gist line.
+                        // schema change, just richer content for the well
+                        // card face's gist line.
                         if let Some(gist) = synth.gist.as_deref().filter(|g| !g.is_empty()) {
                             c.set_top_block_preview(gist);
                         } else if let Some((_, _, preview)) = synth.top_blocks.first() {

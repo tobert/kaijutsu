@@ -57,8 +57,9 @@ background (`main.rs:181`).
     (`TimeWellState`, camera/cards, ring-centric `(focused_ring, ring_pos)`
     keyboard nav — spin-to-gate on Left/Right, camera dolly on Up/Down),
     `sync.rs` (keyed-join reconcile), `text.rs` (per-card vello scene),
-    `hud.rs` (edge HUD), `activity.rs` (kernel-activity ring pulse), `panel.rs`
-    (shared in-scene MSDF panel primitive).
+    `legend.rs` (transient `?` keyboard legend), `activity.rs`
+    (kernel-activity ring pulse), `panel.rs` (shared in-scene MSDF panel
+    primitive).
 - **`input/`** — focus-based action dispatch. `FocusArea` (`Compose|Conversation|
   Dialog`, `focus.rs:71`) is the single source of truth for what keys do;
   `ActiveSurface` (`Chat|Shell`, `focus.rs:116`) disambiguates within Compose

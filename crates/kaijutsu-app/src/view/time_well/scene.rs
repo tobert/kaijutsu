@@ -104,8 +104,8 @@ pub struct TerraceRing(pub usize);
 /// horizon count), refreshed by [`super::text::build_horizon_label`] only when
 /// the count actually changes. Despawned on exit alongside the rest of the
 /// well. (The per-band "ACTIVE"/"RECENT" ring labels that once shared this
-/// path were removed 2026-07-06 — the HUD's SPECS `band` line + legend carry
-/// that information without cluttering the rings.)
+/// path were removed 2026-07-06 — the reading card's SPECS `band` line
+/// carries that information without cluttering the rings.)
 #[derive(Component)]
 pub struct HorizonLabel;
 
@@ -853,7 +853,8 @@ const DIGIT_KEYS: [(KeyCode, usize); 10] = [
 
 /// Time-well keyboard navigation: **ring-centric**, with a Kodak-projector spin.
 /// Selection is `(focused_ring, ring_pos)`; the card at that seat is
-/// [`TimeWellState::selected`], so HUD / lineage / highlight / Enter all follow.
+/// [`TimeWellState::selected`], so the reading card / lineage / highlight /
+/// Enter all follow.
 /// - `0–9` — quick-jump to seat `n` of the **focused** ring: select + exit.
 /// - **Left / Right / Tab** — step the position within the focused ring
 ///   (wrapping), spinning the ring so the selected card eases to the front gate.
@@ -961,7 +962,7 @@ pub fn well_keyboard(
     }
 
     // After any nav change, re-derive the selection from the seat so every
-    // downstream system (highlight, HUD, lineage) follows.
+    // downstream system (highlight, the reading card, lineage) follows.
     if nav_changed {
         let fr = state.focused_ring;
         let pos = state.ring_pos;
@@ -1483,9 +1484,10 @@ pub fn highlight_drift(drift: Res<crate::ui::drift::DriftState>, mut cards: Quer
 
 /// Show the in-world focus card only when *focused* (Enter-to-focus / the dive).
 /// In the overview it stays hidden so the well's mouth — the glowing core +
-/// activity rings — is the open browser space and the selected card's detail
-/// reads off the edge HUD instead (see [`super::hud`]). Also sidesteps the
-/// blank-white empty-selection state, which only the focus card ever showed.
+/// activity rings — is the open browser space; the selected card's detail
+/// reads off the rim card's own face (header/gist/tail band) instead. Also
+/// sidesteps the blank-white empty-selection state, which only the focus card
+/// ever showed.
 ///
 /// Ambient, not dived-only (freeze-fix slice, 2026-07-11): visibility now
 /// derives from BOTH `well_zoomed` and `state.focused` — belt-and-braces,
@@ -1510,11 +1512,12 @@ pub fn sync_focus_card_visibility(
 }
 
 /// Show/hide the [`HorizonLabel`] with the well's zoom state — mirrors
-/// [`super::hud::apply_well_hud_lod`] exactly: ambient, not dived-only, so it
-/// reacts to a zoom-OUT too, not just zoom-in. At room scale the in-world
-/// "+N" event-horizon count stands as an unreadable dark chip floating over
-/// the well (live-observed, freeze-fix slice, 2026-07-11) — hidden until the
-/// next dive. Change-guarded like every other LOD gate here.
+/// `crate::view::patch_bay`'s `apply_patch_lod` exactly (the original pattern
+/// both copied): ambient, not dived-only, so it reacts to a zoom-OUT too, not
+/// just zoom-in. At room scale the in-world "+N" event-horizon count stands
+/// as an unreadable dark chip floating over the well (live-observed,
+/// freeze-fix slice, 2026-07-11) — hidden until the next dive. Change-guarded
+/// like every other LOD gate here.
 pub fn apply_horizon_label_lod(
     room: Res<crate::view::room::RoomState>,
     mut label: Query<&mut Visibility, With<HorizonLabel>>,
@@ -1755,8 +1758,9 @@ fn ring_dim_factor(zoomed: bool, focused_ring: usize, band: usize) -> f32 {
 /// each `TerraceRing`'s material alpha and each rim `Card`'s color-dim toward its
 /// target — full for the focused band, × [`DIM_NONFOCUSED`] otherwise — so
 /// Up/Down fades between rings. Ring alpha resets from [`TERRACE_RING_ALPHA`]
-/// each frame (no compounding). The focus [`ReadingCard`] + HUD panels are not
-/// rim `Card`s, so they're untouched and stay full brightness.
+/// each frame (no compounding). The focus [`ReadingCard`] + the transient
+/// legend panel are not rim `Card`s, so they're untouched and stay full
+/// brightness.
 ///
 /// Ambient, not dived-only (freeze-fix slice, 2026-07-11): must react to a
 /// zoom-OUT too, not just zoom-in, or whatever dim state was live on the last
@@ -1926,10 +1930,8 @@ fn card_block_mesh() -> Mesh {
 /// saturated enough that distinct context buckets stay visually distinct
 /// (this only changes the S/L the hash plugs into `Color::hsl`, not the
 /// FNV→hue hashing itself). Shared by the rim cards' body/track-hue border
-/// (`accent_vec4`, [`super::live::sync_card_live_uniforms`]), the track rays
-/// (`super::rays::sync_track_rays`), and — incidentally, not a target of this
-/// re-skin — the retiring HUD's panel border (`super::hud::update_well_hud`).
-/// **Amy-tunable.**
+/// (`accent_vec4`, [`super::live::sync_card_live_uniforms`]) and the track
+/// rays (`super::rays::sync_track_rays`). **Amy-tunable.**
 const ACCENT_SATURATION: f32 = 0.42;
 const ACCENT_LIGHTNESS: f32 = 0.45;
 

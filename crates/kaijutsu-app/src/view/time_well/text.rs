@@ -10,11 +10,11 @@
 //! longer touches card textures at all (it stays for SVG/ABC elsewhere).
 //!
 //! **HUD-melt slice 3** (`docs/timewell.md`): [`reading_card_glyphs`] absorbs
-//! the reference material the HUD's East (specs) and West (ancestry) panels
-//! carry — [`specs_text`]/[`ancestry_text`] are that content's pure
-//! composition, extracted from `hud::hud_east`/`hud::hud_west`'s own bodies
-//! so both the HUD panels (until slice 4 retires them) and the reading card
-//! render byte-identical text from one place.
+//! the reference material the retired edge HUD's East (specs) and West
+//! (ancestry) panels used to carry — [`specs_text`]/[`ancestry_text`] are
+//! that content's pure composition, extracted from those panels' own bodies
+//! so both the HUD panels (retired in slice 4) and the reading card rendered
+//! byte-identical text from one place.
 
 use bevy::prelude::*;
 use vello::peniko::Brush;
@@ -53,8 +53,8 @@ fn label_brush() -> Brush {
 /// above it, not just the biggest.
 const GIST_FONT_SIZE: f32 = 9.0;
 /// Heuristic characters-per-wrapped-line budget for the gist line — same
-/// "approximate width, not measured" idiom as HUD south's `SOUTH_LINE_CHARS`
-/// (`view::time_well::hud`). Deliberately conservative: parley's real glyph
+/// "approximate width, not measured" idiom the retired HUD South panel's
+/// `SOUTH_LINE_CHARS` used. Deliberately conservative: parley's real glyph
 /// widths drive the actual on-screen wrap ([`VelloFont::layout`]'s
 /// `break_all_lines`), so `wrap_gist` just needs each pre-wrapped line to be
 /// safely short enough that parley never wraps it a second time.
@@ -157,12 +157,12 @@ fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> 
 // HUD-MELT SLICE 3: absorbed panel content (pure text, no Bevy)
 // ============================================================================
 //
-// [`specs_text`] and [`ancestry_text`] are `hud::hud_east`/`hud::hud_west`'s
-// own bodies, extracted so both the HUD's East/West panels (until slice 4
-// retires them) and the reading card's absorbed content
-// ([`reading_card_glyphs`]) compose from the same pure text, byte-for-byte —
-// `hud::hud_east`/`hud::hud_west` become thin wrappers over these, so their
-// own tests (and output) don't move.
+// [`specs_text`] and [`ancestry_text`] are the retired edge HUD's East/West
+// panels' own bodies, extracted so both those panels (retired in slice 4) and
+// the reading card's absorbed content ([`reading_card_glyphs`]) composed from
+// the same pure text, byte-for-byte — the HUD's East/West panels became thin
+// wrappers over these before their own retirement, so their tests (and
+// output) never moved.
 
 /// Specs block: model, fork kind, band, keywords, cluster, and the live
 /// transport line for the track this context rides (`docs/tracks.md`). The
@@ -171,6 +171,9 @@ fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> 
 ///
 /// The track transport line rides along here until timewell Stage 3 gives it
 /// a real home on a track surface — see `docs/timewell.md`.
+#[allow(dead_code)] // orphaned by the HUD-melt slice 4 retirement (its only
+// caller was the retired HUD East panel) — kept as a tested pure primitive;
+// `docs/issues.md` tracks the "give it a real home or delete it" follow-up.
 pub fn specs_text(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
     let keys = if d.keywords.is_empty() {
         "—".to_string()
@@ -203,8 +206,9 @@ pub fn specs_text(d: &super::card::CardData, track: Option<&kaijutsu_client::Tra
 /// lines — the card's own header (title, model badge, fork badge) sits
 /// directly above the block on that face, and repeating them spent vertical
 /// budget the ancestry chain + tail cut need (live-verified 2026-07-12: the
-/// duplicated lines pushed both past `y_limit` on typical content). HUD East
-/// keeps the full [`specs_text`] — it has no header to lean on.
+/// duplicated lines pushed both past `y_limit` on typical content).
+/// [`specs_text`] itself stays the full block — the retired HUD East panel
+/// had no header of its own to lean on.
 pub fn reading_specs_text(
     d: &super::card::CardData,
     track: Option<&kaijutsu_client::TrackInfo>,
@@ -266,7 +270,8 @@ fn band_label(band: Band) -> &'static str {
 /// `"(root)"` is appended only when the **selected** context itself has no
 /// parent (a one-entry chain) — reaching an ancestor with no further parent
 /// several generations up does not retroactively mark it. Pre-existing
-/// `hud_west` behavior, kept as-is by this extraction rather than "fixed".
+/// behavior of the retired HUD West panel, kept as-is by this extraction
+/// rather than "fixed".
 pub fn ancestry_text(
     selected: ContextId,
     title_and_parent: impl Fn(ContextId) -> Option<(String, Option<ContextId>)>,
@@ -303,8 +308,8 @@ pub fn ancestry_text(
 // HDR gain for the focus card's bevel frame (the `border` ring band: the
 // selection's accent lifted so the frame reads as a deliberate beveled edge,
 // replacing the accidental cream ring the pre-mask-fix chatter/beat lanes
-// used to paint; a touch under the HUD panels' `gain_hud_border` so the
-// in-world card doesn't outshine its own HUD) moved onto
+// used to paint; a touch under the legend panel's `gain_hud_border` so the
+// in-world card doesn't outshine the legend) moved onto
 // `ScenePalette::gain_reading_border`.
 
 /// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, drifting]`.
@@ -457,9 +462,10 @@ fn card_text_glyphs(
     // ── Gist line(s). ── Sentence-level extractive summary (Tier 2,
     // `kaijutsu-kernel::runtime::synthesis::compute_gist`), riding the same
     // `CardData.preview` field the old 80-char block-head preview used — no
-    // wire change, just richer content landing here (and in HUD south's
-    // fallback) for free. Smaller and dimmer than the badges above it; skips
-    // cleanly (no reserved space) when there's nothing to show.
+    // wire change, just richer content landing here (and, formerly, in the
+    // retired HUD South panel's fallback) for free. Smaller and dimmer than
+    // the badges above it; skips cleanly (no reserved space) when there's
+    // nothing to show.
     if let Some(preview) = data.preview.as_deref()
         && let Some(wrapped) = wrap_gist(preview, GIST_LINE_CHARS, GIST_MAX_LINES)
         && y < h - pad
@@ -592,9 +598,8 @@ fn layout_reading_block(
 /// shared title/badges header ([`card_header_glyphs`]), then the specs block
 /// ([`specs_text`]), the ancestry chain ([`ancestry_text`]), and a deeper
 /// tail cut ([`READING_TAIL_LINES`]) than the rim card's live-tail band — the
-/// reference material the HUD's East/West/South panels carried before the
-/// melt (`hud.rs`'s own module doc names the panels this supersedes; they
-/// stay live until slice 4 retires them).
+/// reference material the edge HUD's East/West/South panels carried before
+/// the melt, retired in slice 4.
 ///
 /// No gist/keywords/cluster repeat: the specs block already carries keywords
 /// + cluster, and this card is reference material at reading distance, not a
@@ -909,7 +914,7 @@ mod tests {
         assert!(w.ends_with('…'), "overflow past line 1 is elided: {w:?}");
     }
 
-    // ── specs_text (HUD-melt slice 3: hud::hud_east's own body) ──
+    // ── specs_text (HUD-melt slice 3: formerly the East/West HUD panel's body; panels retired slice 4) ──
 
     fn card_data(band: Band) -> super::super::card::CardData {
         super::super::card::CardData {
@@ -986,7 +991,7 @@ mod tests {
         assert!(s.contains("track    ♪ bass ■ stopped"), "stopped: {s}");
     }
 
-    // ── ancestry_text (HUD-melt slice 3: hud::hud_west's own body) ──
+    // ── ancestry_text (HUD-melt slice 3: formerly the East/West HUD panel's body; panels retired slice 4) ──
 
     fn ctx(n: u8) -> ContextId {
         ContextId::from_bytes([n; 16])
@@ -1013,8 +1018,8 @@ mod tests {
         // `(root)` only fires when the SELECTED context itself has no parent
         // (see `ancestry_text_single_generation_marks_root`) — reaching an
         // ancestor with no further parent several generations up does not
-        // retroactively mark it, a pre-existing `hud_west` quirk this
-        // extraction keeps byte-identical rather than "fixing".
+        // retroactively mark it, a pre-existing quirk of the retired HUD West
+        // panel this extraction keeps byte-identical rather than "fixing".
         assert_eq!(out, "LINEAGE\nchild\n◂ parent\n◂ grandparent");
     }
 

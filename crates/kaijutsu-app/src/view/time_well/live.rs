@@ -24,7 +24,9 @@
 //!   wire) extends it to every attached context's card.
 //! - `WellRingsMaterial.energy.y` = the **global** beat envelope — the throat
 //!   glow breathes on the beat of whatever is playing.
-//! - The HUD South panel renders the selected card's tail (see `super::hud`).
+//! - `Card::tail` = the selected card's own live-tail band, rendered directly
+//!   on its face (the retired HUD South panel's old job, absorbed HUD-melt
+//!   slice 2).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -79,7 +81,7 @@ impl TailLine {
         Self { glyph, text: text.into(), block: None }
     }
 
-    /// The display form the HUD renders: `glyph text`.
+    /// The display form the card's tail band renders: `glyph text`.
     pub fn display(&self) -> String {
         format!("{} {}", self.glyph, self.text)
     }
@@ -158,16 +160,15 @@ impl ContextTails {
 /// Pick + truncate the newest `n_lines` of `ctx`'s live tail buffer, each
 /// capped at `line_chars`, oldest → newest, joined with `\n`. `None` when the
 /// context hasn't produced a tail line since the app started — the caller
-/// decides what "nothing yet" means: [`super::hud::hud_south`] falls back to
-/// the polled preview; the card face's own gist line
+/// decides what "nothing yet" means: the retired HUD South panel used to fall
+/// back to the polled preview; the card face's own gist line
 /// (`text::card_text_glyphs`) already shows that same preview, so its tail
 /// band ([`super::scene::Card::tail`], via [`sync_selected_card_tail`]) skips
 /// entirely rather than repeating it.
 ///
-/// Shared pure text-shaping — [`super::hud::hud_south`]'s own logic before
-/// this extraction, now the one place both the HUD South panel and the card
-/// face's live-tail band pick their lines from (`docs/timewell.md`'s HUD
-/// melt, slice 2).
+/// Shared pure text-shaping — the retired HUD South panel's own logic before
+/// this extraction, now the one place the card face's live-tail band picks
+/// its lines from (`docs/timewell.md`'s HUD melt, slice 2).
 pub fn tail_lines(tails: &ContextTails, ctx: ContextId, n_lines: usize, line_chars: usize) -> Option<String> {
     let lines: Vec<String> = tails
         .iter_lines(&ctx)
@@ -352,7 +353,8 @@ impl WellBeats {
     }
 
     /// Whether any track's clock is rolling (has a live phasor). Strictly a
-    /// test helper — the HUD's transport readout uses `TrackInfo.playing`
+    /// test helper — the reading card's transport readout
+    /// (`text::specs_text`/`text::reading_specs_text`) uses `TrackInfo.playing`
     /// from the `listTracks` poll, not the phasor set.
     #[cfg(test)]
     pub fn any_rolling(&self) -> bool {
@@ -465,9 +467,9 @@ pub fn sync_card_live_uniforms(
 }
 
 /// Tail lines shown in the selected card's live-tail band — fewer than the
-/// HUD South panel's [`super::hud::hud_south`] ([`SOUTH_TAIL_LINES`] there is
-/// 5, wider panel) since the card face is smaller and the band is meant to
-/// stay small and dim under the title/badge/gist area, not dominate it.
+/// retired HUD South panel used to show (`SOUTH_TAIL_LINES` was 5, a wider
+/// panel) since the card face is smaller and the band is meant to stay small
+/// and dim under the title/badge/gist area, not dominate it.
 const CARD_TAIL_LINES: usize = 3;
 
 /// Selected-card-ONLY, dived-only live-tail sync: writes [`super::scene::Card::tail`]
@@ -874,8 +876,8 @@ mod tests {
 
         // No tail content yet — and no fallback to `data.preview` either
         // (the card face's own gist line already shows that; see
-        // `tail_lines`'s own doc for why the card path skips the fallback
-        // `hud_south` uses).
+        // `tail_lines`'s own doc for why the card path skips the fallback the
+        // retired HUD South panel used).
         app.update();
         assert_eq!(app.world().get::<super::super::scene::Card>(entity).unwrap().tail, None);
 

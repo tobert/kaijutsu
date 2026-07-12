@@ -51,8 +51,8 @@ pub struct CardData {
     pub cluster_label: Option<String>,
     /// Whether `paused_at` is set. **Visuals only** — design-only state for
     /// now (see `ContextRow::paused_at` in kernel_db.rs): the card shows a
-    /// paused marker and HUD North's status line says so, but nothing about
-    /// placement or behavior changes.
+    /// "PAUSED" marker on its own face, but nothing about placement or
+    /// behavior changes.
     pub paused: bool,
 }
 
@@ -455,7 +455,8 @@ pub fn spiral_order(rings: &BandOrders) -> Vec<ContextId> {
 
 // ── Horizon label (the "+N" count; spawned by `scene::spawn_well_furniture`,
 // filled by `text::build_horizon_label`). The per-band ring labels that once
-// shared this column were removed 2026-07-06 (the HUD carries band names). ──
+// shared this column were removed 2026-07-06 (the reading card's SPECS
+// `band` line carries band names). ──
 
 /// Amy-tunable: how far outside a band's ring the label parks, so it doesn't
 /// collide with that ring's seated cards.

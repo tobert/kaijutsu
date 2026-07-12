@@ -378,19 +378,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   the intent is that as real detail fills the stations in, the engraved
   plates recede: dimmer with familiarity, eventually maybe tooltip-only or a
   debug toggle. Keep this in mind before investing further in plate polish.
-- **Well: the edge HUD should probably retire** (Amy, 2026-07-11, first look
-  at the new hero shot — `RoomShot::WellHero`, time-well/room integration
-  plan): the four camera-parented panels (LINEAGE/SPECS/CONTROLS/title,
-  `time_well::hud`) read as floating flat UI over the well's own hero
-  establishing shot, at odds with the room's diegetic, instrument-engraved
-  ethos the same way the boring-nameplates entry above is already steering
-  away from floating labels. No replacement designed yet — this is a
-  direction to design toward, not a today task: whatever replaces the
-  selection-detail readout (a diegetic in-scene panel? folded into the
-  focused/reading card itself? gone entirely, relying on the card body?)
-  needs its own pass. Until then, leave the HUD as-is (including its Slice E
-  palette re-skin, deliberately skipped — no sense re-coloring chrome that's
-  slated to retire); don't invest further polish in its current form.
+- **`specs_text` orphaned by the HUD-melt slice 4 retirement**
+  (`time_well/text.rs`): its only caller was the retired HUD East panel;
+  `reading_specs_text` (the reading card's own, header-trimmed sibling) is
+  the live surface now. Kept `#[allow(dead_code)]` as a tested pure
+  primitive per its own doc's note that the track transport line "rides
+  along here until timewell Stage 3 gives it a real home on a track
+  surface." Decide when that stage lands: give it that home, or delete it
+  (and its dedicated tests) if nothing claims it.
 - **Patch bay: extract shared wire-geometry helper** (deepseek review,
   2026-07-09): `selected_chord_apex` re-derives the group→seat→angle→chord
   pipeline that `rebuild_patch_scene` also computes (identical today,

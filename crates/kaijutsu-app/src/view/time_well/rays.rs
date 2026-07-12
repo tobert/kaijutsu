@@ -19,9 +19,10 @@
 //! Data flow mirrors the cluster poll: [`poll_tracks`] ships `listTracks`
 //! every few seconds while the well is open; [`apply_tracks`] drains the
 //! result into [`WellTracks`] (the roster + derived context→track maps that
-//! also feed the cards' border hue / beat keying and the HUD's track line);
-//! [`sync_track_rays`] reconciles ray entities; [`animate_track_rays`] pushes
-//! the per-frame phasor state into the material uniforms.
+//! also feed the cards' border hue / beat keying and the reading card's
+//! track line); [`sync_track_rays`] reconciles ray entities;
+//! [`animate_track_rays`] pushes the per-frame phasor state into the
+//! material uniforms.
 
 use std::collections::HashMap;
 use std::f32::consts::TAU;
@@ -227,8 +228,8 @@ pub struct WellTracks {
     /// attached context AND the score context itself, so any card on the
     /// lane can find its beat.
     pub beat_key_of: HashMap<ContextId, ContextId>,
-    /// context → track id, for the border hue + the HUD's track line. Same
-    /// coverage as `beat_key_of`.
+    /// context → track id, for the border hue + the reading card's track
+    /// line. Same coverage as `beat_key_of`.
     pub track_of: HashMap<ContextId, String>,
     /// track id → live ray entity (the rays' own little join).
     ray_entities: HashMap<String, Entity>,

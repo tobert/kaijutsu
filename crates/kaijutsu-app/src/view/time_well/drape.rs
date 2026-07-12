@@ -3,7 +3,7 @@
 //! (`docs/timewell.md`, "The bowl, revisited" — mockup 27's "silk threads
 //! from rim cards to their ancestry below," made spatial instead of only the
 //! West HUD panel's text list). Slice 1 of the HUD-melt plan; the West panel
-//! stays until slice 4 retires it.
+//! was retired in slice 4.
 //!
 //! Two layers, same split as every other module here:
 //! - **Pure curve math** ([`drape_points`], [`drape_ribbon_vertices`]) — no

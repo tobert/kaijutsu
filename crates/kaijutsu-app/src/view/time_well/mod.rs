@@ -25,15 +25,17 @@
 //! - [`activity`] — the well's pulse: kernel-event stream → ring energy + ripples
 //!   driving the base ring deck (unit-tested math).
 //! - [`live`] — live state beyond the poll: per-context tail buffers (the
-//!   HUD's tail -f view) and per-track beat phasors (chatter + beat card
+//!   card face's tail band) and per-track beat phasors (chatter + beat card
 //!   lanes, the deck heartbeat).
 //! - [`rays`] — tracks as beams down the funnel wall: the `listTracks` poll,
 //!   the ray entities at name-stable bearings, and the per-frame beat pulse.
+//! - [`legend`] — the transient `?` keyboard legend, the retired edge HUD's
+//!   last survivor.
 
 pub mod activity;
 pub mod card;
 pub mod drape;
-pub mod hud;
+pub mod legend;
 pub mod live;
 pub mod panel;
 pub mod rays;
@@ -62,17 +64,15 @@ use crate::ui::screen::Screen;
 ///   label LOD gates joined this tier in the freeze-fix slice (2026-07-11):
 ///   each must react to BOTH zoom directions — clearing/hiding on zoom-OUT,
 ///   not just applying on zoom-in — the same reasoning
-///   `hud::apply_well_hud_lod` already needed to justify running here
-///   rather than dived-only. Left dived-only, they froze whatever
-///   dim/pop/lineage state was live on the last dived frame, visible at
-///   room scale until the next dive re-ran them.
-/// - **dived-only** (`run_if(well_zoomed)`) — keyboard and the card/reading/
-///   horizon TEXT builders: room-scale card text is unreadable pixels, so
-///   text rasterization stays gated to the dive (`text::build_card_scenes`'s
-///   own doc has the reasoning + the `card_text_dirty` catch-up arm). The
-///   HUD's own per-frame content builders (`hud::position_well_hud`,
-///   `hud::update_well_hud`) stay dived-only too — only its LOD gate
-///   (`hud::apply_well_hud_lod`) needs the ambient tier.
+///   `legend::despawn_legend_unzoomed` needs to justify running here rather
+///   than dived-only. Left dived-only, they froze whatever dim/pop/lineage
+///   state was live on the last dived frame, visible at room scale until the
+///   next dive re-ran them.
+/// - **dived-only** (`run_if(well_zoomed)`) — keyboard, the legend toggle, and
+///   the card/reading/horizon TEXT builders: room-scale card text is
+///   unreadable pixels, so text rasterization stays gated to the dive
+///   (`text::build_card_scenes`'s own doc has the reasoning + the
+///   `card_text_dirty` catch-up arm).
 pub struct TimeWellPlugin;
 
 impl Plugin for TimeWellPlugin {
@@ -145,21 +145,22 @@ impl Plugin for TimeWellPlugin {
                         // `spin_rings` (group A, above) just settled.
                         drape::sync_lineage_drapes,
                         scene::highlight_drift,
-                        // The HUD's LOD gate lives in the ambient tier, not
-                        // dived-only, like `patch_bay::apply_patch_lod` — it must
-                        // react to BOTH transitions (hiding the panels again on
-                        // zoom-OUT, not just showing them on zoom-in), so it has
-                        // to keep running at room scale even while unzoomed.
-                        hud::apply_well_hud_lod,
+                        // The transient legend's dismissal lives in the ambient
+                        // tier, not dived-only, like `patch_bay::apply_patch_lod`
+                        // — it must react to BOTH transitions (dismissing the
+                        // legend on zoom-OUT, not just leaving it be on zoom-in),
+                        // so it has to keep running at room scale even while
+                        // unzoomed.
+                        legend::despawn_legend_unzoomed,
                     )
                         .chain(),
                 )
                     .chain()
                     .run_if(in_state(Screen::Room)),
             )
-            // Dived-only: keyboard, the HUD's per-frame content, and the
-            // text builders (rasterizing MSDF glyphs no one can read at room
-            // scale would be pure waste — see `text::build_card_scenes`).
+            // Dived-only: keyboard, the legend toggle, and the text builders
+            // (rasterizing MSDF glyphs no one can read at room scale would be
+            // pure waste — see `text::build_card_scenes`).
             .add_systems(
                 Update,
                 (
@@ -169,8 +170,8 @@ impl Plugin for TimeWellPlugin {
                     // Escape double-fires through both handlers and skips the
                     // room-overview stop — see `room::room_keyboard`'s own doc.
                     scene::well_keyboard.after(crate::view::room::room_keyboard),
-                    hud::position_well_hud,
-                    hud::update_well_hud,
+                    legend::toggle_legend,
+                    legend::position_legend,
                     // Writes `Card::tail` (guarded — only on real change)
                     // right before the text builder that reads it, so a
                     // fresh tail lands in the SAME frame's rebuild rather

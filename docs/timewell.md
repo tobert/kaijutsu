@@ -68,6 +68,19 @@ What's actually built, so the staged plan below isn't mistaken for vaporware:
   on each beat while playing; HUD East gained the lane line ("track ♪ bass ▶
   ♩120 · tick 128"). Beat stance is docs/midi.md's *distribute tempo, not
   pulses* applied to viz.
+- **HUD melt** — shipped 2026-07-12, four slices: the camera-parented edge-HUD
+  panel set (N identity / E specs / W lineage / S tail / always-on legend)
+  absorbed into scene-native surfaces and retired. Slice 1: **lineage drapes**
+  down the bowl wall (`drape.rs` — 27's silk threads, built). Slice 2: the
+  selected card's face grew a **live-tail band** (South's job). Slice 3: the
+  reading card absorbed **specs + ancestry + a deeper tail cut**
+  (`text.rs::reading_specs_text`/`ancestry_text`; East/West's reference
+  content at focus time; North's identity/status already lived on the card
+  header + shader status rings). Slice 4: `hud.rs` deleted; the keyboard
+  legend survives as a **transient `?` toggle** (`legend.rs` — dived-only,
+  bottom-left corner panel, dismissed by `?`, zoom-out, or room exit). The
+  well's mouth is the open browser space again; readouts live on the
+  instrument, not on floating chrome.
 
 ---
 
@@ -240,7 +253,8 @@ cards:
 | 3 | DEMOTED | explicit: `d`; ordered `demoted_at` descending |
 | — | event horizon | archived ∪ everything past seat 9 of rings 2/3 — **no card entity**, a "+N" count at the throat |
 
-The verbs (keys provisional; the in-well legend is their source of truth):
+The verbs (keys provisional; the in-well legend — the transient `?` toggle,
+`legend.rs` — is their source of truth):
 
 - **`p` promote** — take a ring-0 seat. When the ring is full the explicit
   verb **fails loud** ("active ring full — demote something first"); seats
@@ -322,9 +336,9 @@ throat. What 27 taught, now built:
   is a carousel, spinnable to bring any of its cards to the front gate.
 - **Lineage drapes down the bowl wall.** The silk threads from rim cards to
   their ancestry below are the fork-lineage grammar made visible — and they
-  need no new wire (`forked_from` is already on every context). The current
-  selection-highlight rings are a pale substitute; draped curves (on-selection
-  first, ambient later) still belong in the plan — not built.
+  need no new wire (`forked_from` is already on every context). Built
+  2026-07-12 (HUD melt slice 1, `drape.rs`): on-selection draped ribbons down
+  the bowl wall; ambient/always-on stays a later taste call.
 - **The table edge is the control ring.** 27 puts filters/affordances on the
   physical table rim. The Stage 2 rank rail should *be* that ring — stations
   around the table edge, instrument-styled — rather than a floating HUD strip.
@@ -473,7 +487,8 @@ The two-level navigation rule from the concept doc, made the primary grammar.
   (recency spiral scoped to the track — same code path, filtered input). This
   is the "dive-in re-layout" the substrate doc deferred; the scoped spiral *is*
   the freer layout, no new algorithm needed.
-- **Level 2 (context detail)**: the existing focus card + edge HUD (unchanged).
+- **Level 2 (context detail)**: the existing focus/reading card (unchanged;
+  it carries the retired edge HUD's reference content since the HUD melt).
 - **Level 3**: second Enter commits into the conversation (unchanged).
 - Esc walks back up one level each press. Skim test: mouth → any context's
   detail in ≤4 keystrokes, every hop animated fast enough to not break flow.
@@ -483,9 +498,9 @@ The two-level navigation rule from the concept doc, made the primary grammar.
   to *reach* it fast.
 - **Lineage drapes** (27's silk threads): selecting a card draws draped curves
   down the bowl wall to its ancestors on colder terraces — the fork-lineage
-  grammar made spatial instead of the current highlight-ring substitute. No
+  grammar made spatial. Shipped 2026-07-12 (HUD melt slice 1, `drape.rs`); no
   wire change (`forked_from` + the existing `ancestors` walk). On-selection
-  first; ambient/dim always-on is a Stage 6 taste call.
+  only; ambient/dim always-on stays a Stage 6 taste call.
 - Focus presentation: the current in-world focus card at the well's mouth vs
   27's expand-in-place on the ring — Amy's call when the terraces exist to
   judge it against (flagged, not decided).
@@ -532,8 +547,7 @@ The "not another JavaScript thing" pass, once the structure is honest.
 - Mouse story: `MeshPickingPlugin` observers (click select, double-click
   commit), hover previews; the rank rail clickable.
 - Motion identity: easing pass over dive/back-out, ripple/ring balance, bloom
-  budget; south HUD slot (preview) ships; deliberate type scale on cards vs
-  chips vs headers.
+  budget; deliberate type scale on cards vs chips vs headers.
 - A semantic accent palette (context_type/track → stable hue map) replacing the
   FNV-hash-to-HSL placeholder (`scene.rs:733-742`).
 - Perf: poll costs (5s/8s cadences), texture rebuild audit, throat instancing.
@@ -612,8 +626,9 @@ won't discover until they hurt:
    `listContexts` payload — deferred until the `since` filter (Stage 5) decides
    whether it's even needed.
 4. **Stats surface** — is a telemetry-fed context enough for the htop slot, or
-   does the well eventually want an ambient stats strip in the HUD? Defer until
-   the rank exists and the itch is real.
+   does the well eventually want an ambient stats readout somewhere in-scene
+   (the edge HUD it would once have ridden is retired)? Defer until the rank
+   exists and the itch is real.
 5. ~~**Track ↔ hyoushigi naming**~~ — RESOLVED (Amy, 2026-07-03): track is the
    general concept; every track has a clock slot, noop for non-musical lanes,
    with a coder clock expected to develop over time (or a musical clock used
@@ -687,7 +702,8 @@ a second consumer exists (the crate's standing rule).
 Populated from `ContextHandleInfo` via the join: `label` → title (short-id
 fallback), `contextType` → accent, `model`/`provider` → badge, `forkKind` →
 fork badge, `keywords` → chips, `topBlockPreview` → preview, `parentId` →
-lineage, `trackId` → border hue + HUD track line; the live status glyph rides
+lineage, `trackId` → border hue + the reading card's track line; the live
+status glyph rides
 the poll (`liveStatus`), while the chatter/beat lanes ride the event stream
 (see the corrected data-tick bullet above). Anything that writes
 `ContextHandleInfo` is picked up on the next poll — new ways to distinguish

@@ -281,6 +281,22 @@ the column for a later slice. A legend HUD names the verbs in the well itself;
 the keys are declared provisional. Ring 0 is the Stage-2 rank arriving in ring
 clothing: append-ordered, kernel-owned, ten seats, digit-addressed.
 
+**The HUD melts into the instrument (July 11–12).** Amy's first look at the
+room's hero shot named the problem: the four camera-parented edge panels read
+as floating flat UI over a diegetic scene. Four slices melted them into the
+instrument — selection drapes down the bowl wall (mockup 27's silk threads,
+finally built), a live-tail band on the selected card's own face, the reading
+card absorbing specs + ancestry as pure shared text (`specs_text`/
+`ancestry_text`, extracted so panel and card rendered byte-identical content
+while both existed) — then `hud.rs` (851 lines) died whole. Live-driving the
+reading card before the cut caught a real bug the panels had been masking: the
+absorbed specs duplicated the card header's model/fork lines and pushed
+ancestry + tail past the glyph budget, silently dropped by the overflow guard
+— exactly the content the slice existed to show. The keyboard legend survived
+as the one panel with no scene-native home, reborn as a transient `?` toggle
+(dismissed by `?`, zoom-out, or leaving the room). Every readout now lives on
+the thing that owns it; the well's mouth is open browser space again.
+
 **Conversation view hardening (July 3).** Two long-standing irritations fell
 in one arc. Error blocks stuck to the bottom traced to Bevy child-ordering
 choreography: three mutations changed order without bumping the re-sort gate,
