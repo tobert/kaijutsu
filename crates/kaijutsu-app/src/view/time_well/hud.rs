@@ -19,12 +19,19 @@
 //! Spawned on enter, despawned on exit, repositioned each frame
 //! ([`position_well_hud`]), and re-laid-out only when the formatted text actually
 //! changes ([`update_well_hud`] — no per-frame relayout).
+//!
+//! **HUD melt** (`docs/timewell.md`): this panel set is being absorbed into
+//! in-scene surfaces slice by slice — N/E/W/S all still spawn and update
+//! here for now, but East's specs block and West's ancestry chain are, as of
+//! slice 3, thin wrappers over [`super::text::specs_text`] /
+//! [`super::text::ancestry_text`], the same pure text the reading card now
+//! carries on its own face at focus time. Slice 4 retires the panels
+//! themselves once every readout has a scene-native home.
 
 use std::f32::consts::FRAC_PI_4;
 
 use bevy::prelude::*;
 use kaijutsu_types::{ContextId, Status};
-use kaijutsu_viz::layout::Band;
 
 use super::panel::{commit_panel_glyphs, create_msdf_panel};
 use super::scene::{Card, TimeWellState, accent_color};
@@ -506,15 +513,6 @@ fn status_label(status: Option<Status>) -> &'static str {
     }
 }
 
-fn band_label(band: Band) -> &'static str {
-    match band {
-        Band::Active => "active",
-        Band::Recent => "recent",
-        Band::Bumped => "bumped",
-        Band::Demoted => "demoted",
-    }
-}
-
 /// Static keyboard legend content ([`HudSlot::Legend`]) — the verbs are
 /// provisional per the design; this listing is their source of truth in-app.
 /// Never changes, so `update_well_hud`'s change-guard means this only ever
@@ -534,68 +532,21 @@ fn hud_north(d: &super::card::CardData, status: Option<Status>) -> String {
     format!("{}\n{} · {}{}", d.title, kind, status_label(status), paused)
 }
 
+/// Thin wrapper: the specs block's pure composition moved to
+/// [`super::text::specs_text`] (HUD-melt slice 3) so the reading card can
+/// absorb the same content — see that function's own doc. Kept here so this
+/// module's own call site and tests below don't move.
 fn hud_east(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
-    let keys = if d.keywords.is_empty() {
-        "—".to_string()
-    } else {
-        d.keywords.join(", ")
-    };
-    let mut lines = vec![
-        format!("model    {}", if d.model_badge.is_empty() { "—" } else { &d.model_badge }),
-        format!("fork     {}", d.fork_badge.as_deref().unwrap_or("—")),
-        format!("band     {}", band_label(d.band)),
-        format!("keywords {keys}"),
-    ];
-    if let Some(c) = &d.cluster_label {
-        lines.push(format!("cluster  ◇ {c}"));
-    }
-    // The lane this context rides, with its live transport (docs/tracks.md).
-    if let Some(t) = track {
-        let bpm = (60_000_000f64 / t.period_us.max(1) as f64).round() as u64;
-        let transport = if t.playing {
-            format!("▶ ♩{bpm} · tick {}", t.playhead_tick)
-        } else {
-            "■ stopped".to_string()
-        };
-        lines.push(format!("track    ♪ {} {transport}", t.id));
-    }
-    // Longest line at the top, tapering to shortest — the block nests into the
-    // top corner (label columns stay aligned; only the row order changes).
-    lines.sort_by_key(|l| std::cmp::Reverse(l.chars().count()));
-    format!("SPECS\n{}", lines.join("\n"))
+    super::text::specs_text(d, track)
 }
 
+/// Thin wrapper: the ancestry chain's pure composition moved to
+/// [`super::text::ancestry_text`] (HUD-melt slice 3) — see that function's
+/// own doc.
 fn hud_west(selected: ContextId, state: &TimeWellState) -> String {
-    // Walk the fork-ancestry chain up (this ◂ parent ◂ …), titles from the join.
-    let mut out = String::from("LINEAGE\n");
-    let mut cur = Some(selected);
-    let mut depth = 0;
-    while let Some(id) = cur {
-        let title = state
-            .join
-            .get(&id)
-            .map(|c| c.id.display_or(Some(c.label.as_str())))
-            .unwrap_or_else(|| id.short());
-        if depth == 0 {
-            out.push_str(&title);
-        } else {
-            out.push_str(&format!("\n◂ {title}"));
-        }
-        // Stop after a handful of generations; guard against cycles.
-        depth += 1;
-        if depth >= 6 {
-            out.push_str("\n◂ …");
-            break;
-        }
-        cur = state.join.get(&id).and_then(|c| c.forked_from);
-        if cur == Some(id) {
-            break;
-        }
-    }
-    if depth == 1 {
-        out.push_str("\n(root)");
-    }
-    out
+    super::text::ancestry_text(selected, |id| {
+        state.join.get(&id).map(|c| (c.id.display_or(Some(c.label.as_str())), c.forked_from))
+    })
 }
 
 /// South = the selected context's live tail (tail -f, oldest → newest), each
@@ -622,6 +573,11 @@ fn hud_south(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: `band_label` moved to `super::text` (HUD-melt slice 3), so
+    // this module's own use of `Band` no longer reaches past `mod tests` —
+    // importing it only here (not at module scope) keeps a plain (non-test)
+    // build free of an unused-import warning.
+    use kaijutsu_viz::layout::Band;
 
     fn card(band: Band) -> super::super::card::CardData {
         super::super::card::CardData {

@@ -8,11 +8,21 @@
 //! selection/lineage rings — is drawn by `well_card.wgsl` (SDF), driven by the
 //! `WellCardMaterial` uniforms this module keeps in sync from `Card`. So vello no
 //! longer touches card textures at all (it stays for SVG/ABC elsewhere).
+//!
+//! **HUD-melt slice 3** (`docs/timewell.md`): [`reading_card_glyphs`] absorbs
+//! the reference material the HUD's East (specs) and West (ancestry) panels
+//! carry — [`specs_text`]/[`ancestry_text`] are that content's pure
+//! composition, extracted from `hud::hud_east`/`hud::hud_west`'s own bodies
+//! so both the HUD panels (until slice 4 retires them) and the reading card
+//! render byte-identical text from one place.
 
 use bevy::prelude::*;
 use vello::peniko::Brush;
 
+use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
+use kaijutsu_viz::join::Join;
+use kaijutsu_viz::layout::Band;
 
 use super::panel::commit_panel_glyphs;
 use super::scene::{
@@ -60,6 +70,30 @@ const GIST_MAX_LINES: usize = 2;
 /// important line on the card face, a hint rather than a spec.
 fn gist_brush() -> Brush {
     bevy_color_to_brush(Color::srgba(0.80, 0.86, 0.97, 0.55))
+}
+
+/// Tail lines shown on the reading card's absorbed tail cut (HUD-melt slice
+/// 3) — deeper than the rim card's live-tail band (`super::live::CARD_TAIL_LINES`
+/// is 3) since the reading card is the surface Enter dollies to for an actual
+/// look, not a passing glance; proportionate to its larger face
+/// ([`READING_TEX_H`] is 2× [`CARD_TEX_H`]). **Amy-tunable.**
+const READING_TAIL_LINES: usize = 8;
+
+/// Font size (logical px, scaled by the card's own `s` like every other
+/// field) for a reading-card block's section label ("SPECS"/"LINEAGE") — one
+/// notch above the dim body so the label reads as a header, not more body
+/// text.
+const READING_BLOCK_HEADER_SIZE: f32 = 11.0;
+/// Font size for a reading-card block's body lines — smaller than the gist
+/// line above it (this is reference material, denser and further down the
+/// hierarchy than the card's own summary).
+const READING_BLOCK_BODY_SIZE: f32 = 10.0;
+
+/// Dim, slightly-brighter-than-body brush for a reading-card block's section
+/// label — one step up from [`gist_brush`]'s dimness, the same alpha-taper
+/// idiom every other field on the card already uses for hierarchy.
+fn reading_block_header_brush() -> Brush {
+    bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.75))
 }
 
 /// Greedy word-wrap: split `text` into lines of at most `line_chars`
@@ -112,6 +146,118 @@ fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> 
     if lines.is_empty() { None } else { Some(lines.join("\n")) }
 }
 
+// ============================================================================
+// HUD-MELT SLICE 3: absorbed panel content (pure text, no Bevy)
+// ============================================================================
+//
+// [`specs_text`] and [`ancestry_text`] are `hud::hud_east`/`hud::hud_west`'s
+// own bodies, extracted so both the HUD's East/West panels (until slice 4
+// retires them) and the reading card's absorbed content
+// ([`reading_card_glyphs`]) compose from the same pure text, byte-for-byte —
+// `hud::hud_east`/`hud::hud_west` become thin wrappers over these, so their
+// own tests (and output) don't move.
+
+/// Specs block: model, fork kind, band, keywords, cluster, and the live
+/// transport line for the track this context rides (`docs/tracks.md`). The
+/// longest line sorts to the top, tapering to the shortest, so the block
+/// nests into its top corner instead of ragging unevenly.
+///
+/// The track transport line rides along here until timewell Stage 3 gives it
+/// a real home on a track surface — see `docs/timewell.md`.
+pub fn specs_text(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
+    let keys = if d.keywords.is_empty() {
+        "—".to_string()
+    } else {
+        d.keywords.join(", ")
+    };
+    let mut lines = vec![
+        format!("model    {}", if d.model_badge.is_empty() { "—" } else { &d.model_badge }),
+        format!("fork     {}", d.fork_badge.as_deref().unwrap_or("—")),
+        format!("band     {}", band_label(d.band)),
+        format!("keywords {keys}"),
+    ];
+    if let Some(c) = &d.cluster_label {
+        lines.push(format!("cluster  ◇ {c}"));
+    }
+    if let Some(t) = track {
+        let bpm = (60_000_000f64 / t.period_us.max(1) as f64).round() as u64;
+        let transport = if t.playing {
+            format!("▶ ♩{bpm} · tick {}", t.playhead_tick)
+        } else {
+            "■ stopped".to_string()
+        };
+        lines.push(format!("track    ♪ {} {transport}", t.id));
+    }
+    lines.sort_by_key(|l| std::cmp::Reverse(l.chars().count()));
+    format!("SPECS\n{}", lines.join("\n"))
+}
+
+fn band_label(band: Band) -> &'static str {
+    match band {
+        Band::Active => "active",
+        Band::Recent => "recent",
+        Band::Bumped => "bumped",
+        Band::Demoted => "demoted",
+    }
+}
+
+/// Ancestry chain as text: walk the fork lineage upward (this ◂ parent ◂ …),
+/// titles from `title_and_parent` — same shape as [`super::card::ancestors`]'s
+/// own `parent_of` closure, paired with a title so the chain prints without a
+/// second lookup.
+///
+/// Unlike the lineage drapes ([`super::drape::sync_lineage_drapes`], slice
+/// 1), which only draw a ribbon to an ancestor with a live `Card` entity,
+/// this has no such requirement: `title_and_parent` returning `None` — an id
+/// with no join entry, i.e. an ancestor past the event horizon
+/// (`sync_time_well` never joins those) — still prints that ancestor's short
+/// id and stops the walk there for lack of further parent info, rather than
+/// silently vanishing. That's the completeness the reading card's ancestry
+/// block (HUD-melt slice 3) leans on: the drapes show topology, this chain
+/// carries the paper trail one generation further.
+///
+/// Stops after 6 generations (guards a pathologically deep chain); an
+/// immediate self-loop (`forked_from == self`) ends the walk on the spot,
+/// and any longer cycle is still bounded by the depth cap, so a malformed
+/// lineage can't hang the card.
+///
+/// `"(root)"` is appended only when the **selected** context itself has no
+/// parent (a one-entry chain) — reaching an ancestor with no further parent
+/// several generations up does not retroactively mark it. Pre-existing
+/// `hud_west` behavior, kept as-is by this extraction rather than "fixed".
+pub fn ancestry_text(
+    selected: ContextId,
+    title_and_parent: impl Fn(ContextId) -> Option<(String, Option<ContextId>)>,
+) -> String {
+    let mut out = String::from("LINEAGE\n");
+    let mut cur = Some(selected);
+    let mut depth = 0;
+    while let Some(id) = cur {
+        let (title, parent) = match title_and_parent(id) {
+            Some(tp) => tp,
+            None => (id.short(), None),
+        };
+        if depth == 0 {
+            out.push_str(&title);
+        } else {
+            out.push_str(&format!("\n◂ {title}"));
+        }
+        depth += 1;
+        if depth >= 6 {
+            out.push_str("\n◂ …");
+            break;
+        }
+        cur = parent;
+        if cur == Some(id) {
+            break;
+        }
+    }
+    if depth == 1 {
+        out.push_str("\n(root)");
+    }
+    out
+}
+
 // HDR gain for the focus card's bevel frame (the `border` ring band: the
 // selection's accent lifted so the frame reads as a deliberate beveled edge,
 // replacing the accidental cream ring the pre-mask-fix chatter/beat lanes
@@ -160,32 +306,25 @@ fn collect_field(
     out.extend(collect_msdf_glyphs(layout, &[], brush, offset, atlas));
 }
 
-/// Lay out the card's text fields and collect MSDF glyphs (crisp at any zoom).
-/// Each field lands at the same `(pad, y)` origin and color the card used before.
-///
-/// `show_tail`: whether to render [`Card::tail`]'s live-tail band (HUD-melt
-/// slice 2). `true` from the rim-card path ([`build_card_scenes`]), `false`
-/// from the reading/focus-card path ([`update_reading_card`]) — that system's
-/// own change-guard only fires on a *selection* change, so a tail that keeps
-/// updating while the selection stays put would go stale on the bigger focus
-/// card; the rim card's path has no such gap (it rides `Changed<Card>`
-/// directly, which the tail's own guarded write already trips). HUD South
-/// only ever showed the rim-selection's tail too, so this keeps the same
-/// scope its job is replacing.
-fn card_text_glyphs(
+/// Lay out the shared "title/badges up top" header every card face shows —
+/// title, the paused marker, model badge, fork badge — appending glyphs into
+/// `out` and returning the y-cursor so the caller can keep flowing content
+/// below it. Shared by the rim card ([`card_text_glyphs`]) and the reading
+/// card ([`reading_card_glyphs`], HUD-melt slice 3): both faces start
+/// identically and diverge only below this point (rim: gist/tail/keywords/
+/// cluster; reading: the absorbed specs/ancestry/tail blocks), so this is the
+/// seam between them, extracted so neither copy can drift from the other.
+fn card_header_glyphs(
     card: &Card,
     font: &VelloFont,
-    w: f32,
-    h: f32,
+    max_advance: Option<f32>,
+    s: f32,
+    pad: f32,
     atlas: &mut MsdfAtlas,
     font_data_map: &mut FontDataMap,
-    show_tail: bool,
-) -> Vec<PositionedGlyph> {
-    let s = h / CARD_TEX_H;
-    let pad = PAD * s;
+    out: &mut Vec<PositionedGlyph>,
+) -> f32 {
     let data = &card.data;
-    let max_advance = Some(w - 2.0 * pad);
-    let mut out = Vec::new();
     let mut y = pad + 6.0 * s;
 
     // ── Title. ──
@@ -197,7 +336,7 @@ fn card_text_glyphs(
         max_advance,
     );
     let title_h = title.height();
-    collect_field(&title, (pad as f64, y as f64), &title_brush, atlas, font_data_map, &mut out);
+    collect_field(&title, (pad as f64, y as f64), &title_brush, atlas, font_data_map, out);
     y += title_h + 6.0 * s;
 
     // ── Paused marker. ── Design-only state (see `CardData::paused`): visuals
@@ -213,7 +352,7 @@ fn card_text_glyphs(
             max_advance,
         );
         let mh = marker.height();
-        collect_field(&marker, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        collect_field(&marker, (pad as f64, y as f64), &brush, atlas, font_data_map, out);
         y += mh + 4.0 * s;
     }
 
@@ -227,7 +366,7 @@ fn card_text_glyphs(
             max_advance,
         );
         let bh = badge.height();
-        collect_field(&badge, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        collect_field(&badge, (pad as f64, y as f64), &brush, atlas, font_data_map, out);
         y += bh + 4.0 * s;
     }
 
@@ -242,9 +381,34 @@ fn card_text_glyphs(
             max_advance,
         );
         let lh = l.height();
-        collect_field(&l, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        collect_field(&l, (pad as f64, y as f64), &brush, atlas, font_data_map, out);
         y += lh + 4.0 * s;
     }
+
+    y
+}
+
+/// Lay out the card's text fields and collect MSDF glyphs (crisp at any zoom).
+/// Each field lands at the same `(pad, y)` origin and color the card used
+/// before. Rim card only (the sole caller is [`build_card_scenes`]) — the
+/// reading/focus card has its own composition as of HUD-melt slice 3,
+/// [`reading_card_glyphs`], which shares [`card_header_glyphs`] with this
+/// function but diverges below it (specs/ancestry/tail-cut instead of
+/// gist/keywords/cluster), so it's a sibling, not a caller, of this one.
+fn card_text_glyphs(
+    card: &Card,
+    font: &VelloFont,
+    w: f32,
+    h: f32,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+) -> Vec<PositionedGlyph> {
+    let s = h / CARD_TEX_H;
+    let pad = PAD * s;
+    let data = &card.data;
+    let max_advance = Some(w - 2.0 * pad);
+    let mut out = Vec::new();
+    let mut y = card_header_glyphs(card, font, max_advance, s, pad, atlas, font_data_map, &mut out);
 
     // ── Gist line(s). ── Sentence-level extractive summary (Tier 2,
     // `kaijutsu-kernel::runtime::synthesis::compute_gist`), riding the same
@@ -268,14 +432,12 @@ fn card_text_glyphs(
         y += lh + 4.0 * s;
     }
 
-    // ── Live-tail band (selected card ONLY, `show_tail` gate — HUD-melt
-    // slice 2, replacing the South HUD panel's job on the card face itself:
-    // `docs/timewell.md`, "Lineage drapes down the bowl wall" 's sibling
-    // slice). `card.tail` is `None` for every non-selected card and for a
-    // selected card with no live lines yet — same style as the gist line
-    // above it (small, dim), one row lower. ──
-    if show_tail
-        && let Some(tail_text) = card.tail.as_deref()
+    // ── Live-tail band (HUD-melt slice 2, replacing the South HUD panel's
+    // job on the card face itself: `docs/timewell.md`, "Lineage drapes down
+    // the bowl wall" 's sibling slice). `card.tail` is `None` for every
+    // non-selected card and for a selected card with no live lines yet —
+    // same style as the gist line above it (small, dim), one row lower. ──
+    if let Some(tail_text) = card.tail.as_deref()
         && y < h - pad
     {
         let brush = gist_brush();
@@ -316,6 +478,124 @@ fn card_text_glyphs(
         let lh = l.height();
         let fy = h - pad - lh;
         collect_field(&l, (pad as f64, fy as f64), &brush, atlas, font_data_map, &mut out);
+    }
+
+    out
+}
+
+/// Lay out one of the reading card's absorbed blocks (specs, ancestry, or the
+/// deeper tail cut — HUD-melt slice 3) at `y`. `has_header` splits a leading
+/// `"HEADER\nbody"` line (the shape [`specs_text`]/[`ancestry_text`] return)
+/// into a brighter [`READING_BLOCK_HEADER_SIZE`] label and a dim
+/// [`READING_BLOCK_BODY_SIZE`] body; `false` renders the whole string as one
+/// dim run (the tail cut carries no such label, same as the rim card's own
+/// live-tail band and HUD South before it). Skips (returns `y` unchanged)
+/// once the flowing content has already reached `y_limit` — the same
+/// overflow guard every block in [`card_text_glyphs`] uses, so a small
+/// selection with a short chain never wastes the reading card's own bottom
+/// margin. Returns the y-cursor after the block.
+fn layout_reading_block(
+    text: &str,
+    font: &VelloFont,
+    max_advance: Option<f32>,
+    s: f32,
+    pad: f32,
+    y: f32,
+    y_limit: f32,
+    has_header: bool,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+    out: &mut Vec<PositionedGlyph>,
+) -> f32 {
+    if text.is_empty() || y >= y_limit {
+        return y;
+    }
+    let mut y = y;
+    let (header, body) = if has_header {
+        match text.split_once('\n') {
+            Some((h, b)) => (Some(h), b),
+            None => (None, text),
+        }
+    } else {
+        (None, text)
+    };
+    if let Some(header) = header {
+        let l = font.layout(
+            header,
+            &VelloTextStyle { font_size: READING_BLOCK_HEADER_SIZE * s, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let lh = l.height();
+        collect_field(&l, (pad as f64, y as f64), &reading_block_header_brush(), atlas, font_data_map, out);
+        y += lh + 3.0 * s;
+    }
+    if !body.is_empty() {
+        let l = font.layout(
+            body,
+            &VelloTextStyle { font_size: READING_BLOCK_BODY_SIZE * s, line_height: 1.3, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let lh = l.height();
+        collect_field(&l, (pad as f64, y as f64), &gist_brush(), atlas, font_data_map, out);
+        y += lh + 10.0 * s;
+    }
+    y
+}
+
+/// The reading (focus) card's own text composition (HUD-melt slice 3): the
+/// shared title/badges header ([`card_header_glyphs`]), then the specs block
+/// ([`specs_text`]), the ancestry chain ([`ancestry_text`]), and a deeper
+/// tail cut ([`READING_TAIL_LINES`]) than the rim card's live-tail band — the
+/// reference material the HUD's East/West/South panels carried before the
+/// melt (`hud.rs`'s own module doc names the panels this supersedes; they
+/// stay live until slice 4 retires them).
+///
+/// No gist/keywords/cluster repeat: the specs block already carries keywords
+/// + cluster, and this card is reference material at reading distance, not a
+/// bigger rim-card face.
+///
+/// `tail` is a **snapshot**, not a live window: [`update_reading_card`]'s own
+/// change-guard only fires on a selection change (the same reasoning the
+/// pre-slice-3 reading card drew from `card_text_glyphs`'s live-tail band —
+/// see `docs/timewell.md`), so a tail that kept updating while the selection
+/// stayed put would go stale here. Acceptable: the reading card is what you
+/// get when you dolly in and look, not a live ticker.
+fn reading_card_glyphs(
+    card: &Card,
+    join: &Join<ContextId, ContextInfo>,
+    track: Option<&kaijutsu_client::TrackInfo>,
+    tail: Option<&str>,
+    font: &VelloFont,
+    w: f32,
+    h: f32,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+) -> Vec<PositionedGlyph> {
+    let s = h / CARD_TEX_H;
+    let pad = PAD * s;
+    let max_advance = Some(w - 2.0 * pad);
+    let y_limit = h - pad;
+    let mut out = Vec::new();
+    let mut y = card_header_glyphs(card, font, max_advance, s, pad, atlas, font_data_map, &mut out);
+
+    let specs = specs_text(&card.data, track);
+    y = layout_reading_block(
+        &specs, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
+    );
+
+    let ancestry = ancestry_text(card.context_id, |id| {
+        join.get(&id).map(|c| (c.id.display_or(Some(c.label.as_str())), c.forked_from))
+    });
+    y = layout_reading_block(
+        &ancestry, font, max_advance, s, pad, y, y_limit, true, atlas, font_data_map, &mut out,
+    );
+
+    if let Some(tail_text) = tail {
+        layout_reading_block(
+            tail_text, font, max_advance, s, pad, y, y_limit, false, atlas, font_data_map, &mut out,
+        );
     }
 
     out
@@ -367,8 +647,7 @@ pub fn build_card_scenes(
         // Pure MSDF surface: the build size lives on the card's `UiRttTexture`
         // (set once at spawn); the MSDF pass clears and owns the texture. No
         // vello scene — the shader draws the body.
-        let glyphs =
-            card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map, true);
+        let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
         commit_panel_glyphs(&mut msdf, glyphs);
 
         if let Some(mat) = materials.get_mut(&mat_node.0) {
@@ -382,7 +661,17 @@ pub fn build_card_scenes(
 }
 
 /// Render the current selection into the center-bottom focus card (MSDF text +
-/// material body) at the larger reading size. Rebuilds only on selection change.
+/// material body) at the larger reading size. Rebuilds only on selection
+/// change.
+///
+/// HUD-melt slice 3: the reading card's content is [`reading_card_glyphs`],
+/// not the rim card's [`card_text_glyphs`] — it absorbs the specs block, the
+/// ancestry chain, and a deeper tail cut (the reference material the HUD's
+/// East/West/South panels carried). `tracks`/`tails` are new params this
+/// slice adds so that content has a track/tail to read at focus time; both
+/// are read once per selection change (the existing `last` guard below), not
+/// per frame — the tail is a snapshot, not a live-updating window (see
+/// [`reading_card_glyphs`]'s own doc).
 pub fn update_reading_card(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
@@ -390,6 +679,8 @@ pub fn update_reading_card(
     mut font_data_map: ResMut<FontDataMap>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
     state: Res<TimeWellState>,
+    tracks: Res<super::rays::WellTracks>,
+    tails: Res<super::live::ContextTails>,
     palette: Res<crate::view::scene_palette::ScenePalette>,
     cards: Query<&Card>,
     mut reading: Query<
@@ -424,19 +715,26 @@ pub fn update_reading_card(
                 mat.border = (accent.truncate() * palette.gain_reading_border).extend(1.0);
             }
             match atlas.as_deref_mut() {
-                Some(atlas) => card_text_glyphs(
-                    card,
-                    font,
-                    READING_TEX_W,
-                    READING_TEX_H,
-                    atlas,
-                    &mut font_data_map,
-                    // No tail band here — see `card_text_glyphs`'s own doc on
-                    // `show_tail` for why (this system's change-guard only
-                    // fires on selection change, so a live-updating tail
-                    // would go stale on the bigger focus card).
-                    false,
-                ),
+                Some(atlas) => {
+                    let track = tracks.track_info_of(&card.context_id);
+                    let tail = super::live::tail_lines(
+                        &tails,
+                        card.context_id,
+                        READING_TAIL_LINES,
+                        GIST_LINE_CHARS,
+                    );
+                    reading_card_glyphs(
+                        card,
+                        &state.join,
+                        track,
+                        tail.as_deref(),
+                        font,
+                        READING_TEX_W,
+                        READING_TEX_H,
+                        atlas,
+                        &mut font_data_map,
+                    )
+                }
                 None => Vec::new(),
             }
         }
@@ -565,5 +863,157 @@ mod tests {
         let w = wrap_gist(text, 15, 1).unwrap();
         assert_eq!(w.lines().count(), 1);
         assert!(w.ends_with('…'), "overflow past line 1 is elided: {w:?}");
+    }
+
+    // ── specs_text (HUD-melt slice 3: hud::hud_east's own body) ──
+
+    fn card_data(band: Band) -> super::super::card::CardData {
+        super::super::card::CardData {
+            title: "alpha".into(),
+            accent: "coder".into(),
+            model_badge: "anthropic/claude-opus-4-8".into(),
+            fork_badge: Some("full".into()),
+            keywords: vec!["rings".into(), "pulse".into()],
+            preview: None,
+            band,
+            forked_from: None,
+            cluster_label: None,
+            paused: false,
+        }
+    }
+
+    #[test]
+    fn specs_text_lists_fields_with_dash_fallbacks() {
+        let mut d = card_data(Band::Recent);
+        d.model_badge = String::new();
+        d.fork_badge = None;
+        d.keywords = vec![];
+        let s = specs_text(&d, None);
+        assert!(s.starts_with("SPECS\n"), "headed block: {s}");
+        assert!(s.contains("model    —"), "empty model → dash: {s}");
+        assert!(s.contains("fork     —"), "no fork → dash: {s}");
+        assert!(s.contains("keywords —"), "no keywords → dash: {s}");
+        assert!(s.contains("band     recent"), "band labeled: {s}");
+        assert!(!s.contains("cluster"), "no cluster line when unclustered: {s}");
+        assert!(!s.contains("track"), "no track line when unattached: {s}");
+    }
+
+    #[test]
+    fn specs_text_shows_cluster_only_when_present() {
+        let mut d = card_data(Band::Demoted);
+        d.cluster_label = Some("storage".into());
+        let s = specs_text(&d, None);
+        assert!(s.contains("cluster  ◇ storage"), "cluster line present: {s}");
+        assert!(s.contains("rings, pulse"), "keywords joined: {s}");
+    }
+
+    #[test]
+    fn specs_text_shows_the_track_line_with_live_transport() {
+        let mut t = kaijutsu_client::TrackInfo {
+            id: "bass".into(),
+            score_context_id: ContextId::from_bytes([9; 16]),
+            playing: true,
+            playhead_tick: 128,
+            period_us: 500_000, // 120 BPM
+            beats_per_phrase: 32,
+            beat_count: 128,
+            last_epoch_ns: 1,
+            clock_kind: "system".into(),
+            attached: vec![],
+        };
+        let s = specs_text(&card_data(Band::Active), Some(&t));
+        assert!(s.contains("track    ♪ bass ▶ ♩120 · tick 128"), "playing: {s}");
+
+        t.playing = false;
+        let s = specs_text(&card_data(Band::Active), Some(&t));
+        assert!(s.contains("track    ♪ bass ■ stopped"), "stopped: {s}");
+    }
+
+    // ── ancestry_text (HUD-melt slice 3: hud::hud_west's own body) ──
+
+    fn ctx(n: u8) -> ContextId {
+        ContextId::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn ancestry_text_single_generation_marks_root() {
+        let a = ctx(1);
+        let out = ancestry_text(a, |_| Some(("alpha".into(), None)));
+        assert_eq!(out, "LINEAGE\nalpha\n(root)");
+    }
+
+    #[test]
+    fn ancestry_text_walks_the_chain_newest_first_no_marker_on_itself() {
+        let (a, b, c) = (ctx(1), ctx(2), ctx(3));
+        let titles: std::collections::HashMap<ContextId, (String, Option<ContextId>)> = [
+            (a, ("child".to_string(), Some(b))),
+            (b, ("parent".to_string(), Some(c))),
+            (c, ("grandparent".to_string(), None)),
+        ]
+        .into_iter()
+        .collect();
+        let out = ancestry_text(a, |id| titles.get(&id).cloned());
+        // `(root)` only fires when the SELECTED context itself has no parent
+        // (see `ancestry_text_single_generation_marks_root`) — reaching an
+        // ancestor with no further parent several generations up does not
+        // retroactively mark it, a pre-existing `hud_west` quirk this
+        // extraction keeps byte-identical rather than "fixing".
+        assert_eq!(out, "LINEAGE\nchild\n◂ parent\n◂ grandparent");
+    }
+
+    #[test]
+    fn ancestry_text_stops_at_an_ancestor_past_the_event_horizon() {
+        // `b` has no join entry (a horizon ancestor — `sync_time_well` never
+        // joins those): the chain still prints its short id, but can't
+        // recurse further without parent info.
+        let (a, b) = (ctx(1), ctx(2));
+        let titles: std::collections::HashMap<ContextId, (String, Option<ContextId>)> =
+            [(a, ("child".to_string(), Some(b)))].into_iter().collect();
+        let out = ancestry_text(a, |id| titles.get(&id).cloned());
+        assert_eq!(out, format!("LINEAGE\nchild\n◂ {}", b.short()));
+        assert!(!out.contains("(root)"), "stopping short of a parent isn't the same as being one: {out}");
+    }
+
+    #[test]
+    fn ancestry_text_caps_depth_at_six_generations() {
+        let ids: Vec<ContextId> = (1..=8).map(ctx).collect();
+        let titles: std::collections::HashMap<ContextId, (String, Option<ContextId>)> = (0..8)
+            .map(|i| {
+                let parent = ids.get(i + 1).copied();
+                (ids[i], (format!("gen{i}"), parent))
+            })
+            .collect();
+        let out = ancestry_text(ids[0], |id| titles.get(&id).cloned());
+        assert!(out.ends_with("\n◂ …"), "depth cap trails off: {out}");
+        // Header + 6 generations (gen0..gen5) + the ellipsis trailer.
+        assert_eq!(out.lines().count(), 8, "header + 6 generations + ellipsis: {out:?}");
+    }
+
+    #[test]
+    fn ancestry_text_self_parent_breaks_the_walk_without_hanging() {
+        // A corrupted lineage (a context listing itself as its own
+        // `forked_from`) must not spin forever: the immediate-self-loop
+        // guard breaks the walk right after the first entry, same as a
+        // genuine root (depth stays 1) — a malformed lineage reads as "no
+        // known ancestor" rather than hanging the card.
+        let a = ctx(1);
+        let out = ancestry_text(a, move |_id| Some(("a".to_string(), Some(a))));
+        assert_eq!(out, "LINEAGE\na\n(root)");
+    }
+
+    #[test]
+    fn ancestry_text_longer_cycle_still_terminates_via_the_depth_cap() {
+        // A 2-cycle (a's parent is b, b's parent is a) has no immediate
+        // self-loop to catch, so the depth cap is what stops it — same
+        // bound as `ancestry_text_caps_depth_at_six_generations`.
+        let (a, b) = (ctx(1), ctx(2));
+        let out = ancestry_text(a, move |id| {
+            if id == a {
+                Some(("a".to_string(), Some(b)))
+            } else {
+                Some(("b".to_string(), Some(a)))
+            }
+        });
+        assert_eq!(out, "LINEAGE\na\n◂ b\n◂ a\n◂ b\n◂ a\n◂ b\n◂ …");
     }
 }
