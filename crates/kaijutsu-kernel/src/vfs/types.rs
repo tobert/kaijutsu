@@ -174,6 +174,58 @@ impl DirEntry {
     }
 }
 
+/// One node of a [`MountTable::snapshot`](super::mount::MountTable::snapshot)
+/// walk — the FSN world's stage-0/1 kernel plumbing (`docs/scenes/vfs.md`
+/// "Kernel plumbing: enumeration + fsnotify"). Mirrors the capnp
+/// `SnapshotNode` wire struct field-for-field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotNode {
+    /// Entry name (not full path) — empty for the walk root when the root
+    /// path has no final component (e.g. `/`).
+    pub name: String,
+    /// Entry type.
+    pub kind: FileType,
+    /// Size in bytes (0 for directories).
+    pub size: u64,
+    /// Modification time, seconds since UNIX epoch. Display only, same
+    /// caveat as [`FileAttr::mtime`].
+    pub mtime_secs: u64,
+    /// Real child count of a directory, even when [`Self::children`] was cut
+    /// short by depth or the entry cap. `0` for files/symlinks.
+    pub child_count: u32,
+    /// gitignore CLASSIFICATION — metadata, never a filter (see
+    /// `docs/scenes/vfs.md`: "gitignored wastes get weather"). Real for
+    /// LocalBackend-backed subtrees; always `false` for virtual/CRDT
+    /// backends (no gitignore semantics there). See
+    /// [`MountTable::snapshot`](super::mount::MountTable::snapshot) doc for
+    /// the exact folding rule and its known precision gap.
+    pub ignored: bool,
+    /// Per-directory listing-generation stamp (structure/name-set changes
+    /// only — see the generation-policy doc on
+    /// [`MountTable::snapshot`](super::mount::MountTable::snapshot)). `0`
+    /// for files/symlinks.
+    pub generation: u64,
+    /// Children, present when this is a directory and depth/cap allowed
+    /// descending. Always empty for files and symlinks (symlinks are never
+    /// expanded, even when they target a directory — avoids cycles).
+    pub children: Vec<SnapshotNode>,
+    /// `true` when this node's real children were cut short by depth or the
+    /// entry cap — the real count is still in [`Self::child_count`].
+    pub truncated_here: bool,
+}
+
+/// Result of [`MountTable::snapshot`](super::mount::MountTable::snapshot) —
+/// mirrors the capnp `snapshot` RPC's three return fields directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotResult {
+    pub root: SnapshotNode,
+    /// Mirrors `root.generation` — a quick staleness check without reading
+    /// into the node.
+    pub generation: u64,
+    /// `true` iff any node in the tree has `truncated_here` set.
+    pub truncated: bool,
+}
+
 /// Attributes to set (for setattr operation).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetAttr {

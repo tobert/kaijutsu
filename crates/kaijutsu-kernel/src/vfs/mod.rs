@@ -25,6 +25,10 @@ mod types;
 
 pub use backends::{CasFs, LocalBackend, MemoryBackend};
 pub use error::{VfsError, VfsResult};
-pub use mount::{MountInfo, MountTable};
+pub use mount::{
+    MountInfo, MountTable, SNAPSHOT_MAX_DEPTH, SNAPSHOT_MAX_ENTRIES, BASELINE_GENERATION,
+};
 pub use ops::VfsOps;
-pub use types::{DirEntry, FileAttr, FileType, OpenFlags, SetAttr, StatFs};
+pub use types::{
+    DirEntry, FileAttr, FileType, OpenFlags, SetAttr, SnapshotNode, SnapshotResult, StatFs,
+};

@@ -27,8 +27,8 @@ pub use rpc::{
     Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
-    RpcClient, RpcError, ShellValue, SimilarContext, StagedDriftInfo, SubmitResult, SyncState,
-    ToolResult, ToolSchema, TrackInfo, VersionSnapshot,
+    RpcClient, RpcError, ShellValue, SimilarContext, SnapshotNode, SnapshotResult, StagedDriftInfo,
+    SubmitResult, SyncState, ToolResult, ToolSchema, TrackInfo, VersionSnapshot, VfsFileType,
 };
 pub use document_store::{DocumentEntry, DocumentStore};
 pub use sftp::{CasFetch, CasResolver, SftpClient, SftpError, default_cache_dir};

@@ -34,6 +34,7 @@ pub mod refs;
 pub mod search;
 pub mod stage;
 pub mod transport;
+pub mod vfs;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -353,6 +354,11 @@ impl KjDispatcher {
         }
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
+        }
+        // `kj vfs` is a structural read query addressed by VFS path, not by
+        // context — same exemption rationale as `kj cas` get/ls/info.
+        if cmd == "vfs" {
+            return self.dispatch_vfs(&argv[1..], caller).await;
         }
         // `kj play` resolves its own target via `--context <ref>` (falling
         // back to the caller's active context, same as `kj transport`), so
@@ -701,6 +707,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(stage::StageArgs::command())
         .subcommand(drift::DriftArgs::command())
         .subcommand(cache::CacheArgs::command())
+        .subcommand(vfs::VfsArgs::command())
 }
 
 #[cfg(test)]

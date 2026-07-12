@@ -85,6 +85,11 @@ hostname = "0.3"
 dunce = "1"
 indexmap = "2"
 
+# gitignore classification (ripgrep's crate) — VFS snapshot's `ignored` flag,
+# docs/scenes/vfs.md. Already in the lock file transitively (kaish-kernel);
+# pinned as a direct dep so kaijutsu-kernel can use it deliberately.
+ignore = "0.4"
+
 # Async utilities
 async-trait = "0.1"
 

@@ -8298,6 +8298,63 @@ impl vfs::Server for VfsImpl {
             }
         })
     }
+
+    fn snapshot(
+        self: Rc<Self>,
+        params: vfs::SnapshotParams,
+        mut results: vfs::SnapshotResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let depth = params.get_depth();
+        let max_entries = params.get_max_entries();
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let snap = kernel
+                .snapshot(Path::new(&path), depth, max_entries)
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            {
+                let mut root_builder = results.get().init_root();
+                set_snapshot_node(&mut root_builder, &snap.root);
+            }
+            results.get().set_generation(snap.generation);
+            results.get().set_truncated(snap.truncated);
+            Ok(())
+        })
+    }
+}
+
+/// Recursively fill a capnp `SnapshotNode` builder from the owned kernel tree
+/// (`Vfs.snapshot`, FSN world stage-0/1 plumbing — docs/scenes/vfs.md).
+fn set_snapshot_node(
+    builder: &mut crate::kaijutsu_capnp::snapshot_node::Builder,
+    node: &kaijutsu_kernel::SnapshotNode,
+) {
+    builder.set_name(&node.name);
+    builder.set_kind(match node.kind {
+        kaijutsu_kernel::FileType::File => crate::kaijutsu_capnp::FileType::File,
+        kaijutsu_kernel::FileType::Directory => crate::kaijutsu_capnp::FileType::Directory,
+        kaijutsu_kernel::FileType::Symlink => crate::kaijutsu_capnp::FileType::Symlink,
+    });
+    builder.set_size(node.size);
+    builder.set_mtime_secs(node.mtime_secs);
+    builder.set_child_count(node.child_count);
+    builder.set_ignored(node.ignored);
+    builder.set_generation(node.generation);
+    builder.set_truncated_here(node.truncated_here);
+    let mut children = builder.reborrow().init_children(node.children.len() as u32);
+    for (i, child) in node.children.iter().enumerate() {
+        let mut child_builder = children.reborrow().get(i as u32);
+        set_snapshot_node(&mut child_builder, child);
+    }
 }
 
 // ============================================================================

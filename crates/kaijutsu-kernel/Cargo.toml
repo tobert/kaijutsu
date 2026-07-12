@@ -58,6 +58,9 @@ usvg = "0.46"
 kaish-glob.workspace = true
 kaish-kernel.workspace = true
 
+# gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
+ignore.workspace = true
+
 # Semantic vector index (used by runtime/synthesis + kj_builtin)
 kaijutsu-index = { path = "../kaijutsu-index" }
 

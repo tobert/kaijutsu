@@ -5866,6 +5866,7 @@ dependencies = [
  "dunce",
  "eventsource-stream",
  "futures",
+ "ignore",
  "include_dir",
  "kaijutsu-abc",
  "kaijutsu-audio",

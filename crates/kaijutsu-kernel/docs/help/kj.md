@@ -62,6 +62,7 @@ rc              add, list, rm, show, edit, reset — lifecycle scripts (/etc/rc/
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 stage           commit, status, include, exclude — curate a staged (liminal) fork
 transport       play, pause, stop, tempo <bpm>, ooda <on|off> — musician beat/playhead control
+vfs             snapshot <path> (--depth, --max-entries) — recursive listing + generation stamps
 workspace (ws)  list, show, create, add, bind, remove
 ```
 

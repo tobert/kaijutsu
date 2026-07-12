@@ -208,6 +208,22 @@ plumbing), quadtree layout + hash-seeded relaxed-Voronoi fields rendered as
 line-list wireframe + vertex points, three LOD tiers live, fly + select
 only — no interaction beyond that, no solid tier, no fsnotify.
 
+**Layout math (Lane A) SHIPPED 2026-07-12** (`feat/fsn-layout`):
+`kaijutsu-viz::fsn` — `CellId` quadtree addressing (explicit-level u64,
+cube-sphere-ready, prefix containment), FNV-1a seeds, voronator-backed
+Voronoi with fixed k=2 Lloyd (blast radius bounded + trajectory-tested),
+`FsnCell::edges()` for line-list meshes. Determinism scope: per compiled
+binary (FMA/predicate caveat in the module doc). CellId assignment for
+subdir sub-cells is a documented placeholder pending open question 2.
+
+**Kernel plumbing (stage 0 + stage-1 groundwork) SHIPPED 2026-07-12**
+(`feat/fsn-snapshot`): `Vfs.snapshot` RPC + `MountTable::snapshot`
+(`crates/kaijutsu-kernel/src/vfs/mount.rs`), per-directory listing-generation
+stamps, `kj vfs snapshot <path>`, client wrapper. `ignored` classification is
+real for LocalBackend-backed subtrees, best-effort precision (see
+`docs/issues.md`). Stage 2 (inotify → event stream) not started. Lane C (the
+Bevy world renderer) consumes this next.
+
 Research trail: S2 cell-ID prefix containment · GosperMap · EvoStreets ·
 Sondag stable treemaps via local moves · `hexasphere` (Bevy dep tree) ·
 H3 aperture-7 (rejected for addressing).

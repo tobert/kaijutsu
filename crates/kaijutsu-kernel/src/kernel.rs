@@ -946,6 +946,19 @@ impl Kernel {
         &self.vfs
     }
 
+    /// Recursive snapshot listing with generation stamps — FSN world
+    /// stage-0/1 plumbing (`docs/scenes/vfs.md`). Thin delegate to
+    /// [`MountTable::snapshot`], which documents caps, error policy,
+    /// generation policy, and the `ignored` classification's known gaps.
+    pub async fn snapshot(
+        &self,
+        path: &Path,
+        depth: u32,
+        max_entries: u32,
+    ) -> VfsResult<crate::vfs::SnapshotResult> {
+        self.vfs.snapshot(path, depth, max_entries).await
+    }
+
     /// Install the shared CRDT file-document cache. Called once by the server
     /// at startup with the same instance handed to the MCP `builtin.file`
     /// tools, so the kaish `MountBackend` and the tools share one cache.
