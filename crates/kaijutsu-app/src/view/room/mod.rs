@@ -1359,13 +1359,16 @@ fn spawn_pylons(
 /// fullscreening a panel" for a *bounded* station) and, since the
 /// time-well/room integration plan's Slice C, the time well too (its own
 /// "diving IS the room's shot table zooming into the well's mouth" pose,
-/// `view/room/shot.rs::RoomShot::WellOverview`) — N stays a future
-/// dive-THROUGH door onto an unbounded world, not a panel/pose to fill the
-/// frame with. A future in-room station with content of its own — the
-/// highway, the archway — adds itself here as that content lands. Pure — no
-/// Bevy types — unit-tested like `bearing::station_is_room_furniture`, which
-/// this pairs with (same stations, same reasoning: each IS its own furniture
-/// AND its own zoom target).
+/// `view/room/shot.rs::RoomShot::WellOverview`) — **N stays a dive-THROUGH
+/// door** onto an unbounded world, not a panel/pose to fill the frame with:
+/// `Station::Vfs` is deliberately absent from this table (see
+/// [`room_keyboard`]'s own Enter/Down branch for its actual dive mechanism,
+/// a `Screen::Fsn` transition, `view::fsn`). A future in-room station with
+/// content of its own — the highway — adds itself here as that content
+/// lands. Pure — no Bevy types — unit-tested like
+/// `bearing::station_is_room_furniture`, which this pairs with (same
+/// stations, same reasoning: each IS its own furniture AND its own zoom
+/// target).
 fn station_is_zoomable(station: Station) -> bool {
     matches!(station, Station::PatchBay | Station::TimeWell)
 }
@@ -1427,8 +1430,19 @@ pub(crate) fn room_keyboard(
                 Station::TimeWell => crate::view::time_well::scene::arm_dive(&mut well_state),
                 _ => {}
             }
+        } else if station == Station::Vfs {
+            // The FSN landscape (`view::fsn`, `docs/scenes/vfs.md` slice 0)
+            // is the ONE dive-THROUGH station: too big to stand as room
+            // furniture, so N-diving is a genuine `Screen` transition, not a
+            // `RoomState::zoomed` write — `station_is_zoomable`'s own doc has
+            // the full reasoning. `Screen::Fsn`'s `OnEnter` hides the room
+            // chrome the same way Editor/Room already do; the world itself
+            // spawns/despawns on `view::fsn::scene`'s own
+            // `OnEnter`/`OnExit(Screen::Fsn)`, not here.
+            next.set(Screen::Fsn);
         }
-        // Unbuilt, non-zoomable stations: stay put (the dimmed plate says why).
+        // Unbuilt, non-zoomable, non-dive-through stations: stay put (the
+        // dimmed plate says why).
         return;
     }
 

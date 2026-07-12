@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::{
-    ActorHandle, ContextMembership, Identity, KernelInfo, ServerEvent, SshConfig,
+    ActorHandle, ContextMembership, Identity, KernelInfo, ServerEvent, SnapshotResult, SshConfig,
 };
 use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
@@ -143,6 +143,22 @@ pub enum RpcResultMessage {
     TracksReceived {
         tracks: Vec<kaijutsu_client::TrackInfo>,
     },
+    /// A `vfs_snapshot` reply landed (`view::fsn::sync`'s poll — the FSN
+    /// world's enumeration-on-demand scheduler, `docs/scenes/vfs.md` claim
+    /// 3). `path` is the query's own path (not necessarily the node's own
+    /// path if the kernel normalizes it), so the drain site can match the
+    /// reply back to whichever cell requested it.
+    VfsSnapshotReceived {
+        path: String,
+        result: SnapshotResult,
+    },
+    /// A `vfs_snapshot` request failed (RPC error, disconnect). Drained by
+    /// the same system as the success variant, whose only job on this arm is
+    /// clearing the one-in-flight debounce slot — without a failure reply the
+    /// FSN fetch queue would wedge forever on the first failed request.
+    /// Deliberately carries no auto-requeue semantics (a permanently-failing
+    /// path would hot-loop) — see `view::fsn::sync::apply_fsn_snapshot`.
+    VfsSnapshotFailed { path: String },
     /// Input document state received (for initializing SyncedInput on context join).
     InputStateReceived {
         context_id: ContextId,

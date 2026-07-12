@@ -748,12 +748,13 @@ pub fn update_mode(
             }
             FocusArea::Conversation => (theme.mode_normal, &theme.mode_label_normal),
         },
-        // The editor / room own the viewport; the conversation dock is
+        // The editor / room / fsn own the viewport; the conversation dock is
         // hidden, but keep the mode indicator coherent rather than panicking.
         // (The editor's own vim mode renders on its panel — docs/vi.md steps
         // 4–5. `Room` covers a station zoom too now — including the well,
-        // which has no second screen left of its own since Slice D.)
-        Screen::Editor | Screen::Room => (theme.mode_normal, &theme.mode_label_normal),
+        // which has no second screen left of its own since Slice D. `Fsn`
+        // reads raw keys like the room, same reasoning.)
+        Screen::Editor | Screen::Room | Screen::Fsn => (theme.mode_normal, &theme.mode_label_normal),
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -1019,6 +1020,9 @@ pub fn update_hints(
             // gain their own zoomed dive.
             Some(_) => "\u{2191}/Esc: room",
         },
+        Screen::Fsn => {
+            "WASD/\u{2190}\u{2192}\u{2191}\u{2193}: fly \u{2502} PgUp/PgDn: altitude \u{2502} Esc: room"
+        }
     };
 
     if dock.hints.text != hints {

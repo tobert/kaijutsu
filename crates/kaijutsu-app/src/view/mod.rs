@@ -17,6 +17,7 @@ pub mod document;
 pub mod editor;
 pub mod fieldset;
 pub mod format;
+pub mod fsn;
 pub mod lifecycle;
 pub mod overlay;
 pub mod palette;

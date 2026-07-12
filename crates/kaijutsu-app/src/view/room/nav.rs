@@ -31,9 +31,10 @@ impl Station {
         }
     }
 
-    /// Whether a dive target exists yet (slice 0: well + patch bay only).
+    /// Whether a dive target exists yet (well + patch bay + the FSN
+    /// landscape, `view::fsn`, `docs/scenes/vfs.md` slice 0).
     pub fn built(self) -> bool {
-        matches!(self, Station::TimeWell | Station::PatchBay)
+        matches!(self, Station::TimeWell | Station::PatchBay | Station::Vfs)
     }
 
     /// Carousel order.
@@ -153,7 +154,7 @@ mod tests {
         assert!(Station::TimeWell.built());
         assert!(Station::PatchBay.built());
         assert!(!Station::Tracks.built());
-        assert!(!Station::Vfs.built());
+        assert!(Station::Vfs.built());
         assert!(!Station::Radiators.built());
     }
 

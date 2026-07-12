@@ -53,6 +53,14 @@ pub struct ScenePalette {
     pub wall_base: LinearRgba,
     pub wall_mullion: LinearRgba,
     pub dark_surface: LinearRgba,
+    /// FSN landscape (`docs/scenes/vfs.md` slice 0, `view::fsn`): prism
+    /// wireframe edges — neon violet.
+    pub fsn_edge: LinearRgba,
+    /// FSN landscape: prism-top vertex points — magenta.
+    pub fsn_vertex: LinearRgba,
+    /// FSN landscape: quad-seam grid lines — faint violet, dimmer than
+    /// `fsn_edge`.
+    pub fsn_seam: LinearRgba,
 
     // ── Brightness tier ladder ──
     pub etch: f32,
@@ -123,6 +131,9 @@ impl ScenePalette {
             wall_base: hue("wall_base", &h.wall_base, d.wall_base),
             wall_mullion: hue("wall_mullion", &h.wall_mullion, d.wall_mullion),
             dark_surface: hue("dark_surface", &h.dark_surface, d.dark_surface),
+            fsn_edge: hue("fsn_edge", &h.fsn_edge, d.fsn_edge),
+            fsn_vertex: hue("fsn_vertex", &h.fsn_vertex, d.fsn_vertex),
+            fsn_seam: hue("fsn_seam", &h.fsn_seam, d.fsn_seam),
 
             etch: t.etch,
             marker: t.marker,
@@ -184,6 +195,10 @@ impl Default for ScenePalette {
             wall_base: lin(0.062, 0.060, 0.094),
             wall_mullion: lin(0.040, 0.040, 0.058),
             dark_surface: lin(0.012, 0.013, 0.019),
+            // Frame 45's edge-line/vertex-point hues (docs/scenes/vfs.md).
+            fsn_edge: lin(0.254, 0.107, 1.000),
+            fsn_vertex: lin(1.000, 0.028, 0.631),
+            fsn_seam: lin(0.068, 0.036, 0.138),
 
             etch: 0.28,
             marker: 0.42,
@@ -303,6 +318,9 @@ mod tests {
         close(compiled.wall_base, parsed.wall_base, "wall_base");
         close(compiled.wall_mullion, parsed.wall_mullion, "wall_mullion");
         close(compiled.dark_surface, parsed.dark_surface, "dark_surface");
+        close(compiled.fsn_edge, parsed.fsn_edge, "fsn_edge");
+        close(compiled.fsn_vertex, parsed.fsn_vertex, "fsn_vertex");
+        close(compiled.fsn_seam, parsed.fsn_seam, "fsn_seam");
         assert_eq!(compiled.etch, parsed.etch);
         assert_eq!(compiled.crest, parsed.crest);
         assert_eq!(compiled.gain_pulse, parsed.gain_pulse);

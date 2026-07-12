@@ -306,6 +306,13 @@ enum RpcCommand {
     ListTracks {
         reply: oneshot::Sender<Result<Vec<crate::rpc::TrackInfo>, CallError>>,
     },
+    // ── VFS (FSN world stage-0/1 plumbing, docs/scenes/vfs.md) ─────────────
+    VfsSnapshot {
+        path: String,
+        depth: u32,
+        max_entries: u32,
+        reply: oneshot::Sender<Result<crate::rpc::SnapshotResult, CallError>>,
+    },
     Conclude {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
@@ -618,6 +625,7 @@ impl RpcCommand {
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListTracks { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::VfsSnapshot { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PromoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -790,6 +798,20 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn list_tracks(&self) -> Result<Vec<crate::rpc::TrackInfo>, CallError> {
         self.send(|reply| RpcCommand::ListTracks { reply }).await
+    }
+
+    /// Recursive VFS snapshot listing (`docs/scenes/vfs.md`'s FSN-world
+    /// plumbing) — thin passthrough to [`crate::rpc::RpcClient::vfs_snapshot`],
+    /// depth/cap clamped kernel-side regardless of what's asked.
+    #[tracing::instrument(skip(self))]
+    pub async fn vfs_snapshot(
+        &self,
+        path: &str,
+        depth: u32,
+        max_entries: u32,
+    ) -> Result<crate::rpc::SnapshotResult, CallError> {
+        let path = path.to_string();
+        self.send(|reply| RpcCommand::VfsSnapshot { path, depth, max_entries, reply }).await
     }
 
     /// Conclude a context — the explicit "done" act (sets `concluded`/stamps
@@ -2512,6 +2534,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::ListTracks { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_tracks());
+        }
+        RpcCommand::VfsSnapshot { path, depth, max_entries, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.vfs_snapshot(&path, depth, max_entries));
         }
         RpcCommand::Conclude { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));
