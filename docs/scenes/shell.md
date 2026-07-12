@@ -48,7 +48,14 @@ not architecture for its own sake** — each panel is taken over by what it
 carries (a bearing's ambient at the cardinals, information radiators on
 the diagonals), with a thin neon edge-trim in the face's identity hue and
 dark glass beneath — the room leans **cyberpunk**: emissive-on-dark,
-restrained LDR at rest. The camera orbits *outside* the shell and sees in
+restrained LDR at rest. Refined 2026-07-12 (Amy): **the overall vibe goal
+is more synthwave than anything** — the reference feel is the time well's
+HDR-forward interior (bloom-bright neon that *earns* its dark ground), not
+the current octagon's murk; the room should read saturated-neon-confident,
+not muted. The color-management pass (issues.md) is the vehicle: today
+brightness/emissive gains are scattered per-shader while `palette.rs` only
+governs hues + the glow-discipline caps, and "muted" is the accidental sum
+of those local decisions rather than a chosen exposure. The camera orbits *outside* the shell and sees in
 through a **cutaway**: every wall element is a single-sided inward-facing
 mesh with back-face culling, so the near walls simply vanish from any
 outside angle (dollhouse render, no shaders). Anything added to the shell

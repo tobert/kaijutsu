@@ -317,16 +317,17 @@ const TRACE_CYAN: [f32; 3] = [0.050, 0.170, 0.210];
 const TRACE_GREEN: [f32; 3] = [0.100, 0.260, 0.150];
 const TRACE_GOLD: [f32; 3] = [0.300, 0.220, 0.100];
 
-/// Inscribed gold double-ring routes depart from (concept 06's gold circle
-/// band): outer/inner center radius and band width per ring. Both clear
-/// [`KEEPOUT_RADIUS`] with room to spare.
+/// Inscribed gold ring routes depart from (concept 06's gold circle band):
+/// center radius and band width. Clears [`KEEPOUT_RADIUS`] with room to
+/// spare. Was a double-ring; the inner one came out 2026-07-12 (Amy) — with
+/// the well console wearing its own gold at center, three nested gold
+/// circles read as clutter.
 const RING_OUTER_R: f32 = 230.0;
-const RING_INNER_R: f32 = 190.0;
 const RING_BAND_WIDTH: f32 = 10.0;
 const RING_GOLD_HUE: [f32; 3] = [1.00, 0.80, 0.36];
 /// Slow breathing rate (mode 1, rad/s) for the room's calmest gold glow
-/// accent — the inscribed floor double-ring: subtle, architectural,
-/// unhurried. (Once shared with the W dais bezel, retired in the 2026-07-10
+/// accent — the inscribed floor ring: subtle, architectural, unhurried.
+/// (Once shared with the W dais bezel, retired in the 2026-07-10
 /// wall-mount slice along with the dais itself.)
 const GOLD_GLOW_RATE: f32 = 0.15;
 
@@ -1001,26 +1002,27 @@ fn spawn_floor(
         ChildOf(root),
     ));
 
-    // Inscribed gold double-ring (concept 06's gold circle band): a thin
-    // annulus at RING_OUTER_R and another at RING_INNER_R; routes depart from
-    // the outer one. Mode 1 (breathing) — Annulus ignores uv, so mode 0
-    // would be safe too, but the ring reads as ONE calm architectural body,
-    // not wiring, so it breathes (`palette::GLOW_TROUGH_SUBTLE`).
+    // Inscribed gold ring (concept 06's gold circle band): a thin annulus at
+    // RING_OUTER_R; routes depart from it. Mode 1 (breathing) — Annulus
+    // ignores uv, so mode 0 would be safe too, but the ring reads as ONE calm
+    // architectural body, not wiring, so it breathes
+    // (`palette::GLOW_TROUGH_SUBTLE`).
     let ring_mat = glow_mats.add(TraceGlowMaterial {
         color: crest_color(RING_GOLD_HUE, palette::GLOW_CREST),
         params: Vec4::new(0.0, GOLD_GLOW_RATE, palette::GLOW_TROUGH_SUBTLE, 1.0),
     });
-    for r in [RING_OUTER_R, RING_INNER_R] {
-        commands.spawn((
-            Mesh3d(meshes.add(Annulus::new(r - RING_BAND_WIDTH * 0.5, r + RING_BAND_WIDTH * 0.5))),
-            MeshMaterial3d(ring_mat.clone()),
-            Transform::from_xyz(0.0, TRACE_Y, 0.0)
-                .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-            Visibility::Inherited,
-            Name::new("ConsoleRingInlay"),
-            ChildOf(root),
-        ));
-    }
+    commands.spawn((
+        Mesh3d(meshes.add(Annulus::new(
+            RING_OUTER_R - RING_BAND_WIDTH * 0.5,
+            RING_OUTER_R + RING_BAND_WIDTH * 0.5,
+        ))),
+        MeshMaterial3d(ring_mat),
+        Transform::from_xyz(0.0, TRACE_Y, 0.0)
+            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        Visibility::Inherited,
+        Name::new("ConsoleRingInlay"),
+        ChildOf(root),
+    ));
 
     // Circuit-board routes: each bundle expands to several routes; every
     // route gets a traveling-wave ribbon (mode 0) + a breathing terminal pad
@@ -2073,10 +2075,9 @@ mod tests {
 
     #[test]
     fn every_route_bundle_departs_from_outside_the_console_keepout() {
-        assert!(RING_OUTER_R > KEEPOUT_RADIUS, "the ring itself clears the keep-out");
         assert!(
-            RING_INNER_R - RING_BAND_WIDTH * 0.5 > KEEPOUT_RADIUS,
-            "even the inner ring's inner edge clears the keep-out"
+            RING_OUTER_R - RING_BAND_WIDTH * 0.5 > KEEPOUT_RADIUS,
+            "the ring's inner edge clears the keep-out"
         );
     }
 

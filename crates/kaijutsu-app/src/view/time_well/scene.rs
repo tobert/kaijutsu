@@ -323,13 +323,13 @@ const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 const TERRACE_RING_SPIN_BASE: f32 = 0.10;
 const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 
-/// Overall alpha/intensity for the terrace rings — kept low for the first cut
-/// so the driver tunes up from a subtle starting point. **Amy-tunable.** Left
-/// as-is by the room-palette re-skin (2026-07-11): [`TERRACE_RING_COLOR`]'s new
-/// max channel is in the same ballpark as the old icy-cyan it replaced, so the
-/// composited brightness at this alpha reads about the same — re-tune live if
-/// the new hue reads dim/loud against the deck.
-const TERRACE_RING_ALPHA: f32 = 0.35;
+/// Overall alpha/intensity for the terrace rings. Started at 0.35 ("kept low
+/// for the first cut so the driver tunes up") — tuned up to 0.55 2026-07-12
+/// after Amy read the new centerpiece mix as "muted like the rest of the
+/// octagon": the variant glyphs + gem glints earn more presence, and the
+/// well's HDR-forward look is the reference. **Amy-tunable**; the deeper fix
+/// (unified brightness/HDR tiers) is the color-management pass in issues.md.
+const TERRACE_RING_ALPHA: f32 = 0.55;
 
 /// The well's neon hue — an indigo/blue-violet bridging the old saturated
 /// cyan-blue (`WellRingsMaterial`'s `ring_color`, formerly `[0.35, 0.62,

@@ -355,7 +355,29 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   as a scrolling violet ticker, newest line blooms). Design + buildability
   notes in shell.md "Ambient telemetry rules"; rides the existing MSDF
   panel pipeline + event stream. Good next wave after trace-glow ships.
-- **Shell: drift-layer representation — design question** (Amy, 2026-07-10):
+- **Shell: color-management pass — synthwave is the vibe target** (Amy,
+  2026-07-12, looking at the terrace glyph mix: "it's muted like the rest
+  of the octagon… the time well has some nice use of HDR and brightness…
+  maybe we need to do a pass of color management next", then "the goal for
+  the vibe overall is more synthwave than anything"): the octagon reads
+  muted next to the well's HDR-forward dived interior, and the reason is
+  structural — `view/palette.rs` governs HUES + the glow-discipline caps
+  (`GLOW_CREST` 1.25, trough×crest < 1.0, LDR tiers like `GOLD_LDR_ETCH`),
+  but BRIGHTNESS is scattered: every shader carries its own emissive gain
+  (`terrace_ring.wgsl` HDR_SCALE 3.0 + GEM_GAIN, `well_rings.wgsl` energy
+  math ×3.0/×2.2, chord GAIN, per-site LDR consts in room/patch-bay), and
+  the camera's bloom threshold + tonemapper were never chosen as a set.
+  Pass shape: (1) palette.rs grows named brightness/HDR tiers (etch /
+  resting / crest / live-HDR) and every emissive multiplier moves onto
+  them; (2) bloom + tonemapping reviewed together against the synthwave
+  target (Bevy's default TonyMcMapface desaturates brights — audit whether
+  it's eating the neon); (3) the trace-glow "decoration stays faint"
+  amendment gets renegotiated DELIBERATELY — synthwave punch vs
+  sustained-HDR-means-live-activity is a real tension, decide the budget,
+  don't drift it; (4) reference frames: the well dived (keeper) vs the
+  octagon at room scale (too muted). Vibe goal recorded in shell.md
+  "Geometry and bearings". Quick partial relief already applied
+  2026-07-12: TERRACE_RING_ALPHA 0.35→0.55.
   the aurora placeholder is PAUSED. shell.md's "air carries drift" stands,
   but before building anything decide *what information* rides the air and
   whether the render is aurora arcs at all — Amy is weighing a point cloud
