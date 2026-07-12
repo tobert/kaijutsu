@@ -38,6 +38,17 @@ pub enum Screen {
     /// (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
     /// fullscreening a panel," superseding the earlier `Screen::PatchBay`).
     Room,
+    /// The FSN landscape (`docs/scenes/vfs.md` slice 0, `view::fsn`) — the
+    /// VFS-as-terrain world behind the room's N archway ("DATA HORIZON").
+    /// Unlike the room's bounded, furnished stations (patch bay, the well),
+    /// the landscape is an **unbounded world**, too big to stand as room
+    /// furniture (`docs/scenes/shell.md`: "N stays a dive-THROUGH door, not
+    /// a panel to fill the frame with") — so N-diving is a genuine `Screen`
+    /// transition, not a `view::room::RoomState::zoomed` write. Entered from
+    /// `Screen::Room` (Enter/Down on the focused `Station::Vfs`); Esc returns
+    /// to `Screen::Room`, not `Conversation` — the room is the level directly
+    /// below, same as every other dive.
+    Fsn,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -76,6 +87,17 @@ impl Plugin for ScreenPlugin {
         // there is no second screen for a station dive to enter any more.
         app.add_systems(
             OnEnter(Screen::Room),
+            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+        );
+
+        // ── Fsn ──
+        // The FSN landscape (`view::fsn`): full-viewport 3D like the room it
+        // dives from, reading raw keys for camera fly + select — hide the
+        // chrome and park focus off Compose (same reasoning as Room/Editor
+        // above). The world's own spawn/despawn rides `OnEnter`/`OnExit(Screen::Fsn)`
+        // in `view::fsn::scene`, not here — this only owns the chrome.
+        app.add_systems(
+            OnEnter(Screen::Fsn),
             (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
     }
