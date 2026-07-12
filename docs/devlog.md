@@ -640,6 +640,34 @@ files but not the directory. Sonnet lanes wrote the code; the lead's
 review, the outside models, and the running kernel each found bugs the
 other two missed. That triangle is the lesson.
 
+## The filesystem becomes a world (July 12, evening)
+
+The fsn landscape went from baked vocabulary to a rendering world in one
+evening of three parallel Sonnet lanes with the lead reviewing seams:
+pure layout math in kaijutsu-viz (CellId quadtree + relaxed-Voronoi with
+fixed-k Lloyd — the blast-radius promise turned into a trajectory-compared
+test), a `Vfs.snapshot` RPC with generation stamps and
+gitignore-as-metadata, and the Bevy scene behind the N archway — a genuine
+`Screen::Fsn` dive-through, wireframe prisms and vertex points in exactly
+frame 45's grammar. Reviews earned their keep in both directions: the lead
+caught a fetch-queue wedge, a truncated-dir refetch loop, and
+guaranteed-overlapping subdir fields before merge; kaibo verified the
+fixes but also *mis-blessed* one thing (Bevy messages don't wait for a
+gated reader — they expire), which became the fourth fix.
+
+The deepest lesson came from the live pass: the unit trees were too
+polite. The real host tree killed the walker three ways in an hour —
+root-only directories (one EACCES failed the whole walk), `/v` existing
+only in the mount table (intermediate mount dirs had never had
+getattr/readdir semantics), and `/proc` PIDs vanishing between readdir
+and getattr. Each fix was a design decision, not a patch: denial is a
+fact about the tree and renders as a seam (truth-seams rule), the mount
+table now answers for its own synthetic namespace, and churn under the
+walk is claim 4 made operational. Then the arch opened onto violet
+districts over a dark plane, the basalt pattern plainly visible, and a
+selection-ring pass over `/etc` pulled `/etc/iptables` out of the
+unbuilt shell — enumeration-on-demand working exactly as designed.
+
 ## Now
 
 As of 2026-07-12: the Tardis room is furnished AND lit — synthwave
