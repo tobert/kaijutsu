@@ -97,8 +97,9 @@ pub(crate) struct FsnSelectionRing;
 // ── Resources ────────────────────────────────────────────────────────────
 
 /// One known directory field's spawned entities + the per-cell data
-/// [`fsn_select`] needs (name, seed XZ, and kind, in `field.cells`' own
-/// name-sorted order so the three stay zipped).
+/// [`fsn_select`] and [`sync_fsn_fields`] need (name, seed XZ, kind, and the
+/// inset cell bbox, all in `field.cells`' own name-sorted order so the four
+/// stay zipped).
 struct FieldEntities {
     seam: Entity,
     sparse_points: Entity,
@@ -114,6 +115,11 @@ struct FieldEntities {
     cell_names: Vec<String>,
     cell_seed_xz: Vec<[f32; 2]>,
     cell_kind: Vec<NodeKind>,
+    /// Each cell's [`layout::cell_bbox_inset`] rect — where that cell's OWN
+    /// subdirectory field goes if/when its listing arrives (`None` = the
+    /// cell is too small to host one). Bboxes, not whole polygons: this is
+    /// all the child-placement chain needs, and it's smaller to retain.
+    cell_bbox: Vec<Option<Rect>>,
 }
 
 /// Every known directory's spawned field entities, keyed by its own absolute
@@ -217,6 +223,20 @@ pub fn exit_fsn(
 /// few dozen directories) that ambient re-evaluation costs nothing worth
 /// guarding against (the time-well freeze-fix lesson: prefer "recompute,
 /// cheaply" over a latch that can go stale).
+///
+/// # Field placement: parent-cell bboxes, built root-first
+///
+/// A non-root path's rect comes from its PARENT's already-built
+/// [`FieldEntities::cell_bbox`] (see `layout`'s module doc for why this
+/// replaced quadtree-quadrant descent). That makes build order a real
+/// dependency chain: if a listing's parent field isn't built yet (HashMap
+/// iteration order is arbitrary), the path is simply skipped this frame and
+/// builds on a later one — listings arrive root-first anyway (the depth-2
+/// front-load ingests a parent before its expanded children), so the chain
+/// settles within a frame or two of data landing. Skips are also the
+/// fail-soft for a child name missing from the parent's cells (stale or
+/// truncated parent listing) and for a cell too small to host a field
+/// (`cell_bbox` = `None`).
 pub fn sync_fsn_fields(
     mut commands: Commands,
     state: Res<FsnState>,
@@ -237,15 +257,36 @@ pub fn sync_fsn_fields(
             continue;
         }
 
+        // Resolve the field's world rect BEFORE tearing anything down, so a
+        // skip (parent not built yet, cell missing, cell too small) leaves
+        // any existing field standing rather than despawned-and-not-rebuilt.
+        let rect = if path == "/" {
+            layout::root_world_rect()
+        } else {
+            let Some((parent, name)) = layout::split_parent(path) else { continue };
+            let Some(parent_fe) = fields.fields.get(parent) else { continue };
+            let Some(i) = parent_fe.cell_names.iter().position(|n| n == name) else { continue };
+            let Some(bbox) = parent_fe.cell_bbox[i] else { continue };
+            bbox
+        };
+
         if let Some(old) = fields.fields.remove(path) {
-            commands.entity(old.seam).despawn();
-            commands.entity(old.sparse_points).despawn();
-            commands.entity(old.wireframe).despawn();
-            commands.entity(old.vertex_points).despawn();
+            despawn_field(&mut commands, &old);
+            // A rebuild re-runs this field's Voronoi layout, which moves its
+            // cells' bboxes — every DESCENDANT field's rect derived from the
+            // old layout is now stale geometry. Drop them too; they rebuild
+            // over the following frames from the new bboxes (their own
+            // `needs_build` sees them missing).
+            let prefix = if path == "/" { "/".to_string() } else { format!("{path}/") };
+            let stale: Vec<String> =
+                fields.fields.keys().filter(|p| p.starts_with(&prefix)).cloned().collect();
+            for p in stale {
+                if let Some(fe) = fields.fields.remove(&p) {
+                    despawn_field(&mut commands, &fe);
+                }
+            }
         }
 
-        let components = layout::path_components(path);
-        let rect = layout::path_world_rect(layout::root_world_rect(), &components);
         let child_specs: Vec<_> = listing
             .children
             .iter()
@@ -266,6 +307,14 @@ pub fn sync_fsn_fields(
         );
         fields.fields.insert(path.clone(), entities);
     }
+}
+
+/// Despawn one field's four entities — the teardown half of a rebuild.
+fn despawn_field(commands: &mut Commands, fe: &FieldEntities) {
+    commands.entity(fe.seam).despawn();
+    commands.entity(fe.sparse_points).despawn();
+    commands.entity(fe.wireframe).despawn();
+    commands.entity(fe.vertex_points).despawn();
 }
 
 /// Build and spawn one field's four entities (all `Visibility::Hidden` at
@@ -349,6 +398,11 @@ fn spawn_field_entities(
     let cell_seed_xz: Vec<[f32; 2]> =
         field.cells.iter().map(|c| [c.seed.x as f32, c.seed.y as f32]).collect();
     let cell_kind: Vec<NodeKind> = field.cells.iter().map(|c| c.kind).collect();
+    let cell_bbox: Vec<Option<Rect>> = field
+        .cells
+        .iter()
+        .map(|c| layout::cell_bbox_inset(&c.polygon, layout::SUBFIELD_INSET_FRAC))
+        .collect();
 
     FieldEntities {
         seam,
@@ -361,6 +415,7 @@ fn spawn_field_entities(
         cell_names,
         cell_seed_xz,
         cell_kind,
+        cell_bbox,
     }
 }
 
@@ -442,10 +497,16 @@ pub fn fsn_camera_fly(
 // ── Selection ────────────────────────────────────────────────────────────
 
 /// The cell nearest the camera's forward-ray ground intersection selects:
-/// updates [`FsnSelection`] and, if the selected cell is a directory,
-/// requests its listing (`FsnState::request`'s own dedup makes this a no-op
-/// once it's fully known — "selection approach on a truncated cell triggers
-/// the deeper snapshot").
+/// updates [`FsnSelection`] and, **on the frame the selection flips** to a
+/// directory cell, requests its listing ("selection approach on a truncated
+/// cell triggers the deeper snapshot"). The request is edge-triggered, not
+/// per-frame: `FsnState::request` deliberately stays re-queueable for a
+/// truncated listing (that's its retry path), so calling it every frame the
+/// same cell remains selected would refetch a genuinely-truncated directory
+/// (more entries than the kernel cap, e.g. a huge `target/`) forever — one
+/// RPC after another for as long as you look at it. Re-selecting the cell
+/// later (look away, look back) is the retry gesture for both truncation
+/// and a failed fetch.
 pub fn fsn_select(
     camera: Query<&Transform, With<FsnCamera>>,
     fields: Res<FsnFields>,
@@ -476,10 +537,16 @@ pub fn fsn_select(
         return;
     };
     let path = candidate_paths[idx].clone();
-    if candidate_kind[idx] == NodeKind::Dir {
-        state.request(path.clone());
-    }
     if selection.selected.as_deref() != Some(path.as_str()) {
+        // Edge: the selection actually flipped to this cell. Only now does a
+        // directory cell request its listing — see this system's doc for why
+        // per-frame requesting would hot-loop on a truncated directory. As a
+        // side benefit, `FsnState` is only ever `DerefMut`-touched on the
+        // flip, so its change detection stays quiet while the selection
+        // rests.
+        if candidate_kind[idx] == NodeKind::Dir {
+            state.request(path.clone());
+        }
         selection.selected = Some(path);
     }
 }
@@ -588,6 +655,122 @@ fn set_visibility(
 pub fn fsn_keyboard(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<Screen>>) {
     if keys.just_pressed(KeyCode::Escape) {
         next.set(Screen::Room);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::fsn::sync::DirListing;
+    use kaijutsu_client::VfsFileType;
+
+    fn child(name: &str, kind: VfsFileType, size: u64, child_count: u32) -> ChildMeta {
+        ChildMeta { name: name.into(), kind, size, child_count, ignored: false }
+    }
+
+    fn listing(generation: u64, children: Vec<ChildMeta>) -> DirListing {
+        DirListing { generation, truncated_here: false, children }
+    }
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .init_resource::<ScenePalette>()
+            .init_resource::<FsnState>()
+            .init_resource::<FsnFields>()
+            .add_systems(Update, sync_fsn_fields);
+        app.world_mut().spawn(FsnRoot);
+        app
+    }
+
+    /// The fresh-dive shape: a root listing and one expanded subdirectory
+    /// listing (the depth-2 front-load) must BOTH get fields — the subdir's
+    /// placed inside its own cell's bbox in the root field, within the root
+    /// world square. Two updates cover the arbitrary HashMap iteration
+    /// order (a child skips the frame its parent isn't built yet — the
+    /// documented root-first dependency chain).
+    #[test]
+    fn root_and_subdir_fields_build_from_listings() {
+        let mut app = test_app();
+        {
+            let mut state = app.world_mut().resource_mut::<FsnState>();
+            state.listings.insert(
+                "/".into(),
+                listing(
+                    1,
+                    vec![
+                        child("src", VfsFileType::Directory, 0, 3),
+                        child("Cargo.toml", VfsFileType::File, 512, 0),
+                        child("docs", VfsFileType::Directory, 0, 8),
+                    ],
+                ),
+            );
+            state
+                .listings
+                .insert("/src".into(), listing(1, vec![child("main.rs", VfsFileType::File, 4096, 0)]));
+        }
+        app.update();
+        app.update();
+
+        let fields = app.world().resource::<FsnFields>();
+        assert!(fields.fields.contains_key("/"), "root field builds");
+        let src = fields.fields.get("/src").expect("subdir field builds inside its parent cell");
+
+        // The subdir field sits inside the root world square, not stacked at
+        // some quadrant-hash address.
+        let root_rect = layout::root_world_rect();
+        assert!(
+            (root_rect.x0..=root_rect.x1).contains(&(src.rect_center.x as f64))
+                && (root_rect.y0..=root_rect.y1).contains(&(src.rect_center.z as f64)),
+            "subdir field center {:?} must lie within the root world rect",
+            src.rect_center
+        );
+    }
+
+    /// A parent rebuild (listing generation bump) re-runs its Voronoi layout
+    /// and moves its cells — descendant fields built from the OLD layout are
+    /// stale geometry and must be dropped and rebuilt, not left standing at
+    /// their old rects.
+    #[test]
+    fn a_parent_rebuild_drops_and_rebuilds_descendant_fields() {
+        let mut app = test_app();
+        {
+            let mut state = app.world_mut().resource_mut::<FsnState>();
+            state.listings.insert(
+                "/".into(),
+                listing(1, vec![child("src", VfsFileType::Directory, 0, 1)]),
+            );
+            state
+                .listings
+                .insert("/src".into(), listing(1, vec![child("lib.rs", VfsFileType::File, 64, 0)]));
+        }
+        app.update();
+        app.update();
+        let old_src_seam = app.world().resource::<FsnFields>().fields["/src"].seam;
+
+        // The root listing re-arrives at a new generation (e.g. a truncated
+        // re-fetch): its field AND the /src descendant must rebuild.
+        {
+            let mut state = app.world_mut().resource_mut::<FsnState>();
+            state.listings.insert(
+                "/".into(),
+                listing(
+                    2,
+                    vec![
+                        child("src", VfsFileType::Directory, 0, 1),
+                        child("new_dir", VfsFileType::Directory, 0, 2),
+                    ],
+                ),
+            );
+        }
+        app.update();
+        app.update();
+
+        let fields = app.world().resource::<FsnFields>();
+        assert!(fields.fields.contains_key("/"), "root rebuilt");
+        let new_src = fields.fields.get("/src").expect("descendant rebuilt from the new layout");
+        assert_ne!(new_src.seam, old_src_seam, "descendant entities must be fresh, not stale");
     }
 }
 

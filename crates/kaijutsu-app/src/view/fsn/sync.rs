@@ -79,9 +79,16 @@ pub struct FsnState {
 impl FsnState {
     /// Queue `path` for a (re)fetch, unless it's already known-and-complete,
     /// already queued, or already in flight — the debounce this module's
-    /// whole design rests on. A caller doesn't need to check any of that
-    /// itself; every call site (initial entry, approach, selection) just
-    /// calls this.
+    /// whole design rests on.
+    ///
+    /// **Call sites must be edge-triggered, never per-frame.** A truncated
+    /// listing (and a path whose last fetch *failed* — it has no listing at
+    /// all) stays re-queueable BY DESIGN, so this is deliberately not
+    /// idempotent for those cases: a per-frame caller would refetch a
+    /// genuinely-truncated directory (more entries than the kernel cap, e.g.
+    /// a huge `target/`) forever, one RPC after another. Fire it on events —
+    /// world entry, a selection *flip* — and re-selecting later is the retry
+    /// policy for both truncation and failure.
     pub fn request(&mut self, path: String) {
         if let Some(listing) = self.listings.get(&path)
             && !listing.truncated_here
@@ -95,6 +102,31 @@ impl FsnState {
             return;
         }
         self.pending.push_back(path);
+    }
+
+    /// Pop the next pending path and mark it in flight — the claim step of
+    /// [`poll_fsn_snapshot`], extracted so tests can drive the queue's
+    /// wedge/unwedge behavior without a live RPC actor. `None` while a
+    /// request is already in flight (the single-flight debounce) or the
+    /// queue is empty.
+    fn take_next_request(&mut self) -> Option<String> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let path = self.pending.pop_front()?;
+        self.in_flight = Some(path.clone());
+        Some(path)
+    }
+
+    /// Clear the in-flight debounce slot if it matches `path` — called on
+    /// BOTH reply arms ([`apply_fsn_snapshot`]: received *and* failed), so
+    /// the queue can never wedge on a failed fetch. Failure deliberately
+    /// does NOT re-queue the path: a permanently-failing path would hot-loop
+    /// the RPC; a later `request` (a fresh selection flip) is the retry.
+    fn settle_in_flight(&mut self, path: &str) {
+        if self.in_flight.as_deref() == Some(path) {
+            self.in_flight = None;
+        }
     }
 
     /// Whether `path`'s own listing is known (regardless of truncation) —
@@ -146,42 +178,47 @@ pub fn poll_fsn_snapshot(
     result_channel: Res<RpcResultChannel>,
 ) {
     let Some(actor) = actor else { return };
-    if state.in_flight.is_some() {
-        return;
-    }
-    let Some(path) = state.pending.pop_front() else { return };
-    state.in_flight = Some(path.clone());
+    let Some(path) = state.take_next_request() else { return };
 
     let handle = actor.handle.clone();
     let tx = result_channel.sender();
-    let request_path = path.clone();
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
-            match handle.vfs_snapshot(&request_path, FETCH_DEPTH, FETCH_MAX_ENTRIES).await {
+            match handle.vfs_snapshot(&path, FETCH_DEPTH, FETCH_MAX_ENTRIES).await {
                 Ok(result) => {
-                    let _ = tx.send(RpcResultMessage::VfsSnapshotReceived {
-                        path: request_path,
-                        result,
-                    });
+                    let _ = tx.send(RpcResultMessage::VfsSnapshotReceived { path, result });
                 }
-                Err(e) => log::debug!("fsn: vfs_snapshot({request_path}) failed: {e}"),
+                Err(e) => {
+                    // The failure MUST land as a reply too — apply_fsn_snapshot
+                    // clears the in-flight debounce on both arms; swallowing
+                    // the error here would wedge the queue forever.
+                    log::warn!("fsn: vfs_snapshot({path}) failed: {e}");
+                    let _ = tx.send(RpcResultMessage::VfsSnapshotFailed { path });
+                }
             }
         })
         .detach();
 }
 
-/// Drain `VfsSnapshotReceived` into [`FsnState::listings`], and clear the
-/// in-flight debounce so the next queued path (if any) can fire. A failed
-/// request (see [`poll_fsn_snapshot`]'s `Err` arm) never reaches this system
-/// at all — the in-flight slot would stay stuck forever were it not for
-/// [`clear_stale_in_flight`] catching that case.
+/// Drain `vfs_snapshot` replies: a success ingests into
+/// [`FsnState::listings`]; BOTH success and failure clear the in-flight
+/// debounce ([`FsnState::settle_in_flight`]) so the next queued path can
+/// fire — [`poll_fsn_snapshot`]'s `Err` arm ships `VfsSnapshotFailed` for
+/// exactly this, otherwise the first failed fetch would wedge the queue
+/// forever. A failure is NOT auto-requeued (a permanently-failing path
+/// would hot-loop); a later selection flip re-`request`ing the path is the
+/// retry policy.
 pub fn apply_fsn_snapshot(mut state: ResMut<FsnState>, mut events: MessageReader<RpcResultMessage>) {
     for ev in events.read() {
-        if let RpcResultMessage::VfsSnapshotReceived { path, result } = ev {
-            if state.in_flight.as_deref() == Some(path.as_str()) {
-                state.in_flight = None;
+        match ev {
+            RpcResultMessage::VfsSnapshotReceived { path, result } => {
+                state.settle_in_flight(path);
+                ingest_snapshot(&mut state, path, &result.root);
             }
-            ingest_snapshot(&mut state, path, &result.root);
+            RpcResultMessage::VfsSnapshotFailed { path } => {
+                state.settle_in_flight(path);
+            }
+            _ => {}
         }
     }
 }
@@ -243,6 +280,61 @@ mod tests {
         state.in_flight = Some("/b".into());
         state.request("/b".into());
         assert_eq!(state.pending.len(), 1, "an in-flight path must not also queue");
+    }
+
+    // ── the wedge guard: take_next_request / settle_in_flight ──
+
+    #[test]
+    fn take_next_request_claims_one_and_holds_the_single_flight_debounce() {
+        let mut state = FsnState::default();
+        state.request("/a".into());
+        state.request("/b".into());
+
+        assert_eq!(state.take_next_request().as_deref(), Some("/a"));
+        assert_eq!(state.in_flight.as_deref(), Some("/a"));
+        assert_eq!(state.take_next_request(), None, "second claim must wait for the first to settle");
+
+        state.settle_in_flight("/a");
+        assert_eq!(state.take_next_request().as_deref(), Some("/b"), "settling releases the queue");
+    }
+
+    /// The wedge regression: a FAILED fetch must clear the in-flight slot
+    /// (via `apply_fsn_snapshot`'s `VfsSnapshotFailed` arm →
+    /// `settle_in_flight`) so the queue keeps draining, must NOT auto-requeue
+    /// the failed path (hot-loop guard), and the path must stay re-requestable
+    /// by a later selection flip.
+    #[test]
+    fn a_failed_fetch_unwedges_the_queue_without_auto_requeueing() {
+        let mut state = FsnState::default();
+        state.request("/flaky".into());
+        let path = state.take_next_request().expect("one pending request to claim");
+        assert_eq!(path, "/flaky");
+
+        // While in flight, a re-request is a no-op (the dedup).
+        state.request("/flaky".into());
+        assert!(state.pending.is_empty());
+
+        // The failure reply lands.
+        state.settle_in_flight(&path);
+        assert!(state.in_flight.is_none(), "the queue must not wedge on a failed fetch");
+        assert!(state.pending.is_empty(), "failure must NOT auto-requeue (hot-loop guard)");
+
+        // A later selection flip retries: no listing exists, so it queues.
+        state.request("/flaky".into());
+        assert_eq!(state.pending.len(), 1, "a failed path stays re-requestable");
+        assert_eq!(state.take_next_request().as_deref(), Some("/flaky"));
+    }
+
+    #[test]
+    fn settle_in_flight_ignores_a_mismatched_path() {
+        let mut state = FsnState::default();
+        state.in_flight = Some("/current".into());
+        state.settle_in_flight("/other");
+        assert_eq!(
+            state.in_flight.as_deref(),
+            Some("/current"),
+            "only the in-flight path's own reply settles it"
+        );
     }
 
     #[test]

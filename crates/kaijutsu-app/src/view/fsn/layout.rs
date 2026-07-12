@@ -4,19 +4,34 @@
 //! `room::bearing`'s stance) so every rule here is a plain-data unit test —
 //! [`super::scene`] is the only place any of this touches an `Entity`.
 //!
-//! # Coordinate convention
+//! # Coordinate convention and field placement
 //!
 //! The FSN world lives on the room's XZ ground plane, +Y up — same
-//! convention as `room::bearing`. [`kaijutsu_viz::fsn::Rect`]'s `(x0,y0,x1,y1)`
-//! fields are reused for BOTH roles this module needs:
-//! - **unit-face space** — [`kaijutsu_viz::fsn::CellId::quad_rect`]'s native
-//!   `[0,1]²`, used only as an intermediate when resolving a path's address.
-//! - **world space** — `y0`/`y1` read as world **Z** (never world Y/height);
-//!   [`root_world_rect`] and [`map_unit_rect_to_world`] are the one seam that
-//!   converts between the two. `layout_field` itself is oblivious to which
-//!   space its `Rect` argument lives in — it is a pure function of whatever
-//!   rect you hand it — so this module never double-maps: a directory's
-//!   children are laid out ONCE, directly in world space.
+//! convention as `room::bearing`. [`kaijutsu_viz::fsn::Rect`]'s `y0`/`y1`
+//! fields read as world **Z** (never world Y/height); `layout_field` is a
+//! pure function of whatever rect you hand it, so a directory's children
+//! are laid out ONCE, directly in world space.
+//!
+//! Where a directory's field rect comes from:
+//! - **root** — [`root_world_rect`], a fixed square at the origin.
+//! - **subdirectory** — the axis-aligned bounding box of its OWN Voronoi
+//!   cell in its parent's already-laid-out field, inset by
+//!   [`SUBFIELD_INSET_FRAC`] ([`cell_bbox_inset`]; `super::scene::
+//!   sync_fsn_fields` does the parent lookup). An earlier draft descended
+//!   the `CellId` quadtree via `placeholder_quadrant` instead — but that
+//!   placeholder is `hash(name) % 4`, so colliding sibling directories got
+//!   the EXACT same world rect and stacked whole fields on top of each
+//!   other (guaranteed with ~10 root children into 4 quadrants). Parent
+//!   Voronoi cells are disjoint by construction, so their inset bboxes may
+//!   brush at the margins but can never coincide — and Lane A's own
+//!   placeholder doc already said this is where subdirs live ("subdirs
+//!   bloom as clusters inside the PARENT's Voronoi field").
+//!
+//! Determinism: a parent field is a pure function of its (rect, listing)
+//! pair (`kaijutsu_viz::fsn`'s contract), so the bbox chain — root square →
+//! cell bbox → child field → its cells' bboxes → … — is identical on every
+//! client, the same layout-is-a-pure-function-of-the-namespace guarantee
+//! the quadtree descent had.
 //!
 //! # Height channel (vfs.md open question 1)
 //!
@@ -41,9 +56,7 @@
 //! path to fall into without restructuring this function.
 
 use kaijutsu_client::VfsFileType;
-use kaijutsu_viz::fsn::{
-    CellId, ChildSpec, FsnCell, FsnField, NodeKind, Rect, path_to_cell, placeholder_quadrant,
-};
+use kaijutsu_viz::fsn::{ChildSpec, FsnCell, FsnField, NodeKind, Rect, Vec2};
 
 // ── World placement (Amy-tunable) ───────────────────────────────────────────
 
@@ -58,49 +71,75 @@ pub fn root_world_rect() -> Rect {
     Rect { x0: -half, y0: -half, x1: half, y1: half }
 }
 
-/// Map a unit-face `[0,1]²` rect (e.g. a [`CellId::quad_rect`]) into world
-/// space through `root_world`'s own rect — the one seam between the two
-/// roles [`Rect`] plays in this module (see the module doc).
-pub fn map_unit_rect_to_world(root_world: Rect, unit: Rect) -> Rect {
-    let w = root_world.width();
-    let h = root_world.height();
-    Rect {
-        x0: root_world.x0 + unit.x0 * w,
-        y0: root_world.y0 + unit.y0 * h,
-        x1: root_world.x0 + unit.x1 * w,
-        y1: root_world.y0 + unit.y1 * h,
-    }
-}
-
-/// Split an absolute VFS path into its non-empty components: `"/"` → `[]`,
-/// `"/foo/bar"` → `["foo", "bar"]`, and a trailing slash is tolerated
-/// (`"/foo/bar/"` → the same as `"/foo/bar"`) since kernel-side paths are
-/// usually clean but a defensive split costs nothing.
-pub fn path_components(path: &str) -> Vec<&str> {
-    path.split('/').filter(|s| !s.is_empty()).collect()
-}
-
 /// Join a directory's own absolute path with a child's name — `"/"` + `"foo"`
 /// → `"/foo"` (no double slash), `"/foo"` + `"bar"` → `"/foo/bar"`.
 pub fn join_path(base: &str, name: &str) -> String {
     if base == "/" { format!("/{name}") } else { format!("{base}/{name}") }
 }
 
-/// Resolve a VFS path's own world-space rect — where ITS field of children
-/// gets laid out — by walking the quadtree address from the root face and
-/// mapping the resulting unit `quad_rect` through [`root_world_rect`].
-/// [`placeholder_quadrant`] is Lane A's documented Open-Question-2 stand-in
-/// (`kaijutsu_viz::fsn`'s own doc) — good enough for slice 0's "which quarter
-/// does this subdirectory occupy" placement, not yet the final slack policy.
+/// Split an absolute path into `(parent, name)`: `"/foo"` → `("/", "foo")`,
+/// `"/foo/bar"` → `("/foo", "bar")`; `None` for the root (no parent) or a
+/// degenerate path. A trailing slash is tolerated (`"/foo/"` splits like
+/// `"/foo"`). Round-trips with [`join_path`] — the inverse the field-placement
+/// chain needs to find a subdirectory's own cell in its parent's field.
+pub fn split_parent(path: &str) -> Option<(&str, &str)> {
+    if path == "/" {
+        return None;
+    }
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    let (parent, name) = trimmed.rsplit_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((if parent.is_empty() { "/" } else { parent }, name))
+}
+
+/// Fraction of a cell's bounding box shaved off EACH side when placing a
+/// subdirectory's own field inside it — breathing room so a child field's
+/// prisms don't butt flush against the parent cell's own edges.
+/// **Amy-tunable.**
+pub const SUBFIELD_INSET_FRAC: f64 = 0.12;
+
+/// Minimum width/height (world units) an inset cell bbox must keep to host
+/// a subdirectory field. Below this the cell is too small for a legible
+/// field — and, harder, [`kaijutsu_viz::fsn::layout_field`] PANICS on a
+/// non-positive-extent rect, so the floor here is what lets
+/// [`cell_bbox_inset`] promise its `Some` is always safe to feed onward.
+/// **Amy-tunable.**
+pub const SUBFIELD_MIN_EXTENT: f64 = 4.0;
+
+/// The world rect a subdirectory's own field occupies: the axis-aligned
+/// bounding box of its Voronoi-cell `polygon` in the PARENT's laid-out
+/// field, inset by `inset_frac` of the bbox's own width/height on each side
+/// (see the module doc for why this replaced quadtree-quadrant descent).
 ///
-/// Panics only if `components` somehow exceeds [`kaijutsu_viz::fsn::CELL_MAX_DEPTH`]
-/// (28) — no real VFS tree gets remotely that deep; a caller that ever did
-/// would need a real fallback policy, not a silently wrong rect.
-pub fn path_world_rect(root_world: Rect, components: &[&str]) -> Rect {
-    let root_cell = CellId::root(0).expect("face 0 is always in range (0..NUM_FACES)");
-    let cell = path_to_cell(root_cell, components.iter().copied(), placeholder_quadrant)
-        .expect("VFS paths stay far short of CELL_MAX_DEPTH (28)");
-    map_unit_rect_to_world(root_world, cell.quad_rect())
+/// `None` when the cell can't host a field: fewer than 3 vertices (a
+/// degenerate clip), non-finite coordinates, or an inset bbox thinner than
+/// [`SUBFIELD_MIN_EXTENT`] in either axis — the caller skips building that
+/// subfield rather than feeding `layout_field` a rect it would panic on.
+/// A returned rect always has both extents `>= SUBFIELD_MIN_EXTENT`.
+pub fn cell_bbox_inset(polygon: &[Vec2], inset_frac: f64) -> Option<Rect> {
+    if polygon.len() < 3 {
+        return None;
+    }
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for v in polygon {
+        if !v.x.is_finite() || !v.y.is_finite() {
+            return None;
+        }
+        x0 = x0.min(v.x);
+        y0 = y0.min(v.y);
+        x1 = x1.max(v.x);
+        y1 = y1.max(v.y);
+    }
+    let dx = (x1 - x0) * inset_frac;
+    let dy = (y1 - y0) * inset_frac;
+    let rect = Rect { x0: x0 + dx, y0: y0 + dy, x1: x1 - dx, y1: y1 - dy };
+    if rect.width() < SUBFIELD_MIN_EXTENT || rect.height() < SUBFIELD_MIN_EXTENT {
+        return None;
+    }
+    Some(rect)
 }
 
 // ── Height channel (vfs.md open question 1 — first candidate) ──────────────
@@ -208,15 +247,14 @@ pub fn field_wireframe(field: &FsnField) -> Vec<Segment> {
 pub const SEAM_Y: f32 = 0.8;
 
 /// The faint quad-seam grid for one directory's own rect: its outer boundary
-/// (4 edges) plus the internal cross dividing it into the 4 quadrants
-/// [`kaijutsu_viz::fsn::placeholder_quadrant`] assigns children into — always
-/// exactly 6 segments, independent of how many children the field actually
-/// has (frame 45's "faint dotted boundaries" read as architecture, not
-/// per-child decoration). **First-candidate simplification, documented**:
-/// slice 0 draws the structural quadrant grid rather than only the
-/// quadrants some child actually occupies — a future pass could prune empty
-/// quadrants once Open Question 2 (`kaijutsu_viz::fsn`'s own doc) settles
-/// the real slack/placement policy.
+/// (4 edges) plus an internal quartering cross — always exactly 6 segments,
+/// independent of how many children the field actually has (frame 45's
+/// "faint dotted boundaries" read as architecture, not per-child
+/// decoration). **Purely cosmetic**: since field placement moved to
+/// parent-cell bboxes ([`cell_bbox_inset`] — see the module doc), the cross
+/// no longer corresponds to any addressing quadrant; it stays as the quad
+/// seam *look* the concept frames show, pending Open Question 2
+/// (`kaijutsu_viz::fsn`'s own doc) settling the real address/seam grammar.
 pub fn seam_grid(rect: Rect) -> Vec<Segment> {
     let (x0, x1, z0, z1) =
         (rect.x0 as f32, rect.x1 as f32, rect.y0 as f32, rect.y1 as f32);
@@ -375,15 +413,7 @@ mod tests {
     use super::*;
     use kaijutsu_viz::fsn::layout_field;
 
-    // ── path_components / join_path ──
-
-    #[test]
-    fn path_components_splits_and_ignores_empties() {
-        assert_eq!(path_components("/"), Vec::<&str>::new());
-        assert_eq!(path_components("/foo/bar"), vec!["foo", "bar"]);
-        assert_eq!(path_components("/foo/bar/"), vec!["foo", "bar"]);
-        assert_eq!(path_components(""), Vec::<&str>::new());
-    }
+    // ── join_path / split_parent ──
 
     #[test]
     fn join_path_avoids_double_slash_at_root() {
@@ -391,7 +421,34 @@ mod tests {
         assert_eq!(join_path("/foo", "bar"), "/foo/bar");
     }
 
-    // ── root_world_rect / map_unit_rect_to_world / path_world_rect ──
+    #[test]
+    fn split_parent_handles_root_children_and_nesting() {
+        assert_eq!(split_parent("/foo"), Some(("/", "foo")));
+        assert_eq!(split_parent("/foo/bar"), Some(("/foo", "bar")));
+        assert_eq!(split_parent("/a/b/c"), Some(("/a/b", "c")));
+    }
+
+    #[test]
+    fn split_parent_of_the_root_is_none() {
+        assert_eq!(split_parent("/"), None);
+        assert_eq!(split_parent(""), None);
+    }
+
+    #[test]
+    fn split_parent_tolerates_a_trailing_slash() {
+        assert_eq!(split_parent("/foo/"), Some(("/", "foo")));
+        assert_eq!(split_parent("/foo/bar/"), Some(("/foo", "bar")));
+    }
+
+    #[test]
+    fn split_parent_round_trips_with_join_path() {
+        for path in ["/etc", "/etc/rc", "/a/b/c/d"] {
+            let (parent, name) = split_parent(path).unwrap();
+            assert_eq!(join_path(parent, name), path, "{path} must round-trip");
+        }
+    }
+
+    // ── root_world_rect ──
 
     #[test]
     fn root_world_rect_is_centered_with_the_configured_side_length() {
@@ -402,51 +459,125 @@ mod tests {
         assert_eq!(r.x1, (ROOT_WORLD_SIZE as f64) / 2.0);
     }
 
+    // ── cell_bbox_inset ──
+
     #[test]
-    fn map_unit_rect_identity_returns_the_root_rect_unchanged() {
-        let root = root_world_rect();
-        let mapped = map_unit_rect_to_world(root, Rect::unit());
-        assert_eq!(mapped, root);
+    fn cell_bbox_inset_shrinks_a_square_by_the_fraction_on_each_side() {
+        let square = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(100.0, 0.0),
+            Vec2::new(100.0, 100.0),
+            Vec2::new(0.0, 100.0),
+        ];
+        let rect = cell_bbox_inset(&square, 0.1).unwrap();
+        assert_eq!(rect, Rect { x0: 10.0, y0: 10.0, x1: 90.0, y1: 90.0 });
     }
 
     #[test]
-    fn map_unit_rect_quarter_lands_in_the_expected_world_quadrant() {
-        let root = root_world_rect();
-        // Unit rect [0.5,1]x[0.5,1] (top-right quadrant) should map to the
-        // root's own top-right quadrant.
-        let unit = Rect { x0: 0.5, y0: 0.5, x1: 1.0, y1: 1.0 };
-        let mapped = map_unit_rect_to_world(root, unit);
-        assert_eq!(mapped.x0, 0.0);
-        assert_eq!(mapped.y0, 0.0);
-        assert_eq!(mapped.x1, root.x1);
-        assert_eq!(mapped.y1, root.y1);
+    fn cell_bbox_inset_lies_inside_the_parent_rect_for_every_laid_out_cell() {
+        // The real production shape: lay out a world-scale field, then every
+        // cell's inset bbox must sit inside the parent rect (a cell polygon
+        // is clipped to the rect, its bbox can't exceed it, and the inset
+        // only shrinks).
+        let parent = root_world_rect();
+        let children: Vec<ChildSpec> = (0..12)
+            .map(|i| ChildSpec { name: format!("d{i}"), kind: NodeKind::Dir, height: 30.0 })
+            .collect();
+        let field = layout_field(parent, &children);
+        let mut some_hosted = false;
+        for cell in &field.cells {
+            let Some(bbox) = cell_bbox_inset(&cell.polygon, SUBFIELD_INSET_FRAC) else {
+                continue;
+            };
+            some_hosted = true;
+            assert!(parent.x0 <= bbox.x0 && bbox.x1 <= parent.x1, "{}: {bbox:?}", cell.name);
+            assert!(parent.y0 <= bbox.y0 && bbox.y1 <= parent.y1, "{}: {bbox:?}", cell.name);
+        }
+        assert!(some_hosted, "world-scale cells must be big enough to host subfields");
     }
 
     #[test]
-    fn path_world_rect_of_the_root_is_the_whole_root_rect() {
-        let root = root_world_rect();
-        let rect = path_world_rect(root, &[]);
-        assert_eq!(rect, root);
+    fn cell_bbox_inset_guarantees_layout_field_safe_extents() {
+        // The contract layout_field's panic-on-degenerate-rect leans on: a
+        // Some() bbox always has BOTH extents >= SUBFIELD_MIN_EXTENT.
+        let parent = root_world_rect();
+        let children: Vec<ChildSpec> = (0..30)
+            .map(|i| ChildSpec { name: format!("n{i}"), kind: NodeKind::File, height: 5.0 })
+            .collect();
+        let field = layout_field(parent, &children);
+        for cell in &field.cells {
+            if let Some(bbox) = cell_bbox_inset(&cell.polygon, SUBFIELD_INSET_FRAC) {
+                assert!(bbox.width() >= SUBFIELD_MIN_EXTENT, "{}: {bbox:?}", cell.name);
+                assert!(bbox.height() >= SUBFIELD_MIN_EXTENT, "{}: {bbox:?}", cell.name);
+                // And layout_field must actually accept it without panicking.
+                let sub = layout_field(
+                    bbox,
+                    &[ChildSpec { name: "probe".into(), kind: NodeKind::File, height: 1.0 }],
+                );
+                assert_eq!(sub.cells.len(), 1);
+            }
+        }
     }
 
     #[test]
-    fn path_world_rect_of_a_subdirectory_is_a_quarter_of_its_parent() {
-        let root = root_world_rect();
-        let child_rect = path_world_rect(root, &["some_dir"]);
-        // Whatever quadrant it landed in, its area must be exactly 1/4 the
-        // parent's (CellId::quad_rect's own guarantee, composed through the
-        // world mapping — quad_rect_quarters_are_disjoint_and_cover_the_parent
-        // in kaijutsu-viz already locks the unit-space half of this).
-        assert!((child_rect.area() - root.area() / 4.0).abs() < 1e-6);
-        assert!(root.x0 <= child_rect.x0 && child_rect.x1 <= root.x1);
-        assert!(root.y0 <= child_rect.y0 && child_rect.y1 <= root.y1);
+    fn cell_bbox_inset_rejects_degenerate_polygons() {
+        // Too few vertices.
+        assert_eq!(cell_bbox_inset(&[], SUBFIELD_INSET_FRAC), None);
+        assert_eq!(cell_bbox_inset(&[Vec2::new(0.0, 0.0)], SUBFIELD_INSET_FRAC), None);
+        assert_eq!(
+            cell_bbox_inset(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)], SUBFIELD_INSET_FRAC),
+            None
+        );
+        // Too small to host a field after the inset (extent < SUBFIELD_MIN_EXTENT).
+        let tiny = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.5, 1.0)];
+        assert_eq!(cell_bbox_inset(&tiny, SUBFIELD_INSET_FRAC), None);
+        // Non-finite coordinates.
+        let nan = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(f64::NAN, 0.0),
+            Vec2::new(100.0, 100.0),
+            Vec2::new(0.0, 100.0),
+        ];
+        assert_eq!(cell_bbox_inset(&nan, SUBFIELD_INSET_FRAC), None);
     }
 
     #[test]
-    fn path_world_rect_of_a_grandchild_is_a_sixteenth() {
-        let root = root_world_rect();
-        let rect = path_world_rect(root, &["a", "b"]);
-        assert!((rect.area() - root.area() / 16.0).abs() < 1e-6);
+    fn cell_bbox_inset_is_deterministic() {
+        let poly = vec![
+            Vec2::new(3.0, -7.0),
+            Vec2::new(90.0, 4.0),
+            Vec2::new(70.0, 88.0),
+            Vec2::new(-10.0, 60.0),
+        ];
+        assert_eq!(
+            cell_bbox_inset(&poly, SUBFIELD_INSET_FRAC),
+            cell_bbox_inset(&poly, SUBFIELD_INSET_FRAC)
+        );
+    }
+
+    #[test]
+    fn colliding_name_hashes_no_longer_stack_sibling_subfields() {
+        // The bug this placement replaced: placeholder_quadrant is
+        // hash(name) % 4, so two sibling directories hashing to the same
+        // quadrant used to get the IDENTICAL world rect. Voronoi cells are
+        // disjoint by construction, so any two cells' inset bboxes must
+        // never coincide — whatever their names hash to.
+        let parent = root_world_rect();
+        let children: Vec<ChildSpec> = (0..10)
+            .map(|i| ChildSpec { name: format!("dir{i}"), kind: NodeKind::Dir, height: 30.0 })
+            .collect();
+        let field = layout_field(parent, &children);
+        let bboxes: Vec<Rect> = field
+            .cells
+            .iter()
+            .filter_map(|c| cell_bbox_inset(&c.polygon, SUBFIELD_INSET_FRAC))
+            .collect();
+        assert!(bboxes.len() >= 2, "need at least two hosted cells to compare");
+        for i in 0..bboxes.len() {
+            for j in (i + 1)..bboxes.len() {
+                assert_ne!(bboxes[i], bboxes[j], "sibling subfield rects must never coincide");
+            }
+        }
     }
 
     // ── height_channel / world_height ──

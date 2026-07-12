@@ -152,6 +152,13 @@ pub enum RpcResultMessage {
         path: String,
         result: SnapshotResult,
     },
+    /// A `vfs_snapshot` request failed (RPC error, disconnect). Drained by
+    /// the same system as the success variant, whose only job on this arm is
+    /// clearing the one-in-flight debounce slot — without a failure reply the
+    /// FSN fetch queue would wedge forever on the first failed request.
+    /// Deliberately carries no auto-requeue semantics (a permanently-failing
+    /// path would hot-loop) — see `view::fsn::sync::apply_fsn_snapshot`.
+    VfsSnapshotFailed { path: String },
     /// Input document state received (for initializing SyncedInput on context join).
     InputStateReceived {
         context_id: ContextId,
