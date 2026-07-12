@@ -169,6 +169,12 @@ fn pick_cluster_label<'a>(
 /// acquiring `metadata`**: collect what you need from the graph, drop the
 /// guard, then touch metadata (`neighbors`/`clusters` show the pattern).
 /// Holding both in the opposite order inverts the writer order and deadlocks.
+///
+/// Lock poisoning is deliberately fatal: a panic while holding either lock
+/// (OOM mid-embed, hnsw_rs panic) poisons it, and every later `.unwrap()`
+/// propagates the panic instead of serving state of unknown integrity —
+/// crash over corruption. The kernel treats a failed SemanticIndex as
+/// "no index" and degrades gracefully; a restart rebuilds from disk.
 pub struct SemanticIndex {
     embedder: Arc<dyn Embedder>,
     hnsw: RwLock<index::HnswIndex>,
@@ -224,9 +230,14 @@ impl SemanticIndex {
         // Lock order: each guard here is a standalone temporary, dropped at
         // the end of its own statement, so hnsw and metadata are never held
         // simultaneously (see struct-level lock order docs).
+        //
+        // Any disagreement triggers the rebuild: graph > meta means dead
+        // points from eviction; meta > graph means orphan rows (crash between
+        // the metadata commit and the graph save) that rebuild() repairs so
+        // those contexts get re-indexed instead of erroring in neighbors().
         let graph_count = this.hnsw.read().unwrap().graph_point_count();
         let meta_count = this.metadata.lock().unwrap().count()?;
-        if graph_count > meta_count {
+        if graph_count != meta_count {
             let stats = this.rebuild()?;
             tracing::info!(
                 graph_count,
@@ -380,11 +391,18 @@ impl SemanticIndex {
                 // here, so lock order (metadata -> hnsw) matches every other
                 // writer. The graph points themselves are only reclaimed by
                 // the next rebuild() (startup auto-rebuild or `kj synth
-                // rebuild`).
+                // rebuild`). The in-memory synthesis cache must be cleared
+                // too — evict_oldest already deleted the SQLite rows, and a
+                // leftover memory entry would serve the evicted context's
+                // gist until the next restart.
                 if !evicted.is_empty() {
                     let mut hnsw = self.hnsw.write().unwrap();
-                    for slot in &evicted {
+                    for (slot, _) in &evicted {
                         hnsw.clear_slot(*slot);
+                    }
+                    drop(hnsw);
+                    for (_, ctx) in &evicted {
+                        self.synthesis_cache.remove(*ctx);
                     }
                 }
 
@@ -1388,6 +1406,47 @@ mod tests {
         idx.index_context(ctx, &make_blocks(ctx, "works after dump cleanup"))
             .unwrap();
         assert_eq!(idx.len(), 1, "index should work after the wipe");
+    }
+
+    /// Eviction must clear the in-memory synthesis cache alongside the SQLite
+    /// rows — otherwise get_any() serves an evicted context's gist/keywords
+    /// until the next restart (deepseek review finding, 2026-07-12).
+    #[test]
+    fn test_eviction_clears_synthesis_cache_in_memory() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_contexts = Some(2);
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+            .unwrap();
+        idx.store_synthesis(
+            ctx1,
+            synthesis::SynthesisResult {
+                keywords: vec![("alpha".to_string(), 0.5)],
+                top_blocks: vec![],
+                gist: Some("alpha gist".to_string()),
+                content_hash: "h1".to_string(),
+            },
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Evicts ctx1 (oldest).
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+            .unwrap();
+        assert_eq!(idx.len(), 2);
+
+        assert!(
+            idx.synthesis_cache().get_any(ctx1).is_none(),
+            "evicted ctx1's synthesis must leave the memory cache immediately, not at restart"
+        );
     }
 
     #[test]

@@ -199,14 +199,27 @@ impl KjBuiltin {
             let idx = idx.clone();
             let block_source = self.block_source.clone();
 
-            // Index + synthesize on blocking thread.
+            // Index + synthesize + persist on the blocking thread — the whole
+            // pipeline stays off the async runtime (store_synthesis takes the
+            // metadata mutex, which index_context holds across ONNX embeds
+            // from sibling blocking threads).
             // BlockStoreSource auto-hydrates from DB if the document isn't in memory.
             // Contexts with no document at all (metadata-only) are skipped.
             let result = tokio::task::spawn_blocking(move || {
                 let blocks = match block_source.block_snapshots(ctx_id) {
                     Ok(b) if b.is_empty() => return Ok(None), // empty doc, nothing to synthesize
                     Ok(b) => b,
-                    Err(_) => return Ok(None), // no document in DB either, skip
+                    Err(e) => {
+                        // No document in DB either — usually metadata-only,
+                        // but a transient fetch failure lands here too, so
+                        // leave a trace instead of a fully silent skip.
+                        tracing::debug!(
+                            context = %ctx_id.short(),
+                            error = %e,
+                            "synth all: no block snapshots, skipping"
+                        );
+                        return Ok(None);
+                    }
                 };
 
                 let was_indexed = idx
@@ -216,26 +229,25 @@ impl KjBuiltin {
                 let synth =
                     super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
-                Ok::<Option<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>)>, String>(
-                    Some((was_indexed, synth)),
-                )
+                let synthesized = if let Some(synth) = synth {
+                    idx.store_synthesis(ctx_id, synth)
+                        .map_err(|e| format!("store synthesis: {e}"))?;
+                    true
+                } else {
+                    false
+                };
+
+                Ok::<Option<(bool, bool)>, String>(Some((was_indexed, synthesized)))
             })
             .await;
 
             match result {
-                Ok(Ok(Some((was_indexed, synth_result)))) => {
+                Ok(Ok(Some((was_indexed, did_synthesize)))) => {
                     if was_indexed {
                         indexed += 1;
                     }
-                    if let Some(synth) = synth_result {
-                        if let Some(ref si) = self.semantic_index {
-                            match si.store_synthesis(ctx_id, synth) {
-                                Ok(()) => synthesized += 1,
-                                Err(e) => {
-                                    errors.push(format!("{}: store synthesis: {e}", ctx_id.short()))
-                                }
-                            }
-                        }
+                    if did_synthesize {
+                        synthesized += 1;
                     }
                 }
                 Ok(Ok(None)) => {

@@ -1366,13 +1366,25 @@ pub async fn create_shared_kernel(
                             Arc::new(move |ctx_id| {
                                 let idx_clone = synth_idx.clone();
                                 let blocks_clone = synth_blocks.clone();
-                                tokio::task::spawn_blocking(move || {
+                                let handle = tokio::task::spawn_blocking(move || {
                                     kaijutsu_kernel::runtime::synthesis::run_synthesis_and_cache(
                                         ctx_id,
                                         idx_clone.embedder_arc(),
                                         blocks_clone,
                                         &idx_clone,
                                     );
+                                });
+                                // run_synthesis_and_cache logs its own errors,
+                                // but a panic on the blocking thread (poisoned
+                                // lock, OOM mid-embed) would otherwise vanish
+                                // with the dropped JoinHandle.
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle.await {
+                                        log::error!(
+                                            "synthesis task panicked for context {}: {e}",
+                                            ctx_id.short()
+                                        );
+                                    }
                                 });
                             });
 

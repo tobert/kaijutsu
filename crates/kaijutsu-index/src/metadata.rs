@@ -489,15 +489,16 @@ impl MetadataStore {
 
     /// Evict the `n` oldest entries by `embedded_at` timestamp.
     ///
-    /// Returns the HNSW slot numbers of the evicted rows (ascending by
-    /// `embedded_at`, i.e. oldest first) so the caller can clear them from the
-    /// HNSW embeddings cache (`HnswIndex::clear_slot`). Select-then-delete
+    /// Returns the evicted `(hnsw_slot, context_id)` pairs (ascending by
+    /// `embedded_at`, i.e. oldest first) so the caller can clear both the
+    /// HNSW embeddings cache (`HnswIndex::clear_slot`, keyed by slot) and the
+    /// in-memory synthesis cache (keyed by context). Select-then-delete
     /// inside one transaction, rather than relying on `RETURNING`, so the set
     /// of rows selected is exactly the set deleted.
     ///
     /// Note: HNSW does not support point deletion — evicted slots become dead
     /// weight in the graph until a full `rebuild()` is performed.
-    pub fn evict_oldest(&mut self, n: usize) -> Result<Vec<u32>, IndexError> {
+    pub fn evict_oldest(&mut self, n: usize) -> Result<Vec<(u32, ContextId)>, IndexError> {
         let tx = self
             .conn
             .transaction()
@@ -557,7 +558,7 @@ impl MetadataStore {
         tx.commit()
             .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
 
-        Ok(slots)
+        Ok(evicted)
     }
 }
 
@@ -697,9 +698,9 @@ mod tests {
 
         assert_eq!(store.count().unwrap(), 3);
 
-        // Evict the 2 oldest — must return their slot numbers, oldest first.
+        // Evict the 2 oldest — must return their (slot, ctx) pairs, oldest first.
         let evicted = store.evict_oldest(2).unwrap();
-        assert_eq!(evicted, vec![s1, s2]);
+        assert_eq!(evicted, vec![(s1, ctx1), (s2, ctx2)]);
         assert_eq!(store.count().unwrap(), 1);
 
         // ctx3 (newest) should remain
@@ -713,13 +714,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = MetadataStore::open(dir.path()).unwrap();
 
-        let slot = store
-            .assign_slot(ContextId::new(), "h1", "model", 384)
-            .unwrap();
+        let ctx = ContextId::new();
+        let slot = store.assign_slot(ctx, "h1", "model", 384).unwrap();
         assert_eq!(store.count().unwrap(), 1);
 
         let evicted = store.evict_oldest(10).unwrap();
-        assert_eq!(evicted, vec![slot]);
+        assert_eq!(evicted, vec![(slot, ctx)]);
         assert_eq!(store.count().unwrap(), 0);
     }
 
@@ -747,7 +747,7 @@ mod tests {
 
         // Evicting one drops ctx_old_max — the max slot leaves metadata.
         let evicted = store.evict_oldest(1).unwrap();
-        assert_eq!(evicted, vec![max_slot]);
+        assert_eq!(evicted, vec![(max_slot, ctx_old_max)]);
 
         let fresh = store
             .assign_slot(ContextId::new(), "h3", "model", 384)

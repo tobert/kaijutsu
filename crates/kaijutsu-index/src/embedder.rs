@@ -111,6 +111,17 @@ impl OnnxEmbedder {
     }
 }
 
+/// Upper bound on texts per ONNX session run.
+///
+/// `embed_batch` pads every text to the batch's longest sequence
+/// (`PaddingStrategy::BatchLongest`), so one unbounded batch — e.g. `kj synth
+/// all` embedding every block of a large context at once — allocates tensors
+/// of `batch × longest_seq × dims` and blew ort's arena allocator (which never
+/// shrinks) past 9 GB on real data. Chunking bounds the arena to a few dozen
+/// MB per run without changing results; callers keep passing whatever batch
+/// size is natural for them.
+const EMBED_CHUNK: usize = 32;
+
 impl Embedder for OnnxEmbedder {
     fn model_name(&self) -> &str {
         &self.name
@@ -123,6 +134,14 @@ impl Embedder for OnnxEmbedder {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, IndexError> {
         if texts.is_empty() {
             return Ok(vec![]);
+        }
+
+        if texts.len() > EMBED_CHUNK {
+            let mut results = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(EMBED_CHUNK) {
+                results.extend(self.embed_batch(chunk)?);
+            }
+            return Ok(results);
         }
 
         // Tokenize
