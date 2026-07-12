@@ -1,100 +1,213 @@
-# VFS Landscape — Station Design (fsn)
+# VFS Landscape — Station Design (the fsn world)
 
-2026-07-07. Station #5 of the scenes charter (`docs/scenes/README.md`).
-Earlier-stage than `patchbay.md` — direction and primitives are decided;
-interaction UX still needs a concepting wave before slices get cut.
+2026-07-07, expanded 2026-07-12 after concept waves 1–5. Station #5 of the
+scenes charter (`docs/scenes/README.md`). The vocabulary is **baked**
+(Amy, wave-5 cull); implementation is sequenced behind the time-well HUD
+melt landing. Canonical concepts: `docs/scenes/concepts/43-vfs-fsn-landscape.png`
+(lineage) and `44..49-vfs-world-*.png` (the world vocabulary — keepers of
+waves 1–5; the full wave story lives in the session galleries + git history
+of the culled set in `~/kj-junk/scenes-mockups-2026-07/`).
 
-**Lineage** (Amy, wave 2): **fsn**, SGI's experimental 3D file browser for
+**Lineage** (Amy, 2026-07): **fsn**, SGI's experimental 3D file browser for
 IRIX — the "It's a UNIX system! I know this!" scene in Jurassic Park. A
 flying view over a dark plane where directories are pedestals, files are
-blocks standing on them, and luminous avenues connect parent to child.
-The homage is deliberate; the palette is ours (Arcane Techmage). Canonical
-concept: `docs/scenes/concepts/43-vfs-fsn-landscape.png`. Two culled
-companions live on in prose: a close-up of one directory platform — full
-slabs, brass trim, a floating glyph label, avenues arcing down to child
-platforms — is the near-LOD tier made concrete; and a diorama frame whose
-lesson is LOD-as-interaction: the selected platform blooms upward into
-full detail while the rest of the city stays cheap translucent blocks.
+blocks, and luminous avenues connect parent to child. The homage is
+deliberate; the palette is ours (synthwave, `docs/color.md`).
 
-## What the station shows
+## The world reading
 
-The kernel VFS as terrain:
+The flat fsn plane grew into a **world** (Amy, wave 1): the octagon room is
+a *ship* hovering over the filesystem — a Dyson shell of panels, addressed
+like paths, lit like cities. The plane survives intact as the near-LOD
+reading of the curved world. The N archway stays the door; the exterior
+view is the station's ambient reading (the archway's "horizon glow tracks
+VFS churn" grown into a whole world). The ship reads at world scale by its
+neon panel trim alone (44) — and from the surface, the ship overhead is the
+orientation landmark: you can never be lost, look up. One unprompted gift
+kept as a design rule candidate: **avenues arc INTO the ship** — the room's
+floor traces continuing out into the world's avenue graph (floor-to-world
+continuity).
 
-- **Directories are platforms; files are slabs standing on them**;
-  parent→child avenues of light branch across a grid-etched plane. You fly
-  it / jump it; you do not walk.
-- **Ownership zones are lighting**: CRDT-owned regions (config, `/etc/rc`)
-  glow warm amber — alive, editable, kernel-truth; mounted read-only
-  regions sit cool cyan behind faint glass (`read_only_shell` made
-  visible). Zone boundaries follow the mount table (`docs/mounts.md`,
-  `docs/config-crdt-ownership.md`).
-- **rc scripts are objects with visible state**: `kj rc list` already knows
-  `[in-sync]` / `[differs from seed]` — staleness renders as a material
-  lane on the slab (a seam of off-color light), not a label. Symlinks
-  (`DocKind::Symlink`, the init.d-style rc composition) render as ghost
-  slabs tethered to their targets.
-- Unlike the patch bay (whose ground truth is split kernel/edge), the VFS
-  is the **pure case of the charter principle**: the scene renders
-  kernel-owned state and nothing else. Whatever the VFS surface can
-  enumerate, the landscape can show.
+## The claims (held constant across waves 1–5, all confirmed)
 
-## LOD is a design primitive here, not an optimization
+1. **Address ≠ area.** A directory's cell is its stable address; size and
+   activity encode as **light and height, never area** — the one decoupling
+   that keeps the world recognizable while the tree churns (the whole
+   stable-treemap literature in one move).
+2. **Path = cell-ID prefix.** S2-style cube-sphere quadtree: six faces,
+   4-way subdivision, containment is a prefix check — the sphere's address
+   space and the VFS namespace are the same structure. LOD chunks fall out
+   for free.
+   *Why not hex addressing:* hexagons don't nest — H3's aperture-7 children
+   poke outside their parents (containment goes approximate), and a
+   hex-tiled sphere is a Goldberg polyhedron carrying exactly 12 pentagon
+   defects. Quad keeps prefix containment exact. Goldberg/`hexasphere`
+   (already in Bevy's dep tree) stays available as *global rendering
+   flavor* only.
+3. **Enumeration on demand is the LOD scheduler.** Approach = subdivide =
+   `readdir` deeper. Unenumerated subtrees are literally unbuilt shell — a
+   Dyson sphere is canonically under construction.
+4. **Churn is geology.** Layout changes are local, animated, slow (Sondag's
+   local moves); hotspots ride the kernel event stream as city lights. A
+   changing world is fine — it changes *where the work is happening*.
+5. **Wireframe = not-yet-enumerated** (added wave 5). Solid = materialized.
+   The render ladder and the enumeration ladder are the same ladder (46).
 
-The charter finding (wave 2), owned by this station because its population
-is unbounded: **near is rich, far is cheap, approach upgrades.**
+## The ground vocabulary: relaxed Voronoi (adopted 2026-07-12)
 
-- Tiers echo the time well's (card → chip → point): near platforms render
-  full slabs with labels and state lanes; mid-distance platforms are
-  simple glowing blocks; far ones are points on the grid. Same instancing
-  strategy as the well's aspirational tiers (`MeshTag` + shared material).
-- Detail upgrade is driven by camera distance *and* by attention: the
-  selected platform blooms regardless of distance — swelling into full
-  slabs and label while its neighbors stay blocks.
-- Budget rule inherited from the charter: the landscape must idle cheap on
-  a battery laptop — the grid, avenues, and far tiers are the whole scene
-  until the player moves.
+Amy's geological-hexagon vision (columnar basalt, Giant's Causeway) and the
+quadtree reconcile because real basalt isn't a hex grid — it's a **relaxed
+Voronoi pattern** from cooling cracks: hexagon-dominant with fives and
+sevens mixed in. That pattern falls out of the design already on record:
+
+**The world layout is a pure function of the namespace.** No layout state
+exists anywhere — not on the wire, not on disk. Every client computes the
+same world from the same names. Per directory cell:
+
+1. **Seed** — each child gets a point inside the parent's quad cell at
+   `hash(name)`. Deterministic, stable for the child's life. Cells are
+   sized with slack so growth lands in gaps instead of forcing reflows.
+2. **Voronoi** — diagram of the seeds, clipped to the cell boundary
+   (Delaunay-dual; crates exist).
+3. **Relax** — k = 2–3 Lloyd iterations, *fixed*. Each iteration only lets
+   a seed feel its immediate Voronoi neighbors, so **k iterations bound the
+   blast radius to k neighbor-rings**: a new file is one new seed whose
+   arrival visibly cracks and resettles only its neighborhood — Sondag's
+   local moves and literal cooling-joint physics from the same mechanism.
+   Determinism needs only: fixed k, name-sorted processing order.
+4. **Extrude** — each cell becomes a prism. Footprint area is *incidental
+   and meaningless by design* (claim 1 — never power-diagram weighting).
+   **Height is the free encoding channel** — wanted ("mix some height
+   elements in", Amy) but unmapped; candidates: block count, recency, tree
+   depth. Decide against real data at slice 0.
+5. **Joints are the activity substrate** — the crack network between
+   columns. **Magenta-violet at rest** (decided, 47 — the app's ScenePalette
+   identity; wave 3's amber was placeholder warmth), warming toward
+   gold/HDR with activity per the room's existing tiering rule. Churn
+   storms are *content*: `target/` is **not** ignored — a compile fractures
+   and glows its district like a rift (49), log-scaled so builds read as
+   storms, not floodlights. Gitignored wastes get weather.
+
+**Subdir grammar — bloom = the quiet square** (decided via 48): at rest a
+subdirectory is an organic cluster of taller columns in the parent's field.
+On approach/selection the cluster **parts like petals** and the child's own
+field rises flush with the floor; the square footprint (its quad cell)
+appears only as a hair-thin seam. No platform, no pedestal — the address
+recedes, contents lead (the boring-nameplates philosophy applied to
+geometry). Esc reverses the bloom. The polygon→square emphasis of earlier
+drafts was explicitly rejected (Amy: shape may be square, don't emphasize).
+
+## Implementation starts at the wireframe (Amy, wave-5 cull)
+
+Frame 45 is the implementation target: Voronoi prisms as neon violet
+edge-lines with magenta vertex points, quad seams as faint dotted
+boundaries — **line-list meshes + point sprites, no textures**. This makes
+wireframe-first the *cheapest* possible slice 0, and it's semantically
+honest under claim 5: the world begins as hologram scaffold and
+materializes where attention lands. Solid obsidian + live joints becomes an
+upgrade tier, not a prerequisite. Height elements mix in from the start if
+a dimension is mapped.
+
+**LOD ladder** (= enumeration ladder): sparse points + faint gridlines
+(unenumerated, far) → wireframe prisms (listed-not-visited, mid) → solid
+columns + live joints (materialized, near/attended). The wave-3 alternative
+mid-tier — the joint network baked to a crack-veined emissive plateau
+texture — stays on record for far-but-solid districts.
+
+## Kernel plumbing: enumeration + fsnotify (designed 2026-07-12)
+
+Staged: **(0)** gitignore-glob snapshot → **(1)** poll/diff listing RPC,
+generation-stamped per cell → **(2)** inotify → kernel event stream.
+Greenfield: no `notify` dep in the workspace yet.
+
+- **The kernel owns the one watcher and all subscriptions**; every client
+  shares it through the shared kernel (thin-client rule). fsnotify is noisy;
+  raw events never cross the wire.
+- **Wire = per-cell activity digests**: ABSOLUTE counters/heat published at
+  a bounded cadence — state snapshots, never deltas, so the stream is
+  lossy-safe (a missed digest costs nothing). Digest granularity keys on
+  cell-ID prefix depth, so **notification granularity ≡ render LOD** — a
+  client subscribes at the depth it renders.
+- **Heat self-heals**: clients decay heat locally (the room's
+  `BearingActivity` decay model) and digests refresh it. No periodic resync
+  on this plane; a missed digest is premature cooling, corrected next tick.
+- **Structure resyncs by generation, not schedule**: listings carry
+  generation stamps (`DocumentEntry::version()` pattern from `slash-v.md`);
+  digests carry the current generation per cell, so a stale cached listing
+  is detected from the digest itself and re-pulled *per cell*. Full sweep
+  only on reconnect (rides the app's existing post-reconnect resync).
+  Kernel side: inotify `IN_Q_OVERFLOW` → rescan the affected subtree and
+  bump generations — the stage-1 poll/diff machinery doubles as the
+  rescanner. An optional low-cadence sweep may exist as a config knob;
+  it is insurance, not the mechanism.
+- **Chill / low-power toggle** (design now, build later — Amy): a client's
+  subscription is just parameters against the kernel's rolling counters —
+  depth + cadence; the extreme is poll-on-demand. Serves flaky links and
+  battery; an app-side "low power" mode later bundles this with render
+  throttling (reactive update mode exists).
 
 ## In the shell
 
 The landscape is the type specimen for the shell's **archway** pattern
-(`docs/scenes/shell.md`): too big to be furniture, so the north bearing is
-a doorway showing a live glimpse — horizon glow tracks VFS churn (writes,
-rc edits, mounts appearing). Diving steps through the arch onto the plane.
+(`docs/scenes/shell.md`): the north bearing is a doorway showing a live
+glimpse — horizon glow tracks VFS churn. Diving steps *through* the arch
+and is a **fall**: detail blooms on approach (the transition IS the LOD
+demo); Esc is the reverse shot. Interior wiring never leaks onto the world
+— the brass sill is the seam. Open (wave-2 frame 11, unresolved): flanking
+wall panels rendering the world as content — "a window is a panel whose
+content is outside" — fits panels-as-screens cleanly but is undecided.
 
-## Interaction sketch (to be concepted, not yet designed)
+## Ownership zones and object states
 
-- **Travel by intent**: jump to a path (type it, or follow an avenue);
-  the camera flies the route so the tree's shape registers.
-- **Select** a slab → floating hologram preview (the existing file read
-  surfaces); **dive** → the vi editor session on that file (`docs/vi.md`)
-  — the landscape is plausibly vi's spatial front door.
-- The overview/diorama reading may become the dive's entry framing:
-  arrive above the whole plane, then descend. Undecided.
+- **Zones follow the mount table** (`docs/mounts.md`,
+  `docs/config-crdt-ownership.md`). The pre-world reading — CRDT-owned
+  regions warm amber, read-only regions cool cyan behind glass
+  (`read_only_shell` made visible) — predates the magenta-violet-at-rest
+  decision. Proposed reconciliation, to test in a future wave: at-rest
+  joint hue stays magenta-violet everywhere; *zone identity tints the
+  boundary/glass treatment* (read-only = cool glass, CRDT-owned = warm seam
+  accents); activity always warms toward gold. Not yet decided.
+- **rc scripts are objects with visible state**: `kj rc list` already knows
+  `[in-sync]` / `[differs from seed]` — staleness renders as a material
+  seam of off-color light on the column, not a label. Symlinks
+  (`DocKind::Symlink`) render as ghost columns tethered to their targets by
+  a light thread. Selection/heat bloom regardless of cell size or depth —
+  light doesn't need area.
+
+## Interaction sketch (to be concepted further)
+
+- **Travel by intent**: jump to a path (type it, or follow an avenue); the
+  camera flies the route so the tree's shape registers.
+- **Select** a column → floating hologram preview; **dive** → the vi editor
+  session on that file (`docs/vi.md`) — the landscape is plausibly vi's
+  spatial front door. Subdirs use the bloom grammar above.
+- Camera keeper (wave 4, frame 19's lesson): monumental
+  parent-columns-in-foreground framing when standing at a daughter cell.
 
 ## Open questions
 
-1. **What does slab height encode?** fsn used file size; ours are mostly
-   small text docs. Candidates: block count for CRDT docs, recency, or
-   nothing (uniform slabs, let zones and state lanes carry meaning).
+1. **Height channel** — wanted, unmapped: block count / recency / depth.
    Decide against real data when slice 0 renders the real tree.
-2. **Enumeration surface**: what the scene reads to build the terrain —
-   the VFS backends can list, but the app needs a listing RPC shaped for
-   incremental sync (the well's poll/diff pattern). Additive wire work;
-   size it when slicing.
-3. Do zones follow the mount table exactly, or does `/etc` deserve its own
-   named district regardless of mount shape?
-4. Search: `/` over the landscape (labels/paths, maybe `search_similar`) —
-   flying to results vs teleporting.
-5. Where the shadow-mount gotcha surfaces: kaish's `/v/blobs` overlay
-   shadowing (auto-memory `gotcha_kaish_v_blobs_shadow`) is exactly the
-   kind of truth-split the landscape must not paper over — if two surfaces
-   disagree, that's a rendering decision (show the seam), not a bug to
-   hide.
+2. **Subdir slack math** — the bloom decides the *look*; the address math
+   (how a subdir's quad sub-cell is assigned inside the parent, how much
+   slack, collision policy) needs its own design pass.
+3. **Windows** (frame 11) — do wall panels render the world as content?
+4. **Zone tint reconciliation** (above).
+5. **Search**: `/` over the landscape (labels/paths, maybe
+   `search_similar`) — flying to results vs teleporting.
+6. **Truth seams**: the kaish `/v/blobs` overlay shadowing
+   (`gotcha_kaish_v_blobs_shadow`) is exactly the kind of split the
+   landscape must not paper over — if two surfaces disagree, show the seam.
 
 ## Status
 
-Concepting. Next wave for this station: in-scene UX — selection, preview
-hologram, path breadcrumb (edge-HUD grammar), zone boundary treatment —
-before any slices are cut. Slice 0 sketch when ready: render the real
-tree read-only from a snapshot listing, LOD tiers live, no interaction
-beyond fly + select.
+**Vocabulary baked** (waves 1–5, 2026-07-11/12; Amy's culls recorded in
+place above). Sequencing: the time-well HUD melt lands first. **Slice 0 =
+the wireframe world**: real tree from a snapshot listing (stage-0/1
+plumbing), quadtree layout + hash-seeded relaxed-Voronoi fields rendered as
+line-list wireframe + vertex points, three LOD tiers live, fly + select
+only — no interaction beyond that, no solid tier, no fsnotify.
+
+Research trail: S2 cell-ID prefix containment · GosperMap · EvoStreets ·
+Sondag stable treemaps via local moves · `hexasphere` (Bevy dep tree) ·
+H3 aperture-7 (rejected for addressing).
