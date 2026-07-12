@@ -122,6 +122,50 @@ fn test_get_config_reads_crdt_owned_theme() {
     });
 }
 
+/// `Vfs.snapshot` round-trip over the real wire: client → SSH → capnp →
+/// rpc.rs `VfsImpl::snapshot` → kernel `MountTable::snapshot` → recursive
+/// capnp `SnapshotNode` reply → client's owned tree. `/etc/rc` is a
+/// CRDT-native (virtual) mount seeded with lifecycle scripts at kernel boot,
+/// so it's guaranteed non-empty without touching the host filesystem — and
+/// it doubles as coverage that a virtual backend reports `ignored: false`
+/// (no gitignore semantics off the real filesystem) over the wire, not just
+/// in the kernel-side unit tests.
+#[test]
+fn test_vfs_snapshot_round_trips_over_rpc() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let result = kernel.vfs_snapshot("/etc/rc", 3, 500).await.unwrap();
+
+        assert_eq!(result.root.name, "rc");
+        assert!(matches!(
+            result.root.kind,
+            kaijutsu_client::VfsFileType::Directory
+        ));
+        assert!(
+            !result.root.children.is_empty(),
+            "seeded /etc/rc should have entries"
+        );
+        assert_eq!(result.generation, result.root.generation);
+        // Virtual backend: no gitignore semantics apply anywhere in the tree.
+        fn assert_never_ignored(node: &kaijutsu_client::SnapshotNode) {
+            assert!(!node.ignored, "virtual backend node reported ignored: {}", node.name);
+            for child in &node.children {
+                assert_never_ignored(child);
+            }
+        }
+        assert_never_ignored(&result.root);
+
+        // A tiny cap forces a visible cut, proving truncated_here/truncated
+        // survive the wire round-trip (not just the in-process walker).
+        let cut = kernel.vfs_snapshot("/etc/rc", 3, 1).await.unwrap();
+        assert!(cut.truncated, "max_entries=1 must truncate a populated tree");
+        assert!(cut.root.truncated_here);
+    });
+}
+
 #[test]
 fn test_create_context_returns_valid_id() {
     run_local(async {

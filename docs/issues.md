@@ -1292,6 +1292,44 @@ Scope a deliberate audit covering three axes:
 Not urgent, but a good forcing function alongside the SFTP/shell sidequest, which
 is the consumer that stresses all three axes at once.
 
+## FSN world — `Vfs.snapshot` stage-0/1 known gaps (landed 2026-07-12, Lane B)
+
+`kaijutsu.capnp` `Vfs.snapshot` + `MountTable::snapshot`
+(`crates/kaijutsu-kernel/src/vfs/mount.rs`) shipped the recursive-listing +
+generation-stamp plumbing from `docs/scenes/vfs.md` stage 0/1. Two
+deliberately-scoped simplifications, documented in the method's own doc
+comment, tracked here for stage 2+:
+
+- **Generation blind spot to non-VFS-mediated writes.** Listing-generation
+  bumps happen at the `MountTable` chokepoint (create/mkdir/unlink/rmdir/
+  rename/symlink/link). An external process writing directly into a
+  `LocalBackend`-backed host path — `cargo build` populating `target/`, a
+  human `vim`-ing a file outside the app — never touches `MountTable`, so the
+  generation counter doesn't bump even though the real directory listing
+  changed. `snapshot`'s own `readdir` still sees the real, current listing
+  (it's not stale content) — only the *generation stamp* lags, which matters
+  once a client starts caching listings keyed on generation (stage 2). Closes
+  when inotify lands (`docs/scenes/vfs.md` stage 2: `IN_Q_OVERFLOW` →
+  rescan-and-bump covers this exact case).
+- **`ignored` gitignore classification is best-effort, not git-exact.** Two
+  gaps in `MountTable::ignore_stack_matches` / `build_ignore_level`: (1)
+  closest-directory-wins folding across `.gitignore` levels approximates but
+  isn't identical to git's precise cross-file cumulative precedence (a
+  negation in a shallower file cannot override an ignore decided by a deeper
+  one — the dominant real-world case, but not literally correct in every
+  edge case); (2) only `.gitignore` files at-or-below the snapshot root are
+  consulted — an ancestor `.gitignore` *above* the requested root path is
+  never read, so `kj vfs snapshot /mnt/project/src` won't see a pattern that
+  only lives in `/mnt/project/.gitignore`'s parent-relative form if `src`
+  itself isn't the walk root. Both are fine for slice-0 (`ignored` is display
+  metadata, never a filter — a wrong classification never hides data), but a
+  real Lane C world render leaning on `ignored` for visual treatment should
+  know it's approximate.
+
+Neither gap blocks Lane C (the Bevy world renderer): the snapshot tree itself
+is always structurally correct (real listings, real attrs); only the
+generation staleness signal and the ignored-styling hint have known slop.
+
 ## kaijutsu-mcp — invoke_peer double-encodes object params (found 2026-06-23)
 
 Calling the `invoke_peer` MCP tool with an object `params` (e.g. `{"context_id":

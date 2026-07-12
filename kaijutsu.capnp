@@ -819,6 +819,24 @@ struct StatFs {
   namelen @6 :UInt32;
 }
 
+# One node of a recursive `Vfs.snapshot` walk — the FSN world's stage-0/1
+# kernel plumbing (docs/scenes/vfs.md "Kernel plumbing: enumeration +
+# fsnotify"). Self-recursive via `children`; capnp handles this natively
+# (a List(SnapshotNode) is a pointer, no size-upfront problem).
+struct SnapshotNode {
+  name @0 :Text;
+  kind @1 :FileType;
+  size @2 :UInt64;
+  mtimeSecs @3 :UInt64;        # Seconds since UNIX epoch
+  childCount @4 :UInt32;       # Real child count, even when `children` is cut by depth/cap
+  ignored @5 :Bool;            # gitignore CLASSIFICATION — metadata, never a filter; the
+                                # world renders ignored entries, just differently (target/ is
+                                # not skipped, it "fractures and glows its district")
+  generation @6 :UInt64;       # Per-directory listing-generation stamp; 0 for files
+  children @7 :List(SnapshotNode);
+  truncatedHere @8 :Bool;      # This node's children were cut (depth or entry cap)
+}
+
 # ============================================================================
 # Peer Types
 # ============================================================================
@@ -1423,4 +1441,19 @@ interface Vfs {
 
   # Path resolution
   realPath @15 (path :Text) -> (realPath :Text);
+
+  # FSN world stage-0/1 plumbing (docs/scenes/vfs.md). Recursive listing walk
+  # with generation stamps, VFS-mediated (never touches the host filesystem
+  # directly) so nested mounts and virtual backends compose correctly.
+  # `depth` (0 = just `root`, no children walked) and `maxEntries` (total
+  # node count in the reply tree, root included) are both caller-supplied but
+  # server-clamped to a hard ceiling regardless of what's asked — walking `/`
+  # with no cap must be structurally impossible. `generation` mirrors
+  # `root.generation` (a quick staleness check without descending the tree);
+  # `truncated` is true iff ANY node in the reply has `truncatedHere` set (a
+  # cheap "is this reply complete" check without walking the whole tree). A
+  # backend error mid-walk fails the whole call rather than returning a
+  # partial tree that would look indistinguishable from an intentional cut.
+  snapshot @16 (path :Text, depth :UInt32, maxEntries :UInt32)
+      -> (root :SnapshotNode, generation :UInt64, truncated :Bool);
 }

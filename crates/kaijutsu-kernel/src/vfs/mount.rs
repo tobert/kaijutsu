@@ -3,15 +3,38 @@
 //! Routes filesystem operations to the appropriate backend based on path.
 
 use async_trait::async_trait;
+use ignore::Match;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::RwLock;
 
 use super::error::{VfsError, VfsResult};
 use super::ops::VfsOps;
-use super::types::{DirEntry, FileAttr, FileType, SetAttr, StatFs};
+use super::types::{DirEntry, FileAttr, FileType, SetAttr, SnapshotNode, SnapshotResult, StatFs};
+
+/// Baseline listing-generation for a directory never observed to mutate
+/// since kernel boot (stage-1 groundwork, `docs/scenes/vfs.md`). Nonzero so a
+/// client can tell "kernel reports live generation 1" apart from `0`, which
+/// stays reserved — matching [`FileAttr::generation`]'s convention — for
+/// "unknown / never observed".
+pub const BASELINE_GENERATION: u64 = 1;
+
+/// Hard ceiling on nodes returned by a single [`MountTable::snapshot`] call,
+/// regardless of the caller's requested `max_entries` — walking `/` with no
+/// cap must be structurally impossible (`docs/scenes/vfs.md` stage-0
+/// plumbing). Generous enough for a meaningful LOD chunk, small enough to
+/// bound one reply's memory/wire size.
+pub const SNAPSHOT_MAX_ENTRIES: u32 = 5_000;
+
+/// Hard ceiling on requested traversal depth for [`MountTable::snapshot`],
+/// independent of `max_entries` — bounds recursion even against a
+/// shallow-but-absurdly-wide `depth` request. No real project tree nests
+/// this deep.
+pub const SNAPSHOT_MAX_DEPTH: u32 = 64;
 
 /// Information about a mount point.
 #[derive(Debug, Clone)]
@@ -36,6 +59,14 @@ pub struct MountTable {
     mounts: RwLock<BTreeMap<PathBuf, Arc<dyn VfsOps>>>,
     /// When true, mount()/unmount() are rejected.
     frozen: AtomicBool,
+    /// Per-directory listing-generation stamps (stage-1 groundwork,
+    /// `docs/scenes/vfs.md`), keyed by the directory's normalized full VFS
+    /// path — this table is the chokepoint every mutating op funnels
+    /// through, so tracking generations here (rather than per-backend) sees
+    /// every VFS-mediated structural change regardless of which backend owns
+    /// the path. In-memory only, `DashMap` for lock-independence from
+    /// `mounts`. See [`Self::snapshot`] for the bump policy.
+    generations: dashmap::DashMap<PathBuf, u64>,
 }
 
 impl std::fmt::Debug for MountTable {
@@ -58,6 +89,7 @@ impl MountTable {
         Self {
             mounts: RwLock::new(BTreeMap::new()),
             frozen: AtomicBool::new(false),
+            generations: dashmap::DashMap::new(),
         }
     }
 
@@ -153,6 +185,255 @@ impl MountTable {
         } else {
             PathBuf::from(s)
         }
+    }
+
+    // ========================================================================
+    // Listing-generation stamps (stage-1 groundwork, docs/scenes/vfs.md)
+    // ========================================================================
+
+    /// The directory that owns `path`'s listing — `path`'s parent, normalized,
+    /// falling back to `/` for a path with no parent component (shouldn't
+    /// happen for well-formed absolute VFS paths, but a mutation at the
+    /// namespace root is still "owned by root" rather than a panic).
+    fn parent_dir(path: &Path) -> PathBuf {
+        let normalized = Self::normalize_mount_path(path.to_path_buf());
+        match normalized.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("/"),
+        }
+    }
+
+    /// Bump the listing-generation of the directory at `dir_path` — called
+    /// after a structural mutation succeeds (create/mkdir/unlink/rmdir/
+    /// rename/symlink/link). `DashMap::entry` is a per-shard lock, so this
+    /// never contends with the `mounts` RwLock.
+    fn bump_generation(&self, dir_path: &Path) {
+        let key = Self::normalize_mount_path(dir_path.to_path_buf());
+        self.generations
+            .entry(key)
+            .and_modify(|g| *g += 1)
+            .or_insert(BASELINE_GENERATION + 1);
+    }
+
+    /// The current listing-generation of `dir_path`, or
+    /// [`BASELINE_GENERATION`] if it has never been observed to mutate since
+    /// boot.
+    fn generation_of(&self, dir_path: &Path) -> u64 {
+        let key = Self::normalize_mount_path(dir_path.to_path_buf());
+        self.generations
+            .get(&key)
+            .map(|g| *g)
+            .unwrap_or(BASELINE_GENERATION)
+    }
+
+    // ========================================================================
+    // Snapshot walk (stage-0 plumbing, docs/scenes/vfs.md)
+    // ========================================================================
+
+    /// If `vfs_dir` is backed by real files (`real_path` resolves) and has a
+    /// `.gitignore`, build a matcher from its content — read through the VFS
+    /// (`self.read_all`, never `std::fs` directly) so virtual/CRDT backends
+    /// are structurally exempt and nested mounts are respected. `None` on
+    /// any miss: no real backing, no file, or unreadable. A malformed
+    /// pattern line is skipped by the builder itself rather than failing the
+    /// whole snapshot over one typo'd `.gitignore`.
+    async fn build_ignore_level(&self, vfs_dir: &Path) -> Option<Arc<Gitignore>> {
+        if self.real_path(vfs_dir).await.ok().flatten().is_none() {
+            return None;
+        }
+        let gi_path = vfs_dir.join(".gitignore");
+        let content = self.read_all(&gi_path).await.ok()?;
+        let text = String::from_utf8_lossy(&content);
+        let mut builder = GitignoreBuilder::new(vfs_dir);
+        for line in text.lines() {
+            let _ = builder.add_line(None, line);
+        }
+        builder.build().ok().map(Arc::new)
+    }
+
+    /// Fold the ancestor `.gitignore` stack for one classification query.
+    /// Closest (deepest) directory wins outright on a definitive match —
+    /// this is an approximation of git's exact cross-file precedence (a
+    /// negation in a shallower file cannot override an ignore decided by a
+    /// deeper one), documented as the known gap in [`Self::snapshot`].
+    fn ignore_stack_matches(levels: &[Arc<Gitignore>], path: &Path, is_dir: bool) -> bool {
+        for gi in levels.iter().rev() {
+            match gi.matched(path, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => continue,
+            }
+        }
+        false
+    }
+
+    /// Recursive walk body for [`Self::snapshot`]. Returns a boxed future
+    /// (manual recursion — `async fn` cannot call itself) so `snapshot`
+    /// itself stays a plain `async fn`.
+    ///
+    /// `budget` counts remaining nodes this call is allowed to ADD beyond
+    /// itself (the caller has already reserved one unit for this node);
+    /// `any_truncated` is a global flag set the first time any node in the
+    /// tree gets cut. `ignore_levels` is the ancestor `.gitignore` stack
+    /// inherited from the parent, used to classify THIS node; if this node
+    /// is a directory we descend into, its own `.gitignore` (if any) is
+    /// appended for its children.
+    fn snapshot_node<'a>(
+        &'a self,
+        vfs_path: PathBuf,
+        name: String,
+        depth_remaining: u32,
+        budget: &'a AtomicU32,
+        any_truncated: &'a AtomicBool,
+        ignore_levels: Vec<Arc<Gitignore>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = VfsResult<SnapshotNode>> + Send + 'a>> {
+        Box::pin(async move {
+            let attr = self.getattr(&vfs_path).await?;
+            let is_dir = attr.kind.is_dir();
+            let ignored = Self::ignore_stack_matches(&ignore_levels, &vfs_path, is_dir);
+            let generation = if is_dir {
+                self.generation_of(&vfs_path)
+            } else {
+                0
+            };
+            let mtime_secs = attr
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let mut node = SnapshotNode {
+                name,
+                kind: attr.kind,
+                size: attr.size,
+                mtime_secs,
+                child_count: 0,
+                ignored,
+                generation,
+                children: Vec::new(),
+                truncated_here: false,
+            };
+
+            // Symlinks are never expanded, even when they target a
+            // directory: avoids cycles entirely and matches the "ghost
+            // column tethered by a light thread" reading (docs/scenes/vfs.md)
+            // — a symlink is a leaf in this walk.
+            if !is_dir {
+                return Ok(node);
+            }
+
+            let mut entries = self.readdir(&vfs_path).await?;
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            node.child_count = entries.len() as u32;
+
+            if depth_remaining == 0 {
+                if !entries.is_empty() {
+                    node.truncated_here = true;
+                    any_truncated.store(true, Ordering::Relaxed);
+                }
+                return Ok(node);
+            }
+
+            let mut child_ignore_levels = ignore_levels;
+            if let Some(level) = self.build_ignore_level(&vfs_path).await {
+                child_ignore_levels.push(level);
+            }
+
+            for entry in entries {
+                let reserved = budget
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+                    .is_ok();
+                if !reserved {
+                    node.truncated_here = true;
+                    any_truncated.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let child_path = vfs_path.join(&entry.name);
+                let child = self
+                    .snapshot_node(
+                        child_path,
+                        entry.name,
+                        depth_remaining - 1,
+                        budget,
+                        any_truncated,
+                        child_ignore_levels.clone(),
+                    )
+                    .await?;
+                node.children.push(child);
+            }
+
+            Ok(node)
+        })
+    }
+
+    /// Recursive snapshot listing with generation stamps — the FSN world's
+    /// stage-0/1 kernel plumbing (`docs/scenes/vfs.md` "Kernel plumbing:
+    /// enumeration + fsnotify"). Walks VFS-mediated (`readdir`/`getattr`),
+    /// never the host filesystem directly, so nested mounts and virtual
+    /// backends compose correctly.
+    ///
+    /// **Caps**: `depth` and `max_entries` are both caller-supplied but
+    /// server-clamped — [`SNAPSHOT_MAX_DEPTH`] / [`SNAPSHOT_MAX_ENTRIES`] —
+    /// so a request for the whole host with no cap can never happen.
+    /// `max_entries` is also floored at 1: the root node always ships even
+    /// if the caller asks for 0.
+    ///
+    /// **Error policy**: a backend error mid-walk fails the whole call
+    /// (`Err`), rather than returning a partial tree that looks complete.
+    /// `truncated_here` exists precisely so an INTENTIONAL cut is visible;
+    /// silently returning a half-tree on an I/O error would look identical
+    /// to a deliberate depth/cap cut, which is exactly the ambiguity this
+    /// avoids.
+    ///
+    /// **Generation policy** (stage-1 groundwork): directory generations
+    /// track STRUCTURE (name-set) changes only —
+    /// create/mkdir/unlink/rmdir/rename (both parents)/symlink/link bump the
+    /// parent's generation; write/truncate/setattr do NOT (content/activity
+    /// is a separate concern reserved for the digest stream, stage 2). A
+    /// directory never observed to mutate since kernel boot reports
+    /// [`BASELINE_GENERATION`]. Files always report generation 0.
+    /// In-memory only — a kernel restart resets every counter, which is fine
+    /// (`docs/scenes/vfs.md`: "a kernel restart invalidating all generations
+    /// is fine and self-corrects via the full-sweep-on-reconnect rule").
+    /// KNOWN GAP: generation bumps only observe VFS-mediated mutations — an
+    /// external process writing directly into a LocalBackend-backed host
+    /// path (e.g. `cargo build` populating `target/`) is invisible to the
+    /// counter until inotify lands (stage 2); tracked in `docs/issues.md`.
+    ///
+    /// **`ignored`** (gitignore classification — metadata, never a filter,
+    /// see `docs/scenes/vfs.md`) is real for LocalBackend-backed subtrees:
+    /// `.gitignore` files are read through the VFS as the walk descends and
+    /// folded closest-directory-wins (see [`Self::ignore_stack_matches`] for
+    /// the precision gap vs. git's exact semantics). Only `.gitignore` files
+    /// at-or-below the snapshot root are considered — an ancestor
+    /// `.gitignore` above the root path is not consulted. Virtual/CRDT
+    /// backends always report `ignored=false`. Both gaps are tracked in
+    /// `docs/issues.md`.
+    pub async fn snapshot(
+        &self,
+        path: &Path,
+        depth: u32,
+        max_entries: u32,
+    ) -> VfsResult<SnapshotResult> {
+        let depth = depth.min(SNAPSHOT_MAX_DEPTH);
+        let cap = max_entries.clamp(1, SNAPSHOT_MAX_ENTRIES);
+        let budget = AtomicU32::new(cap - 1);
+        let any_truncated = AtomicBool::new(false);
+        let normalized = Self::normalize_mount_path(path.to_path_buf());
+        let name = normalized
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string());
+
+        let root = self
+            .snapshot_node(normalized, name, depth, &budget, &any_truncated, Vec::new())
+            .await?;
+        let generation = root.generation;
+        Ok(SnapshotResult {
+            root,
+            generation,
+            truncated: any_truncated.load(Ordering::Relaxed),
+        })
     }
 
     /// The mount point owning `path` (longest-prefix match) paired with its
@@ -393,6 +674,9 @@ impl VfsOps for MountTable {
         fs.readlink(&relative).await
     }
 
+    // Deliberately does NOT bump listing-generation: see the note above
+    // `truncate`/`setattr` below — writing bytes into an existing file
+    // changes content/activity, not the parent directory's name set.
     async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let (fs, relative) = self.find_mount(path).await?;
         fs.write(&relative, offset, data).await
@@ -400,22 +684,30 @@ impl VfsOps for MountTable {
 
     async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.create(&relative, mode).await
+        let attr = fs.create(&relative, mode).await?;
+        self.bump_generation(&Self::parent_dir(path));
+        Ok(attr)
     }
 
     async fn mkdir(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.mkdir(&relative, mode).await
+        let attr = fs.mkdir(&relative, mode).await?;
+        self.bump_generation(&Self::parent_dir(path));
+        Ok(attr)
     }
 
     async fn unlink(&self, path: &Path) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.unlink(&relative).await
+        fs.unlink(&relative).await?;
+        self.bump_generation(&Self::parent_dir(path));
+        Ok(())
     }
 
     async fn rmdir(&self, path: &Path) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.rmdir(&relative).await
+        fs.rmdir(&relative).await?;
+        self.bump_generation(&Self::parent_dir(path));
+        Ok(())
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> VfsResult<()> {
@@ -428,9 +720,21 @@ impl VfsOps for MountTable {
             return Err(VfsError::CrossDeviceLink);
         }
 
-        from_fs.rename(&from_relative, &to_relative).await
+        from_fs.rename(&from_relative, &to_relative).await?;
+        // A rename changes the name-set of BOTH parents (the source loses a
+        // name, the destination gains one), even when they're the same
+        // directory — bumping twice there is harmlessly redundant, still
+        // monotonic.
+        self.bump_generation(&Self::parent_dir(from));
+        self.bump_generation(&Self::parent_dir(to));
+        Ok(())
     }
 
+    // truncate/setattr deliberately do NOT bump generation: listing-generation
+    // tracks STRUCTURE (the directory's name set), not content/activity —
+    // that's the digest stream's job (stage 2, docs/scenes/vfs.md). A
+    // truncated or re-permissioned file doesn't change what names exist in
+    // its parent's listing.
     async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
         fs.truncate(&relative, size).await
@@ -443,7 +747,9 @@ impl VfsOps for MountTable {
 
     async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.symlink(&relative, target).await
+        let attr = fs.symlink(&relative, target).await?;
+        self.bump_generation(&Self::parent_dir(path));
+        Ok(attr)
     }
 
     async fn link(&self, oldpath: &Path, newpath: &Path) -> VfsResult<FileAttr> {
@@ -455,7 +761,11 @@ impl VfsOps for MountTable {
             return Err(VfsError::CrossDeviceLink);
         }
 
-        old_fs.link(&old_relative, &new_relative).await
+        let attr = old_fs.link(&old_relative, &new_relative).await?;
+        // Only newpath's parent gains a name; oldpath's parent's listing is
+        // unchanged (a hard link doesn't remove the original name).
+        self.bump_generation(&Self::parent_dir(newpath));
+        Ok(attr)
     }
 
     fn read_only(&self) -> bool {
@@ -854,5 +1164,298 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data, b"updated");
+    }
+
+    // ========================================================================
+    // Snapshot walk (stage-0 plumbing)
+    // ========================================================================
+
+    /// Build `/scratch` with a small tree:
+    /// ```text
+    /// /scratch
+    ///   a.txt
+    ///   sub/
+    ///     b.txt
+    ///     c.txt
+    /// ```
+    async fn setup_snapshot_tree() -> MountTable {
+        let table = MountTable::new();
+        let scratch = MemoryBackend::new();
+        scratch.create(Path::new("a.txt"), 0o644).await.unwrap();
+        scratch.mkdir(Path::new("sub"), 0o755).await.unwrap();
+        scratch.create(Path::new("sub/b.txt"), 0o644).await.unwrap();
+        scratch.create(Path::new("sub/c.txt"), 0o644).await.unwrap();
+        table.mount("/scratch", scratch).await;
+        table
+    }
+
+    #[tokio::test]
+    async fn snapshot_depth_zero_returns_just_root_and_flags_truncation() {
+        let table = setup_snapshot_tree().await;
+        let result = table
+            .snapshot(Path::new("/scratch"), 0, SNAPSHOT_MAX_ENTRIES)
+            .await
+            .unwrap();
+
+        assert_eq!(result.root.name, "scratch");
+        assert!(result.root.kind.is_dir());
+        // Real count is still reported even though nothing was walked.
+        assert_eq!(result.root.child_count, 2);
+        assert!(result.root.children.is_empty());
+        assert!(result.root.truncated_here, "depth cut must flag truncated_here");
+        assert!(result.truncated, "outer `truncated` must roll up the cut");
+    }
+
+    #[tokio::test]
+    async fn snapshot_walks_full_tree_within_depth_and_cap() {
+        let table = setup_snapshot_tree().await;
+        let result = table
+            .snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES)
+            .await
+            .unwrap();
+
+        assert!(!result.truncated);
+        assert!(!result.root.truncated_here);
+        assert_eq!(result.root.children.len(), 2);
+        let names: Vec<_> = result.root.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "sub"]); // sorted
+
+        let sub = result.root.children.iter().find(|c| c.name == "sub").unwrap();
+        assert!(sub.kind.is_dir());
+        assert_eq!(sub.child_count, 2);
+        assert!(!sub.truncated_here);
+        assert_eq!(sub.children.len(), 2);
+        let sub_names: Vec<_> = sub.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(sub_names, vec!["b.txt", "c.txt"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_entry_cap_truncates_and_reports_real_child_count() {
+        let table = setup_snapshot_tree().await;
+        // Budget: root (1) + a.txt (1) = 2 total; "sub" and its children never
+        // get visited, so the cut is flagged on the root, not deeper.
+        let result = table.snapshot(Path::new("/scratch"), 5, 2).await.unwrap();
+
+        assert!(result.truncated);
+        assert!(result.root.truncated_here);
+        // Real count unaffected by the cut.
+        assert_eq!(result.root.child_count, 2);
+        assert_eq!(result.root.children.len(), 1);
+        assert_eq!(result.root.children[0].name, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn snapshot_symlink_is_a_leaf_even_targeting_a_directory() {
+        let table = setup_snapshot_tree().await;
+        table
+            .symlink(Path::new("/scratch/link"), Path::new("sub"))
+            .await
+            .unwrap();
+
+        let result = table.snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES).await.unwrap();
+        let link = result
+            .root
+            .children
+            .iter()
+            .find(|c| c.name == "link")
+            .expect("symlink node present");
+        assert!(link.kind.is_symlink());
+        // Never expanded, regardless of depth/cap — avoids cycles.
+        assert!(link.children.is_empty());
+        assert_eq!(link.child_count, 0);
+        assert!(!link.truncated_here);
+    }
+
+    #[tokio::test]
+    async fn snapshot_on_missing_path_errors_the_whole_call() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        let result = table.snapshot(Path::new("/scratch/nope"), 3, 100).await;
+        assert!(result.is_err(), "a backend error mid/at-walk must fail the call, not return a partial tree");
+    }
+
+    #[tokio::test]
+    async fn snapshot_max_entries_zero_still_ships_the_root() {
+        let table = setup_snapshot_tree().await;
+        let result = table.snapshot(Path::new("/scratch"), 5, 0).await.unwrap();
+        // Floored at 1: the root always ships.
+        assert_eq!(result.root.name, "scratch");
+        assert!(result.root.truncated_here);
+    }
+
+    // ========================================================================
+    // Listing-generation stamps
+    // ========================================================================
+
+    #[tokio::test]
+    async fn directory_never_mutated_reports_baseline_generation() {
+        let table = MountTable::new();
+        let scratch = MemoryBackend::new();
+        // Pre-existing, built directly on the backend (bypasses the table —
+        // like a mount seeded before it's wired in) so nothing inside "sub"
+        // has ever gone through the table's generation chokepoint.
+        scratch.mkdir(Path::new("sub"), 0o755).await.unwrap();
+        table.mount("/scratch", scratch).await;
+
+        // Bump root's generation through the table without ever touching
+        // inside "sub".
+        table.create(Path::new("/scratch/a.txt"), 0o644).await.unwrap();
+
+        let result = table
+            .snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES)
+            .await
+            .unwrap();
+        assert!(
+            result.root.generation > BASELINE_GENERATION,
+            "root's generation should have bumped via the table-mediated create"
+        );
+        let sub = result.root.children.iter().find(|c| c.name == "sub").unwrap();
+        assert_eq!(
+            sub.generation, BASELINE_GENERATION,
+            "sub was never mutated through the table, so it stays baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn mkdir_and_create_bump_parent_generation() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        let before = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+        assert_eq!(before.root.generation, BASELINE_GENERATION);
+
+        table.create(Path::new("/scratch/a.txt"), 0o644).await.unwrap();
+        let after_create = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+        assert!(after_create.root.generation > before.root.generation);
+
+        table.mkdir(Path::new("/scratch/sub"), 0o755).await.unwrap();
+        let after_mkdir = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+        assert!(after_mkdir.root.generation > after_create.root.generation);
+    }
+
+    #[tokio::test]
+    async fn unlink_and_rmdir_bump_parent_generation() {
+        let table = setup_snapshot_tree().await;
+        let before = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+
+        table.unlink(Path::new("/scratch/a.txt")).await.unwrap();
+        let after_unlink = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+        assert!(after_unlink.root.generation > before.root.generation);
+
+        table.unlink(Path::new("/scratch/sub/b.txt")).await.unwrap();
+        table.unlink(Path::new("/scratch/sub/c.txt")).await.unwrap();
+        let before_rmdir = table.snapshot(Path::new("/scratch/sub"), 0, 10).await.unwrap();
+        table.rmdir(Path::new("/scratch/sub")).await.unwrap();
+        let after_rmdir = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+        assert!(after_rmdir.root.generation > after_unlink.root.generation);
+        // Sanity: rmdir's target itself isn't queried post-removal — its own
+        // generation is moot once the name is gone (only the parent matters).
+        let _ = before_rmdir;
+    }
+
+    #[tokio::test]
+    async fn rename_bumps_both_parent_generations() {
+        let table = MountTable::new();
+        table.mount("/a", MemoryBackend::new()).await;
+        table.mount("/b", MemoryBackend::new()).await;
+        table.create(Path::new("/a/file.txt"), 0o644).await.unwrap();
+
+        let a_before = table.snapshot(Path::new("/a"), 0, 10).await.unwrap();
+        let b_before = table.snapshot(Path::new("/b"), 0, 10).await.unwrap();
+
+        table
+            .rename(Path::new("/a/file.txt"), Path::new("/a/renamed.txt"))
+            .await
+            .unwrap();
+        let a_after = table.snapshot(Path::new("/a"), 0, 10).await.unwrap();
+        assert!(a_after.root.generation > a_before.root.generation);
+
+        // Cross-mount rename isn't supported (CrossDeviceLink), so exercise
+        // the "both parents" claim within one mount via nested dirs instead.
+        table.mkdir(Path::new("/b/src"), 0o755).await.unwrap();
+        table.mkdir(Path::new("/b/dst"), 0o755).await.unwrap();
+        table.create(Path::new("/b/src/f.txt"), 0o644).await.unwrap();
+        let src_before = table.snapshot(Path::new("/b/src"), 0, 10).await.unwrap();
+        let dst_before = table.snapshot(Path::new("/b/dst"), 0, 10).await.unwrap();
+        table
+            .rename(Path::new("/b/src/f.txt"), Path::new("/b/dst/f.txt"))
+            .await
+            .unwrap();
+        let src_after = table.snapshot(Path::new("/b/src"), 0, 10).await.unwrap();
+        let dst_after = table.snapshot(Path::new("/b/dst"), 0, 10).await.unwrap();
+        assert!(src_after.root.generation > src_before.root.generation);
+        assert!(dst_after.root.generation > dst_before.root.generation);
+        let _ = b_before;
+    }
+
+    #[tokio::test]
+    async fn write_truncate_setattr_do_not_bump_generation() {
+        let table = setup_snapshot_tree().await;
+        let before = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+
+        table.write(Path::new("/scratch/a.txt"), 0, b"hi").await.unwrap();
+        table.truncate(Path::new("/scratch/a.txt"), 1).await.unwrap();
+        table
+            .setattr(Path::new("/scratch/a.txt"), SetAttr::new().with_perm(0o600))
+            .await
+            .unwrap();
+
+        let after = table.snapshot(Path::new("/scratch"), 0, 10).await.unwrap();
+        assert_eq!(
+            before.root.generation, after.root.generation,
+            "content/activity ops must not bump listing-generation (structure only)"
+        );
+    }
+
+    #[tokio::test]
+    async fn files_always_report_generation_zero() {
+        let table = setup_snapshot_tree().await;
+        let result = table.snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES).await.unwrap();
+        let file = result.root.children.iter().find(|c| c.name == "a.txt").unwrap();
+        assert_eq!(file.generation, 0);
+    }
+
+    // ========================================================================
+    // gitignore classification (`ignored`)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn gitignore_classifies_matching_entries_under_a_local_backed_subtree() {
+        use crate::vfs::backends::LocalBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(dir.path().join("drop.log"), "drop").unwrap();
+
+        let table = MountTable::new();
+        table.mount("/mnt/project", LocalBackend::new(dir.path())).await;
+
+        let result = table
+            .snapshot(Path::new("/mnt/project"), 3, SNAPSHOT_MAX_ENTRIES)
+            .await
+            .unwrap();
+
+        let keep = result.root.children.iter().find(|c| c.name == "keep.txt").unwrap();
+        let drop = result.root.children.iter().find(|c| c.name == "drop.log").unwrap();
+        assert!(!keep.ignored, "keep.txt must not be classified as ignored");
+        assert!(drop.ignored, "drop.log must be classified as ignored");
+        // Metadata, never a filter: the ignored entry is still present with
+        // full attributes, not skipped.
+        assert!(!drop.name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn virtual_backends_never_report_ignored() {
+        // No gitignore semantics apply outside real-file-backed subtrees —
+        // even a file literally named like a common ignore pattern stays
+        // `ignored: false` on a MemoryBackend.
+        let table = MountTable::new();
+        let scratch = MemoryBackend::new();
+        scratch.create(Path::new("target"), 0o644).await.unwrap();
+        table.mount("/scratch", scratch).await;
+
+        let result = table.snapshot(Path::new("/scratch"), 3, SNAPSHOT_MAX_ENTRIES).await.unwrap();
+        let target = result.root.children.iter().find(|c| c.name == "target").unwrap();
+        assert!(!target.ignored);
     }
 }

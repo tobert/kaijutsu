@@ -1959,6 +1959,113 @@ impl KernelHandle {
         request.send().promise.await?;
         Ok(())
     }
+
+    // =========================================================================
+    // VFS (FSN world stage-0/1 plumbing, docs/scenes/vfs.md)
+    // =========================================================================
+
+    /// Recursive snapshot listing with generation stamps. All walking,
+    /// depth/cap clamping, generation stamping, and gitignore classification
+    /// happen kernel-side (thin client, smart kernel) — this returns the
+    /// finished tree. `depth`/`max_entries` are server-clamped regardless of
+    /// what's asked (see the kernel's `MountTable::snapshot` doc for the
+    /// exact ceilings and the generation/`ignored` policy).
+    #[tracing::instrument(skip(self), name = "rpc_client.vfs_snapshot")]
+    pub async fn vfs_snapshot(
+        &self,
+        path: &str,
+        depth: u32,
+        max_entries: u32,
+    ) -> Result<SnapshotResult, RpcError> {
+        let vfs_response = self.kernel.vfs_request().send().promise.await?;
+        let vfs = vfs_response.get()?.get_vfs()?;
+
+        let mut request = vfs.snapshot_request();
+        {
+            let mut p = request.get();
+            p.set_path(path);
+            p.set_depth(depth);
+            p.set_max_entries(max_entries);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        let root = parse_snapshot_node(reader.get_root()?)?;
+        Ok(SnapshotResult {
+            root,
+            generation: reader.get_generation(),
+            truncated: reader.get_truncated(),
+        })
+    }
+}
+
+// ============================================================================
+// VFS types
+// ============================================================================
+
+/// File type of a [`SnapshotNode`] — client-owned mirror of the wire
+/// `FileType` enum (kaijutsu-client deliberately doesn't depend on
+/// kaijutsu-kernel; see the crate layering note in CLAUDE.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsFileType {
+    File,
+    Directory,
+    Symlink,
+}
+
+/// One node of a `Vfs.snapshot` reply — owned, recursive mirror of the wire
+/// `SnapshotNode` struct. See `MountTable::snapshot`'s doc comment
+/// (kaijutsu-kernel) for the full field semantics (generation policy,
+/// `ignored` classification, truncation).
+#[derive(Debug, Clone)]
+pub struct SnapshotNode {
+    pub name: String,
+    pub kind: VfsFileType,
+    pub size: u64,
+    pub mtime_secs: u64,
+    pub child_count: u32,
+    pub ignored: bool,
+    pub generation: u64,
+    pub children: Vec<SnapshotNode>,
+    pub truncated_here: bool,
+}
+
+/// Result of [`KernelHandle::vfs_snapshot`].
+#[derive(Debug, Clone)]
+pub struct SnapshotResult {
+    pub root: SnapshotNode,
+    /// Mirrors `root.generation` — a quick staleness check without reading
+    /// into the node.
+    pub generation: u64,
+    /// `true` iff any node in the tree has `truncated_here` set.
+    pub truncated: bool,
+}
+
+/// Recursively parse a capnp `SnapshotNode` reader into the owned client
+/// type.
+fn parse_snapshot_node(
+    reader: crate::kaijutsu_capnp::snapshot_node::Reader<'_>,
+) -> Result<SnapshotNode, RpcError> {
+    let name = reader.get_name()?.to_string()?;
+    let kind = match reader.get_kind()? {
+        crate::kaijutsu_capnp::FileType::File => VfsFileType::File,
+        crate::kaijutsu_capnp::FileType::Directory => VfsFileType::Directory,
+        crate::kaijutsu_capnp::FileType::Symlink => VfsFileType::Symlink,
+    };
+    let mut children = Vec::new();
+    for child in reader.get_children()?.iter() {
+        children.push(parse_snapshot_node(child)?);
+    }
+    Ok(SnapshotNode {
+        name,
+        kind,
+        size: reader.get_size(),
+        mtime_secs: reader.get_mtime_secs(),
+        child_count: reader.get_child_count(),
+        ignored: reader.get_ignored(),
+        generation: reader.get_generation(),
+        children,
+        truncated_here: reader.get_truncated_here(),
+    })
 }
 
 /// Read a `ShellValue` from a Cap'n Proto reader.
