@@ -281,22 +281,29 @@ fn bump_sync_generation_on_reconnect(
 
 /// Apply a theme fetched over RPC. Slice 2: the app no longer reads a host
 /// `theme.toml` — the kernel is the sole owner, so theme arrives as a
-/// [`RpcResultMessage::ThemeReceived`] on connect and replaces the `Theme`
-/// resource (theme-reading systems pick it up next frame). A parse failure is
-/// surfaced as a toast and leaves the current theme intact — never a silent
-/// revert to default.
+/// [`RpcResultMessage::ThemeReceived`] on connect and replaces BOTH color
+/// resources: `Theme` (the UI lane) and `ScenePalette` (the 3D scene lane's
+/// `[scene]` table — docs/color.md). Theme-reading systems pick the new values
+/// up next frame; `[scene.post]` hot-applies to the camera via
+/// `apply_scene_post_on_change`. A parse failure is surfaced as a toast and
+/// leaves the current theme intact — never a silent revert to default.
 fn apply_theme_from_rpc(
     mut results: MessageReader<RpcResultMessage>,
     mut theme: ResMut<crate::ui::theme::Theme>,
+    mut scene_palette: ResMut<crate::view::scene_palette::ScenePalette>,
     mut error_queue: ResMut<crate::view::components::GlobalErrorQueue>,
     time: Res<Time>,
 ) {
     for result in results.read() {
         if let RpcResultMessage::ThemeReceived(toml) = result {
-            match crate::ui::theme_loader::parse_theme_toml(toml) {
-                Ok(parsed) => {
-                    *theme = parsed;
-                    log::info!("applied theme from kernel config (RPC)");
+            match toml::from_str::<kaijutsu_types::theme::ThemeData>(toml)
+                .map_err(|e| format!("TOML parse error: {e}"))
+            {
+                Ok(data) => {
+                    *scene_palette =
+                        crate::view::scene_palette::ScenePalette::from_scene_data(&data.scene);
+                    *theme = crate::ui::theme::Theme::from(data);
+                    log::info!("applied theme from kernel config (RPC): UI + scene palette");
                 }
                 Err(e) => {
                     log::error!("theme.toml from kernel is unparseable: {e}");

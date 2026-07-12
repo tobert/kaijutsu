@@ -144,7 +144,9 @@ label_font_size = 11.0
 label_inset = 12.0
 label_pad = 6.0
 
-# ANSI terminal colors (table must come after all flat keys)
+# ─── Tables below here (TOML: tables must come after all flat keys) ───
+
+# ANSI terminal colors
 [ansi]
 black = "#15161e"
 red = "#f7768e"
@@ -162,3 +164,56 @@ bright_blue = "#7aa2f7"
 bright_magenta = "#bb9af7"
 bright_cyan = "#7dcfff"
 bright_white = "#c0caf5"
+
+# ─── The 3D scene lane (docs/color.md) ─────────────────────────────────────
+# Identity hues as sRGB hex — the app linearizes them for the HDR pipeline.
+# Brightness lives in [scene.tiers]; hues keep their brightest channel near
+# full. [scene.post] applies LIVE on theme change; hues/tiers apply at the
+# next room entry.
+
+[scene.hues]
+bg = "#05070b"             # the octagon's void (room clear color)
+gold = "#ffe59e"           # the room's one metal
+brass = "#ddc489"          # sockets, pegs, jacks
+violet_glass = "#55386c"   # information-violet: radiator glass
+violet_thread = "#c476e1"  # information-violet: threads/content
+neon = "#ad95f3"           # the well's electric indigo-violet
+terrace = "#c4b3f9"        # terrace glyphs: paler tint of neon
+wire = "#ff5f73"           # patch-bay chord (HDR gain in [scene.gains])
+trace_crimson = "#86424b"  # floor trace fabrics, one hue per fabric
+trace_cyan = "#3f737e"
+trace_green = "#598b6c"
+trace_gold = "#958159"
+table = "#32353f"          # structural near-blacks
+wall_base = "#464556"
+wall_mullion = "#383844"
+dark_surface = "#1d1e26"
+
+[scene.tiers]
+etch = 0.28          # engraved detail
+marker = 0.42        # station markers at rest
+trim = 0.50          # gold architectural trim
+hardware = 0.55      # brass hardware
+crest = 1.25         # ceiling for any decoration crest (>1.0 blooms softly)
+trough_wiring = 0.55 # floor traces at rest
+trough_wall_trim = 0.60
+trough_pads = 0.65
+trough_subtle = 0.75 # the calmest breathers
+# invariant (tested): every trough × crest < 1.0
+
+[scene.gains]
+pulse = 6.0          # patch-bay traffic packet peak
+chord_selected = 3.4
+wire = 1.4           # chord wire resting HDR
+beat = 2.8           # tracker marker beat thump
+active = 0.5
+focus_lift = 0.35
+reading_border = 1.6
+hud_border = 1.8
+
+[scene.post]
+bloom_intensity = 0.12
+bloom_low_frequency_boost = 0.25
+# one of: tony_mc_mapface | aces | agx | blender_filmic | reinhard |
+#         reinhard_luminance | somewhat_boring | none
+tonemapper = "tony_mc_mapface"

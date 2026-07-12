@@ -209,6 +209,9 @@ fn main() {
         .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.toml
         .insert_resource(theme)
+        // The 3D scene lane's palette ([scene] in theme.toml, docs/color.md):
+        // compiled defaults until the kernel's theme arrives over RPC.
+        .init_resource::<view::scene_palette::ScenePalette>()
         // Startup config errors (drained into GlobalErrorQueue on first frame)
         .insert_resource(startup_errors)
         // Power management — sleep between events instead of spinning every vsync tick.
@@ -224,6 +227,8 @@ fn main() {
         )
         // Drain config-load errors into the dock error HUD on first frame
         .add_systems(Update, config::drain_startup_errors)
+        // [scene.post] hot-applies to the camera when the palette changes
+        .add_systems(Update, view::scene_palette::apply_scene_post_on_change)
         // Adapt window to monitor on first frame (Monitor not available at Startup)
         .add_systems(Update, adapt_window_to_monitor)
         // Update
@@ -244,8 +249,11 @@ fn main() {
 /// `Hdr` + `Bloom` make the 3D well cards glow (the main pass is tonemapped); the
 /// conversation UI renders after tonemapping, so its colors are placeholder-only
 /// and not a concern here (per Amy).
-fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
-    use bevy::core_pipeline::tonemapping::Tonemapping;
+fn setup_camera(
+    mut commands: Commands,
+    theme: Res<ui::theme::Theme>,
+    palette: Res<view::scene_palette::ScenePalette>,
+) {
     use bevy::post_process::bloom::{Bloom, BloomPrefilter};
     use bevy::render::view::Hdr;
     commands.spawn((
@@ -262,11 +270,13 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
         // we raise the threshold above the body brightness.) The low-frequency
         // shelf is pulled way down from the preset's 0.7/0.95: that shelf is the
         // wide sideways scatter — the "fuzzy halo" — and the well wants a tight
-        // rim glow, not a fog. **Amy-tunable** (intensity = overall strength,
-        // low_frequency_boost = halo spread).
+        // rim glow, not a fog. Intensity/boost + the tonemapper come from
+        // `[scene.post]` in theme.toml (ScenePalette; hot-applies on theme
+        // change — docs/color.md). The THRESHOLD stays a literal on purpose:
+        // 1.0 is the HDR-tell boundary contract, not a style knob.
         Bloom {
-            intensity: 0.12,
-            low_frequency_boost: 0.25,
+            intensity: palette.bloom_intensity,
+            low_frequency_boost: palette.bloom_low_frequency_boost,
             low_frequency_boost_curvature: 0.7,
             prefilter: BloomPrefilter {
                 threshold: 1.0,
@@ -274,7 +284,7 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
             },
             ..Bloom::OLD_SCHOOL
         },
-        Tonemapping::TonyMcMapface,
+        palette.tonemapper,
         IsDefaultUiCamera,
         Name::new("AppCamera"),
     ));

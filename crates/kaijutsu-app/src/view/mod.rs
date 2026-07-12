@@ -23,6 +23,7 @@ pub mod palette;
 pub mod patch_bay;
 pub mod render;
 pub mod room;
+pub mod scene_palette;
 pub mod shell_dock;
 pub mod scroll;
 pub mod submit;

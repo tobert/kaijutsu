@@ -207,6 +207,13 @@ pub struct ThemeData {
     pub label_font_size: f32,
     pub label_inset: f32,
     pub label_pad: f32,
+
+    /// The 3D scene lane (`[scene]` table): identity hues, the brightness tier
+    /// ladder, live-signal gains, and the camera post chain. `serde(default)`
+    /// on purpose — themes written before this section existed must keep
+    /// parsing (the live CRDT theme.toml predates it). See `docs/color.md`.
+    #[serde(default)]
+    pub scene: SceneData,
 }
 
 impl Default for ThemeData {
@@ -351,6 +358,192 @@ impl Default for ThemeData {
             label_font_size: 11.0,
             label_inset: 12.0,
             label_pad: 6.0,
+
+            scene: SceneData::default(),
+        }
+    }
+}
+
+// ─── Scene lane (`[scene]`) ─────────────────────────────────────────────────
+//
+// The 3D scenes' color contract (docs/color.md): identity hues as sRGB hex
+// (the app linearizes them for HDR materials), the brightness tier ladder,
+// live-signal gains, and the camera post chain. Defaults mirror the values
+// the scene modules shipped with, so a theme without `[scene]` renders
+// exactly as before.
+
+/// `[scene]` — the 3D scene lane. Every sub-table is `serde(default)` so a
+/// partial `[scene]` section overrides only what it names.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SceneData {
+    pub hues: SceneHuesData,
+    pub tiers: SceneTiersData,
+    pub gains: SceneGainsData,
+    pub post: ScenePostData,
+}
+
+/// `[scene.hues]` — identity hues, hex sRGB. Brightness lives in the tiers;
+/// a hue's brightest channel should sit near full so tier math means what it
+/// says. (`wire` was stored pre-multiplied at 1.4 before this system; it is
+/// now normalized here with the 1.4 in `gains.wire`.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SceneHuesData {
+    /// Room clear color (the octagon's void).
+    pub bg: String,
+    /// The room's one metal: trim, console rings, etch, well core.
+    pub gold: String,
+    /// Hardware: sockets, pegs, jacks.
+    pub brass: String,
+    /// Information-violet: radiator glass backdrop.
+    pub violet_glass: String,
+    /// Information-violet: thread/content strips.
+    pub violet_thread: String,
+    /// The well's electric indigo-violet (ring deck + track rays).
+    pub neon: String,
+    /// Terrace glyph rings: a paler tint of `neon`.
+    pub terrace: String,
+    /// Patch-bay chord wire (normalized; HDR gain in `gains.wire`).
+    pub wire: String,
+    /// Circuit-board floor trace fabrics, one hue family per fabric.
+    pub trace_crimson: String,
+    pub trace_cyan: String,
+    pub trace_green: String,
+    pub trace_gold: String,
+    /// Structural near-blacks (silhouette tiers, not brightness).
+    pub table: String,
+    pub wall_base: String,
+    pub wall_mullion: String,
+    pub dark_surface: String,
+}
+
+impl Default for SceneHuesData {
+    fn default() -> Self {
+        // Hex = exact sRGB encoding of the linear constants the scene modules
+        // shipped with (≤1/255 per-channel rounding).
+        Self {
+            bg: "#05070b".into(),
+            gold: "#ffe59e".into(),
+            brass: "#ddc489".into(),
+            violet_glass: "#55386c".into(),
+            violet_thread: "#c476e1".into(),
+            neon: "#ad95f3".into(),
+            terrace: "#c4b3f9".into(),
+            wire: "#ff5f73".into(),
+            trace_crimson: "#86424b".into(),
+            trace_cyan: "#3f737e".into(),
+            trace_green: "#598b6c".into(),
+            trace_gold: "#958159".into(),
+            table: "#32353f".into(),
+            wall_base: "#464556".into(),
+            wall_mullion: "#383844".into(),
+            dark_surface: "#1d1e26".into(),
+        }
+    }
+}
+
+/// `[scene.tiers]` — the brightness ladder (multiply an identity hue).
+/// LDR structure tiers + the decoration-glow band. Invariant the app tests:
+/// every trough × `crest` < 1.0 (decoration never sustains HDR).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SceneTiersData {
+    /// Engraved detail: guide rings, ticks.
+    pub etch: f32,
+    /// Station markers at rest.
+    pub marker: f32,
+    /// Gold architectural trim (table rims, pylon caps).
+    pub trim: f32,
+    /// Brass hardware.
+    pub hardware: f32,
+    /// Ceiling for ANY decoration crest (>1.0 = soft bloom halo).
+    pub crest: f32,
+    /// Floor traces at rest.
+    pub trough_wiring: f32,
+    /// Wall trim breathing floor.
+    pub trough_wall_trim: f32,
+    /// Terminal pads breathing floor.
+    pub trough_pads: f32,
+    /// The calmest breathers (inscribed floor ring).
+    pub trough_subtle: f32,
+}
+
+impl Default for SceneTiersData {
+    fn default() -> Self {
+        Self {
+            etch: 0.28,
+            marker: 0.42,
+            trim: 0.50,
+            hardware: 0.55,
+            crest: 1.25,
+            trough_wiring: 0.55,
+            trough_wall_trim: 0.60,
+            trough_pads: 0.65,
+            trough_subtle: 0.75,
+        }
+    }
+}
+
+/// `[scene.gains]` — live-signal HDR gains. These are allowed to sustain
+/// >1.0 because they ARE the live-activity tell (docs/color.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SceneGainsData {
+    /// Patch-bay traffic packet peak.
+    pub pulse: f32,
+    /// Selected chord idle gain.
+    pub chord_selected: f32,
+    /// Chord wire resting HDR (hue is normalized in `hues.wire`).
+    pub wire: f32,
+    /// Tracker marker beat thump.
+    pub beat: f32,
+    /// Tracker marker active lift.
+    pub active: f32,
+    /// Station focus lift.
+    pub focus_lift: f32,
+    /// Well reading-card border gain.
+    pub reading_border: f32,
+    /// Well HUD border gain.
+    pub hud_border: f32,
+}
+
+impl Default for SceneGainsData {
+    fn default() -> Self {
+        Self {
+            pulse: 6.0,
+            chord_selected: 3.4,
+            wire: 1.4,
+            beat: 2.8,
+            active: 0.5,
+            focus_lift: 0.35,
+            reading_border: 1.6,
+            hud_border: 1.8,
+        }
+    }
+}
+
+/// `[scene.post]` — the shared HDR camera's post chain. Applied LIVE on theme
+/// change (unlike hues/tiers, which apply at spawn) — `kj config set` on the
+/// theme is a live color-management console. The bloom THRESHOLD is not here
+/// on purpose: 1.0 is the HDR-tell boundary, a contract rather than a style
+/// knob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScenePostData {
+    pub bloom_intensity: f32,
+    pub bloom_low_frequency_boost: f32,
+    /// One of: "tony_mc_mapface", "aces", "agx", "blender_filmic",
+    /// "reinhard", "reinhard_luminance", "somewhat_boring", "none".
+    pub tonemapper: String,
+}
+
+impl Default for ScenePostData {
+    fn default() -> Self {
+        Self {
+            bloom_intensity: 0.12,
+            bloom_low_frequency_boost: 0.25,
+            tonemapper: "tony_mc_mapface".into(),
         }
     }
 }
@@ -392,5 +585,57 @@ mod tests {
         assert_eq!(defaults.bg, deserialized.bg);
         assert_eq!(defaults.cursor_normal, deserialized.cursor_normal);
         assert_eq!(defaults.ansi.magenta, deserialized.ansi.magenta);
+        assert_eq!(defaults.scene.hues.gold, deserialized.scene.hues.gold);
+        assert_eq!(defaults.scene.tiers.crest, deserialized.scene.tiers.crest);
+        assert_eq!(defaults.scene.post.tonemapper, deserialized.scene.post.tonemapper);
+    }
+
+    #[test]
+    fn theme_without_scene_section_still_parses() {
+        // The live CRDT theme.toml predates `[scene]` — it MUST keep parsing,
+        // yielding the compiled scene defaults.
+        let stripped = DEFAULT_THEME_TOML
+            .split("[scene")
+            .next()
+            .unwrap()
+            .to_string();
+        let td: ThemeData = toml::from_str(&stripped)
+            .expect("a theme.toml without [scene] must deserialize");
+        assert_eq!(td.scene.hues.gold, SceneData::default().hues.gold);
+        assert_eq!(td.scene.post.bloom_intensity, 0.12);
+    }
+
+    #[test]
+    fn partial_scene_section_overrides_only_named_keys() {
+        let toml_src = format!(
+            "{}\n[scene.post]\nbloom_intensity = 0.3\n",
+            DEFAULT_THEME_TOML.split("[scene").next().unwrap()
+        );
+        let td: ThemeData = toml::from_str(&toml_src).unwrap();
+        assert_eq!(td.scene.post.bloom_intensity, 0.3, "named key overrides");
+        assert_eq!(
+            td.scene.post.tonemapper, "tony_mc_mapface",
+            "unnamed keys keep defaults"
+        );
+        assert_eq!(td.scene.tiers.crest, 1.25, "untouched tables keep defaults");
+    }
+
+    #[test]
+    fn decoration_troughs_never_sustain_hdr() {
+        // trough × crest < 1.0 — the trace-glow discipline, enforced at the
+        // data layer too (the app re-tests it on the parsed palette).
+        let t = SceneTiersData::default();
+        for (name, trough) in [
+            ("wiring", t.trough_wiring),
+            ("wall_trim", t.trough_wall_trim),
+            ("pads", t.trough_pads),
+            ("subtle", t.trough_subtle),
+        ] {
+            assert!(
+                trough * t.crest < 1.0,
+                "trough_{name} ({trough}) × crest ({}) must stay < 1.0",
+                t.crest
+            );
+        }
     }
 }
