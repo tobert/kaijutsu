@@ -621,7 +621,9 @@ pub(crate) fn spawn_well_furniture(
     // the funnel on the same tilted axis as the deck/cards. Each quad is sized
     // to ITS ring's radius, and the band is drawn centered on that radius so it
     // lands on the cards seated around the ring.
-    for (k, (radius, depth)) in super::card::terrace_ring_geometry().into_iter().enumerate() {
+    let ring_geometry = super::card::terrace_ring_geometry();
+    let ring_count = ring_geometry.len();
+    for (k, (radius, depth)) in ring_geometry.into_iter().enumerate() {
         let side = TERRACE_RING_QUAD_SCALE * radius;
         let ring_mesh = meshes.add(Rectangle::new(side, side));
         // The shader's radial coord is 0 at center → 1 at the quad edge (half
@@ -639,6 +641,9 @@ pub(crate) fn spawn_well_furniture(
             spin_dir,
             TERRACE_RING_COLOR,
             TERRACE_RING_ALPHA,
+            k,
+            ring_count,
+            Vec3::from(palette::GOLD_HUE),
         ));
         let ring_pos = tilt * Vec3::new(0.0, 0.0, depth);
         commands.spawn((

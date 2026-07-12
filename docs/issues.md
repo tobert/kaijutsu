@@ -348,25 +348,9 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   latch the dive keypress so one press can't be consumed twice. Decide
   first whether "Enter resumes where you were" is accidentally *good*
   (it skips a hop of the skim ladder) — Amy's call before hardening.
-- **Well: iterate on the terrace rings' dashed-arc glyph — soon** (Amy,
-  2026-07-11, right after the hexagram swap merged): the dashed inner arc
-  dial (`assets/shaders/terrace_ring.wgsl`, `N_DASH_ARC`/`DASH_DUTY`) is a
-  deliberate placeholder. Next pass: look for **cheap algorithms to do
-  something generative in that space — or geometrically consistent and
-  relatively simple (and consistent)**. "Consistent" is load-bearing:
-  deterministic per ring and stable across frames (seeded, not random-
-  flickery), same discipline as the floor traces' `hash01` determinism.
-  Constraints that survive any redesign: no straight chords / star
-  topology (the whole point of the swap), pure function of `(θ, r,
-  ring-index, globals.time)` in the shader — zero per-frame CPU — and the
-  existing alpha/mix budget (`dim_nonfocused_rings` animates the
-  material's alpha over whatever this draws). Candidate directions to
-  evaluate, all shader-cheap: hash-seeded per-ring dash patterns (each
-  band gets its own stable barcode, à la de Bruijn / LFSR graduations);
-  golden-angle / phyllotaxis tick spacing; low-order harmonic modulation
-  of the ring line (`r(θ) = r0 + ε·cos(kθ + spin)` — rosette/wave rings);
-  Truchet-style quarter-arc tiles along the annulus. Bring 2 concrete
-  looks to the decision, per the two-voices practice. one diagonal octagon
+- **Shell: message-wall MSDF ticker on a diagonal panel** (seeded
+  2026-07-10; this entry's header was restored 2026-07-12 after an edit
+  had glued its body onto a neighboring entry): one diagonal octagon
   panel renders MSDF text — messages flowing through (block/drift traffic
   as a scrolling violet ticker, newest line blooms). Design + buildability
   notes in shell.md "Ambient telemetry rules"; rides the existing MSDF
