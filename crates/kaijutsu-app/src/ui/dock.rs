@@ -727,7 +727,8 @@ pub fn handle_dock_click(
 ///
 /// When the user is in a text-editing surface (Compose/Dialog), shows the vim
 /// editing mode (NORMAL/INSERT/VISUAL). Otherwise shows the app-level mode.
-/// All labels are Rhai-scriptable via `mode_label_*` theme variables.
+/// All labels come from the `mode_label_*` fields of `theme.toml` (CRDT-owned,
+/// fetched over RPC from the kernel).
 pub fn update_mode(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,

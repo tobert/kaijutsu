@@ -162,7 +162,7 @@ fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::them
         }
     }
 
-    // Map CSS generic families to our bundled fonts (from Rhai theme).
+    // Map CSS generic families to our bundled fonts (from theme.toml).
     // Default fontdb maps these to system fonts (Times New Roman, Arial, Courier)
     // which we don't bundle.
     db.set_serif_family(&theme.font_serif);
