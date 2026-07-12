@@ -63,6 +63,17 @@
 //! callers with the same children in different array order get
 //! byte-identical output.
 //!
+//! Scope that claim honestly: the guarantee is **per compiled binary** —
+//! every instance of the same binary produces byte-identical fields — not
+//! "every client, on every platform, forever." `voronator`/`delaunator` use
+//! plain-`f64` orientation predicates (no Shewchuk-style adaptive exact
+//! arithmetic), so compiler FMA contraction or a different
+//! platform/compiler can flip a near-degenerate orientation test and yield
+//! a combinatorially different (still valid) diagram. If cross-binary
+//! bit-stability ever becomes load-bearing (e.g. clients independently
+//! recomputing the same field and diffing it), that's a predicate-hardening
+//! pass, not a tweak.
+//!
 //! # Fail-loud stance
 //!
 //! [`CellId::root`] and [`CellId::child`] return `Err(CellIdError)` rather
@@ -72,6 +83,12 @@
 //! clustering beyond the max), not a crash. This is still "fail loud, not
 //! silent" — `Result` forces the caller to look at it, unlike a wrapping or
 //! clamping fallback would.
+//!
+//! [`layout_field`], by contrast, **panics** on a degenerate rect or a
+//! Voronoi construction failure: those are always upstream programming
+//! errors in a pure function (bad rect math, NaN seeds), never runtime
+//! conditions a renderer should handle per-frame — see the comments at the
+//! panic sites.
 
 use std::fmt;
 
@@ -462,9 +479,31 @@ pub struct FsnCell {
     pub height: f32,
 }
 
+impl FsnCell {
+    /// Every polygon edge as a `(from, to)` pair, **including the closing
+    /// edge** (last vertex → first vertex). The polygon itself is stored
+    /// open (no repeated vertex), which makes "forgot the closing segment"
+    /// a one-character bug waiting for any line-list mesh builder — iterate
+    /// this instead of zipping `polygon.windows(2)` by hand. Yields exactly
+    /// `polygon.len()` edges; empty for a degenerate polygon with fewer
+    /// than 2 vertices (a 1-vertex "polygon" has no edge, not a
+    /// self-loop).
+    pub fn edges(&self) -> impl Iterator<Item = (Vec2, Vec2)> + '_ {
+        let n = self.polygon.len();
+        (0..if n < 2 { 0 } else { n }).map(move |i| (self.polygon[i], self.polygon[(i + 1) % n]))
+    }
+}
+
 /// The laid-out field for one directory's children. `cells` is always in
 /// name-sorted order — part of the determinism contract, not an
 /// implementation accident callers should re-sort away.
+///
+/// Voronoi adjacency (which cells share an edge) is computed internally by
+/// `voronator` during layout and then **discarded** — nothing in slice 0
+/// consumes it. TODO: a future renderer that wants shared-edge dedup (draw
+/// each basalt seam once, not twice) should export adjacency *here*, from
+/// the same diagram that produced the polygons, rather than recomputing it
+/// from polygon geometry after the fact.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FsnField {
     pub cells: Vec<FsnCell>,
@@ -486,15 +525,37 @@ pub const LLOYD_ITERATIONS: usize = 2;
 /// diagram). Children are always processed in name-sorted order, so the
 /// result does not depend on `children`'s input order.
 ///
-/// Degenerate cases never panic: 0 children → an empty field; 1 child → the
-/// whole rect as its cell (no Voronoi machinery needed — a single site's
-/// clipped cell *is* the rect); 2+ children (including collinear seeds) go
-/// through the normal path. `voronator` always succeeds in practice because
-/// it appends four helper points at the rect's extremes before
-/// triangulating, which keeps the point set non-degenerate even when every
-/// real seed is collinear; the `None` branch below is defense-in-depth for
-/// a zero-area `rect`, not a path this module's tests expect to hit.
+/// Degenerate **child counts** never panic: 0 children → an empty field; 1
+/// child → the whole rect as its cell (no Voronoi machinery needed — a
+/// single site's clipped cell *is* the rect); 2+ children (including
+/// collinear seeds) go through the normal path — `voronator` appends four
+/// helper points at the rect's extremes before triangulating, which keeps
+/// the point set non-degenerate even when every real seed is collinear.
+///
+/// A degenerate **rect** (zero/negative width or height, or NaN extents),
+/// by contrast, panics loudly at entry — see the assert below. An earlier
+/// draft fell back to handing every child the full rect when `voronator`
+/// returned `None`: overlapping polygons, a disjointness lie the renderer
+/// would draw as garbage. Silent fallbacks are a mistake; crashing beats
+/// corruption.
+///
+/// # Separation of concerns: no [`CellId`]s here
+///
+/// `layout_field` deliberately neither takes nor returns [`CellId`]s: cell
+/// *addressing* (where a directory's rect sits on the face — claim 2's
+/// path-is-prefix math) and field *layout* (how that directory's children
+/// partition the rect) are separate concerns joined only by the rect. A
+/// renderer that needs both resolves the address via [`path_to_cell`] +
+/// [`CellId::quad_rect`], then feeds the resulting rect here.
 pub fn layout_field(rect: Rect, children: &[ChildSpec]) -> FsnField {
+    // Fail loud, not fallback: a degenerate rect can only be an upstream
+    // programming error in a pure function like this — never a runtime
+    // condition the renderer should be handling per-frame.
+    assert!(
+        rect.width() > 0.0 && rect.height() > 0.0,
+        "layout_field requires a rect with strictly positive width and height, got {rect:?}"
+    );
+
     let mut sorted: Vec<&ChildSpec> = children.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -518,35 +579,33 @@ pub fn layout_field(rect: Rect, children: &[ChildSpec]) -> FsnField {
     let initial_points: Vec<(f64, f64)> = sorted.iter().map(|c| seed_point(rect, &c.name).into()).collect();
     let points = lloyd_relax(rect, &initial_points);
 
-    let cells = match build_voronoi(rect, &points) {
-        Some(diagram) => {
-            let diagram_cells = diagram.cells();
-            debug_assert_eq!(diagram_cells.len(), sorted.len(), "voronator cell count must match site count");
-            sorted
-                .iter()
-                .zip(points.iter())
-                .zip(diagram_cells.iter())
-                .map(|((c, p), poly)| FsnCell {
-                    name: c.name.clone(),
-                    kind: c.kind,
-                    seed: Vec2::from(*p),
-                    polygon: poly.points().iter().map(|pt| Vec2::new(pt.x, pt.y)).collect(),
-                    height: c.height,
-                })
-                .collect()
-        }
-        None => sorted
-            .iter()
-            .zip(points.iter())
-            .map(|(c, p)| FsnCell {
-                name: c.name.clone(),
-                kind: c.kind,
-                seed: Vec2::from(*p),
-                polygon: rect.corners_ccw(),
-                height: c.height,
-            })
-            .collect(),
-    };
+    // Panic over Result: this is a pure function whose failure here is
+    // always an upstream programming error (degenerate rect — caught by the
+    // entry assert — or NaN seed coordinates), never a runtime condition
+    // Lane C should handle per-frame. The rect assert above makes this
+    // effectively unreachable; if it fires anyway, something new is wrong
+    // and we want the name of the culprit, not a garbage field.
+    let diagram = build_voronoi(rect, &points).unwrap_or_else(|| {
+        panic!(
+            "voronator failed to build a Voronoi diagram of {} relaxed seeds in {rect:?} — \
+             likely cause: NaN/non-finite seed coordinates (a degenerate rect is caught at entry)",
+            points.len()
+        )
+    });
+    let diagram_cells = diagram.cells();
+    debug_assert_eq!(diagram_cells.len(), sorted.len(), "voronator cell count must match site count");
+    let cells = sorted
+        .iter()
+        .zip(points.iter())
+        .zip(diagram_cells.iter())
+        .map(|((c, p), poly)| FsnCell {
+            name: c.name.clone(),
+            kind: c.kind,
+            seed: Vec2::from(*p),
+            polygon: poly.points().iter().map(|pt| Vec2::new(pt.x, pt.y)).collect(),
+            height: c.height,
+        })
+        .collect();
 
     FsnField { cells }
 }
@@ -573,9 +632,22 @@ fn lloyd_relax(rect: Rect, initial_points: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// fact.
 fn lloyd_relax_trajectory(rect: Rect, initial_points: &[(f64, f64)]) -> Vec<Vec<(f64, f64)>> {
     let mut trajectory = vec![initial_points.to_vec()];
-    for _ in 0..LLOYD_ITERATIONS {
+    for iteration in 0..LLOYD_ITERATIONS {
         let mut points = trajectory.last().expect("trajectory is never empty").clone();
-        let Some(diagram) = build_voronoi(rect, &points) else { break };
+        // Same fail-loud rationale as layout_field's final build: an earlier
+        // draft silently `break`-ed here, which handed layout_field
+        // *unrelaxed* points and compounded into its (also silent, also
+        // deleted) full-rect fallback. A failure here is an upstream
+        // programming error (degenerate rect, NaN seeds), not a condition
+        // to relax around.
+        let diagram = build_voronoi(rect, &points).unwrap_or_else(|| {
+            panic!(
+                "voronator failed to build a Voronoi diagram of {} seeds in {rect:?} at Lloyd \
+                 iteration {iteration} — likely causes: degenerate rect (zero/negative extent) \
+                 or NaN/non-finite seed coordinates",
+                points.len()
+            )
+        });
         let cells = diagram.cells();
         debug_assert_eq!(cells.len(), points.len(), "voronator cell count must match site count");
         for (p, cell) in points.iter_mut().zip(cells.iter()) {
@@ -685,6 +757,49 @@ mod tests {
     fn parent_of_root_errs() {
         let r = CellId::root(0).unwrap();
         assert_eq!(r.parent(), Err(CellIdError::RootHasNoParent));
+    }
+
+    /// Full-depth round trip: descend to level 28 (the last valid level),
+    /// then walk parent() all the way back and land exactly on the root —
+    /// the path bits must be bit-perfect at the very bottom of the u64
+    /// budget, where an off-by-one shift would corrupt first.
+    #[test]
+    fn max_depth_descend_and_ascend_round_trips_to_root() {
+        let root = CellId::root(0).unwrap();
+        let mut cell = root;
+        // Vary the quadrant so every 2-bit slot carries a nonzero pattern
+        // somewhere (all-zeros would mask a failure to clear bits).
+        for i in 0..CELL_MAX_DEPTH {
+            cell = cell.child(i % 4).unwrap();
+        }
+        assert_eq!(cell.level(), CELL_MAX_DEPTH);
+        for _ in 0..CELL_MAX_DEPTH {
+            cell = cell.parent().unwrap();
+        }
+        assert_eq!(cell, root, "28 children then 28 parents must land exactly on the root");
+    }
+
+    /// Containment at the deepest level: a level-27 parent contains its
+    /// level-28 child, and two level-28 cousins sharing that parent do NOT
+    /// contain each other — the prefix mask must be exact even when the
+    /// diverging bits are the lowest 2 in the path field.
+    #[test]
+    fn contains_holds_at_the_level_28_boundary() {
+        let mut parent = CellId::root(0).unwrap();
+        for i in 0..(CELL_MAX_DEPTH - 1) {
+            parent = parent.child(i % 4).unwrap();
+        }
+        assert_eq!(parent.level(), CELL_MAX_DEPTH - 1);
+
+        let a = parent.child(0).unwrap();
+        let b = parent.child(3).unwrap();
+        assert_eq!(a.level(), CELL_MAX_DEPTH);
+
+        assert!(parent.contains(&a));
+        assert!(parent.contains(&b));
+        assert!(!a.contains(&parent), "a level-28 cell cannot contain its level-27 parent");
+        assert!(!a.contains(&b), "level-28 cousins diverging in the last 2 path bits must not contain each other");
+        assert!(!b.contains(&a));
     }
 
     #[test]
@@ -942,6 +1057,12 @@ mod tests {
         assert_eq!(field.cells.len(), 3, "near-collision seeds must not drop a cell");
         for cell in &field.cells {
             assert!(!cell.polygon.is_empty(), "{} got an empty polygon", cell.name);
+            assert!(
+                polygon_area(&cell.polygon) > 0.0,
+                "{} got a zero-area polygon from near-colliding seeds: {:?}",
+                cell.name,
+                cell.polygon
+            );
         }
     }
 
@@ -951,6 +1072,55 @@ mod tests {
     fn zero_children_yields_empty_field() {
         let field = layout_field(Rect::unit(), &[]);
         assert!(field.cells.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "strictly positive width and height")]
+    fn degenerate_rect_panics_loudly() {
+        // Zero width: the old silent fallback would have produced
+        // overlapping full-rect polygons; now it must refuse at entry.
+        let rect = Rect { x0: 1.0, y0: 0.0, x1: 1.0, y1: 1.0 };
+        layout_field(rect, &[ChildSpec { name: "a".into(), kind: NodeKind::File, height: 1.0 }]);
+    }
+
+    // ── FsnCell::edges ───────────────────────────────────────────────────────
+
+    #[test]
+    fn edges_includes_the_closing_edge() {
+        let rect = Rect::unit();
+        let children: Vec<ChildSpec> = (0..7)
+            .map(|i| ChildSpec { name: format!("e{i}"), kind: NodeKind::File, height: 1.0 })
+            .collect();
+        let field = layout_field(rect, &children);
+        for cell in &field.cells {
+            let edges: Vec<(Vec2, Vec2)> = cell.edges().collect();
+            assert_eq!(
+                edges.len(),
+                cell.polygon.len(),
+                "{}: edge count must equal vertex count (closed loop over an open polygon)",
+                cell.name
+            );
+            let last = edges.last().unwrap();
+            assert_eq!(last.0, *cell.polygon.last().unwrap());
+            assert_eq!(last.1, cell.polygon[0], "{}: the final edge must close last→first", cell.name);
+            // Consecutive edges chain: each edge starts where the previous ended.
+            for w in edges.windows(2) {
+                assert_eq!(w[0].1, w[1].0, "{}: edges must chain tip-to-tail", cell.name);
+            }
+        }
+    }
+
+    #[test]
+    fn edges_of_degenerate_polygons_are_empty() {
+        let mk = |polygon: Vec<Vec2>| FsnCell {
+            name: "d".into(),
+            kind: NodeKind::File,
+            seed: Vec2::new(0.0, 0.0),
+            polygon,
+            height: 0.0,
+        };
+        assert_eq!(mk(vec![]).edges().count(), 0);
+        assert_eq!(mk(vec![Vec2::new(0.5, 0.5)]).edges().count(), 0, "a single vertex has no self-loop edge");
     }
 
     #[test]
@@ -1260,7 +1430,10 @@ mod tests {
         // which (as a real CVT relaxation) shifts nearly *every* site, not
         // just those near one insertion — not to claim "2 hops = a tiny
         // sliver" for a small field. See check 3 below for the precise,
-        // non-heuristic locality proof.
+        // non-heuristic locality proof. The 32-of-40 bound is calibrated
+        // for LLOYD_ITERATIONS = 2: if that constant changes, this bound
+        // must be recalibrated — a correct k bump legitimately grows the
+        // moved set and would break this assert without any bug existing.
         assert!(
             moved_anytime.len() <= 32,
             "blast radius touched {} of 40 original seeds — looks like unbounded ripple, not k-fixed relaxation: {:?}",
