@@ -24,11 +24,6 @@ use bevy::prelude::*;
 use kaijutsu_types::theme::SceneData;
 
 /// The scene lane's colors, tiers, gains, and post chain. See module docs.
-// TEMPORARY allow: hue/tier/gain fields are consumed as the scene modules
-// migrate onto this resource (feat/scene-palette-migration lane). The lane
-// removes this annotation with its last migration — if you're reading this
-// after that lane merged, it's a bug.
-#[allow(dead_code)]
 #[derive(Resource, Debug, Clone)]
 pub struct ScenePalette {
     // ── Identity hues (linear) ──
@@ -232,6 +227,20 @@ pub fn tonemapper_by_name(name: &str) -> Option<Tonemapping> {
         "none" => Tonemapping::None,
         _ => return None,
     })
+}
+
+/// An unlit-material [`Color`] from a linear hue (values may exceed 1.0 —
+/// the scene lane's HDR-capable constructor). Shared by every scene module
+/// that reads [`ScenePalette`] hues (previously duplicated per-module
+/// `lin`/`lin_scaled` helpers in `room/mod.rs` and `patch_bay/mod.rs`).
+pub(crate) fn lin(c: LinearRgba) -> Color {
+    Color::LinearRgba(c)
+}
+
+/// [`lin`] scaled by a brightness tier or gain — the palette's hue × tier
+/// convention (docs/color.md's tier ladder).
+pub(crate) fn lin_scaled(c: LinearRgba, k: f32) -> Color {
+    Color::LinearRgba(LinearRgba::rgb(c.red * k, c.green * k, c.blue * k))
 }
 
 /// Hot-apply `[scene.post]` to the shared camera whenever the palette
