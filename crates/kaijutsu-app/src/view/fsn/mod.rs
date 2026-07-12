@@ -41,11 +41,23 @@ impl Plugin for FsnPlugin {
             .init_resource::<scene::FsnSelection>()
             .add_systems(OnEnter(Screen::Fsn), scene::enter_fsn)
             .add_systems(OnExit(Screen::Fsn), scene::exit_fsn)
+            // UNGATED, unlike everything below: a vfs_snapshot reply must
+            // settle `FsnState`'s in-flight slot even when the player Esc'd
+            // out of the world before it landed. Bevy messages expire after
+            // two frames — a screen-gated reader would silently drop that
+            // reply, leaving `in_flight` set forever and wedging the fetch
+            // queue on the next dive. Same "opens warm" reasoning as
+            // `live::ingest_live_events` in the well; ingesting a reply on
+            // another screen is free (it only writes the cache).
+            .add_systems(Update, sync::apply_fsn_snapshot)
             .add_systems(
                 Update,
                 (
-                    sync::poll_fsn_snapshot,
-                    sync::apply_fsn_snapshot,
+                    // After `apply_fsn_snapshot` so a reply landing this
+                    // frame frees the in-flight slot before the poll decides
+                    // whether it may fire — the next queued fetch goes out
+                    // the same frame its predecessor settled.
+                    sync::poll_fsn_snapshot.after(sync::apply_fsn_snapshot),
                     scene::sync_fsn_fields,
                     scene::fsn_camera_fly,
                     scene::fsn_select,

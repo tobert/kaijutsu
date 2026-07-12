@@ -202,7 +202,15 @@ pub fn poll_fsn_snapshot(
 
 /// Drain `vfs_snapshot` replies: a success ingests into
 /// [`FsnState::listings`]; BOTH success and failure clear the in-flight
-/// debounce ([`FsnState::settle_in_flight`]) so the next queued path can
+/// debounce ([`FsnState::settle_in_flight`]).
+///
+/// **UNGATED** — registered outside the `Screen::Fsn` tuple (see
+/// `FsnPlugin`): a reply can land after the player Esc'd out of the world,
+/// and Bevy messages expire after two frames, so a screen-gated reader would
+/// drop that reply and leave the in-flight slot wedged for the next dive.
+/// Ingesting on another screen is free (this only writes the cache).
+///
+/// BOTH arms settle so the next queued path can
 /// fire — [`poll_fsn_snapshot`]'s `Err` arm ships `VfsSnapshotFailed` for
 /// exactly this, otherwise the first failed fetch would wedge the queue
 /// forever. A failure is NOT auto-requeued (a permanently-failing path
