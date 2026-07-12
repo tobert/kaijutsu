@@ -296,9 +296,7 @@ fn apply_theme_from_rpc(
 ) {
     for result in results.read() {
         if let RpcResultMessage::ThemeReceived(toml) = result {
-            match toml::from_str::<kaijutsu_types::theme::ThemeData>(toml)
-                .map_err(|e| format!("TOML parse error: {e}"))
-            {
+            match crate::ui::theme_loader::parse_theme_data(toml) {
                 Ok(data) => {
                     *scene_palette =
                         crate::view::scene_palette::ScenePalette::from_scene_data(&data.scene);

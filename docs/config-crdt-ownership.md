@@ -263,6 +263,15 @@ Slice-1 reconnaissance found config consumers are **heterogeneous** — they do
 (One rule for all config; loses the vim-the-toml affordance, parallel to retiring
 vim-the-rc-file.)
 
+**2026-07-12 addendum — theme.toml grew a `[scene]` table** (docs/color.md):
+the one theme file now carries BOTH color lanes — the flat keys + `[ansi]`
+feed the UI `Theme`, `[scene.hues/tiers/gains/post]` feed the 3D
+`ScenePalette`. Same ownership mechanics as before (CRDT-owned, seeded once,
+fetched over RPC on connect); `[scene.post]` additionally hot-applies to the
+camera when a theme lands. The "live hot-reload-on-edit" follow-up above is
+still open — a `kj config set` mid-session is NOT pushed to connected apps;
+they pick it up on the next connect.
+
 ---
 
 ## Per-client config — the `/etc/client/` namespace (design direction, 2026-07-05)

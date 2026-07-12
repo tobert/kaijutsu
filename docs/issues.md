@@ -355,30 +355,31 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   as a scrolling violet ticker, newest line blooms). Design + buildability
   notes in shell.md "Ambient telemetry rules"; rides the existing MSDF
   panel pipeline + event stream. Good next wave after trace-glow ships.
-- **Shell: color-management pass — synthwave is the vibe target** (Amy,
-  2026-07-12, looking at the terrace glyph mix: "it's muted like the rest
-  of the octagon… the time well has some nice use of HDR and brightness…
-  maybe we need to do a pass of color management next", then "the goal for
-  the vibe overall is more synthwave than anything"): the octagon reads
-  muted next to the well's HDR-forward dived interior, and the reason is
-  structural — `view/palette.rs` governs HUES + the glow-discipline caps
-  (`GLOW_CREST` 1.25, trough×crest < 1.0, LDR tiers like `GOLD_LDR_ETCH`),
-  but BRIGHTNESS is scattered: every shader carries its own emissive gain
-  (`terrace_ring.wgsl` HDR_SCALE 3.0 + GEM_GAIN, `well_rings.wgsl` energy
-  math ×3.0/×2.2, chord GAIN, per-site LDR consts in room/patch-bay), and
-  the camera's bloom threshold + tonemapper were never chosen as a set.
-  Pass shape: (1) palette.rs grows named brightness/HDR tiers (etch /
-  resting / crest / live-HDR) and every emissive multiplier moves onto
-  them; (2) bloom + tonemapping reviewed together against the synthwave
-  target (Bevy's default TonyMcMapface desaturates brights — audit whether
-  it's eating the neon); (3) the trace-glow "decoration stays faint"
-  amendment gets renegotiated DELIBERATELY — synthwave punch vs
-  sustained-HDR-means-live-activity is a real tension, decide the budget,
-  don't drift it; (4) reference frames: the well dived (keeper) vs the
-  octagon at room scale (too muted). Vibe goal recorded in shell.md
-  "Geometry and bearings". Quick partial relief already applied
-  2026-07-12: TERRACE_RING_ALPHA 0.35→0.55.
-  the aurora placeholder is PAUSED. shell.md's "air carries drift" stands,
+- **Theme: push config changes to connected apps** (found during the color
+  pass, 2026-07-12): the app fetches theme.toml only at connect-time
+  bootstrap — a `kj config set` mid-session applies to nobody until the
+  next reconnect/restart. The `[scene.post]` hot-apply plumbing is already
+  in place app-side (`apply_scene_post_on_change` fires on any ScenePalette
+  write), so the missing piece is kernel→client: a config-changed
+  notification that re-triggers the theme fetch. Matches the still-open
+  "live hot-reload-on-edit" note in config-crdt-ownership.md.
+- **kj config show needs a --raw flag** (2026-07-12): `show` decorates
+  output with a path/length header + toml code fences — piping it into a
+  backup file and later `kj config set`-ing that file stores the decoration
+  as content (the color pass did exactly this; the app's loud
+  parse-failure caught it). A `--raw` mode kills the round-trip footgun.
+- **Theme: tokenize the remaining compiled-only color families**
+  (2026-07-12, follow-up to the color pass): `block_*` conversation text
+  colors, `syntax` highlighting, `md_*` markdown, `sparkline_*`,
+  `output_*`, and `agent_color_*` exist only in
+  `ui/theme.rs::Theme::default` — theme.toml cannot express them, so
+  alternate skins (contrib/themes/tokyo-night.toml) can't restyle them.
+  Extend ThemeData + the From impl + theme.toml; keep the
+  MarkdownColors/SparklineColors mirror tests in step (they pin
+  Theme::default's md/sparkline values today).
+- **Shell: drift-layer representation — design question** (Amy,
+  2026-07-10): the aurora placeholder is PAUSED. shell.md's "air carries
+  drift" stands,
   but before building anything decide *what information* rides the air and
   whether the render is aurora arcs at all — Amy is weighing a point cloud
   with behavior responsive to kernel activity ("lots of cool options") over

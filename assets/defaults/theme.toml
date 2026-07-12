@@ -1,33 +1,35 @@
-# Kaijutsu Default Theme — Tokyo Night
+# Kaijutsu Default Theme — Synthwave
 #
+# The app-wide identity (docs/color.md): deep indigo-violet grounds, electric
+# violet + gold two-tone, neon accents. One identity, two lanes — these flat
+# keys + [ansi] are the sRGB UI lane; [scene.*] is the linear-HDR scene lane.
 # Colors are hex strings: "#rrggbb" or "#rrggbbaa" (with alpha).
-# Edit this file to customize colors, fonts, and effects.
 
 # Base UI
-bg = "#1a1b26"
-panel_bg = "#1a1b26f2"
-fg = "#c0caf5"
-fg_dim = "#565f89"
-accent = "#7aa2f7"
-accent2 = "#9ece6a"
-border = "#3b4261"
-selection_bg = "#7aa2f74d"
+bg = "#131020"
+panel_bg = "#131020f2"
+fg = "#d8d2ee"
+fg_dim = "#6f6592"
+accent = "#a487ff"
+accent2 = "#ffcf7d"
+border = "#3d3260"
+selection_bg = "#a487ff4d"
 
 # Row type colors (conversation left borders)
-row_tool = "#bb9af7"
-row_result = "#e0af68"
+row_tool = "#d18bff"
+row_result = "#e8b45e"
 
 # Semantic colors
-error = "#f7768e"
-warning = "#e0af68"
-success = "#9ece6a"
+error = "#ff5c8a"
+warning = "#ffb45e"
+success = "#4ce0b3"
 
 # Mode colors (vim-style indicator text)
-mode_normal = "#7aa2f7"
-mode_insert = "#9ece6a"
-mode_chat = "#9ece6a"
-mode_shell = "#e0af68"
-mode_visual = "#bb9af7"
+mode_normal = "#a487ff"
+mode_insert = "#4ce0b3"
+mode_chat = "#4ce0b3"
+mode_shell = "#e8b45e"
+mode_visual = "#ff7ad9"
 
 # Mode labels (dock HUD text)
 mode_label_normal = "NORMAL"
@@ -39,10 +41,10 @@ mode_label_stack = "STACK"
 mode_label_input = "INPUT"
 
 # Cursor colors [r, g, b, a]
-cursor_normal = [0.478, 0.635, 0.969, 0.8]
-cursor_insert = [0.620, 0.808, 0.416, 0.9]
-cursor_visual = [0.733, 0.604, 0.969, 0.7]
-cursor_replace = [1.000, 0.620, 0.392, 0.85]
+cursor_normal = [0.643, 0.529, 1.000, 0.8]
+cursor_insert = [0.298, 0.878, 0.702, 0.9]
+cursor_visual = [1.000, 0.478, 0.851, 0.7]
+cursor_replace = [1.000, 0.700, 0.360, 0.85]
 
 # Frame structure
 frame_corner_size = 16.0
@@ -50,12 +52,12 @@ frame_edge_thickness = 2.0
 frame_content_padding = 12.0
 
 # Frame colors
-frame_base = "#1a1b26f2"
-frame_focused = "#7aa2f726"
-frame_insert = "#9ece6a1f"
-frame_visual = "#bb9af71f"
-frame_unfocused = "#1a1b26cc"
-frame_edge = "#3b426199"
+frame_base = "#131020f2"
+frame_focused = "#a487ff26"
+frame_insert = "#4ce0b31f"
+frame_visual = "#ff7ad91f"
+frame_unfocused = "#131020cc"
+frame_edge = "#3d326099"
 
 # Frame shader params [intensity, _, _, _]
 frame_params_base = [0.0, 0.0, 0.0, 0.0]
@@ -90,7 +92,7 @@ effect_chase_color_cycle = 0.0
 input_minimized_height = 48.0
 input_docked_height = 200.0
 input_overlay_width_pct = 0.6
-input_backdrop_color = "#1a1b26d9"
+input_backdrop_color = "#131020d9"
 
 # Font configuration
 font_rainbow = true
@@ -111,23 +113,23 @@ constellation_base_radius = 500.0
 constellation_ring_spacing = 550.0
 
 # Block borders
-block_border_tool_call = "#ffaa0099"
-block_border_tool_result = "#00ff8866"
-block_border_error = "#ff2060cc"
-block_border_thinking = "#6080a04d"
-block_border_drift = "#00aaff80"
+block_border_tool_call = "#e8b45e99"
+block_border_tool_result = "#4ce0b366"
+block_border_error = "#ff2d6ecc"
+block_border_thinking = "#7a6aa04d"
+block_border_drift = "#c476e180"
 block_border_thickness = 1.5
 block_border_corner_radius = 4.0
 block_border_glow_radius = 6.0
 block_border_glow_intensity = 0.25
 text_glow_radius = 2.5
-text_glow_color = "#bfd1f259"
+text_glow_color = "#cbb8ff59"
 block_border_padding = 0.6
 block_spacing = 12.0
 
 # Compose block (input area)
-compose_border = "#3b4261"
-compose_bg = "#1a1b26"
+compose_border = "#3d3260"
+compose_bg = "#131020"
 
 # Modal overlays
 modal_backdrop = "#00000099"
@@ -148,22 +150,22 @@ label_pad = 6.0
 
 # ANSI terminal colors
 [ansi]
-black = "#15161e"
-red = "#f7768e"
-green = "#9ece6a"
-yellow = "#e0af68"
-blue = "#7aa2f7"
-magenta = "#bb9af7"
-cyan = "#7dcfff"
-white = "#a9b1d6"
-bright_black = "#414868"
-bright_red = "#f7768e"
-bright_green = "#9ece6a"
-bright_yellow = "#e0af68"
-bright_blue = "#7aa2f7"
-bright_magenta = "#bb9af7"
-bright_cyan = "#7dcfff"
-bright_white = "#c0caf5"
+black = "#16121f"
+red = "#ff5c8a"
+green = "#4ce0b3"
+yellow = "#ffcf7d"
+blue = "#a487ff"
+magenta = "#ff7ad9"
+cyan = "#7de0ff"
+white = "#cdc6e6"
+bright_black = "#453a66"
+bright_red = "#ff7aa2"
+bright_green = "#6bf0c9"
+bright_yellow = "#ffe0a1"
+bright_blue = "#bda4ff"
+bright_magenta = "#ff9ae4"
+bright_cyan = "#a5ecff"
+bright_white = "#ece7fa"
 
 # ─── The 3D scene lane (docs/color.md) ─────────────────────────────────────
 # Identity hues as sRGB hex — the app linearizes them for the HDR pipeline.
@@ -212,8 +214,8 @@ reading_border = 1.6
 hud_border = 1.8
 
 [scene.post]
-bloom_intensity = 0.12
+bloom_intensity = 0.22
 bloom_low_frequency_boost = 0.25
 # one of: tony_mc_mapface | aces | agx | blender_filmic | reinhard |
 #         reinhard_luminance | somewhat_boring | none
-tonemapper = "tony_mc_mapface"
+tonemapper = "aces"

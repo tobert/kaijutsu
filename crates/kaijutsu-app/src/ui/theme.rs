@@ -406,48 +406,50 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Base UI — Tokyo Night palette
-            bg: Color::srgb(0.102, 0.106, 0.149), // #1a1b26
-            panel_bg: Color::srgba(0.102, 0.106, 0.149, 0.95), // #1a1b26 semi-transparent
-            fg: Color::srgb(0.753, 0.792, 0.961), // #c0caf5
-            fg_dim: Color::srgb(0.337, 0.373, 0.537), // #565f89
-            accent: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7
-            accent2: Color::srgb(0.620, 0.808, 0.416), // #9ece6a
-            border: Color::srgb(0.231, 0.259, 0.380), // #3b4261
-            selection_bg: Color::srgba(0.478, 0.635, 0.969, 0.30), // #7aa2f7 selection
+            // Base UI — Synthwave palette (docs/color.md; the compiled
+            // fallback mirrors the shipped theme.toml so there's no skin
+            // flash between boot and the theme RPC)
+            bg: Color::srgb(0.075, 0.063, 0.125), // #131020
+            panel_bg: Color::srgba(0.075, 0.063, 0.125, 0.95), // #131020 semi-transparent
+            fg: Color::srgb(0.847, 0.824, 0.933), // #d8d2ee
+            fg_dim: Color::srgb(0.435, 0.396, 0.573), // #6f6592
+            accent: Color::srgb(0.643, 0.529, 1.000), // #a487ff
+            accent2: Color::srgb(1.000, 0.812, 0.490), // #ffcf7d
+            border: Color::srgb(0.239, 0.196, 0.376), // #3d3260
+            selection_bg: Color::srgba(0.643, 0.529, 1.000, 0.30), // #a487ff selection
 
             // Row type colors
-            row_tool: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
-            row_result: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
+            row_tool: Color::srgb(0.820, 0.545, 1.000), // #d18bff violet
+            row_result: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
 
             // Block text colors
-            block_user: Color::srgb(0.753, 0.792, 0.961), // #c0caf5 main fg
-            block_assistant: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
-            block_thinking: Color::srgb(0.337, 0.373, 0.537), // #565f89 dim
-            block_tool_call: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
-            block_tool_result: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
-            block_tool_error: Color::srgb(0.969, 0.463, 0.557), // #f7768e red
-            block_error_warning: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
-            block_error_severity: Color::srgb(0.969, 0.463, 0.557), // #f7768e red (same as block_tool_error)
+            block_user: Color::srgb(0.847, 0.824, 0.933), // #d8d2ee main fg
+            block_assistant: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
+            block_thinking: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
+            block_tool_call: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
+            block_tool_result: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3 teal
+            block_tool_error: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a hot red
+            block_error_warning: Color::srgb(1.000, 0.706, 0.369), // #ffb45e amber
+            block_error_severity: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a (same as block_tool_error)
             block_error_fatal: Color::srgb(0.769, 0.118, 0.227), // #c41e3a dark red
-            block_error_accent: Color::srgba(0.969, 0.463, 0.557, 0.5), // #f7768e red, half alpha
-            block_drift_push: Color::srgb(0.490, 0.812, 1.00), // #7dcfff cyan
-            block_drift_pull: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
-            block_drift_merge: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
-            block_notification: Color::srgb(0.490, 0.694, 0.753), // #7db1c0 muted cyan
+            block_error_accent: Color::srgba(1.000, 0.361, 0.541, 0.5), // #ff5c8a, half alpha
+            block_drift_push: Color::srgb(0.490, 0.878, 1.000), // #7de0ff cyan
+            block_drift_pull: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
+            block_drift_merge: Color::srgb(1.000, 0.478, 0.851), // #ff7ad9 magenta
+            block_notification: Color::srgb(0.478, 0.761, 0.812), // #7ac2cf muted cyan
             block_resource: Color::srgb(0.447, 0.757, 0.667), // #72c1aa muted teal
 
             // Semantic
-            error: Color::srgb(0.969, 0.463, 0.557), // #f7768e
-            warning: Color::srgb(0.878, 0.686, 0.404), // #e0af68
-            success: Color::srgb(0.620, 0.808, 0.416), // #9ece6a
+            error: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a
+            warning: Color::srgb(1.000, 0.706, 0.369), // #ffb45e
+            success: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3
 
             // Mode colors (vim-style)
-            mode_normal: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
-            mode_insert: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
-            mode_chat: Color::srgb(0.620, 0.808, 0.416),   // #9ece6a green
-            mode_shell: Color::srgb(0.878, 0.686, 0.404),  // #e0af68 amber
-            mode_visual: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
+            mode_normal: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
+            mode_insert: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3 teal
+            mode_chat: Color::srgb(0.298, 0.878, 0.702),   // #4ce0b3 teal
+            mode_shell: Color::srgb(0.910, 0.706, 0.369),  // #e8b45e gold
+            mode_visual: Color::srgb(1.000, 0.478, 0.851), // #ff7ad9 magenta
 
             // Mode labels (dock HUD, overridable via theme.toml)
             mode_label_normal: "NORMAL".into(),
@@ -459,45 +461,45 @@ impl Default for Theme {
             mode_label_input: "INPUT".into(),
 
             // Cursor colors
-            cursor_normal: Vec4::new(0.478, 0.635, 0.969, 0.8), // #7aa2f7 blue
-            cursor_insert: Vec4::new(0.620, 0.808, 0.416, 0.9), // #9ece6a green
-            cursor_visual: Vec4::new(0.733, 0.604, 0.969, 0.7), // #bb9af7 purple
-            cursor_replace: Vec4::new(1.000, 0.620, 0.392, 0.85), // #ff9e64 orange
+            cursor_normal: Vec4::new(0.643, 0.529, 1.000, 0.8), // #a487ff violet
+            cursor_insert: Vec4::new(0.298, 0.878, 0.702, 0.9), // #4ce0b3 teal
+            cursor_visual: Vec4::new(1.000, 0.478, 0.851, 0.7), // #ff7ad9 magenta
+            cursor_replace: Vec4::new(1.000, 0.700, 0.360, 0.85), // warm gold
 
-            // ANSI palette — Tokyo Night
+            // ANSI palette — Synthwave
             ansi: AnsiColors {
-                black: Color::srgb(0.082, 0.086, 0.118),          // #15161e
-                red: Color::srgb(0.969, 0.463, 0.557),            // #f7768e
-                green: Color::srgb(0.620, 0.808, 0.416),          // #9ece6a
-                yellow: Color::srgb(0.878, 0.686, 0.404),         // #e0af68
-                blue: Color::srgb(0.478, 0.635, 0.969),           // #7aa2f7
-                magenta: Color::srgb(0.733, 0.604, 0.969),        // #bb9af7
-                cyan: Color::srgb(0.490, 0.812, 1.00),            // #7dcfff
-                white: Color::srgb(0.663, 0.694, 0.839),          // #a9b1d6
-                bright_black: Color::srgb(0.255, 0.282, 0.408),   // #414868
-                bright_red: Color::srgb(0.969, 0.463, 0.557),     // #f7768e
-                bright_green: Color::srgb(0.620, 0.808, 0.416),   // #9ece6a
-                bright_yellow: Color::srgb(0.878, 0.686, 0.404),  // #e0af68
-                bright_blue: Color::srgb(0.478, 0.635, 0.969),    // #7aa2f7
-                bright_magenta: Color::srgb(0.733, 0.604, 0.969), // #bb9af7
-                bright_cyan: Color::srgb(0.490, 0.812, 1.00),     // #7dcfff
-                bright_white: Color::srgb(0.753, 0.792, 0.961),   // #c0caf5
+                black: Color::srgb(0.086, 0.071, 0.122),          // #16121f
+                red: Color::srgb(1.000, 0.361, 0.541),            // #ff5c8a
+                green: Color::srgb(0.298, 0.878, 0.702),          // #4ce0b3
+                yellow: Color::srgb(1.000, 0.812, 0.490),         // #ffcf7d
+                blue: Color::srgb(0.643, 0.529, 1.000),           // #a487ff
+                magenta: Color::srgb(1.000, 0.478, 0.851),        // #ff7ad9
+                cyan: Color::srgb(0.490, 0.878, 1.000),           // #7de0ff
+                white: Color::srgb(0.804, 0.776, 0.902),          // #cdc6e6
+                bright_black: Color::srgb(0.271, 0.227, 0.400),   // #453a66
+                bright_red: Color::srgb(1.000, 0.478, 0.635),     // #ff7aa2
+                bright_green: Color::srgb(0.420, 0.941, 0.788),   // #6bf0c9
+                bright_yellow: Color::srgb(1.000, 0.878, 0.631),  // #ffe0a1
+                bright_blue: Color::srgb(0.741, 0.643, 1.000),    // #bda4ff
+                bright_magenta: Color::srgb(1.000, 0.604, 0.894), // #ff9ae4
+                bright_cyan: Color::srgb(0.647, 0.925, 1.000),    // #a5ecff
+                bright_white: Color::srgb(0.925, 0.906, 0.980),   // #ece7fa
             },
 
             // Syntax highlighting — derived from ANSI palette
             syntax: SyntaxColors {
-                keyword: Color::srgb(0.733, 0.604, 0.969),     // magenta
-                string: Color::srgb(0.620, 0.808, 0.416),      // green
-                number: Color::srgb(0.878, 0.686, 0.404),      // yellow
-                operator: Color::srgb(0.490, 0.812, 1.00),     // cyan
-                variable: Color::srgb(0.878, 0.686, 0.404),    // bright_yellow
-                flag: Color::srgb(0.478, 0.635, 0.969),        // bright_blue
-                comment: Color::srgb(0.255, 0.282, 0.408),     // bright_black
-                command: Color::srgb(0.478, 0.635, 0.969),     // blue
-                path: Color::srgb(0.490, 0.812, 1.00),         // cyan
-                punctuation: Color::srgb(0.753, 0.792, 0.961), // fg
-                error: Color::srgb(0.969, 0.463, 0.557),       // red
-                prefix: Color::srgb(0.255, 0.282, 0.408),      // bright_black
+                keyword: Color::srgb(1.000, 0.478, 0.851),     // magenta
+                string: Color::srgb(0.298, 0.878, 0.702),      // green
+                number: Color::srgb(1.000, 0.812, 0.490),      // yellow
+                operator: Color::srgb(0.490, 0.878, 1.000),    // cyan
+                variable: Color::srgb(1.000, 0.878, 0.631),    // bright_yellow
+                flag: Color::srgb(0.741, 0.643, 1.000),        // bright_blue
+                comment: Color::srgb(0.271, 0.227, 0.400),     // bright_black
+                command: Color::srgb(0.643, 0.529, 1.000),     // blue
+                path: Color::srgb(0.490, 0.878, 1.000),        // cyan
+                punctuation: Color::srgb(0.847, 0.824, 0.933), // fg
+                error: Color::srgb(1.000, 0.361, 0.541),       // red
+                prefix: Color::srgb(0.271, 0.227, 0.400),      // bright_black
             },
 
             // Frame configuration
@@ -506,12 +508,12 @@ impl Default for Theme {
             frame_content_padding: 12.0,
 
             // Frame colors
-            frame_base: Color::srgba(0.102, 0.106, 0.149, 0.95), // #1a1b26
-            frame_focused: Color::srgba(0.478, 0.635, 0.969, 0.15), // #7aa2f7
-            frame_insert: Color::srgba(0.620, 0.808, 0.416, 0.12), // #9ece6a
-            frame_visual: Color::srgba(0.733, 0.604, 0.969, 0.12), // #bb9af7
-            frame_unfocused: Color::srgba(0.102, 0.106, 0.149, 0.80), // #1a1b26
-            frame_edge: Color::srgba(0.231, 0.259, 0.380, 0.6),  // #3b4261
+            frame_base: Color::srgba(0.075, 0.063, 0.125, 0.95), // #131020
+            frame_focused: Color::srgba(0.643, 0.529, 1.000, 0.15), // #a487ff
+            frame_insert: Color::srgba(0.298, 0.878, 0.702, 0.12), // #4ce0b3
+            frame_visual: Color::srgba(1.000, 0.478, 0.851, 0.12), // #ff7ad9
+            frame_unfocused: Color::srgba(0.075, 0.063, 0.125, 0.80), // #131020
+            frame_edge: Color::srgba(0.239, 0.196, 0.376, 0.6),  // #3d3260
 
             // Frame shader params
             frame_params_base: Vec4::new(0.0, 0.0, 0.0, 0.0),
@@ -542,13 +544,13 @@ impl Default for Theme {
             input_minimized_height: 48.0,
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
-            input_backdrop_color: Color::srgba(0.102, 0.106, 0.149, 0.85),
+            input_backdrop_color: Color::srgba(0.075, 0.063, 0.125, 0.85),
 
             // OutputData rendering (structured tool results)
-            output_directory: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 soft blue
-            output_executable: Color::srgb(0.620, 0.808, 0.416), // #9ece6a soft green
-            output_symlink: Color::srgb(0.490, 0.812, 1.00),    // #7dcfff cyan
-            output_header: Color::srgb(0.337, 0.373, 0.537),    // #565f89 dim
+            output_directory: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
+            output_executable: Color::srgb(0.298, 0.878, 0.702), // #4ce0b3 teal
+            output_symlink: Color::srgb(0.490, 0.878, 1.000),   // #7de0ff cyan
+            output_header: Color::srgb(0.435, 0.396, 0.573),    // #6f6592 dim
 
             // Markdown rendering
             md_heading_color: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
@@ -591,26 +593,26 @@ impl Default for Theme {
             constellation_packing_factor: 1.8,   // More gap between nodes
 
             // Block borders
-            block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6), // #ffaa00 amber
-            block_border_tool_result: Color::srgba(0.00, 1.00, 0.53, 0.4), // #00ff88 green
-            block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),     // #ff2060 red
-            block_border_error_warning: Color::srgba(0.878, 0.686, 0.404, 0.7), // #e0af68 amber
+            block_border_tool_call: Color::srgba(0.910, 0.706, 0.369, 0.6), // #e8b45e gold
+            block_border_tool_result: Color::srgba(0.298, 0.878, 0.702, 0.4), // #4ce0b3 teal
+            block_border_error: Color::srgba(1.000, 0.176, 0.431, 0.8),  // #ff2d6e hot red
+            block_border_error_warning: Color::srgba(1.000, 0.706, 0.369, 0.7), // #ffb45e amber
             block_border_error_fatal: Color::srgba(0.769, 0.118, 0.227, 0.9),   // #c41e3a dark red
-            block_border_thinking: Color::srgba(0.38, 0.50, 0.63, 0.3),  // #6080a0 muted
-            block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),     // #00aaff blue
+            block_border_thinking: Color::srgba(0.478, 0.416, 0.627, 0.3), // #7a6aa0 muted violet
+            block_border_drift: Color::srgba(0.769, 0.463, 0.882, 0.5),  // #c476e1 violet-thread
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
             block_border_glow_radius: 10.0,
             block_border_glow_intensity: 0.5,
             text_glow_radius: 2.5,
-            text_glow_color: Color::srgba(0.75, 0.82, 0.95, 0.35),
+            text_glow_color: Color::srgba(0.796, 0.722, 1.000, 0.35), // #cbb8ff violet-white
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose block
-            compose_border: Color::srgb(0.231, 0.259, 0.380), // #3b4261 matches border
-            compose_bg: Color::srgb(0.102, 0.106, 0.149),     // #1a1b26 matches bg
-            compose_palette_border: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 accent blue
+            compose_border: Color::srgb(0.239, 0.196, 0.376), // #3d3260 matches border
+            compose_bg: Color::srgb(0.075, 0.063, 0.125),     // #131020 matches bg
+            compose_palette_border: Color::srgb(0.643, 0.529, 1.000), // #a487ff accent violet
             compose_palette_glow_radius: 10.0,
             compose_palette_glow_intensity: 0.6,
 

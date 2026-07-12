@@ -29,23 +29,24 @@ pub struct AnsiColorsData {
 
 impl Default for AnsiColorsData {
     fn default() -> Self {
+        // Synthwave terminal palette (docs/color.md).
         Self {
-            black: "#15161e".into(),
-            red: "#f7768e".into(),
-            green: "#9ece6a".into(),
-            yellow: "#e0af68".into(),
-            blue: "#7aa2f7".into(),
-            magenta: "#bb9af7".into(),
-            cyan: "#7dcfff".into(),
-            white: "#a9b1d6".into(),
-            bright_black: "#414868".into(),
-            bright_red: "#f7768e".into(),
-            bright_green: "#9ece6a".into(),
-            bright_yellow: "#e0af68".into(),
-            bright_blue: "#7aa2f7".into(),
-            bright_magenta: "#bb9af7".into(),
-            bright_cyan: "#7dcfff".into(),
-            bright_white: "#c0caf5".into(),
+            black: "#16121f".into(),
+            red: "#ff5c8a".into(),
+            green: "#4ce0b3".into(),
+            yellow: "#ffcf7d".into(),
+            blue: "#a487ff".into(),
+            magenta: "#ff7ad9".into(),
+            cyan: "#7de0ff".into(),
+            white: "#cdc6e6".into(),
+            bright_black: "#453a66".into(),
+            bright_red: "#ff7aa2".into(),
+            bright_green: "#6bf0c9".into(),
+            bright_yellow: "#ffe0a1".into(),
+            bright_blue: "#bda4ff".into(),
+            bright_magenta: "#ff9ae4".into(),
+            bright_cyan: "#a5ecff".into(),
+            bright_white: "#ece7fa".into(),
         }
     }
 }
@@ -219,31 +220,32 @@ pub struct ThemeData {
 impl Default for ThemeData {
     fn default() -> Self {
         Self {
-            // Base UI — Tokyo Night
-            bg: "#1a1b26".into(),
-            panel_bg: "#1a1b26f2".into(),
-            fg: "#c0caf5".into(),
-            fg_dim: "#565f89".into(),
-            accent: "#7aa2f7".into(),
-            accent2: "#9ece6a".into(),
-            border: "#3b4261".into(),
-            selection_bg: "#7aa2f74d".into(),
+            // Base UI — Synthwave (docs/color.md; Tokyo Night lives on in
+            // contrib/themes/tokyo-night.toml)
+            bg: "#131020".into(),
+            panel_bg: "#131020f2".into(),
+            fg: "#d8d2ee".into(),
+            fg_dim: "#6f6592".into(),
+            accent: "#a487ff".into(),
+            accent2: "#ffcf7d".into(),
+            border: "#3d3260".into(),
+            selection_bg: "#a487ff4d".into(),
 
             // Row type colors
-            row_tool: "#bb9af7".into(),
-            row_result: "#e0af68".into(),
+            row_tool: "#d18bff".into(),
+            row_result: "#e8b45e".into(),
 
             // Semantic
-            error: "#f7768e".into(),
-            warning: "#e0af68".into(),
-            success: "#9ece6a".into(),
+            error: "#ff5c8a".into(),
+            warning: "#ffb45e".into(),
+            success: "#4ce0b3".into(),
 
             // Mode colors
-            mode_normal: "#7aa2f7".into(),
-            mode_insert: "#9ece6a".into(),
-            mode_chat: "#9ece6a".into(),
-            mode_shell: "#e0af68".into(),
-            mode_visual: "#bb9af7".into(),
+            mode_normal: "#a487ff".into(),
+            mode_insert: "#4ce0b3".into(),
+            mode_chat: "#4ce0b3".into(),
+            mode_shell: "#e8b45e".into(),
+            mode_visual: "#ff7ad9".into(),
 
             // Mode labels
             mode_label_normal: "NORMAL".into(),
@@ -255,10 +257,10 @@ impl Default for ThemeData {
             mode_label_input: "INPUT".into(),
 
             // Cursor colors
-            cursor_normal: [0.478, 0.635, 0.969, 0.8],
-            cursor_insert: [0.620, 0.808, 0.416, 0.9],
-            cursor_visual: [0.733, 0.604, 0.969, 0.7],
-            cursor_replace: [1.000, 0.620, 0.392, 0.85], // #ff9e64 orange
+            cursor_normal: [0.643, 0.529, 1.000, 0.8],
+            cursor_insert: [0.298, 0.878, 0.702, 0.9],
+            cursor_visual: [1.000, 0.478, 0.851, 0.7],
+            cursor_replace: [1.000, 0.700, 0.360, 0.85], // warm gold
 
             // ANSI
             ansi: AnsiColorsData::default(),
@@ -269,12 +271,12 @@ impl Default for ThemeData {
             frame_content_padding: 12.0,
 
             // Frame colors
-            frame_base: "#1a1b26f2".into(),
-            frame_focused: "#7aa2f726".into(),
-            frame_insert: "#9ece6a1f".into(),
-            frame_visual: "#bb9af71f".into(),
-            frame_unfocused: "#1a1b26cc".into(),
-            frame_edge: "#3b426199".into(),
+            frame_base: "#131020f2".into(),
+            frame_focused: "#a487ff26".into(),
+            frame_insert: "#4ce0b31f".into(),
+            frame_visual: "#ff7ad91f".into(),
+            frame_unfocused: "#131020cc".into(),
+            frame_edge: "#3d326099".into(),
 
             // Frame shader params
             frame_params_base: [0.0, 0.0, 0.0, 0.0],
@@ -305,7 +307,7 @@ impl Default for ThemeData {
             input_minimized_height: 48.0,
             input_docked_height: 200.0,
             input_overlay_width_pct: 0.6,
-            input_backdrop_color: "#1a1b26d9".into(),
+            input_backdrop_color: "#131020d9".into(),
 
             // Font configuration
             font_rainbow: true,
@@ -326,23 +328,23 @@ impl Default for ThemeData {
             constellation_ring_spacing: 550.0,
 
             // Block borders
-            block_border_tool_call: "#ffaa0099".into(),
-            block_border_tool_result: "#00ff8866".into(),
-            block_border_error: "#ff2060cc".into(),
-            block_border_thinking: "#6080a04d".into(),
-            block_border_drift: "#00aaff80".into(),
+            block_border_tool_call: "#e8b45e99".into(),
+            block_border_tool_result: "#4ce0b366".into(),
+            block_border_error: "#ff2d6ecc".into(),
+            block_border_thinking: "#7a6aa04d".into(),
+            block_border_drift: "#c476e180".into(),
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
             block_border_glow_radius: 6.0,
             block_border_glow_intensity: 0.25,
             text_glow_radius: 2.5,
-            text_glow_color: "#bfd1f259".into(), // soft cool white, 35% alpha
+            text_glow_color: "#cbb8ff59".into(), // soft violet-white, 35% alpha
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose
-            compose_border: "#3b4261".into(),
-            compose_bg: "#1a1b26".into(),
+            compose_border: "#3d3260".into(),
+            compose_bg: "#131020".into(),
 
             // Modal
             modal_backdrop: "#00000099".into(),
@@ -540,10 +542,14 @@ pub struct ScenePostData {
 
 impl Default for ScenePostData {
     fn default() -> Self {
+        // ACES + raised bloom won the 2026-07-12 live A/B against the
+        // synthwave target (vs TonyMcMapface = the pre-pass muted look,
+        // BlenderFilmic = halfway): deep ground, saturated neon, confident
+        // glow. TonyMcMapface remains one theme-edit away.
         Self {
-            bloom_intensity: 0.12,
+            bloom_intensity: 0.22,
             bloom_low_frequency_boost: 0.25,
-            tonemapper: "tony_mc_mapface".into(),
+            tonemapper: "aces".into(),
         }
     }
 }
@@ -595,26 +601,30 @@ mod tests {
         // The live CRDT theme.toml predates `[scene]` — it MUST keep parsing,
         // yielding the compiled scene defaults.
         let stripped = DEFAULT_THEME_TOML
-            .split("[scene")
+            .split("\n[scene.hues]")
             .next()
             .unwrap()
             .to_string();
         let td: ThemeData = toml::from_str(&stripped)
             .expect("a theme.toml without [scene] must deserialize");
         assert_eq!(td.scene.hues.gold, SceneData::default().hues.gold);
-        assert_eq!(td.scene.post.bloom_intensity, 0.12);
+        assert_eq!(
+            td.scene.post.bloom_intensity,
+            ScenePostData::default().bloom_intensity
+        );
     }
 
     #[test]
     fn partial_scene_section_overrides_only_named_keys() {
         let toml_src = format!(
             "{}\n[scene.post]\nbloom_intensity = 0.3\n",
-            DEFAULT_THEME_TOML.split("[scene").next().unwrap()
+            DEFAULT_THEME_TOML.split("\n[scene.hues]").next().unwrap()
         );
         let td: ThemeData = toml::from_str(&toml_src).unwrap();
         assert_eq!(td.scene.post.bloom_intensity, 0.3, "named key overrides");
         assert_eq!(
-            td.scene.post.tonemapper, "tony_mc_mapface",
+            td.scene.post.tonemapper,
+            ScenePostData::default().tonemapper,
             "unnamed keys keep defaults"
         );
         assert_eq!(td.scene.tiers.crest, 1.25, "untouched tables keep defaults");

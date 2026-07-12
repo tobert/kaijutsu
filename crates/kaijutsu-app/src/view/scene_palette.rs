@@ -209,9 +209,11 @@ impl Default for ScenePalette {
             gain_reading_border: 1.6,
             gain_hud_border: 1.8,
 
-            bloom_intensity: 0.12,
+            // ACES + raised bloom: the 2026-07-12 live A/B winner for the
+            // synthwave target (mirrors ScenePostData::default()).
+            bloom_intensity: 0.22,
             bloom_low_frequency_boost: 0.25,
-            tonemapper: Tonemapping::TonyMcMapface,
+            tonemapper: Tonemapping::AcesFitted,
         }
     }
 }
@@ -322,7 +324,7 @@ mod tests {
         let mut scene = SceneData::default();
         scene.post.tonemapper = "vhs".into();
         let p = ScenePalette::from_scene_data(&scene);
-        assert_eq!(p.tonemapper, Tonemapping::TonyMcMapface);
+        assert_eq!(p.tonemapper, ScenePalette::default().tonemapper);
     }
 
     #[test]
