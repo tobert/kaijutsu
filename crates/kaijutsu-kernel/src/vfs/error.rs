@@ -87,6 +87,20 @@ impl VfsError {
         }
     }
 
+    /// Whether this error means "there is no such entry" — the VFS's own
+    /// [`VfsError::NotFound`] or a host-backend [`VfsError::Io`] carrying
+    /// `ENOENT`. The snapshot walker skips a CHILD that vanishes between its
+    /// parent's `readdir` and its own `getattr` (live pseudo-filesystems —
+    /// `/proc` — churn mid-walk; a gone entry is the tree changing, not a
+    /// fault; live-caught 2026-07-12 on an exiting PID).
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            VfsError::NotFound(_) => true,
+            VfsError::Io(e) => e.kind() == io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+
     /// Create a NotFound error.
     pub fn not_found(path: impl Into<String>) -> Self {
         Self::NotFound(path.into())

@@ -397,6 +397,16 @@ impl MountTable {
                         truncated_here: false,
                         denied: true,
                     },
+                    // A child that VANISHED between its parent's readdir and
+                    // its own getattr is skipped, not an error: live
+                    // pseudo-filesystems (/proc) churn mid-walk — an exiting
+                    // PID took the whole root snapshot down before this arm
+                    // (live-caught 2026-07-12). The tree changing under the
+                    // walk is normal (docs/scenes/vfs.md claim 4); the
+                    // budget unit it reserved is simply spent. Dangling
+                    // symlinks do NOT hit this arm — getattr is lstat-like
+                    // and answers for the link itself.
+                    Err(e) if e.is_not_found() => continue,
                     Err(e) => return Err(e),
                 };
                 node.children.push(child);
