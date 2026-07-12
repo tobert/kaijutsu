@@ -18,6 +18,9 @@
 //!   and the `LayoutPos → Vec3` well-lift (no Bevy, unit-tested).
 //! - [`scene`] — the 3D scene: camera, root, screen toggle, billboarding, card
 //!   motion, components, and live state resource.
+//! - [`drape`] — on-selection lineage drapes: curved ribbons down the bowl
+//!   wall from the selected card to each fork-ancestor's card (pure curve
+//!   math, unit-tested; reuses `TraceGlowMaterial`).
 //! - [`sync`] — the layout tick: keyed-join reconcile → spawn/despawn → layout.
 //! - [`activity`] — the well's pulse: kernel-event stream → ring energy + ripples
 //!   driving the base ring deck (unit-tested math).
@@ -29,6 +32,7 @@
 
 pub mod activity;
 pub mod card;
+pub mod drape;
 pub mod hud;
 pub mod live;
 pub mod panel;
@@ -90,45 +94,65 @@ impl Plugin for TimeWellPlugin {
             // you're dived into it or just walking past its bearing.
             .add_systems(
                 Update,
+                // Two nested `.chain()`ed groups, not one flat tuple: Bevy's
+                // `IntoSystemConfigs` tuple impl tops out below the ~21
+                // systems this tier now runs (the drape overlay tipped it
+                // over) — nesting preserves full mouth-to-throat ordering
+                // (every system in group A still runs before every system in
+                // group B) while staying under that ceiling. Split at the
+                // same "pulse/placement plumbing" vs "selection-driven
+                // overlays" seam the comments below already draw.
                 (
-                    sync::poll_clusters,
-                    sync::apply_clusters,
-                    rays::poll_tracks,
-                    rays::apply_tracks,
-                    rays::sync_track_rays,
-                    rays::animate_track_rays,
-                    sync::sync_time_well,
-                    scene::spin_rings,
-                    scene::move_cards_toward_target,
-                    scene::billboard_cards,
-                    // Ambient, not ungated (unlike its sibling
-                    // `tick_ring_activity`): needs live `Card`/`CardTarget`
-                    // entities to resolve an event's ring angle, and those
-                    // only exist while the well's furniture is spawned
-                    // (Screen::Room).
-                    scene::accumulate_ring_activity,
-                    scene::sync_deck_material,
-                    live::sync_card_live_uniforms,
-                    // Moved here from dived-only (freeze-fix slice,
-                    // 2026-07-11): each must react to BOTH zoom directions —
-                    // see this file's own doc comment above for the full
-                    // reasoning, and each system's own doc for its specific
-                    // zoom branch. `highlight_drift` is the one exception: no
-                    // zoom branch at all (see its doc) — `DriftState` polls
-                    // ungated on every screen, so its shimmer is truthful
-                    // live info even at room scale.
-                    scene::dim_nonfocused_rings,
-                    scene::sync_focus_card_visibility,
-                    scene::apply_horizon_label_lod,
-                    scene::highlight_selection,
-                    scene::highlight_lineage,
-                    scene::highlight_drift,
-                    // The HUD's LOD gate lives in the ambient tier, not
-                    // dived-only, like `patch_bay::apply_patch_lod` — it must
-                    // react to BOTH transitions (hiding the panels again on
-                    // zoom-OUT, not just showing them on zoom-in), so it has
-                    // to keep running at room scale even while unzoomed.
-                    hud::apply_well_hud_lod,
+                    (
+                        sync::poll_clusters,
+                        sync::apply_clusters,
+                        rays::poll_tracks,
+                        rays::apply_tracks,
+                        rays::sync_track_rays,
+                        rays::animate_track_rays,
+                        sync::sync_time_well,
+                        scene::spin_rings,
+                        scene::move_cards_toward_target,
+                        scene::billboard_cards,
+                        // Ambient, not ungated (unlike its sibling
+                        // `tick_ring_activity`): needs live `Card`/`CardTarget`
+                        // entities to resolve an event's ring angle, and those
+                        // only exist while the well's furniture is spawned
+                        // (Screen::Room).
+                        scene::accumulate_ring_activity,
+                        scene::sync_deck_material,
+                        live::sync_card_live_uniforms,
+                        // Moved here from dived-only (freeze-fix slice,
+                        // 2026-07-11): each must react to BOTH zoom directions —
+                        // see this file's own doc comment above for the full
+                        // reasoning, and each system's own doc for its specific
+                        // zoom branch. `highlight_drift` is the one exception: no
+                        // zoom branch at all (see its doc) — `DriftState` polls
+                        // ungated on every screen, so its shimmer is truthful
+                        // live info even at room scale.
+                        scene::dim_nonfocused_rings,
+                        scene::sync_focus_card_visibility,
+                        scene::apply_horizon_label_lod,
+                    )
+                        .chain(),
+                    (
+                        scene::highlight_selection,
+                        scene::highlight_lineage,
+                        // The spatial lineage overlay (draped ribbons down
+                        // the bowl wall) — right after the ring-highlight it
+                        // was derived from, so it reads the same frame's
+                        // card positions `move_cards_toward_target`/
+                        // `spin_rings` (group A, above) just settled.
+                        drape::sync_lineage_drapes,
+                        scene::highlight_drift,
+                        // The HUD's LOD gate lives in the ambient tier, not
+                        // dived-only, like `patch_bay::apply_patch_lod` — it must
+                        // react to BOTH transitions (hiding the panels again on
+                        // zoom-OUT, not just showing them on zoom-in), so it has
+                        // to keep running at room scale even while unzoomed.
+                        hud::apply_well_hud_lod,
+                    )
+                        .chain(),
                 )
                     .chain()
                     .run_if(in_state(Screen::Room)),
