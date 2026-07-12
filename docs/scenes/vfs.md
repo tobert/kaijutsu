@@ -224,6 +224,23 @@ real for LocalBackend-backed subtrees, best-effort precision (see
 `docs/issues.md`). Stage 2 (inotify → event stream) not started. Lane C (the
 Bevy world renderer) consumes this next.
 
+**Bevy world renderer (Lane C) SHIPPED 2026-07-12** (`feat/fsn-world`,
+`crates/kaijutsu-app/src/view/fsn/`): `layout` (pure — world placement,
+`height_channel`'s first-candidate mapping, prism/seam/point mesh vertex
+builders, the LOD-tier decision, camera clamps; unit-tested), `sync` (the
+`vfs_snapshot` poll → `FsnState` cache, one in-flight request at a time,
+enumeration-on-demand per claim 3), `scene` (spawn/despawn, the fly camera,
+per-field mesh entities, LOD gating, selection). N ("DATA HORIZON") is a
+genuine `Screen::Fsn` transition from the room, not a `RoomState::zoomed`
+station — the "N stays a dive-THROUGH door" reasoning already recorded in
+`room::mod`'s `station_is_zoomable` doc. Reused `StandardMaterial`
+(unlit, HDR `base_color`) for the `LineList`/point meshes — no new shader.
+Height channel: files by `log2(size)`, directories by capped child count,
+symlinks a flat stub (`layout::height_channel`'s own doc — Amy's first
+candidate against the real tree, per this doc's Open Question 1). Follow-ups
+(staleness invalidation, the seam-grid simplification, subdir bloom, search,
+zone tint) tracked in `docs/issues.md`.
+
 Research trail: S2 cell-ID prefix containment · GosperMap · EvoStreets ·
 Sondag stable treemaps via local moves · `hexasphere` (Bevy dep tree) ·
 H3 aperture-7 (rejected for addressing).

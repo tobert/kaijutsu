@@ -6,6 +6,45 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
+
+`cargo clippy -p kaijutsu-app --all-targets` currently fails to compile the
+test target: `crates/kaijutsu-app/src/text/sparkline.rs:336` asserts against
+`vec![1.5, 3.14, 7.0]`, and `#[deny(clippy::approx_constant)]` rejects the
+literal `3.14` as "approximate value of `f32::consts::PI`". Unrelated to any
+in-flight lane — pre-existing on `main`, just not caught because `cargo build`
+(rustc) doesn't run clippy lints and CI apparently doesn't run
+`--all-targets`. Either rename the test literal to something clearly not
+π-shaped (e.g. `3.5`) or scope an `#[allow]` to that one assertion.
+
+## FSN landscape slice-0 follow-ups (2026-07-12, Lane C, `docs/scenes/vfs.md`)
+
+Deferred out of slice-0 scope, in rough priority order:
+
+- **Generation/staleness invalidation.** `view::fsn::sync::FsnState` caches a
+  directory listing forever once fetched (by design, so a re-dive doesn't
+  re-fetch the root) — nothing currently detects or re-pulls a listing whose
+  kernel-side generation has moved on. Stage-2 fsnotify (vfs.md) is the real
+  fix; until then a long-lived FSN session can drift from the real tree.
+- **Seam grid is the parent's structural cross, not per-quadrant-occupied
+  boundaries** (`view::fsn::layout::seam_grid`'s own doc) — a documented
+  slice-0 simplification, revisit once vfs.md Open Question 2 (subdir
+  slack/placement policy) settles.
+- **Subdir "bloom" grammar** (`docs/scenes/vfs.md`: petals part, the child's
+  own field rises flush with the floor on approach/selection) is unbuilt —
+  slice 0 only spawns a subdirectory's field once its listing is fetched; it
+  pops in at whatever LOD tier distance dictates, no bloom animation.
+  Selection only lights a ring + brightens the field, no bloom, no dive into
+  vi (`docs/vi.md`) on a file cell.
+- **The ship-overhead landmark** (vfs.md, "look up") was skipped per the
+  task's own escape hatch ("OPTIONAL, only if trivial") — not attempted.
+- **`/` search-and-fly-to** (vfs.md open question 5) unbuilt; travel is
+  keyboard-fly only.
+- Zone tint (CRDT-owned vs read-only) and window-panels-as-content (vfs.md
+  open questions 3–4) untouched, same as before this lane.
+
+---
+
 ## SFTP over the VFS (slices 0–2 + extensions + tracing landed 2026-06-26; slice 3 dissolved; limits + TOCTOU open)
 
 Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
