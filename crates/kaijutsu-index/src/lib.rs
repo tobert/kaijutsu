@@ -180,12 +180,35 @@ pub struct SemanticIndex {
 impl SemanticIndex {
     /// Create or load a semantic index.
     ///
+    /// Before any other on-disk state is touched, this compares the
+    /// embedder's `(model_name(), dimensions)` against every distinct pair
+    /// recorded in `index_meta.db` (if one exists — a fresh data_dir is
+    /// never mismatched). Vectors from two different embedding models live
+    /// in incomparable spaces; mixing them into one HNSW graph produces
+    /// meaningless similarity scores with no error. On any mismatch, the
+    /// on-disk index (HNSW graph, SQLite metadata, and any in-flight
+    /// atomic-dump files — a completed old-model dump must not be
+    /// resurrected by `HnswIndex::new`'s crash recovery) is wiped and
+    /// construction proceeds as a fresh, empty index. The index is a
+    /// derived cache: contexts re-index lazily via the watcher / `kj synth
+    /// all`, so this is never data loss.
+    ///
+    /// `model_name` derives from the model directory's basename (see
+    /// `OnnxEmbedder::new`), so renaming the model directory — even with
+    /// identical files inside — also triggers a wipe. That's correct: the
+    /// config changed, and the cache follows.
+    ///
     /// If the loaded graph carries more points than metadata has live rows —
     /// dead slots survived from eviction before the process last stopped —
     /// this runs a `rebuild()` before returning so callers never observe a
     /// stale, bloated graph. See `rebuild()` for what that entails.
     pub fn new(config: IndexConfig, embedder: Box<dyn Embedder>) -> Result<Self, IndexError> {
         std::fs::create_dir_all(&config.data_dir)?;
+
+        // Must run before HnswIndex::new/MetadataStore::open construct
+        // anything real, so a mismatch leaves a genuinely empty data_dir for
+        // the normal fresh-index path below to build on.
+        Self::wipe_on_model_mismatch(&config, embedder.model_name())?;
 
         let hnsw = index::HnswIndex::new(&config)?;
         let metadata = metadata::MetadataStore::open(&config.data_dir)?;
@@ -216,6 +239,67 @@ impl SemanticIndex {
         }
 
         Ok(this)
+    }
+
+    /// Wipe the on-disk index if it was built by a different embedding model
+    /// (name or dimensions) than the one about to open it.
+    ///
+    /// No-op when `index_meta.db` doesn't exist yet — a fresh data_dir can't
+    /// be mismatched. Opens a throwaway `MetadataStore` to read the recorded
+    /// `(model_name, dimensions)` pairs and drops it *before* deleting any
+    /// files: the SQLite connection must close first, or the delete of
+    /// `index_meta.db` (and the WAL/SHM opened alongside it) would fight an
+    /// open handle.
+    fn wipe_on_model_mismatch(config: &IndexConfig, model_name: &str) -> Result<(), IndexError> {
+        let meta_path = config.data_dir.join("index_meta.db");
+        if !meta_path.exists() {
+            return Ok(());
+        }
+
+        let mismatch = {
+            let store = metadata::MetadataStore::open(&config.data_dir)?;
+            store
+                .distinct_models()?
+                .into_iter()
+                .find(|(name, dims)| name != model_name || *dims != config.dimensions)
+            // `store` (and its SQLite connection) drops here, at the end of
+            // this block — before any file deletion below.
+        };
+
+        let Some((old_name, old_dims)) = mismatch else {
+            return Ok(());
+        };
+
+        tracing::warn!(
+            old_model = %old_name,
+            old_dimensions = old_dims,
+            new_model = %model_name,
+            new_dimensions = config.dimensions,
+            "semantic index model mismatch — wiping on-disk index; \
+             it will re-populate lazily from the watcher / `kj synth all`"
+        );
+
+        // Real index files plus any in-flight atomic-dump leftovers
+        // (index.new.*) — a completed old-model dump must be deleted
+        // outright here, not left for HnswIndex::new's recover_atomic_dump
+        // to resurrect onto the (about to be absent) real files.
+        for name in [
+            "index.hnsw.graph",
+            "index.hnsw.data",
+            "index_meta.db",
+            "index_meta.db-wal",
+            "index_meta.db-shm",
+            "index.new.hnsw.graph",
+            "index.new.hnsw.data",
+            "index.new.ready",
+        ] {
+            let path = config.data_dir.join(name);
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Index a context's blocks. Returns true if content was (re-)embedded.
@@ -598,6 +682,33 @@ mod tests {
                 v[0] = 1.0;
             }
             Ok(v)
+        }
+    }
+
+    /// `MockEmbedder` with a caller-chosen model identity.
+    ///
+    /// `MockEmbedder` itself hardcodes `model_name() = "mock"`, which is fine
+    /// for every test except the model-mismatch guard, which needs to
+    /// present a *different* name (or dims) on reopen. Delegates embedding
+    /// to an inner `MockEmbedder` so the hash-based vectors stay identical —
+    /// only the reported identity differs.
+    struct NamedMockEmbedder {
+        inner: MockEmbedder,
+        name: String,
+    }
+
+    impl Embedder for NamedMockEmbedder {
+        fn model_name(&self) -> &str {
+            &self.name
+        }
+        fn dimensions(&self) -> usize {
+            self.inner.dimensions()
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, IndexError> {
+            self.inner.embed_batch(texts)
+        }
+        fn embed(&self, text: &str) -> Result<Vec<f32>, IndexError> {
+            self.inner.embed(text)
         }
     }
 
@@ -1071,5 +1182,173 @@ mod tests {
             !results.is_empty(),
             "search should still work after auto-rebuild"
         );
+    }
+
+    #[test]
+    fn test_model_mismatch_wipes_index() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            // See seed_filler's doc comment: enough points to guarantee
+            // layer-0 connectivity so post-wipe search/index checks are stable.
+            seed_filler(&idx, 30);
+            let ctx = ContextId::new();
+            idx.index_context(ctx, &make_blocks(ctx, "model mismatch test alpha"))
+                .unwrap();
+            idx.save().unwrap();
+            assert_eq!(idx.len(), 31);
+        }
+
+        // Reopen with a different model NAME, same dimensions.
+        let idx = SemanticIndex::new(
+            config,
+            Box::new(NamedMockEmbedder {
+                inner: MockEmbedder { dims: 32 },
+                name: "other-model".to_string(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(idx.len(), 0, "model name mismatch must wipe the index");
+        let results = idx.search("model mismatch test alpha", 5).unwrap();
+        assert!(results.is_empty(), "wiped index should return no results");
+
+        // The index must still be usable after the wipe.
+        let ctx2 = ContextId::new();
+        idx.index_context(ctx2, &make_blocks(ctx2, "fresh content after wipe"))
+            .unwrap();
+        assert_eq!(idx.len(), 1);
+        let results2 = idx.search("fresh content after wipe", 5).unwrap();
+        assert!(!results2.is_empty(), "index should work after the wipe");
+    }
+
+    #[test]
+    fn test_dimensions_mismatch_wipes_index() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            seed_filler(&idx, 30);
+            idx.save().unwrap();
+            assert_eq!(idx.len(), 30);
+        }
+
+        // Reopen with the same model NAME but different dimensions — HNSW
+        // vectors are dimension-bound, so this alone must trip the guard.
+        let mut mismatched = test_config(dir.path());
+        mismatched.dimensions = 16;
+        let idx = SemanticIndex::new(mismatched, Box::new(MockEmbedder { dims: 16 })).unwrap();
+
+        assert_eq!(idx.len(), 0, "dimension mismatch must wipe the index");
+        let results = idx.search("anything", 5).unwrap();
+        assert!(results.is_empty(), "wiped index should return no results");
+
+        let ctx = ContextId::new();
+        idx.index_context(ctx, &make_blocks(ctx, "content in new dims"))
+            .unwrap();
+        assert_eq!(idx.len(), 1, "index should work after the wipe");
+    }
+
+    #[test]
+    fn test_matching_model_preserves_index() {
+        // Mirrors test_persistence_round_trip: identical model name + dims
+        // on reopen must NOT trigger the mismatch guard.
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let ctx1 = ContextId::new();
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            seed_filler(&idx, 30);
+            idx.index_context(ctx1, &make_blocks(ctx1, "matching model preserved"))
+                .unwrap();
+            idx.save().unwrap();
+            assert_eq!(idx.len(), 31);
+        }
+
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+        assert_eq!(
+            idx.len(),
+            31,
+            "identical model name + dimensions must preserve the index"
+        );
+
+        let results = idx.search("matching model preserved", 5).unwrap();
+        assert!(
+            !results.is_empty(),
+            "search should still find indexed content after reopen"
+        );
+    }
+
+    #[test]
+    fn test_mismatch_wipe_removes_pending_dump() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            seed_filler(&idx, 30);
+            idx.save().unwrap();
+        }
+
+        // Simulate a completed-but-unrecovered atomic dump left behind by a
+        // prior process (see HnswIndex::dump_atomic / recover_atomic_dump):
+        // copies of the real files under the "index.new.*" names, plus the
+        // ready marker that says the dump finished.
+        std::fs::copy(
+            dir.path().join("index.hnsw.graph"),
+            dir.path().join("index.new.hnsw.graph"),
+        )
+        .unwrap();
+        std::fs::copy(
+            dir.path().join("index.hnsw.data"),
+            dir.path().join("index.new.hnsw.data"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("index.new.ready"), b"").unwrap();
+
+        // Reopen with a mismatched model — the wipe must run BEFORE
+        // HnswIndex::new's recover_atomic_dump, so the old-model dump is
+        // deleted outright rather than resurrected by recovery.
+        let idx = SemanticIndex::new(
+            config,
+            Box::new(NamedMockEmbedder {
+                inner: MockEmbedder { dims: 32 },
+                name: "different-model".to_string(),
+            }),
+        )
+        .unwrap();
+
+        // These stay gone: nothing in the fresh-construction path that
+        // follows the wipe recreates them until the caller indexes+saves
+        // (below). `index_meta.db` itself is excluded from this check —
+        // `MetadataStore::open` always creates a fresh one as part of
+        // normal construction, mismatch or not; its emptiness is what
+        // `idx.len() == 0` below actually verifies.
+        for name in [
+            "index.hnsw.graph",
+            "index.hnsw.data",
+            "index.new.hnsw.graph",
+            "index.new.hnsw.data",
+            "index.new.ready",
+        ] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "{name} should be removed by the mismatch wipe, not resurrected by recovery"
+            );
+        }
+
+        assert_eq!(idx.len(), 0, "old-model metadata rows must be gone");
+        let ctx = ContextId::new();
+        idx.index_context(ctx, &make_blocks(ctx, "works after dump cleanup"))
+            .unwrap();
+        assert_eq!(idx.len(), 1, "index should work after the wipe");
     }
 }

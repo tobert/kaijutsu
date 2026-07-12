@@ -138,6 +138,11 @@ min_request_interval_ms = 0    # 0 = no cooldown
 #
 # Model dir should contain model.onnx + tokenizer.json
 # Download: https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q
+#
+# Changing `model_dir` (even just renaming the directory — the model's
+# identity is its directory basename) or `dimensions` invalidates the
+# on-disk semantic index: it's wiped at next kernel start and re-populates
+# lazily from the watcher / `kj synth all`.
 
 [embedding]
 enabled = true

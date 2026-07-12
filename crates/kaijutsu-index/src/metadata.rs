@@ -260,6 +260,35 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Distinct `(model_name, dimensions)` pairs recorded across all entries.
+    ///
+    /// Used by `SemanticIndex::new` to detect a model swap (or a dimensions
+    /// change) before touching the HNSW graph: vectors embedded by two
+    /// different models aren't comparable, and mixing them into one graph
+    /// produces meaningless similarity scores with no error.
+    pub fn distinct_models(&self) -> Result<Vec<(String, usize)>, IndexError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT model_name, dimensions FROM index_entries")
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let dims: i64 = row.get(1)?;
+                Ok((name, dims))
+            })
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (name, dims) = row.map_err(|e| IndexError::Database(e.to_string()))?;
+            result.push((name, dims as usize));
+        }
+
+        Ok(result)
+    }
+
     /// Number of indexed entries.
     pub fn count(&self) -> Result<usize, IndexError> {
         let count: i64 = self
