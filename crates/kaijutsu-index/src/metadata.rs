@@ -41,6 +41,23 @@ impl MetadataStore {
         )
         .map_err(|e| IndexError::Database(format!("create table: {}", e)))?;
 
+        // Monotonic slot allocator. Slots must NEVER be reused: hnsw_rs can't
+        // delete points, so an evicted slot's vector stays in the graph until
+        // rebuild — reallocating its number would put two graph points behind
+        // one DataId and let search attribute the dead vector to the new
+        // context. MAX(hnsw_slot)+1 breaks exactly when the highest slot is
+        // evicted; a persistent high-water mark can't. Seeded from existing
+        // rows on first open after upgrade (INSERT OR IGNORE = migration).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS slot_allocator (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                next_slot INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO slot_allocator (id, next_slot)
+                VALUES (0, COALESCE((SELECT MAX(hnsw_slot) + 1 FROM index_entries), 0));",
+        )
+        .map_err(|e| IndexError::Database(format!("create slot_allocator: {}", e)))?;
+
         Ok(Self { conn })
     }
 
@@ -143,14 +160,19 @@ impl MetadataStore {
             return Ok(slot);
         }
 
-        // Allocate next slot
+        // Allocate the next slot from the monotonic high-water mark — never
+        // from MAX(hnsw_slot), which regresses when the highest slot is
+        // evicted (see the slot_allocator comment in `open`).
         let next_slot: u32 = tx
-            .query_row("SELECT MAX(hnsw_slot) FROM index_entries", [], |row| {
-                row.get::<_, Option<i64>>(0)
+            .query_row("SELECT next_slot FROM slot_allocator WHERE id = 0", [], |row| {
+                row.get::<_, i64>(0)
             })
-            .map_err(|e| IndexError::Database(e.to_string()))?
-            .map(|m| m as u32 + 1)
-            .unwrap_or(0);
+            .map_err(|e| IndexError::Database(e.to_string()))? as u32;
+        tx.execute(
+            "UPDATE slot_allocator SET next_slot = next_slot + 1 WHERE id = 0",
+            [],
+        )
+        .map_err(|e| IndexError::Database(e.to_string()))?;
 
         tx.execute(
             "INSERT INTO index_entries (context_id, hnsw_slot, content_hash, dimensions, model_name, embedded_at)
@@ -180,6 +202,36 @@ impl MetadataStore {
             )
             .map_err(|e| IndexError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// List all (hnsw_slot, context_id) pairs, ordered by slot.
+    ///
+    /// Used by `rebuild()` to know which slots are still live in metadata —
+    /// the source of truth for what should survive into the fresh graph.
+    pub fn all_slots(&self) -> Result<Vec<(u32, ContextId)>, IndexError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hnsw_slot, context_id FROM index_entries ORDER BY hnsw_slot")
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let slot: u32 = row.get(0)?;
+                let bytes: Vec<u8> = row.get(1)?;
+                Ok((slot, bytes))
+            })
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (slot, bytes) = row.map_err(|e| IndexError::Database(e.to_string()))?;
+            if bytes.len() == 16 {
+                let arr: [u8; 16] = bytes.try_into().unwrap();
+                result.push((slot, ContextId::from_bytes(arr)));
+            }
+        }
+
+        Ok(result)
     }
 
     /// List all indexed context IDs.
@@ -219,21 +271,52 @@ impl MetadataStore {
 
     /// Evict the `n` oldest entries by `embedded_at` timestamp.
     ///
-    /// Returns the number of rows actually deleted.
+    /// Returns the HNSW slot numbers of the evicted rows (ascending by
+    /// `embedded_at`, i.e. oldest first) so the caller can clear them from the
+    /// HNSW embeddings cache (`HnswIndex::clear_slot`). Select-then-delete
+    /// inside one transaction, rather than relying on `RETURNING`, so the set
+    /// of rows selected is exactly the set deleted.
     ///
     /// Note: HNSW does not support point deletion — evicted slots become dead
     /// weight in the graph until a full `rebuild()` is performed.
-    pub fn evict_oldest(&mut self, n: usize) -> Result<usize, IndexError> {
-        let deleted = self
+    pub fn evict_oldest(&mut self, n: usize) -> Result<Vec<u32>, IndexError> {
+        let tx = self
             .conn
-            .execute(
-                "DELETE FROM index_entries WHERE rowid IN (
-                    SELECT rowid FROM index_entries ORDER BY embedded_at ASC LIMIT ?1
-                )",
-                [n as i64],
+            .transaction()
+            .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
+
+        let slots: Vec<u32> = {
+            let mut stmt = tx
+                .prepare("SELECT hnsw_slot FROM index_entries ORDER BY embedded_at ASC LIMIT ?1")
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([n as i64], |row| row.get::<_, u32>(0))
+                .map_err(|e| IndexError::Database(e.to_string()))?;
+            rows.collect::<Result<Vec<u32>, _>>()
+                .map_err(|e| IndexError::Database(e.to_string()))?
+        };
+
+        // Delete exactly the slots selected above — re-running the ORDER BY
+        // subquery could pick a different set when embedded_at ties (same
+        // millisecond), and the returned slots must match the deleted rows.
+        // Slot numbers are integers we just read back, so inlining is safe.
+        if !slots.is_empty() {
+            let in_list = slots
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                &format!("DELETE FROM index_entries WHERE hnsw_slot IN ({in_list})"),
+                [],
             )
             .map_err(|e| IndexError::Database(format!("evict_oldest: {}", e)))?;
-        Ok(deleted)
+        }
+
+        tx.commit()
+            .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
+
+        Ok(slots)
     }
 }
 
@@ -343,17 +426,17 @@ mod tests {
         let ctx3 = ContextId::new();
 
         // Insert with increasing timestamps (assign_slot uses now_millis)
-        store.assign_slot(ctx1, "h1", "model", 384).unwrap();
+        let s1 = store.assign_slot(ctx1, "h1", "model", 384).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.assign_slot(ctx2, "h2", "model", 384).unwrap();
+        let s2 = store.assign_slot(ctx2, "h2", "model", 384).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         store.assign_slot(ctx3, "h3", "model", 384).unwrap();
 
         assert_eq!(store.count().unwrap(), 3);
 
-        // Evict the 2 oldest
+        // Evict the 2 oldest — must return their slot numbers, oldest first.
         let evicted = store.evict_oldest(2).unwrap();
-        assert_eq!(evicted, 2);
+        assert_eq!(evicted, vec![s1, s2]);
         assert_eq!(store.count().unwrap(), 1);
 
         // ctx3 (newest) should remain
@@ -367,14 +450,101 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = MetadataStore::open(dir.path()).unwrap();
 
-        store
+        let slot = store
             .assign_slot(ContextId::new(), "h1", "model", 384)
             .unwrap();
         assert_eq!(store.count().unwrap(), 1);
 
         let evicted = store.evict_oldest(10).unwrap();
-        assert_eq!(evicted, 1);
+        assert_eq!(evicted, vec![slot]);
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// Slot numbers must never be reused, even after the highest slot is
+    /// evicted. Reuse would collide with the dead point still in the HNSW
+    /// graph (hnsw_rs can't delete): two graph points sharing a DataId, and
+    /// search attributing the dead vector to the new context.
+    #[test]
+    fn test_evicted_max_slot_is_not_reused() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx_old_max = ContextId::new();
+        let ctx_newer = ContextId::new();
+
+        // ctx_old_max gets the highest slot but the OLDEST embedded_at
+        // (indexed once, long ago); ctx_newer holds a lower slot with a
+        // fresher timestamp (re-embedded since).
+        store.assign_slot(ctx_newer, "h1", "model", 384).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let max_slot = store.assign_slot(ctx_old_max, "h2", "model", 384).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Re-embed ctx_newer: keeps its slot, refreshes embedded_at.
+        store.assign_slot(ctx_newer, "h1b", "model", 384).unwrap();
+
+        // Evicting one drops ctx_old_max — the max slot leaves metadata.
+        let evicted = store.evict_oldest(1).unwrap();
+        assert_eq!(evicted, vec![max_slot]);
+
+        let fresh = store
+            .assign_slot(ContextId::new(), "h3", "model", 384)
+            .unwrap();
+        assert!(
+            fresh > max_slot,
+            "slot {fresh} reuses evicted slot {max_slot} — collides with the dead graph point"
+        );
+    }
+
+    /// The allocator's high-water mark must survive reopen (it lives in
+    /// SQLite, not memory).
+    #[test]
+    fn test_slot_allocator_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let max_slot;
+        {
+            let mut store = MetadataStore::open(dir.path()).unwrap();
+            store
+                .assign_slot(ContextId::new(), "h1", "model", 384)
+                .unwrap();
+            max_slot = store
+                .assign_slot(ContextId::new(), "h2", "model", 384)
+                .unwrap();
+            // Empty the table entirely — MAX(hnsw_slot) has nothing to say.
+            store.evict_oldest(10).unwrap();
+        }
+
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+        let fresh = store
+            .assign_slot(ContextId::new(), "h3", "model", 384)
+            .unwrap();
+        assert!(
+            fresh > max_slot,
+            "slot {fresh} reuses slot {max_slot} after reopen of an emptied table"
+        );
+    }
+
+    #[test]
+    fn test_all_slots_ordering() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        let s1 = store.assign_slot(ctx1, "h1", "model", 384).unwrap();
+        let s2 = store.assign_slot(ctx2, "h2", "model", 384).unwrap();
+        let s3 = store.assign_slot(ctx3, "h3", "model", 384).unwrap();
+
+        let all = store.all_slots().unwrap();
+        assert_eq!(all, vec![(s1, ctx1), (s2, ctx2), (s3, ctx3)]);
+    }
+
+    #[test]
+    fn test_all_slots_empty() {
+        let dir = TempDir::new().unwrap();
+        let store = MetadataStore::open(dir.path()).unwrap();
+        assert_eq!(store.all_slots().unwrap(), vec![]);
     }
 
     #[test]

@@ -159,6 +159,7 @@ impl KjBuiltin {
         match sub {
             "all" => self.synth_all().await,
             "status" => self.synth_status(),
+            "rebuild" => self.synth_rebuild().await,
             "help" | "--help" | "-h" => ExecResult::success(Self::synth_help()),
             // Anything else: treat as a context ref
             _ => self.synth_context(sub, caller).await,
@@ -252,6 +253,30 @@ impl KjBuiltin {
             ));
         }
         ExecResult::success(out)
+    }
+
+    /// `kj synth rebuild` — compact the HNSW index, reclaiming slots left
+    /// dead by LRU eviction (`max_contexts`). Blocking work runs off the
+    /// async runtime via `spawn_blocking`, matching `synth_all`.
+    async fn synth_rebuild(&self) -> ExecResult {
+        let Some(ref idx) = self.semantic_index else {
+            return ExecResult::failure(
+                1,
+                "semantic index not configured (check embedding model in models.toml)".to_string(),
+            );
+        };
+
+        let idx = idx.clone();
+        let result = tokio::task::spawn_blocking(move || idx.rebuild()).await;
+
+        match result {
+            Ok(Ok(stats)) => ExecResult::success(format!(
+                "rebuilt: {} kept, {} dead vectors dropped, {} orphan rows repaired",
+                stats.kept, stats.dropped_dead, stats.repaired_orphan_rows
+            )),
+            Ok(Err(e)) => ExecResult::failure(1, format!("rebuild failed: {e}")),
+            Err(e) => ExecResult::failure(1, format!("rebuild failed: join error: {e}")),
+        }
     }
 
     /// `kj synth <ctx_ref>` — index + synthesize a single context.
@@ -353,6 +378,7 @@ Commands:
   kj synth all          Index and synthesize all active contexts
   kj synth <ctx>        Index and synthesize a specific context
   kj synth status       Show index statistics
+  kj synth rebuild      Compact the HNSW index (reclaim evicted slots)
   kj synth help         Show this help
 
 Context references: . (current), .parent, label, hex prefix

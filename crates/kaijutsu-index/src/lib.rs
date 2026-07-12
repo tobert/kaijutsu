@@ -99,6 +99,21 @@ pub struct SearchResult {
     pub label: Option<String>,
 }
 
+/// Outcome of a `SemanticIndex::rebuild()` pass.
+#[derive(Debug, Clone)]
+pub struct RebuildStats {
+    /// Live slots re-inserted into the fresh graph.
+    pub kept: usize,
+    /// Graph points dropped because they had no matching metadata row
+    /// (evicted since the last rebuild — dead weight the old graph carried).
+    pub dropped_dead: usize,
+    /// Metadata rows deleted because they pointed at a slot with no graph
+    /// point behind it — a crash artifact (e.g. process died between
+    /// `assign_slot` and the HNSW insert). The watcher re-indexes the
+    /// context on its next terminal event.
+    pub repaired_orphan_rows: usize,
+}
+
 /// A cluster of related contexts.
 #[derive(Debug, Clone)]
 pub struct ClusterInfo {
@@ -164,19 +179,43 @@ pub struct SemanticIndex {
 
 impl SemanticIndex {
     /// Create or load a semantic index.
+    ///
+    /// If the loaded graph carries more points than metadata has live rows —
+    /// dead slots survived from eviction before the process last stopped —
+    /// this runs a `rebuild()` before returning so callers never observe a
+    /// stale, bloated graph. See `rebuild()` for what that entails.
     pub fn new(config: IndexConfig, embedder: Box<dyn Embedder>) -> Result<Self, IndexError> {
         std::fs::create_dir_all(&config.data_dir)?;
 
         let hnsw = index::HnswIndex::new(&config)?;
         let metadata = metadata::MetadataStore::open(&config.data_dir)?;
 
-        Ok(Self {
+        let this = Self {
             embedder: Arc::from(embedder),
             hnsw: RwLock::new(hnsw),
             metadata: Mutex::new(metadata),
             config,
             synthesis_cache: synthesis::SynthesisCache::new(),
-        })
+        };
+
+        // Lock order: each guard here is a standalone temporary, dropped at
+        // the end of its own statement, so hnsw and metadata are never held
+        // simultaneously (see struct-level lock order docs).
+        let graph_count = this.hnsw.read().unwrap().graph_point_count();
+        let meta_count = this.metadata.lock().unwrap().count()?;
+        if graph_count > meta_count {
+            let stats = this.rebuild()?;
+            tracing::info!(
+                graph_count,
+                meta_count,
+                kept = stats.kept,
+                dropped_dead = stats.dropped_dead,
+                repaired_orphan_rows = stats.repaired_orphan_rows,
+                "startup auto-rebuild reclaimed dead HNSW slots"
+            );
+        }
+
+        Ok(this)
     }
 
     /// Index a context's blocks. Returns true if content was (re-)embedded.
@@ -234,8 +273,23 @@ impl SemanticIndex {
             if count > max {
                 let to_evict = count - max;
                 let evicted = meta.evict_oldest(to_evict)?;
+
+                // The graph points for evicted slots remain in HNSW — it has
+                // no delete — but clear_slot at least stops the embeddings
+                // cache from continuing to serve them. meta is still held
+                // here, so lock order (metadata -> hnsw) matches every other
+                // writer. The graph points themselves are only reclaimed by
+                // the next rebuild() (startup auto-rebuild or `kj synth
+                // rebuild`).
+                if !evicted.is_empty() {
+                    let mut hnsw = self.hnsw.write().unwrap();
+                    for slot in &evicted {
+                        hnsw.clear_slot(*slot);
+                    }
+                }
+
                 tracing::info!(
-                    evicted = evicted,
+                    evicted = evicted.len(),
                     max_contexts = max,
                     "evicted oldest contexts from index"
                 );
@@ -249,19 +303,71 @@ impl SemanticIndex {
     ///
     /// HNSW does not support point deletion — `evict_oldest` removes metadata
     /// rows but leaves orphaned vectors in the graph. Call this periodically
-    /// (e.g. on server startup or via admin command) to compact the index.
+    /// (e.g. on server startup or via `kj synth rebuild`) to compact the index.
+    ///
+    /// Slot numbers are **never renumbered**: the fresh graph re-inserts each
+    /// live slot at its existing number, so a normal rebuild never writes to
+    /// metadata — the graph is simply swapped for a smaller one holding the
+    /// same slots. This makes crash-consistency trivial: if the process dies
+    /// mid-rebuild, metadata and the old (still-present, still valid)
+    /// `index.hnsw.*` files never disagree. The only metadata write is orphan
+    /// repair (see below), which is itself limited to deleting rows that were
+    /// already unusable.
     ///
     /// Blocking — call from `spawn_blocking`.
-    pub fn rebuild(&self) -> Result<(), IndexError> {
-        // TODO: implement full rebuild
-        //  1. Read all (slot, context_id) from metadata
-        //  2. Collect embeddings from current HNSW for live slots
-        //  3. Create a fresh HnswIndex
-        //  4. Re-insert all live embeddings with compacted slot numbers
-        //  5. Update metadata slot numbers to match
-        //  6. Swap the new index into self.hnsw
-        tracing::warn!("rebuild() is not yet implemented — dead HNSW slots persist until then");
-        Ok(())
+    pub fn rebuild(&self) -> Result<RebuildStats, IndexError> {
+        // Lock order: metadata then hnsw, matching index_context. This blocks
+        // concurrent index_context for the duration of the rebuild, which is
+        // correct — we're about to swap the graph out from under it.
+        let mut meta = self.metadata.lock().unwrap();
+        let slots = meta.all_slots()?;
+
+        let mut hnsw = self.hnsw.write().unwrap();
+        let old_point_count = hnsw.graph_point_count();
+
+        let mut entries = Vec::with_capacity(slots.len());
+        let mut repaired_orphan_rows = 0usize;
+
+        for (slot, ctx_id) in &slots {
+            match hnsw.get_embedding(*slot) {
+                Ok(embedding) => entries.push((*slot, embedding)),
+                Err(_) => {
+                    // Metadata row survived without a matching graph point —
+                    // a crash artifact, not a normal eviction (eviction
+                    // deletes the metadata row too, via evict_oldest). Drop
+                    // the row; the watcher re-indexes this context on its
+                    // next terminal event.
+                    tracing::warn!(
+                        context = %ctx_id.short(),
+                        slot = slot,
+                        "rebuild: metadata row has no graph point, repairing"
+                    );
+                    meta.remove(*ctx_id)?;
+                    repaired_orphan_rows += 1;
+                }
+            }
+        }
+
+        let kept = entries.len();
+        let dropped_dead = old_point_count.saturating_sub(kept);
+
+        let new_index = index::HnswIndex::from_entries(&self.config, &entries)?;
+        new_index.save()?;
+
+        *hnsw = new_index;
+
+        let stats = RebuildStats {
+            kept,
+            dropped_dead,
+            repaired_orphan_rows,
+        };
+        tracing::info!(
+            kept = stats.kept,
+            dropped_dead = stats.dropped_dead,
+            repaired_orphan_rows = stats.repaired_orphan_rows,
+            "rebuilt HNSW index"
+        );
+        Ok(stats)
     }
 
     /// Search for contexts similar to a text query.
@@ -801,5 +907,169 @@ mod tests {
         let indexed = idx.index_context(ctx, &[]).unwrap();
         assert!(!indexed, "empty blocks should not be indexed");
         assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_eviction_clears_embeddings_cache() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_contexts = Some(2);
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Evicts ctx1; no rebuild has run yet, so the graph point for ctx1
+        // is still physically present — only the cache entry should be gone.
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+            .unwrap();
+        assert_eq!(idx.len(), 2);
+
+        let hnsw = idx.hnsw.read().unwrap();
+        let all = hnsw.get_all_embeddings().unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "embeddings cache should reflect only live entries after eviction, before rebuild"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_reclaims_evicted_slots() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_contexts = Some(2);
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Indexing a third evicts ctx1 (oldest) down to max_contexts = 2.
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+            .unwrap();
+        assert_eq!(idx.len(), 2);
+
+        // Pre-rebuild: the evicted slot is still dead weight in the graph.
+        let graph_count_before = idx.hnsw.read().unwrap().graph_point_count();
+        assert_eq!(graph_count_before, 3);
+
+        let stats = idx.rebuild().unwrap();
+        assert_eq!(stats.kept, 2, "kept must equal live metadata count");
+        assert_eq!(
+            stats.dropped_dead, 1,
+            "the one evicted slot should be dropped"
+        );
+        assert_eq!(stats.repaired_orphan_rows, 0);
+
+        let graph_count_after = idx.hnsw.read().unwrap().graph_point_count();
+        assert_eq!(
+            graph_count_after,
+            idx.len(),
+            "graph must match metadata after rebuild"
+        );
+
+        let results = idx.search("context", 10).unwrap();
+        let ids: Vec<ContextId> = results.iter().map(|r| r.context_id).collect();
+        assert!(
+            !ids.contains(&ctx1),
+            "evicted ctx1 must not appear in search results"
+        );
+        assert!(
+            ids.contains(&ctx2) || ids.contains(&ctx3),
+            "a live context should still be findable"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_repairs_orphan_metadata_row() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+        // Simulate a crash between assign_slot and the HNSW insert: a
+        // metadata row exists with no matching graph point behind it.
+        let orphan_ctx = ContextId::new();
+        {
+            let mut meta = idx.metadata.lock().unwrap();
+            meta.assign_slot(orphan_ctx, "orphan-hash", "mock", 32)
+                .unwrap();
+        }
+        assert_eq!(idx.len(), 1);
+
+        let stats = idx.rebuild().unwrap();
+        assert_eq!(stats.repaired_orphan_rows, 1);
+        assert_eq!(stats.kept, 0);
+
+        assert_eq!(idx.len(), 0, "orphan row should be removed from metadata");
+    }
+
+    #[test]
+    fn test_startup_auto_rebuild_reclaims_dead_slots() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        // Generous enough that seeding fillers doesn't evict any of them, but
+        // tight enough that indexing one more context forces an eviction —
+        // leaves plenty of live points behind for post-rebuild search
+        // connectivity (see seed_filler's doc comment on tiny-graph flakiness).
+        config.max_contexts = Some(31);
+
+        let ctx_live = ContextId::new();
+
+        {
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            seed_filler(&idx, 30);
+            idx.index_context(ctx_live, &make_blocks(ctx_live, "persistent live context"))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Pushes count to 32 > 31, evicting the oldest filler — leaves a
+            // dead slot in the graph that only a rebuild reclaims.
+            let extra_ctx = ContextId::new();
+            idx.index_context(
+                extra_ctx,
+                &make_blocks(extra_ctx, "one more filler to force eviction"),
+            )
+            .unwrap();
+
+            let meta_count = idx.len();
+            let graph_count = idx.hnsw.read().unwrap().graph_point_count();
+            assert!(
+                graph_count > meta_count,
+                "pre-save: graph should carry a dead slot from eviction"
+            );
+
+            idx.save().unwrap();
+        }
+
+        // Reopen with the same config — auto-rebuild should run because the
+        // saved graph has more points than metadata rows.
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+        let meta_count = idx.len();
+        let graph_count = idx.hnsw.read().unwrap().graph_point_count();
+        assert_eq!(
+            graph_count, meta_count,
+            "auto-rebuild on startup should have reclaimed the dead slot"
+        );
+
+        let results = idx.search("persistent live context", 5).unwrap();
+        assert!(
+            !results.is_empty(),
+            "search should still work after auto-rebuild"
+        );
     }
 }
