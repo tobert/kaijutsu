@@ -109,12 +109,12 @@ fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> 
     if lines.is_empty() { None } else { Some(lines.join("\n")) }
 }
 
-/// HDR gain for the focus card's bevel frame (the `border` ring band): the
-/// selection's accent lifted so the frame reads as a deliberate beveled edge.
-/// It replaces the accidental cream ring the pre-mask-fix chatter/beat lanes
-/// used to paint. A touch under the HUD panels' 1.8 so the in-world card
-/// doesn't outshine its own HUD. **Amy-tunable.**
-const READING_BORDER_GAIN: f32 = 1.6;
+// HDR gain for the focus card's bevel frame (the `border` ring band: the
+// selection's accent lifted so the frame reads as a deliberate beveled edge,
+// replacing the accidental cream ring the pre-mask-fix chatter/beat lanes
+// used to paint; a touch under the HUD panels' `gain_hud_border` so the
+// in-world card doesn't outshine its own HUD) moved onto
+// `ScenePalette::gain_reading_border`.
 
 /// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, drifting]`.
 /// `status` is a float code the shader switches on for the rim FX: pending/none →
@@ -353,6 +353,7 @@ pub fn update_reading_card(
     mut font_data_map: ResMut<FontDataMap>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
     state: Res<TimeWellState>,
+    palette: Res<crate::view::scene_palette::ScenePalette>,
     cards: Query<&Card>,
     mut reading: Query<
         (&mut MsdfBlockGlyphs, &MeshMaterial3d<WellCardMaterial>),
@@ -383,7 +384,7 @@ pub fn update_reading_card(
                 // The focus card is the selection — no selection/lineage ring on it.
                 mat.params = Vec4::ZERO;
                 // Beveled frame: the accent lifted into HDR on the ring band.
-                mat.border = (accent.truncate() * READING_BORDER_GAIN).extend(1.0);
+                mat.border = (accent.truncate() * palette.gain_reading_border).extend(1.0);
             }
             match atlas.as_deref_mut() {
                 Some(atlas) => {

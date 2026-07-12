@@ -11,7 +11,7 @@ use kaijutsu_viz::layout::Band;
 
 use super::card::CardData;
 use crate::ui::screen::Screen;
-use crate::view::palette;
+use crate::view::scene_palette::ScenePalette;
 use super::panel::create_msdf_panel;
 
 // ============================================================================
@@ -331,29 +331,14 @@ const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 /// (unified brightness/HDR tiers) is the color-management pass in issues.md.
 const TERRACE_RING_ALPHA: f32 = 0.55;
 
-/// The well's neon hue — an indigo/blue-violet bridging the old saturated
-/// cyan-blue (`WellRingsMaterial`'s `ring_color`, formerly `[0.35, 0.62,
-/// 1.0]`, and this ring's own formerly icy cyan-white) toward
-/// [`palette::VIOLET_THREAD`] (`[0.550, 0.180, 0.750]`, the room's
-/// information/radiator violet) — the room-palette re-skin (2026-07-11,
-/// "bring the well's colors into the room's dark gold/neon family"). Landed
-/// short of `VIOLET_THREAD` itself on purpose: a straight swap read too
-/// pink/magenta next to the gold core, where this reads as "the room's
-/// violet, but electric" — one hue language, not a rote find-replace of blue
-/// with violet. Shared by the ring deck's `ring_color` and the terrace glyph
-/// rings ([`TERRACE_RING_COLOR`]) so the well's two neon layers read as one
-/// family, the way the gold core and the room's own gold trim already do.
-/// **Amy-tunable — a judgment call; live-tune if it reads too blue or too
-/// violet next to `VIOLET_THREAD` on the radiator walls.**
-const WELL_NEON_HUE: Vec3 = Vec3::new(0.42, 0.30, 0.90);
-
-/// Glyph color for the terrace rings: a lighter, softer tint of
-/// [`WELL_NEON_HUE`] — was an icy cyan-white before the re-skin (matched the
-/// old deck's cyan-blue family); now a paler version of the same indigo-violet
-/// so the terrace glyphs still read a shade lighter than the deck's ring
-/// pulse, the relative-brightness relationship the old cyan-white/cyan-blue
-/// pair had. **Amy-tunable.**
-const TERRACE_RING_COLOR: Vec3 = Vec3::new(0.55, 0.45, 0.95);
+// The well's neon hue — an indigo/blue-violet bridging the old saturated
+// cyan-blue (`WellRingsMaterial`'s `ring_color`, formerly `[0.35, 0.62,
+// 1.0]`, and the terrace ring's own formerly icy cyan-white) toward the
+// room's information/radiator violet — moved onto `ScenePalette::neon`
+// (shared by the ring deck's `ring_color` and the terrace glyph rings so the
+// well's two neon layers read as one family, the way the gold core and the
+// room's own gold trim already do). The terrace glyph color (a lighter,
+// softer tint of the deck's neon) moved onto `ScenePalette::terrace`.
 
 /// Brightness multiplier for rings + cards **not** on the focused ring, so the
 /// focused ring clearly pops (a card parked in front by a neighbor ring no
@@ -551,6 +536,7 @@ pub(crate) fn spawn_well_furniture(
     commands: &mut Commands,
     parent: Option<Entity>,
     state: &mut TimeWellState,
+    palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<crate::shaders::WellCardMaterial>,
     ring_materials: &mut Assets<crate::shaders::WellRingsMaterial>,
@@ -587,15 +573,15 @@ pub(crate) fn spawn_well_furniture(
     // `tick_and_sync_rings`. Not billboarded — it faces the camera (+Z) as a
     // fixed floor; the shader fades its square corners to nothing.
     let deck_mesh = meshes.add(Rectangle::new(RING_DECK_SIZE, RING_DECK_SIZE));
-    // Warm gold core (`palette::GOLD_HUE` — was `[1.0, 0.62, 0.20]`, the
+    // Warm gold core (`ScenePalette::gold` — was `[1.0, 0.62, 0.20]`, the
     // concept-art palette's own warm gold; leaned the rest of the way onto the
-    // room's shared gold) + indigo-violet neon rings (`WELL_NEON_HUE` — was
-    // `[0.35, 0.62, 1.0]`, a saturated cyan-blue). Room-palette re-skin,
+    // room's shared gold) + indigo-violet neon rings (`ScenePalette::neon` —
+    // was `[0.35, 0.62, 1.0]`, a saturated cyan-blue). Room-palette re-skin,
     // 2026-07-11: HDR-on-activity behavior (`energy`/ripples in
     // `well_rings.wgsl`) is untouched — only these RESTING identity hues moved.
     let deck_material = ring_materials.add(crate::shaders::WellRingsMaterial::new(
-        Vec4::new(palette::GOLD_HUE[0], palette::GOLD_HUE[1], palette::GOLD_HUE[2], 1.0),
-        WELL_NEON_HUE.extend(1.0),
+        Vec4::new(palette.gold.red, palette.gold.green, palette.gold.blue, 1.0),
+        ScenePalette::vec3(palette.neon).extend(1.0),
     ));
     // Tilt + place the deck on the same reclined funnel axis as the cards: its
     // center rides to the throat (lifted depth) and its face tips up toward the
@@ -639,11 +625,11 @@ pub(crate) fn spawn_well_furniture(
             outer_frac,
             spin_rate,
             spin_dir,
-            TERRACE_RING_COLOR,
+            ScenePalette::vec3(palette.terrace),
             TERRACE_RING_ALPHA,
             k,
             ring_count,
-            Vec3::from(palette::GOLD_HUE),
+            ScenePalette::vec3(palette.gold),
         ));
         let ring_pos = tilt * Vec3::new(0.0, 0.0, depth);
         commands.spawn((
@@ -1841,6 +1827,12 @@ pub fn move_cards_toward_target(time: Res<Time>, mut cards: Query<(&mut Transfor
 /// is stable across frames.
 /// Accent bucket → linear-rgba [`Vec4`] for `WellCardMaterial.accent` (the card
 /// body color the shader fills). Alpha 0.94 (matches the old vello bg).
+///
+/// Color-space check (feat/scene-palette-migration survey flag): `accent_color`
+/// builds an `Hsla` (`Color::hsl`, CSS-HSL semantics — sRGB-referenced), and
+/// `.to_linear()` converts THAT to `LinearRgba` — so `c` here is already
+/// linear, correct for `WellCardMaterial`'s uniform (the 3D scene lane wants
+/// linear values, docs/color.md). Verified correct; no fix needed.
 pub fn accent_vec4(accent: &str) -> Vec4 {
     let c = accent_color(accent).to_linear();
     Vec4::new(c.red, c.green, c.blue, 0.94)

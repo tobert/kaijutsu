@@ -37,7 +37,7 @@ pub struct TerraceRingMaterial {
     #[uniform(2)]
     pub glyph: Vec4,
 
-    /// Accent color (the room's gold, `palette::GOLD_HUE`): linear rgb in
+    /// Accent color (the room's gold, `ScenePalette::gold`): linear rgb in
     /// `.xyz`, `.w` reserved. The centerpiece's second tone — gold segments,
     /// rosette nodes, motes, and gem glints mix toward it so the terrace
     /// glyphs speak the room's gold-trim + violet-information language.

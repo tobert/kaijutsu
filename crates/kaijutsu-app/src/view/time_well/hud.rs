@@ -97,11 +97,11 @@ const SOUTH_LINE_CHARS: usize = 48;
 /// Inner padding (texture px) — keeps the text inset from the frame so the panel
 /// has breathing room inside its border.
 const HUD_PAD: f32 = 30.0;
-/// Border strength (the `WellCardMaterial.border` alpha) and an HDR gain so the
-/// outline blooms gently. No body fill — the panel is a glowing frame tinted by
-/// the selection's accent, so unequal panel sizes still read as a set.
+/// Border strength (the `WellCardMaterial.border` alpha) — no body fill, the
+/// panel is a glowing frame tinted by the selection's accent, so unequal panel
+/// sizes still read as a set. The HDR gain that makes the outline bloom gently
+/// moved onto `ScenePalette::gain_hud_border`.
 const HUD_BORDER_STRENGTH: f32 = 1.0;
-const HUD_BORDER_GAIN: f32 = 1.8;
 
 /// Per-slot texture (logical authoring) size. N/S are wide-short, E/W tall-narrow;
 /// the quad aspect tracks this so text never distorts.
@@ -357,6 +357,7 @@ pub fn update_well_hud(
     state: Res<TimeWellState>,
     tails: Res<super::live::ContextTails>,
     tracks: Res<super::rays::WellTracks>,
+    palette: Res<crate::view::scene_palette::ScenePalette>,
     cards: Query<&Card>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
@@ -375,9 +376,9 @@ pub fn update_well_hud(
         Some(card) => {
             let c = accent_color(&card.data.accent).to_linear();
             Vec4::new(
-                c.red * HUD_BORDER_GAIN,
-                c.green * HUD_BORDER_GAIN,
-                c.blue * HUD_BORDER_GAIN,
+                c.red * palette.gain_hud_border,
+                c.green * palette.gain_hud_border,
+                c.blue * palette.gain_hud_border,
                 HUD_BORDER_STRENGTH,
             )
         }

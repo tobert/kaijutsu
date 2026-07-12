@@ -21,7 +21,7 @@
 //!   console emblem glows with context chatter ([`activity::BearingActivity`]).
 //!   Strong sustained HDR is reserved for live activity; decoration may also
 //!   carry its own FAINT, slowly moving glow (the circuit board, the wall
-//!   trim — below), capped at [`palette::GLOW_CREST`] and LDR on
+//!   trim — below), capped at [`ScenePalette::crest`] and LDR on
 //!   time-average (Amy, 2026-07-10 — "make the circuit patterns and border
 //!   glow faintly like the concepts... a lil bloom or some other shader;
 //!   something faintly moving might be interesting").
@@ -114,15 +114,15 @@ use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::Screen;
 use crate::view::palette;
 use crate::view::patch_bay;
+use crate::view::scene_palette::{ScenePalette, lin_scaled};
 use crate::view::time_well::live::WellBeats;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use vello::peniko::Brush;
 
-// ── Room palette + geometry (Amy-tunable) ───────────────────────────────────
-
-/// Room background clear — a shade darker than the well's, so leaving the well
-/// upward reads as stepping back into the larger dark of the room.
-const ROOM_BG: Color = Color::srgb(0.020, 0.026, 0.044);
+// ── Room geometry (Amy-tunable) ─────────────────────────────────────────────
+// Color/brightness constants moved onto `Res<ScenePalette>`
+// (feat/scene-palette-migration) — see `palette.rs`'s header. What's left
+// here is geometry only.
 
 /// Floor disc radius (world units); comfortably past the wall stations so the
 /// room reads as a chamber, not a platform. Bumped 1100 → 1300 alongside
@@ -177,10 +177,10 @@ const PYLON_PLINTH_HEIGHT: f32 = 18.0;
 /// a station that doesn't exist yet, not dressed like one that does.
 const PYLON_CAP_WIDTH: f32 = MARKER_WIDTH * 1.6;
 const PYLON_CAP_HEIGHT: f32 = 14.0;
-const PYLON_PLINTH_COLOR: [f32; 3] = TABLE_COLOR;
-/// Cap brightness — the same gold family/weight as the table rim and console
-/// rings, so every gold accent in the room reads as one hue.
-const PYLON_CAP_GOLD_LDR: f32 = 0.50;
+// The plinth reads `ScenePalette::table` directly (it was a bare alias for
+// `TABLE_COLOR`); the cap reads `ScenePalette::gold` × `ScenePalette::trim` —
+// "the same gold family/weight as the table rim and console rings, so every
+// gold accent in the room reads as one hue."
 
 /// Nameplate quad (world units) and its texture (logical px) — the well's plate
 /// grammar, kept API-compatible for the patch bay's own plates.
@@ -196,15 +196,6 @@ pub(crate) const PLATE_FONT_SIZE: f32 = 30.0;
 const PLATE_HEIGHT: f32 = 200.0;
 // `APPROACH_LOOK_HEIGHT` (where the approach pose *looks*, world-Y at the
 // wall) moved to `shot.rs` — pure camera framing, no longer read here.
-
-// ── Console gold hue (Slice C: the real well now stands where the
-// slice-A CONSOLE_RINGS placeholder used to; this hue survives only because
-// the table rim/pylon caps still share the room's one gold family) ─────────
-
-/// Gold hue (linear rgb identity) shared by the table rim, the pylon caps,
-/// and (before Slice C) the retired `CONSOLE_RINGS` placeholder — "every gold
-/// accent in the room reads as one hue" (`spawn_table`'s own doc).
-const CONSOLE_GOLD_HUE: [f32; 3] = [1.00, 0.78, 0.34];
 
 // ── Well table (Amy: "MORE SOLIDNESS" — heavy furniture, not hologram) ──────
 
@@ -229,10 +220,9 @@ const TABLE_PEDESTAL_RADIUS: f32 = 55.0;
 /// standing there*, not by an arbitrary rule.
 const TABLE_PLINTH_RADIUS: f32 = 145.0;
 const TABLE_PLINTH_HEIGHT: f32 = 16.0;
-/// Dark tabletop/pedestal/plinth colour — a shade lighter than the floor.
-const TABLE_COLOR: [f32; 3] = [0.032, 0.036, 0.050];
-/// Gold trim brightness (rim torus): the same LDR weight as the console rings.
-const TABLE_GOLD_LDR: f32 = 0.50;
+// Table/pedestal/plinth colour (`ScenePalette::table`) and the rim torus's
+// gold trim brightness (`ScenePalette::gold` × `ScenePalette::trim`) moved
+// onto the palette resource.
 
 // ── Octagon wall shell (the enclosing chamber; `shell.md`'s cutaway
 // centerpiece) ──────────────────────────────────────────────────────────────
@@ -259,26 +249,23 @@ const WALL_PANEL_GAP: f32 = 40.0;
 /// ([`MARKER_WIDTH`]), so the shell's architecture and the furniture standing
 /// in front of it read as one family.
 const WALL_MULLION_WIDTH: f32 = MARKER_WIDTH;
-/// Dark glass base — a hair lighter than the dome's rim
-/// ([`bearing::dome_color`]`(0.0)`, `[0.050, 0.048, 0.086]`) so a panel reads
-/// as a surface catching the vault's glow, not a hole in it.
-const WALL_BASE_COLOR: [f32; 3] = [0.062, 0.060, 0.094];
-/// Mullion colour — a shade darker than the panel base: unlit structure
-/// between faces of different hues, no identity hue of its own.
-const WALL_MULLION_COLOR: [f32; 3] = [0.040, 0.040, 0.058];
+// Panel base colour (`ScenePalette::wall_base` — a hair lighter than the
+// dome's rim, [`bearing::dome_color`]`(0.0)`, so a panel reads as a surface
+// catching the vault's glow, not a hole in it) and mullion colour
+// (`ScenePalette::wall_mullion` — a shade darker than the panel base) moved
+// onto the palette resource.
 /// Edge-trim strip thickness, and how far it floats proud of the panel base
 /// (inward, along the panel's own local +Z — the "proud" idiom the old
 /// radiator thread-strips used, now needed for the trim too since both are
 /// now zero-thickness quads that would otherwise share a plane).
 const WALL_TRIM_THICKNESS: f32 = 12.0;
 const WALL_TRIM_PROUD: f32 = 2.2;
-/// Trim glow trough — restrained neon at rest, not a blown highlight
-/// (mission's "LDR ~0.5-0.7 of hue"; `trough * palette::GLOW_CREST` stays
-/// under 1.0). The trim now carries a [`TraceGlowMaterial`] traveling wave
-/// (mode 0, `spawn_walls`) whose crest renormalizes to
-/// [`palette::GLOW_CREST`] — this is its RESTING level between passes, the
-/// old flat brightness's role.
-const WALL_TRIM_GLOW_TROUGH: f32 = 0.60;
+// Trim glow trough (`ScenePalette::trough_wall_trim` — restrained neon at
+// rest, not a blown highlight; mission's "LDR ~0.5-0.7 of hue"; `trough *
+// ScenePalette::crest` stays under 1.0) moved onto the palette resource. The
+// trim carries a [`TraceGlowMaterial`] traveling wave (mode 0, `spawn_walls`)
+// whose crest renormalizes to `ScenePalette::crest` — the trough is its
+// RESTING level between passes.
 /// One crest crosses a whole trim strip roughly every this many seconds
 /// (mode 0 period, `rate = 1 / WALL_TRIM_GLOW_PERIOD`) — long and slow, per
 /// panel (`spawn_walls`'s per-panel phase keeps the eight panels from
@@ -306,16 +293,12 @@ const WALL_THREAD_BRIGHTNESS_RANGE: (f32, f32) = (0.3, 0.9);
 /// (each route scales this by its own `width_scale`, 0.5–1.2).
 const TRACE_Y: f32 = 0.6;
 const TRACE_WIDTH: f32 = 7.0;
-/// Etched fabric hues (linear rgb, dim): crimson = MIDI, cyan = PCM, green =
-/// VFS (dimmed from the [0.40, 0.85, 0.52] marker identity for etching
-/// headroom), gold = the well (used sparingly — gold is the console's hue).
-/// At rest a trace is a dark engraving; it lights HDR only when its flow runs
-/// (later slices). One hue family per fabric (the charter's rainbow-board
-/// rule); the violet stubs reuse [`palette::VIOLET_GLASS`] directly.
-const TRACE_CRIMSON: [f32; 3] = [0.24, 0.055, 0.070];
-const TRACE_CYAN: [f32; 3] = [0.050, 0.170, 0.210];
-const TRACE_GREEN: [f32; 3] = [0.100, 0.260, 0.150];
-const TRACE_GOLD: [f32; 3] = [0.300, 0.220, 0.100];
+// Etched fabric hues (crimson = MIDI, cyan = PCM, green = VFS, gold = the
+// well) moved onto `ScenePalette::trace_crimson`/`trace_cyan`/`trace_green`/
+// `trace_gold`; the violet stubs read `ScenePalette::violet_glass` directly
+// (`route_bundles`, below). At rest a trace is a dark engraving; it lights
+// HDR only when its flow runs (later slices). One hue family per fabric (the
+// charter's rainbow-board rule).
 
 /// Inscribed gold ring routes depart from (concept 06's gold circle band):
 /// center radius and band width. Clears [`KEEPOUT_RADIUS`] with room to
@@ -324,7 +307,11 @@ const TRACE_GOLD: [f32; 3] = [0.300, 0.220, 0.100];
 /// circles read as clutter.
 const RING_OUTER_R: f32 = 230.0;
 const RING_BAND_WIDTH: f32 = 10.0;
-const RING_GOLD_HUE: [f32; 3] = [1.00, 0.80, 0.36];
+// The inscribed ring's gold hue used to be its own near-duplicate constant
+// (`RING_GOLD_HUE = [1.00, 0.80, 0.36]`, ~2% off `CONSOLE_GOLD_HUE`'s
+// [1.00, 0.78, 0.34]) — collapsed onto `ScenePalette::gold` (the ONE
+// sanctioned value change in this migration; every gold accent in the room
+// now reads the identical hue, not two eyeballed near-twins).
 /// Slow breathing rate (mode 1, rad/s) for the room's calmest gold glow
 /// accent — the inscribed floor ring: subtle, architectural, unhurried.
 /// (Once shared with the W dais bezel, retired in the 2026-07-10
@@ -342,22 +329,19 @@ const ROUTE_PAD_RADIUS_RANGE: (f32, f32) = (6.0, 14.0);
 // ── Faint moving glow (`TraceGlowMaterial`; Amy, 2026-07-10) ────────────────
 // "make the circuit patterns and border glow faintly like the concepts... a
 // lil bloom or some other shader; something faintly moving might be
-// interesting." Every crest renormalizes to `palette::GLOW_CREST`
+// interesting." Every crest renormalizes to `ScenePalette::crest`
 // (`crest_color`); these constants are each element's RESTING trough and
 // its wave/breath rate — the knobs that make one glowing thing read subtler
 // or livelier than another. SLOW and FAINT is the target across the board —
 // the room must not read as an arcade.
 
-/// Floor-trace glow trough (mode 0, `spawn_floor`): the resting brightness
-/// fraction of a route's crest colour between the traveling crest's passes —
-/// a clear step down so the crest's transit reads as motion, not a flicker.
-const TRACE_GLOW_TROUGH: f32 = 0.55;
-/// Terminal-pad glow trough (mode 1, `spawn_floor`) — a hair brighter than
-/// [`TRACE_GLOW_TROUGH`] (the old `ROUTE_PAD_BRIGHTNESS_GAIN`'s "slightly
-/// brighter than their trace" read, now expressed as a higher resting floor
-/// rather than a colour scale, since every crest shares the same
-/// [`palette::GLOW_CREST`] ceiling regardless of gain).
-const PAD_GLOW_TROUGH: f32 = 0.65;
+// Floor-trace glow trough (mode 0, `spawn_floor`: `ScenePalette::trough_wiring`
+// — the resting brightness fraction of a route's crest colour between the
+// traveling crest's passes, a clear step down so the crest's transit reads
+// as motion, not a flicker) and terminal-pad glow trough (mode 1,
+// `ScenePalette::trough_pads` — a hair brighter than the wiring trough, since
+// every crest shares the same `ScenePalette::crest` ceiling regardless of
+// gain) moved onto the palette resource.
 /// `(min, max)` seconds for one crest to cross a whole route (mode 0 period,
 /// `rate = 1 / period`) — jittered per-route from `bearing::BoardRoute`'s
 /// `glow_phase01` so the board doesn't pulse in lockstep.
@@ -393,16 +377,14 @@ const PLATE_ACCENT: Vec4 = Vec4::new(0.075, 0.085, 0.125, 1.0);
 const CAMERA_EASE_RATE: f32 = 4.0;
 
 // ── Ambient glow gains ───────────────────────────────────────────────────────
+// Marker rest brightness (`ScenePalette::marker`), tracks (E) beat gain
+// (`ScenePalette::gain_beat` — `global_envelope` (0..1) → this much HDR lift
+// on the tracks marker each beat, the acceptance "breathe," `shell.md` slice
+// A), the sustained lift under the beat while a track is rolling
+// (`ScenePalette::gain_active`), and the steady brightness lift on the
+// focused station's marker/console (`ScenePalette::gain_focus_lift`) all
+// moved onto the palette resource.
 
-/// Marker rest brightness (LDR multiplier on the marker's identity hue).
-const MARKER_LDR: f32 = 0.42;
-/// Tracks (E) beat gain: `global_envelope` (0..1) → this much HDR lift on the
-/// tracks marker each beat — the acceptance "breathe" (`shell.md` slice A).
-const TRACKS_BEAT_GAIN: f32 = 2.8;
-/// Sustained lift under the beat while a track is rolling (`activity(East)`).
-const TRACKS_ACTIVE_GAIN: f32 = 0.5;
-/// Steady brightness lift on the focused station's marker/console.
-const FOCUS_LIFT: f32 = 0.35;
 /// Quantization step for the glow lanes — coarse enough that a settled marker
 /// stops re-extracting its material (the well's `LIVE_LANE_STEP` discipline).
 const GLOW_STEP: f32 = 1.0 / 64.0;
@@ -542,6 +524,7 @@ fn enter_room(
     mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
     mut well_tracks: ResMut<crate::view::time_well::rays::WellTracks>,
+    palette: Res<ScenePalette>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     mut glow_mats: ResMut<Assets<TraceGlowMaterial>>,
@@ -553,10 +536,11 @@ fn enter_room(
     // `Query<(Entity, &Projection), _>` alongside it) to stay under Bevy's
     // 16-param ceiling for a function-as-system — `enter_room` was the first
     // system in this codebase to actually hit it (Slice C added enough new
-    // room-furniture params to tip it over).
+    // room-furniture params to tip it over); windows+dock folded into a
+    // second tuple param (feat/scene-palette-migration) to make room for
+    // `palette` without exceeding the ceiling a second time.
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform, &Projection), With<Camera3d>>,
-    windows: Query<&Window>,
-    dock: Query<&ComputedNode, With<crate::ui::dock::NorthDock>>,
+    (windows, dock): (Query<&Window>, Query<&ComputedNode, With<crate::ui::dock::NorthDock>>),
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`
@@ -582,7 +566,7 @@ fn enter_room(
     let mut well_hud_camera: Option<(Entity, f32, f32)> = None;
     if let Ok((cam_entity, mut cam, mut tf, projection)) = app_camera.single_mut() {
         commands.entity(cam_entity).insert(RoomCamera);
-        cam.clear_color = ClearColorConfig::Custom(ROOM_BG);
+        cam.clear_color = ClearColorConfig::Custom(Color::LinearRgba(palette.bg));
         let (pos, look) = shot::resolve(shot::RoomShot::focused(room.carousel.focused_station()));
         *tf = Transform::from_translation(pos).looking_at(look, Vec3::Y);
         let (fov_y, aspect) = crate::view::time_well::hud::read_perspective(projection);
@@ -596,7 +580,7 @@ fn enter_room(
     // Floor disc, inscribed gold ring, and circuit-board routes — one cohesive
     // helper (`shell.md`, "the floor is the wiring": the disc, its rings, and
     // its traces are the chamber, not room chrome).
-    spawn_floor(&mut commands, root, &mut meshes, &mut mats, &mut glow_mats);
+    spawn_floor(&mut commands, root, &palette, &mut meshes, &mut mats, &mut glow_mats);
 
     // Vault dome — an enclosing sphere with a subtle vertical vertex-colour
     // gradient (calm darkness overhead; `shell.md` open question 4 defers the
@@ -619,7 +603,7 @@ fn enter_room(
     // The well table — heavy furniture, not hologram (Amy). Spawned before the
     // ring stack it stands under; render order doesn't matter (depth-tested),
     // this just keeps "table, then what stands on it" readable in the diff.
-    spawn_table(&mut commands, root, &mut meshes, &mut mats);
+    spawn_table(&mut commands, root, &palette, &mut meshes, &mut mats);
 
     // The time well itself — room furniture at the Center bearing (Slice C,
     // `lovely-swimming-prism.md`), replacing the slice-A `CONSOLE_RINGS`
@@ -630,6 +614,7 @@ fn enter_room(
         &mut commands,
         Some(root),
         &mut well_state,
+        &palette,
         &mut meshes,
         &mut card_mats,
         &mut ring_mats,
@@ -674,7 +659,7 @@ fn enter_room(
         // overview shot's near foreground (MARKER_HEIGHT_RESERVED).
         let marker_h = if wp.station.is_some() { MARKER_HEIGHT } else { MARKER_HEIGHT_RESERVED };
         let marker_mesh = meshes.add(Cuboid::new(MARKER_WIDTH, marker_h, MARKER_WIDTH));
-        let marker_mat = mats.add(unlit(lin_v(hue * MARKER_LDR)));
+        let marker_mat = mats.add(unlit(lin_v(hue * palette.marker)));
         // Seated ON the plinth (spawn_pylons), not interpenetrating it — the
         // shared-family dark colours hid the old overlap, but a contrasting
         // plinth tune would have exposed z-fighting (kaibo, 2026-07-10).
@@ -732,7 +717,7 @@ fn enter_room(
     // (`shell.md`'s "the atrium rules" read); the reserved South stub stays
     // plinth-only ([`wants_gold_cap`]). Skips the furnished W bearing same as
     // the marker/plate loop above.
-    spawn_pylons(&mut commands, root, &mut meshes, &mut mats);
+    spawn_pylons(&mut commands, root, &palette, &mut meshes, &mut mats);
 
     // No W-bearing furniture spawns here any more (the 2026-07-10 wall-mount
     // retune): the wheel mounts directly on the W wall panel `spawn_walls`
@@ -743,7 +728,7 @@ fn enter_room(
     // corner mullions, hue-coded edge trim, and — on the four diagonals — the
     // violet information threads that used to stand as free-floating
     // radiators. The chamber, not room chrome (no RoomDistraction).
-    spawn_walls(&mut commands, root, &mut meshes, &mut mats, &mut glow_mats);
+    spawn_walls(&mut commands, root, &palette, &mut meshes, &mut mats, &mut glow_mats);
 
     // Re-root the patch bay into the room as furniture at the W bearing (slice B,
     // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
@@ -752,6 +737,7 @@ fn enter_room(
     patch_bay::spawn_furniture(
         &mut commands,
         root,
+        &palette,
         &mut meshes,
         &mut mats,
         &mut card_mats,
@@ -841,13 +827,18 @@ pub(crate) fn teardown_room(
 /// proportionally toward the bigger room — the violet diagonal stubs don't
 /// reach a wall at all (they depart and land near the inscribed ring) and are
 /// untouched.
-fn route_bundles() -> [bearing::RouteBundle; 9] {
+fn route_bundles(palette: &ScenePalette) -> [bearing::RouteBundle; 9] {
     use bearing::{Bearing, RouteBundle, dir_theta};
     let west = dir_theta(Bearing::West.dir());
     let east = dir_theta(Bearing::East.dir());
     let north = dir_theta(Bearing::North.dir());
     let south = dir_theta(Bearing::South.dir());
     let [ne, se, sw, nw] = bearing::RADIATOR_DIRS.map(dir_theta);
+    let trace_crimson = ScenePalette::vec3(palette.trace_crimson).to_array();
+    let trace_green = ScenePalette::vec3(palette.trace_green).to_array();
+    let trace_cyan = ScenePalette::vec3(palette.trace_cyan).to_array();
+    let trace_gold = ScenePalette::vec3(palette.trace_gold).to_array();
+    let violet_glass = ScenePalette::vec3(palette.violet_glass).to_array();
     [
         RouteBundle {
             center_theta: west,
@@ -860,7 +851,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             // (`palette::WALL_APOTHEM`), so the gap from the wall stays the
             // same size the 2026-07-10 evening apothem bump moved the wall.
             pad_range: (palette::WALL_APOTHEM - 160.0, palette::WALL_APOTHEM - 30.0),
-            hue: TRACE_CRIMSON,
+            hue: trace_crimson,
             brightness_range: (0.7, 1.15),
         },
         RouteBundle {
@@ -875,7 +866,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             // wall-mounted instrument), so it scales with the floor's own
             // growth rather than `WALL_APOTHEM`'s fixed gap.
             pad_range: (532.0, 1064.0),
-            hue: TRACE_CRIMSON,
+            hue: trace_crimson,
             brightness_range: (0.7, 1.15),
         },
         RouteBundle {
@@ -886,7 +877,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             arc_range: (0.2, 0.75),
             // Stretched ×13/11 from (400, 820) — see the E bundle's comment.
             pad_range: (473.0, 969.0),
-            hue: TRACE_GREEN,
+            hue: trace_green,
             brightness_range: (0.75, 1.15),
         },
         RouteBundle {
@@ -897,7 +888,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             arc_range: (0.2, 0.8),
             // Stretched ×13/11 from (460, 850) — see the E bundle's comment.
             pad_range: (544.0, 1005.0),
-            hue: TRACE_CYAN,
+            hue: trace_cyan,
             brightness_range: (0.7, 1.1),
         },
         RouteBundle {
@@ -912,7 +903,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (252.0, 320.0),
             arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
-            hue: palette::VIOLET_GLASS,
+            hue: violet_glass,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -927,7 +918,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (252.0, 320.0),
             arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
-            hue: palette::VIOLET_GLASS,
+            hue: violet_glass,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -942,7 +933,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (252.0, 320.0),
             arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
-            hue: palette::VIOLET_GLASS,
+            hue: violet_glass,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -957,7 +948,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             lane_range: (252.0, 320.0),
             arc_range: (0.02, 0.12),
             pad_range: (300.0, 420.0),
-            hue: palette::VIOLET_GLASS,
+            hue: violet_glass,
             brightness_range: (0.8, 1.2),
         },
         RouteBundle {
@@ -968,7 +959,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
             arc_range: (0.15, 0.4),
             // Stretched ×13/11 from (380, 600) — see the E bundle's comment.
             pad_range: (449.0, 709.0),
-            hue: TRACE_GOLD,
+            hue: trace_gold,
             brightness_range: (0.8, 1.0),
         },
     ]
@@ -981,6 +972,7 @@ fn route_bundles() -> [bearing::RouteBundle; 9] {
 fn spawn_floor(
     commands: &mut Commands,
     root: Entity,
+    palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
     glow_mats: &mut Assets<TraceGlowMaterial>,
@@ -1006,10 +998,14 @@ fn spawn_floor(
     // RING_OUTER_R; routes depart from it. Mode 1 (breathing) — Annulus
     // ignores uv, so mode 0 would be safe too, but the ring reads as ONE calm
     // architectural body, not wiring, so it breathes
-    // (`palette::GLOW_TROUGH_SUBTLE`).
+    // (`ScenePalette::trough_subtle`). Its hue used to be its own
+    // near-duplicate gold const (`RING_GOLD_HUE`) — collapsed onto
+    // `ScenePalette::gold` (the sanctioned value change; see this module's
+    // header note on `route_bundles`).
+    let gold = ScenePalette::vec3(palette.gold).to_array();
     let ring_mat = glow_mats.add(TraceGlowMaterial {
-        color: crest_color(RING_GOLD_HUE, palette::GLOW_CREST),
-        params: Vec4::new(0.0, GOLD_GLOW_RATE, palette::GLOW_TROUGH_SUBTLE, 1.0),
+        color: crest_color(gold, palette.crest),
+        params: Vec4::new(0.0, GOLD_GLOW_RATE, palette.trough_subtle, 1.0),
     });
     commands.spawn((
         Mesh3d(meshes.add(Annulus::new(
@@ -1029,7 +1025,7 @@ fn spawn_floor(
     // (mode 1) sharing its crest colour and its glow_phase01 hash draw ("the
     // same hash stream" — the pad's breath and the trace's wave start from
     // the same per-route random offset).
-    for (bi, bundle) in route_bundles().iter().enumerate() {
+    for (bi, bundle) in route_bundles(palette).iter().enumerate() {
         let seed_base = bi as u32 * 10_007;
         for route in bearing::expand_bundle(
             bundle,
@@ -1049,13 +1045,13 @@ fn spawn_floor(
                 route.hue[1] * route.brightness_scale,
                 route.hue[2] * route.brightness_scale,
             ];
-            let crest = crest_color(identity, palette::GLOW_CREST);
+            let crest = crest_color(identity, palette.crest);
             debug_assert!(
-                crest.x.max(crest.y).max(crest.z) <= palette::GLOW_CREST + 1e-4,
-                "floor trace crest must stay capped at GLOW_CREST: {crest:?}"
+                crest.x.max(crest.y).max(crest.z) <= palette.crest + 1e-4,
+                "floor trace crest must stay capped at ScenePalette::crest: {crest:?}"
             );
             debug_assert!(
-                TRACE_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+                palette.trough_wiring * palette.crest < 1.0,
                 "floor trace trough must stay LDR even against the crest cap"
             );
 
@@ -1068,7 +1064,7 @@ fn spawn_floor(
                 bearing::lerp(TRACE_GLOW_PERIOD_RANGE.0, TRACE_GLOW_PERIOD_RANGE.1, route.glow_phase01);
             let trace_mat = glow_mats.add(TraceGlowMaterial {
                 color: crest,
-                params: Vec4::new(route.glow_phase01, 1.0 / period, TRACE_GLOW_TROUGH, 0.0),
+                params: Vec4::new(route.glow_phase01, 1.0 / period, palette.trough_wiring, 0.0),
             });
             let mesh = meshes.add(ribbon_mesh(&route.points, TRACE_WIDTH * route.width_scale));
             commands.spawn((
@@ -1081,7 +1077,7 @@ fn spawn_floor(
             ));
 
             debug_assert!(
-                PAD_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+                palette.trough_pads * palette.crest < 1.0,
                 "floor trace pad trough must stay LDR even against the crest cap"
             );
             let pad_mat = glow_mats.add(TraceGlowMaterial {
@@ -1089,7 +1085,7 @@ fn spawn_floor(
                 params: Vec4::new(
                     route.glow_phase01 * std::f32::consts::TAU,
                     PAD_GLOW_RATE,
-                    PAD_GLOW_TROUGH,
+                    palette.trough_pads,
                     1.0,
                 ),
             });
@@ -1122,11 +1118,12 @@ fn spawn_floor(
 fn spawn_table(
     commands: &mut Commands,
     root: Entity,
+    palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) {
-    let table_mat = mats.add(unlit(lin(TABLE_COLOR)));
-    let gold_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, TABLE_GOLD_LDR)));
+    let table_mat = mats.add(unlit(Color::LinearRgba(palette.table)));
+    let gold_mat = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
 
     // Plinth — wide and low, grounding the table to the floor.
     commands.spawn((
@@ -1181,14 +1178,16 @@ fn spawn_table(
 fn spawn_walls(
     commands: &mut Commands,
     root: Entity,
+    palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
     glow_mats: &mut Assets<TraceGlowMaterial>,
 ) {
-    let panel_width = bearing::octagon_panel_width(palette::WALL_APOTHEM) - WALL_PANEL_GAP;
+    let wall_apothem = crate::view::palette::WALL_APOTHEM;
+    let panel_width = bearing::octagon_panel_width(wall_apothem) - WALL_PANEL_GAP;
 
     let base_mesh = meshes.add(Rectangle::new(panel_width, WALL_HEIGHT));
-    let base_mat = mats.add(unlit(lin(WALL_BASE_COLOR)));
+    let base_mat = mats.add(unlit(Color::LinearRgba(palette.wall_base)));
     // `glow_quad_mesh` (not a plain `Rectangle`) so `uv.x` tracks each trim
     // strip's own REAL length: the top/bottom strips are wide-and-short, the
     // left/right strips are narrow-and-tall, and `TraceGlowMaterial`'s
@@ -1197,7 +1196,7 @@ fn spawn_walls(
     let h_trim_mesh = meshes.add(glow_quad_mesh(panel_width, WALL_TRIM_THICKNESS));
     let v_trim_mesh = meshes.add(glow_quad_mesh(WALL_TRIM_THICKNESS, WALL_HEIGHT));
     let mullion_mesh = meshes.add(Rectangle::new(WALL_MULLION_WIDTH, WALL_HEIGHT));
-    let mullion_mat = mats.add(unlit(lin(WALL_MULLION_COLOR)));
+    let mullion_mat = mats.add(unlit(Color::LinearRgba(palette.wall_mullion)));
 
     // Identity hue per bearing (read straight off `wall_placements`, so a
     // re-tuned marker hue can't drift out of sync with its wall) plus one
@@ -1213,7 +1212,7 @@ fn spawn_walls(
             .expect("wall_placements always covers all four cardinal bearings")
     };
 
-    for (i, panel) in bearing::octagon_panels(palette::WALL_APOTHEM).iter().enumerate() {
+    for (i, panel) in bearing::octagon_panels(wall_apothem).iter().enumerate() {
         let pos = Vec3::new(panel.center[0], WALL_HEIGHT * 0.5, panel.center[2]);
         // Inward-facing single-sided quad: aim local −Z further out along the
         // same ray so local +Z — the mesh's front normal, and where the trim/
@@ -1236,7 +1235,7 @@ fn spawn_walls(
                 hue_for(b)
             }
             Some(Bearing::Center) => unreachable!("octagon panels never carry the center bearing"),
-            None => palette::VIOLET_THREAD,
+            None => ScenePalette::vec3(palette.violet_thread).to_array(),
         };
         // Per-panel material (not a shared handle): each panel needs its OWN
         // phase (`bearing::hash01`, namespaced well away from the thread
@@ -1245,8 +1244,8 @@ fn spawn_walls(
         // asynchronously rather than in lockstep.
         let phase = bearing::hash01(i as u32 * 90_001 + 4242);
         let trim_mat = glow_mats.add(TraceGlowMaterial {
-            color: crest_color(identity_hue, palette::GLOW_CREST),
-            params: Vec4::new(phase, 1.0 / WALL_TRIM_GLOW_PERIOD, WALL_TRIM_GLOW_TROUGH, 0.0),
+            color: crest_color(identity_hue, palette.crest),
+            params: Vec4::new(phase, 1.0 / WALL_TRIM_GLOW_PERIOD, palette.trough_wall_trim, 0.0),
         });
         let half_h = WALL_HEIGHT * 0.5 - WALL_TRIM_THICKNESS * 0.5;
         let half_w = panel_width * 0.5 - WALL_TRIM_THICKNESS * 0.5;
@@ -1291,7 +1290,7 @@ fn spawn_walls(
                 let local = Vec3::new(x, 0.0, WALL_THREAD_PROUD);
                 commands.spawn((
                     Mesh3d(meshes.add(Rectangle::new(WALL_THREAD_WIDTH, h))),
-                    MeshMaterial3d(mats.add(unlit(lin_scaled(palette::VIOLET_THREAD, brightness)))),
+                    MeshMaterial3d(mats.add(unlit(lin_scaled(palette.violet_thread, brightness)))),
                     Transform::from_translation(panel_tf.transform_point(local))
                         .with_rotation(panel_tf.rotation),
                     Visibility::Inherited,
@@ -1302,7 +1301,7 @@ fn spawn_walls(
         }
     }
 
-    for (i, (pos, _theta)) in bearing::octagon_corners(palette::WALL_APOTHEM).iter().enumerate() {
+    for (i, (pos, _theta)) in bearing::octagon_corners(wall_apothem).iter().enumerate() {
         let center = Vec3::new(pos[0], WALL_HEIGHT * 0.5, pos[2]);
         let outward = Vec3::new(center.x * 2.0, center.y, center.z * 2.0);
         let tf = Transform::from_translation(center).looking_at(outward, Vec3::Y);
@@ -1334,14 +1333,15 @@ fn wants_gold_cap(wp: &bearing::WallPlacement) -> bool {
 fn spawn_pylons(
     commands: &mut Commands,
     root: Entity,
+    palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) {
     let plinth_mesh =
         meshes.add(Cuboid::new(PYLON_PLINTH_WIDTH, PYLON_PLINTH_HEIGHT, PYLON_PLINTH_WIDTH));
-    let plinth_mat = mats.add(unlit(lin(PYLON_PLINTH_COLOR)));
+    let plinth_mat = mats.add(unlit(Color::LinearRgba(palette.table)));
     let cap_mesh = meshes.add(Cuboid::new(PYLON_CAP_WIDTH, PYLON_CAP_HEIGHT, PYLON_CAP_WIDTH));
-    let cap_mat = mats.add(unlit(lin_scaled(CONSOLE_GOLD_HUE, PYLON_CAP_GOLD_LDR)));
+    let cap_mat = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
 
     for wp in bearing::wall_placements() {
         if wp.station.is_some_and(bearing::station_is_room_furniture) {
@@ -1642,6 +1642,7 @@ fn sync_room_glow(
     room_activity: Res<BearingActivity>,
     beats: Res<WellBeats>,
     room: Res<RoomState>,
+    palette: Res<ScenePalette>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     markers: Query<(&BearingMarker, &MeshMaterial3d<StandardMaterial>)>,
 ) {
@@ -1652,13 +1653,13 @@ fn sync_room_glow(
     for (marker, handle) in markers.iter() {
         let mut lift = 0.0;
         if marker.bearing == Bearing::East {
-            lift += beat * TRACKS_BEAT_GAIN
-                + room_activity.normalized(Bearing::East) * TRACKS_ACTIVE_GAIN;
+            lift += beat * palette.gain_beat
+                + room_activity.normalized(Bearing::East) * palette.gain_active;
         }
         if marker.station == Some(focused) {
-            lift += FOCUS_LIFT;
+            lift += palette.gain_focus_lift;
         }
-        let brightness = quantize(MARKER_LDR + lift);
+        let brightness = quantize(palette.marker + lift);
         set_glow(&mut mats, &handle.0, marker.hue * brightness);
     }
 }
@@ -1671,16 +1672,6 @@ fn unlit(base_color: Color) -> StandardMaterial {
     StandardMaterial { base_color, unlit: true, ..default() }
 }
 
-/// A linear-rgb [`Color`] from an `[f32; 3]` (values may exceed 1.0 for HDR).
-fn lin(c: [f32; 3]) -> Color {
-    Color::LinearRgba(LinearRgba::rgb(c[0], c[1], c[2]))
-}
-
-/// [`lin`] scaled by a brightness multiplier.
-fn lin_scaled(c: [f32; 3], k: f32) -> Color {
-    Color::LinearRgba(LinearRgba::rgb(c[0] * k, c[1] * k, c[2] * k))
-}
-
 /// A linear-rgb [`Color`] from a [`Vec3`].
 fn lin_v(v: Vec3) -> Color {
     Color::LinearRgba(LinearRgba::rgb(v.x, v.y, v.z))
@@ -1688,7 +1679,7 @@ fn lin_v(v: Vec3) -> Color {
 
 /// Renormalize an identity hue×brightness colour so its brightest channel
 /// lands exactly at `crest` — every [`TraceGlowMaterial`] element's crest
-/// shares the same ceiling ([`palette::GLOW_CREST`]) regardless of how bright
+/// shares the same ceiling ([`ScenePalette::crest`]) regardless of how bright
 /// its raw identity colour happens to be; the element's `trough` (baked into
 /// `params.z` at the call site) then sets how far the resting brightness
 /// sits below it. Degenerate all-zero input maps to itself (a black trace
@@ -2046,7 +2037,7 @@ mod tests {
         // The wall-mount retune (2026-07-10): the W wiring now flows all the
         // way to the wall the wheel hangs on, not to a floor dais foot — pads
         // land past the old marker radius, just short of the panel itself.
-        let w_bundle = &route_bundles()[0];
+        let w_bundle = &route_bundles(&ScenePalette::default())[0];
         assert!(
             w_bundle.pad_range.0 > ROOM_RADIUS,
             "W pads now reach past the old marker radius, toward the wall: {:?}",
@@ -2066,7 +2057,7 @@ mod tests {
 
     #[test]
     fn route_bundle_total_count_is_within_the_target_board_density() {
-        let total: usize = route_bundles().iter().map(|b| b.count).sum();
+        let total: usize = route_bundles(&ScenePalette::default()).iter().map(|b| b.count).sum();
         assert!(
             (24..=36).contains(&total),
             "board density should read dense like concept 06: {total} routes"
@@ -2086,7 +2077,7 @@ mod tests {
         // The concrete lock the old `TRACE_ARCS` debug_assert covered, applied
         // to the real bundle table + the real ring/chamfer/pad constants
         // `spawn_floor` calls `expand_bundle` with.
-        for (bi, bundle) in route_bundles().iter().enumerate() {
+        for (bi, bundle) in route_bundles(&ScenePalette::default()).iter().enumerate() {
             let seed_base = bi as u32 * 10_007;
             for route in bearing::expand_bundle(
                 bundle,
@@ -2112,12 +2103,13 @@ mod tests {
     fn every_generated_board_route_crest_is_capped_and_trough_stays_ldr() {
         // The new invariant (2026-07-10, the faint-moving-glow slice) in
         // place of the old flat "< 1.0" check: every route's crest
-        // renormalizes to AT MOST `palette::GLOW_CREST` regardless of its
+        // renormalizes to AT MOST `ScenePalette::crest` regardless of its
         // raw identity hue, and both the trace's and the pad's RESTING
         // trough level stay LDR even measured against the crest cap itself
-        // (`trough * GLOW_CREST < 1.0`) — the element only ever reads loud
+        // (`trough * crest < 1.0`) — the element only ever reads loud
         // at the crest's instantaneous peak, never sustained.
-        for (bi, bundle) in route_bundles().iter().enumerate() {
+        let palette = ScenePalette::default();
+        for (bi, bundle) in route_bundles(&palette).iter().enumerate() {
             let seed_base = bi as u32 * 10_007;
             for route in bearing::expand_bundle(
                 bundle,
@@ -2133,20 +2125,20 @@ mod tests {
                     route.hue[1] * route.brightness_scale,
                     route.hue[2] * route.brightness_scale,
                 ];
-                let crest = crest_color(identity, palette::GLOW_CREST);
+                let crest = crest_color(identity, palette.crest);
                 let max_channel = crest.x.max(crest.y).max(crest.z);
                 assert!(
-                    max_channel <= palette::GLOW_CREST + 1e-4,
+                    max_channel <= palette.crest + 1e-4,
                     "bundle {bi} crest exceeds the cap: {crest:?}"
                 );
             }
         }
         assert!(
-            TRACE_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+            palette.trough_wiring * palette.crest < 1.0,
             "trace trough must stay LDR even against the crest cap"
         );
         assert!(
-            PAD_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+            palette.trough_pads * palette.crest < 1.0,
             "pad trough must stay LDR even against the crest cap"
         );
     }
@@ -2246,14 +2238,16 @@ mod tests {
     fn wall_trim_glow_trough_stays_in_the_restrained_neon_range_and_ldr_at_the_crest() {
         // Mission spec: "LDR ~0.5-0.7 of hue" for the trim's resting level —
         // still true now that the trim breathes/waves between this trough
-        // and a crest capped at `palette::GLOW_CREST`; also lock the new
+        // and a crest capped at `ScenePalette::crest`; also lock the new
         // invariant that even AT the crest cap, the trough reads LDR.
+        let palette = ScenePalette::default();
         assert!(
-            (0.5..=0.7).contains(&WALL_TRIM_GLOW_TROUGH),
-            "trim trough out of the restrained range: {WALL_TRIM_GLOW_TROUGH}"
+            (0.5..=0.7).contains(&palette.trough_wall_trim),
+            "trim trough out of the restrained range: {}",
+            palette.trough_wall_trim
         );
         assert!(
-            WALL_TRIM_GLOW_TROUGH * palette::GLOW_CREST < 1.0,
+            palette.trough_wall_trim * palette.crest < 1.0,
             "trim trough must stay LDR even against the crest cap"
         );
         assert!(WALL_TRIM_GLOW_PERIOD > 0.0, "trim wave period must be positive");
@@ -2261,17 +2255,19 @@ mod tests {
 
     #[test]
     fn wall_base_and_mullion_colours_stay_ldr() {
-        let lum = |c: [f32; 3]| c[0] + c[1] + c[2];
-        assert!(lum(WALL_BASE_COLOR) < 1.0, "panel base must stay LDR (decoration, not live activity)");
-        assert!(lum(WALL_MULLION_COLOR) < 1.0, "mullion must stay LDR");
+        let palette = ScenePalette::default();
+        let lum = |c: LinearRgba| c.red + c.green + c.blue;
+        assert!(lum(palette.wall_base) < 1.0, "panel base must stay LDR (decoration, not live activity)");
+        assert!(lum(palette.wall_mullion) < 1.0, "mullion must stay LDR");
     }
 
     #[test]
     fn wall_base_is_a_hair_lighter_than_the_dome_rim() {
+        let palette = ScenePalette::default();
         let dome_rim = bearing::dome_color(0.0);
-        let lum = |c: [f32; 3]| c[0] + c[1] + c[2];
+        let lum = |c: LinearRgba| c.red + c.green + c.blue;
         assert!(
-            lum(WALL_BASE_COLOR) > dome_rim[0] + dome_rim[1] + dome_rim[2],
+            lum(palette.wall_base) > dome_rim[0] + dome_rim[1] + dome_rim[2],
             "the panel base should read a hair lighter than the dome's own rim"
         );
     }

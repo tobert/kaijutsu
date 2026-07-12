@@ -39,6 +39,7 @@ use crate::view::room::nav::Station;
 use crate::view::room::{
     PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text,
 };
+use crate::view::scene_palette::{ScenePalette, lin, lin_scaled};
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use geometry::{chord_points, layout_sockets};
 
@@ -144,21 +145,6 @@ const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
     yaw: -std::f32::consts::FRAC_PI_2,
 };
 
-// ── Palette helpers (this scene's own copy — `room::lin`/`lin_scaled` are
-// private to that module, so the scene-family material discipline gets a
-// second small implementation here rather than a cross-module reach) ────────
-
-/// A linear-rgb [`Color`] from an `[f32; 3]` palette value.
-fn lin(c: [f32; 3]) -> Color {
-    Color::LinearRgba(LinearRgba::rgb(c[0], c[1], c[2]))
-}
-
-/// [`lin`] scaled by a brightness tier — the palette's hue × LDR/HDR-tier
-/// convention (`palette.rs` header).
-fn lin_scaled(c: [f32; 3], k: f32) -> Color {
-    Color::LinearRgba(LinearRgba::rgb(c[0] * k, c[1] * k, c[2] * k))
-}
-
 // ── Scene constants (Amy-tunable) ───────────────────────────────────────────
 
 /// Rim radius where sockets seat; the open center the chords bow around.
@@ -176,11 +162,12 @@ const TABLE_OUTER_R: f32 = RIM_R * 1.16;
 const TABLE_DEPTH: f32 = 12.0;
 
 
-/// Wire hue — crimson = MIDI fabric (`docs/scenes/patchbay.md`, wire grammar).
-/// Already HDR (>1.0) so a live wire blooms; the selected chord multiplies it.
-const WIRE_HUE: LinearRgba = LinearRgba::rgb(1.4, 0.16, 0.24);
-/// Idle-glow multiplier for the inspected chord (a brighter, bloomier wire).
-const CHORD_SELECTED_GAIN: f32 = 3.4;
+// Wire hue — crimson = MIDI fabric (`docs/scenes/patchbay.md`, wire grammar) —
+// moved onto `ScenePalette::wire` (normalized identity) × `ScenePalette::
+// gain_wire` (the resting HDR lift): `wire * gain_wire` reproduces the old
+// pre-multiplied `WIRE_HUE = LinearRgba::rgb(1.4, 0.16, 0.24)` exactly. The
+// idle-glow multiplier for the inspected chord (a brighter, bloomier wire)
+// moved onto `ScenePalette::gain_chord_selected`.
 
 // ── Live layer (Amy-tunable) ────────────────────────────────────────────────
 // Traffic pulses ride the chord src→dest when the render port sends MIDI. The
@@ -191,8 +178,8 @@ const CHORD_SELECTED_GAIN: f32 = 3.4;
 const PULSE_TRAVEL_SECS: f32 = 0.42;
 /// Gaussian half-width of the packet in length-UV (0..1 across the chord).
 const PULSE_BAND_WIDTH: f32 = 0.16;
-/// Peak brightness added at the packet crest (HDR → bloom = "live action").
-const PULSE_GAIN: f32 = 6.0;
+// Peak brightness added at the packet crest (HDR → bloom = "live action")
+// moved onto `ScenePalette::gain_pulse`.
 /// A `pulse_time` sentinel far in the past: no packet, wire solid-lit. Every
 /// wire the app can't observe stays here (the seam slice 4 fills kernel-ward).
 const PULSE_IDLE: f32 = -1.0e6;
@@ -507,6 +494,7 @@ pub(crate) fn arm_scene(state: &mut PatchBayState) {
 pub(crate) fn spawn_furniture(
     commands: &mut Commands,
     room_root: Entity,
+    palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     std_materials: &mut Assets<StandardMaterial>,
     card_materials: &mut Assets<WellCardMaterial>,
@@ -539,11 +527,11 @@ pub(crate) fn spawn_furniture(
     // lie flat with the top face up.
     let table_mesh = meshes.add(Extrusion::new(Annulus::new(TABLE_INNER_R, TABLE_OUTER_R), TABLE_DEPTH));
     // Unlit, palette-driven (Amy, 2026-07-10 — "unify materials with the
-    // room"): `DARK_SURFACE_LIFT` is one shade up from the room's own
-    // furniture surface, so the instrument's working face reads against the
-    // wall panel behind it with no lamp needed.
+    // room"): `ScenePalette::dark_surface` is one shade up from the room's
+    // own furniture surface, so the instrument's working face reads against
+    // the wall panel behind it with no lamp needed.
     let table_material = std_materials.add(StandardMaterial {
-        base_color: lin(palette::DARK_SURFACE_LIFT),
+        base_color: lin(palette.dark_surface),
         unlit: true,
         ..default()
     });
@@ -561,12 +549,12 @@ pub(crate) fn spawn_furniture(
     // above the table's top face — the static half of mockup 14's "concentric
     // guide rings and radial ticks etched in faint gold." The per-seat radial
     // ticks are seat-driven and spawn with the sockets in `rebuild_patch_scene`.
-    // One shared unlit material, `palette::GOLD_HUE` at the etch tier (dimmer
+    // One shared unlit material, `ScenePalette::gold` at the etch tier (dimmer
     // than trim so etched detail supports rather than competes) — reads at
     // rest and never blooms; `cull_mode: None` keeps the up-facing annulus
     // visible either side.
     let etch_material = std_materials.add(StandardMaterial {
-        base_color: lin_scaled(palette::GOLD_HUE, palette::GOLD_LDR_ETCH),
+        base_color: lin_scaled(palette.gold, palette.etch),
         unlit: true,
         cull_mode: None,
         ..default()
@@ -745,6 +733,7 @@ fn poll_patch_graph(
 fn rebuild_patch_scene(
     mut commands: Commands,
     mut state: ResMut<PatchBayState>,
+    palette: Res<ScenePalette>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut card_materials: ResMut<Assets<WellCardMaterial>>,
@@ -808,12 +797,12 @@ fn rebuild_patch_scene(
     // and its ALL-CAPS holographic port label floating above.
     let peg_mesh = meshes.add(Cylinder::new(7.0, 12.0));
     let peg_material = std_materials.add(StandardMaterial {
-        base_color: lin_scaled(palette::BRASS_HUE, palette::BRASS_LDR),
+        base_color: lin_scaled(palette.brass, palette.hardware),
         unlit: true,
         ..default()
     });
     let tick_material = std_materials.add(StandardMaterial {
-        base_color: lin_scaled(palette::GOLD_HUE, palette::GOLD_LDR_ETCH),
+        base_color: lin_scaled(palette.gold, palette.etch),
         unlit: true,
         cull_mode: None,
         ..default()
@@ -948,6 +937,11 @@ fn rebuild_patch_scene(
         .enumerate()
         .map(|(i, e)| ((e.client_id, e.port_id), i))
         .collect();
+    // The wire hue used to be its own pre-multiplied HDR constant
+    // (`WIRE_HUE = LinearRgba::rgb(1.4, 0.16, 0.24)`); `wire * gain_wire`
+    // reproduces it exactly from the normalized identity hue × its resting
+    // gain (`ScenePalette::wire`/`gain_wire`).
+    let wire_color = ScenePalette::vec3(palette.wire) * palette.gain_wire;
     for (wi, wire) in state.snapshot.wires.iter().enumerate() {
         let (Some(&si), Some(&di)) = (by_addr.get(&wire.src), by_addr.get(&wire.dst)) else {
             continue; // endpoint filtered away; skip its wire
@@ -960,11 +954,16 @@ fn rebuild_patch_scene(
         let width = if selected { CHORD_WIDTH_SELECTED } else { CHORD_WIDTH };
         let mesh = meshes.add(ribbon_mesh(&points, width));
         let material = chord_materials.add(ChordMaterial {
-            color: Vec4::new(WIRE_HUE.red, WIRE_HUE.green, WIRE_HUE.blue, 1.0),
+            color: wire_color.extend(1.0),
             // params.y = PULSE_IDLE: no packet until the pulse system stamps a
             // send. tune carries the Amy-tunable pulse shape into the shader.
             params: Vec4::new(if selected { 1.0 } else { 0.0 }, PULSE_IDLE, 0.0, 0.0),
-            tune: Vec4::new(PULSE_TRAVEL_SECS, PULSE_BAND_WIDTH, PULSE_GAIN, CHORD_SELECTED_GAIN),
+            tune: Vec4::new(
+                PULSE_TRAVEL_SECS,
+                PULSE_BAND_WIDTH,
+                palette.gain_pulse,
+                palette.gain_chord_selected,
+            ),
         });
         let mut chord = commands.spawn((
             ChordWire(wi),
