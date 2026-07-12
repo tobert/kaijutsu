@@ -600,24 +600,23 @@ fn hud_west(selected: ContextId, state: &TimeWellState) -> String {
 
 /// South = the selected context's live tail (tail -f, oldest → newest), each
 /// line truncated so it never wraps; falls back to the polled preview when the
-/// context hasn't produced a tail line since the app started.
+/// context hasn't produced a tail line since the app started. Line
+/// pick/truncate/join is [`super::live::tail_lines`] (shared with the card
+/// face's own live-tail band, slice 2 of the HUD-melt plan) — only the
+/// preview fallback stays local here, since the card face already shows that
+/// preview as its gist line and would otherwise repeat it.
 fn hud_south(
     d: &super::card::CardData,
     tails: &super::live::ContextTails,
     ctx: ContextId,
 ) -> String {
-    let lines: Vec<String> = tails
-        .iter_lines(&ctx)
-        .map(|l| crate::text::truncate_chars(&l.display(), SOUTH_LINE_CHARS))
-        .collect();
-    if lines.is_empty() {
-        return match &d.preview {
+    match super::live::tail_lines(tails, ctx, SOUTH_TAIL_LINES, SOUTH_LINE_CHARS) {
+        Some(joined) => joined,
+        None => match &d.preview {
             Some(p) => crate::text::truncate_chars(p, 161),
             None => String::new(),
-        };
+        },
     }
-    let newest = lines.len();
-    lines[newest.saturating_sub(SOUTH_TAIL_LINES)..].join("\n")
 }
 
 #[cfg(test)]

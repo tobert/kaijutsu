@@ -47,6 +47,15 @@ pub struct Card {
     /// the mouth, shrinking toward the throat — see [`super::card::spiral_scale`]).
     /// [`highlight_selection`] eases toward this, popping the selection.
     pub base_scale: f32,
+    /// The selected card's live-tail band content (the last few tail lines,
+    /// pre-shaped by [`super::live::tail_lines`]), `None` for every
+    /// non-selected card. Written by [`super::live::sync_selected_card_tail`]
+    /// **only when it actually changes** — the same guarded-write discipline
+    /// as `selected`/`in_lineage`/`drifting` above, which rides the existing
+    /// `Changed<Card>` gate `text::build_card_scenes` already has rather than
+    /// adding a second rebuild path (`docs/timewell.md`'s HUD melt, replacing
+    /// the South HUD panel's job on the card face itself).
+    pub tail: Option<String>,
 }
 
 /// The placement/root entity that re-roots the well's whole subtree into room

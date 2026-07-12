@@ -227,6 +227,10 @@ pub fn sync_time_well(
                     in_lineage: false,
                     drifting: false,
                     base_scale: scale_of(&id),
+                    // Freshly spawned; `live::sync_selected_card_tail` fills
+                    // this in on the next dived frame if this card happens to
+                    // already be the selection.
+                    tail: None,
                 },
                 CardTarget(pos),
                 seat_of(&id).unwrap_or(RingSeat {

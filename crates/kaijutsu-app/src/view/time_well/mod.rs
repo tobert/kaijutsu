@@ -171,6 +171,11 @@ impl Plugin for TimeWellPlugin {
                     scene::well_keyboard.after(crate::view::room::room_keyboard),
                     hud::position_well_hud,
                     hud::update_well_hud,
+                    // Writes `Card::tail` (guarded — only on real change)
+                    // right before the text builder that reads it, so a
+                    // fresh tail lands in the SAME frame's rebuild rather
+                    // than waiting a tick.
+                    live::sync_selected_card_tail,
                     text::build_card_scenes,
                     text::update_reading_card,
                     text::build_horizon_label,
