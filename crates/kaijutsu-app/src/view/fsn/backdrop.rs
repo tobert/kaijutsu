@@ -61,8 +61,11 @@ use super::sync::FsnState;
 /// own aspect ([`WINDOW_W`]/[`WINDOW_H`]) so the camera's frame and the
 /// glass agree — a square texture on a non-square quad squeezed the world
 /// (and showing it twice on two quads made it read as two copies of a
-/// miniature, not one world out there). **Amy-tunable.**
-pub const BACKDROP_TEX_W: u32 = 1024;
+/// miniature, not one world out there). 2048 since the glass gained
+/// fullscreen duty (`room/shot.rs::portal_fullscreen_pose` fills the whole
+/// frame with it — 1024 read soft stretched across a real monitor).
+/// **Amy-tunable.**
+pub const BACKDROP_TEX_W: u32 = 2048;
 
 /// Render-target texture height — [`BACKDROP_TEX_W`] scaled by the portal
 /// quad's aspect, so Bevy's projection (which takes its aspect from the

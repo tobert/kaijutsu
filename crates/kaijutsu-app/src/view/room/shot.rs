@@ -91,6 +91,16 @@ const WELL_HERO_BACK: f32 = 900.0;
 /// relationship instead of trusting two hand-written copies to agree.
 const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 
+/// Fraction of the N portal's glass height that fills the vertical frustum
+/// when fullscreened (Amy, 2026-07-13: "the window should go fullscreen
+/// with no border, just the HUD") — deliberately < 1.0 so the camera
+/// stands INSIDE the glass edges: the frame crops slightly into the window
+/// rather than showing wall/trim around it. At 0.92 the borderless read
+/// holds up to ~2.0 aspect (the horizontal frustum outgrows the 880-wide
+/// glass past that; an ultrawide monitor would show panel slivers — accept
+/// or shrink this further). **Amy-tunable.**
+const PORTAL_OVERSCAN: f32 = 0.92;
+
 // ── The well's own camera-framing constants (Slice C — moved unchanged from
 // `time_well/scene.rs`'s old `ease_camera_to_focused_ring`, deleted as a
 // system once this math moved here) ─────────────────────────────────────────
@@ -182,12 +192,18 @@ pub fn resolve(shot: RoomShot) -> (Vec3, Vec3) {
             let dir = bearing::focus_dir(station).expect(
                 "RoomShot::Fullscreen is only constructed for a station with a wall bearing to fill the frame with",
             );
-            // Every panel shares the same vertical center (`super::WALL_HEIGHT
-            // * 0.5` — `palette::STATION_W_MOUNT_Y` is this same number, named
-            // for the wheel's own placement contract); a future second
-            // zoomable station reads this general height too, not a
-            // station-specific one.
-            fullscreen_pose(Vec3::from_array(dir), super::WALL_HEIGHT * 0.5)
+            // N is the one panel whose face is a WINDOW: its fullscreen
+            // dollies through to the glass itself ([`portal_fullscreen_pose`]
+            // — no border, just the world and the HUD). Every other panel
+            // fills the frame with its own full height; they all share the
+            // same vertical center (`super::WALL_HEIGHT * 0.5` —
+            // `palette::STATION_W_MOUNT_Y` is this same number, named for
+            // the wheel's own placement contract).
+            if station == Station::Vfs {
+                portal_fullscreen_pose(Vec3::from_array(dir))
+            } else {
+                fullscreen_pose(Vec3::from_array(dir), super::WALL_HEIGHT * 0.5)
+            }
         }
         RoomShot::WellOverview(input) => {
             let (local_eye, local_look) = well_local_shot(input);
@@ -289,6 +305,26 @@ fn fullscreen_pose(bearing_dir: Vec3, mount_y: f32) -> (Vec3, Vec3) {
     (eye, panel)
 }
 
+/// [`fullscreen_pose`]'s sibling for the N portal (Amy, 2026-07-13): fit
+/// the GLASS, not the panel — the standoff comes from the window quad's own
+/// height (`fsn::backdrop::WINDOW_H`) scaled by [`PORTAL_OVERSCAN`], so the
+/// frame sits slightly inside the glass edges and no wall, trim, or panel
+/// margin survives around the world; the always-on HUD is the only chrome
+/// left. Looks at the window's own center height (`fsn::backdrop::
+/// WINDOW_Y`, which is also every panel's center today — read from the
+/// window's constant so a window retune moves this shot with it).
+fn portal_fullscreen_pose(bearing_dir: Vec3) -> (Vec3, Vec3) {
+    use crate::view::fsn::backdrop::{WINDOW_H, WINDOW_Y};
+    let d = (WINDOW_H * PORTAL_OVERSCAN * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+    let glass = Vec3::new(
+        bearing_dir.x * palette::WALL_APOTHEM,
+        WINDOW_Y,
+        bearing_dir.z * palette::WALL_APOTHEM,
+    );
+    let eye = glass - bearing_dir * d;
+    (eye, glass)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +376,23 @@ mod tests {
             palette::STATION_W_MOUNT_Y,
         );
         assert_eq!(via_shot, via_primitive);
+    }
+
+    #[test]
+    fn vfs_fullscreen_fits_the_glass_not_the_panel() {
+        // The N portal's fullscreen (2026-07-13) dollies through to the
+        // window itself: the standoff fits WINDOW_H × PORTAL_OVERSCAN in
+        // the vertical frustum — closer than the panel-height fit every
+        // other station uses — so the frame sits inside the glass edges
+        // (no border, just the world + HUD).
+        use crate::view::fsn::backdrop::{WINDOW_H, WINDOW_Y};
+        let (eye, look) = resolve(RoomShot::Fullscreen(Station::Vfs));
+        let glass_d = (WINDOW_H * PORTAL_OVERSCAN * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+        let panel_d = (super::super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+        let d = (look - eye).length();
+        assert!((d - glass_d).abs() < 1e-3, "stands the glass-fit distance back: {d} vs {glass_d}");
+        assert!(d < panel_d, "closer than the panel fit — inside the panel's own border");
+        assert!((look.y - WINDOW_Y).abs() < 1e-5, "looks at the glass center");
     }
 
     #[test]
