@@ -7,9 +7,11 @@
 pub mod actor_plugin;
 pub mod bootstrap;
 pub mod client_id;
+pub mod share_dial;
 
 pub use actor_plugin::{
     ActorPlugin, RpcActor, RpcConnectionState, RpcResultChannel, RpcResultMessage,
     ServerEventMessage,
 };
 pub use bootstrap::{BootstrapChannel, BootstrapCommand};
+pub use share_dial::ShareDialPlugin;

@@ -54,6 +54,7 @@ pub mod kernel;
 pub mod paths;
 pub mod principal;
 pub mod session;
+pub mod share;
 pub mod theme;
 pub mod tick;
 pub mod timeout;
@@ -74,6 +75,16 @@ pub const SSH_RPC_SUBSYSTEM: &str = "kaijutsu-rpc";
 /// second session channel to read objects (`/v/cas/<hash>`) and browse `/v`.
 /// Standard SSH name so off-the-shelf clients (`sftp`, `sshfs`) work too.
 pub const SSH_SFTP_SUBSYSTEM: &str = "sftp";
+
+/// SSH subsystem name for a client-offered share session — the **reverse**
+/// of [`SSH_SFTP_SUBSYSTEM`] (`docs/slash-r.md`). SSH subsystem requests only
+/// travel client→server, so the client must still open the channel — but
+/// once open, the **roles swap**: the client speaks the SFTP *server* role
+/// (serving its local directories) and the kernel speaks the *client* role,
+/// reading them. Kept as its own name (not reusing `"sftp"`) because that
+/// name is already taken with the opposite meaning by the kernel's forward
+/// adapter (`kaijutsu-server/src/sftp.rs`) on the same dispatch scaffold.
+pub const SSH_SHARE_SUBSYSTEM: &str = "kaijutsu-share";
 
 // Re-export primary types at crate root for convenience.
 pub use block::{

@@ -115,6 +115,19 @@ pub trait VfsOps: Send + Sync {
     /// Get filesystem statistics.
     async fn statfs(&self) -> VfsResult<StatFs>;
 
+    /// Whether ambient sweeps (`MountTable::snapshot` — the FSN backdrop
+    /// walk, the semantic indexer, any future project crawler) must refuse to
+    /// descend past this backend's mount root. Default `false`; `ShareFs`
+    /// (`/r`, `docs/slash-r.md`) overrides `true` — every `readdir` there is a
+    /// network round trip to somebody's laptop, and the kernel's own ambient
+    /// machinery crawling a client's disk unprompted is exactly the risk the
+    /// forward-SFTP doc flagged for editor indexers, reversed. A
+    /// backend-level flag, not a path blocklist, so a future opaque mount
+    /// needs no `snapshot` special-casing.
+    fn opaque_to_sweeps(&self) -> bool {
+        false
+    }
+
     /// Resolve a virtual path to its real filesystem path.
     ///
     /// Returns `Ok(Some(path))` for backends backed by real files (LocalBackend).

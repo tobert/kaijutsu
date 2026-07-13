@@ -99,6 +99,10 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 eventsource-stream = "0.2"
 bytes = "1"
 
+# /r client shares (docs/slash-r.md): ShareFs plays the SFTP *client* role
+# against a client's share server (russh-sftp's role swap).
+russh-sftp.workspace = true
+
 [features]
 test-mock = []
 

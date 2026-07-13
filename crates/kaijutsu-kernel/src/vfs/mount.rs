@@ -415,6 +415,22 @@ impl MountTable {
                 return Ok(node);
             }
 
+            // A backend that refuses ambient sweeps by design (crawl-opacity,
+            // `docs/slash-r.md` — `/r` client shares: every readdir there is a
+            // network round trip to somebody's laptop) stops the walk here,
+            // same shape as a permission refusal below: the node is visible,
+            // its children are not enumerated, and the walk continues past it
+            // rather than failing outright. Reuses `denied` rather than a new
+            // wire field — both mean "you may not see inside," and adding a
+            // distinct capnp-visible bit for FSN to render differently is
+            // follow-up work, not this slice's scope.
+            if let Some((_, fs)) = self.owner_of(&vfs_path).await
+                && fs.opaque_to_sweeps()
+            {
+                node.denied = true;
+                return Ok(node);
+            }
+
             // A refused listing marks the node and stops descending, rather
             // than failing the whole walk: host /etc alone carries a dozen
             // root-only directories, and an unreadable directory is real
@@ -1066,10 +1082,101 @@ impl VfsOps for MountTable {
     }
 }
 
+/// A `MemoryBackend` that opts out of ambient sweeps — the crawl-opacity test
+/// double standing in for `ShareFs` (`docs/slash-r.md`) without pulling the
+/// share machinery into this module's tests.
+#[cfg(test)]
+struct OpaqueBackend(crate::vfs::backends::MemoryBackend);
+
+#[cfg(test)]
+#[async_trait]
+impl VfsOps for OpaqueBackend {
+    async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
+        self.0.getattr(path).await
+    }
+    async fn readdir(&self, path: &Path) -> VfsResult<Vec<DirEntry>> {
+        self.0.readdir(path).await
+    }
+    async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
+        self.0.read(path, offset, size).await
+    }
+    async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
+        self.0.readlink(path).await
+    }
+    async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> VfsResult<u32> {
+        self.0.write(path, offset, data).await
+    }
+    async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
+        self.0.create(path, mode).await
+    }
+    async fn mkdir(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
+        self.0.mkdir(path, mode).await
+    }
+    async fn unlink(&self, path: &Path) -> VfsResult<()> {
+        self.0.unlink(path).await
+    }
+    async fn rmdir(&self, path: &Path) -> VfsResult<()> {
+        self.0.rmdir(path).await
+    }
+    async fn rename(&self, from: &Path, to: &Path) -> VfsResult<()> {
+        self.0.rename(from, to).await
+    }
+    async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
+        self.0.truncate(path, size).await
+    }
+    async fn setattr(&self, path: &Path, attr: SetAttr) -> VfsResult<FileAttr> {
+        self.0.setattr(path, attr).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
+        self.0.symlink(path, target).await
+    }
+    async fn link(&self, oldpath: &Path, newpath: &Path) -> VfsResult<FileAttr> {
+        self.0.link(oldpath, newpath).await
+    }
+    fn read_only(&self) -> bool {
+        self.0.read_only()
+    }
+    async fn statfs(&self) -> VfsResult<StatFs> {
+        self.0.statfs().await
+    }
+    async fn real_path(&self, path: &Path) -> VfsResult<Option<PathBuf>> {
+        self.0.real_path(path).await
+    }
+    fn opaque_to_sweeps(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vfs::backends::MemoryBackend;
+
+    #[tokio::test]
+    async fn snapshot_does_not_descend_into_an_opaque_mount() {
+        let table = MountTable::new();
+        table.mount("/", MemoryBackend::new()).await;
+        let opaque = OpaqueBackend(MemoryBackend::new());
+        opaque.mkdir(Path::new("laptop-a"), 0o755).await.unwrap();
+        opaque
+            .write_all(Path::new("laptop-a/secret.txt"), b"never crawled")
+            .await
+            .unwrap();
+        table.mount("/r", opaque).await;
+
+        let result = table.snapshot(Path::new("/"), 8, 100).await.unwrap();
+        let r_node = result
+            .root
+            .children
+            .iter()
+            .find(|c| c.name == "r")
+            .expect("/r appears in the snapshot");
+        assert!(r_node.denied, "an opaque mount's node is marked as not-walked");
+        assert!(
+            r_node.children.is_empty(),
+            "an opaque mount's children must never be enumerated by the sweep"
+        );
+    }
 
     #[tokio::test]
     async fn test_basic_mount() {

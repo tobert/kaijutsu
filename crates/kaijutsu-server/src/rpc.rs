@@ -1192,6 +1192,17 @@ pub async fn create_shared_kernel(
     let cas_fs = kaijutsu_kernel::vfs::CasFs::new(kernel.cas().clone());
     kernel.mount(paths::CAS_ROOT, cas_fs).await;
 
+    // Mount the client-shares registry at /r (docs/slash-r.md, slice 1).
+    // ShareFs routes internally to whichever clients happen to be live —
+    // per-share mounts are impossible once the table freezes below, so this
+    // is the ONE backend that has to exist for the whole `/r` namespace, rows
+    // appearing/vanishing in its registry as `kaijutsu-share` sessions
+    // connect/disconnect (`ssh.rs`'s `SSH_SHARE_SUBSYSTEM` arm). Opaque to
+    // ambient sweeps by construction (`ShareFs::opaque_to_sweeps`) — the FSN
+    // backdrop and any indexer skip it, never crawling a client's disk.
+    let share_fs = kaijutsu_kernel::vfs::ShareFs::new(kernel.share_registry().clone());
+    kernel.mount(paths::R_ROOT, share_fs).await;
+
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
     kernel.freeze_mounts();

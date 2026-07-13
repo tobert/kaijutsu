@@ -69,6 +69,9 @@ tokio-util.workspace = true
 futures.workspace = true
 log.workspace = true
 whoami.workspace = true
+# /r client shares (docs/slash-r.md): serves ShareHandler over the dedicated
+# kaijutsu-share subsystem connection (share_dial.rs).
+russh-sftp.workspace = true
 indexmap = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }

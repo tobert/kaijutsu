@@ -7,7 +7,7 @@ description = "Cap'n Proto RPC client library for kaijutsu"
 [dependencies]
 capnp.workspace = true
 capnp-rpc.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 futures.workspace = true
 russh.workspace = true
@@ -34,6 +34,16 @@ kaijutsu-types.workspace = true
 # Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint carried by ServerEvent::PlayAudio.
 kaijutsu-audio.workspace = true
 kaijutsu-cas.workspace = true
+
+# Linux-only openat2/RESOLVE_BENEATH for the /r share server's atomic jail
+# (share_server.rs); portable fallback covers other targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "0.38", features = ["fs"] }
+
+# O_NONBLOCK on the share server's portable fallback open (share_server.rs
+# `open_file_beneath`) — a FIFO must never block the opening thread.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 capnpc.workspace = true
