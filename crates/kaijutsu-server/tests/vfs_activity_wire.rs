@@ -52,10 +52,13 @@ fn vfs_activity_digest_streams_over_the_wire_with_absolute_totals() {
         let (callback, mut rx) = vfs_activity_events_channel(64);
         kernel.subscribe_vfs_activity(callback, 500).await.unwrap();
 
-        // A unique directory under the server's real, RW-mounted /tmp (see
-        // kaijutsu-server::rpc's kernel bootstrap: `/tmp` is mounted
-        // read-write for scratch/interop) — real host mutations, not a
-        // virtual backend, so this exercises the LocalBackend bump sites.
+        // A unique directory under the server's real, RW-mounted /tmp —
+        // real host mutations, not a virtual backend, so this exercises the
+        // LocalBackend bump sites. MOUNT DEPENDENCY: this relies on the
+        // kernel bootstrap's `kernel.mount("/tmp", LocalBackend::new("/tmp"))`
+        // in kaijutsu-server/src/rpc.rs, which carries a cross-reference back
+        // to this test. If /tmp stops being RW-mounted there, vfs_create
+        // below fails with a no-mount-point error.
         let dir = tempfile::tempdir_in("/tmp").expect("tempdir under /tmp");
         let vfs_dir = dir.path().to_string_lossy().into_owned();
         let file_path = format!("{vfs_dir}/a.txt");
@@ -63,7 +66,7 @@ fn vfs_activity_digest_streams_over_the_wire_with_absolute_totals() {
         kernel
             .vfs_create(&file_path, 0o644)
             .await
-            .expect("vfs_create over the wire");
+            .expect("vfs_create over the wire — requires the server's RW /tmp mount (rpc.rs bootstrap)");
         let (total1, global1) = recv_digest_containing(&mut rx, &vfs_dir).await;
         assert!(total1 >= 1, "create must register at least one bump");
         assert!(

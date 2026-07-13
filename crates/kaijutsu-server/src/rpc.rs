@@ -1069,7 +1069,10 @@ pub async fn create_shared_kernel(
         )
         .await;
 
-    // Read-write /tmp for scratch/interop with external tools
+    // Read-write /tmp for scratch/interop with external tools.
+    // NOTE: tests/vfs_activity_wire.rs depends on this exact mount (it
+    // creates/writes under a tempdir in /tmp over the wire) — if you unmount
+    // or narrow it, update that test's fixture alongside.
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
     // The rc tree at /etc/rc is CRDT-owned (docs/config-crdt-ownership.md): no

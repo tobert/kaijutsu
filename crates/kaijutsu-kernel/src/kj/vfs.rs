@@ -142,7 +142,7 @@ impl KjDispatcher {
             })
             .collect();
         let data = serde_json::json!({
-            "globalTotal": global_total,
+            "global_total": global_total,
             "entries": data_entries,
         });
         KjResult::ok_with_data(text, data)
@@ -318,7 +318,7 @@ mod tests {
             panic!("expected Ok result");
         };
         let data = data.expect("activity must attach structured data");
-        assert!(data["globalTotal"].as_u64().unwrap() >= 2, "create + write = 2 bumps");
+        assert!(data["global_total"].as_u64().unwrap() >= 2, "create + write = 2 bumps");
         let entries = data["entries"].as_array().expect("entries array");
         let heat = entries
             .iter()
