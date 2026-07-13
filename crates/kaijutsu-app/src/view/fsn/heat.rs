@@ -4,15 +4,17 @@
 //! its parents too (a storm in `/a/b/c` should read as SOMETHING happening
 //! under `/a`, dimmer, even before you dive there).
 //!
-//! # Where this fits (lane A2, self-contained by design)
+//! # Where this fits
 //!
-//! The digest event that actually feeds this (`ServerEvent::VfsActivity` —
-//! a parallel lane's own wire type) is deliberately **not referenced
-//! anywhere in this module**: this file builds the resource, its update
-//! rules, and every consumer (`apply_fsn_lod`'s hue/gain lift, the ambient
-//! decay tick) in full, so the lead can wire the one remaining ingest system
-//! (`ServerEvent::VfsActivity -> FsnHeat::observe/record`) as a follow-up
-//! without touching anything in here.
+//! [`ingest_vfs_activity`] (the stitch that joined lane A2 to lane K's wire)
+//! drains [`ServerEvent::VfsActivity`] digests off the shared server-event
+//! stream into this resource — per-directory entries heat their own paths
+//! (ancestors attenuated), and the digest's global total feeds the room's
+//! N-bearing archway glow through [`BearingActivity`] (recorded HERE, not in
+//! `room::activity::event_bearing` — that fn is stateless, and absolute
+//! totals need the baselines this resource owns; see its doc). Consumers:
+//! `apply_fsn_lod`'s hue/gain lift, `sync_ship_glow`, the ambient decay
+//! tick.
 //!
 //! # Baseline semantics (why "first sighting" and "total < last" both read 0)
 //!
@@ -39,6 +41,11 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use kaijutsu_client::ServerEvent;
+
+use crate::connection::actor_plugin::ServerEventMessage;
+use crate::view::room::activity::BearingActivity;
+use crate::view::room::bearing::Bearing;
 
 /// Per-path heat ceiling (a churn storm pins here; [`FsnHeat::normalized`]
 /// reads the 0..1 fraction). Deliberately smaller headroom than the room's
@@ -63,9 +70,7 @@ const HEAT_EPSILON: f32 = 1e-3;
 /// Per-level falloff applied to every step up the ancestor chain in
 /// [`FsnHeat::record`] — `/a/b/c`'s write warms `/a/b` at this fraction,
 /// `/a` at its square, `/` at its cube (three levels up from `/a/b/c`).
-/// **Amy-tunable.** `#[allow(dead_code)]`: see [`FsnHeat::record`]'s own
-/// note — reachable only once the pending ingest system calls it.
-#[allow(dead_code)]
+/// **Amy-tunable.**
 pub const HEAT_ANCESTOR_ATTENUATION: f32 = 0.5;
 
 /// How much [`FsnHeat::normalized`] can lift `apply_fsn_lod`'s wireframe
@@ -94,15 +99,6 @@ pub fn normalize_digest_path(p: &str) -> &str {
 /// lands around 0.5: a "something happened" nudge, not a flash) while a
 /// hundred-file batch doesn't linearly blow straight through [`HEAT_MAX`].
 /// **`K` is Amy-tunable** (`HEAT_WEIGHT_K`, below).
-///
-/// `#[allow(dead_code)]`: exercised only by [`FsnHeat::observe`]/
-/// [`FsnHeat::record`] below, both themselves unreachable from `cargo
-/// build`'s perspective until the digest ingest system (a parallel lane,
-/// this module's own doc) calls them — `cargo test` reaches this fn directly
-/// (its own unit tests), so it's live code with no live CALLER yet, not
-/// dead code to remove (same shape as `Bearing::Center`'s own
-/// `#[allow(dead_code)]`, `room::bearing`).
-#[allow(dead_code)]
 pub fn scaled_weight(delta: u64) -> f32 {
     if delta == 0 {
         return 0.0;
@@ -111,9 +107,7 @@ pub fn scaled_weight(delta: u64) -> f32 {
 }
 
 /// [`scaled_weight`]'s log-curve gain — picked so `delta == 1` scores ≈0.5
-/// (`log2(2) == 1.0`, so `K == 0.5` directly). **Amy-tunable.** `#[allow(dead_code)]`:
-/// see [`scaled_weight`]'s own note.
-#[allow(dead_code)]
+/// (`log2(2) == 1.0`, so `K == 0.5` directly). **Amy-tunable.**
 pub const HEAT_WEIGHT_K: f32 = 0.5;
 
 /// FSN churn heat: decaying per-path activity plus the cumulative-counter
@@ -125,12 +119,7 @@ pub const HEAT_WEIGHT_K: f32 = 0.5;
 #[derive(Resource, Default)]
 pub struct FsnHeat {
     levels: HashMap<String, f32>,
-    /// `#[allow(dead_code)]`: written only by [`observe`](Self::observe)
-    /// below, itself pending the parallel lane's ingest system — see this
-    /// module's own doc.
-    #[allow(dead_code)]
     last_seen: HashMap<String, u64>,
-    #[allow(dead_code)]
     last_seen_global: Option<u64>,
 }
 
@@ -142,11 +131,6 @@ impl FsnHeat {
     /// [`record`](Self::record) itself — the caller decides where the
     /// resulting weight lands (a path's own heat, its ancestors, or both);
     /// this fn's only job is the counter-to-delta conversion.
-    ///
-    /// `#[allow(dead_code)]`: the digest ingest system that would call this
-    /// is a parallel lane's own follow-up (module doc) — unit-tested
-    /// directly, uncalled from any production system yet.
-    #[allow(dead_code)]
     pub fn observe(&mut self, path: &str, total: u64) -> f32 {
         let path = normalize_digest_path(path);
         let weight = match self.last_seen.get(path) {
@@ -160,8 +144,6 @@ impl FsnHeat {
 
     /// [`observe`](Self::observe)'s same three-way rule against one shared
     /// global baseline (no per-path key) — a single whole-tree churn signal.
-    /// `#[allow(dead_code)]`: see [`observe`](Self::observe)'s own note.
-    #[allow(dead_code)]
     pub fn observe_global(&mut self, total: u64) -> f32 {
         let weight = match self.last_seen_global {
             None => 0.0,
@@ -179,11 +161,6 @@ impl FsnHeat {
     /// reads as a dimmer glow radiating up through its parents, so a storm
     /// deep in an unvisited subtree still shows *something* is happening
     /// before the player ever dives there.
-    ///
-    /// `#[allow(dead_code)]`: see [`observe`](Self::observe)'s own note —
-    /// the ingest system that would call this is the same pending
-    /// follow-up.
-    #[allow(dead_code)]
     pub fn record(&mut self, dir: &str, w: f32) {
         if w <= 0.0 {
             return;
@@ -200,7 +177,6 @@ impl FsnHeat {
         }
     }
 
-    #[allow(dead_code)]
     fn bump(&mut self, path: &str, w: f32) {
         let e = self.levels.entry(path.to_string()).or_insert(0.0);
         *e = (*e + w).min(HEAT_MAX);
@@ -243,6 +219,58 @@ impl FsnHeat {
 /// Registered ungated in `fsn::mod`.
 pub fn tick_fsn_heat(mut heat: ResMut<FsnHeat>, time: Res<Time>) {
     heat.tick(time.delta_secs());
+}
+
+/// Drain `ServerEvent::VfsActivity` digests into [`FsnHeat`] and the room's
+/// N-bearing glow — the stitch between lane K's wire (kernel-native activity
+/// digests) and lane A's heat machinery. Registered UNGATED (`fsn::mod`):
+/// digests arrive on whatever screen is up, and heat must accumulate while
+/// the player sits in the room watching the archway/windows — that's the
+/// whole ambient point.
+///
+/// Own [`MessageReader`] cursor — safe alongside the other
+/// `ServerEventMessage` readers (`room::ingest_room_activity`, the time
+/// well's live ingest); each reader drains independently.
+pub fn ingest_vfs_activity(
+    mut events: MessageReader<ServerEventMessage>,
+    mut heat: ResMut<FsnHeat>,
+    mut bearings: ResMut<BearingActivity>,
+) {
+    for ServerEventMessage(ev) in events.read() {
+        if let ServerEvent::VfsActivity { entries, global_total } = ev {
+            let north = apply_digest(
+                &mut heat,
+                entries.iter().map(|e| (e.path.as_str(), e.total)),
+                *global_total,
+            );
+            if north > 0.0 {
+                // North = the DATA HORIZON archway. Recorded here rather
+                // than `room::activity::event_bearing` because absolute
+                // totals need the baselines FsnHeat owns (that fn's doc).
+                bearings.record(Bearing::North, north);
+            }
+        }
+    }
+}
+
+/// One digest's worth of updates: every entry (a DIRECTORY path — lane K
+/// keys activity by the owning directory) observes its absolute total and,
+/// when that yields a real delta, records heat at itself + attenuated
+/// ancestors. Returns the whole-tree weight for the caller to route into the
+/// room's North bearing (0.0 on a first-sighting/re-baseline digest — no
+/// archway flash on connect). Split from the system for direct testing.
+fn apply_digest<'a>(
+    heat: &mut FsnHeat,
+    entries: impl Iterator<Item = (&'a str, u64)>,
+    global_total: u64,
+) -> f32 {
+    for (path, total) in entries {
+        let w = heat.observe(path, total);
+        if w > 0.0 {
+            heat.record(path, w);
+        }
+    }
+    heat.observe_global(global_total)
 }
 
 #[cfg(test)]
@@ -440,5 +468,45 @@ mod tests {
         let mut heat = FsnHeat::default();
         heat.record("/a/b/", 1.0);
         assert_eq!(heat.level("/a/b"), 1.0);
+    }
+
+    // ── apply_digest: the lane-K stitch ──
+
+    #[test]
+    fn first_digest_baselines_everything_without_heat() {
+        let mut heat = FsnHeat::default();
+        let north = apply_digest(&mut heat, [("/src", 40_u64), ("/etc", 7)].into_iter(), 47);
+        assert_eq!(north, 0.0, "no archway flash on connect");
+        assert_eq!(heat.level("/src"), 0.0);
+        assert_eq!(heat.level("/"), 0.0, "no ancestor heat either");
+    }
+
+    #[test]
+    fn second_digest_heats_entries_ancestors_and_north() {
+        let mut heat = FsnHeat::default();
+        apply_digest(&mut heat, [("/src", 40_u64)].into_iter(), 40);
+        let north = apply_digest(&mut heat, [("/src", 45_u64)].into_iter(), 45);
+
+        let w = scaled_weight(5);
+        assert_eq!(heat.level("/src"), w, "entry heats at itself (it IS a directory)");
+        assert_eq!(
+            heat.level("/"),
+            w * HEAT_ANCESTOR_ATTENUATION,
+            "parent warms attenuated"
+        );
+        assert_eq!(north, w, "global delta routes to the caller for North");
+    }
+
+    #[test]
+    fn unchanged_entries_in_a_later_digest_add_no_heat() {
+        let mut heat = FsnHeat::default();
+        apply_digest(&mut heat, [("/src", 40_u64)].into_iter(), 40);
+        apply_digest(&mut heat, [("/src", 45_u64)].into_iter(), 45);
+        let before = heat.level("/src");
+        // Same absolute total again (e.g. a full-resync digest after
+        // reconnect re-sends what we already saw): delta 0, no re-heat.
+        let north = apply_digest(&mut heat, [("/src", 45_u64)].into_iter(), 45);
+        assert_eq!(heat.level("/src"), before);
+        assert_eq!(north, 0.0);
     }
 }

@@ -553,6 +553,26 @@ fn poll_bootstrap_results(
                                 .detach();
                         }
 
+                        // 1c. Subscribe to VFS activity digests (FSN slice 1
+                        // ambient heat — view::fsn::heat ingests them off the
+                        // shared event stream). interval 0 = server default
+                        // (1000ms). Best-effort and decorative: a failure
+                        // leaves the world cold, never blocks bootstrap. The
+                        // actor remembers the subscription and best-effort
+                        // re-issues it on every reconnect.
+                        {
+                            let h2 = h.clone();
+                            bevy::tasks::IoTaskPool::get()
+                                .spawn(async move {
+                                    if let Err(e) = h2.subscribe_vfs_activity(0).await {
+                                        log::warn!(
+                                            "VFS activity subscribe failed (heat stays cold): {e}"
+                                        );
+                                    }
+                                })
+                                .detach();
+                        }
+
                         // 2. If we joined a specific context, fetch its state.
                         // Invariant: SpawnActor with context_id=Some is only issued
                         // after the kernel is attached (see sync.rs / create_dialog.rs),

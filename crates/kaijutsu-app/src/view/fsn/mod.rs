@@ -38,14 +38,12 @@
 //! (no reason to render an off-screen impression of the world while
 //! standing IN it).
 //!
-//! # Heat ingest: deliberately not registered here
+//! # Heat ingest
 //!
-//! `FsnHeat::observe`/`record` need a digest `ServerEvent` a parallel lane is
-//! still building (`heat`'s own module doc) — this plugin registers the
-//! resource, its ambient decay tick, and every CONSUMER (`apply_fsn_lod`,
-//! `scene::sync_ship_glow`), but no producer system. Until that lane lands,
-//! heat only ever decays; every field/ship reads a steady, cold 0.0 — a
-//! correct, inert default, not a stub that needs guarding against.
+//! `heat::ingest_vfs_activity` drains the kernel's activity digests
+//! (`ServerEvent::VfsActivity`, subscribed during bootstrap —
+//! `connection::actor_plugin`) into `FsnHeat` and the room's North bearing.
+//! Ungated, like the decay tick: heat accumulates and cools on every screen.
 
 pub mod backdrop;
 pub mod heat;
@@ -88,12 +86,16 @@ impl Plugin for FsnPlugin {
             // an ungated poll is simply idle whenever nothing is queued —
             // it doesn't hot-loop or refetch anything extra by running here.
             .add_systems(Update, sync::poll_fsn_snapshot.after(sync::apply_fsn_snapshot))
-            // Heat's ambient decay: ungated like the poll above — a churn
-            // storm should keep cooling whether or not the player is
-            // currently looking at the FSN world (unlike the room's
-            // `BearingActivity`, which only matters while the room itself is
-            // live) — see `heat::tick_fsn_heat`'s own doc.
-            .add_systems(Update, heat::tick_fsn_heat)
+            // Heat: digest ingest then ambient decay, both ungated — digests
+            // arrive on every screen (that's the ambient point: the archway
+            // and windows warm while you sit in the room), and a churn storm
+            // should keep cooling whether or not the player is currently
+            // looking at the FSN world. Chained so a digest recorded this
+            // frame decays from the very next tick, never the same one.
+            .add_systems(
+                Update,
+                (heat::ingest_vfs_activity, heat::tick_fsn_heat).chain(),
+            )
             .add_systems(
                 Update,
                 (
