@@ -52,6 +52,18 @@ bloom/vi-dive/search items below; they stay on record, not on deck.
   deprioritized (ambient reframe).
 - **`/` search-and-fly-to** (vfs.md OQ 5) — unbuilt, deprioritized.
 - Zone tint (vfs.md OQ 4) untouched. Windows (OQ 3) SHIPPED in slice 1.
+- **CAS as a hash-ring neighborhood** (Amy seed, 2026-07-13): `/v/cas` is
+  already 2-hex-prefix sharded (256 buckets) — render it as a bespoke ring
+  district (a "central neighborhood" rotunda) with shards placed by hash
+  prefix around a circle instead of the generic Voronoi field:
+  deterministic, stable, visually distinct from directory districts. Today
+  `/v` renders as a flat cell at best (sorts past the root-fetch truncation
+  + backdrop cap). Plugging it in means opening the layout-mapping seam
+  slice 0 deliberately fence-posted (`view/fsn/layout.rs` module doc:
+  "deliberately a single pure function, not a mapping-selection system") —
+  a per-path layout override with the CAS ring as its first customer.
+  Pairs with the mime-keyed CAS / clip-cell ideas in `docs/pcm.md` /
+  `docs/clips.md`.
 - **`Screen::Fsn` dive is keyboard-unreachable** (2026-07-13, the
   whole-wall zoom retune): Enter on N now fullscreens the portal
   (`station_is_zoomable`, `room/mod.rs`) instead of transitioning to
