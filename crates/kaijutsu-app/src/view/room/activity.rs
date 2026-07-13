@@ -86,6 +86,19 @@ impl BearingActivity {
 /// room-ambient signal. Only beat syncs feed room-ambient activity today (the
 /// tracks/East bearing — a clock is rolling).
 ///
+/// **North (VFS/`Station::Vfs`) is deliberately absent here too**, but for a
+/// different reason than the Center drop below: it's not that nothing should
+/// feed it, it's that THIS function is the wrong seam for it. VFS churn
+/// arrives as a digest's cumulative TOTAL per path, not a discrete pulse like
+/// `BeatSync` — turning "total" into "an event just happened" needs baseline
+/// state across calls (`view::fsn::heat::FsnHeat::observe`'s whole reason for
+/// existing: first-sighting and kernel-restart re-baselining, `FsnHeat`'s own
+/// module doc). A stateless `ev -> (bearing, weight)` match can't hold that
+/// baseline. The FSN heat ingest (arriving in a follow-up — the one system
+/// lane A2 deliberately leaves unbuilt, `view::fsn::heat`'s own module doc)
+/// records North's `BearingActivity` directly, alongside recording into
+/// `FsnHeat` itself, rather than routing through this function.
+///
 /// Block/chatter events are deliberately NOT mapped here (freeze-fix slice,
 /// 2026-07-11): they used to warm a `Center` bearing for the slice-A
 /// `ConsoleEmblem` placeholder, but that placeholder — and the glow branch

@@ -38,8 +38,9 @@ use bevy::prelude::*;
 use kaijutsu_viz::fsn::{FsnField, NodeKind, Rect, layout_field};
 
 use crate::ui::screen::Screen;
-use crate::view::scene_palette::{ScenePalette, lin_scaled};
+use crate::view::scene_palette::{ScenePalette, lin_scaled, warmth_tint};
 
+use super::heat::{FsnHeat, HEAT_GAIN_LIFT};
 use super::layout;
 use super::sync::{ChildMeta, FsnState};
 
@@ -93,6 +94,15 @@ pub struct FsnCamera;
 /// signature can't leak a more-private type.
 #[derive(Component)]
 pub(crate) struct FsnSelectionRing;
+
+/// The ship-overhead silhouette entity (lane A3) — holds its own material
+/// handle so [`sync_ship_glow`] can write it without a `MeshMaterial3d`
+/// query (a `Handle` clone is cheaper than re-deriving it every frame from a
+/// component that already has it).
+#[derive(Component)]
+pub struct FsnShip {
+    material: Handle<StandardMaterial>,
+}
 
 // ── Resources ────────────────────────────────────────────────────────────
 
@@ -150,7 +160,15 @@ pub fn enter_fsn(
     mut state: ResMut<FsnState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    // `Without<FsnBackdropCamera>`: defensive — the backdrop's off-screen
+    // RTT camera (`super::backdrop`) is a `Camera3d` too. It's despawned on
+    // `OnExit(Screen::Room)`, which Bevy runs before `OnEnter(Screen::Fsn)`
+    // for the same transition, so it shouldn't be alive when this runs —
+    // but the exclusion costs nothing and removes the ordering assumption.
+    mut app_camera: Query<
+        (Entity, &mut Camera, &mut Transform),
+        (With<Camera3d>, Without<super::backdrop::FsnBackdropCamera>),
+    >,
     existing: Query<Entity, With<FsnRoot>>,
 ) {
     if !existing.is_empty() {
@@ -177,6 +195,23 @@ pub fn enter_fsn(
             .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
         Visibility::Hidden,
         Name::new("FsnSelectionRing"),
+        ChildOf(root),
+    ));
+
+    // The ship overhead (lane A3): one LineList silhouette, unlit gold at
+    // the trim tier — `sync_ship_glow` lifts it toward `crest` with
+    // whole-tree heat (`FsnHeat::normalized("/")`), same "ambient churn
+    // reads as brightness" idiom the wireframe fields use, but for the
+    // world's OWN overhead landmark rather than any one field.
+    let ship_mesh = meshes.add(line_list_mesh(&layout::flatten_segments(&layout::ship_silhouette_segments())));
+    let ship_material = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
+    commands.spawn((
+        FsnShip { material: ship_material.clone() },
+        Mesh3d(ship_mesh),
+        MeshMaterial3d(ship_material),
+        Transform::default(),
+        Visibility::Inherited,
+        Name::new("FsnShip"),
         ChildOf(root),
     ));
 
@@ -248,6 +283,19 @@ pub fn sync_fsn_fields(
 ) {
     let Ok(root) = roots.single() else { return };
 
+    // Captured ONCE per run (not per field/per cell) — a wall-clock read is
+    // cheap but there's no reason to take it more than once for however many
+    // fields rebuild this frame. Every field built this frame shares the same
+    // "now"; recency otherwise only refreshes on the field's own next
+    // rebuild (a listing re-fetch bumping `built_generation` — see the
+    // `needs_build` check below), never ambiently between fetches. Accepted:
+    // a cell's tint holds steady between dives rather than visibly aging in
+    // place while you watch it, which the design doc doesn't ask for at
+    // slice 1 and ambient per-frame re-tinting would cost a HashMap rebuild
+    // per field per frame for no visible gain.
+    let now_secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
     for (path, listing) in state.listings.iter() {
         let needs_build = fields
             .fields
@@ -301,6 +349,8 @@ pub fn sync_fsn_fields(
             rect,
             &field,
             listing.generation,
+            &listing.children,
+            now_secs,
             &palette,
             &mut meshes,
             &mut mats,
@@ -320,6 +370,22 @@ fn despawn_field(commands: &mut Commands, fe: &FieldEntities) {
 /// Build and spawn one field's four entities (all `Visibility::Hidden` at
 /// spawn — [`apply_fsn_lod`] sets the real tier the very next frame; nothing
 /// flashes fully visible for one frame before the LOD gate catches up).
+///
+/// # Recency glow (lane A1): the vertex-color half of the composition law
+///
+/// Each cell's own child (`children`, this directory's listing — matched by
+/// name, since `field.cells` is built name-sorted from the same listing)
+/// contributes a mtime age against `now_secs`, [`layout::recency_weight`]
+/// turns that into a 0..1 "how gold" weight, and [`warmth_tint`] bakes it
+/// into a per-channel vertex-color tint against `palette.fsn_edge`
+/// (wireframe) / `palette.fsn_vertex` (both point meshes) — see this
+/// module's doc for why the material's own `base_color` (hue × gain × heat,
+/// `apply_fsn_lod`'s sole write) stays untouched by this: `tint × base_color
+/// == lerp(base_color, gold, w)` exactly, so the two channels compose
+/// without either one clobbering the other. A child missing from `children`
+/// (shouldn't happen — `field.cells` is built FROM this same listing) reads
+/// as infinitely aged (no tint) rather than defaulting to full gold, the
+/// safer failure direction.
 #[allow(clippy::too_many_arguments)]
 fn spawn_field_entities(
     commands: &mut Commands,
@@ -328,10 +394,25 @@ fn spawn_field_entities(
     rect: Rect,
     field: &FsnField,
     generation: u64,
+    children: &[ChildMeta],
+    now_secs: u64,
     palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) -> FieldEntities {
+    let mtimes: HashMap<&str, u64> = children.iter().map(|c| (c.name.as_str(), c.mtime_secs)).collect();
+    let recency_of = |name: &str| -> f32 {
+        let age_secs = match mtimes.get(name) {
+            Some(&mtime) => (now_secs as i64 - mtime as i64) as f64,
+            None => f64::INFINITY,
+        };
+        layout::recency_weight(age_secs)
+    };
+    let edge_tints: Vec<[f32; 4]> =
+        field.cells.iter().map(|c| warmth_tint(palette.fsn_edge, palette.gold, recency_of(&c.name))).collect();
+    let vertex_tints: Vec<[f32; 4]> =
+        field.cells.iter().map(|c| warmth_tint(palette.fsn_vertex, palette.gold, recency_of(&c.name))).collect();
+
     let seam_mesh = meshes.add(line_list_mesh(&layout::flatten_segments(&layout::seam_grid(rect))));
     let seam_mat = mats.add(unlit(lin_scaled(palette.fsn_seam, 1.0)));
     let seam = commands
@@ -345,10 +426,14 @@ fn spawn_field_entities(
         ))
         .id();
 
+    // Sparse points: one seed per cell — a straight one-color-per-marker
+    // expansion via `per_cell_colors`.
     let sparse_positions = layout::field_seed_points(field);
     let (sparse_verts, sparse_indices) =
         layout::point_marker_mesh_data(&sparse_positions, SPARSE_POINT_SIZE);
-    let sparse_mesh = meshes.add(triangle_list_mesh(sparse_verts, sparse_indices));
+    let sparse_marker_counts = vec![layout::MARKER_VERT_COUNT; field.cells.len()];
+    let sparse_colors = layout::per_cell_colors(&sparse_marker_counts, &vertex_tints);
+    let sparse_mesh = meshes.add(triangle_list_mesh_colored(sparse_verts, sparse_indices, sparse_colors));
     let sparse_mat = mats.add(unlit(lin_scaled(palette.fsn_vertex, 0.55)));
     let sparse_points = commands
         .spawn((
@@ -361,7 +446,17 @@ fn spawn_field_entities(
         ))
         .id();
 
-    let wireframe_mesh = meshes.add(line_list_mesh(&layout::flatten_segments(&layout::field_wireframe(field))));
+    // Wireframe: `field_wireframe` concatenates every cell's own
+    // `prism_wireframe` in `field.cells`' own order (its own doc), so each
+    // cell's `6 × polygon.len()` position count (2 positions per segment ×
+    // `3 × polygon.len()` segments) computed straight from `field.cells`
+    // lines up 1:1 with that same concatenation — the "vertex counts line
+    // up" invariant `per_cell_colors` depends on, without re-deriving the
+    // segment geometry a second time.
+    let wireframe_positions = layout::flatten_segments(&layout::field_wireframe(field));
+    let wire_vert_counts: Vec<usize> = field.cells.iter().map(|c| 6 * c.polygon.len()).collect();
+    let wireframe_colors = layout::per_cell_colors(&wire_vert_counts, &edge_tints);
+    let wireframe_mesh = meshes.add(line_list_mesh_colored(&wireframe_positions, &wireframe_colors));
     let wireframe_material = mats.add(unlit(lin_scaled(palette.fsn_edge, WIREFRAME_GAIN_MID)));
     let wireframe = commands
         .spawn((
@@ -374,9 +469,17 @@ fn spawn_field_entities(
         ))
         .id();
 
+    // Vertex points: one octahedron per prism-TOP vertex — one level of
+    // `per_cell_colors` expands each cell's tint across its own polygon
+    // vertices, a second level expands each of THOSE across the marker
+    // template's own vertex count.
     let top_positions = layout::field_top_vertices(field);
     let (top_verts, top_indices) = layout::point_marker_mesh_data(&top_positions, VERTEX_POINT_SIZE);
-    let vertex_mesh = meshes.add(triangle_list_mesh(top_verts, top_indices));
+    let per_vertex_counts: Vec<usize> = field.cells.iter().map(|c| c.polygon.len()).collect();
+    let per_top_vertex_tints = layout::per_cell_colors(&per_vertex_counts, &vertex_tints);
+    let top_marker_counts = vec![layout::MARKER_VERT_COUNT; top_positions.len()];
+    let top_colors = layout::per_cell_colors(&top_marker_counts, &per_top_vertex_tints);
+    let vertex_mesh = meshes.add(triangle_list_mesh_colored(top_verts, top_indices, top_colors));
     let vertex_mat = mats.add(unlit(lin_scaled(palette.fsn_vertex, palette.crest * VERTEX_GAIN)));
     let vertex_points = commands
         .spawn((
@@ -423,7 +526,10 @@ fn unlit(color: Color) -> StandardMaterial {
     StandardMaterial { base_color: color, unlit: true, ..default() }
 }
 
-fn line_list_mesh(positions: &[[f32; 3]]) -> Mesh {
+/// `pub(super)`: reused as-is (uncolored — no recency bake) by
+/// [`super::backdrop`]'s cold-start seam grid / ship silhouette, which don't
+/// carry per-cell tint data of their own.
+pub(super) fn line_list_mesh(positions: &[[f32; 3]]) -> Mesh {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::PrimitiveTopology;
 
@@ -433,7 +539,24 @@ fn line_list_mesh(positions: &[[f32; 3]]) -> Mesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
 }
 
-fn triangle_list_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
+/// [`line_list_mesh`] plus a baked per-vertex `Mesh::ATTRIBUTE_COLOR` — the
+/// wireframe's recency tint (lane A1). `colors.len()` must equal
+/// `positions.len()` (the caller's own [`layout::per_cell_colors`] expansion
+/// guarantees this — see [`spawn_field_entities`]'s doc).
+fn line_list_mesh_colored(positions: &[[f32; 3]], colors: &[[f32; 4]]) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::PrimitiveTopology;
+
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.to_vec())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors.to_vec())
+}
+
+/// `pub(super)`: reused as-is (uncolored) by [`super::backdrop`]'s seed-point
+/// meshes.
+pub(super) fn triangle_list_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::{Indices, PrimitiveTopology};
 
@@ -441,6 +564,21 @@ fn triangle_list_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
+/// [`triangle_list_mesh`] plus a baked per-vertex `Mesh::ATTRIBUTE_COLOR` —
+/// the two point meshes' recency tint (lane A1). `colors.len()` must equal
+/// `positions.len()`.
+fn triangle_list_mesh_colored(positions: Vec<[f32; 3]>, indices: Vec<u32>, colors: Vec<[f32; 4]>) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
         .with_inserted_indices(Indices::U32(indices))
 }
 
@@ -563,6 +701,7 @@ pub fn apply_fsn_lod(
     fields: Res<FsnFields>,
     selection: Res<FsnSelection>,
     state: Res<FsnState>,
+    heat: Res<FsnHeat>,
     palette: Res<ScenePalette>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     // `Without<FsnSelectionRing>` keeps this disjoint from `rings`' own
@@ -604,9 +743,20 @@ pub fn apply_fsn_lod(
             layout::LodTier::Sparse | layout::LodTier::Wireframe => WIREFRAME_GAIN_MID,
             layout::LodTier::Attended => palette.crest,
         };
-        let gain = if is_selected_field { base_gain * SELECTION_GAIN_LIFT } else { base_gain };
+        let sel_lift = if is_selected_field { SELECTION_GAIN_LIFT } else { 1.0 };
+        // Heat (lane A2): this directory's own recent-churn level lifts the
+        // field's gain AND shifts its hue toward gold — the material's own
+        // `base_color` half of the color-composition law (`hue × gain ×
+        // heat`), written HERE and only here (this system stays the sole
+        // wireframe-material writer — see the module doc). The vertex-color
+        // half (recency, lane A1) is baked once at mesh build time in
+        // `spawn_field_entities`; this multiply composes with it exactly,
+        // never overwrites it.
+        let h = heat.normalized(path);
+        let gain = base_gain * sel_lift * (1.0 + h * HEAT_GAIN_LIFT);
+        let hue = lerp_hue(palette.fsn_edge, palette.gold, h);
         if let Some(mat) = mats.get_mut(&fe.wireframe_material) {
-            let want = lin_scaled(palette.fsn_edge, gain);
+            let want = lin_scaled(hue, gain);
             if mat.base_color != want {
                 mat.base_color = want;
             }
@@ -630,6 +780,37 @@ pub fn apply_fsn_lod(
 /// bright field; this makes the selected field's whole edge set read
 /// hotter, not just the one cell's ring.
 const SELECTION_GAIN_LIFT: f32 = 1.3;
+
+/// Component-wise lerp from `a` toward `b` by `t` (0..1 expected, not
+/// clamped — callers here always feed a [`FsnHeat::normalized`] output,
+/// already 0..1). The heat hue-shift's own small helper: `apply_fsn_lod`
+/// needs `fsn_edge -> gold` on a plain [`LinearRgba`] pair, not a
+/// `Color`-level blend (which would round-trip through a color space this
+/// module doesn't otherwise touch).
+fn lerp_hue(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
+    LinearRgba::rgb(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t)
+}
+
+/// Lift the ship silhouette's brightness from `trim` toward `crest` with
+/// whole-tree heat (`FsnHeat::normalized("/")` — the ship reads the WORLD's
+/// overall churn, not any one field's) — write-on-change, the same
+/// materials-asset discipline every other glow system here follows.
+pub fn sync_ship_glow(
+    heat: Res<FsnHeat>,
+    palette: Res<ScenePalette>,
+    ships: Query<&FsnShip>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+) {
+    let Ok(ship) = ships.single() else { return };
+    let h = heat.normalized("/");
+    let gain = palette.trim + (palette.crest - palette.trim) * h;
+    if let Some(mat) = mats.get_mut(&ship.material) {
+        let want = lin_scaled(palette.gold, gain);
+        if mat.base_color != want {
+            mat.base_color = want;
+        }
+    }
+}
 
 fn vis(want: bool) -> Visibility {
     if want { Visibility::Inherited } else { Visibility::Hidden }
@@ -665,7 +846,7 @@ mod tests {
     use kaijutsu_client::VfsFileType;
 
     fn child(name: &str, kind: VfsFileType, size: u64, child_count: u32) -> ChildMeta {
-        ChildMeta { name: name.into(), kind, size, child_count, ignored: false }
+        ChildMeta { name: name.into(), kind, size, child_count, ignored: false, mtime_secs: 0 }
     }
 
     fn listing(generation: u64, children: Vec<ChildMeta>) -> DirListing {
@@ -771,6 +952,40 @@ mod tests {
         assert!(fields.fields.contains_key("/"), "root rebuilt");
         let new_src = fields.fields.get("/src").expect("descendant rebuilt from the new layout");
         assert_ne!(new_src.seam, old_src_seam, "descendant entities must be fresh, not stale");
+    }
+
+    /// The recency bake (lane A1): a built wireframe mesh must carry
+    /// `Mesh::ATTRIBUTE_COLOR` with exactly one entry per position — the
+    /// per-cell tint expansion's own invariant (`layout::per_cell_colors`'
+    /// vertex counts must line up with the mesh's own position buffer, or
+    /// the render pipeline silently drops/misreads the attribute).
+    #[test]
+    fn wireframe_mesh_carries_a_matching_length_vertex_color_attribute() {
+        let mut app = test_app();
+        {
+            let mut state = app.world_mut().resource_mut::<FsnState>();
+            state.listings.insert(
+                "/".into(),
+                listing(
+                    1,
+                    vec![
+                        child("recent.rs", VfsFileType::File, 128, 0),
+                        child("ancient.log", VfsFileType::File, 4096, 0),
+                        child("sub", VfsFileType::Directory, 0, 2),
+                    ],
+                ),
+            );
+        }
+        app.update();
+
+        let wireframe_entity = app.world().resource::<FsnFields>().fields["/"].wireframe;
+        let mesh_handle =
+            app.world().get::<Mesh3d>(wireframe_entity).expect("wireframe entity has a mesh").0.clone();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let mesh = meshes.get(&mesh_handle).expect("mesh asset must exist");
+        let positions = mesh.attribute(Mesh::ATTRIBUTE_POSITION).expect("positions attribute");
+        let colors = mesh.attribute(Mesh::ATTRIBUTE_COLOR).expect("baked recency color attribute");
+        assert_eq!(colors.len(), positions.len(), "one baked color per vertex position");
     }
 }
 

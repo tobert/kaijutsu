@@ -537,7 +537,19 @@ fn enter_room(
     // 16-param ceiling for a function-as-system — `enter_room` was the first
     // system in this codebase to actually hit it (Slice C added enough new
     // room-furniture params to tip it over).
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    // `Without<FsnBackdropCamera>`: defensive — `view::fsn::backdrop`'s
+    // off-screen RTT camera is also a `Camera3d`, spawned in the SAME
+    // `OnEnter(Screen::Room)` transition this system runs in
+    // (`FsnBackdropPlugin`'s own `spawn_backdrop`). Bevy runs `OnExit`
+    // before `OnEnter` for a state transition, so in practice this camera
+    // shouldn't exist yet the first time `enter_room` runs after entering
+    // `Screen::Room` — but nothing enforces which `OnEnter(Screen::Room)`
+    // system runs first between plugins, so the exclusion keeps
+    // `app_camera.single_mut()` safe regardless of registration order.
+    mut app_camera: Query<
+        (Entity, &mut Camera, &mut Transform),
+        (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>),
+    >,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`
@@ -1638,10 +1650,19 @@ fn sync_room_glow(
 
     for (marker, handle) in markers.iter() {
         let mut lift = 0.0;
+        // The beat-phasor term stays East-only (`WellBeats::global_envelope`
+        // is a rolling-clock readout, not per-bearing activity — East/tracks
+        // is the one bearing a beat physically means anything at). Every
+        // bearing's OWN `BearingActivity` level lifts its marker, though:
+        // this used to be an East-only `if`, but `BearingActivity` is
+        // already indexed per-bearing (`event_bearing` just had only one
+        // producer wired in) — the FSN heat ingest (arriving in a follow-up,
+        // `activity::event_bearing`'s own doc) will feed North from VFS
+        // churn, and gating the read to East would silently drop it.
         if marker.bearing == Bearing::East {
-            lift += beat * palette.gain_beat
-                + room_activity.normalized(Bearing::East) * palette.gain_active;
+            lift += beat * palette.gain_beat;
         }
+        lift += room_activity.normalized(marker.bearing) * palette.gain_active;
         if marker.station == Some(focused) {
             lift += palette.gain_focus_lift;
         }

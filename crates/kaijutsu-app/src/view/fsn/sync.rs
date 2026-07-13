@@ -50,6 +50,11 @@ pub struct ChildMeta {
     /// wastes get weather," not silence). [`super::scene`] renders an
     /// ignored cell dimmer; it never skips spawning one.
     pub ignored: bool,
+    /// Wire `mtime_secs` (Unix epoch seconds), unchanged — [`super::scene`]'s
+    /// recency glow (lane A1) turns this into an age against "now" at build
+    /// time; this module only carries it through, no clock reads here (this
+    /// is data, not scene glue).
+    pub mtime_secs: u64,
 }
 
 /// One directory's own listing — everything needed to lay out its field.
@@ -153,6 +158,7 @@ fn ingest_snapshot(state: &mut FsnState, base_path: &str, node: &SnapshotNode) {
             size: c.size,
             child_count: c.child_count,
             ignored: c.ignored,
+            mtime_secs: c.mtime_secs,
         })
         .collect();
     state.listings.insert(
@@ -414,6 +420,17 @@ mod tests {
         ingest_snapshot(&mut state, "/", &root);
         assert!(state.listings.contains_key("/a"));
         assert!(state.listings.contains_key("/a/b"), "path joins nest correctly past the root");
+    }
+
+    #[test]
+    fn ingest_snapshot_copies_mtime_secs_from_the_wire_node() {
+        let mut state = FsnState::default();
+        let mut fresh_child = node("recent.rs", VfsFileType::File, vec![]);
+        fresh_child.mtime_secs = 1_752_000_000;
+        let root = node("/", VfsFileType::Directory, vec![fresh_child]);
+        ingest_snapshot(&mut state, "/", &root);
+        let listing = state.listings.get("/").unwrap();
+        assert_eq!(listing.children[0].mtime_secs, 1_752_000_000, "mtime_secs must round-trip");
     }
 
     #[test]
