@@ -17,12 +17,14 @@
 //! - **Longest-prefix routing**: MountTable routes to the most specific
 //!   mount point that matches.
 
+mod activity;
 pub mod backends;
 mod error;
 mod mount;
 mod ops;
 mod types;
 
+pub use activity::{ActivityCursor, ActivityDigest};
 pub use backends::{CasFs, LocalBackend, MemoryBackend};
 pub use error::{VfsError, VfsResult};
 pub use mount::{
