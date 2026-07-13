@@ -129,6 +129,24 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
   `VfsOps::write`/`setattr` closes (a); (b) also needs an atomic-append primitive
   or per-path write serialization. Kernel-wide change, worth doing before slice 4.
 
+## `/r` client shares — reverse SFTP (design `docs/slash-r.md`, 2026-07-13; nothing built)
+
+Clients share local paths into the kernel VFS (`--share ~/Downloads` →
+`/r/<client-id>/downloads`) — the reverse of the landed SFTP direction. Decided:
+heavy IO off capnp, file data on SFTP; one `kaijutsu-share` subsystem
+channel per client serving N shares + an in-band manifest `index`; `/r` is ONE
+`ShareFs` backend mounted pre-freeze (the `MountTable::freeze` constraint)
+routing to live sessions; read-only default; disconnect = loud unmount; `/r`
+is opaque to snapshot/index sweeps (every readdir is a network round trip).
+Slice order in the doc: **0 = streaming pump + streaming CAS store +
+`VfsOps::open_read_stream` first** (kernel-only, `kj cp` first consumer —
+kaish `cp` slurps whole files, kaish-kernel 0.12 `tools/builtin/cp.rs:202`,
+upstream candidate), then RO share, `kj share` verbs, `:rw`, notify push.
+DeepSeek + Gemini Pro reviews both folded 2026-07-13 (provenance footers in
+the doc; gemini's RTT-amplification catch shaped slice 0, and its
+`kaijutsu-generation@` ATTRS extension went into slice 1). Review-complete;
+slice 0 ready to start.
+
 ## Shared state space + myaku (design `docs/shared-state.md`; myaku detail in git history)
 
 High-level sketches landed 2026-06-28; dedicated design sessions to follow. The
