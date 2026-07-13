@@ -69,6 +69,11 @@ shellexpand.workspace = true
 
 # Async streams
 futures = { workspace = true }
+# vfs::pump / MountTable::open_read_stream delegation: lets the delegating
+# override hold an owned Arc<dyn VfsOps> + relative PathBuf across an .await
+# and yield through them, without hand-rolled unsafe self-referential Stream
+# state (docs/slash-r.md slice 0).
+async-stream = "0.3"
 
 # Topic-partitioned pub/sub
 async-broadcast = "0.7"
