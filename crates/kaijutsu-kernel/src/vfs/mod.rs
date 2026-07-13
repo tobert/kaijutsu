@@ -22,6 +22,7 @@ pub mod backends;
 mod error;
 mod mount;
 mod ops;
+pub mod pump;
 mod types;
 
 pub use activity::{ActivityCursor, ActivityDigest};
@@ -30,7 +31,8 @@ pub use error::{VfsError, VfsResult};
 pub use mount::{
     MountInfo, MountTable, SNAPSHOT_MAX_DEPTH, SNAPSHOT_MAX_ENTRIES, BASELINE_GENERATION,
 };
-pub use ops::VfsOps;
+pub use ops::{STREAM_CHUNK_SIZE, VfsOps};
+pub use pump::{CasSink, PumpError, PumpOutcome, PumpSink, SinkError, VfsSink, pump as pump_stream};
 pub use types::{
     DirEntry, FileAttr, FileType, OpenFlags, SetAttr, SnapshotNode, SnapshotResult, StatFs,
 };
