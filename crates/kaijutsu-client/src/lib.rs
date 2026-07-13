@@ -8,6 +8,7 @@ pub mod constants;
 pub mod document_store;
 pub mod rpc;
 pub mod sftp;
+pub mod share_server;
 pub mod ssh;
 pub mod subscriptions;
 pub mod sync;
@@ -33,6 +34,9 @@ pub use rpc::{
 };
 pub use document_store::{DocumentEntry, DocumentStore};
 pub use sftp::{CasFetch, CasResolver, SftpClient, SftpError, default_cache_dir};
+pub use share_server::{
+    ShareArg, ShareHandler, ShareServerConfig, parse_share_arg, validate_unique_names,
+};
 pub use ssh::{KeySource, SshClient, SshConfig, SshError};
 pub use subscriptions::{
     ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel, vfs_activity_events_channel,

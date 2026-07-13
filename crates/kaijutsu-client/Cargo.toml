@@ -7,7 +7,7 @@ description = "Cap'n Proto RPC client library for kaijutsu"
 [dependencies]
 capnp.workspace = true
 capnp-rpc.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 futures.workspace = true
 russh.workspace = true
@@ -35,9 +35,15 @@ kaijutsu-types.workspace = true
 kaijutsu-audio.workspace = true
 kaijutsu-cas.workspace = true
 
+# Linux-only openat2/RESOLVE_BENEATH for the /r share server's atomic jail
+# (share_server.rs); portable fallback covers other targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "0.38", features = ["fs"] }
+
 [build-dependencies]
 capnpc.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true
 tempfile.workspace = true
+libc = "0.2"
