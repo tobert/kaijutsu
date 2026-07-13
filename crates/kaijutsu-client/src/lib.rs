@@ -28,12 +28,15 @@ pub use rpc::{
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
     RpcClient, RpcError, ShellValue, SimilarContext, SnapshotNode, SnapshotResult, StagedDriftInfo,
-    SubmitResult, SyncState, ToolResult, ToolSchema, TrackInfo, VersionSnapshot, VfsFileType,
+    SubmitResult, SyncState, ToolResult, ToolSchema, TrackInfo, VersionSnapshot, VfsActivityEntry,
+    VfsFileType,
 };
 pub use document_store::{DocumentEntry, DocumentStore};
 pub use sftp::{CasFetch, CasResolver, SftpClient, SftpError, default_cache_dir};
 pub use ssh::{KeySource, SshClient, SshConfig, SshError};
-pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel};
+pub use subscriptions::{
+    ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel, vfs_activity_events_channel,
+};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};
 pub use synced_input::SyncedInput;

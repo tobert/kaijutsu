@@ -1996,6 +1996,65 @@ impl KernelHandle {
             truncated: reader.get_truncated(),
         })
     }
+
+    /// Thin wrapper over `Vfs.create` — needed by the vfs-activity e2e test
+    /// to mint a file under a mounted path before writing to it. The
+    /// resulting `FileAttr` is discarded (nothing here needs it yet); callers
+    /// that do can extend this later.
+    #[tracing::instrument(skip(self), name = "rpc_client.vfs_create")]
+    pub async fn vfs_create(&self, path: &str, mode: u32) -> Result<(), RpcError> {
+        let vfs_response = self.kernel.vfs_request().send().promise.await?;
+        let vfs = vfs_response.get()?.get_vfs()?;
+        let mut request = vfs.create_request();
+        {
+            let mut p = request.get();
+            p.set_path(path);
+            p.set_mode(mode);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Thin wrapper over `Vfs.write` — needed by the vfs-activity e2e test to
+    /// generate content-mutation heat (`MountTable::bump_activity`) without a
+    /// full CRDT edit path. Returns the byte count the backend reports written.
+    #[tracing::instrument(skip(self, data), name = "rpc_client.vfs_write")]
+    pub async fn vfs_write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, RpcError> {
+        let vfs_response = self.kernel.vfs_request().send().promise.await?;
+        let vfs = vfs_response.get()?.get_vfs()?;
+        let mut request = vfs.write_request();
+        {
+            let mut p = request.get();
+            p.set_path(path);
+            p.set_offset(offset);
+            p.set_data(data);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_written())
+    }
+
+    /// Subscribe to the VFS activity digest push channel (Lane K, FSN
+    /// slice-1, `docs/scenes/vfs.md`). `interval_ms = 0` requests the
+    /// server's default tick period; the server floors anything requested
+    /// below its minimum rather than rejecting it. The server streams
+    /// `onActivityDigest` callbacks to `callback` until the connection drops
+    /// — see [`crate::subscriptions::vfs_activity_events_channel`] for
+    /// building the callback client.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_vfs_activity")]
+    pub async fn subscribe_vfs_activity(
+        &self,
+        callback: crate::kaijutsu_capnp::vfs_activity_events::Client,
+        interval_ms: u32,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_vfs_activity_request();
+        {
+            let mut p = request.get();
+            p.set_callback(callback);
+            p.set_interval_ms(interval_ms);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -2070,6 +2129,31 @@ fn parse_snapshot_node(
         children,
         truncated_here: reader.get_truncated_here(),
         denied: reader.get_denied(),
+    })
+}
+
+/// One directory's entry in a VFS activity digest tick (Lane K, FSN slice-1,
+/// `docs/scenes/vfs.md`). `total` is an ABSOLUTE monotonic count since kernel
+/// boot, never a delta — see `kaijutsu-kernel::vfs::activity` for the
+/// lossy-safe reasoning. `generation` mirrors the directory's current
+/// listing-generation (same field `SnapshotNode` carries) so a consumer can
+/// tell whether its cached listing for this path is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfsActivityEntry {
+    pub path: String,
+    pub total: u64,
+    pub generation: u64,
+}
+
+/// Parse a capnp `VfsActivityEntry` reader into the owned client struct.
+/// Shared by the push forwarder (`subscriptions.rs`).
+pub(crate) fn parse_vfs_activity_entry(
+    r: crate::kaijutsu_capnp::vfs_activity_entry::Reader<'_>,
+) -> Result<VfsActivityEntry, RpcError> {
+    Ok(VfsActivityEntry {
+        path: r.get_path()?.to_string()?,
+        total: r.get_total(),
+        generation: r.get_generation(),
     })
 }
 

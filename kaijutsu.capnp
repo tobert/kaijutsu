@@ -842,6 +842,27 @@ struct SnapshotNode {
 }
 
 # ============================================================================
+# VFS Activity Digest (Lane K, FSN slice-1, docs/scenes/vfs.md)
+# ============================================================================
+
+struct VfsActivityEntry {
+  # path is normalized MountTable form: absolute, /-rooted, no trailing slash —
+  # the SAME namespace and format as Vfs.snapshot paths and the app's listing keys.
+  path @0 :Text;
+  total @1 :UInt64;      # ABSOLUTE monotonic activity total since kernel boot
+  generation @2 :UInt64; # the dir's current listing-generation (stale-listing detection)
+}
+
+# Push channel for the activity digest stream: per-directory heat (content +
+# structure mutations), delivered as absolute totals so a missed/dropped
+# digest self-heals on the next tick (see kaijutsu-kernel's vfs/activity.rs
+# for the full lossy-safe reasoning).
+interface VfsActivityEvents {
+  # Lossy-safe: totals are absolute state snapshots, never deltas.
+  onActivityDigest @0 (entries :List(VfsActivityEntry), globalTotal :UInt64);
+}
+
+# ============================================================================
 # Peer Types
 # ============================================================================
 
@@ -1415,6 +1436,19 @@ interface Kernel {
   # (`kj transport clock <track> modeled`). `source` is the observed ALSA
   # port ("client:port"), for logs/attribution.
   reportClockEstimate @98 (contextId :Data, beat :Float64, tempoBps :Float64, epochNs :UInt64, source :Text, trace :TraceContext) -> ();
+
+  # ==========================================================================
+  # VFS activity digest stream (Lane K, FSN slice-1, docs/scenes/vfs.md)
+  # ==========================================================================
+  # Push channel: server ticks a per-connection timer and streams
+  # `onActivityDigest` callbacks reporting which directories have gotten hot
+  # since this subscriber's last delivered digest. `intervalMs` is the
+  # requested tick period; 0 requests the server default (1000ms), and the
+  # server floors any request below 500ms. A quiet tick (nothing changed
+  # anywhere since last delivery) sends nothing at all. Connection-scoped,
+  # same lifecycle as subscribeEditor — no cross-connection dedupe, the
+  # bridge simply dies with the connection.
+  subscribeVfsActivity @99 (callback :VfsActivityEvents, intervalMs :UInt32);
 }
 
 # ============================================================================

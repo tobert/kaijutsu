@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 use super::error::{VfsError, VfsResult};
@@ -67,6 +67,23 @@ pub struct MountTable {
     /// the path. In-memory only, `DashMap` for lock-independence from
     /// `mounts`. See [`Self::snapshot`] for the bump policy.
     generations: dashmap::DashMap<PathBuf, u64>,
+    /// Per-directory ACTIVITY totals (Lane K, FSN slice-1 digest stream,
+    /// `docs/scenes/vfs.md`) — ABSOLUTE monotonic counts of content +
+    /// structure mutations attributed to the directory, keyed exactly like
+    /// [`Self::generations`] (normalized parent-dir VFS path via
+    /// [`Self::normalize_mount_path`] + [`Self::parent_dir`]). Where
+    /// `generations` tracks the name-SET (structure only), `activity` tracks
+    /// HEAT: every op that bumps a generation also bumps activity, plus
+    /// write/truncate/setattr which bump activity alone. In-memory only —
+    /// reset-on-restart is fine and documented, same reasoning as
+    /// `generations` (a restart's blank slate self-corrects as new activity
+    /// arrives; there is no "since when" promise to keep).
+    activity: dashmap::DashMap<PathBuf, u64>,
+    /// Global activity total — the sum of every bump across every directory,
+    /// tracked separately (not derived by summing `activity` each tick) so a
+    /// quiet kernel's digest tick is a single relaxed load-and-compare
+    /// against the subscriber's cursor, never a full-map walk.
+    activity_epoch: AtomicU64,
 }
 
 impl std::fmt::Debug for MountTable {
@@ -90,6 +107,8 @@ impl MountTable {
             mounts: RwLock::new(BTreeMap::new()),
             frozen: AtomicBool::new(false),
             generations: dashmap::DashMap::new(),
+            activity: dashmap::DashMap::new(),
+            activity_epoch: AtomicU64::new(0),
         }
     }
 
@@ -218,12 +237,85 @@ impl MountTable {
     /// The current listing-generation of `dir_path`, or
     /// [`BASELINE_GENERATION`] if it has never been observed to mutate since
     /// boot.
-    fn generation_of(&self, dir_path: &Path) -> u64 {
+    /// Public per the same reasoning as [`Self::global_activity`] /
+    /// [`Self::activity_snapshot`] below: the activity digest bridge
+    /// (`kaijutsu-server::rpc::subscribe_vfs_activity`) stamps each wire
+    /// activity entry with the directory's current listing-generation for
+    /// stale-listing detection on the client, and that's a one-off lookup,
+    /// not a full snapshot walk.
+    pub fn generation_of(&self, dir_path: &Path) -> u64 {
         let key = Self::normalize_mount_path(dir_path.to_path_buf());
         self.generations
             .get(&key)
             .map(|g| *g)
             .unwrap_or(BASELINE_GENERATION)
+    }
+
+    // ========================================================================
+    // Activity counters (Lane K, FSN slice-1 digest groundwork,
+    // docs/scenes/vfs.md)
+    // ========================================================================
+
+    /// Bump the activity total of the directory at `dir_path` by one, and
+    /// the global epoch alongside it — called after a backend op succeeds,
+    /// same chokepoint discipline as [`Self::bump_generation`]. Unlike
+    /// generations there is no "baseline" offset: a directory's activity
+    /// starts implicitly at 0 (absent from the map) and every bump is +1,
+    /// so the raw total IS the lifetime event count, which is exactly what
+    /// makes it safe to ship as an absolute value over the wire (a client
+    /// that missed N ticks still lands on the correct total on tick N+1).
+    ///
+    /// ORDERING INVARIANT (Release here, Acquire in
+    /// [`Self::global_activity`] — same pairing precedent as the `frozen`
+    /// flag above): the map write is sequenced before the epoch bump, and a
+    /// reader that observes epoch N must also see every `activity`-map
+    /// write sequenced before the Release that produced N. With Relaxed on
+    /// both sides, a digest tick could observe the new epoch WITHOUT the
+    /// map entry behind it — the digest would ship missing that entry, its
+    /// commit would advance `last_global` past the bump, and the entry
+    /// would strand until some future bump anywhere reopened the epoch
+    /// check (the same failure shape as the truncated-commit bug in
+    /// `activity.rs`, but sourced from the memory model). Masked on x86's
+    /// strong ordering; live on ARM.
+    fn bump_activity(&self, dir_path: &Path) {
+        let key = Self::normalize_mount_path(dir_path.to_path_buf());
+        self.activity.entry(key).and_modify(|a| *a += 1).or_insert(1);
+        self.activity_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// The global activity epoch — the running total of every bump across
+    /// every directory since kernel boot. A digest tick that finds this
+    /// unchanged from the subscriber's cursor can short-circuit without
+    /// touching the per-directory map at all (see `activity.rs`).
+    ///
+    /// Acquire, paired with [`Self::bump_activity`]'s Release: observing
+    /// epoch N here guarantees visibility of every `activity`-map write
+    /// sequenced before the bump that produced N. No deterministic unit
+    /// test can pin a memory-model race down — this comment pair IS the
+    /// guard.
+    pub fn global_activity(&self) -> u64 {
+        self.activity_epoch.load(Ordering::Acquire)
+    }
+
+    /// Snapshot of per-directory activity totals, optionally filtered to
+    /// directories at-or-under `prefix` (normalized the same way as every
+    /// other path in this module), sorted total-descending — "what's hot,
+    /// most-active first" for `kj vfs activity`. `None` returns every
+    /// directory that has ever been bumped since boot.
+    pub fn activity_snapshot(&self, prefix: Option<&Path>) -> Vec<(PathBuf, u64)> {
+        let prefix = prefix.map(|p| Self::normalize_mount_path(p.to_path_buf()));
+        let mut entries: Vec<(PathBuf, u64)> = self
+            .activity
+            .iter()
+            .filter(|entry| match &prefix {
+                None => true,
+                Some(prefix) if prefix.as_os_str() == "/" => true,
+                Some(prefix) => entry.key() == prefix || entry.key().starts_with(prefix),
+            })
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries
     }
 
     // ========================================================================
@@ -447,9 +539,12 @@ impl MountTable {
     /// **Generation policy** (stage-1 groundwork): directory generations
     /// track STRUCTURE (name-set) changes only —
     /// create/mkdir/unlink/rmdir/rename (both parents)/symlink/link bump the
-    /// parent's generation; write/truncate/setattr do NOT (content/activity
-    /// is a separate concern reserved for the digest stream, stage 2). A
-    /// directory never observed to mutate since kernel boot reports
+    /// parent's generation; write/truncate/setattr do NOT. Content/activity
+    /// is a separate counter (`activity`/`activity_epoch`, Lane K, FSN
+    /// slice-1) that ALL of the above bump, plus write/truncate/setattr,
+    /// which bump activity alone — see `activity.rs` for the digest stream
+    /// built on top of it. A directory never observed to mutate since kernel
+    /// boot reports
     /// [`BASELINE_GENERATION`]. Files always report generation 0.
     /// In-memory only — a kernel restart resets every counter, which is fine
     /// (`docs/scenes/vfs.md`: "a kernel restart invalidating all generations
@@ -803,16 +898,21 @@ impl VfsOps for MountTable {
 
     // Deliberately does NOT bump listing-generation: see the note above
     // `truncate`/`setattr` below — writing bytes into an existing file
-    // changes content/activity, not the parent directory's name set.
+    // changes content/activity, not the parent directory's name set. It DOES
+    // bump activity (Lane K, FSN slice-1) — the digest stream now exists
+    // (`activity.rs`), and this is exactly the heat it reports.
     async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.write(&relative, offset, data).await
+        let n = fs.write(&relative, offset, data).await?;
+        self.bump_activity(&Self::parent_dir(path));
+        Ok(n)
     }
 
     async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
         let attr = fs.create(&relative, mode).await?;
         self.bump_generation(&Self::parent_dir(path));
+        self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
     }
 
@@ -820,6 +920,7 @@ impl VfsOps for MountTable {
         let (fs, relative) = self.find_mount(path).await?;
         let attr = fs.mkdir(&relative, mode).await?;
         self.bump_generation(&Self::parent_dir(path));
+        self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
     }
 
@@ -827,6 +928,7 @@ impl VfsOps for MountTable {
         let (fs, relative) = self.find_mount(path).await?;
         fs.unlink(&relative).await?;
         self.bump_generation(&Self::parent_dir(path));
+        self.bump_activity(&Self::parent_dir(path));
         Ok(())
     }
 
@@ -834,6 +936,7 @@ impl VfsOps for MountTable {
         let (fs, relative) = self.find_mount(path).await?;
         fs.rmdir(&relative).await?;
         self.bump_generation(&Self::parent_dir(path));
+        self.bump_activity(&Self::parent_dir(path));
         Ok(())
     }
 
@@ -851,31 +954,41 @@ impl VfsOps for MountTable {
         // A rename changes the name-set of BOTH parents (the source loses a
         // name, the destination gains one), even when they're the same
         // directory — bumping twice there is harmlessly redundant, still
-        // monotonic.
+        // monotonic. Same reasoning extends to activity: both parents felt
+        // heat, even if it's the same directory bumped twice.
         self.bump_generation(&Self::parent_dir(from));
         self.bump_generation(&Self::parent_dir(to));
+        self.bump_activity(&Self::parent_dir(from));
+        self.bump_activity(&Self::parent_dir(to));
         Ok(())
     }
 
     // truncate/setattr deliberately do NOT bump generation: listing-generation
-    // tracks STRUCTURE (the directory's name set), not content/activity —
-    // that's the digest stream's job (stage 2, docs/scenes/vfs.md). A
-    // truncated or re-permissioned file doesn't change what names exist in
-    // its parent's listing.
+    // tracks STRUCTURE (the directory's name set), not content/activity. They
+    // DO bump activity — content mutation (truncate) and metadata mutation
+    // (setattr, e.g. chmod) both count as heat by decision: an `ls -la`-visible
+    // change to a file is exactly the kind of "something happened here" signal
+    // the digest stream exists to surface, even though it leaves the parent's
+    // name-set untouched.
     async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.truncate(&relative, size).await
+        fs.truncate(&relative, size).await?;
+        self.bump_activity(&Self::parent_dir(path));
+        Ok(())
     }
 
     async fn setattr(&self, path: &Path, attr: SetAttr) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.setattr(&relative, attr).await
+        let attr = fs.setattr(&relative, attr).await?;
+        self.bump_activity(&Self::parent_dir(path));
+        Ok(attr)
     }
 
     async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
         let attr = fs.symlink(&relative, target).await?;
         self.bump_generation(&Self::parent_dir(path));
+        self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
     }
 
@@ -890,8 +1003,10 @@ impl VfsOps for MountTable {
 
         let attr = old_fs.link(&old_relative, &new_relative).await?;
         // Only newpath's parent gains a name; oldpath's parent's listing is
-        // unchanged (a hard link doesn't remove the original name).
+        // unchanged (a hard link doesn't remove the original name). Same
+        // reasoning for activity: the heat lands where the new name appeared.
         self.bump_generation(&Self::parent_dir(newpath));
+        self.bump_activity(&Self::parent_dir(newpath));
         Ok(attr)
     }
 
@@ -1539,6 +1654,188 @@ mod tests {
         let result = table.snapshot(Path::new("/scratch"), 5, SNAPSHOT_MAX_ENTRIES).await.unwrap();
         let file = result.root.children.iter().find(|c| c.name == "a.txt").unwrap();
         assert_eq!(file.generation, 0);
+    }
+
+    // ========================================================================
+    // Activity counters (Lane K, stage-1 digest groundwork, docs/scenes/vfs.md)
+    // ========================================================================
+
+    /// Helper: current activity total recorded for `dir`, or 0 if never bumped.
+    fn activity_of(table: &MountTable, dir: &Path) -> u64 {
+        table
+            .activity_snapshot(Some(dir))
+            .into_iter()
+            .find(|(p, _)| p == dir)
+            .map(|(_, total)| total)
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn write_truncate_setattr_bump_activity_not_generation() {
+        let table = setup_snapshot_tree().await;
+        let scratch = Path::new("/scratch");
+        let gen_before = table.snapshot(scratch, 0, 10).await.unwrap().root.generation;
+        let epoch_before = table.global_activity();
+        let act_before = activity_of(&table, scratch);
+
+        table.write(Path::new("/scratch/a.txt"), 0, b"hi").await.unwrap();
+        table.truncate(Path::new("/scratch/a.txt"), 1).await.unwrap();
+        table
+            .setattr(Path::new("/scratch/a.txt"), SetAttr::new().with_perm(0o600))
+            .await
+            .unwrap();
+
+        let gen_after = table.snapshot(scratch, 0, 10).await.unwrap().root.generation;
+        assert_eq!(
+            gen_before, gen_after,
+            "content ops must not bump listing-generation (structure only)"
+        );
+
+        let epoch_after = table.global_activity();
+        assert_eq!(
+            epoch_after - epoch_before,
+            3,
+            "write+truncate+setattr = 3 activity bumps on the global epoch"
+        );
+        let act_after = activity_of(&table, scratch);
+        assert_eq!(
+            act_after - act_before,
+            3,
+            "all three content ops land on the file's parent directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_mkdir_unlink_rmdir_symlink_bump_both_counters() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        let scratch = Path::new("/scratch");
+
+        macro_rules! assert_both_bumped {
+            ($before_gen:expr, $before_act:expr) => {{
+                let after_gen = table.snapshot(scratch, 0, 10).await.unwrap().root.generation;
+                let after_act = activity_of(&table, scratch);
+                assert!(after_gen > $before_gen, "generation must bump");
+                assert!(after_act > $before_act, "activity must bump");
+                (after_gen, after_act)
+            }};
+        }
+
+        let gen0 = table.snapshot(scratch, 0, 10).await.unwrap().root.generation;
+        let act0 = activity_of(&table, scratch);
+
+        table.create(Path::new("/scratch/a.txt"), 0o644).await.unwrap();
+        let (gen1, act1) = assert_both_bumped!(gen0, act0);
+
+        table.mkdir(Path::new("/scratch/sub"), 0o755).await.unwrap();
+        let (gen2, act2) = assert_both_bumped!(gen1, act1);
+
+        table.symlink(Path::new("/scratch/link"), Path::new("a.txt")).await.unwrap();
+        let (gen3, act3) = assert_both_bumped!(gen2, act2);
+
+        table.unlink(Path::new("/scratch/a.txt")).await.unwrap();
+        let (gen4, act4) = assert_both_bumped!(gen3, act3);
+
+        table.unlink(Path::new("/scratch/link")).await.unwrap();
+        let (gen5, act5) = assert_both_bumped!(gen4, act4);
+
+        table.rmdir(Path::new("/scratch/sub")).await.unwrap();
+        let _ = assert_both_bumped!(gen5, act5);
+    }
+
+    #[tokio::test]
+    async fn link_bumps_only_newpath_parent_activity_and_generation() {
+        // MemoryBackend doesn't support hard links; LocalBackend does (real
+        // `fs::hard_link` on the underlying tempdir).
+        use crate::vfs::backends::LocalBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let table = MountTable::new();
+        table.mount("/scratch", LocalBackend::new(dir.path())).await;
+        table.mkdir(Path::new("/scratch/src"), 0o755).await.unwrap();
+        table.mkdir(Path::new("/scratch/dst"), 0o755).await.unwrap();
+        table.create(Path::new("/scratch/src/file.txt"), 0o644).await.unwrap();
+
+        let src = Path::new("/scratch/src");
+        let dst = Path::new("/scratch/dst");
+        let src_gen_before = table.snapshot(src, 0, 10).await.unwrap().root.generation;
+        let src_act_before = activity_of(&table, src);
+        let dst_gen_before = table.snapshot(dst, 0, 10).await.unwrap().root.generation;
+        let dst_act_before = activity_of(&table, dst);
+
+        table
+            .link(Path::new("/scratch/src/file.txt"), Path::new("/scratch/dst/hardlink"))
+            .await
+            .unwrap();
+
+        let src_gen_after = table.snapshot(src, 0, 10).await.unwrap().root.generation;
+        let src_act_after = activity_of(&table, src);
+        assert_eq!(
+            src_gen_before, src_gen_after,
+            "oldpath's parent's name-set is unchanged by a hard link"
+        );
+        assert_eq!(
+            src_act_before, src_act_after,
+            "oldpath's parent gets no activity credit for a link"
+        );
+
+        let dst_gen_after = table.snapshot(dst, 0, 10).await.unwrap().root.generation;
+        let dst_act_after = activity_of(&table, dst);
+        assert!(dst_gen_after > dst_gen_before, "newpath's parent gains a name");
+        assert!(dst_act_after > dst_act_before, "newpath's parent is where the heat lands");
+    }
+
+    #[tokio::test]
+    async fn rename_bumps_activity_of_both_parents() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        table.mkdir(Path::new("/scratch/src"), 0o755).await.unwrap();
+        table.mkdir(Path::new("/scratch/dst"), 0o755).await.unwrap();
+        table.create(Path::new("/scratch/src/f.txt"), 0o644).await.unwrap();
+
+        let src = Path::new("/scratch/src");
+        let dst = Path::new("/scratch/dst");
+        let src_act_before = activity_of(&table, src);
+        let dst_act_before = activity_of(&table, dst);
+
+        table
+            .rename(Path::new("/scratch/src/f.txt"), Path::new("/scratch/dst/f.txt"))
+            .await
+            .unwrap();
+
+        assert!(activity_of(&table, src) > src_act_before, "source parent loses a name = heat");
+        assert!(activity_of(&table, dst) > dst_act_before, "dest parent gains a name = heat");
+    }
+
+    #[tokio::test]
+    async fn reads_never_bump_activity() {
+        let table = setup_snapshot_tree().await;
+        let epoch_before = table.global_activity();
+
+        let _ = table.read(Path::new("/scratch/a.txt"), 0, 100).await.unwrap();
+        let _ = table.read_all(Path::new("/scratch/a.txt")).await.unwrap();
+        let _ = table.readdir(Path::new("/scratch")).await.unwrap();
+        let _ = table.getattr(Path::new("/scratch/a.txt")).await.unwrap();
+
+        assert_eq!(
+            table.global_activity(),
+            epoch_before,
+            "reads must never bump the activity epoch — heat is change, not access"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_op_bumps_no_activity() {
+        let table = MountTable::new();
+        let epoch_before = table.global_activity();
+
+        let result = table.write(Path::new("/nothing/here.txt"), 0, b"x").await;
+        assert!(result.is_err());
+
+        assert_eq!(
+            table.global_activity(),
+            epoch_before,
+            "a failed backend op must not register as activity"
+        );
     }
 
     // ========================================================================

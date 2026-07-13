@@ -78,7 +78,7 @@ use crate::rpc::{
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, ResourceEventsForwarder,
-    ServerEvent,
+    ServerEvent, VfsActivityEventsForwarder,
 };
 use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 
@@ -312,6 +312,15 @@ enum RpcCommand {
         depth: u32,
         max_entries: u32,
         reply: oneshot::Sender<Result<crate::rpc::SnapshotResult, CallError>>,
+    },
+    /// Start (or no-op if already started) the VFS activity digest push
+    /// subscription for this connection. Handled entirely inline by
+    /// `RpcActor::dispatch` (needs `self.event_tx` to build the forwarder,
+    /// same reason `AttachPeer`/`JoinContext`/`ResubscribeBlocks` are
+    /// special-cased there) — never routed through `dispatch_kernel_command`.
+    SubscribeVfsActivity {
+        interval_ms: u32,
+        reply: oneshot::Sender<Result<(), CallError>>,
     },
     Conclude {
         context_id: ContextId,
@@ -626,6 +635,7 @@ impl RpcCommand {
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListTracks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::VfsSnapshot { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SubscribeVfsActivity { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PromoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -812,6 +822,21 @@ impl ActorHandle {
     ) -> Result<crate::rpc::SnapshotResult, CallError> {
         let path = path.to_string();
         self.send(|reply| RpcCommand::VfsSnapshot { path, depth, max_entries, reply }).await
+    }
+
+    /// Start the VFS activity digest push subscription (Lane K, FSN slice-1,
+    /// `docs/scenes/vfs.md`). Events surface on [`Self::subscribe_events`] as
+    /// [`ServerEvent::VfsActivity`] — same shared stream as blocks/editor,
+    /// not a separate channel. Idempotent: a second call while already
+    /// subscribed on this connection is a no-op (the actor guards against
+    /// duplicate subscribes; see `RpcActor::dispatch`). The subscription is
+    /// remembered and best-effort re-issued on every reconnect (heat is
+    /// decorative — a failed re-subscribe logs and never forces another
+    /// reconnect attempt).
+    #[tracing::instrument(skip(self))]
+    pub async fn subscribe_vfs_activity(&self, interval_ms: u32) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::SubscribeVfsActivity { interval_ms, reply })
+            .await
     }
 
     /// Conclude a context — the explicit "done" act (sets `concluded`/stamps
@@ -1558,6 +1583,14 @@ struct RpcActor {
     /// (tech_debt_peer_reattach_on_reconnect). The `Sender` is cheap to clone
     /// and the capnp callback is rebuilt from it on each attach.
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
+    /// Requested tick interval for the VFS activity digest subscription
+    /// (Lane K, FSN slice-1) — `None` until the first
+    /// `SubscribeVfsActivity` command. Persisted like `peer_registration` so
+    /// the actor best-effort re-subscribes on every reconnect (see
+    /// `connect_handshake`); also doubles as the "already subscribed" guard
+    /// so a second `SubscribeVfsActivity` call on a live connection is a
+    /// no-op rather than stacking a duplicate bridge task server-side.
+    vfs_activity_interval_ms: Option<u32>,
 
     /// Owned during `Connected`. Replaced atomically on successful handshake.
     connection: Option<ConnectionState>,
@@ -1609,6 +1642,7 @@ impl RpcActor {
             scope_blocks_to_context,
             joined_context_id: None,
             peer_registration: None,
+            vfs_activity_interval_ms: None,
             connection: None,
             ping_task: None,
             connecting_task: None,
@@ -1679,6 +1713,7 @@ impl RpcActor {
             self.scope_blocks_to_context,
             self.event_tx.clone(),
             self.peer_registration.clone(),
+            self.vfs_activity_interval_ms,
         );
         self.connecting_task = Some(task);
         self.broadcast_state();
@@ -1950,6 +1985,34 @@ impl RpcActor {
                 // prior one on the server by (principal, instance)).
                 self.resubscribe_blocks();
                 let _ = reply.send(Ok(()));
+            }
+            RpcCommand::SubscribeVfsActivity { interval_ms, reply } => {
+                // Guard duplicate subscribes: only the first ask on a live
+                // connection actually issues the RPC. There is no wire method
+                // to "change interval" on an existing bridge, so a repeat
+                // call is a harmless no-op rather than stacking a second
+                // server-side timer task.
+                if self.vfs_activity_interval_ms.is_some() {
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+                self.vfs_activity_interval_ms = Some(interval_ms);
+                let kernel = conn.kernel.clone();
+                let event_tx = self.event_tx.clone();
+                tokio::task::spawn_local(
+                    async move {
+                        let forwarder = VfsActivityEventsForwarder { event_tx };
+                        let client: crate::kaijutsu_capnp::vfs_activity_events::Client =
+                            capnp_rpc::new_client(forwarder);
+                        let result = run_rpc_call(
+                            kernel.subscribe_vfs_activity(client, interval_ms),
+                            &close_tx,
+                        )
+                        .await;
+                        let _ = reply.send(result);
+                    }
+                    .instrument(span),
+                );
             }
             RpcCommand::AttachPeer {
                 config,
@@ -2246,6 +2309,7 @@ fn spawn_handshake(
     scope_blocks_to_context: bool,
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
+    vfs_activity_interval_ms: Option<u32>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
         connect_handshake(
@@ -2255,6 +2319,7 @@ fn spawn_handshake(
             scope_blocks_to_context,
             event_tx,
             peer_registration,
+            vfs_activity_interval_ms,
         )
         .await
     })
@@ -2295,6 +2360,7 @@ async fn connect_handshake(
     scope_blocks_to_context: bool,
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
+    vfs_activity_interval_ms: Option<u32>,
 ) -> ConnectOutcome {
     // 1. SSH dial + auth + channel open (with per-phase deadline).
     let client = match tokio::time::timeout(SSH_DIAL_TIMEOUT, connect_ssh(config)).await {
@@ -2384,6 +2450,30 @@ async fn connect_handshake(
             Ok(Ok(_)) => log::info!("Re-attached peer '{}' on connect", cfg.nick),
             Ok(Err(e)) => log::warn!("peer re-attach failed (non-fatal): {e}"),
             Err(_) => log::warn!("peer re-attach timed out (non-fatal)"),
+        }
+    }
+
+    // 3.6. Re-subscribe to the VFS activity digest stream if a caller had
+    //      asked for one before this (re)connect (Lane K, FSN slice-1).
+    //      BEST-EFFORT, same reasoning as the peer re-attach just above: heat
+    //      is decorative world-rendering signal, never a control input, so a
+    //      failure here must log-and-continue rather than fail the handshake
+    //      or force another reconnect attempt.
+    if let Some(interval_ms) = vfs_activity_interval_ms {
+        let vfs_activity_fwd = VfsActivityEventsForwarder {
+            event_tx: event_tx.clone(),
+        };
+        let vfs_activity_client: crate::kaijutsu_capnp::vfs_activity_events::Client =
+            capnp_rpc::new_client(vfs_activity_fwd);
+        match tokio::time::timeout(
+            RPC_CALL_TIMEOUT,
+            kernel.subscribe_vfs_activity(vfs_activity_client, interval_ms),
+        )
+        .await
+        {
+            Ok(Ok(())) => log::info!("Re-subscribed vfs activity on connect"),
+            Ok(Err(e)) => log::warn!("vfs activity re-subscribe failed (non-fatal): {e}"),
+            Err(_) => log::warn!("vfs activity re-subscribe timed out (non-fatal)"),
         }
     }
 
@@ -2823,6 +2913,13 @@ async fn dispatch_kernel_command(
         RpcCommand::ResubscribeBlocks { reply } => {
             let _ = reply.send(Err(CallError::Rpc(
                 "resubscribe_blocks leaked into kernel dispatch (bug)".into(),
+            )));
+        }
+
+        // ── SubscribeVfsActivity handled inline by RpcActor::dispatch (needs event_tx) ──
+        RpcCommand::SubscribeVfsActivity { reply, .. } => {
+            let _ = reply.send(Err(CallError::Rpc(
+                "subscribe_vfs_activity leaked into kernel dispatch (bug)".into(),
             )));
         }
 

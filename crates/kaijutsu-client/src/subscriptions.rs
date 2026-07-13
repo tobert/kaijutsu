@@ -15,8 +15,13 @@ use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
-use crate::kaijutsu_capnp::{block_events, editor_events, kernel_output, resource_events};
-use crate::rpc::{EditorState, SyncState, parse_block_id, parse_block_snapshot, parse_editor_state};
+use crate::kaijutsu_capnp::{
+    block_events, editor_events, kernel_output, resource_events, vfs_activity_events,
+};
+use crate::rpc::{
+    EditorState, SyncState, VfsActivityEntry, parse_block_id, parse_block_snapshot,
+    parse_editor_state, parse_vfs_activity_entry,
+};
 
 // ============================================================================
 // Event Types
@@ -148,6 +153,15 @@ pub enum ServerEvent {
     BeatSync {
         context_id: ContextId,
         beat_ref: kaijutsu_audio::BeatRef,
+    },
+    /// A VFS activity digest tick (Lane K, FSN slice-1, `docs/scenes/vfs.md`).
+    /// `entries` are the directories whose activity total has changed since
+    /// the server-side cursor's last delivered digest — ABSOLUTE totals, not
+    /// deltas, so a missed tick self-heals on the next one. Heat is
+    /// decorative (world-rendering signal), never a control input.
+    VfsActivity {
+        entries: Vec<VfsActivityEntry>,
+        global_total: u64,
     },
 }
 
@@ -306,6 +320,69 @@ impl editor_events::Server for EditorEventsForwarder {
             .is_err()
         {
             tracing::warn!("Event channel closed, dropping EditorClosed event");
+        }
+        Promise::ok(())
+    }
+}
+
+// ============================================================================
+// VFS Activity Events Forwarder (Lane K, FSN slice-1, docs/scenes/vfs.md)
+// ============================================================================
+
+/// Implements the Cap'n Proto `VfsActivityEvents::Server` trait, forwarding
+/// each digest tick into the shared `broadcast::Sender<ServerEvent>`.
+pub(crate) struct VfsActivityEventsForwarder {
+    pub event_tx: broadcast::Sender<ServerEvent>,
+}
+
+/// Build a `VfsActivityEvents` callback client plus the receiver its pushes
+/// land on — the dedicated-channel counterpart to [`editor_events_channel`]
+/// for callers (headless e2e tests, direct API consumers) that want their
+/// own stream rather than riding the actor's shared `event_tx`. Pass the
+/// returned client to
+/// [`KernelHandle::subscribe_vfs_activity`](crate::rpc::KernelHandle::subscribe_vfs_activity);
+/// drain the receiver for [`ServerEvent::VfsActivity`].
+pub fn vfs_activity_events_channel(
+    capacity: usize,
+) -> (
+    crate::kaijutsu_capnp::vfs_activity_events::Client,
+    broadcast::Receiver<ServerEvent>,
+) {
+    let (tx, rx) = broadcast::channel(capacity);
+    let client: crate::kaijutsu_capnp::vfs_activity_events::Client =
+        capnp_rpc::new_client(VfsActivityEventsForwarder { event_tx: tx });
+    (client, rx)
+}
+
+#[allow(refining_impl_trait)]
+impl vfs_activity_events::Server for VfsActivityEventsForwarder {
+    fn on_activity_digest(
+        self: Rc<Self>,
+        params: vfs_activity_events::OnActivityDigestParams,
+        _results: vfs_activity_events::OnActivityDigestResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let mut entries = Vec::new();
+        let list = match params.get_entries() {
+            Ok(l) => l,
+            Err(e) => return Promise::err(e),
+        };
+        for entry in list.iter() {
+            match parse_vfs_activity_entry(entry) {
+                Ok(e) => entries.push(e),
+                Err(e) => return Promise::err(rpc_to_capnp(e)),
+            }
+        }
+        let global_total = params.get_global_total();
+        if self
+            .event_tx
+            .send(ServerEvent::VfsActivity { entries, global_total })
+            .is_err()
+        {
+            tracing::warn!("Event channel closed, dropping VfsActivity event");
         }
         Promise::ok(())
     }

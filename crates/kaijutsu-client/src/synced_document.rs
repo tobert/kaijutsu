@@ -117,6 +117,7 @@ impl SyncedDocument {
             | ServerEvent::ResourceListChanged { .. }
             | ServerEvent::EditorStateChanged { .. }
             | ServerEvent::EditorClosed { .. }
+            | ServerEvent::VfsActivity { .. }
             | ServerEvent::Reconnected => None,
         }
     }
@@ -446,7 +447,9 @@ impl SyncedDocument {
             // the doc cache. `BeatSync` (the metronome beat reference) is the
             // same shape: a directive the sink's phasor consumes, not doc state.
             | ServerEvent::RenderCue { .. }
-            | ServerEvent::BeatSync { .. } => SyncEffect::Ignored,
+            | ServerEvent::BeatSync { .. }
+            // VFS activity is decorative world-rendering heat, not doc state.
+            | ServerEvent::VfsActivity { .. } => SyncEffect::Ignored,
         }
     }
 
