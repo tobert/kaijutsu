@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -32,7 +34,9 @@ use kaijutsu_types::share::{GENERATION_EXTENSION, GenerationReply, GenerationReq
 use russh_sftp::client::rawsession::RawSftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 
-use crate::vfs::{DirEntry, FileAttr, FileType, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
+use crate::vfs::{
+    DirEntry, FileAttr, FileType, STREAM_CHUNK_SIZE, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
+};
 
 /// Ceiling on a single wire op against a client's share session
 /// (`docs/slash-r.md` "Every remote op gets a timeout") — a hung laptop must
@@ -41,7 +45,8 @@ pub const SHARE_OP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `READ` chunk size for [`ShareFs`]'s `read_all` override — matches the
 /// forward adapter's `MAX_READ_LEN` and the SFTP `READ` window both
-/// directions already use.
+/// directions already use. (`STREAM_CHUNK_SIZE` — the streaming override's
+/// cadence — is deliberately the same value, defined beside the trait.)
 const READ_CHUNK: u32 = 256 * 1024;
 
 /// One share a registered client is offering.
@@ -356,6 +361,100 @@ impl ShareRegistry {
         result.map(|()| out)
     }
 
+    /// Held-handle streaming read — the RTT-amplification fix the whole
+    /// design turns on (`docs/slash-r.md` "The pump rides a streaming read
+    /// primitive"): ONE remote `OPEN`, then sequential `READ`s at
+    /// [`STREAM_CHUNK_SIZE`], one `CLOSE` — versus the trait default's
+    /// OPEN/READ/CLOSE *per chunk* when it loops [`ShareFs::read`].
+    ///
+    /// **Locking:** the per-client session mutex is taken PER WIRE OP (the
+    /// open, each read, the close) and dropped between chunks — never held
+    /// across the whole stream. A multi-GB transfer holding it for minutes
+    /// would starve every other op on that client (getattr, readdir, the
+    /// keepalive ping — which would then evict the session mid-transfer as
+    /// "dead"). SFTP handles are session-scoped, so other ops interleaving
+    /// on the same session between our READs is protocol-legal.
+    ///
+    /// Takes `Arc<Self>` so the returned stream is `'static`-captured
+    /// (owns everything it needs); `ShareFs` clones its registry `Arc` per
+    /// call. EOF/short-read contract matches the trait doc: zero-length
+    /// read = clean end, a short read advances by the actual length, a wire
+    /// error is the final item.
+    pub fn open_read_stream(
+        self: Arc<Self>,
+        client_id: String,
+        share: String,
+        remote_path: String,
+    ) -> BoxStream<'static, VfsResult<Bytes>> {
+        Box::pin(async_stream::stream! {
+            if let Err(e) = self.share_row(&client_id, &share).await {
+                yield Err(e);
+                return;
+            }
+            let session = match self.session_of(&client_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            // OPEN — lock scoped to this one wire op.
+            let handle = {
+                let guard = session.lock().await;
+                match timeout_op(
+                    &client_id,
+                    guard.open(remote_path.clone(), OpenFlags::READ, FileAttributes::empty()),
+                )
+                .await
+                {
+                    Ok(h) => h.handle,
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            };
+
+            // Armed from OPEN onward: if the consumer drops this stream
+            // mid-transfer (an aborted pump), the guard's Drop spawns a
+            // best-effort CLOSE — see [`StreamCloseGuard`] for why Drop
+            // can't just close inline.
+            let mut close_guard =
+                StreamCloseGuard::new(session.clone(), handle.clone(), client_id.clone());
+
+            let mut offset = 0u64;
+            loop {
+                // Each READ takes the lock for exactly one wire op.
+                let chunk = {
+                    let guard = session.lock().await;
+                    timed_read(&client_id, &guard, &handle, offset, STREAM_CHUNK_SIZE).await
+                };
+                match chunk {
+                    // Zero-length read == clean EOF.
+                    Ok(c) if c.is_empty() => break,
+                    // Short reads are legal: advance by the ACTUAL length.
+                    Ok(c) => {
+                        offset += c.len() as u64;
+                        yield Ok(Bytes::from(c));
+                    }
+                    // A wire error is the stream's final item.
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
+            }
+
+            // Natural termination (EOF or error): close inline, best-effort
+            // (same discipline as `read`/`read_all`/`list_dir`), and disarm
+            // the drop guard so it doesn't double-close.
+            close_guard.disarm();
+            let guard = session.lock().await;
+            let _ = timeout_op(&client_id, guard.close(handle)).await;
+        })
+    }
+
     /// Batch-fetch generations for a set of remote paths in ONE extended
     /// request — see `docs/slash-r.md`'s RTT-amplification note and
     /// `kaijutsu_types::share`'s module doc for why this rides
@@ -384,6 +483,72 @@ impl ShareRegistry {
             )));
         }
         Ok(decoded.generations)
+    }
+}
+
+/// Closes a remote SFTP handle when a [`ShareRegistry::open_read_stream`]
+/// consumer DROPS the stream mid-transfer (a `pump` aborted between chunks).
+///
+/// The constraint: `Drop::drop` is synchronous and the SFTP `CLOSE` is an
+/// async wire op behind an async mutex — it cannot run inline in `Drop`. So
+/// the guard `tokio::spawn`s a best-effort close with its own clones of the
+/// session `Arc` + handle string; the spawned task outlives the dropped
+/// stream and the remote handle is reaped promptly instead of leaking until
+/// session close. A stream driven to natural termination (EOF or error)
+/// closes inline in the stream body and [`Self::disarm`]s this guard first.
+///
+/// `Handle::try_current` rather than `tokio::spawn` directly: a panic in
+/// `Drop` aborts the process, and while every real consumer is async (the
+/// stream itself can only be polled on a runtime), a dropped-without-polling
+/// stream on a non-runtime thread must degrade to the documented leak, not
+/// an abort.
+struct StreamCloseGuard {
+    session: Option<Arc<Mutex<RawSftpSession>>>,
+    handle: String,
+    client_id: String,
+}
+
+impl StreamCloseGuard {
+    fn new(session: Arc<Mutex<RawSftpSession>>, handle: String, client_id: String) -> Self {
+        Self {
+            session: Some(session),
+            handle,
+            client_id,
+        }
+    }
+
+    /// Take over closing responsibility (the stream body closes inline on
+    /// natural termination) — the guard's `Drop` becomes a no-op.
+    fn disarm(&mut self) {
+        self.session = None;
+    }
+}
+
+impl Drop for StreamCloseGuard {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return; // disarmed — the stream body closed inline
+        };
+        let handle = std::mem::take(&mut self.handle);
+        let client_id = std::mem::take(&mut self.client_id);
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    let guard = session.lock().await;
+                    if let Err(e) = timeout_op(&client_id, guard.close(handle)).await {
+                        // Best-effort: the session may already be gone (a
+                        // dropped stream often accompanies a disconnect).
+                        tracing::debug!("share stream drop-close for {client_id}: {e}");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "share stream for {client_id} dropped outside a tokio runtime; \
+                     remote handle leaks until session close"
+                );
+            }
+        }
     }
 }
 
@@ -682,6 +847,44 @@ impl VfsOps for ShareFs {
                 self.registry.read_all(&client_id, &share, &remote_path).await
             }
         }
+    }
+
+    /// Held-handle streaming override — the stitch both `/r` lanes were
+    /// built toward (`docs/slash-r.md` slice 0's RTT-amplification catch):
+    /// a pump from `/r/<id>/<share>/file` holds ONE remote SFTP handle for
+    /// the whole transfer via [`ShareRegistry::open_read_stream`], where the
+    /// trait default looping [`Self::read`] would OPEN/READ/CLOSE per
+    /// 256 KiB chunk — three round trips each at network latency.
+    ///
+    /// The synthetic levels (`/r`, `/r/index`, `/r/<id>`, and the share dir
+    /// itself) fall back to the loop-`read` shape of the trait default:
+    /// `/r/index` is tiny (one `read` covers it), and a directory errors
+    /// naturally — and loudly — on the first read.
+    fn open_read_stream<'a>(&'a self, path: &'a Path) -> BoxStream<'a, VfsResult<Bytes>> {
+        if let Route::InShare { client_id, share, remote_path } = route(path)
+            && remote_path != format!("/{share}")
+        {
+            return self.registry.clone().open_read_stream(client_id, share, remote_path);
+        }
+        // Trait-default shape, restated (an overriding impl can't call the
+        // default it replaced): loop this backend's own `read` at the shared
+        // chunk size.
+        Box::pin(futures::stream::unfold(
+            (self, path, 0u64, false),
+            |(this, path, offset, done)| async move {
+                if done {
+                    return None;
+                }
+                match this.read(path, offset, STREAM_CHUNK_SIZE).await {
+                    Ok(chunk) if chunk.is_empty() => None,
+                    Ok(chunk) => {
+                        let advanced = offset + chunk.len() as u64;
+                        Some((Ok(Bytes::from(chunk)), (this, path, advanced, false)))
+                    }
+                    Err(e) => Some((Err(e), (this, path, offset, true))),
+                }
+            },
+        ))
     }
 
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {

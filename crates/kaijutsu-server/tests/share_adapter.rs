@@ -4,19 +4,104 @@
 //! shape, reversed: here the CLIENT crate plays the SFTP *server* role and
 //! the KERNEL (`ShareFs`/`ShareRegistry`) plays the SFTP *client* role.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use kaijutsu_client::{ShareArg, ShareHandler, ShareServerConfig};
-use kaijutsu_kernel::{ShareFs, ShareRegistry, VfsError, VfsOps};
+use kaijutsu_kernel::vfs::{VfsSink, pump_stream};
+use kaijutsu_kernel::{MemoryBackend, MountTable, ShareFs, ShareRegistry, VfsError, VfsOps};
 use kaijutsu_server::share::{run_share_session, run_share_session_with_keepalive};
 use kaijutsu_types::Principal;
+
+use russh_sftp::protocol::{
+    Attrs, Data, FileAttributes, Handle as SftpHandle, Name, OpenFlags, Packet, Status, Version,
+};
+use russh_sftp::server::{Handler as ServerHandler, StatusReply};
+
+/// Delegating wrapper over the REAL `ShareHandler` that counts remote `OPEN`
+/// and `CLOSE` calls — the observable the held-handle streaming tests assert
+/// on: the trait-default stream would show one OPEN per 256 KiB chunk; the
+/// `ShareFs` override must show exactly one for a whole transfer.
+struct CountingHandler {
+    inner: ShareHandler,
+    opens: Arc<AtomicUsize>,
+    closes: Arc<AtomicUsize>,
+}
+
+impl ServerHandler for CountingHandler {
+    type Error = StatusReply;
+
+    fn unimplemented(&self) -> Self::Error {
+        self.inner.unimplemented()
+    }
+    async fn init(
+        &mut self,
+        version: u32,
+        extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
+        self.inner.init(version, extensions).await
+    }
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        attrs: FileAttributes,
+    ) -> Result<SftpHandle, Self::Error> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.open(id, filename, pflags, attrs).await
+    }
+    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        self.inner.close(id, handle).await
+    }
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        self.inner.read(id, handle, offset, len).await
+    }
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        self.inner.lstat(id, path).await
+    }
+    async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        self.inner.stat(id, path).await
+    }
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        self.inner.fstat(id, handle).await
+    }
+    async fn opendir(&mut self, id: u32, path: String) -> Result<SftpHandle, Self::Error> {
+        self.inner.opendir(id, path).await
+    }
+    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        self.inner.readdir(id, handle).await
+    }
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        self.inner.realpath(id, path).await
+    }
+    async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        self.inner.readlink(id, path).await
+    }
+    async fn extended(
+        &mut self,
+        id: u32,
+        request: String,
+        data: Vec<u8>,
+    ) -> Result<Packet, Self::Error> {
+        self.inner.extended(id, request, data).await
+    }
+}
 
 /// [`Killable`] stream modes (stored as an `AtomicU8`).
 const MODE_LIVE: u8 = 0;
@@ -136,6 +221,49 @@ async fn fixture(dir: &Path, share_name: &str) -> (ShareFs, String) {
     .await;
 
     (ShareFs::new(registry), client_id)
+}
+
+/// [`fixture`] with a [`CountingHandler`] in front of the real
+/// `ShareHandler`: returns the registered `ShareFs`, the client id, and the
+/// live OPEN/CLOSE counters. Counters include registration's own traffic
+/// (one `/index` open+close), so tests assert on DELTAS captured after this
+/// returns.
+async fn counting_fixture(
+    dir: &Path,
+    share_name: &str,
+) -> (ShareFs, String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let client_id = format!("client-{}", uuid::Uuid::new_v4());
+    let args = vec![ShareArg {
+        name: share_name.to_string(),
+        path: dir.to_path_buf(),
+        rw: false,
+    }];
+    let config = ShareServerConfig::new(&args, client_id.clone(), "test-nick").unwrap();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    let handler = CountingHandler {
+        inner: ShareHandler::new(config),
+        opens: opens.clone(),
+        closes: closes.clone(),
+    };
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    russh_sftp::server::run(client_io, handler).await;
+
+    let registry = Arc::new(ShareRegistry::new());
+    tokio::spawn(run_share_session(server_io, Principal::system(), registry.clone()));
+    {
+        let registry = registry.clone();
+        let client_id = client_id.clone();
+        wait_for(move || {
+            let registry = registry.clone();
+            let client_id = client_id.clone();
+            async move { registry.is_live(&client_id).await }
+        })
+        .await;
+    }
+
+    (ShareFs::new(registry), client_id, opens, closes)
 }
 
 /// Poll `pred` every 20ms for up to 2s — the registration handshake and
@@ -384,4 +512,112 @@ async fn a_silently_dead_idle_session_is_evicted_by_the_keepalive() {
         })
         .await;
     }
+}
+
+/// THE money assertion for the held-handle streaming override
+/// (`docs/slash-r.md` "The pump rides a streaming read primitive"): a pump
+/// from `/r/<id>/<share>/file` through a real `MountTable` must cost exactly
+/// ONE remote `OPEN` for the whole multi-chunk transfer. The trait default
+/// (looping `ShareFs::read`) would show one OPEN per 256 KiB chunk — four
+/// here — so this is the direct regression signal for the RTT fix, and it
+/// exercises `MountTable::open_read_stream`'s delegation to the backend
+/// override end to end.
+#[tokio::test]
+async fn pump_from_a_share_holds_one_remote_handle_for_the_whole_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    // ~3.5 chunks at the 256 KiB stream cadence — a multi-chunk transfer.
+    let payload: Vec<u8> = (0..900_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("big.bin"), &payload).unwrap();
+    let (fs, client_id, opens, _closes) = counting_fixture(dir.path(), "share").await;
+
+    let table = MountTable::new();
+    table.mount_arc("/r", Arc::new(fs)).await;
+    table.mount("/mem", MemoryBackend::new()).await;
+    let table: Arc<dyn VfsOps> = Arc::new(table);
+
+    let opens_before = opens.load(Ordering::SeqCst);
+    let sink = VfsSink::create(table.clone(), PathBuf::from("/mem/out.bin"))
+        .await
+        .unwrap();
+    let src = format!("/r/{client_id}/share/big.bin");
+    let outcome = pump_stream(&table, Path::new(&src), sink)
+        .await
+        .expect("pump from a share must succeed");
+    assert_eq!(outcome.bytes_transferred, payload.len() as u64);
+
+    let round_trip = table.read_all(Path::new("/mem/out.bin")).await.unwrap();
+    assert_eq!(round_trip, payload, "pumped bytes must be identical");
+
+    assert_eq!(
+        opens.load(Ordering::SeqCst) - opens_before,
+        1,
+        "the whole transfer must cost exactly ONE remote OPEN \
+         (the trait default would cost one per 256 KiB chunk)"
+    );
+}
+
+/// A consumer DROPPING the stream mid-transfer (an aborted pump) must not
+/// leak the remote handle until session close: the drop guard spawns a
+/// best-effort CLOSE, observable as the CLOSE count catching up to the OPEN
+/// count shortly after the drop.
+#[tokio::test]
+async fn dropping_a_stream_mid_transfer_closes_the_remote_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    // Several chunks, so one chunk in is genuinely mid-transfer.
+    let payload: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("big.bin"), &payload).unwrap();
+    let (fs, client_id, opens, closes) = counting_fixture(dir.path(), "share").await;
+
+    let opens_before = opens.load(Ordering::SeqCst);
+    let closes_before = closes.load(Ordering::SeqCst);
+
+    let path = PathBuf::from(format!("{client_id}/share/big.bin"));
+    {
+        let mut stream = fs.open_read_stream(&path);
+        let first = stream.next().await.expect("first chunk").expect("no error");
+        assert!(!first.is_empty());
+        // Dropped here, mid-transfer — the pump-abort case.
+    }
+
+    assert_eq!(opens.load(Ordering::SeqCst) - opens_before, 1, "one OPEN for the stream");
+    // The guard's spawned CLOSE crosses two task boundaries (spawn + the
+    // handler's processing loop); poll for it.
+    wait_for(move || {
+        let closes = closes.clone();
+        async move { closes.load(Ordering::SeqCst) - closes_before == 1 }
+    })
+    .await;
+}
+
+/// The session mutex must be held per wire op, never across the whole
+/// stream: with a stream open (one chunk pulled, more remaining), a getattr
+/// on the SAME client must still complete — a stream holding the lock for
+/// its whole life would park this forever (observed here as a timeout).
+#[tokio::test]
+async fn other_ops_on_the_same_client_proceed_while_a_stream_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("big.bin"), &payload).unwrap();
+    std::fs::write(dir.path().join("small.txt"), b"beside the stream").unwrap();
+    let (fs, client_id, _opens, _closes) = counting_fixture(dir.path(), "share").await;
+
+    let stream_path = PathBuf::from(format!("{client_id}/share/big.bin"));
+    let mut stream = fs.open_read_stream(&stream_path);
+    let mut collected = Vec::new();
+    collected.extend_from_slice(&stream.next().await.expect("first chunk").expect("no error"));
+
+    // Mid-stream: an unrelated op on the same client's session.
+    let other = PathBuf::from(format!("{client_id}/share/small.txt"));
+    let attr = tokio::time::timeout(Duration::from_secs(2), fs.getattr(&other))
+        .await
+        .expect("getattr must not block behind an idle open stream (lock held across chunks?)")
+        .expect("getattr succeeds");
+    assert_eq!(attr.size, b"beside the stream".len() as u64);
+
+    // The interleaved op must not have corrupted the stream: drain it and
+    // verify the full payload arrived intact.
+    while let Some(item) = stream.next().await {
+        collected.extend_from_slice(&item.expect("stream continues cleanly"));
+    }
+    assert_eq!(collected, payload, "interleaved ops must not corrupt the stream");
 }
