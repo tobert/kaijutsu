@@ -37,6 +37,14 @@ struct Cli {
     /// Skip SSH known_hosts verification (TOFU)
     #[arg(long)]
     insecure: bool,
+
+    /// Share a local directory into `/r/<client-id>/<name>` (repeatable).
+    /// Format: `[name=]path[:rw]` — the name defaults to the path's
+    /// basename; `:rw` labels the share read-write in the manifest (write
+    /// support itself is a later slice — every share is served read-only
+    /// today regardless of this flag). See `docs/slash-r.md`.
+    #[arg(long = "share", action = clap::ArgAction::Append, value_parser = kaijutsu_client::parse_share_arg)]
+    shares: Vec<kaijutsu_client::ShareArg>,
 }
 
 mod audio;
@@ -63,11 +71,48 @@ pub use kaijutsu_client::kaijutsu_capnp;
 fn main() {
     let cli = Cli::parse();
 
+    // Cross-arg validation clap's per-value parser can't express: two shares
+    // defaulting to the same name (`--share a/x --share b/x`) must be a
+    // parse error, not a silent shadow (docs/slash-r.md "Open questions").
+    if let Err(e) = kaijutsu_client::validate_unique_names(&cli.shares) {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(clap::error::ErrorKind::ValueValidation, e)
+            .exit();
+    }
+
     let ssh_config = SshConfig {
         host: cli.host,
         port: cli.port,
         insecure: cli.insecure,
         ..SshConfig::default()
+    };
+
+    // Stable per-installation client id (docs/kernel-kv.md), loaded once and
+    // reused both as the `ClientId` resource below and (if shares are
+    // configured) as the `/r` share manifest's claimed identity
+    // (docs/slash-r.md — "namespace, not authority": the SSH principal, not
+    // this string, is what the kernel actually trusts).
+    let client_id = connection::client_id::load_or_seed();
+
+    // Build the share-server config eagerly, before the window even opens:
+    // a bad `--share` path (doesn't exist, not a directory) is a startup
+    // error, not a silently-dropped share discovered later from an empty
+    // `/r/<id>` (fail loud, docs/slash-r.md).
+    let share_config = if cli.shares.is_empty() {
+        None
+    } else {
+        let nick = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(whoami::username);
+        match kaijutsu_client::ShareServerConfig::new(&cli.shares, client_id.to_string(), nick) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
     };
 
     // Set up file logging
@@ -154,11 +199,13 @@ fn main() {
         .add_plugins(shaders::ShaderFxPlugin)
         // Stable per-installation client id, for per-client KV namespacing
         // (docs/kernel-kv.md). Seeded before the connection plugin's systems run.
-        .insert_resource(connection::client_id::ClientId(
-            connection::client_id::load_or_seed(),
-        ))
+        .insert_resource(connection::client_id::ClientId(client_id))
         // Connection plugin (spawns background thread)
-        .add_plugins(connection::ActorPlugin { ssh_config })
+        .add_plugins(connection::ActorPlugin { ssh_config: ssh_config.clone() })
+        // /r client shares (docs/slash-r.md): dials the kaijutsu-share
+        // subsystem on (re)connect and serves any --share directories. A
+        // no-op plugin when no --share flag was given.
+        .add_plugins(connection::ShareDialPlugin { ssh_config, share_config })
         // Render sinks (docs/pcm.md, docs/midi.md): ServerEvent::RenderCue,
         // dispatched by mime — audio/* → AudioPlayer, text/vnd.abc → ALSA MIDI.
         .add_plugins(audio::AudioOutPlugin)
