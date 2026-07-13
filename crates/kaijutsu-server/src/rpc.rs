@@ -105,6 +105,8 @@ use kaijutsu_kernel::{
     SharedBlockStore,
     SharedInputDocFlowBus,
     VfsOps,
+    // VFS activity digest stream (Lane K, FSN slice-1)
+    ActivityCursor,
     block_store::BlockStore,
     flows::EditorFlow,
     flows::TurnFlow,
@@ -2833,6 +2835,103 @@ impl kernel::Server for KernelImpl {
                 log::debug!("editor bridge task for kernel {} ended", kernel_id);
             });
         }
+        Promise::ok(())
+    }
+
+    /// Push channel: server-ticked timer streams `VfsActivityEvents` digests
+    /// to the subscriber (Lane K, FSN slice-1, `docs/scenes/vfs.md`). Unlike
+    /// `subscribe_editor`/`subscribe_blocks` this is NOT a FlowBus bridge —
+    /// there is no event to react to, only a per-connection interval timer
+    /// calling `MountTable::activity_digest` (pure) and, on send success,
+    /// `ActivityCursor::commit`. Same cancellation + callback-timeout +
+    /// health-reaping discipline as the FlowBus bridges above, reusing
+    /// `await_editor_callback`/`SubscriberHealth` (both generic over the
+    /// callback's payload, despite the "editor" name on the former). No
+    /// fat-stack thread: this never re-enters kaish/rc, just a timer tick and
+    /// a capnp call.
+    fn subscribe_vfs_activity(
+        self: Rc<Self>,
+        params: kernel::SubscribeVfsActivityParams,
+        _results: kernel::SubscribeVfsActivityResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_vfs_activity").entered();
+        let p = pry!(params.get());
+        let callback = pry!(p.get_callback());
+        // 0 requests the server default; anything below the floor is clamped
+        // up rather than rejected — a client asking for a tighter interval
+        // than we're willing to serve still gets a working subscription.
+        let requested_ms = p.get_interval_ms();
+        let interval_ms = if requested_ms == 0 {
+            VFS_ACTIVITY_DEFAULT_INTERVAL_MS
+        } else {
+            requested_ms.max(VFS_ACTIVITY_MIN_INTERVAL_MS)
+        };
+
+        let vfs = self.kernel.kernel.vfs().clone();
+        let kernel_id = self.kernel.id;
+        let conn_cancel = self.connection.borrow().cancel_token();
+
+        tokio::task::spawn_local(async move {
+            let mut cursor = ActivityCursor::default();
+            let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
+            const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms as u64));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            log::debug!(
+                "Started vfs activity subscription for kernel {} (interval {}ms)",
+                kernel_id,
+                interval_ms
+            );
+
+            loop {
+                tokio::select! {
+                    _ = conn_cancel.cancelled() => {
+                        log::debug!("vfs activity bridge cancelled with connection");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        // Quiet tick: nothing anywhere has changed since this
+                        // subscriber's cursor last committed. No callback, no
+                        // health accounting — there is nothing to fail at.
+                        let Some(digest) = vfs.activity_digest(&cursor, VFS_ACTIVITY_DIGEST_MAX_ENTRIES) else {
+                            continue;
+                        };
+
+                        let mut req = callback.on_activity_digest_request();
+                        {
+                            let mut entries = req.get().init_entries(digest.entries.len() as u32);
+                            for (i, (path, total)) in digest.entries.iter().enumerate() {
+                                let mut entry = entries.reborrow().get(i as u32);
+                                entry.set_path(&path.to_string_lossy());
+                                entry.set_total(*total);
+                                entry.set_generation(vfs.generation_of(path));
+                            }
+                        }
+                        req.get().set_global_total(digest.global_total);
+
+                        let success = await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await;
+                        // Commit ONLY on a successful send — a failed send
+                        // must be recomputed identically next tick, never
+                        // silently marked delivered (see activity.rs's
+                        // two-phase diff/commit doc).
+                        if success {
+                            cursor.commit(&digest);
+                        }
+
+                        if !health.record(success) {
+                            log::warn!(
+                                "vfs activity bridge for kernel {} stopping: {} consecutive \
+                                 callback failures — reaping subscriber",
+                                kernel_id,
+                                MAX_SUBSCRIBER_FAILURES,
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            log::debug!("vfs activity bridge task for kernel {} ended", kernel_id);
+        });
         Promise::ok(())
     }
 
@@ -7796,6 +7895,24 @@ impl SubscriberHealth {
 /// wedged subscriber is dropped well before the SSH keepalive reaps the
 /// connection.
 const MAX_SUBSCRIBER_FAILURES: u32 = 3;
+
+/// Floor on `subscribeVfsActivity`'s requested tick interval (Lane K, FSN
+/// slice-1) — a client asking for anything tighter is silently clamped up
+/// rather than rejected. Heat is decorative, not a control signal; there is
+/// no reason to let a misconfigured client hammer the digest computation
+/// faster than this.
+const VFS_ACTIVITY_MIN_INTERVAL_MS: u32 = 500;
+
+/// Default tick interval when a client passes `intervalMs = 0` ("use the
+/// server's judgment").
+const VFS_ACTIVITY_DEFAULT_INTERVAL_MS: u32 = 1000;
+
+/// Hard cap on entries per activity digest tick — bounds one push's wire
+/// size the same way `SNAPSHOT_MAX_ENTRIES` bounds a snapshot reply. Entries
+/// beyond the cap aren't lost, just deferred: see `MountTable::
+/// activity_digest`'s largest-delta-first capping and the two-phase
+/// diff/commit that lets a dropped entry return on a later tick.
+const VFS_ACTIVITY_DIGEST_MAX_ENTRIES: usize = 256;
 
 /// Convert a CRDT Status to Cap'n Proto Status.
 fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
