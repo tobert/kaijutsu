@@ -668,17 +668,57 @@ districts over a dark plane, the basalt pattern plainly visible, and a
 selection-ring pass over `/etc` pulled `/etc/iptables` out of the
 unbuilt shell — enumeration-on-demand working exactly as designed.
 
-## Now
+## The world becomes ambient (July 13)
 
-As of 2026-07-12: the Tardis room is furnished AND lit — synthwave
-identity end to end, conversation view and scenes speaking one violet/gold
-family, every color and brightness decision named in theme.toml and
-docs/color.md. The terrace glyph mix gives the well per-ring character
-with gold sparkle. The tracks bearing's breathe-on-jam acceptance and the
-metronome-click chord pulse await the next live jam. Deferred by choice:
-the N archway (returns with the fsn scene), the drift-layer air (paused
-until it knows what information it carries), theme push-on-change and the
-remaining compiled-only color families (issues.md). Next station
-candidates: the tracks highway (TRACKER, E), patchbay slice 2, or the fsn
-world after Amy's wave-2 cull. Open work is in `docs/issues.md`; the live
-handoff in `signoff.md` (ephemeral, repo root).
+Slice 1 opened with a reframe from Amy that rewrote the roadmap: the fsn
+world is **not a file browser** — agents work at the file level and the
+shell covers the rest. It's the space the octagon vessel inhabits, and the
+filesystem is a free source of ambient data that looks good in 3D. That
+single sentence deprioritized the bloom grammar, dive-to-vi, and search,
+and promoted three reaches: heat from the kernel's own hands, recency from
+data already on the wire, and the vessel actually *inhabiting* the world.
+
+The heat design fell out of a distinction worth keeping: the MountTable
+chokepoint already sees every kaijutsu-mediated file op, so the kernel can
+light the world where *it* is working with no new dependencies — inotify
+and host weather (cargo-build storms) stay a later reach, and arguably a
+different statement. The wire is the vfs.md digest design made real minus
+depth-keying: absolute per-directory totals from per-connection timer
+bridges, where the subscription is just parameters against rolling
+counters. Absolute totals proved their worth three times in review — the
+lead caught cap-dropped entries stranding on a quiet kernel, kaibo caught
+a Relaxed-ordering torn read that could strand a bump behind its own
+epoch, and both fixes were the same shape: never advance the cursor past
+what was actually delivered, and the stream self-heals by construction.
+
+On the app side, one composition law kept two ambient signals from
+fighting over one material: recency bakes into vertex colors as a
+relative tint (`tint × base = lerp(base, gold, recency)` exactly), heat
+rides the material hue/gain, and `apply_fsn_lod` stays the sole writer.
+The room got its long-promised N-archway churn glow (recorded from the
+digest's global delta — the stateless `event_bearing` seam was wrong for
+absolute counters, and saying so in its doc mattered), a gold ship
+silhouette hangs overhead as the you-are-never-lost landmark, and the
+walls opened: two panels flanking DATA HORIZON render a sparse world
+impression from an off-screen orbiting camera — the app's first true
+second-camera render-to-texture, which promptly taught the pre-existing
+`single()` camera queries that a second `Camera3d` exists (the fix rode
+the same lane). Live-verify closed the loop end to end: `kj vfs activity`
+counted a kaish write storm exactly, the windows showed the world from
+the room, and a parked-camera A/B caught the gold district cooling back
+to violet as the heat decayed. The slip worth remembering: the first
+live pass ran an app binary built *before* the ingest stitch — recency
+gold masqueraded as heat until the log showed no subscription. Verify
+against the binary you think you shipped.
+
+As of 2026-07-13: the Tardis room is furnished, lit, AND windowed — the
+fsn world renders the real host tree, warms where the kernel works, and
+shows through the N wall without a dive. The kernel publishes its own
+activity as lossy-safe digests; `kj vfs activity` reads the counters raw.
+Ambient-reframe survivors for later: heat drama tuning (Amy's eyeball),
+stage-2 inotify for host weather, the solid/materialized tier, bloom and
+search if the browser reading ever returns. The tracks bearing's
+breathe-on-jam acceptance and the metronome-click chord pulse still await
+the next live jam; theme push-on-change and the remaining compiled-only
+color families remain in issues.md. Open work is in `docs/issues.md`; the
+live handoff in `signoff.md` (ephemeral, repo root).

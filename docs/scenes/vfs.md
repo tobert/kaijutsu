@@ -191,7 +191,9 @@ content is outside" — fits panels-as-screens cleanly but is undecided.
 2. **Subdir slack math** — the bloom decides the *look*; the address math
    (how a subdir's quad sub-cell is assigned inside the parent, how much
    slack, collision policy) needs its own design pass.
-3. **Windows** (frame 11) — do wall panels render the world as content?
+3. **Windows** (frame 11) — ANSWERED YES, slice 1 (Amy 2026-07-13): wall
+   panels flanking the N nameplate render the world via render-to-texture
+   (see Status).
 4. **Zone tint reconciliation** (above).
 5. **Search**: `/` over the landscape (labels/paths, maybe
    `search_similar`) — flying to results vs teleporting.
@@ -240,6 +242,44 @@ symlinks a flat stub (`layout::height_channel`'s own doc — Amy's first
 candidate against the real tree, per this doc's Open Question 1). Follow-ups
 (staleness invalidation, the seam-grid simplification, subdir bloom, search,
 zone tint) tracked in `docs/issues.md`.
+
+**Slice 1 — the ambient world — SHIPPED 2026-07-13** (merges `680ac984` Lane K,
+`92d677f0` Lane A, stitch `5cdaf773`; live-verified on zorak). Amy's reframe
+set the scope: the scene is **ambient instrumentation, not a file browser** —
+the space the vessel inhabits, surfacing the filesystem's ambient data. What
+landed:
+
+- **Kernel-native heat (stage "1.5" — the digest stream without inotify)**:
+  `MountTable` keeps per-directory ABSOLUTE activity totals bumped at the same
+  chokepoint as listing generations (write/truncate/setattr count as heat;
+  generations stay structure-only), and `Kernel.subscribeVfsActivity` pushes
+  bounded-cadence per-directory digests from a per-connection timer bridge —
+  the subscription is literally "parameters against rolling counters" as this
+  doc designed (cadence now; depth later). Absolute totals make the stream
+  lossy-safe end to end: cap drops, failed sends, torn reads, reconnects, and
+  kernel restarts all self-heal. Digest entries carry the directory's current
+  listing-generation (the per-cell stale-detection groundwork above). Debug
+  surface: `kj vfs activity [path]`.
+- **App heat**: `FsnHeat` (decaying, ancestor-attenuated, log-scaled weights —
+  storms not floodlights) warms each field's wireframe material toward gold
+  and lifts gain; the digest's global delta warms the room's **N archway**
+  (`BearingActivity` North) so churn reaches you without diving. First-contact
+  and restart digests baseline silently — no false gold storm on connect.
+- **Recency glow**: `mtime` (already on the wire) bakes into meshes as
+  per-cell vertex-color tints under one composition law — `vertex_tint ×
+  material = lerp(base_hue, gold, recency)` — so recency (per-cell, static)
+  and heat (per-field, decaying) compose without a second material writer.
+- **The vessel tie**: gold octagon **ship silhouette** overhead (the "look
+  up" landmark; brightens with whole-tree heat), and **windows** — open
+  question 3 answered YES: two wall panels flanking the N nameplate render a
+  sparse world impression from an off-screen orbiting camera (the app's first
+  true second-camera render-to-texture, own render layer, resident exactly
+  while the room is).
+
+Deprioritized by the ambient reframe (still on record above): subdir bloom,
+dive-to-vi, `/` search, staleness-as-correctness. Host weather (cargo-build
+storms) still awaits stage-2 inotify — today the world lights where *the
+kernel* works, which is the truer embodiment anyway.
 
 Research trail: S2 cell-ID prefix containment · GosperMap · EvoStreets ·
 Sondag stable treemaps via local moves · `hexasphere` (Bevy dep tree) ·

@@ -17,31 +17,51 @@ in-flight lane — pre-existing on `main`, just not caught because `cargo build`
 `--all-targets`. Either rename the test literal to something clearly not
 π-shaped (e.g. `3.5`) or scope an `#[allow]` to that one assertion.
 
-## FSN landscape slice-0 follow-ups (2026-07-12, Lane C, `docs/scenes/vfs.md`)
+## FSN landscape follow-ups (updated 2026-07-13 post-slice-1, `docs/scenes/vfs.md`)
 
-Deferred out of slice-0 scope, in rough priority order:
+Slice 1 (ambient world) shipped 2026-07-13: kernel-native heat digests,
+recency glow, N-archway glow, ship overhead, windows (vfs.md Status). Amy's
+reframe — ambient instrumentation, not a file browser — DEPRIORITIZED the
+bloom/vi-dive/search items below; they stay on record, not on deck.
 
-- **Generation/staleness invalidation.** `view::fsn::sync::FsnState` caches a
-  directory listing forever once fetched (by design, so a re-dive doesn't
-  re-fetch the root) — nothing currently detects or re-pulls a listing whose
-  kernel-side generation has moved on. Stage-2 fsnotify (vfs.md) is the real
-  fix; until then a long-lived FSN session can drift from the real tree.
+- **Generation/staleness invalidation.** `view::fsn::sync::FsnState` still
+  caches listings forever once fetched. Slice 1 laid groundwork: activity
+  digest entries now carry each directory's current listing-generation
+  (`VfsActivityEntry.generation`), so a per-cell stale-detect + re-pull is
+  buildable without new wire. Stage-2 inotify remains the real fix for
+  non-VFS-mediated writes (generations are blind to them). Deprioritized:
+  stale geometry is acceptable in the ambient reading; heat is the live
+  signal.
+- **Heat drama pass (Amy eyeball).** Live-verified working, but the material
+  warm reads subtle at distance: the hue lerp + `HEAT_GAIN_LIFT` (0.6,
+  `view/fsn/heat.rs`) compete with baked recency gold on fresh districts, and
+  a deep storm reaches visible fields only through ancestor attenuation
+  (0.5^depth). Candidates: raise HEAT_GAIN_LIFT, HDR-boost the hot hue, or
+  bloom the joints (the solid-tier plan). All consts at tops of heat.rs /
+  scene.rs / layout.rs / backdrop.rs, tagged **Amy-tunable**.
+- **Root-fetch truncation starves hot districts of their own fields.** The
+  "/" fetch (depth 2, 4000-entry cap) truncates before alphabetically-late
+  children on a real root (/tmp, /usr, /var got no listing → no field of
+  their own; their heat shows only via the root field's material). Slice-0
+  behavior, more visible now that heat wants those fields. Candidates:
+  per-child follow-up fetches, higher cap, or fetch order by heat.
 - **Seam grid is the parent's structural cross, not per-quadrant-occupied
-  boundaries** (`view::fsn::layout::seam_grid`'s own doc) — a documented
-  slice-0 simplification, revisit once vfs.md Open Question 2 (subdir
-  slack/placement policy) settles.
-- **Subdir "bloom" grammar** (`docs/scenes/vfs.md`: petals part, the child's
-  own field rises flush with the floor on approach/selection) is unbuilt —
-  slice 0 only spawns a subdirectory's field once its listing is fetched; it
-  pops in at whatever LOD tier distance dictates, no bloom animation.
-  Selection only lights a ring + brightens the field, no bloom, no dive into
-  vi (`docs/vi.md`) on a file cell.
-- **The ship-overhead landmark** (vfs.md, "look up") was skipped per the
-  task's own escape hatch ("OPTIONAL, only if trivial") — not attempted.
-- **`/` search-and-fly-to** (vfs.md open question 5) unbuilt; travel is
-  keyboard-fly only.
-- Zone tint (CRDT-owned vs read-only) and window-panels-as-content (vfs.md
-  open questions 3–4) untouched, same as before this lane.
+  boundaries** (`view::fsn::layout::seam_grid`'s own doc) — revisit with
+  vfs.md Open Question 2.
+- **Subdir "bloom" grammar** + **dive into vi on a file cell** — unbuilt,
+  deprioritized (ambient reframe).
+- **`/` search-and-fly-to** (vfs.md OQ 5) — unbuilt, deprioritized.
+- Zone tint (vfs.md OQ 4) untouched. Windows (OQ 3) SHIPPED in slice 1.
+
+## `cargo fmt` unsafe repo-wide (found 2026-07-13, FSN slice-1 lanes)
+
+This environment's rustfmt (1.9.0-stable) disagrees with whatever version
+produced the repo's current formatting: a bare `cargo fmt -p <crate>`
+reformats ~55–95 pre-existing files (pub mod/use reordering etc.). Both
+slice-1 lanes caught it, reverted the collateral, and hand-formatted their
+new code instead. No committed `rustfmt.toml` exists. Fix: pin a rustfmt
+edition/config that matches the tree (or bite the bullet with one dedicated
+whole-repo fmt commit), then re-enable fmt in the loop.
 
 ---
 
