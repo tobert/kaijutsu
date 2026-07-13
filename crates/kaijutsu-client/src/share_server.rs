@@ -389,8 +389,12 @@ fn generation_of(meta: &std::fs::Metadata) -> u64 {
 
 fn dir_attrs(meta: Option<&std::fs::Metadata>) -> FileAttributes {
     let mut fa = FileAttributes::empty();
-    fa.set_dir(true);
+    // `permissions` MUST be assigned before `set_dir` — `set_dir`/`set_regular`/
+    // `set_symlink` OR their type bit INTO `self.permissions` (russh_sftp's
+    // `set_type`), so assigning `.permissions` afterward clobbers the type bit
+    // it just set. Every attrs builder in this file follows this order.
     fa.permissions = Some(meta.map(|m| perm_bits(m)).unwrap_or(0o555));
+    fa.set_dir(true);
     if let Some(m) = meta {
         fa.mtime = Some(unix_secs(m.modified()));
         fa.size = Some(0);
@@ -420,6 +424,9 @@ fn unix_secs(t: io::Result<SystemTime>) -> u32 {
 /// semantics) — used by `readdir`/`lstat`.
 fn attrs_from_lstat(meta: &std::fs::Metadata) -> FileAttributes {
     let mut fa = FileAttributes::empty();
+    // See the ordering note on `dir_attrs`: permissions first, type bit OR'd
+    // in after.
+    fa.permissions = Some(perm_bits(meta));
     if meta.is_dir() {
         fa.set_dir(true);
     } else if meta.file_type().is_symlink() {
@@ -433,7 +440,6 @@ fn attrs_from_lstat(meta: &std::fs::Metadata) -> FileAttributes {
         // type bits unset; size/perm still report.
         fa.size = Some(meta.len());
     }
-    fa.permissions = Some(perm_bits(meta));
     fa.mtime = Some(unix_secs(meta.modified()));
     fa
 }
@@ -527,9 +533,9 @@ impl Handler for ShareHandler {
             Route::Root => Ok(Attrs { id, attrs: dir_attrs(None) }),
             Route::Index => {
                 let mut fa = FileAttributes::empty();
+                fa.permissions = Some(0o444);
                 fa.set_regular(true);
                 fa.size = Some(self.config.manifest.len() as u64);
-                fa.permissions = Some(0o444);
                 Ok(Attrs { id, attrs: fa })
             }
             Route::ShareRoot(s) => {
@@ -636,9 +642,9 @@ impl Handler for ShareHandler {
             // honestly as the manifest file, not that placeholder's type.
             if name == INDEX_NAME {
                 let mut fa = FileAttributes::empty();
+                fa.permissions = Some(0o444);
                 fa.set_regular(true);
                 fa.size = Some(self.config.manifest.len() as u64);
-                fa.permissions = Some(0o444);
                 files.push(File::new(name.clone(), fa));
             } else {
                 files.push(File::new(name.clone(), attrs_from_lstat(meta)));
@@ -981,6 +987,33 @@ mod tests {
         let names: Vec<&str> = name.files.iter().map(|f| f.filename.as_str()).collect();
         assert!(names.contains(&"share"));
         assert!(names.contains(&"index"));
+
+        // Regression guard: `set_dir`/`set_regular` OR their type bit INTO
+        // `permissions` (russh_sftp's `set_type`) — assigning `.permissions`
+        // AFTER calling them clobbers the bit that was just set. This exact
+        // bug shipped once (caught by the cross-crate registration test,
+        // not this one — it never asserted on the type bits) and made every
+        // share root's `is_dir()` read false, so registration refused every
+        // real share as "not a directory."
+        let share_entry = name.files.iter().find(|f| f.filename == "share").unwrap();
+        assert!(share_entry.attrs.is_dir(), "share root must report is_dir()");
+        let index_entry = name.files.iter().find(|f| f.filename == "index").unwrap();
+        assert!(index_entry.attrs.is_regular(), "index must report is_regular()");
+    }
+
+    #[tokio::test]
+    async fn lstat_and_stat_on_a_share_root_report_is_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut handler = ShareHandler::new(one_share(dir.path()));
+
+        let lstat = Handler::lstat(&mut handler, 1, "/share".to_string()).await.unwrap();
+        assert!(lstat.attrs.is_dir(), "lstat /share must report is_dir()");
+
+        let stat = Handler::stat(&mut handler, 2, "/share".to_string()).await.unwrap();
+        assert!(stat.attrs.is_dir(), "stat /share must report is_dir()");
+
+        let lstat_index = Handler::lstat(&mut handler, 3, "/index".to_string()).await.unwrap();
+        assert!(lstat_index.attrs.is_regular(), "lstat /index must report is_regular()");
     }
 
     #[tokio::test]

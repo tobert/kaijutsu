@@ -24,7 +24,7 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use kaijutsu_types::{Principal, SSH_RPC_SUBSYSTEM, SSH_SFTP_SUBSYSTEM};
+use kaijutsu_types::{Principal, SSH_RPC_SUBSYSTEM, SSH_SFTP_SUBSYSTEM, SSH_SHARE_SUBSYSTEM};
 
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
@@ -831,6 +831,35 @@ impl server::Handler for ConnectionHandler {
                 let vfs = self.registry.kernel.kernel.vfs().clone();
                 let session_handler = crate::sftp::SftpSession::new(principal, vfs);
                 russh_sftp::server::run(chan.into_stream(), session_handler).await;
+                session.channel_success(channel)?;
+                Ok(())
+            }
+            SSH_SHARE_SUBSYSTEM => {
+                log::info!(
+                    "Binding channel {} to {} for {} ({}) — role swap: kernel plays SFTP client",
+                    channel,
+                    SSH_SHARE_SUBSYSTEM,
+                    principal.username,
+                    principal.display_name,
+                );
+                // The role swap (`docs/slash-r.md`): the client just opened
+                // this channel and is now serving its own SFTP `Handler` on
+                // it, so the kernel plays the SFTP *client* role
+                // (`RawSftpSession`) instead. Those futures are `Send` too —
+                // same ambient-runtime placement as the forward adapter
+                // above, no dedicated thread. Registration (reading /index,
+                // validating shares, the live-duplicate-client-id check) runs
+                // inside the spawned task, not here — `channel_success` must
+                // fire immediately regardless of whether registration
+                // eventually succeeds, or the client's `request_subsystem`
+                // hangs waiting for an ack that a slow validation would
+                // delay.
+                let share_registry = self.registry.kernel.kernel.share_registry().clone();
+                tokio::spawn(crate::share::run_share_session(
+                    chan.into_stream(),
+                    principal,
+                    share_registry,
+                ));
                 session.channel_success(channel)?;
                 Ok(())
             }
