@@ -488,7 +488,7 @@ impl Plugin for RoomPlugin {
             .add_systems(Update, ingest_room_activity)
             .add_systems(
                 Update,
-                (room_keyboard, room_plate_text, room_focus_visuals, sync_room_glow)
+                (room_keyboard, plain_zoom_keyboard, room_plate_text, room_focus_visuals, sync_room_glow)
                     .chain()
                     .run_if(in_state(Screen::Room)),
             )
@@ -1367,37 +1367,45 @@ fn spawn_pylons(
 
 /// Whether Enter/Down on a focused station fullscreens the camera onto it
 /// (`RoomState::zoomed`) rather than diving to a dedicated `Screen` — the
-/// wheel (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
-/// fullscreening a panel" for a *bounded* station) and, since the
-/// time-well/room integration plan's Slice C, the time well too (its own
-/// "diving IS the room's shot table zooming into the well's mouth" pose,
-/// `view/room/shot.rs::RoomShot::WellOverview`) — **N stays a dive-THROUGH
-/// door** onto an unbounded world, not a panel/pose to fill the frame with:
-/// `Station::Vfs` is deliberately absent from this table (see
-/// [`room_keyboard`]'s own Enter/Down branch for its actual dive mechanism,
-/// a `Screen::Fsn` transition, `view::fsn`). A future in-room station with
-/// content of its own — the highway — adds itself here as that content
-/// lands. Pure — no Bevy types — unit-tested like
-/// `bearing::station_is_room_furniture`, which this pairs with (same
-/// stations, same reasoning: each IS its own furniture AND its own zoom
-/// target).
+/// wheel first (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
+/// fullscreening a panel"), the time well with Slice C (its own
+/// `view/room/shot.rs::RoomShot::WellOverview` pose), and since 2026-07-13
+/// **every wall station**: the approach pose now frames the whole panel
+/// (plus neighbor slivers), and Enter zooms it fullscreen — one uniform
+/// gesture whether the panel carries an instrument, a portal, or nothing
+/// yet. That retune also ended N's "dive-THROUGH door" exception: Enter on
+/// N fullscreens the FSN portal (the primary FSN surface now — diving is
+/// de-emphasized; `Screen::Fsn` remains in code but is keyboard-unreachable,
+/// tracked in `docs/issues.md`). Kept as a table (not a bare `true`) so a
+/// future genuinely-unzoomable station has a row to flip. Pure — no Bevy
+/// types — unit-tested like `bearing::station_is_room_furniture`.
 fn station_is_zoomable(station: Station) -> bool {
-    matches!(station, Station::PatchBay | Station::TimeWell)
+    matches!(
+        station,
+        Station::PatchBay
+            | Station::TimeWell
+            | Station::Tracks
+            | Station::Vfs
+            | Station::Radiators
+    )
 }
 
-/// Room keys: Left/Right cycle the carousel, Enter/Down dives, Esc drops to
-/// the conversation (the room is the top level) — the nav contract is frozen,
-/// unchanged from the blockout. Since Slice C every zoomable station
-/// (including `TimeWell` now) shares ONE dive mechanism: Enter/Down sets
-/// `RoomState::zoomed` — a camera pose, not a screen — and arms whatever
-/// per-station text/dive-state that station needs (`pb_state.arm_text()` for
-/// the wheel, `time_well::scene::arm_dive` for the well).
+/// Room keys: Left/Right cycle the carousel, Enter/Down zooms the focused
+/// station fullscreen, Esc drops to the conversation (the room is the top
+/// level). Since Slice C every zoomable station shares ONE dive mechanism:
+/// Enter/Down sets `RoomState::zoomed` — a camera pose, not a screen — and
+/// arms whatever per-station text/dive-state that station needs
+/// (`pb_state.arm_text()` for the wheel, `time_well::scene::arm_dive` for
+/// the well; the plain panels need nothing). Since 2026-07-13 that is EVERY
+/// wall station (`station_is_zoomable`'s doc has the story, including N's
+/// retired dive-through exception).
 ///
 /// While zoomed, this system steps back almost entirely: Left/Right and
 /// Esc/Up belong to the zoomed station's OWN keyboard system now (patch_bay's
 /// `patch_bay_keyboard` gated on `patch_bay_zoomed`; the well's
-/// `time_well::scene::well_keyboard` gated on `time_well::scene::well_zoomed`)
-/// — "the zoomed station's own keys own them," the same reasoning
+/// `time_well::scene::well_keyboard` gated on `time_well::scene::well_zoomed`;
+/// [`plain_zoom_keyboard`] for the stations with no zoomed content of their
+/// own) — "the zoomed station's own keys own them," the same reasoning
 /// `bearing::station_is_room_furniture` already applies to their geometry.
 /// The one thing this system still owns while zoomed is nothing at all; it
 /// simply returns, so there's no double-handling between the systems.
@@ -1442,24 +1450,41 @@ pub(crate) fn room_keyboard(
                 Station::TimeWell => crate::view::time_well::scene::arm_dive(&mut well_state),
                 _ => {}
             }
-        } else if station == Station::Vfs {
-            // The FSN landscape (`view::fsn`, `docs/scenes/vfs.md` slice 0)
-            // is the ONE dive-THROUGH station: too big to stand as room
-            // furniture, so N-diving is a genuine `Screen` transition, not a
-            // `RoomState::zoomed` write — `station_is_zoomable`'s own doc has
-            // the full reasoning. `Screen::Fsn`'s `OnEnter` hides the room
-            // chrome the same way Editor/Room already do; the world itself
-            // spawns/despawns on `view::fsn::scene`'s own
-            // `OnEnter`/`OnExit(Screen::Fsn)`, not here.
-            next.set(Screen::Fsn);
         }
-        // Unbuilt, non-zoomable, non-dive-through stations: stay put (the
-        // dimmed plate says why).
+        // No dive-through branch any more (2026-07-13): N zooms its portal
+        // like every other wall panel — `station_is_zoomable`'s doc has the
+        // story; `Screen::Fsn` is keyboard-unreachable for now
+        // (`docs/issues.md`).
         return;
     }
 
     if keys.just_pressed(KeyCode::Escape) {
         next.set(Screen::Conversation);
+    }
+}
+
+/// Un-zoom keys for a zoomed station that has no zoomed-keyboard system of
+/// its own (today: Tracks, Vfs, Radiators — panels with no interactive
+/// zoomed content yet): Up/Esc surfaces back to room scale, mirroring the
+/// same keys `patch_bay_keyboard`/`well_keyboard` handle for their own
+/// stations. Without this, zooming onto a plain panel would be a trap —
+/// `room_keyboard` steps back entirely while zoomed, and nothing else would
+/// own the keys.
+///
+/// Runs `.after(room_keyboard)` for the same same-frame reason that system's
+/// doc records for the well/wheel: room_keyboard (already run, saw `zoomed`
+/// as `Some`, returned early) must not see the `None` this system writes and
+/// fire its own Escape-to-Conversation branch in the same tick.
+pub(crate) fn plain_zoom_keyboard(keys: Res<ButtonInput<KeyCode>>, mut room: ResMut<RoomState>) {
+    let plain = matches!(
+        room.zoomed,
+        Some(Station::Tracks) | Some(Station::Vfs) | Some(Station::Radiators)
+    );
+    if !plain {
+        return;
+    }
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::Escape) {
+        room.zoomed = None;
     }
 }
 
@@ -1937,11 +1962,16 @@ mod tests {
     /// a line to is not. `Station::ALL.len()` guard below catches a station
     /// added to the enum without a row here.
     const EXPECTED_ZOOMABLE: &[(Station, bool)] = &[
+        // ALL true since 2026-07-13 (the whole-wall approach retune): the
+        // approach frames the full panel, Enter zooms it — one gesture for
+        // every station, N's dive-through exception included (see
+        // `station_is_zoomable`'s doc). The table stays so a future
+        // genuinely-unzoomable station has a row to flip.
         (Station::TimeWell, true),
         (Station::PatchBay, true),
-        (Station::Tracks, false),
-        (Station::Vfs, false),
-        (Station::Radiators, false),
+        (Station::Tracks, true),
+        (Station::Vfs, true),
+        (Station::Radiators, true),
     ];
 
     #[test]

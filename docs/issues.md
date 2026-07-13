@@ -52,6 +52,16 @@ bloom/vi-dive/search items below; they stay on record, not on deck.
   deprioritized (ambient reframe).
 - **`/` search-and-fly-to** (vfs.md OQ 5) — unbuilt, deprioritized.
 - Zone tint (vfs.md OQ 4) untouched. Windows (OQ 3) SHIPPED in slice 1.
+- **`Screen::Fsn` dive is keyboard-unreachable** (2026-07-13, the
+  whole-wall zoom retune): Enter on N now fullscreens the portal
+  (`station_is_zoomable`, `room/mod.rs`) instead of transitioning to
+  `Screen::Fsn`; the dived world, its fly camera, and `toggle_time_well`'s
+  sibling paths all still exist and pass tests. Deliberate — Amy: "we will
+  probably not have a dive into fsn any time soon." When the dive earns a
+  surface again, candidates: Enter-again while zoomed on N (progressive
+  zoom; needs same-frame key-ordering care — see `room_keyboard`'s doc), or
+  a dedicated key. If it stays unreachable long enough, consider deleting
+  the screen instead of carrying it.
 
 ## `cargo fmt` unsafe repo-wide (found 2026-07-13, FSN slice-1 lanes)
 

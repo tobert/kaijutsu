@@ -1007,17 +1007,16 @@ pub fn update_hints(
         },
         Screen::Editor => "Esc: back to conversation \u{2502} (editor)",
         Screen::Room => match room.zoomed {
-            None => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: dive \u{2502} Esc: conversation",
+            None => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: zoom \u{2502} Esc: conversation",
             Some(crate::view::room::nav::Station::PatchBay) => {
                 "\u{2190}\u{2192}: wire \u{2502} \u{2191}/Esc: room \u{2502} r: rescan"
             }
             Some(crate::view::room::nav::Station::TimeWell) => {
                 "0-9/\u{2190}\u{2192}\u{2191}\u{2193}: seat & ring \u{2502} Enter: focus/commit \u{2502} c/p/d/z/a: act \u{2502} Esc: room"
             }
-            // Other stations aren't zoomable yet (`station_is_zoomable`,
-            // `room/mod.rs`) — `room.zoomed` can't actually be `Some` for
-            // them today, but the match must stay exhaustive as new stations
-            // gain their own zoomed dive.
+            // Every wall station zooms now (`station_is_zoomable`,
+            // 2026-07-13); the plain panels (Tracks/Vfs/Radiators) share
+            // `plain_zoom_keyboard`'s surface-only keys.
             Some(_) => "\u{2191}/Esc: room",
         },
         Screen::Fsn => {

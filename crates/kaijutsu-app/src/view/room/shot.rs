@@ -44,20 +44,27 @@ use crate::view::time_well::scene::{FOCUS_CARD_POS, STATION_CENTER_PLACEMENT, pl
 const OVERVIEW_POS: Vec3 = Vec3::new(0.0, 420.0, 2050.0);
 const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 90.0, 0.0);
 
-/// Approach-pose eye radius: how far out from center the camera stands when
-/// facing a wall station — between the console and the wall, on the SAME
-/// side as the focus ("walk toward the station you're studying", never sit
-/// across the room staring back through the console and the diametrically
-/// opposite pylon).
-const ROOM_CAM_APPROACH_R: f32 = 160.0;
-/// Approach-pose eye height — a comfortable "person standing" height.
-const ROOM_CAM_APPROACH_HEIGHT: f32 = 260.0;
+/// Approach-pose standoff: how far back from the focused wall panel's FACE
+/// the eye stands (retuned 2026-07-13, Amy: "out enough to see a bit of
+/// neighboring walls and the whole wall being viewed" — the old close-in
+/// pose at eye radius 160 looking down at marker height showed a wall
+/// fragment at a tilt). The whole-height pinhole distance for a 560-tall
+/// panel at [`CAMERA_FOV_Y`] is ≈676 ([`fullscreen_pose`]'s own math);
+/// standing 850 back clears that with margin, so the full panel height sits
+/// in frame with breathing room and — at any real window aspect — the
+/// horizontal frustum spills past the panel's ~994 width onto the
+/// neighboring faces. Eye radius from center = `WALL_APOTHEM − 850` = 350,
+/// comfortably outside [`super::KEEPOUT_RADIUS`], still on the focus side.
+/// **Amy-tunable.**
+const APPROACH_PANEL_STANDOFF: f32 = 850.0;
 
-/// Where the approach pose *looks* (world-Y at the wall) by default:
-/// furniture height, not plate height — the station's instrument is the
-/// subject, the plate hangs above it in frame. Two stations override this
-/// (see [`approach_pose`]).
-const APPROACH_LOOK_HEIGHT: f32 = 130.0;
+/// Approach-pose eye height AND look height: the panel's own vertical
+/// center (the same number [`palette::STATION_W_MOUNT_Y`] names for the
+/// wheel's mount). Eye and look sharing a height is the point: the camera
+/// flies LEVEL between panels, no down-tilt (the pre-2026-07-13 pose looked
+/// from 260 down to 130). Derived from `WALL_HEIGHT`, so it follows any
+/// wall retune. **Amy-tunable** (as an offset choice, not a raw number).
+const APPROACH_EYE_HEIGHT: f32 = super::WALL_HEIGHT * 0.5;
 
 /// The well's **hero pose** (Amy: "a final up arrow took the camera to focus
 /// on the well from a bit above looking down... esp with the room to give it
@@ -229,42 +236,32 @@ fn well_local_shot(input: WellShotInput) -> (Vec3, Vec3) {
     (pos, look)
 }
 
-/// The **approach** pose for a wall station: standing on the SAME side of
-/// the room as the focused bearing, between the console and the wall — "walk
-/// toward the station you're studying" (`shell.md`'s travel-by-intent dolly).
-/// Replaces the old across-the-room orbit, whose opposite-side eye put the
-/// console *and* the diametrically opposite pylon in the sight line, fully
-/// occluding the focused station.
+/// The **approach** pose for a wall station: a LEVEL wall-viewing shot
+/// (retuned 2026-07-13 — Amy: see the whole wall being viewed plus a bit of
+/// its neighbors, then Enter fullscreens it). Eye and look share
+/// [`APPROACH_EYE_HEIGHT`] (the panel's vertical center) so flipping
+/// between panels is a level swing with no down-tilt; the eye stands
+/// [`APPROACH_PANEL_STANDOFF`] back from the panel face — far enough that
+/// the whole panel height fits the frustum with margin and the horizontal
+/// frustum catches slivers of the neighboring faces — on the SAME side of
+/// the room as the bearing (still "walk toward the station you're
+/// studying"; the eye never crosses center, so the console never enters the
+/// sight line).
 ///
-/// Two documented per-station exceptions retarget the look point away from
-/// the default marker radius/height (`super::ROOM_RADIUS`,
-/// `APPROACH_LOOK_HEIGHT`):
-/// - `Radiators` (2026-07-10): its NE panel is now the octagon wall shell's
-///   own diagonal face, standing at [`palette::WALL_APOTHEM`] — well past
-///   the old free-floating radiator radius (660) this look-point used to
-///   target. Left at `super::ROOM_RADIUS` (620) the camera would look at
-///   empty air short of the wall.
-/// - `PatchBay` (2026-07-10, the wall-mount retune): the wheel itself moved
-///   from a floor dais to the W wall panel, at [`palette::WALL_APOTHEM`] and
-///   [`palette::STATION_W_MOUNT_Y`] (280, the panel's vertical center) — the
-///   approach now has to rise to meet it, not look at furniture height on
-///   the floor.
-///
-/// Every other wall station's look point is untouched. Panics if `station`
-/// has no wall bearing — only [`RoomShot::focused`]/[`RoomShot::Approach`]
-/// should ever reach this, and `focused` never picks `Approach` for a
-/// bearing-less station.
+/// The old per-station look-point exceptions (marker radius vs wall
+/// apothem, furniture height vs mount height) dissolve: the wall PANEL is
+/// the subject now, and every panel stands at [`palette::WALL_APOTHEM`]
+/// with its center at the same height. Panics if `station` has no wall
+/// bearing — only [`RoomShot::focused`]/[`RoomShot::Approach`] should ever
+/// reach this, and `focused` never picks `Approach` for a bearing-less
+/// station.
 fn approach_pose(station: Station) -> (Vec3, Vec3) {
     let d = bearing::focus_dir(station)
         .expect("RoomShot::Approach is only constructed for a station with a wall bearing");
-    let (wall_r, look_h) = match station {
-        Station::Radiators => (palette::WALL_APOTHEM, APPROACH_LOOK_HEIGHT),
-        Station::PatchBay => (palette::WALL_APOTHEM, palette::STATION_W_MOUNT_Y),
-        _ => (super::ROOM_RADIUS, APPROACH_LOOK_HEIGHT),
-    };
+    let eye_r = palette::WALL_APOTHEM - APPROACH_PANEL_STANDOFF;
     (
-        Vec3::from_array(bearing::approach_camera(d, ROOM_CAM_APPROACH_R, ROOM_CAM_APPROACH_HEIGHT)),
-        Vec3::from_array(bearing::approach_look(d, wall_r, look_h)),
+        Vec3::from_array(bearing::approach_camera(d, eye_r, APPROACH_EYE_HEIGHT)),
+        Vec3::from_array(bearing::approach_look(d, palette::WALL_APOTHEM, APPROACH_EYE_HEIGHT)),
     )
 }
 
@@ -376,7 +373,28 @@ mod tests {
         assert!(pos.x > 0.0, "camera stands on the same (east) side: {pos:?}");
         assert!(pos.x < super::super::ROOM_RADIUS, "the eye stops well short of the wall: {pos:?}");
         assert!(look.x > pos.x, "looks further east, out toward the wall: {look:?}");
-        assert_eq!(pos.y, ROOM_CAM_APPROACH_HEIGHT);
+        assert_eq!(pos.y, APPROACH_EYE_HEIGHT);
+    }
+
+    #[test]
+    fn approach_pose_is_level_and_frames_the_whole_panel_with_margin() {
+        // The 2026-07-13 retune, in two invariants:
+        // (1) LEVEL — eye and look share a height, so flipping between
+        //     panels never tilts down (the old pose looked from 260 to 130).
+        // (2) WHOLE WALL — the eye stands further back than the pinhole
+        //     distance that exactly fits the panel height, so the full
+        //     560-tall panel subtends less than the vertical FOV and the
+        //     horizontal frustum has spill left over for neighbor slivers.
+        let fit_d = (super::super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
+            let (pos, look) = resolve(RoomShot::focused(s));
+            assert_eq!(pos.y, look.y, "{s:?}: the approach must be level, no down-tilt");
+            let d = (look - pos).length();
+            assert!(
+                d > fit_d,
+                "{s:?}: eye at {d} must stand beyond the whole-height fit distance {fit_d}"
+            );
+        }
     }
 
     #[test]
@@ -396,14 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn radiators_and_patch_bay_focus_look_at_the_wall_apothem_not_the_room_radius() {
-        // Two documented exceptions read WALL_APOTHEM instead of ROOM_RADIUS:
-        // Radiators (2026-07-10, the NE panel is the octagon shell's own
-        // diagonal wall face, not the old free-floating slab at 660) and
-        // PatchBay (2026-07-10, the wall-mount retune: the wheel itself
-        // moved from a floor dais to the wall panel). Every OTHER wall
-        // station's look point must be untouched.
-        for s in [Station::Radiators, Station::PatchBay] {
+    fn every_wall_station_approach_looks_at_its_panel_center() {
+        // The 2026-07-13 retune dissolved the old per-station look-point
+        // exceptions (marker radius vs apothem, furniture vs mount height):
+        // the wall PANEL is the subject now, and every panel stands at the
+        // apothem with its center at WALL_HEIGHT × 0.5.
+        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
             let (_, look) = resolve(RoomShot::focused(s));
             let d = bearing::focus_dir(s).unwrap();
             let look_r = look.x * d[0] + look.z * d[2];
@@ -411,32 +427,12 @@ mod tests {
                 (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
                 "{s:?} should look at the wall apothem: {look_r}"
             );
-        }
-        for s in [Station::Tracks, Station::Vfs] {
-            let (_, look) = resolve(RoomShot::focused(s));
-            let d = bearing::focus_dir(s).unwrap();
-            let look_r = look.x * d[0] + look.z * d[2];
             assert!(
-                (look_r - super::super::ROOM_RADIUS).abs() < 1e-3,
-                "{s:?} should still look at the unchanged marker radius: {look_r}"
+                (look.y - super::super::WALL_HEIGHT * 0.5).abs() < 1e-3,
+                "{s:?} should look at the panel's vertical center: {}",
+                look.y
             );
         }
-    }
-
-    #[test]
-    fn patch_bay_focus_looks_at_the_mounted_wheel_height_not_furniture_height() {
-        // The second half of the PatchBay exception: the look point's height
-        // rises to the wall-mounted wheel's own center
-        // (`palette::STATION_W_MOUNT_Y`, 280), not the floor-furniture height
-        // every other wall station's look point uses (`APPROACH_LOOK_HEIGHT`).
-        let (_, look) = resolve(RoomShot::focused(Station::PatchBay));
-        assert!(
-            (look.y - palette::STATION_W_MOUNT_Y).abs() < 1e-3,
-            "PatchBay should look at the mounted wheel's own height: {}",
-            look.y
-        );
-        let (_, tracks_look) = resolve(RoomShot::focused(Station::Tracks));
-        assert_eq!(tracks_look.y, APPROACH_LOOK_HEIGHT, "other stations are unaffected");
     }
 
     #[test]

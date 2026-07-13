@@ -290,7 +290,10 @@ landed:
   front of the view they advertised; `Station::Vfs` joined
   `station_is_room_furniture` (the portal IS the station's face). Diving is
   de-emphasized for now: the world rotating past the glass is the primary
-  FSN surface (the `Screen::Fsn` dive still exists behind Enter).
+  FSN surface. Enter on N now ZOOMS the portal fullscreen like every other
+  wall panel (same-day follow-up: the whole-wall approach retune);
+  `Screen::Fsn` remains in code but is keyboard-unreachable
+  (`docs/issues.md` tracks re-surfacing or deleting it).
 
 Deprioritized by the ambient reframe (still on record above): subdir bloom,
 dive-to-vi, `/` search, staleness-as-correctness. Host weather (cargo-build
