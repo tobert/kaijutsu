@@ -277,9 +277,14 @@ landed:
   orbiting, and what it sees is exactly the portal's render. Absent from
   the portal view itself — you can't see yourself out your own window. And
   **the portal** — open
-  question 3 answered YES: the N face renders a sparse world impression from
-  an off-screen orbiting camera (the app's first true second-camera
-  render-to-texture, own render layer, resident exactly while the room is).
+  question 3 answered YES: the N face renders the world from an off-screen
+  orbiting camera (the app's first true second-camera render-to-texture,
+  own render layer, resident exactly while the room is). Since the portal
+  became the primary surface it carries the FULL ambient law, not the
+  original sparse seed-point glimpse: recency-tinted, heat-lifted wireframe
+  districts — the same `cell_edge_tints` / heat gain+hue functions the
+  dived scene uses, one law at two call sites (`backdrop.rs`'s module doc);
+  still no LOD swap, no selection, one fixed wireframe tier.
   Retuned 2026-07-13 (Amy, same day it shipped): the original two flanking
   portholes both sampled the same square texture — the room saw two squeezed
   copies of a miniature. Now ONE panel-spanning portal (880×470 of the ~954

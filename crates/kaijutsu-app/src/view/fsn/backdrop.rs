@@ -1,12 +1,17 @@
 //! The room's N-window backdrop (lane A4): while `Screen::Room` is live, an
-//! off-screen camera renders a sparse-tier impression of the FSN world to a
-//! texture, shown through one panel-spanning portal on the N bearing — "you
-//! can see it out there before you dive" (`docs/scenes/vfs.md`). Distinct from
-//! [`super::scene`]'s own world (`Screen::Fsn`): this is a much cheaper,
-//! always-uncolored glimpse (no recency bake, no heat, no LOD swap — just a
-//! seam grid and up to a dozen seed-point clusters; no vessel silhouette
-//! either, since 2026-07-13 the room IS the vessel this camera flies),
-//! rendered on its own camera/render-layer so it never contends with the
+//! off-screen camera renders an impression of the FSN world to a texture,
+//! shown through one panel-spanning portal on the N bearing — "you can see
+//! it out there before you dive" (`docs/scenes/vfs.md`). Since 2026-07-13
+//! this portal is the PRIMARY FSN surface (diving is de-emphasized — see
+//! `super::mod`'s own doc), so it now carries the SAME ambient law
+//! [`super::scene`] bakes for the dived world: per-cell recency tint (baked
+//! at mesh build time, [`super::scene::cell_edge_tints`]) and per-field
+//! churn heat (a live gain/hue lift, [`sync_backdrop_heat`]). What it does
+//! NOT carry, still: no LOD swap (one fixed tier — wireframe districts,
+//! never sparse points or the attended-tier vertex markers), no selection,
+//! no vessel silhouette (since 2026-07-13 the room IS the vessel this
+//! camera flies) — the backdrop is a glimpse, not the full instrument.
+//! Rendered on its own camera/render-layer so it never contends with the
 //! main camera's own scene.
 //!
 //! # Two-camera isolation (the prerequisite bug this lane's own fix note calls out)
@@ -33,12 +38,17 @@
 //!
 //! # Content: reused, not duplicated
 //!
-//! Every mesh here is built from [`super::layout`]'s own pure functions (the
-//! same seam grid / seed-point builders [`super::scene`] uses) via
-//! [`super::scene::line_list_mesh`]/[`super::scene::triangle_list_mesh`]
-//! (`pub(super)`, reused as-is — no recency bake, no per-cell tint, this is
-//! the plain uncolored path those two helpers already supported before lane
-//! A1 added their colored siblings).
+//! Every mesh/law here is [`super::layout`]/[`super::scene`]'s own pure
+//! functions, not a second copy: the seam grid via
+//! [`super::scene::line_list_mesh`] (`pub(super)`, plain uncolored — the
+//! seam stays cosmetic, no recency bake); the wireframe districts via
+//! [`super::layout::field_wireframe`] + [`super::scene::cell_edge_tints`]
+//! (the SAME recency-tint law [`super::scene::spawn_field_entities`] bakes,
+//! against the SAME [`super::sync::ChildMeta`] listings) +
+//! [`super::scene::line_list_mesh_colored`]; the resting gain
+//! [`super::scene::WIREFRAME_GAIN_MID`]; and the heat hue-lift's lerp,
+//! [`super::scene::lerp_hue`]. One law, two call sites — never a forked
+//! copy that could drift out of sync with the dived world's own version.
 
 use std::collections::HashMap;
 
@@ -52,8 +62,9 @@ use kaijutsu_viz::fsn::{FsnField, layout_field};
 use crate::view::room::bearing::{self, Bearing};
 use crate::view::scene_palette::{ScenePalette, lin_scaled};
 
+use super::heat::{FsnHeat, HEAT_GAIN_LIFT};
 use super::layout;
-use super::sync::FsnState;
+use super::sync::{ChildMeta, FsnState};
 
 // ── Amy-tunable render constants ────────────────────────────────────────────
 
@@ -108,16 +119,11 @@ pub const WINDOW_Y: f32 = 280.0;
 /// window reads as lit glass rather than a flat picture. **Amy-tunable.**
 pub const WINDOW_LIFT: f32 = 1.15;
 
-/// Point-marker half-extent for the backdrop's own seed-point clusters —
-/// matches `scene::SPARSE_POINT_SIZE`'s value (that constant is private to
-/// `scene`, so this is its own copy, not a re-export). **Amy-tunable.**
-const BACKDROP_POINT_SIZE: f32 = 9.0;
-
 /// Hard cap on how many directory fields the backdrop bothers building
 /// (root + this many depth-1 children) — the backdrop is a glimpse, not the
 /// real world; capping keeps a huge root directory from spawning dozens of
-/// seed-point meshes for a texture nobody can read detail on anyway.
-/// **Amy-tunable.**
+/// wireframe-district meshes for a texture nobody can read detail on
+/// anyway. **Amy-tunable.**
 const BACKDROP_FIELD_CAP: usize = 11;
 
 // ── Components ───────────────────────────────────────────────────────────
@@ -132,7 +138,7 @@ const BACKDROP_FIELD_CAP: usize = 11;
 pub struct FsnBackdropCamera;
 
 /// Root of every backdrop-scene entity (camera-visible content — the seam
-/// grid, seed-point clusters, ship silhouette — NOT the portal quad, which
+/// grid, per-field wireframe districts — NOT the portal quad, which
 /// is a structural child of this same entity but renders on the main
 /// camera's own layer 0; see the module doc's render-layer split). Kept as
 /// its OWN root — never `ChildOf(RoomRoot)` — because `RoomRoot`'s own
@@ -143,6 +149,15 @@ pub struct FsnBackdropCamera;
 pub struct FsnBackdropRoot;
 
 // ── Resources ────────────────────────────────────────────────────────────
+
+/// One built field's spawned wireframe entity plus its own material handle —
+/// the handle is what [`sync_backdrop_heat`] needs to write `base_color`
+/// every frame without re-querying `MeshMaterial3d` (mirrors [`super::scene::
+/// FieldEntities::wireframe_material`]'s identical reason).
+struct BackdropField {
+    entity: Entity,
+    material: Handle<StandardMaterial>,
+}
 
 /// The backdrop's live render-target handle plus the per-path rebuild
 /// tracking [`sync_backdrop_fields`] needs (mirrors [`super::scene::
@@ -155,12 +170,14 @@ pub struct FsnBackdrop {
     /// The render-target texture the portal quad samples — `None` while
     /// `Screen::Room` isn't live (cleared on [`despawn_backdrop`]).
     pub image: Option<Handle<Image>>,
-    /// Path -> the listing generation its seed-point mesh was last built
-    /// from.
+    /// Path -> the listing generation its wireframe district mesh was last
+    /// built from.
     built: HashMap<String, u64>,
-    /// Path -> that path's own spawned seed-point entity, so a generation
-    /// bump can despawn the stale mesh before spawning its replacement.
-    entities: HashMap<String, Entity>,
+    /// Path -> that path's own spawned wireframe entity + material handle,
+    /// so a generation bump can despawn the stale mesh before spawning its
+    /// replacement, and so [`sync_backdrop_heat`] can iterate every built
+    /// field's material each frame.
+    entities: HashMap<String, BackdropField>,
 }
 
 // ── Spawn / despawn ──────────────────────────────────────────────────────
@@ -171,7 +188,7 @@ pub struct FsnBackdrop {
 /// room loads, before any VFS listing has ever arrived). Kicks off the root
 /// listing fetch too if [`FsnState`] is empty (a fresh app that never dove
 /// into `Screen::Fsn` yet) — [`sync_backdrop_fields`] then populates the
-/// seed-point clusters once that reply lands, all without the player ever
+/// wireframe districts once that reply lands, all without the player ever
 /// diving through the N door.
 pub fn spawn_backdrop(
     mut commands: Commands,
@@ -347,8 +364,8 @@ pub fn orbit_backdrop_camera(
 /// unit-testable without a Bevy world.
 #[derive(Debug, Default, PartialEq)]
 struct BackdropSyncPlan {
-    /// Paths whose seed-point mesh must be (re)built this pass, root first,
-    /// children in name-sorted order.
+    /// Paths whose wireframe district mesh must be (re)built this pass,
+    /// root first, children in name-sorted order.
     rebuild: Vec<String>,
     /// Previously-built paths that are no longer candidates at all (fell
     /// out of the capped window — see [`plan_backdrop_sync`]'s cap-crossing
@@ -437,7 +454,7 @@ fn plan_backdrop_sync(
     BackdropSyncPlan { rebuild, remove }
 }
 
-/// (Re)build the backdrop's seed-point clusters from whatever [`FsnState`]
+/// (Re)build the backdrop's wireframe districts from whatever [`FsnState`]
 /// already has cached — root, plus up to [`BACKDROP_FIELD_CAP`] depth-1
 /// children, each once its OWN generation changes and all together when the
 /// ROOT's does (the one-level descendant-invalidation `scene::
@@ -477,7 +494,7 @@ pub fn sync_backdrop_fields(
     // and forgotten — nothing below will ever visit it again.
     for path in &plan.remove {
         if let Some(old) = backdrop.entities.remove(path) {
-            commands.entity(old).despawn();
+            commands.entity(old.entity).despawn();
         }
         backdrop.built.remove(path);
     }
@@ -489,6 +506,13 @@ pub fn sync_backdrop_fields(
     let Some(root_listing) = state.listings.get("/") else {
         return;
     };
+
+    // Captured ONCE per pass, same reasoning as `scene::sync_fsn_fields`'s
+    // own `now_secs` (that fn's doc): a wall-clock read is cheap but every
+    // field rebuilding this pass shares the same "now" rather than each
+    // computing its own.
+    let now_secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 
     let root_rect = layout::root_world_rect();
     let root_specs: Vec<_> = root_listing
@@ -506,6 +530,8 @@ pub fn sync_backdrop_fields(
                 "/",
                 &root_field,
                 root_listing.generation,
+                &root_listing.children,
+                now_secs,
                 &palette,
                 &mut meshes,
                 &mut mats,
@@ -531,7 +557,7 @@ pub fn sync_backdrop_fields(
             // layout that no longer exists; drop it rather than leave a
             // ghost floating over someone else's cell.
             if let Some(old) = backdrop.entities.remove(path) {
-                commands.entity(old).despawn();
+                commands.entity(old.entity).despawn();
             }
             continue;
         };
@@ -548,6 +574,8 @@ pub fn sync_backdrop_fields(
             path,
             &field,
             listing.generation,
+            &listing.children,
+            now_secs,
             &palette,
             &mut meshes,
             &mut mats,
@@ -556,9 +584,18 @@ pub fn sync_backdrop_fields(
     }
 }
 
-/// Rebuild one path's own seed-point mesh iff its listing generation moved
-/// on from what's tracked in [`FsnBackdrop::built`] — despawning the stale
-/// entity first so a rebuild never leaks a duplicate mesh.
+/// Rebuild one path's own wireframe district mesh iff its listing
+/// generation moved on from what's tracked in [`FsnBackdrop::built`] —
+/// despawning the stale entity first so a rebuild never leaks a duplicate
+/// mesh. Bakes the SAME per-cell recency tint [`super::scene::
+/// spawn_field_entities`] does, via [`super::scene::cell_edge_tints`]
+/// against `children` (that path's own listing — root's or a depth-1
+/// child's, `sync_backdrop_fields`' own call sites); the material starts at
+/// [`super::scene::WIREFRAME_GAIN_MID`]'s resting gain (no heat yet —
+/// [`sync_backdrop_heat`] lifts it on a later frame once [`FsnHeat`] has
+/// something to report), and its own handle is retained in
+/// [`FsnBackdrop::entities`] so that system can find it without a
+/// `MeshMaterial3d` query.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_one(
     commands: &mut Commands,
@@ -566,6 +603,8 @@ fn rebuild_one(
     path: &str,
     field: &FsnField,
     generation: u64,
+    children: &[ChildMeta],
+    now_secs: u64,
     palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
@@ -575,26 +614,60 @@ fn rebuild_one(
         return;
     }
     if let Some(old) = backdrop.entities.remove(path) {
-        commands.entity(old).despawn();
+        commands.entity(old.entity).despawn();
     }
 
-    let positions = layout::field_seed_points(field);
-    let (verts, indices) = layout::point_marker_mesh_data(&positions, BACKDROP_POINT_SIZE);
-    let mesh = meshes.add(super::scene::triangle_list_mesh(verts, indices));
-    let mat = mats.add(unlit(lin_scaled(palette.fsn_vertex, 0.55)));
+    let edge_tints = super::scene::cell_edge_tints(field, children, now_secs, palette.fsn_edge, palette);
+    let wireframe_positions = layout::flatten_segments(&layout::field_wireframe(field));
+    let wire_vert_counts: Vec<usize> = field.cells.iter().map(|c| 6 * c.polygon.len()).collect();
+    let wireframe_colors = layout::per_cell_colors(&wire_vert_counts, &edge_tints);
+    let mesh = meshes.add(super::scene::line_list_mesh_colored(&wireframe_positions, &wireframe_colors));
+    let material = mats.add(unlit(lin_scaled(palette.fsn_edge, super::scene::WIREFRAME_GAIN_MID)));
     let entity = commands
         .spawn((
             Mesh3d(mesh),
-            MeshMaterial3d(mat),
+            MeshMaterial3d(material.clone()),
             Transform::default(),
             Visibility::Inherited,
             RenderLayers::layer(FSN_BACKDROP_LAYER),
-            Name::new(format!("FsnBackdropSeeds({path})")),
+            Name::new(format!("FsnBackdropWireframe({path})")),
             ChildOf(root),
         ))
         .id();
-    backdrop.entities.insert(path.to_string(), entity);
+    backdrop.entities.insert(path.to_string(), BackdropField { entity, material });
     backdrop.built.insert(path.to_string(), generation);
+}
+
+/// Lift every built field's wireframe material from [`super::scene::
+/// WIREFRAME_GAIN_MID`]'s resting gain toward `palette.gold`'s hue with
+/// that path's own churn heat ([`FsnHeat::normalized`]) — the SAME
+/// gain/hue law [`super::scene::apply_fsn_lod`] applies to the dived
+/// world's wireframe tier (`gain = base * (1.0 + h * HEAT_GAIN_LIFT)`, hue
+/// lerped `fsn_edge -> gold` by `h`), applied here to every backdrop field
+/// every frame rather than gated by LOD tier (the backdrop has no tiers to
+/// gate on). Write-on-change, checked through `Assets::get` BEFORE ever
+/// touching `get_mut` — `get_mut` marks the asset Modified (a GPU
+/// re-extract) even when the caller then writes nothing, and this system
+/// runs every frame on the app's RESTING screen; a settled material must
+/// stay settled (the same guarded-write reasoning `room::mod`'s
+/// `room_focus_visuals` documents for its plates).
+pub fn sync_backdrop_heat(
+    heat: Res<FsnHeat>,
+    palette: Res<ScenePalette>,
+    backdrop: Res<FsnBackdrop>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+) {
+    for (path, bf) in backdrop.entities.iter() {
+        let h = heat.normalized(path);
+        let gain = super::scene::WIREFRAME_GAIN_MID * (1.0 + h * HEAT_GAIN_LIFT);
+        let hue = super::scene::lerp_hue(palette.fsn_edge, palette.gold, h);
+        let want = lin_scaled(hue, gain);
+        if mats.get(&bf.material).is_some_and(|m| m.base_color != want) {
+            if let Some(mat) = mats.get_mut(&bf.material) {
+                mat.base_color = want;
+            }
+        }
+    }
 }
 
 fn unlit(color: Color) -> StandardMaterial {

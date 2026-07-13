@@ -23,9 +23,11 @@
 //! - [`scene`] — the 3D scene: spawn/despawn, the fly camera, per-directory
 //!   field mesh entities (now recency-tinted), LOD-tier visibility gating
 //!   (now heat-lifted), selection, and the orbiting vessel.
-//! - [`backdrop`] — the Room-side glimpse: an off-screen camera + one
-//!   panel-spanning portal quad showing a sparse impression of the world
-//!   while `Screen::Room` is live, no dive required.
+//! - [`backdrop`] — the Room-side glimpse, and since 2026-07-13 the PRIMARY
+//!   FSN surface: an off-screen camera + one panel-spanning portal quad
+//!   rendering the world's recency-tinted, heat-lifted wireframe districts
+//!   while `Screen::Room` is live, no dive required — one fixed tier, no
+//!   LOD swap, no selection.
 //!
 //! # Entry
 //!
@@ -116,7 +118,11 @@ impl Plugin for FsnPlugin {
             )
             .add_systems(
                 Update,
-                (backdrop::orbit_backdrop_camera, backdrop::sync_backdrop_fields)
+                (
+                    backdrop::orbit_backdrop_camera,
+                    backdrop::sync_backdrop_fields,
+                    backdrop::sync_backdrop_heat,
+                )
                     .chain()
                     .run_if(in_state(Screen::Room)),
             );

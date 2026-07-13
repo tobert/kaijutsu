@@ -53,7 +53,10 @@ const SPARSE_POINT_SIZE: f32 = 9.0;
 const VERTEX_POINT_SIZE: f32 = 13.0;
 
 /// Wireframe brightness at the Wireframe (mid) tier — LDR, a calm presence.
-const WIREFRAME_GAIN_MID: f32 = 0.85;
+/// `pub(super)`: [`super::backdrop`]'s own wireframe districts rest at this
+/// SAME gain (before its own heat lift) — one number, one law, not a second
+/// copy drifting out of sync with this one.
+pub(super) const WIREFRAME_GAIN_MID: f32 = 0.85;
 /// Wireframe brightness at the Attended (near) tier — HDR via
 /// `ScenePalette::crest`, "full-brightness edges" per the design doc.
 const VERTEX_GAIN: f32 = 1.0;
@@ -372,6 +375,43 @@ fn despawn_field(commands: &mut Commands, fe: &FieldEntities) {
     commands.entity(fe.vertex_points).despawn();
 }
 
+/// One field's per-cell recency tint against `base`, expanded ready for
+/// [`layout::per_cell_colors`]' own zip (one color per `field.cells` entry,
+/// in that same name-sorted order): each cell's own child (`children`,
+/// matched by name — `field.cells` is built FROM this same listing)
+/// contributes a mtime age against `now_secs`, [`layout::recency_weight`]
+/// turns that into a 0..1 "how gold" weight, and [`warmth_tint`] bakes it
+/// into a per-channel tint against `base` (`palette.fsn_edge` for the
+/// wireframe, `palette.fsn_vertex` for the point meshes — see
+/// [`spawn_field_entities`]'s own doc for why the base color is a parameter
+/// rather than baked in). A child missing from `children` (shouldn't happen)
+/// reads as infinitely aged (no tint) rather than defaulting to full gold,
+/// the safer failure direction.
+///
+/// `pub(super)`: [`super::backdrop`]'s own wireframe districts bake the SAME
+/// law from the SAME listings — one function, not a second copy of the
+/// recency math that could drift out of sync with this one.
+pub(super) fn cell_edge_tints(
+    field: &FsnField,
+    children: &[ChildMeta],
+    now_secs: u64,
+    base: LinearRgba,
+    palette: &ScenePalette,
+) -> Vec<[f32; 4]> {
+    let mtimes: HashMap<&str, u64> = children.iter().map(|c| (c.name.as_str(), c.mtime_secs)).collect();
+    field
+        .cells
+        .iter()
+        .map(|c| {
+            let age_secs = match mtimes.get(c.name.as_str()) {
+                Some(&mtime) => (now_secs as i64 - mtime as i64) as f64,
+                None => f64::INFINITY,
+            };
+            warmth_tint(base, palette.gold, layout::recency_weight(age_secs))
+        })
+        .collect()
+}
+
 /// Build and spawn one field's four entities (all `Visibility::Hidden` at
 /// spawn — [`apply_fsn_lod`] sets the real tier the very next frame; nothing
 /// flashes fully visible for one frame before the LOD gate catches up).
@@ -405,18 +445,8 @@ fn spawn_field_entities(
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) -> FieldEntities {
-    let mtimes: HashMap<&str, u64> = children.iter().map(|c| (c.name.as_str(), c.mtime_secs)).collect();
-    let recency_of = |name: &str| -> f32 {
-        let age_secs = match mtimes.get(name) {
-            Some(&mtime) => (now_secs as i64 - mtime as i64) as f64,
-            None => f64::INFINITY,
-        };
-        layout::recency_weight(age_secs)
-    };
-    let edge_tints: Vec<[f32; 4]> =
-        field.cells.iter().map(|c| warmth_tint(palette.fsn_edge, palette.gold, recency_of(&c.name))).collect();
-    let vertex_tints: Vec<[f32; 4]> =
-        field.cells.iter().map(|c| warmth_tint(palette.fsn_vertex, palette.gold, recency_of(&c.name))).collect();
+    let edge_tints = cell_edge_tints(field, children, now_secs, palette.fsn_edge, palette);
+    let vertex_tints = cell_edge_tints(field, children, now_secs, palette.fsn_vertex, palette);
 
     let seam_mesh = meshes.add(line_list_mesh(&layout::flatten_segments(&layout::seam_grid(rect))));
     let seam_mat = mats.add(unlit(lin_scaled(palette.fsn_seam, 1.0)));
@@ -548,7 +578,11 @@ pub(super) fn line_list_mesh(positions: &[[f32; 3]]) -> Mesh {
 /// wireframe's recency tint (lane A1). `colors.len()` must equal
 /// `positions.len()` (the caller's own [`layout::per_cell_colors`] expansion
 /// guarantees this — see [`spawn_field_entities`]'s doc).
-fn line_list_mesh_colored(positions: &[[f32; 3]], colors: &[[f32; 4]]) -> Mesh {
+///
+/// `pub(super)`: reused as-is by [`super::backdrop`]'s own wireframe
+/// districts, which bake the identical recency tint via [`cell_edge_tints`]
+/// — mirrors [`line_list_mesh`]'s own `pub(super)` doc note.
+pub(super) fn line_list_mesh_colored(positions: &[[f32; 3]], colors: &[[f32; 4]]) -> Mesh {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::PrimitiveTopology;
 
@@ -559,22 +593,14 @@ fn line_list_mesh_colored(positions: &[[f32; 3]], colors: &[[f32; 4]]) -> Mesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors.to_vec())
 }
 
-/// `pub(super)`: reused as-is (uncolored) by [`super::backdrop`]'s seed-point
-/// meshes.
-pub(super) fn triangle_list_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
-    use bevy::asset::RenderAssetUsages;
-    use bevy::mesh::{Indices, PrimitiveTopology};
-
-    let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_indices(Indices::U32(indices))
-}
-
-/// [`triangle_list_mesh`] plus a baked per-vertex `Mesh::ATTRIBUTE_COLOR` —
+/// A `TriangleList` mesh with a baked per-vertex `Mesh::ATTRIBUTE_COLOR` —
 /// the two point meshes' recency tint (lane A1). `colors.len()` must equal
-/// `positions.len()`.
+/// `positions.len()`. Private: since 2026-07-13 [`super::backdrop`] draws no
+/// point meshes of its own (its one fixed tier is wireframe, not seed
+/// points — see that module's doc), so the uncolored sibling this once had
+/// (`triangle_list_mesh`, `pub(super)` for the backdrop's own use) was
+/// removed rather than left as dead code — see [`line_list_mesh`]'s own doc
+/// for the still-live version of that reuse pattern.
 fn triangle_list_mesh_colored(positions: Vec<[f32; 3]>, indices: Vec<u32>, colors: Vec<[f32; 4]>) -> Mesh {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::{Indices, PrimitiveTopology};
@@ -792,7 +818,11 @@ const SELECTION_GAIN_LIFT: f32 = 1.3;
 /// needs `fsn_edge -> gold` on a plain [`LinearRgba`] pair, not a
 /// `Color`-level blend (which would round-trip through a color space this
 /// module doesn't otherwise touch).
-fn lerp_hue(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
+///
+/// `pub(super)`: [`super::backdrop::sync_backdrop_heat`] performs the exact
+/// same hue shift for its own wireframe districts — one lerp, not a second
+/// copy.
+pub(super) fn lerp_hue(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     LinearRgba::rgb(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t)
 }
 
@@ -1016,6 +1046,75 @@ mod tests {
         let positions = mesh.attribute(Mesh::ATTRIBUTE_POSITION).expect("positions attribute");
         let colors = mesh.attribute(Mesh::ATTRIBUTE_COLOR).expect("baked recency color attribute");
         assert_eq!(colors.len(), positions.len(), "one baked color per vertex position");
+    }
+
+    // ── cell_edge_tints (the shared recency law scene.rs and backdrop.rs both bake) ──
+
+    #[test]
+    fn cell_edge_tints_brackets_fresh_and_missing_children() {
+        use kaijutsu_viz::fsn::ChildSpec;
+
+        let rect = Rect { x0: 0.0, y0: 0.0, x1: 10.0, y1: 10.0 };
+        let specs = vec![
+            ChildSpec { name: "fresh.rs".into(), kind: NodeKind::File, height: 5.0 },
+            ChildSpec { name: "missing.rs".into(), kind: NodeKind::File, height: 5.0 },
+        ];
+        let field = layout_field(rect, &specs);
+        let now_secs = 1_000_000_u64;
+        // Only "fresh.rs" has a matching ChildMeta, at age 0 — "missing.rs"
+        // is absent from `children` entirely (the "shouldn't happen but
+        // fail-soft" case cell_edge_tints' own doc calls out).
+        let children = vec![ChildMeta {
+            name: "fresh.rs".into(),
+            kind: VfsFileType::File,
+            size: 128,
+            child_count: 0,
+            ignored: false,
+            mtime_secs: now_secs,
+        }];
+        let palette = ScenePalette::default();
+
+        let tints = cell_edge_tints(&field, &children, now_secs, palette.fsn_edge, &palette);
+        assert_eq!(tints.len(), field.cells.len(), "one tint per cell");
+
+        let fresh_idx = field.cells.iter().position(|c| c.name == "fresh.rs").unwrap();
+        let missing_idx = field.cells.iter().position(|c| c.name == "missing.rs").unwrap();
+        assert_eq!(
+            tints[fresh_idx],
+            warmth_tint(palette.fsn_edge, palette.gold, 1.0),
+            "age-0 mtime reads as maximally fresh — full gold tint weight"
+        );
+        assert_eq!(
+            tints[missing_idx],
+            warmth_tint(palette.fsn_edge, palette.gold, 0.0),
+            "a child missing from the listing reads as infinitely aged"
+        );
+        assert_eq!(tints[missing_idx], [1.0, 1.0, 1.0, 1.0], "no tint at all — the untouched base color");
+    }
+
+    // ── lerp_hue ──
+
+    #[test]
+    fn lerp_hue_at_zero_and_one_returns_the_endpoints() {
+        let a = LinearRgba::rgb(0.254, 0.107, 1.0);
+        let b = LinearRgba::rgb(1.00, 0.78, 0.34);
+        let close = |c: LinearRgba, want: LinearRgba| {
+            assert!((c.red - want.red).abs() < 1e-6);
+            assert!((c.green - want.green).abs() < 1e-6);
+            assert!((c.blue - want.blue).abs() < 1e-6);
+        };
+        close(lerp_hue(a, b, 0.0), a);
+        close(lerp_hue(a, b, 1.0), b);
+    }
+
+    #[test]
+    fn lerp_hue_at_half_averages_each_channel() {
+        let a = LinearRgba::rgb(0.0, 0.0, 0.0);
+        let b = LinearRgba::rgb(1.0, 0.5, 0.2);
+        let mid = lerp_hue(a, b, 0.5);
+        assert!((mid.red - 0.5).abs() < 1e-6);
+        assert!((mid.green - 0.25).abs() < 1e-6);
+        assert!((mid.blue - 0.1).abs() < 1e-6);
     }
 }
 
