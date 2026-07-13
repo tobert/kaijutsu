@@ -237,7 +237,13 @@ impl MountTable {
     /// The current listing-generation of `dir_path`, or
     /// [`BASELINE_GENERATION`] if it has never been observed to mutate since
     /// boot.
-    fn generation_of(&self, dir_path: &Path) -> u64 {
+    /// Public per the same reasoning as [`Self::global_activity`] /
+    /// [`Self::activity_snapshot`] below: the activity digest bridge
+    /// (`kaijutsu-server::rpc::subscribe_vfs_activity`) stamps each wire
+    /// activity entry with the directory's current listing-generation for
+    /// stale-listing detection on the client, and that's a one-off lookup,
+    /// not a full snapshot walk.
+    pub fn generation_of(&self, dir_path: &Path) -> u64 {
         let key = Self::normalize_mount_path(dir_path.to_path_buf());
         self.generations
             .get(&key)
