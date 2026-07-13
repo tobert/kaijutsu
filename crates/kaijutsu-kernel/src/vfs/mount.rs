@@ -907,6 +907,42 @@ impl VfsOps for MountTable {
         fs.read_all(&relative).await
     }
 
+    /// Delegate `open_read_stream` to the owning backend, same rationale as
+    /// `read_all` above: the trait's DEFAULT implementation just loops
+    /// `read`, which is correct only for backends where `read` is cheap and
+    /// stateless. A backend that overrides `open_read_stream` to hold one
+    /// handle open across the whole transfer (a future wire-backed `ShareFs`,
+    /// `docs/slash-r.md` slice 0) must have that override actually reached —
+    /// using the trait default here instead would silently reopen/close a
+    /// remote handle per chunk.
+    ///
+    /// Built with `async_stream::stream!` rather than a hand-rolled
+    /// `Stream` impl: the owning backend's `Arc<dyn VfsOps>` and the
+    /// translated relative path are both local to one async generator body
+    /// (the macro's `async move` block), so the inner `BoxStream` — which
+    /// borrows them — never has to outlive its owner in a separate struct.
+    /// That's the same soundness the compiler already grants ordinary
+    /// `async`/`.await` locals; no unsafe self-referencing required.
+    fn open_read_stream<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> futures::stream::BoxStream<'a, VfsResult<bytes::Bytes>> {
+        use futures::StreamExt;
+        Box::pin(async_stream::stream! {
+            let (fs, relative) = match self.find_mount(path).await {
+                Ok(v) => v,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            let mut inner = fs.open_read_stream(&relative);
+            while let Some(item) = inner.next().await {
+                yield item;
+            }
+        })
+    }
+
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
         let (fs, relative) = self.find_mount(path).await?;
         fs.readlink(&relative).await

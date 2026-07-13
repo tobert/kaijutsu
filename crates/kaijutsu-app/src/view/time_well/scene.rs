@@ -334,8 +334,13 @@ const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 
 /// Base spin rate (radians/sec-ish, tune by eye) for terrace ring `k`; each
 /// deeper ring spins a touch faster so the funnel reads as receding motion.
-/// **Amy-tunable — kept calm for the first cut.**
-const TERRACE_RING_SPIN_BASE: f32 = 0.10;
+/// **Amy-tunable — kept calm for the first cut.** `pub(crate)`: this is
+/// also the master gear of the room's kinetic ensemble — the FSN portal's
+/// orbit derives from it (`fsn::layout::ORBIT_RATE` = this ×
+/// `ORBIT_GEAR_RATIO`; Amy 2026-07-13: the two motions read gear-like, so
+/// they should BE geared — retune this one number and the whole train
+/// turns together).
+pub(crate) const TERRACE_RING_SPIN_BASE: f32 = 0.13;
 const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 
 /// Overall alpha/intensity for the terrace rings. Started at 0.35 ("kept low

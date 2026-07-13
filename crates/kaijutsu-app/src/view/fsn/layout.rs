@@ -61,13 +61,17 @@ use kaijutsu_viz::fsn::{ChildSpec, FsnCell, FsnField, NodeKind, Rect, Vec2};
 // ── World placement (Amy-tunable) ───────────────────────────────────────────
 
 /// Side length (world units) of the root directory's square footprint on the
-/// XZ plane, centered at the world origin. Bumped 2000 → 3000 (Amy's 50%,
-/// 2026-07-13, with the single N portal): the orbit scales with it
-/// ([`ORBIT_RADIUS`]/[`ORBIT_HEIGHT`]), so the framing holds while
-/// fixed-size elements (point markers, prism heights) shrink relative to
-/// the spread — districts get air between them and the world reads
-/// expansive rather than miniature. **Amy-tunable.**
-pub const ROOT_WORLD_SIZE: f32 = 3000.0;
+/// XZ plane, centered at the world origin. 2000 → 3000 (Amy's 50%,
+/// 2026-07-13, single-portal retune), then 3000 → 12000 the same evening
+/// (Amy: "what if our fsn was MUCH bigger... maybe even a horizon"): this
+/// time the world outgrows the camera ON PURPOSE — the orbit moves out
+/// only ~2.5× ([`ORBIT_RADIUS`]/[`ORBIT_HEIGHT`]'s own doc), so instead of
+/// the framing holding, the world overflows the frustum: the near districts
+/// slide under the camera, the far edge drops toward the skyline, and the
+/// glass reads as a horizon over a sprawl rather than a diorama on a
+/// table. (A uniform world+orbit scale is a visual no-op — the mismatch IS
+/// the effect.) **Amy-tunable.**
+pub const ROOT_WORLD_SIZE: f32 = 12_000.0;
 
 /// The root directory's world-space rect: a square of [`ROOT_WORLD_SIZE`],
 /// centered at the origin (`y` fields read as world Z — see the module doc).
@@ -559,14 +563,35 @@ pub fn ship_silhouette_segments() -> Vec<Segment> {
 /// panel-spanning portal (2026-07-13): the elevation angle falls from ~34°
 /// to ~25°, trading the map-from-above read for a horizon — the world seen
 /// out a window, which is now the primary FSN surface (diving is
-/// de-emphasized; the world rotates past the glass instead). Radius/height
-/// track [`ROOT_WORLD_SIZE`]'s 1.5× bump (1900/900 → 2850/1350) so the
-/// elevation angle (~25°) and world coverage stay put while the airier
-/// spread does the expansive work. At `ORBIT_RATE` 0.05 a full revolution
-/// takes ~2 minutes. **Amy-tunable.**
-pub const ORBIT_RADIUS: f32 = 2850.0;
-pub const ORBIT_HEIGHT: f32 = 1350.0;
-pub const ORBIT_RATE: f32 = 0.05;
+/// de-emphasized; the world rotates past the glass instead). Retuned with
+/// [`ROOT_WORLD_SIZE`]'s 4× horizon bump (2026-07-13 eve) — and this time
+/// deliberately NOT in proportion (2850/1350 → 7200/1900, ~2.5×/1.4×): the
+/// camera sits 1.2× the world's half-extent out at a shallow ~15°
+/// elevation, so the nearest districts pass beneath the frame's bottom
+/// edge, the far edge (~13000 out) settles just under the skyline with sky
+/// above it, and the world reads as terrain to the horizon instead of a
+/// model on a table. **Amy-tunable.**
+pub const ORBIT_RADIUS: f32 = 7200.0;
+pub const ORBIT_HEIGHT: f32 = 1900.0;
+
+/// The horizon's gear ratio against the room's master spin — the time
+/// well's TOP terrace ring (`time_well::scene::TERRACE_RING_SPIN_BASE`).
+/// Amy, 2026-07-13: the well's rings and the world past the glass read
+/// gear-like from the console, so they should BE geared — the FSN orbit is
+/// the big outer wheel of the ensemble. Started at 1/3 (her "maybe 2/3 or
+/// 1/3"), dropped to 1/5 the same evening when the well's base rose 0.10 →
+/// 0.13 (Amy: "well rings could be a touch faster and the fsn a bit
+/// slower" — the gearing means a faster base speeds the horizon too, so
+/// the ratio absorbs both moves: net horizon 0.033 → 0.026 rad/s, ~4 min
+/// per revolution). Retuning the well's spin turns the whole train
+/// together; retune the RATIO here to change only the horizon.
+/// **Amy-tunable.**
+pub const ORBIT_GEAR_RATIO: f32 = 1.0 / 5.0;
+
+/// Angular rate (rad/s) of the vessel's orbit — derived, never set
+/// directly: the master spin × [`ORBIT_GEAR_RATIO`].
+pub const ORBIT_RATE: f32 =
+    crate::view::time_well::scene::TERRACE_RING_SPIN_BASE * ORBIT_GEAR_RATIO;
 
 /// The backdrop camera's pose at time `t` (seconds): a slow circular orbit
 /// at [`ORBIT_RADIUS`]/[`ORBIT_HEIGHT`] around the world origin, always

@@ -52,6 +52,17 @@ bloom/vi-dive/search items below; they stay on record, not on deck.
   deprioritized (ambient reframe).
 - **`/` search-and-fly-to** (vfs.md OQ 5) — unbuilt, deprioritized.
 - Zone tint (vfs.md OQ 4) untouched. Windows (OQ 3) SHIPPED in slice 1.
+- **Portal camera: controls + scripted flybys + heat-directed retargeting**
+  (Amy direction, 2026-07-13 — "later tho, just for direction rn"): when
+  the portal is focused/fullscreened, add (a) manual camera controls, (b) a
+  library of scripted camera moves with the current orbit as the default
+  automatic flyby, and (c) data-driven retargeting — e.g. the camera swings
+  toward `~/src/kaijutsu`'s district when it heats up. Iterate as more data
+  feeds the world (trickle enumeration, stage-2 inotify host weather). The
+  `orbit_pose` seam is already the single pose authority for both the RTT
+  camera and the visible vessel — a camera-director that outputs poses
+  slots in there, and whatever it flies, the dived-world vessel follows
+  for free.
 - **CAS as a hash-ring neighborhood** (Amy seed, 2026-07-13): `/v/cas` is
   already 2-hex-prefix sharded (256 buckets) — render it as a bespoke ring
   district (a "central neighborhood" rotunda) with shards placed by hash

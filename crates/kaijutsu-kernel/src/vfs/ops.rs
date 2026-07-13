@@ -4,10 +4,19 @@
 //! designed for RPC (path-based, no inodes, explicit offset/size).
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use std::path::{Path, PathBuf};
 
 use super::VfsResult;
 use super::types::{DirEntry, FileAttr, SetAttr, StatFs};
+
+/// Chunk size for [`VfsOps::open_read_stream`]'s default loop-`read`
+/// implementation. Matches `MAX_READ_LEN` in `crates/kaijutsu-server/src/sftp.rs`
+/// (the SFTP `READ` window) so a future wire-backed backend (`ShareFs`,
+/// `docs/slash-r.md` slice 1) drives the same cadence its own streaming
+/// override would use, rather than picking an unrelated size.
+pub const STREAM_CHUNK_SIZE: u32 = 256 * 1024;
 
 /// Core VFS operations trait.
 ///
@@ -166,5 +175,51 @@ pub trait VfsOps: Send + Sync {
         }
         self.write(path, 0, data).await?;
         Ok(())
+    }
+
+    /// Open a streaming, chunked read over `path` — the substrate for
+    /// `vfs::pump` (`docs/slash-r.md` slice 0: `cp` across mounts, CAS
+    /// ingest, and eventually share sync all sit on this).
+    ///
+    /// The default implementation loops this backend's own [`Self::read`] at
+    /// [`STREAM_CHUNK_SIZE`] — correct and free for local/memory/CRDT
+    /// backends, where `read` is stateless and cheap to call repeatedly. A
+    /// backend whose `read` is expensive per call (a network protocol with
+    /// its own OPEN/READ/CLOSE framing, e.g. the future `ShareFs`) MUST
+    /// override this to hold one handle open across the whole stream —
+    /// looping the default over such a backend would reopen and close a
+    /// remote handle *per chunk* (RTT-amplification: three round trips per
+    /// 256 KiB at network latency is dead on arrival for a multi-GB file).
+    ///
+    /// Read contract, pinned by tests in `vfs::pump`:
+    /// - a zero-length `read` return is EOF: the stream ends, successfully.
+    /// - a **short** read (non-empty, less than the requested chunk) before
+    ///   EOF is legal; the next request's offset advances by the *actual*
+    ///   bytes returned, never the requested size. The stream keeps pulling
+    ///   until a zero-length read.
+    /// - a `read` error ends the stream with that error as its final item.
+    ///
+    /// Object-safe behind `Arc<dyn VfsOps>`: the returned stream borrows
+    /// `&self`/`path`, so callers must keep the backend's `Arc` (and the
+    /// path) alive for as long as they drive the stream — true of every
+    /// caller here, since `pump` always holds the source `Arc` for its
+    /// whole run.
+    fn open_read_stream<'a>(&'a self, path: &'a Path) -> BoxStream<'a, VfsResult<Bytes>> {
+        Box::pin(futures::stream::unfold(
+            (self, path, 0u64, false),
+            |(this, path, offset, done)| async move {
+                if done {
+                    return None;
+                }
+                match this.read(path, offset, STREAM_CHUNK_SIZE).await {
+                    Ok(chunk) if chunk.is_empty() => None,
+                    Ok(chunk) => {
+                        let advanced = offset + chunk.len() as u64;
+                        Some((Ok(Bytes::from(chunk)), (this, path, advanced, false)))
+                    }
+                    Err(e) => Some((Err(e), (this, path, offset, true))),
+                }
+            },
+        ))
     }
 }

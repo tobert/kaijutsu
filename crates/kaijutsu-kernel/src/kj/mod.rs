@@ -14,6 +14,7 @@ pub mod block;
 pub mod cache;
 pub mod cas;
 pub mod compact;
+pub mod cp;
 pub mod config;
 pub mod context;
 pub mod context_shell;
@@ -355,6 +356,11 @@ impl KjDispatcher {
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
         }
+        // `kj cp` addresses both ends by VFS path, not by context — same
+        // exemption rationale as `kj cas`/`kj vfs`.
+        if cmd == "cp" {
+            return self.dispatch_cp(&argv[1..], caller).await;
+        }
         // `kj vfs` is a structural read query addressed by VFS path, not by
         // context — same exemption rationale as `kj cas` get/ls/info.
         if cmd == "vfs" {
@@ -689,6 +695,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(workspace::WorkspaceArgs::command())
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
+        .subcommand(cp::CpArgs::command())
         .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())
         .subcommand(editor::EditorArgs::command())

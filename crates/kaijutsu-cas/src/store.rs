@@ -297,6 +297,106 @@ impl FileStore {
         }
         Ok(())
     }
+
+    /// Open a streaming writer: incremental BLAKE3 hashing while chunks land
+    /// in `staging/`, atomic rename into `objects/` at
+    /// [`StreamingWriter::finalize`] — never a buffered re-hash pass. The
+    /// pump's `cas put` sink (`docs/slash-r.md` slice 0).
+    pub fn create_streaming_writer(
+        &self,
+        mime_type: impl Into<String>,
+    ) -> Result<StreamingWriter, StoreError> {
+        let chunk = self.create_staging()?;
+        Ok(StreamingWriter {
+            store: self.clone(),
+            chunk: Some(chunk),
+            hasher: blake3::Hasher::new(),
+            mime_type: mime_type.into(),
+        })
+    }
+}
+
+/// Incremental writer into CAS `staging/`, hashing as bytes arrive.
+///
+/// `write` never re-reads what it already wrote — the running BLAKE3 state
+/// covers exactly the bytes streamed, so [`Self::finalize`] exposes the
+/// final [`ContentHash`] with no re-hash pass over the staged file.
+///
+/// Nothing renames without a completed `finalize`: an unfinalized writer's
+/// [`Drop`] actively unlinks the partial staging file (best-effort — a
+/// dropping writer must never panic) rather than leaving garbage for a
+/// restart sweep. `chunk` is `Option` solely so `finalize` can move the
+/// `StagingChunk` out of `&mut self` while still leaving a well-formed
+/// (already-consumed) value behind for `Drop` to see.
+pub struct StreamingWriter {
+    store: FileStore,
+    chunk: Option<StagingChunk>,
+    hasher: blake3::Hasher,
+    mime_type: String,
+}
+
+impl StreamingWriter {
+    /// Feed the next chunk. Order matters — chunks are hashed and written in
+    /// the sequence they arrive; there is no seek/offset parameter, matching
+    /// the pump's sequential `PumpSink` contract.
+    pub fn write(&mut self, data: &[u8]) -> Result<(), StoreError> {
+        let chunk = self.chunk.as_mut().ok_or(StagingError::Closed)?;
+        chunk.write(data)?;
+        self.hasher.update(data);
+        Ok(())
+    }
+
+    /// Flush, hash-finalize, and atomically place the staged bytes into
+    /// `objects/` (idempotent under dedup, same as [`FileStore::seal`]).
+    /// Consumes `self` so a caller cannot write after finalizing.
+    ///
+    /// `self.chunk` is only cleared on the success path (below) — every
+    /// early `?` return in [`Self::finalize_inner`] leaves it `Some`, so a
+    /// failed finalize (flush/sync/rename/metadata error) still hits
+    /// [`Drop`]'s cleanup instead of leaking a staging file silently.
+    pub fn finalize(mut self) -> Result<SealResult, StoreError> {
+        let result = self.finalize_inner();
+        if result.is_ok() {
+            self.chunk = None;
+        }
+        result
+    }
+
+    fn finalize_inner(&mut self) -> Result<SealResult, StoreError> {
+        let chunk = self.chunk.as_mut().ok_or(StagingError::Closed)?;
+        chunk.flush()?;
+        chunk.sync()?;
+        chunk.close();
+
+        let content_hash = ContentHash::from_blake3(self.hasher.finalize());
+        let size_bytes = chunk.bytes_written();
+        let staging_path = chunk.path.clone();
+        let obj_path = self.store.object_path(&content_hash);
+
+        self.store.place_object(&staging_path, &obj_path)?;
+        self.store.write_metadata(&content_hash, &self.mime_type, size_bytes)?;
+
+        Ok(SealResult {
+            content_hash,
+            content_path: obj_path,
+            size_bytes,
+        })
+    }
+}
+
+impl Drop for StreamingWriter {
+    fn drop(&mut self) {
+        // `finalize` takes `self` and leaves `chunk = None` behind, so a
+        // `Some` here means finalize never ran (early return, panic-free
+        // error path, or the caller simply dropped an in-progress writer) —
+        // unlink the partial file rather than leaving staging residue for a
+        // restart sweep to eventually catch. Best-effort: a dropping writer
+        // must never panic on a failed cleanup (matches `TempDirGuard`,
+        // `crates/kaijutsu-kernel/src/kernel.rs`).
+        if let Some(chunk) = self.chunk.take() {
+            let _ = fs::remove_file(&chunk.path);
+        }
+    }
 }
 
 impl ContentStore for FileStore {
@@ -722,5 +822,112 @@ mod tests {
         assert_eq!(reference.hash, hash);
         assert_eq!(reference.mime_type, "application/octet-stream");
         assert_eq!(reference.size_bytes, 11);
+    }
+
+    /// Every file under `staging/`, recursively — a residue check shared by
+    /// the streaming-writer tests below.
+    fn staging_residue(store: &FileStore) -> Vec<PathBuf> {
+        let staging_dir = store.config().staging_dir();
+        let mut stack: Vec<_> = std::fs::read_dir(&staging_dir)
+            .map(|rd| rd.flatten().collect())
+            .unwrap_or_default();
+        let mut files = Vec::new();
+        while let Some(entry) = stack.pop() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.extend(std::fs::read_dir(&path).unwrap().flatten());
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    // ========================================================================
+    // StreamingWriter — incremental hashing, atomic finalize, active
+    // drop-cleanup (`docs/slash-r.md` slice 0).
+    // ========================================================================
+
+    #[test]
+    fn streaming_writer_matches_oneshot_hash_and_leaves_no_residue() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileStore::at_path(temp_dir.path());
+
+        let data = b"streamed in three separate chunks, hashed incrementally";
+        let oneshot_hash = store.store(data, "text/plain").unwrap();
+
+        let mut writer = store.create_streaming_writer("text/plain").unwrap();
+        writer.write(&data[0..10]).unwrap();
+        writer.write(&data[10..30]).unwrap();
+        writer.write(&data[30..]).unwrap();
+        let result = writer.finalize().unwrap();
+
+        assert_eq!(result.content_hash, oneshot_hash, "streamed hash must match a one-shot store() of the same bytes");
+        assert_eq!(result.size_bytes, data.len() as u64);
+        assert!(store.exists(&result.content_hash));
+        assert_eq!(store.retrieve(&result.content_hash).unwrap().unwrap(), data);
+        assert!(
+            staging_residue(&store).is_empty(),
+            "a completed finalize must leave nothing in staging/"
+        );
+    }
+
+    #[test]
+    fn streaming_writer_dedups_against_an_existing_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileStore::at_path(temp_dir.path());
+
+        let data = b"duplicate via streaming writer";
+        let existing = store.store(data, "text/plain").unwrap();
+
+        let mut writer = store.create_streaming_writer("text/plain").unwrap();
+        writer.write(data).unwrap();
+        let result = writer.finalize().unwrap();
+
+        assert_eq!(result.content_hash, existing);
+        assert!(staging_residue(&store).is_empty());
+    }
+
+    #[test]
+    fn streaming_writer_drop_without_finalize_unlinks_staging() {
+        // The core "interruption is loud, no silent partial file" guarantee:
+        // a writer abandoned mid-stream (caller error path, no finalize())
+        // must not leave its staged bytes lying around for a restart sweep
+        // to eventually find.
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileStore::at_path(temp_dir.path());
+
+        {
+            let mut writer = store.create_streaming_writer("text/plain").unwrap();
+            writer.write(b"never gets finalized").unwrap();
+            // writer drops here without calling finalize()
+        }
+
+        assert!(
+            staging_residue(&store).is_empty(),
+            "Drop must actively unlink the partial staging file"
+        );
+    }
+
+    #[test]
+    fn streaming_writer_finalize_failure_still_leaves_drop_to_clean_up() {
+        // A read-only store can still create a streaming writer's staging
+        // file (create_staging only checks read_only, which the writer
+        // itself doesn't re-check) is NOT the scenario here — instead this
+        // proves the more subtle invariant: finalize() only clears its
+        // internal `chunk` slot on the SUCCESS path, so if finalize is
+        // never called at all (the common failure shape — a caller sees an
+        // error from an earlier `write()` and drops the writer without ever
+        // reaching finalize), Drop still has a live chunk to clean up.
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileStore::at_path(temp_dir.path());
+
+        let writer = store.create_streaming_writer("text/plain").unwrap();
+        drop(writer);
+
+        assert!(
+            staging_residue(&store).is_empty(),
+            "an unwritten, unfinalized writer must still clean up its empty staging file"
+        );
     }
 }

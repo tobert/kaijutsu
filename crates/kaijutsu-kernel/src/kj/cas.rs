@@ -84,18 +84,47 @@ impl KjDispatcher {
         }
     }
 
+    /// Ingest a HOST filesystem path (`kj cas put` has always taken one —
+    /// not a VFS path) with bounded memory: read in
+    /// `vfs::STREAM_CHUNK_SIZE` pieces straight into a
+    /// [`kaijutsu_cas::StreamingWriter`], hashing incrementally, rather than
+    /// buffering the whole file before `store()`. This is a self-contained
+    /// swap of `cas_put`'s internals — NOT routed through `VfsOps`/`vfs::pump`,
+    /// since making `kj cas put` accept a VFS path (so it could one day reach
+    /// a share under `/r/<id>/...`) is a slice-1 concern once `ShareFs`
+    /// exists (`docs/slash-r.md`), not a slice-0 restructuring.
     fn cas_put(&self, path_str: &str) -> KjResult {
+        use std::io::Read;
+
         let path = std::path::Path::new(path_str);
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(e) => return KjResult::Err(format!("kj cas put: {}: {}", path_str, e)),
         };
 
         let mime = mime_from_extension(path_str);
         let cas = self.kernel().cas();
+        let mut writer = match cas.create_streaming_writer(mime) {
+            Ok(w) => w,
+            Err(e) => return KjResult::Err(format!("kj cas put: {}", e)),
+        };
 
-        match cas.store(&data, mime) {
-            Ok(hash) => KjResult::ok(hash.to_string()),
+        let mut buf = vec![0u8; crate::vfs::STREAM_CHUNK_SIZE as usize];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) => return KjResult::Err(format!("kj cas put: {}: {}", path_str, e)),
+            };
+            if n == 0 {
+                break;
+            }
+            if let Err(e) = writer.write(&buf[..n]) {
+                return KjResult::Err(format!("kj cas put: {}", e));
+            }
+        }
+
+        match writer.finalize() {
+            Ok(result) => KjResult::ok(result.content_hash.to_string()),
             Err(e) => KjResult::Err(format!("kj cas put: {}", e)),
         }
     }

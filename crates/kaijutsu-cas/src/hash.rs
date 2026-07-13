@@ -26,7 +26,16 @@ pub enum HashError {
 impl ContentHash {
     pub fn from_data(data: &[u8]) -> Self {
         let hash_bytes = blake3::hash(data);
-        let hash_hex = hex::encode(&hash_bytes.as_bytes()[..16]);
+        Self::from_blake3(hash_bytes)
+    }
+
+    /// Derive from an already-computed BLAKE3 output — a streaming
+    /// `blake3::Hasher::finalize()` result — applying the same 128-bit
+    /// truncation as [`Self::from_data`]. Kept separate so a streaming
+    /// writer (`FileStore::create_streaming_writer`) never pays for a
+    /// buffered re-hash of bytes it already hashed incrementally.
+    pub fn from_blake3(output: blake3::Hash) -> Self {
+        let hash_hex = hex::encode(&output.as_bytes()[..16]);
         Self(hash_hex)
     }
 
