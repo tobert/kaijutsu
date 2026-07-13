@@ -38,6 +38,17 @@ enum VfsCommand {
         #[arg(long = "max-entries", default_value_t = 500)]
         max_entries: u32,
     },
+    /// Per-directory activity totals since kernel boot (Lane K digest
+    /// groundwork, `docs/scenes/vfs.md`) — heat, not structure: content
+    /// mutations (write/truncate/setattr) count alongside every structural
+    /// one. Debug/inspection surface for the push digest stream
+    /// (`subscribeVfsActivity`); this command reads the same in-memory
+    /// counters directly, no subscription involved.
+    Activity {
+        /// Restrict to directories at-or-under this VFS path prefix
+        /// (default: every directory ever touched since boot)
+        path: Option<String>,
+    },
 }
 
 impl KjDispatcher {
@@ -65,6 +76,7 @@ impl KjDispatcher {
                 depth,
                 max_entries,
             } => self.vfs_snapshot(&path, depth, max_entries).await,
+            VfsCommand::Activity { path } => self.vfs_activity(path.as_deref()).await,
         }
     }
 
@@ -92,6 +104,48 @@ impl KjDispatcher {
             }
             Err(e) => KjResult::Err(format!("kj vfs snapshot: {e}")),
         }
+    }
+
+    /// `kj vfs activity` — direct read of the in-memory activity counters
+    /// (`MountTable::activity_snapshot`/`global_activity`), the same state
+    /// the `subscribeVfsActivity` push stream digests. No capability gate,
+    /// no active-context requirement: same rationale as `vfs_snapshot`
+    /// above — this is structure/heat discovery, not escalation.
+    async fn vfs_activity(&self, path: Option<&str>) -> KjResult {
+        let vfs = self.kernel().vfs();
+        let prefix = path.map(std::path::Path::new);
+        let entries = vfs.activity_snapshot(prefix);
+        let global_total = vfs.global_activity();
+
+        if entries.is_empty() {
+            return KjResult::ok_ephemeral(
+                "no activity since boot".to_string(),
+                ContentType::Plain,
+            );
+        }
+
+        let mut lines: Vec<String> = entries
+            .iter()
+            .map(|(p, total)| format!("{total}\t{}", p.display()))
+            .collect();
+        lines.push(format!("global: {global_total}"));
+        let text = lines.join("\n");
+
+        let data_entries: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(p, total)| {
+                serde_json::json!({
+                    "path": p.display().to_string(),
+                    "total": total,
+                    "generation": vfs.generation_of(p),
+                })
+            })
+            .collect();
+        let data = serde_json::json!({
+            "globalTotal": global_total,
+            "entries": data_entries,
+        });
+        KjResult::ok_with_data(text, data)
     }
 }
 
@@ -132,6 +186,7 @@ fn render_snapshot_node(node: &SnapshotNode, indent: usize, out: &mut Vec<String
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::{test_caller, test_dispatcher};
+    use crate::vfs::VfsOps;
     use std::sync::Arc;
 
     /// End-to-end through the dispatcher: `kj vfs snapshot` against a real
@@ -197,5 +252,121 @@ mod tests {
         // Empty argv routes to help, not an error.
         let result = dispatcher.dispatch_vfs(&[], &caller).await;
         assert!(result.is_ok(), "kj vfs (bare) should render help: {result:?}");
+    }
+
+    // ========================================================================
+    // `kj vfs activity` (Lane K, FSN slice-1 digest groundwork)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn activity_bare_on_a_fresh_kernel_is_ok_and_empty() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let caller = test_caller();
+
+        let result = dispatcher
+            .dispatch_vfs(&["activity".to_string()], &caller)
+            .await;
+        assert!(result.is_ok(), "kj vfs activity on a fresh kernel should be Ok: {result:?}");
+        assert!(
+            result.message().contains("no activity"),
+            "expected a no-activity message, got: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_reports_touched_dirs_with_the_right_data_shape() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let caller = test_caller();
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        dispatcher
+            .kernel()
+            .mount("/mnt/heat", crate::vfs::LocalBackend::new(dir.path()))
+            .await;
+        dispatcher
+            .kernel()
+            .vfs()
+            .create(std::path::Path::new("/mnt/heat/a.txt"), 0o644)
+            .await
+            .expect("create a.txt");
+        dispatcher
+            .kernel()
+            .vfs()
+            .write(std::path::Path::new("/mnt/heat/a.txt"), 0, b"hi")
+            .await
+            .expect("write a.txt");
+
+        let result = dispatcher
+            .dispatch_vfs(&["activity".to_string()], &caller)
+            .await;
+        assert!(result.is_ok(), "kj vfs activity failed: {result:?}");
+        assert!(
+            result.message().contains("/mnt/heat"),
+            "expected /mnt/heat in the text view, got: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("global:"),
+            "expected a global total footer, got: {}",
+            result.message()
+        );
+
+        let crate::kj::KjResult::Ok { data, .. } = result else {
+            panic!("expected Ok result");
+        };
+        let data = data.expect("activity must attach structured data");
+        assert!(data["globalTotal"].as_u64().unwrap() >= 2, "create + write = 2 bumps");
+        let entries = data["entries"].as_array().expect("entries array");
+        let heat = entries
+            .iter()
+            .find(|e| e["path"] == "/mnt/heat")
+            .expect("/mnt/heat entry present");
+        assert_eq!(heat["total"], 2);
+        assert!(heat["generation"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn activity_prefix_filter_shows_only_the_matching_mount() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let caller = test_caller();
+
+        dispatcher
+            .kernel()
+            .mount("/mnt/a", crate::vfs::MemoryBackend::new())
+            .await;
+        dispatcher
+            .kernel()
+            .mount("/mnt/b", crate::vfs::MemoryBackend::new())
+            .await;
+        dispatcher
+            .kernel()
+            .vfs()
+            .create(std::path::Path::new("/mnt/a/x.txt"), 0o644)
+            .await
+            .expect("create in /mnt/a");
+        dispatcher
+            .kernel()
+            .vfs()
+            .create(std::path::Path::new("/mnt/b/y.txt"), 0o644)
+            .await
+            .expect("create in /mnt/b");
+
+        let result = dispatcher
+            .dispatch_vfs(
+                &["activity".to_string(), "/mnt/a".to_string()],
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "kj vfs activity /mnt/a failed: {result:?}");
+        assert!(result.message().contains("/mnt/a"), "got: {}", result.message());
+        assert!(
+            !result.message().contains("/mnt/b"),
+            "prefix filter must exclude /mnt/b, got: {}",
+            result.message()
+        );
     }
 }
