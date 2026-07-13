@@ -480,22 +480,22 @@ pub fn per_cell_colors(vert_counts: &[usize], cell_colors: &[[f32; 4]]) -> Vec<[
         .collect()
 }
 
-// ── Ship overhead (A3) ───────────────────────────────────────────────────────
+// ── The vessel (A3, reframed 2026-07-13: the ship IS the octagon room) ──────
 
-/// Ship-silhouette ring radius (world units, upper ring) — **Amy-tunable,
-/// first guess.**
-pub const SHIP_RADIUS: f32 = 220.0;
-/// World-Y the upper ring sits at, high over the root field.
-/// **Amy-tunable.**
-pub const SHIP_Y: f32 = 2600.0;
+/// Vessel-silhouette ring radius (world units, upper ring). Bumped 220 →
+/// 440 when the vessel moved from hovering over the world center to riding
+/// [`orbit_pose`]'s own path (Amy, 2026-07-13: "from a view on/in the fsn
+/// you'd see an octagon orbiting") — at orbit distance the old radius read
+/// as a speck. **Amy-tunable.**
+pub const SHIP_RADIUS: f32 = 440.0;
 /// The lower ring's radius as a fraction of [`SHIP_RADIUS`] — a taper toward
 /// the belly. **Amy-tunable.**
 pub const SHIP_LOWER_RADIUS_FRAC: f32 = 0.6;
-/// How far below [`SHIP_Y`] the lower ring sits. **Amy-tunable.**
+/// How far below the upper ring the lower ring sits. **Amy-tunable.**
 pub const SHIP_LOWER_DROP: f32 = 60.0;
-/// How far the nose spine projects (world −Z, matching [`super::scene`]'s
-/// `START_LOOK` dive-in direction) beyond the upper ring's own radius.
-/// **Amy-tunable.**
+/// How far the nose spine projects (local −Z — the vessel's own N window
+/// bearing; `super::scene`'s orbit system yaws it to face the world center)
+/// beyond the upper ring's own radius. **Amy-tunable.**
 pub const SHIP_NOSE_LENGTH: f32 = 140.0;
 
 /// Ring tessellation (octagon, matching the room's own wall-shell
@@ -512,18 +512,22 @@ fn ring_points(radius: f32, y: f32) -> Vec<[f32; 3]> {
         .collect()
 }
 
-/// The overhead ship's wireframe silhouette: two concentric octagon rings
-/// ([`SHIP_RADIUS`] at [`SHIP_Y`], [`SHIP_LOWER_RADIUS_FRAC`] × radius at
-/// `SHIP_Y - `[`SHIP_LOWER_DROP`]), one vertical at each of the upper ring's
-/// vertices connecting down to the matching lower vertex, and a short nose
-/// spine off the ring's north-most point (`[0, SHIP_Y, -SHIP_RADIUS]`, world
-/// -Z — same "into the world" convention `enter_fsn`'s `START_LOOK` uses).
-/// Segment count is always `3 × SHIP_RING_SIDES + 1` (upper ring edges +
-/// lower ring edges + verticals + one nose) — pure, no Bevy types, so
-/// [`super::scene`] just flattens the result via [`flatten_segments`].
+/// The vessel's wireframe silhouette, ORIGIN-CENTERED (upper ring at local
+/// `y = 0` — the entity `Transform` places it on the orbit; before
+/// 2026-07-13 the world position was baked into the vertices at a fixed
+/// overhead `SHIP_Y`, which pinned it over the world center): two
+/// concentric octagon rings ([`SHIP_RADIUS`] at `0`,
+/// [`SHIP_LOWER_RADIUS_FRAC`] × radius at `-`[`SHIP_LOWER_DROP`]), one
+/// vertical at each of the upper ring's vertices connecting down to the
+/// matching lower vertex, and a short nose spine off the ring's local-−Z
+/// point — the vessel's own N window bearing, which the orbit system keeps
+/// yawed at the world center. Segment count is always
+/// `3 × SHIP_RING_SIDES + 1` (upper ring edges + lower ring edges +
+/// verticals + one nose) — pure, no Bevy types, so [`super::scene`] just
+/// flattens the result via [`flatten_segments`].
 pub fn ship_silhouette_segments() -> Vec<Segment> {
-    let upper = ring_points(SHIP_RADIUS, SHIP_Y);
-    let lower = ring_points(SHIP_RADIUS * SHIP_LOWER_RADIUS_FRAC, SHIP_Y - SHIP_LOWER_DROP);
+    let upper = ring_points(SHIP_RADIUS, 0.0);
+    let lower = ring_points(SHIP_RADIUS * SHIP_LOWER_RADIUS_FRAC, -SHIP_LOWER_DROP);
     let n = SHIP_RING_SIDES;
     let mut segs = Vec::with_capacity(3 * n + 1);
     for i in 0..n {
@@ -535,15 +539,21 @@ pub fn ship_silhouette_segments() -> Vec<Segment> {
     for i in 0..n {
         segs.push([upper[i], lower[i]]);
     }
-    let nose_base = [0.0, SHIP_Y, -SHIP_RADIUS];
-    let nose_tip = [0.0, SHIP_Y, -(SHIP_RADIUS + SHIP_NOSE_LENGTH)];
+    let nose_base = [0.0, 0.0, -SHIP_RADIUS];
+    let nose_tip = [0.0, 0.0, -(SHIP_RADIUS + SHIP_NOSE_LENGTH)];
     segs.push([nose_base, nose_tip]);
     segs
 }
 
-// ── Backdrop camera orbit (A4) ───────────────────────────────────────────────
+// ── The vessel's orbit (A4; shared, 2026-07-13) ──────────────────────────────
+//
+// ONE orbit, two riders: the backdrop RTT camera (the view out the room's N
+// portal) and the dived world's visible vessel silhouette both take their
+// pose from `orbit_pose` — the octagon room circles the fsn space with its
+// window always facing the world, and what you'd see from the ground IS the
+// vantage the window renders from, by construction.
 
-/// Backdrop RTT camera's orbit radius/height (world units) and angular rate
+/// The vessel's orbit radius/height (world units) and angular rate
 /// (rad/s) — a slow drift so the portal reads as "something out there is
 /// churning," not a spinning toy. Height dropped 1300 → 900 with the single
 /// panel-spanning portal (2026-07-13): the elevation angle falls from ~34°
@@ -1117,27 +1127,30 @@ mod tests {
     }
 
     #[test]
-    fn ship_silhouette_rings_sit_at_their_configured_y_levels() {
+    fn ship_silhouette_is_origin_centered_with_rings_at_local_y_levels() {
+        // Origin-centered since 2026-07-13 (the vessel rides the orbit via
+        // its entity Transform; a baked-in world Y would double-place it).
         let segs = ship_silhouette_segments();
-        // First 8: upper ring, both endpoints at SHIP_Y.
+        // First 8: upper ring, both endpoints at local y = 0.
         for s in &segs[0..8] {
-            assert_eq!(s[0][1], SHIP_Y);
-            assert_eq!(s[1][1], SHIP_Y);
+            assert_eq!(s[0][1], 0.0);
+            assert_eq!(s[1][1], 0.0);
         }
-        // Next 8: lower ring, both endpoints at SHIP_Y - SHIP_LOWER_DROP.
+        // Next 8: lower ring, both endpoints at -SHIP_LOWER_DROP.
         for s in &segs[8..16] {
-            assert_eq!(s[0][1], SHIP_Y - SHIP_LOWER_DROP);
-            assert_eq!(s[1][1], SHIP_Y - SHIP_LOWER_DROP);
+            assert_eq!(s[0][1], -SHIP_LOWER_DROP);
+            assert_eq!(s[1][1], -SHIP_LOWER_DROP);
         }
         // Next 8: verticals, one endpoint at each level.
         for s in &segs[16..24] {
             let ys = [s[0][1], s[1][1]];
-            assert!(ys.contains(&SHIP_Y) && ys.contains(&(SHIP_Y - SHIP_LOWER_DROP)));
+            assert!(ys.contains(&0.0) && ys.contains(&(-SHIP_LOWER_DROP)));
         }
-        // Final: the nose spine, both ends at SHIP_Y, projecting past -radius.
+        // Final: the nose spine, both ends at local y = 0, projecting past
+        // -radius (local -Z = the vessel's own N window bearing).
         let nose = segs[24];
-        assert_eq!(nose[0][1], SHIP_Y);
-        assert_eq!(nose[1][1], SHIP_Y);
+        assert_eq!(nose[0][1], 0.0);
+        assert_eq!(nose[1][1], 0.0);
         assert_eq!(nose[0][2], -SHIP_RADIUS);
         assert_eq!(nose[1][2], -(SHIP_RADIUS + SHIP_NOSE_LENGTH));
     }

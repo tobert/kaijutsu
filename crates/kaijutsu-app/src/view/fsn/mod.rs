@@ -2,15 +2,19 @@
 //! ("DATA HORIZON"), slice 0 (`docs/scenes/vfs.md`): quadtree layout +
 //! hash-seeded relaxed-Voronoi fields rendered as line-list wireframe +
 //! vertex points, three LOD tiers live, fly + select only. Slice 1 (lane A,
-//! "the ambient world") layers on top: baked recency glow, churn heat, an
-//! overhead ship, and a Room-side backdrop glimpse — none of it changes the
-//! slice-0 shape above, only what colors/brightens the same geometry.
+//! "the ambient world") layers on top: baked recency glow, churn heat, the
+//! orbiting vessel, and a Room-side backdrop glimpse — none of it changes
+//! the slice-0 shape above, only what colors/brightens the same geometry.
+//! Retuned 2026-07-13: the vessel IS the octagon room, circling the world
+//! on the same orbit the room's N portal renders from (diving is
+//! de-emphasized; the portal is the primary FSN surface).
 //!
 //! Module map, mirroring `time_well`'s split:
 //! - [`layout`] — pure math: VFS-path → world-space placement, the
 //!   height-channel mapping, wireframe/point mesh vertex builders, the LOD
-//!   tier decision, camera-fly clamps, recency weight, the ship silhouette,
-//!   and the backdrop camera's orbit pose. No Bevy types, unit-tested.
+//!   tier decision, camera-fly clamps, recency weight, the vessel
+//!   silhouette, and the shared orbit pose (portal camera + visible
+//!   vessel). No Bevy types, unit-tested.
 //! - [`sync`] — data: the `vfs_snapshot` poll → [`sync::FsnState`] drain
 //!   (the enumeration-on-demand scheduler, vfs.md claim 3).
 //! - [`heat`] — data: per-path churn heat (decaying, ancestor-attenuated),
@@ -18,10 +22,10 @@
 //!   in as a follow-up (see that module's own doc).
 //! - [`scene`] — the 3D scene: spawn/despawn, the fly camera, per-directory
 //!   field mesh entities (now recency-tinted), LOD-tier visibility gating
-//!   (now heat-lifted), selection, and the overhead ship.
-//! - [`backdrop`] — the Room-side glimpse: an off-screen camera + two window
-//!   quads showing a sparse impression of the world while `Screen::Room` is
-//!   live, no dive required.
+//!   (now heat-lifted), selection, and the orbiting vessel.
+//! - [`backdrop`] — the Room-side glimpse: an off-screen camera + one
+//!   panel-spanning portal quad showing a sparse impression of the world
+//!   while `Screen::Room` is live, no dive required.
 //!
 //! # Entry
 //!
@@ -103,6 +107,7 @@ impl Plugin for FsnPlugin {
                     scene::fsn_camera_fly,
                     scene::fsn_select,
                     scene::apply_fsn_lod,
+                    scene::orbit_ship,
                     scene::sync_ship_glow,
                     scene::fsn_keyboard,
                 )

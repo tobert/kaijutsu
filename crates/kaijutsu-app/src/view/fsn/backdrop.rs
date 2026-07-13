@@ -4,7 +4,8 @@
 //! can see it out there before you dive" (`docs/scenes/vfs.md`). Distinct from
 //! [`super::scene`]'s own world (`Screen::Fsn`): this is a much cheaper,
 //! always-uncolored glimpse (no recency bake, no heat, no LOD swap — just a
-//! seam grid, up to a dozen seed-point clusters, and the ship silhouette),
+//! seam grid and up to a dozen seed-point clusters; no vessel silhouette
+//! either, since 2026-07-13 the room IS the vessel this camera flies),
 //! rendered on its own camera/render-layer so it never contends with the
 //! main camera's own scene.
 //!
@@ -33,11 +34,11 @@
 //! # Content: reused, not duplicated
 //!
 //! Every mesh here is built from [`super::layout`]'s own pure functions (the
-//! same seam grid / ship silhouette / seed-point builders [`super::scene`]
-//! uses) via [`super::scene::line_list_mesh`]/[`super::scene::
-//! triangle_list_mesh`] (`pub(super)`, reused as-is — no recency bake, no
-//! per-cell tint, this is the plain uncolored path those two helpers already
-//! supported before lane A1 added their colored siblings).
+//! same seam grid / seed-point builders [`super::scene`] uses) via
+//! [`super::scene::line_list_mesh`]/[`super::scene::triangle_list_mesh`]
+//! (`pub(super)`, reused as-is — no recency bake, no per-cell tint, this is
+//! the plain uncolored path those two helpers already supported before lane
+//! A1 added their colored siblings).
 
 use std::collections::HashMap;
 
@@ -100,7 +101,7 @@ pub const WINDOW_Y: f32 = 280.0;
 
 /// Brightness multiplier baked into the window material's `base_color` on
 /// top of the sampled texture — >1.0 so the rendered scene's own bright
-/// texels (the ship, the seam grid) cross the bloom threshold and the
+/// texels (the seam grid, hot districts) cross the bloom threshold and the
 /// window reads as lit glass rather than a flat picture. **Amy-tunable.**
 pub const WINDOW_LIFT: f32 = 1.15;
 
@@ -162,8 +163,8 @@ pub struct FsnBackdrop {
 // ── Spawn / despawn ──────────────────────────────────────────────────────
 
 /// Build the render-target image, the off-screen camera pointed at it, and
-/// the backdrop scene's cold-start content (seam grid + ship silhouette —
-/// drawn UNCONDITIONALLY, so the portal shows *something* the instant the
+/// the backdrop scene's cold-start content (the seam grid — drawn
+/// UNCONDITIONALLY, so the portal shows *something* the instant the
 /// room loads, before any VFS listing has ever arrived). Kicks off the root
 /// listing fetch too if [`FsnState`] is empty (a fresh app that never dove
 /// into `Screen::Fsn` yet) — [`sync_backdrop_fields`] then populates the
@@ -240,19 +241,10 @@ pub fn spawn_backdrop(
         ChildOf(root),
     ));
 
-    let ship_mesh = meshes.add(super::scene::line_list_mesh(&layout::flatten_segments(
-        &layout::ship_silhouette_segments(),
-    )));
-    let ship_mat = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
-    commands.spawn((
-        Mesh3d(ship_mesh),
-        MeshMaterial3d(ship_mat),
-        Transform::default(),
-        Visibility::Inherited,
-        RenderLayers::layer(FSN_BACKDROP_LAYER),
-        Name::new("FsnBackdropShip"),
-        ChildOf(root),
-    ));
+    // No vessel silhouette in the backdrop (removed 2026-07-13): the room
+    // IS the vessel this camera flies — you can't see yourself out your own
+    // window. The dived world keeps the silhouette, riding this same orbit
+    // (`scene::orbit_ship`).
 
     spawn_portal_quad(&mut commands, root, &mut meshes, &mut mats, &image_handle);
 

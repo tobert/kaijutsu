@@ -157,6 +157,7 @@ pub struct FsnSelection {
 pub fn enter_fsn(
     mut commands: Commands,
     palette: Res<ScenePalette>,
+    time: Res<Time>,
     mut state: ResMut<FsnState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
@@ -198,18 +199,22 @@ pub fn enter_fsn(
         ChildOf(root),
     ));
 
-    // The ship overhead (lane A3): one LineList silhouette, unlit gold at
-    // the trim tier — `sync_ship_glow` lifts it toward `crest` with
-    // whole-tree heat (`FsnHeat::normalized("/")`), same "ambient churn
-    // reads as brightness" idiom the wireframe fields use, but for the
-    // world's OWN overhead landmark rather than any one field.
+    // The vessel (lane A3, reframed 2026-07-13): one LineList octagon
+    // silhouette, unlit gold at the trim tier — `sync_ship_glow` lifts it
+    // toward `crest` with whole-tree heat (`FsnHeat::normalized("/")`),
+    // same "ambient churn reads as brightness" idiom the wireframe fields
+    // use. No longer a static landmark over the world center: this IS the
+    // octagon room, circling the fsn space on `layout::orbit_pose` — the
+    // same path the room's N-portal camera flies — placed per-frame by
+    // `orbit_ship` (spawned at the current orbit pose so it never flashes
+    // at the origin for a frame).
     let ship_mesh = meshes.add(line_list_mesh(&layout::flatten_segments(&layout::ship_silhouette_segments())));
     let ship_material = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
     commands.spawn((
         FsnShip { material: ship_material.clone() },
         Mesh3d(ship_mesh),
         MeshMaterial3d(ship_material),
-        Transform::default(),
+        vessel_orbit_transform(time.elapsed_secs()),
         Visibility::Inherited,
         Name::new("FsnShip"),
         ChildOf(root),
@@ -527,8 +532,8 @@ fn unlit(color: Color) -> StandardMaterial {
 }
 
 /// `pub(super)`: reused as-is (uncolored — no recency bake) by
-/// [`super::backdrop`]'s cold-start seam grid / ship silhouette, which don't
-/// carry per-cell tint data of their own.
+/// [`super::backdrop`]'s cold-start seam grid, which doesn't carry per-cell
+/// tint data of its own.
 pub(super) fn line_list_mesh(positions: &[[f32; 3]]) -> Mesh {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::PrimitiveTopology;
@@ -789,6 +794,31 @@ const SELECTION_GAIN_LIFT: f32 = 1.3;
 /// module doesn't otherwise touch).
 fn lerp_hue(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
     LinearRgba::rgb(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t)
+}
+
+/// The vessel's pose at time `t`: [`layout::orbit_pose`]'s position — the
+/// SAME path the room's N-portal camera flies, so "the octagon you see from
+/// the ground" and "the vantage the portal renders from" are one thing by
+/// construction — but yaw-only facing (look at the world center AT OWN
+/// HEIGHT): the octagon floats level, rings horizontal, its nose (local -Z,
+/// the N window bearing) pointed at the world. The portal camera pitches
+/// down to frame the ground; the vessel itself doesn't tip with it — a room
+/// doesn't nose-dive because someone looks out the window.
+fn vessel_orbit_transform(t: f32) -> Transform {
+    let (pos, _) = layout::orbit_pose(t);
+    let pos = Vec3::from_array(pos);
+    Transform::from_translation(pos).looking_at(Vec3::new(0.0, pos.y, 0.0), Vec3::Y)
+}
+
+/// Ride the vessel along its orbit each frame — the dived-world sibling of
+/// [`super::backdrop::orbit_backdrop_camera`], sharing its clock
+/// (`Time::elapsed_secs`) and its path math, so surfacing to the room and
+/// glancing back out the portal never teleports the vessel.
+pub fn orbit_ship(time: Res<Time>, mut ships: Query<&mut Transform, With<FsnShip>>) {
+    let Ok(mut tf) = ships.single_mut() else {
+        return;
+    };
+    *tf = vessel_orbit_transform(time.elapsed_secs());
 }
 
 /// Lift the ship silhouette's brightness from `trim` toward `crest` with

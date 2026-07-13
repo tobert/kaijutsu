@@ -269,8 +269,14 @@ landed:
   per-cell vertex-color tints under one composition law — `vertex_tint ×
   material = lerp(base_hue, gold, recency)` — so recency (per-cell, static)
   and heat (per-field, decaying) compose without a second material writer.
-- **The vessel tie**: gold octagon **ship silhouette** overhead (the "look
-  up" landmark; brightens with whole-tree heat), and **the portal** — open
+- **The vessel tie**: gold octagon **vessel silhouette** (brightens with
+  whole-tree heat) — since the 2026-07-13 retune no longer a static
+  landmark over the world center: it IS the octagon room, riding the same
+  `orbit_pose` the portal camera flies (level, yaw-locked, nose/window
+  facing the world), so from a view on/in the fsn you see an octagon
+  orbiting, and what it sees is exactly the portal's render. Absent from
+  the portal view itself — you can't see yourself out your own window. And
+  **the portal** — open
   question 3 answered YES: the N face renders a sparse world impression from
   an off-screen orbiting camera (the app's first true second-camera
   render-to-texture, own render layer, resident exactly while the room is).
