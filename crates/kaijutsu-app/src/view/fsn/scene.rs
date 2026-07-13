@@ -95,6 +95,15 @@ pub struct FsnCamera;
 #[derive(Component)]
 pub(crate) struct FsnSelectionRing;
 
+/// The ship-overhead silhouette entity (lane A3) — holds its own material
+/// handle so [`sync_ship_glow`] can write it without a `MeshMaterial3d`
+/// query (a `Handle` clone is cheaper than re-deriving it every frame from a
+/// component that already has it).
+#[derive(Component)]
+pub struct FsnShip {
+    material: Handle<StandardMaterial>,
+}
+
 // ── Resources ────────────────────────────────────────────────────────────
 
 /// One known directory field's spawned entities + the per-cell data
@@ -186,6 +195,23 @@ pub fn enter_fsn(
             .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
         Visibility::Hidden,
         Name::new("FsnSelectionRing"),
+        ChildOf(root),
+    ));
+
+    // The ship overhead (lane A3): one LineList silhouette, unlit gold at
+    // the trim tier — `sync_ship_glow` lifts it toward `crest` with
+    // whole-tree heat (`FsnHeat::normalized("/")`), same "ambient churn
+    // reads as brightness" idiom the wireframe fields use, but for the
+    // world's OWN overhead landmark rather than any one field.
+    let ship_mesh = meshes.add(line_list_mesh(&layout::flatten_segments(&layout::ship_silhouette_segments())));
+    let ship_material = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
+    commands.spawn((
+        FsnShip { material: ship_material.clone() },
+        Mesh3d(ship_mesh),
+        MeshMaterial3d(ship_material),
+        Transform::default(),
+        Visibility::Inherited,
+        Name::new("FsnShip"),
         ChildOf(root),
     ));
 
