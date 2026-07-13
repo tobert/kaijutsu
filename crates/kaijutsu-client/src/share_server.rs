@@ -393,7 +393,7 @@ fn dir_attrs(meta: Option<&std::fs::Metadata>) -> FileAttributes {
     // `set_symlink` OR their type bit INTO `self.permissions` (russh_sftp's
     // `set_type`), so assigning `.permissions` afterward clobbers the type bit
     // it just set. Every attrs builder in this file follows this order.
-    fa.permissions = Some(meta.map(|m| perm_bits(m)).unwrap_or(0o555));
+    fa.permissions = Some(meta.map(perm_bits).unwrap_or(0o555));
     fa.set_dir(true);
     if let Some(m) = meta {
         fa.mtime = Some(unix_secs(m.modified()));
