@@ -1,16 +1,27 @@
 //! The FSN landscape — the VFS-as-terrain world behind the room's N archway
 //! ("DATA HORIZON"), slice 0 (`docs/scenes/vfs.md`): quadtree layout +
 //! hash-seeded relaxed-Voronoi fields rendered as line-list wireframe +
-//! vertex points, three LOD tiers live, fly + select only.
+//! vertex points, three LOD tiers live, fly + select only. Slice 1 (lane A,
+//! "the ambient world") layers on top: baked recency glow, churn heat, an
+//! overhead ship, and a Room-side backdrop glimpse — none of it changes the
+//! slice-0 shape above, only what colors/brightens the same geometry.
 //!
 //! Module map, mirroring `time_well`'s split:
 //! - [`layout`] — pure math: VFS-path → world-space placement, the
 //!   height-channel mapping, wireframe/point mesh vertex builders, the LOD
-//!   tier decision, camera-fly clamps. No Bevy types, unit-tested.
+//!   tier decision, camera-fly clamps, recency weight, the ship silhouette,
+//!   and the backdrop camera's orbit pose. No Bevy types, unit-tested.
 //! - [`sync`] — data: the `vfs_snapshot` poll → [`sync::FsnState`] drain
 //!   (the enumeration-on-demand scheduler, vfs.md claim 3).
+//! - [`heat`] — data: per-path churn heat (decaying, ancestor-attenuated),
+//!   self-contained pending the digest ingest system a parallel lane wires
+//!   in as a follow-up (see that module's own doc).
 //! - [`scene`] — the 3D scene: spawn/despawn, the fly camera, per-directory
-//!   field mesh entities, LOD-tier visibility gating, selection.
+//!   field mesh entities (now recency-tinted), LOD-tier visibility gating
+//!   (now heat-lifted), selection, and the overhead ship.
+//! - [`backdrop`] — the Room-side glimpse: an off-screen camera + two window
+//!   quads showing a sparse impression of the world while `Screen::Room` is
+//!   live, no dive required.
 //!
 //! # Entry
 //!
@@ -22,8 +33,22 @@
 //! spawns on first entry (`scene::enter_fsn`, `OnEnter(Screen::Fsn)`) and
 //! despawns on Esc back to the room (`scene::exit_fsn`, `OnExit(Screen::Fsn)`)
 //! — never resident while the room itself is merely open, unlike the
-//! well/patch-bay furniture.
+//! well/patch-bay furniture. The [`backdrop`] glimpse is the opposite
+//! lifetime: resident exactly while `Screen::Room` is, gone in `Screen::Fsn`
+//! (no reason to render an off-screen impression of the world while
+//! standing IN it).
+//!
+//! # Heat ingest: deliberately not registered here
+//!
+//! `FsnHeat::observe`/`record` need a digest `ServerEvent` a parallel lane is
+//! still building (`heat`'s own module doc) — this plugin registers the
+//! resource, its ambient decay tick, and every CONSUMER (`apply_fsn_lod`,
+//! `scene::sync_ship_glow`), but no producer system. Until that lane lands,
+//! heat only ever decays; every field/ship reads a steady, cold 0.0 — a
+//! correct, inert default, not a stub that needs guarding against.
 
+pub mod backdrop;
+pub mod heat;
 pub mod layout;
 pub mod scene;
 pub mod sync;
@@ -39,8 +64,12 @@ impl Plugin for FsnPlugin {
         app.init_resource::<sync::FsnState>()
             .init_resource::<scene::FsnFields>()
             .init_resource::<scene::FsnSelection>()
+            .init_resource::<heat::FsnHeat>()
+            .init_resource::<backdrop::FsnBackdrop>()
             .add_systems(OnEnter(Screen::Fsn), scene::enter_fsn)
             .add_systems(OnExit(Screen::Fsn), scene::exit_fsn)
+            .add_systems(OnEnter(Screen::Room), backdrop::spawn_backdrop)
+            .add_systems(OnExit(Screen::Room), backdrop::despawn_backdrop)
             // UNGATED, unlike everything below: a vfs_snapshot reply must
             // settle `FsnState`'s in-flight slot even when the player Esc'd
             // out of the world before it landed. Bevy messages expire after
@@ -50,22 +79,39 @@ impl Plugin for FsnPlugin {
             // `live::ingest_live_events` in the well; ingesting a reply on
             // another screen is free (it only writes the cache).
             .add_systems(Update, sync::apply_fsn_snapshot)
+            // ALSO ungated (moved out of the `Screen::Fsn` chain below,
+            // slice 1): the backdrop (`Screen::Room`) needs `FsnState`'s own
+            // fetch queue to drain too, so the N windows can populate from a
+            // cold start without ever diving through the door. Safe to run
+            // on every screen: `FsnState::request`/`take_next_request` are
+            // edge-triggered and single-flight (that module's own doc), so
+            // an ungated poll is simply idle whenever nothing is queued —
+            // it doesn't hot-loop or refetch anything extra by running here.
+            .add_systems(Update, sync::poll_fsn_snapshot.after(sync::apply_fsn_snapshot))
+            // Heat's ambient decay: ungated like the poll above — a churn
+            // storm should keep cooling whether or not the player is
+            // currently looking at the FSN world (unlike the room's
+            // `BearingActivity`, which only matters while the room itself is
+            // live) — see `heat::tick_fsn_heat`'s own doc.
+            .add_systems(Update, heat::tick_fsn_heat)
             .add_systems(
                 Update,
                 (
-                    // After `apply_fsn_snapshot` so a reply landing this
-                    // frame frees the in-flight slot before the poll decides
-                    // whether it may fire — the next queued fetch goes out
-                    // the same frame its predecessor settled.
-                    sync::poll_fsn_snapshot.after(sync::apply_fsn_snapshot),
                     scene::sync_fsn_fields,
                     scene::fsn_camera_fly,
                     scene::fsn_select,
                     scene::apply_fsn_lod,
+                    scene::sync_ship_glow,
                     scene::fsn_keyboard,
                 )
                     .chain()
                     .run_if(in_state(Screen::Fsn)),
+            )
+            .add_systems(
+                Update,
+                (backdrop::orbit_backdrop_camera, backdrop::sync_backdrop_fields)
+                    .chain()
+                    .run_if(in_state(Screen::Room)),
             );
     }
 }
