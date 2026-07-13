@@ -25,7 +25,14 @@
 //! - An entry dropped by the `max_entries` cap was never recorded into the
 //!   cursor's `last_sent` map (only what's actually IN the returned digest
 //!   gets committed) — so it stays a diff candidate and reappears on a later
-//!   tick, largest-delta-first, until it's finally included.
+//!   tick, largest-delta-first, until it's finally included. Committing a
+//!   TRUNCATED digest deliberately does NOT advance `last_global`
+//!   (see [`ActivityCursor::commit`]): the epoch short-circuit stays open,
+//!   so the stragglers keep draining on subsequent ticks even if the kernel
+//!   goes completely quiet after the burst — without this, a burst wider
+//!   than the cap followed by silence would strand the overflow heat
+//!   forever (the epoch would equal `last_global` and every later tick
+//!   would short-circuit to `None`).
 //!
 //! **Cost model**: `activity_digest` walks every directory that has EVER
 //! recorded activity (`MountTable::activity_snapshot`), which is O(number of
@@ -51,6 +58,12 @@ use super::mount::MountTable;
 pub struct ActivityDigest {
     pub entries: Vec<(PathBuf, u64)>,
     pub global_total: u64,
+    /// `true` when the `max_entries` cap cut candidates from this digest —
+    /// there were more changed directories than fit. Drives the commit
+    /// policy (a truncated commit must not advance the cursor's
+    /// `last_global`; see [`ActivityCursor::commit`]). Not shipped on the
+    /// wire: a subscriber doesn't act on it, the server-side cursor does.
+    pub truncated: bool,
 }
 
 /// Per-subscriber memory of what's already been delivered. Lives on the
@@ -70,14 +83,24 @@ impl ActivityCursor {
     /// `digest.entries` update `last_sent` — anything the cap left out simply
     /// isn't touched, so it's still a diff candidate (its `last_sent` value,
     /// if any, is still stale) on the next call to `activity_digest`.
-    /// `last_global` always advances to `digest.global_total`: the epoch
-    /// short-circuit in `activity_digest` is about "did anything change
-    /// AT ALL," not "did everything get delivered," so it's correct to
-    /// advance it even when the cap dropped entries — those entries return
-    /// on the next tick that has ANY new activity to report (see the module
-    /// doc's two-phase commit note).
+    ///
+    /// `last_global` advances to `digest.global_total` ONLY for a complete
+    /// (non-truncated) digest. The epoch short-circuit in `activity_digest`
+    /// means "the cursor is fully caught up," and a truncated digest is not
+    /// that: advancing on truncation would close the short-circuit with
+    /// stragglers still undelivered, stranding them forever if no new
+    /// activity ever reopens it (lead-review catch, 2026-07-13). Holding
+    /// `last_global` back instead keeps every subsequent tick non-quiet, so
+    /// the stragglers drain largest-delta-first — each truncated commit
+    /// still records its delivered entries into `last_sent`, shrinking the
+    /// candidate set — until a final non-truncated digest advances
+    /// `last_global` and the quiet-tick short-circuit re-engages. The drain
+    /// terminates by construction: each round delivers ≥1 previously-stale
+    /// entry, and quiet means no new ones are minted.
     pub fn commit(&mut self, digest: &ActivityDigest) {
-        self.last_global = digest.global_total;
+        if !digest.truncated {
+            self.last_global = digest.global_total;
+        }
         for (path, total) in &digest.entries {
             self.last_sent.insert(path.clone(), *total);
         }
@@ -97,7 +120,9 @@ impl MountTable {
     /// Candidates are capped at `max_entries`, keeping the LARGEST deltas
     /// first — the busiest directories are the most useful signal, and
     /// whatever's cut simply reappears next tick (uncommitted candidates
-    /// aren't lost, see [`ActivityCursor::commit`]).
+    /// aren't lost, see [`ActivityCursor::commit`]). A capped digest reports
+    /// `truncated: true`, which tells `commit` to hold `last_global` back so
+    /// the drain continues even on a subsequently quiet kernel.
     pub fn activity_digest(&self, cursor: &ActivityCursor, max_entries: usize) -> Option<ActivityDigest> {
         let epoch = self.global_activity();
         if epoch == cursor.last_global {
@@ -120,10 +145,11 @@ impl MountTable {
 
         // Largest delta first; break ties on path for determinism.
         candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        let truncated = candidates.len() > max_entries;
         candidates.truncate(max_entries);
 
         let entries = candidates.into_iter().map(|(path, total, _)| (path, total)).collect();
-        Some(ActivityDigest { entries, global_total: epoch })
+        Some(ActivityDigest { entries, global_total: epoch, truncated })
     }
 }
 
@@ -215,6 +241,63 @@ mod tests {
         assert!(b_entry.is_none(), "/b was already committed and hasn't changed since — not a candidate");
         let c_entry = digest2.entries.iter().find(|(p, _)| p == Path::new("/c"));
         assert_eq!(c_entry.map(|(_, t)| *t), Some(3), "/c's new total reflects the latest write");
+    }
+
+    #[tokio::test]
+    async fn cap_dropped_entries_drain_on_a_quiet_kernel_and_terminate() {
+        // The stranding bug (lead review, 2026-07-13): a burst touches more
+        // directories than the cap, the capped digest is committed, and then
+        // the kernel goes COMPLETELY quiet. If commit advanced last_global to
+        // the epoch, the next tick's short-circuit would return None forever
+        // and the overflow heat would never arrive — contradicting the module
+        // doc's "reappears on a later tick until it's finally included."
+        // A truncated commit must therefore leave the epoch check open until
+        // a non-truncated digest finally delivers everything.
+        let table = MountTable::new();
+        table.mount("/a", MemoryBackend::new()).await;
+        table.mount("/b", MemoryBackend::new()).await;
+        table.mount("/c", MemoryBackend::new()).await;
+
+        // Burst: /a 1 bump, /b 3 bumps, /c 2 bumps. Then total quiet.
+        table.create(Path::new("/a/x"), 0o644).await.unwrap();
+        table.create(Path::new("/b/x"), 0o644).await.unwrap();
+        table.write(Path::new("/b/x"), 0, b"1").await.unwrap();
+        table.write(Path::new("/b/x"), 0, b"22").await.unwrap();
+        table.create(Path::new("/c/x"), 0o644).await.unwrap();
+        table.write(Path::new("/c/x"), 0, b"1").await.unwrap();
+
+        let mut cursor = ActivityCursor::default();
+
+        // Tick 1 (cap=1): only the largest delta (/b) fits. Commit it.
+        let d1 = table.activity_digest(&cursor, 1).expect("burst happened");
+        assert_eq!(d1.entries.len(), 1);
+        assert_eq!(d1.entries[0].0, Path::new("/b"), "largest delta first");
+        cursor.commit(&d1);
+
+        // Tick 2, NO new activity anywhere: the dropped entries must still
+        // drain. Next-largest straggler is /c.
+        let d2 = table
+            .activity_digest(&cursor, 1)
+            .expect("cap-dropped entries must drain even on a quiet kernel");
+        assert_eq!(d2.entries.len(), 1);
+        assert_eq!(d2.entries[0], (PathBuf::from("/c"), 2), "next-largest straggler, absolute total");
+        cursor.commit(&d2);
+
+        // Tick 3, still quiet: the last straggler /a.
+        let d3 = table
+            .activity_digest(&cursor, 1)
+            .expect("the final straggler must still drain");
+        assert_eq!(d3.entries.len(), 1);
+        assert_eq!(d3.entries[0], (PathBuf::from("/a"), 1));
+        cursor.commit(&d3);
+
+        // Tick 4: everything delivered — the drain terminates. This guards
+        // against the opposite bug (never advancing last_global ⇒ a spinning
+        // non-quiet tick with an empty diff forever).
+        assert!(
+            table.activity_digest(&cursor, 1).is_none(),
+            "once every straggler is delivered, the quiet-tick short-circuit must re-engage"
+        );
     }
 
     #[tokio::test]

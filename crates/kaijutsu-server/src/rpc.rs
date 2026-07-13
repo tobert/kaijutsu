@@ -2890,9 +2890,12 @@ impl kernel::Server for KernelImpl {
                         break;
                     }
                     _ = ticker.tick() => {
-                        // Quiet tick: nothing anywhere has changed since this
-                        // subscriber's cursor last committed. No callback, no
-                        // health accounting — there is nothing to fail at.
+                        // Quiet tick: this subscriber's cursor is fully caught
+                        // up — nothing new anywhere AND no stragglers pending
+                        // from an earlier capped digest (a truncated commit
+                        // holds the cursor's epoch back so the drain continues
+                        // across quiet ticks; see ActivityCursor::commit). No
+                        // callback, no health accounting — nothing to fail at.
                         let Some(digest) = vfs.activity_digest(&cursor, VFS_ACTIVITY_DIGEST_MAX_ENTRIES) else {
                             continue;
                         };
