@@ -340,7 +340,7 @@ const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 /// `ORBIT_GEAR_RATIO`; Amy 2026-07-13: the two motions read gear-like, so
 /// they should BE geared — retune this one number and the whole train
 /// turns together).
-pub(crate) const TERRACE_RING_SPIN_BASE: f32 = 0.10;
+pub(crate) const TERRACE_RING_SPIN_BASE: f32 = 0.13;
 const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 
 /// Overall alpha/intensity for the terrace rings. Started at 0.35 ("kept low

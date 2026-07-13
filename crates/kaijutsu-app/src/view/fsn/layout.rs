@@ -578,12 +578,15 @@ pub const ORBIT_HEIGHT: f32 = 1900.0;
 /// well's TOP terrace ring (`time_well::scene::TERRACE_RING_SPIN_BASE`).
 /// Amy, 2026-07-13: the well's rings and the world past the glass read
 /// gear-like from the console, so they should BE geared — the FSN orbit is
-/// the big outer wheel of the ensemble, turning at 1/3 the top ring's
-/// rate (her "maybe 2/3 or 1/3"; 1/3 is the stately pick — a full
-/// revolution ≈ π minutes at the well's current 0.10). Retuning the
-/// well's spin turns the whole train together; retune the RATIO here to
-/// change only the horizon. **Amy-tunable.**
-pub const ORBIT_GEAR_RATIO: f32 = 1.0 / 3.0;
+/// the big outer wheel of the ensemble. Started at 1/3 (her "maybe 2/3 or
+/// 1/3"), dropped to 1/5 the same evening when the well's base rose 0.10 →
+/// 0.13 (Amy: "well rings could be a touch faster and the fsn a bit
+/// slower" — the gearing means a faster base speeds the horizon too, so
+/// the ratio absorbs both moves: net horizon 0.033 → 0.026 rad/s, ~4 min
+/// per revolution). Retuning the well's spin turns the whole train
+/// together; retune the RATIO here to change only the horizon.
+/// **Amy-tunable.**
+pub const ORBIT_GEAR_RATIO: f32 = 1.0 / 5.0;
 
 /// Angular rate (rad/s) of the vessel's orbit — derived, never set
 /// directly: the master spin × [`ORBIT_GEAR_RATIO`].
