@@ -282,7 +282,17 @@ pub(crate) fn warmth_tint(base: LinearRgba, gold: LinearRgba, w: f32) -> [f32; 4
 /// boundary contract (docs/color.md).
 pub fn apply_scene_post_on_change(
     palette: Res<ScenePalette>,
-    mut cameras: Query<(&mut Bloom, &mut Tonemapping), With<Camera3d>>,
+    // `Without<FsnBackdropCamera>`: defense-in-depth. The FSN backdrop's
+    // off-screen RTT camera (`view::fsn::backdrop`) renders to an LDR
+    // target with a deliberate `Tonemapping::None` and no Bloom — today it
+    // can't match this query anyway (no `Bloom` component), but if someone
+    // later adds Bloom to the backdrop this filter keeps the palette's
+    // display post chain from silently retargeting a render texture that
+    // was never meant to receive it.
+    mut cameras: Query<
+        (&mut Bloom, &mut Tonemapping),
+        (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>),
+    >,
 ) {
     if !palette.is_changed() {
         return;

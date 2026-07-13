@@ -188,10 +188,12 @@ pub fn spawn_backdrop(
 
     // The off-screen camera: NO Hdr, NO Bloom — `scene_palette::
     // apply_scene_post_on_change` queries `(&mut Bloom, &mut Tonemapping)`,
-    // so a camera missing the `Bloom` component is simply never matched;
-    // this camera's tonemapping (explicitly `None` — the render target is
-    // an LDR `Rgba8Unorm` surface, not a display needing a display
-    // transform) is never touched by that system.
+    // so a camera missing the `Bloom` component is never matched, AND that
+    // system now carries an explicit `Without<FsnBackdropCamera>` filter as
+    // defense-in-depth (its own comment); this camera's tonemapping
+    // (explicitly `None` — the render target is an LDR `Rgba8Unorm`
+    // surface, not a display needing a display transform) stays untouched
+    // either way.
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -339,20 +341,49 @@ pub fn orbit_backdrop_camera(
         .looking_at(Vec3::from_array(look_at), Vec3::Y);
 }
 
-/// The rebuild plan for one [`sync_backdrop_fields`] pass: which of the
-/// backdrop's candidate paths — root plus up to [`BACKDROP_FIELD_CAP`]
-/// depth-1 children, name-sorted (the same candidate selection the rebuild
-/// loop uses) — are stale against `built` (missing, or built at a different
-/// generation). Pure over the two maps, so the "does this frame owe any
-/// work at all?" decision is unit-testable without a Bevy world.
+/// One [`sync_backdrop_fields`] pass's work order, decided by
+/// [`plan_backdrop_sync`] — pure data so both halves of the decision are
+/// unit-testable without a Bevy world.
+#[derive(Debug, Default, PartialEq)]
+struct BackdropSyncPlan {
+    /// Paths whose seed-point mesh must be (re)built this pass, root first,
+    /// children in name-sorted order.
+    rebuild: Vec<String>,
+    /// Previously-built paths that are no longer candidates at all (fell
+    /// out of the capped window — see [`plan_backdrop_sync`]'s cap-crossing
+    /// note) whose entity must be despawned and forgotten, name-sorted.
+    remove: Vec<String>,
+}
+
+impl BackdropSyncPlan {
+    fn is_empty(&self) -> bool {
+        self.rebuild.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// The plan for one [`sync_backdrop_fields`] pass, pure over the two maps.
+/// Candidates are root plus up to [`BACKDROP_FIELD_CAP`] depth-1 children,
+/// name-sorted (the same candidate selection the rebuild loop uses).
 ///
 /// This is the frame-rate guard: [`sync_backdrop_fields`] runs every Update
 /// while `Screen::Room` is live (the app's resting screen), and the
 /// relaxed-Voronoi `layout_field` math it feeds is far too expensive to
 /// burn per-frame on an unchanged cache. An empty plan means the caller
-/// returns before ANY layout math — `rebuild_one`'s own per-path generation
-/// guard still stands behind this, but only as defense in depth; this plan
-/// is what keeps the resting frame free.
+/// returns before ANY layout math.
+///
+/// **`rebuild`**: a candidate is stale when `built` doesn't hold its current
+/// listing generation — AND, when the ROOT itself is stale, every candidate
+/// child is stale with it: a child's world rect is its own cell's bbox in
+/// the root field, so a root-layout change moves every child's ground out
+/// from under it (`scene::sync_fsn_fields` handles the same case by
+/// dropping every descendant on a parent rebuild — this is the backdrop's
+/// one-level equivalent).
+///
+/// **`remove`**: the candidate window is name-sorted and capped, so a NEW
+/// alphabetically-earlier listing can push a previously-built path out of
+/// the window — nothing would ever revisit it, and its entity would stay
+/// spawned at stale coordinates forever. Any `built` key that is no longer
+/// a candidate lands here for the caller to despawn and forget.
 ///
 /// No root listing yet means no work at all (children can't place without
 /// the root field), matching the rebuild loop's own early return.
@@ -365,16 +396,17 @@ pub fn orbit_backdrop_camera(
 /// behavior for a rare geometry corner — recording "skipped" as "built"
 /// would instead wedge the child out of ever retrying after a root-layout
 /// change, a worse trade.
-fn paths_needing_rebuild(
+fn plan_backdrop_sync(
     listings: &HashMap<String, super::sync::DirListing>,
     built: &HashMap<String, u64>,
-) -> Vec<String> {
+) -> BackdropSyncPlan {
     let Some(root_listing) = listings.get("/") else {
-        return Vec::new();
+        return BackdropSyncPlan::default();
     };
-    let mut stale = Vec::new();
-    if built.get("/") != Some(&root_listing.generation) {
-        stale.push("/".to_string());
+    let root_stale = built.get("/") != Some(&root_listing.generation);
+    let mut rebuild = Vec::new();
+    if root_stale {
+        rebuild.push("/".to_string());
     }
     // Candidates are capped BEFORE stale-filtering — a stale child beyond
     // the cap is not a candidate and must not trigger work (it would never
@@ -386,26 +418,36 @@ fn paths_needing_rebuild(
         .collect();
     child_paths.sort();
     child_paths.truncate(BACKDROP_FIELD_CAP);
-    for path in child_paths {
-        if built.get(path.as_str()) != Some(&listings[path].generation) {
-            stale.push(path.clone());
+    for path in &child_paths {
+        // A root rebuild cascades: even a generation-current child sits on
+        // a cell bbox the new root layout just moved.
+        if root_stale || built.get(path.as_str()) != Some(&listings[*path].generation) {
+            rebuild.push((*path).clone());
         }
     }
-    stale
+
+    let mut remove: Vec<String> = built
+        .keys()
+        .filter(|k| k.as_str() != "/" && !child_paths.iter().any(|p| p.as_str() == k.as_str()))
+        .cloned()
+        .collect();
+    remove.sort();
+
+    BackdropSyncPlan { rebuild, remove }
 }
 
 /// (Re)build the backdrop's seed-point clusters from whatever [`FsnState`]
 /// already has cached — root, plus up to [`BACKDROP_FIELD_CAP`] depth-1
-/// children, each only once its OWN generation changes (mirrors `scene::
-/// sync_fsn_fields`'s rebuild-on-generation-bump idiom, simplified: no
-/// descendant-invalidation chain, since the backdrop never nests past
-/// depth 1 in the first place).
+/// children, each once its OWN generation changes and all together when the
+/// ROOT's does (the one-level descendant-invalidation `scene::
+/// sync_fsn_fields` also performs: a root rebuild moves every child's cell
+/// bbox, so the children must re-place against the fresh layout).
 ///
-/// Early-outs on an empty [`paths_needing_rebuild`] plan BEFORE any layout
+/// Early-outs on an empty [`plan_backdrop_sync`] plan BEFORE any layout
 /// math — this system runs every frame `Screen::Room` is live, and the
 /// steady state (nothing changed) must cost a few HashMap lookups, not a
-/// relaxed-Voronoi solve. When at least one path IS stale, the root field
-/// is recomputed fresh for that pass (not cached) so a depth-1 child's own
+/// relaxed-Voronoi solve. When the plan is non-empty, the root field is
+/// recomputed fresh for that pass (not cached) so a depth-1 child's own
 /// placement (`layout::cell_bbox_inset` against the root field's own cell)
 /// is always available even when only the child changed — once per actual
 /// change, and simpler than persisting `scene::FsnFields`-style per-cell
@@ -424,8 +466,22 @@ pub fn sync_backdrop_fields(
     // The resting-frame guard: cheap map lookups only, no layout math,
     // no `ResMut` deref-mut (reading `backdrop.built` through `Deref`
     // keeps change detection quiet too).
-    let stale = paths_needing_rebuild(&state.listings, &backdrop.built);
-    if stale.is_empty() {
+    let plan = plan_backdrop_sync(&state.listings, &backdrop.built);
+    if plan.is_empty() {
+        return;
+    }
+
+    // Sweep first: a previously-built path that fell out of the capped
+    // candidate window (see the planner's cap-crossing note) is despawned
+    // and forgotten — nothing below will ever visit it again.
+    for path in &plan.remove {
+        if let Some(old) = backdrop.entities.remove(path) {
+            commands.entity(old).despawn();
+        }
+        backdrop.built.remove(path);
+    }
+
+    if plan.rebuild.is_empty() {
         return;
     }
 
@@ -441,7 +497,7 @@ pub fn sync_backdrop_fields(
         .collect();
     let root_field = layout_field(root_rect, &root_specs);
 
-    for path in &stale {
+    for path in &plan.rebuild {
         if path == "/" {
             rebuild_one(
                 &mut commands,
@@ -457,14 +513,25 @@ pub fn sync_backdrop_fields(
             continue;
         }
 
+        // A planned child may be a root-rebuild CASCADE whose own listing
+        // generation is unchanged — drop its `built` entry so
+        // `rebuild_one`'s generation guard (correct for the ordinary
+        // one-path case, blind to "the ground moved") can't skip it.
+        backdrop.built.remove(path.as_str());
+
         let listing = &state.listings[path];
-        let Some((_, name)) = layout::split_parent(path) else {
-            continue;
-        };
-        let Some(cell) = root_field.cells.iter().find(|c| c.name == name) else {
-            continue;
-        };
-        let Some(bbox) = layout::cell_bbox_inset(&cell.polygon, layout::SUBFIELD_INSET_FRAC) else {
+        let placed = layout::split_parent(path)
+            .and_then(|(_, name)| root_field.cells.iter().find(|c| c.name == name))
+            .and_then(|cell| layout::cell_bbox_inset(&cell.polygon, layout::SUBFIELD_INSET_FRAC));
+        let Some(bbox) = placed else {
+            // The (possibly fresh) root layout has no home for this child —
+            // its name is missing from the root cells, or its cell is too
+            // small to host. Any existing entity sits at coordinates from a
+            // layout that no longer exists; drop it rather than leave a
+            // ghost floating over someone else's cell.
+            if let Some(old) = backdrop.entities.remove(path) {
+                commands.entity(old).despawn();
+            }
             continue;
         };
         let specs: Vec<_> = listing
@@ -550,7 +617,14 @@ mod tests {
         pairs.iter().map(|(p, g)| (p.to_string(), *g)).collect()
     }
 
-    // ── paths_needing_rebuild (the resting-frame guard) ──
+    fn plan(
+        listings: &HashMap<String, DirListing>,
+        built_map: &HashMap<String, u64>,
+    ) -> BackdropSyncPlan {
+        plan_backdrop_sync(listings, built_map)
+    }
+
+    // ── plan_backdrop_sync (the resting-frame guard) ──
 
     #[test]
     fn no_root_listing_means_no_work_at_all() {
@@ -558,7 +632,7 @@ mod tests {
         // A depth-1 listing without the root itself: children can't place
         // without the root field, so the plan must stay empty.
         listings.insert("/a".to_string(), listing(1));
-        assert!(paths_needing_rebuild(&listings, &HashMap::new()).is_empty());
+        assert!(plan(&listings, &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -571,23 +645,37 @@ mod tests {
         listings.insert("/a".to_string(), listing(1));
         listings.insert("/b".to_string(), listing(7));
         let built = built(&[("/", 3), ("/a", 1), ("/b", 7)]);
-        assert!(paths_needing_rebuild(&listings, &built).is_empty());
+        assert!(plan(&listings, &built).is_empty());
     }
 
     #[test]
     fn an_unbuilt_root_is_the_whole_plan() {
         let mut listings = HashMap::new();
         listings.insert("/".to_string(), listing(1));
-        assert_eq!(paths_needing_rebuild(&listings, &HashMap::new()), vec!["/".to_string()]);
+        let p = plan(&listings, &HashMap::new());
+        assert_eq!(p.rebuild, vec!["/".to_string()]);
+        assert!(p.remove.is_empty());
     }
 
     #[test]
-    fn a_root_generation_bump_marks_root_only() {
+    fn a_root_generation_bump_cascades_to_every_built_child() {
+        // The root-rebuild cascade: a child's world rect is its own cell's
+        // bbox in the ROOT field, so a new root layout moves every child's
+        // ground out from under it — generation-current children must
+        // rebuild too (scene::sync_fsn_fields drops descendants on a parent
+        // rebuild for the same reason).
         let mut listings = HashMap::new();
         listings.insert("/".to_string(), listing(2));
         listings.insert("/a".to_string(), listing(1));
-        let built = built(&[("/", 1), ("/a", 1)]);
-        assert_eq!(paths_needing_rebuild(&listings, &built), vec!["/".to_string()]);
+        listings.insert("/b".to_string(), listing(1));
+        let built = built(&[("/", 1), ("/a", 1), ("/b", 1)]);
+        let p = plan(&listings, &built);
+        assert_eq!(
+            p.rebuild,
+            vec!["/".to_string(), "/a".to_string(), "/b".to_string()],
+            "root bump must plan root AND every built child"
+        );
+        assert!(p.remove.is_empty());
     }
 
     #[test]
@@ -597,7 +685,9 @@ mod tests {
         listings.insert("/a".to_string(), listing(1));
         listings.insert("/b".to_string(), listing(5));
         let built = built(&[("/", 1), ("/a", 1), ("/b", 4)]);
-        assert_eq!(paths_needing_rebuild(&listings, &built), vec!["/b".to_string()]);
+        let p = plan(&listings, &built);
+        assert_eq!(p.rebuild, vec!["/b".to_string()], "root untouched, sibling untouched");
+        assert!(p.remove.is_empty());
     }
 
     #[test]
@@ -610,7 +700,7 @@ mod tests {
         listings.insert("/a".to_string(), listing(1));
         listings.insert("/a/b".to_string(), listing(9));
         let built = built(&[("/", 1), ("/a", 1)]);
-        assert!(paths_needing_rebuild(&listings, &built).is_empty());
+        assert!(plan(&listings, &built).is_empty());
     }
 
     #[test]
@@ -632,7 +722,7 @@ mod tests {
         listings.insert("/z-overflow".to_string(), listing(1));
         let built: HashMap<String, u64> = built_pairs.into_iter().collect();
         assert!(
-            paths_needing_rebuild(&listings, &built).is_empty(),
+            plan(&listings, &built).is_empty(),
             "a stale child beyond the cap must not owe work"
         );
     }
@@ -650,6 +740,46 @@ mod tests {
         // Bump one child WITHIN the sorted cap window.
         listings.insert("/d03".to_string(), listing(2));
         let built: HashMap<String, u64> = built_pairs.into_iter().collect();
-        assert_eq!(paths_needing_rebuild(&listings, &built), vec!["/d03".to_string()]);
+        let p = plan(&listings, &built);
+        assert_eq!(p.rebuild, vec!["/d03".to_string()]);
+        assert!(p.remove.is_empty());
+    }
+
+    #[test]
+    fn a_built_child_pushed_out_of_the_cap_window_is_removed() {
+        // The cap-crossing sweep: the candidate window is name-sorted and
+        // capped, so a NEW alphabetically-earlier listing pushes the
+        // sorted-last built path out — without the sweep its entity would
+        // stay spawned at stale coordinates forever, never revisited.
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        let mut built_pairs: Vec<(String, u64)> = vec![("/".to_string(), 1)];
+        // The OLD window: d01..=dCAP (BACKDROP_FIELD_CAP children), built.
+        for i in 1..=BACKDROP_FIELD_CAP {
+            let path = format!("/d{i:02}");
+            listings.insert(path.clone(), listing(1));
+            built_pairs.push((path, 1));
+        }
+        // A new, alphabetically-FIRST child arrives (unbuilt): the window
+        // shifts to d00..d(CAP-1); the old sorted-last child falls out.
+        listings.insert("/d00".to_string(), listing(1));
+        let built: HashMap<String, u64> = built_pairs.into_iter().collect();
+        let p = plan(&listings, &built);
+        assert_eq!(p.rebuild, vec!["/d00".to_string()], "the newcomer needs building");
+        assert_eq!(
+            p.remove,
+            vec![format!("/d{BACKDROP_FIELD_CAP:02}")],
+            "the displaced sorted-last child must be swept"
+        );
+    }
+
+    #[test]
+    fn the_root_is_never_swept() {
+        // `remove` targets displaced CHILDREN only; the root is always a
+        // candidate while its listing exists.
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        let built = built(&[("/", 1)]);
+        assert!(plan(&listings, &built).is_empty());
     }
 }
