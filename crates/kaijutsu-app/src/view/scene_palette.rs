@@ -258,6 +258,24 @@ pub(crate) fn lin_scaled(c: LinearRgba, k: f32) -> Color {
     Color::LinearRgba(LinearRgba::rgb(c.red * k, c.green * k, c.blue * k))
 }
 
+/// FSN recency glow's baked vertex-color half of the color-composition law
+/// (`view::fsn` slice 1, lane A): a per-channel tint that, multiplied into
+/// `base` at render time by the material's own `base_color` (the
+/// `apply_fsn_lod`-owned half), reproduces `lerp(base, gold, w)` exactly —
+/// `tint_c = lerp(1.0, gold_c / base_c, w)`, so `tint_c × base_c =
+/// lerp(base_c, gold_c, w)` for every channel. `w = 0` yields all-ones (no
+/// tint at all — the untouched base color survives the multiply unchanged),
+/// `w = 1` yields the full `gold / base` ratio (base × that ratio = gold
+/// exactly). A near-zero `base` channel (`< 1e-6`) would blow the ratio up
+/// toward infinity for no visible gain (a near-black channel has nothing to
+/// tint), so that channel's tint holds at 1.0 regardless of `w` — the guard
+/// this fn's own doc promises. Alpha is always 1.0 (recency never carries
+/// transparency).
+pub(crate) fn warmth_tint(base: LinearRgba, gold: LinearRgba, w: f32) -> [f32; 4] {
+    let chan = |b: f32, g: f32| -> f32 { if b.abs() < 1e-6 { 1.0 } else { 1.0 + w * (g / b - 1.0) } };
+    [chan(base.red, gold.red), chan(base.green, gold.green), chan(base.blue, gold.blue), 1.0]
+}
+
 /// Hot-apply `[scene.post]` to the shared camera whenever the palette
 /// resource changes (theme RPC, or a live mutation over BRP). Bloom threshold
 /// is deliberately NOT driven from the palette — 1.0 is the HDR-tell
@@ -352,6 +370,46 @@ mod tests {
         scene.post.tonemapper = "vhs".into();
         let p = ScenePalette::from_scene_data(&scene);
         assert_eq!(p.tonemapper, ScenePalette::default().tonemapper);
+    }
+
+    // ── warmth_tint (FSN recency glow's color-composition law) ──
+
+    #[test]
+    fn warmth_tint_times_base_reproduces_the_lerp_toward_gold() {
+        let base = LinearRgba::rgb(0.254, 0.107, 1.0); // fsn_edge
+        let gold = LinearRgba::rgb(1.00, 0.78, 0.34);
+        for w in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let tint = warmth_tint(base, gold, w);
+            let want = [
+                base.red + w * (gold.red - base.red),
+                base.green + w * (gold.green - base.green),
+                base.blue + w * (gold.blue - base.blue),
+            ];
+            let got = [tint[0] * base.red, tint[1] * base.green, tint[2] * base.blue];
+            for (g, wa) in got.iter().zip(want.iter()) {
+                assert!((g - wa).abs() < 1e-5, "w={w}: got {g} want {wa}");
+            }
+            assert_eq!(tint[3], 1.0, "alpha is always opaque");
+        }
+    }
+
+    #[test]
+    fn warmth_tint_at_zero_weight_is_all_ones() {
+        let base = LinearRgba::rgb(0.254, 0.107, 1.0);
+        let gold = LinearRgba::rgb(1.00, 0.78, 0.34);
+        assert_eq!(warmth_tint(base, gold, 0.0), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn warmth_tint_guards_a_near_zero_base_channel() {
+        // A base channel near zero would blow the gold/base ratio toward
+        // infinity for a channel with nothing visible to tint — must hold
+        // at 1.0 (no tint), not explode or divide-by-zero into NaN/inf.
+        let base = LinearRgba::rgb(0.0, 0.5, 1.0);
+        let gold = LinearRgba::rgb(1.0, 1.0, 1.0);
+        let tint = warmth_tint(base, gold, 1.0);
+        assert_eq!(tint[0], 1.0, "near-zero base channel must not blow up");
+        assert!(tint[0].is_finite() && tint[1].is_finite() && tint[2].is_finite());
     }
 
     #[test]
