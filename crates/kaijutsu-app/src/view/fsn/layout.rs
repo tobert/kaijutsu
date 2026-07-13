@@ -61,8 +61,13 @@ use kaijutsu_viz::fsn::{ChildSpec, FsnCell, FsnField, NodeKind, Rect, Vec2};
 // ── World placement (Amy-tunable) ───────────────────────────────────────────
 
 /// Side length (world units) of the root directory's square footprint on the
-/// XZ plane, centered at the world origin. **Amy-tunable, first guess.**
-pub const ROOT_WORLD_SIZE: f32 = 2000.0;
+/// XZ plane, centered at the world origin. Bumped 2000 → 3000 (Amy's 50%,
+/// 2026-07-13, with the single N portal): the orbit scales with it
+/// ([`ORBIT_RADIUS`]/[`ORBIT_HEIGHT`]), so the framing holds while
+/// fixed-size elements (point markers, prism heights) shrink relative to
+/// the spread — districts get air between them and the world reads
+/// expansive rather than miniature. **Amy-tunable.**
+pub const ROOT_WORLD_SIZE: f32 = 3000.0;
 
 /// The root directory's world-space rect: a square of [`ROOT_WORLD_SIZE`],
 /// centered at the origin (`y` fields read as world Z — see the module doc).
@@ -539,10 +544,18 @@ pub fn ship_silhouette_segments() -> Vec<Segment> {
 // ── Backdrop camera orbit (A4) ───────────────────────────────────────────────
 
 /// Backdrop RTT camera's orbit radius/height (world units) and angular rate
-/// (rad/s) — a slow drift so the windows read as "something out there is
-/// churning," not a spinning toy. **Amy-tunable, first guess.**
-pub const ORBIT_RADIUS: f32 = 1900.0;
-pub const ORBIT_HEIGHT: f32 = 1300.0;
+/// (rad/s) — a slow drift so the portal reads as "something out there is
+/// churning," not a spinning toy. Height dropped 1300 → 900 with the single
+/// panel-spanning portal (2026-07-13): the elevation angle falls from ~34°
+/// to ~25°, trading the map-from-above read for a horizon — the world seen
+/// out a window, which is now the primary FSN surface (diving is
+/// de-emphasized; the world rotates past the glass instead). Radius/height
+/// track [`ROOT_WORLD_SIZE`]'s 1.5× bump (1900/900 → 2850/1350) so the
+/// elevation angle (~25°) and world coverage stay put while the airier
+/// spread does the expansive work. At `ORBIT_RATE` 0.05 a full revolution
+/// takes ~2 minutes. **Amy-tunable.**
+pub const ORBIT_RADIUS: f32 = 2850.0;
+pub const ORBIT_HEIGHT: f32 = 1350.0;
 pub const ORBIT_RATE: f32 = 0.05;
 
 /// The backdrop camera's pose at time `t` (seconds): a slow circular orbit

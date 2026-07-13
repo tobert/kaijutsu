@@ -627,10 +627,10 @@ fn enter_room(
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
     // at the labeled ones (the reserved South bearing gets a dim marker only).
-    // A furnished bearing (`bearing::station_is_room_furniture` — today just
-    // PatchBay/W, "the wheel IS the west station") gets neither: no marker, no
-    // plate — the wheel mounts directly on the wall panel instead (no
-    // room-side furniture builder needed for it at all any more).
+    // A furnished bearing (`bearing::station_is_room_furniture` — PatchBay/W,
+    // "the wheel IS the west station", and since 2026-07-13 Vfs/N, whose
+    // panel-spanning FSN portal is the station) gets neither: no marker, no
+    // plate — the station's own wall-mounted face stands in for both.
     for wp in bearing::wall_placements() {
         if wp.station.is_some_and(bearing::station_is_room_furniture) {
             continue;

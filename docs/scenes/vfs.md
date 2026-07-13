@@ -191,9 +191,9 @@ content is outside" — fits panels-as-screens cleanly but is undecided.
 2. **Subdir slack math** — the bloom decides the *look*; the address math
    (how a subdir's quad sub-cell is assigned inside the parent, how much
    slack, collision policy) needs its own design pass.
-3. **Windows** (frame 11) — ANSWERED YES, slice 1 (Amy 2026-07-13): wall
-   panels flanking the N nameplate render the world via render-to-texture
-   (see Status).
+3. **Windows** (frame 11) — ANSWERED YES, slice 1 (Amy 2026-07-13): the N
+   wall renders the world via render-to-texture; retuned same day from two
+   flanking portholes to ONE panel-spanning portal (see Status).
 4. **Zone tint reconciliation** (above).
 5. **Search**: `/` over the landscape (labels/paths, maybe
    `search_similar`) — flying to results vs teleporting.
@@ -270,11 +270,21 @@ landed:
   material = lerp(base_hue, gold, recency)` — so recency (per-cell, static)
   and heat (per-field, decaying) compose without a second material writer.
 - **The vessel tie**: gold octagon **ship silhouette** overhead (the "look
-  up" landmark; brightens with whole-tree heat), and **windows** — open
-  question 3 answered YES: two wall panels flanking the N nameplate render a
-  sparse world impression from an off-screen orbiting camera (the app's first
-  true second-camera render-to-texture, own render layer, resident exactly
-  while the room is).
+  up" landmark; brightens with whole-tree heat), and **the portal** — open
+  question 3 answered YES: the N face renders a sparse world impression from
+  an off-screen orbiting camera (the app's first true second-camera
+  render-to-texture, own render layer, resident exactly while the room is).
+  Retuned 2026-07-13 (Amy, same day it shipped): the original two flanking
+  portholes both sampled the same square texture — the room saw two squeezed
+  copies of a miniature. Now ONE panel-spanning portal (880×470 of the ~954
+  visible face) with the render texture matched to the glass's aspect, a
+  lower ~25° orbit for a horizon read, and a 1.5× world-footprint bump
+  (`ROOT_WORLD_SIZE` 3000, orbit scaled with it) so districts get air. The
+  "DATA HORIZON" nameplate and the N marker pylon are gone — both stood in
+  front of the view they advertised; `Station::Vfs` joined
+  `station_is_room_furniture` (the portal IS the station's face). Diving is
+  de-emphasized for now: the world rotating past the glass is the primary
+  FSN surface (the `Screen::Fsn` dive still exists behind Enter).
 
 Deprioritized by the ambient reframe (still on record above): subdir bloom,
 dive-to-vi, `/` search, staleness-as-correctness. Host weather (cargo-build

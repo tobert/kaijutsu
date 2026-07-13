@@ -1,7 +1,7 @@
 //! The room's N-window backdrop (lane A4): while `Screen::Room` is live, an
 //! off-screen camera renders a sparse-tier impression of the FSN world to a
-//! texture, shown through two wall panels flanking the N bearing — "you can
-//! see it out there before you dive" (`docs/scenes/vfs.md`). Distinct from
+//! texture, shown through one panel-spanning portal on the N bearing — "you
+//! can see it out there before you dive" (`docs/scenes/vfs.md`). Distinct from
 //! [`super::scene`]'s own world (`Screen::Fsn`): this is a much cheaper,
 //! always-uncolored glimpse (no recency bake, no heat, no LOD swap — just a
 //! seam grid, up to a dozen seed-point clusters, and the ship silhouette),
@@ -25,9 +25,9 @@
 //! `RenderLayers::layer(`[`FSN_BACKDROP_LAYER`]`)`; the main camera carries
 //! no `RenderLayers` at all (Bevy's implicit layer 0), so it never sees this
 //! layer's content — and the backdrop camera, seeing ONLY that layer, never
-//! sees the room itself. The two window quads are the one deliberate
-//! exception: they carry no `RenderLayers` (main-camera-visible, showing the
-//! rendered texture), while everything else under [`FsnBackdropRoot`] is
+//! sees the room itself. The portal quad is the one deliberate exception:
+//! it carries no `RenderLayers` (main-camera-visible, showing the rendered
+//! texture), while everything else under [`FsnBackdropRoot`] is
 //! layer-`FSN_BACKDROP_LAYER`-only.
 //!
 //! # Content: reused, not duplicated
@@ -56,8 +56,17 @@ use super::sync::FsnState;
 
 // ── Amy-tunable render constants ────────────────────────────────────────────
 
-/// Render-target texture side length (square, pixels). **Amy-tunable.**
-pub const BACKDROP_TEX: u32 = 512;
+/// Render-target texture width (pixels). Height derives from the portal's
+/// own aspect ([`WINDOW_W`]/[`WINDOW_H`]) so the camera's frame and the
+/// glass agree — a square texture on a non-square quad squeezed the world
+/// (and showing it twice on two quads made it read as two copies of a
+/// miniature, not one world out there). **Amy-tunable.**
+pub const BACKDROP_TEX_W: u32 = 1024;
+
+/// Render-target texture height — [`BACKDROP_TEX_W`] scaled by the portal
+/// quad's aspect, so Bevy's projection (which takes its aspect from the
+/// render target) matches the glass exactly.
+pub const BACKDROP_TEX_H: u32 = (BACKDROP_TEX_W as f32 * (WINDOW_H / WINDOW_W)) as u32;
 
 /// The `RenderLayers` index every backdrop-only entity (and the backdrop
 /// camera itself) carries — keeps the backdrop scene invisible to the main
@@ -65,17 +74,16 @@ pub const BACKDROP_TEX: u32 = 512;
 /// today) in case a future RTT lane wants it.
 const FSN_BACKDROP_LAYER: usize = 2;
 
-/// Window quad size (world units) — sized to sit comfortably inside the N
-/// wall panel next to its nameplate (`room::mod`'s `PLATE_QUAD_W/H`, 210×62,
-/// is the nearby reference scale; these read as narrower-and-taller, a
-/// window rather than a plate). **Amy-tunable, first guess.**
-pub const WINDOW_W: f32 = 150.0;
-pub const WINDOW_H: f32 = 220.0;
-
-/// Fraction of the N panel's own half-width each window sits out from
-/// center (so the two windows flank the panel's midline, not overlap it).
-/// **Amy-tunable.**
-pub const WINDOW_OFFSET_FRAC: f32 = 0.28;
+/// Portal quad size (world units) — ONE panel-spanning window centered on
+/// the N face, not the original pair of flanking portholes (both sampled
+/// the same texture, so the room saw two copies of the same miniature; Amy
+/// called for one expansive portal, 2026-07-13). Sized against the N
+/// panel's visible face: full octagon panel width at `WALL_APOTHEM` 1200 is
+/// ≈994, minus `room::mod`'s `WALL_PANEL_GAP` reveal (40) ≈954 wide by
+/// `WALL_HEIGHT` 560 tall — 880×470 leaves a ~37-unit mullion each side and
+/// 45 above/below at [`WINDOW_Y`]. **Amy-tunable.**
+pub const WINDOW_W: f32 = 880.0;
+pub const WINDOW_H: f32 = 470.0;
 
 /// How far proud of the wall panel's own face the window quads sit — same
 /// z-fighting-avoidance idiom as `room::mod`'s `WALL_TRIM_PROUD`/
@@ -120,8 +128,8 @@ const BACKDROP_FIELD_CAP: usize = 11;
 pub struct FsnBackdropCamera;
 
 /// Root of every backdrop-scene entity (camera-visible content — the seam
-/// grid, seed-point clusters, ship silhouette — NOT the window quads, which
-/// are structural children of this same entity but render on the main
+/// grid, seed-point clusters, ship silhouette — NOT the portal quad, which
+/// is a structural child of this same entity but renders on the main
 /// camera's own layer 0; see the module doc's render-layer split). Kept as
 /// its OWN root — never `ChildOf(RoomRoot)` — because `RoomRoot`'s own
 /// spawn commands are deferred in the same schedule this spawns in
@@ -140,7 +148,7 @@ pub struct FsnBackdropRoot;
 /// field count).
 #[derive(Resource, Default)]
 pub struct FsnBackdrop {
-    /// The render-target texture the window quads sample — `None` while
+    /// The render-target texture the portal quad samples — `None` while
     /// `Screen::Room` isn't live (cleared on [`despawn_backdrop`]).
     pub image: Option<Handle<Image>>,
     /// Path -> the listing generation its seed-point mesh was last built
@@ -155,7 +163,7 @@ pub struct FsnBackdrop {
 
 /// Build the render-target image, the off-screen camera pointed at it, and
 /// the backdrop scene's cold-start content (seam grid + ship silhouette —
-/// drawn UNCONDITIONALLY, so the windows show *something* the instant the
+/// drawn UNCONDITIONALLY, so the portal shows *something* the instant the
 /// room loads, before any VFS listing has ever arrived). Kicks off the root
 /// listing fetch too if [`FsnState`] is empty (a fresh app that never dove
 /// into `Screen::Fsn` yet) — [`sync_backdrop_fields`] then populates the
@@ -176,8 +184,8 @@ pub fn spawn_backdrop(
     }
 
     let image = Image::new_target_texture(
-        BACKDROP_TEX,
-        BACKDROP_TEX,
+        BACKDROP_TEX_W,
+        BACKDROP_TEX_H,
         TextureFormat::Rgba8Unorm,
         Some(TextureFormat::Rgba8UnormSrgb),
     );
@@ -246,25 +254,26 @@ pub fn spawn_backdrop(
         ChildOf(root),
     ));
 
-    spawn_window_quads(&mut commands, root, &mut meshes, &mut mats, &image_handle);
+    spawn_portal_quad(&mut commands, root, &mut meshes, &mut mats, &image_handle);
 
     if state.listings.is_empty() {
         state.request("/".into());
     }
 
-    info!("fsn: backdrop spawned (N windows — the world glimpsed from the room)");
+    info!("fsn: backdrop spawned (N portal — the world glimpsed from the room)");
 }
 
-/// The two window quads flanking the N marker — main-camera-visible (no
-/// `RenderLayers`, the deliberate exception the module doc calls out),
-/// sampling the backdrop's own render target. Transform math mirrors
-/// `room::mod::spawn_walls`' own N-panel placement (`WALL_APOTHEM` out,
-/// `looking_at` the doubled position so local +Z faces the console) since
-/// that fn's own consts (`WALL_HEIGHT`, `WALL_PANEL_GAP`) are private to
-/// `room::mod` — this reconstructs just the placement, not the panel mesh
-/// itself (the real wall panel is still `room::mod`'s to spawn; these quads
-/// sit proud of it).
-fn spawn_window_quads(
+/// The panel-spanning portal quad centered on the N face — main-camera-
+/// visible (no `RenderLayers`, the deliberate exception the module doc
+/// calls out), sampling the backdrop's own render target. Transform math
+/// mirrors `room::mod::spawn_walls`' own N-panel placement (`WALL_APOTHEM`
+/// out, `looking_at` the doubled position so local +Z faces the console)
+/// since that fn's own consts (`WALL_HEIGHT`, `WALL_PANEL_GAP`) are private
+/// to `room::mod` — this reconstructs just the placement, not the panel
+/// mesh itself (the real wall panel is still `room::mod`'s to spawn; the
+/// quad sits proud of it, covering the panel's wall threads behind the
+/// glass).
+fn spawn_portal_quad(
     commands: &mut Commands,
     root: Entity,
     meshes: &mut Assets<Mesh>,
@@ -277,35 +286,32 @@ fn spawn_window_quads(
         .iter()
         .find(|p| p.bearing == Some(Bearing::North))
         .expect("octagon_panels always includes a North face");
-    let panel_width = bearing::octagon_panel_width(wall_apothem);
 
     let pos = Vec3::new(north.center[0], WINDOW_Y, north.center[2]);
     let outward = Vec3::new(pos.x * 2.0, pos.y, pos.z * 2.0);
     let panel_tf = Transform::from_translation(pos).looking_at(outward, Vec3::Y);
 
     let window_mesh = meshes.add(Rectangle::new(WINDOW_W, WINDOW_H));
-    for (label, side) in [("L", -1.0_f32), ("R", 1.0_f32)] {
-        let local = Vec3::new(side * panel_width * WINDOW_OFFSET_FRAC, 0.0, WINDOW_PROUD);
-        let mat = mats.add(StandardMaterial {
-            base_color_texture: Some(image.clone()),
-            base_color: Color::LinearRgba(LinearRgba::rgb(WINDOW_LIFT, WINDOW_LIFT, WINDOW_LIFT)),
-            unlit: true,
-            ..default()
-        });
-        commands.spawn((
-            Mesh3d(window_mesh.clone()),
-            MeshMaterial3d(mat),
-            Transform::from_translation(panel_tf.transform_point(local))
-                .with_rotation(panel_tf.rotation),
-            Visibility::Inherited,
-            Name::new(format!("FsnBackdropWindow{label}")),
-            ChildOf(root),
-        ));
-    }
+    let local = Vec3::new(0.0, 0.0, WINDOW_PROUD);
+    let mat = mats.add(StandardMaterial {
+        base_color_texture: Some(image.clone()),
+        base_color: Color::LinearRgba(LinearRgba::rgb(WINDOW_LIFT, WINDOW_LIFT, WINDOW_LIFT)),
+        unlit: true,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(window_mesh),
+        MeshMaterial3d(mat),
+        Transform::from_translation(panel_tf.transform_point(local))
+            .with_rotation(panel_tf.rotation),
+        Visibility::Inherited,
+        Name::new("FsnBackdropWindow"),
+        ChildOf(root),
+    ));
 }
 
-/// Despawn the backdrop camera + scene root (recursive — takes the window
-/// quads with it too, despite their differing render layer; they're still
+/// Despawn the backdrop camera + scene root (recursive — takes the portal
+/// quad with it too, despite its differing render layer; it's still
 /// `ChildOf` the same root) and drop the resource's live handles, so a later
 /// `OnEnter(Screen::Room)` rebuilds cleanly rather than finding stale state.
 pub fn despawn_backdrop(

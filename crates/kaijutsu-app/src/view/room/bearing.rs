@@ -157,14 +157,18 @@ pub fn wall_placements() -> [WallPlacement; 4] {
 /// [`wall_placements`] to skip in the first place — center has no wall — so
 /// this row matters for callers reasoning generically over "does this station
 /// have its own room-furniture," not for `enter_room`'s wall-placement loop
-/// specifically). `enter_room`'s wall-placement loop reads this to skip the
-/// marker/plinth/cap/plate for a furnished bearing — the wheel mounts
-/// directly on the wall panel instead, no separate furniture builder needed;
-/// a future in-room station rides the same gate. Pure — no Bevy types — so
-/// the gating is unit-testable without spawning anything (mirrors
-/// `super::wants_gold_cap`'s shape).
+/// specifically). [`Station::Vfs`] joined 2026-07-13: the N face wears the
+/// FSN portal (`fsn::backdrop`'s panel-spanning window) — the world seen
+/// through the glass IS the station; the "DATA HORIZON" plate and the marker
+/// pylon both stood square in front of the view they advertised, so N gets
+/// the same no-marker/no-plate treatment. `enter_room`'s wall-placement loop
+/// reads this to skip the marker/plinth/cap/plate for a furnished bearing —
+/// the wheel mounts directly on the wall panel instead, no separate
+/// furniture builder needed; a future in-room station rides the same gate.
+/// Pure — no Bevy types — so the gating is unit-testable without spawning
+/// anything (mirrors `super::wants_gold_cap`'s shape).
 pub fn station_is_room_furniture(station: Station) -> bool {
-    matches!(station, Station::PatchBay | Station::TimeWell)
+    matches!(station, Station::PatchBay | Station::TimeWell | Station::Vfs)
 }
 
 // ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
@@ -714,7 +718,10 @@ mod tests {
         (Station::TimeWell, true),
         (Station::PatchBay, true),
         (Station::Tracks, false),
-        (Station::Vfs, false),
+        // N wears the FSN portal — the world through the glass is the
+        // station's own furniture/signage (2026-07-13; the fn doc has the
+        // story).
+        (Station::Vfs, true),
         (Station::Radiators, false),
     ];
 
