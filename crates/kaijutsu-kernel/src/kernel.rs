@@ -62,6 +62,13 @@ pub struct Kernel {
     drift: SharedDriftRouter,
     /// Content-addressed store for binary blobs (images, etc.).
     cas: Arc<FileStore>,
+    /// `/r` client-shares registry (`docs/slash-r.md`) — session-scoped,
+    /// in-memory bookkeeping of live reverse-SFTP sessions. Shared between
+    /// the `ShareFs` `VfsOps` backend mounted at `/r` (routing/serving) and
+    /// the SSH server's `kaijutsu-share` subsystem arm (registration on
+    /// channel-up, unregistration on channel-down) — one `Arc`, two
+    /// consumers, no other coupling between them.
+    share_registry: Arc<crate::vfs::ShareRegistry>,
     /// Image generation backend registry.
     image_backends: RwLock<crate::image::ImageBackendRegistry>,
     /// MCP-centric tool broker (Phase 1; sits alongside the old `tools`
@@ -180,6 +187,7 @@ impl Kernel {
             turn_flows: shared_turn_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
+            share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
                 let b = Broker::new();
@@ -241,6 +249,7 @@ impl Kernel {
             turn_flows: shared_turn_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
+            share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
                 let b = Broker::new();
@@ -688,6 +697,11 @@ impl Kernel {
     /// Get the content-addressed store.
     pub fn cas(&self) -> &Arc<FileStore> {
         &self.cas
+    }
+
+    /// Get the `/r` client-shares registry (`docs/slash-r.md`).
+    pub fn share_registry(&self) -> &Arc<crate::vfs::ShareRegistry> {
+        &self.share_registry
     }
 
     /// Get the image backend registry.

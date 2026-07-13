@@ -66,6 +66,22 @@ pub enum VfsError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
+    /// A `/r` client share's session is gone (never registered, or the
+    /// channel dropped — `docs/slash-r.md`). Distinct from [`VfsError::Io`]
+    /// so callers can tell "somebody's laptop went away" from a genuine
+    /// local I/O fault: a half-written file plus a vanished mount beats a
+    /// hung `cp`.
+    #[error("/r share {0}: session disconnected")]
+    ShareDisconnected(String),
+
+    /// A `/r` client share's wire op exceeded its deadline
+    /// (`docs/slash-r.md` "Every remote op gets a timeout") — a hung laptop
+    /// must not park a kernel task forever. Distinct from
+    /// [`VfsError::ShareDisconnected`]: the session may still be alive, this
+    /// one op just didn't answer in time.
+    #[error("/r share {0}: operation timed out")]
+    ShareTimeout(String),
+
     /// Other error.
     #[error("{0}")]
     Other(String),
@@ -200,6 +216,10 @@ impl From<VfsError> for io::Error {
                 io::Error::new(io::ErrorKind::InvalidInput, "file name too long")
             }
             VfsError::Io(e) => e,
+            VfsError::ShareDisconnected(msg) => {
+                io::Error::new(io::ErrorKind::NotConnected, msg)
+            }
+            VfsError::ShareTimeout(msg) => io::Error::new(io::ErrorKind::TimedOut, msg),
             VfsError::Other(msg) => io::Error::other(msg),
         }
     }

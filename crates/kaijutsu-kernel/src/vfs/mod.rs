@@ -25,7 +25,10 @@ mod ops;
 mod types;
 
 pub use activity::{ActivityCursor, ActivityDigest};
-pub use backends::{CasFs, LocalBackend, MemoryBackend};
+pub use backends::{
+    CasFs, LocalBackend, MemoryBackend, SHARE_OP_TIMEOUT, ShareFs, ShareRegisterError,
+    ShareRegistry, ShareRow,
+};
 pub use error::{VfsError, VfsResult};
 pub use mount::{
     MountInfo, MountTable, SNAPSHOT_MAX_DEPTH, SNAPSHOT_MAX_ENTRIES, BASELINE_GENERATION,

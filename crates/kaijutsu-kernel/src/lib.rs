@@ -103,8 +103,9 @@ pub use llm::{
 pub use execution::{ExecContext, ExecResult};
 pub use state::KernelState;
 pub use vfs::{
-    ActivityCursor, ActivityDigest, DirEntry, FileAttr, FileType, MountTable, SetAttr,
-    SnapshotNode, SnapshotResult, StatFs, VfsError, VfsOps, VfsResult,
+    ActivityCursor, ActivityDigest, DirEntry, FileAttr, FileType, MountTable, SHARE_OP_TIMEOUT,
+    SetAttr, ShareFs, ShareRegisterError, ShareRegistry, ShareRow, SnapshotNode, SnapshotResult,
+    StatFs, VfsError, VfsOps, VfsResult,
     backends::{LocalBackend, MemoryBackend},
 };
 
