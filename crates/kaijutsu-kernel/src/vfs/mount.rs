@@ -264,18 +264,37 @@ impl MountTable {
     /// so the raw total IS the lifetime event count, which is exactly what
     /// makes it safe to ship as an absolute value over the wire (a client
     /// that missed N ticks still lands on the correct total on tick N+1).
+    ///
+    /// ORDERING INVARIANT (Release here, Acquire in
+    /// [`Self::global_activity`] — same pairing precedent as the `frozen`
+    /// flag above): the map write is sequenced before the epoch bump, and a
+    /// reader that observes epoch N must also see every `activity`-map
+    /// write sequenced before the Release that produced N. With Relaxed on
+    /// both sides, a digest tick could observe the new epoch WITHOUT the
+    /// map entry behind it — the digest would ship missing that entry, its
+    /// commit would advance `last_global` past the bump, and the entry
+    /// would strand until some future bump anywhere reopened the epoch
+    /// check (the same failure shape as the truncated-commit bug in
+    /// `activity.rs`, but sourced from the memory model). Masked on x86's
+    /// strong ordering; live on ARM.
     fn bump_activity(&self, dir_path: &Path) {
         let key = Self::normalize_mount_path(dir_path.to_path_buf());
         self.activity.entry(key).and_modify(|a| *a += 1).or_insert(1);
-        self.activity_epoch.fetch_add(1, Ordering::Relaxed);
+        self.activity_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// The global activity epoch — the running total of every bump across
     /// every directory since kernel boot. A digest tick that finds this
     /// unchanged from the subscriber's cursor can short-circuit without
     /// touching the per-directory map at all (see `activity.rs`).
+    ///
+    /// Acquire, paired with [`Self::bump_activity`]'s Release: observing
+    /// epoch N here guarantees visibility of every `activity`-map write
+    /// sequenced before the bump that produced N. No deterministic unit
+    /// test can pin a memory-model race down — this comment pair IS the
+    /// guard.
     pub fn global_activity(&self) -> u64 {
-        self.activity_epoch.load(Ordering::Relaxed)
+        self.activity_epoch.load(Ordering::Acquire)
     }
 
     /// Snapshot of per-directory activity totals, optionally filtered to
