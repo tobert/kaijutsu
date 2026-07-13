@@ -339,6 +339,61 @@ pub fn orbit_backdrop_camera(
         .looking_at(Vec3::from_array(look_at), Vec3::Y);
 }
 
+/// The rebuild plan for one [`sync_backdrop_fields`] pass: which of the
+/// backdrop's candidate paths — root plus up to [`BACKDROP_FIELD_CAP`]
+/// depth-1 children, name-sorted (the same candidate selection the rebuild
+/// loop uses) — are stale against `built` (missing, or built at a different
+/// generation). Pure over the two maps, so the "does this frame owe any
+/// work at all?" decision is unit-testable without a Bevy world.
+///
+/// This is the frame-rate guard: [`sync_backdrop_fields`] runs every Update
+/// while `Screen::Room` is live (the app's resting screen), and the
+/// relaxed-Voronoi `layout_field` math it feeds is far too expensive to
+/// burn per-frame on an unchanged cache. An empty plan means the caller
+/// returns before ANY layout math — `rebuild_one`'s own per-path generation
+/// guard still stands behind this, but only as defense in depth; this plan
+/// is what keeps the resting frame free.
+///
+/// No root listing yet means no work at all (children can't place without
+/// the root field), matching the rebuild loop's own early return.
+///
+/// One accepted corner: a stale child the rebuild loop then SKIPS (its name
+/// missing from the root field's cells, or its cell too small to host —
+/// `cell_bbox_inset` = `None`) never lands in `built`, so it stays in the
+/// plan and the layout math re-runs each frame until its own (or the
+/// root's) listing changes. That degrades exactly to the old always-run
+/// behavior for a rare geometry corner — recording "skipped" as "built"
+/// would instead wedge the child out of ever retrying after a root-layout
+/// change, a worse trade.
+fn paths_needing_rebuild(
+    listings: &HashMap<String, super::sync::DirListing>,
+    built: &HashMap<String, u64>,
+) -> Vec<String> {
+    let Some(root_listing) = listings.get("/") else {
+        return Vec::new();
+    };
+    let mut stale = Vec::new();
+    if built.get("/") != Some(&root_listing.generation) {
+        stale.push("/".to_string());
+    }
+    // Candidates are capped BEFORE stale-filtering — a stale child beyond
+    // the cap is not a candidate and must not trigger work (it would never
+    // be rebuilt anyway; treating it as stale would re-run the root layout
+    // every frame forever).
+    let mut child_paths: Vec<&String> = listings
+        .keys()
+        .filter(|p| layout::split_parent(p).is_some_and(|(parent, _)| parent == "/"))
+        .collect();
+    child_paths.sort();
+    child_paths.truncate(BACKDROP_FIELD_CAP);
+    for path in child_paths {
+        if built.get(path.as_str()) != Some(&listings[path].generation) {
+            stale.push(path.clone());
+        }
+    }
+    stale
+}
+
 /// (Re)build the backdrop's seed-point clusters from whatever [`FsnState`]
 /// already has cached — root, plus up to [`BACKDROP_FIELD_CAP`] depth-1
 /// children, each only once its OWN generation changes (mirrors `scene::
@@ -346,11 +401,15 @@ pub fn orbit_backdrop_camera(
 /// descendant-invalidation chain, since the backdrop never nests past
 /// depth 1 in the first place).
 ///
-/// The root field is recomputed fresh every run (not cached) so a depth-1
-/// child's own placement (`layout::cell_bbox_inset` against the root
-/// field's own cell) is always available — cheap at this field count, and
-/// simpler than persisting `scene::FsnFields`-style per-cell bbox caches
-/// for a view that never does LOD or selection.
+/// Early-outs on an empty [`paths_needing_rebuild`] plan BEFORE any layout
+/// math — this system runs every frame `Screen::Room` is live, and the
+/// steady state (nothing changed) must cost a few HashMap lookups, not a
+/// relaxed-Voronoi solve. When at least one path IS stale, the root field
+/// is recomputed fresh for that pass (not cached) so a depth-1 child's own
+/// placement (`layout::cell_bbox_inset` against the root field's own cell)
+/// is always available even when only the child changed — once per actual
+/// change, and simpler than persisting `scene::FsnFields`-style per-cell
+/// bbox caches for a view that never does LOD or selection.
 pub fn sync_backdrop_fields(
     state: Res<FsnState>,
     mut backdrop: ResMut<FsnBackdrop>,
@@ -361,6 +420,15 @@ pub fn sync_backdrop_fields(
     roots: Query<Entity, With<FsnBackdropRoot>>,
 ) {
     let Ok(root) = roots.single() else { return };
+
+    // The resting-frame guard: cheap map lookups only, no layout math,
+    // no `ResMut` deref-mut (reading `backdrop.built` through `Deref`
+    // keeps change detection quiet too).
+    let stale = paths_needing_rebuild(&state.listings, &backdrop.built);
+    if stale.is_empty() {
+        return;
+    }
+
     let Some(root_listing) = state.listings.get("/") else {
         return;
     };
@@ -373,27 +441,22 @@ pub fn sync_backdrop_fields(
         .collect();
     let root_field = layout_field(root_rect, &root_specs);
 
-    rebuild_one(
-        &mut commands,
-        root,
-        "/",
-        &root_field,
-        root_listing.generation,
-        &palette,
-        &mut meshes,
-        &mut mats,
-        &mut backdrop,
-    );
+    for path in &stale {
+        if path == "/" {
+            rebuild_one(
+                &mut commands,
+                root,
+                "/",
+                &root_field,
+                root_listing.generation,
+                &palette,
+                &mut meshes,
+                &mut mats,
+                &mut backdrop,
+            );
+            continue;
+        }
 
-    let mut child_paths: Vec<&String> = state
-        .listings
-        .keys()
-        .filter(|p| layout::split_parent(p).is_some_and(|(parent, _)| parent == "/"))
-        .collect();
-    child_paths.sort();
-    child_paths.truncate(BACKDROP_FIELD_CAP);
-
-    for path in child_paths {
         let listing = &state.listings[path];
         let Some((_, name)) = layout::split_parent(path) else {
             continue;
@@ -471,5 +534,122 @@ fn unlit(color: Color) -> StandardMaterial {
         base_color: color,
         unlit: true,
         ..default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::fsn::sync::DirListing;
+
+    fn listing(generation: u64) -> DirListing {
+        DirListing { generation, truncated_here: false, children: vec![] }
+    }
+
+    fn built(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs.iter().map(|(p, g)| (p.to_string(), *g)).collect()
+    }
+
+    // ── paths_needing_rebuild (the resting-frame guard) ──
+
+    #[test]
+    fn no_root_listing_means_no_work_at_all() {
+        let mut listings = HashMap::new();
+        // A depth-1 listing without the root itself: children can't place
+        // without the root field, so the plan must stay empty.
+        listings.insert("/a".to_string(), listing(1));
+        assert!(paths_needing_rebuild(&listings, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn everything_built_at_current_generation_is_an_empty_plan() {
+        // THE steady state — every Update frame while the room rests. An
+        // empty plan is what lets sync_backdrop_fields return before any
+        // Voronoi math.
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(3));
+        listings.insert("/a".to_string(), listing(1));
+        listings.insert("/b".to_string(), listing(7));
+        let built = built(&[("/", 3), ("/a", 1), ("/b", 7)]);
+        assert!(paths_needing_rebuild(&listings, &built).is_empty());
+    }
+
+    #[test]
+    fn an_unbuilt_root_is_the_whole_plan() {
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        assert_eq!(paths_needing_rebuild(&listings, &HashMap::new()), vec!["/".to_string()]);
+    }
+
+    #[test]
+    fn a_root_generation_bump_marks_root_only() {
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(2));
+        listings.insert("/a".to_string(), listing(1));
+        let built = built(&[("/", 1), ("/a", 1)]);
+        assert_eq!(paths_needing_rebuild(&listings, &built), vec!["/".to_string()]);
+    }
+
+    #[test]
+    fn a_child_generation_bump_marks_that_child_only() {
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        listings.insert("/a".to_string(), listing(1));
+        listings.insert("/b".to_string(), listing(5));
+        let built = built(&[("/", 1), ("/a", 1), ("/b", 4)]);
+        assert_eq!(paths_needing_rebuild(&listings, &built), vec!["/b".to_string()]);
+    }
+
+    #[test]
+    fn deeper_paths_are_never_candidates() {
+        // Only root + depth-1 children are backdrop candidates; a cached
+        // depth-2 listing (from the world's own deeper dives) must not
+        // drag the plan non-empty.
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        listings.insert("/a".to_string(), listing(1));
+        listings.insert("/a/b".to_string(), listing(9));
+        let built = built(&[("/", 1), ("/a", 1)]);
+        assert!(paths_needing_rebuild(&listings, &built).is_empty());
+    }
+
+    #[test]
+    fn a_stale_child_beyond_the_cap_is_not_a_candidate() {
+        // Candidates are name-sorted then truncated to BACKDROP_FIELD_CAP
+        // BEFORE stale-filtering — a stale child past the cap would never
+        // be rebuilt, so treating it as stale would re-run the root layout
+        // every frame forever.
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        let mut built_pairs: Vec<(String, u64)> = vec![("/".to_string(), 1)];
+        // BACKDROP_FIELD_CAP children within the cap, all built current...
+        for i in 0..BACKDROP_FIELD_CAP {
+            let path = format!("/d{i:02}");
+            listings.insert(path.clone(), listing(1));
+            built_pairs.push((path, 1));
+        }
+        // ...plus one sorted-last child ("/z…") that is stale (never built).
+        listings.insert("/z-overflow".to_string(), listing(1));
+        let built: HashMap<String, u64> = built_pairs.into_iter().collect();
+        assert!(
+            paths_needing_rebuild(&listings, &built).is_empty(),
+            "a stale child beyond the cap must not owe work"
+        );
+    }
+
+    #[test]
+    fn a_stale_child_within_the_cap_is_planned() {
+        let mut listings = HashMap::new();
+        listings.insert("/".to_string(), listing(1));
+        let mut built_pairs: Vec<(String, u64)> = vec![("/".to_string(), 1)];
+        for i in 0..BACKDROP_FIELD_CAP {
+            let path = format!("/d{i:02}");
+            listings.insert(path.clone(), listing(1));
+            built_pairs.push((path, 1));
+        }
+        // Bump one child WITHIN the sorted cap window.
+        listings.insert("/d03".to_string(), listing(2));
+        let built: HashMap<String, u64> = built_pairs.into_iter().collect();
+        assert_eq!(paths_needing_rebuild(&listings, &built), vec!["/d03".to_string()]);
     }
 }
