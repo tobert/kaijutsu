@@ -1650,10 +1650,19 @@ fn sync_room_glow(
 
     for (marker, handle) in markers.iter() {
         let mut lift = 0.0;
+        // The beat-phasor term stays East-only (`WellBeats::global_envelope`
+        // is a rolling-clock readout, not per-bearing activity — East/tracks
+        // is the one bearing a beat physically means anything at). Every
+        // bearing's OWN `BearingActivity` level lifts its marker, though:
+        // this used to be an East-only `if`, but `BearingActivity` is
+        // already indexed per-bearing (`event_bearing` just had only one
+        // producer wired in) — the FSN heat ingest (arriving in a follow-up,
+        // `activity::event_bearing`'s own doc) will feed North from VFS
+        // churn, and gating the read to East would silently drop it.
         if marker.bearing == Bearing::East {
-            lift += beat * palette.gain_beat
-                + room_activity.normalized(Bearing::East) * palette.gain_active;
+            lift += beat * palette.gain_beat;
         }
+        lift += room_activity.normalized(marker.bearing) * palette.gain_active;
         if marker.station == Some(focused) {
             lift += palette.gain_focus_lift;
         }

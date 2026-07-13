@@ -675,6 +675,7 @@ pub fn apply_fsn_lod(
     fields: Res<FsnFields>,
     selection: Res<FsnSelection>,
     state: Res<FsnState>,
+    heat: Res<FsnHeat>,
     palette: Res<ScenePalette>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     // `Without<FsnSelectionRing>` keeps this disjoint from `rings`' own
@@ -716,9 +717,20 @@ pub fn apply_fsn_lod(
             layout::LodTier::Sparse | layout::LodTier::Wireframe => WIREFRAME_GAIN_MID,
             layout::LodTier::Attended => palette.crest,
         };
-        let gain = if is_selected_field { base_gain * SELECTION_GAIN_LIFT } else { base_gain };
+        let sel_lift = if is_selected_field { SELECTION_GAIN_LIFT } else { 1.0 };
+        // Heat (lane A2): this directory's own recent-churn level lifts the
+        // field's gain AND shifts its hue toward gold — the material's own
+        // `base_color` half of the color-composition law (`hue × gain ×
+        // heat`), written HERE and only here (this system stays the sole
+        // wireframe-material writer — see the module doc). The vertex-color
+        // half (recency, lane A1) is baked once at mesh build time in
+        // `spawn_field_entities`; this multiply composes with it exactly,
+        // never overwrites it.
+        let h = heat.normalized(path);
+        let gain = base_gain * sel_lift * (1.0 + h * HEAT_GAIN_LIFT);
+        let hue = lerp_hue(palette.fsn_edge, palette.gold, h);
         if let Some(mat) = mats.get_mut(&fe.wireframe_material) {
-            let want = lin_scaled(palette.fsn_edge, gain);
+            let want = lin_scaled(hue, gain);
             if mat.base_color != want {
                 mat.base_color = want;
             }
@@ -742,6 +754,37 @@ pub fn apply_fsn_lod(
 /// bright field; this makes the selected field's whole edge set read
 /// hotter, not just the one cell's ring.
 const SELECTION_GAIN_LIFT: f32 = 1.3;
+
+/// Component-wise lerp from `a` toward `b` by `t` (0..1 expected, not
+/// clamped — callers here always feed a [`FsnHeat::normalized`] output,
+/// already 0..1). The heat hue-shift's own small helper: `apply_fsn_lod`
+/// needs `fsn_edge -> gold` on a plain [`LinearRgba`] pair, not a
+/// `Color`-level blend (which would round-trip through a color space this
+/// module doesn't otherwise touch).
+fn lerp_hue(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
+    LinearRgba::rgb(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t)
+}
+
+/// Lift the ship silhouette's brightness from `trim` toward `crest` with
+/// whole-tree heat (`FsnHeat::normalized("/")` — the ship reads the WORLD's
+/// overall churn, not any one field's) — write-on-change, the same
+/// materials-asset discipline every other glow system here follows.
+pub fn sync_ship_glow(
+    heat: Res<FsnHeat>,
+    palette: Res<ScenePalette>,
+    ships: Query<&FsnShip>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+) {
+    let Ok(ship) = ships.single() else { return };
+    let h = heat.normalized("/");
+    let gain = palette.trim + (palette.crest - palette.trim) * h;
+    if let Some(mat) = mats.get_mut(&ship.material) {
+        let want = lin_scaled(palette.gold, gain);
+        if mat.base_color != want {
+            mat.base_color = want;
+        }
+    }
+}
 
 fn vis(want: bool) -> Visibility {
     if want { Visibility::Inherited } else { Visibility::Hidden }
