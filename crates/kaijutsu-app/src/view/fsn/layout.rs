@@ -295,6 +295,13 @@ const MARKER_VERTS: [[f32; 3]; 6] =
 const MARKER_INDICES: [u32; 24] =
     [2, 0, 4, 2, 4, 1, 2, 1, 5, 2, 5, 0, 3, 4, 0, 3, 1, 4, 3, 5, 1, 3, 0, 5];
 
+/// Vertices contributed per point by [`point_marker_mesh_data`] — the marker
+/// template's own vertex count, exposed so callers can build a matching
+/// per-vertex-color buffer (e.g. [`super::scene`]'s recency tint, expanded
+/// via [`per_cell_colors`] once per marker) without duplicating the literal
+/// `6` [`MARKER_VERTS`] already encodes.
+pub const MARKER_VERT_COUNT: usize = MARKER_VERTS.len();
+
 /// Build ONE combined triangle mesh's raw buffers for every point in
 /// `positions`: a tiny octahedron of `size` at each, so a whole field's
 /// vertex/seed points cost one extra `Mesh`, not one entity per point (the
@@ -406,6 +413,146 @@ pub fn nearest_index(point: [f32; 2], candidates: &[[f32; 2]]) -> Option<usize> 
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).expect("distances are always finite"))
         .map(|(i, _)| i)
+}
+
+// ── Recency glow (A1 — vertex-color RELATIVE tint, baked at mesh build) ─────
+//
+// The color-composition law this module's half of: vertex colors carry
+// RECENCY as a per-channel tint toward gold, `super::scene_palette::
+// warmth_tint` bakes `tint = lerp(1.0, gold_c/base_c, w)` so `tint × base_color
+// == lerp(base_color, gold, w)` exactly once the material's own base_color is
+// multiplied in at render time. This half only computes `w` (0..1, how gold)
+// from an mtime age — the tint math itself lives in `scene_palette` (it needs
+// the palette's hues, which this Bevy-free module doesn't touch).
+
+/// Age (seconds) at or under which a cell reads as maximally fresh — full
+/// gold tint weight. An hour. **Amy-tunable.**
+pub const RECENCY_FRESH_SECS: f64 = 3_600.0;
+/// Age (seconds) at or over which a cell has faded to no tint at all — 90
+/// days. **Amy-tunable.**
+pub const RECENCY_OLD_SECS: f64 = 90.0 * 86_400.0;
+
+/// Recency tint weight (0..1) for a cell whose mtime is `age_secs` old: 1.0
+/// at/under [`RECENCY_FRESH_SECS`], 0.0 at/over [`RECENCY_OLD_SECS`], a log
+/// ramp between — `1 - ln(age/fresh) / ln(old/fresh)`, so the falloff eases
+/// rather than dropping linearly (a file just past "fresh" still reads
+/// mostly warm). A negative age (clock skew, a future mtime) clamps to 1.0
+/// — the freshest reading; a NaN age clamps to 1.0 too (the only way to
+/// dodge `ln`'s NaN-in-NaN-out without a fresh/old special case); `+inf`
+/// falls out through the ordinary `>= RECENCY_OLD_SECS` check to 0.0, which
+/// already reads correctly (infinitely old).
+pub fn recency_weight(age_secs: f64) -> f32 {
+    if age_secs.is_nan() || age_secs <= RECENCY_FRESH_SECS {
+        return 1.0;
+    }
+    if age_secs >= RECENCY_OLD_SECS {
+        return 0.0;
+    }
+    let ratio = age_secs / RECENCY_FRESH_SECS;
+    let span = RECENCY_OLD_SECS / RECENCY_FRESH_SECS;
+    let w = 1.0 - ratio.ln() / span.ln();
+    w.clamp(0.0, 1.0) as f32
+}
+
+/// Expand one color per cell into one color per vertex, given each cell's
+/// own vertex count (e.g. [`prism_wireframe`]'s `3 × vertex_count` — this
+/// function doesn't care WHICH per-cell layout produced the count, only that
+/// `vert_counts` and `cell_colors` are the same two zipped sequences the
+/// caller already built cell-by-cell). Debug-asserts the lengths match
+/// (a caller bug, not a runtime condition this pure fn should paper over
+/// with a silent truncation — crashing in debug/test builds beats a subtly
+/// wrong paint job shipping to release).
+pub fn per_cell_colors(vert_counts: &[usize], cell_colors: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    debug_assert_eq!(
+        vert_counts.len(),
+        cell_colors.len(),
+        "per_cell_colors: exactly one color per cell"
+    );
+    vert_counts
+        .iter()
+        .zip(cell_colors)
+        .flat_map(|(&n, &c)| std::iter::repeat_n(c, n))
+        .collect()
+}
+
+// ── Ship overhead (A3) ───────────────────────────────────────────────────────
+
+/// Ship-silhouette ring radius (world units, upper ring) — **Amy-tunable,
+/// first guess.**
+pub const SHIP_RADIUS: f32 = 220.0;
+/// World-Y the upper ring sits at, high over the root field.
+/// **Amy-tunable.**
+pub const SHIP_Y: f32 = 2600.0;
+/// The lower ring's radius as a fraction of [`SHIP_RADIUS`] — a taper toward
+/// the belly. **Amy-tunable.**
+pub const SHIP_LOWER_RADIUS_FRAC: f32 = 0.6;
+/// How far below [`SHIP_Y`] the lower ring sits. **Amy-tunable.**
+pub const SHIP_LOWER_DROP: f32 = 60.0;
+/// How far the nose spine projects (world −Z, matching [`super::scene`]'s
+/// `START_LOOK` dive-in direction) beyond the upper ring's own radius.
+/// **Amy-tunable.**
+pub const SHIP_NOSE_LENGTH: f32 = 140.0;
+
+/// Ring tessellation (octagon, matching the room's own wall-shell
+/// convention) for both silhouette rings.
+const SHIP_RING_SIDES: usize = 8;
+
+/// One ring's vertices, evenly spaced in the XZ plane at height `y`.
+fn ring_points(radius: f32, y: f32) -> Vec<[f32; 3]> {
+    (0..SHIP_RING_SIDES)
+        .map(|i| {
+            let theta = (i as f32 / SHIP_RING_SIDES as f32) * std::f32::consts::TAU;
+            [radius * theta.cos(), y, radius * theta.sin()]
+        })
+        .collect()
+}
+
+/// The overhead ship's wireframe silhouette: two concentric octagon rings
+/// ([`SHIP_RADIUS`] at [`SHIP_Y`], [`SHIP_LOWER_RADIUS_FRAC`] × radius at
+/// `SHIP_Y - `[`SHIP_LOWER_DROP`]), one vertical at each of the upper ring's
+/// vertices connecting down to the matching lower vertex, and a short nose
+/// spine off the ring's north-most point (`[0, SHIP_Y, -SHIP_RADIUS]`, world
+/// -Z — same "into the world" convention `enter_fsn`'s `START_LOOK` uses).
+/// Segment count is always `3 × SHIP_RING_SIDES + 1` (upper ring edges +
+/// lower ring edges + verticals + one nose) — pure, no Bevy types, so
+/// [`super::scene`] just flattens the result via [`flatten_segments`].
+pub fn ship_silhouette_segments() -> Vec<Segment> {
+    let upper = ring_points(SHIP_RADIUS, SHIP_Y);
+    let lower = ring_points(SHIP_RADIUS * SHIP_LOWER_RADIUS_FRAC, SHIP_Y - SHIP_LOWER_DROP);
+    let n = SHIP_RING_SIDES;
+    let mut segs = Vec::with_capacity(3 * n + 1);
+    for i in 0..n {
+        segs.push([upper[i], upper[(i + 1) % n]]);
+    }
+    for i in 0..n {
+        segs.push([lower[i], lower[(i + 1) % n]]);
+    }
+    for i in 0..n {
+        segs.push([upper[i], lower[i]]);
+    }
+    let nose_base = [0.0, SHIP_Y, -SHIP_RADIUS];
+    let nose_tip = [0.0, SHIP_Y, -(SHIP_RADIUS + SHIP_NOSE_LENGTH)];
+    segs.push([nose_base, nose_tip]);
+    segs
+}
+
+// ── Backdrop camera orbit (A4) ───────────────────────────────────────────────
+
+/// Backdrop RTT camera's orbit radius/height (world units) and angular rate
+/// (rad/s) — a slow drift so the windows read as "something out there is
+/// churning," not a spinning toy. **Amy-tunable, first guess.**
+pub const ORBIT_RADIUS: f32 = 1900.0;
+pub const ORBIT_HEIGHT: f32 = 1300.0;
+pub const ORBIT_RATE: f32 = 0.05;
+
+/// The backdrop camera's pose at time `t` (seconds): a slow circular orbit
+/// at [`ORBIT_RADIUS`]/[`ORBIT_HEIGHT`] around the world origin, always
+/// looking back at the origin. Returns `(position, look_at)` as plain arrays
+/// — this module's own no-Bevy-types stance — `super::backdrop` turns the
+/// pair into a `Transform::from_translation(..).looking_at(..)`.
+pub fn orbit_pose(t: f32) -> ([f32; 3], [f32; 3]) {
+    let theta = t * ORBIT_RATE;
+    ([ORBIT_RADIUS * theta.cos(), ORBIT_HEIGHT, ORBIT_RADIUS * theta.sin()], [0.0, 0.0, 0.0])
 }
 
 #[cfg(test)]
@@ -888,5 +1035,117 @@ mod tests {
     #[test]
     fn nearest_index_empty_candidates_is_none() {
         assert_eq!(nearest_index([0.0, 0.0], &[]), None);
+    }
+
+    // ── recency_weight ──
+
+    #[test]
+    fn recency_weight_is_one_at_and_under_fresh() {
+        assert_eq!(recency_weight(0.0), 1.0);
+        assert_eq!(recency_weight(RECENCY_FRESH_SECS), 1.0);
+        assert_eq!(recency_weight(RECENCY_FRESH_SECS * 0.5), 1.0);
+    }
+
+    #[test]
+    fn recency_weight_is_zero_at_and_over_old() {
+        assert_eq!(recency_weight(RECENCY_OLD_SECS), 0.0);
+        assert_eq!(recency_weight(RECENCY_OLD_SECS * 10.0), 0.0);
+    }
+
+    #[test]
+    fn recency_weight_ramps_monotonically_between_fresh_and_old() {
+        let samples: Vec<f32> = [0.25, 0.5, 0.75]
+            .iter()
+            .map(|frac| {
+                let age = RECENCY_FRESH_SECS + frac * (RECENCY_OLD_SECS - RECENCY_FRESH_SECS);
+                recency_weight(age)
+            })
+            .collect();
+        assert!(samples[0] > samples[1] && samples[1] > samples[2], "{samples:?} must decrease");
+        for w in samples {
+            assert!((0.0..=1.0).contains(&w), "{w} out of range");
+        }
+    }
+
+    #[test]
+    fn recency_weight_treats_a_future_mtime_as_fresh() {
+        assert_eq!(recency_weight(-100.0), 1.0, "clock skew must not go negative/NaN");
+    }
+
+    #[test]
+    fn recency_weight_treats_nan_as_fresh_and_infinity_as_infinitely_old() {
+        assert_eq!(recency_weight(f64::NAN), 1.0, "NaN must not propagate into the tint math");
+        assert_eq!(recency_weight(f64::INFINITY), 0.0, "an infinite age reads as maximally stale");
+    }
+
+    // ── per_cell_colors ──
+
+    #[test]
+    fn per_cell_colors_expands_each_cell_to_its_own_vertex_count() {
+        let counts = [3usize, 0, 2];
+        let colors = [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
+        let out = per_cell_colors(&counts, &colors);
+        assert_eq!(out.len(), 5);
+        assert_eq!(&out[0..3], &[colors[0]; 3]);
+        assert_eq!(&out[3..5], &[colors[2]; 2]);
+    }
+
+    #[test]
+    fn per_cell_colors_of_empty_input_is_empty() {
+        assert!(per_cell_colors(&[], &[]).is_empty());
+    }
+
+    // ── ship_silhouette_segments ──
+
+    #[test]
+    fn ship_silhouette_segment_count_matches_the_3x_plus_nose_invariant() {
+        let segs = ship_silhouette_segments();
+        assert_eq!(segs.len(), 3 * 8 + 1);
+    }
+
+    #[test]
+    fn ship_silhouette_rings_sit_at_their_configured_y_levels() {
+        let segs = ship_silhouette_segments();
+        // First 8: upper ring, both endpoints at SHIP_Y.
+        for s in &segs[0..8] {
+            assert_eq!(s[0][1], SHIP_Y);
+            assert_eq!(s[1][1], SHIP_Y);
+        }
+        // Next 8: lower ring, both endpoints at SHIP_Y - SHIP_LOWER_DROP.
+        for s in &segs[8..16] {
+            assert_eq!(s[0][1], SHIP_Y - SHIP_LOWER_DROP);
+            assert_eq!(s[1][1], SHIP_Y - SHIP_LOWER_DROP);
+        }
+        // Next 8: verticals, one endpoint at each level.
+        for s in &segs[16..24] {
+            let ys = [s[0][1], s[1][1]];
+            assert!(ys.contains(&SHIP_Y) && ys.contains(&(SHIP_Y - SHIP_LOWER_DROP)));
+        }
+        // Final: the nose spine, both ends at SHIP_Y, projecting past -radius.
+        let nose = segs[24];
+        assert_eq!(nose[0][1], SHIP_Y);
+        assert_eq!(nose[1][1], SHIP_Y);
+        assert_eq!(nose[0][2], -SHIP_RADIUS);
+        assert_eq!(nose[1][2], -(SHIP_RADIUS + SHIP_NOSE_LENGTH));
+    }
+
+    // ── orbit_pose ──
+
+    #[test]
+    fn orbit_pose_holds_the_configured_radius_and_height_over_time() {
+        for t in [0.0, 3.7, 12.0, 100.0] {
+            let (pos, look_at) = orbit_pose(t);
+            let xz_dist = (pos[0] * pos[0] + pos[2] * pos[2]).sqrt();
+            assert!((xz_dist - ORBIT_RADIUS).abs() < 1e-2, "t={t}: {xz_dist} vs {ORBIT_RADIUS}");
+            assert_eq!(pos[1], ORBIT_HEIGHT);
+            assert_eq!(look_at, [0.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn orbit_pose_advances_with_time() {
+        let (p0, _) = orbit_pose(0.0);
+        let (p1, _) = orbit_pose(10.0);
+        assert_ne!(p0, p1, "the orbit must actually move");
     }
 }
