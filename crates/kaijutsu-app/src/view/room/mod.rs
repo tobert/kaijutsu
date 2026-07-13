@@ -537,7 +537,19 @@ fn enter_room(
     // 16-param ceiling for a function-as-system — `enter_room` was the first
     // system in this codebase to actually hit it (Slice C added enough new
     // room-furniture params to tip it over).
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    // `Without<FsnBackdropCamera>`: defensive — `view::fsn::backdrop`'s
+    // off-screen RTT camera is also a `Camera3d`, spawned in the SAME
+    // `OnEnter(Screen::Room)` transition this system runs in
+    // (`FsnBackdropPlugin`'s own `spawn_backdrop`). Bevy runs `OnExit`
+    // before `OnEnter` for a state transition, so in practice this camera
+    // shouldn't exist yet the first time `enter_room` runs after entering
+    // `Screen::Room` — but nothing enforces which `OnEnter(Screen::Room)`
+    // system runs first between plugins, so the exclusion keeps
+    // `app_camera.single_mut()` safe regardless of registration order.
+    mut app_camera: Query<
+        (Entity, &mut Camera, &mut Transform),
+        (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>),
+    >,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`

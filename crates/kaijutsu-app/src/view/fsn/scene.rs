@@ -150,7 +150,15 @@ pub fn enter_fsn(
     mut state: ResMut<FsnState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
-    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
+    // `Without<FsnBackdropCamera>`: defensive — the backdrop's off-screen
+    // RTT camera (`super::backdrop`) is a `Camera3d` too. It's despawned on
+    // `OnExit(Screen::Room)`, which Bevy runs before `OnEnter(Screen::Fsn)`
+    // for the same transition, so it shouldn't be alive when this runs —
+    // but the exclusion costs nothing and removes the ordering assumption.
+    mut app_camera: Query<
+        (Entity, &mut Camera, &mut Transform),
+        (With<Camera3d>, Without<super::backdrop::FsnBackdropCamera>),
+    >,
     existing: Query<Entity, With<FsnRoot>>,
 ) {
     if !existing.is_empty() {
