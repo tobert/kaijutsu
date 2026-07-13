@@ -570,11 +570,25 @@ pub fn ship_silhouette_segments() -> Vec<Segment> {
 /// elevation, so the nearest districts pass beneath the frame's bottom
 /// edge, the far edge (~13000 out) settles just under the skyline with sky
 /// above it, and the world reads as terrain to the horizon instead of a
-/// model on a table. At `ORBIT_RATE` 0.05 a full revolution still takes
-/// ~2 minutes. **Amy-tunable.**
+/// model on a table. **Amy-tunable.**
 pub const ORBIT_RADIUS: f32 = 7200.0;
 pub const ORBIT_HEIGHT: f32 = 1900.0;
-pub const ORBIT_RATE: f32 = 0.05;
+
+/// The horizon's gear ratio against the room's master spin — the time
+/// well's TOP terrace ring (`time_well::scene::TERRACE_RING_SPIN_BASE`).
+/// Amy, 2026-07-13: the well's rings and the world past the glass read
+/// gear-like from the console, so they should BE geared — the FSN orbit is
+/// the big outer wheel of the ensemble, turning at 1/3 the top ring's
+/// rate (her "maybe 2/3 or 1/3"; 1/3 is the stately pick — a full
+/// revolution ≈ π minutes at the well's current 0.10). Retuning the
+/// well's spin turns the whole train together; retune the RATIO here to
+/// change only the horizon. **Amy-tunable.**
+pub const ORBIT_GEAR_RATIO: f32 = 1.0 / 3.0;
+
+/// Angular rate (rad/s) of the vessel's orbit — derived, never set
+/// directly: the master spin × [`ORBIT_GEAR_RATIO`].
+pub const ORBIT_RATE: f32 =
+    crate::view::time_well::scene::TERRACE_RING_SPIN_BASE * ORBIT_GEAR_RATIO;
 
 /// The backdrop camera's pose at time `t` (seconds): a slow circular orbit
 /// at [`ORBIT_RADIUS`]/[`ORBIT_HEIGHT`] around the world origin, always
