@@ -49,6 +49,14 @@ pub const DOCS_ROOT: &str = "/v/docs";
 /// Root of the CRDT input-document view mount.
 pub const INPUT_ROOT: &str = "/v/input";
 
+/// Root of the client-shares namespace (`docs/slash-r.md`) — the reverse of
+/// `/v`: a sibling top-level tree (not under `/v`) because it names remote
+/// *clients*, not kernel-local virtual filesystems. Layout:
+/// `/r/<client-id>/<share-name>/...`, plus a synthesized `/r/index` registry
+/// TSV. One `ShareFs` backend mounts here; per-client mounts are impossible
+/// (the mount table freezes after bootstrap).
+pub const R_ROOT: &str = "/r";
+
 // ---------------------------------------------------------------------
 // Builders — replace scattered `format!` calls at mount/write sites.
 // ---------------------------------------------------------------------
@@ -78,6 +86,16 @@ pub fn client_config_path(client_id: Option<&str>, name: &str) -> String {
         Some(id) => format!("{CLIENT_ROOT}/{id}/{name}"),
         None => format!("{CLIENT_ROOT}/{name}"),
     }
+}
+
+/// A live client's root under `/r`: `/r/<client_id>`.
+pub fn r_client_path(client_id: &str) -> String {
+    format!("{R_ROOT}/{client_id}")
+}
+
+/// One share's canonical path: `/r/<client_id>/<share>`.
+pub fn r_share_path(client_id: &str, share: &str) -> String {
+    format!("{R_ROOT}/{client_id}/{share}")
 }
 
 // ---------------------------------------------------------------------
@@ -140,6 +158,12 @@ mod tests {
             client_config_path(Some("abc-123"), "metronome.toml"),
             "/etc/client/abc-123/metronome.toml"
         );
+    }
+
+    #[test]
+    fn r_builders_join_components() {
+        assert_eq!(r_client_path("c-123"), "/r/c-123");
+        assert_eq!(r_share_path("c-123", "downloads"), "/r/c-123/downloads");
     }
 
     #[test]
