@@ -1,10 +1,15 @@
 # The `/r` remote-mount namespace: client shares over reverse SFTP
 
-*Design note. Proposed 2026-07-13 (Amy + Claude co-design session). Nothing
-built yet; the streaming-copy primitive is decided as the first slice so later
-work builds on it. Companions: `docs/sftp.md` (the landed forward direction),
-`docs/slash-v.md` (the `/v` surfaces + the index-TSV house style this reuses),
-`docs/mounts.md` (the opaque-host inversion `/r` sits beside).*
+*Design note. Proposed 2026-07-13 (Amy + Claude co-design session); reviewed
+pre-build by DeepSeek + Gemini Pro (provenance footers). **Slices 0+1 +
+stitch SHIPPED same day** (merges `ad4b212e` pump, `99d4e5cd` share — two
+Sonnet-subagent worktree lanes + a post-build deepseek review round; sections
+below updated to the as-built reality, deviations marked). Not yet
+live-verified on a real kernel; remaining slices (kj share verbs, `:rw`,
+notify) tracked in `docs/issues.md`. Companions: `docs/sftp.md` (the landed
+forward direction), `docs/slash-v.md` (the `/v` surfaces + the index-TSV
+house style this reuses), `docs/mounts.md` (the opaque-host inversion `/r`
+sits beside).*
 
 A client shares a slice of its local filesystem into the kernel's VFS —
 the exact reverse of the SFTP we already ship. `kaijutsu-app --share ~/Downloads`
@@ -120,7 +125,15 @@ CLI arg is the durable intent. On disconnect, unregistration walks the
 routing table, removes the rows, then drops the `SftpSession` — the drop
 cancels its pending futures, so **in-flight ops fail** with a dedicated
 error (`VfsError` variant, mapped loudly everywhere it surfaces) — a
-half-written file plus a vanished mount beats a hung `cp`.
+half-written file plus a vanished mount beats a hung `cp`. Unregistration
+is token-guarded so a stale session's cleanup can never evict a fresh
+reconnect's registration. **As built, one addition** (deepseek post-build
+review): a clean channel close is observed immediately, but a silently-dead
+peer (partition, suspended laptop — no FIN) generates no traffic to trip
+on, so the session task runs a **keepalive** — every
+`SHARE_KEEPALIVE_INTERVAL` (15 s), one cheap timed `LSTAT /index`, raced
+against the close signal; a failed ping evicts the session. "Vanish the
+moment the channel drops" is honest for idle and wedged peers alike.
 
 Backend details that are decisions, not chores:
 
@@ -139,20 +152,27 @@ Backend details that are decisions, not chores:
   followed symlinks (the standing gotcha); `ShareFs` overrides it to loop
   `read` to EOF, exactly like the client CAS fetcher does past the 256 KiB
   SFTP `READ` cap.
-- **Coherence stamp: a vendor ATTRS extension, because we own both ends**
+- **Coherence stamp: a vendor extension, because we own both ends**
   (gemini review, superseding the first two plans — remote-mtime was weak,
   a kernel-side write counter was blind to client-local edits). SFTP v3
   attrs carry mtime as **u32 seconds**, useless as a generation, and
-  `FileDocumentCache` staleness needs a *strictly advancing* stamp. But
-  kaijutsu ships both halves of this protocol, so the client's share server
-  adds `kaijutsu-generation@kaijutsu.dev` to its `ATTRS` replies, carrying
-  host mtime-**nanos** — exactly `LocalBackend`'s own generation rule,
-  now crossing the wire. Strictly monotonic on day one, covering client-local
-  edits at stat time (cache staleness *and* the TOCTOU guard). The extension
-  is **required**: a share session whose attrs lack it is refused loudly as
-  version skew (monorepo flag-day culture, no compat shim). Remote mtime
-  stays display-only. The notify slice then becomes about *push* —
-  invalidation without polling, FSN heat — not about stat correctness.
+  `FileDocumentCache` staleness needs a *strictly advancing* stamp. Kaijutsu
+  ships both halves of this protocol, so the client serves
+  `kaijutsu-generation@kaijutsu.dev`, carrying host mtime-**nanos** —
+  exactly `LocalBackend`'s own generation rule, now crossing the wire.
+  Strictly monotonic on day one, covering client-local edits at stat time.
+  **As built (deviation from the ATTRS plan):** russh-sftp 2.3's
+  `FileAttributes` has no extended-attribute slot (its `Serialize` says
+  `// todo`), so the stamp rides a sibling `SSH_FXP_EXTENDED`
+  request/reply (`kaijutsu-types/src/share.rs` — batched `paths: Vec` on
+  the wire, though `getattr` currently sends one path per call: a known
+  perf follow-up, 2 RTTs per stat). The **required** check moved to a
+  better home than per-file attrs: the client advertises the extension in
+  its SFTP `INIT` version reply, and registration refuses a session
+  without it, loudly, as version skew (monorepo flag-day culture, no
+  compat shim). Remote mtime stays display-only. The notify slice then
+  becomes about *push* — invalidation without polling, FSN heat — not
+  about stat correctness.
 - **Writable shares enforce at both ends**: the kernel checks the registry
   `rw` flag before issuing a mutating op (fail fast, good errors), and the
   client's share server rejects mutations on an ro share regardless (its
@@ -285,18 +305,20 @@ shares are cables the clients plug in.
 ## Implementation slices
 
 0. **Streaming pump + streaming CAS store + the `VfsOps` stream primitive.**
-   Kernel-only, no wire work: `open_read_stream` with its loop-`read` default
-   impl, the pump, the hashing CAS sink with drop-cleanup; `kj cp` as first
-   consumer; fault-injection tests. Everything later builds on it.
-1. **Reverse-SFTP share, read-only.** `SSH_SHARE_SUBSYSTEM` constant + server
-   match arm; client share server (jail + manifest +
-   `kaijutsu-generation@kaijutsu.dev` attrs extension) behind repeatable
-   `--share [name=]path`; `ShareFs` mounted at `/r` pre-freeze with registry
-   (live-duplicate client-id rejection), session lock + per-op timeouts,
-   `index`, `read_all` override, the streaming-read override (held handle,
-   pipelined `READ`s), attr squashing, disconnect-unmount + dedicated error;
-   crawl-opacity flag honored by `snapshot`. Verify via kaish `ls /r`, `cp`
-   out of a share — mind the kaish shadow-overlay papercut that bit `/v/cas`.
+   ✅ **SHIPPED 2026-07-13** (`ad4b212e`): `open_read_stream` + loop-`read`
+   default + `MountTable` delegation, `vfs/pump.rs` (`PumpSink`/`VfsSink`/
+   `CasSink`), `StreamingWriter` (drop-unlinks-staging), `kj cp`, `kj cas
+   put` streams; fault-injection tests.
+1. **Reverse-SFTP share, read-only.** ✅ **SHIPPED 2026-07-13** (`99d4e5cd`,
+   including the stitch: `ShareFs::open_read_stream` holds ONE remote handle
+   per transfer with per-chunk lock scoping + a drop-guard `CLOSE`; proven
+   by a counting harness). All of: subsystem constant + arm, jailed client
+   share server + manifest + generation extension, repeatable `--share
+   [name=]path`, `ShareFs` pre-freeze with registry/timeouts/keepalive,
+   `/r/index`, `read_all` override, attr squashing, crawl opacity.
+   **Not yet live-verified** on a real kernel — kaish `ls /r`, `cp` out of a
+   share, and the kaish shadow-overlay papercut check (which bit `/v/cas`)
+   are the outstanding verification steps.
 2. **`kj share` verbs + polish.** `kj share ls` (registry TSV), eject;
    `/v/session` rows gain the share channel kind.
 3. **Writable shares.** `:rw` suffix, both-ends enforcement, TOCTOU stance

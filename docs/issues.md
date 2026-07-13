@@ -16,6 +16,10 @@ in-flight lane — pre-existing on `main`, just not caught because `cargo build`
 (rustc) doesn't run clippy lints and CI apparently doesn't run
 `--all-targets`. Either rename the test literal to something clearly not
 π-shaped (e.g. `3.5`) or scope an `#[allow]` to that one assertion.
+Same class, found 2026-07-13 (r-pump lane): `cargo clippy --all-targets -p
+kaijutsu-kernel` fails on `deny(clippy::reversed_empty_ranges)` in
+`crates/kaijutsu-kernel/src/llm/splice.rs` test code (`&[3..1]`) — also
+pre-existing, also only under `--all-targets`.
 
 ## FSN landscape follow-ups (updated 2026-07-13 post-slice-1, `docs/scenes/vfs.md`)
 
@@ -140,23 +144,37 @@ whole-file review are folded. Remaining, in `docs/sftp.md` slice order:
   `VfsOps::write`/`setattr` closes (a); (b) also needs an atomic-append primitive
   or per-path write serialization. Kernel-wide change, worth doing before slice 4.
 
-## `/r` client shares — reverse SFTP (design `docs/slash-r.md`, 2026-07-13; nothing built)
+## `/r` client shares — reverse SFTP (design `docs/slash-r.md`; slices 0+1+stitch SHIPPED 2026-07-13)
 
-Clients share local paths into the kernel VFS (`--share ~/Downloads` →
-`/r/<client-id>/downloads`) — the reverse of the landed SFTP direction. Decided:
-heavy IO off capnp, file data on SFTP; one `kaijutsu-share` subsystem
-channel per client serving N shares + an in-band manifest `index`; `/r` is ONE
-`ShareFs` backend mounted pre-freeze (the `MountTable::freeze` constraint)
-routing to live sessions; read-only default; disconnect = loud unmount; `/r`
-is opaque to snapshot/index sweeps (every readdir is a network round trip).
-Slice order in the doc: **0 = streaming pump + streaming CAS store +
-`VfsOps::open_read_stream` first** (kernel-only, `kj cp` first consumer —
-kaish `cp` slurps whole files, kaish-kernel 0.12 `tools/builtin/cp.rs:202`,
-upstream candidate), then RO share, `kj share` verbs, `:rw`, notify push.
-DeepSeek + Gemini Pro reviews both folded 2026-07-13 (provenance footers in
-the doc; gemini's RTT-amplification catch shaped slice 0, and its
-`kaijutsu-generation@` ATTRS extension went into slice 1). Review-complete;
-slice 0 ready to start.
+Shipped: streaming pump + `VfsOps::open_read_stream` + streaming CAS +
+`kj cp` (`ad4b212e`), the full read-only reverse-SFTP loop + held-handle
+stream stitch (`99d4e5cd`). Design + review trail in `docs/slash-r.md`.
+Remaining, roughly in order:
+
+- **Live verification** — not yet run on a real kernel: kernel restart,
+  kaish `ls /r` (check the kaish shadow-overlay papercut that bit `/v/cas`),
+  an app launched with `--share`, `kj cp` out of the share, disconnect
+  behavior. Needs an app invocation carrying the flag (runner arg).
+- **`kj share` verbs** (slice 2) — `ls` (render `/r/index`), eject;
+  `/v/session` rows for share channels.
+- **`:rw` writable shares** (slice 3) — parsing ships; both-ends enforcement
+  + write path don't.
+- **Notify push** (slice 4) — client-side watcher → generation bumps +
+  activity digests (FSN heat for client-local edits).
+- **Generation lookups are unbatched** — the `kaijutsu-generation@` EXTENDED
+  request carries `paths: Vec` but `ShareFs::getattr` sends one path per
+  call: 2 RTTs per stat, and forward-SFTP `readdir` over `/r` costs
+  N×(LSTAT+EXTENDED). Batch at the `readdir` seam when it hurts.
+- **Reconnect leaks one `SshClient` handle** per re-dial for the process
+  lifetime (`share_dial.rs` — `russh_sftp::server::run` exposes no
+  completion signal to know when dropping is safe). Slow leak, reconnects
+  are rare; fix wants an upstream hook or a wrapper stream signal.
+- **Crawl opacity reuses `snapshot`'s `denied` wire field** — FSN renders
+  an opaque `/r` the same as a permission-denied dir; a distinct bit (and a
+  deliberate FSN rendering for "someone's machine is here") is follow-up.
+- **kaish `cp` still slurps whole files** (kaish-kernel 0.12
+  `tools/builtin/cp.rs:202`) — upstream candidate now that the kernel-side
+  pump exists as prior art.
 
 ## Shared state space + myaku (design `docs/shared-state.md`; myaku detail in git history)
 

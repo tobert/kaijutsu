@@ -722,3 +722,52 @@ breathe-on-jam acceptance and the metronome-click chord pulse still await
 the next live jam; theme push-on-change and the remaining compiled-only
 color families remain in issues.md. Open work is in `docs/issues.md`; the
 live handoff in `signoff.md` (ephemeral, repo root).
+
+## The filesystem joins the band — /r client shares (July 2026)
+
+The idea arrived as one sentence from Amy: reverse the SFTP we already
+have, so a client can share `~/Downloads` or `~/src` into the kernel the
+way `code .` shares a directory with an editor — patch cables for
+filesystems, to sit beside the MIDI ones. The design conversation settled
+the load-bearing lines fast: heavy IO stays off capnp (control verbs and
+light metadata are fine — the rule was never purity), file bytes ride
+SFTP with the roles swapped (the client opens a `kaijutsu-share` channel
+and speaks the *server* role; subsystem requests only travel one way, so
+the swap is the whole trick), and the share session describes itself with
+an in-band `index` TSV manifest instead of a capnp token handshake — the
+slash-v "index is the resolver" ethos applied to negotiation, which
+dissolved the pairing problem outright.
+
+Two pre-build reviews earned their keep before a line of code existed.
+DeepSeek confirmed the role swap and flagged session serialization;
+Gemini Pro caught the finding that reshaped slice 0: `VfsOps::read` is
+stateless, SFTP is stateful, so a naive pump over a share would pay
+OPEN/READ/CLOSE per 256 KiB — ~1.7 MB/s at 50 ms RTT. The fix became the
+first thing built: `open_read_stream` on the trait, loop-`read` by
+default, held-handle when it matters. Gemini also pointed out that owning
+both protocol ends means we can ship nanosecond generations in a vendor
+extension rather than accepting SFTP v3's one-second mtime; the built
+form landed as a sibling `SSH_FXP_EXTENDED` request (russh-sftp's attrs
+have no extension slot) with the required-check riding INIT extension
+advertisement — an accidental improvement, since INIT is where version
+negotiation belongs anyway.
+
+The build ran the FSN slice-1 playbook: two worktree lanes, Sonnet
+subagents on the code, lead reviewing every diff and re-running every
+suite. The pump lane landed clean. The share lane built the whole loop —
+jailed client server (openat2 `RESOLVE_BENEATH`, ENOSYS-only fallback),
+registration with token-guarded unregister, `ShareFs` behind the frozen
+mount table — and caught two of its own bugs by running tests (a FIFO
+open that blocks forever without `O_NONBLOCK`; an attrs builder ordering
+clobber that made every share root a non-directory). A post-build
+deepseek pass over the worktree found six more the tests missed, the
+worst being a dead `readlink` stub that *lied* (getattr said symlink,
+readlink said not-a-symlink) and an `index`-by-name attrs override that
+clobbered any real file named `index`. The same agent fixed all six with
+regression tests, then stitched the held-handle override — proven by a
+counting harness asserting exactly ONE remote OPEN for a four-chunk
+transfer, with per-chunk lock scoping so the keepalive and sibling ops
+interleave with a long copy. One day, design to stitch: `ad4b212e`
+(pump), `99d4e5cd` (share). Live verification against a real kernel is
+the open loop; slices 2–4 (`kj share` verbs, `:rw`, notify) wait in
+issues.md.
