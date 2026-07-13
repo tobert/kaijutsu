@@ -367,13 +367,42 @@ fn open_file_beneath(root: &Path, rel: &Path) -> io::Result<std::fs::File> {
         }
     }
 
+    open_file_fallback(root, rel)
+}
+
+/// The portable fallback body of [`open_file_beneath`]: canonicalize-then-
+/// open, with the documented residual TOCTOU. Split out so the fallback is
+/// directly testable even on hosts whose `openat2` path handles the default
+/// case — this code is live on non-Linux unix and pre-5.6 kernels.
+fn open_file_fallback(root: &Path, rel: &Path) -> io::Result<std::fs::File> {
     let real = resolve_follow(root, rel)?;
-    let meta = std::fs::metadata(&real)?;
+    let file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NONBLOCK for the same reason the openat2 path carries it: a
+            // FIFO swapped in between `resolve_follow` and this open would
+            // otherwise block the thread until a writer appears — the
+            // check-then-open gap is exactly the fallback's documented
+            // residual race, so the type check must run on the OPENED fd
+            // (fstat below), never a pre-open stat alone.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&real)?
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::File::open(&real)?
+        }
+    };
+    // fstat the opened object itself — no window between check and use.
+    let meta = file.metadata()?;
     if meta.is_dir() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "is a directory"));
     }
     refuse_special(&meta)?;
-    std::fs::File::open(&real)
+    Ok(file)
 }
 
 /// Host mtime-nanos — `LocalBackend`'s own generation rule
@@ -449,7 +478,14 @@ enum HandleEntry {
     Manifest,
     File(tokio::fs::File),
     Dir {
-        entries: Vec<(String, std::fs::Metadata)>,
+        /// `None` metadata marks THE synthesized `/index` manifest entry —
+        /// only `opendir`'s `Route::Root` arm ever creates one, so the
+        /// marker is structural: a real file that happens to be named
+        /// `index` inside a share always carries `Some(meta)` and lists
+        /// with its own attrs, never the manifest's (and the manifest entry
+        /// itself needs no host `stat` to exist — no silent drop, no
+        /// `temp_dir` placeholder).
+        entries: Vec<(String, Option<std::fs::Metadata>)>,
         cursor: usize,
         dots_sent: bool,
     },
@@ -584,30 +620,28 @@ impl Handler for ShareHandler {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-        let entries: Vec<(String, std::fs::Metadata)> = match route(&self.config, &path)? {
+        let entries: Vec<(String, Option<std::fs::Metadata>)> = match route(&self.config, &path)? {
             Route::Root => {
-                let mut v: Vec<(String, std::fs::Metadata)> = self
+                let mut v: Vec<(String, Option<std::fs::Metadata>)> = self
                     .config
                     .shares
                     .iter()
-                    .filter_map(|s| std::fs::metadata(&s.root).ok().map(|m| (s.name.clone(), m)))
+                    .filter_map(|s| {
+                        std::fs::metadata(&s.root).ok().map(|m| (s.name.clone(), Some(m)))
+                    })
                     .collect();
-                // The manifest has no real host file — synthesize an entry
-                // via the root itself's metadata as a stand-in container (its
-                // actual attrs are re-synthesized by `lstat`/`readdir`, this
-                // only feeds the entries-list scan below).
-                if let Ok(root_meta) = std::fs::metadata(std::env::temp_dir()) {
-                    v.push((INDEX_NAME.to_string(), root_meta));
-                }
+                // The manifest has no real host file — a `None`-metadata
+                // marker entry, always present (its attrs are synthesized
+                // from the in-memory manifest in `readdir`; nothing on disk
+                // to stat, nothing to silently fail).
+                v.push((INDEX_NAME.to_string(), None));
                 v
             }
             Route::Index => return Err(StatusReply::new(StatusCode::Failure).with_message("not a directory")),
-            Route::ShareRoot(s) => {
-                read_dir_lstat(&s.root).map_err(|e| io_status(&e))?
-            }
+            Route::ShareRoot(s) => real_entries(read_dir_lstat(&s.root).map_err(|e| io_status(&e))?),
             Route::InShare(s, rel) => {
                 let real = resolve_follow(&s.root, &rel).map_err(|e| io_status(&e))?;
-                read_dir_lstat(&real).map_err(|e| io_status(&e))?
+                real_entries(read_dir_lstat(&real).map_err(|e| io_status(&e))?)
             }
         };
         let handle = self.alloc(HandleEntry::Dir { entries, cursor: 0, dots_sent: false });
@@ -621,7 +655,7 @@ impl Handler for ShareHandler {
                 *dots_sent = true;
                 let start = *cursor;
                 let end = (start + READDIR_CHUNK).min(entries.len());
-                let batch: Vec<(String, std::fs::Metadata)> = entries[start..end].to_vec();
+                let batch: Vec<(String, Option<std::fs::Metadata>)> = entries[start..end].to_vec();
                 *cursor = end;
                 if batch.is_empty() && !include_dots {
                     return Err(StatusReply::new(StatusCode::Eof));
@@ -637,17 +671,20 @@ impl Handler for ShareHandler {
             files.push(File::new("..".to_string(), dir_attrs(None)));
         }
         for (name, meta) in &batch {
-            // The root listing's synthesized `index` entry borrowed a real
-            // dir's metadata as a placeholder (see `opendir`); report it
-            // honestly as the manifest file, not that placeholder's type.
-            if name == INDEX_NAME {
-                let mut fa = FileAttributes::empty();
-                fa.permissions = Some(0o444);
-                fa.set_regular(true);
-                fa.size = Some(self.config.manifest.len() as u64);
-                files.push(File::new(name.clone(), fa));
-            } else {
-                files.push(File::new(name.clone(), attrs_from_lstat(meta)));
+            match meta {
+                // The root's synthesized `/index` manifest entry (see
+                // `HandleEntry::Dir` — only the root listing mints a
+                // `None`). Keyed on the marker, NOT the name: a real file
+                // named `index` inside a share carries `Some(meta)` below
+                // and lists with its own attrs.
+                None => {
+                    let mut fa = FileAttributes::empty();
+                    fa.permissions = Some(0o444);
+                    fa.set_regular(true);
+                    fa.size = Some(self.config.manifest.len() as u64);
+                    files.push(File::new(name.clone(), fa));
+                }
+                Some(meta) => files.push(File::new(name.clone(), attrs_from_lstat(meta))),
             }
         }
         Ok(Name { id, files })
@@ -815,6 +852,15 @@ fn read_dir_lstat(dir: &Path) -> io::Result<Vec<(String, std::fs::Metadata)>> {
     Ok(out)
 }
 
+/// Lift a real directory listing into the `Option<Metadata>` entry shape —
+/// every real entry is `Some`; only `opendir`'s root arm mints the `None`
+/// manifest marker (see `HandleEntry::Dir`).
+fn real_entries(
+    listing: Vec<(String, std::fs::Metadata)>,
+) -> Vec<(String, Option<std::fs::Metadata>)> {
+    listing.into_iter().map(|(name, meta)| (name, Some(meta))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +977,25 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
+    /// The PORTABLE fallback (live on non-Linux unix / pre-5.6 kernels; the
+    /// openat2 path shadows it on this host) must not block on a FIFO: the
+    /// old order stat-then-`File::open` left the open itself blocking when a
+    /// FIFO appeared after the check. The fix opens with `O_NONBLOCK` and
+    /// fstats the opened fd — this test HANGING (not merely failing) is the
+    /// regression signal.
+    #[test]
+    fn fallback_open_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let fifo_path = root.join("fallbackfifo");
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let err = open_file_fallback(&root, Path::new("fallbackfifo")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     #[test]
     fn open_file_beneath_refuses_a_path_escaping_the_jail() {
         let dir = tempfile::tempdir().unwrap();
@@ -1014,6 +1079,48 @@ mod tests {
 
         let lstat_index = Handler::lstat(&mut handler, 3, "/index".to_string()).await.unwrap();
         assert!(lstat_index.attrs.is_regular(), "lstat /index must report is_regular()");
+    }
+
+    /// Regression: the readdir attrs override for the root's synthesized
+    /// `/index` entry used to key on the NAME — so a real file named `index`
+    /// inside a share listed with the manifest's size/permissions instead of
+    /// its own. The override is now keyed on the `None`-metadata marker only
+    /// `opendir`'s root arm mints.
+    #[tokio::test]
+    async fn a_real_file_named_index_inside_a_share_lists_its_own_attrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"just a file"; // 11 bytes, unlike any manifest
+        std::fs::write(dir.path().join("index"), body).unwrap();
+        let config = one_share(dir.path());
+        let manifest_len = config.manifest.len() as u64;
+        assert_ne!(manifest_len, body.len() as u64, "test needs distinguishable sizes");
+        let mut handler = ShareHandler::new(config);
+
+        // Inside the share: the real file's own size, not the manifest's.
+        let h = Handler::opendir(&mut handler, 1, "/share".to_string()).await.unwrap();
+        let listing = Handler::readdir(&mut handler, 2, h.handle).await.unwrap();
+        let entry = listing
+            .files
+            .iter()
+            .find(|f| f.filename == "index")
+            .expect("real index file listed");
+        assert_eq!(
+            entry.attrs.size,
+            Some(body.len() as u64),
+            "a real file named index must list with its own size"
+        );
+
+        // At the root: the synthesized manifest entry still reports the
+        // manifest's size (and exists without any host stat backing it).
+        let h = Handler::opendir(&mut handler, 3, "/".to_string()).await.unwrap();
+        let root_listing = Handler::readdir(&mut handler, 4, h.handle).await.unwrap();
+        let root_index = root_listing
+            .files
+            .iter()
+            .find(|f| f.filename == "index")
+            .expect("root index entry always present");
+        assert_eq!(root_index.attrs.size, Some(manifest_len));
+        assert!(root_index.attrs.is_regular());
     }
 
     #[tokio::test]

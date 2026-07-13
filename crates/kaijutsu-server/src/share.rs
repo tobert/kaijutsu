@@ -19,6 +19,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +36,17 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 /// count, small enough to bound registration memory against a hostile or
 /// buggy client.
 const MAX_MANIFEST_LEN: usize = 64 * 1024;
+
+/// How often an idle registered session is pinged (`ShareRegistry::ping` —
+/// one `LSTAT /index` under `SHARE_OP_TIMEOUT`). [`ClosedSignalStream`]
+/// catches a channel that closes CLEANLY (EOF/write error reach its polls
+/// because the session's internal read loop runs continuously), but a
+/// silently-dead peer (network partition, suspended laptop — no FIN ever
+/// arrives) leaves the read pending forever; only traffic surfaces that, and
+/// an idle session generates none. The keepalive IS that traffic, so a dead
+/// idle client vanishes from `/r` within one interval instead of squatting
+/// until the next VFS op ("Disconnect = unmount, loud", `docs/slash-r.md`).
+pub const SHARE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Wraps a stream, cancelling `cancel` the moment it observes EOF (a
 /// zero-byte read) or a read/write error — the proactive disconnect signal
@@ -97,12 +109,28 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClosedSignalStream<S> {
 }
 
 /// Drive one `kaijutsu-share` channel end-to-end: validate + register, then
-/// block until the channel closes and unregister. Never returns an error —
-/// every failure is logged and the session simply never (or no longer)
-/// appears under `/r`, matching the fail-loud-but-don't-crash-the-connection
-/// posture the rest of the SSH server uses for a single misbehaving client.
+/// watch for disconnect (channel-close signal OR failed keepalive) and
+/// unregister. Never returns an error — every failure is logged and the
+/// session simply never (or no longer) appears under `/r`, matching the
+/// fail-loud-but-don't-crash-the-connection posture the rest of the SSH
+/// server uses for a single misbehaving client.
 pub async fn run_share_session<S>(stream: S, principal: Principal, registry: Arc<ShareRegistry>)
 where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    run_share_session_with_keepalive(stream, principal, registry, SHARE_KEEPALIVE_INTERVAL).await
+}
+
+/// [`run_share_session`] with an explicit keepalive interval — public so the
+/// integration suite can drive the keepalive path on a test-scale interval
+/// instead of waiting out [`SHARE_KEEPALIVE_INTERVAL`]; production always
+/// enters through [`run_share_session`].
+pub async fn run_share_session_with_keepalive<S>(
+    stream: S,
+    principal: Principal,
+    registry: Arc<ShareRegistry>,
+    keepalive: Duration,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let cancel = CancellationToken::new();
@@ -116,7 +144,34 @@ where
                 principal.username,
                 principal.display_name,
             );
-            cancel.cancelled().await;
+            let mut tick = tokio::time::interval(keepalive);
+            tick.tick().await; // first tick fires immediately; drop it
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                // One cheap wire op; the registry takes the session lock only
+                // for the ping itself, never across this loop's waiting. The
+                // ping is RACED against the close signal: a channel that dies
+                // mid-ping trips `ClosedSignalStream` (the write fails), and
+                // waiting out the ping's full op-timeout after the channel
+                // already declared itself dead would just delay eviction.
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = registry.ping(&client_id) => {
+                        if let Err(e) = result {
+                            log::info!(
+                                "share session for client={client_id} ({}) failed keepalive: \
+                                 {e}; treating as disconnect",
+                                principal.username,
+                            );
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
             registry.unregister(&client_id, token).await;
             log::info!(
                 "share session for client={client_id} ({}) closed; unregistered",

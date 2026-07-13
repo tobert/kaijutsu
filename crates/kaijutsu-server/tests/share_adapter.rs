@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -15,55 +15,77 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use kaijutsu_client::{ShareArg, ShareHandler, ShareServerConfig};
 use kaijutsu_kernel::{ShareFs, ShareRegistry, VfsError, VfsOps};
-use kaijutsu_server::share::run_share_session;
+use kaijutsu_server::share::{run_share_session, run_share_session_with_keepalive};
 use kaijutsu_types::Principal;
 
-/// Wraps a stream so a test can force it closed from the OUTSIDE, even
-/// though `russh_sftp::server::run` takes ownership of the stream into an
-/// internally spawned task we have no `JoinHandle` for (aborting a task that
-/// merely CALLED `run()` does nothing — `run()` returns as soon as it
-/// spawns, handing the stream to a task tokio tracks independently).
-/// [`KillSwitch::kill`] flips a flag AND wakes the last-stored waker, so a
-/// task currently parked in `poll_read` (waiting for the next SFTP packet,
-/// the common idle case) is forced to re-poll immediately rather than
-/// waiting for the underlying transport's own (nonexistent, for a duplex
-/// pipe) readiness event.
+/// [`Killable`] stream modes (stored as an `AtomicU8`).
+const MODE_LIVE: u8 = 0;
+/// Reads return EOF, writes error — a peer that closed CLEANLY.
+const MODE_EOF: u8 = 1;
+/// Reads pend FOREVER, writes error — a peer that silently died (network
+/// partition, suspended laptop): no FIN ever arrives, so nothing on the
+/// read path can notice; only attempted TRAFFIC (the keepalive's write)
+/// surfaces the death.
+const MODE_WEDGED: u8 = 2;
+
+/// Wraps a stream so a test can force it dead from the OUTSIDE, even though
+/// `russh_sftp::server::run` (and the client-role `RawSftpSession`) take
+/// ownership of the stream into internally spawned tasks with no exposed
+/// `JoinHandle` (aborting a task that merely CALLED `run()` does nothing —
+/// `run()` returns as soon as it spawns). [`KillSwitch::kill`]/[`KillSwitch::wedge`]
+/// flip the mode AND wake the last-stored waker, so a task currently parked
+/// in `poll_read` (waiting for the next SFTP packet, the common idle case)
+/// re-polls immediately.
 struct Killable<S> {
     inner: S,
-    killed: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
 #[derive(Clone)]
 struct KillSwitch {
-    killed: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl KillSwitch {
-    fn kill(&self) {
-        self.killed.store(true, Ordering::SeqCst);
+    fn set(&self, mode: u8) {
+        self.mode.store(mode, Ordering::SeqCst);
         if let Some(w) = self.waker.lock().unwrap().take() {
             w.wake();
         }
     }
+    /// Clean close: next read is EOF.
+    fn kill(&self) {
+        self.set(MODE_EOF);
+    }
+    /// Silent death: reads pend forever, writes fail.
+    fn wedge(&self) {
+        self.set(MODE_WEDGED);
+    }
 }
 
 fn killable<S>(inner: S) -> (Killable<S>, KillSwitch) {
-    let killed = Arc::new(AtomicBool::new(false));
+    let mode = Arc::new(AtomicU8::new(MODE_LIVE));
     let waker = Arc::new(Mutex::new(None));
     (
-        Killable { inner, killed: killed.clone(), waker: waker.clone() },
-        KillSwitch { killed, waker },
+        Killable { inner, mode: mode.clone(), waker: waker.clone() },
+        KillSwitch { mode, waker },
     )
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Killable<S> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.killed.load(Ordering::SeqCst) {
+        match this.mode.load(Ordering::SeqCst) {
             // Zero-byte read (buf unchanged) == EOF.
-            return Poll::Ready(Ok(()));
+            MODE_EOF => return Poll::Ready(Ok(())),
+            MODE_WEDGED => {
+                // No EOF, no error, no data — ever. (Waker deliberately NOT
+                // stored: nothing will make this readable again.)
+                return Poll::Pending;
+            }
+            _ => {}
         }
         *this.waker.lock().unwrap() = Some(cx.waker().clone());
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -73,7 +95,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Killable<S> {
 impl<S: AsyncWrite + Unpin> AsyncWrite for Killable<S> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        if this.killed.load(Ordering::SeqCst) {
+        if this.mode.load(Ordering::SeqCst) != MODE_LIVE {
             return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "killed")));
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
@@ -278,4 +300,88 @@ async fn disconnect_unregisters_promptly_and_pending_ops_surface_the_dedicated_e
         matches!(err, VfsError::ShareDisconnected(_)),
         "expected ShareDisconnected after the client vanished, got {err:?}"
     );
+}
+
+/// Regression (HIGH-1): `ShareFs::readlink` was a dead stub returning
+/// `NotASymlink` for EVERY `/r` path — while `getattr`/`readdir` correctly
+/// reported the same paths as `FileType::Symlink`. An in-jail symlink must
+/// readlink to its stored target over the wire.
+#[tokio::test]
+async fn readlink_reports_an_in_jail_symlink_target() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("real.txt"), b"target body").unwrap();
+    // Relative target, so the answer is host-layout-independent.
+    std::os::unix::fs::symlink("real.txt", dir.path().join("link.txt")).unwrap();
+    let (fs, client_id) = fixture(dir.path(), "share").await;
+
+    let link_path = Path::new(&format!("{client_id}/share/link.txt")).to_path_buf();
+
+    // getattr reports it as a symlink…
+    let attr = fs.getattr(&link_path).await.unwrap();
+    assert!(attr.is_symlink(), "lstat-shaped getattr must report the link itself");
+
+    // …and readlink now backs that up with the actual target.
+    let target = fs.readlink(&link_path).await.unwrap();
+    assert_eq!(target, Path::new("real.txt"));
+
+    // A regular file is still not a symlink.
+    let file_path = Path::new(&format!("{client_id}/share/real.txt")).to_path_buf();
+    assert!(fs.readlink(&file_path).await.is_err(), "readlink on a regular file errors");
+}
+
+/// Regression (MEDIUM-3): a SILENTLY dead idle session — reads pending
+/// forever (no FIN, so no EOF for `ClosedSignalStream` to observe), writes
+/// failing — must be evicted by the keepalive ping within its interval,
+/// WITHOUT any VFS op touching `/r` first. This is the case only the
+/// keepalive catches: the clean-close case above is detected by the
+/// continuously-polled read loop seeing EOF.
+#[tokio::test]
+async fn a_silently_dead_idle_session_is_evicted_by_the_keepalive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+
+    let client_id = format!("client-{}", uuid::Uuid::new_v4());
+    let args = vec![ShareArg { name: "share".to_string(), path: dir.path().to_path_buf(), rw: false }];
+    let config = ShareServerConfig::new(&args, client_id.clone(), "nick").unwrap();
+    let handler = ShareHandler::new(config);
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    russh_sftp::server::run(client_io, handler).await;
+
+    // Wedge-capable wrapper on the SERVER side (the stream the registered
+    // session reads/writes), keepalive at test scale.
+    let (killable_server_io, switch) = killable(server_io);
+    let registry = Arc::new(ShareRegistry::new());
+    tokio::spawn(run_share_session_with_keepalive(
+        killable_server_io,
+        Principal::system(),
+        registry.clone(),
+        Duration::from_millis(100),
+    ));
+    {
+        let registry = registry.clone();
+        let client_id = client_id.clone();
+        wait_for(move || {
+            let registry = registry.clone();
+            let client_id = client_id.clone();
+            async move { registry.is_live(&client_id).await }
+        })
+        .await;
+    }
+
+    // Silent death: no EOF ever arrives; only attempted traffic (the next
+    // keepalive ping's write) can surface it.
+    switch.wedge();
+
+    // The registry empties within the keepalive window — no VFS op issued.
+    {
+        let registry = registry.clone();
+        let client_id = client_id.clone();
+        wait_for(move || {
+            let registry = registry.clone();
+            let client_id = client_id.clone();
+            async move { !registry.is_live(&client_id).await }
+        })
+        .await;
+    }
 }

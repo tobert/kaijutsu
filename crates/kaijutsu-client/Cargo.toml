@@ -40,10 +40,14 @@ kaijutsu-cas.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "0.38", features = ["fs"] }
 
+# O_NONBLOCK on the share server's portable fallback open (share_server.rs
+# `open_file_beneath`) — a FIFO must never block the opening thread.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 capnpc.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true
 tempfile.workspace = true
-libc = "0.2"

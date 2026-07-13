@@ -264,6 +264,41 @@ impl ShareRegistry {
             .collect())
     }
 
+    /// Cheap liveness probe against a registered session: `LSTAT /index`
+    /// (the manifest every share server synthesizes — always present, no
+    /// disk I/O client-side) under the usual [`SHARE_OP_TIMEOUT`]. The
+    /// server's keepalive loop (`kaijutsu-server/src/share.rs`) calls this on
+    /// an interval so an idle-but-dead session is evicted without waiting
+    /// for the next VFS op to trip over it ("shares vanish from readdir the
+    /// moment the channel drops", `docs/slash-r.md`). Takes the session lock
+    /// only for the one wire op — never across the caller's sleep.
+    pub async fn ping(&self, client_id: &str) -> VfsResult<()> {
+        let session = self.session_of(client_id).await?;
+        let guard = session.lock().await;
+        timeout_op(client_id, guard.lstat("/index".to_string())).await?;
+        Ok(())
+    }
+
+    /// `readlink` on a path inside a live client's share — same shape as
+    /// [`Self::getattr`] (session lock, per-op timeout, mapped errors). The
+    /// target comes back verbatim from the client's share server (which
+    /// reports the link's own stored target, resolved-or-not is the
+    /// caller's concern) — `getattr`/`readdir` already report these paths as
+    /// `FileType::Symlink` via [`wire_kind`], so this is the read that makes
+    /// that report honest instead of a blanket `NotASymlink`.
+    pub async fn readlink(&self, client_id: &str, share: &str, remote_path: &str) -> VfsResult<PathBuf> {
+        self.share_row(client_id, share).await?;
+        let session = self.session_of(client_id).await?;
+        let guard = session.lock().await;
+        let name = timeout_op(client_id, guard.readlink(remote_path.to_string())).await?;
+        let file = name
+            .files
+            .into_iter()
+            .next()
+            .ok_or_else(|| VfsError::other("readlink: empty Name reply"))?;
+        Ok(PathBuf::from(file.filename))
+    }
+
     /// A single wire `READ` — the plain (non-streaming) read this slice uses
     /// throughout (`docs/slash-r.md` explicitly defers the held-handle
     /// streaming override to a sibling lane).
@@ -385,7 +420,11 @@ async fn list_dir(
             }
         }
     }
-    guard.close(handle).await?;
+    // Best-effort close, matching this function's own error path and
+    // `read`/`read_all`'s discipline: the listing is already complete and
+    // correct — propagating a failed CLOSE here would discard good data over
+    // a handle the remote will reap at session end anyway.
+    let _ = guard.close(handle).await;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -646,7 +685,30 @@ impl VfsOps for ShareFs {
     }
 
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
-        Err(VfsError::NotASymlink(path.display().to_string()))
+        match route(path) {
+            // The synthetic levels (/r, /r/index, /r/<id>, and /r/<id>/<share>
+            // itself — a share root is always a real directory, never a link)
+            // genuinely hold no symlinks.
+            Route::Root | Route::Index | Route::Client(_) => {
+                Err(VfsError::NotASymlink(path.display().to_string()))
+            }
+            // A share root (`/r/<id>/<share>`, remote "/<share>") is always a
+            // real directory — answered locally so the client's generic
+            // Failure reply can't be mislabeled a disconnect by
+            // map_client_err.
+            Route::InShare { ref share, ref remote_path, .. }
+                if *remote_path == format!("/{share}") =>
+            {
+                Err(VfsError::NotASymlink(path.display().to_string()))
+            }
+            // Inside a share the entry may really be a symlink — getattr and
+            // readdir already report FileType::Symlink for these via
+            // wire_kind, so the readlink that backs that report goes over the
+            // wire. (A non-link path answers with the remote's own error.)
+            Route::InShare { client_id, share, remote_path } => {
+                self.registry.readlink(&client_id, &share, &remote_path).await
+            }
+        }
     }
 
     // ── writes: no write support this slice regardless of a share's
@@ -883,6 +945,23 @@ mod tests {
         let fs = ShareFs::new(registry);
         let err = fs.getattr(Path::new("no-such-client")).await.unwrap_err();
         assert!(matches!(err, VfsError::NotFound(_)));
+    }
+
+    /// The synthetic namespace levels (`/r`, `/r/index`, `/r/<id>`, and the
+    /// share root itself) answer readlink locally with `NotASymlink` — no
+    /// wire op, no live session needed. Paths INSIDE a share go over the
+    /// wire (covered by the integration suite, which has a live session).
+    #[tokio::test]
+    async fn readlink_on_synthetic_levels_is_not_a_symlink_locally() {
+        let registry = Arc::new(ShareRegistry::new());
+        let fs = ShareFs::new(registry);
+        for path in ["", "index", "c1", "c1/share"] {
+            let err = fs.readlink(Path::new(path)).await.unwrap_err();
+            assert!(
+                matches!(err, VfsError::NotASymlink(_)),
+                "readlink({path:?}) must be NotASymlink, got {err:?}"
+            );
+        }
     }
 
     #[test]
