@@ -124,6 +124,29 @@ impl Metronome {
     /// unit-testable without ALSA. Scheduling *ahead* into the device queue is
     /// what makes the click land at the phasor's beat time rather than at the
     /// irregular frame that noticed it (docs/midi.md real-time stance).
+    ///
+    /// Policy: a metronome never stacks clicks, and never silences longer than
+    /// a bounded slack.
+    ///
+    /// - **Never replay**: if `next_beat` has fallen at-or-behind the current
+    ///   floor (a stalled frame, or several beats came due while nothing
+    ///   polled), the WHOLE missed backlog collapses to exactly ONE
+    ///   clamped-to-now click and `next_beat` skips straight to `floor + 1` —
+    ///   missed beats are missed, not replayed (that replay was the burst:
+    ///   `a_stalled_frame_catches_up_without_replaying_the_past` encoded the
+    ///   old, wrong policy and was rewritten, not preserved). The loop below
+    ///   then only ever schedules the *future*, so it needs no `.max(0.0)`
+    ///   clamp of its own — the overdue branch owns "now".
+    /// - **Un-strand**: if `next_beat` has instead drifted too far *ahead* of
+    ///   `cur` (a backward phase lurch stranded it beyond the horizon — the
+    ///   starve half of the bug), re-seed to `floor + 1` rather than sit
+    ///   silent until wall-clock time arithmetically closes the whole gap.
+    ///   The slack (`max_ahead = horizon_secs * tempo + 2.0` beats) is sized
+    ///   so a legitimate ≤1-beat backward phase step (`LocalBeat::max_step`)
+    ///   never trips it — that would double-click a beat already sitting in
+    ///   the ALSA queue. A genuine strand still recovers within
+    ///   `max_ahead / tempo` (≈1.25 s at 120 BPM), not the 5–6 s the live bug
+    ///   measured.
     fn schedule_due(&mut self, now: Instant, horizon: Duration) -> Vec<Duration> {
         let Some(beat) = &self.beat else {
             return Vec::new();
@@ -133,18 +156,30 @@ impl Metronome {
         if tempo <= 0.0 {
             return Vec::new();
         }
+        let horizon_secs = horizon.as_secs_f64();
         // First call: start at the next whole beat after the anchor (don't
         // retro-fire the beat we anchored on).
         let mut next = self.next_beat.unwrap_or_else(|| cur.floor() as i64 + 1);
-        let horizon_secs = horizon.as_secs_f64();
         let mut offsets = Vec::new();
+
+        if (next as f64) <= cur.floor() {
+            // Overdue: the entire backlog is one click, clamped to now.
+            offsets.push(Duration::ZERO);
+            next = cur.floor() as i64 + 1;
+        } else {
+            let max_ahead = horizon_secs * tempo + 2.0;
+            if next as f64 - cur > max_ahead {
+                // Stranded: re-seed near cur instead of waiting out the gap.
+                next = cur.floor() as i64 + 1;
+            }
+        }
+
         loop {
             let secs = (next as f64 - cur) / tempo;
             if secs > horizon_secs {
                 break;
             }
-            // Clamp a just-missed beat to "now" rather than scheduling the past.
-            offsets.push(Duration::from_secs_f64(secs.max(0.0)));
+            offsets.push(Duration::from_secs_f64(secs));
             next += 1;
         }
         self.next_beat = Some(next);
@@ -296,21 +331,102 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_frame_catches_up_without_replaying_the_past() {
-        // A long gap (a stalled frame) schedules every beat that came due in it,
-        // each once, clamping an already-past beat to now (offset 0) rather than
-        // scheduling into the past.
+    fn a_stalled_frame_clicks_at_most_once_never_a_burst() {
+        // A long gap (a stalled frame) must NOT replay every beat that came due
+        // in it — that was the burst bug (the OLD policy this test used to
+        // encode: beats 1, 2, 3 each individually clamped to now and fired
+        // back-to-back). The new policy collapses the whole missed backlog to
+        // exactly ONE clamped-to-now click, then resumes cadence on the grid.
         let mut m = Metronome::default();
         let t0 = Instant::now();
         m.observe(BeatRef::new(0.0, 2.0), t0);
         m.schedule_due(t0, H); // start scheduling (seeds next_beat = 1)
-        // Now a long stall to 1.6 s: beats 1 (0.5s), 2 (1.0s), 3 (1.5s) all came
-        // due during the gap and must each be scheduled once, clamped to now.
+
+        // A long stall to 1.6 s: beats 1 (0.5s), 2 (1.0s), 3 (1.5s) all came due
+        // during the gap. At most one click, clamped to now.
         let due = m.schedule_due(t0 + Duration::from_millis(1600), H);
-        assert_eq!(due.len(), 3, "beats 1,2,3 each scheduled once: {due:?}");
-        assert!(due.iter().all(|d| d.as_secs_f64() < 0.001), "past beats clamp to now");
-        // Nothing replays on the next call.
-        assert!(m.schedule_due(t0 + Duration::from_millis(1650), H).is_empty());
+        assert_eq!(due.len(), 1, "the whole missed backlog collapses to one click: {due:?}");
+        assert!(due[0].is_zero(), "the one click is clamped to now, not scheduled into the past");
+
+        // Nothing replays on an immediate re-call.
+        assert!(m.schedule_due(t0 + Duration::from_millis(1600), H).is_empty(), "no replay");
+
+        // Cadence resumes on the normal grid: cur reads beat 3.2 at 1.6s, so
+        // next_beat became 4 (due at 2.0s) — 150ms later, beat 4 is 250ms away
+        // (right at the horizon edge) and gets scheduled exactly once, like any
+        // ordinary upcoming beat.
+        let resumed = m.schedule_due(t0 + Duration::from_millis(1750), H);
+        assert_eq!(resumed.len(), 1, "cadence resumed on the grid, not still catching up");
+        assert!(near(resumed[0], 250.0), "beat 4 lands at its normal predicted offset");
+    }
+
+    #[test]
+    fn a_large_forward_jump_still_clicks_at_most_once() {
+        // A bigger backlog than the 3-beat case above (here 8 beats missed)
+        // must STILL collapse to exactly one click — the invariant is "at most
+        // one clamped click ever", not "one click per missed beat below some
+        // threshold".
+        let mut m = Metronome::default();
+        let t0 = Instant::now();
+        m.observe(BeatRef::new(0.0, 2.0), t0);
+        m.schedule_due(t0, H); // seeds next_beat = 1
+
+        let due = m.schedule_due(t0 + Duration::from_millis(2000), H); // cur = 4.0
+        assert_eq!(due.len(), 1, "still exactly one click regardless of backlog size: {due:?}");
+        assert!(due[0].is_zero());
+    }
+
+    #[test]
+    fn a_stranded_next_beat_recovers_within_bounded_slack() {
+        // Mirrors the starve half of the live bug: a backward phase walk can
+        // strand `next_beat` several beats ahead of `cur`. The OLD policy just
+        // waited for wall-clock `cur` to arithmetically climb back up to
+        // `next_beat` — measured live as 5-6 s of dead silence. The new
+        // un-strand policy detects the gap (`next - cur > max_ahead`) and
+        // re-seeds near `cur` instead, bounding recovery to roughly
+        // `max_ahead / tempo` regardless of how far the strand was.
+        let mut m = Metronome::default();
+        let t0 = Instant::now();
+        m.observe(BeatRef::new(0.0, 2.0), t0);
+        m.schedule_due(t0, H); // seeds next_beat = 1
+
+        // Directly strand next_beat 8 beats ahead of cur (private field,
+        // testing from inside the module) — simulating what a multi-beat
+        // backward walk would have left behind. At 2 bps this beat would be
+        // 4.5 s away if we waited for cur to reach it arithmetically.
+        m.next_beat = Some(9);
+
+        // Detection: the strand itself must not emit a phantom click.
+        let due = m.schedule_due(t0, H); // cur is still ~0.0
+        assert!(due.is_empty(), "detecting + re-seeding a strand is silent, not a click");
+
+        // Recovery lands on the ordinary grid near cur, nowhere near beat 9's
+        // 4.5s-away arithmetic due time.
+        let recovered = m.schedule_due(t0 + Duration::from_millis(300), H);
+        assert_eq!(recovered.len(), 1, "recovered near cur, not still waiting for beat 9");
+        assert!(near(recovered[0], 200.0), "beat 1 (re-seeded target) at its normal offset");
+    }
+
+    #[test]
+    fn a_legitimate_backward_phase_step_does_not_reseed() {
+        // LocalBeat's ordinary phase correction (bounded to `max_step`, ≤1
+        // beat per reference by default) must NEVER trip the un-strand
+        // re-seed — that would double-click a beat already sitting in the
+        // ALSA device queue. The slack (`max_ahead ≈ 2.5 beats` at the test
+        // horizon/tempo) is sized specifically to absorb this.
+        let mut m = Metronome::default();
+        let t0 = Instant::now();
+        m.observe(BeatRef::new(10.0, 2.0), t0);
+        let seeded = m.schedule_due(t0, H); // seeds next_beat = 11
+        assert!(seeded.is_empty());
+
+        let t1 = t0 + Duration::from_millis(100); // free-run would read 10.2
+        // A reference 1 beat behind steps phase backward (bounded ≤1 beat).
+        m.observe(BeatRef::new(9.0, 2.0), t1);
+
+        let due = m.schedule_due(t1, H);
+        assert!(due.is_empty(), "no un-strand click from a legitimate ≤1-beat step: {due:?}");
+        assert_eq!(m.next_beat, Some(11), "next_beat must not be reseeded by a legitimate step");
     }
 
     /// The Bevy wiring: a `ServerEvent::BeatSync` message anchors the phasor.
@@ -334,6 +450,57 @@ mod tests {
 
         let m = app.world().resource::<Metronome>();
         assert!(m.beat.is_some(), "a BeatSync message must anchor the phasor");
+    }
+
+    /// The Bevy-level sibling of the pure flood regression in
+    /// `timebase.rs` (`a_flood_of_backdated_refs_folds_to_the_true_position...`):
+    /// 4+ `BeatSync` messages all arrive in ONE frame (a delivery flood — refs
+    /// queued behind a turn's streamed output, released together), each
+    /// stamped with its TRUE emission time spread over the past several
+    /// seconds. `ingest_beat_signals` must back-date each to its own emission
+    /// instant rather than fold all four at this frame's one receipt `now` —
+    /// the phasor should land near the NEWEST ref's true position, and the
+    /// resulting `schedule_due` call must not burst multiple clicks trying to
+    /// "catch up" through the backlog.
+    #[test]
+    fn a_flood_of_beat_sync_messages_settles_at_the_newest_ref_without_a_burst() {
+        use kaijutsu_types::ContextId;
+
+        let now_epoch_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64;
+        let tempo = 2.0; // 120 BPM: one beat every 0.5s
+
+        let mut app = App::new();
+        app.init_resource::<Metronome>()
+            .add_message::<ServerEventMessage>()
+            .add_systems(Update, ingest_beat_signals);
+
+        // Beats 2, 4, 6, 8 (one every 4s at 2 bps — 8 beats apart), stamped
+        // with their true emission times: beat 8 is "now", beat 2 was 3s ago
+        // (mirrors the pure timebase.rs regression exactly).
+        let refs = [
+            (2.0, 3_000_000_000u64),
+            (4.0, 2_000_000_000u64),
+            (6.0, 1_000_000_000u64),
+            (8.0, 0u64),
+        ];
+        for (beat, age_ns) in refs {
+            app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+                context_id: ContextId::new(),
+                beat_ref: BeatRef { beat, tempo_bps: tempo, epoch_ns: now_epoch_ns - age_ns },
+            }));
+        }
+        app.update(); // ONE frame ingests all four
+
+        let now = Instant::now();
+        let pos = app.world().resource::<Metronome>().beat.as_ref().expect("anchored").position(now);
+        assert!((pos - 8.0).abs() < 1.0, "phasor settles near the newest ref's beat, got {pos}");
+
+        let mut m = app.world_mut().resource_mut::<Metronome>();
+        let due = m.schedule_due(now, SCHEDULE_HORIZON);
+        assert!(due.len() <= 1, "no burst from the flood: {due:?}");
     }
 
     /// A transport flush (stop/pause) halts the metronome — otherwise the phasor
