@@ -282,6 +282,15 @@ pub fn build_block_scenes(
             continue;
         }
 
+        // Virtualized-out blocks (`virtualize_conversation`) are
+        // `Display::None`, which also zeros `ComputedNode.size()` — but
+        // check the source (`Node.display`) explicitly rather than relying
+        // on the width==0 side effect, so this early-out stays correct even
+        // for a legitimately zero-width-but-laid-out node.
+        if node.display == Display::None {
+            continue;
+        }
+
         let width = computed.size().x;
         if width <= 0.0 {
             continue;
@@ -749,7 +758,7 @@ pub fn build_block_scenes(
 /// Build vello scenes for role group border entities.
 pub fn build_role_group_scenes(
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut UiVectorScene, &mut UiRttTexture, &ComputedNode),
+        (&RoleGroupBorder, &mut UiVectorScene, &mut UiRttTexture, &ComputedNode, &Node),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
@@ -758,7 +767,12 @@ pub fn build_role_group_scenes(
 ) {
     let font = fonts.get(&font_handles.mono);
 
-    for (border, mut ui_scene, mut rtt, computed) in role_borders.iter_mut() {
+    for (border, mut ui_scene, mut rtt, computed, node) in role_borders.iter_mut() {
+        // Virtualized-out headers are Display::None; skip explicitly rather
+        // than relying on the incidental size.x==0 side effect.
+        if node.display == Display::None {
+            continue;
+        }
         let size = computed.size();
         if size.x < 1.0 {
             continue;

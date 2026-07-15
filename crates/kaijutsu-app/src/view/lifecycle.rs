@@ -8,8 +8,8 @@ use bevy::prelude::*;
 use crate::text::shaping::VelloFont;
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, LayoutGeneration, MainCell,
-    RoleGroupBorder, RoleGroupBorderLayout,
+    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationSpacer,
+    LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout, SpacerEdge,
 };
 use crate::shaders::BlockFxMaterial;
 
@@ -20,6 +20,13 @@ pub struct EditorEntities {
     pub main_cell: Option<Entity>,
     /// The ConversationContainer entity (flex parent for BlockCells).
     pub conversation_container: Option<Entity>,
+    /// The top spacer entity — first child of `conversation_container`,
+    /// its `Node.height` stands in for virtualized-out content above the
+    /// visible window. See `ensure_conversation_spacers`.
+    pub top_spacer: Option<Entity>,
+    /// The bottom spacer entity — last child of `conversation_container`.
+    /// See `ensure_conversation_spacers`.
+    pub bottom_spacer: Option<Entity>,
 }
 use crate::text::ShapingFonts;
 use crate::ui::timeline::TimelineVisibility;
@@ -131,6 +138,81 @@ pub fn track_conversation_container(
 
     entities.conversation_container = Some(focused);
     layout_gen.bump();
+}
+
+/// Maintain the "the *focused* conversation container always has exactly one
+/// Top and one Bottom spacer of its own" invariant.
+///
+/// The tiling reconciler rebuilds panes by despawning old ConversationContainer
+/// entities recursively (`ui/tiling_reconciler.rs`), which takes any spacer
+/// children down with it; `track_conversation_container` re-parents block
+/// cells + role headers onto the new container but has no reference to
+/// spacers to carry forward. Rather than special-casing spacer survival at
+/// every site that can change `conversation_container`, this system runs
+/// every frame and lazily (re)spawns whichever spacer is missing or dead —
+/// so pane splits, container rebuilds, and first-ever creation all funnel
+/// through one invariant-restoring path instead of N one-time spawn sites.
+///
+/// A spacer is only "still valid" if it is alive AND actually a child of the
+/// *current* `conversation_container`. Without the parentage check, a spacer
+/// that still belongs to a previously-focused pane would be treated as valid
+/// on a focus switch, and `reorder_conversation_children` would then steal it
+/// onto the new container — leaving the old pane spacer-less. There is one
+/// ConversationContainer per pane (`tiling_reconciler` spawns them per-pane)
+/// but `EditorEntities` tracks only the focused one, so re-anchoring the
+/// tracked pair to the current container on every focus change is required.
+pub fn ensure_conversation_spacers(
+    mut commands: Commands,
+    mut entities: ResMut<EditorEntities>,
+    spacers: Query<Entity, With<ConversationSpacer>>,
+    child_of: Query<&ChildOf>,
+) {
+    let Some(conv_entity) = entities.conversation_container else {
+        return;
+    };
+
+    // Valid = alive, a ConversationSpacer, and parented to the current
+    // container (ChildOf::parent() is Bevy 0.18's child→parent link).
+    let is_valid = |ent: Option<Entity>| {
+        ent.is_some_and(|e| {
+            spacers.contains(e)
+                && child_of.get(e).is_ok_and(|c| c.parent() == conv_entity)
+        })
+    };
+
+    if !is_valid(entities.top_spacer) {
+        let top = commands
+            .spawn((
+                ConversationSpacer {
+                    edge: SpacerEdge::Top,
+                },
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(0.0),
+                    ..default()
+                },
+            ))
+            .id();
+        commands.entity(conv_entity).add_child(top);
+        entities.top_spacer = Some(top);
+    }
+
+    if !is_valid(entities.bottom_spacer) {
+        let bottom = commands
+            .spawn((
+                ConversationSpacer {
+                    edge: SpacerEdge::Bottom,
+                },
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(0.0),
+                    ..default()
+                },
+            ))
+            .id();
+        commands.entity(conv_entity).add_child(bottom);
+        entities.bottom_spacer = Some(bottom);
+    }
 }
 
 /// Spawn or update BlockCell entities to match the MainCell's BlockStore.
@@ -268,7 +350,18 @@ pub fn spawn_block_cells(
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
-                    BlockCellLayout::default(),
+                    // Seed the logical y at the current document tail rather
+                    // than 0. virtualize_conversation runs before this cell's
+                    // first readback, so if it entered the geometry model at
+                    // y_offset=0 it would land at the top of the `shown` list
+                    // and blow the bottom spacer up to ~content_height for one
+                    // frame (visible flicker on every appended/streaming
+                    // block). Appended blocks always land at the tail, so
+                    // content_height is the correct provisional offset.
+                    BlockCellLayout {
+                        y_offset: scroll_state.content_height,
+                        ..default()
+                    },
                     crate::view::block_render::BlockScene::default(),
                     crate::view::ui_rtt::UiVectorScene::default(),
                     crate::view::ui_rtt::UiRttTexture::default(),

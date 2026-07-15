@@ -35,9 +35,9 @@ use crate::view::overlay::{OverlayStyle, OverlaySummonState};
 use crate::view::shell_dock::ShellDockSummonState;
 use crate::view::{
     BlockCellContainer, BlockCellLayout, ContextSwitchRequested, ConversationContainer,
-    ConversationScrollState, DocumentCache, EditorEntities, FocusTarget, LayoutGeneration,
-    MainCell, PendingContextSwitch, RoleGroupBorderLayout, SessionPrincipal, SubmitFailed,
-    ViewingConversation,
+    ConversationScrollState, ConversationSpacer, DocumentCache, EditorEntities, FocusTarget,
+    LayoutGeneration, MainCell, PendingContextSwitch, RoleGroupBorderLayout, SessionPrincipal,
+    SubmitFailed, ViewingConversation,
 };
 
 use crate::view::lifecycle as view_lifecycle;
@@ -60,6 +60,7 @@ impl Plugin for CellPlugin {
         // Register types for BRP reflection
         app.register_type::<ConversationScrollState>()
             .register_type::<ConversationContainer>()
+            .register_type::<ConversationSpacer>()
             .register_type::<MainCell>()
             .register_type::<ViewingConversation>()
             .register_type::<FocusTarget>()
@@ -144,9 +145,13 @@ impl Plugin for CellPlugin {
                 view_overlay::spawn_input_overlay,
                 view_shell_dock::spawn_shell_dock,
                 view_lifecycle::track_conversation_container.after(view_lifecycle::spawn_main_cell),
+                view_lifecycle::ensure_conversation_spacers
+                    .after(view_lifecycle::track_conversation_container),
                 view_lifecycle::spawn_block_cells,
                 view_lifecycle::sync_role_headers.after(view_lifecycle::spawn_block_cells),
-                ApplyDeferred.after(view_lifecycle::sync_role_headers),
+                ApplyDeferred
+                    .after(view_lifecycle::sync_role_headers)
+                    .after(view_lifecycle::ensure_conversation_spacers),
             )
                 .in_set(CellPhase::Spawn),
         );
@@ -192,7 +197,7 @@ impl Plugin for CellPlugin {
                 view_render::reorder_conversation_children
                     .after(view_render::update_block_cell_nodes),
                 view_scroll::smooth_scroll.after(view_render::layout_block_cells),
-                view_render::cull_offscreen_blocks.after(view_scroll::smooth_scroll),
+                view_render::virtualize_conversation.after(view_scroll::smooth_scroll),
             )
                 .in_set(CellPhase::Layout),
         );

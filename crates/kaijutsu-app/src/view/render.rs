@@ -10,8 +10,8 @@ use bevy::prelude::*;
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationScrollState,
-    EditorEntities, FocusedBlockCell, LayoutGeneration, MainCell, RoleGroupBorder,
-    RoleGroupBorderLayout,
+    ConversationSpacer, EditorEntities, FocusedBlockCell, LayoutGeneration, MainCell,
+    RoleGroupBorder, RoleGroupBorderLayout,
 };
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
@@ -380,8 +380,7 @@ pub fn update_block_cell_nodes(
     }
 }
 
-/// Compute the ConversationContainer's children in document order,
-/// interleaving role headers before their associated block.
+/// Interleave role headers into block document order — no spacers.
 ///
 /// Pure function — no ECS access — so the ordering logic can be unit
 /// tested without spinning up a Bevy `App`. Any block present in `blocks`
@@ -390,14 +389,21 @@ pub fn update_block_cell_nodes(
 /// signature of an upstream spawn/removal bug (spawn_block_cells lagging
 /// or a stale container ref), not something this function should paper
 /// over.
-pub fn compute_ordered_children(
+///
+/// Shared by `compute_ordered_children` (which wraps the result with the
+/// top/bottom spacers for `reorder_conversation_children`) and
+/// `readback_block_heights`/`virtualize_conversation` (which need the same
+/// document-order walk over *just* the measurable block/header entities,
+/// spacers excluded, to keep the logical geometry model consistent with
+/// child order).
+fn interleave_blocks_and_headers(
     blocks: &[kaijutsu_crdt::BlockSnapshot],
     container: &BlockCellContainer,
     header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
     mut on_missing_block: impl FnMut(&kaijutsu_crdt::BlockSnapshot),
 ) -> Vec<Entity> {
     let mut prev_role: Option<kaijutsu_crdt::Role> = None;
-    let mut ordered_children = Vec::with_capacity(blocks.len());
+    let mut ordered = Vec::with_capacity(blocks.len());
 
     for block in blocks {
         // Skip tool blocks for role transition tracking (they use fieldset borders)
@@ -407,17 +413,45 @@ pub fn compute_ordered_children(
         if !dominated_by_border {
             let is_transition = prev_role != Some(block.role);
             if is_transition && let Some(&header_ent) = header_map.get(&block.id) {
-                ordered_children.push(header_ent);
+                ordered.push(header_ent);
             }
             prev_role = Some(block.role);
         }
 
         match container.get_entity(&block.id) {
-            Some(block_ent) => ordered_children.push(block_ent),
+            Some(block_ent) => ordered.push(block_ent),
             None => on_missing_block(block),
         }
     }
 
+    ordered
+}
+
+/// Compute the ConversationContainer's children in document order:
+/// `[top_spacer, ...interleaved block/header entities..., bottom_spacer]`.
+///
+/// Pure function — no ECS access — so the ordering logic can be unit
+/// tested without spinning up a Bevy `App`. The two spacers must always be
+/// the first and last children so their `Node.height` can stand in for
+/// virtualized-out (`Display::None`) content above/below the visible
+/// window — see `ConversationSpacer`.
+pub fn compute_ordered_children(
+    blocks: &[kaijutsu_crdt::BlockSnapshot],
+    container: &BlockCellContainer,
+    header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
+    top_spacer: Entity,
+    bottom_spacer: Entity,
+    on_missing_block: impl FnMut(&kaijutsu_crdt::BlockSnapshot),
+) -> Vec<Entity> {
+    let mut ordered_children = Vec::with_capacity(blocks.len() + 2);
+    ordered_children.push(top_spacer);
+    ordered_children.extend(interleave_blocks_and_headers(
+        blocks,
+        container,
+        header_map,
+        on_missing_block,
+    ));
+    ordered_children.push(bottom_spacer);
     ordered_children
 }
 
@@ -434,6 +468,13 @@ pub fn compute_ordered_children(
 /// it so the caller can despawn them explicitly instead of leaking them
 /// until app restart.
 ///
+/// `is_spacer` is an explicit exclusion, not just an omission: the two
+/// `ConversationSpacer` entities are always included in `ordered_children`
+/// (see `compute_ordered_children`) so in practice they never reach this
+/// filter, but a spacer must never be despawned as a false-positive orphan
+/// even if that invariant is ever violated upstream — despawning one would
+/// desync `EditorEntities.top_spacer`/`bottom_spacer` from reality.
+///
 /// Pure function — takes membership predicates instead of `Query` so it's
 /// unit-testable without ECS.
 pub fn find_orphaned_children(
@@ -441,6 +482,7 @@ pub fn find_orphaned_children(
     ordered_children: &[Entity],
     is_block_cell: impl Fn(Entity) -> bool,
     is_role_header: impl Fn(Entity) -> bool,
+    is_spacer: impl Fn(Entity) -> bool,
 ) -> Vec<Entity> {
     let ordered_set: std::collections::HashSet<Entity> =
         ordered_children.iter().copied().collect();
@@ -448,7 +490,7 @@ pub fn find_orphaned_children(
         .iter()
         .copied()
         .filter(|&child| !ordered_set.contains(&child))
-        .filter(|&child| is_block_cell(child) || is_role_header(child))
+        .filter(|&child| (is_block_cell(child) || is_role_header(child)) && !is_spacer(child))
         .collect()
 }
 
@@ -467,6 +509,7 @@ pub fn reorder_conversation_children(
     main_cells: Query<&CellEditor, With<MainCell>>,
     role_headers: Query<&RoleGroupBorder>,
     block_cell_entities: Query<Entity, With<BlockCell>>,
+    spacer_entities: Query<Entity, With<ConversationSpacer>>,
     children_query: Query<&Children>,
     layout_gen: Res<LayoutGeneration>,
     mut last_gen: Local<u64>,
@@ -480,6 +523,17 @@ pub fn reorder_conversation_children(
         return;
     };
     let Some(conv_entity) = entities.conversation_container else {
+        return;
+    };
+    // Spacers are spawned by `ensure_conversation_spacers`, which runs
+    // earlier in the same frame (CellPhase::Spawn) whenever
+    // `conversation_container` is set — so by the time this Layout-phase
+    // system runs, both should already exist. If not (e.g. very first
+    // frame ordering), skip this generation; the next bump retries.
+    let Some(top_spacer) = entities.top_spacer else {
+        return;
+    };
+    let Some(bottom_spacer) = entities.bottom_spacer else {
         return;
     };
     let Ok(editor) = main_cells.get(main_ent) else {
@@ -499,14 +553,21 @@ pub fn reorder_conversation_children(
         }
     }
 
-    let ordered_children = compute_ordered_children(&blocks, container, &header_map, |block| {
-        error!(
-            "reorder_conversation_children: block {:?} (kind={:?}) is in editor.blocks() \
-             but has no BlockCellContainer entry — dropped from render order this frame; \
-             spawn_block_cells should have created it",
-            block.id, block.kind
-        );
-    });
+    let ordered_children = compute_ordered_children(
+        &blocks,
+        container,
+        &header_map,
+        top_spacer,
+        bottom_spacer,
+        |block| {
+            error!(
+                "reorder_conversation_children: block {:?} (kind={:?}) is in editor.blocks() \
+                 but has no BlockCellContainer entry — dropped from render order this frame; \
+                 spawn_block_cells should have created it",
+                block.id, block.kind
+            );
+        },
+    );
 
     let current_children: Vec<Entity> = children_query
         .get(conv_entity)
@@ -524,6 +585,7 @@ pub fn reorder_conversation_children(
         &ordered_children,
         |e| block_cell_entities.contains(e),
         |e| role_headers.contains(e),
+        |e| spacer_entities.contains(e),
     );
     for orphan in orphans {
         error!(
@@ -545,60 +607,106 @@ pub fn reorder_conversation_children(
     }
 }
 
-/// Read back actual block heights from Taffy layout (PostUpdate).
+/// Read a `Val::Px` margin as a plain `f32`, treating any other unit as 0.
+/// Block/header margins are always set as `Val::Px` by
+/// `update_block_cell_nodes`/`sync_role_headers`.
+fn margin_bottom_px(node: &Node) -> f32 {
+    match node.margin.bottom {
+        Val::Px(px) => px,
+        _ => 0.0,
+    }
+}
+
+/// Read back block/header heights from Taffy layout and recompute the
+/// logical geometry model (PostUpdate).
 ///
 /// Runs after `UiSystems::Layout` so Parley has measured text and Taffy has
 /// sized all boxes. This is the sole source of truth for block heights.
+///
+/// Two passes folded into one document-order walk over block/header
+/// entities (NOT `Children` — those now also hold the two spacers plus
+/// zero-height `Display::None` gaps, which would corrupt a running sum):
+///
+/// 1. **Measure visible only.** An entity currently `Display::Flex` (laid
+///    out) has its cached `height` refreshed from `ComputedNode`, and its
+///    `last_measured_version` stamped with the block's current
+///    `last_render_version` (blocks only — headers don't stream). An entity
+///    that's `Display::None` keeps its last-cached height untouched.
+/// 2. **Recompute logical geometry from cache.** `y_offset` accumulates
+///    `cached_height + margin_bottom` in document order for every entity,
+///    visible or not, so `content_height` and per-entity `y_offset` stay
+///    byte-for-byte what they'd be if nothing were virtualized out.
 pub fn readback_block_heights(
     entities: Res<EditorEntities>,
-    children_query: Query<&Children>,
-    block_cells: Query<(&ComputedNode, &Node), With<BlockCell>>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    containers: Query<&BlockCellContainer>,
+    role_header_query: Query<&RoleGroupBorder>,
+    block_cells: Query<(&ComputedNode, &Node, &BlockCell), With<BlockCell>>,
     role_headers: Query<(&ComputedNode, &Node), (With<RoleGroupBorder>, Without<BlockCell>)>,
     mut block_layouts: Query<&mut BlockCellLayout, With<BlockCell>>,
     mut header_layouts: Query<&mut RoleGroupBorderLayout, Without<BlockCell>>,
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
-    let Some(conv_entity) = entities.conversation_container else {
+    let Some(main_ent) = entities.main_cell else {
         return;
     };
-    let Ok(children) = children_query.get(conv_entity) else {
+    let Ok(editor) = main_cells.get(main_ent) else {
         return;
     };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let blocks = editor.blocks();
+    let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+        std::collections::HashMap::new();
+    for &header_ent in &container.role_headers {
+        if let Ok(header) = role_header_query.get(header_ent) {
+            header_map.insert(header.block_id, header_ent);
+        }
+    }
+
+    let ordered = interleave_blocks_and_headers(&blocks, container, &header_map, |_| {});
 
     let mut y_offset: f32 = 0.0;
 
-    for child in children.iter() {
-        if let Ok((computed, node)) = block_cells.get(child) {
-            let height = computed.size().y;
-
-            let margin_bottom = match node.margin.bottom {
-                Val::Px(px) => px,
-                _ => 0.0,
+    for entity in ordered {
+        if let Ok((computed, node, block_cell)) = block_cells.get(entity) {
+            let Ok(mut layout) = block_layouts.get_mut(entity) else {
+                continue;
             };
 
-            if let Ok(mut layout) = block_layouts.get_mut(child)
-                && ((layout.y_offset - y_offset).abs() > 0.5
-                    || (layout.height - height).abs() > 0.5)
-            {
-                layout.y_offset = y_offset;
-                layout.height = height;
+            if node.display != Display::None {
+                let measured = computed.size().y;
+                if (layout.height - measured).abs() > 0.5 {
+                    layout.height = measured;
+                }
+                let measured_version = block_cell.last_render_version.unwrap_or(0);
+                if layout.last_measured_version != measured_version {
+                    layout.last_measured_version = measured_version;
+                }
             }
 
-            y_offset += height + margin_bottom;
-        } else if let Ok((computed, node)) = role_headers.get(child) {
-            let height = computed.size().y;
-            let margin_bottom = match node.margin.bottom {
-                Val::Px(px) => px,
-                _ => 0.0,
+            if (layout.y_offset - y_offset).abs() > 0.5 {
+                layout.y_offset = y_offset;
+            }
+            y_offset += layout.height + margin_bottom_px(node);
+        } else if let Ok((computed, node)) = role_headers.get(entity) {
+            let Ok(mut layout) = header_layouts.get_mut(entity) else {
+                continue;
             };
 
-            if let Ok(mut layout) = header_layouts.get_mut(child)
-                && (layout.y_offset - y_offset).abs() > 0.5
-            {
-                layout.y_offset = y_offset;
+            if node.display != Display::None {
+                let measured = computed.size().y;
+                if (layout.height - measured).abs() > 0.5 {
+                    layout.height = measured;
+                }
             }
 
-            y_offset += height + margin_bottom;
+            if (layout.y_offset - y_offset).abs() > 0.5 {
+                layout.y_offset = y_offset;
+            }
+            y_offset += layout.height + margin_bottom_px(node);
         }
     }
 
@@ -658,45 +766,194 @@ pub fn highlight_focused_block(
     }
 }
 
-/// Cull off-screen block cells by toggling Visibility.
+/// Pure computation of top/bottom `ConversationSpacer` heights from the
+/// logical geometry of the entities that end up shown (`Display::Flex`) this
+/// frame, in document order.
 ///
-/// Blocks entirely outside the visible scroll range are hidden so the renderer
-/// skips them during extract — no Parley layout, no Vello scene encoding.
-/// A margin of one screen height above/below prevents pop-in during fast scroll.
+/// `shown` is `(y_offset, height, margin_bottom)` for each shown entity, in
+/// document order (blocks and headers interleaved, as walked by
+/// `virtualize_conversation`). Pure/ECS-free so it's unit-testable without a
+/// Bevy `App`.
 ///
-/// This dramatically reduces per-frame rendering work when large tool results
-/// (thousands of lines) are in the document but not on screen.
-pub fn cull_offscreen_blocks(
+/// - `top` = the first shown entity's logical `y_offset` (0 if it's already
+///   at the document top, or if nothing is shown).
+/// - `bottom` = `content_height` minus the last shown entity's logical
+///   bottom edge (`y_offset + height + margin_bottom`) — 0 if it's already
+///   at the document bottom, or if nothing is shown.
+pub fn compute_spacer_heights(shown: &[(f32, f32, f32)], content_height: f32) -> (f32, f32) {
+    let top = shown.first().map(|&(y, _, _)| y).unwrap_or(0.0).max(0.0);
+    let bottom = shown
+        .last()
+        .map(|&(y, h, m)| (content_height - (y + h + m)).max(0.0))
+        .unwrap_or(0.0);
+    (top, bottom)
+}
+
+fn set_display(node: &mut Node, display: Display) {
+    if node.display != display {
+        node.display = display;
+    }
+}
+
+fn set_visibility(vis: &mut Visibility, target: Visibility) {
+    if *vis != target {
+        *vis = target;
+    }
+}
+
+/// Virtualize the conversation column: remove offscreen block/header nodes
+/// from Taffy layout entirely (`Node.display = Display::None`) instead of
+/// only hiding them (`Visibility::Hidden`), and size the top/bottom
+/// `ConversationSpacer` nodes to stand in for the removed space.
+///
+/// This is the fix for the O(N) relayout problem: a `Visibility::Hidden`
+/// node is still measured and positioned by Taffy every relayout; a
+/// `Display::None` node is skipped entirely, so relayout cost tracks the
+/// number of *visible* blocks, not the total. `Visibility::Hidden` is kept
+/// alongside `Display::None` (same dual pattern as the shell dock,
+/// `shell_dock.rs:73-92`) so `build_block_scenes` and friends keep their
+/// existing Visibility-gated skip as a second line of defense.
+///
+/// A margin of one screen height above/below the viewport prevents pop-in
+/// during fast scroll — same predicate as the `Visibility`-only culling this
+/// replaces.
+///
+/// Two exceptions force an entity `Display::Flex` regardless of the window:
+/// - **Never measured** (`height <= 0.0`, i.e. cached height is still the
+///   `Default`): a freshly spawned block spawns `Display::Flex` so it gets
+///   measured once by `readback_block_heights`, but if this system ran
+///   before that first measurement it must not hide it — hiding an
+///   unmeasured block would make it stay unmeasured (`Display::None` nodes
+///   aren't laid out), a permanent stuck-at-zero-height block.
+/// - **Streaming while offscreen** (`BlockCell.last_render_version >
+///   BlockCellLayout.last_measured_version`): a block's cached height goes
+///   stale once it's `Display::None`, since `readback_block_heights` only
+///   remeasures `Display::Flex` entities. Forcing one extra frame of
+///   `Display::Flex` lets readback catch up before the block re-enters the
+///   window (e.g. scrolling/following it into view) — otherwise the stale
+///   cached height would produce a visible scrollbar/content jump. In
+///   practice this is rare and geometrically local: streaming blocks are
+///   appended at the document tail, which is exactly where a follow-mode
+///   viewport already sits, so the forced-visible entity ends up adjacent
+///   to (not disjoint from) the real visible window that also drives the
+///   spacer bounds below.
+pub fn virtualize_conversation(
     entities: Res<EditorEntities>,
     scroll_state: Res<ConversationScrollState>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&BlockCellLayout, &mut Visibility), With<BlockCell>>,
+    role_header_query: Query<&RoleGroupBorder>,
+    mut block_cells: Query<
+        (&BlockCellLayout, &BlockCell, &mut Node, &mut Visibility),
+        With<BlockCell>,
+    >,
+    mut role_headers: Query<
+        (&RoleGroupBorderLayout, &mut Node, &mut Visibility),
+        (With<RoleGroupBorder>, Without<BlockCell>),
+    >,
+    mut spacers: Query<(&ConversationSpacer, &mut Node), Without<BlockCell>>,
 ) {
     let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Ok(editor) = main_cells.get(main_ent) else {
         return;
     };
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
 
+    let blocks = editor.blocks();
+    let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+        std::collections::HashMap::new();
+    for &header_ent in &container.role_headers {
+        if let Ok(header) = role_header_query.get(header_ent) {
+            header_map.insert(header.block_id, header_ent);
+        }
+    }
+    let ordered = interleave_blocks_and_headers(&blocks, container, &header_map, |_| {});
+
     let margin = scroll_state.visible_height;
     let top = scroll_state.offset - margin;
     let bottom = scroll_state.offset + scroll_state.visible_height + margin;
 
-    for &entity in container.block_cells.values() {
-        let Ok((layout, mut vis)) = block_cells.get_mut(entity) else {
-            continue;
-        };
-        let block_top = layout.y_offset;
-        let block_bottom = layout.y_offset + layout.height;
-        let should_show = block_bottom >= top && block_top <= bottom;
-        let target = if should_show {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        if *vis != target {
-            *vis = target;
+    let mut shown: Vec<(f32, f32, f32)> = Vec::new();
+
+    for entity in ordered {
+        if let Ok((layout, block_cell, mut node, mut vis)) = block_cells.get_mut(entity) {
+            // "Never measured" must key off the version sentinel, NOT
+            // `height <= 0.0` — a legitimately empty block measures to
+            // height 0 and would otherwise be pinned Display::Flex forever.
+            // `readback_block_heights` stamps `last_measured_version` on
+            // every visible measurement, so version==0 means "readback has
+            // not yet run on this block".
+            let never_measured = layout.last_measured_version == 0;
+            let in_window =
+                layout.y_offset + layout.height >= top && layout.y_offset <= bottom;
+            let stale = block_cell
+                .last_render_version
+                .is_some_and(|v| v > layout.last_measured_version);
+            let should_show = never_measured || in_window || stale;
+
+            set_display(&mut node, if should_show { Display::Flex } else { Display::None });
+            set_visibility(
+                &mut vis,
+                if should_show {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+            );
+
+            if should_show {
+                shown.push((layout.y_offset, layout.height, margin_bottom_px(&node)));
+            }
+        } else if let Ok((layout, mut node, mut vis)) = role_headers.get_mut(entity) {
+            // RoleGroupBorderLayout has no version field, so we can't use the
+            // block sentinel here. Role headers are never legitimately
+            // zero-height (they always render a labeled rule line, min_height
+            // ROLE_HEADER_HEIGHT), so `height <= 0.0` safely means "not yet
+            // measured" for headers.
+            let never_measured = layout.height <= 0.0;
+            let in_window =
+                layout.y_offset + layout.height >= top && layout.y_offset <= bottom;
+            let should_show = never_measured || in_window;
+
+            set_display(&mut node, if should_show { Display::Flex } else { Display::None });
+            set_visibility(
+                &mut vis,
+                if should_show {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+            );
+
+            if should_show {
+                shown.push((layout.y_offset, layout.height, margin_bottom_px(&node)));
+            }
+        }
+    }
+
+    // Write ONLY this container's two spacers, looked up through
+    // `EditorEntities`. A global `spacers.iter_mut()` would clobber every
+    // pane's spacers in a split view — overwriting background panes' heights
+    // with the focused pane's geometry.
+    let (top_h, bottom_h) = compute_spacer_heights(&shown, scroll_state.content_height);
+    if let Some(top_ent) = entities.top_spacer
+        && let Ok((_, mut node)) = spacers.get_mut(top_ent)
+    {
+        let target = Val::Px(top_h);
+        if node.height != target {
+            node.height = target;
+        }
+    }
+    if let Some(bottom_ent) = entities.bottom_spacer
+        && let Ok((_, mut node)) = spacers.get_mut(bottom_ent)
+    {
+        let target = Val::Px(bottom_h);
+        if node.height != target {
+            node.height = target;
         }
     }
 }
@@ -704,6 +961,7 @@ pub fn cull_offscreen_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cell::SpacerEdge;
     use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Role};
 
     fn test_block_id(seq: u64) -> BlockId {
@@ -739,14 +997,27 @@ mod tests {
         let mut header_map = std::collections::HashMap::new();
         header_map.insert(model_id, header_ent);
 
+        let top_spacer = Entity::from_raw_u32(4).unwrap();
+        let bottom_spacer = Entity::from_raw_u32(5).unwrap();
+
         let mut missing = Vec::new();
-        let ordered =
-            compute_ordered_children(&blocks, &container, &header_map, |b| missing.push(b.id));
+        let ordered = compute_ordered_children(
+            &blocks,
+            &container,
+            &header_map,
+            top_spacer,
+            bottom_spacer,
+            |b| missing.push(b.id),
+        );
 
         assert!(missing.is_empty());
         // No header registered for the first (User) block, so it opens the
         // list; the Model transition's header is interleaved before it.
-        assert_eq!(ordered, vec![user_ent, header_ent, model_ent]);
+        // The spacers always bracket the interleaved list.
+        assert_eq!(
+            ordered,
+            vec![top_spacer, user_ent, header_ent, model_ent, bottom_spacer]
+        );
     }
 
     #[test]
@@ -764,16 +1035,56 @@ mod tests {
         // missing_id deliberately has no container entry — this is the
         // upstream-bug signature (spawn_block_cells lag / stale container).
 
+        let top_spacer = Entity::from_raw_u32(2).unwrap();
+        let bottom_spacer = Entity::from_raw_u32(3).unwrap();
+
         let mut missing = Vec::new();
         let ordered = compute_ordered_children(
             &blocks,
             &container,
             &std::collections::HashMap::new(),
+            top_spacer,
+            bottom_spacer,
             |b| missing.push(b.id),
         );
 
-        assert_eq!(ordered, vec![present_ent]);
+        assert_eq!(ordered, vec![top_spacer, present_ent, bottom_spacer]);
         assert_eq!(missing, vec![missing_id]);
+    }
+
+    // ------------------------------------------------------------------
+    // compute_spacer_heights
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compute_spacer_heights_empty_shown_list_yields_zero_both() {
+        assert_eq!(compute_spacer_heights(&[], 1000.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn compute_spacer_heights_first_shown_at_document_top_yields_zero_top() {
+        // The topmost entity in the document is itself shown, so nothing
+        // is virtualized out above it — top spacer collapses to 0.
+        let shown = vec![(0.0, 50.0, 8.0), (58.0, 30.0, 8.0)];
+        let (top, _bottom) = compute_spacer_heights(&shown, 200.0);
+        assert_eq!(top, 0.0);
+    }
+
+    #[test]
+    fn compute_spacer_heights_middle_window_computes_both_gaps() {
+        // Document: [0..100) virtualized out, [100..180) the shown window,
+        // [180..500) virtualized out below it.
+        let shown = vec![(100.0, 50.0, 5.0), (155.0, 20.0, 5.0)]; // last ends at 180
+        let (top, bottom) = compute_spacer_heights(&shown, 500.0);
+        assert_eq!(top, 100.0);
+        assert_eq!(bottom, 500.0 - 180.0);
+    }
+
+    #[test]
+    fn compute_spacer_heights_last_shown_at_document_bottom_yields_zero_bottom() {
+        let shown = vec![(900.0, 100.0, 0.0)];
+        let (_top, bottom) = compute_spacer_heights(&shown, 1000.0);
+        assert_eq!(bottom, 0.0);
     }
 
     // ------------------------------------------------------------------
@@ -785,7 +1096,7 @@ mod tests {
         let a = Entity::from_raw_u32(1).unwrap();
         let b = Entity::from_raw_u32(2).unwrap();
         let orphans =
-            find_orphaned_children(&[a, b], &[b, a], |_| true, |_| false);
+            find_orphaned_children(&[a, b], &[b, a], |_| true, |_| false, |_| false);
         assert!(orphans.is_empty());
     }
 
@@ -801,6 +1112,7 @@ mod tests {
             &[kept],
             |e| e == leaked,
             |_| false,
+            |_| false,
         );
         assert_eq!(orphans, vec![leaked]);
     }
@@ -814,6 +1126,7 @@ mod tests {
             &[kept],
             |_| false,
             |e| e == leaked,
+            |_| false,
         );
         assert_eq!(orphans, vec![leaked]);
     }
@@ -831,6 +1144,26 @@ mod tests {
             &[kept],
             |_| false,
             |_| false,
+            |_| false,
+        );
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn find_orphaned_children_never_flags_a_spacer_even_if_it_matches_block_or_header() {
+        // Defense-in-depth per the review correction: a ConversationSpacer
+        // must never be swept as an orphan, even if it somehow also matched
+        // the block-cell/role-header predicates (it never does in practice
+        // — spacers are always included in `ordered_children` — but the
+        // exclusion must win if that invariant is ever violated upstream).
+        let kept = Entity::from_raw_u32(1).unwrap();
+        let spacer = Entity::from_raw_u32(2).unwrap();
+        let orphans = find_orphaned_children(
+            &[kept, spacer],
+            &[kept],
+            |e| e == spacer,
+            |_| false,
+            |e| e == spacer,
         );
         assert!(orphans.is_empty());
     }
@@ -859,8 +1192,9 @@ mod tests {
 
     /// Spawn a MainCell + CellEditor with `n` text blocks inserted in
     /// document order, plus matching BlockCell entities parented under a
-    /// fresh conversation container (in that same order — the "everything
-    /// already agrees" starting point each test then perturbs).
+    /// fresh conversation container bracketed by top/bottom spacers (in
+    /// that same order — the "everything already agrees" starting point
+    /// each test then perturbs).
     fn seed_conversation(app: &mut App, block_count: usize) -> (Vec<BlockId>, Entity) {
         let mut editor = CellEditor::new();
         let mut ids = Vec::with_capacity(block_count);
@@ -891,15 +1225,34 @@ mod tests {
         }
         app.world_mut().entity_mut(main_ent).insert(container);
 
+        let top_spacer = app
+            .world_mut()
+            .spawn(ConversationSpacer {
+                edge: SpacerEdge::Top,
+            })
+            .id();
+        let bottom_spacer = app
+            .world_mut()
+            .spawn(ConversationSpacer {
+                edge: SpacerEdge::Bottom,
+            })
+            .id();
+
         let conv_ent = app.world_mut().spawn(Node::default()).id();
+        app.world_mut().entity_mut(conv_ent).add_child(top_spacer);
         app.world_mut()
             .entity_mut(conv_ent)
             .add_children(&cell_entities);
+        app.world_mut()
+            .entity_mut(conv_ent)
+            .add_child(bottom_spacer);
 
         {
             let mut entities = app.world_mut().resource_mut::<EditorEntities>();
             entities.main_cell = Some(main_ent);
             entities.conversation_container = Some(conv_ent);
+            entities.top_spacer = Some(top_spacer);
+            entities.bottom_spacer = Some(bottom_spacer);
         }
 
         (ids, conv_ent)
@@ -922,13 +1275,17 @@ mod tests {
         // bump has happened yet, so the system should no-op).
         app.update();
         assert_eq!(children_of(&app, conv_ent), {
+            let entities = app.world().resource::<EditorEntities>();
+            let (top_spacer, bottom_spacer) =
+                (entities.top_spacer.unwrap(), entities.bottom_spacer.unwrap());
             let container = app
                 .world()
-                .get::<BlockCellContainer>(
-                    app.world().resource::<EditorEntities>().main_cell.unwrap(),
-                )
+                .get::<BlockCellContainer>(entities.main_cell.unwrap())
                 .unwrap();
-            ids.iter().map(|id| container.get_entity(id).unwrap()).collect::<Vec<_>>()
+            let mut expected = vec![top_spacer];
+            expected.extend(ids.iter().map(|id| container.get_entity(id).unwrap()));
+            expected.push(bottom_spacer);
+            expected
         });
 
         // Reposition the last block to the front via move_block — a pure
@@ -958,11 +1315,14 @@ mod tests {
 
         app.update();
 
+        let (top_spacer, bottom_spacer) = {
+            let entities = app.world().resource::<EditorEntities>();
+            (entities.top_spacer.unwrap(), entities.bottom_spacer.unwrap())
+        };
         let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
-        let expected: Vec<Entity> = new_order
-            .iter()
-            .map(|id| container.get_entity(id).unwrap())
-            .collect();
+        let mut expected: Vec<Entity> = vec![top_spacer];
+        expected.extend(new_order.iter().map(|id| container.get_entity(id).unwrap()));
+        expected.push(bottom_spacer);
         assert_eq!(
             children_of(&app, conv_ent),
             expected,

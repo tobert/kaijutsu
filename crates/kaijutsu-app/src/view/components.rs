@@ -278,6 +278,28 @@ pub struct BlockEditCursor {
 #[reflect(Component)]
 pub struct ConversationContainer;
 
+/// Which edge of the conversation column a spacer occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+pub enum SpacerEdge {
+    Top,
+    Bottom,
+}
+
+/// Marker for one of the two spacer nodes bracketing a `ConversationContainer`'s
+/// virtualized children.
+///
+/// `virtualize_conversation` removes offscreen block/header nodes from taffy
+/// layout via `Node.display = Display::None`; the spacers' `Node.height`
+/// stands in for the removed space so `content_height`/`ScrollPosition.y`
+/// stay correct. Exactly one `Top` and one `Bottom` spacer exist per
+/// `ConversationContainer`, always the first and last child respectively —
+/// see `reorder_conversation_children` and `lifecycle::ensure_conversation_spacers`.
+#[derive(Component, Reflect)]
+#[reflect(Component)]
+pub struct ConversationSpacer {
+    pub edge: SpacerEdge,
+}
+
 // ============================================================================
 // INPUT OVERLAY — Ephemeral input surface
 // ============================================================================
@@ -934,10 +956,18 @@ impl BlockCellContainer {
 pub struct BlockCellLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,
-    /// Computed height based on content.
+    /// Computed height based on content. Cached from the last frame this
+    /// block was actually laid out (`Display::Flex`) — kept as-is while the
+    /// block is virtualized out (`Display::None`) so the logical geometry
+    /// model stays valid without a live taffy measurement.
     pub height: f32,
     /// Indentation level (for nested tool results).
     pub indent_level: u32,
+    /// `BlockCell.last_render_version` at the time `height` was last
+    /// measured from `ComputedNode`. Used by `virtualize_conversation` to
+    /// detect a block whose content changed while it was `Display::None` —
+    /// see the streaming-offscreen stale-height guard.
+    pub last_measured_version: u64,
 }
 
 // ============================================================================
@@ -964,6 +994,9 @@ pub struct RoleGroupBorder {
 pub struct RoleGroupBorderLayout {
     /// Y position (top) relative to conversation content start.
     pub y_offset: f32,
+    /// Computed height based on content. Same caching contract as
+    /// `BlockCellLayout::height` — held over while `Display::None`.
+    pub height: f32,
 }
 
 #[cfg(test)]
