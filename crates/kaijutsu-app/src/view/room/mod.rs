@@ -1668,6 +1668,14 @@ fn ingest_room_activity(
 /// + quantized so a settled marker never touches `Assets<StandardMaterial>`
 /// (the well's `sync_card_live_uniforms` discipline).
 ///
+/// The `Bearing::East` branch below is now inert code, not deleted: Tracker
+/// Station slice 0 (`snazzy-jumping-hejlsberg.md`) made `Station::Tracks` a
+/// furnished bearing (`bearing::station_is_room_furniture`), so
+/// `enter_room` no longer spawns an East `BearingMarker` for this loop to
+/// find — the beat-breathe it used to carry is re-homed onto
+/// `tracker::pulse_tracker_playheads`, per-column and per-tempo instead of
+/// one shared pylon.
+///
 /// The console-emblem glow branch this used to carry (`ConsoleEmblem`,
 /// `CONSOLE_CHATTER_GAIN`) is gone with the slice-A placeholder it lit (Slice
 /// C, `lovely-swimming-prism.md`) — the real time well now stands at the
