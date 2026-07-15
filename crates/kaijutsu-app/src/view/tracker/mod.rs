@@ -209,6 +209,18 @@ const HEADER_Y: f32 = FACE_H / 2.0 - 20.0;
 /// Frame ribbon width (the faint edge around the face).
 const FRAME_WIDTH: f32 = 3.0;
 
+/// Whether a row quad centered at local `y` sits fully inside the grid band.
+/// There is no clip/mask geometry on the face, and a column's row set is
+/// deliberately TALLER than the visible band ([`grid::row_count_for`] rounds
+/// up to a phrase multiple plus a wrap margin — for a long phrase, much
+/// taller) — without this cull, the margin rows draw over the glyph/dot band
+/// above the grid and past the frame below it. Rows outside the band go
+/// `Visibility::Hidden`, which also makes the wrap teleport invisible: a row
+/// only ever jumps edges while hidden.
+fn row_in_band(y: f32) -> bool {
+    (GRID_BOTTOM + ROW_HEIGHT / 2.0..=GRID_TOP - ROW_HEIGHT / 2.0).contains(&y)
+}
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 /// Per-track column bookkeeping + the two row materials shared across every
@@ -504,6 +516,7 @@ pub(crate) fn sync_tracker_columns(
     mut card_materials: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     roots: Query<Entity, With<TrackerRoot>>,
+    columns: Query<&TrackerColumn>,
 ) {
     if !well_tracks.is_changed() && state.column_entities.len() == well_tracks.tracks.len() {
         return;
@@ -511,6 +524,18 @@ pub(crate) fn sync_tracker_columns(
     let Ok(root) = roots.single() else {
         return;
     };
+
+    // Carry each surviving track's frozen scroll position through the
+    // rebuild: a stopped track's poll flips `playing` within ~5s of the
+    // freeze, which lands here as a full rebuild — without this carry the
+    // rebuilt rows would snap back to beat 0, breaking the exact-freeze
+    // contract (`grid.rs`'s freeze test; the phasor is already gone, so
+    // `animate_tracker_scroll` would never correct the snap).
+    let carried: std::collections::HashMap<String, f64> = state
+        .column_entities
+        .iter()
+        .filter_map(|(id, e)| columns.get(*e).ok().map(|c| (id.clone(), c.last_position)))
+        .collect();
 
     for (_, e) in state.column_entities.drain() {
         commands.entity(e).despawn();
@@ -543,11 +568,13 @@ pub(crate) fn sync_tracker_columns(
 
     let slots = grid::column_layout(well_tracks.tracks.len(), FACE_W, COL_W_MAX, COL_GAP);
     for (t, slot) in well_tracks.tracks.iter().zip(slots.iter()) {
+        let p0 = carried.get(&t.id).copied().unwrap_or(0.0);
         let entity = spawn_column(
             &mut commands,
             root,
             t,
             slot,
+            p0,
             &palette,
             &mut meshes,
             &mut std_materials,
@@ -570,6 +597,12 @@ fn spawn_column(
     root: Entity,
     t: &TrackInfo,
     slot: &grid::ColumnSlot,
+    // The scroll position to seat the rows at: the previous column's frozen
+    // `last_position` when this spawn is a rebuild, `0.0` for a track seen
+    // for the first time. A live phasor overrides it the same frame
+    // (`animate_tracker_scroll` is chained right after the sync); a frozen
+    // one never does, which is exactly the point.
+    p0: f64,
     palette: &ScenePalette,
     meshes: &mut Assets<Mesh>,
     std_materials: &mut Assets<StandardMaterial>,
@@ -589,7 +622,7 @@ fn spawn_column(
                 score_ctx: t.score_context_id,
                 beats_per_phrase: t.beats_per_phrase,
                 playing: t.playing,
-                last_position: 0.0,
+                last_position: p0,
             },
             Transform::from_xyz(slot.x_center, 0.0, 0.0),
             Visibility::Inherited,
@@ -668,23 +701,25 @@ fn spawn_column(
     }
 
     // Row-line quads: R rows, phrase rows on the brighter shared material.
-    // Initial Y uses p = 0.0 — `animate_tracker_scroll` (chained right
-    // after this system) corrects it to the live phasor position before
-    // the frame renders; this is just a sane starting pose, never visible
-    // as a snap.
+    // Seated at `p0` (the carried freeze position, or 0.0 for a new track) —
+    // `animate_tracker_scroll` (chained right after this system) overrides
+    // with the live phasor position before the frame renders when one is
+    // rolling; a frozen column keeps this pose. Rows outside the band spawn
+    // hidden ([`row_in_band`]).
     let total = grid::row_count_for(t.beats_per_phrase, WINDOW_ROWS);
     let below = total as f64 * (1.0 - PLAYHEAD_FRAC as f64);
     let row_mesh = meshes.add(Rectangle::new(inner_w, ROW_HEIGHT));
     for j in 0..total {
         let material =
             if grid::is_phrase_row(j, t.beats_per_phrase) { phrase_material.clone() } else { row_material.clone() };
-        let y = PLAYHEAD_Y + grid::row_offset(j, 0.0, total, below) as f32 * ROW_SPACING;
+        let y = PLAYHEAD_Y + grid::row_offset(j, p0, total, below) as f32 * ROW_SPACING;
+        let vis = if row_in_band(y) { Visibility::Inherited } else { Visibility::Hidden };
         commands.spawn((
             TrackerRow { index: j },
             Mesh3d(row_mesh.clone()),
             MeshMaterial3d(material),
             Transform::from_xyz(0.0, y, 0.0),
-            Visibility::Inherited,
+            vis,
             Name::new("TrackerRow"),
             ChildOf(column),
         ));
@@ -739,7 +774,7 @@ fn spawn_column(
 fn animate_tracker_scroll(
     beats: Res<WellBeats>,
     mut columns: Query<(&mut TrackerColumn, &Children)>,
-    mut rows: Query<(&TrackerRow, &mut Transform)>,
+    mut rows: Query<(&TrackerRow, &mut Transform, &mut Visibility)>,
 ) {
     let now = Instant::now();
     for (mut col, children) in columns.iter_mut() {
@@ -750,12 +785,20 @@ fn animate_tracker_scroll(
         let total = grid::row_count_for(col.beats_per_phrase, WINDOW_ROWS);
         let below = total as f64 * (1.0 - PLAYHEAD_FRAC as f64);
         for child in children.iter() {
-            let Ok((row, mut tf)) = rows.get_mut(child) else {
+            let Ok((row, mut tf, mut vis)) = rows.get_mut(child) else {
                 continue;
             };
             let y = PLAYHEAD_Y + grid::row_offset(row.index, p, total, below) as f32 * ROW_SPACING;
             if (tf.translation.y - y).abs() > f32::EPSILON {
                 tf.translation.y = y;
+            }
+            // Band cull ([`row_in_band`]): margin rows hide instead of
+            // drawing over the header band / past the frame, and the wrap
+            // teleport only ever happens while hidden. Change-guarded like
+            // the transform write.
+            let want = if row_in_band(y) { Visibility::Inherited } else { Visibility::Hidden };
+            if *vis != want {
+                *vis = want;
             }
         }
     }
@@ -814,8 +857,20 @@ fn fill_tracker_text(
     mut atlas: Option<ResMut<MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
     mut state: ResMut<TrackerState>,
-    mut titles: Query<&mut MsdfBlockGlyphs, (With<TrackerTitlePlate>, Without<TrackerHeaderPlate>)>,
-    mut idle: Query<&mut MsdfBlockGlyphs, (With<TrackerIdlePlate>, Without<TrackerHeaderPlate>)>,
+    // The three queries are pairwise disjoint via crossed `Without`s — the
+    // same shape `patch_bay::fill_patch_text` uses. `With<A>` vs `With<B>`
+    // alone does NOT prove disjointness to Bevy's conflict checker (nothing
+    // stops one entity carrying both markers), and three `&mut
+    // MsdfBlockGlyphs` queries without that proof are a B0001 panic the
+    // first time the Update schedule initializes this system.
+    mut titles: Query<
+        &mut MsdfBlockGlyphs,
+        (With<TrackerTitlePlate>, Without<TrackerIdlePlate>, Without<TrackerHeaderPlate>),
+    >,
+    mut idle: Query<
+        &mut MsdfBlockGlyphs,
+        (With<TrackerIdlePlate>, Without<TrackerTitlePlate>, Without<TrackerHeaderPlate>),
+    >,
     mut headers: Query<(&TrackerHeaderPlate, &mut MsdfBlockGlyphs)>,
 ) {
     if !state.text_dirty {
@@ -916,6 +971,37 @@ mod tests {
             (palette::WALL_APOTHEM - at.x - palette::STATION_E_PROUD).abs() < 1e-3,
             "proud of the wall by STATION_E_PROUD, not deep inside it: {at:?}"
         );
+    }
+
+    // ── band cull ──
+
+    #[test]
+    fn row_in_band_accepts_the_playhead_and_rejects_the_margins() {
+        // The playhead's own Y is always in-band.
+        assert!(row_in_band(PLAYHEAD_Y));
+        // Fully inside the band edges: in.
+        assert!(row_in_band(GRID_TOP - ROW_HEIGHT));
+        assert!(row_in_band(GRID_BOTTOM + ROW_HEIGHT));
+        // A quad that would poke past an edge: out.
+        assert!(!row_in_band(GRID_TOP));
+        assert!(!row_in_band(GRID_BOTTOM));
+        // Deep in the header band / below the face: out.
+        assert!(!row_in_band(GLYPH_Y));
+        assert!(!row_in_band(-(FACE_H / 2.0) - 10.0));
+    }
+
+    #[test]
+    fn tallest_phrase_wraps_only_outside_the_band() {
+        // For a long phrase (total >> window), every row the math can place
+        // at the wrap seam (the extremes of `row_offset`'s range) must be
+        // out of band — the teleport is never visible.
+        let p_len = 64u64;
+        let total = grid::row_count_for(p_len, WINDOW_ROWS);
+        let below = total as f64 * (1.0 - PLAYHEAD_FRAC as f64);
+        let lo = PLAYHEAD_Y + (-below) as f32 * ROW_SPACING;
+        let hi = PLAYHEAD_Y + (total as f64 - below - 1.0) as f32 * ROW_SPACING;
+        assert!(!row_in_band(lo), "bottom wrap seam visible: y={lo}");
+        assert!(!row_in_band(hi), "top wrap seam visible: y={hi}");
     }
 
     // ── LOD gate ──
