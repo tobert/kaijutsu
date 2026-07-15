@@ -847,3 +847,26 @@ score outlives every player by design, but injecting the *whole* committed
 score into each wake means a long-lived track eventually drowns every
 musician that sits down at it — a fresh chair at the morning-old track
 opened at 190k tokens. The band view needs a window.
+
+The phase story closed the same day. With the clicks honest, Amy heard
+the next layer: click and bass drifting apart — the exact
+boundary-jitter failure the 2026-07-02 timebase analysis had predicted
+and posted a validator for. Three more fixes landed as one doctrine
+(docs/midi.md, "The one timebase"): the kernel grid went
+scheduled-periodic (re-arm on the deadline, not the wakeup — lateness
+stopped compounding into the musical timeline), render cues got the
+same emission stamp beat references had (a late cue now spends its
+lateness out of its own lead instead of shifting the phrase), and the
+phasor earned Amy's principle as a mechanism — a deadband inside which
+it takes zero steps and simply IS the local clock, with stale references
+demoted to liveness signals on a ladder. The measurement went from
+zero-millisecond click blobs and six-second holes in the morning to,
+by late afternoon, four hundred click-to-bass pairs across three-plus
+continuous minutes holding a +0.2 ms mean offset with a slope
+indistinguishable from zero — and a click grid averaging 500.00 ms
+exactly. The day also kept teaching on the side: the track-delete verb's
+four live uses found two real gaps in itself (cold tracks after restart,
+persisted rows after manual detach), and the jam demonstrated that any
+track played continuously for a few hours drowns every musician that
+sits down at it — the windowed-band-view problem now filed as the next
+real design arc.

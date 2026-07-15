@@ -83,6 +83,16 @@ consumer: Minibrute on the laptop app, then the per-track channel-routing fix
 (this file → Hyoushigi/Musician area; `docs/chameleon.md` open items) built
 on profile vocabulary.
 
+## App (and headless sink) as MCP clients offered back to the kernel (seeded 2026-07-15)
+
+Eventual direction (Amy): `kaijutsu-app` — and the future headless sink
+variant — should also be **MCP clients**, offering their local capabilities
+(audio devices, capture, render, screenshots?) back to the kernel as tool
+surfaces, the way `kaijutsu-mcp` exposes the kernel outward today. Deep work
+(client-side MCP host, capability registration, routing through the broker);
+deliberately parked — noted while designing audio capture so the capture
+seams don't foreclose it.
+
 ## Grooming tracks — kaijutsu-style cron (seeded 2026-07-15, MIDI-profiles round)
 
 Scheduled background operations as **tracks**: a slow clock + probe
@@ -580,6 +590,16 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   wake-conversation cap (drop/summarize old wake turns; rotation on a
   token/wake budget rather than phrase count is a candidate). Third fresh
   chair of the day (`bassline-c`) is the standing workaround.
+
+- **`kj drive` on a non-OODA-armed musician silently discards its ABC**
+  (cost an hour of verify confusion 2026-07-15): `on_turn_completed`
+  refuses to crystallize unless `attachment.ooda_armed` ("not an
+  OODA-armed musician we manage") — so `ooda off` + manual `kj drive`
+  produces model/text ABC that never reaches the score, no cues, no
+  sound, no warning anywhere. Either crystallize driven turns regardless
+  of the OODA arm (drive is explicit human intent — arguably MORE
+  deserving than an automated wake), or log loudly at the refusal.
+  Decide the semantics; the silent path is the bug.
 
 - **Musician create-rc auto-attaches to a label-derived track before an
   explicit `--track` can move it** (bit twice 2026-07-15): `kj context
