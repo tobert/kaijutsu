@@ -27,7 +27,7 @@ use crate::llm::{LlmError, LlmResult, Message};
 
 use self::sse::{ClaudeSseEvent, decode_event};
 use self::stream::StateMachine;
-use self::types::{MessagesResponse, ResponseContent};
+use self::types::{MessagesResponse, ResponseContent, Thinking};
 
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -87,6 +87,7 @@ impl Client {
     /// Available Claude model IDs surfaced by this provider.
     pub fn available_models(&self) -> Vec<&'static str> {
         vec![
+            "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-sonnet-4-6",
             "claude-haiku-4-5-20251001",
@@ -160,7 +161,12 @@ impl Client {
         opts: BuildOpts,
         messages: Vec<Message>,
     ) -> LlmResult<Stream> {
-        let body = build::build_request(&opts, &messages, true);
+        let mut body = build::build_request(&opts, &messages, true);
+        // Provider-tailored knob (the reason this client is bespoke):
+        // adaptive thinking with visible summaries wherever the model
+        // supports it. Omitted on older models — sending `adaptive`
+        // there is a 400. See `Thinking::default_for_model`.
+        body.thinking = Thinking::default_for_model(&opts.model);
 
         let response = self
             .http
@@ -509,5 +515,62 @@ data: {\"type\":\"message_stop\"}
         assert!(!text.is_empty(), "live response must include some text");
         assert!(saw_done, "live response must terminate with Done");
         assert_eq!(stop_reason, "end_turn", "expected natural turn end");
+    }
+
+    /// Live thinking smoke test — confirms adaptive thinking with
+    /// `display: "summarized"` actually yields non-empty ThinkingDelta
+    /// text on a model that supports it. Uses a prompt that reliably
+    /// triggers thinking under the adaptive policy.
+    ///
+    /// ```sh
+    /// ANTHROPIC_API_KEY=$(< ~/.anthropic-key.txt) \
+    ///   cargo test -p kaijutsu-kernel --lib claude_live_thinking \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY; run with `cargo test --ignored claude_live`"]
+    async fn claude_live_thinking_streams_summarized_thinking_text() {
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => return,
+        };
+        let client = Client::new(api_key);
+        let opts = BuildOpts::new("claude-opus-4-6").with_max_tokens(2048);
+        let mut stream = client
+            .stream(
+                opts,
+                vec![Message::user(
+                    "A farmer has 17 sheep. All but 9 run away, then a third of the \
+                     remainder are sold, and he buys back twice what he sold. How many \
+                     sheep now? Reason it through carefully before answering.",
+                )],
+            )
+            .await
+            .expect("stream open must succeed with valid key");
+        let mut thinking_text = String::new();
+        let mut saw_thinking_end_signature = false;
+        let mut text = String::new();
+        while let Some(ev) = stream.next_event().await {
+            match ev {
+                StreamEvent::ThinkingDelta(t) => thinking_text.push_str(&t),
+                StreamEvent::ThinkingEnd { signature } => {
+                    saw_thinking_end_signature |= signature.is_some();
+                }
+                StreamEvent::TextDelta(t) => text.push_str(&t),
+                StreamEvent::Error(e) => panic!("live stream error: {e}"),
+                _ => {}
+            }
+        }
+        println!("\n--- thinking ---\n{thinking_text}\n--- answer ---\n{text}\n");
+        assert!(!text.is_empty(), "must produce answer text");
+        assert!(
+            !thinking_text.trim().is_empty(),
+            "adaptive + summarized must yield non-empty thinking text \
+             (empty means display defaulted to omitted — the bug this fixes)"
+        );
+        assert!(
+            saw_thinking_end_signature,
+            "thinking block must carry a signature for multi-turn replay"
+        );
     }
 }

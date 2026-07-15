@@ -6,6 +6,38 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Anthropic client maturity (seeded 2026-07-15, thinking-enable arc)
+
+Adaptive thinking (`{type: adaptive, display: summarized}`, model-gated)
+landed 2026-07-15 in `claude::Client::stream()`. The client is young; we own
+it precisely so we can tailor to the provider — gaps observed while wiring
+thinking, roughly by priority:
+
+- **No config path into provider clients.** The documented seam
+  (`llm_stream.rs` "provider-specific knobs applied inside `Client::stream()`
+  from configuration and context state") works, but "configuration" is
+  currently a hardcoded default — there is no per-context or models.toml
+  route to say "thinking off for this context" or "effort: low here".
+  Natural homes: a per-model options table in models.toml, or context config
+  KV (`/etc/client`-style cascade). Decide once, then the same pipe carries
+  future knobs (effort, `output_config`, fast mode).
+- **Model capability knowledge is string-parsing.** `Thinking::default_for_model`
+  parses `claude-<family>-<major>-<minor>` and gates on `>= 4.6`. Fine for
+  one knob; a second capability (effort levels, sampling-param rejection on
+  4.7+, 1M context) wants a small capability table — or a startup query of
+  Anthropic's Models API (`GET /v1/models/{id}` returns `capabilities`),
+  which is the tailor-to-provider move.
+- **`temperature` will 400 on Opus 4.7+/Sonnet 5/Fable if ever set.**
+  `BuildOpts.temperature` is currently never set on the Claude path, so
+  latent — but nothing gates it. Same capability-table story as above.
+- **Cross-model history replay is untested.** A context that switches
+  Claude→other-provider (or Claude-with-thinking→haiku) replays
+  `ContentBlock::Reasoning` blocks into requests where they may be rejected
+  or silently dropped. Hydration/splice may need a per-provider filter.
+- **`available_models()` is a hand-maintained list** (opus-4-8 was missing
+  until 2026-07-15; fable-5 still absent pending a routing decision). The
+  Models API query above would retire it.
+
 ## Beat-tracking + local-model follow-ups (seeded 2026-07-15, rten/beat-this arc)
 
 `kj audio beats` (beat-this crate, rten backend) and the rten embedder swap

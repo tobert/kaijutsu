@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use super::types::{
     CacheControl, ImageSource, MessageContent, MessageRole, MessagesRequest, RequestContent,
-    RequestMessage, RequestTool, SystemBlock, SystemPrompt, Thinking,
+    RequestMessage, RequestTool, SystemBlock, SystemPrompt,
 };
 use crate::llm::stream::{BuildOpts, CacheTarget, CacheTtl};
 use crate::llm::{ContentBlock, Message, MessageContent as KaiContent, Role};
@@ -111,9 +111,10 @@ fn plan_cache(breakpoints: &[CacheTarget]) -> CachePlan {
 /// `streaming` selects between the SSE form (`stream: Some(true)`) and
 /// the non-streaming form (omitted). All other knobs come from `opts`.
 ///
-/// Extended thinking is *not* wired here — Phase 2 lays the type
-/// (see [`Thinking`]) but leaves the budget source open until per-context
-/// configuration is settled.
+/// Thinking is *not* decided here — `build_request` leaves it `None`
+/// and [`super::Client::stream`] applies [`Thinking::default_for_model`]
+/// (adaptive + summarized on models that support it). `prompt()` leaves
+/// it off deliberately: distillation drops thinking blocks anyway.
 pub fn build_request(
     opts: &BuildOpts,
     messages: &[Message],
@@ -140,7 +141,7 @@ pub fn build_request(
         tool_choice: None,
         temperature: opts.temperature,
         stream: streaming.then_some(true),
-        thinking: None, // Phase 2 leaves config source open
+        thinking: None, // stream() applies the model-gated default
         stop_sequences: vec![],
     }
 }
@@ -215,15 +216,6 @@ fn apply_cache_to_last_eligible(blocks: &mut [RequestContent], ttl: CacheTtl) ->
         }
     }
     false
-}
-
-/// Builder for extended thinking blocks (typed; not yet wired to a
-/// configuration source). Phase 2 exposes the entry point so callers
-/// that want thinking can set it after `build_request` returns.
-#[allow(dead_code)] // exposed for downstream callers in Phase 2.5+
-pub fn with_thinking(mut req: MessagesRequest, budget_tokens: u64) -> MessagesRequest {
-    req.thinking = Some(Thinking::Enabled { budget_tokens });
-    req
 }
 
 fn build_tools(

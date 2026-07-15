@@ -188,13 +188,84 @@ pub enum ToolChoice {
     None,
 }
 
-/// Extended thinking config.
+/// Thinking config for `/v1/messages`.
+///
+/// `Adaptive` is the current-generation shape (Claude 4.6+): the model
+/// decides when and how much to think. `display` controls only whether
+/// the response's thinking text is a readable summary or an empty
+/// string — thinking happens and is billed the same either way. Opus
+/// 4.7+ / Sonnet 5 / Fable 5 default to `omitted` server-side, so a
+/// client that wants visible reasoning must send `summarized`
+/// explicitly.
+///
+/// `Enabled { budget_tokens }` is the legacy pre-4.6 shape. It is
+/// rejected with a 400 on Opus 4.7+ / Sonnet 5 / Fable 5 — only valid
+/// for models [`Thinking::default_for_model`] returns `None` for.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)] // Disabled variant reserved for explicit override
+#[allow(dead_code)] // Enabled/Disabled reserved for explicit overrides
 pub enum Thinking {
-    Enabled { budget_tokens: u64 },
+    Adaptive {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
+    Enabled {
+        budget_tokens: u64,
+    },
     Disabled,
+}
+
+/// Visibility of thinking text in responses (`thinking.display`).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Omitted reserved for explicit override
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+impl Thinking {
+    /// Adaptive thinking with readable (summarized) thinking text.
+    pub fn adaptive_summarized() -> Self {
+        Self::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
+        }
+    }
+
+    /// Model-gated default thinking config for a Claude model id.
+    ///
+    /// Adaptive thinking exists on the 4.6+ generation (Opus 4.6/4.7/
+    /// 4.8, Sonnet 4.6, Sonnet 5) and the Fable/Mythos tier; sending
+    /// `type: "adaptive"` to anything older is a 400, so those return
+    /// `None` (thinking simply off, matching prior behavior). Parses
+    /// `claude-<family>-<major>[-<minor>][-<date>]` rather than
+    /// allowlisting ids so future point releases inherit the right
+    /// default without a table edit.
+    pub fn default_for_model(model: &str) -> Option<Self> {
+        let mut parts = model.split('-');
+        if parts.next() != Some("claude") {
+            return None;
+        }
+        let family = parts.next()?;
+        match family {
+            // Always-on thinking tier; adaptive is the only accepted shape.
+            "fable" | "mythos" => Some(Self::adaptive_summarized()),
+            "opus" | "sonnet" => {
+                let major: u32 = parts.next()?.parse().ok()?;
+                // Minor is absent on bare ids like `claude-sonnet-5` and
+                // date-suffixed on pinned ids; a non-numeric next part
+                // (the date) reads as minor 0, which is correct for
+                // `claude-sonnet-5-20260203`-style ids.
+                let minor: u32 = parts
+                    .next()
+                    .and_then(|p| if p.len() <= 2 { p.parse().ok() } else { None })
+                    .unwrap_or(0);
+                ((major, minor) >= (4, 6)).then(Self::adaptive_summarized)
+            }
+            // haiku-4-5 and unknown families: no adaptive support.
+            _ => None,
+        }
+    }
 }
 
 /// `cache_control` annotation. Anthropic accepts this on tools,
@@ -319,6 +390,62 @@ mod tests {
         assert!(v.get("thinking").is_none());
         assert_eq!(v["model"], "claude-haiku-4-5");
         assert_eq!(v["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn thinking_adaptive_summarized_wire_shape() {
+        let v = serde_json::to_value(Thinking::adaptive_summarized()).unwrap();
+        assert_eq!(v["type"], "adaptive");
+        assert_eq!(v["display"], "summarized");
+    }
+
+    #[test]
+    fn thinking_adaptive_without_display_omits_field() {
+        let v = serde_json::to_value(Thinking::Adaptive { display: None }).unwrap();
+        assert_eq!(v["type"], "adaptive");
+        assert!(v.get("display").is_none());
+    }
+
+    #[test]
+    fn thinking_default_covers_adaptive_generation() {
+        // 4.6+ opus/sonnet, sonnet 5, and the fable/mythos tier get
+        // adaptive + summarized.
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+        ] {
+            let t = Thinking::default_for_model(model)
+                .unwrap_or_else(|| panic!("{model} must default to adaptive thinking"));
+            let v = serde_json::to_value(&t).unwrap();
+            assert_eq!(v["type"], "adaptive", "{model}");
+            assert_eq!(v["display"], "summarized", "{model}");
+        }
+    }
+
+    #[test]
+    fn thinking_default_off_where_adaptive_would_400() {
+        // Pre-4.6 models and haiku reject `type: "adaptive"` — the
+        // default must omit thinking entirely, matching prior behavior.
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-1",
+            "claude-3-5-sonnet-20241022",
+            "deepseek-v4-flash", // non-claude id must never match
+            "gpt-4o",
+        ] {
+            assert!(
+                Thinking::default_for_model(model).is_none(),
+                "{model} must not default to thinking"
+            );
+        }
     }
 
     #[test]
