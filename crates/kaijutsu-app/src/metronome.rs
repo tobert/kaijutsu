@@ -13,7 +13,7 @@
 //! not scheduled on a lead), so this is the empirical validator of "good enough":
 //! run a track and compare the click against the per-cue MIDI notes (`aseqdump`).
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 use kaijutsu_audio::{LocalBeat, RENDER_FLUSH_MIME};
@@ -153,18 +153,29 @@ impl Metronome {
 }
 
 /// Drive the phasor from the transport signals on the event stream: fold every
-/// `BeatSync` reference in (`receipt` is `Instant::now()` at frame time — the
-/// same re-anchor-at-receipt the render sinks use for `lead`), and **reset on a
-/// `RENDER_FLUSH` cue** (stop/pause) so the metronome halts instead of
-/// free-running past the end of the take.
+/// `BeatSync` reference in, back-dated to its own emission instant
+/// (`BeatRef::backdated_at`) rather than anchored at one shared frame `now` —
+/// a delivery flood (several refs queued behind a turn's streamed output,
+/// arriving in one frame) would otherwise walk the phasor several beats at
+/// once (the burst). A stamp older than `REF_STALE_MAX` is dropped instead of
+/// folded — the phasor free-runs on its last feedforward tempo rather than
+/// snapping backward. **Reset on a `RENDER_FLUSH` cue** (stop/pause) so the
+/// metronome halts instead of free-running past the end of the take.
 fn ingest_beat_signals(
     mut messages: MessageReader<ServerEventMessage>,
     mut metronome: ResMut<Metronome>,
 ) {
     let now = Instant::now();
+    let now_epoch_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     for ServerEventMessage(event) in messages.read() {
         match event {
-            ServerEvent::BeatSync { beat_ref, .. } => metronome.observe(*beat_ref, now),
+            ServerEvent::BeatSync { beat_ref, .. } => match beat_ref.backdated_at(now, now_epoch_ns) {
+                Some(at) => metronome.observe(*beat_ref, at),
+                None => log::debug!("metronome: dropped a stale beat ref"),
+            },
             ServerEvent::RenderCue { cue, .. } if cue.mime == RENDER_FLUSH_MIME => {
                 metronome.reset()
             }

@@ -291,18 +291,45 @@ pub fn beat_envelope_at(frac: f64) -> f32 {
 
 impl WellBeats {
     /// Fold a wire reference into the phasor for `ctx` (anchoring on first).
-    pub fn observe(&mut self, ctx: ContextId, reference: BeatRef, at: Instant) {
+    ///
+    /// `at` is the reference's own back-dated emission instant
+    /// (`BeatRef::backdated_at`) — what the phasor folds against, so a flood
+    /// of buffered refs settles at the newest ref's true position instead of
+    /// walking several beats at one shared receipt `now`. `received` is the
+    /// *actual* receipt instant, separate from `at`: it is what `last_ref`
+    /// (the [`Self::prune_stale`] liveness clock) stamps. These differ on
+    /// purpose — folding at a back-dated `at` can leave `at` seconds behind
+    /// `received` on a delivery flood, and stamping liveness from the
+    /// (older) `at` instead of the (fresher) `received` would let
+    /// `prune_stale` kill a phasor that is, in wall-clock reality, still
+    /// live (a sustained backlog of old-but-not-stale refs proves the track
+    /// is alive even while every individual ref reads a bit behind).
+    pub fn observe(&mut self, ctx: ContextId, reference: BeatRef, at: Instant, received: Instant) {
         match self.phasors.get_mut(&ctx) {
             Some(p) => {
                 p.beat.observe(reference, at);
-                p.last_ref = at;
+                p.last_ref = received;
             }
             None => {
                 self.phasors.insert(
                     ctx,
-                    Phasor { beat: LocalBeat::new(reference, at), last_ref: at },
+                    Phasor { beat: LocalBeat::new(reference, at), last_ref: received },
                 );
             }
+        }
+    }
+
+    /// Bump the liveness clock for an EXISTING phasor without touching its
+    /// beat position — the arm for a reference that arrived but was too
+    /// stale to fold (`BeatRef::backdated_at` returned `None`). A stale ref
+    /// still proves the track is alive (something arrived), so `prune_stale`
+    /// must not reap it; but folding it would anchor the phasor's position in
+    /// the past, so the beat itself is left untouched. A no-op if `ctx` has
+    /// no phasor yet — there is nothing to keep alive, and this must never
+    /// create one (that would anchor a fresh phasor with no position at all).
+    pub fn touch(&mut self, ctx: &ContextId, received: Instant) {
+        if let Some(p) = self.phasors.get_mut(ctx) {
+            p.last_ref = received;
         }
     }
 
@@ -383,6 +410,13 @@ impl WellBeats {
 /// Ingest the kernel-wide event stream into tails + phasors. Runs **ungated**
 /// (every screen) so the well opens warm; both resources are bounded
 /// ([`TAIL_CONTEXT_CAP`], one phasor per rolling track).
+///
+/// Each `BeatSync` folds at its own back-dated emission instant
+/// (`BeatRef::backdated_at`), not this frame's shared `now_inst` — the same
+/// flood-resistance fix as `metronome::ingest_beat_signals`. A stale ref
+/// (age > `REF_STALE_MAX`) still proves the track alive: it bumps the
+/// phasor's liveness clock via [`WellBeats::touch`] without folding a beat
+/// position from the past.
 pub fn ingest_live_events(
     mut events: MessageReader<ServerEventMessage>,
     mut tails: ResMut<ContextTails>,
@@ -390,6 +424,10 @@ pub fn ingest_live_events(
     time: Res<Time>,
 ) {
     let now_inst = Instant::now();
+    let now_epoch_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let now = time.elapsed_secs_f64();
     for ServerEventMessage(ev) in events.read() {
         match ev {
@@ -402,7 +440,10 @@ pub fn ingest_live_events(
                 tails.resolve(context_id, *block_id, *status);
             }
             ServerEvent::BeatSync { context_id, beat_ref } => {
-                beats.observe(*context_id, *beat_ref, now_inst);
+                match beat_ref.backdated_at(now_inst, now_epoch_ns) {
+                    Some(at) => beats.observe(*context_id, *beat_ref, at, now_inst),
+                    None => beats.touch(context_id, now_inst),
+                }
             }
             ServerEvent::RenderCue { context_id, cue } if cue.mime == RENDER_FLUSH_MIME => {
                 beats.reset(context_id);
@@ -719,7 +760,7 @@ mod tests {
         assert_eq!(beats.envelope(&ctx(1), t0), 0.0, "no phasor yet");
 
         // 120 BPM (2 beats/sec): anchor exactly on a beat.
-        beats.observe(ctx(1), BeatRef::new(8.0, 2.0), t0);
+        beats.observe(ctx(1), BeatRef::new(8.0, 2.0), t0, t0);
         let on_beat = beats.envelope(&ctx(1), t0);
         assert!((on_beat - 1.0).abs() < 1e-3, "on the beat: {on_beat}");
 
@@ -740,7 +781,7 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(beats.beat_position(&ctx(1), t0), None, "no phasor yet");
 
-        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0);
+        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0, t0);
         let p0 = beats.beat_position(&ctx(1), t0).expect("phasor now live");
         assert!((p0 - 0.0).abs() < 1e-6, "anchored at beat 0: {p0}");
 
@@ -754,7 +795,7 @@ mod tests {
     fn beat_position_is_none_after_reset() {
         let mut beats = WellBeats::default();
         let t0 = Instant::now();
-        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0);
+        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0, t0);
         assert!(beats.beat_position(&ctx(1), t0).is_some());
 
         beats.reset(&ctx(1));
@@ -767,8 +808,8 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(beats.global_envelope(t0), 0.0);
         // Track A anchored on-beat, track B anchored mid-beat.
-        beats.observe(ctx(1), BeatRef::new(4.0, 2.0), t0);
-        beats.observe(ctx(2), BeatRef::new(4.5, 2.0), t0);
+        beats.observe(ctx(1), BeatRef::new(4.0, 2.0), t0, t0);
+        beats.observe(ctx(2), BeatRef::new(4.5, 2.0), t0, t0);
         let g = beats.global_envelope(t0);
         let a = beats.envelope(&ctx(1), t0);
         assert!((g - a).abs() < 1e-6, "global = loudest (on-beat) track");
@@ -779,11 +820,49 @@ mod tests {
     fn stale_phasor_is_pruned_without_a_flush() {
         let mut beats = WellBeats::default();
         let t0 = Instant::now();
-        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0);
+        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0, t0);
         beats.prune_stale(t0 + PHASOR_STALE / 2);
         assert!(beats.any_rolling(), "fresh phasor survives");
         beats.prune_stale(t0 + PHASOR_STALE + Duration::from_secs(1));
         assert!(!beats.any_rolling(), "stale phasor dropped");
+    }
+
+    /// A stale-but-received reference (`backdated_at` returned `None`) still
+    /// proves the track is alive — `touch` must bump the liveness clock (so
+    /// `prune_stale` doesn't reap a phasor that's still receiving, just
+    /// receiving old references) WITHOUT moving the beat position (folding a
+    /// stale ref would anchor the phasor in the past).
+    #[test]
+    fn touch_keeps_a_phasor_alive_without_moving_its_position() {
+        let mut beats = WellBeats::default();
+        let t0 = Instant::now();
+        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0, t0);
+        let p_before = beats.beat_position(&ctx(1), t0).expect("phasor live");
+
+        // Without a touch, the phasor goes stale at PHASOR_STALE.
+        let t_touch = t0 + PHASOR_STALE - Duration::from_millis(1);
+        beats.touch(&ctx(1), t_touch);
+        // Now well past the ORIGINAL anchor's staleness window, but only
+        // just past the touch — must survive because touch reset the clock.
+        beats.prune_stale(t_touch + PHASOR_STALE / 2);
+        assert!(beats.any_rolling(), "touch kept the phasor alive past the original window");
+
+        let p_after = beats.beat_position(&ctx(1), t0).expect("still live");
+        assert_eq!(p_after, p_before, "touch must not move the beat position");
+
+        // Far enough past the touch, it still eventually prunes.
+        beats.prune_stale(t_touch + PHASOR_STALE + Duration::from_secs(1));
+        assert!(!beats.any_rolling(), "touch delays but does not prevent eventual pruning");
+    }
+
+    /// `touch` on a context with no phasor is a no-op — it must never create
+    /// one (that would anchor a fresh phasor with no beat position at all).
+    #[test]
+    fn touch_on_an_unknown_context_is_a_no_op() {
+        let mut beats = WellBeats::default();
+        let t0 = Instant::now();
+        beats.touch(&ctx(1), t0);
+        assert!(!beats.any_rolling(), "touch must not create a phasor");
     }
 
     // ── Bevy wiring ──
@@ -839,6 +918,61 @@ mod tests {
         }));
         app.update();
         assert!(!app.world().resource::<WellBeats>().any_rolling(), "flush drops the phasor");
+    }
+
+    /// A `BeatSync` stamped stale-old (`epoch_ns` older than `REF_STALE_MAX`)
+    /// must not move an already-anchored phasor's position — `ingest_live_events`
+    /// routes the `None` arm of `backdated_at` to `WellBeats::touch`, not
+    /// `observe`. Wired at the system level (not just the pure `WellBeats` unit
+    /// test above) to prove `ingest_live_events` actually calls `backdated_at`
+    /// and branches on it, rather than always folding.
+    #[test]
+    fn a_stale_beat_sync_touches_liveness_without_moving_the_phasor() {
+        let mut app = App::new();
+        app.add_plugins(bevy::time::TimePlugin)
+            .init_resource::<ContextTails>()
+            .init_resource::<WellBeats>()
+            .add_message::<ServerEventMessage>()
+            .add_systems(Update, ingest_live_events);
+
+        // Anchor with an unstamped (epoch_ns=0) ref first — falls back to
+        // receipt time, so this frame's position is well-defined.
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+            context_id: ctx(5),
+            beat_ref: BeatRef::new(2.0, 2.0),
+        }));
+        app.update();
+        let pos_before = app
+            .world()
+            .resource::<WellBeats>()
+            .beat_position(&ctx(5), Instant::now())
+            .expect("anchored");
+
+        // A second ref, stamped 10 s old (well past REF_STALE_MAX) but with a
+        // wildly different beat value — if this folded, position would jump.
+        let ancient_epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64
+            - 10_000_000_000;
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+            context_id: ctx(5),
+            beat_ref: kaijutsu_audio::BeatRef { beat: 999.0, tempo_bps: 2.0, epoch_ns: ancient_epoch_ns },
+        }));
+        app.update();
+
+        assert!(app.world().resource::<WellBeats>().any_rolling(), "touch keeps it alive");
+        let pos_after = app
+            .world()
+            .resource::<WellBeats>()
+            .beat_position(&ctx(5), Instant::now())
+            .expect("still anchored");
+        // Position should have advanced only by ordinary free-run (a couple
+        // frames' worth), nowhere near the stale ref's beat=999.
+        assert!(
+            pos_after < pos_before + 1.0,
+            "stale ref must not fold: pos_before={pos_before} pos_after={pos_after}"
+        );
     }
 
     fn minimal_card(id: ContextId) -> super::super::scene::Card {
