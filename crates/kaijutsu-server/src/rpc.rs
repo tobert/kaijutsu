@@ -6764,6 +6764,7 @@ fn build_block_metadata(
 fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, cue: &kaijutsu_audio::RenderCue) {
     builder.set_mime(&cue.mime);
     builder.set_lead_nanos(u64::try_from(cue.lead.as_nanos()).unwrap_or(u64::MAX));
+    builder.set_epoch_ns(cue.epoch_ns);
     match &cue.payload {
         kaijutsu_audio::CuePayload::Inline(bytes) => builder.set_inline(bytes),
         kaijutsu_audio::CuePayload::Cas(hash) => builder.set_cas_hash(&hash.to_string()),

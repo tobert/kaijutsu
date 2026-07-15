@@ -354,6 +354,7 @@ mod tests {
                     ContentHash::from_str("00000000000000000000000000000000").unwrap(),
                 ),
                 lead: std::time::Duration::ZERO,
+                epoch_ns: 0,
             },
         );
 

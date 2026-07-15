@@ -597,7 +597,12 @@ mod tests {
         // The flush arrives on the same stream as a RenderCue.
         let flush = ServerEvent::RenderCue {
             context_id: ContextId::new(),
-            cue: RenderCue { mime: RENDER_FLUSH_MIME.into(), payload: CuePayload::Inline(vec![]), lead: Duration::ZERO },
+            cue: RenderCue {
+                mime: RENDER_FLUSH_MIME.into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+            },
         };
         let mut app = App::new();
         app.insert_resource(m)

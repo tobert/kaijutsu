@@ -346,6 +346,13 @@ struct RenderCue {
     inline @2 :Data;      # inline symbolic content / tiny sample bytes
     casHash @3 :Text;     # hex ContentHash — resolved from CAS at the sink
   }
+  # Sender wallclock (ns since UNIX_EPOCH) at emission — mirrors BeatRef.epochNs
+  # below (phase-align Slice 2). 0 = unstamped (an old peer, or a synthetic cue
+  # with no meaningful emission instant, e.g. a RENDER_FLUSH directive). A sink
+  # back-dates `leadNanos` by however old the cue reads on receipt, so per-cue
+  # transfer latency can't walk the render out of phase with the click
+  # (`docs/midi.md`).
+  epochNs @4 :UInt64;
 }
 
 # A low-rate beat reference for a sink's continuous local timebase (docs/midi.md

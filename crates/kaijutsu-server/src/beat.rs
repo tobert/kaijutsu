@@ -774,6 +774,9 @@ impl BeatScheduler {
             mime: kaijutsu_audio::RENDER_FLUSH_MIME.to_string(),
             payload: kaijutsu_audio::CuePayload::Inline(Vec::new()),
             lead: Duration::ZERO,
+            // Unstamped: a flush is dispatch-on-receipt by meaning (drop the
+            // queue NOW), there is nothing to back-date against.
+            epoch_ns: 0,
         };
         self.kernel
             .block_flows()
@@ -1724,14 +1727,24 @@ impl BeatScheduler {
         // Publish a wire `RenderCue` per crossed ABC cell to every attached sink
         // (the app renders it to MIDI). `lead` is relative — `at` is a near-future
         // local instant on the speculation lead, so `at − now` is the transfer +
-        // schedule budget the sink re-anchors at `receipt + lead`.
+        // schedule budget the sink re-anchors at `receipt + lead`. `now`/`now_epoch_ns`
+        // are ONE paired read shared by the whole batch (not re-read per cue) so
+        // every cue this beat carries the identical emission stamp — the sink's
+        // `backdate_events` folds `epoch_ns` against its own receipt to kill the
+        // per-cue transfer-latency jump that used to walk the render out of phase
+        // with the click (phase-align Slice 2).
         let now = Instant::now();
+        let now_epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         for (abc, at) in &rendered {
             let lead = at.saturating_duration_since(now);
             let cue = kaijutsu_audio::RenderCue {
                 mime: kaijutsu_audio::ABC_MIME.to_string(),
                 payload: kaijutsu_audio::CuePayload::Inline(abc.clone().into_bytes()),
                 lead,
+                epoch_ns: now_epoch_ns,
             };
             self.kernel
                 .block_flows()
@@ -3170,6 +3183,7 @@ mod tests {
             BlockFlow::RenderCue { context_id, cue } => {
                 assert_eq!(context_id, score, "cue is keyed by the track's score context");
                 assert_eq!(cue.mime, kaijutsu_audio::ABC_MIME, "ABC cue mime");
+                assert!(cue.epoch_ns > 0, "a render cue is stamped with its emission wallclock");
                 match cue.payload {
                     kaijutsu_audio::CuePayload::Inline(bytes) => {
                         assert_eq!(bytes, abc.as_bytes(), "the resolved ABC rides inline");

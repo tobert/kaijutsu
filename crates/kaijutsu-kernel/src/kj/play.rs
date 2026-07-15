@@ -125,6 +125,10 @@ impl KjDispatcher {
             mime: mime.clone(),
             payload,
             lead: std::time::Duration::ZERO,
+            // Unstamped: `kj play` is a direct play-now directive (lead ZERO,
+            // fired at receipt) — there's no phrase-boundary transfer latency
+            // to back-date against, unlike the track render seam's cues.
+            epoch_ns: 0,
         };
         let receivers = self.kernel().block_flows().publish(BlockFlow::RenderCue {
             context_id,

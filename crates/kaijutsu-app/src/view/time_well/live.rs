@@ -934,6 +934,7 @@ mod tests {
                 mime: RENDER_FLUSH_MIME.into(),
                 payload: CuePayload::Inline(vec![]),
                 lead: Duration::ZERO,
+                epoch_ns: 0,
             },
         }));
         app.update();

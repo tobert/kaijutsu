@@ -12,7 +12,7 @@
 //! cue instead. `lead` absorbs wire latency exactly as the speculation lead does
 //! for scheduling (`docs/midi.md`): the app schedules ahead, never just-in-time.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 use kaijutsu_audio::{CuePayload, ABC_MIME, RENDER_FLUSH_MIME};
@@ -323,13 +323,78 @@ fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
         .collect()
 }
 
+/// A cue older than this on receipt is rejected outright rather than
+/// back-dated — the pipe is backed up badly enough that "when this was true"
+/// is no longer useful (mirrors `timebase::REF_STALE_MAX`'s staleness drop for
+/// `BeatSync` references; Amy's stale-data rejection applies to render cues
+/// too, not just the phasor).
+const CUE_STALE_MAX: Duration = kaijutsu_audio::REF_STALE_MAX;
+
+/// Re-anchor a cue's schedule against how OLD it actually is on receipt — the
+/// phase-align fix for the per-phrase ΔL jump (`docs/midi.md`): a cue
+/// delivered late used to sound late wholesale (`receipt + lead` anchors at
+/// the LATE receipt), so consecutive cues carried independent transfer
+/// latencies and the render drifted out of phase with the kernel-true click.
+///
+/// `age` is `now_epoch_ns − cue.epoch_ns` at receipt; `None` means the cue was
+/// unstamped (an old peer, or a directive with no meaningful emission
+/// instant) — old behavior verbatim, no back-dating.
+///
+/// - `age ≤ lead`: the lead already had enough slack to absorb the delay —
+///   `lead' = lead − age` kills the jump outright, events untouched.
+/// - `age > lead`: the delay ate through the whole lead; `d = age − lead` is
+///   how far into what SHOULD have already started this cue now sits. Events
+///   whose own intra-cue offset is `< d` would schedule into the past — ALSA
+///   can't do that, and clamping them all to `now` would smear them into one
+///   late chord instead of dropping cleanly, so they're DROPPED instead.
+///   NoteOffs among the dropped are orphaned harmlessly (a note-off with no
+///   matching note-on is a no-op); NoteOns are never stranded without their
+///   off, because `abc_to_timed_events` always orders a note's off strictly
+///   after its on, so an on that survives always keeps its off too. Survivors
+///   shift by `−d` and `lead'` collapses to `ZERO` (there's no lead left to
+///   spend — the survivors schedule as soon as possible).
+/// - `d > CUE_STALE_MAX`: the whole cue is too stale to trust even partially
+///   — reject it outright (`None`) rather than dribble out a handful of
+///   barely-salvaged notes.
+fn backdate_events(
+    events: Vec<(Duration, Vec<u8>)>,
+    lead: Duration,
+    age: Option<Duration>,
+) -> Option<(Vec<(Duration, Vec<u8>)>, Duration)> {
+    let Some(age) = age else {
+        return Some((events, lead)); // unstamped: old behavior verbatim
+    };
+    if age <= lead {
+        return Some((events, lead - age));
+    }
+    let deficit = age - lead;
+    if deficit > CUE_STALE_MAX {
+        return None; // way too stale to trust even partially
+    }
+    let survivors = events
+        .into_iter()
+        .filter(|(offset, _)| *offset >= deficit)
+        .map(|(offset, data)| (offset - deficit, data))
+        .collect();
+    Some((survivors, Duration::ZERO))
+}
+
 /// Consume `RenderCue` ABC cues and schedule their MIDI into the ALSA seq queue.
 /// Reads the same message stream as the audio sink (`audio.rs`) — each system
 /// keeps its own cursor — and filters by mime, so the two never contend.
+///
+/// `SystemTime::now()` is read ONCE per batch, above the loop — every cue this
+/// frame ages against the SAME receipt instant rather than one drifting per
+/// cue as the loop runs (a frame processing several buffered cues shouldn't
+/// see their relative ages skewed by loop-iteration time).
 fn play_midi_cues(
     mut messages: MessageReader<ServerEventMessage>,
     mut sink: NonSendMut<MidiSink>,
 ) {
+    let now_epoch_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     for ServerEventMessage(event) in messages.read() {
         let ServerEvent::RenderCue { cue, .. } = event else {
             continue;
@@ -356,7 +421,21 @@ fn play_midi_cues(
             warn!("MIDI cue ABC rendered to no events; skipping");
             continue;
         }
-        schedule(&mut sink, events, cue.lead);
+        let age = (cue.epoch_ns != 0)
+            .then(|| Duration::from_nanos(now_epoch_ns.saturating_sub(cue.epoch_ns)));
+        let Some((events, lead)) = backdate_events(events, cue.lead, age) else {
+            // Slice 4 records `record_stale_cue_dropped` here.
+            warn!(
+                "MIDI cue rejected — stale beyond {CUE_STALE_MAX:?} by the time it was \
+                 received; dropping the whole phrase rather than smear it"
+            );
+            continue;
+        };
+        if events.is_empty() {
+            warn!("MIDI cue backdated to no survivors (fully in the past); skipping");
+            continue;
+        }
+        schedule(&mut sink, events, lead);
     }
 }
 
@@ -658,6 +737,112 @@ mod tests {
         // string that happens to contain them renders real notes; that's why
         // this uses a structured, genuinely note-free tune.
         assert!(abc_to_timed_events("X:1\nT:empty\nM:4/4\nL:1/4\nK:C\n").is_empty());
+    }
+
+    // ── Slice 2 (phase-align): backdate_events ──────────────────────────────
+
+    /// A synthetic 3-event cue: NoteOn/NoteOff at offset 0 (the note that's
+    /// most at risk of landing in the past), and a lone later NoteOn at offset
+    /// 400ms — enough spread to exercise "some survive, some don't".
+    fn synthetic_events() -> Vec<(Duration, Vec<u8>)> {
+        vec![
+            (Duration::ZERO, vec![0x90, 60, 100]),                    // NoteOn, t=0
+            (Duration::from_millis(200), vec![0x80, 60, 0]),          // NoteOff, t=200ms
+            (Duration::from_millis(400), vec![0x90, 64, 100]),        // NoteOn, t=400ms
+        ]
+    }
+
+    #[test]
+    fn fresh_cue_shrinks_lead_by_its_age_events_untouched() {
+        let events = synthetic_events();
+        let lead = Duration::from_millis(300);
+        let age = Some(Duration::from_millis(120)); // age <= lead
+        let (out_events, out_lead) = backdate_events(events.clone(), lead, age).expect("not stale");
+        assert_eq!(out_lead, Duration::from_millis(180), "lead shrinks by exactly the age");
+        assert_eq!(out_events, events, "events are untouched when the lead absorbs the age");
+    }
+
+    #[test]
+    fn age_equal_to_lead_is_the_fresh_boundary_not_the_late_one() {
+        // age == lead is the `age <= lead` branch (fresh), not `age > lead`.
+        let events = synthetic_events();
+        let lead = Duration::from_millis(200);
+        let age = Some(Duration::from_millis(200));
+        let (out_events, out_lead) = backdate_events(events.clone(), lead, age).expect("not stale");
+        assert_eq!(out_lead, Duration::ZERO, "lead fully consumed, but not the late branch");
+        assert_eq!(out_events, events, "still untouched — the boundary is inclusive on the fresh side");
+    }
+
+    #[test]
+    fn late_cue_drops_past_notes_and_shifts_survivors() {
+        // lead=100ms, age=350ms → deficit d=250ms. Offset 0 (<250ms) and
+        // offset 200ms (<250ms) are dropped; offset 400ms (>=250ms) survives,
+        // shifted to 400ms-250ms=150ms.
+        let events = synthetic_events();
+        let lead = Duration::from_millis(100);
+        let age = Some(Duration::from_millis(350));
+        let (out_events, out_lead) = backdate_events(events, lead, age).expect("within stale window");
+        assert_eq!(out_lead, Duration::ZERO, "no lead left to spend once behind");
+        assert_eq!(out_events.len(), 1, "only the offset-400ms event survives: {out_events:?}");
+        assert_eq!(out_events[0].0, Duration::from_millis(150), "survivor shifted by -d");
+        assert_eq!(out_events[0].1, vec![0x90, 64, 100], "survivor is the second NoteOn");
+    }
+
+    #[test]
+    fn a_dropped_noteon_orphans_its_later_noteoff_harmlessly() {
+        // The NoteOn at offset 0 is dropped (< d), but its NoteOff at 200ms
+        // survives when d <= 200ms — an orphaned NoteOff (no matching On) rides
+        // through. That's fine: a NoteOff for a note that was never turned on
+        // is a no-op at the synth, never a stuck note.
+        let events = synthetic_events();
+        let lead = Duration::from_millis(50);
+        let age = Duration::from_millis(200 + 50); // d = 200ms exactly
+        let (out_events, _lead) =
+            backdate_events(events, lead, Some(age)).expect("within stale window");
+        // Offset-0 NoteOn dropped (0 < 200); offset-200ms NoteOff survives at
+        // the boundary (200 >= 200) shifted to 0; offset-400ms NoteOn survives
+        // shifted to 200ms.
+        assert_eq!(out_events.len(), 2, "the orphaned off + the later on survive: {out_events:?}");
+        assert_eq!(out_events[0].1, vec![0x80, 60, 0], "the orphaned NoteOff rides through");
+        assert_eq!(out_events[0].0, Duration::ZERO, "shifted to now");
+        assert!(
+            !out_events.iter().any(|(_, d)| d == &vec![0x90, 60, 100]),
+            "the dropped NoteOn must not appear: {out_events:?}"
+        );
+    }
+
+    #[test]
+    fn a_cue_stale_beyond_the_max_is_rejected_outright() {
+        let events = synthetic_events();
+        let lead = Duration::from_millis(50);
+        // deficit = age - lead must exceed CUE_STALE_MAX (5s).
+        let age = Some(CUE_STALE_MAX + Duration::from_millis(1) + lead);
+        assert_eq!(
+            backdate_events(events, lead, age),
+            None,
+            "a cue this stale is rejected whole, not partially salvaged"
+        );
+    }
+
+    #[test]
+    fn a_cue_exactly_at_the_stale_boundary_is_still_accepted() {
+        let events = synthetic_events();
+        let lead = Duration::from_millis(50);
+        let age = Some(CUE_STALE_MAX + lead); // deficit == CUE_STALE_MAX exactly
+        assert!(
+            backdate_events(events, lead, age).is_some(),
+            "exactly CUE_STALE_MAX deficit is still accepted (boundary is inclusive)"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_cue_passes_through_verbatim() {
+        let events = synthetic_events();
+        let lead = Duration::from_millis(300);
+        let (out_events, out_lead) =
+            backdate_events(events.clone(), lead, None).expect("unstamped never rejects");
+        assert_eq!(out_lead, lead, "no age to backdate against — lead untouched");
+        assert_eq!(out_events, events, "events untouched too");
     }
 
     /// Live ALSA loopback (needs `/dev/snd/seq`; `#[ignore]` so CI stays green —
