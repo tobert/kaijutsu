@@ -68,6 +68,16 @@ const STEP: TickDelta = TickDelta::new(1);
 /// machine drift is ~0, so every 8 beats keeps it locked while staying steady.
 const BEAT_SYNC_EVERY: u64 = 8;
 
+/// How many whole periods a track may run late before `fire_due` gives up on
+/// catching the grid back up and re-seeds it at `now` instead (Amy-tunable —
+/// the phasor-slew metrics from Slice 4 are the tuning loop for this). A late
+/// wakeup in `(0, GRID_RESEED_AFTER_PERIODS]` periods pops and re-fires the
+/// SAME while-loop pass (bounded catch-up: the scheduler owes at most this many
+/// beats before it's caught up); beyond it, the missed beats are missed —
+/// re-seeding at the actual wakeup is the metronome's own stance (crash/silence
+/// over corruption: no silent unbounded catch-up burst).
+const GRID_RESEED_AFTER_PERIODS: u32 = 2;
+
 /// The local instant at which a committed cell starting at `start` should render,
 /// given the beat's jitter-free scheduled fire instant (`base`), the live beat
 /// `period`, and the current `playhead` (Stage 3 WI 4). A cell commits AHEAD of
@@ -1187,19 +1197,44 @@ impl BeatScheduler {
             if generation != cur_gen {
                 continue; // a later `play` re-enlisted the track → this entry is stale
             }
-            // Latch the SCHEDULED fire instant (`t`, the heap entry's deadline) BEFORE
-            // processing — this is the jitter-free reference the render seam schedules
-            // off, not the late actual wakeup `now` (Stage 3 review, deepseek).
+            // How late the actual wakeup is against the grid's deadline `t`. Within
+            // the cap, the grid stays true: `scheduled` is still `t`, so the re-arm
+            // below and every consumer that reads it (render seam, BeatSync epoch)
+            // never see the scheduler's jitter. Beyond the cap the grid has fallen
+            // too far behind to be worth catching up (an unbounded catch-up burst is
+            // its own failure mode) — re-seed at the actual wakeup instead. Missed
+            // beats are missed; that's the metronome's own stance.
+            let late = now.saturating_duration_since(t);
+            let scheduled = if late > period * GRID_RESEED_AFTER_PERIODS {
+                log::warn!(
+                    "beat: track '{}' woke {:?} late (> {GRID_RESEED_AFTER_PERIODS} periods of \
+                     {:?}) — re-seeding its grid at the actual wakeup instead of catching up",
+                    track_id.as_str(),
+                    late,
+                    period,
+                );
+                now
+            } else {
+                t
+            };
+            // Latch the SCHEDULED fire instant BEFORE processing — this is the
+            // jitter-free reference the render seam schedules off, not the late
+            // actual wakeup `now` (Stage 3 review, deepseek). Lateness within the cap
+            // pops the next entry immediately in this SAME while-loop pass (bounded
+            // catch-up); a re-seed pushes past `now` and breaks the loop.
             if let Some(tr) = self.tracks.get_mut(&track_id) {
-                tr.last_fire_scheduled = t;
+                tr.last_fire_scheduled = scheduled;
             }
-            self.process_track(&track_id, &mut outcome);
+            self.process_track(&track_id, &mut outcome, now);
             // Re-arm the TRACK's next beat under the SAME generation (a normal beat
-            // doesn't bump it). Rotation detaches CONTEXTS inside `process_track`, never
-            // the track — the clock keeps running across a page-turn (continuity is
-            // free; the production gap during the child's boot is absorbed by the
-            // speculation lead downstream, docs/tracks.md).
-            self.heap.push(Reverse((now + period, track_id, cur_gen)));
+            // doesn't bump it), off the SCHEDULED instant (was `now + period` — that
+            // let scheduler lateness accumulate into the grid beat over beat; anchoring
+            // on `scheduled` keeps the grid at exactly `period` from where it should
+            // have fired, so lateness never compounds). Rotation detaches CONTEXTS
+            // inside `process_track`, never the track — the clock keeps running across
+            // a page-turn (continuity is free; the production gap during the child's
+            // boot is absorbed by the speculation lead downstream, docs/tracks.md).
+            self.heap.push(Reverse((scheduled + period, track_id, cur_gen)));
         }
         outcome
     }
@@ -1208,15 +1243,29 @@ impl BeatScheduler {
     /// shared wall-clock epoch, then for EACH attached context slew its Timeline to
     /// the track playhead, materialize whatever committed, and answer the cadence
     /// questions. A context at a rotate horizon is detached synchronously this beat
-    /// (the clock keeps running). Called only for a playing track.
-    fn process_track(&mut self, track_id: &TrackId, outcome: &mut BeatOutcome) {
+    /// (the clock keeps running). Called only for a playing track — `fire_due` is
+    /// the single caller, and `now` is its actual-wakeup `Instant` (NOT the
+    /// SCHEDULED one; that's `last_fire_scheduled`, already latched by the caller).
+    fn process_track(&mut self, track_id: &TrackId, outcome: &mut BeatOutcome, now: Instant) {
         // Latch the beat's wall-clock epoch ONCE so every context woken this beat
         // sees the identical `KJ_EPOCH_NS` (the cross-context join key) — never a
-        // per-context `now()` that would differ by microseconds.
-        let epoch_ns = std::time::SystemTime::now()
+        // per-context `now()` that would differ by microseconds. The epoch is the
+        // SCHEDULED instant's wallclock, not this read's: back-date the raw
+        // `SystemTime::now()` reading by how late the actual wakeup (`now`) is
+        // against `last_fire_scheduled` (already latched by `fire_due` before this
+        // call). This keeps `KJ_EPOCH_NS` deterministic per beat — consumers see it
+        // at most `wake-lateness` earlier than the old jittery-actual-wakeup stamp,
+        // never later (docs/tracks.md `KJ_EPOCH_NS` row).
+        let wall_now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let scheduled_lateness = self
+            .tracks
+            .get(track_id)
+            .map(|tr| now.saturating_duration_since(tr.last_fire_scheduled))
+            .unwrap_or_default();
+        let epoch_ns = wall_now_ns.saturating_sub(scheduled_lateness.as_nanos() as u64);
         // Phase 1: advance the track once (the brief &mut tracks borrow).
         let (beat_count, playhead, policy, attached_ids) = {
             let Some(track) = self.tracks.get_mut(track_id) else {
@@ -1699,11 +1748,12 @@ impl BeatScheduler {
     /// `block.beat_sync` (a headless kernel, no sink attached) this emits nothing.
     ///
     /// Stamps `epoch_ns` from `last_epoch_ns` — the wallclock this beat's
-    /// [`process_track`](Self::process_track) latched at :1227, BEFORE this call
-    /// (line :1249) — so it is never 0 by the time a beat is publishable. That's
-    /// the jittery *actual* wakeup wallclock, not a scheduled one, which is fine:
-    /// the phasor's `phase_gain` low-pass exists to filter exactly that kind of
-    /// jitter (`timebase.rs` doc comment).
+    /// [`process_track`](Self::process_track) latched, BEFORE this call, so it is
+    /// never 0 by the time a beat is publishable. Since Slice 1 this is the beat's
+    /// SCHEDULED wallclock (back-dated by however late the actual wakeup ran), not
+    /// the jittery actual-wakeup one — the grid re-arms off the same scheduled
+    /// instant (`fire_due`), so the epoch a phasor locks onto is deterministic per
+    /// beat instead of carrying the scheduler's own jitter into the wire.
     fn publish_beat_sync(&self, track_id: &TrackId, playhead: Tick) {
         if self.kernel.block_flows().topic_subscribers("block.beat_sync") == 0 {
             return;
@@ -2938,6 +2988,128 @@ mod tests {
         sched.detach(&track_id, ctx);
         let out = sched.fire_due(base + Duration::from_secs(6));
         assert!(out.fired.is_empty(), "detached → context no longer fires");
+    }
+
+    // ── Slice 1 (phase-align): the scheduled grid ───────────────────────────
+
+    /// `fire_due` re-arms off the SCHEDULED fire instant, not the late actual
+    /// wakeup: a beat due at `base+1s` fired 300ms late (`base+1.3s`, within the
+    /// catch-up cap) must re-arm at `base+2s`, never `base+2.3s` — otherwise
+    /// scheduler lateness would compound into the grid beat over beat.
+    #[tokio::test]
+    async fn grid_rearm_anchors_on_scheduled_not_actual_wakeup() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 5);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let base = Instant::now();
+        sched.play(&track, base);
+        assert_eq!(sched.next_wake(), Some(base + Duration::from_secs(1)));
+
+        // Woken 300ms late — within the 2-period cap, so no re-seed.
+        sched.fire_due(base + Duration::from_millis(1300));
+        assert_eq!(
+            sched.next_wake(),
+            Some(base + Duration::from_secs(2)),
+            "re-arm is scheduled(+1s) + period, not the late actual wakeup(+1.3s) + period"
+        );
+    }
+
+    /// Lateness within the cap `(0, GRID_RESEED_AFTER_PERIODS]` periods is bounded
+    /// catch-up: the SAME `fire_due` call pops and fires every beat the grid now
+    /// owes, in one pass, without re-seeding.
+    #[tokio::test]
+    async fn moderate_lateness_catches_up_within_cap_in_one_call() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 5);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let base = Instant::now();
+        sched.play(&track, base); // first entry due at base+1s
+
+        // Woken 2.5s after play — 1.5s late against the first deadline, within
+        // the 2-period cap: both owed beats fire in this one call.
+        let out = sched.fire_due(base + Duration::from_millis(2500));
+        assert_eq!(out.fired, vec![ctx, ctx], "two beats caught up in one call");
+        assert_eq!(sched.snapshot_tracks()[0].beat_count, 2);
+        assert_eq!(
+            sched.next_wake(),
+            Some(base + Duration::from_secs(3)),
+            "caught up to scheduled+period, never re-seeded"
+        );
+    }
+
+    /// Beyond the cap, catching up is not worth it: the grid gives up and
+    /// re-seeds at the actual wakeup, firing exactly ONE beat no matter how long
+    /// the stall — missed beats are missed (the metronome's own stance, not a
+    /// silent unbounded catch-up burst).
+    #[tokio::test]
+    async fn stalled_wakeup_reseeds_grid_and_fires_once() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 5);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let base = Instant::now();
+        sched.play(&track, base); // first entry due at base+1s
+
+        // 9s late against the first deadline — way past the 2-period cap.
+        let out = sched.fire_due(base + Duration::from_secs(10));
+        assert_eq!(
+            out.fired,
+            vec![ctx],
+            "only ONE beat fires despite the huge gap — the grid re-seeded instead of \
+             bursting through 9 owed beats"
+        );
+        assert_eq!(sched.snapshot_tracks()[0].beat_count, 1);
+        assert_eq!(
+            sched.next_wake(),
+            Some(base + Duration::from_secs(11)),
+            "re-seeded at the actual wakeup (+10s), not caught up from the stale deadline"
+        );
+    }
+
+    /// `KJ_EPOCH_NS`/`BeatSync.epoch_ns` is the beat's SCHEDULED wallclock, not
+    /// the actual-wakeup one: firing 800ms late (still within the catch-up cap)
+    /// must back-date the stamp by ~0.8s off a raw `SystemTime::now()` reading
+    /// taken just before the fire.
+    #[tokio::test]
+    async fn beat_epoch_is_backdated_to_the_scheduled_instant() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 2);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        let base = Instant::now();
+        sched.play(&track, base); // first entry due at base+1s
+
+        let wall_before_ns = epoch_now_ns();
+        // 800ms late — within the cap, so the scheduled instant (base+1s) is
+        // still what's latched; the epoch should trail the raw read by ~0.8s.
+        sched.fire_due(base + Duration::from_millis(1800));
+        let epoch_ns = sched.snapshot_tracks()[0].last_epoch_ns;
+
+        let backdate_ns = wall_before_ns.saturating_sub(epoch_ns);
+        // ~800ms of backdating, with generous slack for the two SystemTime
+        // reads' own scheduling overhead.
+        assert!(
+            (700_000_000..=950_000_000).contains(&backdate_ns),
+            "epoch should be backdated by ~0.8s of scheduler lateness, got {backdate_ns}ns"
+        );
     }
 
     /// 5c-2 core: when a committed ABC cell crosses the write barrier, the

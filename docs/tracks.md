@@ -199,6 +199,17 @@ convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 | `KJ_PULSE` | per-attachment monotonic counter | ordering key *within a run* (resets on restart — the documented contract, consistent with conversation re-hydration) |
 | `KJ_EPOCH_NS` | wall clock, latched once per beat | human "when" + cross-context join — identical for every context woken on the same beat |
 
+`KJ_EPOCH_NS` (phase-align, Slice 1): the value is the beat's **scheduled**
+wallclock, not the actual wakeup's. `fire_due` computes it by back-dating the
+raw `SystemTime::now()` reading by however late the actual wakeup ran against
+the grid's own deadline (`last_fire_scheduled`) — so within the catch-up cap
+(`GRID_RESEED_AFTER_PERIODS`) the stamp a phasor locks onto is deterministic
+per beat, never carrying the scheduler's own jitter downstream. The contract
+nuance: a consumer now sees `KJ_EPOCH_NS` up to the wake-lateness *earlier*
+than it would have under the old actual-wakeup stamp — never later. Beyond the
+cap the grid re-seeds at the actual wakeup and the stamp reverts to that
+instant for one beat (the missed-beats-are-missed case).
+
 A **musician**'s tick behaviour produces ABC into the track's score; a
 **probe**'s tick behaviour runs a kaish script that writes `/run`
 (`shared-state.md`). Same mechanism, different rc. *Being a "musician" = being
