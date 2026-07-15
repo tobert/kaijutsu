@@ -68,7 +68,11 @@ pub fn tempo_label(period_us: u64) -> String {
 /// guards to `window_rows` itself: nothing to round to a multiple of.
 pub fn row_count_for(beats_per_phrase: u64, window_rows: usize) -> usize {
     if beats_per_phrase == 0 {
-        return window_rows;
+        // `.max(1)`: [`row_offset`] takes this as its modulus, and a
+        // zero-row column would panic there (`rem_euclid(0)`) — unreachable
+        // with today's WINDOW_ROWS but cheap insurance against a retune
+        // (kaibo review advisory).
+        return window_rows.max(1);
     }
     let p = beats_per_phrase as usize;
     let needed = window_rows + p;
@@ -195,6 +199,13 @@ mod tests {
     #[test]
     fn row_count_for_zero_phrase_guards_to_the_window() {
         assert_eq!(row_count_for(0, 16), 16);
+    }
+
+    #[test]
+    fn row_count_for_never_returns_zero() {
+        // Its result is row_offset's modulus; zero would panic there.
+        assert_eq!(row_count_for(0, 0), 1);
+        assert!(row_count_for(4, 0) >= 1);
     }
 
     // ── row_offset ──

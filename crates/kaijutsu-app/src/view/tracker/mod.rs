@@ -233,6 +233,14 @@ pub struct TrackerState {
     /// Re-lay-out the title/idle/header text on the next dived frame (the
     /// patch-bay `text_dirty` shape).
     text_dirty: bool,
+    /// track id → last known beat position — the DURABLE half of the freeze
+    /// contract (kaibo review finding): the entity-side carry in
+    /// [`sync_tracker_columns`] dies with the columns at `teardown_room`, so
+    /// without this map a room exit/re-entry would seat a frozen track's
+    /// rows back at beat 0. Written by [`animate_tracker_scroll`] while a
+    /// phasor is live, pruned to the roster on rebuild, and deliberately
+    /// NOT cleared by [`Self::arm`].
+    freeze_carry: std::collections::HashMap<String, f64>,
     row_material: Option<Handle<StandardMaterial>>,
     phrase_row_material: Option<Handle<StandardMaterial>>,
 }
@@ -242,6 +250,7 @@ impl Default for TrackerState {
         Self {
             column_entities: std::collections::HashMap::new(),
             text_dirty: true,
+            freeze_carry: std::collections::HashMap::new(),
             row_material: None,
             phrase_row_material: None,
         }
@@ -255,6 +264,8 @@ impl TrackerState {
     /// entity ids left over from the previous room visit). Called from
     /// `room::enter_room`, same frame `spawn_furniture` runs.
     pub(crate) fn arm(&mut self) {
+        // `freeze_carry` deliberately survives: it is the only copy of a
+        // frozen track's position once teardown has taken the entities.
         self.column_entities.clear();
         self.text_dirty = true;
     }
@@ -530,7 +541,10 @@ pub(crate) fn sync_tracker_columns(
     // freeze, which lands here as a full rebuild — without this carry the
     // rebuilt rows would snap back to beat 0, breaking the exact-freeze
     // contract (`grid.rs`'s freeze test; the phasor is already gone, so
-    // `animate_tracker_scroll` would never correct the snap).
+    // `animate_tracker_scroll` would never correct the snap). The entity
+    // read is the fresh copy; `state.freeze_carry` is the durable fallback
+    // for the rebuild the entity carry can't cover (room re-entry, where
+    // teardown took the entities — kaibo review finding).
     let carried: std::collections::HashMap<String, f64> = state
         .column_entities
         .iter()
@@ -540,6 +554,12 @@ pub(crate) fn sync_tracker_columns(
     for (_, e) in state.column_entities.drain() {
         commands.entity(e).despawn();
     }
+    // Prune the durable carry to the live roster so vanished track names
+    // don't accumulate forever (a returning track restarts from 0 like any
+    // new one).
+    let roster: std::collections::HashSet<&str> =
+        well_tracks.tracks.iter().map(|t| t.id.as_str()).collect();
+    state.freeze_carry.retain(|id, _| roster.contains(id.as_str()));
     state.text_dirty = true;
     if well_tracks.tracks.is_empty() {
         return;
@@ -574,7 +594,11 @@ pub(crate) fn sync_tracker_columns(
 
     let slots = grid::column_layout(well_tracks.tracks.len(), FACE_W, COL_W_MAX, COL_GAP);
     for (t, slot) in well_tracks.tracks.iter().zip(slots.iter()) {
-        let p0 = carried.get(&t.id).copied().unwrap_or(0.0);
+        let p0 = carried
+            .get(&t.id)
+            .or_else(|| state.freeze_carry.get(&t.id))
+            .copied()
+            .unwrap_or(0.0);
         let entity = spawn_column(
             &mut commands,
             root,
@@ -784,6 +808,7 @@ fn spawn_column(
 /// [`TrackerColumn::last_position`] holds.
 fn animate_tracker_scroll(
     beats: Res<WellBeats>,
+    mut state: ResMut<TrackerState>,
     mut columns: Query<(&mut TrackerColumn, &Children)>,
     mut rows: Query<(&TrackerRow, &mut Transform, &mut Visibility)>,
 ) {
@@ -793,6 +818,9 @@ fn animate_tracker_scroll(
             continue;
         };
         col.last_position = p;
+        // The durable copy ([`TrackerState::freeze_carry`]): survives the
+        // teardown that takes this component with it.
+        state.freeze_carry.insert(col.track_id.clone(), p);
         let total = grid::row_count_for(col.beats_per_phrase, WINDOW_ROWS);
         let below = total as f64 * (1.0 - PLAYHEAD_FRAC as f64);
         for child in children.iter() {
@@ -982,6 +1010,22 @@ mod tests {
             (palette::WALL_APOTHEM - at.x - palette::STATION_E_PROUD).abs() < 1e-3,
             "proud of the wall by STATION_E_PROUD, not deep inside it: {at:?}"
         );
+    }
+
+    // ── freeze carry across room visits ──
+
+    #[test]
+    fn arm_clears_entities_but_preserves_the_freeze_carry() {
+        // The kaibo-review regression: room exit tears the column entities
+        // down, so re-entry's `arm()` must NOT also drop the durable
+        // freeze positions — they are the only copy left, and clearing
+        // them would seat a frozen track's rows back at beat 0.
+        let mut s = TrackerState::default();
+        s.column_entities.insert("bass".to_string(), Entity::PLACEHOLDER);
+        s.freeze_carry.insert("bass".to_string(), 42.5);
+        s.arm();
+        assert!(s.column_entities.is_empty(), "stale entity ids must go");
+        assert_eq!(s.freeze_carry.get("bass"), Some(&42.5), "freeze position must survive");
     }
 
     // ── band cull ──
