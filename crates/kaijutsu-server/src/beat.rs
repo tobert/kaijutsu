@@ -1216,6 +1216,7 @@ impl BeatScheduler {
                     late,
                     period,
                 );
+                kaijutsu_telemetry::record_grid_reseed(track_id.as_str());
                 now
             } else {
                 t
@@ -1280,6 +1281,7 @@ impl BeatScheduler {
             let ids: Vec<ContextId> = track.attached.keys().cloned().collect();
             (track.beat_count, track.playhead, track.phrasing(), ids)
         };
+        kaijutsu_telemetry::record_beat_fired(track_id.as_str());
         // Phase 2: per attached context — materialize, then answer the cadence. No
         // &mut tracks borrow is held across `materialize_one` (it re-borrows briefly).
         let mut to_detach: Vec<ContextId> = Vec::new();
@@ -1790,6 +1792,7 @@ impl BeatScheduler {
         self.kernel
             .block_flows()
             .publish(BlockFlow::BeatSync { context_id: score_ctx, beat_ref });
+        kaijutsu_telemetry::record_beat_sync_published();
     }
 
     /// Drain the engine failure ledger past `failure_water`, surfacing exactly one

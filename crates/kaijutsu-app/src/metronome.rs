@@ -220,9 +220,13 @@ fn ingest_beat_signals(
             ServerEvent::BeatSync { beat_ref, .. } => match beat_ref.disposition(now, now_epoch_ns)
             {
                 RefDisposition::Fold(at) => {
-                    let _slew = metronome.observe(*beat_ref, at);
-                    // Slice 4 records `_slew` into `kaijutsu.phasor.slew_beats`
-                    // (consumer=metronome) here.
+                    if let Some(slew) = metronome.observe(*beat_ref, at) {
+                        kaijutsu_telemetry::record_phasor_slew(
+                            "metronome",
+                            slew.error_beats,
+                            slew.deadbanded,
+                        );
+                    }
                 }
                 RefDisposition::Touch => {
                     log::debug!(
@@ -277,6 +281,7 @@ fn click_on_beat(
     }
     for offset in metronome.schedule_due(Instant::now(), SCHEDULE_HORIZON) {
         sink.click_at(click.note, click.channel, click.velocity, click.gate_ms, offset);
+        kaijutsu_telemetry::record_metronome_click();
     }
 }
 

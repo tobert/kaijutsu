@@ -457,8 +457,13 @@ pub fn ingest_live_events(
             ServerEvent::BeatSync { context_id, beat_ref } => {
                 match beat_ref.disposition(now_inst, now_epoch_ns) {
                     RefDisposition::Fold(at) => {
-                        let _slew = beats.observe(*context_id, *beat_ref, at, now_inst);
-                        // Slice 4 records `_slew` here (consumer=time_well).
+                        if let Some(slew) = beats.observe(*context_id, *beat_ref, at, now_inst) {
+                            kaijutsu_telemetry::record_phasor_slew(
+                                "time_well",
+                                slew.error_beats,
+                                slew.deadbanded,
+                            );
+                        }
                     }
                     RefDisposition::Touch | RefDisposition::Drop => {
                         beats.touch(context_id, now_inst)

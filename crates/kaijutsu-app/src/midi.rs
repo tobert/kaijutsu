@@ -424,7 +424,7 @@ fn play_midi_cues(
         let age = (cue.epoch_ns != 0)
             .then(|| Duration::from_nanos(now_epoch_ns.saturating_sub(cue.epoch_ns)));
         let Some((events, lead)) = backdate_events(events, cue.lead, age) else {
-            // Slice 4 records `record_stale_cue_dropped` here.
+            kaijutsu_telemetry::record_stale_cue_dropped();
             warn!(
                 "MIDI cue rejected — stale beyond {CUE_STALE_MAX:?} by the time it was \
                  received; dropping the whole phrase rather than smear it"
