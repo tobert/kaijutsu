@@ -545,11 +545,17 @@ pub(crate) fn sync_tracker_columns(
         return;
     }
 
+    // Ordinary rows sit on the quiet `etch` tier (0.28 — engraved detail);
+    // phrase rows get the louder `trough_subtle` tier (0.75). Live-verify
+    // finding: the first cut had these swapped, which both inverted the
+    // phrase emphasis (boundaries read as gaps) and made the whole grid a
+    // wall of bright bars — the grid should be the quiet texture the
+    // accent-hued playhead pulses against.
     let row_material = state
         .row_material
         .get_or_insert_with(|| {
             std_materials.add(StandardMaterial {
-                base_color: lin_scaled(palette.gold, palette.trough_subtle),
+                base_color: lin_scaled(palette.gold, palette.etch),
                 unlit: true,
                 ..default()
             })
@@ -559,7 +565,7 @@ pub(crate) fn sync_tracker_columns(
         .phrase_row_material
         .get_or_insert_with(|| {
             std_materials.add(StandardMaterial {
-                base_color: lin_scaled(palette.gold, palette.etch),
+                base_color: lin_scaled(palette.gold, palette.trough_subtle),
                 unlit: true,
                 ..default()
             })
@@ -748,7 +754,12 @@ fn spawn_column(
 
     // Header plate: id / tempo · phrase length. Dive LOD, filled once the
     // font loads (`fill_tracker_text`).
-    let header_text = format!("{}\n{} · {}/PHRASE", t.id, grid::tempo_label(t.period_us), t.beats_per_phrase);
+    // "/PHR" not "/PHRASE": `layout_plate_text`'s plate is single-line-sized
+    // (340×100 tex, ~18 chars/line at the plate font) — "120 BPM · 32/PHRASE"
+    // is 19 chars, which parley wraps onto a third line the texture then
+    // clips (live-verify finding: the header read "120 BPM · 32/" with a
+    // half-clipped "PHRASE" under it).
+    let header_text = format!("{}\n{} · {}/PHR", t.id, grid::tempo_label(t.period_us), t.beats_per_phrase);
     let header = header_plate_bundle(
         meshes,
         card_materials,
