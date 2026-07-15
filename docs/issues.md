@@ -630,6 +630,13 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Control Plane & Navigation (kj)
 
+- **`kj transport restore` — only if delete accidents actually happen**
+  (decided 2026-07-15 with the tombstone delete): recovery is sqlite-only by
+  design (the one-line UPDATE is in `kj transport delete --help` +
+  docs/tracks.md). If someone actually fat-fingers a delete and the sqlite
+  path proves annoying, a `restore --track <tombstone-name>` verb is the
+  shape (rename back + clear `deleted_at`; refuse if the original name has
+  been retaken by a fresh track).
 - **`--out` writes bypass the VFS (`kj cas get` + `kj block cat`; gemini-pro
   review 2026-07-04).** Both verbs `std::fs::write` the `--out` path
   (`kj/cas.rs:119`, `kj/block.rs:730` — the new verb deliberately mirrored the
