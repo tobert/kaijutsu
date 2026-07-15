@@ -307,8 +307,16 @@ well scene**, not a new world. Slices, each shippable alone:
   occupy, so there is only one way out of it to get right. The patch bay's
   own LOD and keyboard gate on `RoomState::zoomed` instead of
   `in_state(Screen::PatchBay)`.
-- **Slice C+ — bearings accrete**: highway ambient at E when tracks-station
-  work starts; the N archway when the fsn scene exists. No fixed order.
+- **Slice C+ — bearings accrete**: the N portal (fsn scene through the
+  glass) landed 2026-07-13; **E landed 2026-07-15 as the TRACKER station**
+  (`view/tracker/`, slice 0): a pattern-grid face mounted on the E panel
+  the same "surface taken over by its content" way as the W wheel — one
+  vertical column per track, rows scrolling at each track's own tempo
+  (independent clock domains, `docs/tracks.md`), a fixed playhead row
+  pulsing per-column on `WellBeats` phasors. The East marker's old
+  beat-breathe re-homed onto those playhead pulses (`sync_room_glow`'s E
+  branch is inert). Slice 0 is read-only track state; score cells are
+  slice 1. Only S (reserved) and the diagonals remain unfurnished.
 
 ## Open questions
 

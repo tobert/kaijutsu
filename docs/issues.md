@@ -447,8 +447,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
-- **Well: a single Enter from the room overview dives AND focuses when a
-  selection persists** (found live-verifying the freeze-fix slice,
+- **Tracker station slice 1: score cells on the grid** (2026-07-15, the
+  designed-in seam after slice 0 shipped): rows carry note content read
+  from each track's score context (`text/vnd.abc` blocks). Prereq: decide
+  the read-a-second-context plumbing — one-shot `get_all_blocks(score_ctx)`
+  vs `subscribe_blocks_filtered` + a `SyncedDocument`; `WellTracks.beat_key_of`
+  already resolves the ids. Row identity is beat-mod-R with kernel-anchored
+  phrase alignment, so cells attach as per-row content children on the same
+  `row_offset` math; the column subtree is grouped (header/grid/playhead)
+  so cells are an added group, not a restructure. Revisit a per-column
+  shader or Vello layer only if room-scale cell text is wanted.
+- **Tracker station: Amy eyeball items** (2026-07-15, all Amy-tunable
+  consts at the top of `view/tracker/mod.rs` + `palette.rs` "Station E
+  contract"): overall grid brightness (rows on `etch`, phrase rows on
+  `trough_subtle` after the live-verify swap — dimmer rows may read even
+  better), `ROW_SPACING`/`PLAYHEAD_FRAC`/`COL_W_MAX`, dot/glyph sizes, and
+  the "TRACKER" title plate seated ABOVE the face (`FACE_H/2 + 44`) sits
+  outside the zoomed camera frame so it's effectively invisible — decide:
+  move it inside, or delete it (room-scale shows no text by design, and
+  you know what you zoomed into). Header abbreviates to `N/PHR` because
+  the shared 340×100 plate is single-line-sized; a wider tracker-specific
+  plate would fit `/PHRASE`.
   2026-07-11): `room_keyboard`'s Enter dives (`zoomed = Some(TimeWell)`),
   and because the dived-only chain's `run_if(well_zoomed)` is evaluated
   after that same-frame write, `well_keyboard` runs in the SAME frame,

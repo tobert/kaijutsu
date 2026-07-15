@@ -771,3 +771,39 @@ interleave with a long copy. One day, design to stitch: `ad4b212e`
 (pump), `99d4e5cd` (share). Live verification against a real kernel is
 the open loop; slices 2–4 (`kj share` verbs, `:rw`, notify) wait in
 issues.md.
+
+## The beat gets a face — the TRACKER station (July 15)
+
+The East wall had worn a promissory nameplate since the octagon existed:
+"TRACKER", a dim marker breathing with the well's loudest beat. Slice 0
+of the tracker station replaced the promise with the instrument. Amy
+picked the **pattern grid** over a DAW lane-wall and a staff-notation
+score wall — the classic-tracker homage turned honest to kaijutsu's own
+model: tracks are independent clock domains (`docs/tracks.md`), so each
+column scrolls at *its own* tempo past one fixed playhead row, and no
+shared row-grid pretends there's a band conductor. Slice 0 shows track
+state only (transport, tempo, phrase lines, attached-context dots, the
+per-column beat pulse); note cells wait for the score-sync plumbing
+decision.
+
+Two design facts carried the build. First, **zero new wire**: the roster
+was already polled (`WellTracks`) and the beat phasors already ingested
+(`WellBeats`) — the one new API is `beat_position()`, whose `None` *is*
+the freeze signal, so a stopped track's rows hold exactly (through the
+5-second poll rebuild via an entity carry, and through room re-entry via
+a durable map kaibo's review demanded). Second, the render split: rows
+move by Transform writes (per-frame-free), text is MSDF plates, the
+pulse is quantized change-guarded material writes — Vello RTT was
+rejected because a continuously-scrolling face would re-raster its whole
+texture every frame.
+
+The review ladder earned its keep in one afternoon: the lead's diff pass
+caught a Bevy B0001 query-conflict panic the whole unit suite was
+structurally blind to (schedules never initialize in tests — the app
+would have died at first frame), plus rows drawing outside the grid band
+and the freeze snapping to zero after the stop-poll rebuild. The live
+pass caught the phrase-emphasis tiers *inverted* (boundaries read as
+gaps in a wall of bright bars) and a header wrapping onto a clipped
+third line. kaibo deepseek then confirmed all six design contracts and
+found the room-re-entry freeze loss neither earlier pass had. Two tracks
+at 120 and 60 BPM scrolling independently on the E wall closed the loop.
