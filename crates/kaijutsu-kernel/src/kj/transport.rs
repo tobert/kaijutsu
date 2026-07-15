@@ -159,10 +159,40 @@ enum TransportCommand {
         #[arg(long)]
         track: Option<String>,
     },
+    /// Delete a track — a rename-aside **tombstone**, never a hard delete
+    /// (`docs/tracks.md` Transport). REQUIRES `--track <name>` explicitly: unlike
+    /// every other transport verb, this one never resolves a track from the
+    /// caller's own attachment — deletion must never hit a track you merely
+    /// happen to be attached to. Stops the clock, detaches every attached context
+    /// (their playhead persists, same as `detach`), tears down the track's live
+    /// clock/timeline state, and hides it from `kj transport` and `listTracks`.
+    /// The **score context (the durable notation) is left untouched** —
+    /// attaching `--track <name>` again after a delete starts a brand-new track
+    /// with a brand-new score; it never resurrects the old one.
+    ///
+    /// Recovery is **sqlite-only by decision** (no `kj` verb — a deliberately
+    /// cold, deliberate path for an operation that undoes a delete): stop the
+    /// kernel, then run `UPDATE tracks SET track_id = '<name>', deleted_at = NULL
+    /// WHERE track_id = '<name>~tombstone-<epoch-ms>'` against the kernel's
+    /// sqlite DB. This command reports the exact tombstone name on success; if
+    /// it's been lost, find it again with `SELECT track_id FROM tracks WHERE
+    /// deleted_at IS NOT NULL`.
+    Delete {
+        /// Track to delete. REQUIRED — never resolved from the caller's own
+        /// attachment; deletion must never hit a track you merely happen to be
+        /// attached to.
+        #[arg(long)]
+        track: String,
+    },
 }
 
 impl TransportCommand {
     /// The `--context` ref this verb targets (shared across all verbs).
+    ///
+    /// `Delete` has no `--context` — deletion is deliberately never resolved
+    /// from the caller's attachment, so there is nothing here to feed the
+    /// `resolve_context_arg(None, ..)` default-to-current-context fallback used
+    /// by every other verb's track resolution.
     fn context(&self) -> Option<&str> {
         match self {
             TransportCommand::Attach { context, .. }
@@ -174,10 +204,12 @@ impl TransportCommand {
             | TransportCommand::Ooda { context, .. }
             | TransportCommand::Clock { context, .. }
             | TransportCommand::Rotate { context, .. } => context.as_deref(),
+            TransportCommand::Delete { .. } => None,
         }
     }
 
     /// The `--track` override this verb carries (all verbs that name a track).
+    /// `Delete`'s `track` is required (not `Option`), so it always yields `Some`.
     fn track_name(&self) -> Option<&str> {
         match self {
             TransportCommand::Attach { track, .. }
@@ -189,6 +221,7 @@ impl TransportCommand {
             | TransportCommand::Ooda { track, .. }
             | TransportCommand::Clock { track, .. }
             | TransportCommand::Rotate { track, .. } => track.as_deref(),
+            TransportCommand::Delete { track } => Some(track.as_str()),
         }
     }
 
@@ -204,6 +237,7 @@ impl TransportCommand {
             TransportCommand::Ooda { .. } => "ooda",
             TransportCommand::Clock { .. } => "clock",
             TransportCommand::Rotate { .. } => "rotate",
+            TransportCommand::Delete { .. } => "delete",
         }
     }
 }
@@ -407,6 +441,23 @@ impl KjDispatcher {
                         Some(tid),
                     )
                 }
+
+                TransportCommand::Delete { track } => {
+                    // Deliberately bypasses `resolve_track_for_ctx` entirely —
+                    // the whole point of this verb is that it NEVER infers a
+                    // track from the caller's own attachment.
+                    let track_id = match TrackId::new(track.as_str()) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return KjResult::Err(format!(
+                                "kj transport delete: invalid track {track:?}: {e}"
+                            ));
+                        }
+                    };
+                    let verb = format!("deleted track '{}'", track_id.as_str());
+                    let tid = track_id.as_str().to_string();
+                    (BeatCommand::Delete { track: track_id }, verb, Some(tid))
+                }
             };
 
         // Send and AWAIT the scheduler's verdict so the report reflects what
@@ -419,16 +470,27 @@ impl KjDispatcher {
             );
         };
         match ack_rx.await {
-            Ok(Ok(())) => KjResult::Ok {
-                message: format!("transport: {} '{}'", verb, ctx.short()),
-                content_type: ContentType::Plain,
-                ephemeral: false,
-                data: Some(serde_json::json!({
-                    "context_id": ctx.to_hex(),
-                    "track_id": track_id_for_data,
-                    "action": action,
-                })),
-            },
+            // `detail` is `Some(..)` only for a command that carries extra
+            // success info the caller couldn't otherwise learn — today,
+            // `Delete`'s tombstone name (the scheduler computed it inside the
+            // DB transaction that renamed the row; nowhere else knows it).
+            Ok(Ok(detail)) => {
+                let message = match &detail {
+                    Some(tombstone) => format!("transport: {verb} (tombstone: '{tombstone}')"),
+                    None => format!("transport: {} '{}'", verb, ctx.short()),
+                };
+                KjResult::Ok {
+                    message,
+                    content_type: ContentType::Plain,
+                    ephemeral: false,
+                    data: Some(serde_json::json!({
+                        "context_id": ctx.to_hex(),
+                        "track_id": track_id_for_data,
+                        "action": action,
+                        "tombstone": detail,
+                    })),
+                }
+            }
             // The scheduler refused (e.g. not attached) — report the truth, loudly.
             Ok(Err(reason)) => KjResult::Err(format!("kj transport: {reason}")),
             // The scheduler dropped the reply without answering (it shut down
@@ -685,7 +747,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(d.kernel().set_beat_ingress(tx), "ingress installs once");
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(&[s("transport"), s("play"), s("--track"), s("c")], &c)
@@ -711,7 +773,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("play")], &c).await;
         assert!(result.is_ok(), "transport play failed: {}", result.message());
@@ -790,7 +852,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(d.kernel().set_beat_ingress(tx), "ingress installs once");
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let bad = d
             .dispatch(
@@ -830,7 +892,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(
@@ -886,7 +948,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("attach")], &c).await;
         assert!(result.is_ok(), "transport attach failed: {}", result.message());
@@ -925,7 +987,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("attach")], &c).await;
         assert!(result.is_ok(), "transport attach failed: {}", result.message());
@@ -959,7 +1021,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("attach")], &c).await;
         assert!(!result.is_ok(), "attaching a context with no track lane should fail");
@@ -984,7 +1046,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(&[s("transport"), s("attach"), s("--track"), s("bass")], &c)
@@ -1009,7 +1071,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(
@@ -1076,7 +1138,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("attach")], &c).await;
         assert!(
@@ -1105,7 +1167,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         // --track bypasses the attachment lookup (nothing is seeded here).
         let result = d
@@ -1132,7 +1194,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("detach")], &c).await;
         assert!(result.is_ok(), "detach (no --track) failed: {}", result.message());
@@ -1157,7 +1219,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(
@@ -1187,7 +1249,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d.dispatch(&[s("transport"), s("ooda"), s("on")], &c).await;
         assert!(result.is_ok(), "ooda on (no --track) failed: {}", result.message());
@@ -1211,7 +1273,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(
@@ -1245,7 +1307,7 @@ mod tests {
         let c = caller_with_context(ctx);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         d.kernel().set_beat_ingress(tx);
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         let result = d
             .dispatch(
@@ -1368,7 +1430,7 @@ mod tests {
         d.kernel().set_beat_ingress(tx);
         // The rc runs `kj transport attach && kj transport play`, each AWAITing the
         // scheduler ack; the stub acks Ok so the `&&` chain proceeds.
-        let mut cmds = spawn_beat_stub(rx, Ok(()));
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
 
         // Fire the rotate lifecycle exactly as the beat scheduler's fire_rotate does.
         let caller = caller_with_context(parent);
@@ -1406,6 +1468,144 @@ mod tests {
         let forked_from =
             d.kernel_db().lock().get_context(child).unwrap().unwrap().forked_from;
         assert_eq!(forked_from, Some(parent), "child is forked from the parent");
+    }
+
+    // ── delete ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn transport_delete_requires_track_flag() {
+        // The one hard gate this verb has: no implicit resolution from the
+        // caller's attachment, ever — bare `kj transport delete` (even with a
+        // real attachment seeded) must refuse before it ever reaches the
+        // scheduler, not silently target whatever track the caller happens to
+        // be on.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("bass"), None, principal);
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
+
+        let result = d.dispatch(&[s("transport"), s("delete")], &c).await;
+        assert!(!result.is_ok(), "delete with no --track must error");
+        assert!(
+            cmds.try_recv().is_err(),
+            "no Delete command reaches the scheduler without an explicit --track"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_delete_sends_delete_command() {
+        use kaijutsu_types::TrackId;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        // The caller isn't even attached to "bass" — proves delete never
+        // consults the caller's own attachment, only the explicit --track.
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(Some("bass~tombstone-1234".to_string())));
+
+        let result = d
+            .dispatch(&[s("transport"), s("delete"), s("--track"), s("bass")], &c)
+            .await;
+        assert!(result.is_ok(), "delete failed: {}", result.message());
+        match cmds.recv().await.expect("a Delete should be sent") {
+            BeatCommand::Delete { track } => {
+                assert_eq!(track, TrackId::new("bass").unwrap());
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_delete_reports_the_tombstone_name_on_success() {
+        // The scheduler is the only place that knows the tombstone name (it
+        // computed it inside the DB transaction that renamed the row); `kj
+        // transport` must relay it, not recompute or guess at it.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(rx, Ok(Some("bass~tombstone-1752607200000".to_string())));
+
+        let result = d
+            .dispatch(&[s("transport"), s("delete"), s("--track"), s("bass")], &c)
+            .await;
+        assert!(result.is_ok(), "delete failed: {}", result.message());
+        assert!(
+            result.message().contains("bass~tombstone-1752607200000"),
+            "the report carries the tombstone name: {}",
+            result.message()
+        );
+        let crate::kj::KjResult::Ok { data: Some(data), .. } = result else {
+            panic!("delete must report structured data");
+        };
+        assert_eq!(
+            data.get("tombstone").and_then(|v| v.as_str()),
+            Some("bass~tombstone-1752607200000"),
+            "the tombstone name rides the data payload too: {data:?}"
+        );
+        assert_eq!(data.get("action").and_then(|v| v.as_str()), Some("delete"));
+    }
+
+    #[tokio::test]
+    async fn transport_delete_surfaces_scheduler_refusal() {
+        // An unknown track refuses at the scheduler (BeatScheduler::delete) —
+        // `kj transport delete` must report that refusal, never a blind success.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(
+            rx,
+            Err("track 'bass' has no clock — nothing to delete".to_string()),
+        );
+
+        let result = d
+            .dispatch(&[s("transport"), s("delete"), s("--track"), s("bass")], &c)
+            .await;
+        assert!(
+            matches!(result, crate::kj::KjResult::Err(_)),
+            "a scheduler refusal must surface as an error, not blind success"
+        );
+        assert!(
+            result.message().contains("nothing to delete"),
+            "the error carries the scheduler's reason: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_delete_rejects_invalid_track_name() {
+        // `~` (the tombstone separator) is outside the track-id charset — this
+        // is the enforcement point `kernel_db::tombstone_track`'s doc cites:
+        // `TrackId::new` refuses it here, so a tombstoned name can never be
+        // targeted by `kj transport delete` (or `attach`) in the first place.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let mut cmds = spawn_beat_stub(rx, Ok(None));
+
+        let result = d
+            .dispatch(
+                &[s("transport"), s("delete"), s("--track"), s("bass~tombstone-1")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "an invalid track name must be refused");
+        assert!(cmds.try_recv().is_err(), "no Delete command sent on refusal");
     }
 
     // ── misc error paths ──────────────────────────────────────────────────────
