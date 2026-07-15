@@ -972,7 +972,8 @@ impl BeatScheduler {
     ///
     /// Stage 2: detach does NOT touch the TRACK timeline — the clock + score live on
     /// the track and outlive any producer (continuity is free; that's the whole
-    /// point). The track timeline is dropped only on track teardown (not wired yet).
+    /// point). The track timeline is dropped only on track teardown (`delete`,
+    /// below — the first and only wired teardown path).
     pub fn detach(&mut self, track_id: &TrackId, context_id: ContextId) {
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.attached.remove(&context_id);
@@ -998,6 +999,84 @@ impl BeatScheduler {
             None => {
                 self.context_track.remove(&context_id);
             }
+        }
+    }
+
+    /// Delete a track — a **rename-aside tombstone**, not a hard delete
+    /// (`docs/tracks.md` Transport). The first real track-teardown path: until
+    /// now a track's live `Timeline` was armed on first attach and simply
+    /// outlived every producer forever (`detach`, above, deliberately never
+    /// drops it). In order:
+    ///
+    /// 1. **Stop the clock** (`stop`): `playing = false`, flush the buffered
+    ///    speculation lead to attached sinks, persist. No sense advancing a
+    ///    track that's about to disappear.
+    /// 2. **Detach every attached context** through the exact same `detach`
+    ///    path `BeatCommand::Detach` uses — so playhead persistence and the
+    ///    reverse-index cleanup match byte-for-byte — AND delete each
+    ///    context's persisted `attachments` row. That row-delete is the one
+    ///    thing plain `detach` deliberately skips (rotation needs it to survive
+    ///    for fork-inheritance); a `delete` is permanent, so there is no future
+    ///    re-attach to inherit it for, and it's the same "move to a new track"
+    ///    idiom `attach` already uses when a context switches lanes.
+    ///    `tombstone_track` (step 5) refuses loudly if this is ever skipped —
+    ///    a dangling attachment row would point at a name that no longer
+    ///    resolves.
+    /// 3. **Tear down the live `Timeline`** (`disarm_track_timeline`): drops
+    ///    the open future + committed cell log. Safe — the durable recovery
+    ///    payload is the score CONTEXT's materialized blocks
+    ///    (`reconstruct_score_cells` rebuilds the committed log from them on a
+    ///    future re-attach), never this in-memory `Timeline`.
+    /// 4. **Drop the in-memory `TrackState`** — this is what hides the track
+    ///    from `snapshot_tracks` (the `listTracks` wire surface): it reads
+    ///    `self.tracks` directly. A stale heap entry for this track
+    ///    self-cleans on its next pop (`fire_due`'s "unknown/removed track"
+    ///    arm already drops it) — no explicit heap surgery needed.
+    /// 5. **Tombstone the persisted row** (`tombstone_track`): rename aside +
+    ///    stamp `deleted_at`, atomically. The **score context is left
+    ///    untouched** — it's the durable recovery payload — and recovery is
+    ///    sqlite-only by decision (the one-line `UPDATE` is documented on `kj
+    ///    transport delete`'s long help and in `docs/tracks.md`). Attaching
+    ///    `--track <name>` again after a delete finds nothing under that name
+    ///    and creates a genuinely fresh track + score (§5, `docs/tracks.md`).
+    ///
+    /// Refuses (`Err`, no side effects) when the track doesn't exist — mirrors
+    /// `track_ack`'s loud-refusal style for every other clock-domain command.
+    /// `Ok(Some(tombstone_name))` on success, so `kj transport` can report it.
+    pub fn delete(&mut self, track_id: &TrackId) -> BeatAck {
+        if !self.tracks.contains_key(track_id) {
+            return Err(format!(
+                "track '{}' has no clock — nothing to delete",
+                track_id.as_str()
+            ));
+        }
+        self.stop(track_id);
+        // Collect first: `detach` mutates `self.tracks`/`self.context_track`,
+        // so it can't run while a borrow of `track.attached` is still live.
+        let attached: Vec<ContextId> = self
+            .tracks
+            .get(track_id)
+            .map(|t| t.attached.keys().copied().collect())
+            .unwrap_or_default();
+        for ctx in attached {
+            self.detach(track_id, ctx);
+            // Permanent delete cleanup `detach` deliberately skips (rotation's
+            // fork-inheritance needs the row to survive a plain detach).
+            if let Some(db) = self.documents.db() {
+                let _ = db.lock().delete_attachment(track_id.as_str(), ctx);
+            }
+        }
+        self.kernel.disarm_track_timeline(track_id);
+        self.tracks.remove(track_id);
+        let Some(db) = self.documents.db() else {
+            return Ok(None); // db-less store (embedded/test): nothing to tombstone.
+        };
+        match db.lock().tombstone_track(track_id.as_str()) {
+            Ok(name) => Ok(Some(name)),
+            Err(e) => Err(format!(
+                "beat: failed to tombstone track {}: {e}",
+                track_id.as_str()
+            )),
         }
     }
 
@@ -1902,11 +1981,11 @@ impl BeatScheduler {
                 // silent poisoned (rewound) timeline reported as success. The
                 // attachment carries wakeup/rotate/ooda, so there is no separate
                 // cadence-restore step (attach persists the binding itself).
-                self.attach(track, context_id, attachment, policy)
+                self.attach(track, context_id, attachment, policy).map(|()| None)
             }
             BeatCommand::Detach { track, context_id } => {
                 self.detach(&track, context_id);
-                Ok(())
+                Ok(None)
             }
             BeatCommand::Play(track) => {
                 self.play(&track, Instant::now());
@@ -1936,6 +2015,7 @@ impl BeatScheduler {
                 self.set_clock(&track, kind);
                 self.track_ack(&track)
             }
+            BeatCommand::Delete { track } => self.delete(&track),
         }
     }
 
@@ -1966,12 +2046,14 @@ impl BeatScheduler {
         out
     }
 
-    /// `Ok` if the track has a live clock domain (so a clock-domain command landed),
-    /// else a loud `Err` — none of the apply methods drop a track, so checking after
-    /// the call is exact.
+    /// `Ok(None)` if the track has a live clock domain (so a clock-domain command
+    /// landed), else a loud `Err` — called only from `Play`/`Pause`/`Stop`/
+    /// `SetTempo`/`SetClock`, none of which drop a track, so checking after the
+    /// call is exact. (`Delete` is the one command that removes a track; it
+    /// returns its own `BeatAck` directly rather than going through this.)
     fn track_ack(&self, track_id: &TrackId) -> BeatAck {
         if self.tracks.contains_key(track_id) {
-            Ok(())
+            Ok(None)
         } else {
             Err(format!(
                 "track '{}' has no clock — `kj transport attach` a context to it first",
@@ -1980,15 +2062,15 @@ impl BeatScheduler {
         }
     }
 
-    /// `Ok` if the context is attached to the track (so a per-attachment command
-    /// landed), else a loud `Err`.
+    /// `Ok(None)` if the context is attached to the track (so a per-attachment
+    /// command landed), else a loud `Err`.
     fn attached_ack(&self, track_id: &TrackId, ctx: ContextId) -> BeatAck {
         let attached = self
             .tracks
             .get(track_id)
             .is_some_and(|t| t.attached.contains_key(&ctx));
         if attached {
-            Ok(())
+            Ok(None)
         } else {
             Err(format!(
                 "context {} is not attached to track '{}' — run `kj transport attach` first",
@@ -5026,5 +5108,167 @@ mod tests {
             Some(4),
             "detach persists the handoff playhead so a 0-block child inherits it across a crash"
         );
+    }
+
+    // ── delete (kj transport delete) ────────────────────────────────────
+
+    /// `delete` refuses an unknown track loudly (mirrors `track_ack`'s style for
+    /// every other clock-domain command) rather than reporting a blind success.
+    #[tokio::test]
+    async fn delete_refuses_unknown_track() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let mut sched = BeatScheduler::new(kernel, documents);
+        let track = TrackId::new("nope").unwrap();
+        let err = sched.delete(&track).unwrap_err();
+        assert!(
+            err.contains("nothing to delete"),
+            "refusal explains why: {err}"
+        );
+    }
+
+    /// `delete` is the scheduler's first real track-teardown path: after it, the
+    /// track is gone from `snapshot_tracks` (the `listTracks` wire surface) and
+    /// its live `Timeline` is torn down — a db-less (embedded/test) store simply
+    /// skips the tombstone step (`Ok(None)`, no DB to write to).
+    #[tokio::test]
+    async fn delete_tears_down_the_live_track_and_timeline() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::new("bass").unwrap();
+        arm_track_with_markers(&kernel, &track, 3);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        assert!(kernel.track_timeline(&track).is_some(), "armed by attach");
+
+        let ack = sched.delete(&track);
+        assert_eq!(ack, Ok(None), "db-less store: nothing to tombstone");
+        assert!(
+            sched.snapshot_tracks().is_empty(),
+            "the track vanishes from the roster"
+        );
+        assert!(
+            kernel.track_timeline(&track).is_none(),
+            "the live Timeline is disarmed — the first real teardown"
+        );
+
+        // A second delete of the same (now-gone) track refuses.
+        let err = sched.delete(&track).unwrap_err();
+        assert!(err.contains("nothing to delete"), "{err}");
+    }
+
+    /// `delete` must detach EVERY attached context (collect-then-iterate, since
+    /// `detach` mutates the very map being walked), through the SAME `detach`
+    /// path `BeatCommand::Detach` uses — the persisted playhead handoff matches
+    /// byte for byte — AND permanently purge each context's persisted
+    /// `attachments` row (the one thing a plain `detach` deliberately skips, so
+    /// rotation's fork-inheritance still works; a `delete` has no future
+    /// re-attach to inherit for). Also proves the DB half: the row is RENAMED
+    /// (never hard-deleted, `score_context_id` intact) and hidden from both
+    /// `get_track`(original name) and `list_tracks`.
+    #[tokio::test]
+    async fn delete_detaches_every_context_purges_attachments_and_tombstones_the_row() {
+        let (kernel, documents, db, ctx_a) = db_backed_kernel_and_docs().await;
+        // A second context on the same db/workspace, attached to the SAME track —
+        // proves "every attached context," not just the one `db_backed_kernel_and_docs`
+        // hands back.
+        use kaijutsu_kernel::kernel_db::ContextRow;
+        use kaijutsu_types::{ConsentMode, ContextState};
+        let ctx_b = ContextId::new();
+        {
+            let g = db.lock();
+            let ws = g.get_or_create_default_workspace(PrincipalId::new()).unwrap();
+            g.insert_context_with_document(
+                &ContextRow {
+                    context_id: ctx_b,
+                    label: Some("lead".to_string()),
+                    provider: None,
+                    model: None,
+                    system_prompt: None,
+                    consent_mode: ConsentMode::default(),
+                    context_state: ContextState::Live,
+                    context_type: "musician".to_string(),
+                    created_at: 0,
+                    created_by: PrincipalId::new(),
+                    forked_from: None,
+                    fork_kind: None,
+                    archived_at: None,
+                    workspace_id: None,
+                    preset_id: None,
+                    concluded_at: None,
+                    last_activity_at: None,
+                    promoted_at: None,
+                    demoted_at: None,
+                    paused_at: None,
+                },
+                ws,
+            )
+            .unwrap();
+        }
+        documents.create_document(ctx_b, DocumentKind::Conversation, None).unwrap();
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::new("bass").unwrap();
+        let base = Instant::now();
+        sched.attach(track.clone(), ctx_a, slow_attachment(), slow_policy()).unwrap();
+        sched.attach(track.clone(), ctx_b, slow_attachment(), slow_policy()).unwrap();
+        sched.play(&track, base);
+        for i in 1..=3 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        assert_eq!(
+            sched.snapshot_tracks()[0].attached.len(),
+            2,
+            "both contexts attached before delete"
+        );
+        let score_ctx = sched.score_context(&track);
+
+        let tombstone = sched
+            .delete(&track)
+            .expect("delete succeeds")
+            .expect("delete reports the tombstone name");
+        assert!(
+            tombstone.starts_with("bass~tombstone-"),
+            "tombstone name carries the original id: {tombstone}"
+        );
+
+        // Both attachment rows are permanently gone (not just live-detached).
+        assert!(
+            db.lock().get_attachment("bass", ctx_a).unwrap().is_none(),
+            "ctx_a's persisted attachment row is purged"
+        );
+        assert!(
+            db.lock().get_attachment("bass", ctx_b).unwrap().is_none(),
+            "ctx_b's persisted attachment row is purged"
+        );
+
+        // Hidden under the original name from both read paths.
+        assert!(
+            db.lock().get_track("bass").unwrap().is_none(),
+            "get_track(original name) sees nothing post-tombstone"
+        );
+        assert!(
+            db.lock().list_tracks().unwrap().is_empty(),
+            "list_tracks excludes the tombstoned row"
+        );
+
+        // The row survives under the tombstone name: playhead persisted (the
+        // SAME handoff a plain detach snapshots) and score_context_id intact —
+        // the durable recovery payload.
+        let row = db.lock().get_track(&tombstone).unwrap().unwrap();
+        assert_eq!(
+            row.playhead_tick,
+            Some(3),
+            "the handoff playhead persisted before the rename"
+        );
+        assert_eq!(
+            row.score_context_id,
+            Some(score_ctx),
+            "score_context_id survives — the durable recovery payload"
+        );
+
+        // Gone from the live roster and its Timeline torn down.
+        assert!(sched.snapshot_tracks().is_empty());
+        assert!(kernel.track_timeline(&track).is_none());
     }
 }
