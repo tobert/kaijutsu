@@ -25,7 +25,10 @@ pub mod clockin;
 pub use clockin::{ClockEstimate, ClockEstimator, ClockEvent, PULSES_PER_BEAT};
 
 pub mod timebase;
-pub use timebase::{beat_onsets_in, BeatRef, LocalBeat};
+pub use timebase::{
+    beat_onsets_in, stamp_age, BeatRef, LocalBeat, RefDisposition, Slew, REF_FOLD_MAX,
+    REF_STALE_MAX,
+};
 
 /// A committed ABC score, rendered to MIDI at the sink (`docs/midi.md` "Render
 /// is a wire cue"). The payload is the ABC text; a render sink that can render

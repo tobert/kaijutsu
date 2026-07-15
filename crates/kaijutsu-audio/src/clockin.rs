@@ -431,7 +431,9 @@ mod tests {
             if let Some(e) = est.observe(ClockEvent::Pulse { epoch_ns: t }) {
                 let at = t0 + Duration::from_nanos(e.epoch_ns);
                 match &mut phasor {
-                    Some(p) => p.observe(e.reference, at),
+                    Some(p) => {
+                        p.observe(e.reference, at);
+                    }
                     None => phasor = Some(crate::LocalBeat::new(e.reference, at)),
                 }
             }
