@@ -447,6 +447,33 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Metronome clicks burst + starve around musician OODA turns** (Amy heard
+  it live 2026-07-15; measured via `aseqdump -p <app render port>`): bursts
+  of ~10 SIMULTANEOUS ch15/C6 note-ons (0ms apart — one loud blob), ragged
+  intervals, then ~5–6s of click silence, cycling ~10s — while the bass on
+  the same port stays dead-even 500ms (cue payloads ride the speculation
+  lead into the ALSA queue; clicks follow BeatSync arrival). Two
+  contributing factors, both needed:
+  1. **App:** `metronome.rs::schedule_due` fires the entire missed backlog
+     clamped-to-now when the phasor position jumps forward (the blob), and
+     its monotonic `next_beat` strands in the future when the phasor walks
+     backward (the silence — position must free-run to catch up). Fix
+     shape: never emit more than one clamped-to-now click (skip
+     `next_beat` forward past a >1-beat backlog), and re-seed `next_beat`
+     when it's stranded more than a couple beats ahead of `cur`. Pure fn,
+     unit-testable; `LocalBeat` itself is fine (bounded ±1-beat step,
+     feedforward tempo).
+  2. **Kernel:** BeatSync references stop-then-flood around the musician's
+     tick turns (journal 2026-07-15: gemma4-e4b turns ~18s, back-to-back —
+     next iteration starts 57ms after the last completes, i.e. the wakeup
+     divisor is shorter than the turn). Whether the beat-scheduler thread
+     itself stalls during a tick turn (it drives rc — the
+     `KAISH_RC_THREAD_STACK` history) or emission batches elsewhere needs
+     pinning; either way reference delivery should stay smooth while a
+     turn runs. Bigger design question than the app-side hardening.
+  Immediate relief either way: `enabled = false` (or lower `velocity`) in
+  `/etc/client/metronome.toml`.
+
 - **Tracker station slice 1: score cells on the grid** (2026-07-15, the
   designed-in seam after slice 0 shipped): rows carry note content read
   from each track's score context (`text/vnd.abc` blocks). Prereq: decide
