@@ -103,6 +103,13 @@ bytes = "1"
 # against a client's share server (russh-sftp's role swap).
 russh-sftp.workspace = true
 
+# `kj audio beats` — Beat This! (ISMIR 2024) beat/downbeat tracking, pure Rust
+# (rten inference, symphonia decode, rubato resample). Default features only —
+# the `ort` feature (external ONNX Runtime) is deliberately NOT enabled; rten
+# is the same backend kaijutsu-index's embedder uses (both pinned to 0.24, no
+# version skew between the two rten copies in the workspace).
+beat-this = "1.0"
+
 [features]
 test-mock = []
 

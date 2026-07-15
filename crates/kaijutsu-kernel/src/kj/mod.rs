@@ -9,6 +9,7 @@
 //! kernel state and is constructed once per server.
 
 pub mod attach;
+pub mod audio;
 pub mod binding;
 pub mod block;
 pub mod cache;
@@ -356,6 +357,11 @@ impl KjDispatcher {
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
         }
+        // `kj audio` operates on a host filesystem path (like `kj play`/
+        // `kj cas put`), not a context — same exemption rationale.
+        if cmd == "audio" {
+            return self.dispatch_audio(&argv[1..], caller).await;
+        }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
         if cmd == "cp" {
@@ -695,6 +701,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(workspace::WorkspaceArgs::command())
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
+        .subcommand(audio::AudioArgs::command())
         .subcommand(cp::CpArgs::command())
         .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())

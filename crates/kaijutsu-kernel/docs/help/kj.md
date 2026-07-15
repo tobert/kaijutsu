@@ -45,6 +45,7 @@ kj drift merge
 
 ```
 attach          Attach to an existing context and run its rc attach lifecycle
+audio           beats — offline audio analysis (beat/downbeat tracking via beat-this)
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
 block           list, ls, inspect, count, read, cat, create, append, history, diff, edit, status
 cache           list, add, clear — Claude prompt-cache breakpoints

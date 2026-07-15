@@ -6,6 +6,31 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Beat-tracking + local-model follow-ups (seeded 2026-07-15, rten/beat-this arc)
+
+`kj audio beats` (beat-this crate, rten backend) and the rten embedder swap
+landed 2026-07-15. Deliberately left out, in rough priority order:
+
+- **Track integration is the real prize**: seed a track's tempo/cadence from a
+  reference recording (`kj audio beats` output → transport arm), and run beat
+  analysis on rendered/captured clips once the pcm.md/clips.md seam exists
+  (bytes never ride the track; beats are exactly the derived-result shape that
+  should cross the wire instead).
+- **Model registry / `kj models` verb**: two model dirs now follow the
+  `~/.local/share/kaijutsu/models/<name>/` convention (bge-small-en-v1.5,
+  beat-this) with install instructions living in models.toml comments and a
+  README. A registry (name → expected files → checksum → fetch) would make
+  `kj models list/fetch/verify` possible and close the manual-download gap.
+  This is also where a `kaijutsu-inference`-style shared crate becomes
+  justified — explicitly deferred (Amy, 2026-07-15) until there's real
+  sharing; the Embedder trait + per-crate rten deps are the seam until then.
+- **models.toml `[audio]`/beat-this section**: the verb hardcodes the model
+  dir convention; a config section needs toml_config plumbing + the
+  seeded-once CRDT caveat handled.
+- **Vendor risk note**: beat-this is v1.0.0, single maintainer (danigb), MIT —
+  small enough to vendor/fork if it stalls. rten GPU support (Metal-first) is
+  on its author's 2026 roadmap; CPU is fine for our workloads.
+
 ## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
 
 `cargo clippy -p kaijutsu-app --all-targets` currently fails to compile the
