@@ -275,6 +275,63 @@ slew limiting, phase-slew-not-step, reference-jitter outlier rejection. The full
 findings list (incl. the `beat.rs:940` random-walk cadence one-liner and the PCM
 guardrails) lives in `docs/issues.md` → Hyoushigi / Musician.
 
+## The one timebase — emission stamps, back-dating, and the locked phasor (2026-07-15)
+
+**The validator fired.** The metronome slice above was built to *measure*
+divergence between the per-cue trigger path and the continuous timebase, and on
+2026-07-15 it did its job twice in one day, by ear (Amy) and then by port tap:
+
+1. First the click itself burst-and-starved while the bass stayed even —
+   references were queuing behind a turn's block flood, then flooding, and the
+   receiver folded every buffered reference at one frame-`now`. That landed the
+   first half of this doctrine (`BeatRef.epochNs` + receiver back-dating).
+2. Then, with the click honest, click and bass **wandered apart** — exactly the
+   boundary-jitter failure the 2026-07-02 correction predicted: the cue's
+   `receipt + lead` anchor *passes arrival jitter through*, one ΔL per phrase,
+   while the click now tracked kernel-true time.
+
+What those two findings hardened into, stated as doctrine:
+
+- **Every wire timing artifact carries its emission wallclock.** `BeatRef.epochNs`
+  and `RenderCue.epochNs` (ns since UNIX_EPOCH; `0` = unstamped, old-peer
+  fallback to receipt). `Instant`s still never cross the wire — only wallclock
+  stamps do, and only ever as *age*: the sink computes `age = its own wallclock −
+  stamp` and back-dates receipt, so the Θ-cancellation of the relative-lead
+  scheme survives intact while variable transit latency stops mattering. On one
+  box the stamp is exact; across boxes it is as good as NTP, which is the same
+  trust the `reportClockEstimate` reverse path already runs on.
+- **Stale timing data is rejected, on a ladder** (Amy, 2026-07-15: throw away
+  adjustments when the data is too stale): a reference folds phase only while
+  young (`REF_FOLD_MAX`, ~1 s); older-but-plausible it only proves liveness
+  (`Touch`); beyond `REF_STALE_MAX` (5 s) it is dropped. A cue older than its
+  own lead has missed its onset — the past notes are dropped, never smeared
+  into a late chord; a cue stale past the same 5 s bound is rejected whole.
+- **Missed beats are missed.** No timing consumer ever replays a backlog — the
+  metronome's never-stack-clicks policy, the grid's capped catch-up, the cue
+  sink's past-note drop are one stance. Silence recovers; a burst never sounds
+  right.
+- **The kernel's grid is scheduled-periodic.** Beats re-arm at `scheduled +
+  period` (never `actual_wake + period`, which integrates scheduler lateness
+  into the musical timeline), with a small capped catch-up and a re-seed past
+  it (suspend/stall = the grid moves on). Every per-beat stamp — `BeatSync`,
+  `KJ_EPOCH_NS`, the render base — derives from the *scheduled* instant, so the
+  timeline the sinks reconstruct is the ideal grid, not the wakeup jitter.
+- **Once dialed in, the local clock is the truth between references** (Amy's
+  principle — modern system clocks hold phase far better than a jittery
+  reference stream corrects it). The receiver phasor runs exact feedforward
+  tempo and corrects *phase* only outside a small deadband (~0.02 beats);
+  inside it, it takes zero steps and free-runs. References become confirmation,
+  not steering. The phasor's residual and every fold land in OTel
+  (`kaijutsu.phasor.slew_beats` et al.) — the deadband is tuned from that
+  histogram, not from vibes.
+
+This is a deliberate first step onto the 2026-07-02 "upgrade path" (gemini's
+absolute-tick-through-PLL): back-dating the anchor buys most of the jitter
+buffer without moving cue scheduling into the tick domain. Go further — true
+tick-domain scheduling against the phasor — only if the metronome validator
+shows residual boundary error after this lands (PCM transients and multi-sink
+flam remain the likely triggers, as before).
+
 ## The topology (Amy's room, 2026-06-29)
 
 - **KeyStep Pro (KSP) — usual clock master**, on a long-range USB3 hub with the

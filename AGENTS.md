@@ -40,6 +40,15 @@ inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, 
 index, telemetry, hyoushigi, viz. Wire schema: `kaijutsu.capnp`. The stdio MCP server (`kaijutsu-mcp`)
 exposes most kernel capabilities and can be called as a hook from client applications.
 
+## Time
+
+Musical time is doctrine, not folklore — `docs/midi.md` "The one timebase":
+never chase a clock (model it); wire timing artifacts carry emission wallclock
+stamps and sinks back-date; stale timing data is rejected on a ladder; missed
+beats are missed (never replay); the kernel grid is scheduled-periodic; a
+dialed-in phasor free-runs on the local clock inside a deadband. Touch any
+beat/clock/cue code with that section open.
+
 ## Conversation vs Context
 
 **Context** is the durable side: CRDT block log, exclusions, edits, conversation metadata. Multi-writer. Holds more than the live conversation knows about.

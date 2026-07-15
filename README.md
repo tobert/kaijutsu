@@ -135,7 +135,10 @@ that renders as both standard staff notation and audio.
 
 FFI-free audio/render types: the mime-keyed `RenderCue` wire cue, the clip
 record (`docs/clips.md`), and the beat phasor/timebase used by the metronome.
-Sinks (the app, future edge nodes) own the actual hardware.
+Sinks (the app, future edge nodes) own the actual hardware. The timing
+doctrine — emission-stamped wire artifacts, receiver back-dating, staleness
+ladder, the deadband-locked phasor ("the local clock is the truth between
+references") — lives in `docs/midi.md`, "The one timebase".
 
 ### kaijutsu-hyoushigi
 
