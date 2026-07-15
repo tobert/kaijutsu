@@ -161,14 +161,19 @@ pub fn wall_placements() -> [WallPlacement; 4] {
 /// FSN portal (`fsn::backdrop`'s panel-spanning window) — the world seen
 /// through the glass IS the station; the "DATA HORIZON" plate and the marker
 /// pylon both stood square in front of the view they advertised, so N gets
-/// the same no-marker/no-plate treatment. `enter_room`'s wall-placement loop
-/// reads this to skip the marker/plinth/cap/plate for a furnished bearing —
-/// the wheel mounts directly on the wall panel instead, no separate
-/// furniture builder needed; a future in-room station rides the same gate.
-/// Pure — no Bevy types — so the gating is unit-testable without spawning
-/// anything (mirrors `super::wants_gold_cap`'s shape).
+/// the same no-marker/no-plate treatment. [`Station::Tracks`] joined in the
+/// Tracker Station slice 0 (`snazzy-jumping-hejlsberg.md`): the pattern-grid
+/// face mounts directly on the E wall panel the same way the wheel mounts on
+/// W, so E gets the same no-marker/no-plate treatment — the East marker's
+/// old beat-breathe (`room::sync_room_glow`'s `Bearing::East` branch) is
+/// re-homed onto `tracker::pulse_tracker_playheads`, per-column instead of
+/// one shared pylon. `enter_room`'s wall-placement loop reads this to skip
+/// the marker/plinth/cap/plate for a furnished bearing — the station's own
+/// wall-mounted face stands in for both; a future in-room station rides the
+/// same gate. Pure — no Bevy types — so the gating is unit-testable without
+/// spawning anything (mirrors `super::wants_gold_cap`'s shape).
 pub fn station_is_room_furniture(station: Station) -> bool {
-    matches!(station, Station::PatchBay | Station::TimeWell | Station::Vfs)
+    matches!(station, Station::PatchBay | Station::TimeWell | Station::Tracks | Station::Vfs)
 }
 
 // ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
@@ -717,7 +722,10 @@ mod tests {
     const EXPECTED_ROOM_FURNITURE: &[(Station, bool)] = &[
         (Station::TimeWell, true),
         (Station::PatchBay, true),
-        (Station::Tracks, false),
+        // The pattern-grid face mounts directly on the E wall panel (Tracker
+        // Station slice 0, `snazzy-jumping-hejlsberg.md`; the fn doc has the
+        // story).
+        (Station::Tracks, true),
         // N wears the FSN portal — the world through the glass is the
         // station's own furniture/signage (2026-07-13; the fn doc has the
         // story).
