@@ -30,6 +30,12 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
 - **Vendor risk note**: beat-this is v1.0.0, single maintainer (danigb), MIT —
   small enough to vendor/fork if it stalls. rten GPU support (Metal-first) is
   on its author's 2026 roadmap; CPU is fine for our workloads.
+- **MCP `shell` tool returns `data: null` for every kj verb** (observed
+  2026-07-15 during live verify): even `kj context list`, whose .data shape
+  is documented, comes back null over the MCP surface — so `kj audio beats`'
+  structured payload is unreachable there too. Either the MCP shell path
+  drops KjResult data or it was never wired; find which and either wire it
+  through or fix the tool description that promises it.
 
 ## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
 
