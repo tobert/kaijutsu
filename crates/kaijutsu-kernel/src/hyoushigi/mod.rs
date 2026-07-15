@@ -225,6 +225,21 @@ pub enum BeatCommand {
     /// master's estimate stream. The current period carries over; a modeled
     /// clock free-runs at it until the first reference arrives.
     SetClock { track: TrackId, kind: ClockKind },
+    /// Delete a track — a **rename-aside tombstone**, not a hard delete
+    /// (`docs/tracks.md` Transport). Sent only by `kj transport delete --track
+    /// <name>`, which requires the track name EXPLICITLY (never resolved from
+    /// the caller's own attachment — deletion must never hit a track you merely
+    /// happen to be on). The scheduler stops the clock, detaches every attached
+    /// context through the same path `Detach` uses (so playhead persistence and
+    /// per-attachment cleanup match exactly), tears down the track's live
+    /// `Timeline`, drops the in-memory `TrackState` (hiding it from
+    /// `listTracks`), and finally renames the persisted row aside + stamps
+    /// `deleted_at` (`KernelDb::tombstone_track`). The **score context is
+    /// untouched** — it's the durable recovery payload; recovery is
+    /// sqlite-only by decision (documented in the `delete` subcommand's long
+    /// help and `docs/tracks.md`). `Ok(Some(tombstone_name))` on success;
+    /// `Err` when the track doesn't exist.
+    Delete { track: TrackId },
 }
 
 /// Which driver beats a track (the `clock_kind` persisted discriminator's
@@ -238,12 +253,16 @@ pub enum ClockKind {
     Modeled,
 }
 
-/// What the scheduler reports back for a transport command: `Ok(())` when it
-/// was applied to an armed context, `Err(reason)` when it was a no-op (e.g. the
-/// context isn't armed). Lets `kj transport` report what actually happened
-/// instead of blindly claiming success after a fire-and-forget send — the
-/// scheduler owns the `armed` map, so it is the single source of truth.
-pub type BeatAck = Result<(), String>;
+/// What the scheduler reports back for a transport command: `Ok(None)` when it
+/// was applied cleanly, `Ok(Some(detail))` when it was applied AND carries a
+/// success detail the caller couldn't otherwise learn (today: `Delete`'s
+/// tombstone name — the scheduler is the one place that knows it, since it
+/// computed it inside the same DB transaction), `Err(reason)` when it was a
+/// no-op (e.g. the context isn't armed). Lets `kj transport` report what
+/// actually happened instead of blindly claiming success after a fire-and-
+/// forget send — the scheduler owns the `tracks` map, so it is the single
+/// source of truth.
+pub type BeatAck = Result<Option<String>, String>;
 
 /// Live state of one track, read from the scheduler's **in-memory** truth —
 /// the wire answer to "what tracks exist and what are they doing." The

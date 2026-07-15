@@ -2792,7 +2792,7 @@ mod tests {
                     crate::hyoushigi::BeatRequest::Command { command, reply } => {
                         let _ = cmd_tx.send(command);
                         if let Some(reply) = reply {
-                            let _ = reply.send(Ok(()));
+                            let _ = reply.send(Ok(None));
                         }
                     }
                     crate::hyoushigi::BeatRequest::Snapshot { reply } => {
