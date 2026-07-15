@@ -1051,10 +1051,15 @@ impl BeatScheduler {
     /// `Ok(Some(tombstone_name))` on success, so `kj transport` can report it.
     pub fn delete(&mut self, track_id: &TrackId) -> BeatAck {
         if !self.tracks.contains_key(track_id) {
-            return Err(format!(
-                "track '{}' has no clock — nothing to delete",
-                track_id.as_str()
-            ));
+            // No live clock domain — but the track may still be a real
+            // persisted row: the cold-start re-arm sweep is deferred
+            // (docs/tracks.md), so a kernel restart leaves every persisted
+            // track without a `TrackState` until something re-attaches.
+            // Deleting exactly such a leftover is this verb's core accident-
+            // cleanup use (found dogfooding: the first live `delete` ran
+            // right after a restart and refused). Purge + tombstone straight
+            // in the DB; there is nothing in memory to tear down.
+            return self.delete_cold(track_id);
         }
         self.stop(track_id);
         // Collect first: `detach` mutates `self.tracks`/`self.context_track`,
@@ -1098,6 +1103,57 @@ impl BeatScheduler {
         self.kernel.disarm_track_timeline(track_id);
         self.tracks.remove(track_id);
         Ok(tombstone)
+    }
+
+    /// The cold half of [`Self::delete`]: tombstone a track that has **no live
+    /// clock domain** — a persisted row orphaned by a kernel restart (the
+    /// deferred cold-start re-arm sweep leaves every persisted track without a
+    /// `TrackState` until re-attach). Same permanence as the warm path — purge
+    /// the persisted attachment rows, then tombstone — with no clock/timeline/
+    /// `TrackState` to tear down. Refuses when there is no persisted row either
+    /// (the track genuinely doesn't exist) or on a db-less store (nothing
+    /// persisted anywhere to delete).
+    fn delete_cold(&mut self, track_id: &TrackId) -> BeatAck {
+        let Some(db) = self.documents.db() else {
+            return Err(format!(
+                "track '{}' has no clock — nothing to delete",
+                track_id.as_str()
+            ));
+        };
+        let mut db = db.lock();
+        let row = db
+            .get_track(track_id.as_str())
+            .map_err(|e| format!("beat: failed to read track '{}': {e}", track_id.as_str()))?;
+        if row.is_none() {
+            return Err(format!(
+                "track '{}' has no clock and no persisted row — nothing to delete",
+                track_id.as_str()
+            ));
+        }
+        let attachments = db.list_attachments_for_track(track_id.as_str()).map_err(|e| {
+            format!(
+                "beat: failed to list persisted attachments for track '{}': {e}",
+                track_id.as_str()
+            )
+        })?;
+        for a in &attachments {
+            db.delete_attachment(track_id.as_str(), a.context_id).map_err(|e| {
+                format!(
+                    "beat: failed to delete persisted attachment for {} on track '{}': {e} \
+                     — retry the delete (or recover via sqlite)",
+                    a.context_id,
+                    track_id.as_str()
+                )
+            })?;
+        }
+        match db.tombstone_track(track_id.as_str()) {
+            Ok(name) => Ok(Some(name)),
+            Err(e) => Err(format!(
+                "beat: failed to tombstone track '{}': {e} — retry the delete (or recover \
+                 via sqlite)",
+                track_id.as_str()
+            )),
+        }
     }
 
     /// The next wake instant, if any context is scheduled.
@@ -5290,5 +5346,43 @@ mod tests {
         // Gone from the live roster and its Timeline torn down.
         assert!(sched.snapshot_tracks().is_empty());
         assert!(kernel.track_timeline(&track).is_none());
+    }
+
+    /// The COLD delete path (found dogfooding the verb live): the cold-start
+    /// re-arm sweep is deferred, so a kernel restart leaves every persisted
+    /// track with no `TrackState` — and the very first live `delete` ran right
+    /// after a restart and refused with "no clock". A fresh scheduler over the
+    /// same DB (= a restarted kernel) must still tombstone the persisted row
+    /// and purge its persisted attachment rows; a name with no row anywhere
+    /// still refuses.
+    #[tokio::test]
+    async fn delete_cold_tombstones_a_persisted_row_with_no_live_clock() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let track = TrackId::new("bass").unwrap();
+        {
+            // First life: attach persists the track + attachment rows.
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        }
+
+        // Second life: a fresh scheduler over the same store — no TrackState.
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        assert!(sched.snapshot_tracks().is_empty(), "restart: no live clock domains");
+
+        let tombstone = sched
+            .delete(&track)
+            .expect("cold delete succeeds against the persisted row")
+            .expect("cold delete reports the tombstone name");
+        assert!(tombstone.starts_with("bass~tombstone-"), "{tombstone}");
+        assert!(
+            db.lock().get_attachment("bass", ctx).unwrap().is_none(),
+            "cold delete purges the persisted attachment row"
+        );
+        assert!(db.lock().get_track("bass").unwrap().is_none());
+
+        // A name with no live clock AND no persisted row refuses, loudly
+        // naming both absences.
+        let err = sched.delete(&TrackId::new("ghost").unwrap()).unwrap_err();
+        assert!(err.contains("no persisted row"), "{err}");
     }
 }
