@@ -478,50 +478,38 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
-- **Metronome clicks burst + starve around musician OODA turns** — RESOLVED
-  for the app-side + wire contributing factors on `feat/beat-epoch`
-  ("Timestamped beat references"), deferred follow-ups below. Original
-  report (Amy heard it live 2026-07-15; measured via `aseqdump -p <app
-  render port>`): bursts of ~10 SIMULTANEOUS ch15/C6 note-ons (0ms apart —
-  one loud blob), ragged intervals, then ~5–6s of click silence, cycling
-  ~10s — while the bass on the same port stays dead-even 500ms. Three
-  contributing factors, explorer-verified:
-  1. **Delivery** (deferred, see below): the per-connection forward task
-     serializes all `block.*` events into one capnp callback stream —
-     BeatSync queues behind a turn's streamed-output flood, then floods out
-     back-to-back.
-  2. **Receipt-time anchoring** (FIXED): `BeatRef` carried no timestamp, so
-     every buffered ref in a flood folded against ONE per-frame `now` and
-     walked the phasor several beats. Fix: `BeatRef.epoch_ns` (sender
-     wallclock at emission, wired capnp→server→client), `BeatRef::
-     backdated_at` (mirrors kernel `apply_clock_estimate`'s u64-ns age math)
-     re-anchors each ref to its own emission instant before folding — a
-     flood now settles at the newest ref's true position instead of walking
-     through the backlog. `WellBeats` (time_well) got a companion liveness
-     split (`observe(ctx, ref, at, received)` + `touch`) so a stale-but-
-     received ref still proves the track alive without folding a position
-     from the past.
-  3. **Click policy** (FIXED): `Metronome::schedule_due` used to replay the
-     whole missed backlog clamped-to-now (the blob) and strand monotonic
-     `next_beat` after a backward walk (the starve). Fix: at most one
-     clamped-to-now click ever (missed beats are missed, not replayed), and
-     an "un-strand" re-seed when `next_beat` drifts more than
-     `horizon_secs*tempo + 2.0` beats ahead of `cur` (sized so a legitimate
-     ≤1-beat `LocalBeat` phase step never trips it) — bounds recovery to
-     ≈1.25s at 120 BPM instead of the measured 5–6s.
-  Immediate relief either way: `enabled = false` (or lower `velocity`) in
-  `/etc/client/metronome.toml`.
-  - **Deferred:** delivery head-of-line lane for `block.beat_sync`
-    (`rpc.rs` per-connection forward task, ~2185-2600) — a dedicated
-    low-latency lane instead of one serialized capnp callback stream shared
-    with turn output.
-  - **Deferred:** turn-overlap gate/tuning — the musician's wakeup divisor
-    (32 beats ≈ 16s default) can be shorter than an actual turn (measured
-    ~18s for gemma4-e4b), so the next iteration can start before the last
-    finishes; no in-flight gate today. Back-dated refs correct perfectly
-    however late, so this is a behavior/tuning question, not correctness.
-  - **Deferred:** `async_broadcast` overflow eviction semantics for
-    buffered refs — not addressed by this fix.
+- **Beat-reference delivery + turn-cadence follow-ups** (deferred from the
+  2026-07-15 timestamped-beat-refs fix, merged `0a39718b` + live-verified;
+  the arc's story is in the devlog — "The beat learns to carry its own
+  clock"):
+  - **Delivery head-of-line lane for `block.beat_sync`** (`rpc.rs`
+    per-connection forward task, ~2185-2600): one serialized capnp callback
+    stream shared with turn output delays refs by seconds during a turn.
+    Back-dating makes that harmless for correctness; a dedicated
+    low-latency lane matters only if reference latency ever does (live
+    tempo ramps mid-turn).
+  - **Turn-overlap gate/tuning**: the musician wakeup divisor (32 beats ≈
+    16s default) can be shorter than a real turn (~18s on gemma4-e4b), so
+    the next OODA iteration spawns before the last finishes — observed
+    live, one spawn per wake. No in-flight gate today. A behavior/tuning
+    question, not correctness.
+  - **`async_broadcast` overflow eviction** can silently drop buffered refs
+    on a slow client (warn only); any surviving ref re-locks the phasor, so
+    low priority.
+
+- **Score/KJ_HEARD injection is unbounded — a long-lived track drowns every
+  musician** (found 2026-07-15 re-establishing the jam): a FRESH musician
+  context attached to the morning-old `bassline` track sent **190k tokens**
+  on its first turn (47 blocks → 12 messages, so single injected blocks are
+  enormous — the track score's committed ABC riding in whole); the original
+  `bassline` context had grown to 467k with auto-compaction failing
+  (`exceed_context_size_error` on every wake — the turn never runs, the
+  track goes silent). Rotation doesn't help: the score outliving the player
+  is the DESIGN (docs/tracks.md), so the band view (`KJ_HEARD` / hydration
+  of score content) must be **windowed** — recent N phrases, not the whole
+  committed log. Decide the window's home (attachment? track policy? the
+  musician rc?) and whether drive-path hydration needs the same cap.
+  Workaround live today: play on a fresh track (`groove`).
 
 - **Tracker station slice 1: score cells on the grid** (2026-07-15, the
   designed-in seam after slice 0 shipped): rows carry note content read

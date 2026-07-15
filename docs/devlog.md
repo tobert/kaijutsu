@@ -807,3 +807,43 @@ gaps in a wall of bright bars) and a header wrapping onto a clipped
 third line. kaibo deepseek then confirmed all six design contracts and
 found the room-re-entry freeze loss neither earlier pass had. Two tracks
 at 120 and 60 BPM scrolling independently on the E wall closed the loop.
+
+## The beat learns to carry its own clock (July 15, afternoon)
+
+Amy's ear caught it during the first tracker-station jam: the metronome
+"bumping a few times, not evenly spaced, like some midi is stuck." A
+timestamped port tap made it concrete — bursts of ten simultaneous C6
+note-ons, then five seconds of silence, cycling — while the bass on the
+same wire stayed metronomic. The asymmetry was the whole diagnosis: bass
+notes ride render cues with a phrase-length lead into the ALSA queue, so
+delivery jitter vanishes; the click follows raw BeatSync references with
+no lead at all.
+
+The kernel was innocent — beats fired on time; ticks are fire-and-forget.
+The references were stalling behind the musician turn's streamed-output
+flood on the single per-connection callback stream, then arriving all at
+once, and the receivers folded every buffered reference against one
+frame-now, walking the phasor beats at a time. The click scheduler then
+amplified the walk: replay-the-backlog on a forward lurch (the blob),
+stranded monotonic next_beat on a backward one (the starve). The repo
+already knew the answer in the other direction: the MIDI-clock-in path
+ships `epoch_ns` with every estimate and back-dates at the consumer. The
+forward path even latched the per-beat wallclock — and dropped it on the
+floor while building the reference.
+
+So the fix was symmetry: `BeatRef.epochNs` on the wire, each reference
+re-anchored to its own emission instant before folding (stale ones
+dropped, the phasor free-running on exact feedforward tempo), a liveness
+split so a backlogged-but-alive track never gets pruned, and a click
+policy worth stating as law — a metronome never stacks clicks and never
+silences past a bounded slack; missed beats are missed. The burst
+behavior had been *encoded in a unit test* as correct; the test was
+rewritten, not preserved. Live verify: 149 consecutive intervals between
+499 and 510 ms straight through the model's turns, where the morning's
+trace showed zero-millisecond blobs and six-second holes.
+
+The jam also surfaced the next lesson, filed for its own arc: the track's
+score outlives every player by design, but injecting the *whole* committed
+score into each wake means a long-lived track eventually drowns every
+musician that sits down at it — a fresh chair at the morning-old track
+opened at 190k tokens. The band view needs a window.
