@@ -51,6 +51,45 @@ pub struct BeatRef {
 /// `beat.rs::apply_clock_estimate`'s staleness drop).
 pub const REF_STALE_MAX: Duration = Duration::from_secs(5);
 
+/// A reference within this age is fresh enough to FOLD (back-date and hand to
+/// [`LocalBeat::observe`] — it corrects phase/tempo). Older than this but
+/// still within [`REF_STALE_MAX`] is TOUCH territory: too old to trust its
+/// phase (folding it would step the beat toward stale data), but not so old
+/// it should be treated as silence — a caller uses it only as a liveness
+/// signal (e.g. resetting a "sender's gone quiet" timer). Distinct from
+/// `REF_STALE_MAX` on purpose: fold-eligibility is a tighter bound than
+/// drop-eligibility (Amy's ask — "trust the local clock, reject stale
+/// adjustments harder").
+pub const REF_FOLD_MAX: Duration = Duration::from_secs(1);
+
+/// What a receiver should do with a [`BeatRef`], given its age. The
+/// three-way split (vs. the old binary fold-or-drop) is the "reject stale
+/// adjustments harder" stance: only a genuinely fresh reference gets to move
+/// the phasor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RefDisposition {
+    /// Fresh enough (age ≤ [`REF_FOLD_MAX`], or unstamped) — fold it into the
+    /// phasor via [`LocalBeat::observe`] at the carried back-dated `Instant`.
+    Fold(Instant),
+    /// Too old to trust for phase (`REF_FOLD_MAX` < age ≤ `REF_STALE_MAX`) but
+    /// not stale enough to ignore outright — liveness only, never `observe`.
+    Touch,
+    /// Older than `REF_STALE_MAX` — discard; the phasor free-runs.
+    Drop,
+}
+
+/// The shared age computation behind [`BeatRef::backdated_at`] and
+/// [`BeatRef::disposition`]: `None` for an unstamped reference (`epoch_ns ==
+/// 0`, e.g. an old peer or a synthetic test `BeatRef`), `Some(age)` otherwise.
+/// `saturating_sub` floors a future-stamped ref (clock skew, or `now_epoch_ns`
+/// sampled a hair before `epoch_ns`) at age zero rather than underflowing.
+pub fn stamp_age(epoch_ns: u64, now_epoch_ns: u64) -> Option<Duration> {
+    if epoch_ns == 0 {
+        return None;
+    }
+    Some(Duration::from_nanos(now_epoch_ns.saturating_sub(epoch_ns)))
+}
+
 impl BeatRef {
     pub fn new(beat: f64, tempo_bps: f64) -> Self {
         Self { beat, tempo_bps, epoch_ns: 0 }
@@ -62,26 +101,40 @@ impl BeatRef {
     ///
     /// - `epoch_ns == 0` (unstamped) → `Some(now)`, the old receipt-time
     ///   behavior.
-    /// - Otherwise the age is computed in the u64-ns wallclock domain
-    ///   (`now_epoch_ns.saturating_sub(epoch_ns)` — a future-stamped ref, e.g.
-    ///   clock skew or `now_epoch_ns` sampled a hair before `epoch_ns`,
-    ///   saturates to age `0` rather than underflowing) and only the *final*
-    ///   subtraction crosses into the `Instant` domain (mirrors
-    ///   `beat.rs::apply_clock_estimate`'s `at = Instant::now() -
-    ///   Duration::from_nanos(age_ns)` — cross-reference, not a refactor of it).
+    /// - Otherwise the age is computed in the u64-ns wallclock domain via
+    ///   [`stamp_age`] (a future-stamped ref saturates to age `0` rather than
+    ///   underflowing) and only the *final* subtraction crosses into the
+    ///   `Instant` domain (mirrors `beat.rs::apply_clock_estimate`'s `at =
+    ///   Instant::now() - Duration::from_nanos(age_ns)` — cross-reference, not
+    ///   a refactor of it).
     /// - Age `> REF_STALE_MAX` → `None`: the ref is too old to trust: the
     ///   caller should drop it (never fold it) and let the phasor free-run.
     pub fn backdated_at(&self, now: Instant, now_epoch_ns: u64) -> Option<Instant> {
-        if self.epoch_ns == 0 {
+        let Some(age) = stamp_age(self.epoch_ns, now_epoch_ns) else {
             return Some(now);
-        }
-        let age_ns = now_epoch_ns.saturating_sub(self.epoch_ns);
-        if age_ns > REF_STALE_MAX.as_nanos() as u64 {
+        };
+        if age > REF_STALE_MAX {
             return None;
         }
         // `checked_sub` guards an early-process `now` too close to program
-        // start for `age_ns` to subtract from; clamp to `now` rather than panic.
-        Some(now.checked_sub(Duration::from_nanos(age_ns)).unwrap_or(now))
+        // start for `age` to subtract from; clamp to `now` rather than panic.
+        Some(now.checked_sub(age).unwrap_or(now))
+    }
+
+    /// The three-way disposition (see [`RefDisposition`]): fresh/unstamped →
+    /// `Fold` at the back-dated instant; `(REF_FOLD_MAX, REF_STALE_MAX]` →
+    /// `Touch` (liveness only); beyond `REF_STALE_MAX` → `Drop`.
+    pub fn disposition(&self, now: Instant, now_epoch_ns: u64) -> RefDisposition {
+        let Some(age) = stamp_age(self.epoch_ns, now_epoch_ns) else {
+            return RefDisposition::Fold(now); // unstamped → fold at receipt time
+        };
+        if age <= REF_FOLD_MAX {
+            RefDisposition::Fold(now.checked_sub(age).unwrap_or(now))
+        } else if age <= REF_STALE_MAX {
+            RefDisposition::Touch
+        } else {
+            RefDisposition::Drop
+        }
     }
 }
 
@@ -114,6 +167,37 @@ pub struct LocalBeat {
     /// Max phase step (beats) a single reference may apply — glitch protection so
     /// an outlier reference nudges the beat only a little, never yanks it.
     max_step: f64,
+    /// Phase-error deadband (beats): once dialed in, a reference whose error
+    /// falls at-or-inside this band applies NO step — the phasor trusts its own
+    /// free-run line over chasing sub-deadband noise (Amy's ask: "once dialed
+    /// in, trust the local clock; reject stale adjustments harder"). Tempo is
+    /// still adopted even when deadbanded — inside the band the phasor already
+    /// IS the local clock, exact feedforward is free and keeps it that way.
+    phase_deadband: f64,
+    /// EMA-smoothed magnitude of the raw phase error each `observe` sees — the
+    /// health signal (mirrors `clockin.rs::ClockEstimator::residual_ns`): near
+    /// zero once locked, shrinking across a persistent offset, otherwise a
+    /// standing nonzero floor (the tuning loop for `phase_deadband`).
+    residual: f64,
+}
+
+/// One `observe` call's report — what happened to the phasor, for the
+/// telemetry rider (Slice 4) and for tests. Not `#[must_use]`: most callers
+/// (the two production consumers, most tests here) only care about the
+/// phasor's resulting state and are free to ignore it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slew {
+    /// The raw phase error (beats) this reference reported, BEFORE the
+    /// deadband/step decision — positive = the phasor was behind.
+    pub error_beats: f64,
+    /// The step actually applied to `ref_beat`. `0.0` when deadbanded.
+    pub step_beats: f64,
+    /// Whether `|error_beats|` fell at-or-inside `phase_deadband` (so
+    /// `step_beats == 0.0` and position held the free-run line).
+    pub deadbanded: bool,
+    /// The EMA residual AFTER folding this observation in — see
+    /// [`LocalBeat::residual_beats`].
+    pub residual_beats: f64,
 }
 
 impl LocalBeat {
@@ -121,6 +205,14 @@ impl LocalBeat {
     /// one-beat step (startup uses [`new`](Self::new), which locks fully).
     const DEFAULT_PHASE_GAIN: f64 = 0.20;
     const DEFAULT_MAX_STEP: f64 = 1.0;
+    /// Default deadband (beats) — ≈10 ms at 120 BPM. Amy-tunable: the phasor
+    /// slew metrics (Slice 4) are the empirical loop that dials this in from
+    /// what's actually observed on the wire, not a guess held forever.
+    const DEFAULT_PHASE_DEADBAND: f64 = 0.02;
+    /// EMA weight for the residual health signal. Matches `clockin.rs`'s
+    /// scale of "smooth over roughly a handful of observations" rather than
+    /// reacting to any single one.
+    const RESIDUAL_EMA_ALPHA: f64 = 0.25;
 
     /// Anchor a fresh phasor on its first reference (an instant lock — startup
     /// and post-gap re-entry snap to the reference; only *ongoing* corrections
@@ -132,6 +224,8 @@ impl LocalBeat {
             tempo_bps: initial.tempo_bps,
             phase_gain: Self::DEFAULT_PHASE_GAIN,
             max_step: Self::DEFAULT_MAX_STEP,
+            phase_deadband: Self::DEFAULT_PHASE_DEADBAND,
+            residual: 0.0,
         }
     }
 
@@ -142,9 +236,21 @@ impl LocalBeat {
         self
     }
 
+    /// Override the phase-error deadband (beats). Chainable.
+    pub fn with_deadband(mut self, phase_deadband: f64) -> Self {
+        self.phase_deadband = phase_deadband;
+        self
+    }
+
     /// The current extrapolation tempo (beats/sec) — the last reference's tempo.
     pub fn tempo_bps(&self) -> f64 {
         self.tempo_bps
+    }
+
+    /// The EMA-smoothed phase-error magnitude — see the [`Slew::residual_beats`]
+    /// doc on the struct field this mirrors.
+    pub fn residual_beats(&self) -> f64 {
+        self.residual
     }
 
     /// The fractional beat position at local instant `now` (free-run
@@ -157,17 +263,27 @@ impl LocalBeat {
 
     /// Ingest a reference received at local instant `at`: adopt its (exact) tempo
     /// as feedforward — **no persistent rate bias** — and nudge *phase* a bounded
-    /// fraction of the way toward it. Re-anchoring at `at` keeps future
-    /// extrapolation exact; the small phase step (not a rate change) is what locks
-    /// the beat without sloshing.
-    pub fn observe(&mut self, r: BeatRef, at: Instant) {
+    /// fraction of the way toward it, UNLESS the error falls inside the deadband
+    /// (then no step: position holds the free-run line, tempo still adopts).
+    /// Re-anchoring at `at` keeps future extrapolation exact; the small phase
+    /// step (not a rate change) is what locks the beat without sloshing.
+    pub fn observe(&mut self, r: BeatRef, at: Instant) -> Slew {
         let current = self.position(at);
         let error = r.beat - current; // beats we're behind (+) or ahead (−)
-        let step = (self.phase_gain * error).clamp(-self.max_step, self.max_step);
+        let deadbanded = error.abs() <= self.phase_deadband;
+        let step = if deadbanded {
+            0.0
+        } else {
+            (self.phase_gain * error).clamp(-self.max_step, self.max_step)
+        };
 
         self.ref_beat = current + step;
         self.ref_at = at;
         self.tempo_bps = r.tempo_bps; // feedforward — the loop cannot wind up
+        self.residual = Self::RESIDUAL_EMA_ALPHA * error.abs()
+            + (1.0 - Self::RESIDUAL_EMA_ALPHA) * self.residual;
+
+        Slew { error_beats: error, step_beats: step, deadbanded, residual_beats: self.residual }
     }
 }
 
@@ -346,6 +462,102 @@ mod tests {
         assert!(prev_error < 0.05, "converged close, residual {prev_error}");
     }
 
+    // ── Slice 3 (phase-align): the deadband + disposition ladder ────────────
+
+    #[test]
+    fn deadband_holds_position_under_small_jitter() {
+        let t0 = Instant::now();
+        let make = || LocalBeat::new(BeatRef::new(0.0, 2.0), t0).with_tuning(0.25, 1.0);
+        let t1 = t0 + Duration::from_secs(1); // free-run reads 2.0
+
+        // +0.015 beats: inside the default 0.02 deadband.
+        let mut ahead = make();
+        let slew = ahead.observe(BeatRef::new(2.015, 2.0), t1);
+        assert!(slew.deadbanded, "0.015 beat error is within the 0.02 deadband");
+        assert_eq!(slew.step_beats, 0.0, "no step applied inside the deadband");
+        assert!((slew.error_beats - 0.015).abs() < EPS, "raw error still reported");
+        assert!((ahead.position(t1) - 2.0).abs() < EPS, "position holds the free-run line");
+        assert!((ahead.tempo_bps() - 2.0).abs() < EPS, "tempo still adopted inside the deadband");
+
+        // -0.015 beats: same on the other side of zero.
+        let mut behind = make();
+        let slew = behind.observe(BeatRef::new(1.985, 2.0), t1);
+        assert!(slew.deadbanded, "-0.015 beat error is within the 0.02 deadband");
+        assert_eq!(slew.step_beats, 0.0);
+        assert!((behind.position(t1) - 2.0).abs() < EPS, "position holds on the other side too");
+    }
+
+    #[test]
+    fn large_error_still_steps_bounded_beyond_the_deadband() {
+        let t0 = Instant::now();
+        let mut beat = LocalBeat::new(BeatRef::new(0.0, 2.0), t0).with_tuning(0.25, 1.0);
+        let t1 = t0 + Duration::from_secs(1); // reads 2.0
+        // A wild reference (100 beats ahead) — well outside the deadband, and
+        // the gain × error would be a 20-beat step; the max_step cap still wins.
+        let slew = beat.observe(BeatRef::new(102.0, 2.0), t1);
+        assert!(!slew.deadbanded, "a 100-beat error is nowhere near the deadband");
+        assert!((slew.step_beats - 1.0).abs() < EPS, "step capped at max_step, got {}", slew.step_beats);
+        assert!((beat.position(t1) - 3.0).abs() < EPS);
+        assert!((beat.tempo_bps() - 2.0).abs() < EPS, "tempo still exact (feedforward)");
+    }
+
+    #[test]
+    fn disposition_ladder_fold_touch_drop() {
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 10_000_000_000;
+
+        // 0.5s old (≤ REF_FOLD_MAX) → Fold.
+        let fresh = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - 500_000_000 };
+        match fresh.disposition(now, now_epoch_ns) {
+            RefDisposition::Fold(at) => assert!(at < now, "backdated into the past"),
+            other => panic!("expected Fold for a 0.5s-old ref, got {other:?}"),
+        }
+
+        // 2s old (REF_FOLD_MAX, REF_STALE_MAX] → Touch.
+        let stale_ish = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - 2_000_000_000 };
+        assert_eq!(stale_ish.disposition(now, now_epoch_ns), RefDisposition::Touch);
+
+        // 6s old (> REF_STALE_MAX) → Drop.
+        let ancient = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - 6_000_000_000 };
+        assert_eq!(ancient.disposition(now, now_epoch_ns), RefDisposition::Drop);
+
+        // Unstamped → Fold at receipt time (the old fallback behavior).
+        let unstamped = BeatRef::new(1.0, 2.0);
+        assert_eq!(unstamped.disposition(now, now_epoch_ns), RefDisposition::Fold(now));
+    }
+
+    #[test]
+    fn residual_decays_when_locked() {
+        // The same persistent-offset scenario as
+        // `a_persistent_offset_converges_over_successive_references`: the
+        // phasor starts consistently behind (tempo 1.8 vs a 2.0-bps truth) and
+        // each reference shrinks the error. The EMA residual has a one-phrase
+        // warm-up bump (it starts at 0, so the first couple of samples pull it
+        // UP before the shrinking error pulls it back down) — track that it
+        // decays monotonically once past that warm-up, and settles small.
+        let t0 = Instant::now();
+        let mut beat = LocalBeat::new(BeatRef::new(0.0, 1.8), t0).with_tuning(0.5, 1.0);
+        let mut residuals = Vec::new();
+        for phrase in 1..=8 {
+            let at = t0 + Duration::from_secs(phrase);
+            let truth = 2.0 * phrase as f64;
+            let slew = beat.observe(BeatRef::new(truth, 2.0), at);
+            residuals.push(slew.residual_beats);
+        }
+        // Past the warm-up (index 1, phrase 2 — the EMA's peak), residual must
+        // never grow again.
+        for w in residuals[1..].windows(2) {
+            assert!(
+                w[1] <= w[0] + EPS,
+                "residual grew after warm-up: {:?} → {}",
+                w[0],
+                w[1]
+            );
+        }
+        let last = *residuals.last().unwrap();
+        assert!(last < 0.05, "residual settles small once locked, got {last}");
+    }
+
     #[test]
     fn beat_onsets_are_half_open_and_never_double_fire() {
         assert_eq!(beat_onsets_in(0.9, 1.2), vec![1]);
@@ -465,7 +677,9 @@ mod tests {
             let r = BeatRef { beat: b, tempo_bps: tempo, epoch_ns: now_epoch_ns - age_ns };
             let at = r.backdated_at(now, now_epoch_ns).expect("all within staleness window");
             match &mut beat {
-                Some(lb) => lb.observe(r, at),
+                Some(lb) => {
+                    lb.observe(r, at);
+                }
                 None => beat = Some(LocalBeat::new(r, at)),
             }
         }

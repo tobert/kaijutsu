@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use kaijutsu_audio::{BeatRef, LocalBeat, RENDER_FLUSH_MIME};
+use kaijutsu_audio::{BeatRef, LocalBeat, RefDisposition, Slew, RENDER_FLUSH_MIME};
 use kaijutsu_client::ServerEvent;
 use kaijutsu_crdt::BlockId;
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role, Status};
@@ -304,17 +304,29 @@ impl WellBeats {
     /// `prune_stale` kill a phasor that is, in wall-clock reality, still
     /// live (a sustained backlog of old-but-not-stale refs proves the track
     /// is alive even while every individual ref reads a bit behind).
-    pub fn observe(&mut self, ctx: ContextId, reference: BeatRef, at: Instant, received: Instant) {
+    /// Returns the [`Slew`] report on an ongoing correction (the Slice 4
+    /// telemetry rider records it, `consumer=time_well`); `None` on the
+    /// anchoring first observe for this context (no prior phasor state to
+    /// report a slew against).
+    pub fn observe(
+        &mut self,
+        ctx: ContextId,
+        reference: BeatRef,
+        at: Instant,
+        received: Instant,
+    ) -> Option<Slew> {
         match self.phasors.get_mut(&ctx) {
             Some(p) => {
-                p.beat.observe(reference, at);
+                let slew = p.beat.observe(reference, at);
                 p.last_ref = received;
+                Some(slew)
             }
             None => {
                 self.phasors.insert(
                     ctx,
                     Phasor { beat: LocalBeat::new(reference, at), last_ref: received },
                 );
+                None
             }
         }
     }
@@ -411,12 +423,15 @@ impl WellBeats {
 /// (every screen) so the well opens warm; both resources are bounded
 /// ([`TAIL_CONTEXT_CAP`], one phasor per rolling track).
 ///
-/// Each `BeatSync` folds at its own back-dated emission instant
-/// (`BeatRef::backdated_at`), not this frame's shared `now_inst` — the same
-/// flood-resistance fix as `metronome::ingest_beat_signals`. A stale ref
-/// (age > `REF_STALE_MAX`) still proves the track alive: it bumps the
-/// phasor's liveness clock via [`WellBeats::touch`] without folding a beat
-/// position from the past.
+/// Each `BeatSync` is routed by its [`RefDisposition`]: `Fold` (age ≤
+/// `REF_FOLD_MAX`, or unstamped) folds at its own back-dated emission instant
+/// — not this frame's shared `now_inst` — the same flood-resistance fix as
+/// `metronome::ingest_beat_signals`. `Touch` and `Drop` (older than
+/// `REF_FOLD_MAX`, whether or not past `REF_STALE_MAX`) both still prove the
+/// track alive: either bumps the phasor's liveness clock via
+/// [`WellBeats::touch`] without folding a beat position from the past — this
+/// is the one place `Touch` and `Drop` behave alike, because `WellBeats`
+/// (unlike the single-phasor metronome) HAS a liveness clock to bump.
 pub fn ingest_live_events(
     mut events: MessageReader<ServerEventMessage>,
     mut tails: ResMut<ContextTails>,
@@ -440,9 +455,19 @@ pub fn ingest_live_events(
                 tails.resolve(context_id, *block_id, *status);
             }
             ServerEvent::BeatSync { context_id, beat_ref } => {
-                match beat_ref.backdated_at(now_inst, now_epoch_ns) {
-                    Some(at) => beats.observe(*context_id, *beat_ref, at, now_inst),
-                    None => beats.touch(context_id, now_inst),
+                match beat_ref.disposition(now_inst, now_epoch_ns) {
+                    RefDisposition::Fold(at) => {
+                        if let Some(slew) = beats.observe(*context_id, *beat_ref, at, now_inst) {
+                            kaijutsu_telemetry::record_phasor_slew(
+                                "time_well",
+                                slew.error_beats,
+                                slew.deadbanded,
+                            );
+                        }
+                    }
+                    RefDisposition::Touch | RefDisposition::Drop => {
+                        beats.touch(context_id, now_inst)
+                    }
                 }
             }
             ServerEvent::RenderCue { context_id, cue } if cue.mime == RENDER_FLUSH_MIME => {
@@ -914,6 +939,7 @@ mod tests {
                 mime: RENDER_FLUSH_MIME.into(),
                 payload: CuePayload::Inline(vec![]),
                 lead: Duration::ZERO,
+                epoch_ns: 0,
             },
         }));
         app.update();
@@ -972,6 +998,55 @@ mod tests {
         assert!(
             pos_after < pos_before + 1.0,
             "stale ref must not fold: pos_before={pos_before} pos_after={pos_after}"
+        );
+    }
+
+    /// A `BeatSync` in the `Touch` band (older than `REF_FOLD_MAX` but within
+    /// `REF_STALE_MAX`) must ALSO touch, not fold — the middle rung of the
+    /// disposition ladder that `Drop` alone (the test above) doesn't exercise.
+    /// `WellBeats` treats `Touch` and `Drop` alike (unlike the metronome,
+    /// which has no liveness clock to bump for either).
+    #[test]
+    fn a_touch_band_beat_sync_also_touches_without_folding() {
+        let mut app = App::new();
+        app.add_plugins(bevy::time::TimePlugin)
+            .init_resource::<ContextTails>()
+            .init_resource::<WellBeats>()
+            .add_message::<ServerEventMessage>()
+            .add_systems(Update, ingest_live_events);
+
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+            context_id: ctx(6),
+            beat_ref: BeatRef::new(2.0, 2.0),
+        }));
+        app.update();
+        let pos_before = app
+            .world()
+            .resource::<WellBeats>()
+            .beat_position(&ctx(6), Instant::now())
+            .expect("anchored");
+
+        // 2 s old: past REF_FOLD_MAX (1s), within REF_STALE_MAX (5s) — Touch.
+        let touch_epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64
+            - 2_000_000_000;
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+            context_id: ctx(6),
+            beat_ref: kaijutsu_audio::BeatRef { beat: 999.0, tempo_bps: 2.0, epoch_ns: touch_epoch_ns },
+        }));
+        app.update();
+
+        assert!(app.world().resource::<WellBeats>().any_rolling(), "Touch keeps it alive too");
+        let pos_after = app
+            .world()
+            .resource::<WellBeats>()
+            .beat_position(&ctx(6), Instant::now())
+            .expect("still anchored");
+        assert!(
+            pos_after < pos_before + 1.0,
+            "a Touch-band ref must not fold either: pos_before={pos_before} pos_after={pos_after}"
         );
     }
 

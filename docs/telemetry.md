@@ -223,6 +223,12 @@ choice (no context/trace ids as metric attributes).
 |--------|------|------------|--------|
 | `gen_ai.client.token.usage` | histogram `{token}` | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.token.type` (input/output/cache_read/cache_creation) | `record_llm_usage()` at `StreamEvent::Done` |
 | `gen_ai.client.operation.count` | counter `{operation}` | `gen_ai.system`, `gen_ai.request.model` | same |
+| `kaijutsu.beat.fired` | counter `{beat}` | `track` | `beat.rs::process_track` (server) |
+| `kaijutsu.beat.grid_reseed` | counter `{reseed}` | `track` | `beat.rs::fire_due`'s re-seed branch — the grid gave up on bounded catch-up |
+| `kaijutsu.beat.sync_published` | counter `{reference}` | — | `beat.rs::publish_beat_sync` post-gate |
+| `kaijutsu.metronome.click` | counter `{click}` | — | `metronome.rs::click_on_beat` (app) |
+| `kaijutsu.phasor.slew_beats` | histogram `{beat}` | `consumer` (metronome/time_well), `outcome` (stepped/deadband) | `metronome.rs`/`live.rs` `Fold` arm — the phase-align tuning loop for `DEFAULT_PHASE_DEADBAND`/`REF_FOLD_MAX` |
+| `kaijutsu.render_cue.stale_dropped` | counter `{cue}` | — | `midi.rs::backdate_events` reject branch (app) |
 
 Naming follows OTel GenAI semantic conventions (`gen_ai.*`). This is
 **intentionally distinct** from the kaijutsu `llm.*` span fields — spans and

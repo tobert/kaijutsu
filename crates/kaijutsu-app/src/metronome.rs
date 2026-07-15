@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
-use kaijutsu_audio::{LocalBeat, RENDER_FLUSH_MIME};
+use kaijutsu_audio::{LocalBeat, RefDisposition, Slew, RENDER_FLUSH_MIME};
 use kaijutsu_client::{ConnectionStatus, ServerEvent};
 
 use crate::connection::actor_plugin::{ConnectionStatusMessage, ServerEventMessage};
@@ -99,10 +99,16 @@ impl Metronome {
     /// Fold a reference into the phasor (creating it on the first one). `next_beat`
     /// is left untouched — it seeds lazily from the phasor in [`schedule_due`] and
     /// stays monotonic across corrections (which keep position continuous).
-    fn observe(&mut self, reference: kaijutsu_audio::BeatRef, at: Instant) {
+    /// Returns the [`Slew`] report on an ongoing correction (the Slice 4
+    /// telemetry rider records it); `None` on the anchoring first observe
+    /// (there's no prior phasor state to report a slew against).
+    fn observe(&mut self, reference: kaijutsu_audio::BeatRef, at: Instant) -> Option<Slew> {
         match &mut self.beat {
-            Some(beat) => beat.observe(reference, at),
-            None => self.beat = Some(LocalBeat::new(reference, at)),
+            Some(beat) => Some(beat.observe(reference, at)),
+            None => {
+                self.beat = Some(LocalBeat::new(reference, at));
+                None
+            }
         }
     }
 
@@ -188,14 +194,18 @@ impl Metronome {
 }
 
 /// Drive the phasor from the transport signals on the event stream: fold every
-/// `BeatSync` reference in, back-dated to its own emission instant
-/// (`BeatRef::backdated_at`) rather than anchored at one shared frame `now` —
-/// a delivery flood (several refs queued behind a turn's streamed output,
-/// arriving in one frame) would otherwise walk the phasor several beats at
-/// once (the burst). A stamp older than `REF_STALE_MAX` is dropped instead of
-/// folded — the phasor free-runs on its last feedforward tempo rather than
-/// snapping backward. **Reset on a `RENDER_FLUSH` cue** (stop/pause) so the
-/// metronome halts instead of free-running past the end of the take.
+/// `BeatSync` reference in per its [`RefDisposition`] — `Fold` (fresh, age ≤
+/// `REF_FOLD_MAX`, or unstamped) is back-dated to its own emission instant and
+/// `observe`d (a delivery flood — several refs queued behind a turn's
+/// streamed output, arriving in one frame — would otherwise walk the phasor
+/// several beats at once if all folded at one shared frame `now`, the burst);
+/// `Touch` (older, but within `REF_STALE_MAX`) is a no-op here — the
+/// metronome is a single phasor with no separate liveness clock to bump, so
+/// there's nothing to touch, just a debug trace; `Drop` (stale past
+/// `REF_STALE_MAX`) is also a debug no-op — the phasor free-runs on its last
+/// feedforward tempo rather than snapping backward. **Reset on a
+/// `RENDER_FLUSH` cue** (stop/pause) so the metronome halts instead of
+/// free-running past the end of the take.
 fn ingest_beat_signals(
     mut messages: MessageReader<ServerEventMessage>,
     mut metronome: ResMut<Metronome>,
@@ -207,9 +217,25 @@ fn ingest_beat_signals(
         .unwrap_or(0);
     for ServerEventMessage(event) in messages.read() {
         match event {
-            ServerEvent::BeatSync { beat_ref, .. } => match beat_ref.backdated_at(now, now_epoch_ns) {
-                Some(at) => metronome.observe(*beat_ref, at),
-                None => log::debug!("metronome: dropped a stale beat ref"),
+            ServerEvent::BeatSync { beat_ref, .. } => match beat_ref.disposition(now, now_epoch_ns)
+            {
+                RefDisposition::Fold(at) => {
+                    if let Some(slew) = metronome.observe(*beat_ref, at) {
+                        kaijutsu_telemetry::record_phasor_slew(
+                            "metronome",
+                            slew.error_beats,
+                            slew.deadbanded,
+                        );
+                    }
+                }
+                RefDisposition::Touch => {
+                    log::debug!(
+                        "metronome: touch-only beat ref (single-phasor has no liveness clock)"
+                    );
+                }
+                RefDisposition::Drop => {
+                    log::debug!("metronome: dropped a stale beat ref");
+                }
             },
             ServerEvent::RenderCue { cue, .. } if cue.mime == RENDER_FLUSH_MIME => {
                 metronome.reset()
@@ -255,6 +281,7 @@ fn click_on_beat(
     }
     for offset in metronome.schedule_due(Instant::now(), SCHEDULE_HORIZON) {
         sink.click_at(click.note, click.channel, click.velocity, click.gate_ms, offset);
+        kaijutsu_telemetry::record_metronome_click();
     }
 }
 
@@ -503,6 +530,60 @@ mod tests {
         assert!(due.len() <= 1, "no burst from the flood: {due:?}");
     }
 
+    /// A `BeatSync` in the `Touch` band (older than `REF_FOLD_MAX` but within
+    /// `REF_STALE_MAX`) must NOT move the phasor — the metronome is a single
+    /// phasor with no separate liveness clock, so a `Touch` disposition is a
+    /// pure no-op here (the debug trace, nothing else). This is the harder
+    /// half of "reject stale adjustments harder": a ref that used to fold
+    /// (anything under the old 5s `REF_STALE_MAX`) now only folds within a
+    /// tighter 1s window.
+    #[test]
+    fn a_touch_disposition_ref_does_not_move_the_phasor() {
+        use kaijutsu_types::ContextId;
+
+        let mut app = App::new();
+        app.init_resource::<Metronome>()
+            .add_message::<ServerEventMessage>()
+            .add_systems(Update, ingest_beat_signals);
+
+        // Anchor the phasor first with a fresh (Fold) reference.
+        let now_epoch_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64;
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+            context_id: ContextId::new(),
+            beat_ref: BeatRef { beat: 0.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns },
+        }));
+        app.update();
+        let anchored_pos = {
+            let m = app.world().resource::<Metronome>();
+            m.beat.as_ref().expect("anchored").position(Instant::now())
+        };
+
+        // A ref 2s old — past REF_FOLD_MAX (1s), within REF_STALE_MAX (5s) —
+        // reports a wildly different beat. If it folded, the phasor would
+        // step toward 999.0; it must not.
+        app.world_mut().write_message(ServerEventMessage(ServerEvent::BeatSync {
+            context_id: ContextId::new(),
+            beat_ref: BeatRef {
+                beat: 999.0,
+                tempo_bps: 2.0,
+                epoch_ns: now_epoch_ns.saturating_sub(2_000_000_000),
+            },
+        }));
+        app.update();
+
+        let after_pos = {
+            let m = app.world().resource::<Metronome>();
+            m.beat.as_ref().expect("still anchored").position(Instant::now())
+        };
+        assert!(
+            (after_pos - anchored_pos).abs() < 1.0,
+            "a Touch-band ref must not step the phasor toward its beat: {anchored_pos} → {after_pos}"
+        );
+    }
+
     /// A transport flush (stop/pause) halts the metronome — otherwise the phasor
     /// free-runs past the end of the take and keeps clicking (the "note still
     /// playing after stop" bug). After a flush the phasor is dropped, so
@@ -521,7 +602,12 @@ mod tests {
         // The flush arrives on the same stream as a RenderCue.
         let flush = ServerEvent::RenderCue {
             context_id: ContextId::new(),
-            cue: RenderCue { mime: RENDER_FLUSH_MIME.into(), payload: CuePayload::Inline(vec![]), lead: Duration::ZERO },
+            cue: RenderCue {
+                mime: RENDER_FLUSH_MIME.into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+            },
         };
         let mut app = App::new();
         app.insert_resource(m)

@@ -25,7 +25,10 @@ pub mod clockin;
 pub use clockin::{ClockEstimate, ClockEstimator, ClockEvent, PULSES_PER_BEAT};
 
 pub mod timebase;
-pub use timebase::{beat_onsets_in, BeatRef, LocalBeat};
+pub use timebase::{
+    beat_onsets_in, stamp_age, BeatRef, LocalBeat, RefDisposition, Slew, REF_FOLD_MAX,
+    REF_STALE_MAX,
+};
 
 /// A committed ABC score, rendered to MIDI at the sink (`docs/midi.md` "Render
 /// is a wire cue"). The payload is the ABC text; a render sink that can render
@@ -74,6 +77,17 @@ pub struct RenderCue {
     /// *relative* `Duration` because a process-local `Instant` can't cross the
     /// wire; `Duration::ZERO` == play now (the old `PlayAudio` semantics).
     pub lead: Duration,
+    /// Sender wallclock (ns since UNIX_EPOCH) at emission — mirrors
+    /// `timebase::BeatRef::epoch_ns` (phase-align Slice 2). `0` = unstamped
+    /// (an old peer, or a synthetic cue with no meaningful emission instant,
+    /// e.g. a `RENDER_FLUSH` directive or `now_inline`). A sink back-dates
+    /// `lead` by however old the cue reads on receipt (`age = now_epoch_ns -
+    /// epoch_ns`) — a per-cue transfer-latency jump can't walk the render out
+    /// of phase with the click, the same fix `BeatRef` got in Slice 3.
+    /// `#[serde(default)]` so an old wire payload without this field still
+    /// deserializes (additive schema evolution; wire-only, no CBOR at rest).
+    #[serde(default)]
+    pub epoch_ns: u64,
 }
 
 /// The two forms a cue's content takes on the wire: small content inline, or a
@@ -92,6 +106,7 @@ impl std::fmt::Debug for RenderCue {
         f.debug_struct("RenderCue")
             .field("mime", &self.mime)
             .field("lead", &self.lead)
+            .field("epoch_ns", &self.epoch_ns)
             .field("payload", &self.payload)
             .finish()
     }
@@ -117,6 +132,7 @@ impl RenderCue {
             mime: mime.into(),
             payload: CuePayload::Inline(bytes),
             lead: Duration::ZERO,
+            epoch_ns: 0,
         }
     }
 }
@@ -237,6 +253,7 @@ mod tests {
             mime: "audio/wav".into(),
             payload: CuePayload::Inline(vec![1, 2, 3, 4, 5]),
             lead: Duration::from_millis(250),
+            epoch_ns: 0,
         };
         let s = format!("{cue:?}");
         assert!(s.contains("[5 bytes]"), "debug shows the byte count: {s}");
@@ -248,6 +265,7 @@ mod tests {
             mime: "audio/flac".into(),
             payload: CuePayload::Cas(ContentHash::from_data(b"x")),
             lead: Duration::ZERO,
+            epoch_ns: 0,
         };
         let cs = format!("{cas:?}");
         assert!(cs.contains("Cas"), "cas debug names the variant: {cs}");
@@ -260,11 +278,12 @@ mod tests {
         let back: AudioFormatHint = serde_json::from_str(&json).expect("deserialize format");
         assert_eq!(back, format);
 
-        // Inline payload + non-zero lead round-trips whole.
+        // Inline payload + non-zero lead + a stamped epoch round-trips whole.
         let cue = RenderCue {
             mime: "audio/wav".into(),
             payload: CuePayload::Inline(vec![1, 2, 3]),
             lead: Duration::from_millis(500),
+            epoch_ns: 123_456_789,
         };
         let json = serde_json::to_string(&cue).expect("serialize RenderCue");
         let back: RenderCue = serde_json::from_str(&json).expect("deserialize RenderCue");
@@ -275,10 +294,36 @@ mod tests {
             mime: "application/vnd.kaijutsu.clip+json".into(),
             payload: CuePayload::Cas(ContentHash::from_data(b"clip")),
             lead: Duration::ZERO,
+            epoch_ns: 0,
         };
         let json = serde_json::to_string(&cas).expect("serialize cas cue");
         let back: RenderCue = serde_json::from_str(&json).expect("deserialize cas cue");
         assert_eq!(back, cas);
+    }
+
+    /// An old wire payload (pre-`epoch_ns` peer) has no `epoch_ns` key at all —
+    /// `#[serde(default)]` must fill it with `0` (unstamped), the same
+    /// additive-schema-evolution contract `BeatRef` got in Slice 3, not fail to
+    /// parse. Built by round-tripping a real cue through `serde_json::Value`
+    /// and stripping the key, rather than hand-writing the JSON shape, so the
+    /// test doesn't depend on `Duration`'s exact serde representation.
+    #[test]
+    fn render_cue_without_epoch_ns_field_deserializes_to_zero() {
+        let cue = RenderCue {
+            mime: "audio/wav".into(),
+            payload: CuePayload::Inline(vec![1, 2, 3]),
+            lead: Duration::from_millis(500),
+            epoch_ns: 999,
+        };
+        let mut value: serde_json::Value =
+            serde_json::to_value(&cue).expect("serialize to Value");
+        value.as_object_mut().expect("cue is a JSON object").remove("epoch_ns");
+        let old_payload = serde_json::to_string(&value).expect("re-serialize the stripped value");
+
+        let back: RenderCue = serde_json::from_str(&old_payload).expect("old payload still parses");
+        assert_eq!(back.epoch_ns, 0, "missing field defaults to unstamped");
+        assert_eq!(back.mime, cue.mime);
+        assert_eq!(back.lead, cue.lead);
     }
 
     /// Object-safety + `&self`/interior-mutability shape check: a test-only
@@ -307,6 +352,7 @@ mod tests {
             mime: "audio/mpeg".into(),
             payload: CuePayload::Cas(ContentHash::from_data(b"sample")),
             lead: Duration::ZERO,
+            epoch_ns: 0,
         })
         .expect("emit should succeed");
 

@@ -965,6 +965,7 @@ fn parse_render_cue(
 ) -> Result<kaijutsu_audio::RenderCue, capnp::Error> {
     let mime = reader.get_mime()?.to_str()?.to_string();
     let lead = std::time::Duration::from_nanos(reader.get_lead_nanos());
+    let epoch_ns = reader.get_epoch_ns();
     let payload = match reader.which()? {
         crate::kaijutsu_capnp::render_cue::Inline(bytes) => {
             kaijutsu_audio::CuePayload::Inline(bytes?.to_vec())
@@ -976,7 +977,7 @@ fn parse_render_cue(
             kaijutsu_audio::CuePayload::Cas(hash)
         }
     };
-    Ok(kaijutsu_audio::RenderCue { mime, payload, lead })
+    Ok(kaijutsu_audio::RenderCue { mime, payload, lead, epoch_ns })
 }
 
 // ============================================================================

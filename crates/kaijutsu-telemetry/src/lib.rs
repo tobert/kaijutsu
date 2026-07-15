@@ -24,7 +24,11 @@
 pub mod metrics;
 mod otel;
 
-pub use metrics::{TokenCounts, record_cwd_restore_failed, record_llm_usage};
+pub use metrics::{
+    TokenCounts, record_beat_fired, record_beat_sync_published, record_cwd_restore_failed,
+    record_grid_reseed, record_llm_usage, record_metronome_click, record_phasor_slew,
+    record_stale_cue_dropped,
+};
 pub use otel::{OtelGuard, otel_layer};
 
 /// Check whether OTel export should be enabled.
