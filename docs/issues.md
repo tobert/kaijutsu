@@ -37,6 +37,19 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
   drops KjResult data or it was never wired; find which and either wire it
   through or fix the tool description that promises it.
 
+## MIDI device profiles + device contexts (seeded 2026-07-15, `docs/midi-next.md`)
+
+Design direction captured in `docs/midi-next.md` (living doc): CRDT-owned
+device profiles under `/etc/midi/devices/` (prose+data hybrid; settings vs
+capabilities ground-truth split), track bindings as *device.role* not raw
+channel ints, rc-injected device contexts as side channels (profile as skill
+body + narrow loadout + cheap model), `kj midi` emit verbs + provenance-tagged
+`/run/midi/<device>` state, SysEx via a sink `exchange()` method (transfer
+job shape deferred). Nothing in code yet. Slice order in the doc; first
+consumer: Minibrute on the laptop app, then the per-track channel-routing fix
+(this file → Hyoushigi/Musician area; `docs/chameleon.md` open items) built
+on profile vocabulary.
+
 ## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
 
 `cargo clippy -p kaijutsu-app --all-targets` currently fails to compile the

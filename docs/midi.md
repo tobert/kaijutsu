@@ -474,6 +474,9 @@ real KSP / loft node in later.
   track/lane (drums → ch 9). Full write-up + fix sites: `docs/chameleon.md`
   "Open items" (per-track MIDI channel; per-track render-cue routing). Same
   routing gap as `docs/pcm.md` "Distributed listening" — solve together.
+  **Channel-assignment vocabulary now lives in `docs/midi-next.md`** (device
+  profiles + bindings, 2026-07-15): a track binds to a *device.role* resolved
+  through a profile, not a raw channel int — build the fix on that.
 
 Resolved since the design round (kept here so old readers don't re-open them):
 the **`ClockSource` trait surface** landed 2026-06-30 with `tracks.md` Stage 3 M1
