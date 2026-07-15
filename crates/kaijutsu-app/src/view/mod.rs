@@ -30,6 +30,7 @@ pub mod scroll;
 pub mod submit;
 pub mod sync;
 pub mod time_well;
+pub mod tracker;
 pub mod vello_rasterizer;
 pub mod ui_rtt;
 
