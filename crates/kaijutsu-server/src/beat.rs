@@ -1697,14 +1697,21 @@ impl BeatScheduler {
     /// the tempo is `1 / period`. Sink-dependent + gated like
     /// [`publish_render_cues`](Self::publish_render_cues): with no subscriber on
     /// `block.beat_sync` (a headless kernel, no sink attached) this emits nothing.
+    ///
+    /// Stamps `epoch_ns` from `last_epoch_ns` — the wallclock this beat's
+    /// [`process_track`](Self::process_track) latched at :1227, BEFORE this call
+    /// (line :1249) — so it is never 0 by the time a beat is publishable. That's
+    /// the jittery *actual* wakeup wallclock, not a scheduled one, which is fine:
+    /// the phasor's `phase_gain` low-pass exists to filter exactly that kind of
+    /// jitter (`timebase.rs` doc comment).
     fn publish_beat_sync(&self, track_id: &TrackId, playhead: Tick) {
         if self.kernel.block_flows().topic_subscribers("block.beat_sync") == 0 {
             return;
         }
-        let Some((period, score_ctx)) = self
+        let Some((period, score_ctx, epoch_ns)) = self
             .tracks
             .get(track_id)
-            .map(|t| (t.clock.period(), t.score_context))
+            .map(|t| (t.clock.period(), t.score_context, t.last_epoch_ns))
         else {
             return;
         };
@@ -1715,6 +1722,7 @@ impl BeatScheduler {
         let beat_ref = kaijutsu_audio::BeatRef {
             beat: playhead.get() as f64,
             tempo_bps: 1.0 / secs,
+            epoch_ns,
         };
         self.kernel
             .block_flows()

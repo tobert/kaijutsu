@@ -472,32 +472,50 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
-- **Metronome clicks burst + starve around musician OODA turns** (Amy heard
-  it live 2026-07-15; measured via `aseqdump -p <app render port>`): bursts
-  of ~10 SIMULTANEOUS ch15/C6 note-ons (0ms apart — one loud blob), ragged
-  intervals, then ~5–6s of click silence, cycling ~10s — while the bass on
-  the same port stays dead-even 500ms (cue payloads ride the speculation
-  lead into the ALSA queue; clicks follow BeatSync arrival). Two
-  contributing factors, both needed:
-  1. **App:** `metronome.rs::schedule_due` fires the entire missed backlog
-     clamped-to-now when the phasor position jumps forward (the blob), and
-     its monotonic `next_beat` strands in the future when the phasor walks
-     backward (the silence — position must free-run to catch up). Fix
-     shape: never emit more than one clamped-to-now click (skip
-     `next_beat` forward past a >1-beat backlog), and re-seed `next_beat`
-     when it's stranded more than a couple beats ahead of `cur`. Pure fn,
-     unit-testable; `LocalBeat` itself is fine (bounded ±1-beat step,
-     feedforward tempo).
-  2. **Kernel:** BeatSync references stop-then-flood around the musician's
-     tick turns (journal 2026-07-15: gemma4-e4b turns ~18s, back-to-back —
-     next iteration starts 57ms after the last completes, i.e. the wakeup
-     divisor is shorter than the turn). Whether the beat-scheduler thread
-     itself stalls during a tick turn (it drives rc — the
-     `KAISH_RC_THREAD_STACK` history) or emission batches elsewhere needs
-     pinning; either way reference delivery should stay smooth while a
-     turn runs. Bigger design question than the app-side hardening.
+- **Metronome clicks burst + starve around musician OODA turns** — RESOLVED
+  for the app-side + wire contributing factors on `feat/beat-epoch`
+  ("Timestamped beat references"), deferred follow-ups below. Original
+  report (Amy heard it live 2026-07-15; measured via `aseqdump -p <app
+  render port>`): bursts of ~10 SIMULTANEOUS ch15/C6 note-ons (0ms apart —
+  one loud blob), ragged intervals, then ~5–6s of click silence, cycling
+  ~10s — while the bass on the same port stays dead-even 500ms. Three
+  contributing factors, explorer-verified:
+  1. **Delivery** (deferred, see below): the per-connection forward task
+     serializes all `block.*` events into one capnp callback stream —
+     BeatSync queues behind a turn's streamed-output flood, then floods out
+     back-to-back.
+  2. **Receipt-time anchoring** (FIXED): `BeatRef` carried no timestamp, so
+     every buffered ref in a flood folded against ONE per-frame `now` and
+     walked the phasor several beats. Fix: `BeatRef.epoch_ns` (sender
+     wallclock at emission, wired capnp→server→client), `BeatRef::
+     backdated_at` (mirrors kernel `apply_clock_estimate`'s u64-ns age math)
+     re-anchors each ref to its own emission instant before folding — a
+     flood now settles at the newest ref's true position instead of walking
+     through the backlog. `WellBeats` (time_well) got a companion liveness
+     split (`observe(ctx, ref, at, received)` + `touch`) so a stale-but-
+     received ref still proves the track alive without folding a position
+     from the past.
+  3. **Click policy** (FIXED): `Metronome::schedule_due` used to replay the
+     whole missed backlog clamped-to-now (the blob) and strand monotonic
+     `next_beat` after a backward walk (the starve). Fix: at most one
+     clamped-to-now click ever (missed beats are missed, not replayed), and
+     an "un-strand" re-seed when `next_beat` drifts more than
+     `horizon_secs*tempo + 2.0` beats ahead of `cur` (sized so a legitimate
+     ≤1-beat `LocalBeat` phase step never trips it) — bounds recovery to
+     ≈1.25s at 120 BPM instead of the measured 5–6s.
   Immediate relief either way: `enabled = false` (or lower `velocity`) in
   `/etc/client/metronome.toml`.
+  - **Deferred:** delivery head-of-line lane for `block.beat_sync`
+    (`rpc.rs` per-connection forward task, ~2185-2600) — a dedicated
+    low-latency lane instead of one serialized capnp callback stream shared
+    with turn output.
+  - **Deferred:** turn-overlap gate/tuning — the musician's wakeup divisor
+    (32 beats ≈ 16s default) can be shorter than an actual turn (measured
+    ~18s for gemma4-e4b), so the next iteration can start before the last
+    finishes; no in-flight gate today. Back-dated refs correct perfectly
+    however late, so this is a behavior/tuning question, not correctness.
+  - **Deferred:** `async_broadcast` overflow eviction semantics for
+    buffered refs — not addressed by this fix.
 
 - **Tracker station slice 1: score cells on the grid** (2026-07-15, the
   designed-in seam after slice 0 shipped): rows carry note content read

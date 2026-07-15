@@ -6771,11 +6771,14 @@ fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, c
 }
 
 /// Fill a Cap'n Proto `BeatRef` builder from the typed reference (docs/midi.md
-/// "The relative-lead timebase, analyzed"). Carries no instant — the sink stamps
-/// receipt locally, like `RenderCue.leadNanos`.
+/// "The relative-lead timebase, analyzed"). Carries the sender's emission
+/// wallclock (`epochNs`, mirroring `reportClockEstimate`) so the sink can
+/// back-date it to its own emission instant instead of anchoring at receipt —
+/// covers both forward-loop callers (`on_beat_sync_request` above).
 fn set_beat_ref(mut builder: crate::kaijutsu_capnp::beat_ref::Builder<'_>, beat_ref: &kaijutsu_audio::BeatRef) {
     builder.set_beat(beat_ref.beat);
     builder.set_tempo_bps(beat_ref.tempo_bps);
+    builder.set_epoch_ns(beat_ref.epoch_ns);
 }
 
 /// The FlowBus topic pattern a **filtered** client block-subscription listens on.

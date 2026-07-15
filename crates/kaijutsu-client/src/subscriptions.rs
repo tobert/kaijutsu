@@ -944,6 +944,7 @@ impl block_events::Server for BlockEventsForwarder {
         let beat_ref = kaijutsu_audio::BeatRef {
             beat: beat_reader.get_beat(),
             tempo_bps: beat_reader.get_tempo_bps(),
+            epoch_ns: beat_reader.get_epoch_ns(),
         };
 
         let event = ServerEvent::BeatSync { context_id, beat_ref };
