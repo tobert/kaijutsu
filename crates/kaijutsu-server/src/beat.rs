@@ -1019,26 +1019,32 @@ impl BeatScheduler {
     ///    for fork-inheritance); a `delete` is permanent, so there is no future
     ///    re-attach to inherit it for, and it's the same "move to a new track"
     ///    idiom `attach` already uses when a context switches lanes.
-    ///    `tombstone_track` (step 5) refuses loudly if this is ever skipped —
+    ///    `tombstone_track` (step 3) refuses loudly if this is ever skipped —
     ///    a dangling attachment row would point at a name that no longer
     ///    resolves.
-    /// 3. **Tear down the live `Timeline`** (`disarm_track_timeline`): drops
-    ///    the open future + committed cell log. Safe — the durable recovery
-    ///    payload is the score CONTEXT's materialized blocks
-    ///    (`reconstruct_score_cells` rebuilds the committed log from them on a
-    ///    future re-attach), never this in-memory `Timeline`.
-    /// 4. **Drop the in-memory `TrackState`** — this is what hides the track
-    ///    from `snapshot_tracks` (the `listTracks` wire surface): it reads
-    ///    `self.tracks` directly. A stale heap entry for this track
-    ///    self-cleans on its next pop (`fire_due`'s "unknown/removed track"
-    ///    arm already drops it) — no explicit heap surgery needed.
-    /// 5. **Tombstone the persisted row** (`tombstone_track`): rename aside +
+    /// 3. **Tombstone the persisted row** (`tombstone_track`): rename aside +
     ///    stamp `deleted_at`, atomically. The **score context is left
     ///    untouched** — it's the durable recovery payload — and recovery is
     ///    sqlite-only by decision (the one-line `UPDATE` is documented on `kj
     ///    transport delete`'s long help and in `docs/tracks.md`). Attaching
     ///    `--track <name>` again after a delete finds nothing under that name
     ///    and creates a genuinely fresh track + score (§5, `docs/tracks.md`).
+    /// 4. **Tear down the live `Timeline`** (`disarm_track_timeline`): drops
+    ///    the open future + committed cell log. Safe — the durable recovery
+    ///    payload is the score CONTEXT's materialized blocks
+    ///    (`reconstruct_score_cells` rebuilds the committed log from them on a
+    ///    future re-attach), never this in-memory `Timeline`.
+    /// 5. **Drop the in-memory `TrackState`** — this is what hides the track
+    ///    from `snapshot_tracks` (the `listTracks` wire surface): it reads
+    ///    `self.tracks` directly. A stale heap entry for this track
+    ///    self-cleans on its next pop (`fire_due`'s "unknown/removed track"
+    ///    arm already drops it) — no explicit heap surgery needed.
+    ///
+    /// The DB writes (steps 2–3) come BEFORE the in-memory teardown (4–5) on
+    /// purpose: a persist failure leaves the track stopped + detached but
+    /// still *listed*, so the verb can simply be retried — removing it from
+    /// memory first would strand a half-deleted track no verb can reach
+    /// (`delete`'s own existence check would answer "nothing to delete").
     ///
     /// Refuses (`Err`, no side effects) when the track doesn't exist — mirrors
     /// `track_ack`'s loud-refusal style for every other clock-domain command.
@@ -1061,23 +1067,37 @@ impl BeatScheduler {
         for ctx in attached {
             self.detach(track_id, ctx);
             // Permanent delete cleanup `detach` deliberately skips (rotation's
-            // fork-inheritance needs the row to survive a plain detach).
-            if let Some(db) = self.documents.db() {
-                let _ = db.lock().delete_attachment(track_id.as_str(), ctx);
+            // fork-inheritance needs the row to survive a plain detach). A
+            // failure bubbles — never a swallowed warn — so the operator sees
+            // it while the track is still listed and retryable (fn doc).
+            if let Some(db) = self.documents.db()
+                && let Err(e) = db.lock().delete_attachment(track_id.as_str(), ctx)
+            {
+                return Err(format!(
+                    "beat: failed to delete persisted attachment for {ctx} on track '{}': {e} \
+                     — track left stopped + detached; retry the delete (or recover via sqlite)",
+                    track_id.as_str()
+                ));
             }
         }
+        // DB tombstone BEFORE the in-memory teardown — see the fn doc's
+        // retryability note.
+        let tombstone = match self.documents.db() {
+            None => None, // db-less store (embedded/test): nothing to tombstone.
+            Some(db) => match db.lock().tombstone_track(track_id.as_str()) {
+                Ok(name) => Some(name),
+                Err(e) => {
+                    return Err(format!(
+                        "beat: failed to tombstone track '{}': {e} — track left stopped + \
+                         detached; retry the delete (or recover via sqlite)",
+                        track_id.as_str()
+                    ));
+                }
+            },
+        };
         self.kernel.disarm_track_timeline(track_id);
         self.tracks.remove(track_id);
-        let Some(db) = self.documents.db() else {
-            return Ok(None); // db-less store (embedded/test): nothing to tombstone.
-        };
-        match db.lock().tombstone_track(track_id.as_str()) {
-            Ok(name) => Ok(Some(name)),
-            Err(e) => Err(format!(
-                "beat: failed to tombstone track {}: {e}",
-                track_id.as_str()
-            )),
-        }
+        Ok(tombstone)
     }
 
     /// The next wake instant, if any context is scheduled.
