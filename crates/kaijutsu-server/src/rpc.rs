@@ -1358,7 +1358,7 @@ pub async fn create_shared_kernel(
             emb_config.max_tokens,
             &resolved_data_dir,
         );
-        match kaijutsu_index::OnnxEmbedder::new(
+        match kaijutsu_index::RtenEmbedder::new(
             &emb_config.model_dir,
             emb_config.dimensions,
             emb_config.max_tokens,

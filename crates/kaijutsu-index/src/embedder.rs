@@ -4,15 +4,16 @@
 //! implementation can be swapped for API-backed embedders in the future.
 
 use std::path::Path;
-use std::sync::Mutex;
 
-use ort::value::Tensor;
+use rten::{Model, NodeId, ValueOrView};
+use rten_tensor::NdTensor;
+use rten_tensor::prelude::*;
 
 use crate::IndexError;
 
 /// Trait abstracting over embedding generation.
 ///
-/// Implementations must be Send + Sync (the ONNX session is thread-safe).
+/// Implementations must be Send + Sync (the ONNX model is thread-safe).
 /// Methods are sync — callers should use `spawn_blocking` for CPU-bound inference.
 pub trait Embedder: Send + Sync {
     /// Human-readable model name (e.g. "bge-small-en-v1.5").
@@ -33,12 +34,16 @@ pub trait Embedder: Send + Sync {
     }
 }
 
-/// ONNX-backed embedder using ort + HuggingFace tokenizer.
+/// ONNX-backed embedder using rten (pure-Rust inference) + HuggingFace tokenizer.
 ///
 /// Loads from a directory containing `model.onnx` and `tokenizer.json`.
-/// Inference: tokenize → run session → mean-pool → L2-normalize.
-pub struct OnnxEmbedder {
-    session: Mutex<ort::session::Session>,
+/// Inference: tokenize → run model → mean-pool → L2-normalize.
+pub struct RtenEmbedder {
+    model: Model,
+    input_ids_node: NodeId,
+    attention_mask_node: NodeId,
+    token_type_ids_node: Option<NodeId>,
+    output_node: NodeId,
     tokenizer: tokenizers::Tokenizer,
     dims: usize,
     #[allow(dead_code)] // Phase 2+: used in content extraction truncation
@@ -46,7 +51,7 @@ pub struct OnnxEmbedder {
     name: String,
 }
 
-impl OnnxEmbedder {
+impl RtenEmbedder {
     /// Create a new embedder from a model directory.
     ///
     /// The directory must contain:
@@ -65,12 +70,23 @@ impl OnnxEmbedder {
             ));
         }
 
-        let session = ort::session::Session::builder()
-            .map_err(|e| IndexError::Onnx(e.to_string()))?
-            .with_intra_threads(1)
-            .map_err(|e| IndexError::Onnx(e.to_string()))?
-            .commit_from_file(&model_path)
-            .map_err(|e| IndexError::Onnx(e.to_string()))?;
+        let model =
+            Model::load_file(&model_path).map_err(|e| IndexError::Inference(e.to_string()))?;
+
+        let input_ids_node = model
+            .node_id("input_ids")
+            .map_err(|e| IndexError::Inference(e.to_string()))?;
+        let attention_mask_node = model
+            .node_id("attention_mask")
+            .map_err(|e| IndexError::Inference(e.to_string()))?;
+        // Not every model exports a token_type_ids input; only wire it up if present.
+        let token_type_ids_node = model.find_node("token_type_ids");
+        // Prefer the conventional "last_hidden_state" output name; fall back to
+        // the model's first declared output (matches the old ort code, which
+        // indexed outputs[0] positionally).
+        let output_node = model.find_node("last_hidden_state").or_else(|| {
+            model.output_ids().first().copied()
+        }).ok_or_else(|| IndexError::Inference("model has no output nodes".into()))?;
 
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| IndexError::Tokenizer(e.to_string()))?;
@@ -102,7 +118,11 @@ impl OnnxEmbedder {
         );
 
         Ok(Self {
-            session: Mutex::new(session),
+            model,
+            input_ids_node,
+            attention_mask_node,
+            token_type_ids_node,
+            output_node,
             tokenizer,
             dims: dimensions,
             max_tokens,
@@ -111,18 +131,17 @@ impl OnnxEmbedder {
     }
 }
 
-/// Upper bound on texts per ONNX session run.
+/// Upper bound on texts per model run.
 ///
 /// `embed_batch` pads every text to the batch's longest sequence
 /// (`PaddingStrategy::BatchLongest`), so one unbounded batch — e.g. `kj synth
 /// all` embedding every block of a large context at once — allocates tensors
-/// of `batch × longest_seq × dims` and blew ort's arena allocator (which never
-/// shrinks) past 9 GB on real data. Chunking bounds the arena to a few dozen
-/// MB per run without changing results; callers keep passing whatever batch
-/// size is natural for them.
+/// of `batch × longest_seq × dims`. Chunking bounds that allocation to a few
+/// dozen MB per run without changing results; callers keep passing whatever
+/// batch size is natural for them.
 const EMBED_CHUNK: usize = 32;
 
-impl Embedder for OnnxEmbedder {
+impl Embedder for RtenEmbedder {
     fn model_name(&self) -> &str {
         &self.name
     }
@@ -153,60 +172,61 @@ impl Embedder for OnnxEmbedder {
         let batch_size = encodings.len();
         let seq_len = encodings[0].get_ids().len();
 
-        // Build flat vectors for input tensors
-        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
-        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
-        let mut token_type_ids: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        // Build flat vectors for input tensors. rten's ONNX ops expect i32,
+        // unlike ort which used i64.
+        let mut input_ids: Vec<i32> = Vec::with_capacity(batch_size * seq_len);
+        let mut attention_mask: Vec<i32> = Vec::with_capacity(batch_size * seq_len);
+        let mut token_type_ids: Vec<i32> = Vec::with_capacity(batch_size * seq_len);
 
         for enc in &encodings {
             for &id in enc.get_ids() {
-                input_ids.push(id as i64);
+                input_ids.push(id as i32);
             }
             for &mask in enc.get_attention_mask() {
-                attention_mask.push(mask as i64);
+                attention_mask.push(mask as i32);
             }
             for &tt in enc.get_type_ids() {
-                token_type_ids.push(tt as i64);
+                token_type_ids.push(tt as i32);
             }
         }
 
-        // Create ort Tensor values via (shape, data) tuples
         let shape = [batch_size, seq_len];
-        let input_ids_tensor = Tensor::from_array((shape, input_ids.clone()))
-            .map_err(|e| IndexError::Onnx(e.to_string()))?;
-        let attention_mask_tensor = Tensor::from_array((shape, attention_mask.clone()))
-            .map_err(|e| IndexError::Onnx(e.to_string()))?;
-        let token_type_ids_tensor = Tensor::from_array((shape, token_type_ids))
-            .map_err(|e| IndexError::Onnx(e.to_string()))?;
+        let input_ids_tensor = NdTensor::from_data(shape, input_ids);
+        // attention_mask is cloned into the tensor: the original is still
+        // needed below for mean-pooling.
+        let attention_mask_tensor = NdTensor::from_data(shape, attention_mask.clone());
 
-        // Run inference with named inputs
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| IndexError::Onnx(format!("session lock: {}", e)))?;
-        let outputs = session
-            .run(ort::inputs![
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-                "token_type_ids" => token_type_ids_tensor,
-            ])
-            .map_err(|e| IndexError::Onnx(e.to_string()))?;
+        let mut inputs: Vec<(NodeId, ValueOrView)> = vec![
+            (self.input_ids_node, input_ids_tensor.into()),
+            (self.attention_mask_node, attention_mask_tensor.into()),
+        ];
+        if let Some(token_type_ids_node) = self.token_type_ids_node {
+            let token_type_ids_tensor = NdTensor::from_data(shape, token_type_ids);
+            inputs.push((token_type_ids_node, token_type_ids_tensor.into()));
+        }
+
+        // Run inference
+        let [output] = self
+            .model
+            .run_n(inputs, [self.output_node], None)
+            .map_err(|e| IndexError::Inference(e.to_string()))?;
 
         // Extract token embeddings: shape [batch_size, seq_len, dims]
-        // First output is typically "last_hidden_state"
-        let embeddings_value = &outputs[0];
+        let hidden: NdTensor<f32, 3> = output
+            .try_into()
+            .map_err(|e: rten::TryFromValueError| IndexError::Inference(e.to_string()))?;
 
-        let (emb_shape, emb_data) = embeddings_value
-            .try_extract_tensor::<f32>()
-            .map_err(|e| IndexError::Onnx(e.to_string()))?;
-
-        // emb_shape is [batch_size, seq_len, dims] (deref to &[i64])
-        let dims = emb_shape.get(2).copied().unwrap_or(self.dims as i64) as usize;
-        let actual_seq_len = emb_shape.get(1).copied().unwrap_or(seq_len as i64) as usize;
+        let [out_batch, actual_seq_len, dims] = hidden.shape();
+        assert_eq!(
+            out_batch, batch_size,
+            "model output batch size ({out_batch}) does not match input batch size ({batch_size})"
+        );
         assert!(
             actual_seq_len <= seq_len,
-            "ONNX output seq_len ({actual_seq_len}) exceeds input seq_len ({seq_len})"
+            "model output seq_len ({actual_seq_len}) exceeds input seq_len ({seq_len})"
         );
+
+        let emb_data: Vec<f32> = hidden.to_vec();
 
         // Mean-pool over sequence length, respecting attention mask
         let mut results = Vec::with_capacity(batch_size);

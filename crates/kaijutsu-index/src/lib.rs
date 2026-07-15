@@ -24,7 +24,7 @@ pub mod watcher;
 
 pub use config::IndexConfig;
 pub use content::extract_context_content;
-pub use embedder::{Embedder, OnnxEmbedder};
+pub use embedder::{Embedder, RtenEmbedder};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -44,8 +44,8 @@ pub enum IndexError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
-    #[error("ONNX error: {0}")]
-    Onnx(String),
+    #[error("Inference error: {0}")]
+    Inference(String),
 
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
@@ -200,7 +200,7 @@ impl SemanticIndex {
     /// all`, so this is never data loss.
     ///
     /// `model_name` derives from the model directory's basename (see
-    /// `OnnxEmbedder::new`), so renaming the model directory — even with
+    /// `RtenEmbedder::new`), so renaming the model directory — even with
     /// identical files inside — also triggers a wipe. That's correct: the
     /// config changed, and the cache follows.
     ///

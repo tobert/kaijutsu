@@ -134,10 +134,21 @@ min_request_interval_ms = 0    # 0 = no cooldown
 # Embedding Model (Semantic Indexing)
 # ============================================================================
 # Local ONNX embedding model for constellation clustering, drift discovery,
-# and semantic search across contexts.
+# and semantic search across contexts. Inference is pure-Rust (rten) — no
+# ONNX Runtime library involved.
 #
-# Model dir should contain model.onnx + tokenizer.json
-# Download: https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q
+# Model dir should contain model.onnx + tokenizer.json.
+# Recommended artifact for bge-small-en-v1.5:
+#   fp32 export (works as-is, 133 MB): onnx/model.onnx + tokenizer.json from
+#     https://huggingface.co/Xenova/bge-small-en-v1.5
+#   int8 (34 MB, faster load, what we ship): quantize the fp32 export with
+#     rten's own tool (needs a Python venv with onnxruntime, onnx, onnx_ir):
+#     python ort-quantize.py dynamic fp32.onnx model.onnx
+#     https://github.com/robertknight/rten/blob/main/tools/ort-quantize.py
+#   Verify a candidate file: cargo run -p kaijutsu-index --example embed_check
+#
+# Quantized exports from other pipelines may not load — rten rejects e.g.
+# fp16 initializers (the old Qdrant bge-small-en-v1.5-onnx-Q fails this way).
 #
 # Changing `model_dir` (even just renaming the directory — the model's
 # identity is its directory basename) or `dimensions` invalidates the

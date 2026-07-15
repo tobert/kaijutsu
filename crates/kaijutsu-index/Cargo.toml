@@ -7,8 +7,9 @@ description = "Semantic vector indexing for kaijutsu contexts"
 [dependencies]
 kaijutsu-types.workspace = true
 
-# ONNX inference + tokenizer
-ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+# ONNX inference (pure Rust) + tokenizer
+rten = "0.24"
+rten-tensor = "0.24"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 # Vector index
