@@ -538,6 +538,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   committed log. Decide the window's home (attachment? track policy? the
   musician rc?) and whether drive-path hydration needs the same cap.
   Workaround live today: play on a fresh track (`groove`).
+  **2026-07-15 late-day datapoint that sharpens the diagnosis**: `bassline-b`,
+  a FRESH context on the YOUNG `groove` track, hit 91k tokens after ~2h of
+  16s OODA wakes — so the accumulator is the musician's own conversation
+  growing per wake (KJ_HEARD + prompt + response blocks every 16s), not only
+  old-score injection. Auto-compaction can't save it: the summarization
+  request itself exceeds the model window once past it (the 467k case
+  failed exactly there). So the fix needs BOTH a windowed band view AND a
+  wake-conversation cap (drop/summarize old wake turns; rotation on a
+  token/wake budget rather than phrase count is a candidate). Third fresh
+  chair of the day (`bassline-c`) is the standing workaround.
+
+- **Musician create-rc auto-attaches to a label-derived track before an
+  explicit `--track` can move it** (bit twice 2026-07-15): `kj context
+  create <name> --type musician` runs the create rc, which attaches to
+  track `<name>`; a following `kj transport attach --context <name>
+  --track <other>` moves the context but leaves a freshly-minted stray
+  track `<name>` + score context behind (cleaned up with `kj transport
+  delete` both times — tombstones `bassline-b~…`, `bassline-c~…`). Fix
+  shape: teach `context create` a `--track` passthrough the create rc
+  honors, or make the create rc skip auto-attach when the caller
+  will bind explicitly (a `KJ_NO_AUTO_ATTACH` env? a create flag?).
 
 - **Tracker station slice 1: score cells on the grid** (2026-07-15, the
   designed-in seam after slice 0 shipped): rows carry note content read
