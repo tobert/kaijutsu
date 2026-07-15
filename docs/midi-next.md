@@ -69,7 +69,27 @@ Format: **prose + data hybrid** — a model-facing `.md` body carrying the
 machine-facing versioned-JSON sections (jq-able, the clip-record precedent).
 The prose is not documentation *about* the profile; it **is the skill body**
 a specialized context boots with (next section). The rc `.kai`/`.md` split,
-applied to devices.
+applied to devices. Conventions (set by the first drafts): channels are
+**1–16** in profiles (wire byte = channel−1); best-knowledge facts ride in
+an `unverified` list per JSON section until confirmed against the real unit;
+role channels may reference settings (`"@settings.receive_channel"`) so a
+pull re-routes bindings automatically.
+
+**Profiles are rc-style buckets, not single files (Amy, 2026-07-15).** The
+first TiMidity draft exposed it: a static `settings` section bakes in
+host-current facts (which box, which client) that don't carry to the next
+machine TiMidity runs on. So `/etc/midi/devices/<name>/` is a bucket of
+`SXX-*.{md,kai}` exactly like rc: **static knowledge is `.md`** (capabilities,
+skill prose — document ground truth), **the current picture is `.kai`
+output** (locate the device now, synthesize settings from live sources —
+read `/run/midi`, `aconnect -l`, even snoop a local `timidity.cfg` /
+`/proc/<pid>/cmdline`). The ground-truth split maps onto file types. This is
+what makes a profile *portable*: it stops naming zorak — wherever TiMidity
+runs, `S10-locate.kai` finds it. TiMidity is the reference case for
+kai-synthesized profiles ("we'll always have it around somewhere in the
+rig"). Kai runs kernel-side (EmbeddedKaish) — fine while the kernel shares a
+box with the device; cross-node probing rides the sink-fed `/run` store, so
+profiles stay machine-independent either way.
 
 ## Device contexts: profile + model + toolbox (the skills angle)
 
@@ -259,6 +279,48 @@ one promise held open five minutes. Settings pulls and identity are
 exchanges; firmware and Sample-Dump-Standard territory becomes a job when
 something actually needs it.
 
+## Keeping it current — grooming tracks (seeded 2026-07-15)
+
+Kai-computed profile sections are fresh at hydrate and stale thereafter; the
+refresh cadence wants to be a **track**: a slow clock + a probe attachment
+(`ooda_armed: false`) firing kai on beats — `kj midi identify` sweeps, KSP
+settings re-pulls, `/run/midi` staleness checks, pulled-vs-document drift
+flags. Chameleon's cue traps are "cron in musical time"
+(`docs/chameleon.md`); grooming tracks are the same machinery at ops tempo —
+kaijutsu-style cron, and much bigger than MIDI (archiving, index grooming,
+compaction). Seeded as its own backlog item in `docs/issues.md`; profile
+refresh is likely its first consumer.
+
+## Plugin instruments (VST/LV2/CLAP) — brooding (2026-07-15)
+
+Software instruments beyond TiMidity — Surge XT is the motivating case
+(open-source, CLAP-native, deep parameter surface). Three paths, not yet
+decided:
+
+1. **Standalone plugin host as a device (near-zero new code).** Run Surge XT
+   standalone (or Carla/jalv for arbitrary plugins) as its own process with
+   ALSA MIDI in + PipeWire audio out, and profile it exactly like TiMidity —
+   another software device with an ALSA client name. Crash isolation for
+   free (plugins are notoriously crashy; the wire-sink doctrine already says
+   keep hardware-adjacent risk out of the kernel — same logic keeps plugin
+   code out of the app).
+2. **CLAP in-app via clack** — already anticipated by `docs/chameleon.md`
+   ("CLAP hosting (clack) when plugins land"). The prize: **CLAP parameters
+   are introspectable and settable**, so plugin instruments get *actual*
+   read-back — the best-case provenance (`observed` becomes "read the real
+   value"), full `relative_safe`, and profiles that could be **auto-generated
+   from param enumeration** (the MIDI-CI Property Exchange dream, realized
+   locally). The costs: crashy third-party code and RT audio threads inside
+   the Bevy app.
+3. **The likely synthesis: a headless CLAP-host *sink*** — a separate
+   kaijutsu process speaking the same cue/exchange protocol as the app,
+   hosting plugins, exposing params via `exchange()`. Isolation *and*
+   introspection, and it converges with the `midi.md` M4 headless edge sink
+   rather than inventing a new species.
+
+Direction to sit with: **standalone-first** (a Surge XT profile costs one
+bucket, proves plugins-as-devices), host-sink when the M4 shape firms up.
+
 ## Where models beat the DAWs
 
 DAW device support fails on *maintenance economics* — volunteer XML rots.
@@ -295,7 +357,8 @@ Three moves change that:
    control cues incl. fire-and-forget sysex bytes, kaish-scriptable day one);
    the **`exchange()` sink method** + `kj midi identify` (Identity-Request
    fingerprint); ALSA-name matching. Hand-author **Minibrute** and
-   **TiMidity** profiles.
+   **TiMidity** profiles — **drafted 2026-07-15** as the embedded seeds:
+   `assets/defaults/midi/devices/{minibrute,timidity}.md`.
 2. **Routing consumes profiles.** The render sink resolves "track →
    *device.role*" through the profile to port + channel — paying for the
    per-track channel-routing open item (`midi.md` open questions,
@@ -310,9 +373,11 @@ Three moves change that:
 4. **SysEx settings pull.** `kj midi pull` against the KSP, sysex-controls as
    reference; the ground-truth split enforced (settings overwrite,
    capabilities flag).
-5. **Later:** Bitbox deep dive (XML preset ingestion?); KSP/DrumBrute pattern
-   pull → score; manual→profile drafting as a repeatable flow; ear-verified
-   MIDI-learn; MIDI-CI PE for future gear.
+5. **Later:** rc-style profile buckets with kai-synthesized sections
+   (TiMidity as reference case) + a grooming track refreshing them; Bitbox
+   deep dive (XML preset ingestion?); KSP/DrumBrute pattern pull → score;
+   plugin instruments (Surge XT standalone first); manual→profile drafting
+   as a repeatable flow; ear-verified MIDI-learn; MIDI-CI PE for future gear.
 
 ## Open questions
 

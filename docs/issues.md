@@ -40,8 +40,9 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
 ## MIDI device profiles + device contexts (seeded 2026-07-15, `docs/midi-next.md`)
 
 Design direction captured in `docs/midi-next.md` (living doc): CRDT-owned
-device profiles under `/etc/midi/devices/` (prose+data hybrid; settings vs
-capabilities ground-truth split), track bindings as *device.role* not raw
+device profiles under `/etc/midi/devices/` (rc-style buckets: static `.md` +
+kai-synthesized current picture; settings vs capabilities ground-truth
+split), track bindings as *device.role* not raw
 channel ints, rc-injected device contexts as side channels (profile as skill
 body + narrow loadout + cheap model), `kj midi` emit verbs + provenance-tagged
 `/run/midi/<device>` state, SysEx via a sink `exchange()` method (transfer
@@ -49,6 +50,20 @@ job shape deferred). Nothing in code yet. Slice order in the doc; first
 consumer: Minibrute on the laptop app, then the per-track channel-routing fix
 (this file → Hyoushigi/Musician area; `docs/chameleon.md` open items) built
 on profile vocabulary.
+
+## Grooming tracks — kaijutsu-style cron (seeded 2026-07-15, MIDI-profiles round)
+
+Scheduled background operations as **tracks**: a slow clock + probe
+attachments (`ooda_armed: false`) firing kai scripts on beats. Kinship:
+chameleon's cue traps are "cron in musical time" (`docs/chameleon.md`,
+unbuilt); this is the same machinery at ops tempo, and the rc synergy is
+direct (groomer scripts are CRDT-owned, `kj rc edit`-able). Use cases
+queued up: device-profile refresh (`kj midi identify`/`pull` sweeps,
+`/run/midi` staleness, pulled-vs-document drift flags — likely first
+consumer, `docs/midi-next.md` "Keeping it current"), archive rotation,
+index/synthesis grooming, oplog/CRDT compaction, auto-memory grooming.
+Needs a design round before code — write the companion doc when the first
+consumer is real.
 
 ## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
 
