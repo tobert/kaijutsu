@@ -273,6 +273,7 @@ kj transport attach --track bass [--wakeup N] [--rotate N]   # bind; track creat
 kj transport detach [--track bass]                           # unbind; track persists
 kj transport play|pause|stop|tempo --track bass [...]
 kj transport ooda|rotate --track bass on|off                 # separate knobs
+kj transport delete --track bass                             # tombstone; --track is REQUIRED
 ```
 
 - **stop = stop the clock**, nothing else. Rotation is *suspended*, not cleared —
@@ -285,6 +286,23 @@ kj transport ooda|rotate --track bass on|off                 # separate knobs
   track from the calling context's attachment. (*Vocabulary:* "track" is the
   DAW-sense clock domain / durable identity; "lane" stays reserved for automation
   *inside* a track and "voice" for ABC's `V:` field, per `chameleon.md`.)
+- **delete = a rename-aside tombstone**, the one exception to "omit `--track` to
+  resolve from the calling context's attachment" — it REQUIRES `--track`
+  explicitly, because deletion must never hit a track you merely happen to be
+  attached to. It stops the clock, detaches every attached context through the
+  same path `detach` uses (their playhead persists identically), tears down the
+  track's live clock/timeline state (the first real track-teardown path — a
+  track was previously never disarmed), and hides it from `kj transport` /
+  `listTracks`. The **score context — the durable notation — is left
+  untouched**; it's the recovery payload, and attaching `--track <name>` again
+  afterward starts a genuinely fresh track + score, never resurrecting the old
+  one. The persisted `tracks` row is renamed to `{name}~tombstone-<epoch-ms>`
+  and stamped with `deleted_at` (`~` is outside the track-id charset, so a
+  tombstone name can never collide with — or be re-attached under — a live
+  one). Recovery is **sqlite-only by decision** (no `kj` verb): `UPDATE tracks
+  SET track_id = '<name>', deleted_at = NULL WHERE track_id =
+  '<name>~tombstone-<epoch-ms>'`, run directly against the kernel's DB. `kj
+  transport delete` reports the exact tombstone name on success.
 
 ## Restart contract
 
@@ -294,10 +312,13 @@ score context's materialized ABC blocks** (`reconstruct_score_cells` →
 the ABC source blocks ARE the committed cells (the MIDI sibling is derived, never
 committed), and the materialize cursor starts *past* the restored cells so they
 are never re-emitted. Persisted tempo/phrase/clock-kind are recovered from the
-`tracks` row — a restart never silently reverts to default policy. The **open
-future, squashes, and in-flight speculations do not survive restart**, and
-`KJ_PULSE`/`beat_count` reset — consistent with conversation re-hydration; full
-cross-restart counter durability lands with the deferred cold-start re-arm sweep.
+`tracks` row — a restart never silently reverts to default policy. Tombstoned
+rows (`deleted_at IS NOT NULL` — `kj transport delete`) are **skipped at
+reconstruction**: they carry no live clock domain to rebuild, only a renamed-
+aside row a future sqlite recovery can restore. The **open future, squashes,
+and in-flight speculations do not survive restart**, and `KJ_PULSE`/`beat_count`
+reset — consistent with conversation re-hydration; full cross-restart counter
+durability lands with the deferred cold-start re-arm sweep.
 
 ## Render — a wire cue, not an in-process sink
 
@@ -335,7 +356,8 @@ in git history until migrated into `shared-state.md`.
 ## Where the code is
 
 - `crates/kaijutsu-server/src/beat.rs` — `BeatScheduler`, `TrackState`, attach/
-  detach/rotation, materialize crossing, `KJ_*` injection, score reconstruction.
+  detach/rotation/**delete** (the tombstone teardown), materialize crossing,
+  `KJ_*` injection, score reconstruction.
 - `crates/kaijutsu-server/src/clock.rs` — `ClockSourceKind` + `SystemClock`.
 - `crates/kaijutsu-hyoushigi/src/engine.rs` — the `Timeline` (open future,
   committed log, `rehydrate_committed`, `set_clock`); `cell.rs` — `Cell` with
@@ -345,6 +367,7 @@ in git history until migrated into `shared-state.md`.
 - `crates/kaijutsu-kernel/src/kj/transport.rs` — the `kj transport` surface;
   `kj/play.rs` — `kj play`.
 - `crates/kaijutsu-kernel/src/kernel_db.rs` — the `tracks` + `attachments`
-  tables (`score_context_id` set-once, `clock_kind` mutable).
+  tables (`score_context_id` set-once, `clock_kind` mutable, `deleted_at` the
+  tombstone marker); `tombstone_track` does the rename-aside + stamp.
 - `crates/kaijutsu-abc/src/midi.rs` — `events()` / `generate()`.
 - `assets/defaults/rc/musician/` — the musician tick/rotate rc bundle.
