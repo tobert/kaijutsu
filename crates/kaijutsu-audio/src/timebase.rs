@@ -15,26 +15,73 @@
 //! `Instant`-based: a sink drives it from its own local clock, exactly as it
 //! anchors `RenderCue.lead` at `receipt + lead`.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A low-rate beat reference the kernel ships to sinks: the fractional beat
 /// coordinate at the instant of emission, plus the current tempo. Integer beat
 /// values are onsets (the clicks). The phasor slews toward it.
 ///
-/// Serializable because it is a wire payload — and like `RenderCue.lead`, it
-/// carries no absolute `Instant` (a process-local one can't cross the wire); the
-/// sink stamps *receipt* against its own clock when it arrives.
+/// Serializable because it is a wire payload. Unlike `RenderCue.lead` (a
+/// relative offset that composes fine at receipt time), a low-rate reference
+/// that's been queued behind a flood needs its *emission* instant to fold
+/// correctly — so it carries `epoch_ns`, the sender's wallclock at emission
+/// (mirrors `reportClockEstimate`'s `epochNs`, `beat.rs` `apply_clock_estimate`).
+/// `epoch_ns == 0` means an unstamped reference (an old peer, or a synthetic
+/// test `BeatRef`) — [`Self::backdated_at`] falls back to receipt time. A
+/// receiver folds many buffered refs against ONE frame `now` by back-dating
+/// each to its own emission instant first, rather than anchoring them all at
+/// the same receipt instant (which walks the phasor several beats on a flood).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BeatRef {
     /// Fractional beat coordinate at emission. Integer values are beat onsets.
     pub beat: f64,
     /// Tempo in beats per second (120 BPM == `2.0`).
     pub tempo_bps: f64,
+    /// Sender wallclock (ns since UNIX_EPOCH) at emission. `0` = unstamped
+    /// (old peer or a test-constructed ref) → the sink falls back to receipt
+    /// time. `#[serde(default)]` so old wire payloads without this field still
+    /// deserialize (additive schema evolution).
+    #[serde(default)]
+    pub epoch_ns: u64,
 }
+
+/// A reference older than this is dropped rather than back-dated — the pipe is
+/// backed up badly enough that "when this was true" is no longer useful; the
+/// phasor free-runs on its last feedforward tempo instead (mirrors
+/// `beat.rs::apply_clock_estimate`'s staleness drop).
+pub const REF_STALE_MAX: Duration = Duration::from_secs(5);
 
 impl BeatRef {
     pub fn new(beat: f64, tempo_bps: f64) -> Self {
-        Self { beat, tempo_bps }
+        Self { beat, tempo_bps, epoch_ns: 0 }
+    }
+
+    /// Re-anchor this reference's emission instant into the receiver's local
+    /// `Instant` domain: `now` is the receiver's `Instant::now()`, `now_epoch_ns`
+    /// its `SystemTime::now()` at (as close as possible to) the same moment.
+    ///
+    /// - `epoch_ns == 0` (unstamped) → `Some(now)`, the old receipt-time
+    ///   behavior.
+    /// - Otherwise the age is computed in the u64-ns wallclock domain
+    ///   (`now_epoch_ns.saturating_sub(epoch_ns)` — a future-stamped ref, e.g.
+    ///   clock skew or `now_epoch_ns` sampled a hair before `epoch_ns`,
+    ///   saturates to age `0` rather than underflowing) and only the *final*
+    ///   subtraction crosses into the `Instant` domain (mirrors
+    ///   `beat.rs::apply_clock_estimate`'s `at = Instant::now() -
+    ///   Duration::from_nanos(age_ns)` — cross-reference, not a refactor of it).
+    /// - Age `> REF_STALE_MAX` → `None`: the ref is too old to trust: the
+    ///   caller should drop it (never fold it) and let the phasor free-run.
+    pub fn backdated_at(&self, now: Instant, now_epoch_ns: u64) -> Option<Instant> {
+        if self.epoch_ns == 0 {
+            return Some(now);
+        }
+        let age_ns = now_epoch_ns.saturating_sub(self.epoch_ns);
+        if age_ns > REF_STALE_MAX.as_nanos() as u64 {
+            return None;
+        }
+        // `checked_sub` guards an early-process `now` too close to program
+        // start for `age_ns` to subtract from; clamp to `now` rather than panic.
+        Some(now.checked_sub(Duration::from_nanos(age_ns)).unwrap_or(now))
     }
 }
 
@@ -316,9 +363,122 @@ mod tests {
 
     #[test]
     fn beat_ref_serde_round_trips() {
-        let r = BeatRef::new(4.25, 2.0);
+        let r = BeatRef { beat: 4.25, tempo_bps: 2.0, epoch_ns: 123_456_789 };
         let json = serde_json::to_string(&r).expect("serialize");
         let back: BeatRef = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn beat_ref_without_epoch_ns_field_deserializes_to_zero() {
+        // An old wire payload (pre-epoch_ns peer) has no `epoch_ns` key at all —
+        // `#[serde(default)]` must fill it with 0 (unstamped), not fail to parse.
+        let json = r#"{"beat":4.25,"tempo_bps":2.0}"#;
+        let r: BeatRef = serde_json::from_str(json).expect("old payload still parses");
+        assert_eq!(r.epoch_ns, 0);
+    }
+
+    // ========================================================================
+    // BeatRef::backdated_at
+    // ========================================================================
+
+    #[test]
+    fn backdated_at_falls_back_to_receipt_for_an_unstamped_ref() {
+        let r = BeatRef::new(4.0, 2.0); // epoch_ns == 0
+        let now = Instant::now();
+        assert_eq!(r.backdated_at(now, 999), Some(now));
+    }
+
+    #[test]
+    fn backdated_at_backdates_a_recent_stamp_by_its_age() {
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 10_000_000_000; // arbitrary wallclock instant
+        let age_ns = 200_000_000; // 200 ms old
+        let r = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - age_ns };
+        let at = r.backdated_at(now, now_epoch_ns).expect("recent, not stale");
+        // `at` should read as `now - 200ms`: it must be strictly before `now`
+        // and the gap must match the age within a hair (integer ns math).
+        assert!(at < now, "backdated instant must be before receipt");
+        let observed_age = now.duration_since(at);
+        assert!(
+            (observed_age.as_nanos() as i128 - age_ns as i128).abs() < 1_000,
+            "backdated age should match the stamped age, got {observed_age:?}"
+        );
+    }
+
+    #[test]
+    fn backdated_at_drops_a_stale_reference() {
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 10_000_000_000;
+        // Exactly REF_STALE_MAX + 1ns old → dropped.
+        let stale_ns = REF_STALE_MAX.as_nanos() as u64 + 1;
+        let r = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - stale_ns };
+        assert_eq!(r.backdated_at(now, now_epoch_ns), None, "older than REF_STALE_MAX drops");
+    }
+
+    #[test]
+    fn backdated_at_accepts_a_reference_exactly_at_the_stale_boundary() {
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 10_000_000_000;
+        // Exactly REF_STALE_MAX old (not one ns past it) → still accepted.
+        let boundary_ns = REF_STALE_MAX.as_nanos() as u64;
+        let r = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - boundary_ns };
+        assert!(
+            r.backdated_at(now, now_epoch_ns).is_some(),
+            "exactly REF_STALE_MAX old is still accepted (boundary is inclusive)"
+        );
+    }
+
+    #[test]
+    fn backdated_at_clamps_a_future_stamp_to_now() {
+        // A ref stamped slightly ahead of the receiver's clock (skew, or
+        // `now_epoch_ns` sampled a hair before `epoch_ns`) must not underflow
+        // into a huge age — `saturating_sub` floors it at age 0 → `now`.
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 10_000_000_000;
+        let r = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns + 5_000_000 };
+        assert_eq!(r.backdated_at(now, now_epoch_ns), Some(now), "future stamp clamps to now");
+    }
+
+    #[test]
+    fn a_flood_of_backdated_refs_folds_to_the_true_position_not_a_receipt_time_walk() {
+        // THE pure regression for the burst bug: refs for beats 2/4/6/8 (2.0
+        // bps ⇒ one every 8 beats == 4 s apart) arrive all bunched up (a
+        // delivery-flood), stamped with their TRUE emission times spread over
+        // the past ~3 s, but all *processed* at one receipt instant. Folding
+        // each at its own back-dated instant (rather than all at the single
+        // receipt `now`) must leave the phasor reading the newest ref's true
+        // position, not walk several beats through the whole backlog.
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 100_000_000_000; // arbitrary wallclock "now"
+        let tempo = 2.0;
+        // Each successive beat happened `1.0 / tempo` seconds after the last;
+        // beat 8 is "now" (fresh), beat 2 happened 3s ago.
+        let refs = [
+            (2.0, 3_000_000_000u64),
+            (4.0, 2_000_000_000u64),
+            (6.0, 1_000_000_000u64),
+            (8.0, 0u64),
+        ];
+        let mut beat: Option<LocalBeat> = None;
+        for (b, age_ns) in refs {
+            let r = BeatRef { beat: b, tempo_bps: tempo, epoch_ns: now_epoch_ns - age_ns };
+            let at = r.backdated_at(now, now_epoch_ns).expect("all within staleness window");
+            match &mut beat {
+                Some(lb) => lb.observe(r, at),
+                None => beat = Some(LocalBeat::new(r, at)),
+            }
+        }
+        let phasor = beat.expect("at least one ref folded");
+        // Each ref agreed with the others in its own timeframe (beat 2 three
+        // seconds ago, beat 8 now, all at the same 2.0 bps) — so after folding
+        // all four, position(now) should read ≈ 8.0, not overshoot past it the
+        // way a receipt-time fold (`observe` called at `now` for EVERY ref)
+        // would by re-anchoring stale refs' beat values at the current instant.
+        assert!(
+            (phasor.position(now) - 8.0).abs() < 0.5,
+            "flood of back-dated refs settles near beat 8.0, got {}",
+            phasor.position(now)
+        );
     }
 }
