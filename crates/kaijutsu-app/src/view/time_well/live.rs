@@ -339,6 +339,20 @@ impl WellBeats {
             .unwrap_or((0.0, 0.0))
     }
 
+    /// The phasor's raw beat position (unbounded, NOT wrapped to `0..1` the
+    /// way [`Self::envelope_and_frac`]'s `frac` is) for the track keyed by
+    /// `ctx` — `None` when no phasor is live under that key. This is the
+    /// **freeze signal** the tracker station's scroll math anchors on
+    /// (`tracker::grid::row_offset`'s `p` argument): `Some` while a track's
+    /// clock is rolling, `None` the instant a transport flush drops the
+    /// phasor ([`Self::reset`]). A caller scrolling rows on this position
+    /// caches the last `Some` value and simply stops writing on `None` —
+    /// exact freeze, not a fallback to `0.0` (which would snap the grid back
+    /// to the playhead instead of holding still).
+    pub fn beat_position(&self, ctx: &ContextId, now: Instant) -> Option<f64> {
+        self.phasors.get(ctx).map(|p| p.beat.position(now))
+    }
+
     /// The loudest envelope across every rolling track — the well's shared
     /// heartbeat (phase across independent clock domains is meaningless, so
     /// max, not sum).
@@ -718,6 +732,33 @@ mod tests {
 
         beats.reset(&ctx(1));
         assert_eq!(beats.envelope(&ctx(1), t0), 0.0, "flush silences the pulse");
+    }
+
+    #[test]
+    fn beat_position_is_some_while_rolling_and_advances() {
+        let mut beats = WellBeats::default();
+        let t0 = Instant::now();
+        assert_eq!(beats.beat_position(&ctx(1), t0), None, "no phasor yet");
+
+        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0);
+        let p0 = beats.beat_position(&ctx(1), t0).expect("phasor now live");
+        assert!((p0 - 0.0).abs() < 1e-6, "anchored at beat 0: {p0}");
+
+        let p1 = beats
+            .beat_position(&ctx(1), t0 + Duration::from_millis(500))
+            .expect("still rolling");
+        assert!(p1 > p0, "advances with time: {p0} -> {p1}");
+    }
+
+    #[test]
+    fn beat_position_is_none_after_reset() {
+        let mut beats = WellBeats::default();
+        let t0 = Instant::now();
+        beats.observe(ctx(1), BeatRef::new(0.0, 2.0), t0);
+        assert!(beats.beat_position(&ctx(1), t0).is_some());
+
+        beats.reset(&ctx(1));
+        assert_eq!(beats.beat_position(&ctx(1), t0), None, "flush drops the phasor");
     }
 
     #[test]

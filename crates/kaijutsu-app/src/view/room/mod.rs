@@ -524,6 +524,7 @@ fn enter_room(
     mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
     mut well_tracks: ResMut<crate::view::time_well::rays::WellTracks>,
+    mut tracker_state: ResMut<crate::view::tracker::TrackerState>,
     palette: Res<ScenePalette>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
@@ -727,6 +728,22 @@ fn enter_room(
         &mut images,
     );
     patch_bay::arm_scene(&mut pb_state);
+
+    // The tracker station at E — furniture the same "the instrument IS the
+    // station" way the wheel is at W (Tracker Station slice 0,
+    // `snazzy-jumping-hejlsberg.md`). `arm` clears the previous visit's
+    // stale column-entity ids the same way `well_tracks`' own re-arm does
+    // just above (the `clear_ray_entities` stale-id lesson).
+    crate::view::tracker::spawn_furniture(
+        &mut commands,
+        root,
+        &palette,
+        &mut meshes,
+        &mut mats,
+        &mut card_mats,
+        &mut images,
+    );
+    tracker_state.arm();
 
     info!("room: entered (Tardis chamber — patch bay at W, the time well at center)");
 }
@@ -1650,6 +1667,14 @@ fn ingest_room_activity(
 /// LDR), and the focused station's marker takes a steady lift. Change-guarded
 /// + quantized so a settled marker never touches `Assets<StandardMaterial>`
 /// (the well's `sync_card_live_uniforms` discipline).
+///
+/// The `Bearing::East` branch below is now inert code, not deleted: Tracker
+/// Station slice 0 (`snazzy-jumping-hejlsberg.md`) made `Station::Tracks` a
+/// furnished bearing (`bearing::station_is_room_furniture`), so
+/// `enter_room` no longer spawns an East `BearingMarker` for this loop to
+/// find — the beat-breathe it used to carry is re-homed onto
+/// `tracker::pulse_tracker_playheads`, per-column and per-tempo instead of
+/// one shared pylon.
 ///
 /// The console-emblem glow branch this used to carry (`ConsoleEmblem`,
 /// `CONSOLE_CHATTER_GAIN`) is gone with the slice-A placeholder it lit (Slice

@@ -248,6 +248,9 @@ fn main() {
         .add_plugins(view::patch_bay::PatchBayPlugin)
         // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
         .add_plugins(view::time_well::TimeWellPlugin)
+        // Tracker station — the pattern-grid face at E (Tracker Station
+        // slice 0, `snazzy-jumping-hejlsberg.md`).
+        .add_plugins(view::tracker::TrackerPlugin)
         // The FSN landscape (VFS-as-terrain world; N-dive from the room, Esc
         // to surface) — a genuine `Screen::Fsn` transition, not a
         // `RoomState::zoomed` station, so it has no ordering dependency on

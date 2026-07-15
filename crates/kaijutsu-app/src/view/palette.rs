@@ -108,3 +108,37 @@ pub(crate) const STATION_W_PROUD: f32 = 10.0;
 /// local → ≈523 placed) still clears the panel edge. Push toward ~0.76
 /// only if the nameplate ring is allowed to kiss the mullions.
 pub(crate) const STATION_W_SCALE: f32 = 0.66;
+
+// ── Station E contract (the tracker pattern-grid face mounted ON the east
+// wall) ──────────────────────────────────────────────────────────────────
+// Tracker Station slice 0 (`snazzy-jumping-hejlsberg.md`): the same "the
+// surface gets taken over by its content" call the W wheel made
+// (2026-07-10) applies at E — the pattern grid mounts directly on the E
+// panel rather than standing as furniture in front of it. Unlike the
+// patch-bay wheel (a horizontal table re-oriented face-out), the tracker
+// face is authored VERTICALLY from the start (local XY is the face plane,
+// local +Z the outward normal) — `tracker::STATION_E_PLACEMENT`'s own doc
+// has the resulting pitch/yaw derivation, which is simpler than W's
+// (no roll tie-break needed: local +Y is already "up").
+
+/// Face-center height on the E panel — the panel's own vertical center,
+/// same convention and same number as [`STATION_W_MOUNT_Y`] (both walls
+/// share `room::WALL_HEIGHT`, so both centers coincide).
+pub(crate) const STATION_E_MOUNT_Y: f32 = 280.0;
+
+/// How far the face's local origin floats proud of the E panel, along world
+/// −X (into the room) — the E mirror of [`STATION_W_PROUD`]; same value,
+/// same "inset-flush, part of the wall" reasoning (no coplanar-seating lift
+/// needed either: the tracker face has no backing slab the way the wheel's
+/// table did, it's a flat panel-mounted plate).
+pub(crate) const STATION_E_PROUD: f32 = 10.0;
+
+/// Uniform scale of the placed tracker face. Unlike the patch-bay wheel
+/// (small local geometry scaled UP to fill its wall), the tracker face is
+/// authored directly in world-scale units (`tracker::FACE_W`/`FACE_H` ≈
+/// 994×560, matching the panel's own full width/height —
+/// `bearing::octagon_panel_width` at [`WALL_APOTHEM`] × `room::WALL_HEIGHT`)
+/// so this starts at `1.0` and only needs retuning live if the authored
+/// face doesn't already read flush against its panel. **Amy-tunable —
+/// retune live over BRP once a face is on the wall to check.**
+pub(crate) const STATION_E_SCALE: f32 = 1.0;

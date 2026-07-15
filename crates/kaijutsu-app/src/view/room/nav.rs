@@ -32,9 +32,10 @@ impl Station {
     }
 
     /// Whether a dive target exists yet (well + patch bay + the FSN
-    /// landscape, `view::fsn`, `docs/scenes/vfs.md` slice 0).
+    /// landscape, `view::fsn`, `docs/scenes/vfs.md` slice 0 + the tracker
+    /// station, `view::tracker`, slice 0 of the plan `snazzy-jumping-hejlsberg.md`).
     pub fn built(self) -> bool {
-        matches!(self, Station::TimeWell | Station::PatchBay | Station::Vfs)
+        matches!(self, Station::TimeWell | Station::PatchBay | Station::Tracks | Station::Vfs)
     }
 
     /// Carousel order.
@@ -153,7 +154,7 @@ mod tests {
     fn built_table() {
         assert!(Station::TimeWell.built());
         assert!(Station::PatchBay.built());
-        assert!(!Station::Tracks.built());
+        assert!(Station::Tracks.built());
         assert!(Station::Vfs.built());
         assert!(!Station::Radiators.built());
     }
