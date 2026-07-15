@@ -1098,6 +1098,34 @@ impl BeatScheduler {
                 ));
             }
         }
+        // Sweep persisted attachment rows the in-memory walk above can't see:
+        // a context that plain-`detach`ed earlier left its row behind ON
+        // PURPOSE (rotation's fork-inheritance) and is no longer in
+        // `attached`, so the loop never touches it — and `tombstone_track`'s
+        // dangling-row guard would then refuse forever, wedging the verb (a
+        // manual detach-then-delete is a natural flow; found by the verb's
+        // 4th live use). Same query-and-purge the cold path already does.
+        if let Some(db) = self.documents.db() {
+            let db = db.lock();
+            let leftovers = db.list_attachments_for_track(track_id.as_str()).map_err(|e| {
+                format!(
+                    "beat: failed to list persisted attachments for track '{}': {e} — track \
+                     left stopped + detached; retry the delete (or recover via sqlite)",
+                    track_id.as_str()
+                )
+            })?;
+            for a in &leftovers {
+                db.delete_attachment(track_id.as_str(), a.context_id).map_err(|e| {
+                    format!(
+                        "beat: failed to delete persisted attachment for {} on track '{}': {e} \
+                         — track left stopped + detached; retry the delete (or recover via \
+                         sqlite)",
+                        a.context_id,
+                        track_id.as_str()
+                    )
+                })?;
+            }
+        }
         // DB tombstone BEFORE the in-memory teardown — see the fn doc's
         // retryability note.
         let tombstone = match self.documents.db() {
@@ -5543,6 +5571,37 @@ mod tests {
         // Gone from the live roster and its Timeline torn down.
         assert!(sched.snapshot_tracks().is_empty());
         assert!(kernel.track_timeline(&track).is_none());
+    }
+
+    /// A manual detach-then-delete must succeed (found by the verb's 4th live
+    /// use): plain `detach` deliberately leaves the persisted attachment row
+    /// (rotation's fork-inheritance), so the delete's in-memory walk never
+    /// sees that context — without the persisted-row sweep, `tombstone_track`'s
+    /// dangling-row guard refuses FOREVER (retry can't help: the context is
+    /// gone from `attached` on every attempt). The sweep purges leftovers the
+    /// same way the cold path does.
+    #[tokio::test]
+    async fn delete_after_a_manual_detach_sweeps_the_leftover_row() {
+        let (kernel, documents, db, ctx) = db_backed_kernel_and_docs().await;
+        let track = TrackId::new("bass").unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        // The natural operator flow: detach first (row survives on purpose)…
+        sched.detach(&track, ctx);
+        assert!(
+            db.lock().get_attachment("bass", ctx).unwrap().is_some(),
+            "plain detach leaves the persisted row (rotation inheritance)"
+        );
+
+        // …then delete. Must sweep the leftover row and tombstone, not wedge.
+        let tombstone = sched
+            .delete(&track)
+            .expect("delete succeeds after a manual detach")
+            .expect("tombstone name reported");
+        assert!(tombstone.starts_with("bass~tombstone-"), "{tombstone}");
+        assert!(db.lock().get_attachment("bass", ctx).unwrap().is_none());
+        assert!(db.lock().get_track("bass").unwrap().is_none());
     }
 
     /// The COLD delete path (found dogfooding the verb live): the cold-start
