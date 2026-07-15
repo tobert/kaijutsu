@@ -709,7 +709,17 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- track's life (docs/tracks.md Stage 3): a track sketched on the system clock
     -- can later be slaved to a MIDI master — unlike set-once `score_context_id`,
     -- the clock *source* is circumstantial. `'system'` is the only kind M1 builds.
-    clock_kind        TEXT    NOT NULL DEFAULT 'system'
+    clock_kind        TEXT    NOT NULL DEFAULT 'system',
+    -- Rename-aside tombstone (`kj transport delete`, docs/tracks.md Transport).
+    -- NULL = live. Set together with the `track_id` rename to `{id}~tombstone-
+    -- {deleted_at}` in `tombstone_track`'s transaction, so the two always agree.
+    -- `~` is outside the track-id charset (`[a-z0-9_-]`, `kaijutsu_types::track`),
+    -- enforced on the attach path via `TrackId::new`, so a tombstoned row can
+    -- never collide with — or be re-attached under — a live name. The score
+    -- context is untouched: it's the durable recovery payload. Recovery is
+    -- sqlite-only by decision: `UPDATE tracks SET track_id = '<original>',
+    -- deleted_at = NULL WHERE track_id = '<original>~tombstone-<deleted_at>'`.
+    deleted_at        INTEGER
 );
 
 -- ── Attachments (context → track binding — docs/tracks.md §2+3) ─
@@ -1076,6 +1086,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN promoted_at INTEGER",
             "ALTER TABLE contexts ADD COLUMN demoted_at INTEGER",
             "ALTER TABLE contexts ADD COLUMN paused_at INTEGER",
+            "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -3630,11 +3641,14 @@ impl KernelDb {
         }))
     }
 
-    /// List all persisted tracks. Order is not guaranteed.
+    /// List all **live** persisted tracks — tombstoned rows (`deleted_at IS NOT
+    /// NULL`) are excluded, matching `get_track`'s implicit skip (a tombstoned
+    /// row no longer answers to its original name because `tombstone_track`
+    /// renamed it aside). Order is not guaranteed.
     pub fn list_tracks(&self) -> KernelDbResult<Vec<PersistedTrack>> {
         let mut stmt = self.conn.prepare(
             "SELECT track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_context_id, clock_kind
-             FROM tracks",
+             FROM tracks WHERE deleted_at IS NULL",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -3672,6 +3686,79 @@ impl KernelDb {
             .conn
             .execute("DELETE FROM tracks WHERE track_id = ?1", params![track_id])?;
         Ok(deleted as u64)
+    }
+
+    /// Tombstone a track: **rename it aside** to `{track_id}~tombstone-{deleted_at}`
+    /// and stamp `deleted_at`, atomically, in one transaction. `kj transport
+    /// delete`'s DB half — the scheduler half (stop the clock, detach every
+    /// attached context, tear down the live `Timeline`, drop the in-memory
+    /// `TrackState`) has already run by the time this is called.
+    ///
+    /// A rename, not a `DELETE`: the row (and the durable `tracks` history it
+    /// carries — `score_context_id` above all) survives, just invisible under
+    /// its old name. `list_tracks`/`get_track` (by construction — the PK no
+    /// longer matches) stop returning it, so name reuse via `kj transport attach
+    /// --track <name>` starts a genuinely fresh track + score. Recovery is
+    /// **sqlite-only by decision** (no `kj` verb): `UPDATE tracks SET track_id =
+    /// '<original>', deleted_at = NULL WHERE track_id =
+    /// '<original>~tombstone-<deleted_at>'`.
+    ///
+    /// `~` is outside the track-id charset (`[a-z0-9_-]`,
+    /// `kaijutsu_types::track::is_track_char`) and `TrackId::new` enforces that
+    /// charset on every attach-path call (`kj/transport.rs`
+    /// `resolve_track_for_ctx` / `beat_attach_payload`), so a tombstone name can
+    /// never collide with — or be re-attached under — a live track id.
+    ///
+    /// PRECONDITION, checked here loudly rather than silently repaired: every
+    /// `attachments` row for `track_id` must already be gone. The scheduler's
+    /// delete path detaches every attached context AND deletes its persisted
+    /// attachment row before calling here (the same "move to a new track"
+    /// idiom `attach` already uses for a context switching lanes). A non-zero
+    /// remaining count means that step was skipped — refuse rather than rename
+    /// the track out from under a still-live binding, which would leave the
+    /// attachment row pointing at a `track_id` that resolves to nothing.
+    ///
+    /// The epoch unit for both the suffix and `deleted_at` is milliseconds —
+    /// the same unit `concluded_at`/`last_activity_at` use (this module's
+    /// header: "All timestamps are Unix milliseconds") — and it is the SAME
+    /// read of the clock for both, so the name and the column can never
+    /// disagree by a tick. Returns the tombstone name on success; `NotFound`
+    /// if `track_id` doesn't exist (already deleted, or never existed).
+    pub fn tombstone_track(&mut self, track_id: &str) -> KernelDbResult<String> {
+        if track_id.is_empty() {
+            return Err(KernelDbError::Validation(
+                "tombstone_track called with an empty track_id".into(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM attachments WHERE track_id = ?1",
+            params![track_id],
+            |row| row.get(0),
+        )?;
+        if remaining != 0 {
+            return Err(KernelDbError::Validation(format!(
+                "tombstone_track({track_id}): refusing — {remaining} attachment row(s) still \
+                 reference this track; detach (and delete the persisted row for) every attached \
+                 context before tombstoning, never rename a track out from under a live binding"
+            )));
+        }
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tracks WHERE track_id = ?1",
+            params![track_id],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(KernelDbError::NotFound(format!("track {track_id}")));
+        }
+        let deleted_at = now_millis();
+        let tombstone_name = format!("{track_id}~tombstone-{deleted_at}");
+        tx.execute(
+            "UPDATE tracks SET track_id = ?1, deleted_at = ?2 WHERE track_id = ?3",
+            params![tombstone_name, deleted_at, track_id],
+        )?;
+        tx.commit()?;
+        Ok(tombstone_name)
     }
 
     // ========================================================================
@@ -6327,6 +6414,97 @@ mod tests {
             0,
             "attachment cascade-deleted with the track"
         );
+    }
+
+    // ── tombstone (kj transport delete) ─────────────────────────────────
+
+    #[test]
+    fn tombstone_track_renames_aside_and_hides_from_reads() {
+        // The round trip `kj transport delete` depends on: the row is RENAMED
+        // (not deleted), `deleted_at` is stamped, `score_context_id` survives
+        // untouched (the durable recovery payload), and the tombstoned row is
+        // invisible to both `list_tracks` and a `get_track` lookup by the
+        // ORIGINAL name (so re-attaching that name starts fresh).
+        let mut db = KernelDb::in_memory().unwrap();
+        let score = ContextId::new();
+        db.upsert_track(&PersistedTrack { score_context_id: Some(score), ..make_track("bass", 250) })
+            .unwrap();
+        db.upsert_track(&make_track("lead", 500)).unwrap();
+
+        let tombstone_name = db.tombstone_track("bass").unwrap();
+        assert!(
+            tombstone_name.starts_with("bass~tombstone-"),
+            "tombstone name carries the original id: {tombstone_name}"
+        );
+
+        // Hidden from both read paths under the original name.
+        assert!(
+            db.get_track("bass").unwrap().is_none(),
+            "get_track(original name) sees nothing — the PK moved"
+        );
+        let live = db.list_tracks().unwrap();
+        assert_eq!(live.len(), 1, "list_tracks shows only the untouched sibling");
+        assert_eq!(live[0].track_id, "lead");
+
+        // The row survives under its new name, with score_context_id intact —
+        // the durable recovery payload — and deleted_at stamped.
+        let deleted_at: i64 = db
+            .conn
+            .query_row(
+                "SELECT deleted_at FROM tracks WHERE track_id = ?1",
+                params![tombstone_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(deleted_at > 0, "deleted_at is stamped");
+        assert!(
+            tombstone_name.ends_with(&deleted_at.to_string()),
+            "the suffix and deleted_at come from the SAME clock read: {tombstone_name} vs {deleted_at}"
+        );
+        let score_blob: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT score_context_id FROM tracks WHERE track_id = ?1",
+                params![tombstone_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ContextId::try_from_slice(&score_blob),
+            Some(score),
+            "score_context_id survives the rename untouched — the recovery payload"
+        );
+    }
+
+    #[test]
+    fn tombstone_track_refuses_with_dangling_attachments() {
+        // The scheduler's delete path must detach + delete every attachment row
+        // BEFORE tombstoning; if it didn't, renaming the track_id out from under
+        // a live attachment row would leave that row pointing at a name that no
+        // longer resolves. Refuse loudly rather than silently orphan it.
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.upsert_track(&make_track("bass", 250)).unwrap();
+        let ctx = make_context_row(Some("dangling"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        db.upsert_attachment(&make_attachment("bass", ctx.context_id)).unwrap();
+
+        let err = db.tombstone_track("bass").unwrap_err();
+        assert!(
+            matches!(err, KernelDbError::Validation(_)),
+            "a dangling attachment refuses the tombstone: {err:?}"
+        );
+        // Untouched: still live under its original name.
+        assert!(db.get_track("bass").unwrap().is_some(), "the track was NOT renamed");
+    }
+
+    #[test]
+    fn tombstone_track_unknown_track_is_not_found() {
+        let mut db = KernelDb::in_memory().unwrap();
+        assert!(matches!(
+            db.tombstone_track("no-such-track"),
+            Err(KernelDbError::NotFound(_))
+        ));
     }
 
     #[test]
