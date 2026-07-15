@@ -350,13 +350,19 @@ struct RenderCue {
 
 # A low-rate beat reference for a sink's continuous local timebase (docs/midi.md
 # "The relative-lead timebase, analyzed"). Mirrors kaijutsu_audio::BeatRef: the
-# fractional beat coordinate at emission plus the tempo. Carries no absolute
-# instant (a process-local one can't cross the wire) — the sink stamps receipt
-# locally, exactly as it re-anchors RenderCue.leadNanos. The phasor slews toward
-# it; it never hard-resyncs.
+# fractional beat coordinate at emission plus the tempo, PLUS the sender's
+# wallclock at emission (epochNs) — mirroring reportClockEstimate's epochNs
+# (the reverse-direction ClockEstimate path this mirrors forward). The sink
+# back-dates each reference to its own emission instant (BeatRef::backdated_at)
+# rather than folding every buffered reference at one receipt-time now — a
+# delivery flood (refs queued behind a turn's streamed output) would otherwise
+# walk the phasor several beats. epochNs == 0 means unstamped (an old peer) —
+# the sink falls back to receipt time, the old behavior. The phasor still never
+# hard-resyncs: a fresh reference nudges it, it doesn't snap.
 struct BeatRef {
   beat @0 :Float64;       # fractional beat coordinate at emission; integers are onsets
   tempoBps @1 :Float64;   # tempo in beats per second (120 BPM == 2.0)
+  epochNs @2 :UInt64;     # sender wallclock (ns since UNIX_EPOCH) at emission; 0 = unstamped
 }
 
 # Callback for receiving block updates from server
