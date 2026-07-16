@@ -66,7 +66,10 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 
 /// Compute screen-space pixel range for adaptive anti-aliasing.
 fn screen_px_range(uv: vec2<f32>) -> f32 {
-    let atlas_size = vec2<f32>(textureDimensions(atlas_texture, 0));
+    // uniforms.sdf_texel already carries (1/atlas_width, 1/atlas_height) —
+    // set once per frame in block_render.rs from the atlas's known
+    // dimensions, so there's no need to ask the GPU for them per fragment.
+    let atlas_size = 1.0 / uniforms.sdf_texel;
     let uv_fwidth = fwidth(uv);
     let pixel_dist = max(uv_fwidth.x, uv_fwidth.y);
     let unit_range = uniforms.msdf_range / atlas_size.x;
