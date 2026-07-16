@@ -159,6 +159,12 @@ pub struct ConversationGeometry {
     pub content_height: f32,
     /// Document version at the last reconcile (the reconcile gate).
     pub last_doc_version: u64,
+    /// Block ids in document order at the last reconcile. Second reconcile
+    /// gate: a context switch can REPLACE the editor's store wholesale with
+    /// a coincidentally-equal version (welcome → hydrated context), which
+    /// the version gate alone can't see — stale rows then feed the band a
+    /// dead id and the spawn/despawn loop never converges.
+    block_ids: Vec<BlockId>,
     /// Cols used for the current estimates (re-estimation gate on resize).
     pub cols: usize,
     /// Prefix sums need recomputation.
@@ -170,13 +176,15 @@ impl ConversationGeometry {
         &self.rows
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
     /// Look up the block row for `id`.
     pub fn block_row(&self, id: &BlockId) -> Option<&GeomRow> {
         self.block_index.get(id).map(|&i| &self.rows[i])
+    }
+
+    /// Whether the given document-order id sequence matches the one this
+    /// geometry was last reconciled against.
+    pub fn ids_match(&self, ids: &[BlockId]) -> bool {
+        self.block_ids == ids
     }
 
     /// Look up the header row preceding block `id`, if that block starts a
@@ -325,6 +333,7 @@ impl ConversationGeometry {
 
         self.rows = rows;
         self.block_index = block_index;
+        self.block_ids = ids.to_vec();
         self.last_doc_version = doc_version;
         self.cols = params.cols;
         self.dirty = true;
@@ -585,9 +594,13 @@ pub fn sync_conversation_geometry(
         role_header_spacing: theme.role_header_spacing,
     };
 
+    // Reconcile on version change OR id-sequence change: a context switch
+    // can replace the store wholesale at a coincidentally-equal version
+    // (welcome → hydrated context), which stalls a version-only gate on
+    // stale rows and feeds the entity band a dead id forever.
     let doc_version = editor.version();
-    if doc_version != geom.last_doc_version || (geom.is_empty() && editor.has_blocks()) {
-        let ids = editor.block_ids();
+    let ids = editor.block_ids();
+    if doc_version != geom.last_doc_version || !geom.ids_match(&ids) {
         geom.reconcile(
             &ids,
             |id| editor.block_snapshot(id).map(row_seed),
@@ -918,6 +931,26 @@ mod tests {
         assert_eq!(g.block_row(&bid(1)).unwrap().height, 77.0); // measured: untouched
         assert_eq!(g.block_row(&bid(2)).unwrap().height, 7.0 * 30.0); // re-estimated
         assert_eq!(g.cols, 50);
+    }
+
+    /// Regression (live-found on zorak): a context switch can replace the
+    /// editor's store wholesale while the document version coincidentally
+    /// matches the old one. `ids_match` is the second gate that catches it —
+    /// without it, stale rows feed the entity band a dead id and the
+    /// spawn/despawn loop never converges.
+    #[test]
+    fn ids_match_detects_store_swap_at_equal_version() {
+        let mut g = ConversationGeometry::default();
+        g.reconcile(&[bid(1)], |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
+        assert!(g.ids_match(&[bid(1)]));
+        // Same version, different ids — the swap signature.
+        assert!(!g.ids_match(&[bid(2)]));
+
+        let changed = g.reconcile(&[bid(2)], |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
+        assert!(changed);
+        assert!(g.block_row(&bid(1)).is_none());
+        assert!(g.block_row(&bid(2)).is_some());
+        assert!(g.ids_match(&[bid(2)]));
     }
 
     // ---- band planning ----------------------------------------------------

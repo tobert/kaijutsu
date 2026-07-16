@@ -94,21 +94,25 @@ vs a stamp alongside `promoted_at`/`demoted_at`/`paused_at`.
   resolver's connection if idle recovery still needs to be faster than
   `FETCH_TIMEOUT` in practice.
 
-## Conversation virtualization follow-ups (seeded 2026-07-16, from `6504fafe`)
+## Conversation geometry model — accepted limits (seeded 2026-07-16, from `82207a2a`+`7e3f2fa1`)
 
-The O(visible) virtualization shipped with two accepted v1 limits, named in
-the commit message and carried here so they outlive it:
+Both `6504fafe` follow-ups shipped (estimated-height placeholders killed the
+O(N) first-load pass; band despawn/respawn bounds entities + VRAM to the
+viewport band). New accepted limits of the geometry model, carried here:
 
-- **Estimated-height placeholders**: first load of a long conversation still
-  pays one O(N) layout pass before the window collapses to Display::None;
-  seeding never-measured blocks with an estimated height would cap it.
-- **Despawn (not just Display::None) offscreen blocks** to reclaim per-block
-  RTT texture memory — Display::None leaves the entity + its render target
-  alive; long sessions accumulate GPU memory proportional to history, not
-  window. Needs the respawn path to rebuild from the block store cleanly.
-- Also accepted: a never-measured/stale tail block forced visible while
-  scrolled far away can make the shown set briefly non-contiguous for one
-  self-correcting frame.
+- **Offscreen-streamed rows keep stale estimates** until they enter the
+  spawn band (re-measured there, before visibility) — the scrollbar/spacers
+  drift a little while text streams into rows you've scrolled away from.
+  If it ever matters: re-estimate estimated rows on version change.
+- **ToolCall at the outer band edge** can briefly render CloseBottom while
+  its ToolResult is still outside the band (border joins are computed from
+  in-band snapshots only); corrects as the pair scrolls in.
+- **`handle_collapse_toggle` still clones the whole document** on keypress
+  (`editor.blocks()` in input/systems.rs) — noticeable hitch on huge
+  contexts; could walk geometry rows for Thinking ids instead.
+- **Width changes only re-estimate unmeasured rows**; measured heights of
+  despawned rows go stale on resize until band entry (same just-in-time
+  correction path, pre-existing behavior).
 
 ## Anthropic client maturity (seeded 2026-07-15, thinking-enable arc)
 
