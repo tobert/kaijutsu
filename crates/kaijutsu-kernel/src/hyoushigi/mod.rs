@@ -516,7 +516,11 @@ pub fn schedule_clip_cell(
 ) -> anyhow::Result<kaijutsu_types::Tick> {
     // Gate 1 of 3: eager parse + CAS-presence validate. Reject a malformed or
     // dangling-media record before it touches CAS or the timeline — a rejected
-    // schedule must leave zero residue.
+    // schedule leaves zero residue OF THE RECORD (nothing scheduled, record
+    // never stored). The media bytes a caller cas-put before calling us may
+    // outlive a rejection — harmless by construction: CAS is content-addressed,
+    // so the orphan is idempotent and reusable, never a dangling reference
+    // (kaibo review 2026-07-16 pinned the distinction).
     Clip::parse_validated(clip_json, kernel.cas().as_ref())
         .map_err(|e| anyhow::anyhow!("schedule_clip_cell: invalid clip record: {e}"))?;
 

@@ -66,16 +66,18 @@ pub(crate) struct PlayArgs {
     /// how to arm it.
     #[arg(long)]
     track: Option<String>,
-    /// With `--track`: the absolute tick to place the clip at. Omitted =
-    /// ASAP (`playhead + 1` at schedule time). Ignored (and meaningless)
-    /// without `--track`.
-    #[arg(long)]
+    /// With `--track`: the absolute tick to place the clip at (must be ≥ 0).
+    /// Omitted = ASAP (`playhead + 1` at schedule time). Meaningless without
+    /// `--track`, so clap rejects that combination outright (kaibo review
+    /// 2026-07-16: silent-ignore was a UX footgun).
+    #[arg(long, requires = "track")]
     at: Option<i64>,
     /// With `--track`: the clip's human label — hashes are opaque, the label
     /// is how the score reads. Defaults to the file stem for the `<path>`
     /// form (`kick-808.wav` → `kick-808`); REQUIRED for the `--cas` form
-    /// (a hash has no derivable name). Ignored without `--track`.
-    #[arg(long)]
+    /// (a hash has no derivable name). Meaningless without `--track`, so
+    /// clap rejects that combination outright.
+    #[arg(long, requires = "track")]
     label: Option<String>,
 }
 
@@ -272,11 +274,25 @@ impl KjDispatcher {
                     };
                     let label = match parsed.label.as_deref().map(str::trim) {
                         Some(l) if !l.is_empty() => l.to_string(),
-                        _ => std::path::Path::new(path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| path.to_string()),
+                        _ => {
+                            let stem = std::path::Path::new(path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("");
+                            if stem.trim().is_empty() {
+                                // A whitespace-only stem (`"   .wav"`) or an
+                                // underivable one would flow into Clip validation
+                                // as an opaque "label must be non-empty" — say
+                                // what actually went wrong instead (kaibo review;
+                                // NB a plain dotfile `.wav` is FINE: file_stem()
+                                // returns the whole name ".wav", a usable label).
+                                return KjResult::Err(format!(
+                                    "kj play --track: cannot derive a label from {path:?} \
+                                     (empty file stem) — pass --label"
+                                ));
+                            }
+                            stem.to_string()
+                        }
                     };
                     (hash, mime, label)
                 }
@@ -303,6 +319,15 @@ impl KjDispatcher {
         // the store `schedule_clip_cell` performs internally under the same hash.
         let record = ContentHash::from_data(clip_json.as_bytes());
 
+        // A negative tick would fall through to Timeline::schedule's in-the-past
+        // gate with a technically-true-but-confusing "InThePast { start: Tick(-1) }"
+        // error; the user didn't pick a past tick, they picked a nonsense one —
+        // reject it here with the real reason (kaibo review 2026-07-16).
+        if let Some(at) = parsed.at {
+            if at < 0 {
+                return KjResult::Err(format!("kj play --track: --at must be ≥ 0 (got {at})"));
+            }
+        }
         let at = parsed.at.map(kaijutsu_types::Tick::new);
         let tick = match schedule_clip_cell(
             self.kernel(),
@@ -835,5 +860,109 @@ mod tests {
             &caller,
         );
         assert!(!result.is_ok(), "unknown extension should error under --track too");
+    }
+
+    // ── Polish guards (kaibo review 2026-07-16) ─────────────────────────────
+
+    /// `--at` (and `--label`) without `--track` is meaningless — clap's
+    /// `requires = "track"` rejects it outright instead of silently ignoring
+    /// it (the review's UX-footgun finding: `kj play kick.wav --at 50` used
+    /// to succeed with `--at` doing nothing).
+    #[tokio::test]
+    async fn play_at_without_track_is_rejected_not_ignored() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick.wav");
+        std::fs::write(&wav_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        for stray in [["--at", "50"], ["--label", "kick"]] {
+            let result = dispatcher.dispatch_play(
+                &[
+                    wav_path.to_string_lossy().into_owned(),
+                    stray[0].to_string(),
+                    stray[1].to_string(),
+                ],
+                &caller,
+            );
+            assert!(
+                !result.is_ok(),
+                "{} without --track must be rejected, not silently ignored: {result:?}",
+                stray[0]
+            );
+        }
+    }
+
+    /// A negative `--at` is rejected with the REAL reason (a nonsense tick),
+    /// not Timeline::schedule's confusing "InThePast {{ start: Tick(-1) }}".
+    #[tokio::test]
+    async fn play_track_negative_at_errors_clearly() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick.wav");
+        std::fs::write(&wav_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        // NB `--at -3` (space-separated) never reaches our guard — clap reads
+        // `-3` as a flag and errors at parse. `--at=-3` is the form that
+        // parses and must hit the clear-message gate.
+        let result = dispatcher.dispatch_play(
+            &[
+                wav_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+                "--at=-3".to_string(),
+            ],
+            &caller,
+        );
+        assert!(!result.is_ok(), "negative --at must error");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("must be ≥ 0"),
+            "the error names the real problem (nonsense tick), not InThePast: {msg}"
+        );
+    }
+
+    /// A whitespace-only file stem (`"   .wav"`) derives an unusable label —
+    /// the error says so and points at `--label`, instead of the opaque
+    /// downstream "clip label must be non-empty". (A plain dotfile `.wav` is
+    /// NOT this case: `file_stem()` returns the whole name ".wav", which is a
+    /// perfectly usable label.)
+    #[tokio::test]
+    async fn play_track_whitespace_stem_errors_clearly() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let ws_path = dir.path().join("   .wav");
+        std::fs::write(&ws_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                ws_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+            ],
+            &caller,
+        );
+        assert!(!result.is_ok(), "an underivable label must error");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("--label"),
+            "the error points the user at --label: {msg}"
+        );
     }
 }

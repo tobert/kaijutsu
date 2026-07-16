@@ -211,11 +211,14 @@ keys pass through untouched.
 
 ### Fallback semantics
 
-Same required `Fallback` as any recipe. `UseLastGood` on a clip lane repeats
-the lane's last committed *clip record* — symbolic, cheap, media already in
-every sink's cache from the first play (the vamp insurance carries over from
-ABC unchanged). Fresh-lane default: `Skip` — silence until the first good
-clip, matching the locked chameleon default.
+Same required `Fallback` as any recipe. **As implemented (R2): every placed
+clip carries `Skip`** — a missed resolve is silence (the engine drops the
+cell without wedging the lane; a resolve *error* is loud, bypassing fallback
+entirely). A placed one-shot must never vamp-repeat. `UseLastGood` on a clip
+lane — repeating the lane's last committed *clip record*, media already in
+every sink's cache — remains a coherent **future option** for a lane that
+wants vamp insurance (a looping percussion lane, say), but nothing authors
+it today; it would come with the verb growing a flag, not as a default.
 
 ### Growth path
 

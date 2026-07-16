@@ -6,6 +6,27 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Input prefix: deferred chords + pending-hint UI (seeded 2026-07-16, input rework)
+
+The Ctrl+A prefix machine shipped with Amy's core set (`docs/input.md`);
+three pieces deferred:
+
+- **`Ctrl+A A` rename**: needs a `kj context rename` verb first (kernel-side
+  `drift.rename` exists; no CLI surface). Then wire the prefilled-`kj`
+  prompt pattern: summon the shell surface with `kj context rename ` typed,
+  cursor at end, Enter runs / Esc abandons. Amy wants the pattern reusable
+  beyond rename.
+- **`Ctrl+A '` switch-by-prompt**: same prefill pattern, `kj context switch `.
+- **Pending-prefix hint + `Ctrl+A ?` legend**: an armed prefix currently has
+  no visual (log only). Wants a small statusline-corner indicator and a
+  transient chord-table overlay rendered from the table (the well legend's
+  shape).
+- **Selection auto-copies to PRIMARY** (the other half of the xterm model —
+  Ctrl+V/middle-click paste shipped): needs a selection UX first. The
+  overlay's `selection_anchor` has no live producer (mouse drag-select and
+  vi visual mode are both unwired); when one lands, copy-on-selection to
+  PRIMARY rides it.
+
 ## Context lifecycle: "done for now" marker (seeded 2026-07-16, input rework)
 
 Amy wants a soft "done for now" intent marker on contexts — distinct from
@@ -216,7 +237,16 @@ bloom/vi-dive/search items below; they stay on record, not on deck.
   a dedicated key. If it stays unreachable long enough, consider deleting
   the screen instead of carrying it.
 
-## `cargo fmt` unsafe repo-wide (found 2026-07-13, FSN slice-1 lanes)
+## `cargo fmt` unsafe repo-wide (found 2026-07-13, FSN slice-1 lanes; re-bitten 2026-07-16)
+
+**2026-07-16 update (both pcm lanes hit it independently):** the installed
+rustfmt (1.9.0, no pinned toolchain, no `rustfmt.toml`) reformats ~350 lines
+of pre-existing code even when scoped to a single touched file, and
+`cargo fmt -p <crate>` ignores file arguments entirely (one lane reformatted
+100 unrelated files before catching it; both caught + reverted via
+`git status` before committing). Until a `rustfmt.toml` or pinned toolchain
+lands, subagent briefs should say "hand-match surrounding style, do NOT run
+a formatter" — the current briefs' `cargo fmt` instruction is a trap.
 
 This environment's rustfmt (1.9.0-stable) disagrees with whatever version
 produced the repo's current formatting: a bare `cargo fmt -p <crate>`
@@ -810,13 +840,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   error blocks, watch for the new fail-loud `error!` logs from
   `reorder_conversation_children` — if they fire, the upstream
   container-entry gap they point at is the remaining bug to chase.
-- **Triple-Esc does not interrupt a running agentic loop (observed 2026-06-17,
-  same session).** Tapping Esc three times while a context was mid-drive
-  (autonomous turn / tool loop) did not cancel or interrupt it — the loop ran to
-  completion. Expected an abort path on rapid-Esc analogous to the
-  double-tap-dismiss pattern. Need to wire a keyboard interrupt that reaches the
-  in-flight drive/turn (InterruptState → kernel turn cancellation), not just the
-  compose overlay.
+- **Verify the interrupt ladder actually cancels an in-flight drive**
+  (originally observed 2026-06-17 as "triple-Esc doesn't interrupt";
+  reframed 2026-07-16 by the input rework: Esc is vi's/PopLevel now,
+  interruption is **Ctrl+C**'s job — docs/input.md). The app side fires
+  `interrupt_context(ctx, immediate)` on the Ctrl+C ladder; what was never
+  confirmed is the kernel side cancelling a mid-drive turn/tool loop
+  (rather than only a streaming LLM turn). Next agentic session: Ctrl+C
+  twice mid-drive and watch whether the loop actually stops.
 
 ## Control Plane & Navigation (kj)
 
