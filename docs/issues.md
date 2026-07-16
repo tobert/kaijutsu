@@ -15,39 +15,27 @@ armed-footer legend): needs a selection UX first. The overlay's
 mode are both unwired); when one lands, copy-on-selection to PRIMARY rides
 it — `InputOverlay::selection_range` is the read point.
 
-## msdfgen-rs `Shape::get_bound()` / `Contour::get_bound()` zero-seeded (seeded 2026-07-16, msdf-geometry lane)
+## msdfgen-rs `Shape::get_bound()` / `Contour::get_bound()` zero-seeded (seeded 2026-07-16, msdf-geometry lane; sidestepped 2026-07-16, msdf-bbox lane)
 
-`msdfgen-rs` (`/home/atobey/src/msdfgen-rs`, local path dep, do-not-modify
-per lane boundary) has a real bug independent of the three geometry bugs
-this lane fixed: `Shape::get_bound()`/`Contour::get_bound()`
-(`src/shape.rs`, `src/contour.rs`) seed their accumulator with
-`Bound::default()` == `(0,0,0,0)`, then call the raw C++ `bound(l,b,r,t)`
-out-parameter method, which only ever *shrinks toward* an extreme
-(`sys/lib/core/edge-segments.cpp`'s `boundPoint`: `if (p.x < l) l = p.x;`
-etc.). That out-parameter method is designed to be called with the caller
-pre-seeding `±LARGE_VALUE` — which is exactly what the C++ convenience
-`Shape::getBounds()` does, but msdfgen-rs never binds `getBounds()` at all.
-Net effect: `left`/`bottom` silently stay `0.0` whenever a glyph's true
-left/bottom edge is positive — the common case for glyphs with left-side
-bearing or sitting above the baseline. Verified by hand against
-`CascadiaCodeNF.ttf`'s `.` glyph (glyph_id 1862): ttf-parser's tight bbox is
-`x_min=452`, but `Shape::get_bound()` reports `left=0.0`.
+`msdfgen-rs` (`/home/atobey/src/msdfgen-rs`, local path dep, do-not-modify)
+has a real bug: `Shape::get_bound()`/`Contour::get_bound()` seed their
+accumulator at `(0,0,0,0)` and only ever *shrink toward* an extreme, instead
+of pre-seeding `±LARGE_VALUE` the way the C++ `Shape::getBounds()`
+convenience does (which msdfgen-rs never binds). Net effect: `left`/`bottom`
+silently stay `0.0` whenever a glyph's true left/bottom edge is positive —
+the common case (left-side bearing, glyphs above the baseline). Verified
+against `CascadiaCodeNF.ttf`'s `.` glyph: ttf-parser reports `x_min=452`,
+`Shape::get_bound()` reports `left=0.0`.
 
-Consequence in `kaijutsu-app`: `generator.rs::generate_glyph`'s bitmap
-sizing/centering (both before and after the Fix-1 scale correction) reads
-`bounds.left`/`bounds.bottom` from this buggy call, so bitmaps are
-oversized and off-center for affected glyphs. Fix 1's scale correction
-(`msdf-geometry` lane) is unaffected in *magnitude* — ink size is an affine
-difference, so the wrong `translate` offset cancels out — but the glyph's
-absolute *position* in the padded bitmap (and thus the anchor) is still
-built on the wrong `bounds.left`/`bounds.bottom`. Not fixed here: out of
-scope for the three geometry bugs assigned, and msdfgen-rs is off-limits to
-modify from this lane. Fix, when picked up: either patch msdfgen-rs's
-`get_bound()`/`get_bound_miters()` to seed `±f64::MAX` before calling the
-raw `bound()`/`boundMiters()`, or have `kaijutsu-app` stop relying on
-`Shape::get_bound()` for glyph extents and use `ttf_parser::Face::
-glyph_bounding_box()` instead (already proven accurate against this bug in
-`generator.rs`'s tests).
+Sidestepped, not fixed: `kaijutsu-app` no longer calls `get_bound()`
+anywhere (`generator.rs::generate_glyph` sizes/centers/anchors every glyph
+from `ttf_parser::Face::glyph_bounding_box()` instead), so exposure to this
+bug is zero for us. Upstream (`katyo/msdfgen-rs`) is dormant; the bug itself
+is still real for anyone else depending on the crate. Nice-to-have,
+unclaimed: patch `get_bound()`/`get_bound_miters()` to seed `±f64::MAX`
+before the raw C++ `bound()`/`boundMiters()` call, and send it upstream as a
+PR. Amy also wants to check back later on the pure-Rust `bymsdfgen` crates
+as a possible future replacement for msdfgen-rs's C++ core.
 
 ## Context lifecycle: "done for now" marker (seeded 2026-07-16, input rework)
 
