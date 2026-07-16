@@ -11,9 +11,13 @@ use crate::text::rich::SpanBrush;
 
 /// Extract positioned glyphs from a Parley layout for MSDF rendering.
 ///
-/// Iterates glyph runs, snaps baselines to pixel boundaries, applies
-/// x-height grid fitting, maps per-run brush to RGBA8 color, and
-/// queues unknown glyphs to the atlas for async generation.
+/// Iterates glyph runs, maps per-run brush to RGBA8 color, and queues
+/// unknown glyphs to the atlas for async generation. Baselines are left as
+/// raw (unsnapped) logical pixels here — snapping to a pixel boundary only
+/// makes sense in PHYSICAL pixels (a fractional HiDPI `scale_factor` means
+/// a logical-integer baseline isn't necessarily a physical scanline), so it
+/// happens later, in `MsdfBlockRenderer::build_vertices` (renderer.rs),
+/// which knows the render target's physical size and scale.
 ///
 /// # Arguments
 /// * `layout` — Parley layout (already computed by `VelloFont::layout()`)
@@ -43,9 +47,6 @@ pub fn collect_msdf_glyphs(
             let font_size = run.font_size();
             let font_id = FontId::from_parley(font);
 
-            // Snap baseline to pixel boundary
-            let y_snapped = y.round();
-
             // Determine color from span brushes
             let text_range = run.text_range();
             let run_brush = crate::text::rich::brush_at_offset(span_brushes, text_range.start)
@@ -54,7 +55,7 @@ pub fn collect_msdf_glyphs(
 
             for glyph in glyph_run.glyphs() {
                 let gx = x + glyph.x;
-                let gy = y_snapped - glyph.y;
+                let gy = y - glyph.y;
                 x += glyph.advance;
 
                 let key = GlyphKey::new(font_id, glyph.id as u16);

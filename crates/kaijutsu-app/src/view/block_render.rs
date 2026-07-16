@@ -974,11 +974,16 @@ pub fn render_msdf_block_textures(
             continue;
         }
 
+        // Physical texture size (item.width/height, already
+        // ceil(logical*scale) — see ui_rtt_texture_dims) + scale_factor, not
+        // built_width/built_height: build_vertices maps glyph coordinates
+        // into physical pixel space directly (Fix 3 — see its doc comment).
         let vertices = MsdfBlockRenderer::build_vertices(
             &item.glyphs,
             &msdf_atlas,
-            item.built_width,
-            item.built_height,
+            item.width as f32,
+            item.height as f32,
+            render_params.scale_factor,
             item.rainbow,
         );
 
@@ -1077,10 +1082,12 @@ pub fn render_msdf_block_textures(
 struct ExtractedMsdfBlockItem {
     glyphs: Vec<crate::text::msdf::PositionedGlyph>,
     image_handle: Handle<Image>,
+    /// Physical pixel dims of the render target (`ceil(logical * scale)`,
+    /// see `ui_rtt::ui_rtt_texture_dims`) — also what `build_vertices` maps
+    /// glyph coordinates into (Fix 3; `built_width`/`built_height` on
+    /// `UiRttTexture` are logical and no longer needed here).
     width: u32,
     height: u32,
-    built_width: f32,
-    built_height: f32,
     version: u64,
     rainbow: bool,
     /// Whether Vello rendered borders first (false = MSDF must clear).
@@ -1099,8 +1106,8 @@ pub struct ExtractedMsdfBlockData {
     skip_attempts: HashMap<AssetId<Image>, u32>,
 }
 
-/// Extracted MSDF rendering parameters (from Theme + Time).
-#[derive(Resource, Default, Clone)]
+/// Extracted MSDF rendering parameters (from Theme + Time + TextMetrics).
+#[derive(Resource, Clone)]
 pub struct ExtractedMsdfRenderParams {
     pub hint_amount: f32,
     pub stem_darkening: f32,
@@ -1109,6 +1116,30 @@ pub struct ExtractedMsdfRenderParams {
     pub text_bias: f32,
     pub gamma_correction: f32,
     pub time: f32,
+    /// Window HiDPI scale factor, passed to `build_vertices` to convert
+    /// glyph-space (logical) coordinates into the render target's physical
+    /// pixel space (Fix 3). Every field here is overwritten every frame by
+    /// `extract_msdf_render_params` before `render_msdf_block_textures`
+    /// (guarded on non-empty `ExtractedMsdfBlockData`, itself populated in
+    /// the same extract pass) ever reads it — 1.0 is just a sane value for
+    /// the otherwise-unreachable pre-first-extract instant, not a value
+    /// this resource is expected to render with.
+    pub scale_factor: f32,
+}
+
+impl Default for ExtractedMsdfRenderParams {
+    fn default() -> Self {
+        Self {
+            hint_amount: 0.0,
+            stem_darkening: 0.0,
+            horz_scale: 0.0,
+            vert_scale: 0.0,
+            text_bias: 0.0,
+            gamma_correction: 0.0,
+            time: 0.0,
+            scale_factor: 1.0,
+        }
+    }
 }
 
 /// Extract MSDF atlas data to the render world.
@@ -1159,8 +1190,6 @@ fn extract_msdf_blocks(
             image_handle: texture.image.clone(),
             width: texture.width,
             height: texture.height,
-            built_width: texture.built_width,
-            built_height: texture.built_height,
             version: msdf_glyphs.version,
             rainbow: msdf_glyphs.rainbow,
             has_vello_content: has_vello,
@@ -1168,11 +1197,12 @@ fn extract_msdf_blocks(
     }
 }
 
-/// Extract MSDF rendering params (theme + time) to the render world.
+/// Extract MSDF rendering params (theme + time + scale factor) to the render world.
 fn extract_msdf_render_params(
     mut extracted: ResMut<ExtractedMsdfRenderParams>,
     theme: Extract<Res<Theme>>,
     time: Extract<Res<Time>>,
+    text_metrics: Extract<Res<TextMetrics>>,
 ) {
     extracted.hint_amount = theme.msdf_hint_amount;
     extracted.stem_darkening = theme.msdf_stem_darkening;
@@ -1181,6 +1211,7 @@ fn extract_msdf_render_params(
     extracted.text_bias = theme.msdf_text_bias;
     extracted.gamma_correction = theme.msdf_gamma_correction;
     extracted.time = time.elapsed_secs();
+    extracted.scale_factor = text_metrics.scale_factor;
 }
 
 /// Returns true if an MSDF block should be extracted for rendering this frame.
