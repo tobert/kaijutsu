@@ -23,12 +23,14 @@ pub mod atlas;
 pub mod generator;
 pub mod glyph;
 pub mod layout_bridge;
+pub mod music_bridge;
 pub mod renderer;
 
 pub use atlas::MsdfAtlas;
 pub use generator::MsdfGenerator;
 pub use glyph::{FontId, PositionedGlyph};
 pub use layout_bridge::collect_msdf_glyphs;
+pub use music_bridge::collect_music_glyphs;
 // MsdfBlockRenderer is used directly in the render world via crate::text::msdf::renderer
 
 use bevy::prelude::*;
