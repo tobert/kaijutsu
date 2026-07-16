@@ -9,9 +9,10 @@ use crate::text::shaping::VelloFont;
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationSpacer,
-    LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout, SpacerEdge,
+    FocusTarget, LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout, SpacerEdge,
 };
 use crate::shaders::BlockFxMaterial;
+use crate::view::geometry::{ConversationGeometry, plan_block_band, plan_header_band};
 
 /// Consolidated resource tracking editor-related singleton entities.
 #[derive(Resource, Default)]
@@ -239,12 +240,13 @@ pub fn spawn_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
-    geometries: Query<&crate::view::geometry::ConversationGeometry>,
+    geometries: Query<&ConversationGeometry>,
     existing_block_cells: Query<Entity, With<BlockCell>>,
     mut layout_gen: ResMut<LayoutGeneration>,
     font_handles: Res<ShapingFonts>,
     fonts: Res<Assets<VelloFont>>,
     mut scroll_state: ResMut<crate::cell::ConversationScrollState>,
+    focus: Res<FocusTarget>,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -335,22 +337,49 @@ pub fn spawn_block_cells(
         }
     }
 
-    // Gate new spawns on font availability — build_block_scenes needs a valid
-    // font to render text into the Vello scene.
-    let font_loaded = fonts.get(&font_handles.mono).is_some();
-    if !font_loaded && current_blocks.iter().any(|id| !container.contains(id)) {
-        // Blocks waiting to spawn but font not ready yet — will retry next frame.
+    // Band plan: entities exist only for rows around the viewport
+    // (spawn inside ±SPAWN_MARGIN_SCREENS, despawn beyond
+    // ±DESPAWN_MARGIN_SCREENS — see geometry.rs). The focused block is
+    // exempt from despawn so FocusedBlockCell survives scrolling away.
+    let Ok(geom) = geometries.get(main_ent) else {
+        // Geometry rides the MainCell spawn bundle — its absence is a bug,
+        // not a fallback path. Spawning all blocks here would silently
+        // reintroduce the O(N)-entities behavior this band exists to kill.
+        warn!("spawn_block_cells: MainCell has no ConversationGeometry; skipping spawn/despawn");
         return;
+    };
+    let plan = plan_block_band(
+        geom.rows(),
+        |id| container.contains(id),
+        scroll_state.offset,
+        scroll_state.visible_height,
+        focus.block_id,
+    );
+
+    // Despawn beyond the keep band BEFORE the font gate — reclaiming render
+    // resources (RTT texture, glyph buffers, scenes ride the entity) needs
+    // no fonts. Measured heights persist in the geometry rows.
+    let had_band_despawns = !plan.to_despawn.is_empty();
+    for id in &plan.to_despawn {
+        if let Some(entity) = container.get_entity(id) {
+            commands.entity(entity).try_despawn();
+            container.remove(entity);
+        }
     }
+
+    // Gate new spawns on font availability — build_block_scenes needs a valid
+    // font to render text into the Vello scene. The plan is recomputed next
+    // frame, so waiting loses nothing.
+    let font_loaded = fonts.get(&font_handles.mono).is_some();
 
     let current_version = editor.version();
     let conv_entity = entities.conversation_container;
-    let geom = geometries.get(main_ent).ok();
 
     let mut had_additions = false;
+    let mut added_new_tail_blocks = false;
 
-    for block_id in &current_blocks {
-        if !container.contains(block_id) {
+    if font_loaded {
+        for block_id in &plan.to_spawn {
             // Single-phase spawn: BlockCell + BlockScene + BlockTexture + ImageNode + MaterialNode.
             // The GpuImage is prepared asynchronously by Bevy's RenderAssetPlugin, reacting
             // to AssetEvent::Modified/Created on the Image asset — one frame after this
@@ -362,10 +391,9 @@ pub fn spawn_block_cells(
             // runs earlier this frame): estimated/cached height + document
             // y_offset place the block correctly for virtualize_conversation
             // BEFORE its first readback — an appended block enters at the
-            // tail, a respawned one back at its old position, with no
-            // one-frame spacer blowup. The geometry fallback (row missing:
-            // seed at the tail) matches the pre-geometry behavior.
-            let row = geom.and_then(|g| g.block_row(block_id));
+            // tail, a respawned one back at its old measured position, with
+            // no one-frame spacer blowup.
+            let row = geom.block_row(block_id);
             let layout_seed = BlockCellLayout {
                 y_offset: row
                     .map(|r| r.y_offset)
@@ -374,6 +402,11 @@ pub fn spawn_block_cells(
                 indent_level: row.map(|r| r.indent_level).unwrap_or(0),
                 last_measured_version: row.map(|r| r.measured_version).unwrap_or(0),
             };
+            // A row minted at the current document version is genuinely new
+            // content (streamed/appended); anything older is a respawn of a
+            // block scrolling back into the band and must NOT trigger the
+            // new-content scroll anchor.
+            let is_new_content = row.is_some_and(|r| r.created_at_version == current_version);
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
@@ -408,6 +441,7 @@ pub fn spawn_block_cells(
             }
             container.add(*block_id, entity);
             had_additions = true;
+            added_new_tail_blocks |= is_new_content;
         }
     }
 
@@ -418,39 +452,45 @@ pub fn spawn_block_cells(
     // never re-runs and the visual order goes stale until app restart.
     let order_changed = container.resort_to_document_order(&current_blocks);
 
-    if had_additions || had_removals || order_changed {
+    if had_additions || had_removals || had_band_despawns || order_changed {
         info!(
-            "spawn_block_cells: additions={} removals={} order_changed={} container_now={}",
+            "spawn_block_cells: additions={} removals={} band_despawns={} order_changed={} container_now={}",
             had_additions,
             had_removals,
+            plan.to_despawn.len(),
             order_changed,
             container.block_cells.len(),
         );
         layout_gen.bump();
     }
 
-    if had_additions {
+    if added_new_tail_blocks {
         scroll_state.new_blocks_added = true;
     }
 }
 
-/// Sync RoleGroupBorder entities for role transitions.
+/// Sync RoleGroupBorder entities for role transitions — band-gated and
+/// incremental.
 ///
-/// Spawns role group border entities with BlockScene + BlockTexture for
-/// Vello-drawn horizontal lines with inset role labels.
+/// Header rows come from [`ConversationGeometry`] (same tool-block-skipping
+/// rules, no whole-document snapshot clone). Like block cells, header
+/// entities exist only inside the spawn band around the viewport; scrolled
+/// far away they despawn to reclaim their textures, and their geometry rows
+/// keep the measured heights. The reconcile is incremental — surviving
+/// headers are never despawn/respawned (no flash), unlike the old
+/// drain-everything rebuild.
+///
+/// Runs every frame (the band moves with scroll, which bumps no
+/// generation); the plan walk is cheap and the common case changes nothing.
 pub fn sync_role_headers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
-    geometries: Query<&crate::view::geometry::ConversationGeometry>,
+    geometries: Query<&ConversationGeometry>,
     mut containers: Query<&mut BlockCellContainer>,
     role_header_query: Query<&RoleGroupBorder>,
-    layout_gen: Res<LayoutGeneration>,
-    mut last_gen: Local<u64>,
+    scroll_state: Res<crate::cell::ConversationScrollState>,
+    mut layout_gen: ResMut<LayoutGeneration>,
 ) {
-    if layout_gen.0 == *last_gen {
-        return;
-    }
-
     let Some(main_ent) = entities.main_cell else {
         return;
     };
@@ -462,44 +502,55 @@ pub fn sync_role_headers(
     let Ok(mut container) = containers.get_mut(main_ent) else {
         return;
     };
-    // Consume the generation only once the guards pass — an early-out above
-    // must retry next frame, not wait for the next bump.
-    *last_gen = layout_gen.0;
 
-    // Expected role transitions come from the geometry rows (reconciled
-    // earlier this frame) — same tool-block-skipping rules, no whole-document
-    // snapshot clone.
-    let expected: Vec<(kaijutsu_crdt::Role, kaijutsu_crdt::BlockId)> = geom
+    // Live headers by the block id they precede. Also collect entries whose
+    // geometry row vanished (role run dissolved) — those despawn regardless
+    // of band.
+    let header_keys: std::collections::HashSet<kaijutsu_crdt::BlockId> = geom
         .rows()
         .iter()
         .filter_map(|row| match row.key {
-            crate::view::geometry::RowKey::Header(id) => Some((row.role, id)),
+            crate::view::geometry::RowKey::Header(id) => Some(id),
             crate::view::geometry::RowKey::Block(_) => None,
         })
         .collect();
 
-    // Skip rebuild if transitions match (prevents despawn/respawn flash)
-    let existing_matches = container.role_headers.len() == expected.len()
-        && container
-            .role_headers
-            .iter()
-            .zip(expected.iter())
-            .all(|(ent, (role, block_id))| {
-                role_header_query
-                    .get(*ent)
-                    .map(|h| h.role == *role && h.block_id == *block_id)
-                    .unwrap_or(false)
-            });
+    let mut live: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
+        std::collections::HashMap::new();
+    let mut dead: Vec<Entity> = Vec::new();
+    for &ent in &container.role_headers {
+        match role_header_query.get(ent) {
+            Ok(h) if header_keys.contains(&h.block_id) => {
+                live.insert(h.block_id, ent);
+            }
+            // Despawned externally or no longer a transition.
+            _ => dead.push(ent),
+        }
+    }
 
-    if existing_matches {
+    let (to_spawn, to_despawn) = plan_header_band(
+        geom.rows(),
+        |id| live.contains_key(id),
+        scroll_state.offset,
+        scroll_state.visible_height,
+    );
+
+    if dead.is_empty() && to_spawn.is_empty() && to_despawn.is_empty() {
         return;
     }
 
-    for entity in container.role_headers.drain(..) {
-        commands.entity(entity).try_despawn();
+    for ent in dead {
+        commands.entity(ent).try_despawn();
+        container.role_headers.retain(|e| *e != ent);
+    }
+    for id in &to_despawn {
+        if let Some(ent) = live.remove(id) {
+            commands.entity(ent).try_despawn();
+            container.role_headers.retain(|e| *e != ent);
+        }
     }
 
-    for (role, block_id) in expected {
+    for (role, block_id) in to_spawn {
         let entity = commands
             .spawn((
                 RoleGroupBorder { role, block_id },
@@ -523,6 +574,10 @@ pub fn sync_role_headers(
 
         container.role_headers.push(entity);
     }
+
+    // Header set changed — reorder must run so the new entities land in
+    // document position (and stale ones leave Children).
+    layout_gen.bump();
 }
 
 #[cfg(test)]
@@ -530,6 +585,192 @@ mod tests {
     use super::*;
     use crate::cell::ConversationContainer;
     use crate::ui::tiling::PaneFocus;
+    use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+
+    /// The Slice-C invariant: entities beyond the keep band despawn (their
+    /// render resources with them) while the geometry rows retain every
+    /// block's height — content_height must not move when entities go.
+    #[test]
+    fn band_despawns_far_offscreen_blocks_and_keeps_geometry() {
+        let mut app = App::new();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<LayoutGeneration>();
+        app.init_resource::<crate::text::TextMetrics>();
+        app.init_resource::<crate::ui::theme::Theme>();
+        app.init_resource::<FocusTarget>();
+        app.init_resource::<ShapingFonts>();
+        app.insert_resource(Assets::<VelloFont>::default());
+        app.insert_resource(Assets::<BlockFxMaterial>::default());
+        app.insert_resource(crate::cell::ConversationScrollState {
+            offset: 0.0,
+            visible_height: 300.0,
+            ..Default::default()
+        });
+        app.add_systems(
+            Update,
+            (
+                crate::view::geometry::sync_conversation_geometry,
+                spawn_block_cells,
+            )
+                .chain(),
+        );
+
+        // 100 one-line blocks with an entity each (as if all had spawned
+        // before the band existed).
+        let mut editor = CellEditor::new();
+        let mut ids = Vec::new();
+        for i in 0..100 {
+            let id = editor
+                .store
+                .insert_block(
+                    None,
+                    ids.last(),
+                    Role::User,
+                    BlockKind::Text,
+                    format!("block {i}"),
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert_block");
+            ids.push(id);
+        }
+        let main_ent = app
+            .world_mut()
+            .spawn((
+                editor,
+                MainCell,
+                crate::view::geometry::ConversationGeometry::default(),
+            ))
+            .id();
+        let mut container = BlockCellContainer::default();
+        for &id in &ids {
+            let ent = app.world_mut().spawn(BlockCell::new(id)).id();
+            container.add(id, ent);
+        }
+        app.world_mut().entity_mut(main_ent).insert(container);
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+
+        app.update();
+
+        let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
+        let kept = container.block_cells.len();
+        assert!(
+            kept < 100,
+            "far-offscreen blocks must despawn (kept {kept} of 100)"
+        );
+        assert!(
+            kept > 30,
+            "the keep band (viewport + hysteresis) must survive (kept {kept})"
+        );
+        // The head of the document (viewport at top) must be kept.
+        assert!(container.contains(&ids[0]));
+        // The tail entity must be despawned — really gone from the world.
+        let tail_gone = !container.contains(&ids[99]);
+        assert!(tail_gone, "tail block must leave the container");
+
+        // Geometry retains ALL rows and the full content height.
+        let geom = app
+            .world()
+            .get::<crate::view::geometry::ConversationGeometry>(main_ent)
+            .unwrap();
+        let block_rows = geom
+            .rows()
+            .iter()
+            .filter(|r| matches!(r.key, crate::view::geometry::RowKey::Block(_)))
+            .count();
+        assert_eq!(block_rows, 100, "geometry must keep every block row");
+        // header(24) + 100 × (30 + 12) = 4224
+        assert!(
+            (geom.content_height - 4224.0).abs() < 1.0,
+            "content height must be unaffected by despawn, got {}",
+            geom.content_height,
+        );
+
+        // Despawns count as layout changes — reorder must get a bump.
+        assert!(
+            app.world().resource::<LayoutGeneration>().0 > 0,
+            "band despawns must bump LayoutGeneration"
+        );
+    }
+
+    /// The focused block is exempt from band despawn — FocusedBlockCell
+    /// rides the entity and must survive scrolling far away.
+    #[test]
+    fn band_despawn_exempts_the_focused_block() {
+        let mut app = App::new();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<LayoutGeneration>();
+        app.init_resource::<crate::text::TextMetrics>();
+        app.init_resource::<crate::ui::theme::Theme>();
+        app.init_resource::<ShapingFonts>();
+        app.insert_resource(Assets::<VelloFont>::default());
+        app.insert_resource(Assets::<BlockFxMaterial>::default());
+        app.insert_resource(crate::cell::ConversationScrollState {
+            offset: 0.0,
+            visible_height: 300.0,
+            ..Default::default()
+        });
+        app.add_systems(
+            Update,
+            (
+                crate::view::geometry::sync_conversation_geometry,
+                spawn_block_cells,
+            )
+                .chain(),
+        );
+
+        let mut editor = CellEditor::new();
+        let mut ids = Vec::new();
+        for i in 0..100 {
+            let id = editor
+                .store
+                .insert_block(
+                    None,
+                    ids.last(),
+                    Role::User,
+                    BlockKind::Text,
+                    format!("block {i}"),
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert_block");
+            ids.push(id);
+        }
+        let main_ent = app
+            .world_mut()
+            .spawn((
+                editor,
+                MainCell,
+                crate::view::geometry::ConversationGeometry::default(),
+            ))
+            .id();
+        let mut container = BlockCellContainer::default();
+        for &id in &ids {
+            let ent = app.world_mut().spawn(BlockCell::new(id)).id();
+            container.add(id, ent);
+        }
+        app.world_mut().entity_mut(main_ent).insert(container);
+        app.world_mut().resource_mut::<EditorEntities>().main_cell = Some(main_ent);
+
+        // Focus the LAST block (far outside the keep band at scroll top).
+        app.insert_resource({
+            let mut focus = FocusTarget::default();
+            focus.block_id = Some(ids[99]);
+            focus
+        });
+
+        app.update();
+
+        let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
+        assert!(
+            container.contains(&ids[99]),
+            "focused block must be exempt from band despawn"
+        );
+        assert!(
+            !container.contains(&ids[98]),
+            "its unfocused neighbor must still despawn"
+        );
+    }
 
     fn build_test_app() -> App {
         let mut app = App::new();

@@ -162,14 +162,22 @@ pub fn determine_block_border_style(
         return;
     };
 
-    let blocks_vec = editor.blocks();
-    let blocks: std::collections::HashMap<_, _> = blocks_vec.iter().map(|b| (b.id, b)).collect();
+    // Snapshot only the in-band blocks (the container holds the spawn band,
+    // not the whole document) — border styles are a per-entity property.
+    let blocks: std::collections::HashMap<_, _> = container
+        .block_cells
+        .keys()
+        .filter_map(|id| editor.block_snapshot(id).map(|s| (*id, s)))
+        .collect();
 
     // Build set of tool_call_ids that have a *visible* ToolResult.
     // Empty success results render no border, so the call should not
     // use OpenBottom to connect to an invisible block.
-    let has_result: std::collections::HashSet<_> = blocks_vec
-        .iter()
+    // In-band snapshots suffice: a ToolResult is adjacent to its call, so
+    // both are in the band whenever either border can render; a call at the
+    // outer band edge may briefly mis-join until its result scrolls in.
+    let has_result: std::collections::HashSet<_> = blocks
+        .values()
         .filter(|b| b.kind == BlockKind::ToolResult)
         .filter(|b| !b.content.trim().is_empty() || b.output.is_some() || b.is_error)
         .filter_map(|b| b.tool_call_id)

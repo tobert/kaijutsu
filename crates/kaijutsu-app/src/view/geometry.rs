@@ -67,7 +67,10 @@ pub struct GeomRow {
     pub kind: BlockKind,
     /// Whether the block rendered collapsed at seed time.
     pub collapsed: bool,
-    /// Indent level (parent_id nesting), mirrored to `BlockCellLayout`.
+    /// Parent block (DAG nesting). Sources the indent level and the
+    /// error-child index without a document snapshot.
+    pub parent_id: Option<BlockId>,
+    /// Indent level (parent nesting), mirrored to `BlockCellLayout`.
     pub indent_level: u32,
     /// Document version when this row was first created. Persisted here so a
     /// despawned block's `TimelineVisibility.created_at_version` survives
@@ -85,7 +88,7 @@ pub struct RowSeed {
     pub role: Role,
     pub kind: BlockKind,
     pub collapsed: bool,
-    pub indented: bool,
+    pub parent_id: Option<BlockId>,
 }
 
 /// Estimation + margin parameters, sampled from `TextMetrics` + `Theme` at
@@ -178,8 +181,7 @@ impl ConversationGeometry {
 
     /// Look up the header row preceding block `id`, if that block starts a
     /// role run.
-    // Consumed by band spawn/despawn (Slice C); drop the allow there.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Model accessor; exercised by tests, no prod caller yet.
     pub fn header_row(&self, id: &BlockId) -> Option<&GeomRow> {
         let &i = self.block_index.get(id)?;
         if i == 0 {
@@ -232,6 +234,15 @@ impl ConversationGeometry {
                         continue;
                     };
                     structure_changed = true;
+                    // Mirror `layout_block_cells`' historical rules: tool
+                    // blocks are flush, children indent one level.
+                    let is_tool =
+                        matches!(seed.kind, BlockKind::ToolCall | BlockKind::ToolResult);
+                    let indent_level = if !is_tool && seed.parent_id.is_some() {
+                        1
+                    } else {
+                        0
+                    };
                     GeomRow {
                         key: RowKey::Block(*id),
                         height: estimate_block_height(
@@ -248,7 +259,8 @@ impl ConversationGeometry {
                         role: seed.role,
                         kind: seed.kind,
                         collapsed: seed.collapsed,
-                        indent_level: if seed.indented { 1 } else { 0 },
+                        parent_id: seed.parent_id,
+                        indent_level,
                         created_at_version: doc_version,
                     }
                 }
@@ -272,6 +284,7 @@ impl ConversationGeometry {
                         role: block_row.role,
                         kind: block_row.kind,
                         collapsed: false,
+                        parent_id: None,
                         indent_level: 0,
                         created_at_version: doc_version,
                     });
@@ -401,40 +414,122 @@ impl ConversationGeometry {
         true
     }
 
-    /// Index range of rows intersecting `[top, bottom]` (both in content
-    /// coordinates). Requires offsets to be current. Returns an empty range
-    /// when nothing intersects.
-    // Consumed by band spawn/despawn (Slice C); drop the allow there.
-    #[allow(dead_code)]
-    pub fn rows_in_range(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
-        if self.rows.is_empty() || bottom < top {
-            return 0..0;
+}
+
+// ============================================================================
+// ENTITY BAND PLANNING
+// ============================================================================
+
+/// How far past the viewport (in screens) rows keep/get entities. Spawn
+/// inside ±[`SPAWN_MARGIN_SCREENS`]; despawn only beyond
+/// ±[`DESPAWN_MARGIN_SCREENS`]. The gap between them is hysteresis so a row
+/// sitting at a band edge doesn't thrash spawn/despawn while scrolling.
+/// Virtualize's show window (±1 screen) sits inside the spawn band, so a
+/// row always has an entity — and a rendered texture — before it can
+/// become visible.
+pub const SPAWN_MARGIN_SCREENS: f32 = 2.0;
+pub const DESPAWN_MARGIN_SCREENS: f32 = 4.0;
+
+/// A band plan: which block rows need entities spawned, and which existing
+/// entities should be despawned to reclaim their render resources.
+#[derive(Debug, Default, PartialEq)]
+pub struct BandPlan {
+    pub to_spawn: Vec<BlockId>,
+    pub to_despawn: Vec<BlockId>,
+}
+
+/// Decide entity existence for every block row against the viewport band.
+///
+/// `viewport_height <= 0` (first frames, before the container is measured)
+/// falls back to one nominal screen so a fresh conversation still spawns
+/// its initial window instead of nothing.
+///
+/// `exempt` (the focused block) is never despawned: focus survives
+/// scrolling away, and the `FocusedBlockCell` marker rides the entity.
+pub fn plan_block_band(
+    rows: &[GeomRow],
+    has_entity: impl Fn(&BlockId) -> bool,
+    viewport_top: f32,
+    viewport_height: f32,
+    exempt: Option<BlockId>,
+) -> BandPlan {
+    let vh = if viewport_height > 0.0 {
+        viewport_height
+    } else {
+        600.0
+    };
+    let spawn_top = viewport_top - SPAWN_MARGIN_SCREENS * vh;
+    let spawn_bottom = viewport_top + vh + SPAWN_MARGIN_SCREENS * vh;
+    let keep_top = viewport_top - DESPAWN_MARGIN_SCREENS * vh;
+    let keep_bottom = viewport_top + vh + DESPAWN_MARGIN_SCREENS * vh;
+
+    let mut plan = BandPlan::default();
+    for row in rows {
+        let RowKey::Block(id) = row.key else {
+            continue;
+        };
+        let bottom_edge = row.y_offset + row.height + row.margin_bottom;
+        let in_spawn = bottom_edge >= spawn_top && row.y_offset <= spawn_bottom;
+        let in_keep = bottom_edge >= keep_top && row.y_offset <= keep_bottom;
+        let exists = has_entity(&id);
+
+        if in_spawn && !exists {
+            plan.to_spawn.push(id);
+        } else if !in_keep && exists && Some(id) != exempt {
+            plan.to_despawn.push(id);
         }
-        // First row whose bottom edge reaches `top`.
-        let start = self
-            .rows
-            .partition_point(|r| r.y_offset + r.height + r.margin_bottom < top);
-        // First row whose top edge is past `bottom`.
-        let end = self.rows.partition_point(|r| r.y_offset <= bottom);
-        start..end.max(start)
     }
+    plan
+}
+
+/// Header-row variant of [`plan_block_band`]: same bands, but spawn entries
+/// carry the role the header renders. Headers have no focus exemption.
+pub fn plan_header_band(
+    rows: &[GeomRow],
+    has_entity: impl Fn(&BlockId) -> bool,
+    viewport_top: f32,
+    viewport_height: f32,
+) -> (Vec<(Role, BlockId)>, Vec<BlockId>) {
+    let vh = if viewport_height > 0.0 {
+        viewport_height
+    } else {
+        600.0
+    };
+    let spawn_top = viewport_top - SPAWN_MARGIN_SCREENS * vh;
+    let spawn_bottom = viewport_top + vh + SPAWN_MARGIN_SCREENS * vh;
+    let keep_top = viewport_top - DESPAWN_MARGIN_SCREENS * vh;
+    let keep_bottom = viewport_top + vh + DESPAWN_MARGIN_SCREENS * vh;
+
+    let mut to_spawn = Vec::new();
+    let mut to_despawn = Vec::new();
+    for row in rows {
+        let RowKey::Header(id) = row.key else {
+            continue;
+        };
+        let bottom_edge = row.y_offset + row.height + row.margin_bottom;
+        let in_spawn = bottom_edge >= spawn_top && row.y_offset <= spawn_bottom;
+        let in_keep = bottom_edge >= keep_top && row.y_offset <= keep_bottom;
+        let exists = has_entity(&id);
+
+        if in_spawn && !exists {
+            to_spawn.push((row.role, id));
+        } else if !in_keep && exists {
+            to_despawn.push(id);
+        }
+    }
+    (to_spawn, to_despawn)
 }
 
 /// Build a [`RowSeed`] from a block snapshot — the only place block content
 /// is read for geometry, and it runs once per new row.
 fn row_seed(snapshot: kaijutsu_crdt::BlockSnapshot) -> RowSeed {
-    let is_tool = matches!(
-        snapshot.kind,
-        BlockKind::ToolCall | BlockKind::ToolResult
-    );
     RowSeed {
         text_len: snapshot.content.len(),
         newline_count: snapshot.content.matches('\n').count(),
         role: snapshot.role,
         kind: snapshot.kind,
         collapsed: snapshot.collapsed,
-        // Mirror `layout_block_cells`: tool blocks are flush, children indent.
-        indented: !is_tool && snapshot.parent_id.is_some(),
+        parent_id: snapshot.parent_id,
     }
 }
 
@@ -528,7 +623,7 @@ mod tests {
             role,
             kind: BlockKind::Text,
             collapsed: false,
-            indented: false,
+            parent_id: None,
         }
     }
 
@@ -539,7 +634,7 @@ mod tests {
             role: Role::Tool,
             kind,
             collapsed: false,
-            indented: false,
+            parent_id: None,
         }
     }
 
@@ -825,38 +920,101 @@ mod tests {
         assert_eq!(g.cols, 50);
     }
 
-    // ---- windowing --------------------------------------------------------
+    // ---- band planning ----------------------------------------------------
 
-    #[test]
-    fn rows_in_range_selects_intersecting_rows() {
+    /// 100 one-line user blocks (42px pitch after the 24px header): plan
+    /// against a 300px viewport at the top of the document.
+    fn banded_geometry() -> ConversationGeometry {
         let mut g = ConversationGeometry::default();
-        let ids: Vec<BlockId> = (1..=10).map(bid).collect();
+        let ids: Vec<BlockId> = (1..=100).map(bid).collect();
         g.reconcile(&ids, |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
         g.recompute_offsets();
-        // Layout: header(24) then 10 blocks of 42 each → content 444.
-        let range = g.rows_in_range(100.0, 200.0);
-        // Rows in [100, 200]: blocks at y=66..108, 108..150, 150..192, 192..234.
-        assert_eq!(range, 2..6);
-        for row in &g.rows()[range] {
-            let top = row.y_offset;
-            let bottom = row.y_offset + row.height + row.margin_bottom;
-            assert!(bottom >= 100.0 && top <= 200.0);
-        }
+        g
     }
 
     #[test]
-    fn rows_in_range_empty_and_out_of_bounds() {
-        let mut g = ConversationGeometry::default();
-        assert_eq!(g.rows_in_range(0.0, 100.0), 0..0);
+    fn plan_spawns_only_the_spawn_band_when_nothing_exists() {
+        let g = banded_geometry();
+        let plan = plan_block_band(g.rows(), |_| false, 0.0, 300.0, None);
+        // Spawn band = [-600, 1500]: blocks 0..~35 of 100.
+        assert!(!plan.to_spawn.is_empty());
+        assert!(
+            plan.to_spawn.len() < 45,
+            "spawn band must not cover the whole document: {} of 100",
+            plan.to_spawn.len(),
+        );
+        assert!(plan.to_despawn.is_empty());
+        // Must include the very first block (viewport at top).
+        assert_eq!(plan.to_spawn[0], bid(1));
+    }
 
-        g.reconcile(&[bid(1)], |_| Some(text_seed(Role::User, 40, 0)), &params(), 1);
+    #[test]
+    fn plan_despawns_only_beyond_the_keep_band() {
+        let g = banded_geometry();
+        // Everything exists; viewport at the top. Keep band = [-1200, 2700]:
+        // blocks past y=2700 (block ~64 on) despawn, the hysteresis zone
+        // between spawn and keep bands (blocks ~36..=64) stays untouched.
+        let plan = plan_block_band(g.rows(), |_| true, 0.0, 300.0, None);
+        assert!(plan.to_spawn.is_empty());
+        assert!(!plan.to_despawn.is_empty());
+        let first_despawned_y = g
+            .block_row(plan.to_despawn.first().unwrap())
+            .unwrap()
+            .y_offset;
+        assert!(
+            first_despawned_y > 300.0 + DESPAWN_MARGIN_SCREENS * 300.0,
+            "despawn must start beyond the keep band, got y={first_despawned_y}",
+        );
+    }
+
+    #[test]
+    fn plan_exempts_the_focused_block_from_despawn() {
+        let g = banded_geometry();
+        let focused = bid(100); // far outside the keep band
+        let plan = plan_block_band(g.rows(), |_| true, 0.0, 300.0, Some(focused));
+        assert!(!plan.to_despawn.contains(&focused));
+        // Its neighbors still despawn.
+        assert!(plan.to_despawn.contains(&bid(99)));
+    }
+
+    #[test]
+    fn plan_zero_viewport_height_falls_back_to_a_nominal_screen() {
+        let g = banded_geometry();
+        let plan = plan_block_band(g.rows(), |_| false, 0.0, 0.0, None);
+        // With the 600px fallback the initial window still spawns.
+        assert!(!plan.to_spawn.is_empty());
+        assert!(plan.to_spawn.len() < 100);
+    }
+
+    #[test]
+    fn plan_header_band_spawns_and_despawns_headers() {
+        // Alternate roles so every block starts a role run (header pitch
+        // matches block pitch).
+        let mut g = ConversationGeometry::default();
+        let ids: Vec<BlockId> = (1..=100).map(bid).collect();
+        g.reconcile(
+            &ids,
+            |id| {
+                Some(text_seed(
+                    if id.seq % 2 == 0 { Role::Model } else { Role::User },
+                    40,
+                    0,
+                ))
+            },
+            &params(),
+            1,
+        );
         g.recompute_offsets();
-        // Far past the end.
-        let r = g.rows_in_range(10_000.0, 20_000.0);
-        assert!(r.is_empty());
-        // Inverted window.
-        let r = g.rows_in_range(50.0, 10.0);
-        assert!(r.is_empty());
+
+        let (to_spawn, to_despawn) = plan_header_band(g.rows(), |_| false, 0.0, 300.0);
+        assert!(!to_spawn.is_empty());
+        assert!(to_spawn.len() < 60, "got {} headers", to_spawn.len());
+        assert!(to_despawn.is_empty());
+        assert_eq!(to_spawn[0], (Role::User, bid(1)));
+
+        let (to_spawn, to_despawn) = plan_header_band(g.rows(), |_| true, 0.0, 300.0);
+        assert!(to_spawn.is_empty());
+        assert!(!to_despawn.is_empty());
     }
 
     #[test]

@@ -68,15 +68,8 @@ pub fn sync_block_cell_buffers(
         return;
     }
 
-    let blocks_ordered = editor.blocks();
-    let block_index: std::collections::HashMap<&kaijutsu_crdt::BlockId, usize> = blocks_ordered
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (&b.id, i))
-        .collect();
-
     let mut layout_changed = false;
-    for &entity in container.block_cells.values() {
+    for (block_id, &entity) in container.block_cells.iter() {
         let Ok((mut block_cell, mut block_scene, timeline_vis)) = block_cells.get_mut(entity) else {
             continue;
         };
@@ -89,10 +82,12 @@ pub fn sync_block_cell_buffers(
             continue;
         }
 
-        let Some(&idx) = block_index.get(&block_cell.block_id) else {
+        // One snapshot per dirty in-band entity — never a whole-document
+        // clone; the container only holds the spawn band.
+        let Some(block) = editor.block_snapshot(block_id) else {
             continue;
         };
-        let block = &blocks_ordered[idx];
+        let block = &block;
 
         let local_ctx = doc_cache.active_id();
         let text = format_single_block(block, local_ctx);
@@ -492,6 +487,7 @@ pub fn reorder_conversation_children(
     mut commands: Commands,
     containers: Query<&BlockCellContainer>,
     geometries: Query<&ConversationGeometry>,
+    scroll_state: Res<ConversationScrollState>,
     role_headers: Query<&RoleGroupBorder>,
     block_cell_entities: Query<Entity, With<BlockCell>>,
     spacer_entities: Query<Entity, With<ConversationSpacer>>,
@@ -537,6 +533,18 @@ pub fn reorder_conversation_children(
         }
     }
 
+    // Outside the spawn band, entity-less rows are the design (band
+    // despawn); inside it they mean spawn_block_cells lagged (font gate) or
+    // lost an entry — loud, but survivable for a frame.
+    let vh = if scroll_state.visible_height > 0.0 {
+        scroll_state.visible_height
+    } else {
+        600.0
+    };
+    let spawn_top = scroll_state.offset - crate::view::geometry::SPAWN_MARGIN_SCREENS * vh;
+    let spawn_bottom =
+        scroll_state.offset + vh + crate::view::geometry::SPAWN_MARGIN_SCREENS * vh;
+
     let ordered_children = compute_ordered_children(
         geom.rows(),
         container,
@@ -544,11 +552,17 @@ pub fn reorder_conversation_children(
         top_spacer,
         bottom_spacer,
         |block_id| {
-            error!(
-                "reorder_conversation_children: block {block_id:?} has a geometry row \
-                 but no BlockCellContainer entry — dropped from render order this frame; \
-                 spawn_block_cells should have created it"
-            );
+            if let Some(row) = geom.block_row(block_id) {
+                let bottom_edge = row.y_offset + row.height + row.margin_bottom;
+                if bottom_edge >= spawn_top && row.y_offset <= spawn_bottom {
+                    warn!(
+                        "reorder_conversation_children: in-band block {block_id:?} has no \
+                         BlockCellContainer entry — dropped from render order this frame; \
+                         spawn_block_cells should have created it (font gate on first frames \
+                         is the benign case)"
+                    );
+                }
+            }
         },
     );
 
@@ -1023,7 +1037,7 @@ mod tests {
                     role: roles[id],
                     kind: BlockKind::Text,
                     collapsed: false,
-                    indented: false,
+                    parent_id: None,
                 })
             },
             &EstimateParams::default(),

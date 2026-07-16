@@ -733,24 +733,31 @@ impl ErrorChildIndex {
 }
 
 /// Rebuild the `ErrorChildIndex` when blocks change.
+///
+/// Sourced from the geometry rows (kind + parent captured at seed time) —
+/// the whole-document walk stays, but with no snapshot clone; this runs on
+/// every layout bump, which the entity band now ties to scrolling.
 pub fn build_error_child_index(
     mut idx: ResMut<ErrorChildIndex>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
     layout_gen: Res<LayoutGeneration>,
 ) {
     if idx.generation == layout_gen.0 {
         return;
     }
-    idx.generation = layout_gen.0;
-    idx.by_parent.clear();
-    let Ok(editor) = main_cells.single() else {
+    let Ok(geom) = geometries.single() else {
         return;
     };
-    for block in editor.blocks() {
-        if block.kind == BlockKind::Error {
-            if let Some(parent) = block.parent_id {
-                idx.by_parent.entry(parent).or_default().push(block.id);
-            }
+    idx.generation = layout_gen.0;
+    idx.by_parent.clear();
+    for row in geom.rows() {
+        let crate::view::geometry::RowKey::Block(id) = row.key else {
+            continue;
+        };
+        if row.kind == BlockKind::Error
+            && let Some(parent) = row.parent_id
+        {
+            idx.by_parent.entry(parent).or_default().push(id);
         }
     }
 }

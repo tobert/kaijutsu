@@ -204,7 +204,15 @@ impl Plugin for InputPlugin {
         // Cleanup phase: defensive logic
         app.add_systems(
             Update,
-            systems::cleanup_stale_focused_markers.in_set(InputPhase::Cleanup),
+            (
+                systems::cleanup_stale_focused_markers,
+                // Deferred focus marker: nav can focus a block whose entity
+                // is outside the spawn band; once scrolling brings the band
+                // there and spawn_block_cells creates the entity, this
+                // attaches the FocusedBlockCell marker.
+                systems::apply_focused_block_marker,
+            )
+                .in_set(InputPhase::Cleanup),
         );
     }
 }

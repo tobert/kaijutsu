@@ -405,7 +405,7 @@ pub fn handle_screenshot(mut commands: Commands, mut actions: MessageReader<Acti
 // ============================================================================
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationScrollState,
+    BlockCell, BlockCellContainer, CellEditor, ConversationScrollState,
     EditorEntities, FocusTarget, FocusedBlockCell, MainCell,
 };
 
@@ -426,9 +426,8 @@ pub fn handle_navigate_blocks(
     mut commands: Commands,
     mut actions: MessageReader<ActionFired>,
     entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    block_cells: Query<(Entity, &BlockCell, &BlockCellLayout)>,
     mut focus: ResMut<FocusTarget>,
     mut scroll_state: ResMut<ConversationScrollState>,
     focused_markers: Query<Entity, With<FocusedBlockCell>>,
@@ -452,15 +451,26 @@ pub fn handle_navigate_blocks(
     let Some(main_ent) = entities.main_cell else {
         return;
     };
-    let Ok(editor) = main_cells.get(main_ent) else {
+    let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
 
-    let blocks = editor.blocks();
-    if blocks.is_empty() {
+    // Navigate over geometry block rows: every block is navigable whether or
+    // not it currently has an entity (the band respawns it as the scroll
+    // catches up).
+    use crate::view::geometry::RowKey;
+    let block_rows: Vec<(kaijutsu_crdt::BlockId, f32, f32)> = geom
+        .rows()
+        .iter()
+        .filter_map(|row| match row.key {
+            RowKey::Block(id) => Some((id, row.y_offset, row.height)),
+            RowKey::Header(_) => None,
+        })
+        .collect();
+    if block_rows.is_empty() {
         return;
     }
 
@@ -468,51 +478,90 @@ pub fn handle_navigate_blocks(
     let current_idx = focus
         .block_id
         .as_ref()
-        .and_then(|id| blocks.iter().position(|b| &b.id == id));
+        .and_then(|id| block_rows.iter().position(|(bid, _, _)| bid == id));
 
     // Calculate new index
     let new_idx = match direction {
         NavigationDirection::Next => match current_idx {
-            Some(i) if i + 1 < blocks.len() => i + 1,
+            Some(i) if i + 1 < block_rows.len() => i + 1,
             Some(i) => i,
             None => 0,
         },
         NavigationDirection::Previous => match current_idx {
             Some(i) if i > 0 => i - 1,
             Some(i) => i,
-            None => blocks.len() - 1,
+            None => block_rows.len() - 1,
         },
         NavigationDirection::First => 0,
-        NavigationDirection::Last => blocks.len() - 1,
+        NavigationDirection::Last => block_rows.len() - 1,
     };
 
-    let new_block = &blocks[new_idx];
+    let (new_id, row_y, row_h) = block_rows[new_idx];
 
     // Update focus resource
-    focus.focus_block(new_block.id);
+    focus.focus_block(new_id);
 
     // Remove old FocusedBlockCell markers
     for entity in focused_markers.iter() {
         commands.entity(entity).remove::<FocusedBlockCell>();
     }
 
-    // Add FocusedBlockCell marker to the new focused entity
-    if let Some(entity) = container.get_entity(&new_block.id) {
+    // Add FocusedBlockCell marker when the entity exists this frame;
+    // otherwise apply_focused_block_marker picks it up once the band
+    // spawns it (the scroll below moves the band there).
+    if let Some(entity) = container.get_entity(&new_id) {
         commands.entity(entity).insert(FocusedBlockCell);
+    }
 
-        // Scroll to keep focused block visible
-        if let Ok((_, _, layout)) = block_cells.get(entity) {
-            scroll_to_block_visible(&mut scroll_state, layout);
+    // Scroll to keep the focused block visible — geometry provides the
+    // rect even for entity-less blocks.
+    scroll_to_rect_visible(&mut scroll_state, row_y, row_h);
+
+    debug!("Block focus: {:?} (index {})", new_id, new_idx);
+}
+
+/// Apply the `FocusedBlockCell` marker once the focused block's entity
+/// exists. Focus nav can land on a block that is outside the entity band
+/// (despawned); the nav scrolls toward it, the band spawns it a frame or
+/// two later, and this system attaches the marker then. Also strips stale
+/// markers when focus moved on while an entity was despawned.
+pub fn apply_focused_block_marker(
+    mut commands: Commands,
+    entities: Res<EditorEntities>,
+    containers: Query<&BlockCellContainer>,
+    focus: Res<FocusTarget>,
+    marked: Query<(Entity, &BlockCell), With<FocusedBlockCell>>,
+) {
+    let Some(focused_id) = focus.block_id else {
+        return;
+    };
+    let Some(main_ent) = entities.main_cell else {
+        return;
+    };
+    let Ok(container) = containers.get(main_ent) else {
+        return;
+    };
+
+    let mut already_marked = false;
+    for (entity, cell) in marked.iter() {
+        if cell.block_id == focused_id {
+            already_marked = true;
+        } else {
+            commands.entity(entity).remove::<FocusedBlockCell>();
         }
     }
 
-    debug!("Block focus: {:?} (index {})", new_block.id, new_idx);
+    if !already_marked
+        && let Some(entity) = container.get_entity(&focused_id)
+    {
+        commands.entity(entity).insert(FocusedBlockCell);
+    }
 }
 
-/// Scroll to keep a block visible in the viewport.
-fn scroll_to_block_visible(scroll_state: &mut ConversationScrollState, layout: &BlockCellLayout) {
-    let block_top = layout.y_offset;
-    let block_bottom = layout.y_offset + layout.height;
+/// Scroll to keep a block's rect visible in the viewport.
+fn scroll_to_rect_visible(scroll_state: &mut ConversationScrollState, y_offset: f32, height: f32) {
+    let block_top = y_offset;
+    let block_bottom = y_offset + height;
     let view_top = scroll_state.offset;
     let view_bottom = scroll_state.offset + scroll_state.visible_height;
 
@@ -648,9 +697,9 @@ pub fn handle_toggle_block_excluded(
             continue;
         };
 
-        // Find the block's current excluded state
-        let blocks = editor.blocks();
-        let Some(block) = blocks.iter().find(|b| &b.id == block_id) else {
+        // Find the block's current excluded state — one snapshot, not a
+        // whole-document clone.
+        let Some(block) = editor.block_snapshot(block_id) else {
             continue;
         };
         let new_excluded = !block.excluded;
