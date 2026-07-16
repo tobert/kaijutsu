@@ -111,12 +111,19 @@ impl SftpClient {
     /// Opens its **own** connection (full TCP + auth), not a channel multiplexed
     /// onto an existing one — see the module docs for why, and the future
     /// optimization.
+    ///
+    /// Logs INFO on success (`docs/issues.md` "Audio sink follow-ups" — the
+    /// live fanfare-clip debugging session had no visibility into how long a
+    /// (re)connect took; this is the happy-path counterpart to the redial
+    /// warning `CasResolver`'s callers log on a stale transport).
     pub async fn connect(config: SshConfig) -> Result<Self, SftpError> {
+        let started = std::time::Instant::now();
         let mut ssh = SshClient::new(config);
         let channel = ssh.connect_subsystem(SSH_SFTP_SUBSYSTEM).await?;
         let session = SftpSession::new(channel.into_stream())
             .await
             .map_err(map_sftp_err)?;
+        tracing::info!("sftp session ready in {}ms", started.elapsed().as_millis());
         Ok(Self { session, _ssh: ssh })
     }
 
@@ -161,13 +168,37 @@ impl CasFetch for SftpClient {
     }
 }
 
+/// Whether [`CasResolver::resolve`] served bytes from the local cache or
+/// this call performed a wire fetch — surfaced (docs/pcm.md R4, "Resolver
+/// transport hardening") so a caller can log the honest distinction instead
+/// of guessing "hit" vs "miss" from elapsed time (a fast fetch over a
+/// healthy link can read exactly like a hit). The single-flight double-check
+/// (a call that waited on another resolve's fetch and got its bytes without
+/// itself touching the wire) still counts as [`ResolveSource::Hit`] — no
+/// *this* call ever crossed the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveSource {
+    Hit,
+    Fetched,
+}
+
+impl ResolveSource {
+    /// A short label for a log line — `"cache hit"` / `"fetched"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResolveSource::Hit => "cache hit",
+            ResolveSource::Fetched => "fetched",
+        }
+    }
+}
+
 /// Resolves content-addressed objects through a local XDG CAS cache, fetching
 /// misses over the wire and re-verifying before it trusts (and caches) them.
 ///
-/// - **hit** → local bytes, no wire traffic.
+/// - **hit** → local bytes, no wire traffic ([`ResolveSource::Hit`]).
 /// - **miss** → fetch → verify the fetched bytes hash back to the requested
-///   address → store → return. A mismatch is [`SftpError::HashMismatch`]; the
-///   bad bytes are never cached.
+///   address → store → return ([`ResolveSource::Fetched`]). A mismatch is
+///   [`SftpError::HashMismatch`]; the bad bytes are never cached.
 pub struct CasResolver<F: CasFetch> {
     cache: FileStore,
     fetch: F,
@@ -234,11 +265,12 @@ impl<F: CasFetch> CasResolver<F> {
 
     /// Resolve an object to its bytes, fetching + caching on a miss. Concurrent
     /// resolves for the same hash coalesce onto a single wire transfer
-    /// (single-flight).
-    pub async fn resolve(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+    /// (single-flight). The [`ResolveSource`] tag lets a caller log the honest
+    /// hit/fetch distinction (`docs/pcm.md` R4).
+    pub async fn resolve(&self, hash: &ContentHash) -> Result<(Vec<u8>, ResolveSource), SftpError> {
         // Fast path: a cache hit needs no lock and no wire.
         if let Some(bytes) = self.cache.retrieve(hash)? {
-            return Ok(bytes);
+            return Ok((bytes, ResolveSource::Hit));
         }
 
         // Single-flight: take (or create) this hash's fetch lock. All clones
@@ -266,11 +298,16 @@ impl<F: CasFetch> CasResolver<F> {
     }
 
     /// The miss path, run under the per-hash lock: re-check the cache (a prior
-    /// holder may have just filled it), else fetch, verify, and cache.
-    async fn fetch_verify_store(&self, hash: &ContentHash) -> Result<Vec<u8>, SftpError> {
+    /// holder may have just filled it), else fetch, verify, and cache. A
+    /// double-check hit here still tags [`ResolveSource::Hit`] — this call
+    /// never itself touched the wire, a concurrent sibling did.
+    async fn fetch_verify_store(
+        &self,
+        hash: &ContentHash,
+    ) -> Result<(Vec<u8>, ResolveSource), SftpError> {
         // Double-check: whoever held the lock before us may have cached it.
         if let Some(bytes) = self.cache.retrieve(hash)? {
-            return Ok(bytes);
+            return Ok((bytes, ResolveSource::Hit));
         }
 
         let bytes = self.fetch.fetch(hash).await?;
@@ -286,7 +323,7 @@ impl<F: CasFetch> CasResolver<F> {
         // The mime is unknown at the transport layer; the clip carries the real
         // one. The cache keys on the content hash, so the placeholder is inert.
         self.cache.store(&bytes, "application/octet-stream")?;
-        Ok(bytes)
+        Ok((bytes, ResolveSource::Fetched))
     }
 }
 
@@ -355,8 +392,9 @@ mod tests {
         let hash = ContentHash::from_data(&body);
         let resolver = CasResolver::new(FileStore::at_path(dir.path()), StubFetch::new(body.clone()));
 
-        let got = resolver.resolve(&hash).await.unwrap();
+        let (got, source) = resolver.resolve(&hash).await.unwrap();
         assert_eq!(got, body, "returns the fetched bytes");
+        assert_eq!(source, ResolveSource::Fetched, "a genuine miss reports Fetched");
         assert_eq!(resolver.fetch.call_count(), 1, "fetched once");
         assert!(resolver.cache.exists(&hash), "cached the verified object");
     }
@@ -369,8 +407,9 @@ mod tests {
         let resolver = CasResolver::new(FileStore::at_path(dir.path()), StubFetch::new(body.clone()));
 
         resolver.resolve(&hash).await.unwrap(); // miss → fetch + cache
-        let got = resolver.resolve(&hash).await.unwrap(); // hit
+        let (got, source) = resolver.resolve(&hash).await.unwrap(); // hit
         assert_eq!(got, body);
+        assert_eq!(source, ResolveSource::Hit, "the second resolve is a cache hit");
         assert_eq!(resolver.fetch.call_count(), 1, "the second resolve did not fetch");
     }
 
@@ -383,8 +422,9 @@ mod tests {
 
         // Stub would return junk — proving the resolver serves the cache, not it.
         let resolver = CasResolver::new(cache, StubFetch::new(vec![0xde, 0xad]));
-        let got = resolver.resolve(&hash).await.unwrap();
+        let (got, source) = resolver.resolve(&hash).await.unwrap();
         assert_eq!(got, body);
+        assert_eq!(source, ResolveSource::Hit, "a prewarmed cache is always a hit");
         assert_eq!(resolver.fetch.call_count(), 0, "cache hit skips the wire");
     }
 
@@ -428,7 +468,7 @@ mod tests {
             .collect();
 
         for handle in handles {
-            let got = handle.await.unwrap().unwrap();
+            let (got, _source) = handle.await.unwrap().unwrap();
             assert_eq!(got, body, "every resolver gets the bytes");
         }
 

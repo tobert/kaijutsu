@@ -33,7 +33,7 @@ pub use rpc::{
     VfsFileType,
 };
 pub use document_store::{DocumentEntry, DocumentStore};
-pub use sftp::{CasFetch, CasResolver, SftpClient, SftpError, default_cache_dir};
+pub use sftp::{CasFetch, CasResolver, ResolveSource, SftpClient, SftpError, default_cache_dir};
 pub use share_server::{
     ShareArg, ShareHandler, ShareServerConfig, parse_share_arg, validate_unique_names,
 };

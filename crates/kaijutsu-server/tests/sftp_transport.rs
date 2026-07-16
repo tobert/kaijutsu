@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{run_local, start_server, start_server_with_state_dir};
 use kaijutsu_cas::{ContentStore, FileStore};
-use kaijutsu_client::{CasResolver, KeySource, SftpClient, SftpError, SshConfig};
+use kaijutsu_client::{CasResolver, KeySource, ResolveSource, SftpClient, SftpError, SshConfig};
 
 fn ephemeral_config(addr: std::net::SocketAddr) -> SshConfig {
     SshConfig {
@@ -101,8 +101,9 @@ fn object_resolves_over_v_cas_and_verifies() {
             .expect("sftp subsystem connect");
         let resolver = CasResolver::new(FileStore::at_path(cache_dir.path()), sftp);
 
-        let got = resolver.resolve(&hash).await.expect("resolve over /v/cas");
+        let (got, source) = resolver.resolve(&hash).await.expect("resolve over /v/cas");
         assert_eq!(got, body, "resolved bytes match the seeded object");
+        assert_eq!(source, ResolveSource::Fetched, "a fresh cache means the first resolve fetched");
 
         // The verified object landed in the client cache (content-addressed), so a
         // fresh FileStore over the same dir sees it.
