@@ -25,6 +25,27 @@ demotion (placement, not intent) — as the hook for automation like
 layer above placement. Design question when picked up: a new `ContextState`
 vs a stamp alongside `promoted_at`/`demoted_at`/`paused_at`.
 
+## Audio sink follow-ups (seeded 2026-07-16, clip-arc live verify)
+
+- **Metronome stops when kaijutsu-app is backgrounded** (Amy, by ear): the
+  rodio scheduler thread free-runs, but cue dispatch + the metronome click
+  ride Bevy `Update` systems — an unfocused/minimized window throttles the
+  frame loop and the clicks stop. Confirms the sink's *dispatch* is tied to
+  the render loop; if background playback should keep time, the
+  ServerEvent→scheduler bridge (and the click) need a home that survives
+  frame throttling (the rodio thread itself is the obvious candidate).
+- **CasResolver connection dies idle, recovery is slow + silent** (fanfare
+  clip, live): the app's prefetch resolver connects eagerly on the first
+  CAS cue and the slot keeps that connection for the app's life; ~11 min
+  idle later the next fetch hit a dead transport — dead-peer detection was
+  slow, the single redial retry is unlogged, and there's no deadline-aware
+  timeout, so a placed clip just doesn't sound with nothing in the log.
+  Server side verified healthy (`kaijutsu-client/examples/sftp_probe.rs` —
+  genuine-SSH probe: connect 80ms, 209KB read 130ms). All R4-shaped:
+  prepare directive at commit + keepalive/reconnect-on-idle + skip-loud
+  fetch deadline + happy-path INFO logs ("sftp session ready", "media
+  resolved (cache|fetch) in Xms", "clip scheduled at deadline").
+
 ## Conversation virtualization follow-ups (seeded 2026-07-16, from `6504fafe`)
 
 The O(visible) virtualization shipped with two accepted v1 limits, named in
