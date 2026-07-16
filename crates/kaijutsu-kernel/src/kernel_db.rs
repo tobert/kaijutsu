@@ -773,6 +773,45 @@ fn parse_optional_context_id(
     }
 }
 
+/// Build a [`PersistedTrack`] from a raw `tracks` row, validating the numeric
+/// invariants BEFORE the `i64 -> u64` cast: a negative field or a zero
+/// `period_ms` (a beat that never advances) is corruption, refused loudly rather
+/// than wrapped into a nonsense cadence (`0 - 1` would surface as `u64::MAX`).
+/// The single construction path both `get_track` and `list_tracks` funnel
+/// through, so neither read API can skip the check.
+#[allow(clippy::too_many_arguments)]
+fn validated_track(
+    track_id: String,
+    period_ms: i64,
+    beats_per_phrase: i64,
+    playhead_tick: Option<i64>,
+    playing: i64,
+    score_blob: Option<Vec<u8>>,
+    clock_kind: String,
+) -> KernelDbResult<PersistedTrack> {
+    if period_ms < 0 || beats_per_phrase < 0 {
+        return Err(KernelDbError::Validation(format!(
+            "track {track_id} has a negative field (period_ms={period_ms}, \
+             beats_per_phrase={beats_per_phrase}) — corrupt"
+        )));
+    }
+    if period_ms == 0 {
+        return Err(KernelDbError::Validation(format!(
+            "track {track_id} has a zero period_ms — corrupt (a beat that never advances)"
+        )));
+    }
+    let score_context_id = parse_optional_context_id(&track_id, score_blob)?;
+    Ok(PersistedTrack {
+        track_id,
+        period_ms: period_ms as u64,
+        beats_per_phrase: beats_per_phrase as u64,
+        playhead_tick,
+        playing: playing != 0,
+        score_context_id,
+        clock_kind,
+    })
+}
+
 fn read_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<ContextId> {
     let bytes: Vec<u8> = row.get(idx)?;
     ContextId::try_from_slice(&bytes).ok_or_else(|| {
@@ -3633,26 +3672,16 @@ impl KernelDb {
         else {
             return Ok(None);
         };
-        if period_ms < 0 || beats_per_phrase < 0 {
-            return Err(KernelDbError::Validation(format!(
-                "track {track_id} has a negative field (period_ms={period_ms}, \
-                 beats_per_phrase={beats_per_phrase}) — corrupt"
-            )));
-        }
-        if period_ms == 0 {
-            return Err(KernelDbError::Validation(format!(
-                "track {track_id} has a zero period_ms — corrupt (a beat that never advances)"
-            )));
-        }
-        Ok(Some(PersistedTrack {
-            track_id: track_id.to_string(),
-            period_ms: period_ms as u64,
-            beats_per_phrase: beats_per_phrase as u64,
+        validated_track(
+            track_id.to_string(),
+            period_ms,
+            beats_per_phrase,
             playhead_tick,
-            playing: playing != 0,
-            score_context_id: parse_optional_context_id(track_id, score_blob)?,
+            playing,
+            score_blob,
             clock_kind,
-        }))
+        )
+        .map(Some)
     }
 
     /// List all **live** persisted tracks — tombstoned rows (`deleted_at IS NOT
@@ -3679,16 +3708,18 @@ impl KernelDb {
         for row in rows {
             let (track_id, period_ms, beats_per_phrase, playhead_tick, playing, score_blob, clock_kind) =
                 row?;
-            let score_context_id = parse_optional_context_id(&track_id, score_blob)?;
-            tracks.push(PersistedTrack {
+            // Same validating construction path as `get_track` — a corrupt row
+            // (negative field, zero period) is refused here too, not cast into a
+            // nonsense `u64` cadence that the roster would then display.
+            tracks.push(validated_track(
                 track_id,
-                period_ms: period_ms as u64,
-                beats_per_phrase: beats_per_phrase as u64,
+                period_ms,
+                beats_per_phrase,
                 playhead_tick,
-                playing: playing != 0,
-                score_context_id,
+                playing,
+                score_blob,
                 clock_kind,
-            });
+            )?);
         }
         Ok(tracks)
     }
@@ -6380,6 +6411,26 @@ mod tests {
         assert!(
             matches!(db.get_track("neg"), Err(KernelDbError::Validation(_))),
             "a negative period_ms is corrupt → loud Validation error"
+        );
+    }
+
+    #[test]
+    fn list_tracks_rejects_a_corrupt_row_like_get_track() {
+        // `list_tracks` must run the SAME numeric validation as `get_track` — a
+        // corrupt row (here a negative period) must surface as a loud Validation
+        // error, never a nonsense `u64::MAX` cadence cast silently into the roster.
+        let db = KernelDb::in_memory().unwrap();
+        db.upsert_track(&make_track("good", 500)).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tracks (track_id, period_ms, beats_per_phrase)
+                 VALUES ('rotten', -1, 16)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            matches!(db.list_tracks(), Err(KernelDbError::Validation(_))),
+            "a corrupt row must make list_tracks refuse loudly, not wrap to u64::MAX"
         );
     }
 
