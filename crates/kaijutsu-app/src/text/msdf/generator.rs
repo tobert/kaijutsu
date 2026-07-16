@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
-use msdfgen::{Bitmap, FillRule, FontExt, MsdfGeneratorConfig, Range, Rgba};
+use msdfgen::{Bitmap, FillRule, FontExt, Framing, MsdfGeneratorConfig, Projection, Rgba, Vector2};
 use std::collections::{HashMap, HashSet};
 
 use super::atlas::MsdfAtlas;
@@ -199,10 +199,50 @@ fn generate_glyph(
     let width = ((bounds.width() * px_per_unit).ceil() as u32 + padding).max(16);
     let height = ((bounds.height() * px_per_unit).ceil() as u32 + padding).max(16);
 
-    // Calculate framing for the glyph
-    let range = Range::Px(msdf_range);
-    let Some(framing) = bounds.autoframe(width, height, range, None) else {
-        return placeholder_glyph(key);
+    // Calculate framing for the glyph.
+    //
+    // NOTE: deliberately NOT using `Bound::autoframe` (msdfgen-rs
+    // src/bound.rs) here, even though it looks like the obvious call:
+    //
+    //   - Its `scale: None` path (what `Range::Px(_)` + `None` used to
+    //     invoke) derives its OWN per-glyph scale from whichever axis is
+    //     the tighter fit — `(padded_target_px - range) / content_units`
+    //     on ONE axis, applied isotropically to both. Since bitmap
+    //     width/height are computed per-axis (`ceil(content_px) +
+    //     padding`, above), the two axes' implied scales differ, and
+    //     neither generally equals our intended `px_per_unit`. Every
+    //     glyph rendered at a glyph-dependent size instead of the atlas's
+    //     assumed constant `MSDF_PX_PER_EM`.
+    //   - Its `scale: Some(_)` path looks like the fix (pass our own
+    //     scale in) but has an upstream bug: it computes `res.translate`
+    //     from the passed-in scale but never assigns `res.scale` itself,
+    //     which stays at `Framing::default()`'s value — so it silently
+    //     produces a wrong (unit) scale too.
+    //
+    // We build the `Framing` by hand instead: hold `scale` fixed at
+    // `px_per_unit` on both axes, and solve `translate` to center the
+    // glyph's content bounds in the padded bitmap. Projection semantics
+    // (confirmed against msdfgen-rs's C++ `Projection::project`, and
+    // `correct_sign`/`correct_msdf_error`, which consume the same
+    // `Framing` we pass to `generate_mtsdf`): `bitmap_px = (shape_units +
+    // translate) * scale`.
+    let scale = px_per_unit;
+    let content_width = bounds.width() * px_per_unit;
+    let content_height = bounds.height() * px_per_unit;
+    let margin_px_x = (width as f64 - content_width) / 2.0;
+    let margin_px_y = (height as f64 - content_height) / 2.0;
+    let translate_x = margin_px_x / scale - bounds.left;
+    let translate_y = margin_px_y / scale - bounds.bottom;
+
+    let framing = Framing {
+        projection: Projection {
+            scale: Vector2::new(scale, scale),
+            translate: Vector2::new(translate_x, translate_y),
+        },
+        // `Framing.range` is in SHAPE units, not pixels — this is what
+        // `autoframe`'s `Range::Px` branch computes as `range / scale`
+        // (there `scale` is its own derived value; here it's ours).
+        range: msdf_range / scale,
     };
 
     // Generate the MSDF
@@ -226,18 +266,16 @@ fn generate_glyph(
         })
         .collect();
 
-    // Calculate anchor (offset for positioning)
-    let content_width = bounds.width() * px_per_unit;
-    let content_height = bounds.height() * px_per_unit;
-    let actual_padding_x = (width as f64 - content_width) / 2.0;
-    let actual_padding_y = (height as f64 - content_height) / 2.0;
-
-    let origin_bitmap_x = actual_padding_x - bounds.left * px_per_unit;
-    let origin_from_bottom = actual_padding_y - bounds.bottom * px_per_unit;
-    let origin_from_top = height as f64 - origin_from_bottom;
-
-    let anchor_x = origin_bitmap_x as f32 / px_per_em as f32;
-    let anchor_y = origin_from_top as f32 / px_per_em as f32;
+    // Calculate anchor (offset from bitmap origin to glyph pen origin, in
+    // em units). Exact now that `scale` above is exactly `px_per_unit`
+    // rather than autoframe's derived value: `translate_x/y * px_per_unit`
+    // is precisely the bitmap-pixel offset from the shape origin to the
+    // padded content box (see `bitmap_px = (shape_units + translate) *
+    // scale` above), matching the anchor convention documented on
+    // `AtlasRegion` (atlas.rs) and the V-flip in `build_vertices`
+    // (renderer.rs): anchor_y is measured from the bitmap TOP.
+    let anchor_x = (translate_x * px_per_unit / px_per_em) as f32;
+    let anchor_y = ((height as f64 - translate_y * px_per_unit) / px_per_em) as f32;
 
     trace!(
         "MSDF gen glyph_id={}: bitmap={}x{}, anchor=({:.4}, {:.4}) em",
@@ -274,6 +312,7 @@ fn placeholder_glyph(key: GlyphKey) -> GeneratedGlyph {
 
 #[cfg(test)]
 mod tests {
+    use super::super::glyph::FontId;
     use super::*;
 
     // `queue_pending`/`poll_completed` themselves call
@@ -307,5 +346,187 @@ mod tests {
     #[test]
     fn zero_budget_never_retries() {
         assert!(!should_retry_font_wait(0, 0));
+    }
+
+    // -- Fix 1: per-glyph scale wobble -------------------------------------
+    //
+    // `generate_glyph` must size every glyph's MSDF at exactly
+    // `px_per_unit` (== px_per_em / units_per_em). Before the fix it framed
+    // the shape with `bounds.autoframe(width, height, Range::Px(4), None)`,
+    // which derives its OWN isotropic scale from whichever axis
+    // (`(padded_target_px - range) / content_units`) is the tighter fit,
+    // and applies that single scale to BOTH axes. Because bitmap
+    // width/height are computed per-axis (`ceil(content_px) + padding`),
+    // the two axes' implied scales differ glyph-by-glyph — small for a
+    // near-square glyph, large for one where padding dominates a tiny
+    // content extent (e.g. '.'). Every glyph ends up rendered at a
+    // glyph-dependent size instead of the atlas's assumed constant
+    // `MSDF_PX_PER_EM`.
+
+    /// A pixel counts as "inside" the glyph when the MSDF median channel —
+    /// the same value the shader thresholds against — is >= 0.5 (128/255).
+    /// Returns the inclusive bounding box of inside pixels, in bitmap pixel
+    /// coordinates (orientation doesn't matter for measuring extent).
+    fn ink_bbox(data: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+        let mut bbox: Option<(u32, u32, u32, u32)> = None;
+        for row in 0..height {
+            for col in 0..width {
+                let idx = ((row * width + col) * 4) as usize;
+                let mut rgb = [data[idx], data[idx + 1], data[idx + 2]];
+                rgb.sort_unstable();
+                let median = rgb[1];
+                if median >= 128 {
+                    bbox = Some(match bbox {
+                        None => (col, col, row, row),
+                        Some((min_x, max_x, min_y, max_y)) => (
+                            min_x.min(col),
+                            max_x.max(col),
+                            min_y.min(row),
+                            max_y.max(row),
+                        ),
+                    });
+                }
+            }
+        }
+        bbox
+    }
+
+    /// Generate a real glyph from the shipped Cascadia Code NF font and
+    /// check its geometry.
+    ///
+    /// Ground truth for the ink SIZE (width/height) comes from
+    /// `ttf_parser::Face::glyph_bounding_box`, NOT `msdfgen::Shape::get_bound()`
+    /// — verified by hand against this exact font (glyph_id 1862, '.'):
+    /// ttf-parser reports `x_min=452, x_max=748` (a tight, correct bbox from
+    /// the font's own `glyf` table), but msdfgen's `Shape::get_bound()`
+    /// reports `left=0.0`. That is a separate, pre-existing bug in
+    /// msdfgen-rs itself (`Shape::get_bound()`/`Contour::get_bound()` seed
+    /// their accumulator with `Bound::default()` == `(0,0,0,0)` and then
+    /// only ever *shrink toward* an extreme — see
+    /// `sys/lib/core/edge-segments.cpp`'s `boundPoint`, `if (p.x < l) l =
+    /// p.x;` etc. — instead of the C++ `Shape::getBounds()` convenience's
+    /// `±LARGE_VALUE` seed, which msdfgen-rs doesn't bind at all. So `left`
+    /// silently stays `0.0` whenever the shape's true left edge is
+    /// positive, which is the common case for any glyph with left-side
+    /// bearing.) Not fixed here — out of scope (can't modify msdfgen-rs;
+    /// see docs/issues.md) — but it means `bounds.width()*px_per_unit`
+    /// cannot be trusted as ground truth for this assertion.
+    ///
+    /// The ink WIDTH/HEIGHT check is immune to that bug regardless: Fix 1's
+    /// whole point is that `bitmap_px` is an affine function of shape units
+    /// with slope exactly `px_per_unit` everywhere, so a *difference*
+    /// between two shape-space x (or y) coordinates always scales
+    /// correctly even when the `translate` offset itself was computed from
+    /// a wrong `bounds.left`/`bounds.bottom`.
+    ///
+    /// The anchor check, by contrast, deliberately reuses
+    /// `shape.get_bound()` (the same, possibly-buggy bounds `generate_glyph`
+    /// itself sees) — it is a regression/self-consistency check that
+    /// `generate_glyph`'s anchor formula matches its own inputs, not an
+    /// independent check of visual correctness.
+    fn assert_glyph_geometry_matches_bounds(ch: char) {
+        let font_data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/fonts/CascadiaCodeNF.ttf"
+        ))
+        .expect("shipped test font must be present");
+
+        let face = ttf_parser::Face::parse(&font_data, 0).expect("font must parse");
+        let glyph_id = face
+            .glyph_index(ch)
+            .unwrap_or_else(|| panic!("font has no glyph for {ch:?}"));
+
+        let msdf_range = 4.0;
+        let px_per_em = 64.0;
+        let angle_threshold = 3.0;
+
+        let key = GlyphKey::new(FontId::for_test(1), glyph_id.0);
+        let generated = generate_glyph(
+            key,
+            &font_data,
+            glyph_id.0,
+            msdf_range,
+            px_per_em,
+            angle_threshold,
+        );
+        assert!(
+            !generated.is_placeholder,
+            "{ch:?} must generate real MSDF data"
+        );
+
+        let units_per_em = face.units_per_em() as f64;
+        let px_per_unit = px_per_em / units_per_em;
+
+        let tight_bbox = face
+            .glyph_bounding_box(glyph_id)
+            .unwrap_or_else(|| panic!("{ch:?} must have a tight bbox"));
+        let expected_content_w = (tight_bbox.x_max - tight_bbox.x_min) as f64 * px_per_unit;
+        let expected_content_h = (tight_bbox.y_max - tight_bbox.y_min) as f64 * px_per_unit;
+
+        let (min_x, max_x, min_y, max_y) =
+            ink_bbox(&generated.data, generated.width, generated.height)
+                .unwrap_or_else(|| panic!("{ch:?} must have visible ink"));
+        let ink_w = (max_x - min_x + 1) as f64;
+        let ink_h = (max_y - min_y + 1) as f64;
+
+        assert!(
+            (ink_w - expected_content_w).abs() <= 2.5,
+            "{ch:?}: ink width {ink_w} should be within 2.5px of content width \
+             {expected_content_w} (bitmap {}x{})",
+            generated.width,
+            generated.height,
+        );
+        assert!(
+            (ink_h - expected_content_h).abs() <= 2.5,
+            "{ch:?}: ink height {ink_h} should be within 2.5px of content height \
+             {expected_content_h} (bitmap {}x{})",
+            generated.width,
+            generated.height,
+        );
+
+        // Anchor closed form (self-consistency, see doc comment above):
+        // recompute the same formula `generate_glyph` uses, from the same
+        // (possibly bounds-bug-affected) `shape.get_bound()` inputs.
+        let mut shape = face.glyph_shape(glyph_id).expect("glyph must have a shape");
+        shape.edge_coloring_simple(angle_threshold, 0);
+        let bounds = shape.get_bound();
+        let content_w = bounds.width() * px_per_unit;
+        let content_h = bounds.height() * px_per_unit;
+        let margin_x = (generated.width as f64 - content_w) / 2.0;
+        let margin_y = (generated.height as f64 - content_h) / 2.0;
+        let translate_x = margin_x / px_per_unit - bounds.left;
+        let translate_y = margin_y / px_per_unit - bounds.bottom;
+        let expected_anchor_x = (translate_x * px_per_unit / px_per_em) as f32;
+        let expected_anchor_y =
+            ((generated.height as f64 - translate_y * px_per_unit) / px_per_em) as f32;
+
+        assert!(
+            (generated.anchor_x - expected_anchor_x).abs() < 1e-3,
+            "{ch:?}: anchor_x {} != expected {}",
+            generated.anchor_x,
+            expected_anchor_x,
+        );
+        assert!(
+            (generated.anchor_y - expected_anchor_y).abs() < 1e-3,
+            "{ch:?}: anchor_y {} != expected {}",
+            generated.anchor_y,
+            expected_anchor_y,
+        );
+    }
+
+    #[test]
+    fn generate_glyph_period_ink_matches_content_bounds() {
+        // '.' is the sharpest regression case: padding (8px) is a large
+        // fraction of its tiny content extent, so autoframe's derived scale
+        // was off by close to 2x before the fix.
+        assert_glyph_geometry_matches_bounds('.');
+    }
+
+    #[test]
+    fn generate_glyph_capital_m_ink_matches_content_bounds() {
+        // 'M' is wide and roughly square, so autoframe's derived scale was
+        // off by a smaller (~+10%) but still-wrong amount before the fix —
+        // this guards the "every glyph, not just narrow ones" claim.
+        assert_glyph_geometry_matches_bounds('M');
     }
 }
