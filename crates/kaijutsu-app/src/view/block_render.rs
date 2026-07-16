@@ -223,6 +223,22 @@ pub struct GpuTextureLimits {
 // MAIN WORLD SYSTEMS
 // ============================================================================
 
+/// Round a logical-pixel dimension so that `logical * scale` lands exactly
+/// on a physical pixel boundary, then convert back to logical pixels.
+///
+/// `UiRttTexture`'s physical texture is sized by
+/// [`crate::view::ui_rtt::ui_rtt_texture_dims`] as `ceil(logical *
+/// scale)`. A `built_width`/`built_height` that isn't already a multiple of
+/// `1/scale` produces a physical texture whose aspect ratio doesn't quite
+/// match the logical node's — the MSDF vertex builder maps glyph
+/// coordinates into that texture's NDC space assuming an exact match, so
+/// any drift here shows up as sub-pixel stretch. Rounding both dimensions
+/// through this function keeps `ceil` in `ui_rtt_texture_dims` a no-op
+/// (the value is already an integer physical pixel count).
+fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
+    (logical * scale).round() / scale
+}
+
 /// Build vello scenes for block cells.
 ///
 /// Runs in PostUpdate after UiSystems::Layout. For each block with changed
@@ -578,12 +594,14 @@ pub fn build_block_scenes(
         }
 
         // Round to physical pixel boundary so built_height matches what Taffy
-        // renders. Width already comes from ComputedNode (post-Taffy), but height
-        // is computed by us — without rounding, the MSDF texture NDC has a
-        // different aspect ratio than the displayed node, causing subtle vertical
-        // stretch on HiDPI displays.
+        // renders. Height is computed by us — without rounding, the MSDF
+        // texture NDC has a different aspect ratio than the displayed node,
+        // causing subtle vertical stretch on HiDPI displays. `width` itself
+        // stays raw here (it still drives `max_advance`/layout above, and
+        // label positions below) — only the *stored* `rtt.built_width` gets
+        // the same treatment, at the bottom of this function.
         let scale = text_metrics.scale_factor;
-        let total_height = ((content_height + pad_top + pad_bottom) * scale).round() / scale;
+        let total_height = round_to_physical_px(content_height + pad_top + pad_bottom, scale);
 
         // Collect label glyphs for shader-drawn border labels.
         // Labels are baked into the MSDF texture at positions in the border padding zone.
@@ -738,7 +756,11 @@ pub fn build_block_scenes(
         }
 
         ui_scene.scene = scene;
-        rtt.built_width = width;
+        // `width` itself (used above for max_advance/layout and label
+        // positions) stays the raw Taffy value — only what we store for the
+        // RTT texture mapping gets rounded, same reasoning as `total_height`
+        // above.
+        rtt.built_width = round_to_physical_px(width, scale);
         rtt.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
         block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
@@ -1176,6 +1198,50 @@ fn should_extract_msdf_block(version: u64, _glyphs_empty: bool, last_rendered: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- round_to_physical_px (Fix 2: built_width physical-pixel rounding) -
+    //
+    // `rtt.built_height` was already rounded this way (the NDC-aspect-
+    // mismatch comment above `total_height` predates this fix); `built_width`
+    // stored the raw fractional Taffy width, which `ui_rtt_texture_dims`
+    // (ceil(logical * scale)) and the MSDF vertex builder (divides by the
+    // *stored* built_width/height, not the physical texture size — see Fix 3)
+    // both assume is already physical-pixel-exact.
+
+    #[test]
+    fn round_to_physical_px_is_exact_at_integer_scale() {
+        // Scale 1.0: every logical pixel is already a physical pixel, so a
+        // fractional Taffy width (e.g. from flex remainder distribution)
+        // still needs the round — this is the exact scale-1.0 HiDPI-off case
+        // the bug report covers.
+        assert_eq!(round_to_physical_px(100.0, 1.0), 100.0);
+        assert_eq!(round_to_physical_px(100.4, 1.0), 100.0);
+        assert_eq!(round_to_physical_px(100.6, 1.0), 101.0);
+    }
+
+    #[test]
+    fn round_to_physical_px_lands_on_a_physical_pixel_at_fractional_scale() {
+        // The bug this fixes: a fractional `scale` (common HiDPI values
+        // like 1.25, 1.5) turns an un-rounded logical width into a
+        // fractional physical pixel count, which is what corrupted the NDC
+        // aspect ratio (`ui_rtt_texture_dims` then `ceil()`s a non-integer,
+        // and the vertex builder's implicit "built_width*scale ==
+        // texture_width" assumption breaks).
+        for &(logical, scale) in &[
+            (100.4_f32, 1.25_f32),
+            (247.3, 1.5),
+            (63.999, 2.0),
+            (1.0, 1.3333334), // 4/3 — a genuinely awkward scale factor
+        ] {
+            let rounded = round_to_physical_px(logical, scale);
+            let physical = rounded * scale;
+            assert!(
+                (physical - physical.round()).abs() < 1e-3,
+                "round_to_physical_px({logical}, {scale}) = {rounded} -> \
+                 physical {physical} is not integer-pixel-aligned",
+            );
+        }
+    }
 
     // -- should_extract_msdf_block -----------------------------------------
 
