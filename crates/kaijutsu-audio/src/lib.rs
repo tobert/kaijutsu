@@ -41,6 +41,22 @@ pub const ABC_MIME: &str = "text/vnd.abc";
 /// doesn't play on after the clock stops. `lead` is `ZERO` (flush now).
 pub const RENDER_FLUSH_MIME: &str = "application/vnd.kaijutsu.render-flush";
 
+/// The R4 prepare directive (`docs/pcm.md` "The prepare horizon"): a
+/// [`RenderCue`] with this mime tells every sink "you will need this CAS
+/// object soon — warm your cache." Published at *commit* time (the moment a
+/// clip cell validates and lands on a track's timeline), long before the
+/// crossing's fire cue, whose `lead` only needs to cover jitter, not a cold
+/// cache's fetch latency. `payload` is always `CuePayload::Cas(media_hash)` —
+/// the clip's sample bytes, never the record itself (a sink warming its cache
+/// needs nothing else). `lead` is `Duration::ZERO`: a prepare cue has no
+/// fire-time meaning, so there is nothing to schedule against. `epoch_ns` is
+/// stamped by the sender at emission like any other cue, but a sink never
+/// treats a prepare cue as "stale" the way it does a fire cue — the stamp is
+/// for log/telemetry sanity, not for backdating a play. **Not a render**: a
+/// sink that sees this mime must never play or schedule anything from it,
+/// only prefetch/cache-warm.
+pub const PREPARE_MIME: &str = "application/vnd.kaijutsu.prepare";
+
 /// One render sink. Implemented in the app (Bevy) and, later, an edge-node
 /// agent (ALSA). `&self` (not `&mut self`) because the Bevy sink spawns
 /// entities via `Commands` rather than mutating sink state, and the ALSA
@@ -233,6 +249,17 @@ mod tests {
         );
         assert_eq!(AudioFormatHint::from_path_extension("notes.txt"), None);
         assert_eq!(AudioFormatHint::from_path_extension("noext"), None);
+    }
+
+    /// The prepare mime is distinct from every other wire mime (flush, ABC,
+    /// clip) — a sink dispatching on `cue.mime` must never confuse a
+    /// cache-warm directive with a fire directive.
+    #[test]
+    fn prepare_mime_is_its_own_distinct_directive() {
+        assert_ne!(PREPARE_MIME, RENDER_FLUSH_MIME);
+        assert_ne!(PREPARE_MIME, ABC_MIME);
+        assert_ne!(PREPARE_MIME, CLIP_MIME);
+        assert_eq!(PREPARE_MIME, "application/vnd.kaijutsu.prepare");
     }
 
     #[test]
