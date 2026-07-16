@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kaijutsu_abc::ParseMode;
+use kaijutsu_audio::{Clip, CLIP_MIME};
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_hyoushigi::{
     ContextHash, ContextQuery, Fallback, Recipe, ResolveError, Resolution, Resolver, ResolverCtx,
@@ -478,6 +479,71 @@ pub fn schedule_abc_cell(
     Ok(start)
 }
 
+/// Absorb a producer-authored clip record onto a track's timeline — the
+/// sibling of [`schedule_abc_cell`] for placed samples (`docs/pcm.md` R2, "The
+/// clip record — Shape A"). Where a musician's ABC phrase is *vamped*
+/// (repeated on a missed resolve via `Fallback::UseLastGood`), a clip is a
+/// deliberately placed one-shot authored directly by a producer (`kj play
+/// --track`) — so its recipe carries **`Fallback::Skip`**, never
+/// `UseLastGood`. `docs/pcm.md` "Fallback semantics": a fresh clip lane's
+/// default is silence-until-the-first-good-clip; a placed one-shot must never
+/// vamp-repeat a stale sample on a missed resolve the way a continuously-vamped
+/// ABC lane does.
+///
+/// Gate 1 of 3: [`Clip::parse_validated`] rejects a structurally malformed
+/// record OR one whose `media` hash is absent from CAS **before** anything is
+/// stored or scheduled — the same eager-gate discipline as `schedule_abc_cell`'s
+/// `validate_abc`, so a rejected commit leaves zero residue.
+///
+/// `at`: `Some(tick)` places the clip at that absolute tick (rejected by
+/// [`Timeline::schedule`] if it isn't strictly ahead of the playhead — the same
+/// in-the-past gate every scheduled cell gets, so a `--at` behind the playhead
+/// fails loud here with no special-casing needed). `None` defaults to ASAP =
+/// `playhead + 1`, computed **after** the timeline lock is taken (never
+/// before) — reading the playhead outside the lock and scheduling under it
+/// separately would let a concurrent commit race the default between read and
+/// schedule (TOCTOU).
+///
+/// Returns the scheduled cell's start tick. Errors (malformed/absent-media
+/// clip, unarmed track, CAS write, schedule-in-the-past) bubble — crash over
+/// silently dropping the clip.
+pub fn schedule_clip_cell(
+    kernel: &Kernel,
+    clip_json: &str,
+    at: Option<kaijutsu_types::Tick>,
+    track: TrackId,
+    played_by: PrincipalId,
+) -> anyhow::Result<kaijutsu_types::Tick> {
+    // Gate 1 of 3: eager parse + CAS-presence validate. Reject a malformed or
+    // dangling-media record before it touches CAS or the timeline — a rejected
+    // schedule must leave zero residue.
+    Clip::parse_validated(clip_json, kernel.cas().as_ref())
+        .map_err(|e| anyhow::anyhow!("schedule_clip_cell: invalid clip record: {e}"))?;
+
+    let timeline = kernel.track_timeline(&track).ok_or_else(|| {
+        anyhow::anyhow!("schedule_clip_cell: track {} is not armed", track.as_str())
+    })?;
+    let hash = kernel.cas().store(clip_json.as_bytes(), CLIP_MIME)?;
+
+    let mut g = timeline.lock();
+    // Computed INSIDE the lock — the TOCTOU guard documented above.
+    let start = at.unwrap_or_else(|| g.playhead() + TickDelta::new(1));
+    g.schedule(Cell::deferred_on(
+        Span::instant(start),
+        Recipe {
+            resolver: ResolverId::new(CasCommitResolver::ID),
+            params: serde_json::json!({ "hash": hash.as_str(), "mime": CLIP_MIME }),
+            query: ContextQuery::default(),
+            // Skip, NOT UseLastGood — see the doc comment above.
+            fallback: Fallback::Skip,
+        },
+        track,
+        played_by,
+    ))
+    .map_err(|e| anyhow::anyhow!("schedule_clip_cell: {e}"))?;
+    Ok(start)
+}
+
 /// The single production resolver (§2): commit CAS-referenced bytes onto the score
 /// at a tick, validating by mime. The generic "put this content on the score"
 /// resolver — notation today (`text/vnd.abc`), automation cells tomorrow (same
@@ -548,11 +614,21 @@ impl Resolver for CasCommitResolver {
                 ResolveError::Failed(format!("cas_commit: hash not in CAS: {}", hash.as_str()))
             })?;
 
-        // Gate 2 of 3: per-mime validate. `text/vnd.abc` must parse; an unknown
-        // mime is a defined pass-through (most content needs no kernel opinion) —
-        // a documented default, never a silent fallback.
+        // Gate 2 of 3: per-mime validate. `text/vnd.abc` must parse; a clip
+        // record must be structurally well-formed (presence of its `media` in
+        // CAS was already gate 1, `schedule_clip_cell`'s eager
+        // `parse_validated` — this resolver is pure, so it never re-checks CAS
+        // presence, only that the committed bytes are still a well-formed
+        // Shape A record). An unknown mime is a defined pass-through (most
+        // content needs no kernel opinion) — a documented default, never a
+        // silent fallback.
         if mime.as_str() == ABC_MIME {
             validate_abc(&bytes).map_err(|e| ResolveError::Failed(format!("cas_commit: {e}")))?;
+        } else if mime.as_str() == CLIP_MIME {
+            let json = std::str::from_utf8(&bytes).map_err(|e| {
+                ResolveError::Failed(format!("cas_commit: clip record is not UTF-8: {e}"))
+            })?;
+            Clip::parse(json).map_err(|e| ResolveError::Failed(format!("cas_commit: {e}")))?;
         }
 
         // The committed body IS the source bytes under its source mime — never a
@@ -1938,5 +2014,308 @@ mod tests {
         kernel.arm_track_timeline(t.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
         kernel.disarm_track_timeline(&t);
         assert!(kernel.track_timeline(&t).is_none(), "disarmed → no track timeline");
+    }
+
+    // --- Clip cells: `schedule_clip_cell` + the CLIP_MIME resolver arm ------
+    // (docs/pcm.md R2 — the producer side of a placed sample.)
+
+    use kaijutsu_audio::{Clip, CLIP_MIME, CLIP_VERSION};
+    use kaijutsu_cas::{ContentHash, ContentStore};
+
+    use crate::block_store::SharedBlockStore;
+
+    /// Build a minimal, structurally-valid Shape A clip record whose `media`
+    /// is already present in `cas` — the happy-path shape every clip test
+    /// starts from. Returns `(json, media_hash)`.
+    fn a_valid_clip_json(cas: &kaijutsu_cas::FileStore, label: &str) -> (String, ContentHash) {
+        let media = cas.store(b"RIFF....WAVEfake-but-hashable", "audio/wav").unwrap();
+        let clip = Clip {
+            v: CLIP_VERSION,
+            media: media.clone(),
+            mime: "audio/wav".to_string(),
+            label: label.to_string(),
+            src_offset_ms: 0,
+            src_len_ms: None,
+            gain_db: 0.0,
+            ext: serde_json::Map::new(),
+        };
+        (clip.to_json().expect("clip serializes"), media)
+    }
+
+    /// Happy path: a valid clip record with present media schedules under the
+    /// ASAP default (`playhead + 1`) and commits at the barrier under the
+    /// `CLIP_MIME` mime — the sibling shape of `schedule_abc_cell`'s cell.
+    #[tokio::test]
+    async fn schedule_clip_cell_commits_and_returns_tick() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("clips").unwrap();
+        kernel.arm_track_timeline(track.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+
+        let (json, _media) = a_valid_clip_json(kernel.cas(), "kick");
+
+        let tick = super::schedule_clip_cell(
+            &kernel,
+            &json,
+            None,
+            track.clone(),
+            kaijutsu_types::PrincipalId::new(),
+        )
+        .expect("a valid clip with present media schedules");
+        assert_eq!(tick, Tick::new(1), "ASAP default is playhead(0) + 1");
+
+        let tl = kernel.track_timeline(&track).expect("armed");
+        tl.lock().advance_to(tick);
+        assert_eq!(tl.lock().committed().len(), 1, "the clip cell commits at the barrier");
+
+        let cref = {
+            let g = tl.lock();
+            match &g.committed()[0].body {
+                kaijutsu_hyoushigi::Body::Concrete(c) => c.clone(),
+                _ => panic!("committed cell must be concrete"),
+            }
+        };
+        assert_eq!(cref.mime, CLIP_MIME, "committed body carries the clip MIME");
+    }
+
+    /// An explicit `--at` tick is honored verbatim (no ASAP default applied)
+    /// when it is ahead of the playhead.
+    #[tokio::test]
+    async fn schedule_clip_cell_honors_explicit_at_tick() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("clips").unwrap();
+        kernel.arm_track_timeline(track.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        let (json, _media) = a_valid_clip_json(kernel.cas(), "kick");
+
+        let tick = super::schedule_clip_cell(
+            &kernel,
+            &json,
+            Some(Tick::new(50)),
+            track.clone(),
+            kaijutsu_types::PrincipalId::new(),
+        )
+        .expect("an explicit future tick schedules");
+        assert_eq!(tick, Tick::new(50), "the explicit --at tick is used verbatim, no ASAP default");
+    }
+
+    /// Gate 1: a clip record whose `media` was never stored in CAS is rejected
+    /// loudly, and leaves ZERO residue — the record itself is never stored
+    /// either (mirrors `malformed_abc_rejected_at_schedule`'s zero-residue pin).
+    #[tokio::test]
+    async fn schedule_clip_cell_rejects_absent_media_with_zero_residue() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("clips").unwrap();
+        kernel.arm_track_timeline(track.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+
+        // A well-formed hash, but never stored anywhere.
+        let dangling = ContentHash::from_data(b"never-stored-anywhere");
+        let clip = Clip {
+            v: CLIP_VERSION,
+            media: dangling,
+            mime: "audio/wav".to_string(),
+            label: "kick".to_string(),
+            src_offset_ms: 0,
+            src_len_ms: None,
+            gain_db: 0.0,
+            ext: serde_json::Map::new(),
+        };
+        let json = clip.to_json().unwrap();
+        let would_be_record_hash = ContentHash::from_data(json.as_bytes());
+
+        let err = super::schedule_clip_cell(
+            &kernel,
+            &json,
+            None,
+            track.clone(),
+            kaijutsu_types::PrincipalId::new(),
+        );
+        assert!(err.is_err(), "absent media must reject loudly at schedule time");
+
+        assert!(
+            !kernel.cas().exists(&would_be_record_hash),
+            "a rejected clip leaves zero residue — the record itself is never stored"
+        );
+        let tl = kernel.track_timeline(&track).expect("armed");
+        assert_eq!(tl.lock().future_len(), 0, "nothing scheduled either");
+    }
+
+    /// An `--at` tick at or behind the playhead is rejected — the same
+    /// in-the-past gate `Timeline::schedule` enforces for every cell, exercised
+    /// here because `--at` (unlike ABC's relative `lead`) can name an absolute
+    /// tick a caller might get wrong.
+    #[tokio::test]
+    async fn schedule_clip_cell_rejects_past_tick() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("clips").unwrap();
+        // Seed the playhead ahead so an --at behind it is unambiguously in the past.
+        kernel.arm_track_timeline(track.clone(), TickClock::default(), kaijutsu_types::Tick::new(10));
+        let (json, _media) = a_valid_clip_json(kernel.cas(), "kick");
+
+        let err = super::schedule_clip_cell(
+            &kernel,
+            &json,
+            Some(Tick::new(5)),
+            track.clone(),
+            kaijutsu_types::PrincipalId::new(),
+        );
+        assert!(err.is_err(), "a tick behind the playhead must reject");
+        assert!(
+            err.unwrap_err().to_string().contains("schedule_clip_cell"),
+            "error names the function for grep-ability"
+        );
+    }
+
+    /// A valid clip aimed at a track with no armed timeline is a loud error
+    /// naming the track — never a silent no-op (mirrors `schedule_abc_cell`'s
+    /// "track is not armed" error).
+    #[tokio::test]
+    async fn schedule_clip_cell_rejects_unarmed_track() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("never-armed").unwrap();
+        let (json, _media) = a_valid_clip_json(kernel.cas(), "kick");
+
+        let err = super::schedule_clip_cell(
+            &kernel,
+            &json,
+            None,
+            track.clone(),
+            kaijutsu_types::PrincipalId::new(),
+        );
+        assert!(err.is_err(), "an unarmed track must reject");
+        assert!(
+            err.unwrap_err().to_string().contains("not armed"),
+            "error explains the track isn't armed"
+        );
+    }
+
+    /// Gate 2 of 3: the `cas_commit` resolver accepts a well-formed clip record
+    /// under `CLIP_MIME` and commits it — the sibling of ABC's resolve-time
+    /// re-validation.
+    #[tokio::test]
+    async fn cas_commit_resolver_clip_mime_accepts_valid_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(kaijutsu_cas::FileStore::at_path(dir.path()));
+        let (json, _media) = a_valid_clip_json(&cas, "kick");
+        let hash = cas.store(json.as_bytes(), CLIP_MIME).unwrap();
+
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 1.0,
+            commit_margin: TickDelta::new(0),
+        });
+        super::register_resolvers(&mut tl, cas.clone());
+        tl.schedule(Cell::deferred_on(
+            Span::instant(Tick::new(1)),
+            Recipe {
+                resolver: ResolverId::new(super::CasCommitResolver::ID),
+                params: serde_json::json!({ "hash": hash.as_str(), "mime": CLIP_MIME }),
+                query: ContextQuery::default(),
+                fallback: Fallback::Skip,
+            },
+            kaijutsu_types::TrackId::solo(),
+            kaijutsu_types::PrincipalId::beat(),
+        ))
+        .unwrap();
+        tl.advance_to(Tick::new(1));
+
+        assert_eq!(
+            tl.committed().len(),
+            1,
+            "a well-formed clip record under CLIP_MIME resolves and commits"
+        );
+    }
+
+    /// Gate 2 of 3: garbage bytes committed under `CLIP_MIME` fail the resolve
+    /// — the cell ends `Failed`, nothing commits (mirrors
+    /// `cas_commit_rejects_malformed_hash`'s asymmetric-boundary behavior).
+    #[tokio::test]
+    async fn cas_commit_resolver_clip_mime_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(kaijutsu_cas::FileStore::at_path(dir.path()));
+        let hash = cas.store(b"not a clip record at all", CLIP_MIME).unwrap();
+
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 1.0,
+            commit_margin: TickDelta::new(0),
+        });
+        super::register_resolvers(&mut tl, cas.clone());
+        tl.schedule(Cell::deferred_on(
+            Span::instant(Tick::new(1)),
+            Recipe {
+                resolver: ResolverId::new(super::CasCommitResolver::ID),
+                params: serde_json::json!({ "hash": hash.as_str(), "mime": CLIP_MIME }),
+                query: ContextQuery::default(),
+                fallback: Fallback::Skip,
+            },
+            kaijutsu_types::TrackId::solo(),
+            kaijutsu_types::PrincipalId::beat(),
+        ))
+        .unwrap();
+        tl.advance_to(Tick::new(1));
+
+        assert!(tl.committed().is_empty(), "garbage under CLIP_MIME must not commit");
+    }
+
+    /// End-to-end verification (docs/pcm.md "Verification", R1–R3 line minus
+    /// the render cue, which is slice C / R3 and untouched here): a clip
+    /// scheduled through the real `schedule_clip_cell` commits at the barrier
+    /// and materializes into the score context. No deriver is registered for
+    /// `CLIP_MIME` (the pass-through default, §9), so it lands as exactly ONE
+    /// block — `Role::Asset` (a non-`text/*` mime), content = the clip
+    /// record's own CAS hash (the two-level reference: this hash is the
+    /// *record*, distinct from the `media` hash inside it).
+    #[tokio::test]
+    async fn clip_cell_schedules_commits_and_materializes_into_score() {
+        use kaijutsu_types::PrincipalId;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("clips").unwrap();
+        kernel.arm_track_timeline(track.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+
+        let (json, _media) = a_valid_clip_json(kernel.cas(), "kick");
+        let record_hash = ContentHash::from_data(json.as_bytes());
+        let played_by = PrincipalId::new();
+
+        let tick = super::schedule_clip_cell(&kernel, &json, None, track.clone(), played_by)
+            .expect("a valid clip schedules");
+
+        let tl = kernel.track_timeline(&track).expect("armed");
+        tl.lock().advance_to(tick);
+        assert_eq!(tl.lock().committed().len(), 1, "the clip cell committed at the barrier");
+
+        // A fresh, DB-less block store + context to materialize into.
+        let blocks: SharedBlockStore = Arc::new(BlockStore::new(PrincipalId::new()));
+        let ctx = ContextId::new();
+        blocks.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let mut cursor = MaterializeCursor::default();
+        let derivers = DeriverRegistry::production(); // no clip deriver — pass-through (§9)
+        let inserted =
+            materialize_committed(&tl, kernel.cas().as_ref(), &blocks, ctx, &mut cursor, &derivers)
+                .unwrap();
+        assert_eq!(inserted.len(), 1, "no deriver for CLIP_MIME → one block, no sibling");
+
+        let snaps = blocks.block_snapshots(ctx).unwrap();
+        assert_eq!(snaps.len(), 1);
+        let snap = &snaps[0];
+        assert_eq!(
+            snap.role,
+            kaijutsu_types::Role::Asset,
+            "a non-text/* mime materializes as an asset"
+        );
+        assert_eq!(
+            snap.content,
+            record_hash.as_str(),
+            "content is the clip record's own CAS hash (not the media hash inside it)"
+        );
+        assert_eq!(
+            snap.content_type,
+            kaijutsu_types::ContentType::Plain,
+            "CLIP_MIME has no dedicated ContentType yet — the documented Plain default"
+        );
+        assert_eq!(snap.tick, Some(tick), "carries the beat coordinate");
+        assert_eq!(snap.track, Some(track), "carries the lane");
+        assert!(snap.ephemeral, "score blocks are hydration-silent");
+        assert_eq!(snap.id.principal_id, played_by, "materializes under the committing principal");
     }
 }
