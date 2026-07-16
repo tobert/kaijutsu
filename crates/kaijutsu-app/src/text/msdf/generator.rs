@@ -8,7 +8,7 @@ use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use msdfgen::{Bitmap, FillRule, FontExt, MsdfGeneratorConfig, Range, Rgba};
 use std::collections::{HashMap, HashSet};
 
-use super::atlas::MsdfAtlas;
+use super::atlas::{AtlasRegion, MsdfAtlas};
 use super::glyph::GlyphKey;
 
 /// Result of generating an MSDF glyph.
@@ -129,7 +129,19 @@ impl MsdfGenerator {
     }
 
     /// Poll for completed generation tasks and insert into atlas.
-    pub fn poll_completed(&mut self, atlas: &mut MsdfAtlas, images: &mut Assets<Image>) {
+    ///
+    /// Returns the set of `GlyphKey`s that actually landed a region in the
+    /// atlas this call — a successful `insert` or `insert_placeholder`. A
+    /// glyph whose pack failed (returned `None`, e.g. still growing, or
+    /// terminally too big) is NOT included: nothing changed for it, so no
+    /// block needs a version bump on its account. Callers use this set to
+    /// bump only the blocks that reference a newly-visible glyph instead of
+    /// every text block on screen (see `poll_msdf_generator`).
+    pub fn poll_completed(
+        &mut self,
+        atlas: &mut MsdfAtlas,
+        images: &mut Assets<Image>,
+    ) -> HashSet<GlyphKey> {
         let mut completed = Vec::new();
         self.tasks.retain_mut(|task| {
             if task.is_finished() {
@@ -140,10 +152,11 @@ impl MsdfGenerator {
             }
         });
 
+        let mut landed = HashSet::new();
         for glyph in completed {
             self.queued.remove(&glyph.key);
-            if glyph.is_placeholder {
-                atlas.insert_placeholder(glyph.key, images);
+            let result = if glyph.is_placeholder {
+                atlas.insert_placeholder(glyph.key, images)
             } else {
                 atlas.insert(
                     glyph.key,
@@ -153,11 +166,28 @@ impl MsdfGenerator {
                     glyph.anchor_y,
                     &glyph.data,
                     images,
-                );
-            }
+                )
+            };
+            record_landed(&mut landed, glyph.key, result);
         }
+        landed
     }
 
+}
+
+/// Record `key` as landed iff `insert_result` shows it actually occupies a
+/// region now. Pack failure (`None`) must NOT be recorded — factored out of
+/// `poll_completed`'s loop so it can be exercised without a real task pool:
+/// call `MsdfAtlas::insert`/`insert_placeholder` directly (they don't touch
+/// `AsyncComputeTaskPool`) and feed the `Option<AtlasRegion>` result in.
+fn record_landed(
+    landed: &mut HashSet<GlyphKey>,
+    key: GlyphKey,
+    insert_result: Option<AtlasRegion>,
+) {
+    if insert_result.is_some() {
+        landed.insert(key);
+    }
 }
 
 /// Pure retry-budget check, factored out for unit testing without a real
@@ -274,13 +304,17 @@ fn placeholder_glyph(key: GlyphKey) -> GeneratedGlyph {
 
 #[cfg(test)]
 mod tests {
+    use super::super::glyph::FontId;
     use super::*;
 
-    // `queue_pending`/`poll_completed` themselves call
-    // `AsyncComputeTaskPool::get()`, which panics without a real Bevy App
-    // (TaskPoolPlugin) to initialize the global pool — so the retry-budget
-    // decision is tested here as the pure function it was factored into,
-    // per the "practical without a real task pool" testing note.
+    // `queue_pending` calls `AsyncComputeTaskPool::get()`, which panics
+    // without a real Bevy App (TaskPoolPlugin) to initialize the global
+    // pool — so the retry-budget decision is tested here as the pure
+    // function it was factored into, per the "practical without a real task
+    // pool" testing note. `record_landed` is exercised the same way: not by
+    // driving `poll_completed`'s task-draining loop, but by calling
+    // `MsdfAtlas::insert`/`insert_placeholder` directly (no task pool
+    // involved) and feeding their results through the helper.
 
     #[test]
     fn retries_while_under_budget() {
@@ -307,5 +341,55 @@ mod tests {
     #[test]
     fn zero_budget_never_retries() {
         assert!(!should_retry_font_wait(0, 0));
+    }
+
+    // -- record_landed -------------------------------------------------
+
+    #[test]
+    fn record_landed_includes_a_successful_pack_but_not_a_failed_one() {
+        let mut images = Assets::<Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 64, 64).with_max_dim(64);
+        let key_ok = GlyphKey::new(FontId::for_test(1), 0);
+        let key_fail = GlyphKey::new(FontId::for_test(2), 0);
+
+        let mut landed = HashSet::new();
+
+        // Fits comfortably in the 64x64 atlas.
+        let data_ok = vec![0u8; 8 * 8 * 4];
+        let result_ok = atlas.insert(key_ok, 8, 8, 0.0, 0.0, &data_ok, &mut images);
+        record_landed(&mut landed, key_ok, result_ok);
+
+        // Too big for the atlas, with growth capped at the current size —
+        // mirrors `pack_failure_removes_key_from_pending_not_left_stuck` in
+        // atlas.rs.
+        let data_fail = vec![0u8; 70 * 70 * 4];
+        let result_fail = atlas.insert(key_fail, 70, 70, 0.0, 0.0, &data_fail, &mut images);
+        record_landed(&mut landed, key_fail, result_fail);
+
+        assert!(
+            landed.contains(&key_ok),
+            "a glyph that successfully packed must be recorded as landed"
+        );
+        assert!(
+            !landed.contains(&key_fail),
+            "a glyph whose pack failed must NOT be recorded as landed — nothing \
+             changed for it, so no block should be bumped on its account"
+        );
+    }
+
+    #[test]
+    fn record_landed_includes_a_successful_placeholder() {
+        let mut images = Assets::<Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
+        let key = GlyphKey::new(FontId::for_test(1), 0);
+
+        let mut landed = HashSet::new();
+        let result = atlas.insert_placeholder(key, &mut images);
+        record_landed(&mut landed, key, result);
+
+        assert!(
+            landed.contains(&key),
+            "a successful placeholder insert is as much a landing as a real glyph"
+        );
     }
 }
