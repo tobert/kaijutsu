@@ -1,11 +1,8 @@
 //! Pure navigation primitives for the room level (`docs/scenes/shell.md`,
-//! "Levels — the arrows continue"): the station carousel and the generic
-//! double-tap used as the well-edge speedbump.
+//! "Levels — the arrows continue"): the station carousel.
 //!
 //! No Bevy types here — unit-tested pure logic, same stance as
 //! `view/time_well/card.rs`.
-
-use std::time::Instant;
 
 /// The stations the room carousel cycles with Left/Right. Order is the
 /// carousel order; unbuilt stations ride along as dimmed nameplates.
@@ -73,71 +70,13 @@ impl StationCarousel {
     }
 }
 
-/// Generic double-tap window (the third copy of this shape in the app —
-/// `input/interrupt.rs` and `input/vim/dismiss.rs` predate it; folding all
-/// three onto this one is recorded in docs/issues.md, not done here).
-///
-/// `#[allow(dead_code)]`: unused as of the time-well/room integration plan's
-/// Slice C, which retired this type's one consumer (`room::WellEdgeBump` —
-/// the well's old Up-Up speedbump, gone now that leaving the well is just
-/// `room.zoomed = None`). Kept rather than deleted: it's the still-open
-/// consolidation target `docs/issues.md` already points `interrupt.rs`/
-/// `dismiss.rs` at, not dead weight from an abandoned idea.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct DoubleTap {
-    window_ms: u128,
-    count: u8,
-    last: Option<Instant>,
-}
-
-#[allow(dead_code)] // see the struct's own doc
-impl DoubleTap {
-    pub fn new(window_ms: u128) -> Self {
-        Self {
-            window_ms,
-            count: 0,
-            last: None,
-        }
-    }
-
-    /// Register a press at `now`; returns the running count (1 = armed,
-    /// 2 = fired). A press outside the window restarts at 1. Saturates at 2
-    /// and self-resets when it fires.
-    pub fn press_at(&mut self, now: Instant) -> u8 {
-        let within_window = self
-            .last
-            .is_some_and(|last| now.duration_since(last).as_millis() < self.window_ms);
-        self.count = if within_window {
-            (self.count + 1).min(2)
-        } else {
-            1
-        };
-        self.last = Some(now);
-
-        if self.count >= 2 {
-            self.reset();
-            2
-        } else {
-            self.count
-        }
-    }
-
-    /// Convenience: `press_at(Instant::now())`.
-    pub fn press(&mut self) -> u8 {
-        self.press_at(Instant::now())
-    }
-
-    pub fn reset(&mut self) {
-        self.count = 0;
-        self.last = None;
-    }
-}
+// The generic double-tap window that lived here (the retired well-edge
+// speedbump's timer) was consolidated with `input/interrupt.rs` and
+// `input/vim/dismiss.rs` onto `input/tap.rs::TapCounter` (2026-07-16).
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     // -- Station::label / Station::built ------------------------------
 
@@ -215,73 +154,5 @@ mod tests {
         assert_eq!(c.focused, 3);
         c.step(-3);
         assert_eq!(c.focused, 0);
-    }
-
-    // -- DoubleTap ---------------------------------------------------------
-
-    #[test]
-    fn first_press_arms() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        assert_eq!(d.press_at(t0), 1);
-    }
-
-    #[test]
-    fn second_press_within_window_fires() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        assert_eq!(d.press_at(t0), 1);
-        assert_eq!(d.press_at(t0 + Duration::from_millis(100)), 2);
-    }
-
-    #[test]
-    fn firing_self_resets_so_third_press_is_one() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        assert_eq!(d.press_at(t0), 1);
-        assert_eq!(d.press_at(t0 + Duration::from_millis(100)), 2);
-        // The gesture already fired and reset itself; the next press,
-        // even immediately after, starts a fresh arm at 1.
-        assert_eq!(d.press_at(t0 + Duration::from_millis(150)), 1);
-    }
-
-    #[test]
-    fn press_outside_window_restarts_at_one() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        assert_eq!(d.press_at(t0), 1);
-        // Well past the 500ms window.
-        assert_eq!(d.press_at(t0 + Duration::from_millis(600)), 1);
-    }
-
-    #[test]
-    fn press_exactly_at_window_boundary_restarts() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        assert_eq!(d.press_at(t0), 1);
-        // duration_since == window_ms is NOT "< window_ms", so this counts
-        // as a late (non-firing) press.
-        assert_eq!(d.press_at(t0 + Duration::from_millis(500)), 1);
-    }
-
-    #[test]
-    fn reset_clears_state() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        d.press_at(t0);
-        d.reset();
-        // A subsequent press is a fresh arm, not a fire, even though it's
-        // "close" to the pre-reset press.
-        assert_eq!(d.press_at(t0 + Duration::from_millis(10)), 1);
-    }
-
-    #[test]
-    fn multiple_double_tap_cycles() {
-        let mut d = DoubleTap::new(500);
-        let t0 = Instant::now();
-        assert_eq!(d.press_at(t0), 1);
-        assert_eq!(d.press_at(t0 + Duration::from_millis(50)), 2);
-        assert_eq!(d.press_at(t0 + Duration::from_millis(700)), 1);
-        assert_eq!(d.press_at(t0 + Duration::from_millis(750)), 2);
     }
 }

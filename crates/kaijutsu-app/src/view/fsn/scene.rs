@@ -615,13 +615,14 @@ fn triangle_list_mesh_colored(positions: Vec<[f32; 3]>, indices: Vec<u32>, color
 
 // ── Camera fly ───────────────────────────────────────────────────────────
 
-/// Keyboard-first fly: arrows/WASD translate over the world's XZ plane
-/// (world-axis-relative, not camera-relative — the camera holds a fixed
-/// pitch, never yaws, so "forward" always means the same world direction);
-/// PgUp/PgDn adjust altitude. Both axes clamp via `layout::clamp_camera_xz`/
-/// `clamp_altitude`.
+/// Action-driven fly: `FlyAxis`/`FlyAltitude` arrive per-frame from the
+/// dispatcher's held-key poll (arrows/WASD, PgUp/PgDn) and the gamepad left
+/// stick while `FsnFly` is the active context. Translation is over the
+/// world's XZ plane (world-axis-relative, not camera-relative — the camera
+/// holds a fixed pitch, never yaws, so "forward" always means the same world
+/// direction). Both axes clamp via `layout::clamp_camera_xz`/`clamp_altitude`.
 pub fn fsn_camera_fly(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut actions: MessageReader<crate::input::ActionFired>,
     time: Res<Time>,
     mut camera: Query<&mut Transform, With<FsnCamera>>,
 ) {
@@ -629,36 +630,41 @@ pub fn fsn_camera_fly(
     let dt = time.delta_secs();
     let mut dx: f32 = 0.0;
     let mut dz: f32 = 0.0;
-    if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
-        dz -= 1.0;
+    let mut dy: f32 = 0.0;
+    for crate::input::ActionFired { action, context } in actions.read() {
+        if *context != crate::input::InputContext::FsnFly {
+            continue;
+        }
+        match action {
+            // FlyAxis y+ is "forward"; the world's forward is -Z.
+            crate::input::Action::FlyAxis { x, y } => {
+                dx += x;
+                dz -= y;
+            }
+            crate::input::Action::FlyAltitude(v) => dy += v,
+            _ => {}
+        }
     }
-    if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
-        dz += 1.0;
-    }
-    if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
-        dx -= 1.0;
-    }
-    if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
-        dx += 1.0;
-    }
+
     if dx != 0.0 || dz != 0.0 {
+        // Cap the magnitude at 1 instead of normalizing: digital diagonals
+        // stay uniform-speed, while partial stick deflection keeps its
+        // analog magnitude.
         let len = (dx * dx + dz * dz).sqrt();
+        if len > 1.0 {
+            dx /= len;
+            dz /= len;
+        }
         let (x, z) = layout::clamp_camera_xz(
-            tf.translation.x + dx / len * CAM_FLY_SPEED * dt,
-            tf.translation.z + dz / len * CAM_FLY_SPEED * dt,
+            tf.translation.x + dx * CAM_FLY_SPEED * dt,
+            tf.translation.z + dz * CAM_FLY_SPEED * dt,
         );
         tf.translation.x = x;
         tf.translation.z = z;
     }
 
-    let mut dy = 0.0;
-    if keys.pressed(KeyCode::PageUp) || keys.pressed(KeyCode::Equal) {
-        dy += 1.0;
-    }
-    if keys.pressed(KeyCode::PageDown) || keys.pressed(KeyCode::Minus) {
-        dy -= 1.0;
-    }
     if dy != 0.0 {
+        let dy = dy.clamp(-1.0, 1.0);
         tf.translation.y = layout::clamp_altitude(tf.translation.y + dy * CAM_ALTITUDE_SPEED * dt);
     }
 }
@@ -890,12 +896,21 @@ fn set_visibility(
 
 // ── Keyboard ─────────────────────────────────────────────────────────────
 
-/// Esc surfaces back to the room — `Screen::Fsn` was entered FROM
+/// PopLevel (Esc) surfaces back to the room — `Screen::Fsn` was entered FROM
 /// `Screen::Room` (the N-dive), so that's the level directly above, same as
-/// every other dive's Esc discipline (`docs/scenes/shell.md`).
-pub fn fsn_keyboard(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<Screen>>) {
-    if keys.just_pressed(KeyCode::Escape) {
-        next.set(Screen::Room);
+/// every other dive's Esc discipline (`docs/scenes/shell.md`). Action-driven
+/// via the `FsnFly` context, which also closes the old suppression-list gap
+/// (`input/context.rs` forgot Fsn → central Esc double-fired with this).
+pub fn fsn_keyboard(
+    mut actions: MessageReader<crate::input::ActionFired>,
+    mut next: ResMut<NextState<Screen>>,
+) {
+    for crate::input::ActionFired { action, context } in actions.read() {
+        if *context == crate::input::InputContext::FsnFly
+            && matches!(action, crate::input::Action::PopLevel)
+        {
+            next.set(Screen::Room);
+        }
     }
 }
 

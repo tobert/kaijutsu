@@ -4,55 +4,37 @@
 //! switches to Normal mode (modalkit's default), and in Normal mode the
 //! VimMachine produces no useful action. To give the user a way to
 //! actually leave compose, we count rapid Escape presses — the second tap
-//! within `WINDOW_MS` while vim is in Normal mode fires `Action::Unfocus`.
+//! within the window while vim is in Normal mode fires `Action::PopLevel`.
 //!
-//! The state shape mirrors `input::interrupt::InterruptState` (used for
-//! Ctrl+C). When we add more double-tap dismiss gestures (e.g. screen-style
-//! Ctrl+A Ctrl+A → start of line) we can lift this into a generic helper.
+//! Built on the shared [`TapCounter`] (`input/tap.rs`) — the same primitive
+//! under the Ctrl+C interrupt ladder. The counter saturates at 2 and only
+//! the dismiss consumes it, so an `Esc Esc` that lands outside Normal mode
+//! stays armed for the next tap.
 
 use bevy::prelude::*;
+
+use crate::input::tap::TapCounter;
 
 /// Time window for counting consecutive Escape presses (milliseconds).
 const WINDOW_MS: u128 = 500;
 
 /// Per-session state for the double-Escape dismiss gesture.
-#[derive(Resource, Default)]
-pub struct EscapeDismissState {
-    count: u8,
-    last_press: Option<std::time::Instant>,
+#[derive(Resource)]
+pub struct EscapeDismissState(TapCounter);
+
+impl Default for EscapeDismissState {
+    fn default() -> Self {
+        Self(TapCounter::new(WINDOW_MS, 2))
+    }
 }
 
 impl EscapeDismissState {
-    /// Record a new Escape press and return the current count (1 or 2).
-    ///
-    /// If the previous press was more than `WINDOW_MS` ago, the count
-    /// resets to 1.
-    pub fn press(&mut self) -> u8 {
-        let now = std::time::Instant::now();
-        if let Some(last) = self.last_press
-            && now.duration_since(last).as_millis() < WINDOW_MS
-        {
-            self.count = (self.count + 1).min(2);
-        } else {
-            self.count = 1;
-        }
-        self.last_press = Some(now);
-        self.count
-    }
-
     /// Reset the press count and timestamp.
     ///
     /// Called after a successful dismiss, and on any non-Escape keypress
     /// so that `Esc x Esc` does not count as a double-tap.
     pub fn reset(&mut self) {
-        self.count = 0;
-        self.last_press = None;
-    }
-
-    /// Current press count without mutating state. Test/debug accessor.
-    #[cfg(test)]
-    pub fn count(&self) -> u8 {
-        self.count
+        self.0.reset()
     }
 }
 
@@ -63,12 +45,12 @@ impl EscapeDismissState {
 ///   - vim is currently in Normal mode (no mode banner)
 ///
 /// On a true return the state is already reset, so the caller can fire
-/// `Action::Unfocus` and move on.
+/// `Action::PopLevel` and move on.
 pub fn should_dismiss_after_escape(
     state: &mut EscapeDismissState,
     in_normal_mode: bool,
 ) -> bool {
-    let count = state.press();
+    let count = state.0.press();
     if count >= 2 && in_normal_mode {
         state.reset();
         true
@@ -80,40 +62,6 @@ pub fn should_dismiss_after_escape(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn first_press_is_one() {
-        let mut s = EscapeDismissState::default();
-        assert_eq!(s.press(), 1);
-    }
-
-    #[test]
-    fn second_press_within_window_is_two() {
-        let mut s = EscapeDismissState::default();
-        s.press();
-        assert_eq!(s.press(), 2);
-    }
-
-    #[test]
-    fn third_press_saturates_at_two() {
-        // We don't escalate beyond 2 — there's no third dismiss tier.
-        let mut s = EscapeDismissState::default();
-        s.press();
-        s.press();
-        assert_eq!(s.press(), 2);
-    }
-
-    #[test]
-    fn reset_clears_count() {
-        let mut s = EscapeDismissState::default();
-        s.press();
-        s.press();
-        s.reset();
-        assert_eq!(s.count(), 0);
-        assert!(s.last_press.is_none());
-        // Next press starts at 1 again.
-        assert_eq!(s.press(), 1);
-    }
 
     #[test]
     fn dismiss_helper_fires_on_second_press_in_normal_mode() {
@@ -133,24 +81,35 @@ mod tests {
     }
 
     #[test]
+    fn saturated_count_stays_armed_until_normal_mode() {
+        // Esc Esc both landing outside Normal (e.g. visual → normal
+        // transitions still in flight): the counter saturates at 2 and
+        // stays armed, so the NEXT rapid Esc in Normal mode dismisses.
+        let mut s = EscapeDismissState::default();
+        assert!(!should_dismiss_after_escape(&mut s, false));
+        assert!(!should_dismiss_after_escape(&mut s, false));
+        assert!(should_dismiss_after_escape(&mut s, true));
+    }
+
+    #[test]
     fn dismiss_helper_resets_state_on_fire() {
         // After firing, the next press starts a fresh count of 1 — so we
         // don't accidentally dismiss on every subsequent Esc.
         let mut s = EscapeDismissState::default();
         should_dismiss_after_escape(&mut s, true);
         should_dismiss_after_escape(&mut s, true);
-        // State is reset after the dismiss above; this should be a fresh 1.
-        assert_eq!(s.press(), 1);
+        // State was reset by the dismiss above; this single press must not
+        // fire even in Normal mode.
+        assert!(!should_dismiss_after_escape(&mut s, true));
     }
 
     #[test]
-    fn window_expiry_resets_count() {
-        // Stale presses outside the window fall back to a fresh count.
+    fn reset_breaks_the_gesture() {
+        // A non-Escape key between taps calls reset() — `Esc x Esc` must
+        // not dismiss.
         let mut s = EscapeDismissState::default();
-        s.press();
-        // Backdate the last press so the next one falls outside the window.
-        s.last_press =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(WINDOW_MS as u64 + 50));
-        assert_eq!(s.press(), 1);
+        assert!(!should_dismiss_after_escape(&mut s, true));
+        s.reset();
+        assert!(!should_dismiss_after_escape(&mut s, true));
     }
 }

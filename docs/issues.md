@@ -6,26 +6,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Input prefix: deferred chords + pending-hint UI (seeded 2026-07-16, input rework)
+## Input: selection auto-copies to PRIMARY (seeded 2026-07-16, input rework)
 
-The Ctrl+A prefix machine shipped with Amy's core set (`docs/input.md`);
-three pieces deferred:
-
-- **`Ctrl+A A` rename**: needs a `kj context rename` verb first (kernel-side
-  `drift.rename` exists; no CLI surface). Then wire the prefilled-`kj`
-  prompt pattern: summon the shell surface with `kj context rename ` typed,
-  cursor at end, Enter runs / Esc abandons. Amy wants the pattern reusable
-  beyond rename.
-- **`Ctrl+A '` switch-by-prompt**: same prefill pattern, `kj context switch `.
-- **Pending-prefix hint + `Ctrl+A ?` legend**: an armed prefix currently has
-  no visual (log only). Wants a small statusline-corner indicator and a
-  transient chord-table overlay rendered from the table (the well legend's
-  shape).
-- **Selection auto-copies to PRIMARY** (the other half of the xterm model —
-  Ctrl+V/middle-click paste shipped): needs a selection UX first. The
-  overlay's `selection_anchor` has no live producer (mouse drag-select and
-  vi visual mode are both unwired); when one lands, copy-on-selection to
-  PRIMARY rides it.
+The other half of the xterm clipboard model (Ctrl+V + middle-click paste
+shipped; so did the full prefix set incl. `'`/`A` prompts and the
+armed-footer legend): needs a selection UX first. The overlay's
+`selection_anchor` has no live producer (mouse drag-select and vi visual
+mode are both unwired); when one lands, copy-on-selection to PRIMARY rides
+it — `InputOverlay::selection_range` is the read point.
 
 ## Context lifecycle: "done for now" marker (seeded 2026-07-16, input rework)
 

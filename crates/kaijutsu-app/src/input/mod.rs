@@ -3,24 +3,24 @@
 //! Replaces the vim-style modal input with a focus-based model inspired by 4X strategy games.
 //! What's focused determines available actions, not a global mode.
 //!
-//! ## Architecture
+//! ## Architecture (docs/input.md)
 //!
 //! ```text
 //! Raw Input (Keyboard, Gamepad, MouseWheel)
 //!     │
 //!     ▼
-//! sync_input_context    — derives InputContext from FocusArea
-//!     │
+//! sync_input_context    — derives InputContexts + KeyboardGrab from
+//!     │                    FocusArea + Screen + RoomState
 //!     ▼
-//! dispatch_input        — ONE system, reads ALL raw input
-//!     │                    matches bindings in active context
-//!     ├──────┬──────┐
-//!     │      │      │
-//!     ▼      ▼      ▼
-//! ActionFired  TextInputReceived   (Bevy messages)
-//!     │             │
-//!     ▼             ▼
-//! Domain handlers consume actions
+//! dispatch_input        — the ONLY raw-keyboard reader
+//!     │                    matches bindings in active contexts
+//!     │                    (Global only while a grab is held)
+//!     ├──────────┬───────────────┐
+//!     ▼          ▼               ▼
+//! ActionFired  GrabbedKey    AnalogInput
+//!     │          │ (compose VimMachine / vi editor session)
+//!     ▼          ▼
+//! Domain handlers consume actions; grab owners consume keys
 //! ```
 //!
 //! ## BRP Introspection
@@ -40,7 +40,9 @@ pub mod events;
 pub mod focus;
 pub mod map;
 pub mod bindings_config;
+pub mod prefix;
 pub mod systems;
+pub mod tap;
 pub mod vim;
 
 // Re-export core types for ergonomic use.
@@ -93,7 +95,9 @@ impl Plugin for InputPlugin {
 
         // Register messages
         app.add_message::<events::ActionFired>()
-            .add_message::<events::TextInputReceived>();
+            .add_message::<events::TextInputReceived>()
+            .add_message::<events::GrabbedKey>()
+            .add_message::<events::LiteralPrefix>();
 
         // System clipboard (graceful fallback if unavailable)
         match arboard::Clipboard::new() {
@@ -110,6 +114,8 @@ impl Plugin for InputPlugin {
             .init_resource::<focus::ActiveSurface>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
+            .init_resource::<context::KeyboardGrab>()
+            .init_resource::<prefix::PrefixState>()
             .init_resource::<events::AnalogInput>()
             .init_resource::<interrupt::InterruptState>()
             .insert_resource(vim::VimMachineResource::new())
@@ -122,6 +128,7 @@ impl Plugin for InputPlugin {
             .register_type::<map::InputMap>()
             .register_type::<context::ActiveInputContexts>()
             .register_type::<context::InputContext>()
+            .register_type::<context::KeyboardGrab>()
             .register_type::<events::AnalogInput>()
             .register_type::<events::ActionFired>()
             .register_type::<events::TextInputReceived>()
@@ -147,14 +154,19 @@ impl Plugin for InputPlugin {
             (context::sync_input_context,).in_set(InputPhase::SyncContext),
         );
 
-        // Dispatch phase: raw input → ActionFired/TextInputReceived
-        // vim_dispatch_compose runs when compose is focused (VimMachine owns keyboard).
-        // dispatch_input handles everything else (Navigation, gamepad, mouse).
+        // Dispatch phase: raw input → ActionFired/GrabbedKey.
+        // dispatch_input is the only raw-keyboard reader; grab owners consume
+        // the GrabbedKey stream it emits, so they must run after it to see
+        // this frame's keys (the vi editor orders itself the same way).
         app.add_systems(
             Update,
             (
                 dispatch::dispatch_input,
-                vim::dispatch::vim_dispatch_compose.run_if(focus::in_compose),
+                vim::dispatch::vim_dispatch_compose
+                    .run_if(bevy::ecs::prelude::resource_equals(
+                        context::KeyboardGrab::ComposeVim,
+                    ))
+                    .after(dispatch::dispatch_input),
             )
                 .in_set(InputPhase::Dispatch),
         );
@@ -167,7 +179,9 @@ impl Plugin for InputPlugin {
                 systems::handle_focus_cycle,
                 systems::handle_focus_compose,
                 systems::handle_toggle_surface,
-                systems::handle_unfocus,
+                systems::handle_pop_level,
+                systems::handle_detach,
+                systems::handle_prompt_prefill,
                 systems::handle_interrupt,
                 // App-level actions (global)
                 systems::handle_quit,

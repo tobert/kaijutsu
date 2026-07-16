@@ -412,15 +412,14 @@ impl Plugin for PatchBayPlugin {
                 Update,
                 (
                     // Dived-only input; first so a Left/Right selection lands
-                    // before the rebuild/fill it feeds. `.after(room_keyboard)`
-                    // (kaibo review, 2026-07-11): must observe `RoomState::zoomed`
-                    // from BEFORE this system's own Esc handler can clear it this
-                    // frame, or a same-frame Escape double-fires through both
-                    // handlers and skips the room-overview stop — see
-                    // `room::room_keyboard`'s own doc for the full mechanics.
+                    // before the rebuild/fill it feeds. Ordering vs
+                    // `room_keyboard` is no longer load-bearing — ActionFired
+                    // carries its binding context, so a PatchBayZoomed Esc
+                    // can't replay through the room's consumer. Runs after
+                    // the central dispatcher to see this frame's actions.
                     patch_bay_keyboard
                         .run_if(patch_bay_zoomed)
-                        .after(crate::view::room::room_keyboard),
+                        .after(crate::input::InputPhase::Dispatch),
                     // Ambient truth: the observed graph, its chords, the
                     // selection glow, and traffic pulses stay live at room
                     // scale AND zoomed — the chords ARE the W ambient even
@@ -642,39 +641,46 @@ fn apply_patch_lod(room: Res<RoomState>, mut lod: Query<&mut Visibility, With<Pa
 
 // ── Systems ─────────────────────────────────────────────────────────────────
 
-/// Keys, zoomed-only (`run_if(patch_bay_zoomed)`): Left/Right cycle wires;
-/// Up/Esc surface to the room — clearing `RoomState::zoomed` directly now,
-/// no `Screen` transition to make any more (`room::room_keyboard`'s own doc
-/// on why it steps back entirely while zoomed and leaves these keys to this
-/// system); `r` rescans.
+/// Actions, zoomed-only (`run_if(patch_bay_zoomed)`, bindings in the
+/// `PatchBayZoomed` context of `input/defaults.rs`): StepNext/StepPrev
+/// (Left/Right/Tab) cycle wires; PopLevel (Up/Esc) surfaces to the room —
+/// clearing `RoomState::zoomed` directly, no `Screen` transition
+/// (`room::room_keyboard`'s own doc on why it steps back entirely while
+/// zoomed and leaves these actions to this system); Rescan (`r`) rescans.
 fn patch_bay_keyboard(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut actions: MessageReader<crate::input::ActionFired>,
     mut state: ResMut<PatchBayState>,
     mut alsa: NonSendMut<PatchBayAlsa>,
     mut room: ResMut<RoomState>,
 ) {
-    let n = state.snapshot.wires.len();
-    if n > 0 {
-        if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
-            state.selected = (state.selected + 1) % n;
-            state.text_dirty = true;
-        } else if keys.just_pressed(KeyCode::ArrowLeft) {
-            state.selected = (state.selected + n - 1) % n;
-            state.text_dirty = true;
+    use crate::input::Action;
+
+    for crate::input::ActionFired { action, context } in actions.read() {
+        if *context != crate::input::InputContext::PatchBayZoomed {
+            continue;
         }
-    }
-
-    if keys.just_pressed(KeyCode::KeyR) {
-        let elapsed = state.timer.duration();
-        state.timer.set_elapsed(elapsed);
-        // A failed open otherwise latches forever (`poll_patch_graph`'s
-        // `get_or_insert_with` never runs its closure again); an explicit
-        // rescan is the one path allowed to retry it.
-        alsa.clear_failed_open();
-    }
-
-    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::Escape) {
-        room.zoomed = None;
+        match action {
+            Action::StepNext | Action::StepPrev => {
+                let n = state.snapshot.wires.len();
+                if n > 0 {
+                    let step = if matches!(action, Action::StepNext) { 1 } else { n - 1 };
+                    state.selected = (state.selected + step) % n;
+                    state.text_dirty = true;
+                }
+            }
+            Action::Rescan => {
+                let elapsed = state.timer.duration();
+                state.timer.set_elapsed(elapsed);
+                // A failed open otherwise latches forever (`poll_patch_graph`'s
+                // `get_or_insert_with` never runs its closure again); an explicit
+                // rescan is the one path allowed to retry it.
+                alsa.clear_failed_open();
+            }
+            Action::PopLevel => {
+                room.zoomed = None;
+            }
+            _ => {}
+        }
     }
 }
 

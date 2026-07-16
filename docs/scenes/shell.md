@@ -170,10 +170,11 @@ budget discipline:
 - **Levels — the arrows continue** (Amy, 2026-07-08): the room extends the
   well's existing arrow grammar one level upward. **Up/Down move between
   detail levels; Left/Right move within a level.** From the well's top
-  (mouth) ring, Up exits to the room — through a **speedbump**: the first
-  Up at the edge arms the exit, a second Up within the double-tap window
-  fires it (the existing 500ms InterruptState pattern, pointed upward), so
-  a habitual Up during ring nav never ejects you. In the room, Left/Right
+  (mouth) ring, Up rises into the **hero pose** — a look-only framing of
+  the whole well (Down returns to the mouth ring, Esc leaves). The old
+  Up-Up speedbump exit is retired (Slice C, with `WellEdgeBump`): leaving
+  the well is Esc's job, the same generic zoom-out every zoomable station
+  uses. In the room, Left/Right
   cycle the stations — well, patch bay, tracks, radiators, … (unbuilt
   stations ride the carousel as dimmed nameplates) — and Down/Enter dives
   into the focused one. Esc always walks up one level, everywhere. The
@@ -188,10 +189,14 @@ budget discipline:
   back out to the room-scale approach pose. The zoomed station's own keys
   (the wheel's Left/Right wire-cycling, `r` rescan) own the keyboard while
   zoomed; Left/Right at room scale still steps the carousel underneath, but
-  not while zoomed. The well still cuts to its own dedicated screen — only a
-  bounded, furnished station fullscreens in place.
-- **Entry**: Ctrl+W keeps meaning *the well* (muscle memory is sacred);
-  the room sits one speedbumped Up above it.
+  not while zoomed. The well now fullscreens in place like every other
+  zoomable station — `Screen::TimeWell` is retired (Slice D); nothing cuts
+  to a second screen except the true dive-throughs (the fsn landscape, the
+  vi editor).
+- **Entry**: the `Ctrl+A` prefix — `Ctrl+A w` / `Ctrl+A "` (and gamepad
+  Start) go to the well from anywhere; see `docs/input.md` (2026-07-16,
+  retiring the bare Ctrl+W toggle — it was never sacred, just first). The
+  room sits one Esc above the well.
 - **Travel by intent** (charter): the camera dollies continuously between
   stations and levels so spatial relationships register. No free-flight,
   no walking.

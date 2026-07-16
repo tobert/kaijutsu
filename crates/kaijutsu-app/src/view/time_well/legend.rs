@@ -101,12 +101,12 @@ fn legend_transform(fov_y: f32, aspect: f32) -> Transform {
     Transform::from_translation(center).with_scale(Vec3::new(w, h, 1.0))
 }
 
-/// Toggle the legend on `?` (`KeyCode::Slash` — both `/` and `?` land on it,
-/// Shift just changes the glyph). Dived-only, like the rest of the well's
-/// keyboard handling.
+/// Toggle the legend on `Action::ToggleLegend` (`?` — bound as both bare and
+/// shifted Slash in the `WellZoomed` context, `input/defaults.rs`).
+/// Dived-only, like the rest of the well's keyboard handling.
 pub fn toggle_legend(
     mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut actions: MessageReader<crate::input::ActionFired>,
     existing: Query<Entity, With<WellLegend>>,
     // `Without<FsnBackdropCamera>`: the backdrop's off-screen RTT camera is
     // ALSO a `Camera3d` (`view::fsn::backdrop`), and it's resident exactly
@@ -123,7 +123,11 @@ pub fn toggle_legend(
     mut font_data_map: ResMut<FontDataMap>,
     palette: Res<crate::view::scene_palette::ScenePalette>,
 ) {
-    if !keys.just_pressed(KeyCode::Slash) {
+    let toggled = actions.read().any(|m| {
+        m.context == crate::input::InputContext::WellZoomed
+            && matches!(m.action, crate::input::Action::ToggleLegend)
+    });
+    if !toggled {
         return;
     }
 

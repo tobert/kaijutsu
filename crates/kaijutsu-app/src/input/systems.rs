@@ -17,7 +17,7 @@ use super::focus::FocusArea;
 ///
 /// Within-conversation Tab cycle: Compose → Conversation → Compose.
 pub fn handle_focus_cycle(mut actions: MessageReader<ActionFired>, mut focus: ResMut<FocusArea>) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         match action {
             Action::CycleFocusForward => {
                 *focus = match focus.as_ref() {
@@ -55,7 +55,7 @@ pub fn handle_focus_compose(
     doc_cache: Res<crate::cell::DocumentCache>,
     mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if !matches!(action, Action::FocusCompose | Action::SummonChat) {
             continue;
         }
@@ -123,7 +123,7 @@ pub fn handle_toggle_surface(
         ),
     >,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if !matches!(action, Action::ToggleSurface) {
             continue;
         }
@@ -155,23 +155,24 @@ pub fn handle_toggle_surface(
     }
 }
 
-/// Handle Unfocus action (Escape — context-dependent "go up").
+/// Handle PopLevel action for the conversation screen (Escape — "go up").
 ///
-/// Escape precedence:
+/// Scene consumers (room, well, patch bay, fsn) handle PopLevel for their
+/// own levels; this system owns the conversation-side transitions:
 /// 1. FocusArea::Dialog → ignored (dialog systems own their Escape)
 /// 2. FocusArea::Compose → FocusArea::Conversation
-pub fn handle_unfocus(
+pub fn handle_pop_level(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     mut surface: ResMut<super::focus::ActiveSurface>,
     mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
-    for ActionFired(action) in actions.read() {
-        if !matches!(action, Action::Unfocus) {
+    for ActionFired { action, .. } in actions.read() {
+        if !matches!(action, Action::PopLevel) {
             continue;
         }
 
-        // 1. Dialogs handle their own Escape/Unfocus.
+        // 1. Dialogs handle their own Escape/PopLevel.
         if matches!(*focus, FocusArea::Dialog) {
             continue;
         }
@@ -187,6 +188,69 @@ pub fn handle_unfocus(
             if surface.is_shell() {
                 *surface = super::focus::ActiveSurface::Chat;
             }
+        }
+    }
+}
+
+/// The prefilled-`kj` prompt pattern (docs/input.md; Amy 2026-07-16: "pop a
+/// kj so the user can type and hit enter — we might use that pattern
+/// elsewhere"): summon the SHELL surface with a command line already typed,
+/// cursor at the end, in Insert mode. Enter runs it; Esc-Esc abandons it.
+/// The shell surface is local-only (no CRDT input sync), so the prefill is
+/// a plain overlay write.
+pub fn handle_prompt_prefill(
+    mut actions: MessageReader<ActionFired>,
+    mut focus: ResMut<FocusArea>,
+    mut surface: ResMut<super::focus::ActiveSurface>,
+    mut vim: ResMut<crate::input::vim::VimMachineResource>,
+    mut shell_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        With<crate::view::shell_dock::ShellDockMarker>,
+    >,
+) {
+    for ActionFired { action, .. } in actions.read() {
+        let prefill = match action {
+            Action::PromptContextRename => "kj context rename ",
+            Action::PromptContextSwitch => "kj context switch ",
+            _ => continue,
+        };
+
+        *surface = super::focus::ActiveSurface::Shell;
+        *focus = FocusArea::Compose;
+
+        let Ok(mut overlay) = shell_overlay.single_mut() else {
+            continue;
+        };
+        overlay.text = prefill.to_string();
+        overlay.cursor = overlay.text.len();
+        overlay.selection_anchor = None;
+
+        // Fresh vim state, straight into Insert at the end of the line.
+        use modalkit::keybindings::BindingMachine;
+        vim.machine.reset_mode();
+        while vim.machine.pop().is_some() {}
+        vim.machine
+            .input_key(modalkit::crossterm::event::KeyCode::Char('i').into());
+        while vim.machine.pop().is_some() {}
+        overlay.vim_mode = vim.machine.show_mode();
+    }
+}
+
+/// Handle DetachToConversation (`Ctrl+A d`) — back to the Conversation view
+/// from any scene or the editor. The editor session stays alive kernel-side
+/// (same suspend semantics as its Ctrl+Z intercept); scene teardown rides
+/// the screens' own OnExit schedules.
+pub fn handle_detach(
+    mut actions: MessageReader<ActionFired>,
+    screen: Res<State<crate::ui::screen::Screen>>,
+    mut next: ResMut<NextState<crate::ui::screen::Screen>>,
+) {
+    for ActionFired { action, .. } in actions.read() {
+        if !matches!(action, Action::DetachToConversation) {
+            continue;
+        }
+        if *screen.get() != crate::ui::screen::Screen::Conversation {
+            next.set(crate::ui::screen::Screen::Conversation);
         }
     }
 }
@@ -217,7 +281,7 @@ pub fn handle_interrupt(
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         let _immediate = match action {
             Action::InterruptContext { immediate } => *immediate,
             _ => continue,
@@ -290,7 +354,7 @@ pub fn handle_interrupt(
 
 /// Handle Quit action.
 pub fn handle_quit(mut actions: MessageReader<ActionFired>, mut exit: MessageWriter<AppExit>) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if matches!(action, Action::Quit) {
             info!("Quitting...");
             exit.write(AppExit::Success);
@@ -303,7 +367,7 @@ pub fn handle_debug_toggle(
     mut actions: MessageReader<ActionFired>,
     mut debug_options: ResMut<UiDebugOptions>,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if matches!(action, Action::DebugToggle) {
             debug_options.toggle();
             info!(
@@ -318,7 +382,7 @@ pub fn handle_debug_toggle(
 pub fn handle_screenshot(mut commands: Commands, mut actions: MessageReader<ActionFired>) {
     use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if matches!(action, Action::Screenshot) {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -371,7 +435,7 @@ pub fn handle_navigate_blocks(
 ) {
     let mut direction: Option<NavigationDirection> = None;
 
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         match action {
             Action::FocusNextBlock => direction = Some(NavigationDirection::Next),
             Action::FocusPrevBlock => direction = Some(NavigationDirection::Previous),
@@ -478,7 +542,7 @@ pub fn handle_scroll(
     mut actions: MessageReader<ActionFired>,
     mut scroll_state: ResMut<ConversationScrollState>,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         match action {
             Action::ScrollDelta(delta) => {
                 scroll_state.scroll_by(*delta);
@@ -516,7 +580,7 @@ pub fn handle_collapse_toggle(
     focus: Res<FocusTarget>,
     mut cells: Query<&mut CellEditor>,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if !matches!(action, Action::CollapseToggle) {
             continue;
         }
@@ -567,7 +631,7 @@ pub fn handle_toggle_block_excluded(
     actor: Option<Res<crate::connection::RpcActor>>,
     doc_cache: Res<crate::cell::DocumentCache>,
 ) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         if !matches!(action, Action::ToggleBlockExcluded) {
             continue;
         }
@@ -623,7 +687,7 @@ use crate::ui::tiling::{FocusDirection, SplitDirection, TilingTree};
 ///
 /// Replaces the old `handle_tiling_keys` system.
 pub fn handle_tiling(mut actions: MessageReader<ActionFired>, mut tree: ResMut<TilingTree>) {
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         match action {
             Action::FocusPaneLeft => {
                 if tree.focus_direction(FocusDirection::Left) {
@@ -751,7 +815,7 @@ pub fn handle_compose_input(
     }
 
     // Handle editing actions
-    for ActionFired(action) in actions.read() {
+    for ActionFired { action, .. } in actions.read() {
         match action {
             Action::Submit => {
                 if !overlay.is_empty()
@@ -893,50 +957,17 @@ pub fn handle_compose_input(
             }
             Action::CursorLeft => overlay.move_left(),
             Action::CursorRight => overlay.move_right(),
-            Action::SelectAll => overlay.select_all(),
-            Action::Copy => {
-                if let Some(ref mut clip) = clipboard
-                    && let Some(text) = overlay.selected_text()
-                    && let Err(e) = clip.0.set_text(text)
-                {
-                    warn!("Copy failed: {e}");
-                }
-            }
-            Action::Cut => {
-                if let Some(ref mut clip) = clipboard
-                    && let Some(text) = overlay.selected_text()
-                {
-                    let range = overlay.selection_range().unwrap();
-                    let del_pos = range.start;
-                    let del_len = range.end - range.start;
-
-                    if let Err(e) = clip.0.set_text(text) {
-                        warn!("Cut failed: {e}");
-                    } else {
-                        overlay.delete_selection();
-
-                        if !is_shell {
-                            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                                let handle = actor.handle.clone();
-                                let pos = del_pos as u64;
-                                let delete = del_len as u64;
-                                bevy::tasks::IoTaskPool::get()
-                                    .spawn(async move {
-                                        if let Err(e) =
-                                            handle.edit_input(ctx, pos, "", delete).await
-                                        {
-                                            log::warn!("edit_input (cut) failed: {e}");
-                                        }
-                                    })
-                                    .detach();
-                            }
-                        }
-                    }
-                }
-            }
-            Action::Paste => {
+            // Xterm-style paste (docs/input.md): Ctrl+V reads CLIPBOARD;
+            // middle-click reads PRIMARY (Linux), falling back to CLIPBOARD
+            // where no primary selection exists.
+            Action::Paste | Action::PastePrimary => {
                 if let Some(ref mut clip) = clipboard {
-                    match clip.0.get_text() {
+                    let fetched = if matches!(action, Action::PastePrimary) {
+                        primary_selection_text(&mut clip.0)
+                    } else {
+                        clip.0.get_text()
+                    };
+                    match fetched {
                         Ok(text) => {
                             let sel_range = overlay.selection_range();
                             let pos_before = if let Some(ref range) = sel_range {
@@ -974,6 +1005,20 @@ pub fn handle_compose_input(
             }
             _ => {}
         }
+    }
+}
+
+/// The PRIMARY selection on Linux (X11/Wayland); other platforms have no
+/// primary selection, so middle-click falls back to the ordinary clipboard.
+fn primary_selection_text(clip: &mut arboard::Clipboard) -> Result<String, arboard::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        clip.get().clipboard(LinuxClipboardKind::Primary).text()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        clip.get_text()
     }
 }
 

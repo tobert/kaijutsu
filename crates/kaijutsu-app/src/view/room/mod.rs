@@ -486,10 +486,14 @@ impl Plugin for RoomPlugin {
             // resources stay current while you're elsewhere). Bounded to five
             // bearings.
             .add_systems(Update, ingest_room_activity)
+            // `.after(InputPhase::Dispatch)`: these consume ActionFired from
+            // the central dispatcher and should see this frame's actions, not
+            // last frame's.
             .add_systems(
                 Update,
                 (room_keyboard, plain_zoom_keyboard, room_plate_text, room_focus_visuals, sync_room_glow)
                     .chain()
+                    .after(crate::input::InputPhase::Dispatch)
                     .run_if(in_state(Screen::Room)),
             )
             // The camera dolly retargets the moment `RoomState::zoomed` flips so
@@ -1438,45 +1442,51 @@ fn station_is_zoomable(station: Station) -> bool {
 /// explicitly instead of leaning on `main.rs`'s plugin-addition order (which
 /// is real today but easy to silently break by reordering plugins later).
 pub(crate) fn room_keyboard(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut actions: MessageReader<crate::input::ActionFired>,
     mut room: ResMut<RoomState>,
     mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
     mut next: ResMut<NextState<Screen>>,
 ) {
-    if room.zoomed.is_some() {
-        return;
-    }
+    use crate::input::Action;
 
-    if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
-        room.carousel.step(1);
-    } else if keys.just_pressed(KeyCode::ArrowLeft) {
-        room.carousel.step(-1);
-    }
-
-    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::ArrowDown) {
-        let station = room.carousel.focused_station();
-        if station_is_zoomable(station) {
-            room.zoomed = Some(station);
-            // Arm the newly-zoomed station's own per-dive state — the old
-            // `enter_patch_bay`'s job for the wheel, moved to the zoom-in site
-            // since there's no more `OnEnter(Screen::PatchBay)` to hang it on;
-            // the well's `arm_dive` (Slice C) follows the same shape.
-            match station {
-                Station::PatchBay => pb_state.arm_text(),
-                Station::TimeWell => crate::view::time_well::scene::arm_dive(&mut well_state),
-                _ => {}
-            }
+    for crate::input::ActionFired { action, context } in actions.read() {
+        // Only actions fired under the RoomNav context belong to the
+        // carousel — the context stamp (not run-state) is what prevents a
+        // buffered cross-frame or zoomed-station action from replaying here.
+        if *context != crate::input::InputContext::RoomNav {
+            continue;
         }
-        // No dive-through branch any more (2026-07-13): N zooms its portal
-        // like every other wall panel — `station_is_zoomable`'s doc has the
-        // story; `Screen::Fsn` is keyboard-unreachable for now
-        // (`docs/issues.md`).
-        return;
-    }
-
-    if keys.just_pressed(KeyCode::Escape) {
-        next.set(Screen::Conversation);
+        match action {
+            Action::StepNext => room.carousel.step(1),
+            Action::StepPrev => room.carousel.step(-1),
+            Action::Activate => {
+                let station = room.carousel.focused_station();
+                if station_is_zoomable(station) {
+                    room.zoomed = Some(station);
+                    // Arm the newly-zoomed station's own per-dive state — the old
+                    // `enter_patch_bay`'s job for the wheel, moved to the zoom-in site
+                    // since there's no more `OnEnter(Screen::PatchBay)` to hang it on;
+                    // the well's `arm_dive` (Slice C) follows the same shape.
+                    match station {
+                        Station::PatchBay => pb_state.arm_text(),
+                        Station::TimeWell => {
+                            crate::view::time_well::scene::arm_dive(&mut well_state)
+                        }
+                        _ => {}
+                    }
+                }
+                // No dive-through branch any more (2026-07-13): N zooms its portal
+                // like every other wall panel — `station_is_zoomable`'s doc has the
+                // story; `Screen::Fsn` is keyboard-unreachable for now
+                // (`docs/issues.md`).
+                return;
+            }
+            Action::PopLevel => {
+                next.set(Screen::Conversation);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1492,16 +1502,16 @@ pub(crate) fn room_keyboard(
 /// doc records for the well/wheel: room_keyboard (already run, saw `zoomed`
 /// as `Some`, returned early) must not see the `None` this system writes and
 /// fire its own Escape-to-Conversation branch in the same tick.
-pub(crate) fn plain_zoom_keyboard(keys: Res<ButtonInput<KeyCode>>, mut room: ResMut<RoomState>) {
-    let plain = matches!(
-        room.zoomed,
-        Some(Station::Tracks) | Some(Station::Vfs) | Some(Station::Radiators)
-    );
-    if !plain {
-        return;
-    }
-    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::Escape) {
-        room.zoomed = None;
+pub(crate) fn plain_zoom_keyboard(
+    mut actions: MessageReader<crate::input::ActionFired>,
+    mut room: ResMut<RoomState>,
+) {
+    for crate::input::ActionFired { action, context } in actions.read() {
+        if *context == crate::input::InputContext::StationZoomed
+            && matches!(action, crate::input::Action::PopLevel)
+        {
+            room.zoomed = None;
+        }
     }
 }
 

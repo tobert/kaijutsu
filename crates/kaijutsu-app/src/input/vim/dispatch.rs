@@ -1,12 +1,11 @@
 //! Vim dispatch system for compose input.
 //!
-//! When the compose overlay is focused, keyboard events are routed through
-//! the VimMachine instead of the flat binding table. This system converts
-//! Bevy keyboard events to TerminalKey, feeds them to the state machine,
-//! and translates the resulting modalkit Actions into kaijutsu ActionFired
-//! or TextInputReceived messages.
+//! When the compose overlay is focused, the central dispatcher holds a
+//! `KeyboardGrab::ComposeVim` and routes unclaimed pressed keys here as
+//! `GrabbedKey` messages (docs/input.md). This system converts them to
+//! TerminalKey, feeds them to the VimMachine, and translates the resulting
+//! modalkit Actions into kaijutsu ActionFired or TextInputReceived messages.
 
-use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 
 use editor_types::{
@@ -215,13 +214,15 @@ fn clamp_normal_cursor(overlay: &mut crate::cell::InputOverlay) {
     }
 }
 
-/// Bevy system that dispatches keyboard input through the VimMachine
+/// Bevy system that dispatches grabbed keyboard input through the VimMachine
 /// when the compose overlay is focused.
 ///
-/// Run condition: `in_compose()` — only active when FocusArea::Compose.
+/// Runs when `KeyboardGrab::ComposeVim` is held; must run after
+/// `dispatch_input` (the `GrabbedKey` writer) within `InputPhase::Dispatch`.
 /// Routes keyboard to the correct overlay (chat or shell) based on ActiveSurface.
 pub fn vim_dispatch_compose(
-    mut keyboard: MessageReader<KeyboardInput>,
+    mut keyboard: MessageReader<crate::input::events::GrabbedKey>,
+    mut literal: MessageReader<crate::input::events::LiteralPrefix>,
     keys: Res<ButtonInput<KeyCode>>,
     mut vim: ResMut<VimMachineResource>,
     mut motion_state: ResMut<VimMotionState>,
@@ -256,23 +257,65 @@ pub fn vim_dispatch_compose(
         }
     };
 
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
+    // `Ctrl+A a` — the prefix machine delivered a literal Ctrl+A: feed it to
+    // the VimMachine as a real Ctrl+A TerminalKey (increment, i_CTRL-A, …).
+    for _ in literal.read() {
+        use modalkit::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers};
+        use modalkit::key::TerminalKey;
+        vim.machine
+            .input_key(TerminalKey::from(KeyEvent::new(
+                CtKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )));
+        overlay.vim_mode = vim.machine.show_mode();
+        while let Some((mk_action, ctx)) = vim.machine.pop() {
+            translate_action(
+                &mk_action,
+                &ctx,
+                &mut overlay,
+                &mut motion_state,
+                &actor,
+                &doc_cache,
+                &mut action_writer,
+                &mut text_writer,
+                surface.is_shell(),
+            );
         }
+        clamp_normal_cursor(&mut overlay);
+    }
+
+    for grabbed in keyboard.read() {
+        // GrabbedKey carries only pressed events (dispatch filters releases).
+        let event = &grabbed.0;
 
         let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
 
         // Ctrl+C bypasses VimMachine — interrupt must always work
         // regardless of vim state (operator-pending, visual, etc.).
         if ctrl && event.key_code == KeyCode::KeyC {
-            action_writer.write(ActionFired(Action::InterruptContext { immediate: false }));
+            action_writer.write(ActionFired::new(
+                Action::InterruptContext { immediate: false },
+                crate::input::InputContext::TextInput,
+            ));
             continue;
         }
 
         // Ctrl+Z bypasses VimMachine — toggle between chat and shell surface.
         if ctrl && event.key_code == KeyCode::KeyZ {
-            action_writer.write(ActionFired(Action::ToggleSurface));
+            action_writer.write(ActionFired::new(
+                Action::ToggleSurface,
+                crate::input::InputContext::TextInput,
+            ));
+            continue;
+        }
+
+        // Ctrl+V bypasses VimMachine — xterm-style clipboard paste
+        // (docs/input.md). Handled by handle_compose_input's Paste arm.
+        if ctrl && event.key_code == KeyCode::KeyV {
+            action_writer.write(ActionFired::new(
+                Action::Paste,
+                crate::input::InputContext::TextInput,
+            ));
             continue;
         }
 
@@ -320,7 +363,10 @@ pub fn vim_dispatch_compose(
         if is_escape {
             let in_normal = vim.machine.show_mode().is_none();
             if super::dismiss::should_dismiss_after_escape(&mut esc_state, in_normal) {
-                action_writer.write(ActionFired(Action::Unfocus));
+                action_writer.write(ActionFired::new(
+                Action::PopLevel,
+                crate::input::InputContext::TextInput,
+            ));
             }
         }
     }
@@ -456,12 +502,18 @@ fn translate_action(
 
         // --- Submit (Enter with submit_on_enter) ---
         MkAction::Prompt(PromptAction::Submit) => {
-            action_writer.write(ActionFired(Action::Submit));
+            action_writer.write(ActionFired::new(
+                Action::Submit,
+                crate::input::InputContext::TextInput,
+            ));
         }
 
         // --- Prompt abort (Ctrl+D when empty, or Escape in command mode) ---
         MkAction::Prompt(PromptAction::Abort(..)) => {
-            action_writer.write(ActionFired(Action::Unfocus));
+            action_writer.write(ActionFired::new(
+                Action::PopLevel,
+                crate::input::InputContext::TextInput,
+            ));
         }
 
         // --- Application-specific actions ---

@@ -102,6 +102,9 @@ impl Plugin for FsnPlugin {
                 Update,
                 (heat::ingest_vfs_activity, heat::tick_fsn_heat).chain(),
             )
+            // `.after(InputPhase::Dispatch)`: fly + keyboard consume
+            // ActionFired (FlyAxis/FlyAltitude/PopLevel) from the central
+            // dispatcher and should see this frame's actions.
             .add_systems(
                 Update,
                 (
@@ -114,6 +117,7 @@ impl Plugin for FsnPlugin {
                     scene::fsn_keyboard,
                 )
                     .chain()
+                    .after(crate::input::InputPhase::Dispatch)
                     .run_if(in_state(Screen::Fsn)),
             )
             .add_systems(

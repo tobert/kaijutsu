@@ -15,14 +15,19 @@
 
 use bevy::prelude::*;
 
+use super::tap::TapCounter;
+
 /// Time window for counting consecutive interrupt presses (milliseconds).
 const WINDOW_MS: u128 = 500;
 
 /// Per-session state for the multi-press interrupt gesture.
-#[derive(Resource, Default)]
-pub struct InterruptState {
-    count: u8,
-    last_press: Option<std::time::Instant>,
+#[derive(Resource)]
+pub struct InterruptState(TapCounter);
+
+impl Default for InterruptState {
+    fn default() -> Self {
+        Self(TapCounter::new(WINDOW_MS, 3))
+    }
 }
 
 impl InterruptState {
@@ -30,23 +35,11 @@ impl InterruptState {
     ///
     /// If the previous press was more than `WINDOW_MS` ago, the count resets to 1.
     pub fn press(&mut self) -> u8 {
-        let now = std::time::Instant::now();
-        if let Some(last) = self.last_press {
-            if now.duration_since(last).as_millis() < WINDOW_MS {
-                self.count = (self.count + 1).min(3);
-            } else {
-                self.count = 1;
-            }
-        } else {
-            self.count = 1;
-        }
-        self.last_press = Some(now);
-        self.count
+        self.0.press()
     }
 
     /// Reset the press count and timestamp (after a 3-press clear).
     pub fn reset(&mut self) {
-        self.count = 0;
-        self.last_press = None;
+        self.0.reset()
     }
 }

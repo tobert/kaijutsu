@@ -139,6 +139,15 @@ pub fn load_bindings() -> Result<LoadedBindings, BindingsConfigError> {
 }
 
 /// Load bindings from an explicit path. Useful for tests.
+///
+/// The file MERGES over the built-in default table — it never replaces it.
+/// A file entry with the same (source, modifiers, context) as a default
+/// overrides that default; anything else is added. Defaults the file doesn't
+/// mention survive. This is what lets the shipped table evolve: the old
+/// behavior (file replaces table) froze every install at whatever default
+/// dump `write_default_configs_if_missing` had written — a stale 2026-04
+/// bindings.toml silently discarded months of new default bindings (found
+/// live 2026-07-16 when none of the scene bindings existed in a running app).
 pub fn load_bindings_from_path(path: &Path) -> Result<LoadedBindings, BindingsConfigError> {
     if !path.exists() {
         info!("Bindings not found at {:?}, using defaults", path);
@@ -153,22 +162,41 @@ pub fn load_bindings_from_path(path: &Path) -> Result<LoadedBindings, BindingsCo
         source: e,
     })?;
 
-    let (bindings, entry_errors) =
+    let (user_bindings, entry_errors) =
         parse_bindings_toml(&content).map_err(|msg| BindingsConfigError::Parse {
             path: path.to_path_buf(),
             message: msg,
         })?;
 
+    let bindings = merge_over_defaults(user_bindings);
+
     info!(
-        "Loaded {} bindings from {:?} ({} per-entry errors)",
-        bindings.len(),
+        "Loaded {} bindings from {:?} merged over defaults → {} total ({} per-entry errors)",
+        content.matches("[[bindings]]").count(),
         path,
+        bindings.len(),
         entry_errors.len()
     );
     Ok(LoadedBindings {
         bindings,
         entry_errors,
     })
+}
+
+/// Merge user bindings over the default table: same (source, modifiers,
+/// context) → the user's action/label wins; otherwise the entry is appended.
+fn merge_over_defaults(user: Vec<Binding>) -> Vec<Binding> {
+    let mut merged = default_bindings();
+    for u in user {
+        if let Some(slot) = merged.iter_mut().find(|d| {
+            d.source == u.source && d.modifiers == u.modifiers && d.context == u.context
+        }) {
+            *slot = u;
+        } else {
+            merged.push(u);
+        }
+    }
+    merged
 }
 
 /// Parse a TOML string into a list of bindings plus per-entry error messages.
@@ -193,11 +221,12 @@ pub fn parse_bindings_toml(content: &str) -> Result<(Vec<Binding>, Vec<String>),
     Ok((bindings, entry_errors))
 }
 
-/// Serialize bindings to TOML format (for writing defaults or app-managed config).
-///
-/// Panics on serialization failure — our `BindingEntry` is a plain record of
-/// owned strings and bools, so `toml::to_string_pretty` is infallible in
-/// practice. If this ever fires it is a bug in the toml crate or this module.
+/// Serialize bindings to TOML format. Test-only since the override-template
+/// change (2026-07-16): production never writes the table out any more, but
+/// the round-trip test pins action/context string coverage for every enum
+/// variant through this. A future "export the live InputMap" verb would
+/// promote it back.
+#[cfg(test)]
 pub fn bindings_to_toml(bindings: &[Binding]) -> String {
     let entries: Vec<BindingEntry> = bindings.iter().map(binding_to_entry).collect();
     let toml_struct = BindingsTomlOut { bindings: entries };
@@ -205,6 +234,7 @@ pub fn bindings_to_toml(bindings: &[Binding]) -> String {
         .expect("serializing BindingEntry is infallible for well-formed Binding values")
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct BindingsTomlOut {
     bindings: Vec<BindingEntry>,
@@ -214,6 +244,7 @@ struct BindingsTomlOut {
 // SERIALIZATION: Binding ↔ BindingEntry
 // ============================================================================
 
+#[cfg(test)]
 fn binding_to_entry(b: &Binding) -> BindingEntry {
     let (key_str, is_gamepad) = match &b.source {
         super::binding::InputSource::Key(k) => (format!("{:?}", k), false),
@@ -253,6 +284,7 @@ fn binding_from_entry(e: &BindingEntry) -> Result<Binding, String> {
 // STRING ↔ ENUM CONVERSIONS (Rhai-independent)
 // ============================================================================
 
+#[cfg(test)]
 fn modifiers_to_str(m: &Modifiers) -> String {
     let mut parts = Vec::new();
     if m.ctrl {
@@ -291,12 +323,18 @@ fn parse_modifiers(s: &str) -> Result<Modifiers, String> {
     Ok(m)
 }
 
+#[cfg(test)]
 fn context_to_str(ctx: InputContext) -> String {
     match ctx {
         InputContext::Global => "Global",
         InputContext::Navigation => "Navigation",
         InputContext::TextInput => "TextInput",
         InputContext::Dialog => "Dialog",
+        InputContext::RoomNav => "RoomNav",
+        InputContext::WellZoomed => "WellZoomed",
+        InputContext::PatchBayZoomed => "PatchBayZoomed",
+        InputContext::StationZoomed => "StationZoomed",
+        InputContext::FsnFly => "FsnFly",
     }
     .to_string()
 }
@@ -307,10 +345,16 @@ fn parse_context(s: &str) -> Result<InputContext, String> {
         "Navigation" => Ok(InputContext::Navigation),
         "TextInput" => Ok(InputContext::TextInput),
         "Dialog" => Ok(InputContext::Dialog),
+        "RoomNav" => Ok(InputContext::RoomNav),
+        "WellZoomed" => Ok(InputContext::WellZoomed),
+        "PatchBayZoomed" => Ok(InputContext::PatchBayZoomed),
+        "StationZoomed" => Ok(InputContext::StationZoomed),
+        "FsnFly" => Ok(InputContext::FsnFly),
         _ => Err(format!("unknown context '{s}'")),
     }
 }
 
+#[cfg(test)]
 fn action_to_str(a: &Action) -> String {
     // Payloaded variants encode their payload after a ':' so the round-trip
     // through bindings.toml is lossless (before this, direction/etc was
@@ -322,7 +366,7 @@ fn action_to_str(a: &Action) -> String {
         Action::SummonChat => "SummonChat".into(),
         Action::ToggleSurface => "ToggleSurface".into(),
         Action::ToggleBlockExcluded => "ToggleBlockExcluded".into(),
-        Action::Unfocus => "Unfocus".into(),
+        Action::PopLevel => "PopLevel".into(),
         Action::Activate => "Activate".into(),
         Action::FocusNextBlock => "FocusNextBlock".into(),
         Action::FocusPrevBlock => "FocusPrevBlock".into(),
@@ -355,12 +399,8 @@ fn action_to_str(a: &Action) -> String {
         Action::CursorEnd => "CursorEnd".into(),
         Action::CursorWordLeft => "CursorWordLeft".into(),
         Action::CursorWordRight => "CursorWordRight".into(),
-        Action::SelectAll => "SelectAll".into(),
-        Action::Copy => "Copy".into(),
-        Action::Cut => "Cut".into(),
         Action::Paste => "Paste".into(),
-        Action::Undo => "Undo".into(),
-        Action::Redo => "Redo".into(),
+        Action::PastePrimary => "PastePrimary".into(),
         Action::InsertNewline => "InsertNewline".into(),
         Action::Quit => "Quit".into(),
         Action::Screenshot => "Screenshot".into(),
@@ -368,6 +408,29 @@ fn action_to_str(a: &Action) -> String {
         Action::InterruptContext { immediate } => {
             format!("InterruptContext:{immediate}")
         }
+        Action::StepNext => "StepNext".into(),
+        Action::StepPrev => "StepPrev".into(),
+        Action::LevelUp => "LevelUp".into(),
+        Action::LevelDown => "LevelDown".into(),
+        Action::JumpSeat(n) => format!("JumpSeat:{n}"),
+        Action::Promote => "Promote".into(),
+        Action::Demote => "Demote".into(),
+        Action::Conclude => "Conclude".into(),
+        Action::PauseToggle => "PauseToggle".into(),
+        Action::Archive => "Archive".into(),
+        Action::Rescan => "Rescan".into(),
+        Action::ToggleLegend => "ToggleLegend".into(),
+        Action::SwitchToActiveSeat(n) => format!("SwitchToActiveSeat:{n}"),
+        Action::SwitchToPreviousContext => "SwitchToPreviousContext".into(),
+        Action::ActiveSeatStep(d) => format!("ActiveSeatStep:{d}"),
+        Action::CloseAndDemoteContext => "CloseAndDemoteContext".into(),
+        Action::GoToWell => "GoToWell".into(),
+        Action::DetachToConversation => "DetachToConversation".into(),
+        Action::SendLiteralPrefix => "SendLiteralPrefix".into(),
+        Action::PromptContextRename => "PromptContextRename".into(),
+        Action::PromptContextSwitch => "PromptContextSwitch".into(),
+        Action::FlyAxis { x, y } => format!("FlyAxis:{x},{y}"),
+        Action::FlyAltitude(v) => format!("FlyAltitude:{v}"),
     }
 }
 
@@ -383,7 +446,9 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "SummonChat" => Ok(Action::SummonChat),
         "ToggleSurface" => Ok(Action::ToggleSurface),
         "ToggleBlockExcluded" => Ok(Action::ToggleBlockExcluded),
-        "Unfocus" => Ok(Action::Unfocus),
+        "PopLevel" => Ok(Action::PopLevel),
+        // Pre-rename alias (bindings.toml written before 2026-07-16).
+        "Unfocus" => Ok(Action::PopLevel),
         "Activate" => Ok(Action::Activate),
         "FocusNextBlock" => Ok(Action::FocusNextBlock),
         "FocusPrevBlock" => Ok(Action::FocusPrevBlock),
@@ -415,20 +480,37 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "CursorEnd" => Ok(Action::CursorEnd),
         "CursorWordLeft" => Ok(Action::CursorWordLeft),
         "CursorWordRight" => Ok(Action::CursorWordRight),
-        "SelectAll" => Ok(Action::SelectAll),
-        "Copy" => Ok(Action::Copy),
-        "Cut" => Ok(Action::Cut),
         "Paste" => Ok(Action::Paste),
-        "Undo" => Ok(Action::Undo),
-        "Redo" => Ok(Action::Redo),
+        "PastePrimary" => Ok(Action::PastePrimary),
         "InsertNewline" => Ok(Action::InsertNewline),
         "Quit" => Ok(Action::Quit),
         "Screenshot" => Ok(Action::Screenshot),
         "DebugToggle" => Ok(Action::DebugToggle),
+        "StepNext" => Ok(Action::StepNext),
+        "StepPrev" => Ok(Action::StepPrev),
+        "LevelUp" => Ok(Action::LevelUp),
+        "LevelDown" => Ok(Action::LevelDown),
+        "Promote" => Ok(Action::Promote),
+        "Demote" => Ok(Action::Demote),
+        "Conclude" => Ok(Action::Conclude),
+        "PauseToggle" => Ok(Action::PauseToggle),
+        "Archive" => Ok(Action::Archive),
+        "Rescan" => Ok(Action::Rescan),
+        "ToggleLegend" => Ok(Action::ToggleLegend),
+        "SwitchToPreviousContext" => Ok(Action::SwitchToPreviousContext),
+        "CloseAndDemoteContext" => Ok(Action::CloseAndDemoteContext),
+        "GoToWell" => Ok(Action::GoToWell),
+        "DetachToConversation" => Ok(Action::DetachToConversation),
+        "SendLiteralPrefix" => Ok(Action::SendLiteralPrefix),
+        "PromptContextRename" => Ok(Action::PromptContextRename),
+        "PromptContextSwitch" => Ok(Action::PromptContextSwitch),
+        "SwitchToActiveSeat" => Ok(Action::SwitchToActiveSeat(0)),
+        "ActiveSeatStep" => Ok(Action::ActiveSeatStep(1)),
         // Payloaded variants without an explicit payload default to a
         // sensible zero/false value so tersely-typed user TOML keeps working.
         "InterruptContext" => Ok(Action::InterruptContext { immediate: false }),
         "ScrollDelta" => Ok(Action::ScrollDelta(0.0)),
+        "JumpSeat" => Ok(Action::JumpSeat(0)),
         _ => Err(format!("unknown action '{s}'")),
     }
 }
@@ -446,6 +528,42 @@ fn parse_action_with_payload(name: &str, payload: &str) -> Result<Action, String
                 .parse()
                 .map_err(|e| format!("InterruptContext payload '{payload}' must be a bool: {e}"))?;
             Ok(Action::InterruptContext { immediate })
+        }
+        "JumpSeat" => {
+            let n: usize = payload
+                .parse()
+                .map_err(|e| format!("JumpSeat payload '{payload}' must be a seat index: {e}"))?;
+            Ok(Action::JumpSeat(n))
+        }
+        "SwitchToActiveSeat" => {
+            let n: usize = payload.parse().map_err(|e| {
+                format!("SwitchToActiveSeat payload '{payload}' must be a seat index: {e}")
+            })?;
+            Ok(Action::SwitchToActiveSeat(n))
+        }
+        "ActiveSeatStep" => {
+            let d: i32 = payload.parse().map_err(|e| {
+                format!("ActiveSeatStep payload '{payload}' must be a step: {e}")
+            })?;
+            Ok(Action::ActiveSeatStep(d))
+        }
+        "FlyAxis" => {
+            let (x, y) = payload
+                .split_once(',')
+                .ok_or_else(|| format!("FlyAxis payload '{payload}' must be 'x,y'"))?;
+            let x: f32 = x
+                .parse()
+                .map_err(|e| format!("FlyAxis x '{x}' must be a float: {e}"))?;
+            let y: f32 = y
+                .parse()
+                .map_err(|e| format!("FlyAxis y '{y}' must be a float: {e}"))?;
+            Ok(Action::FlyAxis { x, y })
+        }
+        "FlyAltitude" => {
+            let v: f32 = payload
+                .parse()
+                .map_err(|e| format!("FlyAltitude payload '{payload}' must be a float: {e}"))?;
+            Ok(Action::FlyAltitude(v))
         }
         _ => Err(format!(
             "action '{name}' does not take a payload (got ':{payload}')"
@@ -565,7 +683,7 @@ mod tests {
         "SummonChat",
         "ToggleSurface",
         "ToggleBlockExcluded",
-        "Unfocus",
+        "PopLevel",
         "Activate",
         "FocusNextBlock",
         "FocusPrevBlock",
@@ -597,17 +715,34 @@ mod tests {
         "CursorEnd",
         "CursorWordLeft",
         "CursorWordRight",
-        "SelectAll",
-        "Copy",
-        "Cut",
         "Paste",
-        "Undo",
-        "Redo",
+        "PastePrimary",
         "InsertNewline",
         "Quit",
         "Screenshot",
         "DebugToggle",
         "InterruptContext",
+        "StepNext",
+        "StepPrev",
+        "LevelUp",
+        "LevelDown",
+        "JumpSeat",
+        "Promote",
+        "Demote",
+        "Conclude",
+        "PauseToggle",
+        "Archive",
+        "Rescan",
+        "ToggleLegend",
+        "SwitchToActiveSeat",
+        "SwitchToPreviousContext",
+        "ActiveSeatStep",
+        "CloseAndDemoteContext",
+        "GoToWell",
+        "DetachToConversation",
+        "SendLiteralPrefix",
+        "PromptContextRename",
+        "PromptContextSwitch",
     ];
 
     const ALL_KEYS: &[&str] = &[
@@ -799,6 +934,73 @@ mod tests {
         let loaded = load_bindings_from_path(&path).unwrap();
         assert_eq!(loaded.bindings.len(), default_bindings().len());
         assert!(loaded.entry_errors.is_empty());
+    }
+
+    #[test]
+    fn test_file_merges_over_defaults_not_replaces() {
+        // The 2026-04 snapshot trap: a file that is a stale full dump of old
+        // defaults must not erase bindings the shipped table has since grown.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bindings.toml");
+        // One override (Escape in Navigation → Quit, silly but detectable)
+        // and one addition (F5 → Screenshot).
+        std::fs::write(
+            &path,
+            r#"
+[[bindings]]
+key = "Escape"
+context = "Navigation"
+action = "Quit"
+label = "user override"
+
+[[bindings]]
+key = "F5"
+context = "Global"
+action = "Screenshot"
+label = "user addition"
+"#,
+        )
+        .unwrap();
+        let loaded = load_bindings_from_path(&path).unwrap();
+        assert!(loaded.entry_errors.is_empty(), "{:?}", loaded.entry_errors);
+
+        // Addition: exactly one more than the default table.
+        assert_eq!(loaded.bindings.len(), default_bindings().len() + 1);
+
+        // Override replaced the default row in place, not duplicated it.
+        let esc_nav: Vec<_> = loaded
+            .bindings
+            .iter()
+            .filter(|b| {
+                b.source == super::super::binding::InputSource::Key(KeyCode::Escape)
+                    && b.context == InputContext::Navigation
+                    && b.modifiers == Modifiers::NONE
+            })
+            .collect();
+        assert_eq!(esc_nav.len(), 1);
+        assert_eq!(esc_nav[0].action, Action::Quit);
+
+        // A default the file never mentioned survives (a scene binding —
+        // the exact class the snapshot trap was silently deleting).
+        assert!(loaded.bindings.iter().any(|b| {
+            b.context == InputContext::WellZoomed && b.action == Action::StepNext
+        }));
+    }
+
+    #[test]
+    fn test_pre_rename_unfocus_alias_parses() {
+        // Old dumps say "Unfocus"; they must land as PopLevel, not error.
+        let (bindings, errors) = parse_bindings_toml(
+            r#"
+[[bindings]]
+key = "Escape"
+context = "Navigation"
+action = "Unfocus"
+"#,
+        )
+        .unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(bindings[0].action, Action::PopLevel);
     }
 
     #[test]

@@ -371,10 +371,6 @@ impl InputOverlay {
         })
     }
 
-    /// Get the selected text, or None if no selection.
-    pub fn selected_text(&self) -> Option<&str> {
-        self.selection_range().map(|r| &self.text[r])
-    }
 
     /// Delete the current selection and return the deleted text.
     pub fn delete_selection(&mut self) -> Option<String> {
@@ -384,14 +380,6 @@ impl InputOverlay {
         self.cursor = range.start;
         self.selection_anchor = None;
         Some(deleted)
-    }
-
-    /// Select all text.
-    pub fn select_all(&mut self) {
-        if !self.text.is_empty() {
-            self.selection_anchor = Some(0);
-            self.cursor = self.text.len();
-        }
     }
 
     /// Clear selection without modifying text.

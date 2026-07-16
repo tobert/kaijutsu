@@ -8,7 +8,6 @@
 //! `editor_keys` (`keys`, `editor_dispatch_keys`) — the screen/landing
 //! foundation plus its renderer and forwarder.
 
-use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 use bevy::tasks::IoTaskPool;
 use kaijutsu_client::{ActorHandle, EditorState, ServerEvent};
@@ -184,7 +183,8 @@ fn handle_editor_session_lost(
 /// `EditorClosed`, which [`handle_editor_events`] turns into the screen pop. No
 /// app-side mode tracking, no quit detection.
 fn editor_dispatch_keys(
-    mut keyboard: MessageReader<KeyboardInput>,
+    mut keyboard: MessageReader<crate::input::events::GrabbedKey>,
+    mut literal: MessageReader<crate::input::events::LiteralPrefix>,
     keys: Res<ButtonInput<KeyCode>>,
     active: Res<ActiveEditor>,
     mut key_pipe: ResMut<EditorKeyPipe>,
@@ -193,14 +193,22 @@ fn editor_dispatch_keys(
     mut surface: ResMut<ActiveSurface>,
 ) {
     if active.session.is_none() {
-        keyboard.clear();
+        // Drop grabbed keys with no session to receive them.
+        keyboard.read().for_each(|_| {});
+        literal.read().for_each(|_| {});
         return;
     }
 
-    for event in keyboard.read() {
-        if !event.state.is_pressed() {
-            continue;
-        }
+    // `Ctrl+A a` — the prefix machine delivered a literal Ctrl+A for the
+    // kernel vi session (vim's increment). Modifier state is long gone, so
+    // it travels as notation, not as a GrabbedKey.
+    for _ in literal.read() {
+        key_pipe.0.push("<C-a>");
+    }
+
+    for grabbed in keyboard.read() {
+        // GrabbedKey carries only pressed events (dispatch filters releases).
+        let event = &grabbed.0;
         // Bare modifier presses (Shift/Ctrl/… on their own) are never vi keys.
         if keys::is_modifier_key(event.key_code) {
             continue;
@@ -213,10 +221,11 @@ fn editor_dispatch_keys(
         // "suspended job", and `fg` re-foregrounds it. This is a *local*
         // intercept (no kernel round-trip), so it also frees a frozen editor when
         // the kernel is unreachable — the escape hatch. (The Action-system
-        // Ctrl+Z↔ToggleSurface is suppressed on `Screen::Editor`, so there is no
-        // double-handling.) The buffer isn't forwarded `<C-z>`. Keys queued
-        // before the suspend stay in the pipe — the pump runs ungated, so they
-        // still deliver to the live (suspended) session.
+        // Ctrl+Z↔ToggleSurface can't double-handle: `KeyboardGrab::EditorSession`
+        // leaves only Global bindings matchable, and Ctrl+Z isn't Global.) The
+        // buffer isn't forwarded `<C-z>`. Keys queued before the suspend stay in
+        // the pipe — the pump runs ungated, so they still deliver to the live
+        // (suspended) session.
         if ctrl && event.key_code == KeyCode::KeyZ {
             next_screen.set(Screen::Conversation);
             *focus = FocusArea::Compose;
@@ -355,7 +364,10 @@ impl Plugin for EditorPlugin {
             // Chained so one frame can consume an outcome, enqueue fresh keys,
             // and ship the next batch. Only dispatch is editor-screen-gated:
             // the outcome/pump pair runs ungated so keys queued right before a
-            // Ctrl+Z suspend still deliver (they no-op when idle).
+            // Ctrl+Z suspend still deliver (they no-op when idle). The chain
+            // runs after the central dispatcher — editor_dispatch_keys
+            // consumes the GrabbedKey stream it emits, and must see this
+            // frame's keys, not last frame's.
             .add_systems(
                 Update,
                 (
@@ -363,7 +375,8 @@ impl Plugin for EditorPlugin {
                     editor_dispatch_keys.run_if(in_state(Screen::Editor)),
                     editor_pump_keys,
                 )
-                    .chain(),
+                    .chain()
+                    .after(crate::input::InputPhase::Dispatch),
             )
             // The surface build needs ComputedNode, so it runs post-layout; the
             // cursor sync reads the geometry the build just computed.

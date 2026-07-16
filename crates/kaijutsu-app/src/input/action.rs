@@ -24,10 +24,13 @@ pub enum Action {
     SummonChat,
     /// Toggle active surface between Chat and Shell (Ctrl+Z)
     ToggleSurface,
-    /// Context-dependent "go up" (Escape)
-    /// - TextInput → Conversation
+    /// Escape / gamepad East — the one "walk up a level" action
+    /// (docs/input.md "Escape — two meanings total"):
+    /// - Compose → Conversation (via double-Esc in Normal mode)
     /// - Dialog → cancel
-    Unfocus,
+    /// - well focus → overview → room; patch bay/station → room;
+    ///   fsn → room; room → conversation
+    PopLevel,
     /// Context-dependent "do the thing" (Enter)
     /// - Navigation: edit focused User Text block
     /// - Dialog: confirm
@@ -111,18 +114,12 @@ pub enum Action {
     CursorWordLeft,
     /// Ctrl+Right — word right
     CursorWordRight,
-    /// Ctrl+A — select all
-    SelectAll,
-    /// Ctrl+C — copy
-    Copy,
-    /// Ctrl+X — cut
-    Cut,
-    /// Ctrl+V — paste
+    /// Ctrl+V — paste the CLIPBOARD selection into compose (docs/input.md
+    /// "xterm-style": Ctrl+C stays interrupt, copy rides selection).
     Paste,
-    /// Ctrl+Z — undo
-    Undo,
-    /// Ctrl+Shift+Z — redo
-    Redo,
+    /// Middle-click — paste the PRIMARY selection (X11/Wayland), falling
+    /// back to CLIPBOARD off-Linux.
+    PastePrimary,
     /// Shift+Enter — insert newline (without submitting)
     InsertNewline,
 
@@ -140,9 +137,75 @@ pub enum Action {
     DebugToggle,
 
     // ========================================================================
-    // Context Interrupt (Escape in TextInput/Navigation)
+    // Scene navigation (RoomNav / WellZoomed / PatchBayZoomed / StationZoomed)
     // ========================================================================
-    /// Multi-press Escape — graduated cancel:
+    /// Step forward within the current level: next carousel station, next
+    /// ring seat (spinning it to the gate), next patch-bay wire.
+    StepNext,
+    /// Step backward within the current level.
+    StepPrev,
+    /// Move one detail level shallower (well: ring toward the mouth; at the
+    /// mouth ring, rises into the hero pose).
+    LevelUp,
+    /// Move one detail level deeper (well: ring toward the throat; in the
+    /// hero pose, returns to the mouth ring).
+    LevelDown,
+    /// Jump to seat *n* of the focused ring (well digits `0–9`).
+    JumpSeat(usize),
+
+    // Well verbs (fire-and-forget RPC on the selected context)
+    /// `p` — take a ring-0 seat (unarchives if archived).
+    Promote,
+    /// `d` — one step outward on the kernel demote ladder.
+    Demote,
+    /// `c` — conclude the selected context.
+    Conclude,
+    /// `z` — toggle paused.
+    PauseToggle,
+    /// `a` — straight past the event horizon.
+    Archive,
+
+    /// `r` in the patch bay — rescan the ALSA graph.
+    Rescan,
+    /// `?` — toggle the in-scene keyboard legend.
+    ToggleLegend,
+
+    // FSN fly (continuous — emitted per frame while held / deflected)
+    /// Camera-plane fly axis, -1..1 per component (WASD/arrows or left stick).
+    FlyAxis { x: f32, y: f32 },
+    /// Altitude axis, -1..1 (PgUp/PgDn, Equal/Minus).
+    FlyAltitude(f32),
+
+    // ========================================================================
+    // Ctrl+A prefix verbs (input/prefix.rs; docs/input.md "The prefix table")
+    // ========================================================================
+    /// `Ctrl+A <digit>` — switch to ring-0 (ACTIVE rank) seat n, from anywhere.
+    SwitchToActiveSeat(usize),
+    /// `Ctrl+A Ctrl+A` — toggle to the MRU-previous context.
+    SwitchToPreviousContext,
+    /// `Ctrl+A n`/`p` — step to the next/previous ring-0 seat.
+    ActiveSeatStep(i32),
+    /// `Ctrl+A q` — demote the current context one ladder step and land on
+    /// the MRU-previous one ("done for now"; the close half of screen's kill
+    /// without the kill).
+    CloseAndDemoteContext,
+    /// `Ctrl+A w` / `Ctrl+A "` / gamepad Start — go to the well, from anywhere.
+    GoToWell,
+    /// `Ctrl+A d` — detach: back to the Conversation view from any scene or
+    /// the editor (the editor session stays alive, suspend-style).
+    DetachToConversation,
+    /// `Ctrl+A a` — deliver a literal Ctrl+A to the focused vi surface.
+    SendLiteralPrefix,
+    /// `Ctrl+A A` — the prefilled-`kj` prompt: summon the shell with
+    /// `kj context rename ` typed, cursor at end; Enter runs, Esc abandons.
+    PromptContextRename,
+    /// `Ctrl+A '` — same pattern, `kj context switch ` (switch-by-prompt).
+    PromptContextSwitch,
+
+    // ========================================================================
+    // Context Interrupt (Ctrl+C in TextInput/Navigation)
+    // ========================================================================
+    /// Multi-press Ctrl+C — graduated cancel:
     /// - 1st press: soft interrupt (stop agentic loop after current tool turn)
     /// - 2nd press: hard interrupt (abort LLM stream + kill jobs)
     /// - 3rd press: hard interrupt + clear compose buffer

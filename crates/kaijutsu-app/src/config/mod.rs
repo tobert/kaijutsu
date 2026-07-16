@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use std::path::Path;
 
 use crate::input::binding::Binding;
-use crate::input::bindings_config::{self, bindings_to_toml};
+use crate::input::bindings_config;
 use crate::input::defaults::default_bindings;
 use crate::ui::theme::Theme;
 use crate::view::components::GlobalErrorQueue;
@@ -36,11 +36,13 @@ pub struct AppConfig {
     pub errors: Vec<String>,
 }
 
-/// Load theme and bindings from user config.
+/// Load bindings from user config.
 ///
-/// Reads `theme.toml` and `bindings.toml` from `~/.config/kaijutsu/`.
-/// File-level and per-entry errors are accumulated in `AppConfig::errors`;
-/// good values still load and the app continues to boot.
+/// Reads `bindings.toml` from `~/.config/kaijutsu/` (merged over the
+/// built-in defaults). The theme never touches host disk: it starts on
+/// `Theme::default()` and the CRDT-owned `theme.toml` arrives over RPC on
+/// connect. File-level and per-entry errors are accumulated in
+/// `AppConfig::errors`; good values still load and the app continues to boot.
 pub fn load_app_config() -> AppConfig {
     let Some(config_dir) = dirs::config_dir().map(|p| p.join("kaijutsu")) else {
         info!("No config directory available, using defaults for theme and bindings");
@@ -111,12 +113,33 @@ pub fn write_default_configs_if_missing() {
         return;
     }
 
-    // Write default bindings as TOML
+    // Write an overrides TEMPLATE, not a dump of the default table. The file
+    // MERGES over the built-in defaults at load (`load_bindings_from_path`),
+    // so it should contain only what the user actually changed — a full dump
+    // freezes the install at whatever the defaults were the day it was
+    // written (the 2026-04 snapshot trap, found 2026-07-16).
     let bindings_path = config_dir.join("bindings.toml");
     if !bindings_path.exists() {
-        let content = bindings_to_toml(&default_bindings());
-        match std::fs::write(&bindings_path, &content) {
-            Ok(()) => info!("Wrote default bindings to {:?}", bindings_path),
+        let content = "\
+# kaijutsu key binding overrides.
+#
+# Entries here MERGE over the built-in default table: an entry with the same
+# key + modifiers + context replaces that default; new combinations are added.
+# Defaults you don't mention stay live, and evolve with the app.
+# The full current table is BRP-visible (`InputMap`) and documented in
+# docs/input.md.
+#
+# [[bindings]]
+# key = \"KeyJ\"
+# modifiers = \"CTRL\"        # empty, or +-joined: CTRL, SHIFT, ALT, SUPER
+# context = \"Navigation\"    # Global, Navigation, TextInput, Dialog,
+#                            # RoomNav, WellZoomed, PatchBayZoomed,
+#                            # StationZoomed, FsnFly
+# action = \"FocusNextBlock\"
+# label = \"Next block\"
+";
+        match std::fs::write(&bindings_path, content) {
+            Ok(()) => info!("Wrote bindings override template to {:?}", bindings_path),
             Err(e) => warn!("Could not write bindings to {:?}: {}", bindings_path, e),
         }
     }

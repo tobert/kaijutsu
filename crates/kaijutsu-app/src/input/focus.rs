@@ -43,11 +43,6 @@ pub enum FocusArea {
 }
 
 impl FocusArea {
-    /// Check if focus is on text input (Compose).
-    pub fn is_text_input(&self) -> bool {
-        matches!(self, FocusArea::Compose)
-    }
-
     /// Check if focus is on navigation (Conversation blocks).
     #[allow(dead_code)] // Useful for domain guards
     pub fn is_navigation(&self) -> bool {

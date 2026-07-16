@@ -812,72 +812,72 @@ pub fn well_zoomed(room: &crate::view::room::RoomState) -> bool {
 /// Esc keeps its own strict well → room → conversation grammar everywhere
 /// else ([`well_keyboard`]'s Escape branch, `room_keyboard`'s) — this binding
 /// only ever short-circuits that with a direct hop, both ways.
-pub fn toggle_time_well(
-    keys: Res<ButtonInput<KeyCode>>,
-    focus_area: Res<crate::input::focus::FocusArea>,
+/// Go to the well from anywhere — `Ctrl+A w`, `Ctrl+A "`, or gamepad Start
+/// (docs/input.md; replaced the raw Ctrl+W toggle 2026-07-16 — Ctrl+W now
+/// reaches kernel vi untouched in the editor, where it's the window verb).
+///
+/// From any screen, land dived into the well: carousel focused on it,
+/// zoomed, dive armed. Already there → no-op (screen's `C-a w` re-lists;
+/// leaving is Esc's job). From the editor this is a suspend-style exit —
+/// the kernel session stays alive, same as its Ctrl+Z intercept.
+pub fn handle_go_to_well(
+    mut actions: MessageReader<crate::input::ActionFired>,
     screen: Res<State<Screen>>,
     mut next: ResMut<NextState<Screen>>,
     mut room: ResMut<crate::view::room::RoomState>,
     mut state: ResMut<TimeWellState>,
 ) {
-    if focus_area.is_text_input() {
-        return;
-    }
-    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-    if !(ctrl && keys.just_pressed(KeyCode::KeyW)) {
-        return;
-    }
+    for crate::input::ActionFired { action, .. } in actions.read() {
+        if !matches!(action, crate::input::Action::GoToWell) {
+            continue;
+        }
 
-    match *screen.get() {
-        Screen::Conversation => {
-            room.carousel = crate::view::room::nav::StationCarousel::new(
-                crate::view::room::nav::Station::TimeWell,
-            );
-            room.zoomed = Some(crate::view::room::nav::Station::TimeWell);
-            arm_dive(&mut state);
+        let already_there = *screen.get() == Screen::Room
+            && room.zoomed == Some(crate::view::room::nav::Station::TimeWell);
+        if already_there {
+            continue;
+        }
+
+        room.carousel = crate::view::room::nav::StationCarousel::new(
+            crate::view::room::nav::Station::TimeWell,
+        );
+        room.zoomed = Some(crate::view::room::nav::Station::TimeWell);
+        arm_dive(&mut state);
+        if *screen.get() != Screen::Room {
             next.set(Screen::Room);
         }
-        Screen::Room => next.set(Screen::Conversation),
-        _ => {}
     }
 }
-
-/// Digit-to-slot mapping for band-0 addressing (`0–9`).
-const DIGIT_KEYS: [(KeyCode, usize); 10] = [
-    (KeyCode::Digit0, 0),
-    (KeyCode::Digit1, 1),
-    (KeyCode::Digit2, 2),
-    (KeyCode::Digit3, 3),
-    (KeyCode::Digit4, 4),
-    (KeyCode::Digit5, 5),
-    (KeyCode::Digit6, 6),
-    (KeyCode::Digit7, 7),
-    (KeyCode::Digit8, 8),
-    (KeyCode::Digit9, 9),
-];
 
 /// Time-well keyboard navigation: **ring-centric**, with a Kodak-projector spin.
 /// Selection is `(focused_ring, ring_pos)`; the card at that seat is
 /// [`TimeWellState::selected`], so the reading card / lineage / highlight /
 /// Enter all follow.
-/// - `0–9` — quick-jump to seat `n` of the **focused** ring: select + exit.
-/// - **Left / Right / Tab** — step the position within the focused ring
-///   (wrapping), spinning the ring so the selected card eases to the front gate.
-/// - **Up / Down** — change the focused ring (Up → shallower/mouth, Down →
-///   deeper/throat), carrying the position index (clamped); the newly focused
-///   ring spins its selected card to the gate and the camera retargets to it.
-/// - **Enter** focuses then commits; **`c`** concludes the selection; **`p`**
-///   promotes, **`d`** demotes, **`z`** toggles pause, **`a`** archives — see
-///   the verb handlers below (fire-and-forget RPC, same pattern as `c`).
 ///
-/// Esc (focus-aware) is handled below: from focus it backs out to the ring
+/// Consumes `ActionFired` from the central table (the `WellZoomed` context in
+/// `input/defaults.rs` — keys are rebindable there, this system only knows
+/// intent):
+/// - `JumpSeat(n)` (`0–9`) — quick-jump to seat `n` of the **focused** ring:
+///   select + exit.
+/// - `StepNext`/`StepPrev` (**Left / Right / Tab**, dpad) — step the position
+///   within the focused ring (wrapping), spinning the ring so the selected
+///   card eases to the front gate.
+/// - `LevelUp`/`LevelDown` (**Up / Down**) — change the focused ring (Up →
+///   shallower/mouth, Down → deeper/throat), carrying the position index
+///   (clamped); the newly focused ring spins its selected card to the gate
+///   and the camera retargets to it.
+/// - `Activate` (**Enter**, South) focuses then commits; `Conclude` (`c`),
+///   `Promote` (`p`), `Demote` (`d`), `PauseToggle` (`z`), `Archive` (`a`) —
+///   see the verb arms below (fire-and-forget RPC).
+///
+/// PopLevel/Esc (focus-aware) is handled below: from focus it backs out to the ring
 /// overview; from the overview it leaves the well — `room.zoomed = None`,
 /// the same generic zoom-out every `station_is_zoomable` station uses now
 /// (Slice C — the well is no longer a screen cut sitting BELOW the room, so
 /// "leave the well" surfaces to the room's own ambient view, not straight to
 /// Conversation the way the old `Screen::TimeWell` scene cut did).
 pub fn well_keyboard(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut actions: MessageReader<crate::input::ActionFired>,
     mut state: ResMut<TimeWellState>,
     mut switch: MessageWriter<crate::view::components::ContextSwitchRequested>,
     mut next: ResMut<NextState<Screen>>,
@@ -885,235 +885,261 @@ pub fn well_keyboard(
     drift: Res<crate::ui::drift::DriftState>,
     mut room: ResMut<crate::view::room::RoomState>,
 ) {
-    // The hero pose is a look-only dead end (see `TimeWellState::hero`'s own
-    // doc): Down returns to the mouth ring's normal gate framing, Esc leaves
-    // the well entirely (the same generic zoom-out as below) — everything
-    // else is inert while parked here, since this pose frames the well as a
-    // whole, not any one ring or card.
-    if state.hero {
-        if keys.just_pressed(KeyCode::ArrowDown) {
-            state.hero = false;
-        } else if keys.just_pressed(KeyCode::Escape) {
-            room.zoomed = None;
+    use crate::input::Action;
+
+    for crate::input::ActionFired { action, context } in actions.read() {
+        // Only WellZoomed-context actions belong to the well; the context
+        // stamp is what prevents buffered cross-frame actions (or another
+        // station's same-key actions) from replaying here.
+        if *context != crate::input::InputContext::WellZoomed {
+            continue;
         }
-        return;
-    }
-
-    // `0–9`: jump straight to seat `n` of the focused ring and drop into the
-    // conversation (a no-op if that seat is empty).
-    for (kc, n) in DIGIT_KEYS {
-        if keys.just_pressed(kc)
-            && let Some(&id) = state.ring_cards[state.focused_ring].get(n)
-        {
-            switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
-            next.set(Screen::Conversation);
-            return;
-        }
-    }
-
-    let mut nav_changed = false;
-
-    // Left/Right (Tab = Right): walk the focused ring, wrapping, and spin it so
-    // the newly selected seat rolls to the gate.
-    let lr = if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
-        1
-    } else if keys.just_pressed(KeyCode::ArrowLeft) {
-        -1
-    } else {
-        0
-    };
-    if lr != 0 {
-        let fr = state.focused_ring;
-        let len = state.ring_cards.get(fr).map(|v| v.len()).unwrap_or(0);
-        if len > 0 {
-            let pos = super::card::step_ring_pos(state.ring_pos, len, lr);
-            state.ring_pos = pos;
-            let cur = state.ring_rotation_target[fr];
-            state.ring_rotation_target[fr] = super::card::spin_target_to_gate(cur, pos, len);
-            nav_changed = true;
-        }
-    }
-
-    // Up/Down: change the focused ring (clamp 0..N_BANDS-1), carry the position
-    // onto the new ring, spin the new ring to the gate. The camera follows
-    // because `ease_shell_camera` keys on `focused_ring` via `shot::WellShotInput`.
-    // Up at the mouth ring (already the shallowest — nothing to clamp INTO)
-    // rises into the hero pose instead of a dead-end no-op (`TimeWellState::hero`'s
-    // own doc). The old speedbumped double-tap-to-Room edge (`WellEdgeBump`) stays
-    // retired (Slice C): "leave the well" from anywhere in this ladder is still
-    // just `room.zoomed = None` (see Esc below), never a second screen.
-    let ud = if keys.just_pressed(KeyCode::ArrowUp) {
-        -1
-    } else if keys.just_pressed(KeyCode::ArrowDown) {
-        1
-    } else {
-        0
-    };
-    if ud != 0 {
-        let fr = state.focused_ring as i32;
-        let new_ring = (fr + ud).clamp(0, super::card::N_BANDS as i32 - 1) as usize;
-        if new_ring != state.focused_ring {
-            let new_len = state.ring_cards.get(new_ring).map(|v| v.len()).unwrap_or(0);
-            let pos = super::card::carry_ring_pos(state.ring_pos, new_len);
-            state.focused_ring = new_ring;
-            state.ring_pos = pos;
-            let cur = state.ring_rotation_target[new_ring];
-            state.ring_rotation_target[new_ring] =
-                super::card::spin_target_to_gate(cur, pos, new_len.max(1));
-            nav_changed = true;
-        } else if ud == -1 && state.focused_ring == 0 {
-            state.hero = true;
-        }
-    }
-
-    // After any nav change, re-derive the selection from the seat so every
-    // downstream system (highlight, the reading card, lineage) follows.
-    if nav_changed {
-        let fr = state.focused_ring;
-        let pos = state.ring_pos;
-        let sel = state.ring_cards.get(fr).and_then(|v| v.get(pos)).copied();
-        state.selected = sel;
-    }
-
-    // Enter is two-stage: from the overview it *focuses* (the camera dollies into
-    // the focus card); a second Enter while focused *commits* — switches to the
-    // context and leaves the well.
-    if keys.just_pressed(KeyCode::Enter) {
-        if state.focused {
-            if let Some(id) = state.selected {
-                switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
-                next.set(Screen::Conversation);
+        // The hero pose is a look-only dead end (see `TimeWellState::hero`'s
+        // own doc): Down returns to the mouth ring's normal gate framing, Esc
+        // leaves the well entirely (the same generic zoom-out as below) —
+        // everything else is inert while parked here, since this pose frames
+        // the well as a whole, not any one ring or card.
+        if state.hero {
+            match action {
+                Action::LevelDown => state.hero = false,
+                Action::PopLevel => room.zoomed = None,
+                _ => {}
             }
-        } else if state.selected.is_some() {
-            state.focused = true;
+            continue;
         }
-        return;
-    }
 
-    // Esc backs out: from focus it returns to the ring overview; from the
-    // overview it leaves the well — `room.zoomed = None`, the same generic
-    // zoom-out every zoomable station uses (not a `Screen` transition; see
-    // this function's own doc for why the well no longer jumps straight to
-    // Conversation here).
-    if keys.just_pressed(KeyCode::Escape) {
-        if state.focused {
-            state.focused = false;
-        } else {
-            room.zoomed = None;
-        }
-        return;
-    }
-
-    // `c`: conclude the selected context (fire-and-forget over RPC; the next
-    // DriftState poll seats it in Bumped, never Recent — see `assign_placement`).
-    if keys.just_pressed(KeyCode::KeyC)
-        && let Some(id) = state.selected
-        && let Some(actor) = actor.as_ref()
-    {
-        let handle = actor.handle.clone();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.conclude(id).await {
-                    log::warn!("well: conclude {} failed: {e}", id.short());
+        match action {
+            // `0–9`: jump straight to seat `n` of the focused ring and drop
+            // into the conversation (a no-op if that seat is empty).
+            Action::JumpSeat(n) => {
+                if let Some(&id) = state.ring_cards[state.focused_ring].get(*n) {
+                    switch
+                        .write(crate::view::components::ContextSwitchRequested { context_id: id });
+                    next.set(Screen::Conversation);
+                    return;
                 }
-            })
-            .detach();
-        info!("well: conclude {}", id.short());
-    }
+            }
 
-    // `p` / `d` / `z` / `a`: promote / demote / toggle-pause / archive the
-    // selection — fire-and-forget over RPC, same pattern as `c` above. The
-    // kernel owns the demote ladder and the active-ring cap; a failure logs a
-    // visible warning with the context short id. Promote's ring-full refusal
-    // ("active ring full (10 seats) — demote something first") surfaces
-    // through that same warn — seats never appear or vanish silently.
-    //
-    // Each verb passes the `begin_placement` in-flight guard first: a second
-    // placement verb on the same context before the next poll refreshes is
-    // ignored, so a double-`d` can't walk the ladder two rungs sight-unseen
-    // (auto → demoted → ARCHIVED inside one poll interval).
-    if keys.just_pressed(KeyCode::KeyP)
-        && let Some(id) = state.selected
-        && let Some(actor) = actor.as_ref()
-    {
-        if !state.begin_placement(id) {
-            info!("well: promote {} ignored — placement already in flight", id.short());
-            return;
-        }
-        let handle = actor.handle.clone();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.promote_context(id).await {
-                    log::warn!("well: promote {} failed: {e}", id.short());
+            // Left/Right (Tab = Right): walk the focused ring, wrapping, and
+            // spin it so the newly selected seat rolls to the gate.
+            Action::StepNext | Action::StepPrev => {
+                let dir = if matches!(action, Action::StepNext) { 1 } else { -1 };
+                let fr = state.focused_ring;
+                let len = state.ring_cards.get(fr).map(|v| v.len()).unwrap_or(0);
+                if len > 0 {
+                    let pos = super::card::step_ring_pos(state.ring_pos, len, dir);
+                    state.ring_pos = pos;
+                    let cur = state.ring_rotation_target[fr];
+                    state.ring_rotation_target[fr] =
+                        super::card::spin_target_to_gate(cur, pos, len);
+                    // Re-derive the selection from the seat so every
+                    // downstream system (highlight, reading card, lineage)
+                    // follows.
+                    state.selected = state.ring_cards.get(fr).and_then(|v| v.get(pos)).copied();
                 }
-            })
-            .detach();
-        info!("well: promote {}", id.short());
-    }
+            }
 
-    if keys.just_pressed(KeyCode::KeyD)
-        && let Some(id) = state.selected
-        && let Some(actor) = actor.as_ref()
-    {
-        if !state.begin_placement(id) {
-            info!("well: demote {} ignored — placement already in flight", id.short());
-            return;
-        }
-        let handle = actor.handle.clone();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.demote_context(id).await {
-                    log::warn!("well: demote {} failed: {e}", id.short());
+            // Up/Down: change the focused ring (clamp 0..N_BANDS-1), carry the
+            // position onto the new ring, spin the new ring to the gate. The
+            // camera follows because `ease_shell_camera` keys on
+            // `focused_ring` via `shot::WellShotInput`. Up at the mouth ring
+            // (already the shallowest — nothing to clamp INTO) rises into the
+            // hero pose instead of a dead-end no-op (`TimeWellState::hero`'s
+            // own doc). The old speedbumped double-tap-to-Room edge
+            // (`WellEdgeBump`) stays retired (Slice C): "leave the well" from
+            // anywhere in this ladder is still just `room.zoomed = None` (see
+            // PopLevel below), never a second screen.
+            Action::LevelUp | Action::LevelDown => {
+                let ud = if matches!(action, Action::LevelUp) { -1 } else { 1 };
+                let fr = state.focused_ring as i32;
+                let new_ring = (fr + ud).clamp(0, super::card::N_BANDS as i32 - 1) as usize;
+                if new_ring != state.focused_ring {
+                    let new_len = state.ring_cards.get(new_ring).map(|v| v.len()).unwrap_or(0);
+                    let pos = super::card::carry_ring_pos(state.ring_pos, new_len);
+                    state.focused_ring = new_ring;
+                    state.ring_pos = pos;
+                    let cur = state.ring_rotation_target[new_ring];
+                    state.ring_rotation_target[new_ring] =
+                        super::card::spin_target_to_gate(cur, pos, new_len.max(1));
+                    state.selected = state
+                        .ring_cards
+                        .get(new_ring)
+                        .and_then(|v| v.get(pos))
+                        .copied();
+                } else if ud == -1 && state.focused_ring == 0 {
+                    state.hero = true;
                 }
-            })
-            .detach();
-        info!("well: demote {}", id.short());
-    }
+            }
 
-    // `z` toggles `paused_at`: the RPC takes the new absolute value, so read
-    // the selection's current flag off the same poll `sync.rs` reads
-    // (`DriftState`'s ContextInfo) and send its negation. The in-flight guard
-    // matters here too — the flag read is stale until the poll lands, so an
-    // unguarded double-`z` would send the same value twice instead of
-    // toggling back.
-    if keys.just_pressed(KeyCode::KeyZ)
-        && let Some(id) = state.selected
-        && let Some(actor) = actor.as_ref()
-    {
-        if !state.begin_placement(id) {
-            info!("well: pause-toggle {} ignored — placement already in flight", id.short());
-            return;
-        }
-        let currently_paused = drift.contexts.iter().any(|c| c.id == id && c.paused_at.is_some());
-        let next_paused = !currently_paused;
-        let handle = actor.handle.clone();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.set_context_paused(id, next_paused).await {
-                    log::warn!("well: pause {} -> {next_paused} failed: {e}", id.short());
+            // Enter is two-stage: from the overview it *focuses* (the camera
+            // dollies into the focus card); a second Enter while focused
+            // *commits* — switches to the context and leaves the well.
+            Action::Activate => {
+                if state.focused {
+                    if let Some(id) = state.selected {
+                        switch.write(crate::view::components::ContextSwitchRequested {
+                            context_id: id,
+                        });
+                        next.set(Screen::Conversation);
+                    }
+                } else if state.selected.is_some() {
+                    state.focused = true;
                 }
-            })
-            .detach();
-        info!("well: pause {} -> {next_paused}", id.short());
-    }
+            }
 
-    if keys.just_pressed(KeyCode::KeyA)
-        && let Some(id) = state.selected
-        && let Some(actor) = actor.as_ref()
-    {
-        if !state.begin_placement(id) {
-            info!("well: archive {} ignored — placement already in flight", id.short());
-            return;
-        }
-        let handle = actor.handle.clone();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.archive_context(id).await {
-                    log::warn!("well: archive {} failed: {e}", id.short());
+            // Esc backs out: from focus it returns to the ring overview; from
+            // the overview it leaves the well — `room.zoomed = None`, the same
+            // generic zoom-out every zoomable station uses (not a `Screen`
+            // transition; see this function's own doc for why the well no
+            // longer jumps straight to Conversation here).
+            Action::PopLevel => {
+                if state.focused {
+                    state.focused = false;
+                } else {
+                    room.zoomed = None;
                 }
-            })
-            .detach();
-        info!("well: archive {}", id.short());
+            }
+
+    // `c`: conclude the selected context (fire-and-forget over RPC; the
+            // next DriftState poll seats it in Bumped, never Recent — see
+            // `assign_placement`).
+            Action::Conclude => {
+                if let Some(id) = state.selected
+                    && let Some(actor) = actor.as_ref()
+                {
+                    let handle = actor.handle.clone();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.conclude(id).await {
+                                log::warn!("well: conclude {} failed: {e}", id.short());
+                            }
+                        })
+                        .detach();
+                    info!("well: conclude {}", id.short());
+                }
+            }
+
+            // `p` / `d` / `z` / `a`: promote / demote / toggle-pause /
+            // archive the selection — fire-and-forget over RPC, same pattern
+            // as `c` above. The kernel owns the demote ladder and the
+            // active-ring cap; a failure logs a visible warning with the
+            // context short id. Promote's ring-full refusal ("active ring
+            // full (10 seats) — demote something first") surfaces through
+            // that same warn — seats never appear or vanish silently.
+            //
+            // Each verb passes the `begin_placement` in-flight guard first: a
+            // second placement verb on the same context before the next poll
+            // refreshes is ignored, so a double-`d` can't walk the ladder two
+            // rungs sight-unseen (auto → demoted → ARCHIVED inside one poll
+            // interval).
+            Action::Promote => {
+                if let Some(id) = state.selected
+                    && let Some(actor) = actor.as_ref()
+                {
+                    if !state.begin_placement(id) {
+                        info!(
+                            "well: promote {} ignored — placement already in flight",
+                            id.short()
+                        );
+                        continue;
+                    }
+                    let handle = actor.handle.clone();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.promote_context(id).await {
+                                log::warn!("well: promote {} failed: {e}", id.short());
+                            }
+                        })
+                        .detach();
+                    info!("well: promote {}", id.short());
+                }
+            }
+
+            Action::Demote => {
+                if let Some(id) = state.selected
+                    && let Some(actor) = actor.as_ref()
+                {
+                    if !state.begin_placement(id) {
+                        info!(
+                            "well: demote {} ignored — placement already in flight",
+                            id.short()
+                        );
+                        continue;
+                    }
+                    let handle = actor.handle.clone();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.demote_context(id).await {
+                                log::warn!("well: demote {} failed: {e}", id.short());
+                            }
+                        })
+                        .detach();
+                    info!("well: demote {}", id.short());
+                }
+            }
+
+            // `z` toggles `paused_at`: the RPC takes the new absolute value,
+            // so read the selection's current flag off the same poll
+            // `sync.rs` reads (`DriftState`'s ContextInfo) and send its
+            // negation. The in-flight guard matters here too — the flag read
+            // is stale until the poll lands, so an unguarded double-`z` would
+            // send the same value twice instead of toggling back.
+            Action::PauseToggle => {
+                if let Some(id) = state.selected
+                    && let Some(actor) = actor.as_ref()
+                {
+                    if !state.begin_placement(id) {
+                        info!(
+                            "well: pause-toggle {} ignored — placement already in flight",
+                            id.short()
+                        );
+                        continue;
+                    }
+                    let currently_paused = drift
+                        .contexts
+                        .iter()
+                        .any(|c| c.id == id && c.paused_at.is_some());
+                    let next_paused = !currently_paused;
+                    let handle = actor.handle.clone();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.set_context_paused(id, next_paused).await {
+                                log::warn!(
+                                    "well: pause {} -> {next_paused} failed: {e}",
+                                    id.short()
+                                );
+                            }
+                        })
+                        .detach();
+                    info!("well: pause {} -> {next_paused}", id.short());
+                }
+            }
+
+            Action::Archive => {
+                if let Some(id) = state.selected
+                    && let Some(actor) = actor.as_ref()
+                {
+                    if !state.begin_placement(id) {
+                        info!(
+                            "well: archive {} ignored — placement already in flight",
+                            id.short()
+                        );
+                        continue;
+                    }
+                    let handle = actor.handle.clone();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.archive_context(id).await {
+                                log::warn!("well: archive {} failed: {e}", id.short());
+                            }
+                        })
+                        .detach();
+                    info!("well: archive {}", id.short());
+                }
+            }
+
+            _ => {}
+        }
     }
 }
 

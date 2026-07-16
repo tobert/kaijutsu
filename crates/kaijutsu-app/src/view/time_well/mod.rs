@@ -86,8 +86,12 @@ impl Plugin for TimeWellPlugin {
             .init_resource::<live::ContextTails>()
             .init_resource::<live::WellBeats>()
             .init_resource::<rays::WellTracks>()
-            // The toggle runs in every screen (it decides based on current state).
-            .add_systems(Update, scene::toggle_time_well)
+            // Go-to-well runs on every screen (prefix/gamepad reach it from
+            // anywhere); it consumes ActionFired, so it follows dispatch.
+            .add_systems(
+                Update,
+                scene::handle_go_to_well.after(crate::input::InputPhase::Dispatch),
+            )
             // Fully ungated: opens warm on every screen, well included.
             .add_systems(Update, (live::ingest_live_events, scene::tick_ring_activity))
             // Ambient: room-scale truth. The well breathes here whether
@@ -164,12 +168,13 @@ impl Plugin for TimeWellPlugin {
             .add_systems(
                 Update,
                 (
-                    // `.after(room_keyboard)` (kaibo review, 2026-07-11): must
-                    // observe `RoomState::zoomed` from BEFORE this system's own
-                    // Esc handler can clear it this frame, or a same-frame
-                    // Escape double-fires through both handlers and skips the
-                    // room-overview stop — see `room::room_keyboard`'s own doc.
-                    scene::well_keyboard.after(crate::view::room::room_keyboard),
+                    // Ordering vs `room_keyboard` is no longer load-bearing —
+                    // ActionFired carries the binding context that matched, so
+                    // a WellZoomed Esc can never replay through the room's
+                    // consumer (the 2026-07-11 same-frame double-fire is
+                    // structurally gone). Kept `.after(InputPhase::Dispatch)`
+                    // via the group below so actions land same-frame.
+                    scene::well_keyboard,
                     legend::toggle_legend,
                     legend::position_legend,
                     // Writes `Card::tail` (guarded — only on real change)
@@ -182,6 +187,7 @@ impl Plugin for TimeWellPlugin {
                     text::build_horizon_label,
                 )
                     .chain()
+                    .after(crate::input::InputPhase::Dispatch)
                     .run_if(|room: Res<crate::view::room::RoomState>| scene::well_zoomed(&room)),
             );
     }

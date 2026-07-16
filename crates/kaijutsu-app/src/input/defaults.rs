@@ -193,12 +193,12 @@ pub fn default_bindings() -> Vec<Binding> {
         "Activate focused block",
     ));
 
-    // Escape — unfocus (Compose→Conversation, etc.)
+    // Escape — pop (Compose→Conversation, etc.)
     b.push(Binding::key(
         KeyCode::Escape,
         InputContext::Navigation,
-        Action::Unfocus,
-        "Unfocus / pop view",
+        Action::PopLevel,
+        "Pop view",
     ));
 
     // Ctrl+C — multi-press interrupt (soft → hard → hard+clear)
@@ -272,7 +272,7 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(
         KeyCode::Escape,
         InputContext::Dialog,
-        Action::Unfocus,
+        Action::PopLevel,
         "Cancel dialog",
     ));
     b.push(Binding::key(
@@ -327,8 +327,285 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
+    // RoomNav (Screen::Room, not zoomed — the octagon station carousel)
+    // ====================================================================
+
+    b.push(Binding::key(
+        KeyCode::ArrowRight,
+        InputContext::RoomNav,
+        Action::StepNext,
+        "Next station",
+    ));
+    b.push(Binding::key(
+        KeyCode::Tab,
+        InputContext::RoomNav,
+        Action::StepNext,
+        "Next station",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowLeft,
+        InputContext::RoomNav,
+        Action::StepPrev,
+        "Previous station",
+    ));
+    b.push(Binding::key(
+        KeyCode::Enter,
+        InputContext::RoomNav,
+        Action::Activate,
+        "Dive into station",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowDown,
+        InputContext::RoomNav,
+        Action::Activate,
+        "Dive into station",
+    ));
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::RoomNav,
+        Action::PopLevel,
+        "Back to conversation",
+    ));
+
+    // ====================================================================
+    // WellZoomed (Screen::Room, zoomed into the time well)
+    // ====================================================================
+
+    b.push(Binding::key(
+        KeyCode::ArrowRight,
+        InputContext::WellZoomed,
+        Action::StepNext,
+        "Spin ring forward",
+    ));
+    b.push(Binding::key(
+        KeyCode::Tab,
+        InputContext::WellZoomed,
+        Action::StepNext,
+        "Spin ring forward",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowLeft,
+        InputContext::WellZoomed,
+        Action::StepPrev,
+        "Spin ring backward",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowUp,
+        InputContext::WellZoomed,
+        Action::LevelUp,
+        "Shallower ring / hero pose",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowDown,
+        InputContext::WellZoomed,
+        Action::LevelDown,
+        "Deeper ring",
+    ));
+    b.push(Binding::key(
+        KeyCode::Enter,
+        InputContext::WellZoomed,
+        Action::Activate,
+        "Focus / commit",
+    ));
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::WellZoomed,
+        Action::PopLevel,
+        "Back out / leave well",
+    ));
+    // Digits 0-9 → jump to seat n of the focused ring
+    for (i, key) in [
+        KeyCode::Digit0,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        b.push(Binding::key(
+            key,
+            InputContext::WellZoomed,
+            Action::JumpSeat(i),
+            format!("Jump to seat {i}"),
+        ));
+    }
+    // Placement verbs (the in-well legend renders these from this table)
+    b.push(Binding::key(
+        KeyCode::KeyP,
+        InputContext::WellZoomed,
+        Action::Promote,
+        "Promote to active ring",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyD,
+        InputContext::WellZoomed,
+        Action::Demote,
+        "Demote one step outward",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyC,
+        InputContext::WellZoomed,
+        Action::Conclude,
+        "Conclude context",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyZ,
+        InputContext::WellZoomed,
+        Action::PauseToggle,
+        "Toggle paused",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyA,
+        InputContext::WellZoomed,
+        Action::Archive,
+        "Archive past the horizon",
+    ));
+    // `?` legend — bind both bare Slash and Shift+Slash so the shifted
+    // glyph on every layout that puts ? over / keeps working.
+    b.push(Binding::key(
+        KeyCode::Slash,
+        InputContext::WellZoomed,
+        Action::ToggleLegend,
+        "Toggle legend",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::Slash,
+        Modifiers::SHIFT,
+        InputContext::WellZoomed,
+        Action::ToggleLegend,
+        "Toggle legend",
+    ));
+
+    // ====================================================================
+    // PatchBayZoomed (Screen::Room, zoomed into the patch bay)
+    // ====================================================================
+
+    b.push(Binding::key(
+        KeyCode::ArrowRight,
+        InputContext::PatchBayZoomed,
+        Action::StepNext,
+        "Next wire",
+    ));
+    b.push(Binding::key(
+        KeyCode::Tab,
+        InputContext::PatchBayZoomed,
+        Action::StepNext,
+        "Next wire",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowLeft,
+        InputContext::PatchBayZoomed,
+        Action::StepPrev,
+        "Previous wire",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyR,
+        InputContext::PatchBayZoomed,
+        Action::Rescan,
+        "Rescan ALSA graph",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowUp,
+        InputContext::PatchBayZoomed,
+        Action::PopLevel,
+        "Back to room",
+    ));
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::PatchBayZoomed,
+        Action::PopLevel,
+        "Back to room",
+    ));
+
+    // ====================================================================
+    // StationZoomed (zoomed station with no keyboard of its own)
+    // ====================================================================
+
+    b.push(Binding::key(
+        KeyCode::ArrowUp,
+        InputContext::StationZoomed,
+        Action::PopLevel,
+        "Back to room",
+    ));
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::StationZoomed,
+        Action::PopLevel,
+        "Back to room",
+    ));
+
+    // ====================================================================
+    // FsnFly (Screen::Fsn — fly keys are polled continuously in dispatch)
+    // ====================================================================
+
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::FsnFly,
+        Action::PopLevel,
+        "Back to room",
+    ));
+
+    // ====================================================================
     // Gamepad bindings
     // ====================================================================
+
+    // Scene navigation — dpad steps, South dives/commits (East pops via
+    // the Global binding below).
+    for ctx in [
+        InputContext::RoomNav,
+        InputContext::WellZoomed,
+        InputContext::PatchBayZoomed,
+    ] {
+        b.push(Binding::gamepad(
+            GamepadButton::DPadRight,
+            ctx,
+            Action::StepNext,
+            "Step forward",
+        ));
+        b.push(Binding::gamepad(
+            GamepadButton::DPadLeft,
+            ctx,
+            Action::StepPrev,
+            "Step backward",
+        ));
+    }
+    b.push(Binding::gamepad(
+        GamepadButton::South,
+        InputContext::RoomNav,
+        Action::Activate,
+        "Dive into station",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::South,
+        InputContext::WellZoomed,
+        Action::Activate,
+        "Focus / commit",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::DPadUp,
+        InputContext::WellZoomed,
+        Action::LevelUp,
+        "Shallower ring",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::DPadDown,
+        InputContext::WellZoomed,
+        Action::LevelDown,
+        "Deeper ring",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::DPadDown,
+        InputContext::RoomNav,
+        Action::Activate,
+        "Dive into station",
+    ));
 
     // South (A/X) — context-dependent activate
     b.push(Binding::gamepad(
@@ -344,12 +621,20 @@ pub fn default_bindings() -> Vec<Binding> {
         "Confirm",
     ));
 
-    // East (B/O) — go back / cancel
+    // East (B/O) — go back / cancel / pop one level, everywhere
     b.push(Binding::gamepad(
         GamepadButton::East,
         InputContext::Global,
-        Action::Unfocus,
-        "Back / Cancel",
+        Action::PopLevel,
+        "Back / pop level",
+    ));
+
+    // Start (|||) — go to the well, from anywhere: the pad-side Ctrl+A w.
+    b.push(Binding::gamepad(
+        GamepadButton::Start,
+        InputContext::Global,
+        Action::GoToWell,
+        "Go to the well",
     ));
 
     // DPad — block navigation

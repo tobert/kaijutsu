@@ -217,12 +217,12 @@ diagnosed. The two-surface split below is still the target; only the
   appendix, applied
   to the keyboard surface too.) Pinning is deferred until the itch is real.
   The rank is the keyboard surface, curated by *membership* — shells, work
-  contexts, a stats surface. Rendered as a fixed rail at the mouth of the well
-  (and later, mirrored in the conversation view's dock so switching doesn't
-  require entering the well). **Not built yet** — the well today still has
-  only a legacy `0–9` quick-jump over the flat mouth→throat card order (select
-  + switch + exit), a holdover from the spiral that isn't the rule-governed
-  rank; Stage 2 replaces it.
+  contexts, a stats surface. **Since built** as ring 0 (see "Ring membership
+  becomes explicit" below): in the well, digits address the focused ring's
+  seats; from everywhere else, switching is specced as the `Ctrl+A` prefix —
+  `Ctrl+A 0–9` reaches ring-0 seats without entering the well
+  (`docs/input.md`, 2026-07-16). The table-edge rail rendering at the mouth
+  is still open.
 - **The rings** (arrows): pure recency river, now four discrete terraces
   instead of a continuous spiral. Newest activity sits in the `HotNow` ring at
   the mouth; everything sinks band by band toward `Horizon` at the throat as
@@ -296,8 +296,9 @@ app-side seat count — keep them in agreement).
 What this absorbs from the staged plan: **Stage 1's** banding half (recency
 now only *orders* the automatic rings, it no longer defines bands); **Stage
 2's** rank core — ring 0 *is* the rank: ≤10, append-ordered, digit-addressed,
-kernel-owned (still open from Stage 2: the table-edge rail rendering, digit
-switching from the conversation view, deliberate reorder à la `kj rank move`);
+kernel-owned (still open from Stage 2: the table-edge rail rendering and
+deliberate reorder à la `kj rank move`; digit switching from the conversation
+view is specced as `Ctrl+A 0–9` in `docs/input.md`);
 and **Stage 5's** cutoff — no-entity-past-the-seats arrived early, while
 search-at-the-horizon and the `since` payload valve remain open.
 

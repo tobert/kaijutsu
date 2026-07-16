@@ -105,6 +105,18 @@ change, **drawn from the conversation with the user**. Commit messages briefly e
 what happened as context for the more important task of explaining the decisions we
 made.
 
+## App Input
+
+All keyboard/gamepad/mouse input in `kaijutsu-app` flows through the central
+action table (`crates/kaijutsu-app/src/input/`): raw input → Ctrl+A prefix →
+one dispatcher → `ActionFired` → domain handlers. **Never read
+`ButtonInput`/`KeyboardInput` directly in a view or scene** — add an
+`InputContext` + bindings to the table instead; gamepad, `bindings.toml`
+rebinding, and the `?` legend then come free. The vi editor is the one
+sanctioned raw reader (an explicit keyboard grab). `docs/input.md` is
+canonical: Esc doctrine (vi owns Esc where a vi surface is live; elsewhere
+it is exactly one `PopLevel`), the Ctrl+A prefix table, clipboard model.
+
 ## Bevy 0.18 Quick Reference
 
 Trust this table over training memory — Bevy 0.18 renamed the event system and is newer than most model training.

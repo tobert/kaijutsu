@@ -988,9 +988,27 @@ pub fn update_hints(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
     room: Res<crate::view::room::RoomState>,
+    prefix: Res<crate::input::prefix::PrefixState>,
     mut dock: ResMut<DockState>,
 ) {
-    if !focus_area.is_changed() && !screen.is_changed() && !room.is_changed() {
+    if !focus_area.is_changed()
+        && !screen.is_changed()
+        && !room.is_changed()
+        && !prefix.is_changed()
+    {
+        return;
+    }
+
+    // A pending Ctrl+A owns the footer while armed — this IS the prefix
+    // legend (docs/input.md): it appears exactly when you need it and
+    // vanishes with the pending state, so no separate `?` overlay.
+    if prefix.armed() {
+        let hints = "^A \u{2192} 0-9: seat \u{2502} ^A: last \u{2502} n/p: step \u{2502} \
+                     q: close \u{2502} w/\": well \u{2502} ': switch \u{2502} A: rename \u{2502} \
+                     d: detach \u{2502} a: literal";
+        if dock.hints.text != hints {
+            dock.hints.text = hints.to_string();
+        }
         return;
     }
 
@@ -1211,7 +1229,12 @@ impl Plugin for DockPlugin {
                     update_event_pulse,
                     update_model_badge,
                     update_block_activity,
-                    handle_dock_click,
+                    // Conversation-only: the dock's ComputedNode/GlobalTransform
+                    // survive Visibility::Hidden, so without the gate a click
+                    // in the dock's footprint would switch contexts UNDER a
+                    // fullscreen scene (input-rework audit, 2026-07-16).
+                    handle_dock_click
+                        .run_if(in_state(crate::ui::screen::Screen::Conversation)),
                 ),
             )
             .add_systems(
