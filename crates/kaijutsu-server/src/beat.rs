@@ -853,15 +853,24 @@ impl BeatScheduler {
             .publish(BlockFlow::RenderCue { context_id, cue });
     }
 
-    pub fn pause(&mut self, track_id: &TrackId) {
+    /// Hold a track's clock — the playhead freezes, forward-only (a later `play`
+    /// resumes where it froze, no rewind, no missed-beat catch-up). Rotation is
+    /// suspended/remembered (attachments keep their `rotate` cadence) and
+    /// per-attachment OODA arm is untouched (re-arm with `SetOoda`). The
+    /// speculation lead means a sink's device queue holds ~a phrase of FUTURE
+    /// events; the clock stopping won't unschedule them, so a flush cue tells
+    /// every attached wire sink to truncate everything after `now` + silence
+    /// sounding notes (Stage 3 review SEV-1) — otherwise a hold would play out
+    /// the buffered phrase and leave notes hanging.
+    ///
+    /// `pause` and `stop` are the same clock-domain operation under two
+    /// transport-vocabulary names (MIDI idiom: stop = stop the clock only,
+    /// nothing else resets) — kept as separate public verbs so `kj transport`
+    /// can offer both, sharing this one body so they can't drift apart.
+    fn hold(&mut self, track_id: &TrackId) {
         let mut flush_ctx = None;
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.playing = false;
-            // The speculation lead means a sink's device queue holds ~a phrase of
-            // FUTURE events; the clock stopping won't unschedule them. The flush
-            // cue below tells every attached wire sink to truncate everything
-            // after `now` + silence sounding notes (Stage 3 review SEV-1), so a
-            // pause doesn't blindly play the buffered phrase.
             flush_ctx = Some(track.score_context);
         }
         if let Some(ctx) = flush_ctx {
@@ -870,26 +879,14 @@ impl BeatScheduler {
         let _ = self.persist_track(track_id);
     }
 
-    /// Stop a track's clock — MIDI idiom: **stop = stop the clock only**. Rotation is
-    /// suspended/remembered (the attachments keep their `rotate` cadence) and
-    /// per-attachment OODA arm is untouched (re-arm with `SetOoda`). The playhead is
-    /// forward-only, so `stop` then `play` resumes where it froze (no rewind), which
-    /// makes it behaviourally an alias of `pause` here — both kept for transport
-    /// vocabulary.
+    /// `kj transport pause` — see [`Self::hold`].
+    pub fn pause(&mut self, track_id: &TrackId) {
+        self.hold(track_id);
+    }
+
+    /// `kj transport stop` — see [`Self::hold`].
     pub fn stop(&mut self, track_id: &TrackId) {
-        let mut flush_ctx = None;
-        if let Some(track) = self.tracks.get_mut(track_id) {
-            track.playing = false;
-            // Same as `pause`: the flush cue below tells every attached wire sink
-            // to truncate the buffered (lead-time) events past `now`, so a stop
-            // doesn't play out ~a phrase of queued notes and leave them hanging
-            // (Stage 3 review SEV-1).
-            flush_ctx = Some(track.score_context);
-        }
-        if let Some(ctx) = flush_ctx {
-            self.publish_render_flush(ctx);
-        }
-        let _ = self.persist_track(track_id);
+        self.hold(track_id);
     }
 
     /// Set a track's beat period (tempo). Takes effect on the next beat. Routes to
