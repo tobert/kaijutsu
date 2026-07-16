@@ -5794,6 +5794,7 @@ dependencies = [
  "pollster",
  "pulldown-cmark",
  "rect_packer",
+ "rodio",
  "russh-sftp",
  "serde",
  "serde_json",

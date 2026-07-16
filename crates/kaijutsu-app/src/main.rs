@@ -48,6 +48,7 @@ struct Cli {
 }
 
 mod audio;
+mod audio_sched;
 mod cell;
 mod commands;
 mod config;
@@ -171,7 +172,10 @@ fn main() {
                     ..default()
                 })
                 // Disable Bevy's LogPlugin - we set up our own tracing subscriber
-                .disable::<bevy::log::LogPlugin>(),
+                .disable::<bevy::log::LogPlugin>()
+                // The app owns rodio directly now (docs/pcm.md R5 — audio_sched.rs's
+                // dedicated scheduler thread); bevy_audio never opens a device.
+                .disable::<bevy::audio::AudioPlugin>(),
         )
         // 3D mesh picking for constellation node clicks
         .add_plugins(MeshPickingPlugin)

@@ -23,13 +23,27 @@ kaijutsu-types.workspace = true
 kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true
 
+# Direct rodio dep (docs/pcm.md R5 — the app owns rodio outright, decided
+# 2026-07-16): `audio_sched.rs`'s scheduler thread builds the `OutputStream`
+# and decodes/trims/gains samples; bevy_audio no longer plays anything
+# (main.rs disables `AudioPlugin`). "wav" + "vorbis" match what bevy_audio's
+# "wav" feature + bevy's default "vorbis" used to decode — same formats, one
+# fewer layer. bevy still pulls rodio 0.20 transitively (see the `bevy` dep
+# comment below); same semver range, so cpal/rodio dedupe to one copy.
+rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis"] }
+
 # kaish (for syntax validation)
 kaish-kernel.workspace = true
 logos = "0.16"
 
-# "wav" decodes PCM samples (docs/pcm.md slice 3); "default" only turns on
-# "vorbis" (Ogg), so a WAV AudioSource would silently fail to decode without it.
-bevy = { version = "0.18", features = ["default", "bevy_ui_debug", "wav"] }
+# bevy_audio's PLUGIN is disabled at runtime (main.rs — the app owns rodio
+# directly, docs/pcm.md R5) but the CRATE still compiles as part of bevy's
+# "default" feature set (bevy_audio's own default pulls in rodio/vorbis) —
+# dropping "wav" here is deliberate: no code here spawns bevy_audio types
+# anymore, so there's nothing left to decode WAV *through bevy*. Dropping
+# bevy_audio from the build entirely (full feature enumeration instead of
+# "default") is deliberate follow-up hygiene, NOT this lane (docs/pcm.md R5).
+bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true
 bevy_mesh.workspace = true
 bevy_remote.workspace = true
