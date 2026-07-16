@@ -179,6 +179,11 @@ pub(crate) fn db_to_linear(gain_db: f64) -> f64 {
 /// `audio.rs::FETCH_TIMEOUT` (R4 step 5), a wholly different budget. 100ms is
 /// comfortably above scheduler jitter and comfortably below "a listener
 /// notices this one-shot played meaningfully late."
+///
+/// Scope (kaibo review): this gate applies only to **CAS-resolved** outcomes
+/// (`drain_prefetch_results`) — an *inline* cue's bytes are already present,
+/// so there is no fetch-latency window to gate; receipt-time staleness
+/// (`effective_deadline`) is its whole check.
 pub(crate) const GRACE: Duration = Duration::from_millis(100);
 
 /// What to do once a scheduled sound's bytes are ready to fire, given how far

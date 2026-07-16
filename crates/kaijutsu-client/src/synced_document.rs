@@ -446,6 +446,11 @@ impl SyncedDocument {
             // state. A render sink handles it off the raw event stream, not
             // the doc cache. `BeatSync` (the metronome beat reference) is the
             // same shape: a directive the sink's phasor consumes, not doc state.
+            // GUARD (R4, kaibo review): PREPARE_MIME cues carry
+            // `ContextId::nil()` as a documented sentinel — if RenderCue ever
+            // stops being unconditionally Ignored here, nil must be filtered
+            // before any context-keyed routing, or a prepare cue would route
+            // into a nil context's doc cache.
             | ServerEvent::RenderCue { .. }
             | ServerEvent::BeatSync { .. }
             // VFS activity is decorative world-rendering heat, not doc state.
