@@ -33,18 +33,18 @@ vs a stamp alongside `promoted_at`/`demoted_at`/`paused_at`.
   frame loop and the clicks stop. Confirms the sink's *dispatch* is tied to
   the render loop; if background playback should keep time, the
   ServerEvent→scheduler bridge (and the click) need a home that survives
-  frame throttling (the rodio thread itself is the obvious candidate).
-- **CasResolver connection dies idle, recovery is slow + silent** (fanfare
-  clip, live): the app's prefetch resolver connects eagerly on the first
-  CAS cue and the slot keeps that connection for the app's life; ~11 min
-  idle later the next fetch hit a dead transport — dead-peer detection was
-  slow, the single redial retry is unlogged, and there's no deadline-aware
-  timeout, so a placed clip just doesn't sound with nothing in the log.
-  Server side verified healthy (`kaijutsu-client/examples/sftp_probe.rs` —
-  genuine-SSH probe: connect 80ms, 209KB read 130ms). All R4-shaped:
-  prepare directive at commit + keepalive/reconnect-on-idle + skip-loud
-  fetch deadline + happy-path INFO logs ("sftp session ready", "media
-  resolved (cache|fetch) in Xms", "clip scheduled at deadline").
+  frame throttling (the rodio thread itself is the obvious candidate). NOT
+  touched by R4's prepare-horizon work (`docs/pcm.md`) — this is
+  dispatch/`Update`-scheduling territory, a separate lane.
+- **CasResolver's SFTP session has no proactive keepalive** (seeded R4,
+  2026-07-16): R4 (`docs/pcm.md`) bounded per-fetch recovery with a
+  `FETCH_TIMEOUT` + logged redial, closing the "slow + silent" symptom the
+  fanfare-clip failure exposed — but nothing yet keeps the session alive
+  *between* fetches (no TCP/SFTP keepalive ping), so a long-idle connection
+  still goes stale; R4 just detects and redials it promptly now instead of
+  ~70s later with nothing in the log. Add a periodic no-op ping on the
+  resolver's connection if idle recovery still needs to be faster than
+  `FETCH_TIMEOUT` in practice.
 
 ## Conversation virtualization follow-ups (seeded 2026-07-16, from `6504fafe`)
 

@@ -5,9 +5,8 @@
 > earlier design generations — including the retired `docs/playback.md` — are
 > recoverable from git history). Code is truth: the wire cue, the app sinks,
 > the clip record, and the whole clip *path* — producer (`kj play --track`)
-> → crossing → sink renderer — are **landed** (R1/R2/R3/R5, 2026-07-16);
-> open: R4 (prepare horizon + skip-loud late gate) and the slice-4 edge
-> node, mapped in "The remaining work" below. Companions:
+> → crossing → sink renderer — are **landed** (R1–R5, 2026-07-16); open: the
+> slice-4 edge node, mapped in "The remaining work" below. Companions:
 > `docs/midi.md` ("Render is a wire cue" — the phase split; "The one
 > timebase" — the timing doctrine every cue rides), `docs/tracks.md`
 > (track/transport), `docs/hyoushigi.md` (the `Cell` substrate),
@@ -90,12 +89,13 @@ not a block — `matches_filter` bypasses it.
   port at the backdated `receipt + lead`; ALSA's queue owns sub-ms timing.
   Flush drops scheduled events + all-notes-off. (Known future work: flush is
   whole-queue, not per-track — issues.md, relative-lead findings.)
-- **`kaijutsu-app/src/audio.rs` + `audio_sched.rs`** (R1+R5 landed
+- **`kaijutsu-app/src/audio.rs` + `audio_sched.rs`** (R1+R4+R5 landed
   2026-07-16) — `audio.rs` is pure dispatch: it computes each cue's
   epoch-backdated deadline at receipt (same ladder as midi.rs, collapsed to
-  go/no-go/when), resolves CAS payloads through `CasResolver`
-  (fetch-on-cue; R4 improves this), parses `CLIP_MIME` records and applies
-  their source range + gain, then hands everything to `audio_sched.rs` — a
+  go/no-go/when), resolves CAS payloads through `CasResolver`, warms the
+  cache ahead of time on a `PREPARE_MIME` cue (`PrefetchKind::Warm`), parses
+  `CLIP_MIME` records and applies their source range + gain, then hands
+  everything that clears R4's skip-loud gate to `audio_sched.rs` — a
   dedicated thread owning the rodio `OutputStream` with a deadline heap
   (decode-ahead, `Sink`-per-sound polyphony, flush drops pending + stops
   live). `bevy_audio` no longer plays anything (`AudioPlugin` disabled;
@@ -288,30 +288,47 @@ make it musical.
   a restart drops past clip cells from the in-memory committed log (the
   score context keeps them durably; clips carry `Skip`, so no fallback
   pool is affected).
-- **R4 — the prepare horizon** (two-phase, resolved 2026-07-02; mechanism
-  decided 2026-07-16): don't force one `lead` to be both jitter buffer and
-  bulk-I/O window. **The prepare signal is its own wire directive at commit
-  time** — the moment a clip cell validates+commits, the kernel publishes a
-  tiny prepare cue (its own mime, payload = the media hash) and every sink
-  warms its XDG cache; earliest possible signal, zero new record fields,
-  rides the seam exactly like the flush cue. The render cue at the crossing
-  is unchanged and carries only the short **fire** lead (~100 ms, sample
-  verified local). Late-fetch policy is **skip-loud** (resolved): log the
-  underrun and drop — never fire-late or stretch a transient. Decode runs
-  off a pool; if not ready by `lead − safety`, fire the fallback.
+- **R4 — the prepare horizon. ✅ landed 2026-07-16** (two-phase, resolved
+  2026-07-02; mechanism decided and built same day as R1–R3/R5): don't
+  force one `lead` to be both jitter buffer and bulk-I/O window. **The
+  prepare signal is its own wire directive at commit time**
+  (`kaijutsu_audio::PREPARE_MIME`) — the moment `schedule_clip_cell`
+  validates+commits a clip cell, the kernel publishes a tiny prepare cue
+  (payload = the media hash, `lead` ZERO, `epoch_ns` stamped) unconditionally
+  (a hash, no CAS read — nothing expensive to gate); every sink warms its
+  XDG cache (the app's `PrefetchKind::Warm`, logging "media warmed: N bytes
+  in Xms"). The render cue at the crossing is unchanged and carries only the
+  short **fire** lead. Late-fetch policy is **skip-loud**: a pure
+  `decide_deadline(deadline, stamped, now) -> Fire | DropLate`
+  (`audio_sched.rs`) drops a *musically-placed* cue (its `RenderCue` stamped
+  `epoch_ns`) whose media lands more than `GRACE` (100 ms — scheduler wakeup
+  slop, not fetch latency) past its backdated deadline — logged
+  (`kaijutsu_telemetry::record_stale_cue_dropped`, naming the hash and how
+  late) and never fired stale; an unstamped cue (`kj play --cas`'s asap
+  semantics) still fires however late, unchanged. Same slice hardened the
+  resolver transport (the live fanfare-clip failure, `docs/issues.md`): each
+  `CasResolver::resolve` attempt is bounded by a `FETCH_TIMEOUT` (10 s — a
+  generous transfer bound, distinct from the musical deadline above) via
+  `tokio::time::timeout`, folding a timeout into the same transport-error
+  bucket the existing one-redial retry already handles (now logged: "sftp
+  transport stale; redialing"); `resolve` itself now returns `(bytes,
+  ResolveSource)` — `Hit`/`Fetched`, surfaced rather than guessed from
+  timing — so the happy path logs "media resolved (cache hit|fetched) N
+  bytes in Xms", and `SftpClient::connect` logs "sftp session ready in
+  Xms".
 - **R5 — sample lead scheduling. ✅ landed 2026-07-16** (same merge; decided
   same day — Amy: "if we're going to pierce to rodio we should do that all
   the time"): the app owns rodio outright. `audio_sched.rs`'s dedicated
   thread holds the `OutputStream` + a deadline-ordered heap; play-now and
   scheduled/trimmed/gained playback are ONE path; timing lives below the
   frame loop (`recv_timeout`-as-sleep, `Sink`-per-sound). Bevy renders
-  everything *else* and no longer opens an audio device. **Interim
-  behavior, deliberately carried to R4**: a CAS resolve that outruns its
-  deadline fires *late* today — right for `kj play --cas` (asap
-  semantics), wrong for a musically-placed clip; R4's prepare horizon +
-  skip-loud gate owns the fix. Polish list: unify midi.rs `CUE_STALE_MAX`
-  with the scheduler's `REF_STALE_MAX` (same value, two names); full bevy
-  feature enumeration to stop compiling bevy_audio at all.
+  everything *else* and no longer opens an audio device. A CAS resolve that
+  outruns its deadline firing late (right for `kj play --cas`'s asap
+  semantics, wrong for a musically-placed clip) was carried as an interim
+  gap into R4, which closed it: `decide_deadline`'s skip-loud gate, above.
+  Polish list: unify midi.rs `CUE_STALE_MAX` with the scheduler's
+  `REF_STALE_MAX` (same value, two names); full bevy feature enumeration to
+  stop compiling bevy_audio at all.
 - **Slice 4 — the edge-node sink** (unchanged, later): headless `kj play` on
   a node with no app produces sound, emitted by the agent binary. Waits on
   the node-agent RPC model (M4).
