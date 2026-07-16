@@ -6,6 +6,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## ⬆ NEXT UP (Amy, 2026-07-16): MCP shell reply timeouts — replies lost while execution succeeds
+
+Bumped to next-in-queue after ongoing work closes. Long dismissed as "the
+stale-FlowBus quirk"; 2026-07-16's clip-arc sessions showed it's chronic,
+not a restart one-off:
+
+- **Symptom**: the MCP `shell` tool call times out (30s–300s, whatever the
+  client timeout) while the kernel executes the command fine — journal
+  shows `kaish returned code=0` within ~ms. The REPLY never reaches the MCP
+  client. Hit **~half of all calls** across two sessions today, both right
+  after kernel restarts AND tens of minutes later; a parallel session's
+  `kj rc list | grep` and `kj transport play` hit the same. Retries usually
+  work instantly; `/mcp` reconnect sometimes helps, sometimes unneeded.
+- **Operational workaround (today's law)**: never re-run a mutating command
+  on timeout — check `journalctl --user -u kaijutsu-server | grep "kaish
+  returned"` first; the kernel almost certainly ran it.
+- **Starting points**: the MCP server's shell reply path — how the exec
+  result travels back (ExecResult latch nonce → FlowBus subscription →
+  MCP response) and where a subscription goes stale or a reply races a
+  re-subscribe; `kaijutsu-server/src/rpc.rs` `shell_execute` reply routing;
+  whether the MCP session's FlowBus sub survives kernel restart vs gets
+  silently orphaned (`project_mcp_synceddocument_sync` fixed the *document*
+  sync path with a SyncedDocument+Notify rework in June — the shell reply
+  path may need the same treatment). The intermittency long after restart
+  says this is NOT just the restart-staleness case.
+
 ## Input: selection auto-copies to PRIMARY (seeded 2026-07-16, input rework)
 
 The other half of the xterm clipboard model (Ctrl+V + middle-click paste
