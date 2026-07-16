@@ -409,7 +409,7 @@ pub fn build_block_scenes(
                         &layout, &span_brushes, &fallback_brush, text_offset, atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
@@ -527,7 +527,7 @@ pub fn build_block_scenes(
                         atlas,
                     );
                     msdf_glyphs.glyphs = music_glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                 } else {
                     // No atlas yet (startup ordering) — fall back to the
@@ -578,7 +578,7 @@ pub fn build_block_scenes(
                         &parley_layout, &span_brushes, &fallback_brush, text_offset, atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
@@ -640,7 +640,7 @@ pub fn build_block_scenes(
                         &layout, &[], &text_brush, text_offset, atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }

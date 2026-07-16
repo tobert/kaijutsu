@@ -84,6 +84,14 @@ impl FontDataMap {
 #[derive(Component, Default)]
 pub struct MsdfBlockGlyphs {
     pub glyphs: Vec<PositionedGlyph>,
+    /// Monotonic re-render signal for the MSDF pass. Two writers bump it —
+    /// scene rebuilds (`build_block_scenes`) and glyph arrivals
+    /// (`poll_msdf_generator`) — and BOTH must advance it from its own
+    /// previous value (`wrapping_add(1)`), never derive it from another
+    /// counter. Deriving from `scene_version` once reset it below the
+    /// extract gate's `last_rendered` high-water mark after arrival bumps,
+    /// permanently silencing the composite for that block (staff-without-
+    /// glyphs bug, msdf-music live verify 2026-07-16).
     pub version: u64,
     pub rainbow: bool,
 }
