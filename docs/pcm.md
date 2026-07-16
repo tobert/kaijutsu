@@ -38,8 +38,9 @@ pub trait RenderSink: Send {
 
 - **Mime-keyed, content-agnostic.** ABC, a clip record, an inline sample —
   the sink dispatches on `mime`. The wire never carries raw decoded PCM;
-  decoding lives at the sink (Bevy decoders / Symphonia). `RenderCue::Debug`
-  prints payload byte *counts*, never bytes (log-safety, deliberate).
+  decoding lives at the sink (rodio decoders, Symphonia-backed features as
+  formats grow — R5 decision). `RenderCue::Debug` prints payload byte
+  *counts*, never bytes (log-safety, deliberate).
 - **Bytes never ride the track, big payloads never ride inline.** `Cas` is
   the primary payload; the sink resolves it from a local XDG CAS cache, miss
   → SFTP `/v/cas/<ab>/<hash>` → re-hash verify (`docs/slash-v.md` track B).
@@ -92,7 +93,8 @@ not a block — `matches_filter` bypasses it.
   off the Bevy main thread and plays on resolve. **This first cut is
   fetch-on-cue, and `lead` is honored only at ZERO** — the prepare horizon
   (R4) and real sample scheduling (R5) are the open half. A `CLIP_MIME` cue
-  warn+skips today (R1).
+  warn+skips today (R1). (Decided 2026-07-16: this whole path migrates off
+  `bevy_audio` onto an app-owned rodio output — R5.)
 - **Edge-node agent** (headless ALSA, the `midi.md` M4 node) — later, slice
   4 unchanged: Symphonia decode + `pawlsa`'s proven ALSA PCM loop
   (`~/src/pawlsa-mcp/src/alsa/playback.rs`; its `pw` graph-control surface
@@ -247,26 +249,40 @@ make it musical.
   — parse the record, resolve `media` through the existing `CasResolver`,
   apply `src_offset_ms`/`src_len_ms`/`gain_db`, play. Source range + gain
   need control below `AudioPlayer`'s spawn-and-forget (see decision 3).
-- **R2 — producer verb**: commit a clip cell to a track's score — cas-put
-  the media (or reference an existing hash), author the record through the
-  validator, commit at a tick. Verb shape is decision 1.
+- **R2 — producer verb: `kj play`, grown** (decided 2026-07-16, Amy — no
+  new noun; "clip" as a verb reads as audio clipping): bare `kj play` stays
+  play-now, unchanged; `--track <t>` commits a clip cell instead — cas-put
+  the media (or take `--cas`), author the record through the validator,
+  commit. `--at <tick>` places into the future; omitted, it defaults to
+  asap = the earliest barrier-safe tick ahead of the playhead. `label`
+  defaults to the file stem (`--label` overrides; `--cas` with no
+  derivable name requires it — labels are how the score reads).
 - **R3 — crossing mime pass-through** (`beat.rs publish_render_cues`): lift
   the `ABC_MIME` filter so any crossed cell's mime rides the cue; ABC keeps
   its inline pre-resolve, a clip cell's record is small enough to inline
   (the *media* stays CAS). Regression: non-ABC cells must not have been
   silently load-bearing anywhere.
-- **R4 — the prepare horizon** (two-phase, resolved 2026-07-02; restate on
-  the epoch substrate): don't force one `lead` to be both jitter buffer and
-  bulk-I/O window. A long **prepare** horizon (10–30 s — warm the sink's
-  cache when the cell becomes *known*) is separate from the short **fire**
-  lead (~100 ms, once the sample is verified local). Late-fetch policy is
-  **skip-loud** (resolved): log the underrun and drop — never fire-late or
-  stretch a transient. Decode runs off a pool; if not ready by `lead −
-  safety`, fire the fallback.
-- **R5 — sample lead scheduling**: Bevy's `AudioPlayer` has no scheduling
-  primitive (the named build risk — issues.md, relative-lead findings), so
-  honoring a non-zero `lead` for samples is net-new: delayed-spawn at ~16 ms
-  frame granularity, or pierce to the rodio `Sink`. Decision 3.
+- **R4 — the prepare horizon** (two-phase, resolved 2026-07-02; mechanism
+  decided 2026-07-16): don't force one `lead` to be both jitter buffer and
+  bulk-I/O window. **The prepare signal is its own wire directive at commit
+  time** — the moment a clip cell validates+commits, the kernel publishes a
+  tiny prepare cue (its own mime, payload = the media hash) and every sink
+  warms its XDG cache; earliest possible signal, zero new record fields,
+  rides the seam exactly like the flush cue. The render cue at the crossing
+  is unchanged and carries only the short **fire** lead (~100 ms, sample
+  verified local). Late-fetch policy is **skip-loud** (resolved): log the
+  underrun and drop — never fire-late or stretch a transient. Decode runs
+  off a pool; if not ready by `lead − safety`, fire the fallback.
+- **R5 — sample lead scheduling: the app owns rodio outright** (decided
+  2026-07-16; Amy: "if we're going to pierce to rodio we should do that all
+  the time"). Bevy's `AudioPlayer` has no scheduling primitive (the named
+  build risk — issues.md, relative-lead findings) and no source-range/gain
+  control either, so `bevy_audio` leaves the sink entirely: the app holds
+  its own rodio `OutputStream` + a scheduling thread; play-now and
+  scheduled/trimmed/gained playback are ONE path. Timing delegates below
+  the frame loop (sleep-until-deadline append), matching the MIDI path's
+  discipline — never frame granularity. Bevy renders everything *else*;
+  it no longer opens an audio device.
 - **Slice 4 — the edge-node sink** (unchanged, later): headless `kj play` on
   a node with no app produces sound, emitted by the agent binary. Waits on
   the node-agent RPC model (M4).
@@ -275,22 +291,23 @@ Adjacent prize (issues.md "Beat-tracking + local-model follow-ups"): once
 clips exist, `kj audio beats` runs on clip media and seeds a track's tempo
 from a reference recording.
 
-### Decisions open for the implementation session
+### Decisions — resolved 2026-07-16 (Amy + Claude), inlined above
 
-1. **Producer verb shape** — the thinnest part of the old design ("`kj play`
-   grows a `--at`/clip-emitting form" was one sentence). Candidates: a `kj
-   clip add <path|--cas> --track <t> --at <tick> --label …` verb vs growing
-   `kj play`; either way the flow is cas-put → validate → commit cell. Does
-   the musician path author clips in v1, or humans/verbs only?
-2. **`prepare_at` tick vs `prepare_lead` duration** on the cue/record — left
-   "(or)" in the 2026-07-02 design; pick one, stated on the epoch-stamped
-   substrate (a prepare horizon keyed to scheduled wallclock, not receipt).
-3. **Delayed-spawn vs rodio piercing** for R5 — note `src_offset`/`src_len`/
-   `gain_db` need rodio-level control *regardless* (R1), which leans the
-   whole question toward piercing once, for both.
+1. **Producer verb** → `kj play`, grown (R2). No new noun: "clip" as a verb
+   reads as audio *clipping*; the word stays record/cell vocabulary only.
+2. **Prepare signal** → its own wire directive at commit time (R4) — not a
+   `prepare_at`/`prepare_lead` record field; the record stays pure placement.
+3. **Sample scheduling** → don't pierce *sometimes* — the app audio sink
+   drops `bevy_audio` and owns rodio directly for ALL playback (R5): one
+   output stream, one path, trim + gain + timing together. Cargo
+   consequence: `kaijutsu-app` takes `rodio` as a direct dep and drops
+   Bevy's `audio`/`wav` features (default-features enumeration); watch for
+   a second rodio version riding in if any bevy feature still pulls it.
 4. **Standing law, carried**: two-phase horizons; skip-loud on late; 4 KiB
    inline threshold (provisional); snapshot `receipt` at parse time, before
-   any fetch, so fetch latency never folds into audio jitter.
+   any fetch, so fetch latency never folds into audio jitter. Musician
+   authorship of clips is v2 (needs the clip-MIME commit resolver, the
+   sibling of ABC's `cas_commit`).
 
 ## Distributed listening — later
 
@@ -323,7 +340,9 @@ pick up when listening goes multi-peer:
 - **R4:** a cache-cold multi-MB sample committed ahead of the playhead is
   fetched under the prepare horizon and fires on time; yanking the bytes
   late produces a logged skip, never a late fire.
-- **R5:** a non-zero-lead sample cue fires within a frame of its backdated
-  instant (BRP/log timestamps), matching the MIDI path's discipline.
+- **R5:** a non-zero-lead sample cue fires at its backdated instant with
+  jitter well under a frame (log/tap timestamps) — the rodio thread, not
+  the Bevy frame loop, owns the deadline. Plain `kj play` still sounds
+  (the play-now path survived the bevy_audio demolition).
 - **Slice 4:** headless `kj play` on a node with no app produces sound via
   the agent, never the kernel binary.
