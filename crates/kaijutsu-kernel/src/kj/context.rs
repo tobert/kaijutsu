@@ -117,6 +117,16 @@ enum ContextCommand {
         context: String,
         new_parent: String,
     },
+    /// Rename a context — set its label (default: current). Refuses a label
+    /// another context already holds; *moving* a label between contexts is
+    /// `retag` (latched).
+    Rename {
+        /// New label
+        name: String,
+        /// Context to rename (default: current)
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+    },
     /// Soft-delete a context (latched).
     Archive { context: String },
     /// Conclude a context — mark this work "done" (the time-well's hot→recent
@@ -342,6 +352,7 @@ impl KjDispatcher {
             ContextCommand::Set { .. }
                 | ContextCommand::Unset { .. }
                 | ContextCommand::Move { .. }
+                | ContextCommand::Rename { .. }
                 | ContextCommand::Archive { .. }
                 | ContextCommand::Remove { .. }
                 | ContextCommand::Retag { .. }
@@ -390,6 +401,9 @@ impl KjDispatcher {
             ContextCommand::Pause { context } => self.context_pause(&context, caller, true).await,
             ContextCommand::Resume { context } => self.context_pause(&context, caller, false).await,
             ContextCommand::Remove { context } => self.context_remove(&context, caller).await,
+            ContextCommand::Rename { name, context } => {
+                self.context_rename(&name, context.as_deref(), caller).await
+            }
             ContextCommand::Retag { label, context } => {
                 self.context_retag(&label, &context, caller).await
             }
@@ -1331,6 +1345,51 @@ impl KjDispatcher {
     }
 
     /// `kj context retag <label> <ctx>` — move a label to a different context (latched).
+    /// `kj context rename <name> [--context <ref>]` — set a context's label.
+    ///
+    /// DB-first (the UNIQUE constraint on `contexts.label` is the uniqueness
+    /// authority — `update_label` maps its violation to a typed "already in
+    /// use" error), then the drift router's live label index mirrors it. A
+    /// mirror failure after a successful persist is reported loudly rather
+    /// than swallowed; a kernel restart converges from the DB.
+    async fn context_rename(
+        &self,
+        name: &str,
+        ctx_ref: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let id = {
+            let db = self.kernel_db().lock();
+            match super::refs::resolve_context_arg(ctx_ref, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context rename: {e}")),
+            }
+        };
+
+        let old_label = {
+            let db = self.kernel_db().lock();
+            let old = db
+                .get_context(id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.label);
+            if let Err(e) = db.update_label(id, Some(name)) {
+                return KjResult::Err(format!("kj context rename: {e}"));
+            }
+            old
+        };
+
+        if let Err(e) = self.drift_router().write().rename(id, Some(name)) {
+            return KjResult::Err(format!(
+                "kj context rename: persisted to DB but the live label index \
+                 failed to update ({e}); a kernel restart will converge"
+            ));
+        }
+
+        let from = old_label.unwrap_or_else(|| id.short());
+        KjResult::ok(format!("renamed {from} → '{name}' ({})", id.short()))
+    }
+
     async fn context_retag(&self, label: &str, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         // Resolve the new holder and find old holder (single lock scope)
         let (new_holder_id, old_holder) = {
@@ -1981,6 +2040,82 @@ mod tests {
         let db = d.kernel_db().lock();
         let row = db.get_context(target).unwrap().unwrap();
         assert!(row.archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn context_rename_current_updates_db_and_drift_index() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("oldname"), None, principal);
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("rename"), s("newname")], &c)
+            .await;
+        assert!(result.is_ok(), "rename failed: {}", result.message());
+        assert!(result.message().contains("oldname"), "{}", result.message());
+        assert!(result.message().contains("newname"), "{}", result.message());
+
+        // DB is the authority.
+        {
+            let db = d.kernel_db().lock();
+            let row = db.get_context(ctx).unwrap().unwrap();
+            assert_eq!(row.label.as_deref(), Some("newname"));
+        }
+        // The live label index followed (the mirror the verb must not skip).
+        {
+            let router = d.drift_router().read();
+            let h = router.get(ctx).expect("still registered");
+            assert_eq!(h.label.as_deref(), Some("newname"));
+        }
+    }
+
+    #[tokio::test]
+    async fn context_rename_by_ref_and_resolves_after() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let home = register_context(&d, Some("home"), None, principal);
+        let _other = register_context(&d, Some("scratchpad"), None, principal);
+
+        let c = caller_with_context(home);
+        let result = d
+            .dispatch(
+                &[s("context"), s("rename"), s("workbench"), s("--context"), s("scratchpad")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "rename failed: {}", result.message());
+
+        // The new label resolves as a context ref end-to-end.
+        let info = d
+            .dispatch(&[s("context"), s("info"), s("workbench")], &c)
+            .await;
+        assert!(info.is_ok(), "info by new label failed: {}", info.message());
+    }
+
+    #[tokio::test]
+    async fn context_rename_refuses_taken_label() {
+        // Label-stealing is `retag`'s (latched) job — rename must refuse.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let a = register_context(&d, Some("alpha"), None, principal);
+        let _b = register_context(&d, Some("beta"), None, principal);
+
+        let c = caller_with_context(a);
+        let result = d
+            .dispatch(&[s("context"), s("rename"), s("beta")], &c)
+            .await;
+        assert!(!result.is_ok(), "rename onto a taken label must fail");
+        assert!(
+            result.message().contains("already in use"),
+            "msg: {}",
+            result.message()
+        );
+
+        // The original label survives the refused rename.
+        let db = d.kernel_db().lock();
+        let row = db.get_context(a).unwrap().unwrap();
+        assert_eq!(row.label.as_deref(), Some("alpha"));
     }
 
     #[tokio::test]
