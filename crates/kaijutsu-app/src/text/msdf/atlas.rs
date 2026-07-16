@@ -401,7 +401,16 @@ impl MsdfAtlas {
         }
 
         if let Some(image) = images.get_mut(&self.texture) {
-            image.data = Some(self.pixels.clone());
+            // Reuse the existing Vec allocation instead of a fresh
+            // `self.pixels.clone()` every dirty frame — the atlas texture is
+            // multi-MiB, and warmup dirties it often. `clone_from` handles a
+            // length mismatch correctly (e.g. right after `grow()` resized
+            // the image's buffer in place), just without discarding the
+            // buffer when the lengths already match.
+            match &mut image.data {
+                Some(existing) => existing.clone_from(&self.pixels),
+                none => *none = Some(self.pixels.clone()),
+            }
         }
 
         self.dirty = false;
@@ -692,5 +701,134 @@ mod tests {
 
         assert!(a.overlaps(&b), "a and b should overlap");
         assert!(!a.overlaps(&c), "a and c should not overlap");
+    }
+
+    // -- sync_to_gpu ---------------------------------------------------
+
+    /// The whole point of the fix: `sync_to_gpu` must reuse the existing
+    /// `image.data` allocation (`Vec::clone_from`) rather than replacing it
+    /// with a fresh `self.pixels.clone()` every dirty frame. A multi-MiB
+    /// atlas texture re-allocated on every dirty sync is real churn during
+    /// warmup. RED before the fix: `image.data = Some(self.pixels.clone())`
+    /// always allocates a new Vec, so `ptr_before` would never equal
+    /// `ptr_after`.
+    #[test]
+    fn sync_to_gpu_reuses_the_existing_data_allocation_not_a_fresh_one() {
+        let mut images = Assets::<Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
+        let key1 = GlyphKey::new(FontId::for_test(1), 0);
+        atlas.request(key1);
+        let data1 = vec![7u8; (8 * 8 * 4) as usize];
+        atlas
+            .insert(key1, 8, 8, 0.0, 0.0, &data1, &mut images)
+            .expect("fits in the initial atlas");
+        atlas.sync_to_gpu(&mut images);
+
+        let ptr_before = images
+            .get(&atlas.texture)
+            .unwrap()
+            .data
+            .as_ref()
+            .expect("image data present after first sync")
+            .as_ptr();
+
+        // Dirty the atlas again without changing its dimensions (a second
+        // glyph at the same atlas size) and sync a second time.
+        let key2 = GlyphKey::new(FontId::for_test(1), 1);
+        atlas.request(key2);
+        let data2 = vec![11u8; (8 * 8 * 4) as usize];
+        atlas
+            .insert(key2, 8, 8, 0.0, 0.0, &data2, &mut images)
+            .expect("fits in the initial atlas");
+        atlas.sync_to_gpu(&mut images);
+
+        let ptr_after = images
+            .get(&atlas.texture)
+            .unwrap()
+            .data
+            .as_ref()
+            .expect("image data present after second sync")
+            .as_ptr();
+
+        assert_eq!(
+            ptr_before, ptr_after,
+            "sync_to_gpu must reuse the existing Vec allocation (clone_from), \
+             not replace it with a fresh clone() on every dirty frame"
+        );
+    }
+
+    #[test]
+    fn sync_to_gpu_copies_current_pixels_and_clears_dirty() {
+        let mut images = Assets::<Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
+        let key = GlyphKey::new(FontId::for_test(1), 0);
+        atlas.request(key);
+        let data = vec![7u8; (8 * 8 * 4) as usize];
+        atlas
+            .insert(key, 8, 8, 0.0, 0.0, &data, &mut images)
+            .expect("fits");
+        assert!(atlas.dirty);
+
+        atlas.sync_to_gpu(&mut images);
+
+        assert!(!atlas.dirty);
+        let synced = images
+            .get(&atlas.texture)
+            .unwrap()
+            .data
+            .as_ref()
+            .expect("image data present after sync");
+        assert_eq!(
+            synced, &atlas.pixels,
+            "GPU-bound copy must match the CPU-side pixel buffer"
+        );
+    }
+
+    #[test]
+    fn sync_to_gpu_is_noop_when_not_dirty() {
+        let mut images = Assets::<Image>::default();
+        let atlas = MsdfAtlas::new(&mut images, 64, 64);
+        assert!(!atlas.dirty);
+
+        // If sync ran while not dirty it would stomp this sentinel — prove
+        // the early return actually skips the body.
+        if let Some(image) = images.get_mut(&atlas.texture) {
+            image.data = None;
+        }
+        let mut atlas = atlas;
+        atlas.sync_to_gpu(&mut images);
+
+        assert!(
+            images.get(&atlas.texture).unwrap().data.is_none(),
+            "sync_to_gpu must not touch image.data while `dirty` is false"
+        );
+    }
+
+    /// After a grow(), `Image::resize` keeps `image.data` as `Some(..)` (it
+    /// resizes the Vec in place, it does not clear it to `None`) but at a
+    /// different length than before. `clone_from` must still land the
+    /// correctly-sized, correctly-populated buffer.
+    #[test]
+    fn sync_to_gpu_after_growth_copies_the_resized_buffer_correctly() {
+        let mut images = Assets::<Image>::default();
+        let mut atlas = MsdfAtlas::new(&mut images, 64, 64).with_max_dim(128);
+        let key = GlyphKey::new(FontId::for_test(1), 0);
+        atlas.request(key);
+        let data = vec![9u8; (90 * 90 * 4) as usize];
+        atlas
+            .insert(key, 90, 90, 0.0, 0.0, &data, &mut images)
+            .expect("fits after growth");
+        assert_eq!(atlas.width, 128);
+
+        atlas.sync_to_gpu(&mut images);
+
+        let synced = images
+            .get(&atlas.texture)
+            .unwrap()
+            .data
+            .as_ref()
+            .expect("image data present after sync");
+        assert_eq!(synced.len(), (128 * 128 * 4) as usize);
+        assert_eq!(synced, &atlas.pixels);
     }
 }

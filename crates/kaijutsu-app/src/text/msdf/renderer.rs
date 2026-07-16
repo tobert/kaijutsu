@@ -11,7 +11,7 @@ use bevy::render::{
         binding_types::{sampler as sampler_binding, texture_2d, uniform_buffer},
         *,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::RenderDevice,
     texture::GpuImage,
 };
 use bytemuck::{Pod, Zeroable};
@@ -283,14 +283,15 @@ impl MsdfBlockRenderer {
         vertices
     }
 
-    /// Clear a block texture to transparent (no glyphs to render).
+    /// Encode a clear pass for a block texture into a shared `encoder`
+    /// (no submit — the caller batches all items for the frame into one
+    /// encoder and submits once).
     ///
     /// Used when glyphs transition from non-empty to empty — the render pass
     /// must still clear the texture to remove stale glyph pixels.
-    pub fn clear_texture(
+    pub fn encode_clear(
         &self,
-        device: &RenderDevice,
-        queue: &RenderQueue,
+        encoder: &mut CommandEncoder,
         gpu_images: &RenderAssets<GpuImage>,
         target_image: &Handle<Image>,
     ) -> bool {
@@ -298,10 +299,6 @@ impl MsdfBlockRenderer {
             warn_once!("MSDF clear: target GpuImage not ready");
             return false;
         };
-
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("msdf_block_clear_encoder"),
-        });
 
         {
             encoder.begin_render_pass(&RenderPassDescriptor {
@@ -322,15 +319,16 @@ impl MsdfBlockRenderer {
             // Pass drops immediately — no draw call needed, just clear.
         }
 
-        queue.submit([encoder.finish()]);
         true
     }
 
-    /// Render MSDF glyphs to a block texture via a render pass.
-    pub fn render_to_texture(
+    /// Encode an MSDF glyph render pass for a block texture into a shared
+    /// `encoder` (no submit — the caller batches all items for the frame
+    /// into one encoder and submits once).
+    pub fn encode_render(
         &self,
         device: &RenderDevice,
-        queue: &RenderQueue,
+        encoder: &mut CommandEncoder,
         pipeline_cache: &PipelineCache,
         gpu_images: &RenderAssets<GpuImage>,
         atlas_image: &Handle<Image>,
@@ -383,11 +381,6 @@ impl MsdfBlockRenderer {
             usage: BufferUsages::VERTEX,
         });
 
-        // Record render pass
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("msdf_block_encoder"),
-        });
-
         {
             let load_op = if clear {
                 LoadOp::Clear(Default::default())
@@ -417,7 +410,6 @@ impl MsdfBlockRenderer {
             render_pass.draw(0..vertices.len() as u32, 0..1);
         }
 
-        queue.submit([encoder.finish()]);
         true
     }
 }

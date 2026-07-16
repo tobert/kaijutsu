@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_asset::RenderAssets,
-    render_resource::PipelineCache,
+    render_resource::{CommandEncoder, CommandEncoderDescriptor, PipelineCache},
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
@@ -959,16 +959,26 @@ pub fn render_msdf_block_textures(
 
     let items: Vec<_> = msdf_data.items.drain(..).collect();
 
+    if items.is_empty() {
+        return;
+    }
+
+    // One encoder for the whole frame's worth of dirty blocks — document-load
+    // bursts can dirty dozens of blocks in a single frame, and each used to
+    // create its own CommandEncoder and its own `queue.submit`. Encoding
+    // every item into one encoder and submitting once collapses that to a
+    // single submit per frame (zero submits if nothing actually encoded).
+    let mut encoder: CommandEncoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("msdf_block_batch_encoder"),
+    });
+    let mut encoded_any = false;
+
     for item in items {
         if item.glyphs.is_empty() {
             // Glyphs went from non-empty to empty — clear stale pixels.
-            let cleared = msdf_renderer.clear_texture(
-                &device,
-                &queue,
-                &gpu_images,
-                &item.image_handle,
-            );
+            let cleared = msdf_renderer.encode_clear(&mut encoder, &gpu_images, &item.image_handle);
             if cleared {
+                encoded_any = true;
                 msdf_data.last_rendered.insert(item.image_handle.id(), item.version);
             }
             continue;
@@ -1009,9 +1019,9 @@ pub fn render_msdf_block_textures(
 
         // Clear if no Vello content (no border); composite if Vello drew borders first
         let clear = !item.has_vello_content;
-        let rendered = msdf_renderer.render_to_texture(
+        let rendered = msdf_renderer.encode_render(
             &device,
-            &queue,
+            &mut encoder,
             &pipeline_cache,
             &gpu_images,
             &msdf_atlas.texture,
@@ -1022,6 +1032,7 @@ pub fn render_msdf_block_textures(
         );
 
         if rendered {
+            encoded_any = true;
             msdf_data
                 .last_rendered
                 .insert(item.image_handle.id(), item.version);
@@ -1071,6 +1082,10 @@ pub fn render_msdf_block_textures(
                 );
             }
         }
+    }
+
+    if encoded_any {
+        queue.submit([encoder.finish()]);
     }
 }
 
