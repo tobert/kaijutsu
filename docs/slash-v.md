@@ -105,8 +105,8 @@ rest of the CAS surface (the crate, the store, `kj cas`) — no design change, s
 
 *Landed and live-verified 2026-07-02: `kj cas put` → SFTP fetch → hash-verified XDG
 cache → speakers. The driver was clips — a sink resolves a clip's `media` hash
-locally and pulls misses from the kernel under the prepare horizon (`docs/pcm.md`,
-`docs/clips.md`). No new RPC. The slice-by-slice execution plan (B0–B4) lives in git
+locally and pulls misses from the kernel under the prepare horizon
+(`docs/pcm.md`). No new RPC. The slice-by-slice execution plan (B0–B4) lives in git
 history; `docs/devlog.md` tells the story. The landed design:*
 
 **`CasFs`** (`crates/kaijutsu-kernel/src/vfs/backends/cas.rs`) — a read-only

@@ -184,7 +184,7 @@ the kernel stays what it always was — a durable orchestrator with no audio FFI
 
 **MIDI and samples become one path.** A render is a **mime-keyed symbolic cue**
 scheduled on the lead. The committed score stays symbolic (ABC / a clip record,
-`docs/clips.md`); what crosses to the sink is a small cue, never the score:
+`docs/pcm.md`); what crosses to the sink is a small cue, never the score:
 
 - **`RenderCue { mime, payload, lead }`** — `payload` is inline symbolic content
   or a CAS ref; `lead` is a *relative* `Duration` (a process-local `Instant`

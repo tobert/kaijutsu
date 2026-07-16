@@ -1,4 +1,4 @@
-//! Shape A clip record — placed media on a track (`docs/clips.md`).
+//! Shape A clip record — placed media on a track (`docs/pcm.md`).
 //!
 //! A **clip** is a placed media reference: a small, human/model-readable
 //! symbolic record ("play this CAS hash at this offset, at this gain") that a
@@ -16,7 +16,7 @@
 use kaijutsu_cas::{ContentHash, ContentStore};
 use serde::{Deserialize, Serialize};
 
-/// The clip record MIME (`docs/clips.md` Shape A). A [`crate::RenderCue`]
+/// The clip record MIME (`docs/pcm.md` Shape A). A [`crate::RenderCue`]
 /// carrying a clip sets this as its `mime`.
 pub const CLIP_MIME: &str = "application/vnd.kaijutsu.clip+json";
 
@@ -25,7 +25,7 @@ pub const CLIP_MIME: &str = "application/vnd.kaijutsu.clip+json";
 /// doesn't break goes in [`Clip::ext`]).
 pub const CLIP_VERSION: u32 = 1;
 
-/// A Shape A clip record (`docs/clips.md`). A small JSON object models author
+/// A Shape A clip record (`docs/pcm.md`). A small JSON object models author
 /// as text; `serde` round-trips it, kaish `jq`s it, and the app can render it
 /// as plain text until a clip renderer exists.
 ///
@@ -34,7 +34,7 @@ pub const CLIP_VERSION: u32 = 1;
 /// linear (`0.0` == unity). Tempo changes move *where* the clip starts in wall
 /// time (the `Tick` anchor follows the beat) but never its internal playback
 /// rate — no stretch/repitch in v1 (the `stretch` field name is reserved for
-/// Shape B). See `docs/clips.md` for the full rationale.
+/// Shape B). See `docs/pcm.md` for the full rationale.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     /// Record version (per-record, OTIO-style). Must equal [`CLIP_VERSION`].
@@ -42,7 +42,7 @@ pub struct Clip {
     /// The sample bytes, in CAS. REQUIRED. Note this is a *different* object at
     /// a different altitude from the cell's own content hash (the cell hashes
     /// the clip record; the record's `media` hashes the sample) — the two-level
-    /// reference of `docs/clips.md`.
+    /// reference of `docs/pcm.md`.
     pub media: ContentHash,
     /// What the sink decodes (an [`crate::AudioFormatHint`] source, e.g.
     /// `audio/wav`). REQUIRED, non-empty.

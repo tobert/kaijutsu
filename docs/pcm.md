@@ -1,396 +1,329 @@
-# PCM — playing samples through the audio render seam
+# Samples & clips — media on the mime-keyed render seam
 
-> **Status:** design direction, captured 2026-06-30 in a co-design session
-> (Amy + Claude); refreshed 2026-07-01 (harmonization pass). Decisions are
-> *directions*, not commitments — code is truth, this is where we're aiming.
-> **No code yet**, and nothing blocks it: `tracks.md` Stage 3 M1 (the
-> `RenderTarget` seam + `AlsaMidiOut`) landed 2026-06-30, which was this doc's
-> only prerequisite. Companions: `docs/midi.md` ("ALSA for MIDI, PipeWire for
-> samples"; output-first), `docs/tracks.md` (the `RenderTarget` seam this slots
-> into — Stage 3 §"The render-target seam"), `docs/chameleon.md` ("MIDI/sample
-> is a render of the score"). This doc also absorbed the surviving ideas from
-> `docs/playback.md` (retired 2026-07-01 — see "Distributed listening", below).
+> **Status:** as-built + the remaining design; aggressively rewritten
+> 2026-07-16, absorbing `docs/clips.md` (merged here whole; it and this doc's
+> earlier design generations — including the retired `docs/playback.md` — are
+> recoverable from git history). Code is truth: the wire cue, the app sinks,
+> and the clip record are **landed**; the open work is the clip *path* —
+> producer → track → sink — mapped in "The remaining work" below. Companions:
+> `docs/midi.md` ("Render is a wire cue" — the phase split; "The one
+> timebase" — the timing doctrine every cue rides), `docs/tracks.md`
+> (track/transport), `docs/hyoushigi.md` (the `Cell` substrate),
+> `docs/chameleon.md` (vocabulary: **clip** = placed media on a track, DAW
+> sense; "cue" stays chameleon's trap message), `docs/slash-v.md` (track B —
+> the `/v/cas` mount + client fetcher, landed), `docs/cue-prior-art.md` (the
+> seven-industry survey the clip record was synthesized from).
 
-## The insight
+## One seam, as built
 
-Sample playback is **not new machinery** — it is a second render sink alongside
-the MIDI-out one that **already landed**: `tracks.md` Stage 3 M1 shipped the
-`RenderTarget` trait + `AlsaMidiOut` + `add_render_target` (in
-`crates/kaijutsu-server/src/render.rs`, loopback-verified on zorak). `midi.md`
-already split the jobs: **MIDI → ALSA** (in-kernel timestamped queues, no graph
-tax), **audio samples → PipeWire** (the audio graph is the right home for PCM).
-This doc is the samples half, scoped down to the smallest thing that makes a
-sound: *the kernel decides to play a sample, and a sample plays.*
+MIDI and samples are one render path. The kernel decides *what/when*; a sink
+near the hardware does the physical emit. The kernel/server binary links no
+`alsa`/`pipewire`/`symphonia` — the in-process `AlsaMidiOut`/`RenderTarget`
+generation was demolished 2026-07-02 once the app sink proved parity.
 
-## Decisions (this co-design round)
-
-- **Abstract seam; the kernel process never emits audio.** Define an
-  `AudioRenderTarget` seam, but hardware emission lives **outside** the kernel
-  process — in a peripheral that speaks RPC. Implement the **app (Bevy) sink
-  first** (the dev loop already has a window + speakers); a **headless edge-node
-  agent** is the sibling for later (the loft Lenovo of `midi.md` — a node the
-  kernel *owns over RPC*, not the kernel binary linking ALSA/PipeWire). The
-  kernel orchestrates *what/when*; the node does the physical *emit*.
-- **A fixed WAV/PCM first.** The first sound is a known sample file, not a synth.
-  Prove the whole pipe end-to-end with zero music-rendering risk.
-- **Standalone before the track.** Build a minimal "the kernel makes a sound
-  happen" path now, *independent* of the `Track`/`RenderTarget` machinery. Fold
-  it into the track render seam once Stage 3 lands (it is the same shape).
-- **Don't reinvent decoding.** App uses Bevy's `wav` format feature now; grow
-  into more formats via **Symphonia** (rodio's Symphonia backend in `-app`;
-  Symphonia directly in the kernel sink). We never hand-roll a WAV parser.
-
-## Where audio lives (why both)
-
-`midi.md`: samples are "bridged locally on whichever node has the speakers." In
-the dev loop that node is **the app** (Amy at the GPU box over remote desktop) —
-`bevy_audio` is a few lines and the window is already there. For headless play,
-the home is a **separate edge-node agent**, *not* the kernel process: the kernel
-is the durable orchestrator and should stay free of audio/MIDI FFI, so hardware
-I/O is pushed to a peripheral that attaches over RPC. So: one seam, two *external*
-sinks (app, edge-node agent). App first because it is cheapest to a working sound;
-the edge-node agent reuses the proven ALSA-PCM path from `pawlsa` when we go
-headless. The kernel **crate** never links `alsa`/`pipewire`/`symphonia` — and after
-the M4 extraction ("The MIDI parallel", below) the server binary won't either;
-today `AlsaMidiOut`'s ALSA FFI lives in `kaijutsu-server`, acknowledged there.
-
-## The seam
-
-The landed `RenderTarget` (in `crates/kaijutsu-server/src/render.rs`) consumes a
-**committed score cell** + a local instant — perfect for slice 5, wrong for the
-standalone first slice, which has a *sample*, not a cell. So the standalone slice
-gets its own narrow seam, `AudioRenderTarget`, that converges onto `RenderTarget`
-when audio becomes a track render. Same posture as the MIDI one (a render is a
-*consumer*, never a producer; it receives resolved bytes + a local instant, never
-re-resolves CAS):
+What crosses the wire lives in the FFI-free `kaijutsu-audio` crate
+(`src/lib.rs` — no audio deps, no tokio, nothing kernel-ward):
 
 ```rust
-/// One audio sink. Implemented in the app (Bevy) and, later, the edge-node agent (ALSA).
-pub trait AudioRenderTarget: Send {
-    /// Play one sample. `at == None` means "now" (first slice); a scheduled
-    /// instant arrives with the track integration (speculation lead).
-    fn play(&self, sample: AudioRef, at: Option<Instant>) -> anyhow::Result<()>;
+pub struct RenderCue {
+    pub mime: String,        // dispatch key: audio/wav, text/vnd.abc, …clip+json
+    pub payload: CuePayload, // Inline(Vec<u8>) | Cas(ContentHash)
+    pub lead: Duration,      // sink fires at receipt + lead (ZERO = now)
+    pub epoch_ns: u64,       // sender wallclock at emission; 0 = unstamped
 }
-
-/// What crosses the wire / the seam. Encoded bytes + a format tag, or a CAS
-/// ref the sink resolves. Decoding lives at the sink (Bevy decoders / Symphonia)
-/// — the wire never carries raw PCM for the first slice.
-pub enum AudioRef {
-    Encoded { bytes: Vec<u8>, format: AudioFormatHint }, // small samples inline
-    Cas { hash: ContentHash, format: AudioFormatHint },  // larger: fetch from CAS
+pub trait RenderSink: Send {
+    fn emit(&self, cue: RenderCue) -> anyhow::Result<()>;
 }
 ```
 
-- **App impl — `BevyAudioOut`.** Turns `AudioRef` into a Bevy `AudioSource`
-  (Bevy's `wav` decoder now; Symphonia-backed formats later) and spawns an
-  `AudioPlayer`. Lives in `kaijutsu-app`.
-- **Edge-node agent impl — `AlsaPcmOut` (later).** Decode with **Symphonia** →
-  raw PCM → ALSA PCM out (PipeWire intercepts via its ALSA shim). Reuses
-  `pawlsa`'s playback loop. Lives in the node-agent binary — **not** the kernel.
+- **Mime-keyed, content-agnostic.** ABC, a clip record, an inline sample —
+  the sink dispatches on `mime`. The wire never carries raw decoded PCM;
+  decoding lives at the sink (Bevy decoders / Symphonia). `RenderCue::Debug`
+  prints payload byte *counts*, never bytes (log-safety, deliberate).
+- **Bytes never ride the track, big payloads never ride inline.** `Cas` is
+  the primary payload; the sink resolves it from a local XDG CAS cache, miss
+  → SFTP `/v/cas/<ab>/<hash>` → re-hash verify (`docs/slash-v.md` track B).
+  Inline is for symbolic content and tiny samples (threshold provisional at
+  4 KiB — revisit if it chafes).
+- **Timing rides the one timebase** (`docs/midi.md` — doctrine, not
+  folklore). `lead` is *relative* (an `Instant` can't cross the wire);
+  `epoch_ns` is the emission wallclock stamp, and the sink **backdates**:
+  lead is spent down by the cue's measured age on receipt, past events drop,
+  a >5 s-stale cue rejects whole (`midi.rs::backdate_events`). Cue `at`s
+  derive from the *scheduled* beat grid, never a wakeup wallclock.
+- **Flush is a cue.** `RENDER_FLUSH_MIME` with an empty payload — transport
+  stop/pause tells every sink to drop scheduled-not-played events and
+  silence sounding notes. The mime IS the message.
+- **`emit(&self)`, not `&mut self`, is deliberate.** The Bevy sink acts
+  through `Commands`; the ALSA sink's handle sits behind internal
+  mutability. Don't "fix" it.
 
-- **`play(&self)` vs `emit(&mut self)` is deliberate, not an oversight.** The
-  Bevy sink spawns entities via `Commands` (world access, not sink-struct
-  mutation) and the edge-node agent's ALSA handle lives behind internal
-  mutability — unlike `AlsaMidiOut`, which mutates its seq connection inline.
-  Don't "fix" the asymmetry.
-- **`AudioFormatHint` values align with Symphonia's codec set** (`Wav | Flac |
-  Mp3 | Ogg | Aac` to start); the wire MIME derives from it (`audio/wav`, …).
+The delivery path: kernel publishes `BlockFlow::RenderCue` on the FlowBus →
+both rpc bridges forward → `onRenderCue @13` (`kaijutsu.capnp`) → client
+forwarder emits `ServerEvent::RenderCue` → app systems. It's a directive,
+not a block — `matches_filter` bypasses it.
 
-The trait + `AudioRef` + format types live in the **`kaijutsu-audio` crate**
-(landed, slice 1), which is **FFI-free**: no `alsa`/`pipewire`/`symphonia`,
-no `tokio` (the trait's `at` is a `std::time::Instant`; sinks convert). Its
-dependency set is `kaijutsu-cas` (for `ContentHash`) — `kaijutsu-types` is
-allowed but not currently pulled (nothing in it needs it yet) — plus `anyhow`
-(the trait's `Result`) + `serde` (the wire/record derives); nothing
-kernel-ward, never `kaijutsu-hyoushigi`/`-kernel`/`-server`. The FFI deps live only in the
-consuming binaries (`kaijutsu-app`, the edge-node agent), so the kernel can
-depend on `kaijutsu-audio` for orchestration without ever linking a hardware
-library.
+### Producers (kernel side, today)
 
-### How it converges — the mime-keyed seam (decided 2026-07-01)
+- **`kj play <path>` / `kj play --cas <hash>`** (`kj/play.rs`) — play-now
+  (`lead == ZERO`); mime by extension sniff (`AudioFormatHint`) or from CAS
+  metadata. The standalone trigger and the debugging hammer.
+- **The materialize crossing** (`kaijutsu-server/src/beat.rs
+  publish_render_cues`) — for every cell that crossed the write barrier this
+  beat: resolve the source bytes from durable CAS *kernel-side*, compute a
+  jitter-free `at` off the scheduled grid (`base + (cell.start − playhead) ×
+  period`, clamped ≥ now), stamp ONE `now`/`epoch_ns` pair for the whole
+  batch, publish per cell. Subscriber-gated: a headless kernel with no sink
+  attached skips the CAS reads entirely (the score is still durable — only
+  the ephemeral render is skipped). **ABC-hardwired today**: `cref.mime !=
+  ABC_MIME → skip` (beat.rs:1768). Lifting that *is* the clip track path
+  (R3 below).
+- **Transport stop/pause** — the flush cue, ungated (cheap, must always land).
 
-The slice-5 fold-in is decided, and it is small: **the track's render seam
-becomes mime-keyed over symbolic content; bytes never ride the track.**
-`RenderTarget::emit(abc: &str, at)` grows a mime — `emit(content: &str, mime:
-&str, at)` — and targets register by MIME: `AlsaMidiOut` takes `text/vnd.abc`
-and behaves exactly as today; an audio target takes a **clip** MIME (a small
-symbolic cue: CAS hash + placement/params — "play `<hash>` at this tick, this
-gain"), parses it, resolves the hashes it names, and fires at `at`. A committed
-sample is therefore a *clip cell* — notation, like ABC — never inline audio
-bytes. The score stays symbolic ("hearing is symbolic," `docs/chameleon.md`),
-and this is the render-side twin of the mime-keyed `DeriverRegistry` and the
-decouple-Act-from-ABC axis: one generalization, both sides of the barrier.
-(Vocabulary: **"clip"** = a placed media reference on a track, DAW sense —
-"cue" stays reserved for chameleon's trap messages.)
+### Sinks (today the app; later an edge node)
 
-**Sample bytes move out-of-band, prefetched under the speculation lead.** Cells
-commit ahead of the playhead, so `emit` fires with `at` in the near future —
-that lead is the transfer budget. A sink checks a client-side CAS cache (XDG
-dir), pulls a miss over **SFTP against `/v/cas/<ab>/<hash>`** (the `/v/cas`
-CAS mount + the client fetcher/cache are designed in `docs/slash-v.md` track B —
-the mount does **not** exist yet; SFTP already speaks the VFS, so it's zero new
-RPC, and sshfs is the prototyping path), and fires on time. Same constraint-remover as MIDI output:
-the network delivers *ahead of time*, never just-in-time. Consequence for the
-wire type above: `AudioRef::Cas` + the client cache is the primary path even in
-the standalone slices; `Encoded` inline bytes shrink to a tiny-sample
-convenience. Late-fetch behavior (skip loud vs fire late) is decided at the
-first real sink — the fallback machinery is the natural hook.
+- **`kaijutsu-app/src/midi.rs`** — `text/vnd.abc`: renders ABC→MIDI *at the
+  sink* (`kaijutsu_abc::midi::events`) and schedules into a local ALSA seq
+  port at the backdated `receipt + lead`; ALSA's queue owns sub-ms timing.
+  Flush drops scheduled events + all-notes-off. (Known future work: flush is
+  whole-queue, not per-track — issues.md, relative-lead findings.)
+- **`kaijutsu-app/src/audio.rs`** — `audio/*`: `Inline` spawns an
+  `AudioPlayer` now (play-now parity); `Cas` resolves through `CasResolver`
+  off the Bevy main thread and plays on resolve. **This first cut is
+  fetch-on-cue, and `lead` is honored only at ZERO** — the prepare horizon
+  (R4) and real sample scheduling (R5) are the open half. A `CLIP_MIME` cue
+  warn+skips today (R1).
+- **Edge-node agent** (headless ALSA, the `midi.md` M4 node) — later, slice
+  4 unchanged: Symphonia decode + `pawlsa`'s proven ALSA PCM loop
+  (`~/src/pawlsa-mcp/src/alsa/playback.rs`; its `pw` graph-control surface
+  is the later routing/volume story). `alsa = 0.11` / `pipewire = 0.9` /
+  `symphonia` land in the agent binary, never the kernel. Prerequisite: the
+  node-agent RPC model (exists only by analogy).
 
-The **clip payload is designed: `docs/clips.md`** (Shape A —
-`application/vnd.kaijutsu.clip+json`: media hash + mime + required label +
-source range + gain, versioned record + extension bag), synthesized from the
-industry survey in `docs/cue-prior-art.md`. The *code* still lands with its
-first consumer (slice 5); the schema, validation rules, tempo-change default,
-and growth path (stretch policy → Shape B; late-bound cues = Shape C
-resolvers) are locked there so the session starts from a map.
+## Shipped ledger
 
-**The seam is a wire cue, and MIDI joins it (decided 2026-07-01).** The
-convergence above is realized not as a mime growing on the *in-process*
-`RenderTarget::emit` but as a **`RenderCue { mime, payload, lead }` directive
-that crosses the wire to an off-box sink** — because the same real-time stance
-that lets a sample prefetch under the lead also says MIDI's hardware emit never
-needed to be in-process. So this is no longer "the samples half": **MIDI and
-samples are one render path**, both mime-keyed cues on the lead, and the
-in-process `RenderTarget` trait (`tracks.md`) dissolves into the wire cue as the
-sink moves to the app (now) and an edge node (later). The full statement — the
-`RenderCue` shape, the compose/render/emit phase split (with `abc→midi` staying
-kernel-side for now), and why MIDI becomes sink-dependent — lives in
-`docs/midi.md` "Render is a wire cue; the sink owns the hardware." This doc's
-slices below are the samples-shaped view of that one seam.
+Details in git history + devlog ("The music stack — from one loop to a band
+on the wire"; "The beat learns to carry its own clock").
 
-## Reusable code from `~/src/pawlsa-mcp`
+- **Slices 1–3** (June 30 – July 1): `kaijutsu-audio` crate, wire directive,
+  app sink — `kj play <wav>` heard live.
+- **5a** (July 2): the play-now `PlayAudio` pair replaced by the mime-keyed
+  wire `RenderCue`; `AudioFormatHint` off the wire (mime is free text).
+- **5b** (July 2): the Shape A `Clip` record + validator (below) — landed,
+  tested, awaiting its consumer.
+- **5c** (July 2): the app became the first MIDI sink; parity proven on a
+  real musician track; server-side `AlsaMidiOut` + `RenderTarget` trait +
+  `kj transport render` + the server `alsa` dep **demolished**. CAS-audio
+  fetch-on-cue prefetch landed same day (track B B4).
+- **Phase-align** (July 15): `RenderCue.epoch_ns` + sink backdating + the
+  stale ladder; the kernel grid went scheduled-periodic. Verified: 400
+  click↔bass pairs, mean +0.2 ms, no drift.
 
-- `src/alsa/playback.rs` — ALSA PCM open + write loop (`alsa` crate 0.11). The
-  edge-node sink's output stage. (Its hand-rolled `parse_wav` we **replace with
-  Symphonia** per the decoding decision. It's a blocking loop — confirm
-  threading when extracting; it runs beside the agent's RPC runtime.)
-- `src/pw/mod.rs` — `spawn_pw_thread`/`PwHandle`: link create/destroy, node
-  volume/mute, device profile/route via SPA pods (`pipewire` crate 0.9). **Not
-  needed for the first sound**; this is the later routing/volume control surface.
-- Deps to pull when the edge-node sink lands: `alsa = "0.11"`, `pipewire = "0.9"`,
-  `symphonia` (decode). These land in the agent binary, never the kernel.
+## The clip record — Shape A
 
-## The wire (standalone first)
+**A clip is a placed media reference on a track**: a committed hyoushigi
+cell whose content is a small, human/model-readable symbolic record — "play
+this CAS hash, from this offset, at this gain." The cell owns *where in
+musical time* (`Cell.span`); the payload owns *what media and how to render
+it*; the transport owns *when proposals fire* (quantization, follows); the
+sink owns *making it sound*. Models author clip records as text, the same
+way they author ABC.
 
-The kernel→app push channel already exists: `BlockEvents` (server→client
-subscription) carries `KernelOutputEvent` via the `on_output` callback, consumed
-by `BlockEventsForwarder` in `crates/kaijutsu-client/src/subscriptions.rs`.
+**Landed** (`kaijutsu-audio/src/clip.rs`): `Clip`, `CLIP_MIME =
+application/vnd.kaijutsu.clip+json`, `Clip::parse` /
+`Clip::parse_validated`, `ClipError` — pure data, FFI-free, tested. **No
+consumer yet**; that's R1–R3.
 
-- **Add an audio-play directive** as a sibling event on that channel — a new
-  `BlockEvents` callback method, **not** `KernelOutput` (that interface is keyed
-  by `execId` and carries shell stdout/stderr; wrong semantic domain) — carrying
-  `AudioRef`: a `Cas` ref as the primary form (the client cache fetches — see
-  "How it converges"), `Encoded` inline only for tiny samples. Schema in
-  `kaijutsu.capnp`.
-- **Trigger:** a `kj` subcommand (e.g. `kj play <path|asset>`) — kernel resolves
-  the sample (VFS path or CAS asset) and calls the active `AudioRenderTarget`.
-  With the app as the home, "call the target" == "emit the directive over the
-  client channel"; the app's `BevyAudioOut` is the target on the far side.
-- **App side:** the forwarder pushes the directive into the Bevy world over the
-  existing client→app bridge; a Bevy system (`MessageReader<PlayAudio>` — Bevy
-  0.18 `Message`, not `Event`) loads the bytes as an `AudioSource` and spawns an
-  `AudioPlayer`.
+### `Cell` stays untouched — the mapping
 
-## Bevy 0.18 audio specifics
+The `cue-prior-art.md` survey found every industry re-inventing the same six
+field clusters. They map onto what exists without touching the substrate
+(expanding `Cell` would break hyoushigi's founding rule — a new modality
+never edits the substrate):
 
-- `kaijutsu-app` enables Bevy `"default"` features. **Checklist item RESOLVED
-  (2026-07-01):** `AudioPlugin` *is* in the plugin set — `default` → `audio =
-  ["bevy_audio", "vorbis"]` → `bevy_audio` (verified against `~/src/bevy`
-  Cargo.toml), and `main.rs` uses `DefaultPlugins` disabling only `LogPlugin`,
-  so no plugin-group work is needed. **But the only decoder `default` turns on
-  is `vorbis` (Ogg) — `wav` is NOT enabled**, so slice 3 MUST add `"wav"` to
-  `crates/kaijutsu-app/Cargo.toml`'s bevy features (`["default", "bevy_ui_debug",
-  "wav"]`) or a WAV `AudioSource` won't decode. (`AudioPlayer` component +
-  `AudioSource` asset + `AudioSink`; remember 0.18's `Message`/`MessageReader`/
-  `MessageWriter` rename, per CLAUDE.md.)
-- **Symphonia later:** rodio (under `bevy_audio`) has a Symphonia backend; enable
-  the corresponding Bevy/rodio format features (FLAC/MP3/OGG/AAC) when we want
-  them in `-app`. Same crate (`symphonia`) is the kernel sink's decoder.
+| Convergent cluster | Where it lives | Status |
+|---|---|---|
+| identity | `BlockId` at materialization; `Cell.played_by` + `Cell.track` | exists |
+| temporal anchor + duration | `Cell.span` — the *timeline placement* | exists |
+| media reference | the payload's `media` hash | landed |
+| trigger / advance rule | transport/producers, resolved at fire time — never the committed record | exists |
+| param envelope | the payload's baked params (`gain_db`; fades/env are Shape B); *live* params are Shape C resolver territory | landed |
+| human label | the payload's **required** `label` | landed |
 
-## Slices
+The survey's strongest lesson holds: **timeline placement and source range
+are separate concerns** (EDL's four timecodes, OTIO's `source_range`).
+`Cell.span` is placement; `src_offset_ms`/`src_len_ms` are source range; the
+payload never repeats the tick.
 
-1. **Seam + types. ✅ landed.** `AudioRenderTarget` trait + `AudioRef`/`AudioFormatHint`
-   in the new **FFI-free `kaijutsu-audio` crate**. No platform code, no audio deps —
-   the kernel depends on this for orchestration; sinks live in their binaries.
-   `AudioFormatHint` carries the `mime()`/`from_mime()`/`from_path_extension()`
-   round-trip (the wire MIME + `kj play` extension sniff). 7 tests green.
-2. **Wire the directive. ✅ landed.** New `BlockEvents.onPlayAudio @13` in
-   `kaijutsu.capnp` (+ wire `AudioRef` union encoded|casHash + `AudioFormatHint`
-   enum); the directive rides a new `BlockFlow::PlayAudio` on the in-process
-   **FlowBus** (not a client-callback list) — both `rpc.rs` bridges forward it,
-   `matches_filter` bypasses it (a directive, not a filterable block). Client
-   forwarder `on_play_audio` → `ServerEvent::PlayAudio` in `subscriptions.rs`;
-   `kj play <path>` resolves a sample (sniff-before-read, fail loud) and emits it.
-3. **App sink. ✅ landed + live-verified.** `crates/kaijutsu-app/src/audio.rs`
-   (`AudioOutPlugin` + a `MessageReader<ServerEventMessage>` system → `AudioSource`
-   + `AudioPlayer`/`PlaybackSettings::DESPAWN`); added the `wav` feature. **Verified
-   live on the runner box (2026-07-01):** `kj play pawlsa-test.wav` → "209850 bytes,
-   audio/wav — 2 listener(s)"; BRP `world_query` caught the spawned entity
-   (`PlaybackSettings{ mode: Despawn }` — `AudioPlayer<AudioSource>` is a generic,
-   so not reflection-registered; query `PlaybackSettings` instead). Audible-sound
-   confirmation: Amy (speakers on the Wayland box).
-4. **(later) Edge-node agent sink.** A new peripheral binary (the `midi.md`
-   "first kernel-owned compute node") attaches over RPC and runs `AlsaPcmOut` —
-   Symphonia decode + `pawlsa`'s ALSA PCM loop; headless play with no GUI. The
-   `alsa`/`pipewire`/`symphonia` deps live *here*, never in the kernel. Two
-   flagged reconciliations for this slice: the **node-agent RPC model** is a
-   named prerequisite (see `midi.md` M4 — it exists only by analogy today), and
-   the **`alsa` crate version** (pawlsa rides `0.11`; the in-tree M1 target
-   rides `0.9` via bevy/cpal).
-5. **Fold into the Track — the wire `RenderCue` (see "How it converges" +
-   `midi.md` "Render is a wire cue").** This is the unified render seam, and it
-   subsumes MIDI. Natural sub-slices, each landing buildable:
-   - **5a — the cue seam. ✅ landed.** The play-now `PlayAudio`/`AudioRef` pair
-     was replaced outright by a mime-keyed `RenderCue { mime, payload:
-     Inline | Cas, lead }` in `kaijutsu-audio`, over the FlowBus/`BlockEvents`
-     (`onPlayAudio@13` → `onRenderCue@13`; the `AudioFormatHint` *wire* enum
-     dropped — `mime` is free Text, so the wire is content-agnostic). `lead` is
-     a relative `Duration` (nanos on the wire; a process-local `Instant` can't
-     cross it); the sink schedules at `receipt + lead`. `kj play` stays play-now
-     (`lead == ZERO`) with an inline payload; the app sink dispatches by mime
-     (inline `audio/*` plays, CAS + non-audio warn+skip = 5c). `AudioFormatHint`
-     survives as the kj-play extension→MIME sniff helper (off the wire); the
-     FFI-free trait is now `RenderSink::emit(&self, RenderCue)`.
-   - **5b — the clip record + validator. ✅ landed.** Shape A
-     (`docs/clips.md`) `Clip` record + the content-type-keyed validator in
-     `kaijutsu-audio` (pure data, FFI-free). `Clip::parse` is structural (v
-     known, label/mime non-empty, media a well-formed hash);
-     `Clip::parse_validated(json, &dyn ContentStore)` adds "media present in
-     CAS" (fail loud at schedule) — the presence check lives here because
-     `ContentStore::exists` is a pure trait boundary, keeping it unit-testable
-     against a stub. (Code is truth: `ContentHash` is serde-transparent and
-     does NOT validate on deserialize — well-formedness is checked explicitly;
-     and a hash is 32 hex chars — clips.md corrected 2026-07-02.)
-   - **5c — the MIDI sink + demolition. ✅ landed (2026-07-02, live on zorak).**
-     The app is the first MIDI sink: it renders `text/vnd.abc` cues to MIDI (same
-     `kaijutsu_abc::midi::events` path — the app already deps `kaijutsu-abc`, so
-     render-at-sink beat shipping SMF) and schedules into a local ALSA seq port at
-     `receipt + lead`; `kj play *.abc` is the standalone trigger (5c-1). The
-     materialize crossing publishes a `RenderCue` per crossed cell (keyed by the
-     track's score context) + a `RENDER_FLUSH_MIME` cue on stop/pause, so a real
-     musician track plays through the app with **no** in-process target (5c-2).
-     With parity proven, the server-side `AlsaMidiOut` + `RenderTarget` trait +
-     `kj transport render` verb + the `alsa` server dep were demolished — the
-     kernel/server binary links no audio/MIDI FFI (5c-3). **CAS-audio prefetch
-     landed 2026-07-02 (track B B4):** a `CuePayload::Cas` `audio/*` cue in the
-     app sink (`kaijutsu-app/src/audio.rs`) now resolves `media` through a
-     `BlobResolver` (XDG CAS cache, miss → SFTP `/v/cas/<ab>/<hash>`, re-hash
-     verify) off a dedicated tokio runtime — kept off the RPC actor's `!Send`
-     current-thread world — and plays the resolved bytes; the `/v/cas` mount +
-     `BlobResolver` are `docs/slash-v.md` track B (landed + live-verified). This
-     first cut is **fetch-on-cue**. **Still ahead in 5c:** the *clip-record* path
-     (parse+validate the Shape A `Clip`, then resolve its `media` hash — the
-     audio path above handles the bytes once parsed), firing under the two-phase
-     **prepare horizon** (warm the cache when a cell becomes known) with precise
-     `lead` scheduling rather than on-cue; and the headless edge-node sink
-     (slice 4 / `midi.md` M4) so a kernel with no app can still make sound.
-   The `abc→midi` render stays kernel-side for now (a relocatable phase — see the
-   three-phase split in `midi.md`); an ABC-consuming sampler ("NoteOn → pick
-   sample → play") is a later mime on the same seam (`midi.md` "samples-with-MIDI").
+**The two-level reference:** the cell's `ContentRef` hashes the *clip record
+itself* (immutability anchor + memoization key); the record's `media` field
+hashes the *sample bytes*. Both CAS, different objects at different
+altitudes.
 
-## The MIDI parallel — now the plan, not a later refactor (2026-07-01)
+### The schema (code is truth: `clip.rs`)
 
-The same principle — *the kernel process owns no hardware FFI* — applies to MIDI,
-which **already shipped in-process**: `AlsaMidiOut` lives in
-`crates/kaijutsu-server/src/render.rs` (M1, loopback-verified on zorak). We
-**committed to converging them** (2026-07-01, with the real-time stance in
-`docs/midi.md`): MIDI's ALSA-seq emission moves off the server binary onto the
-**same wire sink** samples use, so the kernel/server binary stops linking `alsa`
-and MIDI and PCM ride one `RenderCue`. The speculation-lead scheduling
-(`last_fire_scheduled`/jitter-free `at`) travels with it as a *relative lead* the
-sink re-anchors — exactly `midi.md`'s "the node near the gear regenerates fine
-timing."
+```jsonc
+{
+  "v": 1,                          // record version (per-record, OTIO-style)
+  "media": "<32-hex ContentHash>", // REQUIRED — the sample bytes, in CAS
+  "mime": "audio/wav",             // REQUIRED — what the sink decodes
+  "label": "rimshot, dry",         // REQUIRED, non-empty — hashes are opaque;
+                                   //   the label is how the score reads
+  "src_offset_ms": 0,              // optional, default 0
+  "src_len_ms": null,              // optional, default to-end
+  "gain_db": 0.0,                  // optional, default 0.0 — dB, NOT linear
+  "ext": {}                        // extension bag — unknown keys survive round-trips
+}
+```
 
-The unlock that de-risked it: **the app is the first MIDI sink, so this did NOT
-wait on the M4 edge node.** This **landed 2026-07-02 (slice 5c)**, live on zorak:
-the app renders `text/vnd.abc` cues to MIDI into a local ALSA seq port (→
-`aconnect` → TiMidity, same box), the materialize crossing publishes the cues
-side-by-side with the in-process target, parity was verified on a real musician
-track, and then the server-side `AlsaMidiOut` + `RenderTarget` trait + the `alsa`
-server dep were demolished. The edge-node agent becomes *just another sink* on
-the same protocol — the headless sink for MIDI and PCM alike — still ahead
-(slice 4 / M4). Full design + phase split: `docs/midi.md` "Render is a wire cue."
+Decisions stated out loud (silent answers breed complaints — the
+Reaper/Ableton lesson):
 
-## Distributed listening — later (absorbs `playback.md`, retired 2026-07-01)
+- **Media-internal time is integer milliseconds.** Source range is
+  wall-time-domain, not musical; floats invite fuzz; sub-ms trims are out of
+  scope at this altitude.
+- **Gain is dB** (`0.0` = unity). Consoles, Wwise, and humans speak dB.
+- **Tempo-change default:** a clip is anchored to its `Tick` — a tempo change
+  moves *where the clip starts in wall time*, never its internal playback
+  rate. No stretch/repitch in v1; the `stretch` field name is **reserved**
+  for Shape B.
+- **Span vs source range precedence:** playback is governed by the source
+  range, in full; `Cell.span.len` is the clip's advisory *musical footprint*
+  (windowed reads, `KJ_HEARD`), not a truncation gate. Stopping sound early
+  is the transport's job (the flush cue), not the record's.
 
-`docs/playback.md` (2026-06-10, git history) designed multi-listener playback
-before the track/`RenderTarget` architecture existed. Its *mechanism* decisions
-are superseded: scheduling rides the materialize crossing and kernel-push render
-targets now, not sink-side block subscription + CAS prefetch; and its
-pause=mute / stop=clock-freeze **verb remap never happened** — `tracks.md`
-Stage 1 decided transport differently (`stop` stops the track's clock with
-rotation suspended; both `stop` and `pause` flush render targets). A sink-side
-mute would be *new, presentation-only* state, not a remap of `pause`. What
-survives, to pick up when listening goes multi-peer:
+### Validation — landed, fail loud
+
+`Clip::parse` is structural: `v` known, `label`/`mime` non-empty; `media`
+well-formedness is enforced by `ContentHash`'s validating deserialize (CAS
+B0), so a malformed hash fails at parse. `Clip::parse_validated(json,
+&dyn ContentStore)` adds **media present in CAS** — an absent sample fails
+at schedule time, loudly, not two phrases later at prefetch. Unknown `ext`
+keys pass through untouched.
+
+### Fallback semantics
+
+Same required `Fallback` as any recipe. `UseLastGood` on a clip lane repeats
+the lane's last committed *clip record* — symbolic, cheap, media already in
+every sink's cache from the first play (the vamp insurance carries over from
+ABC unchanged). Fresh-lane default: `Skip` — silence until the first good
+clip, matching the locked chameleon default.
+
+### Growth path
+
+- **Shape A → B, field-by-field, each with its consuming renderer:**
+  `stretch` policy first, then loop braces, fades, clip-local envelopes;
+  `color`/`notes` for the human cluster.
+- **Shape C is a resolver milestone, not a payload change** — its output is
+  Shape A (TTS, name→hash cue-sheet lookup, switch-like selection; the cue
+  sheet is ordinary committed/config state). Gated on hyoushigi's reactive
+  `compute_basis` open question.
+- **Automation lanes stay separate cells** with an automation MIME on the
+  same timeline — a clip's `ext`/`env` never grows into a second automation
+  system.
+- **An ABC-consuming sampler** ("NoteOn → pick sample → play") is a later
+  mime on this same seam (`docs/midi.md` "samples-with-MIDI").
+
+## How a clip plays — the target end-to-end
+
+1. A producer commits a clip cell *through the validator* (model turn or the
+   clip verb — R2). `parse_validated` runs at commit/schedule: absent media
+   fails loud here.
+2. The cell crosses the write barrier at the beat; the crossing publishes
+   `RenderCue { CLIP_MIME, payload, lead, epoch_ns }` exactly as it does ABC
+   — once R3 lifts the ABC-hardwire.
+3. The sink parses the record, resolves `media` from its XDG cache (warm
+   from the prepare horizon — R4), applies source range + gain, and fires at
+   the backdated instant (R5).
+4. Transport stop/pause flushes scheduled clips exactly as MIDI. No deriver
+   is involved — a clip renders directly; there is no barrier-side sibling.
+
+## The remaining work — the map
+
+Ordered; each lands buildable. R1–R3 are the clip path end-to-end; R4–R5
+make it musical.
+
+- **R1 — sink clip path** (`kaijutsu-app/src/audio.rs`): handle `CLIP_MIME`
+  — parse the record, resolve `media` through the existing `CasResolver`,
+  apply `src_offset_ms`/`src_len_ms`/`gain_db`, play. Source range + gain
+  need control below `AudioPlayer`'s spawn-and-forget (see decision 3).
+- **R2 — producer verb**: commit a clip cell to a track's score — cas-put
+  the media (or reference an existing hash), author the record through the
+  validator, commit at a tick. Verb shape is decision 1.
+- **R3 — crossing mime pass-through** (`beat.rs publish_render_cues`): lift
+  the `ABC_MIME` filter so any crossed cell's mime rides the cue; ABC keeps
+  its inline pre-resolve, a clip cell's record is small enough to inline
+  (the *media* stays CAS). Regression: non-ABC cells must not have been
+  silently load-bearing anywhere.
+- **R4 — the prepare horizon** (two-phase, resolved 2026-07-02; restate on
+  the epoch substrate): don't force one `lead` to be both jitter buffer and
+  bulk-I/O window. A long **prepare** horizon (10–30 s — warm the sink's
+  cache when the cell becomes *known*) is separate from the short **fire**
+  lead (~100 ms, once the sample is verified local). Late-fetch policy is
+  **skip-loud** (resolved): log the underrun and drop — never fire-late or
+  stretch a transient. Decode runs off a pool; if not ready by `lead −
+  safety`, fire the fallback.
+- **R5 — sample lead scheduling**: Bevy's `AudioPlayer` has no scheduling
+  primitive (the named build risk — issues.md, relative-lead findings), so
+  honoring a non-zero `lead` for samples is net-new: delayed-spawn at ~16 ms
+  frame granularity, or pierce to the rodio `Sink`. Decision 3.
+- **Slice 4 — the edge-node sink** (unchanged, later): headless `kj play` on
+  a node with no app produces sound, emitted by the agent binary. Waits on
+  the node-agent RPC model (M4).
+
+Adjacent prize (issues.md "Beat-tracking + local-model follow-ups"): once
+clips exist, `kj audio beats` runs on clip media and seeds a track's tempo
+from a reference recording.
+
+### Decisions open for the implementation session
+
+1. **Producer verb shape** — the thinnest part of the old design ("`kj play`
+   grows a `--at`/clip-emitting form" was one sentence). Candidates: a `kj
+   clip add <path|--cas> --track <t> --at <tick> --label …` verb vs growing
+   `kj play`; either way the flow is cas-put → validate → commit cell. Does
+   the musician path author clips in v1, or humans/verbs only?
+2. **`prepare_at` tick vs `prepare_lead` duration** on the cue/record — left
+   "(or)" in the 2026-07-02 design; pick one, stated on the epoch-stamped
+   substrate (a prepare horizon keyed to scheduled wallclock, not receipt).
+3. **Delayed-spawn vs rodio piercing** for R5 — note `src_offset`/`src_len`/
+   `gain_db` need rodio-level control *regardless* (R1), which leans the
+   whole question toward piercing once, for both.
+4. **Standing law, carried**: two-phase horizons; skip-loud on late; 4 KiB
+   inline threshold (provisional); snapshot `receipt` at parse time, before
+   any fetch, so fetch latency never folds into audio jitter.
+
+## Distributed listening — later
+
+Survivors of the retired `playback.md` (2026-06-10 → retired 2026-07-01), to
+pick up when listening goes multi-peer:
 
 - **Every attached listener hears playback on their own output** — shared
-  listening = shared context. The app sink (slice 3) is the first voice; N
-  peer sinks is the generalization, and the kernel (headless systemd service)
-  still never needs an audio stack.
-- **Peer capability advertisement.** `PeerConfig` is nick-only today; attach
-  grows a *general* capabilities bag (accepted formats, optional latency
-  estimate) so the kernel knows which sinks take `audio/midi` vs PCM. Keep the
-  slot generic — rendering surfaces will want it too.
-- **A capnp transport surface** (app buttons / spacebar) — subscribable
-  transport state beyond `kj transport`. Also on `hyoushigi.md`'s not-yet list.
-- **Routing.** Default: all attached sinks of a context play. A
-  `kj transport route <sink>` verb for targeted output (room speakers vs
-  headphones) comes later.
-- **midi→pcm for dumb sinks.** Smart sinks synth `audio/midi` themselves;
-  PCM-only sinks need a midi→pcm step — the deferred-PCM-cell vs
-  budget-excepted-deriver shapes are recorded in `docs/issues.md` (Hyoushigi
-  section). Soundfont synthesis is heavy, so the cell shape is favored.
-- **The metronome slice.** A 拍子木 click in the app on the beat remains the
-  cheapest audible clock-sync test harness when peer sinks land.
+  listening = shared context. The app sink is the first voice; N peer sinks
+  is the generalization; the kernel never grows an audio stack.
+- **Peer capability advertisement** — attach grows a general capabilities
+  bag (accepted mimes, latency estimate) so the kernel knows which sinks
+  take what. Keep the slot generic; rendering surfaces will want it too.
+- **A capnp transport surface** (app buttons / spacebar) — also on
+  `hyoushigi.md`'s not-yet list.
+- **Routing** — default: all attached sinks of a context play; a
+  `kj transport route <sink>` verb later. Volume/routing control reuses
+  `pawlsa`'s PipeWire surface when it lands.
+- **midi→pcm for dumb sinks** — deferred-PCM-cell vs budget-excepted-deriver
+  shapes recorded in `docs/issues.md` (Hyoushigi section); the cell shape is
+  favored (soundfont synthesis is heavy).
 - **Out of scope then and now:** continuous streams (no natural tick
-  coordinate — clips are still objects); seek/rewind (the playhead is
+  coordinate — clips are objects); seek/rewind (the playhead is
   forward-only; revisiting the past is an export).
-
-## Open questions (for the implementation session)
-
-- **Inline vs CAS on the wire** — the lean is DECIDED ("How it converges"):
-  `Cas` primary + a client-side XDG CAS cache; `Encoded` only for tiny samples.
-  Residual number set **provisionally at 4 KiB** (2026-07-02 — a clip record is
-  <1 KiB, any real sample dwarfs it; the gemini batch asked for a hard number so
-  the kernel-side chooser isn't ambiguous). Revisit at the first real sink if it
-  chafes.
-- **The clip payload format** — RESOLVED: designed in `docs/clips.md`
-  (Shape A), research record in `docs/cue-prior-art.md`. The clip *validator*
-  is a voice of the decouple-Act-from-ABC generalization (`docs/issues.md` —
-  same content-type-keyed move, input side).
-- **Prefetch vs. fire — RESOLVED (timing analysis, 2026-07-02): two-phase.** Do
-  not force one `lead` to be both jitter buffer and bulk-I/O window. A cache-cold
-  multi-MB SFTP fetch can exceed the fire lead; so a long-lead **prepare/preload**
-  horizon (10–30 s, warm the XDG CAS cache when the cell becomes *known*) is
-  separate from the short **fire** `lead` (~100 ms, once the sample is verified
-  local). Same relative-lead substrate, two horizons — the clip cue / `docs/clips.md`
-  grows a `prepare_at` tick (or `prepare_lead`). Snapshot `receipt` at parse-time,
-  *before* the fetch, or the fetch latency folds into audio jitter. Full findings:
-  `docs/issues.md` → Hyoushigi / Musician.
-- **Late-fetch policy — RESOLVED (timing analysis, 2026-07-02): skip-loud.** If the
-  sample isn't decoded and local by its deadline, log the underrun and **drop** it —
-  never fire-late or time-stretch a transient (a late kick destroys the groove; a
-  stretched transient sounds worse). The fallback machinery is the hook. Decode runs
-  off a pool, never blocking the scheduling frame; if it isn't ready by
-  `lead − safety`, fire the fallback.
-- **Routing/volume** — `pawlsa`'s `pw` graph control (default endpoint, node
-  volume/mute, links) is deferred to a later surface; first sound just plays to
-  the default sink.
-- **Timing — RESOLVED (2026-07-02): the substrate is the relative-lead wire cue,
-  and it's sound.** First slice plays immediately (`at = None`); scheduled playback
-  fires at `receipt + lead`. The timing model was analyzed before building on it
-  (`docs/midi.md` "The relative-lead timebase, analyzed" + `docs/issues.md`); the
-  one net-new build item is that Bevy's `AudioPlayer` has no scheduling primitive,
-  so honoring `lead` for *samples* needs a scheduler the MIDI path (ALSA seq queue)
-  gets for free.
 
 ## Verification
 
-- **End-to-end (slice 3):** with the app running (`./contrib/kj status`),
-  `kj play <wav>` → audible sound; log/`world_query` confirms an `AudioPlayer`
-  entity was spawned.
-- **Decode unit test:** load one of `pawlsa`'s sample WAVs
-  (`~/src/pawlsa-mcp/pawlsa-test.wav` et al.) through the chosen decoder.
-- **(later) Edge-node sink:** headless `kj play` on a node with no app attached
-  produces sound via ALSA/PipeWire — emitted by the edge-node agent, never the
-  kernel binary.
+- **R1–R3 end-to-end:** commit a clip cell on a playing track → the sample
+  sounds on the beat through the app sink; `parse_validated` rejects an
+  absent-media record loudly at commit.
+- **R4:** a cache-cold multi-MB sample committed ahead of the playhead is
+  fetched under the prepare horizon and fires on time; yanking the bytes
+  late produces a logged skip, never a late fire.
+- **R5:** a non-zero-lead sample cue fires within a frame of its backdated
+  instant (BRP/log timestamps), matching the MIDI path's discipline.
+- **Slice 4:** headless `kj play` on a node with no app produces sound via
+  the agent, never the kernel binary.

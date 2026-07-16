@@ -52,7 +52,7 @@ which derives the lane from the label, attaches stopped + OODA-armed).
   several ABC voices (keys on two staves). "Lane" stays reserved for
   automation inside a track. **"Clip"** is reserved for a placed media
   reference on a track (a committed cell with the clip MIME — design in
-  `docs/clips.md`); "cue" keeps meaning a trap message (the event taxonomy
+  `docs/pcm.md`); "cue" keeps meaning a trap message (the event taxonomy
   below).
 - **Phrases, not bars, in the kernel (2026-06-11).** The timebase speaks
   `beats_per_phrase` (on `BeatPolicy`, a track-level knob); the kernel chunks

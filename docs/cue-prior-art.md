@@ -4,7 +4,7 @@
 > ~1000-line version, with inline source URLs and per-format field tables,
 > lives in git history). Written to answer one question from Amy: *do we
 > need a cue format at all, or just a cue data model on the track?* The
-> synthesis landed in `docs/clips.md` (Shape A clip payload, tick-anchored
+> synthesis landed in `docs/pcm.md`'s clip record (Shape A payload, tick-anchored
 > no-stretch tempo default, triggers in the transport, late binding as
 > `Deferred(Recipe)`, no standalone format). This doc keeps the survey's
 > evidence: one paragraph per industry, the convergent field-cluster
@@ -150,7 +150,7 @@ Three observations:
    cluster is *load-bearing*, not cosmetic: the label is how the next
    model turn (and the human) reads the score.
 
-## Compressed conclusions (the ones clips.md relies on)
+## Compressed conclusions (the ones the clip record relies on)
 
 **Timing.** Three camps: wall/timecode (unambiguous, musically mute —
 exporter targets, not a model to build on; their pathology is
@@ -207,7 +207,7 @@ export is case 1 again. The only discipline the format-less path demands
 is OTIO's: version the record per-object and keep an extension bag so
 unknown fields survive round-trips.
 
-**Recommendation (landed in clips.md).** Ship the minimal
+**Recommendation (landed in `docs/pcm.md`'s clip record).** Ship the minimal
 WebVTT-grade clip payload (Shape A: media hash + mime + required label +
 source offset/length + gain) with versioned-record + extension-bag
 discipline; grow toward the DAW-grade shape field-by-field as renderers

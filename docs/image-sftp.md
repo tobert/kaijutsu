@@ -94,5 +94,5 @@ CAS hash facts (for the decode/cache step):
 
 ## Related docs
 
-`docs/slash-v.md` (Track B, the `/v/cas` design), `docs/pcm.md`, `docs/clips.md`,
+`docs/slash-v.md` (Track B, the `/v/cas` design), `docs/pcm.md`,
 `docs/sftp.md`.

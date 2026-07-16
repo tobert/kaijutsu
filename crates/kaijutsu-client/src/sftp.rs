@@ -6,7 +6,7 @@
 //! [`SftpClient`] opens its **own** SSH connection and binds a channel to the
 //! `sftp` subsystem to read VFS paths; a [`CasResolver`] layers a local XDG CAS
 //! cache on top so a clip's `media` hash resolves from disk on a hit and pulls
-//! the miss over the wire from `/v/cas/<hash>` (docs/clips.md, docs/slash-v.md).
+//! the miss over the wire from `/v/cas/<hash>` (docs/pcm.md, docs/slash-v.md).
 //!
 //! (Multiplexing the SFTP channel onto the *existing* RPC connection instead of
 //! dialing a second one is a later optimization — it needs `SshClient` to split

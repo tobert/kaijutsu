@@ -116,7 +116,7 @@ hook physically can't rewrite the cached prefix.
 
 The longest arc, and the one that forced most of the system's ideas to get
 real. Canonical designs: `docs/chameleon.md`, `docs/tracks.md`, `docs/midi.md`,
-`docs/pcm.md`, `docs/clips.md`, `docs/hyoushigi.md`.
+`docs/pcm.md` (which absorbed `docs/clips.md`, 2026-07-16), `docs/hyoushigi.md`.
 
 **The chameleon loop (June 13).** The first loop reached MIDI end to end:
 models playing to a beat, a player's turn text *being* the score

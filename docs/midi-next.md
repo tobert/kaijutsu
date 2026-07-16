@@ -261,7 +261,7 @@ even USB gear enforces chunk-and-wait because device buffers are small). So
 the question is never how bytes cross the LAN; it's who runs the pacing state
 machine — and that's the sink, always: pacing is local-to-the-hardware
 timing. Big blobs move via **CAS, not SFTP** — the `Inline | Cas` seam cue
-payloads already define (`docs/pcm.md`/`docs/clips.md`); a captured bulk dump
+payloads already define (`docs/pcm.md`); a captured bulk dump
 is a candidate for the *first heavy payload* that forces the deferred
 client→kernel CAS write surface (`midi.md` M2).
 

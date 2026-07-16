@@ -45,7 +45,7 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
 
 - **Track integration is the real prize**: seed a track's tempo/cadence from a
   reference recording (`kj audio beats` output → transport arm), and run beat
-  analysis on rendered/captured clips once the pcm.md/clips.md seam exists
+  analysis on rendered/captured clips once the clip seam (`docs/pcm.md`) exists
   (bytes never ride the track; beats are exactly the derived-result shape that
   should cross the wire instead).
 - **Model registry / `kj models` verb**: two model dirs now follow the
@@ -178,8 +178,7 @@ bloom/vi-dive/search items below; they stay on record, not on deck.
   slice 0 deliberately fence-posted (`view/fsn/layout.rs` module doc:
   "deliberately a single pure function, not a mapping-selection system") —
   a per-path layout override with the CAS ring as its first customer.
-  Pairs with the mime-keyed CAS / clip-cell ideas in `docs/pcm.md` /
-  `docs/clips.md`.
+  Pairs with the mime-keyed CAS / clip-cell ideas in `docs/pcm.md`.
 - **`Screen::Fsn` dive is keyboard-unreachable** (2026-07-13, the
   whole-wall zoom retune): Enter on N now fullscreens the portal
   (`station_is_zoomable`, `room/mod.rs`) instead of transitioning to
@@ -1208,21 +1207,16 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
        case: a player switching/restarting master clocks mid-session.
 - **Relative-lead timing — open findings from the 2026-07-02 analysis** (the
   substrate verdict + resolved findings live in `docs/midi.md` "The relative-lead
-  timebase, analyzed" and `docs/pcm.md`; this is the still-open remainder):
-    1. **`beat.rs:940` re-arms `now + period`, not `t + period`** — beat cadence
-       is a random walk of accumulated wakeup jitter. Fine at phrase granularity
-       (documented intentional, `clock.rs:65-69`) but becomes an accumulating
-       bias once `SystemClock` is the reference for a remote edge-node PLL.
-       One-line fix; land with a red-first test + Amy's nod.
+  timebase, analyzed" and `docs/pcm.md`; phase-align 2026-07-15 closed two more:
+  the `now + period` re-arm random walk — grid is scheduled-periodic now — and
+  the capture-`now`-close-to-the-send gap in `publish_render_cues`. This is the
+  still-open remainder):
     2. **Bevy has no audio-scheduling primitive** — the real PCM build risk.
-       `AudioPlayer` plays on spawn (`audio.rs:40-78` ignores `cue.lead`);
+       `AudioPlayer` plays on spawn (`audio.rs` ignores nonzero `cue.lead`);
        honoring `lead` for samples is net-new substrate (delayed-spawn at ~16ms
-       frame granularity, or pierce to the `rodio` Sink). MIDI delegates sub-ms
-       timing to the ALSA seq queue (`midi.rs:237`).
-    3. **Capture `now` close to the send** in `publish_render_cues`
-       (`beat.rs:1297` captures pre-loop) — fine for tiny ABC, but PCM CAS reads
-       inside that loop widen the gap into the lead budget.
-    4. **Multi-sink flam + whole-queue flush** (`midi.rs:92` flushes the *whole*
+       frame granularity, or pierce to the `rodio` Sink — `docs/pcm.md` R5,
+       open decision 3). MIDI delegates sub-ms timing to the ALSA seq queue.
+    4. **Multi-sink flam + whole-queue flush** (`midi.rs` flushes the *whole*
        ALSA queue regardless of track) — future; per-track flush + shared-clock
        scheduling are the eventual answer.
     5. **PLL failure modes to design against** when the modeled clock lands
@@ -1564,15 +1558,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   **budget-excepted deriver** (only if midi→pcm proves fast enough to run at the
   barrier — almost certainly not, soundfont synthesis is heavy). See
   `docs/pcm.md` § Distributed listening (playback.md retired 2026-07-01).
-- **Clip cells — design DONE (`docs/clips.md`, 2026-07-01); implementation
-  lands with pcm.md slice 5.** Shape A payload
+- **Clip cells — record + validator LANDED (pcm.md 5b, 2026-07-02); the clip
+  *path* is the open work.** Shape A payload
   (`application/vnd.kaijutsu.clip+json`) over the mime-keyed render seam;
-  bytes out-of-band (SFTP + `/v/cas`, client XDG CAS cache, prefetched
-  under the speculation lead). Research record: `docs/cue-prior-art.md`.
-  Remaining work when slice 5 opens: the record type + validator in
-  `kaijutsu-audio` (the validator is a voice of decouple-Act-from-ABC above),
-  the first clip-MIME render target, the prefetch path, and the `kj play`
-  clip-emitting form.
+  bytes out-of-band (SFTP + `/v/cas`, client XDG CAS cache). Remaining:
+  R1 sink clip renderer, R2 producer verb, R3 crossing mime pass-through,
+  R4 prepare horizon, R5 sample lead scheduling — the map + open decisions
+  live in `docs/pcm.md` "The remaining work" (which absorbed clips.md
+  2026-07-16). Research record: `docs/cue-prior-art.md`.
 - **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
   spans now that a producer exists.
 - **Multi-listener playback (was `docs/playback.md` — retired 2026-07-01).**

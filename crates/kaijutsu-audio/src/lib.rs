@@ -54,7 +54,7 @@ pub trait RenderSink: Send {
 /// A render directive crossing the wire / the seam to an off-box sink
 /// (`docs/midi.md` "Render is a wire cue"; `docs/pcm.md` "How it converges").
 /// Mime-keyed and content-agnostic: an audio sample, a clip record
-/// (`docs/clips.md`), timed MIDI events, or ABC all ride this one directive and
+/// (`docs/pcm.md`), timed MIDI events, or ABC all ride this one directive and
 /// the sink dispatches on `mime`. Generalizes the slice-3 play-now
 /// `PlayAudio`/`AudioRef` pair. The wire never carries raw decoded PCM — the
 /// payload is symbolic content (or encoded sample bytes for tiny inline
