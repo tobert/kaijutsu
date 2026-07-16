@@ -219,15 +219,31 @@ fn generate_glyph(
     // Color the edges for MSDF
     shape.edge_coloring_simple(angle_threshold, 0);
 
-    // Calculate dimensions
-    let bounds = shape.get_bound();
+    // Glyph extents come from ttf-parser, NOT `shape.get_bound()`: the
+    // latter's accumulator is zero-seeded and only ever shrinks toward an
+    // extreme, so `left`/`bottom` silently stay 0 for any glyph whose true
+    // left/bottom edge is positive (left-side bearing, glyphs above the
+    // baseline — the common case). See docs/issues.md ("msdfgen-rs
+    // `Shape::get_bound()` / `Contour::get_bound()` zero-seeded"). This is
+    // the control-point bbox, a superset of the true curve bbox
+    // (quadratic/cubic control points always bound their curves) — a hair
+    // loose on curvy glyphs is fine, too small is impossible.
+    let Some(bbox) = face.glyph_bounding_box(glyph_ttf_id) else {
+        // No outline (e.g. space) — same terminal path as a missing shape.
+        return placeholder_glyph(key);
+    };
+    let bounds_left = bbox.x_min as f64;
+    let bounds_bottom = bbox.y_min as f64;
+    let bounds_width = (bbox.x_max - bbox.x_min) as f64;
+    let bounds_height = (bbox.y_max - bbox.y_min) as f64;
+
     let units_per_em = face.units_per_em() as f64;
     let px_per_unit = px_per_em / units_per_em;
 
     // Minimum size with padding for MSDF range
     let padding = (msdf_range * 2.0).ceil() as u32;
-    let width = ((bounds.width() * px_per_unit).ceil() as u32 + padding).max(16);
-    let height = ((bounds.height() * px_per_unit).ceil() as u32 + padding).max(16);
+    let width = ((bounds_width * px_per_unit).ceil() as u32 + padding).max(16);
+    let height = ((bounds_height * px_per_unit).ceil() as u32 + padding).max(16);
 
     // Calculate framing for the glyph.
     //
@@ -257,12 +273,12 @@ fn generate_glyph(
     // `Framing` we pass to `generate_mtsdf`): `bitmap_px = (shape_units +
     // translate) * scale`.
     let scale = px_per_unit;
-    let content_width = bounds.width() * px_per_unit;
-    let content_height = bounds.height() * px_per_unit;
+    let content_width = bounds_width * px_per_unit;
+    let content_height = bounds_height * px_per_unit;
     let margin_px_x = (width as f64 - content_width) / 2.0;
     let margin_px_y = (height as f64 - content_height) / 2.0;
-    let translate_x = margin_px_x / scale - bounds.left;
-    let translate_y = margin_px_y / scale - bounds.bottom;
+    let translate_x = margin_px_x / scale - bounds_left;
+    let translate_y = margin_px_y / scale - bounds_bottom;
 
     let framing = Framing {
         projection: Projection {
@@ -425,38 +441,17 @@ mod tests {
     }
 
     /// Generate a real glyph from the shipped Cascadia Code NF font and
-    /// check its geometry.
+    /// check its geometry: ink size, centering, no origin-strip waste, and
+    /// anchor correctness.
     ///
-    /// Ground truth for the ink SIZE (width/height) comes from
-    /// `ttf_parser::Face::glyph_bounding_box`, NOT `msdfgen::Shape::get_bound()`
-    /// — verified by hand against this exact font (glyph_id 1862, '.'):
-    /// ttf-parser reports `x_min=452, x_max=748` (a tight, correct bbox from
-    /// the font's own `glyf` table), but msdfgen's `Shape::get_bound()`
-    /// reports `left=0.0`. That is a separate, pre-existing bug in
-    /// msdfgen-rs itself (`Shape::get_bound()`/`Contour::get_bound()` seed
-    /// their accumulator with `Bound::default()` == `(0,0,0,0)` and then
-    /// only ever *shrink toward* an extreme — see
-    /// `sys/lib/core/edge-segments.cpp`'s `boundPoint`, `if (p.x < l) l =
-    /// p.x;` etc. — instead of the C++ `Shape::getBounds()` convenience's
-    /// `±LARGE_VALUE` seed, which msdfgen-rs doesn't bind at all. So `left`
-    /// silently stays `0.0` whenever the shape's true left edge is
-    /// positive, which is the common case for any glyph with left-side
-    /// bearing.) Not fixed here — out of scope (can't modify msdfgen-rs;
-    /// see docs/issues.md) — but it means `bounds.width()*px_per_unit`
-    /// cannot be trusted as ground truth for this assertion.
-    ///
-    /// The ink WIDTH/HEIGHT check is immune to that bug regardless: Fix 1's
-    /// whole point is that `bitmap_px` is an affine function of shape units
-    /// with slope exactly `px_per_unit` everywhere, so a *difference*
-    /// between two shape-space x (or y) coordinates always scales
-    /// correctly even when the `translate` offset itself was computed from
-    /// a wrong `bounds.left`/`bounds.bottom`.
-    ///
-    /// The anchor check, by contrast, deliberately reuses
-    /// `shape.get_bound()` (the same, possibly-buggy bounds `generate_glyph`
-    /// itself sees) — it is a regression/self-consistency check that
-    /// `generate_glyph`'s anchor formula matches its own inputs, not an
-    /// independent check of visual correctness.
+    /// Ground truth throughout is `ttf_parser::Face::glyph_bounding_box`,
+    /// NOT `msdfgen::Shape::get_bound()` — the latter has a real,
+    /// independent bug (accumulator zero-seeded, only ever shrinks toward
+    /// an extreme, so `left`/`bottom` silently stay `0.0` for any glyph
+    /// whose true left/bottom edge is positive). See docs/issues.md
+    /// ("msdfgen-rs `Shape::get_bound()` / `Contour::get_bound()`
+    /// zero-seeded") for the full writeup; `generate_glyph` itself no
+    /// longer calls `get_bound()` at all as of this lane.
     fn assert_glyph_geometry_matches_bounds(ch: char) {
         let font_data = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -517,18 +512,65 @@ mod tests {
             generated.height,
         );
 
-        // Anchor closed form (self-consistency, see doc comment above):
-        // recompute the same formula `generate_glyph` uses, from the same
-        // (possibly bounds-bug-affected) `shape.get_bound()` inputs.
-        let mut shape = face.glyph_shape(glyph_id).expect("glyph must have a shape");
-        shape.edge_coloring_simple(angle_threshold, 0);
-        let bounds = shape.get_bound();
-        let content_w = bounds.width() * px_per_unit;
-        let content_h = bounds.height() * px_per_unit;
-        let margin_x = (generated.width as f64 - content_w) / 2.0;
-        let margin_y = (generated.height as f64 - content_h) / 2.0;
-        let translate_x = margin_x / px_per_unit - bounds.left;
-        let translate_y = margin_y / px_per_unit - bounds.bottom;
+        // -- Centering: the ink bbox must be centered in the bitmap (left
+        // margin ≈ right margin, bottom margin ≈ top margin), within ~3px
+        // tolerance for control-point-bbox looseness on curves plus the
+        // ±1px ceil/rounding in the width/height/padding math. This is the
+        // assertion the zero-seeded `get_bound()` bug fails hard: for '.'
+        // the true left edge sits at x_min=452 font units, but the buggy
+        // call reports left=0, so the old framing math treats a blank
+        // ~452-unit strip as content and shoves the ink toward one edge.
+        let left_margin = min_x as f64;
+        let right_margin = (generated.width - 1 - max_x) as f64;
+        let bottom_margin = min_y as f64;
+        let top_margin = (generated.height - 1 - max_y) as f64;
+        assert!(
+            (left_margin - right_margin).abs() <= 3.0,
+            "{ch:?}: left margin {left_margin} should ≈ right margin {right_margin} \
+             (bitmap {}x{}, ink x=[{min_x},{max_x}])",
+            generated.width,
+            generated.height,
+        );
+        assert!(
+            (bottom_margin - top_margin).abs() <= 3.0,
+            "{ch:?}: bottom margin {bottom_margin} should ≈ top margin {top_margin} \
+             (bitmap {}x{}, ink y=[{min_y},{max_y}])",
+            generated.width,
+            generated.height,
+        );
+
+        // -- No origin-strip waste: the bitmap must not carry a large blank
+        // strip from the pen origin (0,0) to the actual ink. `generate_glyph`
+        // adds `padding` once per axis (`ceil(content_px) + padding`, not
+        // twice), so the budget here is one `padding` plus a few px of
+        // `slack` for the `.max(16)` clamp and ceil rounding elsewhere in
+        // the size math.
+        let padding = (msdf_range * 2.0).ceil();
+        let slack = 6.0;
+        assert!(
+            generated.width as f64 <= ink_w + padding + slack,
+            "{ch:?}: bitmap width {} should be within {} of ink width {ink_w} \
+             (padding {padding}) — origin-strip waste?",
+            generated.width,
+            padding + slack,
+        );
+        assert!(
+            generated.height as f64 <= ink_h + padding + slack,
+            "{ch:?}: bitmap height {} should be within {} of ink height {ink_h} \
+             (padding {padding}) — origin-strip waste?",
+            generated.height,
+            padding + slack,
+        );
+
+        // Anchor closed form: recompute the same formula `generate_glyph`
+        // uses, from the same `glyph_bounding_box` ground truth it now
+        // consumes. Since the fix, this is a genuine correctness check (not
+        // just self-consistency): a wrong `generate_glyph` translate/anchor
+        // formula would diverge from this independent recomputation.
+        let margin_x = (generated.width as f64 - expected_content_w) / 2.0;
+        let margin_y = (generated.height as f64 - expected_content_h) / 2.0;
+        let translate_x = margin_x / px_per_unit - tight_bbox.x_min as f64;
+        let translate_y = margin_y / px_per_unit - tight_bbox.y_min as f64;
         let expected_anchor_x = (translate_x * px_per_unit / px_per_em) as f32;
         let expected_anchor_y =
             ((generated.height as f64 - translate_y * px_per_unit) / px_per_em) as f32;
@@ -561,6 +603,33 @@ mod tests {
         // off by a smaller (~+10%) but still-wrong amount before the fix —
         // this guards the "every glyph, not just narrow ones" claim.
         assert_glyph_geometry_matches_bounds('M');
+    }
+
+    #[test]
+    fn generate_glyph_space_is_placeholder() {
+        // Space has no outline (`glyph_bounding_box` returns `None`), so it
+        // must take the same placeholder path as a missing shape — not flow
+        // through with a degenerate zero-width/height bbox.
+        let font_data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/fonts/CascadiaCodeNF.ttf"
+        ))
+        .expect("shipped test font must be present");
+
+        let face = ttf_parser::Face::parse(&font_data, 0).expect("font must parse");
+        let glyph_id = face
+            .glyph_index(' ')
+            .unwrap_or_else(|| panic!("font has no glyph for space"));
+
+        let key = GlyphKey::new(FontId::for_test(1), glyph_id.0);
+        let generated = generate_glyph(key, &font_data, glyph_id.0, 4.0, 64.0, 3.0);
+
+        assert!(
+            generated.is_placeholder,
+            "space (glyph_id {}) has no bounding box and must produce a \
+             placeholder, not a degenerate zero-size bitmap",
+            glyph_id.0,
+        );
     }
     // -- record_landed -------------------------------------------------
 
