@@ -462,25 +462,30 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Abc { tune, .. }) => {
+                // ABC always rasterizes lines/paths/text (staff lines, stems,
+                // barlines, beams, slurs, ties, titles/chords) through Vello
+                // — `render_method` stays `Vello` in both branches below.
+                // That's required, not incidental: MSDF only *composites*
+                // onto a block's texture instead of clearing it when
+                // `render_method == Vello` (see `extract_msdf_blocks`'s
+                // `has_vello_content`), and only a `Vello`-tagged block gets
+                // `ui_scene.version` bumped at all (below) so the Vello pass
+                // runs before the MSDF pass composites music glyphs on top
+                // — see the "Msdf-mode borders" finding in the S1 report for
+                // why `BlockRenderMethod::Msdf` can't do this today.
                 *render_method = BlockRenderMethod::Vello;
                 let default_opts = kaijutsu_abc::engrave::EngravingOptions::default();
                 let elements =
                     kaijutsu_abc::engrave::layout::engrave(tune, &default_opts);
 
                 let notation_brush = bevy_color_to_brush(theme.block_assistant);
-                let (abc_scene, intrinsic_w, intrinsic_h) =
-                    crate::text::abc::render_engraving_to_scene(
-                        &elements,
-                        default_opts.margin,
-                        &notation_brush,
-                        Some(font),
-                        &text_metrics,
-                    );
+                let bounds =
+                    crate::text::abc::compute_engraving_bounds(&elements, default_opts.margin);
 
-                let w_scale = content_width as f64 / intrinsic_w;
-                let h_scale = SVG_MAX_HEIGHT as f64 / intrinsic_h;
+                let w_scale = content_width as f64 / bounds.width;
+                let h_scale = SVG_MAX_HEIGHT as f64 / bounds.height;
                 let scale = w_scale.min(h_scale);
-                content_height = (intrinsic_h * scale) as f32;
+                content_height = (bounds.height * scale) as f32;
 
                 let clip_rect = vello::kurbo::Rect::new(
                     pad_left as f64,
@@ -488,18 +493,65 @@ pub fn build_block_scenes(
                     (pad_left + content_width) as f64,
                     (pad_top + content_height) as f64,
                 );
-                scene.push_layer(
-                    Fill::NonZero,
-                    vello::peniko::Mix::Normal,
-                    1.0,
-                    Affine::IDENTITY,
-                    &clip_rect,
-                );
-                scene.append(
-                    &abc_scene,
-                    Some(Affine::translate(text_offset) * Affine::scale(scale)),
-                );
-                scene.pop_layer();
+
+                if let Some(ref mut atlas) = atlas {
+                    // MSDF path: Vello draws everything except the music
+                    // glyphs (noteheads, clefs, rests, accidentals, ...);
+                    // those are collected as MSDF atlas quads below.
+                    let (abc_scene, _, _) = crate::text::abc::render_engraving_notation_only(
+                        &elements,
+                        default_opts.margin,
+                        &notation_brush,
+                        Some(font),
+                        &text_metrics,
+                    );
+                    scene.push_layer(
+                        Fill::NonZero,
+                        vello::peniko::Mix::Normal,
+                        1.0,
+                        Affine::IDENTITY,
+                        &clip_rect,
+                    );
+                    scene.append(
+                        &abc_scene,
+                        Some(Affine::translate(text_offset) * Affine::scale(scale)),
+                    );
+                    scene.pop_layer();
+
+                    let music_glyphs = crate::text::msdf::collect_music_glyphs(
+                        &elements,
+                        text_offset,
+                        (bounds.origin_x, bounds.origin_y),
+                        scale,
+                        &notation_brush,
+                        atlas,
+                    );
+                    msdf_glyphs.glyphs = music_glyphs;
+                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
+                } else {
+                    // No atlas yet (startup ordering) — fall back to the
+                    // full Vello render unchanged, same as before this slice.
+                    let (abc_scene, _, _) = crate::text::abc::render_engraving_to_scene(
+                        &elements,
+                        default_opts.margin,
+                        &notation_brush,
+                        Some(font),
+                        &text_metrics,
+                    );
+                    scene.push_layer(
+                        Fill::NonZero,
+                        vello::peniko::Mix::Normal,
+                        1.0,
+                        Affine::IDENTITY,
+                        &clip_rect,
+                    );
+                    scene.append(
+                        &abc_scene,
+                        Some(Affine::translate(text_offset) * Affine::scale(scale)),
+                    );
+                    scene.pop_layer();
+                }
             }
             Some(RichContentKind::Output { layout, plain_text }) => {
                 let parley_layout = font.layout(
