@@ -11,7 +11,7 @@ use bevy::render::{
         binding_types::{sampler as sampler_binding, texture_2d, uniform_buffer},
         *,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::RenderDevice,
     texture::GpuImage,
 };
 use bytemuck::{Pod, Zeroable};
@@ -213,14 +213,28 @@ impl MsdfBlockRenderer {
     /// Build a vertex buffer for a single block's MSDF glyphs.
     ///
     /// Converts positioned glyphs to NDC quads using atlas region data.
-    /// `tex_width`/`tex_height` are in logical (pre-scale) pixels matching
-    /// the coordinate space of `PositionedGlyph`.
+    /// `tex_width_phys`/`tex_height_phys` are the render target's PHYSICAL
+    /// pixel size (`ceil(logical * scale_factor)`, see
+    /// `ui_rtt::ui_rtt_texture_dims`) — NOT the logical size
+    /// `PositionedGlyph` coordinates are expressed in. `scale_factor` is
+    /// the window's HiDPI scale, used to convert glyph-space (logical)
+    /// coordinates into that physical space.
+    ///
+    /// The baseline (Y) is snapped to an integer physical pixel row here —
+    /// not earlier, in logical space (`layout_bridge.rs`) — because at a
+    /// fractional `scale_factor` a logical-integer baseline is not
+    /// necessarily a physical scanline; snapping too early left horizontal
+    /// stems blurred by the physical texture's `ceil()` rounding. X is
+    /// deliberately NOT snapped: sub-pixel advances are what keep kerning
+    /// and monospace column spacing correct.
+    ///
     /// `rainbow` sets the per-vertex rainbow flag for color cycling.
     pub fn build_vertices(
         glyphs: &[PositionedGlyph],
         atlas: &ExtractedMsdfAtlas,
-        tex_width: f32,
-        tex_height: f32,
+        tex_width_phys: f32,
+        tex_height_phys: f32,
+        scale_factor: f32,
         rainbow: bool,
     ) -> Vec<MsdfVertex> {
         let mut vertices = Vec::with_capacity(glyphs.len() * 6);
@@ -232,21 +246,24 @@ impl MsdfBlockRenderer {
 
             let [u0, v0, u1, v1] = region.uv_rect(atlas.width, atlas.height);
 
-            // Compute quad size in block-local pixels
+            // Compute quad size in PHYSICAL pixels.
             let scale = glyph.font_size / MSDF_PX_PER_EM;
-            let quad_w = region.width as f32 * scale;
-            let quad_h = region.height as f32 * scale;
+            let quad_w = region.width as f32 * scale * scale_factor;
+            let quad_h = region.height as f32 * scale * scale_factor;
 
-            // Quad position: pen position - anchor offset (anchor is in em units).
-            // anchor_x/y is the distance from bitmap origin to glyph origin in ems.
-            let qx = glyph.x - region.anchor_x * glyph.font_size;
-            let qy = glyph.y - region.anchor_y * glyph.font_size;
+            // Quad position, in PHYSICAL pixels: pen position - anchor
+            // offset (anchor is in em units), both converted from logical
+            // to physical by `scale_factor`. Baseline Y snaps to an integer
+            // physical row; X does not (see doc comment above).
+            let qx_phys = glyph.x * scale_factor - region.anchor_x * glyph.font_size * scale_factor;
+            let y_base_phys = (glyph.y * scale_factor).round();
+            let qy_phys = y_base_phys - region.anchor_y * glyph.font_size * scale_factor;
 
             // Convert to NDC [-1, 1]
-            let x0 = qx / tex_width * 2.0 - 1.0;
-            let y0 = 1.0 - qy / tex_height * 2.0;
-            let x1 = (qx + quad_w) / tex_width * 2.0 - 1.0;
-            let y1 = 1.0 - (qy + quad_h) / tex_height * 2.0;
+            let x0 = qx_phys / tex_width_phys * 2.0 - 1.0;
+            let y0 = 1.0 - qy_phys / tex_height_phys * 2.0;
+            let x1 = (qx_phys + quad_w) / tex_width_phys * 2.0 - 1.0;
+            let y1 = 1.0 - (qy_phys + quad_h) / tex_height_phys * 2.0;
 
             let color = glyph.color;
             let importance = glyph.importance;
@@ -266,14 +283,15 @@ impl MsdfBlockRenderer {
         vertices
     }
 
-    /// Clear a block texture to transparent (no glyphs to render).
+    /// Encode a clear pass for a block texture into a shared `encoder`
+    /// (no submit — the caller batches all items for the frame into one
+    /// encoder and submits once).
     ///
     /// Used when glyphs transition from non-empty to empty — the render pass
     /// must still clear the texture to remove stale glyph pixels.
-    pub fn clear_texture(
+    pub fn encode_clear(
         &self,
-        device: &RenderDevice,
-        queue: &RenderQueue,
+        encoder: &mut CommandEncoder,
         gpu_images: &RenderAssets<GpuImage>,
         target_image: &Handle<Image>,
     ) -> bool {
@@ -281,10 +299,6 @@ impl MsdfBlockRenderer {
             warn_once!("MSDF clear: target GpuImage not ready");
             return false;
         };
-
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("msdf_block_clear_encoder"),
-        });
 
         {
             encoder.begin_render_pass(&RenderPassDescriptor {
@@ -305,15 +319,16 @@ impl MsdfBlockRenderer {
             // Pass drops immediately — no draw call needed, just clear.
         }
 
-        queue.submit([encoder.finish()]);
         true
     }
 
-    /// Render MSDF glyphs to a block texture via a render pass.
-    pub fn render_to_texture(
+    /// Encode an MSDF glyph render pass for a block texture into a shared
+    /// `encoder` (no submit — the caller batches all items for the frame
+    /// into one encoder and submits once).
+    pub fn encode_render(
         &self,
         device: &RenderDevice,
-        queue: &RenderQueue,
+        encoder: &mut CommandEncoder,
         pipeline_cache: &PipelineCache,
         gpu_images: &RenderAssets<GpuImage>,
         atlas_image: &Handle<Image>,
@@ -366,11 +381,6 @@ impl MsdfBlockRenderer {
             usage: BufferUsages::VERTEX,
         });
 
-        // Record render pass
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("msdf_block_encoder"),
-        });
-
         {
             let load_op = if clear {
                 LoadOp::Clear(Default::default())
@@ -400,7 +410,6 @@ impl MsdfBlockRenderer {
             render_pass.draw(0..vertices.len() as u32, 0..1);
         }
 
-        queue.submit([encoder.finish()]);
         true
     }
 }
@@ -427,5 +436,208 @@ impl Default for ExtractedMsdfAtlas {
             msdf_range: MsdfAtlas::DEFAULT_RANGE,
             version: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::glyph::{FontId, GlyphKey};
+    use super::*;
+    use std::collections::HashMap;
+
+    // -- Fix 3: vertex mapping + baseline snap in physical pixel space -----
+    //
+    // Before the fix, `build_vertices` divided by LOGICAL tex_width/height
+    // (matching layout_bridge's LOGICAL-pixel-snapped baseline), but the
+    // target texture is `ceil(logical * scale_factor)` PHYSICAL pixels
+    // (`ui_rtt_texture_dims`). At a fractional scale_factor, a
+    // logical-integer baseline isn't a physical scanline, and the ceil()
+    // mismatch stretches positions sub-pixel — horizontal stems blur.
+    // `build_vertices` now takes the PHYSICAL texture size + scale_factor
+    // directly and snaps the baseline in physical space.
+
+    fn atlas_with_region(key: GlyphKey, region: AtlasRegion) -> ExtractedMsdfAtlas {
+        let mut regions = HashMap::new();
+        regions.insert(key, region);
+        ExtractedMsdfAtlas {
+            regions,
+            texture: Handle::default(),
+            width: 256,
+            height: 256,
+            msdf_range: MsdfAtlas::DEFAULT_RANGE,
+            version: 1,
+        }
+    }
+
+    /// Inverse of `y0 = 1.0 - qy_phys / tex_height_phys * 2.0`: recover the
+    /// physical-pixel Y of a quad edge from its emitted NDC.
+    fn ndc_y_to_phys(y_ndc: f32, tex_height_phys: f32) -> f32 {
+        (1.0 - y_ndc) * tex_height_phys / 2.0
+    }
+
+    /// Inverse of `x0 = qx_phys / tex_width_phys * 2.0 - 1.0`.
+    fn ndc_x_to_phys(x_ndc: f32, tex_width_phys: f32) -> f32 {
+        (x_ndc + 1.0) * tex_width_phys / 2.0
+    }
+
+    #[test]
+    fn build_vertices_snaps_baseline_to_an_integer_physical_row_at_fractional_scale() {
+        let key = GlyphKey::new(FontId::for_test(1), 42);
+        let region = AtlasRegion {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            anchor_x: 0.1,
+            anchor_y: 0.8,
+        };
+        let atlas = atlas_with_region(key, region);
+
+        let glyph = PositionedGlyph {
+            key,
+            x: 10.3,
+            y: 20.37, // fractional logical baseline
+            font_size: 16.0,
+            color: [255, 255, 255, 255],
+            importance: 0.5,
+        };
+
+        let scale_factor = 1.25;
+        let tex_w_phys = 400.0;
+        let tex_h_phys = 300.0;
+
+        let verts = MsdfBlockRenderer::build_vertices(
+            std::slice::from_ref(&glyph),
+            &atlas,
+            tex_w_phys,
+            tex_h_phys,
+            scale_factor,
+            false,
+        );
+        assert_eq!(verts.len(), 6);
+
+        // Vertex 0 is the quad's top-left corner (see the V-flip comment in
+        // build_vertices: top-left position gets the bottom UV).
+        let qy_top_phys = ndc_y_to_phys(verts[0].position[1], tex_h_phys);
+        let baseline_phys = qy_top_phys + region.anchor_y * glyph.font_size * scale_factor;
+
+        assert!(
+            (baseline_phys - baseline_phys.round()).abs() < 1e-3,
+            "baseline {baseline_phys} is not snapped to an integer physical pixel row",
+        );
+    }
+
+    #[test]
+    fn build_vertices_at_scale_1_matches_the_logical_pixel_mapping_for_integer_baselines() {
+        // At scale 1.0 with an already-integer baseline, physical pixels ==
+        // logical pixels and the physical-space round() is a no-op, so the
+        // new mapping must reduce exactly to the old logical-pixel formula.
+        let key = GlyphKey::new(FontId::for_test(2), 7);
+        let region = AtlasRegion {
+            x: 10,
+            y: 20,
+            width: 32,
+            height: 40,
+            anchor_x: 0.05,
+            anchor_y: 0.75,
+        };
+        let atlas = atlas_with_region(key, region);
+
+        let glyph = PositionedGlyph {
+            key,
+            x: 12.0,
+            y: 30.0, // integer baseline
+            font_size: 20.0,
+            color: [10, 20, 30, 255],
+            importance: 0.5,
+        };
+
+        let tex_w = 500.0;
+        let tex_h = 400.0;
+
+        let verts = MsdfBlockRenderer::build_vertices(
+            std::slice::from_ref(&glyph),
+            &atlas,
+            tex_w,
+            tex_h,
+            1.0,
+            false,
+        );
+
+        // Old (pre-Fix-3) formula, reproduced directly against the same inputs.
+        let scale = glyph.font_size / MSDF_PX_PER_EM;
+        let quad_w = region.width as f32 * scale;
+        let quad_h = region.height as f32 * scale;
+        let qx = glyph.x - region.anchor_x * glyph.font_size;
+        let qy = glyph.y - region.anchor_y * glyph.font_size;
+        let expected_x0 = qx / tex_w * 2.0 - 1.0;
+        let expected_y0 = 1.0 - qy / tex_h * 2.0;
+        let expected_x1 = (qx + quad_w) / tex_w * 2.0 - 1.0;
+        let expected_y1 = 1.0 - (qy + quad_h) / tex_h * 2.0;
+
+        assert!((verts[0].position[0] - expected_x0).abs() < 1e-5);
+        assert!((verts[0].position[1] - expected_y0).abs() < 1e-5);
+        assert!((verts[4].position[0] - expected_x1).abs() < 1e-5);
+        assert!((verts[4].position[1] - expected_y1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn build_vertices_does_not_snap_x_subpixel_advances_survive() {
+        // Snapping x would break kerning and monospace column alignment —
+        // only the baseline (Y) snaps.
+        let key = GlyphKey::new(FontId::for_test(3), 1);
+        let region = AtlasRegion {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            anchor_x: 0.0,
+            anchor_y: 0.5,
+        };
+        let atlas = atlas_with_region(key, region);
+
+        let scale_factor = 1.5;
+        let tex_w = 200.0;
+        let tex_h = 200.0;
+
+        let glyph_a = PositionedGlyph {
+            key,
+            x: 5.1,
+            y: 10.0,
+            font_size: 16.0,
+            color: [0; 4],
+            importance: 0.5,
+        };
+        let glyph_b = PositionedGlyph {
+            x: 5.4,
+            ..glyph_a.clone()
+        };
+
+        let verts_a = MsdfBlockRenderer::build_vertices(
+            std::slice::from_ref(&glyph_a),
+            &atlas,
+            tex_w,
+            tex_h,
+            scale_factor,
+            false,
+        );
+        let verts_b = MsdfBlockRenderer::build_vertices(
+            std::slice::from_ref(&glyph_b),
+            &atlas,
+            tex_w,
+            tex_h,
+            scale_factor,
+            false,
+        );
+
+        let x_a_phys = ndc_x_to_phys(verts_a[0].position[0], tex_w);
+        let x_b_phys = ndc_x_to_phys(verts_b[0].position[0], tex_w);
+        let expected_delta = (glyph_b.x - glyph_a.x) * scale_factor;
+
+        assert!(
+            (x_b_phys - x_a_phys - expected_delta).abs() < 1e-3,
+            "x advance was not preserved sub-pixel: a={x_a_phys} b={x_b_phys} \
+             expected_delta={expected_delta}",
+        );
     }
 }
