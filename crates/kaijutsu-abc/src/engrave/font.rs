@@ -252,6 +252,13 @@ pub fn font_cache() -> &'static FontCache {
     FONT_CACHE.get_or_init(FontCache::load)
 }
 
+/// Raw bytes of the embedded SMuFL font, for consumers that need to parse
+/// the font themselves (e.g. registering it with an external glyph
+/// rasterizer such as the app's MSDF atlas).
+pub fn font_bytes() -> &'static [u8] {
+    BRAVURA_OTF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
