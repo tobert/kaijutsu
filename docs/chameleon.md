@@ -276,6 +276,23 @@ full story in devlog/git history).** The Rust side is a minimal mechanism; the
   `--window 0` rejected). The musician `create` rc (`S30-hydrate.kai`) sets
   the window once at birth; `fork/S40-hydrate.kai` re-marks the thin child at
   its tail.
+- **Kernel backstop (hardened 2026-07-16):** the rc scripts above set the
+  window at birth, but rc is CRDT-seeded-once — a musician whose
+  `create`/`fork` ran before a kernel's live rc picked up the window step
+  gets NO policy at all, and an unwindowed context driving at tempo
+  hydrates its whole, ever-growing history every turn (exactly this: an
+  unwindowed gemma4-e4b player crash-looped, 66–70k tokens against a 32k
+  local window, retrying every beat). Two rc-independent kernel sites now
+  enforce the invariant **beat-attached ⟹ bounded hydration** directly, so
+  it can't depend on which rc revision happened to run at birth: `kj/fork.rs`
+  sets the default window when a beat attachment survives a fork but no
+  policy does (keyed on attachment *presence*, not `context_type` — a fork
+  child's row always says `"default"`); `beat.rs::attach` sets it on any
+  attach that finds none — including a manual re-attach after a restart
+  (the cold-start re-arm sweep is itself deferred: a plain restart leaves a
+  persisted track with no live `TrackState` until something calls attach
+  again, so this backstop is not a substitute for that sweep landing).
+  Neither ever overrides an existing policy.
 
 Honest edges (open): **(a)** the marker-advance-on-durable-revision flow isn't
 built (comes with the producer). **(b)** Windowing bounds *tokens*, not
