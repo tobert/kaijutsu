@@ -40,14 +40,22 @@ oversized and off-center for affected glyphs. Fix 1's scale correction
 (`msdf-geometry` lane) is unaffected in *magnitude* — ink size is an affine
 difference, so the wrong `translate` offset cancels out — but the glyph's
 absolute *position* in the padded bitmap (and thus the anchor) is still
-built on the wrong `bounds.left`/`bounds.bottom`. Not fixed here: out of
-scope for the three geometry bugs assigned, and msdfgen-rs is off-limits to
-modify from this lane. Fix, when picked up: either patch msdfgen-rs's
-`get_bound()`/`get_bound_miters()` to seed `±f64::MAX` before calling the
-raw `bound()`/`boundMiters()`, or have `kaijutsu-app` stop relying on
-`Shape::get_bound()` for glyph extents and use `ttf_parser::Face::
-glyph_bounding_box()` instead (already proven accurate against this bug in
-`generator.rs`'s tests).
+built on the wrong `bounds.left`/`bounds.bottom`. Fix, when picked up:
+either patch msdfgen-rs's `get_bound()`/`get_bound_miters()` to seed
+`±f64::MAX` before calling the raw `bound()`/`boundMiters()`, or have
+`kaijutsu-app` stop relying on `Shape::get_bound()` for glyph extents and
+use `ttf_parser::Face::glyph_bounding_box()` instead (already proven
+accurate against this bug in `generator.rs`'s tests).
+
+**Upstream checked 2026-07-16 (Fable session)**: our clone is AT
+`katyo/msdfgen-rs` master tip (0 behind); upstream is dormant (last release
+2020, 3 open issues, no fix) — waiting for a new version is not a path.
+Preferred fix = the `glyph_bounding_box()` route in our `generate_glyph`:
+`face` is already parsed there, `None` → existing placeholder path replaces
+the empty-shape edge case for free, control-point bboxes are ⊇ curve bboxes
+so framing stays safe, and it shrinks atlas bitmaps (origin-inclusion waste
+gone) with no third-party fork to maintain. Patching the clone + upstream
+PR is a nice-to-have on top, not a prerequisite.
 
 ## Context lifecycle: "done for now" marker (seeded 2026-07-16, input rework)
 
