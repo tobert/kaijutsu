@@ -521,6 +521,14 @@ impl KjDispatcher {
                 .is_some()
         });
 
+        // The child's own tail block — read from the block store now, OUTSIDE
+        // the `kernel_db` lock taken below, so the two locks are never held at
+        // once (block_store then kernel_db, same order as everywhere else in
+        // this file). Only consumed by the hydration backstop further down:
+        // when no policy travels for a beat-attached child, its default window
+        // anchors at ITS OWN tail, not the parent's marker.
+        let child_tail = self.block_store().last_block_id(new_id);
+
         // Write-through: KernelDb then DriftRouter
         {
             let mut db = self.kernel_db().lock();
@@ -601,6 +609,54 @@ impl KjDispatcher {
                 && let Err(e) = db.set_hydration_policy(new_id, *cm, *window)
             {
                 return KjResult::Err(format!("kj fork: failed to carry hydration policy: {e}"));
+            }
+
+            // Backstop half of the hydration invariant (docs/chameleon.md): a
+            // context that HAS (or gains) a beat-track attachment must carry a
+            // hydration-window policy, or an at-tempo driver hydrates the full,
+            // ever-growing history every turn until the model's context window
+            // overflows — the exact crash-loop this guards (an unwindowed gemma
+            // player hit 70k tokens against a 32k window, retrying every beat).
+            // The carry above already moved a *surviving* parent policy; this
+            // covers the gap it leaves open: a full fork whose PARENT itself had
+            // no policy. Keys on attachment PRESENCE
+            // (`list_attachments_for_context`), not `context_type` — the row
+            // above hardcodes `context_type = "default"` for every child
+            // regardless of whether it's beat-driven, so context_type can't
+            // distinguish a musician fork from a plain one; the attachment copy
+            // (inside `insert_forked_context`, just above) is the only signal.
+            match db.get_hydration_policy(new_id) {
+                // A policy already landed — the carry above, or (in principle)
+                // anything upstream. Never override: an operator's explicit
+                // `kj context hydrate` or a create-rc window must win over this
+                // backstop default.
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let has_attachment = match db.list_attachments_for_context(new_id) {
+                        Ok(rows) => !rows.is_empty(),
+                        Err(e) => {
+                            return KjResult::Err(format!(
+                                "kj fork: failed to check attachments for hydration backstop: {e}"
+                            ));
+                        }
+                    };
+                    if has_attachment
+                        && let Some(marker) = child_tail
+                        && let Err(e) = db.set_hydration_policy(
+                            new_id,
+                            marker,
+                            crate::kernel_db::DEFAULT_HYDRATION_WINDOW,
+                        )
+                    {
+                        return KjResult::Err(format!(
+                            "kj fork: failed to set default hydration window: {e}"
+                        ));
+                    }
+                    // else: no attachment → a plain, non-beat fork → leave the
+                    // policy unset, preserving "take it all" full-fork semantics
+                    // for ordinary (non-musician) lineages.
+                }
+                Err(e) => return KjResult::Err(format!("kj fork: {e}")),
             }
         }
 
@@ -2042,6 +2098,111 @@ mod tests {
         assert!(
             d.block_store().get_block_snapshot(child, &cm).unwrap().is_some(),
             "carried marker must resolve in the child"
+        );
+    }
+
+    /// The backstop half of the hydration invariant (docs/chameleon.md): a full
+    /// fork of a beat-attached parent that had NO policy must not hand the child
+    /// an unbounded-hydration musician. The child inherits the attachment (copied
+    /// by `insert_forked_context`) but has nothing to carry (parent had no
+    /// policy), so the guard sets the default window keyed on the child's own
+    /// tail — same posture as musician-create, applied retroactively at fork.
+    #[tokio::test]
+    async fn full_fork_of_beat_attached_parent_without_policy_gets_default_window() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+
+        // Attach the parent to a track — this makes it a musician — WITHOUT ever
+        // setting a hydration policy (the exact gap the crash-loop exploited).
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_track(&crate::kernel_db::PersistedTrack {
+                track_id: "bass".to_string(),
+                period_ms: 250,
+                beats_per_phrase: 16,
+                playhead_tick: None,
+                playing: false,
+                score_context_id: None,
+                clock_kind: "system".to_string(),
+            })
+            .unwrap();
+            db.upsert_attachment(&crate::kernel_db::PersistedAttachment {
+                track_id: "bass".to_string(),
+                context_id: source,
+                wakeup_every: 1,
+                rotate_every_phrases: None,
+                ooda_armed: false,
+            })
+            .unwrap();
+            assert!(
+                db.get_hydration_policy(source).unwrap().is_none(),
+                "precondition: parent has no policy"
+            );
+        }
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("kid")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "kid");
+        // NB: the marker must anchor at the last COPIED content block ("echo"),
+        // not `last_block_id(child)` as observed after the fork completes — a
+        // later step (`inject_fork_marker`) appends an ephemeral, hydration-
+        // excluded fork-summary block, so a post-hoc `last_block_id` would pick
+        // that up instead. The implementation deliberately reads the tail right
+        // after the document copy (before the marker note lands) for exactly
+        // this reason. Compute the same expected id via the documented (principal,
+        // seq)-preserving remap (see the 3d comment above `child_marker`).
+        let source_last = d.block_store().block_snapshots(source).unwrap()[4].id;
+        let expected_marker =
+            kaijutsu_crdt::BlockId::new(child, source_last.principal_id, source_last.seq);
+        let (marker, window) = child_policy(&d, child)
+            .expect("beat-attached child without a carried policy must get the backstop default");
+        assert_eq!(
+            window,
+            crate::kernel_db::DEFAULT_HYDRATION_WINDOW,
+            "backstop uses the shared default window"
+        );
+        assert_eq!(
+            marker, expected_marker,
+            "backstop anchors the marker at the child's last copied content block"
+        );
+        assert!(
+            d.block_store()
+                .get_block_snapshot(child, &marker)
+                .unwrap()
+                .is_some(),
+            "the backstop marker must resolve to a real block in the child"
+        );
+    }
+
+    /// The negative case for the same backstop: a plain (non-beat) full fork of
+    /// an unattached parent must NOT gain a policy — "take it all" stays the
+    /// default shape for ordinary forks. The guard keys on attachment presence,
+    /// not on `context_type` (the fork row always hardcodes `"default"`).
+    #[tokio::test]
+    async fn fork_of_unattached_parent_without_policy_gets_no_window() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        assert!(
+            d.kernel_db()
+                .lock()
+                .list_attachments_for_context(source)
+                .unwrap()
+                .is_empty(),
+            "precondition: parent has no track attachment"
+        );
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("plain-kid")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "plain-kid");
+        assert!(
+            child_policy(&d, child).is_none(),
+            "a non-beat fork must not gain a hydration window"
         );
     }
 

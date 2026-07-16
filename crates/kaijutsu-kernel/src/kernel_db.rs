@@ -3461,7 +3461,21 @@ impl KernelDb {
         )?;
         Ok(deleted as u64)
     }
+}
 
+/// Default hydration window (in blocks) applied as a backstop when a context
+/// becomes beat-driven without an explicit policy — keeps a musician's per-turn
+/// hydration bounded so an at-tempo driver can't grow the wire history without
+/// limit (the crash-loop this guards). Matches the rc default (`kj context
+/// hydrate --window 16` in assets/defaults/rc/musician/…). See docs/chameleon.md.
+///
+/// Free-standing (not an associated const) so both `kj/fork.rs` (same crate,
+/// `crate::kernel_db::DEFAULT_HYDRATION_WINDOW`) and `kaijutsu-server`
+/// (`kaijutsu_kernel::kernel_db::DEFAULT_HYDRATION_WINDOW`) can import it by
+/// module path without naming `KernelDb`.
+pub const DEFAULT_HYDRATION_WINDOW: u32 = 16;
+
+impl KernelDb {
     /// Set (upsert) the hydration window policy for `context_id`: from now on the
     /// conversation hydrates only `[0, marker] ∪ last-window_size`, not its whole
     /// history. `marker` is the pinned-prefix end P (a durable block — `[0,P]`
