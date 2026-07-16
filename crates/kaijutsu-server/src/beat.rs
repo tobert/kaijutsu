@@ -54,9 +54,13 @@ use kaijutsu_types::{
 use crate::clock::{ClockSource, ClockSourceKind};
 use crate::rpc::ServerRegistry;
 
-/// The score's source-notation mime — the only content a render target consumes
-/// (matches `ABC_MIME` in the kernel bridge). A committed cell of any other mime
-/// is not handed to a (MIDI) render target.
+/// The score's source-notation mime (matches `ABC_MIME` in the kernel bridge).
+/// Since R3 (docs/pcm.md, 2026-07-16) the render crossing is mime-agnostic —
+/// every committed cell's mime rides its `RenderCue` — so this const's
+/// remaining job is attach-time rehydration, which rebuilds the committed log
+/// from the score context's **notation** blocks only (a restart drops past
+/// clip cells from the in-memory log; the score context stays the durable
+/// record — see docs/issues.md "Clip cells").
 const ABC_MIME: &str = "text/vnd.abc";
 
 /// Ticks the playhead advances per beat (PPQ 1: one tick per beat). The tick is
@@ -1739,12 +1743,17 @@ impl BeatScheduler {
     /// Publish a wire `RenderCue` for every cell that crossed the write barrier
     /// this beat (`[hw_before, hw_after)` in the track's committed log) to the
     /// track's score context (docs/midi.md "Render is a wire cue"): any attached
-    /// app sink renders it, a track with no sink just makes no sound. Each cue
-    /// carries the **pre-resolved** ABC `&str` (so a sink never re-hits CAS) and a
-    /// `lead` — the near-future local instant translated to a duration from now.
+    /// app sink renders it, a track with no sink just makes no sound.
+    /// **Mime-agnostic** (docs/pcm.md R3, 2026-07-16 — was ABC-hardwired): each
+    /// cue carries the cell's own mime plus its **pre-resolved** source bytes
+    /// inline (so a sink never re-hits CAS for the *symbolic* content — a clip
+    /// record's `media` stays a CAS ref the sink resolves) and a `lead` — the
+    /// near-future local instant translated to a duration from now. Committed
+    /// cells are symbolic by construction ("bytes never ride the track"), so
+    /// inlining is safe; sinks dispatch by mime and ignore what isn't theirs.
     /// Cheap exit (no CAS reads) when nothing crossed this beat. The materialize
     /// crossing already stored every crossed cell's source bytes in durable CAS,
-    /// so a single `retrieve` per cell here resolves the ABC once.
+    /// so a single `retrieve` per cell here resolves the content once.
     fn publish_render_cues(
         &mut self,
         track_id: &TrackId,
@@ -1795,11 +1804,13 @@ impl BeatScheduler {
             return;
         };
         let cas = self.kernel.cas().clone();
-        let mut rendered: Vec<(String, Instant)> = Vec::with_capacity(crossed.len());
+        // (mime, source bytes, fire instant) per crossed cell — mime-agnostic:
+        // the cell's own mime rides the cue and the sink dispatches on it. No
+        // UTF-8 gate here anymore (that was the ABC-only generation): the wire
+        // payload is bytes, and a text-consuming sink (midi.rs) does its own
+        // from_utf8 with a loud warn.
+        let mut rendered: Vec<(String, Vec<u8>, Instant)> = Vec::with_capacity(crossed.len());
         for (cref, start) in crossed {
-            if cref.mime != ABC_MIME {
-                continue; // only ABC is handed to a (MIDI) render target this stage
-            }
             let bytes = match cas.retrieve(&cref.hash) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
@@ -1821,41 +1832,31 @@ impl BeatScheduler {
                     continue;
                 }
             };
-            let abc = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!(
-                        "beat: render of track {} skipped a cell — source is not UTF-8 \
-                         ABC: {e}",
-                        track_id.as_str()
-                    );
-                    continue;
-                }
-            };
-            rendered.push((abc, render_instant(base, period, start, playhead)));
+            rendered.push((cref.mime, bytes, render_instant(base, period, start, playhead)));
         }
         if rendered.is_empty() {
             return;
         }
-        // Publish a wire `RenderCue` per crossed ABC cell to every attached sink
-        // (the app renders it to MIDI). `lead` is relative — `at` is a near-future
-        // local instant on the speculation lead, so `at − now` is the transfer +
-        // schedule budget the sink re-anchors at `receipt + lead`. `now`/`now_epoch_ns`
-        // are ONE paired read shared by the whole batch (not re-read per cue) so
-        // every cue this beat carries the identical emission stamp — the sink's
-        // `backdate_events` folds `epoch_ns` against its own receipt to kill the
-        // per-cue transfer-latency jump that used to walk the render out of phase
-        // with the click (phase-align Slice 2).
+        // Publish a wire `RenderCue` per crossed cell to every attached sink
+        // (the app renders ABC to MIDI, clips to samples). `lead` is relative —
+        // `at` is a near-future local instant on the speculation lead, so `at −
+        // now` is the transfer + schedule budget the sink re-anchors at
+        // `receipt + lead`. `now`/`now_epoch_ns` are ONE paired read shared by
+        // the whole batch (not re-read per cue) so every cue this beat carries
+        // the identical emission stamp — the sink's `backdate_events` folds
+        // `epoch_ns` against its own receipt to kill the per-cue
+        // transfer-latency jump that used to walk the render out of phase with
+        // the click (phase-align Slice 2).
         let now = Instant::now();
         let now_epoch_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        for (abc, at) in &rendered {
+        for (mime, bytes, at) in rendered {
             let lead = at.saturating_duration_since(now);
             let cue = kaijutsu_audio::RenderCue {
-                mime: kaijutsu_audio::ABC_MIME.to_string(),
-                payload: kaijutsu_audio::CuePayload::Inline(abc.clone().into_bytes()),
+                mime,
+                payload: kaijutsu_audio::CuePayload::Inline(bytes),
                 lead,
                 epoch_ns: now_epoch_ns,
             };
@@ -3357,6 +3358,103 @@ mod tests {
                 match cue.payload {
                     kaijutsu_audio::CuePayload::Inline(bytes) => {
                         assert_eq!(bytes, abc.as_bytes(), "the resolved ABC rides inline");
+                    }
+                    other => panic!("expected Inline payload, got {other:?}"),
+                }
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
+    }
+
+    /// A resolver that commits a fixed, structurally-valid Shape A clip record
+    /// (mime `application/vnd.kaijutsu.clip+json`) — the R3 crossing test needs
+    /// a real clip cell to cross the barrier.
+    struct ValidClip;
+    impl ValidClip {
+        fn record() -> String {
+            let media = kaijutsu_cas::ContentHash::from_data(b"clip-media-bytes");
+            format!(r#"{{"v":1,"media":"{media}","mime":"audio/wav","label":"rimshot"}}"#)
+        }
+    }
+    impl Resolver for ValidClip {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("valid_clip")
+        }
+        fn estimate_cost(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::ZERO
+        }
+        fn compute_basis(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"valid-clip")
+        }
+        fn resolve(
+            &self,
+            _p: &serde_json::Value,
+            _c: &dyn ResolverCtx,
+        ) -> Result<Resolution, ResolveError> {
+            Ok(Resolution::new(Self::record(), kaijutsu_audio::CLIP_MIME))
+        }
+    }
+
+    /// R3 core: the materialize crossing is mime-agnostic — a committed CLIP
+    /// cell publishes a wire `RenderCue{ application/vnd.kaijutsu.clip+json }`
+    /// with the record riding inline (the *media* stays CAS — the sink resolves
+    /// it), exactly as an ABC cell does. This is the lift of the old
+    /// `cref.mime != ABC_MIME → skip` filter; the app clip renderer (R1)
+    /// consumes what this publishes.
+    #[tokio::test]
+    async fn crossing_a_clip_cell_publishes_a_render_cue() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        let track = TrackId::solo();
+        let tl = kernel.arm_track_timeline(
+            track.clone(),
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(ValidClip));
+            g.schedule(Cell::deferred_on(
+                Span::instant(Tick::new(1)),
+                Recipe {
+                    resolver: ResolverId::new("valid_clip"),
+                    params: serde_json::Value::Null,
+                    query: ContextQuery::default(),
+                    fallback: Fallback::Skip,
+                },
+                track.clone(),
+                PrincipalId::beat(),
+            ))
+            .unwrap();
+        }
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+        let score = sched.score_context(&track);
+
+        let mut sub = kernel.block_flows().subscribe("block.render_cue");
+
+        sched.play(&track, base);
+        sched.fire_due(base + Duration::from_secs(1)); // playhead reaches tick 1
+
+        let msg = sub
+            .try_recv()
+            .expect("a RenderCue must be published for the crossed clip cell");
+        match msg.payload {
+            BlockFlow::RenderCue { context_id, cue } => {
+                assert_eq!(context_id, score, "cue is keyed by the track's score context");
+                assert_eq!(cue.mime, kaijutsu_audio::CLIP_MIME, "clip cue mime");
+                assert!(cue.epoch_ns > 0, "a render cue is stamped with its emission wallclock");
+                match cue.payload {
+                    kaijutsu_audio::CuePayload::Inline(bytes) => {
+                        assert_eq!(
+                            bytes,
+                            ValidClip::record().into_bytes(),
+                            "the committed clip record rides inline; its media stays CAS"
+                        );
                     }
                     other => panic!("expected Inline payload, got {other:?}"),
                 }

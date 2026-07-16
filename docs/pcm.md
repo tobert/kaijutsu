@@ -4,8 +4,10 @@
 > 2026-07-16, absorbing `docs/clips.md` (merged here whole; it and this doc's
 > earlier design generations — including the retired `docs/playback.md` — are
 > recoverable from git history). Code is truth: the wire cue, the app sinks,
-> and the clip record are **landed**; the open work is the clip *path* —
-> producer → track → sink — mapped in "The remaining work" below. Companions:
+> the clip record, and the whole clip *path* — producer (`kj play --track`)
+> → crossing → sink renderer — are **landed** (R1/R2/R3/R5, 2026-07-16);
+> open: R4 (prepare horizon + skip-loud late gate) and the slice-4 edge
+> node, mapped in "The remaining work" below. Companions:
 > `docs/midi.md` ("Render is a wire cue" — the phase split; "The one
 > timebase" — the timing doctrine every cue rides), `docs/tracks.md`
 > (track/transport), `docs/hyoushigi.md` (the `Cell` substrate),
@@ -76,9 +78,9 @@ not a block — `matches_filter` bypasses it.
   period`, clamped ≥ now), stamp ONE `now`/`epoch_ns` pair for the whole
   batch, publish per cell. Subscriber-gated: a headless kernel with no sink
   attached skips the CAS reads entirely (the score is still durable — only
-  the ephemeral render is skipped). **ABC-hardwired today**: `cref.mime !=
-  ABC_MIME → skip` (beat.rs:1768). Lifting that *is* the clip track path
-  (R3 below).
+  the ephemeral render is skipped). **Mime-agnostic since R3** (2026-07-16):
+  every crossed cell's own mime rides its cue; sinks dispatch and ignore
+  what isn't theirs.
 - **Transport stop/pause** — the flush cue, ungated (cheap, must always land).
 
 ### Sinks (today the app; later an edge node)
@@ -242,7 +244,7 @@ it today; it would come with the verb growing a flag, not as a default.
    fails loud here.
 2. The cell crosses the write barrier at the beat; the crossing publishes
    `RenderCue { CLIP_MIME, payload, lead, epoch_ns }` exactly as it does ABC
-   — once R3 lifts the ABC-hardwire.
+   (mime-agnostic since R3).
 3. The sink parses the record, resolves `media` from its XDG cache (warm
    from the prepare horizon — R4), applies source range + gain, and fires at
    the backdated instant (R5).
@@ -277,11 +279,15 @@ make it musical.
   cas` precedent — capabilities are focus nudges in a shared-trust kernel).
   Until R3 lands, a committed clip cell materializes into the score but
   produces no `RenderCue`.
-- **R3 — crossing mime pass-through** (`beat.rs publish_render_cues`): lift
-  the `ABC_MIME` filter so any crossed cell's mime rides the cue; ABC keeps
-  its inline pre-resolve, a clip cell's record is small enough to inline
-  (the *media* stays CAS). Regression: non-ABC cells must not have been
-  silently load-bearing anywhere.
+- **R3 — crossing mime pass-through. ✅ landed 2026-07-16** (lead-built,
+  red-first): `publish_render_cues` is mime-agnostic — every crossed cell's
+  own mime rides its cue with the pre-resolved bytes inline (the *media* of
+  a clip stays CAS); the UTF-8 gate went with the ABC hardwire (the wire is
+  bytes; text sinks do their own from_utf8, loud). Known consequence,
+  carried in issues.md: attach-time rehydration is still notation-only, so
+  a restart drops past clip cells from the in-memory committed log (the
+  score context keeps them durably; clips carry `Skip`, so no fallback
+  pool is affected).
 - **R4 — the prepare horizon** (two-phase, resolved 2026-07-02; mechanism
   decided 2026-07-16): don't force one `lead` to be both jitter buffer and
   bulk-I/O window. **The prepare signal is its own wire directive at commit

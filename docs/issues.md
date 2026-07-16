@@ -1615,14 +1615,21 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   **budget-excepted deriver** (only if midi→pcm proves fast enough to run at the
   barrier — almost certainly not, soundfont synthesis is heavy). See
   `docs/pcm.md` § Distributed listening (playback.md retired 2026-07-01).
-- **Clip cells — record + validator LANDED (pcm.md 5b, 2026-07-02); the clip
-  *path* is the open work.** Shape A payload
-  (`application/vnd.kaijutsu.clip+json`) over the mime-keyed render seam;
-  bytes out-of-band (SFTP + `/v/cas`, client XDG CAS cache). Remaining:
-  R1 sink clip renderer, R2 producer verb, R3 crossing mime pass-through,
-  R4 prepare horizon, R5 sample lead scheduling — the map + open decisions
-  live in `docs/pcm.md` "The remaining work" (which absorbed clips.md
-  2026-07-16). Research record: `docs/cue-prior-art.md`.
+- **Clip cells — R1+R2+R3+R5 LANDED 2026-07-16** (`docs/pcm.md` "The
+  remaining work" is the map; research record `docs/cue-prior-art.md`).
+  Still open:
+    - **R4 prepare horizon** — the prepare directive at commit + the
+      skip-loud late gate (interim: a late CAS resolve fires late, which is
+      right for `kj play --cas` but wrong for a musically-placed clip).
+    - **Attach-time rehydration is notation-only** (`beat.rs` rehydrate
+      filters `ContentType::Abc`): after a kernel restart the in-memory
+      committed log drops past *clip* cells (the score context keeps them
+      durably; `UseLastGood`'s notation-purity is unaffected — clips carry
+      `Skip`). Matters only if something later reads the committed log for
+      historical clips; fold clip-aware rehydration in then.
+    - **Slice 4 edge-node sink** (midi.md M4) and the bevy full
+      feature-enumeration (MUST land before any bevy upgrade — the
+      two-rodio/two-cpal device fight, pcm.md polish list).
 - **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
   spans now that a producer exists.
 - **Multi-listener playback (was `docs/playback.md` — retired 2026-07-01).**
