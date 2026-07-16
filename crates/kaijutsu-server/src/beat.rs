@@ -811,8 +811,17 @@ impl BeatScheduler {
         track.playing = true;
         track.generation += 1; // invalidate any stale in-flight heap entry
         let generation = track.generation;
-        let period = track.clock.period();
-        self.heap.push(Reverse((now + period, track_id.clone(), generation)));
+        // Ask the CLOCK when to fire, not a bare `now + period`. A SystemClock's
+        // `next_fire` ignores `last` and returns exactly `now + period` — byte-
+        // for-byte today's behavior, unchanged (clock.rs). A ModeledClock instead
+        // phase-locks onto the master's next integer beat: `last` is the track's
+        // stale pre-pause `last_fire_scheduled`, which the clock's own
+        // `from = max(last, now)` guard discards in favor of `now` here — a
+        // resume starts fresh from the actual resume instant, it never tries to
+        // catch up on beats missed while paused/stopped.
+        let last = track.last_fire_scheduled;
+        let next = track.clock.next_fire(last, now);
+        self.heap.push(Reverse((next, track_id.clone(), generation)));
         let _ = self.persist_track(track_id);
     }
 
@@ -1327,7 +1336,23 @@ impl BeatScheduler {
             // inside `process_track`, never the track — the clock keeps running across
             // a page-turn (continuity is free; the production gap during the child's
             // boot is absorbed by the speculation lead downstream, docs/tracks.md).
-            self.heap.push(Reverse((scheduled + period, track_id, cur_gen)));
+            //
+            // Ask the CLOCK for the next beat after `scheduled`, not a bare
+            // `scheduled + period`. Passing `scheduled` for BOTH `next_fire` args
+            // exactly reproduces `scheduled + period` for a SystemClock (its
+            // `next_fire` ignores `last` and returns `now + period`, so this is
+            // byte-for-byte the fix above, unchanged for system-clocked tracks).
+            // For a ModeledClock it instead re-derives the next INTEGER MASTER
+            // BEAT from the anchor — self-correcting any residual phase error
+            // every beat rather than compounding it additively. This was dead
+            // code before: the scheduler always used a flat `+period` step
+            // regardless of clock kind, so a `"modeled"` track's MIDI slaving
+            // updated its TEMPO (`apply_clock_estimate` → `set_period`) but never
+            // actually locked its PHASE to the observed master.
+            if let Some(tr) = self.tracks.get_mut(&track_id) {
+                let next = tr.clock.next_fire(scheduled, scheduled);
+                self.heap.push(Reverse((next, track_id, cur_gen)));
+            }
         }
         outcome
     }
@@ -2458,6 +2483,8 @@ mod tests {
     use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
 
+    use crate::clock::{ClockSourceKind, ModeledClock};
+
     use super::BeatScheduler;
     use super::{
         MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json, poison_action, render_instant,
@@ -3053,6 +3080,60 @@ mod tests {
         // A stamp 10 s in the past is stale — dropped, period untouched.
         sched.apply_clock_estimate(ctx, 8.0, 2.4, epoch_now_ns() - 10_000_000_000, "24:0");
         assert_eq!(sched.snapshot_tracks()[0].period, Duration::from_secs(1));
+    }
+
+    /// A ModeledClock's `next_fire` phase-locks each beat onto the master's
+    /// integer-beat grid (clock.rs) — but `play` and `fire_due`'s re-arm used
+    /// to bypass it entirely, re-arming every track (system OR modeled) with a
+    /// flat `+period` step off `now`/`scheduled`. That left a `"modeled"` track
+    /// indistinguishable from a system-clocked one: MIDI slaving updated the
+    /// TEMPO (`apply_clock_estimate` → `set_period`) but never actually locked
+    /// the PHASE. Both call sites now delegate to `clock.next_fire`.
+    #[tokio::test]
+    async fn modeled_clock_play_and_rearm_land_on_the_masters_grid() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let track = TrackId::solo();
+        arm_track_with_markers(&kernel, &track, 5);
+        sched.attach(track.clone(), ctx, slow_attachment(), slow_policy()).unwrap();
+
+        // Anchor a 500ms-period ModeledClock directly (bypassing the real-time
+        // `apply_clock_estimate` path for a deterministic test): master beat
+        // 4.25 was true at `t0` — mirrors clock.rs's own
+        // `modeled_fires_on_the_masters_integer_beats`, whose next integer
+        // beats land at t0+375ms, then t0+875ms, ...
+        let t0 = Instant::now();
+        let mut mc = ModeledClock::new(Duration::from_millis(500));
+        mc.apply_estimate(4.25, 2.0, t0);
+        sched.tracks.get_mut(&track).unwrap().clock = ClockSourceKind::Modeled(mc);
+
+        // `play` must ask the clock, not assume `now + period` (t0+500ms,
+        // OFF the master's grid).
+        sched.play(&track, t0);
+        assert_eq!(
+            sched.next_wake(),
+            Some(t0 + Duration::from_millis(375)),
+            "play lands on the master's grid, not a naive now+period"
+        );
+
+        // Fire that beat, then force a scheduler stall well beyond the
+        // GRID_RESEED_AFTER_PERIODS cap (2 * 500ms = 1s): due at t0+375ms,
+        // actually processed at t0+2125ms (1.75s late). This triggers a grid
+        // RE-SEED (`scheduled = now`) at an instant that is NOT on the
+        // anchor's integer-beat grid (t0+2125ms is master beat 8.5, not a
+        // whole beat) — so the re-arm's `next_fire` call must re-derive the
+        // true next beat (t0+2375ms) rather than a bare `scheduled + period`
+        // (t0+2125ms + 500ms = t0+2625ms), which would drift 250ms off the
+        // master's actual grid. That drift is exactly the bug this closes.
+        sched.fire_due(t0 + Duration::from_millis(2125));
+        assert_eq!(
+            sched.next_wake(),
+            Some(t0 + Duration::from_millis(2375)),
+            "re-arm re-locks to the master's true next beat after a reseed, \
+             not a bare scheduled+period"
+        );
     }
 
     /// Playing drives one ticked block per beat in tick order; attaching alone
