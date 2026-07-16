@@ -53,13 +53,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use kaijutsu_audio::{
-    ABC_MIME, CLIP_MIME, Clip, ClipError, CuePayload, REF_STALE_MAX, RENDER_FLUSH_MIME,
+    ABC_MIME, CLIP_MIME, Clip, ClipError, CuePayload, PREPARE_MIME, REF_STALE_MAX,
+    RENDER_FLUSH_MIME,
 };
 use kaijutsu_cas::ContentHash;
 use kaijutsu_client::{CasResolver, ServerEvent, SftpClient, SftpError, SshConfig};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::audio_sched::{self, AudioSchedulerHandle, effective_deadline};
+use crate::audio_sched::{self, AudioSchedulerHandle, DeadlineDecision, GRACE, decide_deadline, effective_deadline};
 use crate::connection::actor_plugin::{RpcConnectionState, ServerEventMessage};
 
 /// Bridges `ServerEvent::RenderCue` directives to the audio scheduler thread.
@@ -79,19 +80,34 @@ impl Plugin for AudioOutPlugin {
 /// clip record resolves the record JSON first and must dispatch a SECOND
 /// fetch for its `media` before anything can play.
 enum PrefetchKind {
-    /// A plain `audio/*` cue — the resolved bytes ARE the sample.
-    Audio { deadline: Instant },
+    /// A plain `audio/*` cue — the resolved bytes ARE the sample. `stamped`
+    /// is whether the originating `RenderCue` carried a non-zero `epoch_ns`
+    /// (the crossing always stamps; `kj play`'s cues don't) — R4's
+    /// skip-loud gate (`audio_sched::decide_deadline`) fires on it once the
+    /// bytes land.
+    Audio { deadline: Instant, stamped: bool },
     /// A clip record fetched from CAS (`CuePayload::Cas` + `CLIP_MIME`) —
     /// parse it, then dispatch a second prefetch for its `media` hash.
-    ClipRecord { deadline: Instant },
+    /// `stamped` is carried through (not gated here — a record fetch running
+    /// long isn't itself "playing" anything late) so the eventual
+    /// `ClipMedia` dispatch inherits the right value.
+    ClipRecord { deadline: Instant, stamped: bool },
     /// A clip's sample media resolved — ready to schedule with the record's
-    /// trim/gain baked in.
+    /// trim/gain baked in. `stamped` gates R4's skip-loud decision the same
+    /// way `Audio` does.
     ClipMedia {
         deadline: Instant,
+        stamped: bool,
         src_offset: Option<Duration>,
         src_len: Option<Duration>,
         gain_db: f64,
     },
+    /// R4 cache-warm (`PREPARE_MIME`, docs/pcm.md "The prepare horizon") — no
+    /// deadline, nothing ever plays: the resolve itself (which writes the XDG
+    /// cache as a side effect, `CasResolver::resolve`) IS the whole point.
+    /// `started` is stamped at dispatch so the outcome can log end-to-end
+    /// warm latency (connect + resolve, including any redial).
+    Warm { started: Instant },
 }
 
 /// A resolved (or failed) CAS prefetch, tagged with the cue's mime and
@@ -99,6 +115,11 @@ enum PrefetchKind {
 /// thread for [`drain_prefetch_results`].
 struct PrefetchOutcome {
     mime: String,
+    /// The object that was fetched — carried through so a skip-loud drop can
+    /// name it in the log (`docs/pcm.md` R4: "log the underrun … naming the
+    /// label-less hash" — no clip label rides this far down the pipeline,
+    /// only the hash does).
+    hash: ContentHash,
     kind: PrefetchKind,
     result: Result<Vec<u8>, String>,
 }
@@ -155,14 +176,33 @@ impl CasPrefetch {
                 .await
                 .map_err(|e| e.to_string());
             // A closed receiver just means the app is shutting down.
-            let _ = tx.send(PrefetchOutcome { mime, kind, result });
+            let _ = tx.send(PrefetchOutcome {
+                mime,
+                hash,
+                kind,
+                result,
+            });
         });
     }
 }
 
+/// A per-object resolve bound (docs/pcm.md R4, "Resolver transport
+/// hardening") — a *transfer* bound, not the musical deadline (that gate is
+/// `decide_deadline`/`effective_deadline` at delivery, R4 step 4). The live
+/// failure this closes: an idle (~11 min) SFTP connection died silently;
+/// dead-peer detection took ~70s, well past any reasonable "is this cue
+/// still coming" patience. Generous on purpose — this must never trip on a
+/// genuinely large, healthy transfer, only on a transport that has gone
+/// silent.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Resolve `hash`, connecting the shared resolver on first use. A transport
-/// failure drops the connection so it redials; a per-object failure (NotFound /
-/// HashMismatch) leaves the healthy transport in place.
+/// failure OR a [`FETCH_TIMEOUT`] timeout (treated identically — a dead-but-
+/// not-yet-RST'd transport looks exactly like a slow one from here) drops
+/// the connection so it redials; a per-object failure (NotFound /
+/// HashMismatch) leaves the healthy transport in place. Logs the happy path
+/// too (`docs/issues.md` "Audio sink follow-ups") — hit/miss and timing, so a
+/// live debugging session has something to read instead of silence.
 async fn resolve_with_lazy_connect(
     slot: &AsyncMutex<Option<Arc<CasResolver<SftpClient>>>>,
     hash: &ContentHash,
@@ -175,8 +215,27 @@ async fn resolve_with_lazy_connect(
     let mut redialed = false;
     loop {
         let resolver = get_or_connect(slot, &config).await?;
-        match resolver.resolve(hash).await {
-            Ok(bytes) => return Ok(bytes),
+        let started = Instant::now();
+        let outcome = match tokio::time::timeout(FETCH_TIMEOUT, resolver.resolve(hash)).await {
+            Ok(inner) => inner,
+            // A timeout is not a `SftpError` on its own — fold it into the
+            // SAME "transport" bucket the redial logic below already
+            // recognizes (`Ssh`/`Protocol`) rather than adding a third
+            // never-redialed error class.
+            Err(_elapsed) => Err(SftpError::Protocol(format!(
+                "resolve timed out after {FETCH_TIMEOUT:?} — treating as a dead transport"
+            ))),
+        };
+        match outcome {
+            Ok((bytes, source)) => {
+                info!(
+                    "media resolved ({}) {} bytes in {}ms",
+                    source.label(),
+                    bytes.len(),
+                    started.elapsed().as_millis()
+                );
+                return Ok(bytes);
+            }
             Err(e) => {
                 let transport = matches!(e, SftpError::Ssh(_) | SftpError::Protocol(_));
                 if transport {
@@ -189,6 +248,10 @@ async fn resolve_with_lazy_connect(
                 }
                 if transport && !redialed {
                     redialed = true;
+                    // The live failure this closes: the previous single
+                    // redial-retry was silent, so a placed clip just didn't
+                    // sound with nothing in the log (`docs/issues.md`).
+                    info!("sftp transport stale; redialing");
                     continue;
                 }
                 return Err(e);
@@ -237,10 +300,12 @@ fn clip_source_offset(clip: &Clip) -> Option<Duration> {
 /// [`PrefetchKind::ClipMedia`] carrying its baked trim/gain and the
 /// (already-backdated) `deadline`. Split out from the dispatch call so
 /// parsing + field-mapping is unit-testable with no connection, no CAS, no
-/// async machinery at all.
+/// async machinery at all. `stamped` just rides along into the returned
+/// `PrefetchKind` — see `PrefetchKind::ClipMedia`'s doc.
 fn clip_media_fetch(
     json: &str,
     deadline: Instant,
+    stamped: bool,
 ) -> Result<(ContentHash, String, PrefetchKind), ClipError> {
     let clip = Clip::parse(json)?;
     Ok((
@@ -248,6 +313,7 @@ fn clip_media_fetch(
         clip.mime.clone(),
         PrefetchKind::ClipMedia {
             deadline,
+            stamped,
             src_offset: clip_source_offset(&clip),
             src_len: clip.src_len_ms.map(Duration::from_millis),
             gain_db: clip.gain_db,
@@ -264,10 +330,11 @@ fn clip_media_fetch(
 fn dispatch_clip_media(
     json: &str,
     deadline: Instant,
+    stamped: bool,
     prefetch: &CasPrefetch,
     connection: Option<&RpcConnectionState>,
 ) {
-    let (media, mime, kind) = match clip_media_fetch(json, deadline) {
+    let (media, mime, kind) = match clip_media_fetch(json, deadline, stamped) {
         Ok(v) => v,
         Err(e) => {
             warn!("clip record failed to parse; skipping (loud, not silent): {e}");
@@ -290,12 +357,13 @@ fn dispatch_clip_media(
 fn handle_clip_cue(
     payload: &CuePayload,
     deadline: Instant,
+    stamped: bool,
     prefetch: &CasPrefetch,
     connection: Option<&RpcConnectionState>,
 ) {
     match payload {
         CuePayload::Inline(bytes) => match std::str::from_utf8(bytes) {
-            Ok(json) => dispatch_clip_media(json, deadline, prefetch, connection),
+            Ok(json) => dispatch_clip_media(json, deadline, stamped, prefetch, connection),
             Err(_) => warn!("clip cue payload was not UTF-8; skipping"),
         },
         CuePayload::Cas(hash) => match connection {
@@ -304,7 +372,7 @@ fn handle_clip_cue(
                     hash.clone(),
                     CLIP_MIME.to_string(),
                     conn.ssh_config.clone(),
-                    PrefetchKind::ClipRecord { deadline },
+                    PrefetchKind::ClipRecord { deadline, stamped },
                 );
             }
             _ => warn!(
@@ -346,11 +414,49 @@ fn play_render_cues(
             continue;
         }
 
-        if cue.mime == CLIP_MIME {
-            match effective_deadline(now, cue.lead, cue.epoch_ns, now_epoch_ns) {
-                Some(deadline) => {
-                    handle_clip_cue(&cue.payload, deadline, &prefetch, connection.as_deref())
+        if cue.mime == PREPARE_MIME {
+            // Not gated by staleness — `PREPARE_MIME`'s own contract
+            // (`kaijutsu-audio::lib.rs`) says a sink never rejects a prepare
+            // cue as stale; the cache is worth warming even if the cue is
+            // "old" by the time it's processed.
+            match &cue.payload {
+                CuePayload::Cas(hash) => match connection.as_deref() {
+                    Some(conn) if conn.connected => {
+                        prefetch.dispatch(
+                            hash.clone(),
+                            cue.mime.clone(),
+                            conn.ssh_config.clone(),
+                            PrefetchKind::Warm { started: now },
+                        );
+                    }
+                    _ => warn!(
+                        "prepare cue arrived before a live connection — cannot warm the cache \
+                         (hash={hash:?})"
+                    ),
+                },
+                CuePayload::Inline(_) => {
+                    // A prepare cue's whole point is naming a CAS object to
+                    // warm ahead of time — an inline payload has nothing to
+                    // warm and is a producer bug, not a sink concern to hide.
+                    warn!(
+                        "prepare cue carried an Inline payload — protocol misuse ({PREPARE_MIME} \
+                         must be CuePayload::Cas); skipping"
+                    );
                 }
+            }
+            continue;
+        }
+
+        if cue.mime == CLIP_MIME {
+            let stamped = cue.epoch_ns != 0;
+            match effective_deadline(now, cue.lead, cue.epoch_ns, now_epoch_ns) {
+                Some(deadline) => handle_clip_cue(
+                    &cue.payload,
+                    deadline,
+                    stamped,
+                    &prefetch,
+                    connection.as_deref(),
+                ),
                 None => {
                     kaijutsu_telemetry::record_stale_cue_dropped();
                     warn!(
@@ -407,7 +513,10 @@ fn play_render_cues(
                                 hash.clone(),
                                 cue.mime.clone(),
                                 conn.ssh_config.clone(),
-                                PrefetchKind::Audio { deadline },
+                                PrefetchKind::Audio {
+                                    deadline,
+                                    stamped: cue.epoch_ns != 0,
+                                },
                             );
                         }
                         _ => warn!(
@@ -433,6 +542,11 @@ fn play_render_cues(
 /// Act on prefetched CAS objects as they resolve — the async tail of the CAS
 /// branches in [`play_render_cues`]. Runs on the Bevy main thread, so the
 /// off-thread resolve never touches scheduler dispatch directly.
+///
+/// R4's skip-loud gate (`audio_sched::decide_deadline`) is applied HERE,
+/// right before the two places that would otherwise call
+/// `scheduler.play_at` — a `DropLate` decision means nothing reaches the
+/// scheduler at all, never a late `PlayAt`.
 fn drain_prefetch_results(
     prefetch: Res<CasPrefetch>,
     scheduler: Res<AudioSchedulerHandle>,
@@ -440,30 +554,75 @@ fn drain_prefetch_results(
 ) {
     while let Ok(outcome) = prefetch.rx.try_recv() {
         match outcome.kind {
-            PrefetchKind::Audio { deadline } => match outcome.result {
-                Ok(bytes) => scheduler.play_at(bytes, deadline, None, None, 0.0),
+            PrefetchKind::Audio { deadline, stamped } => match outcome.result {
+                Ok(bytes) => match decide_deadline(deadline, stamped, Instant::now()) {
+                    DeadlineDecision::Fire => scheduler.play_at(bytes, deadline, None, None, 0.0),
+                    DeadlineDecision::DropLate { late_by } => {
+                        kaijutsu_telemetry::record_stale_cue_dropped();
+                        warn!(
+                            "audio media landed too late — dropping rather than firing stale \
+                             (hash={:?}, {} bytes, {}ms past deadline, grace is {:?})",
+                            outcome.hash,
+                            bytes.len(),
+                            late_by.as_millis(),
+                            GRACE
+                        );
+                    }
+                },
                 Err(e) => warn!("CAS prefetch failed (mime={}): {e}", outcome.mime),
             },
-            PrefetchKind::ClipRecord { deadline } => match outcome.result {
+            PrefetchKind::ClipRecord { deadline, stamped } => match outcome.result {
                 Ok(bytes) => match std::str::from_utf8(&bytes) {
-                    Ok(json) => {
-                        dispatch_clip_media(json, deadline, &prefetch, connection.as_deref())
-                    }
+                    Ok(json) => dispatch_clip_media(
+                        json,
+                        deadline,
+                        stamped,
+                        &prefetch,
+                        connection.as_deref(),
+                    ),
                     Err(_) => warn!("CAS clip record was not UTF-8; skipping"),
                 },
                 Err(e) => warn!("CAS clip record prefetch failed: {e}"),
             },
             PrefetchKind::ClipMedia {
                 deadline,
+                stamped,
                 src_offset,
                 src_len,
                 gain_db,
             } => match outcome.result {
-                Ok(bytes) => scheduler.play_at(bytes, deadline, src_offset, src_len, gain_db),
+                Ok(bytes) => match decide_deadline(deadline, stamped, Instant::now()) {
+                    DeadlineDecision::Fire => {
+                        scheduler.play_at(bytes, deadline, src_offset, src_len, gain_db)
+                    }
+                    DeadlineDecision::DropLate { late_by } => {
+                        kaijutsu_telemetry::record_stale_cue_dropped();
+                        warn!(
+                            "clip media landed too late — dropping rather than firing stale \
+                             (hash={:?}, {} bytes, {}ms past deadline, grace is {:?})",
+                            outcome.hash,
+                            bytes.len(),
+                            late_by.as_millis(),
+                            GRACE
+                        );
+                    }
+                },
                 Err(e) => warn!(
                     "clip media not resolved from CAS; skipping (mime={}): {e}",
                     outcome.mime
                 ),
+            },
+            PrefetchKind::Warm { started } => match outcome.result {
+                // The XDG cache write already happened INSIDE the resolve
+                // (`CasResolver::resolve`/`fetch_verify_store` stores every
+                // verified fetch) — there is nothing left to do with `bytes`
+                // here but report that the warm landed.
+                Ok(bytes) => info!(
+                    "media warmed: {} bytes in {}ms",
+                    bytes.len(),
+                    started.elapsed().as_millis()
+                ),
+                Err(e) => warn!("media warm failed (mime={}): {e}", outcome.mime),
             },
         }
     }
@@ -503,13 +662,16 @@ mod tests {
 
     /// Push a prefetch outcome straight onto the channel (same-module access) —
     /// stands in for the off-thread resolve completing, so the drain system is
-    /// testable without a live SFTP server.
+    /// testable without a live SFTP server. `hash` is arbitrary — none of
+    /// these tests care WHICH object resolved, only that the outcome carries
+    /// one to name in a skip-loud log line.
     fn deliver(app: &mut App, mime: &str, kind: PrefetchKind, result: Result<Vec<u8>, String>) {
         app.world()
             .resource::<CasPrefetch>()
             .tx
             .send(PrefetchOutcome {
                 mime: mime.to_string(),
+                hash: ContentHash::from_data(b"test-object"),
                 kind,
                 result,
             })
@@ -642,7 +804,10 @@ mod tests {
         deliver(
             &mut app,
             "audio/wav",
-            PrefetchKind::Audio { deadline },
+            PrefetchKind::Audio {
+                deadline,
+                stamped: true,
+            },
             Ok(vec![1, 2, 3, 4]),
         );
 
@@ -671,6 +836,7 @@ mod tests {
             "audio/wav",
             PrefetchKind::Audio {
                 deadline: Instant::now(),
+                stamped: true,
             },
             Err(format!(
                 "no such path: {}/…",
@@ -678,6 +844,78 @@ mod tests {
             )),
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    // ── R4: skip-loud on a stale CAS fetch, integration through drain ──────
+
+    /// A stamped (musically-placed) audio cue whose media lands more than
+    /// `GRACE` past its deadline is dropped — NOTHING reaches the scheduler,
+    /// not even a late `PlayAt` (closes R5's carried interim behavior,
+    /// docs/pcm.md R4).
+    #[test]
+    fn a_stamped_audio_object_landing_past_grace_is_dropped_not_scheduled() {
+        let (mut app, rx) = test_app();
+        let deadline = Instant::now() - (GRACE + Duration::from_millis(50));
+        deliver(
+            &mut app,
+            "audio/wav",
+            PrefetchKind::Audio {
+                deadline,
+                stamped: true,
+            },
+            Ok(vec![1, 2, 3, 4]),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a stamped cue landing past GRACE must never reach the scheduler"
+        );
+    }
+
+    /// An UNSTAMPED audio cue (asap semantics, e.g. `kj play --cas`) still
+    /// fires even when its media lands wildly late — there is no musical
+    /// placement to violate, so R4's skip-loud gate must never touch it.
+    #[test]
+    fn an_unstamped_audio_object_landing_late_still_schedules() {
+        let (mut app, rx) = test_app();
+        let deadline = Instant::now() - Duration::from_secs(5);
+        deliver(
+            &mut app,
+            "audio/wav",
+            PrefetchKind::Audio {
+                deadline,
+                stamped: false,
+            },
+            Ok(vec![1, 2, 3, 4]),
+        );
+        match rx.try_recv().expect("unstamped cues still fire however late") {
+            SchedulerCmd::PlayAt { bytes, .. } => assert_eq!(bytes, vec![1, 2, 3, 4]),
+            other => panic!("expected PlayAt, got {other:?}"),
+        }
+    }
+
+    /// The same skip-loud gate applies to a clip's resolved media, not just
+    /// plain audio — a stamped clip cue landing past grace is dropped, never
+    /// scheduled with its trim/gain applied.
+    #[test]
+    fn a_stamped_clip_media_object_landing_past_grace_is_dropped_not_scheduled() {
+        let (mut app, rx) = test_app();
+        let deadline = Instant::now() - (GRACE + Duration::from_millis(50));
+        deliver(
+            &mut app,
+            "audio/wav",
+            PrefetchKind::ClipMedia {
+                deadline,
+                stamped: true,
+                src_offset: None,
+                src_len: None,
+                gain_db: 0.0,
+            },
+            Ok(vec![9, 9, 9]),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a stamped clip media landing past GRACE must never reach the scheduler"
+        );
     }
 
     /// A transport flush cue reaches the scheduler as `Flush` — wired to the
@@ -690,6 +928,81 @@ mod tests {
             RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new()),
         );
         assert!(matches!(rx.try_recv(), Ok(SchedulerCmd::Flush)));
+    }
+
+    // ── R4: the prepare-cue cache warm (PREPARE_MIME) ──────────────────────
+
+    /// A `PREPARE_MIME` cue with no live connection can't dispatch a warm —
+    /// it warns and touches neither the scheduler nor the internal prefetch
+    /// channel (mirrors the plain CAS-audio "no connection" edge).
+    #[test]
+    fn prepare_cue_with_no_connection_warns_and_dispatches_nothing() {
+        let (mut app, rx) = test_app();
+        play(
+            &mut app,
+            RenderCue {
+                mime: PREPARE_MIME.into(),
+                payload: CuePayload::Cas(ContentHash::from_data(b"warm-me")),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+            },
+        );
+        assert!(rx.try_recv().is_err(), "nothing ever reaches the scheduler for a prepare cue");
+        assert!(
+            app.world().resource::<CasPrefetch>().rx.try_recv().is_err(),
+            "no connection means no dispatch was ever made"
+        );
+    }
+
+    /// An `Inline` payload under `PREPARE_MIME` is a protocol misuse (the
+    /// whole point of a prepare cue is naming a CAS object to warm) — warn
+    /// and skip, never dispatch, never panic.
+    #[test]
+    fn inline_prepare_cue_is_a_protocol_misuse_and_dispatches_nothing() {
+        let (mut app, rx) = test_app();
+        play(
+            &mut app,
+            RenderCue::now_inline(PREPARE_MIME, vec![1, 2, 3]),
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.world().resource::<CasPrefetch>().rx.try_recv().is_err(),
+            "an Inline prepare payload must never dispatch a fetch"
+        );
+    }
+
+    /// The async tail of a successful warm: nothing is ever scheduled — the
+    /// resolve's side effect (writing the XDG cache) already happened inside
+    /// `CasResolver::resolve`, so `drain_prefetch_results` has nothing left
+    /// to do but report it landed.
+    #[test]
+    fn a_resolved_warm_prefetch_schedules_nothing() {
+        let (mut app, rx) = test_app();
+        deliver(
+            &mut app,
+            PREPARE_MIME,
+            PrefetchKind::Warm {
+                started: Instant::now(),
+            },
+            Ok(vec![1, 2, 3, 4]),
+        );
+        assert!(rx.try_recv().is_err(), "a warm never plays or schedules anything");
+    }
+
+    /// A failed warm is a loud no-op, same as a failed audio/clip prefetch —
+    /// nothing sent to the scheduler.
+    #[test]
+    fn a_failed_warm_prefetch_schedules_nothing() {
+        let (mut app, rx) = test_app();
+        deliver(
+            &mut app,
+            PREPARE_MIME,
+            PrefetchKind::Warm {
+                started: Instant::now(),
+            },
+            Err("transport died mid-warm".to_string()),
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     // ── The clip renderer (R1): flips from "asserts-skip" to "asserts-scheduled" ─
@@ -737,6 +1050,7 @@ mod tests {
             "audio/wav",
             PrefetchKind::ClipMedia {
                 deadline,
+                stamped: true,
                 src_offset: Some(Duration::from_millis(100)),
                 src_len: Some(Duration::from_millis(500)),
                 gain_db: -6.0,
@@ -795,17 +1109,20 @@ mod tests {
             r#"{{"v":1,"media":"{media}","mime":"audio/wav","label":"rimshot","src_offset_ms":100,"src_len_ms":500,"gain_db":-6.0}}"#
         );
         let deadline = Instant::now() + Duration::from_millis(50);
-        let (got_media, got_mime, kind) = clip_media_fetch(&json, deadline).expect("valid record");
+        let (got_media, got_mime, kind) =
+            clip_media_fetch(&json, deadline, true).expect("valid record");
         assert_eq!(got_media, media);
         assert_eq!(got_mime, "audio/wav");
         match kind {
             PrefetchKind::ClipMedia {
                 deadline: d,
+                stamped,
                 src_offset,
                 src_len,
                 gain_db,
             } => {
                 assert_eq!(d, deadline);
+                assert!(stamped, "stamped rides straight through from the caller");
                 assert_eq!(src_offset, Some(Duration::from_millis(100)));
                 assert_eq!(src_len, Some(Duration::from_millis(500)));
                 assert_eq!(gain_db, -6.0);
@@ -818,14 +1135,17 @@ mod tests {
     fn clip_media_fetch_defaults_zero_offset_to_none() {
         let media = ContentHash::from_data(b"kick");
         let json = format!(r#"{{"v":1,"media":"{media}","mime":"audio/wav","label":"kick"}}"#);
-        let (_, _, kind) = clip_media_fetch(&json, Instant::now()).expect("valid minimal record");
+        let (_, _, kind) =
+            clip_media_fetch(&json, Instant::now(), false).expect("valid minimal record");
         match kind {
             PrefetchKind::ClipMedia {
+                stamped,
                 src_offset,
                 src_len,
                 gain_db,
                 ..
             } => {
+                assert!(!stamped, "stamped rides straight through from the caller");
                 assert_eq!(
                     src_offset, None,
                     "zero offset maps to None, build_source's fast path"
@@ -839,6 +1159,6 @@ mod tests {
 
     #[test]
     fn clip_media_fetch_rejects_an_invalid_record() {
-        assert!(clip_media_fetch("{}", Instant::now()).is_err());
+        assert!(clip_media_fetch("{}", Instant::now(), true).is_err());
     }
 }

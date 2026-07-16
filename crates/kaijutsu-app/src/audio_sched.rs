@@ -167,6 +167,54 @@ pub(crate) fn db_to_linear(gain_db: f64) -> f64 {
     10f64.powf(gain_db / 20.0)
 }
 
+// ── R4: skip-loud on a late CAS-resolved fire (docs/pcm.md, "closes R5's
+// interim behavior") ────────────────────────────────────────────────────────
+
+/// How late a *musically-placed* cue's media may land past its already-
+/// backdated deadline before the fire is dropped loud rather than played
+/// (`docs/pcm.md` R4, "Late-fetch policy is skip-loud"). Small on purpose —
+/// this only absorbs the scheduler thread's own wakeup slop right at the
+/// deadline (`run`'s `recv_timeout`-as-sleep granularity), never a real fetch
+/// delay: the fetch itself is bounded separately and generously by
+/// `audio.rs::FETCH_TIMEOUT` (R4 step 5), a wholly different budget. 100ms is
+/// comfortably above scheduler jitter and comfortably below "a listener
+/// notices this one-shot played meaningfully late."
+pub(crate) const GRACE: Duration = Duration::from_millis(100);
+
+/// What to do once a scheduled sound's bytes are ready to fire, given how far
+/// `now` sits past `deadline`. Pure — no clock read, no I/O — so it's
+/// unit-testable with hand-picked `Instant`s; the one call site is
+/// `audio.rs::drain_prefetch_results`, right before it would otherwise call
+/// `scheduler.play_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadlineDecision {
+    /// Play it — on time, or unstamped (no musical placement to violate).
+    Fire,
+    /// Too late for a *stamped* cue — drop instead of firing arbitrarily
+    /// late. Carries how late, for the log line.
+    DropLate { late_by: Duration },
+}
+
+/// `stamped` is whether the cue that produced this deadline carried a
+/// non-zero `RenderCue::epoch_ns` — the musical crossing always stamps;
+/// `kj play`'s play-now/`--cas` cues do not (asap semantics, and there is no
+/// musical placement to be "late" against). An unstamped cue always fires,
+/// however late — that preserves `kj play --cas`'s existing behavior
+/// (`docs/pcm.md` R5's interim note, now closed for the stamped case only).
+/// A stamped cue fires within `GRACE` of its deadline and drops loud beyond
+/// it.
+pub(crate) fn decide_deadline(deadline: Instant, stamped: bool, now: Instant) -> DeadlineDecision {
+    if !stamped {
+        return DeadlineDecision::Fire;
+    }
+    let late_by = now.saturating_duration_since(deadline);
+    if late_by > GRACE {
+        DeadlineDecision::DropLate { late_by }
+    } else {
+        DeadlineDecision::Fire
+    }
+}
+
 // ── The pending queue: deadline-ordered, payload-agnostic ──────────────────
 
 /// One pending scheduled sound, min-ordered by `deadline` (earliest first)
@@ -469,6 +517,56 @@ mod tests {
         let lead = Duration::from_millis(50);
         let now_epoch_ns = aged(EPOCH, REF_STALE_MAX + Duration::from_secs(1) + lead);
         assert!(effective_deadline(now, lead, EPOCH, now_epoch_ns).is_none());
+    }
+
+    // ── decide_deadline: R4's skip-loud gate ───────────────────────────────
+
+    #[test]
+    fn a_stamped_cue_past_grace_drops_late() {
+        let deadline = Instant::now();
+        let now = deadline + GRACE + Duration::from_millis(1);
+        assert_eq!(
+            decide_deadline(deadline, true, now),
+            DeadlineDecision::DropLate {
+                late_by: GRACE + Duration::from_millis(1)
+            },
+            "a musically-placed cue more than GRACE late must drop, not fire"
+        );
+    }
+
+    #[test]
+    fn a_stamped_cue_on_time_fires() {
+        let deadline = Instant::now();
+        let now = deadline; // exactly on time
+        assert_eq!(
+            decide_deadline(deadline, true, now),
+            DeadlineDecision::Fire,
+            "on time (or early) always fires"
+        );
+    }
+
+    #[test]
+    fn a_stamped_cue_exactly_at_the_grace_boundary_still_fires() {
+        let deadline = Instant::now();
+        let now = deadline + GRACE; // exactly GRACE late — inclusive boundary
+        assert_eq!(
+            decide_deadline(deadline, true, now),
+            DeadlineDecision::Fire,
+            "exactly GRACE late is still accepted (boundary is inclusive)"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_cue_always_fires_however_late() {
+        // asap semantics (`kj play --cas`) — no musical placement to violate,
+        // so lateness (even wildly past GRACE) never drops it.
+        let deadline = Instant::now();
+        let now = deadline + GRACE * 100;
+        assert_eq!(
+            decide_deadline(deadline, false, now),
+            DeadlineDecision::Fire,
+            "unstamped cues fire regardless of how late — asap semantics preserved"
+        );
     }
 
     // ── db_to_linear ─────────────────────────────────────────────────────
