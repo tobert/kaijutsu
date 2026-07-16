@@ -17,9 +17,11 @@
 //!   producer side of a placed sample. `--at <tick>` places it at an
 //!   absolute tick (default: ASAP, `playhead + 1`); `--label` names it in the
 //!   score (defaults to the file stem for `<path>`, REQUIRED for `--cas`,
-//!   which has no derivable name). This mode does **not** publish a
-//!   `RenderCue` — the wire cue rides the crossing at the write barrier,
-//!   lifting the ABC-hardwire (docs/pcm.md R3), a later slice.
+//!   which has no derivable name). This mode does **not** publish a play-now
+//!   `RenderCue` — the *fire* cue still rides the crossing at the write
+//!   barrier (docs/pcm.md R3) — but `schedule_clip_cell` itself now publishes
+//!   the R4 *prepare* directive (`PREPARE_MIME`) at commit, so every sink
+//!   starts warming its cache immediately, long before the crossing.
 
 use clap::Parser;
 use kaijutsu_audio::{AudioFormatHint, Clip, CuePayload, RenderCue, CLIP_VERSION};
@@ -571,11 +573,13 @@ mod tests {
     }
 
     /// `kj play <path> --track <t>` commits a clip cell instead of playing
-    /// now: no `RenderCue` is published (the crossing is a later slice, R3),
-    /// the label defaults to the file stem, and `.data` carries full ids for
-    /// track/tick/media/record/label/mime — the two-level reference
-    /// (docs/pcm.md): `media` is the sample bytes' hash, `record` is the clip
-    /// JSON's own (different) hash.
+    /// now: no *play-now* `RenderCue` is published (the fire cue still rides
+    /// the crossing, a later slice, R3) — but `schedule_clip_cell` DOES now
+    /// publish the R4 prepare directive at commit (`PREPARE_MIME`, naming the
+    /// clip's `media` hash). The label defaults to the file stem, and `.data`
+    /// carries full ids for track/tick/media/record/label/mime — the
+    /// two-level reference (docs/pcm.md): `media` is the sample bytes' hash,
+    /// `record` is the clip JSON's own (different) hash.
     #[tokio::test]
     async fn play_track_commits_a_clip_cell_from_path() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -612,13 +616,6 @@ mod tests {
             result.message()
         );
 
-        // The commit mode never publishes a play-now RenderCue — the wire
-        // cue rides the write-barrier crossing (R3), untouched by this slice.
-        assert!(
-            sub.try_recv().is_none(),
-            "kj play --track must not publish a play-now RenderCue"
-        );
-
         let crate::kj::KjResult::Ok { data, .. } = result else {
             panic!("expected Ok result");
         };
@@ -628,6 +625,29 @@ mod tests {
         assert_eq!(data["mime"], "audio/wav");
         let expected_media = ContentHash::from_data(&sample_bytes).to_string();
         assert_eq!(data["media"], expected_media, "media hash matches the stored file bytes");
+
+        // The commit mode publishes exactly one directive: the R4 prepare
+        // cue (naming the clip's media hash) — never a play-now fire cue.
+        let msg = sub
+            .try_recv()
+            .expect("schedule_clip_cell must publish the R4 prepare directive at commit");
+        match msg.payload {
+            crate::flows::BlockFlow::RenderCue { cue, .. } => {
+                assert_eq!(
+                    cue.mime,
+                    kaijutsu_audio::PREPARE_MIME,
+                    "kj play --track publishes a prepare cue, never a play-now RenderCue"
+                );
+                match cue.payload {
+                    CuePayload::Cas(hash) => {
+                        assert_eq!(hash.to_string(), expected_media, "prepare cue names the media hash")
+                    }
+                    other => panic!("expected Cas(media), got {other:?}"),
+                }
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
+        assert!(sub.try_recv().is_none(), "exactly one directive published at commit");
         assert_eq!(data["record"].as_str().unwrap().len(), 32, "record is a 32-hex CAS hash");
         assert_ne!(
             data["record"], data["media"],

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kaijutsu_abc::ParseMode;
-use kaijutsu_audio::{Clip, CLIP_MIME};
+use kaijutsu_audio::{Clip, CuePayload, RenderCue, CLIP_MIME, PREPARE_MIME};
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_hyoushigi::{
     ContextHash, ContextQuery, Fallback, Recipe, ResolveError, Resolution, Resolver, ResolverCtx,
@@ -24,6 +24,8 @@ use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId, Role, TrackId,
 };
 use parking_lot::Mutex;
+
+use crate::flows::BlockFlow;
 
 // Re-export the hyoushigi cell primitives the server's beat scheduler needs to
 // reconstruct a track's committed log (Stage 2 WI 7) — so `kaijutsu-server` reaches
@@ -521,7 +523,7 @@ pub fn schedule_clip_cell(
     // outlive a rejection — harmless by construction: CAS is content-addressed,
     // so the orphan is idempotent and reusable, never a dangling reference
     // (kaibo review 2026-07-16 pinned the distinction).
-    Clip::parse_validated(clip_json, kernel.cas().as_ref())
+    let clip = Clip::parse_validated(clip_json, kernel.cas().as_ref())
         .map_err(|e| anyhow::anyhow!("schedule_clip_cell: invalid clip record: {e}"))?;
 
     let timeline = kernel.track_timeline(&track).ok_or_else(|| {
@@ -529,23 +531,70 @@ pub fn schedule_clip_cell(
     })?;
     let hash = kernel.cas().store(clip_json.as_bytes(), CLIP_MIME)?;
 
-    let mut g = timeline.lock();
-    // Computed INSIDE the lock — the TOCTOU guard documented above.
-    let start = at.unwrap_or_else(|| g.playhead() + TickDelta::new(1));
-    g.schedule(Cell::deferred_on(
-        Span::instant(start),
-        Recipe {
-            resolver: ResolverId::new(CasCommitResolver::ID),
-            params: serde_json::json!({ "hash": hash.as_str(), "mime": CLIP_MIME }),
-            query: ContextQuery::default(),
-            // Skip, NOT UseLastGood — see the doc comment above.
-            fallback: Fallback::Skip,
-        },
-        track,
-        played_by,
-    ))
-    .map_err(|e| anyhow::anyhow!("schedule_clip_cell: {e}"))?;
+    let start = {
+        let mut g = timeline.lock();
+        // Computed INSIDE the lock — the TOCTOU guard documented above.
+        let start = at.unwrap_or_else(|| g.playhead() + TickDelta::new(1));
+        g.schedule(Cell::deferred_on(
+            Span::instant(start),
+            Recipe {
+                resolver: ResolverId::new(CasCommitResolver::ID),
+                params: serde_json::json!({ "hash": hash.as_str(), "mime": CLIP_MIME }),
+                query: ContextQuery::default(),
+                // Skip, NOT UseLastGood — see the doc comment above.
+                fallback: Fallback::Skip,
+            },
+            track,
+            played_by,
+        ))
+        .map_err(|e| anyhow::anyhow!("schedule_clip_cell: {e}"))?;
+        start
+        // `g` drops here — publish below never holds the timeline lock.
+    };
+
+    // R4 (docs/pcm.md "The prepare horizon"): commit is the earliest possible
+    // moment to tell every sink "warm your cache" — long before this cell
+    // crosses the write barrier, where the fire cue's short `lead` only has
+    // to cover jitter, not a cold cache's fetch latency. Published
+    // unconditionally, same discipline as the crossing's flush cue
+    // (`publish_render_flush`, `kaijutsu-server/src/beat.rs`): this is a
+    // hash, not a CAS read, so there's no expensive work to gate behind a
+    // subscriber check the way `publish_render_cues` gates the fire cue.
+    publish_prepare_cue(kernel, clip.media);
+
     Ok(start)
+}
+
+/// Publish the R4 prepare directive (docs/pcm.md "The prepare horizon"): a
+/// [`PREPARE_MIME`] cue naming a clip's `media` hash, so every attached sink
+/// starts warming its CAS cache the instant the clip *commits*.
+///
+/// `context_id`: [`ContextId::nil()`] — a deliberate, documented sentinel
+/// (`kaijutsu_types::ids` — "for sentinel values only"), not a fabricated
+/// real one. This function has no reachable "track's score context": that
+/// mapping lives one layer out, in `kaijutsu-server`'s per-track registry
+/// (`beat.rs`'s `Tracks`), which this crate never sees. A plausible-looking
+/// `ContextId::new()` would read as meaningful when it isn't; `nil()` says so
+/// honestly. Verified safe, not assumed: `BlockFlow::matches_filter` bypasses
+/// context/kind filtering for `RenderCue` unconditionally (`flows.rs`), and
+/// the app sink destructures `ServerEvent::RenderCue { cue, .. }`, discarding
+/// `context_id` entirely (`kaijutsu-app/src/audio.rs::play_render_cues`) — no
+/// consumer anywhere keys off this field today. Per-listener routing by
+/// context is future work (docs/pcm.md "Distributed listening").
+fn publish_prepare_cue(kernel: &Kernel, media: ContentHash) {
+    let epoch_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    kernel.block_flows().publish(BlockFlow::RenderCue {
+        context_id: ContextId::nil(),
+        cue: RenderCue {
+            mime: PREPARE_MIME.to_string(),
+            payload: CuePayload::Cas(media),
+            lead: Duration::ZERO,
+            epoch_ns,
+        },
+    });
 }
 
 /// The single production resolver (§2): commit CAS-referenced bytes onto the score
@@ -2079,6 +2128,62 @@ mod tests {
             }
         };
         assert_eq!(cref.mime, CLIP_MIME, "committed body carries the clip MIME");
+    }
+
+    /// R4 (docs/pcm.md "The prepare horizon"): scheduling a clip publishes the
+    /// `PREPARE_MIME` directive at COMMIT time — before the cell has crossed
+    /// the write barrier, before any beat has fired at all. Subscribe BEFORE
+    /// calling `schedule_clip_cell` — the FlowBus is a live broadcast, not a
+    /// queue a late subscriber can catch up on (mirrors `kj/play.rs`'s
+    /// `play_publishes_block_flow_render_cue`).
+    #[tokio::test]
+    async fn schedule_clip_cell_publishes_a_prepare_cue_at_commit() {
+        let kernel = Kernel::new_ephemeral("test").await;
+        let track = kaijutsu_types::TrackId::new("clips").unwrap();
+        kernel.arm_track_timeline(track.clone(), TickClock::default(), kaijutsu_types::Tick::ZERO);
+        let (json, media) = a_valid_clip_json(kernel.cas(), "kick");
+
+        let mut sub = kernel.block_flows().subscribe("block.render_cue");
+
+        super::schedule_clip_cell(
+            &kernel,
+            &json,
+            None,
+            track.clone(),
+            kaijutsu_types::PrincipalId::new(),
+        )
+        .expect("a valid clip schedules");
+
+        // Nothing has crossed the write barrier — no beat has fired — yet the
+        // prepare cue must already have landed.
+        let tl = kernel.track_timeline(&track).expect("armed");
+        assert_eq!(
+            tl.lock().committed().len(),
+            0,
+            "the prepare cue must precede any crossing, not follow one"
+        );
+
+        let msg = sub.try_recv().expect(
+            "BlockFlow::RenderCue (the prepare directive) should have been published at commit",
+        );
+        match msg.payload {
+            BlockFlow::RenderCue { cue, .. } => {
+                assert_eq!(
+                    cue.mime,
+                    kaijutsu_audio::PREPARE_MIME,
+                    "commit publishes the prepare mime, never a fire cue"
+                );
+                assert_eq!(cue.lead, std::time::Duration::ZERO, "prepare has no fire-time lead");
+                assert_ne!(cue.epoch_ns, 0, "the sender stamps its emission wallclock");
+                match cue.payload {
+                    kaijutsu_audio::CuePayload::Cas(hash) => {
+                        assert_eq!(hash, media, "prepare cue names the clip's media hash")
+                    }
+                    other => panic!("expected Cas(media), got {other:?}"),
+                }
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
     }
 
     /// An explicit `--at` tick is honored verbatim (no ASAP default applied)
