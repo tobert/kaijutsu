@@ -48,6 +48,9 @@ pub fn dispatch_input(
     mut grab_writer: MessageWriter<GrabbedKey>,
     mut literal_writer: MessageWriter<LiteralPrefix>,
     mut analog_input: ResMut<AnalogInput>,
+    // Latched left-stick direction for the well's ring spin: -1/0/+1, fires
+    // one step per deadband crossing (see the WellZoomed stick lane below).
+    mut well_spin_latch: Local<i32>,
 ) {
     // An armed prefix that outlived its window lapses quietly. Gated on
     // armed() (an &self read, no DerefMut) so the resource only shows
@@ -240,8 +243,37 @@ pub fn dispatch_input(
                 InputContext::FsnFly,
             ));
         }
+
+        // Left stick → ring spin (WellZoomed): a flick is a discrete step,
+        // not a continuous rate — latch on the deadband crossing so one
+        // deflection fires exactly one StepNext/StepPrev, and re-arm only
+        // after the stick returns inside the deadband (docs/input.md
+        // gamepad table). Wider threshold than the scroll/fly lanes: a
+        // deliberate flick, not drift.
+        if active_contexts.contains(InputContext::WellZoomed) {
+            const SPIN_THRESHOLD: f32 = 0.6;
+            let dir = if left.x > SPIN_THRESHOLD {
+                1
+            } else if left.x < -SPIN_THRESHOLD {
+                -1
+            } else {
+                0
+            };
+            if dir != 0 && *well_spin_latch == 0 {
+                let action = if dir > 0 {
+                    Action::StepNext
+                } else {
+                    Action::StepPrev
+                };
+                action_writer.write(ActionFired::new(action, InputContext::WellZoomed));
+            }
+            *well_spin_latch = dir;
+        } else {
+            *well_spin_latch = 0;
+        }
     } else {
         // No gamepad connected — zero out
+        *well_spin_latch = 0;
         if analog_input.left_stick_x != 0.0
             || analog_input.left_stick_y != 0.0
             || analog_input.right_stick_x != 0.0

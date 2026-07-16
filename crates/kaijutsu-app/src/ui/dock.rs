@@ -1001,11 +1001,13 @@ pub fn update_hints(
 
     // A pending Ctrl+A owns the footer while armed — this IS the prefix
     // legend (docs/input.md): it appears exactly when you need it and
-    // vanishes with the pending state, so no separate `?` overlay.
+    // vanishes with the pending state, so no separate `?` overlay. The
+    // working set only — sized to sit clear of the left badge cluster at
+    // normal window widths (n/p and `a` live in docs/input.md); a reminder,
+    // not the reference.
     if prefix.armed() {
-        let hints = "^A \u{2192} 0-9: seat \u{2502} ^A: last \u{2502} n/p: step \u{2502} \
-                     q: close \u{2502} w/\": well \u{2502} ': switch \u{2502} A: rename \u{2502} \
-                     d: detach \u{2502} a: literal";
+        let hints = "^A: 0-9 seat \u{2502} ^A last \u{2502} q close \u{2502} \
+                     w well \u{2502} ' switch \u{2502} A rename \u{2502} d detach";
         if dock.hints.text != hints {
             dock.hints.text = hints.to_string();
         }
