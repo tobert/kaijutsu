@@ -17,12 +17,40 @@ impl FontId {
         Self(font.data.data().as_ptr() as usize)
     }
 
+    /// Create a FontId from a statically-known font's byte slice — e.g. an
+    /// embedded `include_bytes!` asset (the Bravura music font) registered
+    /// once at startup so the async MSDF generator can resolve it without
+    /// ever going through Parley. Same pointer-derived identity scheme as
+    /// `from_parley`: a `&'static [u8]` lives at one fixed address for the
+    /// process lifetime, so the pointer is a stable, distinct key.
+    pub fn from_static(bytes: &'static [u8]) -> Self {
+        Self(bytes.as_ptr() as usize)
+    }
+
     /// Construct an arbitrary FontId for tests that need distinct GlyphKeys
     /// without a real `parley::FontData` (the real font pipeline isn't under
     /// test here, only atlas/generator bookkeeping).
     #[cfg(test)]
     pub(crate) fn for_test(id: usize) -> Self {
         Self(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_static_is_stable_across_calls() {
+        static BYTES: &[u8] = b"pretend-font-data";
+        assert_eq!(FontId::from_static(BYTES), FontId::from_static(BYTES));
+    }
+
+    #[test]
+    fn from_static_differs_for_distinct_statics() {
+        static A: &[u8] = b"font-a";
+        static B: &[u8] = b"font-b";
+        assert_ne!(FontId::from_static(A), FontId::from_static(B));
     }
 }
 

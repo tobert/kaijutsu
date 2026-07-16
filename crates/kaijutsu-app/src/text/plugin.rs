@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 
-use super::msdf::glyph::GlyphKey;
+use super::msdf::glyph::{FontId, GlyphKey};
 use super::msdf::{FontDataMap, MsdfGenerator, PositionedGlyph};
 use super::resources::{ShapingFonts, SvgFontDb, TextMetrics};
 use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
@@ -32,7 +32,7 @@ impl Plugin for KjTextPlugin {
             .init_resource::<SvgFontDb>()
             .insert_resource(MsdfGenerator::new())
             .init_resource::<FontDataMap>()
-            .add_systems(Startup, (load_fonts, load_svg_fontdb))
+            .add_systems(Startup, (load_fonts, load_svg_fontdb, register_music_font))
             .add_systems(
                 Update,
                 (
@@ -133,6 +133,17 @@ fn poll_msdf_generator(
 /// every non-empty block unconditionally (see the caller).
 fn block_touches(inserted: &HashSet<GlyphKey>, glyphs: &[PositionedGlyph]) -> bool {
     glyphs.iter().any(|g| inserted.contains(&g.key))
+}
+
+/// Register the embedded music font (Bravura, via `kaijutsu-abc`) under a
+/// static `FontId` so the async MSDF generator can always resolve it — ABC
+/// notation glyphs are keyed from the start (see
+/// `text::msdf::music_bridge::collect_music_glyphs`) rather than waiting on
+/// a Parley layout to run first, the way `FontDataMap::register` needs for
+/// text fonts.
+fn register_music_font(mut font_data_map: ResMut<FontDataMap>) {
+    let bytes = kaijutsu_abc::engrave::font::font_bytes();
+    font_data_map.register_static(FontId::from_static(bytes), bytes);
 }
 
 /// Load bundled fonts for the kaijutsu-owned shaping path (`ShapingFonts`).

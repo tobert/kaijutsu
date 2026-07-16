@@ -33,7 +33,7 @@ pub use layout_bridge::collect_msdf_glyphs;
 
 use bevy::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Map from FontId to raw font bytes (Arc-shared for async generation).
 ///
@@ -51,6 +51,17 @@ impl FontDataMap {
         self.data
             .entry(id)
             .or_insert_with(|| Arc::new(font.data.data().to_vec()));
+    }
+
+    /// Register a statically-known font's bytes (e.g. an embedded music
+    /// font) under a `FontId::from_static` identity. Idempotent, same as
+    /// `register` — a font already registered under this id is left alone.
+    /// Unlike `register`, this doesn't need a live Parley layout to have run
+    /// first: it's meant for startup registration of fonts the app knows
+    /// about in advance (`kaijutsu_abc::engrave::font::font_bytes()`), so
+    /// the async MSDF generator can always resolve them.
+    pub fn register_static(&mut self, id: FontId, bytes: &'static [u8]) {
+        self.data.entry(id).or_insert_with(|| Arc::new(bytes.to_vec()));
     }
 
     /// Get font data for a FontId.
@@ -83,4 +94,94 @@ pub enum BlockRenderMethod {
     /// MSDF renders text glyphs; Vello renders borders only.
     #[default]
     Msdf,
+}
+
+/// Lazily-built codepoint → glyph-id map for the embedded music font
+/// (Bravura, via `kaijutsu_abc::engrave::font::font_bytes()`). Built once
+/// from the font's cmap table via `ttf_parser` — the same crate/version
+/// `MsdfGenerator` uses to parse font data for MSDF generation, so glyph ids
+/// resolved here are guaranteed valid inputs to that pipeline.
+///
+/// SMuFL codepoints (noteheads, clefs, rests, accidentals, ...) all live in
+/// the Unicode Private Use Area, so scanning U+E000..=U+F8FF once at
+/// startup captures every glyph the engraving IR can reference without
+/// needing to know kaijutsu-abc's specific codepoint list.
+static MUSIC_CMAP: OnceLock<HashMap<u32, u16>> = OnceLock::new();
+
+fn build_music_cmap() -> HashMap<u32, u16> {
+    let bytes = kaijutsu_abc::engrave::font::font_bytes();
+    let mut map = HashMap::new();
+
+    let Ok(face) = ttf_parser::Face::parse(bytes, 0) else {
+        error!("music cmap: Bravura font_bytes() failed to parse — no music glyphs will resolve");
+        return map;
+    };
+
+    for cp in 0xE000u32..=0xF8FF {
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
+        if let Some(id) = face.glyph_index(ch) {
+            map.insert(cp, id.0);
+        }
+    }
+
+    map
+}
+
+/// Look up a music glyph id for a SMuFL codepoint via the lazily-built
+/// Bravura cmap. Returns `None` for a codepoint the font doesn't map —
+/// callers (the music glyph bridge) must skip it and log once, never panic.
+pub fn music_glyph_id(codepoint: u32) -> Option<u16> {
+    MUSIC_CMAP.get_or_init(build_music_cmap).get(&codepoint).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_static_then_get_returns_the_bytes() {
+        static BYTES: &[u8] = b"pretend-music-font-bytes";
+        let mut map = FontDataMap::default();
+        let id = FontId::from_static(BYTES);
+
+        map.register_static(id, BYTES);
+
+        assert_eq!(map.get(&id).map(|b| b.as_slice()), Some(BYTES));
+    }
+
+    #[test]
+    fn register_static_is_idempotent() {
+        static BYTES: &[u8] = b"pretend-music-font-bytes-2";
+        let mut map = FontDataMap::default();
+        let id = FontId::from_static(BYTES);
+
+        map.register_static(id, BYTES);
+        let first_ptr = map.get(&id).unwrap().as_ptr();
+        map.register_static(id, BYTES);
+        let second_ptr = map.get(&id).unwrap().as_ptr();
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            first_ptr, second_ptr,
+            "a second register_static for the same id must not replace the stored Arc"
+        );
+    }
+
+    #[test]
+    fn music_cmap_maps_treble_clef_to_a_nonzero_glyph_id() {
+        // U+E050 is the SMuFL treble (G) clef — also exercised by
+        // generator.rs's `bravura_cff_glyph_produces_real_msdf_ink` test as
+        // the go/no-go codepoint for the msdfgen/CFF bridge.
+        let id = music_glyph_id(0xE050);
+        assert!(id.is_some(), "Bravura's cmap should map U+E050 (treble clef)");
+        assert_ne!(id.unwrap(), 0, "glyph id 0 is .notdef, not a real glyph");
+    }
+
+    #[test]
+    fn music_cmap_returns_none_for_an_unmapped_codepoint() {
+        // Outside the scanned PUA range entirely.
+        assert_eq!(music_glyph_id(0x0041), None);
+    }
 }
