@@ -40,6 +40,7 @@ use crate::view::{
     SubmitFailed, ViewingConversation,
 };
 
+use crate::view::geometry as view_geometry;
 use crate::view::lifecycle as view_lifecycle;
 use crate::view::overlay as view_overlay;
 use crate::view::shell_dock as view_shell_dock;
@@ -147,7 +148,9 @@ impl Plugin for CellPlugin {
                 view_lifecycle::track_conversation_container.after(view_lifecycle::spawn_main_cell),
                 view_lifecycle::ensure_conversation_spacers
                     .after(view_lifecycle::track_conversation_container),
-                view_lifecycle::spawn_block_cells,
+                view_geometry::sync_conversation_geometry,
+                view_lifecycle::spawn_block_cells
+                    .after(view_geometry::sync_conversation_geometry),
                 view_lifecycle::sync_role_headers.after(view_lifecycle::spawn_block_cells),
                 ApplyDeferred
                     .after(view_lifecycle::sync_role_headers)

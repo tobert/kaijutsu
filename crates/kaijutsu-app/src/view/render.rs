@@ -16,6 +16,7 @@ use crate::cell::{
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
 use crate::view::block_render::BlockScene;
+use crate::view::geometry::{ConversationGeometry, GeomRow, RowKey};
 
 use super::format::{block_color, format_single_block};
 // Layout constants now in Theme; lifecycle.rs constants kept for spawn-time defaults.
@@ -235,8 +236,8 @@ pub fn sync_block_cell_buffers(
 /// estimation. This system only sets indent_level.
 pub fn layout_block_cells(
     entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
+    geometries: Query<&ConversationGeometry>,
     mut block_cells: Query<(&BlockCell, &mut BlockCellLayout)>,
     layout_gen: Res<LayoutGeneration>,
     mut last_layout_gen: Local<u64>,
@@ -244,13 +245,8 @@ pub fn layout_block_cells(
     if layout_gen.0 == *last_layout_gen {
         return;
     }
-    *last_layout_gen = layout_gen.0;
 
     let Some(main_ent) = entities.main_cell else {
-        return;
-    };
-
-    let Ok(editor) = main_cells.get(main_ent) else {
         return;
     };
 
@@ -258,31 +254,24 @@ pub fn layout_block_cells(
         return;
     };
 
-    let blocks_ordered = editor.blocks();
-    let block_lookup: std::collections::HashMap<
-        kaijutsu_crdt::BlockId,
-        &kaijutsu_crdt::BlockSnapshot,
-    > = blocks_ordered.iter().map(|b| (b.id, b)).collect();
+    let Ok(geom) = geometries.get(main_ent) else {
+        return;
+    };
+    // Consume the generation only once the guards pass — an early-out above
+    // must retry next frame, not wait for the next bump.
+    *last_layout_gen = layout_gen.0;
 
     for &entity in container.block_cells.values() {
         let Ok((block_cell, mut block_layout)) = block_cells.get_mut(entity) else {
             continue;
         };
 
-        let indent_level = if let Some(block) = block_lookup.get(&block_cell.block_id) {
-            // Tool call/result blocks are flush (no indent) — they form unified boxes
-            if block.kind == kaijutsu_crdt::BlockKind::ToolCall
-                || block.kind == kaijutsu_crdt::BlockKind::ToolResult
-            {
-                0
-            } else if block.parent_id.is_some() {
-                1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        // Indent captured at geometry seed time (tool blocks flush,
+        // children indent) — no per-bump snapshot clone of the document.
+        let indent_level = geom
+            .block_row(&block_cell.block_id)
+            .map(|r| r.indent_level)
+            .unwrap_or(0);
 
         if block_layout.indent_level != indent_level {
             block_layout.indent_level = indent_level;
@@ -315,7 +304,6 @@ pub fn update_block_cell_nodes(
     if layout_gen.0 == *last_gen {
         return;
     }
-    *last_gen = layout_gen.0;
 
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -323,6 +311,8 @@ pub fn update_block_cell_nodes(
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
+    // Consume the generation only once the guards pass (see layout_block_cells).
+    *last_gen = layout_gen.0;
 
     for &entity in container.block_cells.values() {
         let Ok((layout, mut node, border_style)) = block_cells.get_mut(entity) else {
@@ -380,47 +370,42 @@ pub fn update_block_cell_nodes(
     }
 }
 
-/// Interleave role headers into block document order — no spacers.
+/// Resolve geometry rows to live entities in document order — no spacers.
 ///
 /// Pure function — no ECS access — so the ordering logic can be unit
-/// tested without spinning up a Bevy `App`. Any block present in `blocks`
-/// but missing a `container` entry is reported via `on_missing_block`
-/// instead of being silently dropped from the ordering: that gap is the
-/// signature of an upstream spawn/removal bug (spawn_block_cells lagging
-/// or a stale container ref), not something this function should paper
-/// over.
+/// tested without spinning up a Bevy `App`. Row structure (role-header
+/// interleaving, tool-block rules) is already decided by
+/// `ConversationGeometry::reconcile`; this only maps rows to entities. A
+/// block row with no `container` entry is reported via `on_missing_block`:
+/// today that gap is the signature of an upstream spawn/removal bug
+/// (spawn_block_cells lagging or a stale container ref); once offscreen
+/// blocks despawn by design, the caller's predicate decides which gaps are
+/// expected. Header rows with no entity are skipped silently (header spawn
+/// has always lagged one layout generation).
 ///
 /// Shared by `compute_ordered_children` (which wraps the result with the
-/// top/bottom spacers for `reorder_conversation_children`) and
-/// `readback_block_heights`/`virtualize_conversation` (which need the same
-/// document-order walk over *just* the measurable block/header entities,
-/// spacers excluded, to keep the logical geometry model consistent with
-/// child order).
-fn interleave_blocks_and_headers(
-    blocks: &[kaijutsu_crdt::BlockSnapshot],
+/// top/bottom spacers for `reorder_conversation_children`) — while
+/// `readback_block_heights`/`virtualize_conversation` walk the geometry
+/// rows directly, so all three see the same document order.
+fn ordered_entities_from_rows(
+    rows: &[GeomRow],
     container: &BlockCellContainer,
     header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
-    mut on_missing_block: impl FnMut(&kaijutsu_crdt::BlockSnapshot),
+    mut on_missing_block: impl FnMut(&kaijutsu_crdt::BlockId),
 ) -> Vec<Entity> {
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
-    let mut ordered = Vec::with_capacity(blocks.len());
+    let mut ordered = Vec::with_capacity(rows.len());
 
-    for block in blocks {
-        // Skip tool blocks for role transition tracking (they use fieldset borders)
-        let dominated_by_border = block.kind == kaijutsu_crdt::BlockKind::ToolCall
-            || block.kind == kaijutsu_crdt::BlockKind::ToolResult;
-
-        if !dominated_by_border {
-            let is_transition = prev_role != Some(block.role);
-            if is_transition && let Some(&header_ent) = header_map.get(&block.id) {
-                ordered.push(header_ent);
+    for row in rows {
+        match row.key {
+            RowKey::Header(id) => {
+                if let Some(&header_ent) = header_map.get(&id) {
+                    ordered.push(header_ent);
+                }
             }
-            prev_role = Some(block.role);
-        }
-
-        match container.get_entity(&block.id) {
-            Some(block_ent) => ordered.push(block_ent),
-            None => on_missing_block(block),
+            RowKey::Block(id) => match container.get_entity(&id) {
+                Some(block_ent) => ordered.push(block_ent),
+                None => on_missing_block(&id),
+            },
         }
     }
 
@@ -436,17 +421,17 @@ fn interleave_blocks_and_headers(
 /// virtualized-out (`Display::None`) content above/below the visible
 /// window — see `ConversationSpacer`.
 pub fn compute_ordered_children(
-    blocks: &[kaijutsu_crdt::BlockSnapshot],
+    rows: &[GeomRow],
     container: &BlockCellContainer,
     header_map: &std::collections::HashMap<kaijutsu_crdt::BlockId, Entity>,
     top_spacer: Entity,
     bottom_spacer: Entity,
-    on_missing_block: impl FnMut(&kaijutsu_crdt::BlockSnapshot),
+    on_missing_block: impl FnMut(&kaijutsu_crdt::BlockId),
 ) -> Vec<Entity> {
-    let mut ordered_children = Vec::with_capacity(blocks.len() + 2);
+    let mut ordered_children = Vec::with_capacity(rows.len() + 2);
     ordered_children.push(top_spacer);
-    ordered_children.extend(interleave_blocks_and_headers(
-        blocks,
+    ordered_children.extend(ordered_entities_from_rows(
+        rows,
         container,
         header_map,
         on_missing_block,
@@ -506,7 +491,7 @@ pub fn reorder_conversation_children(
     entities: Res<EditorEntities>,
     mut commands: Commands,
     containers: Query<&BlockCellContainer>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
+    geometries: Query<&ConversationGeometry>,
     role_headers: Query<&RoleGroupBorder>,
     block_cell_entities: Query<Entity, With<BlockCell>>,
     spacer_entities: Query<Entity, With<ConversationSpacer>>,
@@ -517,7 +502,6 @@ pub fn reorder_conversation_children(
     if layout_gen.0 == *last_gen {
         return;
     }
-    *last_gen = layout_gen.0;
 
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -529,21 +513,21 @@ pub fn reorder_conversation_children(
     // earlier in the same frame (CellPhase::Spawn) whenever
     // `conversation_container` is set — so by the time this Layout-phase
     // system runs, both should already exist. If not (e.g. very first
-    // frame ordering), skip this generation; the next bump retries.
+    // frame ordering), leave the generation unconsumed so the retry happens
+    // next frame, not at the next bump.
     let Some(top_spacer) = entities.top_spacer else {
         return;
     };
     let Some(bottom_spacer) = entities.bottom_spacer else {
         return;
     };
-    let Ok(editor) = main_cells.get(main_ent) else {
+    let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
-
-    let blocks = editor.blocks();
+    *last_gen = layout_gen.0;
 
     let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
         std::collections::HashMap::new();
@@ -554,17 +538,16 @@ pub fn reorder_conversation_children(
     }
 
     let ordered_children = compute_ordered_children(
-        &blocks,
+        geom.rows(),
         container,
         &header_map,
         top_spacer,
         bottom_spacer,
-        |block| {
+        |block_id| {
             error!(
-                "reorder_conversation_children: block {:?} (kind={:?}) is in editor.blocks() \
-                 but has no BlockCellContainer entry — dropped from render order this frame; \
-                 spawn_block_cells should have created it",
-                block.id, block.kind
+                "reorder_conversation_children: block {block_id:?} has a geometry row \
+                 but no BlockCellContainer entry — dropped from render order this frame; \
+                 spawn_block_cells should have created it"
             );
         },
     );
@@ -617,29 +600,34 @@ fn margin_bottom_px(node: &Node) -> f32 {
     }
 }
 
-/// Read back block/header heights from Taffy layout and recompute the
-/// logical geometry model (PostUpdate).
+/// Read back block/header heights from Taffy layout into the
+/// [`ConversationGeometry`] model (PostUpdate).
 ///
 /// Runs after `UiSystems::Layout` so Parley has measured text and Taffy has
-/// sized all boxes. This is the sole source of truth for block heights.
+/// sized all boxes. The geometry rows are the sole source of truth for
+/// heights; entity `BlockCellLayout`/`RoleGroupBorderLayout` are mirrors
+/// kept for consumers that already hold the entity.
 ///
-/// Two passes folded into one document-order walk over block/header
-/// entities (NOT `Children` — those now also hold the two spacers plus
-/// zero-height `Display::None` gaps, which would corrupt a running sum):
+/// One walk over geometry rows (document order, entity-optional):
 ///
-/// 1. **Measure visible only.** An entity currently `Display::Flex` (laid
-///    out) has its cached `height` refreshed from `ComputedNode`, and its
-///    `last_measured_version` stamped with the block's current
-///    `last_render_version` (blocks only — headers don't stream). An entity
-///    that's `Display::None` keeps its last-cached height untouched.
-/// 2. **Recompute logical geometry from cache.** `y_offset` accumulates
-///    `cached_height + margin_bottom` in document order for every entity,
-///    visible or not, so `content_height` and per-entity `y_offset` stay
-///    byte-for-byte what they'd be if nothing were virtualized out.
+/// 1. **Measure visible only.** A live entity currently `Display::Flex`
+///    (laid out) has its row height refreshed from `ComputedNode` and its
+///    `measured_version` stamped (blocks: `last_render_version`; headers:
+///    any non-zero). `Display::None` or entity-less rows keep their cached
+///    (or estimated) height untouched — an estimate is replaced by a real
+///    measurement just-in-time as the row first becomes visible.
+/// 2. **Prefix sums from the model.** `recompute_offsets` rebuilds
+///    `y_offset`/`content_height` from cached heights, so geometry stays
+///    what it would be if nothing were virtualized out.
+///
+/// **Scroll anchoring:** when a row *fully above the viewport* changes
+/// height (an estimate corrected by measurement, or a resize), everything
+/// below shifts by the delta. The viewport is shifted by the same delta so
+/// the content the user is looking at doesn't visually jump.
 pub fn readback_block_heights(
     entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
+    mut geometries: Query<&mut ConversationGeometry>,
     role_header_query: Query<&RoleGroupBorder>,
     block_cells: Query<(&ComputedNode, &Node, &BlockCell), With<BlockCell>>,
     role_headers: Query<(&ComputedNode, &Node), (With<RoleGroupBorder>, Without<BlockCell>)>,
@@ -650,14 +638,13 @@ pub fn readback_block_heights(
     let Some(main_ent) = entities.main_cell else {
         return;
     };
-    let Ok(editor) = main_cells.get(main_ent) else {
-        return;
-    };
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
+    let Ok(mut geom) = geometries.get_mut(main_ent) else {
+        return;
+    };
 
-    let blocks = editor.blocks();
     let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
         std::collections::HashMap::new();
     for &header_ent in &container.role_headers {
@@ -666,47 +653,90 @@ pub fn readback_block_heights(
         }
     }
 
-    let ordered = interleave_blocks_and_headers(&blocks, container, &header_map, |_| {});
+    // Pass 1: measure laid-out entities into their geometry rows.
+    // `anchor_delta` accumulates height changes of rows fully above the
+    // viewport top (compared against pre-measure offsets, which are the
+    // offsets the current scroll position was computed against).
+    let viewport_top = scroll_state.offset;
+    let mut anchor_delta = 0.0_f32;
 
-    let mut y_offset: f32 = 0.0;
+    for i in 0..geom.rows().len() {
+        let (key, old_y, old_h) = {
+            let row = &geom.rows()[i];
+            (row.key, row.y_offset, row.height)
+        };
+        let above_viewport = old_y + old_h <= viewport_top;
 
-    for entity in ordered {
-        if let Ok((computed, node, block_cell)) = block_cells.get(entity) {
-            let Ok(mut layout) = block_layouts.get_mut(entity) else {
-                continue;
-            };
-
-            if node.display != Display::None {
-                let measured = computed.size().y;
-                if (layout.height - measured).abs() > 0.5 {
-                    layout.height = measured;
+        let delta = match key {
+            RowKey::Block(id) => {
+                let Some(entity) = container.get_entity(&id) else {
+                    continue;
+                };
+                let Ok((computed, node, block_cell)) = block_cells.get(entity) else {
+                    continue;
+                };
+                if node.display == Display::None {
+                    continue;
                 }
-                let measured_version = block_cell.last_render_version.unwrap_or(0);
-                if layout.last_measured_version != measured_version {
-                    layout.last_measured_version = measured_version;
+                let version = block_cell.last_render_version.unwrap_or(0);
+                geom.measure(key, computed.size().y, margin_bottom_px(node), version)
+            }
+            RowKey::Header(id) => {
+                let Some(&entity) = header_map.get(&id) else {
+                    continue;
+                };
+                let Ok((computed, node)) = role_headers.get(entity) else {
+                    continue;
+                };
+                if node.display == Display::None {
+                    continue;
+                }
+                // Headers don't stream; any non-zero stamp means "measured".
+                geom.measure(key, computed.size().y, margin_bottom_px(node), 1)
+            }
+        };
+
+        if above_viewport {
+            anchor_delta += delta;
+        }
+    }
+
+    // Pass 2: prefix sums + mirrors for live entities.
+    geom.recompute_offsets();
+
+    for row in geom.rows() {
+        match row.key {
+            RowKey::Block(id) => {
+                let Some(entity) = container.get_entity(&id) else {
+                    continue;
+                };
+                let Ok(mut layout) = block_layouts.get_mut(entity) else {
+                    continue;
+                };
+                if (layout.height - row.height).abs() > 0.01 {
+                    layout.height = row.height;
+                }
+                if (layout.y_offset - row.y_offset).abs() > 0.01 {
+                    layout.y_offset = row.y_offset;
+                }
+                if layout.last_measured_version != row.measured_version {
+                    layout.last_measured_version = row.measured_version;
                 }
             }
-
-            if (layout.y_offset - y_offset).abs() > 0.5 {
-                layout.y_offset = y_offset;
-            }
-            y_offset += layout.height + margin_bottom_px(node);
-        } else if let Ok((computed, node)) = role_headers.get(entity) {
-            let Ok(mut layout) = header_layouts.get_mut(entity) else {
-                continue;
-            };
-
-            if node.display != Display::None {
-                let measured = computed.size().y;
-                if (layout.height - measured).abs() > 0.5 {
-                    layout.height = measured;
+            RowKey::Header(id) => {
+                let Some(&entity) = header_map.get(&id) else {
+                    continue;
+                };
+                let Ok(mut layout) = header_layouts.get_mut(entity) else {
+                    continue;
+                };
+                if (layout.height - row.height).abs() > 0.01 {
+                    layout.height = row.height;
+                }
+                if (layout.y_offset - row.y_offset).abs() > 0.01 {
+                    layout.y_offset = row.y_offset;
                 }
             }
-
-            if (layout.y_offset - y_offset).abs() > 0.5 {
-                layout.y_offset = y_offset;
-            }
-            y_offset += layout.height + margin_bottom_px(node);
         }
     }
 
@@ -718,8 +748,17 @@ pub fn readback_block_heights(
         scroll_state.new_blocks_added = false;
     }
 
-    if (scroll_state.content_height - y_offset).abs() > 0.5 {
-        scroll_state.content_height = y_offset;
+    if (scroll_state.content_height - geom.content_height).abs() > 0.5 {
+        scroll_state.content_height = geom.content_height;
+    }
+
+    // Anchor correction: keep the viewport visually pinned when content
+    // above it changed size. Follow mode is exempt — it re-clamps to the
+    // bottom every frame anyway, and correcting under it would fight the
+    // clamp during streaming.
+    if anchor_delta.abs() > 0.5 && !scroll_state.following {
+        scroll_state.offset = (scroll_state.offset + anchor_delta).max(0.0);
+        scroll_state.target_offset = (scroll_state.target_offset + anchor_delta).max(0.0);
     }
 }
 
@@ -818,37 +857,32 @@ fn set_visibility(vis: &mut Visibility, target: Visibility) {
 /// during fast scroll — same predicate as the `Visibility`-only culling this
 /// replaces.
 ///
-/// Two exceptions force an entity `Display::Flex` regardless of the window:
-/// - **Never measured** (`height <= 0.0`, i.e. cached height is still the
-///   `Default`): a freshly spawned block spawns `Display::Flex` so it gets
-///   measured once by `readback_block_heights`, but if this system ran
-///   before that first measurement it must not hide it — hiding an
-///   unmeasured block would make it stay unmeasured (`Display::None` nodes
-///   aren't laid out), a permanent stuck-at-zero-height block.
-/// - **Streaming while offscreen** (`BlockCell.last_render_version >
-///   BlockCellLayout.last_measured_version`): a block's cached height goes
-///   stale once it's `Display::None`, since `readback_block_heights` only
-///   remeasures `Display::Flex` entities. Forcing one extra frame of
-///   `Display::Flex` lets readback catch up before the block re-enters the
-///   window (e.g. scrolling/following it into view) — otherwise the stale
-///   cached height would produce a visible scrollbar/content jump. In
-///   practice this is rare and geometrically local: streaming blocks are
-///   appended at the document tail, which is exactly where a follow-mode
-///   viewport already sits, so the forced-visible entity ends up adjacent
-///   to (not disjoint from) the real visible window that also drives the
-///   spacer bounds below.
+/// One exception forces an entity `Display::Flex` regardless of the window:
+/// **streaming while offscreen** (`BlockCell.last_render_version >
+/// row.measured_version`): a block's measured height goes stale once it's
+/// `Display::None`, since `readback_block_heights` only remeasures
+/// `Display::Flex` entities. Forcing one extra frame of `Display::Flex`
+/// lets readback catch up before the block re-enters the window — otherwise
+/// the stale height would produce a visible scrollbar/content jump. In
+/// practice this is rare and geometrically local: streaming blocks are
+/// appended at the document tail, which is exactly where a follow-mode
+/// viewport already sits.
+///
+/// Never-measured rows get **no** exception (unlike the pre-geometry
+/// version of this system, which force-showed them and paid an O(N) layout
+/// pass on first load of a long conversation): their estimated
+/// height/y_offset from [`ConversationGeometry`] place them in or out of
+/// the window immediately, and the estimate is replaced by a real
+/// measurement just-in-time as the row scrolls into the window.
 pub fn virtualize_conversation(
     entities: Res<EditorEntities>,
     scroll_state: Res<ConversationScrollState>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
+    geometries: Query<&ConversationGeometry>,
     role_header_query: Query<&RoleGroupBorder>,
-    mut block_cells: Query<
-        (&BlockCellLayout, &BlockCell, &mut Node, &mut Visibility),
-        With<BlockCell>,
-    >,
+    mut block_cells: Query<(&BlockCell, &mut Node, &mut Visibility), With<BlockCell>>,
     mut role_headers: Query<
-        (&RoleGroupBorderLayout, &mut Node, &mut Visibility),
+        (&mut Node, &mut Visibility),
         (With<RoleGroupBorder>, Without<BlockCell>),
     >,
     // Crossed Withouts against BOTH other `&mut Node` queries — a spacer is
@@ -863,14 +897,13 @@ pub fn virtualize_conversation(
     let Some(main_ent) = entities.main_cell else {
         return;
     };
-    let Ok(editor) = main_cells.get(main_ent) else {
+    let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
     let Ok(container) = containers.get(main_ent) else {
         return;
     };
 
-    let blocks = editor.blocks();
     let mut header_map: std::collections::HashMap<kaijutsu_crdt::BlockId, Entity> =
         std::collections::HashMap::new();
     for &header_ent in &container.role_headers {
@@ -878,7 +911,6 @@ pub fn virtualize_conversation(
             header_map.insert(header.block_id, header_ent);
         }
     }
-    let ordered = interleave_blocks_and_headers(&blocks, container, &header_map, |_| {});
 
     let margin = scroll_state.visible_height;
     let top = scroll_state.offset - margin;
@@ -886,58 +918,57 @@ pub fn virtualize_conversation(
 
     let mut shown: Vec<(f32, f32, f32)> = Vec::new();
 
-    for entity in ordered {
-        if let Ok((layout, block_cell, mut node, mut vis)) = block_cells.get_mut(entity) {
-            // "Never measured" must key off the version sentinel, NOT
-            // `height <= 0.0` — a legitimately empty block measures to
-            // height 0 and would otherwise be pinned Display::Flex forever.
-            // `readback_block_heights` stamps `last_measured_version` on
-            // every visible measurement, so version==0 means "readback has
-            // not yet run on this block".
-            let never_measured = layout.last_measured_version == 0;
-            let in_window =
-                layout.y_offset + layout.height >= top && layout.y_offset <= bottom;
-            let stale = block_cell
-                .last_render_version
-                .is_some_and(|v| v > layout.last_measured_version);
-            let should_show = never_measured || in_window || stale;
+    for row in geom.rows() {
+        let in_window = row.y_offset + row.height >= top && row.y_offset <= bottom;
 
-            set_display(&mut node, if should_show { Display::Flex } else { Display::None });
-            set_visibility(
-                &mut vis,
+        match row.key {
+            RowKey::Block(id) => {
+                let Some(entity) = container.get_entity(&id) else {
+                    continue;
+                };
+                let Ok((block_cell, mut node, mut vis)) = block_cells.get_mut(entity) else {
+                    continue;
+                };
+                let stale = block_cell
+                    .last_render_version
+                    .is_some_and(|v| v > row.measured_version);
+                let should_show = in_window || stale;
+
+                set_display(&mut node, if should_show { Display::Flex } else { Display::None });
+                set_visibility(
+                    &mut vis,
+                    if should_show {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    },
+                );
+
                 if should_show {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                },
-            );
-
-            if should_show {
-                shown.push((layout.y_offset, layout.height, margin_bottom_px(&node)));
+                    shown.push((row.y_offset, row.height, row.margin_bottom));
+                }
             }
-        } else if let Ok((layout, mut node, mut vis)) = role_headers.get_mut(entity) {
-            // RoleGroupBorderLayout has no version field, so we can't use the
-            // block sentinel here. Role headers are never legitimately
-            // zero-height (they always render a labeled rule line, min_height
-            // ROLE_HEADER_HEIGHT), so `height <= 0.0` safely means "not yet
-            // measured" for headers.
-            let never_measured = layout.height <= 0.0;
-            let in_window =
-                layout.y_offset + layout.height >= top && layout.y_offset <= bottom;
-            let should_show = never_measured || in_window;
+            RowKey::Header(id) => {
+                let Some(&entity) = header_map.get(&id) else {
+                    continue;
+                };
+                let Ok((mut node, mut vis)) = role_headers.get_mut(entity) else {
+                    continue;
+                };
 
-            set_display(&mut node, if should_show { Display::Flex } else { Display::None });
-            set_visibility(
-                &mut vis,
-                if should_show {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                },
-            );
+                set_display(&mut node, if in_window { Display::Flex } else { Display::None });
+                set_visibility(
+                    &mut vis,
+                    if in_window {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    },
+                );
 
-            if should_show {
-                shown.push((layout.y_offset, layout.height, margin_bottom_px(&node)));
+                if in_window {
+                    shown.push((row.y_offset, row.height, row.margin_bottom));
+                }
             }
         }
     }
@@ -946,7 +977,7 @@ pub fn virtualize_conversation(
     // `EditorEntities`. A global `spacers.iter_mut()` would clobber every
     // pane's spacers in a split view — overwriting background panes' heights
     // with the focused pane's geometry.
-    let (top_h, bottom_h) = compute_spacer_heights(&shown, scroll_state.content_height);
+    let (top_h, bottom_h) = compute_spacer_heights(&shown, geom.content_height);
     if let Some(top_ent) = entities.top_spacer
         && let Ok((_, mut node)) = spacers.get_mut(top_ent)
     {
@@ -969,16 +1000,37 @@ pub fn virtualize_conversation(
 mod tests {
     use super::*;
     use crate::cell::SpacerEdge;
-    use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Role};
+    use kaijutsu_crdt::{BlockId, BlockKind, ContextId, PrincipalId, Role};
 
     fn test_block_id(seq: u64) -> BlockId {
         BlockId::new(ContextId::new(), PrincipalId::new(), seq)
     }
 
-    fn text_block(id: BlockId, role: Role) -> kaijutsu_crdt::BlockSnapshot {
-        BlockSnapshotBuilder::new(id, BlockKind::Text)
-            .role(role)
-            .build()
+    /// Build geometry rows for `(id, role)` text blocks via the production
+    /// reconcile path — the same row structure the live systems walk.
+    fn rows_for(blocks: &[(BlockId, Role)]) -> Vec<GeomRow> {
+        use crate::view::geometry::{EstimateParams, RowSeed};
+        let mut geom = ConversationGeometry::default();
+        let ids: Vec<BlockId> = blocks.iter().map(|(id, _)| *id).collect();
+        let roles: std::collections::HashMap<BlockId, Role> =
+            blocks.iter().copied().collect();
+        geom.reconcile(
+            &ids,
+            |id| {
+                Some(RowSeed {
+                    text_len: 10,
+                    newline_count: 0,
+                    role: roles[id],
+                    kind: BlockKind::Text,
+                    collapsed: false,
+                    indented: false,
+                })
+            },
+            &EstimateParams::default(),
+            1,
+        );
+        geom.recompute_offsets();
+        geom.rows().to_vec()
     }
 
     // ------------------------------------------------------------------
@@ -989,10 +1041,7 @@ mod tests {
     fn compute_ordered_children_interleaves_header_at_role_transition() {
         let user_id = test_block_id(0);
         let model_id = test_block_id(1);
-        let blocks = vec![
-            text_block(user_id, Role::User),
-            text_block(model_id, Role::Model),
-        ];
+        let rows = rows_for(&[(user_id, Role::User), (model_id, Role::Model)]);
 
         let mut container = BlockCellContainer::default();
         let user_ent = Entity::from_raw_u32(1).unwrap();
@@ -1000,6 +1049,9 @@ mod tests {
         container.add(user_id, user_ent);
         container.add(model_id, model_ent);
 
+        // Only the Model transition has a spawned header entity — the User
+        // header row exists in geometry but resolves to no entity (spawn
+        // lag), which must be skipped silently.
         let header_ent = Entity::from_raw_u32(3).unwrap();
         let mut header_map = std::collections::HashMap::new();
         header_map.insert(model_id, header_ent);
@@ -1009,16 +1061,16 @@ mod tests {
 
         let mut missing = Vec::new();
         let ordered = compute_ordered_children(
-            &blocks,
+            &rows,
             &container,
             &header_map,
             top_spacer,
             bottom_spacer,
-            |b| missing.push(b.id),
+            |id| missing.push(*id),
         );
 
         assert!(missing.is_empty());
-        // No header registered for the first (User) block, so it opens the
+        // No header entity for the first (User) block, so it opens the
         // list; the Model transition's header is interleaved before it.
         // The spacers always bracket the interleaved list.
         assert_eq!(
@@ -1031,10 +1083,7 @@ mod tests {
     fn compute_ordered_children_reports_block_with_no_container_entry() {
         let present_id = test_block_id(0);
         let missing_id = test_block_id(1);
-        let blocks = vec![
-            text_block(present_id, Role::User),
-            text_block(missing_id, Role::User),
-        ];
+        let rows = rows_for(&[(present_id, Role::User), (missing_id, Role::User)]);
 
         let mut container = BlockCellContainer::default();
         let present_ent = Entity::from_raw_u32(1).unwrap();
@@ -1047,12 +1096,12 @@ mod tests {
 
         let mut missing = Vec::new();
         let ordered = compute_ordered_children(
-            &blocks,
+            &rows,
             &container,
             &std::collections::HashMap::new(),
             top_spacer,
             bottom_spacer,
-            |b| missing.push(b.id),
+            |id| missing.push(*id),
         );
 
         assert_eq!(ordered, vec![top_spacer, present_ent, bottom_spacer]);
@@ -1193,7 +1242,19 @@ mod tests {
         app.init_resource::<EditorEntities>();
         app.init_resource::<LayoutGeneration>();
         app.init_resource::<ConversationScrollState>();
-        app.add_systems(Update, reorder_conversation_children);
+        app.init_resource::<crate::text::TextMetrics>();
+        app.init_resource::<Theme>();
+        // Production ordering: geometry reconciles before the reorder walks
+        // its rows (CellPhase::Spawn precedes CellPhase::Layout in the real
+        // schedule).
+        app.add_systems(
+            Update,
+            (
+                crate::view::geometry::sync_conversation_geometry,
+                reorder_conversation_children,
+            )
+                .chain(),
+        );
         app
     }
 
@@ -1221,7 +1282,10 @@ mod tests {
             ids.push(id);
         }
 
-        let main_ent = app.world_mut().spawn((editor, MainCell)).id();
+        let main_ent = app
+            .world_mut()
+            .spawn((editor, MainCell, ConversationGeometry::default()))
+            .id();
 
         let mut container = BlockCellContainer::default();
         let mut cell_entities = Vec::with_capacity(block_count);
@@ -1334,6 +1398,88 @@ mod tests {
             children_of(&app, conv_ent),
             expected,
             "reorder_conversation_children must repair Children to match the new document order"
+        );
+    }
+
+    /// The Slice-B invariant: on the very first frame of a long conversation
+    /// — nothing measured, every row an estimate — virtualize must show only
+    /// the viewport window, NOT force-show never-measured blocks. (The
+    /// pre-geometry implementation force-showed all N, which is exactly the
+    /// O(N) first-load layout pass this model exists to kill.)
+    #[test]
+    fn virtualize_first_frame_shows_window_not_all_blocks() {
+        let mut app = App::new();
+        app.init_resource::<EditorEntities>();
+        app.init_resource::<LayoutGeneration>();
+        app.init_resource::<crate::text::TextMetrics>();
+        app.init_resource::<Theme>();
+        app.insert_resource(ConversationScrollState {
+            offset: 0.0,
+            visible_height: 300.0,
+            ..default()
+        });
+        app.add_systems(
+            Update,
+            (
+                crate::view::geometry::sync_conversation_geometry,
+                virtualize_conversation,
+            )
+                .chain(),
+        );
+
+        let (ids, _conv) = seed_conversation(&mut app, 50);
+        let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
+
+        // Give block entities the components virtualize toggles, and the
+        // spacers the Node it writes.
+        let block_ents: Vec<Entity> = {
+            let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
+            ids.iter().map(|id| container.get_entity(id).unwrap()).collect()
+        };
+        for &ent in &block_ents {
+            app.world_mut()
+                .entity_mut(ent)
+                .insert((Node::default(), Visibility::default()));
+        }
+        let (top_spacer, bottom_spacer) = {
+            let e = app.world().resource::<EditorEntities>();
+            (e.top_spacer.unwrap(), e.bottom_spacer.unwrap())
+        };
+        app.world_mut().entity_mut(top_spacer).insert(Node::default());
+        app.world_mut().entity_mut(bottom_spacer).insert(Node::default());
+
+        app.update();
+
+        // Estimates: header 20+4, each one-line block 30+12 → window
+        // [-300, 600] shows the first ~14 blocks; the rest must be
+        // Display::None on frame one, with the bottom spacer standing in.
+        let flex: Vec<usize> = block_ents
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                app.world().get::<Node>(**e).unwrap().display == Display::Flex
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !flex.is_empty() && flex.len() < 20,
+            "expected only the estimated window shown on frame one, got {} of {} blocks Flex",
+            flex.len(),
+            block_ents.len(),
+        );
+        assert_eq!(flex[0], 0, "window at scroll top must start at block 0");
+        assert!(
+            flex.windows(2).all(|w| w[1] == w[0] + 1),
+            "shown set must be contiguous, got {flex:?}",
+        );
+
+        let bottom_node = app.world().get::<Node>(bottom_spacer).unwrap();
+        let Val::Px(bottom_px) = bottom_node.height else {
+            panic!("bottom spacer height must be set in px");
+        };
+        assert!(
+            bottom_px > 1000.0,
+            "bottom spacer must stand in for the ~36 estimated-out blocks, got {bottom_px}",
         );
     }
 

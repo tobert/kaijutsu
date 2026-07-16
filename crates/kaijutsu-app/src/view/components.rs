@@ -168,6 +168,13 @@ impl CellEditor {
         self.store.block_ids_ordered()
     }
 
+    /// Get a single block snapshot (clones one block's content — the
+    /// per-row seed path for `ConversationGeometry`, and the per-entity
+    /// fetch that replaces whole-document `blocks()` clones).
+    pub fn block_snapshot(&self, id: &BlockId) -> Option<BlockSnapshot> {
+        self.store.get_block_snapshot(id)
+    }
+
     /// Toggle collapse state of a thinking block.
     pub fn toggle_block_collapse(&mut self, block_id: &BlockId) {
         if let Some(block) = self.store.get_block_snapshot(block_id) {

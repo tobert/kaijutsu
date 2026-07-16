@@ -77,7 +77,15 @@ pub fn spawn_main_cell(
     // The BlockCell system handles per-block rendering.
     // MainCell only holds the CellEditor (source of truth for content).
     let entity = commands
-        .spawn((CellEditor::default().with_text(welcome_text), MainCell))
+        .spawn((
+            CellEditor::default().with_text(welcome_text),
+            MainCell,
+            // The logical geometry model rides with the MainCell from birth
+            // so every geometry-reading system (reorder, virtualize,
+            // readback) finds it on the very first LayoutGeneration bump —
+            // a deferred insert would eat that generation.
+            crate::view::geometry::ConversationGeometry::default(),
+        ))
         .id();
 
     entities.main_cell = Some(entity);
@@ -231,6 +239,7 @@ pub fn spawn_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     mut containers: Query<&mut BlockCellContainer>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry>,
     existing_block_cells: Query<Entity, With<BlockCell>>,
     mut layout_gen: ResMut<LayoutGeneration>,
     font_handles: Res<ShapingFonts>,
@@ -336,6 +345,7 @@ pub fn spawn_block_cells(
 
     let current_version = editor.version();
     let conv_entity = entities.conversation_container;
+    let geom = geometries.get(main_ent).ok();
 
     let mut had_additions = false;
 
@@ -347,21 +357,27 @@ pub fn spawn_block_cells(
             // spawn, not synchronously with it. ImageNode itself doesn't force preparation.
             // MaterialNode renders on top with shader effects (glow, animation).
             let material_handle = fx_materials.add(BlockFxMaterial::default());
+
+            // Seed layout from the geometry row (sync_conversation_geometry
+            // runs earlier this frame): estimated/cached height + document
+            // y_offset place the block correctly for virtualize_conversation
+            // BEFORE its first readback — an appended block enters at the
+            // tail, a respawned one back at its old position, with no
+            // one-frame spacer blowup. The geometry fallback (row missing:
+            // seed at the tail) matches the pre-geometry behavior.
+            let row = geom.and_then(|g| g.block_row(block_id));
+            let layout_seed = BlockCellLayout {
+                y_offset: row
+                    .map(|r| r.y_offset)
+                    .unwrap_or(scroll_state.content_height),
+                height: row.map(|r| r.height).unwrap_or(0.0),
+                indent_level: row.map(|r| r.indent_level).unwrap_or(0),
+                last_measured_version: row.map(|r| r.measured_version).unwrap_or(0),
+            };
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
-                    // Seed the logical y at the current document tail rather
-                    // than 0. virtualize_conversation runs before this cell's
-                    // first readback, so if it entered the geometry model at
-                    // y_offset=0 it would land at the top of the `shown` list
-                    // and blow the bottom spacer up to ~content_height for one
-                    // frame (visible flicker on every appended/streaming
-                    // block). Appended blocks always land at the tail, so
-                    // content_height is the correct provisional offset.
-                    BlockCellLayout {
-                        y_offset: scroll_state.content_height,
-                        ..default()
-                    },
+                    layout_seed,
                     crate::view::block_render::BlockScene::default(),
                     crate::view::ui_rtt::UiVectorScene::default(),
                     crate::view::ui_rtt::UiRttTexture::default(),
@@ -374,7 +390,12 @@ pub fn spawn_block_cells(
                         ..default()
                     },
                     TimelineVisibility {
-                        created_at_version: current_version,
+                        // Persisted in the geometry row so a despawned block
+                        // respawns with its true creation version (timeline
+                        // dimming would otherwise mis-classify it as new).
+                        created_at_version: row
+                            .map(|r| r.created_at_version)
+                            .unwrap_or(current_version),
                         opacity: 1.0,
                         is_past: false,
                     },
@@ -420,7 +441,7 @@ pub fn spawn_block_cells(
 pub fn sync_role_headers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
-    main_cells: Query<&CellEditor, With<MainCell>>,
+    geometries: Query<&crate::view::geometry::ConversationGeometry>,
     mut containers: Query<&mut BlockCellContainer>,
     role_header_query: Query<&RoleGroupBorder>,
     layout_gen: Res<LayoutGeneration>,
@@ -429,37 +450,33 @@ pub fn sync_role_headers(
     if layout_gen.0 == *last_gen {
         return;
     }
-    *last_gen = layout_gen.0;
 
     let Some(main_ent) = entities.main_cell else {
         return;
     };
 
-    let Ok(editor) = main_cells.get(main_ent) else {
+    let Ok(geom) = geometries.get(main_ent) else {
         return;
     };
 
     let Ok(mut container) = containers.get_mut(main_ent) else {
         return;
     };
+    // Consume the generation only once the guards pass — an early-out above
+    // must retry next frame, not wait for the next bump.
+    *last_gen = layout_gen.0;
 
-    // Compute expected role transitions (skip tool blocks — they use fieldset borders)
-    let blocks = editor.blocks();
-    let mut expected: Vec<(kaijutsu_crdt::Role, kaijutsu_crdt::BlockId)> = Vec::new();
-    let mut prev_role: Option<kaijutsu_crdt::Role> = None;
-    for block in &blocks {
-        // Tool blocks get their attribution from the fieldset border label,
-        // so they don't need role group headers ("ASSISTANT", "TOOL", etc.)
-        if block.kind == kaijutsu_crdt::BlockKind::ToolCall
-            || block.kind == kaijutsu_crdt::BlockKind::ToolResult
-        {
-            continue;
-        }
-        if prev_role != Some(block.role) {
-            expected.push((block.role, block.id));
-        }
-        prev_role = Some(block.role);
-    }
+    // Expected role transitions come from the geometry rows (reconciled
+    // earlier this frame) — same tool-block-skipping rules, no whole-document
+    // snapshot clone.
+    let expected: Vec<(kaijutsu_crdt::Role, kaijutsu_crdt::BlockId)> = geom
+        .rows()
+        .iter()
+        .filter_map(|row| match row.key {
+            crate::view::geometry::RowKey::Header(id) => Some((row.role, id)),
+            crate::view::geometry::RowKey::Block(_) => None,
+        })
+        .collect();
 
     // Skip rebuild if transitions match (prevents despawn/respawn flash)
     let existing_matches = container.role_headers.len() == expected.len()
