@@ -6,6 +6,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Context lifecycle: "done for now" marker (seeded 2026-07-16, input rework)
+
+Amy wants a soft "done for now" intent marker on contexts — distinct from
+`ContextState::Concluded` (done, sticky, never visit-repromoted) and from
+demotion (placement, not intent) — as the hook for automation like
+"summarize contexts that are done changing". `Ctrl+A q` (close-and-demote,
+`docs/input.md`) works today without it; this is the seed for the semantic
+layer above placement. Design question when picked up: a new `ContextState`
+vs a stamp alongside `promoted_at`/`demoted_at`/`paused_at`.
+
+## Conversation virtualization follow-ups (seeded 2026-07-16, from `6504fafe`)
+
+The O(visible) virtualization shipped with two accepted v1 limits, named in
+the commit message and carried here so they outlive it:
+
+- **Estimated-height placeholders**: first load of a long conversation still
+  pays one O(N) layout pass before the window collapses to Display::None;
+  seeding never-measured blocks with an estimated height would cap it.
+- **Despawn (not just Display::None) offscreen blocks** to reclaim per-block
+  RTT texture memory — Display::None leaves the entity + its render target
+  alive; long sessions accumulate GPU memory proportional to history, not
+  window. Needs the respawn path to rebuild from the block store cleanly.
+- Also accepted: a never-measured/stale tail block forced visible while
+  scrolled far away can make the shown set briefly non-contiguous for one
+  self-correcting frame.
+
 ## Anthropic client maturity (seeded 2026-07-15, thinking-enable arc)
 
 Adaptive thinking (`{type: adaptive, display: summarized}`, model-gated)
