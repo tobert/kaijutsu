@@ -1,27 +1,47 @@
 //! `kj play <path>` — resolve an audio sample and push a render cue over the
-//! FlowBus (docs/pcm.md "The wire").
+//! FlowBus (docs/pcm.md "The wire"); `kj play --track <t>` — commit a clip
+//! record onto a track's score instead (docs/pcm.md R2, "the producer verb").
 //!
-//! The kernel never touches audio hardware. `kj play` reads the file, sniffs
-//! its format from the extension to derive the wire MIME, wraps the bytes in a
-//! play-now [`RenderCue`] (inline, `lead == 0` — correct for this slice; a
-//! `Cas` payload is the primary path once the speculation-lead prefetch lands,
-//! slice 5c), and publishes `BlockFlow::RenderCue` — the same FlowBus every
-//! `BlockEvents` subscription bridge already drains, so every attached
-//! client's render sink receives it with no new transport.
+//! Two modes, one verb, switched on `--track`:
+//!
+//! - **Bare `kj play <path|--cas>`** (unchanged): the kernel never touches
+//!   audio hardware — it reads the file, sniffs its format from the extension
+//!   to derive the wire MIME, wraps the bytes in a play-now [`RenderCue`]
+//!   (inline, `lead == 0`), and publishes `BlockFlow::RenderCue` — the same
+//!   FlowBus every `BlockEvents` subscription bridge already drains, so every
+//!   attached client's render sink receives it with no new transport.
+//! - **`kj play <path|--cas> --track <t>`**: instead of playing now, the same
+//!   media (cas-put from `<path>`, or an existing `--cas` hash) is wrapped in
+//!   a Shape A [`Clip`](kaijutsu_audio::Clip) record and committed onto
+//!   track `t`'s timeline via [`crate::hyoushigi::schedule_clip_cell`] — the
+//!   producer side of a placed sample. `--at <tick>` places it at an
+//!   absolute tick (default: ASAP, `playhead + 1`); `--label` names it in the
+//!   score (defaults to the file stem for `<path>`, REQUIRED for `--cas`,
+//!   which has no derivable name). This mode does **not** publish a
+//!   `RenderCue` — the wire cue rides the crossing at the write barrier,
+//!   lifting the ABC-hardwire (docs/pcm.md R3), a later slice.
 
 use clap::Parser;
-use kaijutsu_audio::{AudioFormatHint, CuePayload, RenderCue};
+use kaijutsu_audio::{AudioFormatHint, Clip, CuePayload, RenderCue, CLIP_VERSION};
 use kaijutsu_cas::{ContentHash, ContentStore};
-use kaijutsu_types::ContentType;
+use kaijutsu_types::{ContentType, TrackId};
 
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::flows::BlockFlow;
+use crate::hyoushigi::schedule_clip_cell;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "play",
-    about = "Play an audio sample over the connected clients' render targets (docs/pcm.md)",
+    about = "Play an audio sample now, or commit it as a clip cell onto a track with --track (docs/pcm.md)",
+    long_about = "Bare `kj play <path|--cas>` plays now over every attached client's render \
+                  target (unchanged). With `--track <t>`, the same media is committed as a \
+                  Shape A clip record onto track <t>'s score instead of playing immediately — \
+                  the producer side of a placed sample (docs/pcm.md R2). `--at <tick>` places \
+                  it at an absolute tick (default: ASAP, playhead + 1); `--label` names the clip \
+                  in the score (defaults to the file stem for a <path>; REQUIRED for --cas, which \
+                  has no derivable name).",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -40,6 +60,23 @@ pub(crate) struct PlayArgs {
     /// attached client regardless of which context is named.
     #[arg(long, short = 'c')]
     context: Option<String>,
+    /// Commit a clip cell onto this track's score instead of playing now
+    /// (docs/pcm.md R2). The track must already be armed (`kj transport
+    /// attach --track <t>` first) — an un-armed track is a loud error naming
+    /// how to arm it.
+    #[arg(long)]
+    track: Option<String>,
+    /// With `--track`: the absolute tick to place the clip at. Omitted =
+    /// ASAP (`playhead + 1` at schedule time). Ignored (and meaningless)
+    /// without `--track`.
+    #[arg(long)]
+    at: Option<i64>,
+    /// With `--track`: the clip's human label — hashes are opaque, the label
+    /// is how the score reads. Defaults to the file stem for the `<path>`
+    /// form (`kick-808.wav` → `kick-808`); REQUIRED for the `--cas` form
+    /// (a hash has no derivable name). Ignored without `--track`.
+    #[arg(long)]
+    label: Option<String>,
 }
 
 impl KjDispatcher {
@@ -60,6 +97,12 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj play: {e}"));
             }
         };
+
+        // `--track` switches modes entirely: commit a clip cell instead of
+        // playing now. Bare `kj play` (no `--track`) falls through unchanged.
+        if let Some(track_name) = parsed.track.clone() {
+            return self.commit_clip_cell(parsed, track_name, caller);
+        }
 
         // Build the cue payload from exactly one source: a CAS hash (bytes stay
         // out-of-band, the sink resolves them from /v/cas) or a local file
@@ -139,6 +182,156 @@ impl KjDispatcher {
             format!("playing {desc} ({mime}) — {receivers} listener(s)"),
             ContentType::Plain,
         )
+    }
+
+    /// `kj play --track <t> <path|--cas>` — the commit-a-clip-cell mode
+    /// (docs/pcm.md R2). Resolves the media (cas-put a file, or an existing
+    /// `--cas` hash), builds a Shape A [`Clip`] record, and hands it to
+    /// [`schedule_clip_cell`] to land on track `t`'s timeline.
+    ///
+    /// Track resolution mirrors `kj transport`'s `--track <name>` path
+    /// (`TrackId::new`, loud on an invalid name) with one addition: unlike
+    /// `kj transport`, this verb never falls back to the caller's context
+    /// attachment when `--track` is omitted — omitting `--track` entirely
+    /// means "stay in play-now mode" (dispatched before this method is ever
+    /// called). Here `--track` is always `Some`, so only the name needs
+    /// parsing. The track must already be **armed** (a live
+    /// [`crate::hyoushigi::SharedTimeline`], independent of whether its clock
+    /// is currently playing — a clip may be placed ahead of `kj transport
+    /// play`), or this is a loud error naming how to arm it.
+    fn commit_clip_cell(&self, parsed: PlayArgs, track_name: String, caller: &KjCaller) -> KjResult {
+        let track = match TrackId::new(track_name.as_str()) {
+            Ok(t) => t,
+            Err(e) => {
+                return KjResult::Err(format!(
+                    "kj play --track: invalid track name {track_name:?}: {e}"
+                ));
+            }
+        };
+        if self.kernel().track_timeline(&track).is_none() {
+            return KjResult::Err(format!(
+                "kj play --track: track '{}' is not armed — attach it first \
+                 (`kj transport attach --track {}`)",
+                track.as_str(),
+                track.as_str()
+            ));
+        }
+
+        // Resolve media + mime + label from exactly one source, mirroring the
+        // play-now branch's (cas, path) split.
+        let (media, mime, label): (ContentHash, String, String) =
+            match (parsed.cas.as_deref(), parsed.path.as_deref()) {
+                (Some(hash_str), _) => {
+                    let hash = match hash_str.parse::<ContentHash>() {
+                        Ok(h) => h,
+                        Err(e) => return KjResult::Err(format!("kj play --cas: invalid hash: {e}")),
+                    };
+                    let mime = match self.kernel().cas().inspect(&hash) {
+                        Ok(Some(r)) => r.mime_type,
+                        Ok(None) => {
+                            return KjResult::Err(format!("kj play --cas: not found: {hash}"));
+                        }
+                        Err(e) => return KjResult::Err(format!("kj play --cas: {e}")),
+                    };
+                    // A hash has no derivable name — --label is REQUIRED here.
+                    let label = match parsed.label.as_deref().map(str::trim) {
+                        Some(l) if !l.is_empty() => l.to_string(),
+                        _ => {
+                            return KjResult::Err(
+                                "kj play --track --cas: --label is required (a hash has no \
+                                 derivable name — labels are how the score reads)"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    (hash, mime, label)
+                }
+                (None, Some(path)) => {
+                    // The clip's mime is what the SINK decodes — only real audio
+                    // formats make sense here (unlike bare `kj play`, `.abc` isn't
+                    // accepted: an ABC phrase is a musician's committed notation,
+                    // scheduled through `schedule_abc_cell`, never a placed clip).
+                    let mime = match AudioFormatHint::from_path_extension(path) {
+                        Some(f) => f.mime().to_string(),
+                        None => {
+                            return KjResult::Err(format!(
+                                "kj play --track: {path}: unrecognized or missing extension \
+                                 (expected one of .wav/.flac/.mp3/.ogg/.aac/.m4a)"
+                            ));
+                        }
+                    };
+                    let bytes = match std::fs::read(path) {
+                        Ok(b) => b,
+                        Err(e) => return KjResult::Err(format!("kj play: {path}: {e}")),
+                    };
+                    let hash = match self.kernel().cas().store(&bytes, &mime) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            return KjResult::Err(format!("kj play --track: storing {path}: {e}"));
+                        }
+                    };
+                    let label = match parsed.label.as_deref().map(str::trim) {
+                        Some(l) if !l.is_empty() => l.to_string(),
+                        _ => std::path::Path::new(path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| path.to_string()),
+                    };
+                    (hash, mime, label)
+                }
+                (None, None) => return clap_help_for::<PlayArgs>(),
+            };
+
+        let clip = Clip {
+            v: CLIP_VERSION,
+            media: media.clone(),
+            mime: mime.clone(),
+            label: label.clone(),
+            src_offset_ms: 0,
+            src_len_ms: None,
+            gain_db: 0.0,
+            ext: serde_json::Map::new(),
+        };
+        let clip_json = match clip.to_json() {
+            Ok(j) => j,
+            Err(e) => return KjResult::Err(format!("kj play --track: building clip record: {e}")),
+        };
+        // The record's own CAS hash — distinct from `media` (the two-level
+        // reference, docs/pcm.md). Pure/deterministic (content-addressed by
+        // bytes alone), so computing it here for the report doesn't duplicate
+        // the store `schedule_clip_cell` performs internally under the same hash.
+        let record = ContentHash::from_data(clip_json.as_bytes());
+
+        let at = parsed.at.map(kaijutsu_types::Tick::new);
+        let tick = match schedule_clip_cell(
+            self.kernel(),
+            &clip_json,
+            at,
+            track.clone(),
+            caller.principal_id,
+        ) {
+            Ok(t) => t,
+            Err(e) => return KjResult::Err(format!("kj play --track: {e}")),
+        };
+
+        KjResult::Ok {
+            message: format!(
+                "clip '{label}' ({mime}) scheduled onto track '{}' at tick {}",
+                track.as_str(),
+                tick.get()
+            ),
+            content_type: ContentType::Plain,
+            ephemeral: false,
+            data: Some(serde_json::json!({
+                "track": track.as_str(),
+                "tick": tick.get(),
+                "media": media.to_string(),
+                "record": record.to_string(),
+                "label": label,
+                "mime": mime,
+            })),
+        }
     }
 }
 
@@ -332,5 +525,315 @@ mod tests {
         );
         assert!(!result.is_ok(), "unknown extension should error: {result:?}");
         assert!(sub.try_recv().is_none(), "no directive published on error");
+    }
+
+    // ── kj play --track: commit a clip cell (docs/pcm.md R2) ────────────────
+
+    use kaijutsu_cas::ContentHash;
+    use kaijutsu_hyoushigi::TickClock;
+    use kaijutsu_types::{Tick, TrackId};
+
+    /// Arm `track` directly on the dispatcher's kernel — the kernel-crate
+    /// equivalent of `kj transport attach --track <t>` (a unit test has no
+    /// beat scheduler to answer the async attach round trip, and
+    /// `schedule_clip_cell` only needs the timeline to be armed, not playing).
+    fn arm_track(dispatcher: &crate::kj::KjDispatcher, track: &str) {
+        dispatcher.kernel().arm_track_timeline(
+            TrackId::new(track).unwrap(),
+            TickClock::default(),
+            Tick::ZERO,
+        );
+    }
+
+    /// `kj play <path> --track <t>` commits a clip cell instead of playing
+    /// now: no `RenderCue` is published (the crossing is a later slice, R3),
+    /// the label defaults to the file stem, and `.data` carries full ids for
+    /// track/tick/media/record/label/mime — the two-level reference
+    /// (docs/pcm.md): `media` is the sample bytes' hash, `record` is the clip
+    /// JSON's own (different) hash.
+    #[tokio::test]
+    async fn play_track_commits_a_clip_cell_from_path() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let mut sub = dispatcher.kernel().block_flows().subscribe("block.render_cue");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick-808.wav");
+        let sample_bytes = b"RIFF....WAVEfmt not-a-real-wav-but-bytes-are-bytes".to_vec();
+        std::fs::write(&wav_path, &sample_bytes).expect("write sample wav");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                wav_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+            ],
+            &caller,
+        );
+        assert!(result.is_ok(), "kj play --track failed: {result:?}");
+        assert!(
+            result.message().contains("kick-808"),
+            "message names the (file-stem) label: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("clips"),
+            "message names the track: {}",
+            result.message()
+        );
+
+        // The commit mode never publishes a play-now RenderCue — the wire
+        // cue rides the write-barrier crossing (R3), untouched by this slice.
+        assert!(
+            sub.try_recv().is_none(),
+            "kj play --track must not publish a play-now RenderCue"
+        );
+
+        let crate::kj::KjResult::Ok { data, .. } = result else {
+            panic!("expected Ok result");
+        };
+        let data = data.expect("a clip commit must attach structured data");
+        assert_eq!(data["track"], "clips");
+        assert_eq!(data["label"], "kick-808", "label defaults to the file stem");
+        assert_eq!(data["mime"], "audio/wav");
+        let expected_media = ContentHash::from_data(&sample_bytes).to_string();
+        assert_eq!(data["media"], expected_media, "media hash matches the stored file bytes");
+        assert_eq!(data["record"].as_str().unwrap().len(), 32, "record is a 32-hex CAS hash");
+        assert_ne!(
+            data["record"], data["media"],
+            "the record hash and the media hash are different objects (two-level reference)"
+        );
+        assert!(
+            data["tick"].as_i64().unwrap() > 0,
+            "the ASAP tick is ahead of the zero-seeded playhead"
+        );
+    }
+
+    /// `--label` overrides the file-stem default.
+    #[tokio::test]
+    async fn play_track_label_flag_overrides_file_stem() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick-808.wav");
+        std::fs::write(&wav_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                wav_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+                "--label".to_string(),
+                "rimshot dry".to_string(),
+            ],
+            &caller,
+        );
+        assert!(result.is_ok(), "kj play --track --label failed: {result:?}");
+        let crate::kj::KjResult::Ok { data, .. } = result else {
+            panic!("expected Ok result");
+        };
+        assert_eq!(data.unwrap()["label"], "rimshot dry", "--label overrides the file stem");
+    }
+
+    /// `--cas --track` with no `--label` is a loud error — a hash has no
+    /// derivable name, and labels are how the score reads.
+    #[tokio::test]
+    async fn play_track_cas_without_label_errors() {
+        use kaijutsu_cas::ContentStore;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let sample = b"RIFF....WAVE fake but hashable".to_vec();
+        let hash = dispatcher.kernel().cas().store(&sample, "audio/wav").expect("seed cas");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                "--cas".to_string(),
+                hash.to_string(),
+                "--track".to_string(),
+                "clips".to_string(),
+            ],
+            &caller,
+        );
+        assert!(!result.is_ok(), "--cas --track with no --label must error");
+        assert!(
+            result.message().contains("--label"),
+            "error names the missing flag: {}",
+            result.message()
+        );
+    }
+
+    /// `--cas --track --label` commits, resolving mime from the object's CAS
+    /// metadata (no extension to sniff for a bare hash).
+    #[tokio::test]
+    async fn play_track_cas_with_label_commits() {
+        use kaijutsu_cas::ContentStore;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let sample = b"RIFF....WAVE fake but hashable".to_vec();
+        let hash = dispatcher.kernel().cas().store(&sample, "audio/wav").expect("seed cas");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                "--cas".to_string(),
+                hash.to_string(),
+                "--track".to_string(),
+                "clips".to_string(),
+                "--label".to_string(),
+                "snare".to_string(),
+            ],
+            &caller,
+        );
+        assert!(result.is_ok(), "kj play --cas --track --label failed: {result:?}");
+        let crate::kj::KjResult::Ok { data, .. } = result else {
+            panic!("expected Ok result");
+        };
+        let data = data.unwrap();
+        assert_eq!(data["mime"], "audio/wav", "mime resolved from CAS metadata, not an extension");
+        assert_eq!(data["media"], hash.to_string());
+        assert_eq!(data["label"], "snare");
+    }
+
+    /// A `--track` naming an un-armed track is a loud error explaining how to
+    /// arm it — never a silent no-op.
+    #[tokio::test]
+    async fn play_track_unarmed_errors() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        // Deliberately NOT armed.
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick.wav");
+        std::fs::write(&wav_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                wav_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "never-armed".to_string(),
+            ],
+            &caller,
+        );
+        assert!(!result.is_ok(), "an unarmed track must error");
+        assert!(
+            result.message().contains("not armed"),
+            "error explains the track isn't armed: {}",
+            result.message()
+        );
+    }
+
+    /// `--at <tick>` places the clip at an explicit absolute tick, verbatim.
+    #[tokio::test]
+    async fn play_track_at_places_the_clip_at_the_given_tick() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick.wav");
+        std::fs::write(&wav_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                wav_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+                "--at".to_string(),
+                "50".to_string(),
+            ],
+            &caller,
+        );
+        assert!(result.is_ok(), "kj play --track --at failed: {result:?}");
+        let crate::kj::KjResult::Ok { data, .. } = result else {
+            panic!("expected Ok result");
+        };
+        assert_eq!(data.unwrap()["tick"], 50, "explicit --at tick is used verbatim, no ASAP default");
+    }
+
+    /// `--at` behind the playhead is a loud error — the same in-the-past gate
+    /// every scheduled cell gets (`Timeline::schedule`).
+    #[tokio::test]
+    async fn play_track_at_in_the_past_errors() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        // Seed the playhead ahead so tick 5 is unambiguously in the past.
+        dispatcher.kernel().arm_track_timeline(
+            TrackId::new("clips").unwrap(),
+            TickClock::default(),
+            Tick::new(10),
+        );
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wav_path = dir.path().join("kick.wav");
+        std::fs::write(&wav_path, b"RIFF....WAVEfake").expect("write sample wav");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                wav_path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+                "--at".to_string(),
+                "5".to_string(),
+            ],
+            &caller,
+        );
+        assert!(!result.is_ok(), "a tick behind the playhead must error");
+    }
+
+    /// `--track` with an unrecognized extension is a loud error too — never a
+    /// silently guessed mime (mirrors the play-now path's own gate; `.abc` is
+    /// deliberately NOT accepted here — a placed clip is audio, never notation).
+    #[tokio::test]
+    async fn play_track_unknown_extension_errors() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("c"), None, principal);
+        let caller = crate::kj::test_helpers::caller_with_context(ctx);
+        arm_track(&dispatcher, "clips");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("notes.xyz");
+        std::fs::write(&path, b"whatever").expect("write file");
+
+        let result = dispatcher.dispatch_play(
+            &[
+                path.to_string_lossy().into_owned(),
+                "--track".to_string(),
+                "clips".to_string(),
+            ],
+            &caller,
+        );
+        assert!(!result.is_ok(), "unknown extension should error under --track too");
     }
 }

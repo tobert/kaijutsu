@@ -851,7 +851,14 @@ pub fn virtualize_conversation(
         (&RoleGroupBorderLayout, &mut Node, &mut Visibility),
         (With<RoleGroupBorder>, Without<BlockCell>),
     >,
-    mut spacers: Query<(&ConversationSpacer, &mut Node), Without<BlockCell>>,
+    // Crossed Withouts against BOTH other `&mut Node` queries — a spacer is
+    // never a block cell or a role header, but B0001 needs the static proof
+    // (the startup panic the unit suite can't catch; schedules never init
+    // in tests).
+    mut spacers: Query<
+        (&ConversationSpacer, &mut Node),
+        (Without<BlockCell>, Without<RoleGroupBorder>),
+    >,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;

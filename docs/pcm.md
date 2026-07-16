@@ -255,14 +255,25 @@ make it musical.
   `CLIP_MIME` cues parse (`Clip::parse`, loud on failure), resolve `media`
   through `CasResolver` (Inline and Cas record payloads; the latter is a
   two-stage resolve), and schedule with source range + gain applied.
-- **R2 — producer verb: `kj play`, grown** (decided 2026-07-16, Amy — no
-  new noun; "clip" as a verb reads as audio clipping): bare `kj play` stays
-  play-now, unchanged; `--track <t>` commits a clip cell instead — cas-put
-  the media (or take `--cas`), author the record through the validator,
-  commit. `--at <tick>` places into the future; omitted, it defaults to
-  asap = the earliest barrier-safe tick ahead of the playhead. `label`
-  defaults to the file stem (`--label` overrides; `--cas` with no
-  derivable name requires it — labels are how the score reads).
+- **R2 — producer verb: `kj play`, grown. ✅ landed 2026-07-16**
+  (`pcm-play-track` merge; decided same day, Amy — no new noun; "clip" as a
+  verb reads as audio clipping): bare `kj play` stays play-now, unchanged;
+  `--track <t>` commits a clip cell instead — cas-put the media (or take
+  `--cas`), author the record through the validator, commit via
+  `schedule_clip_cell` (`hyoushigi/mod.rs`, the sibling of
+  `schedule_abc_cell`: eager `parse_validated` → armed-track lookup → CAS
+  store → schedule, but **`Fallback::Skip`, never `UseLastGood`** — a
+  placed one-shot must never vamp-repeat). `--at <tick>` places into the
+  future; omitted, it defaults to ASAP = `playhead + 1`, computed inside
+  the timeline lock (no TOCTOU). `label` defaults to the file stem
+  (`--label` overrides; `--cas` with no derivable name requires it —
+  labels are how the score reads). The `CasCommitResolver`'s gate-2
+  CLIP_MIME arm (structural re-validation at resolve time) landed
+  alongside it, on the same generic `cas_commit` resolver ABC already uses.
+  Standing judgment: `kj play --track` is **ungated** (the `kj play`/`kj
+  cas` precedent — capabilities are focus nudges in a shared-trust kernel).
+  Until R3 lands, a committed clip cell materializes into the score but
+  produces no `RenderCue`.
 - **R3 — crossing mime pass-through** (`beat.rs publish_render_cues`): lift
   the `ABC_MIME` filter so any crossed cell's mime rides the cue; ABC keeps
   its inline pre-resolve, a clip cell's record is small enough to inline
