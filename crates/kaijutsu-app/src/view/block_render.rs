@@ -980,6 +980,22 @@ pub fn render_msdf_block_textures(
             if cleared {
                 encoded_any = true;
                 msdf_data.last_rendered.insert(item.image_handle.id(), item.version);
+                msdf_data.skip_attempts.remove(&item.image_handle.id());
+            } else {
+                // Same skip-tracking as the render path below: a one-frame
+                // GpuImage-not-ready is expected (asset prepare lag), but a
+                // clear that never lands must escalate, not spin silently.
+                let attempts = msdf_data
+                    .skip_attempts
+                    .entry(item.image_handle.id())
+                    .or_insert(0);
+                *attempts += 1;
+                if *attempts > 2 {
+                    warn!(
+                        "MSDF clear skipped {} consecutive frames: {}x{} target_gpu not ready",
+                        attempts, item.width, item.height,
+                    );
+                }
             }
             continue;
         }
