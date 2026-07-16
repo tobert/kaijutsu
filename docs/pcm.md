@@ -88,13 +88,16 @@ not a block — `matches_filter` bypasses it.
   port at the backdated `receipt + lead`; ALSA's queue owns sub-ms timing.
   Flush drops scheduled events + all-notes-off. (Known future work: flush is
   whole-queue, not per-track — issues.md, relative-lead findings.)
-- **`kaijutsu-app/src/audio.rs`** — `audio/*`: `Inline` spawns an
-  `AudioPlayer` now (play-now parity); `Cas` resolves through `CasResolver`
-  off the Bevy main thread and plays on resolve. **This first cut is
-  fetch-on-cue, and `lead` is honored only at ZERO** — the prepare horizon
-  (R4) and real sample scheduling (R5) are the open half. A `CLIP_MIME` cue
-  warn+skips today (R1). (Decided 2026-07-16: this whole path migrates off
-  `bevy_audio` onto an app-owned rodio output — R5.)
+- **`kaijutsu-app/src/audio.rs` + `audio_sched.rs`** (R1+R5 landed
+  2026-07-16) — `audio.rs` is pure dispatch: it computes each cue's
+  epoch-backdated deadline at receipt (same ladder as midi.rs, collapsed to
+  go/no-go/when), resolves CAS payloads through `CasResolver`
+  (fetch-on-cue; R4 improves this), parses `CLIP_MIME` records and applies
+  their source range + gain, then hands everything to `audio_sched.rs` — a
+  dedicated thread owning the rodio `OutputStream` with a deadline heap
+  (decode-ahead, `Sink`-per-sound polyphony, flush drops pending + stops
+  live). `bevy_audio` no longer plays anything (`AudioPlugin` disabled;
+  dropping its compilation entirely is follow-up hygiene).
 - **Edge-node agent** (headless ALSA, the `midi.md` M4 node) — later, slice
   4 unchanged: Symphonia decode + `pawlsa`'s proven ALSA PCM loop
   (`~/src/pawlsa-mcp/src/alsa/playback.rs`; its `pw` graph-control surface
@@ -120,6 +123,9 @@ on the wire"; "The beat learns to carry its own clock").
 - **Phase-align** (July 15): `RenderCue.epoch_ns` + sink backdating + the
   stale ladder; the kernel grid went scheduled-periodic. Verified: 400
   click↔bass pairs, mean +0.2 ms, no drift.
+- **R1+R5** (July 16): the app-owned rodio scheduler + the clip renderer
+  (`pcm-rodio-sink` merge) — bevy_audio demolished from the playback path;
+  lead honored for every audio/clip cue with full backdating.
 
 ## The clip record — Shape A
 
@@ -245,10 +251,10 @@ clip, matching the locked chameleon default.
 Ordered; each lands buildable. R1–R3 are the clip path end-to-end; R4–R5
 make it musical.
 
-- **R1 — sink clip path** (`kaijutsu-app/src/audio.rs`): handle `CLIP_MIME`
-  — parse the record, resolve `media` through the existing `CasResolver`,
-  apply `src_offset_ms`/`src_len_ms`/`gain_db`, play. Source range + gain
-  need control below `AudioPlayer`'s spawn-and-forget (see decision 3).
+- **R1 — sink clip path. ✅ landed 2026-07-16** (`pcm-rodio-sink` merge):
+  `CLIP_MIME` cues parse (`Clip::parse`, loud on failure), resolve `media`
+  through `CasResolver` (Inline and Cas record payloads; the latter is a
+  two-stage resolve), and schedule with source range + gain applied.
 - **R2 — producer verb: `kj play`, grown** (decided 2026-07-16, Amy — no
   new noun; "clip" as a verb reads as audio clipping): bare `kj play` stays
   play-now, unchanged; `--track <t>` commits a clip cell instead — cas-put
@@ -273,16 +279,19 @@ make it musical.
   verified local). Late-fetch policy is **skip-loud** (resolved): log the
   underrun and drop — never fire-late or stretch a transient. Decode runs
   off a pool; if not ready by `lead − safety`, fire the fallback.
-- **R5 — sample lead scheduling: the app owns rodio outright** (decided
-  2026-07-16; Amy: "if we're going to pierce to rodio we should do that all
-  the time"). Bevy's `AudioPlayer` has no scheduling primitive (the named
-  build risk — issues.md, relative-lead findings) and no source-range/gain
-  control either, so `bevy_audio` leaves the sink entirely: the app holds
-  its own rodio `OutputStream` + a scheduling thread; play-now and
-  scheduled/trimmed/gained playback are ONE path. Timing delegates below
-  the frame loop (sleep-until-deadline append), matching the MIDI path's
-  discipline — never frame granularity. Bevy renders everything *else*;
-  it no longer opens an audio device.
+- **R5 — sample lead scheduling. ✅ landed 2026-07-16** (same merge; decided
+  same day — Amy: "if we're going to pierce to rodio we should do that all
+  the time"): the app owns rodio outright. `audio_sched.rs`'s dedicated
+  thread holds the `OutputStream` + a deadline-ordered heap; play-now and
+  scheduled/trimmed/gained playback are ONE path; timing lives below the
+  frame loop (`recv_timeout`-as-sleep, `Sink`-per-sound). Bevy renders
+  everything *else* and no longer opens an audio device. **Interim
+  behavior, deliberately carried to R4**: a CAS resolve that outruns its
+  deadline fires *late* today — right for `kj play --cas` (asap
+  semantics), wrong for a musically-placed clip; R4's prepare horizon +
+  skip-loud gate owns the fix. Polish list: unify midi.rs `CUE_STALE_MAX`
+  with the scheduler's `REF_STALE_MAX` (same value, two names); full bevy
+  feature enumeration to stop compiling bevy_audio at all.
 - **Slice 4 — the edge-node sink** (unchanged, later): headless `kj play` on
   a node with no app produces sound, emitted by the agent binary. Waits on
   the node-agent RPC model (M4).
