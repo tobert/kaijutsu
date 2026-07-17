@@ -472,7 +472,7 @@ impl HookListener {
     }
 }
 
-/// Push local ops to the server. Mirrors `KaijutsuMcp::push_to_server()`.
+/// Push local ops to the server.
 async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let context_id = {
         let guard = remote.joined.read().await;

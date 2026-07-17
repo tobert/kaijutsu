@@ -535,66 +535,6 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Push local changes to the server via the actor.
-    ///
-    /// Returns the number of ops pushed and the new ack version.
-    pub async fn push_to_server(&self) -> Result<(usize, u64), anyhow::Error> {
-        let remote = self
-            .remote()
-            .ok_or_else(|| anyhow::anyhow!("Not connected to server"))?;
-
-        let context_id = {
-            let guard = remote.joined.read().await;
-            guard
-                .as_ref()
-                .map(|j| j.context_id)
-                .ok_or_else(|| anyhow::anyhow!("No active context — call register_session first"))?
-        };
-
-        // Collect ops since the sync frontier from the SyncedDocument. Extract
-        // the owned payload before dropping the lock — never hold it across the
-        // push await below.
-        let ops = {
-            let guard = remote.synced.lock();
-            let doc = guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("No synced document"))?;
-            let frontier = doc.sync().frontier().cloned().unwrap_or_default();
-            doc.doc().ops_since(&frontier)
-        };
-
-        // Check for empty payload before serializing
-        if ops.block_ops.is_empty()
-            && ops.new_blocks.is_empty()
-            && ops.updated_headers.is_empty()
-            && ops.deleted_blocks.is_empty()
-        {
-            tracing::debug!("No ops to push");
-            return Ok((0, 0));
-        }
-
-        let ops_bytes =
-            kaijutsu_types::codec::encode(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
-
-        tracing::debug!(
-            ctx = %context_id,
-            ops_bytes = ops_bytes.len(),
-            "Pushing ops to server"
-        );
-
-        // Push via persistent actor (no reconnect dance)
-        let ack_version = remote
-            .actor
-            .push_ops(context_id, &ops_bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
-
-        tracing::info!(ctx = %context_id, ack_version, "Pushed ops");
-
-        let ops_count = ops_bytes.len() / 50; // Rough estimate
-        Ok((ops_count.max(1), ack_version))
-    }
-
     /// Get the actor handle for direct RPC operations.
     fn actor(&self) -> Option<&ActorHandle> {
         match &self.backend {

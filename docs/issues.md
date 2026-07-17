@@ -1869,9 +1869,6 @@ the *remaining* findings, triaged.
   (`crates/kaijutsu-client/src/synced_document.rs`): events buffered before a
   resync are never replayed against the new doc. Harmless if the server snapshot
   is always ahead of the buffered events; otherwise a silent loss.
-- **LOW — dead `push_to_server` on `KaijutsuMcp`** (lib.rs): nothing calls it
-  (the hook listener has its own `push_ops`); carries the same stale-frontier
-  bug. Delete or consolidate.
 - **PERF follow-up — the shell poll's authoritative read pulls the full context
   snapshot per command** (`execute_and_poll_shell`, Phase 2). Fine for short MCP
   contexts; a per-block read RPC (`actor.get_block(ctx, id)`) would avoid the
