@@ -37,7 +37,10 @@
 #
 # ═══════════════════════════════════════════════════════════════════
 #
-# Usage: ./contrib/kaijutsu-runner.sh [--release]
+# Usage: ./contrib/kaijutsu-runner.sh [--release] [app args...]
+#   --release is consumed by the runner; every other arg is passed through to
+#   kaijutsu-app verbatim, e.g.:
+#     ./contrib/kaijutsu-runner.sh --host 192.168.1.4 --port 2222
 #
 # Control files (touch to trigger):
 #   /tmp/kj.pause    - pause watching (remove to resume)
@@ -64,13 +67,26 @@ CARGO_PROFILE_FLAG=""
 # dynamic_linking compiles Bevy as a shared lib for fast incremental relinks —
 # debug-only, so release builds stay self-contained.
 CARGO_FEATURES_FLAG="--features dynamic_linking"
-[[ "${1:-}" == "--release" ]] && PROFILE="release" && CARGO_PROFILE_FLAG="--release" && CARGO_FEATURES_FLAG=""
+
+# --release is ours; everything else passes through to kaijutsu-app.
+APP_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--release" ]]; then
+        PROFILE="release" CARGO_PROFILE_FLAG="--release" CARGO_FEATURES_FLAG=""
+    else
+        APP_ARGS+=("$arg")
+    fi
+done
+# Shell-quoted string form for the two places that need a single string:
+# the script(1) re-exec and the `cargo watch -x` command.
+APP_ARGS_STR=""
+[[ ${#APP_ARGS[@]} -gt 0 ]] && APP_ARGS_STR=$(printf '%q ' "${APP_ARGS[@]}")
 
 # If not already inside script(1), re-exec under it
 if [[ -z "${SCRIPT_WRAPPER:-}" ]]; then
     export SCRIPT_WRAPPER=1
     echo "📜 Wrapping in script(1) → $TYPESCRIPT"
-    exec script -f -q -c "$0 $*" "$TYPESCRIPT"
+    exec script -f -q -c "$(printf '%q ' "$0" "$@")" "$TYPESCRIPT"
 fi
 
 WATCH_PID=""
@@ -112,8 +128,11 @@ start_watch() {
     export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}"
     export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-kaijutsu-app}"
 
+    local run_cmd="run -p kaijutsu-app $CARGO_PROFILE_FLAG $CARGO_FEATURES_FLAG"
+    [[ -n "$APP_ARGS_STR" ]] && run_cmd="$run_cmd -- $APP_ARGS_STR"
+
     cargo watch \
-        -x "run -p kaijutsu-app $CARGO_PROFILE_FLAG $CARGO_FEATURES_FLAG" \
+        -x "$run_cmd" \
         -w crates/kaijutsu-app \
         -w crates/kaijutsu-client \
         --why \
@@ -144,6 +163,7 @@ log "🎮 Kaijutsu Runner"
 log "   Profile: $PROFILE"
 log "   Project: $PROJECT_DIR"
 log "   Output:  $TYPESCRIPT"
+[[ -n "$APP_ARGS_STR" ]] && log "   App args: $APP_ARGS_STR"
 log ""
 log "   Control files:"
 log "     touch $CTRL_PAUSE   → pause"
