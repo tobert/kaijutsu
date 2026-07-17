@@ -1764,31 +1764,25 @@ dropped-stdout bug and the content/exit_code completion race are fixed (poll now
 does an authoritative `get_context_sync` read after terminal status); these are
 the *remaining* findings, triaged.
 
-- **HIGH (PARTIAL) — hook authoring vs resync: sole-writer + pushed-frontier.**
-  `HookListener` writes blocks directly (`doc_mut().insert_*` under
-  `synced.lock()`), so the bg listener is NOT the sole writer. `apply_sync_state`
-  replaces the doc wholesale, so un-pushed hook blocks could be wiped on resync;
-  and `push_ops` bases `ops_since` on the inbound SyncManager frontier, which
-  local authoring never advances → every hook event re-pushes all prior local
-  ops (idempotent but O(N)). MITIGATED 2026-06-13: `resync_synced` now FLUSHES
-  local ops (`flush_local_ops`) before fetching the snapshot, so hook blocks
-  round-trip through the server and survive the common case. REMAINING (cohesive
-  follow-up, needs design + CRDT-frontier testing): (a) a dedicated "pushed"
-  frontier so flush stops re-sending; (b) close the residual flush→apply window
-  where a block authored mid-resync is still lost — cleanest via a command
-  channel that makes the bg task the true sole writer (authoring + push + resync
-  all serialized in one task).
-  **PRIORITY RAISED 2026-07-17 (kaibo or-kimi review of the reply-timeout
-  fix):** `execute_and_poll_shell`'s stall fallback is now a SECOND
-  `resync_synced` caller (fires during event-delivery stalls), so the
-  flush→apply window and the two-concurrent-resyncs stale-snapshot-last-wins
-  interleaving are reachable in normal operation, not just reconnect/lag.
-  Judged net-positive to ship (window is one RPC round-trip, stall-only,
-  hook-authored blocks only — vs 50% of shell calls timing out), but the
-  command-channel rework should come off the back burner. Same review also
-  noted `apply_sync_state` still doesn't drain `pending_events` (tracked
-  below) and that resubscribe-acks-before-subscription-active leaves a
-  narrow incremental-event gap the stall resync covers for shell state.
+- **Sole-writer command channel SHIPPED 2026-07-17** (`doc_task.rs`; the old
+  HIGH hook-authoring-vs-resync entry is RESOLVED — sole writer, dedicated
+  pushed frontier, flush→apply window closed by construction, resyncs
+  coalesce, flush-failure aborts the swap). Remaining follow-ups from its
+  kaibo review, all accepted/deferred:
+  - **Hook-ack latency under a long fetch (watch item):** AuthorBlocks
+    queues FIFO behind an in-flight resync fetch (up to the 30s RPC
+    timeout), and the Claude Code adapter hook timeout is 5s — the adapter
+    can move on before the ack; the block still lands afterward. Latency
+    regression only, mirror is ambient by design. If it bites: a
+    hook-backpressure test + possibly acking after local insert before push.
+  - **`ContextResynced` events ride `ApplyEvent` and are ignored**; the
+    bridge could convert them into a direct apply_sync_state and save one
+    fetch on reconnect. Optimization, unclaimed.
+  - **`pending_events` on FullSync are CLEARED, not replayed** (decided:
+    replay is unsafe — header setters stamp fresh local ticks, so a stale
+    replay would overwrite newer data; comment on `apply_sync_state`).
+  - **resubscribe-acks-before-subscription-active** leaves a narrow
+    incremental-event gap; the stall resync covers it for shell state.
 - **LOW — `renameContext` RPC has no structured result channel.** The 2026-07-17
   server-side handler (`kaijutsu-server/src/rpc.rs`) returns errors via
   `Promise::err` because `renameContext @29` declares no results — a caller can't
@@ -1813,14 +1807,6 @@ the *remaining* findings, triaged.
 - **MED — Remote input tools vs Local divergence:** Local `read/write/edit_input`
   swallow `create_input_doc` errors via `let _ =`; `submit_input` is
   unimplemented in Local mode. Either implement Local submit or document the gap.
-- **LOW — hook insert/push failures only `warn!` then return `allow`.** The
-  agent proceeds while its action's CRDT blocks are silently dropped — counter
-  to the crash-loud stance. Consider returning `deny` (or a visible error) on
-  push/insert failure.
-- **LOW — `SyncedDocument::pending_events` not drained on `apply_sync_state`**
-  (`crates/kaijutsu-client/src/synced_document.rs`): events buffered before a
-  resync are never replayed against the new doc. Harmless if the server snapshot
-  is always ahead of the buffered events; otherwise a silent loss.
 - **LOW — `InvokePeerRequest.params` generates an untyped MCP schema property**
   (found 2026-07-17 while closing the double-encoding entry): the field is
   `serde_json::Value`, so the derived tool schema gives `params` no `type` at
