@@ -261,6 +261,9 @@ mod tests {
     }
 
     #[test]
+    // 3..1 below is a deliberately reversed range — the fixture's whole point
+    // is exercising plan_splice's handling of an inverted run, not a mistake.
+    #[allow(clippy::reversed_empty_ranges)]
     fn zero_width_and_inverted_runs_drop() {
         let blocks = vec![user(), model(), user(), model()];
         // 2..2 is empty; 3..1 is inverted — both vanish, leaving only 0..2.
