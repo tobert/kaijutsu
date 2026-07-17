@@ -178,9 +178,10 @@ impl Plugin for BlockRenderPlugin {
 
 /// Initialize the MSDF atlas resource (requires Assets<Image>).
 fn init_msdf_atlas(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    let atlas = crate::text::msdf::MsdfAtlas::new(&mut images, 1024, 1024);
+    let dim = crate::text::msdf::MsdfAtlas::INITIAL_DIM;
+    let atlas = crate::text::msdf::MsdfAtlas::new(&mut images, dim, dim);
     commands.insert_resource(atlas);
-    info!("Initialized MSDF atlas (1024x1024)");
+    info!("Initialized MSDF atlas ({dim}x{dim})");
 }
 
 // ============================================================================

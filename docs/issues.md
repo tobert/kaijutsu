@@ -217,18 +217,15 @@ consumer is real.
 
 ## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
 
-`cargo clippy -p kaijutsu-app --all-targets` currently fails to compile the
-test target: `crates/kaijutsu-app/src/text/sparkline.rs:336` asserts against
-`vec![1.5, 3.14, 7.0]`, and `#[deny(clippy::approx_constant)]` rejects the
-literal `3.14` as "approximate value of `f32::consts::PI`". Unrelated to any
-in-flight lane — pre-existing on `main`, just not caught because `cargo build`
-(rustc) doesn't run clippy lints and CI apparently doesn't run
-`--all-targets`. Either rename the test literal to something clearly not
-π-shaped (e.g. `3.5`) or scope an `#[allow]` to that one assertion.
-Same class, found 2026-07-13 (r-pump lane): `cargo clippy --all-targets -p
-kaijutsu-kernel` fails on `deny(clippy::reversed_empty_ranges)` in
-`crates/kaijutsu-kernel/src/llm/splice.rs` test code (`&[3..1]`) — also
-pre-existing, also only under `--all-targets`.
+The `kaijutsu-app`/sparkline half of this (found 2026-07-13, r-pump lane) shipped
+2026-07-17: `cargo clippy -p kaijutsu-kernel --all-targets` fails on
+`deny(clippy::reversed_empty_ranges)` in
+`crates/kaijutsu-kernel/src/llm/splice.rs` test code (`&[3..1]`, a deliberately
+reversed range exercising `plan_splice`'s edge-case handling) — pre-existing,
+only under `--all-targets`. Rewrite the fixture to express "empty range"
+without triggering the lint (e.g. `#[allow]` on the test, or a helper that
+constructs the range without a literal clippy can reverse-detect) rather than
+changing `plan_splice`'s actual behavior.
 
 ## FSN landscape follow-ups (updated 2026-07-13 post-slice-1, `docs/scenes/vfs.md`)
 
@@ -868,31 +865,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   re-composites. If it still reads as jank, the polish is presentation-side:
   hold a block's texture (or fade it in) until its first *complete* composite
   — every glyph region present — instead of showing partial bakes.
-- **Pre-existing clippy deny blocks full-crate `--tests` runs:**
-  `text/sparkline.rs:331` uses `3.14` as a test literal and trips
-  `deny(clippy::approx_constant)`, so `cargo clippy -p kaijutsu-app
-  --all-targets` fails before reaching new code (both 2026-07-03 fix agents
-  had to allow-list around it). Rename the literal (e.g. `3.5`) or allow the
-  lint on that test. Also: `ExtractedMsdfAtlas::default()`
-  (`text/msdf/renderer.rs:425`) hardcodes `1024` duplicating the atlas's
-  initial size — harmless (pre-first-extract only) but now that the atlas
-  grows at runtime the magic number is worth deleting.
-- **Pre-existing clippy deny blocks `kaijutsu-kernel --tests`/`--all-targets`
-  too (found 2026-07-11, gist-line lane):** `llm/splice.rs:267` builds a test
-  fixture range `3..1` (deliberately reversed, exercising `plan_splice`'s
-  edge-case handling) which now trips `deny(clippy::reversed_empty_ranges)`.
-  `cargo clippy -p kaijutsu-kernel` (lib only) is clean; adding `--tests` or
-  `--all-targets` fails the whole crate before reaching anything else. Same
-  shape as the `kaijutsu-app`/sparkline entry above — rewrite the fixture to
-  express "empty range" without triggering the lint (e.g. `#[allow]` on the
-  test, or a helper that constructs the range without a literal clippy can
-  reverse-detect) rather than changing `plan_splice`'s actual behavior.
-- **Auto-follow on local submit:** the conversation only re-engages
-  scroll-follow when already at the bottom
-  (`view/sync.rs:200-206`); a shell-dock submit is a strong signal of
-  intent to watch the result — force `start_following()` on local
-  submits (mirror the `InputCleared` handler at `sync.rs:309`). A
-  "new content below" affordance would cover non-local appends.
 - **Live-verify the error-block ordering fix (view-order holes, fixed
   2026-07-03, `a47c9a18`).** The three diagnosed mechanisms are fixed with
   unit + headless-App tests (see devlog), but the original "errors pinned at
@@ -1215,33 +1187,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     (since 2026-07-06) sentinels the side faces as `8..24`, which breaks if
     Bevy changes its cuboid vertex order. Robust fix: classify faces by
     `ATTRIBUTE_NORMAL` (front ≈ `[0,0,1]`, sides ⟂ Z) instead of index ranges.
-  - *Redundant per-tick sort* (gemini, simplification). `sync_time_well` calls
-    `spiral_positions` (sorts via `band_orders`) **and** `ring_cards =
-    band_orders(...)` — the same recency sort twice per tick. Call `band_orders`
-    once and derive the flat odometer order + `(band, within_index)` pos-map from
-    that single result.
   - *Passive-aging short-circuit* (gemini, design). `sync_time_well` early-exits
     on an empty join diff, so cards don't re-band as wall-clock time passes — a
     context won't demote to a deeper ring on idle alone until some *other* diff
     arrives. Ties to the ring-MEMBERSHIP / coarse auto-decay thread (explicit
     hot-row + coarse decay, see `signoff.md`): the band derivation likely needs a
     coarse timer independent of the block diff.
-  - *`build_card_scenes` rebuilds MSDF glyphs on param-only changes* (deepseek,
-    minor). Selection/lineage/drift toggles flip `Changed<Card>`, which re-lays-out
-    glyphs even though only `mat.params` changed. Split the `mat.params` sync into
-    a separate `Changed<Card>` query that doesn't re-shape text.
-  - *Empty-ring spin* (deepseek, minor). A focused but empty ring still eases its
-    rotation toward the gate each tick (harmless); a `flen > 0` guard would skip it.
   - *Spin chaining on rapid reversal* (deepseek, medium → downgraded on code-read).
     `spin_target_to_gate` measures the short path from the accumulated *target*, not
     the eased position, so a very fast direction-reversal could feel like the ring
     keeps going before reversing. **Not a correctness bug** (resting target is the
     gate π, steps are one-card; math verified sound by both models) — a possible
     feel-tuning item only.
-  - *VERIFIED-FINE, do not re-audit:* gemini's "CRITICAL: no system writes Card
-    flags → material params" is **false** — `text.rs build_card_scenes` (a
-    `Changed<Card>` query) writes `mat.params = card_params(card)`; gemini's batch
-    context simply lacked `text.rs`. Selection/lineage/drift/status render correctly.
 - **`ScaleLinear`/`ScaleTime` round-trip loses precision under extreme
   domain→range compression** (≳10³–10⁸×): inverting through a tiny range
   amplifies f64 representation error past any sane tolerance. This is an f64

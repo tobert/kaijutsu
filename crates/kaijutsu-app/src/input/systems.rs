@@ -824,6 +824,7 @@ pub fn handle_compose_input(
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     mut focus: ResMut<FocusArea>,
     surface: Res<super::focus::ActiveSurface>,
+    mut scroll_state: ResMut<ConversationScrollState>,
 ) {
     let mut overlay = if surface.is_shell() {
         match shell_overlay.single_mut() {
@@ -871,6 +872,11 @@ pub fn handle_compose_input(
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
                 {
                     let handle = actor.handle.clone();
+
+                    // A local submit (shell or chat) is a strong signal of
+                    // intent to watch the result — re-engage scroll-follow
+                    // even if the user had scrolled away from the bottom.
+                    scroll_state.start_following();
 
                     if is_shell {
                         // Shell: call shell_execute directly with local text

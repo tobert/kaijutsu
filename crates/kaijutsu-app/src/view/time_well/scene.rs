@@ -19,30 +19,18 @@ use super::panel::create_msdf_panel;
 // ============================================================================
 
 /// A context card entity in the well. Carries the stable context id (the join
-/// key), the derived [`CardData`] (re-written on the layout tick), and the live
-/// execution status (set on the data tick from block events).
+/// key), the derived [`CardData`] (re-written on the layout tick), and the
+/// tail band. Every field here is **text-affecting** — it feeds
+/// [`super::text::card_text_glyphs`] — so `Changed<Card>` is exactly the
+/// signal [`super::text::build_card_scenes`] wants: a flip here means the
+/// MSDF glyphs actually need re-laying-out. Shader-param-only state (the
+/// selection/lineage/drift flags + live status) lives on the sibling
+/// [`CardParams`] component instead, precisely so *those* flips don't also
+/// trip this gate.
 #[derive(Component)]
 pub struct Card {
     pub context_id: ContextId,
     pub data: CardData,
-    /// Live status from block events; `None` until a status event arrives for
-    /// this context. The data tick mutates this without ever relaying out.
-    pub status: Option<kaijutsu_types::Status>,
-    /// Whether this card is the current selection. Drives the in-texture
-    /// selection ring (see `text::build_card_scene`); flipped by
-    /// [`highlight_selection`] only when it actually changes, so a card's scene
-    /// rebuilds on select/deselect but not every frame.
-    pub selected: bool,
-    /// Whether this card is a fork-ancestor of the current selection. Drives the
-    /// lineage ring (distinct from the selection ring); flipped by
-    /// [`highlight_lineage`] only on change, same rebuild discipline as
-    /// `selected`.
-    pub in_lineage: bool,
-    /// Whether this context is an endpoint (source or target) of a staged drift.
-    /// Drives the drift shimmer — an animated HDR sheen sweeping the card body
-    /// (the "drift = shimmer" bling). Flipped by [`highlight_drift`] only on
-    /// change, same rebuild discipline as `selected`/`in_lineage`.
-    pub drifting: bool,
     /// Base render scale from this card's position on the vortex spiral (1.0 at
     /// the mouth, shrinking toward the throat — see [`super::card::spiral_scale`]).
     /// [`highlight_selection`] eases toward this, popping the selection.
@@ -51,11 +39,37 @@ pub struct Card {
     /// pre-shaped by [`super::live::tail_lines`]), `None` for every
     /// non-selected card. Written by [`super::live::sync_selected_card_tail`]
     /// **only when it actually changes** — the same guarded-write discipline
-    /// as `selected`/`in_lineage`/`drifting` above, which rides the existing
-    /// `Changed<Card>` gate `text::build_card_scenes` already has rather than
-    /// adding a second rebuild path (`docs/timewell.md`'s HUD melt, replacing
-    /// the South HUD panel's job on the card face itself).
+    /// [`CardParams`] uses, which rides the existing `Changed<Card>` gate
+    /// `text::build_card_scenes` already has rather than adding a second
+    /// rebuild path (`docs/timewell.md`'s HUD melt, replacing the South HUD
+    /// panel's job on the card face itself).
     pub tail: Option<String>,
+}
+
+/// Shader-uniform-only card state, split out of [`Card`] (2026-07-17) so
+/// flipping selection/lineage/drift/status doesn't also trip `Changed<Card>`
+/// — every field here feeds only `WellCardMaterial.params` (via
+/// [`super::text::card_params`] / [`super::text::sync_card_material_params`]),
+/// never MSDF glyph text, so its own `Changed<CardParams>` is a strictly
+/// cheaper rebuild signal than the glyph re-layout `Changed<Card>` triggers.
+#[derive(Component, Default)]
+pub struct CardParams {
+    /// Live status from block events; `None` until a status event arrives for
+    /// this context. The data tick mutates this without ever relaying out.
+    pub status: Option<kaijutsu_types::Status>,
+    /// Whether this card is the current selection. Drives the selection ring
+    /// (`well_card.wgsl`, driven by `WellCardMaterial.params`); flipped by
+    /// [`highlight_selection`] only when it actually changes.
+    pub selected: bool,
+    /// Whether this card is a fork-ancestor of the current selection. Drives the
+    /// lineage ring (distinct from the selection ring); flipped by
+    /// [`highlight_lineage`] only on change, same discipline as `selected`.
+    pub in_lineage: bool,
+    /// Whether this context is an endpoint (source or target) of a staged drift.
+    /// Drives the drift shimmer — an animated HDR sheen sweeping the card body
+    /// (the "drift = shimmer" bling). Flipped by [`highlight_drift`] only on
+    /// change, same discipline as `selected`/`in_lineage`.
+    pub drifting: bool,
 }
 
 /// The placement/root entity that re-roots the well's whole subtree into room
@@ -1431,16 +1445,17 @@ fn selection_scale_target(base: f32, is_selected: bool) -> f32 {
 pub fn highlight_selection(
     room: Res<crate::view::room::RoomState>,
     state: Res<TimeWellState>,
-    mut cards: Query<(&mut Card, &mut Transform)>,
+    mut cards: Query<(&Card, &mut CardParams, &mut Transform)>,
 ) {
     let selected = effective_selection(well_zoomed(&room), state.selected);
-    for (mut card, mut tf) in cards.iter_mut() {
+    for (card, mut params, mut tf) in cards.iter_mut() {
         let is_sel = Some(card.context_id) == selected;
 
         // Ring flag: write through the `Mut` only on a real change so we don't
-        // trip `Changed<Card>` (the scene-rebuild trigger) every frame.
-        if card.selected != is_sel {
-            card.selected = is_sel;
+        // trip `Changed<CardParams>` (the material-param sync trigger) every
+        // frame.
+        if params.selected != is_sel {
+            params.selected = is_sel;
         }
 
         // Snap-and-hold: while easing, write the eased scale; once within
@@ -1473,7 +1488,7 @@ pub fn highlight_selection(
 pub fn highlight_lineage(
     room: Res<crate::view::room::RoomState>,
     state: Res<TimeWellState>,
-    mut cards: Query<&mut Card>,
+    mut cards: Query<(&Card, &mut CardParams)>,
 ) {
     use std::collections::HashSet;
     let lineage: HashSet<ContextId> = match effective_selection(well_zoomed(&room), state.selected) {
@@ -1482,10 +1497,10 @@ pub fn highlight_lineage(
         }),
         None => HashSet::new(),
     };
-    for mut card in cards.iter_mut() {
+    for (card, mut params) in cards.iter_mut() {
         let in_lin = lineage.contains(&card.context_id);
-        if card.in_lineage != in_lin {
-            card.in_lineage = in_lin;
+        if params.in_lineage != in_lin {
+            params.in_lineage = in_lin;
         }
     }
 }
@@ -1503,12 +1518,15 @@ pub fn highlight_lineage(
 /// plugin wiring), so a staged drift's shimmer at room scale is truthful live
 /// info, not stale frozen state, and it clears naturally the moment the next
 /// poll lands — nothing here can freeze.
-pub fn highlight_drift(drift: Res<crate::ui::drift::DriftState>, mut cards: Query<&mut Card>) {
+pub fn highlight_drift(
+    drift: Res<crate::ui::drift::DriftState>,
+    mut cards: Query<(&Card, &mut CardParams)>,
+) {
     let drifting = super::card::drift_endpoints(&drift.staged);
-    for mut card in cards.iter_mut() {
+    for (card, mut params) in cards.iter_mut() {
         let is_drifting = drifting.contains(&card.context_id);
-        if card.drifting != is_drifting {
-            card.drifting = is_drifting;
+        if params.drifting != is_drifting {
+            params.drifting = is_drifting;
         }
     }
 }
@@ -1756,6 +1774,13 @@ pub fn spin_rings(
     // recompute is only needed while spinning).
     let mut active = [false; super::card::N_BANDS];
     for i in 0..super::card::N_BANDS {
+        // An empty ring has no cards to move (and sync_time_well's
+        // `flen.max(1)` only gives it a synthetic single-slot gate target) —
+        // skip the easing so an empty ring doesn't spin every tick.
+        let flen = state.ring_cards[i].len();
+        if flen == 0 {
+            continue;
+        }
         let cur = state.ring_rotation[i];
         let tgt = state.ring_rotation_target[i];
         if cur != tgt {

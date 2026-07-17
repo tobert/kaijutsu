@@ -431,8 +431,8 @@ impl Default for ExtractedMsdfAtlas {
         Self {
             regions: std::collections::HashMap::new(),
             texture: Handle::default(),
-            width: 1024,
-            height: 1024,
+            width: MsdfAtlas::INITIAL_DIM,
+            height: MsdfAtlas::INITIAL_DIM,
             msdf_range: MsdfAtlas::DEFAULT_RANGE,
             version: 0,
         }

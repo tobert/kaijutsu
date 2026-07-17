@@ -1065,10 +1065,6 @@ mod tests {
                 cluster_label: None,
                 paused: false,
             },
-            status: None,
-            selected: false,
-            in_lineage: false,
-            drifting: false,
             base_scale: 1.0,
             tail: None,
         }

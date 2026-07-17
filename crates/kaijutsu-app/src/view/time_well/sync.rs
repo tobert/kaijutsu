@@ -20,7 +20,9 @@ use super::card::{
     ClusterAssignment, assign_placement, card_base_scale, card_from, ring_seat_rotated,
     spiral_positions,
 };
-use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, RingSeat, TimeWellRoot, TimeWellState};
+use super::scene::{
+    CARD_TEX_H, CARD_TEX_W, Card, CardParams, CardTarget, RingSeat, TimeWellRoot, TimeWellState,
+};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use super::panel::create_msdf_panel;
 
@@ -40,7 +42,7 @@ pub fn sync_time_well(
     drift: Res<crate::ui::drift::DriftState>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut cards: Query<(&mut Card, &mut CardTarget, &mut RingSeat)>,
+    mut cards: Query<(&mut Card, &mut CardTarget, &mut RingSeat, &mut CardParams)>,
     roots: Query<Entity, With<TimeWellRoot>>,
 ) {
     // The well shows live + concluded contexts; archived are hidden entirely.
@@ -219,6 +221,13 @@ pub fn sync_time_well(
                 Card {
                     context_id: id,
                     data,
+                    base_scale: scale_of(&id),
+                    // Freshly spawned; `live::sync_selected_card_tail` fills
+                    // this in on the next dived frame if this card happens to
+                    // already be the selection.
+                    tail: None,
+                },
+                CardParams {
                     // Live activity comes straight off the poll now (kernel-derived,
                     // see `ContextInfo.live_status`) — covers every visible card, not
                     // just the active context. Drives the card pulse.
@@ -226,11 +235,6 @@ pub fn sync_time_well(
                     selected: false,
                     in_lineage: false,
                     drifting: false,
-                    base_scale: scale_of(&id),
-                    // Freshly spawned; `live::sync_selected_card_tail` fills
-                    // this in on the next dived frame if this card happens to
-                    // already be the selection.
-                    tail: None,
                 },
                 CardTarget(pos),
                 seat_of(&id).unwrap_or(RingSeat {
@@ -255,7 +259,7 @@ pub fn sync_time_well(
     // Snapshot the id→entity pairs to avoid borrowing `state` inside the loop.
     let pairs: Vec<(ContextId, Entity)> = state.entities.iter().map(|(&id, &e)| (id, e)).collect();
     for (id, entity) in pairs {
-        let Ok((mut card, mut target, mut seat)) = cards.get_mut(entity) else {
+        let Ok((mut card, mut target, mut seat, mut params)) = cards.get_mut(entity) else {
             continue; // just-spawned this frame; already correct
         };
         if let Some(pos) = target_of(&id) {
@@ -284,10 +288,11 @@ pub fn sync_time_well(
                 card.data = next;
             }
             // Live status rides the same poll; same change-guard so the pulse
-            // flips without re-rasterizing static cards every poll.
+            // flips without touching `CardParams` (and re-triggering its own
+            // `WellCardMaterial.params` sync) for static cards.
             let next_status = Some(info.live_status);
-            if card.status != next_status {
-                card.status = next_status;
+            if params.status != next_status {
+                params.status = next_status;
             }
         }
     }

@@ -183,6 +183,11 @@ impl Plugin for TimeWellPlugin {
                     // than waiting a tick.
                     live::sync_selected_card_tail,
                     text::build_card_scenes,
+                    // Shader-param-only half of the old combined material
+                    // sync (see its own doc) — decoupled from the glyph
+                    // rebuild above so a selection/lineage/drift/status flip
+                    // doesn't force one.
+                    text::sync_card_material_params,
                     text::update_reading_card,
                     text::build_horizon_label,
                 )
