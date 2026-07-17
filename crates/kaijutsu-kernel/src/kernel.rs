@@ -520,11 +520,20 @@ impl Kernel {
     /// List tool definitions visible to a context via the broker.
     /// Auto-populates the binding on first call. Returns `(name, schema,
     /// description)` triples suitable for LLM tool-definition construction.
+    ///
+    /// Propagates a broker failure rather than swallowing it into an empty
+    /// `Vec` — a broken binding used to silently present the LLM a
+    /// tool-less context with no log, indistinguishable from a context that
+    /// legitimately has no grants. Both production callers
+    /// (`get_tool_schemas` RPC, `llm_stream::build_tool_definitions`) are
+    /// already set up to fail their request/turn loudly on a broker error,
+    /// so propagating here was the contained fix — no new fallback path to
+    /// invent at either call site.
     pub async fn list_tool_defs_via_broker(
         &self,
         context_id: kaijutsu_types::ContextId,
         principal_id: PrincipalId,
-    ) -> Vec<(String, serde_json::Value, Option<String>)> {
+    ) -> crate::mcp::McpResult<Vec<(String, serde_json::Value, Option<String>)>> {
         use crate::mcp::CallContext;
 
         // Deny-by-default: list whatever the context's binding (assigned by its
@@ -536,13 +545,19 @@ impl Kernel {
             kaijutsu_types::SessionId::new(),
             kaijutsu_types::KernelId::new(),
         );
-        match broker.list_visible_tools(context_id, &ctx).await {
-            Ok(visible) => visible
-                .into_iter()
-                .map(|(visible_name, kt)| (visible_name, kt.input_schema, kt.description))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        let visible = broker.list_visible_tools(context_id, &ctx).await.map_err(|e| {
+            tracing::error!(
+                context_id = %context_id,
+                error = %e,
+                "list_tool_defs_via_broker: broker.list_visible_tools failed — \
+                 propagating instead of presenting a silently tool-less context",
+            );
+            e
+        })?;
+        Ok(visible
+            .into_iter()
+            .map(|(visible_name, kt)| (visible_name, kt.input_schema, kt.description))
+            .collect())
     }
 
     /// Register the Phase 1 builtin virtual MCP servers

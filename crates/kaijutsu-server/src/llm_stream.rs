@@ -163,17 +163,17 @@ async fn build_tool_definitions(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
     principal_id: PrincipalId,
-) -> Vec<ToolDefinition> {
-    kernel
+) -> Result<Vec<ToolDefinition>, kaijutsu_kernel::mcp::McpError> {
+    Ok(kernel
         .list_tool_defs_via_broker(context_id, principal_id)
-        .await
+        .await?
         .into_iter()
         .map(|(name, schema, description)| ToolDefinition {
             name,
             description: description.unwrap_or_default(),
             input_schema: schema,
         })
-        .collect()
+        .collect())
 }
 
 /// Resolve LLM provider and spawn streaming for a user prompt.
@@ -311,8 +311,22 @@ pub(crate) async fn spawn_llm_for_prompt(
     }
 
     // Build tool definitions via the broker (binding + ListTools filter do
-    // the curation — D-54 retired the legacy post-filter).
-    let tools = build_tool_definitions(&kernel_arc, context_id, user_principal_id).await;
+    // the curation — D-54 retired the legacy post-filter). A broker failure
+    // here used to silently collapse to an empty tool list — the model would
+    // run with no tools and no indication why. Fail the turn loudly instead,
+    // same as the provider-resolution and hydration failures above.
+    let tools = match build_tool_definitions(&kernel_arc, context_id, user_principal_id).await {
+        Ok(tools) => tools,
+        Err(e) => {
+            log::error!("Failed to build tool definitions for context {context_id}: {e}");
+            let detail = format!(
+                "Could not resolve this context's tool bindings: {e}. \
+                 The turn was stopped instead of running the model with no tools."
+            );
+            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
+            return Err(capnp::Error::failed(detail));
+        }
+    };
 
     // Assemble situational system-prompt addendum (A4): static base + rc
     // sections (the `.md` lifecycle scripts) + per-call facts so the model

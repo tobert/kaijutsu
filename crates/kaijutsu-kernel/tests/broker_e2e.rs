@@ -156,7 +156,8 @@ async fn list_visible_tools_surfaces_expected_names() {
     let defs = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     let names: Vec<&str> = defs.iter().map(|(n, _, _)| n.as_str()).collect();
 
     // Sampling, not the full 13 (per-server tests cover exhaustive lists).
@@ -179,7 +180,8 @@ async fn tool_search_returns_scored_matches() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     let exec = fx
         .kernel
@@ -442,7 +444,8 @@ async fn no_first_touch_seeding_under_deny_by_default() {
     let defs = fx
         .kernel
         .list_tool_defs_via_broker(unbound, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     assert!(defs.is_empty(), "unbound context must see no tools");
     // list_visible_tools may write back a name_map, but it must NOT seed a
     // permissive (granting) binding — deny-by-default holds.
@@ -495,7 +498,8 @@ async fn tool_search_no_match_returns_empty() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     let exec = fx
         .kernel
@@ -535,7 +539,8 @@ async fn tool_search_tiebreak_is_alphabetical() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     let exec = fx
         .kernel
@@ -600,7 +605,8 @@ async fn policy_show_and_set_round_trip() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     // Show: builtin.kernel_info should have the default policy.
     let show = fx
@@ -897,7 +903,8 @@ async fn late_registration_visible_next_turn() {
     let defs_before = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     let names_before: Vec<&str> = defs_before.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
         names_before.contains(&"block_create"),
@@ -926,7 +933,8 @@ async fn late_registration_visible_next_turn() {
     let defs_after = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     let names_after: Vec<&str> = defs_after.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
         names_after.contains(&"fail"),

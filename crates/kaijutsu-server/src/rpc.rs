@@ -2141,7 +2141,13 @@ impl kernel::Server for KernelImpl {
             async move {
                 let visible = kernel_arc
                     .list_tool_defs_via_broker(context_id, principal_id)
-                    .await;
+                    .await
+                    .map_err(|e| {
+                        log::error!(
+                            "get_tool_schemas: list_tool_defs_via_broker failed for context {context_id}: {e}"
+                        );
+                        capnp::Error::failed(format!("list_tool_defs_via_broker: {e}"))
+                    })?;
                 let mut builder = results.get().init_schemas(visible.len() as u32);
                 for (i, (name, schema, description)) in visible.iter().enumerate() {
                     let mut s = builder.reborrow().get(i as u32);
