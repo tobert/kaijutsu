@@ -730,7 +730,7 @@ pub(crate) mod test_helpers {
     use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::drift::shared_drift_router;
     use crate::kernel_db::KernelDb;
-    use kaijutsu_types::paths::{CONFIG_ROOT, RC_ROOT};
+    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, RC_ROOT};
 
     /// Create a KjDispatcher with in-memory state for testing.
     ///
@@ -828,6 +828,15 @@ pub(crate) mod test_helpers {
             .seed_entries(crate::config_seed::config_seed_files())
             .expect("seed config into CRDT");
         kernel.mount(CONFIG_ROOT, config_fs).await;
+        // Per-client config lives on the same backend type at /etc/client
+        // (mirrors production's `create_shared_kernel` mount trio) — seed and
+        // mount it too so `kj config list` tests exercise the real path.
+        let client_fs =
+            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), CLIENT_ROOT);
+        client_fs
+            .seed_entries(crate::config_seed::client_seed_files())
+            .expect("seed client config into CRDT");
+        kernel.mount(CLIENT_ROOT, client_fs).await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 

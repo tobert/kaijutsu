@@ -246,24 +246,57 @@ impl KjDispatcher {
 
     async fn config_list(&self, json: bool) -> KjResult {
         use crate::vfs::{VfsError, VfsOps};
-        let entries = match self
-            .kernel()
-            .vfs()
-            .readdir(std::path::Path::new(CONFIG_ROOT))
-            .await
-        {
+        // readdir a directory, mapping "absent" (no mount, nothing seeded yet)
+        // to an empty listing rather than an error.
+        async fn dir_entries(
+            vfs: &crate::vfs::MountTable,
+            dir: &str,
+        ) -> Result<Vec<crate::vfs::DirEntry>, String> {
+            match vfs.readdir(std::path::Path::new(dir)).await {
+                Ok(e) => Ok(e),
+                Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Ok(Vec::new()),
+                Err(e) => Err(format!("readdir {dir}: {e}")),
+            }
+        }
+
+        let vfs = self.kernel().vfs();
+        let config_entries = match dir_entries(vfs, CONFIG_ROOT).await {
             Ok(e) => e,
-            Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Vec::new(),
             Err(e) => return KjResult::Err(format!("kj config list: {e}")),
         };
-        let mut names: Vec<String> = entries
+        let mut names: Vec<String> = config_entries
             .into_iter()
             .filter(|e| e.kind.is_file())
             .map(|e| e.name)
             .collect();
+
+        // Per-client config namespace (config_canonical's "at most one nesting
+        // level" shape): shared defaults flat at /etc/client/<file>, one
+        // override level at /etc/client/<client-id>/<file>. Listed as full
+        // paths (not bare names) since `kj config show` needs the CLIENT_ROOT
+        // prefix to disambiguate them from /etc/config names.
+        let client_top = match dir_entries(vfs, CLIENT_ROOT).await {
+            Ok(e) => e,
+            Err(e) => return KjResult::Err(format!("kj config list: {e}")),
+        };
+        for entry in client_top {
+            if entry.kind.is_file() {
+                names.push(format!("{CLIENT_ROOT}/{}", entry.name));
+            } else if entry.kind.is_dir() {
+                let client_dir = format!("{CLIENT_ROOT}/{}", entry.name);
+                let client_files = match dir_entries(vfs, &client_dir).await {
+                    Ok(e) => e,
+                    Err(e) => return KjResult::Err(format!("kj config list: {e}")),
+                };
+                for file in client_files.into_iter().filter(|e| e.kind.is_file()) {
+                    names.push(format!("{client_dir}/{}", file.name));
+                }
+            }
+        }
         names.sort();
 
-        // Iteration handles: bare file names (the key for `kj config show/set`).
+        // Iteration handles accepted by `kj config show/set`: bare names for
+        // /etc/config, full /etc/client/... paths for the per-client namespace.
         let data = serde_json::Value::Array(
             names
                 .iter()
@@ -490,6 +523,55 @@ mod tests {
                 assert!(names.contains(&"models.toml"), "names: {names:?}");
                 assert!(names.contains(&"theme.toml"), "names: {names:?}");
                 assert!(names.contains(&"system.md"), "names: {names:?}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// `kj config list` also surfaces the per-client namespace at
+    /// `/etc/client` — the shared metronome default at the mount root, plus a
+    /// per-client override written under a client id — not just `/etc/config`.
+    #[tokio::test]
+    async fn list_also_surfaces_client_namespace() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        // A per-client override: config_set writes through config_canonical,
+        // which recognizes the CLIENT_ROOT/<client-id>/<file> shape.
+        let set = d
+            .dispatch(
+                &[
+                    s("config"),
+                    s("set"),
+                    s("/etc/client/abc-123/metronome.toml"),
+                    s("--content"),
+                    s("enabled = false"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(matches!(set, KjResult::Ok { .. }), "set failed: {set:?}");
+
+        let result = d.dispatch(&[s("config"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let names: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                // /etc/config entries are still there, as bare names.
+                assert!(names.contains(&"models.toml"), "names: {names:?}");
+                // The shared client default, seeded at the mount root.
+                assert!(
+                    names.contains(&"/etc/client/metronome.toml"),
+                    "names: {names:?}"
+                );
+                // The per-client override, one nesting level down.
+                assert!(
+                    names.contains(&"/etc/client/abc-123/metronome.toml"),
+                    "names: {names:?}"
+                );
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
