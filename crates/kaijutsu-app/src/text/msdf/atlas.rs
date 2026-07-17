@@ -91,6 +91,9 @@ pub struct MsdfAtlas {
 impl MsdfAtlas {
     /// Default MSDF range (distance field extent in pixels).
     pub const DEFAULT_RANGE: f32 = 4.0;
+    /// Initial atlas dimensions (both width and height) before any growth.
+    /// The atlas doubles from here at runtime up to `MAX_DIM`.
+    pub const INITIAL_DIM: u32 = 1024;
     /// Hard cap on atlas dimensions. A glyph that still won't fit at this
     /// size is marked permanently failed rather than growing forever.
     pub const MAX_DIM: u32 = 4096;
