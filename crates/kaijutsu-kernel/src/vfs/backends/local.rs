@@ -650,6 +650,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setattr_actually_sets_mtime() {
+        // Regression: setattr used to open the file and discard the handle
+        // without ever calling a timestamp syscall — a no-op dressed as
+        // success. mtime is load-bearing for FileDocumentCache staleness
+        // detection, so this must actually move the file's mtime.
+        let (backend, _dir) = setup().await;
+        backend.create(Path::new("test.txt"), 0o644).await.unwrap();
+
+        let before = backend
+            .getattr(Path::new("test.txt"))
+            .await
+            .unwrap()
+            .mtime;
+        let target = before + std::time::Duration::from_secs(3600);
+
+        let mut attr = SetAttr::new();
+        attr.mtime = Some(target);
+        backend
+            .setattr(Path::new("test.txt"), attr)
+            .await
+            .unwrap();
+
+        let after = backend
+            .getattr(Path::new("test.txt"))
+            .await
+            .unwrap()
+            .mtime;
+        assert_eq!(after, target, "setattr must actually set mtime, not no-op");
+    }
+
+    #[tokio::test]
     async fn test_hard_link() {
         let (backend, _dir) = setup().await;
 
