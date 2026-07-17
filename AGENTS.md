@@ -131,4 +131,10 @@ Trust this table over training memory — Bevy 0.18 renamed the event system and
 | `BorderColor(color)` | `BorderColor::all(color)` |
 | `query.get_single()` | `query.single()` |
 
+**HiDPI units:** `ComputedNode` (size/content_box/border/padding) and UI
+`GlobalTransform` are **physical** pixels; font sizes, `Val::Px`, and
+`ScrollPosition` are **logical**. Never feed a raw `ComputedNode` dimension
+into layout math — convert via `view::ui_rtt::logical_size` /
+`logical_content_size` (invisible at 1x, breaks on HiDPI).
+
 Bevy source: `~/src/bevy`, examples at `~/src/bevy/examples/`

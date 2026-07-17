@@ -693,7 +693,9 @@ pub fn readback_block_heights(
                     continue;
                 }
                 let version = block_cell.last_render_version.unwrap_or(0);
-                geom.measure(key, computed.size().y, margin_bottom_px(node), version)
+                // ComputedNode is physical px; geometry rows are logical.
+                let height = crate::view::ui_rtt::logical_size(computed).y;
+                geom.measure(key, height, margin_bottom_px(node), version)
             }
             RowKey::Header(id) => {
                 let Some(&entity) = header_map.get(&id) else {
@@ -706,7 +708,8 @@ pub fn readback_block_heights(
                     continue;
                 }
                 // Headers don't stream; any non-zero stamp means "measured".
-                geom.measure(key, computed.size().y, margin_bottom_px(node), 1)
+                let height = crate::view::ui_rtt::logical_size(computed).y;
+                geom.measure(key, height, margin_bottom_px(node), 1)
             }
         };
 

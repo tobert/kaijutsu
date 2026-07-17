@@ -243,7 +243,8 @@ pub fn build_overlay_glyphs(
                 continue;
             };
 
-            let width = computed.size().x;
+            // ComputedNode is physical px; layout below is logical.
+            let width = crate::view::ui_rtt::logical_size(computed).x;
             if width <= 0.0 {
                 continue;
             }

@@ -112,6 +112,24 @@ pub fn ui_rtt_texture_dims(
     (w.clamp(1, max_dim), h.clamp(1, max_dim))
 }
 
+/// A laid-out node's size in LOGICAL pixels.
+///
+/// bevy_ui 0.18's [`ComputedNode`] reports size/content/border/padding in
+/// PHYSICAL pixels, while everything the app authors in — font sizes,
+/// `Val::Px`, `ScrollPosition`, `built_width`/`built_height` — is logical.
+/// Every read of a `ComputedNode` dimension must convert through this (or
+/// [`logical_content_size`]) or HiDPI screens get double-scaled layout math
+/// (tall-narrow glyphs, half-size dock text — see devlog).
+pub fn logical_size(computed: &bevy::ui::ComputedNode) -> Vec2 {
+    computed.size() * computed.inverse_scale_factor()
+}
+
+/// A laid-out node's content-box size in LOGICAL pixels (see [`logical_size`]).
+pub fn logical_content_size(computed: &bevy::ui::ComputedNode) -> Vec2 {
+    let cb = computed.content_box();
+    Vec2::new(cb.width(), cb.height()) * computed.inverse_scale_factor()
+}
+
 /// Create a render-target texture with the format + usage flags vello needs.
 pub fn create_ui_rtt_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
     let size = Extent3d {
@@ -296,7 +314,35 @@ impl Plugin for UiRttPlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::ui_rtt_texture_dims;
+    use super::{logical_content_size, logical_size, ui_rtt_texture_dims};
+    use bevy::prelude::Vec2;
+    use bevy::ui::ComputedNode;
+
+    #[test]
+    fn logical_size_undoes_hidpi_scale() {
+        // ComputedNode is physical px; at scale 2 (inverse 0.5) a 200×100
+        // physical node is 100×50 logical. This is the unit conversion every
+        // ComputedNode read must make — regression guard for the 4k
+        // tall-narrow-glyph bug.
+        let node = ComputedNode {
+            size: Vec2::new(200.0, 100.0),
+            inverse_scale_factor: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(logical_size(&node), Vec2::new(100.0, 50.0));
+        // content_box == size here (no border/padding/scrollbar).
+        assert_eq!(logical_content_size(&node), Vec2::new(100.0, 50.0));
+    }
+
+    #[test]
+    fn logical_size_is_identity_at_1x() {
+        let node = ComputedNode {
+            size: Vec2::new(123.0, 45.0),
+            inverse_scale_factor: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(logical_size(&node), Vec2::new(123.0, 45.0));
+    }
 
     #[test]
     fn scales_logical_by_factor() {

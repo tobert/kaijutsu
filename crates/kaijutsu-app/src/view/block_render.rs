@@ -308,7 +308,8 @@ pub fn build_block_scenes(
             continue;
         }
 
-        let width = computed.size().x;
+        // ComputedNode is physical px; all layout below is logical.
+        let width = crate::view::ui_rtt::logical_size(computed).x;
         if width <= 0.0 {
             continue;
         }
@@ -796,7 +797,8 @@ pub fn build_role_group_scenes(
         if node.display == Display::None {
             continue;
         }
-        let size = computed.size();
+        // ComputedNode is physical px; the fieldset scene builds in logical.
+        let size = crate::view::ui_rtt::logical_size(computed);
         if size.x < 1.0 {
             continue;
         }

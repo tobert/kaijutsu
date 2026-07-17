@@ -144,8 +144,10 @@ pub fn build_editor_surface(
         return;
     };
 
-    let width = computed.size().x;
-    let height = computed.size().y;
+    // ComputedNode is physical px; layout below is logical.
+    let logical = crate::view::ui_rtt::logical_size(computed);
+    let width = logical.x;
+    let height = logical.y;
     if width <= 0.0 || height <= 0.0 {
         return;
     }

@@ -60,8 +60,9 @@ pub fn smooth_scroll(
 
     let new_visible = if let Some(conv) = entities.conversation_container {
         if let Ok((_, computed)) = scroll_positions.get(conv) {
-            let content_box = computed.content_box();
-            let h = content_box.height();
+            // ComputedNode is physical px; scroll offsets (and the
+            // ScrollPosition we write below) are logical.
+            let h = crate::view::ui_rtt::logical_content_size(computed).y;
             if h > 0.0 { h } else { old_visible }
         } else {
             old_visible

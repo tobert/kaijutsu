@@ -577,10 +577,11 @@ pub fn sync_conversation_geometry(
     // ComputedNode source `visible_height` uses (view/scroll.rs), keeping
     // every geometry unit consistent with scroll offsets.
     let char_w = (text_metrics.cell_char_width + text_metrics.letter_spacing).max(1.0);
+    // ComputedNode is physical px; char_w/line_height above are logical.
     let width = entities
         .conversation_container
         .and_then(|e| computed_nodes.get(e).ok())
-        .map(|c| c.content_box().width())
+        .map(|c| crate::view::ui_rtt::logical_content_size(c).x)
         .filter(|w| *w > 1.0);
     let cols = width
         .map(|w| (w / char_w).floor().max(20.0) as usize)

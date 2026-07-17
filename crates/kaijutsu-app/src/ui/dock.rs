@@ -14,7 +14,7 @@ use bevy::prelude::*;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::view::block_render::GpuTextureLimits;
 use crate::view::ui_rtt::{
-    UiVectorScene, UiRttTexture, create_ui_rtt_texture, ui_rtt_texture_dims,
+    UiVectorScene, UiRttTexture, create_ui_rtt_texture, logical_size, ui_rtt_texture_dims,
 };
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
@@ -373,7 +373,9 @@ pub fn render_north_dock(
     // Rebuild on data/theme change or when the dock changed width (right-aligned
     // groups must reflow; a stale-width scene would otherwise stretch onto the
     // resized texture).
-    let width_changed = (rtt.built_width - computed.size().x).abs() > 0.5;
+    // ComputedNode is physical px; the dock scene builds in logical.
+    let logical_width = logical_size(computed).x;
+    let width_changed = (rtt.built_width - logical_width).abs() > 0.5;
     if !dock_state.is_changed() && !theme.is_changed() && !width_changed {
         return;
     }
@@ -383,7 +385,7 @@ pub fn render_north_dock(
     };
 
     let mut scene = vello::Scene::new();
-    let width = computed.size().x as f64;
+    let width = logical_width as f64;
 
     // Insets: 16px horizontal, 6px vertical
     let pad_h = 16.0_f64;
@@ -475,8 +477,9 @@ pub fn render_north_dock(
     );
 
     scene_comp.scene = scene;
-    rtt.built_width = computed.size().x;
-    rtt.built_height = computed.size().y;
+    let logical = logical_size(computed);
+    rtt.built_width = logical.x;
+    rtt.built_height = logical.y;
     scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
@@ -495,7 +498,9 @@ pub fn render_south_dock(
         return;
     };
 
-    let width_changed = (rtt.built_width - computed.size().x).abs() > 0.5;
+    // ComputedNode is physical px; the dock scene builds in logical.
+    let logical_width = logical_size(computed).x;
+    let width_changed = (rtt.built_width - logical_width).abs() > 0.5;
     if !dock_state.is_changed() && !theme.is_changed() && !width_changed {
         return;
     }
@@ -505,7 +510,7 @@ pub fn render_south_dock(
     };
 
     let mut scene = vello::Scene::new();
-    let width = computed.size().x as f64;
+    let width = logical_width as f64;
     hit_regions.south_regions.clear();
 
     // Insets: 12px horizontal, 4px vertical
@@ -634,8 +639,9 @@ pub fn render_south_dock(
     }
 
     scene_comp.scene = scene;
-    rtt.built_width = computed.size().x;
-    rtt.built_height = computed.size().y;
+    let logical = logical_size(computed);
+    rtt.built_width = logical.x;
+    rtt.built_height = logical.y;
     scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
@@ -655,7 +661,8 @@ pub fn resize_dock_textures(
     let max_dim = gpu_limits.max_texture_dim;
 
     for (computed, mut texture, mut image_node) in query.iter_mut() {
-        let size = computed.size();
+        // ComputedNode is physical px; ui_rtt_texture_dims expects logical.
+        let size = logical_size(computed);
         if size.x <= 0.0 || size.y <= 0.0 {
             continue;
         }
@@ -697,9 +704,12 @@ pub fn handle_dock_click(
         return;
     };
 
-    // Convert cursor to dock-local coordinates
-    let dock_global = global_transform.translation();
-    let dock_size = computed.size();
+    // Convert cursor to dock-local coordinates. The UI transform and
+    // ComputedNode are physical px; cursor_position() and the hit regions
+    // (built in the logical-space scene) are logical — convert to logical.
+    let inv = computed.inverse_scale_factor();
+    let dock_global = global_transform.translation() * inv;
+    let dock_size = logical_size(computed);
     // UI node origin is at the center of the node in global transform
     let local_x = cursor_pos.x - (dock_global.x - dock_size.x / 2.0);
     let local_y = cursor_pos.y - (dock_global.y - dock_size.y / 2.0);
