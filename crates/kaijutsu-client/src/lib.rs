@@ -21,8 +21,8 @@ pub mod kaijutsu_capnp {
 }
 
 pub use actor::{
-    ActorHandle, CallError, NotReadyReason, PeerAttachResult, PeerConfig, PeerInvocation,
-    spawn_actor,
+    ActorHandle, CallError, DocSyncBackend, NotReadyReason, PeerAttachResult, PeerConfig,
+    PeerInvocation, spawn_actor,
 };
 pub use rpc::{
     Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,

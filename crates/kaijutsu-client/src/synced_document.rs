@@ -459,6 +459,24 @@ impl SyncedDocument {
     }
 
     /// Apply a sync state (from `get_context_sync` RPC or reconnect).
+    ///
+    /// A `FullSync` result replaces `self.doc` wholesale (see
+    /// `SyncManager::apply_initial_state`). Any events still sitting in
+    /// `pending_events` were buffered against the OLD document instance
+    /// because they arrived before their block's `BlockInserted` — that
+    /// pairing is now meaningless: the block they were waiting on either
+    /// already exists in the fresh snapshot (so no future `BlockInserted`
+    /// will ever arrive to trigger `replay_pending`, and the buffered
+    /// event(s) would sit orphaned forever) or the buffered payload predates
+    /// the snapshot's own causal history for that block. Replaying them
+    /// against the fresh doc isn't provably safe either way: the metadata
+    /// setters they'd go through (`set_status` et al.) stamp a brand-new
+    /// LOCAL tick unconditionally rather than doing last-write-wins against
+    /// the event's original timestamp, so a stale buffered status/collapsed/
+    /// exit-code event would silently overwrite genuinely newer data with a
+    /// tick that *looks* newest. Clearing (matching what `SyncReset`
+    /// already does on the receive path) is the documented, deliberately
+    /// simple choice — see the sole-writer doc-task rework's design notes.
     pub fn apply_sync_state(&mut self, state: &SyncState) -> Result<SyncEffect, SyncError> {
         if state.ops.is_empty() {
             return Ok(SyncEffect::Ignored);
@@ -469,6 +487,16 @@ impl SyncedDocument {
         match result {
             crate::sync::SyncResult::FullSync { block_count } => {
                 self.context_id = state.context_id;
+                if !self.pending_events.is_empty() {
+                    let dropped: usize = self.pending_events.values().map(Vec::len).sum();
+                    debug!(
+                        blocks = self.pending_events.len(),
+                        events = dropped,
+                        "apply_sync_state: dropping orphaned out-of-order events buffered \
+                         against the pre-resync document",
+                    );
+                    self.pending_events.clear();
+                }
                 Ok(SyncEffect::FullSync { block_count })
             }
             _ => Ok(SyncEffect::Updated {
@@ -749,6 +777,65 @@ mod tests {
         assert!(matches!(effect, SyncEffect::FullSync { .. }));
         assert!(sd.is_synced());
         assert_eq!(sd.block_count(), blocks_before);
+    }
+
+    /// Unlike `SyncReset` (a received event that explicitly clears the
+    /// buffer), `apply_sync_state` is also reached directly — from a Lagged
+    /// broadcast recv, a reconnect, or (in the sole-writer doc-task rework)
+    /// a coalesced resync — with no `SyncReset` event ever having been
+    /// processed. Before the fix this left `pending_events` orphaned:
+    /// buffered against a document instance that's about to be replaced,
+    /// for a block that (once the fresh snapshot lands) already exists —
+    /// so no future `BlockInserted` will ever arrive to trigger
+    /// `replay_pending`, and the entry sits dead until MAX_PENDING_BLOCKS.
+    #[test]
+    fn apply_sync_state_drops_orphaned_pending_events_without_a_sync_reset() {
+        let ctx = test_context_id();
+        let server = create_server_store(ctx);
+        let state = SyncState {
+            context_id: ctx,
+            version: 1,
+            ops: snapshot_bytes(&server),
+        };
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
+
+        // Buffer an out-of-order event — no SyncReset involved.
+        let unknown = {
+            let mut other = create_server_store(ctx);
+            other
+                .insert_block(
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    "not yet inserted client-side",
+                    Status::Running,
+                    ContentType::Plain,
+                )
+                .unwrap()
+        };
+        sd.apply_event(&ServerEvent::BlockStatusChanged {
+            context_id: ctx,
+            block_id: unknown,
+            status: kaijutsu_types::Status::Running,
+        });
+        assert_eq!(sd.pending_events.len(), 1, "out-of-order event should buffer");
+
+        // Directly apply a fresh sync state, as a Lagged/reconnect/resync
+        // path would — never routed through a SyncReset event.
+        let fresh = SyncState {
+            context_id: ctx,
+            version: 2,
+            ops: snapshot_bytes(&server),
+        };
+        let effect = sd.apply_sync_state(&fresh).unwrap();
+
+        assert!(matches!(effect, SyncEffect::FullSync { .. }));
+        assert!(
+            sd.pending_events.is_empty(),
+            "apply_sync_state must drop pending_events buffered against the \
+             document instance it just replaced, not leave them orphaned"
+        );
     }
 
     #[test]

@@ -1514,6 +1514,36 @@ impl ActorHandle {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// DocSyncBackend (test seam for kaijutsu-mcp's sole-writer doc task)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Narrow seam over the two RPCs a document-sync task needs: fetch the
+/// server's authoritative snapshot, and push locally-authored ops.
+///
+/// `ActorHandle` implements this as a thin passthrough to its own
+/// `get_context_sync`/`push_ops` methods. The seam exists so a consumer
+/// (`kaijutsu-mcp`'s `doc_task` module) can be exercised against a fake with
+/// controllable timing and call-counting in unit tests, instead of every
+/// race condition needing a real ephemeral SSH server + kernel. Mirrors the
+/// `CasFetch` seam in `sftp.rs`.
+#[async_trait::async_trait]
+pub trait DocSyncBackend: Send + Sync {
+    async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError>;
+    async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError>;
+}
+
+#[async_trait::async_trait]
+impl DocSyncBackend for ActorHandle {
+    async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, CallError> {
+        ActorHandle::get_context_sync(self, context_id).await
+    }
+
+    async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError> {
+        ActorHandle::push_ops(self, context_id, ops).await
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // RpcActor (internal, !Send, runs in spawn_local)
 // ────────────────────────────────────────────────────────────────────────────
 
