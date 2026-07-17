@@ -370,9 +370,7 @@ impl Kernel {
 
         // Deny-by-default: use whatever binding the context has (assigned by
         // its rc `create`/`fork` lifecycle). No first-touch permissive seeding
-        // — an unbound context grants nothing. The resolver still needs the
-        // sticky `name_map` populated, so kick `list_visible_tools` to refresh
-        // it against the current binding.
+        // — an unbound context grants nothing.
         let broker = self.broker.clone();
         let seed_ctx = CallContext::new(
             tool_ctx.principal_id,
@@ -380,20 +378,56 @@ impl Kernel {
             tool_ctx.session_id,
             tool_ctx.kernel_id,
         );
-        let _ = broker
+
+        // Surface a genuine binding-fetch failure (a real DB read error) as
+        // this call's own error instead of letting it silently collapse to
+        // an empty (deny-all) binding — that used to surface later as a
+        // confusing `ToolNotFound` for a tool the loadout actually grants,
+        // naming a typo instead of a storage fault. This also warms the same
+        // in-memory binding cache `list_visible_tools` reads below, so the
+        // happy path pays no extra DB round trip for the check.
+        broker.binding_checked(&tool_ctx.context_id).await?;
+
+        // The resolver needs the sticky `name_map` populated/refreshed
+        // against the current binding — kick `list_visible_tools` and
+        // resolve straight from its output (the same `name_map` entries
+        // `ContextToolBinding::resolve` would read) instead of re-fetching
+        // the binding a second time.
+        let visible = broker
             .list_visible_tools(tool_ctx.context_id, &seed_ctx)
             .await?;
-        let binding = broker
-            .binding(&tool_ctx.context_id)
-            .await
-            .unwrap_or_default();
-
-        let (instance, tool) = binding.resolve(tool_name).cloned().ok_or_else(|| {
-            McpError::ToolNotFound {
-                instance: InstanceId::new(""),
-                tool: tool_name.to_string(),
+        let (instance, tool) = match visible
+            .into_iter()
+            .find(|(visible_name, _)| visible_name == tool_name)
+        {
+            Some((_, kt)) => (kt.instance, kt.name),
+            None => {
+                // `tool_name` isn't visible to this context. That's either a
+                // typo/hallucinated name (never existed anywhere) or a real,
+                // registered tool this context's loadout/binding just
+                // doesn't grant — deny-by-default filtering makes both look
+                // identical here. Check the unfiltered registry (a handful
+                // of servers, walked only on this error path) so the caller
+                // learns which, instead of a bare "not found" that reads
+                // like a typo when it was really a capability decision.
+                let known = self
+                    .list_all_registered_tools()
+                    .await
+                    .into_iter()
+                    .any(|(name, _, _, _)| name == tool_name);
+                return Err(if known {
+                    McpError::LoadoutDenied {
+                        context: tool_ctx.context_id,
+                        tool: tool_name.to_string(),
+                    }
+                } else {
+                    McpError::ToolNotFound {
+                        instance: InstanceId::new(""),
+                        tool: tool_name.to_string(),
+                    }
+                });
             }
-        })?;
+        };
 
         let arguments: serde_json::Value = if params_json.trim().is_empty() {
             serde_json::json!({})

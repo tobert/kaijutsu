@@ -3094,6 +3094,20 @@ impl KernelDb {
         }))
     }
 
+    /// Test-only fault injection: drop a binding detail table out from under
+    /// a context that already has a `context_bindings` parent row, so
+    /// `get_context_binding` fails partway through instead of returning
+    /// `Ok(None)`/`Ok(Some(_))`. Exists to exercise the "a real DB error must
+    /// surface, not silently become deny-all" fix in `Broker::binding_checked`
+    /// — there is no other way to force `get_context_binding` down its `Err`
+    /// path through public API alone. Never compiled outside test builds.
+    #[cfg(test)]
+    pub(crate) fn poison_context_binding_detail_table_for_test(&self) -> KernelDbResult<()> {
+        self.conn
+            .execute_batch("DROP TABLE context_binding_instances")?;
+        Ok(())
+    }
+
     /// Delete the full binding for a context (cascades to instances + names).
     /// Returns true if a parent row existed.
     pub fn delete_context_binding(&self, context_id: ContextId) -> KernelDbResult<bool> {

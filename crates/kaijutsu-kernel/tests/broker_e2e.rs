@@ -668,6 +668,44 @@ async fn unknown_tool_name_surfaces_tool_not_found() {
 }
 
 #[tokio::test]
+async fn denied_tool_call_names_the_tool_and_context_not_an_empty_or_confusing_error() {
+    // A narrow loadout (the musician/toolie shape: only a couple of tool
+    // grants, no `*`) that hides `write` must not report a dispatch of it
+    // as "not found" — from the caller's side that reads like a typo, when
+    // it's really a capability decision. The error must be non-empty and
+    // name both the tool and the denying context so the caller (or a human
+    // debugging live) can act (`kj binding allow`).
+    use kaijutsu_kernel::mcp::Capability;
+    let fx = setup().await;
+
+    let mut binding = ContextToolBinding::new();
+    binding.grant(Capability::Tool {
+        instance: InstanceId::new("builtin.file"),
+        tool: "read".into(),
+    });
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+
+    let err = fx
+        .kernel
+        .dispatch_tool_via_broker("write", r#"{"path":"/x","content":"y"}"#, &fx.exec_ctx)
+        .await
+        .expect_err("ungranted-but-registered tool must error");
+
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "denial error message must not be empty");
+    assert!(msg.contains("write"), "error must name the denied tool: {msg}");
+    assert!(
+        msg.contains(&fx.ctx_id.to_string()),
+        "error must name the denying context: {msg}"
+    );
+    assert!(
+        matches!(err, McpError::LoadoutDenied { ref tool, context } if tool == "write" && context == fx.ctx_id),
+        "expected LoadoutDenied for a registered-but-ungranted tool (not ToolNotFound, \
+         which would read as a typo), got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn is_error_result_maps_to_exec_failure() {
     // D-28 happy-path: a tool that *completes successfully* but returns
     // `KernelToolResult { is_error: true }` must surface at the call site as

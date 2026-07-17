@@ -1057,6 +1057,44 @@ impl Broker {
         }
     }
 
+    /// Like [`Self::binding`], but surfaces a genuine DB read failure as an
+    /// error instead of silently treating it the same as "never bound".
+    /// `binding()` stays `Option`-returning for its many read-only call
+    /// sites (`kj binding show`, the bindings MCP server, tests) where "no
+    /// row" and "DB trouble" are both correctly deny-by-default; this
+    /// variant is for call sites — like tool dispatch — where conflating a
+    /// storage fault with a legitimate empty binding surfaces later as a
+    /// confusing "tool not found" with no clue a DB read failed.
+    pub async fn binding_checked(&self, context_id: &ContextId) -> McpResult<ContextToolBinding> {
+        if let Some(b) = self.bindings.read().await.get(context_id).cloned() {
+            return Ok(b);
+        }
+        let Some(db) = self.db.read().await.clone() else {
+            // No DB wired (tests / ephemeral broker) — never-bound is the
+            // only possible state; deny-by-default.
+            return Ok(ContextToolBinding::default());
+        };
+        let loaded = {
+            let guard = db.lock();
+            guard
+                .get_context_binding(*context_id)
+                .map_err(|e| McpError::BindingUnavailable {
+                    context: *context_id,
+                    reason: e.to_string(),
+                })?
+        };
+        match loaded {
+            Some(loaded) => {
+                self.bindings
+                    .write()
+                    .await
+                    .insert(*context_id, loaded.clone());
+                Ok(loaded)
+            }
+            None => Ok(ContextToolBinding::default()),
+        }
+    }
+
     /// Capability gate for facade tools (`shell`, `edit_input`, `submit_input`)
     /// — the non-broker-routed surface that reaches the kernel over the shared
     /// RPC handlers (`shell_execute`/`edit_input`/`submit_input`), which both
@@ -2139,6 +2177,14 @@ fn error_to_hook_json(e: &McpError) -> String {
         McpError::FacadeDenied { facade } => (
             "FacadeDenied",
             serde_json::json!({"facade": facade}),
+        ),
+        McpError::LoadoutDenied { context, tool } => (
+            "LoadoutDenied",
+            serde_json::json!({"context": context.to_string(), "tool": tool}),
+        ),
+        McpError::BindingUnavailable { context, reason } => (
+            "BindingUnavailable",
+            serde_json::json!({"context": context.to_string(), "reason": reason}),
         ),
         McpError::HookRecursionLimit { depth } => (
             "HookRecursionLimit",
@@ -6292,5 +6338,126 @@ mod tests {
             matches!(err, McpError::Protocol(_)),
             "expected original Protocol error to propagate (hook saw KJ_TOOL_ERROR and exited 0); got {err:?}",
         );
+    }
+
+    // -------------------------------------------------------------------
+    // binding_checked (item 3: a real binding-fetch failure must surface,
+    // not silently collapse to deny-all)
+    // -------------------------------------------------------------------
+
+    /// No DB wired and never bound: `binding_checked` matches `binding()` —
+    /// deny-by-default, not an error.
+    #[tokio::test]
+    async fn binding_checked_with_no_db_and_no_cache_entry_is_default_not_error() {
+        let broker = Arc::new(Broker::new());
+        let ctx = ContextId::new();
+        let binding = broker
+            .binding_checked(&ctx)
+            .await
+            .expect("no DB wired is not a failure — it's the deny-by-default default");
+        assert!(binding.is_empty());
+    }
+
+    /// A context with no `context_bindings` row (never bound) is a
+    /// legitimate deny-by-default `Ok(default)`, not an error, even with a
+    /// real DB wired.
+    #[tokio::test]
+    async fn binding_checked_never_bound_context_is_default_not_error() {
+        use crate::kernel_db::KernelDb;
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let broker = Arc::new(Broker::new());
+        broker.set_db(kernel_db).await;
+
+        let ctx = ContextId::new();
+        let binding = broker
+            .binding_checked(&ctx)
+            .await
+            .expect("never-bound context is deny-by-default, not a DB failure");
+        assert!(binding.is_empty());
+    }
+
+    /// The regression this fix closes: a real DB read failure (here, a
+    /// dropped binding detail table) must surface as `BindingUnavailable`
+    /// naming the context and the underlying reason — never silently
+    /// collapse to an empty (deny-all) binding the way `binding()` does.
+    /// `binding()` swallowing this was the root of the "denied tool call
+    /// reports a confusing ToolNotFound with no clue a DB read failed" bug;
+    /// `dispatch_tool_via_broker_with_cancel` calls `binding_checked` first
+    /// specifically so this failure reaches the caller intact.
+    #[tokio::test]
+    async fn binding_checked_surfaces_a_real_db_failure() {
+        use crate::kernel_db::{ContextRow, DocumentRow, KernelDb};
+        use kaijutsu_types::{now_millis, ConsentMode, ContextState, DocKind};
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ctx = ContextId::new();
+        {
+            let mut db = kernel_db.lock();
+            let creator = PrincipalId::system();
+            let ws_id = db.get_or_create_default_workspace(creator).unwrap();
+            // `contexts.context_id` FKs to `documents.document_id` — a
+            // context is a document first.
+            db.insert_document(&DocumentRow {
+                document_id: ctx,
+                workspace_id: ws_id,
+                doc_kind: DocKind::Code,
+                language: None,
+                path: None,
+                created_at: now_millis() as i64,
+                created_by: creator,
+            })
+            .unwrap();
+            db.insert_context(&ContextRow {
+                context_id: ctx,
+                label: None,
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: "default".to_string(),
+                created_at: now_millis() as i64,
+                created_by: creator,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: Some(ws_id),
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+            })
+            .unwrap();
+            // A real row in context_bindings (so the parent-row lookup
+            // succeeds), then poison the first detail table the query walks —
+            // this is exactly the kind of partial-schema/store fault a naive
+            // `unwrap_or_default()` would silently paper over.
+            db.upsert_context_binding(ctx, &ContextToolBinding::with_instances(vec![]))
+                .unwrap();
+            db.poison_context_binding_detail_table_for_test().unwrap();
+        }
+
+        let broker = Arc::new(Broker::new());
+        broker.set_db(kernel_db).await;
+
+        let err = broker
+            .binding_checked(&ctx)
+            .await
+            .expect_err("a dropped detail table must surface as an error, not deny-all");
+        // The Display text (what a caller actually sees via `e.to_string()`)
+        // names both the context and the real cause — not a bare "not
+        // found" that reads like the tool never existed.
+        let msg = err.to_string();
+        assert!(msg.contains(&ctx.to_string()), "message must name the context: {msg}");
+        match err {
+            McpError::BindingUnavailable { context, reason } => {
+                assert_eq!(context, ctx);
+                assert!(!reason.is_empty(), "reason must not be empty");
+            }
+            other => panic!("expected BindingUnavailable, got {other:?}"),
+        }
     }
 }
