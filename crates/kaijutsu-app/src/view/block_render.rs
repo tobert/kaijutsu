@@ -1003,16 +1003,18 @@ pub fn render_msdf_block_textures(
             continue;
         }
 
-        // Physical texture size (item.width/height, already
-        // ceil(logical*scale) — see ui_rtt_texture_dims) + scale_factor, not
-        // built_width/built_height: build_vertices maps glyph coordinates
-        // into physical pixel space directly (Fix 3 — see its doc comment).
+        // Physical texture size (item.width/height) + the item's OWN
+        // logical→physical scale, not the window scale: UI-node surfaces
+        // size textures ceil(logical*window_scale) so the two agree, but
+        // world-space MSDF panels (time well) allocate 1:1 textures whose
+        // scale is 1.0 at any DPI (Fix 3 + per-surface scale — see
+        // build_vertices' doc comment and msdf_item_scale).
         let vertices = MsdfBlockRenderer::build_vertices(
             &item.glyphs,
             &msdf_atlas,
             item.width as f32,
             item.height as f32,
-            render_params.scale_factor,
+            item.scale,
             item.rainbow,
         );
 
@@ -1122,10 +1124,26 @@ struct ExtractedMsdfBlockItem {
     /// `UiRttTexture` are logical and no longer needed here).
     width: u32,
     height: u32,
+    /// This surface's own logical→physical mapping (`width / built_width`).
+    /// UI-node surfaces size their texture `ceil(logical * window_scale)` so
+    /// this equals the window scale; world-space MSDF panels (time well
+    /// cards/legend) allocate 1:1 textures so it is 1.0 regardless of DPI —
+    /// the window scale factor must never be assumed here.
+    scale: f32,
     version: u64,
     rainbow: bool,
     /// Whether Vello rendered borders first (false = MSDF must clear).
     has_vello_content: bool,
+}
+
+/// A surface's logical→physical scale from its texture + build-space widths.
+/// Falls back to 1.0 when the build width is degenerate (never-built panel).
+fn msdf_item_scale(tex_width: u32, built_width: f32) -> f32 {
+    if built_width > 0.0 {
+        tex_width as f32 / built_width
+    } else {
+        1.0
+    }
 }
 
 /// Resource holding extracted MSDF block data.
@@ -1150,15 +1168,6 @@ pub struct ExtractedMsdfRenderParams {
     pub text_bias: f32,
     pub gamma_correction: f32,
     pub time: f32,
-    /// Window HiDPI scale factor, passed to `build_vertices` to convert
-    /// glyph-space (logical) coordinates into the render target's physical
-    /// pixel space (Fix 3). Every field here is overwritten every frame by
-    /// `extract_msdf_render_params` before `render_msdf_block_textures`
-    /// (guarded on non-empty `ExtractedMsdfBlockData`, itself populated in
-    /// the same extract pass) ever reads it — 1.0 is just a sane value for
-    /// the otherwise-unreachable pre-first-extract instant, not a value
-    /// this resource is expected to render with.
-    pub scale_factor: f32,
 }
 
 impl Default for ExtractedMsdfRenderParams {
@@ -1171,7 +1180,6 @@ impl Default for ExtractedMsdfRenderParams {
             text_bias: 0.0,
             gamma_correction: 0.0,
             time: 0.0,
-            scale_factor: 1.0,
         }
     }
 }
@@ -1224,6 +1232,7 @@ fn extract_msdf_blocks(
             image_handle: texture.image.clone(),
             width: texture.width,
             height: texture.height,
+            scale: msdf_item_scale(texture.width, texture.built_width),
             version: msdf_glyphs.version,
             rainbow: msdf_glyphs.rainbow,
             has_vello_content: has_vello,
@@ -1231,12 +1240,13 @@ fn extract_msdf_blocks(
     }
 }
 
-/// Extract MSDF rendering params (theme + time + scale factor) to the render world.
+/// Extract MSDF rendering params (theme + time) to the render world. The
+/// logical→physical scale is per-surface (`ExtractedMsdfBlockItem::scale`),
+/// not a global here — world-space panels and UI-node surfaces differ.
 fn extract_msdf_render_params(
     mut extracted: ResMut<ExtractedMsdfRenderParams>,
     theme: Extract<Res<Theme>>,
     time: Extract<Res<Time>>,
-    text_metrics: Extract<Res<TextMetrics>>,
 ) {
     extracted.hint_amount = theme.msdf_hint_amount;
     extracted.stem_darkening = theme.msdf_stem_darkening;
@@ -1245,7 +1255,6 @@ fn extract_msdf_render_params(
     extracted.text_bias = theme.msdf_text_bias;
     extracted.gamma_correction = theme.msdf_gamma_correction;
     extracted.time = time.elapsed_secs();
-    extracted.scale_factor = text_metrics.scale_factor;
 }
 
 /// Returns true if an MSDF block should be extracted for rendering this frame.
@@ -1306,6 +1315,29 @@ mod tests {
                  physical {physical} is not integer-pixel-aligned",
             );
         }
+    }
+
+    // -- msdf_item_scale ----------------------------------------------------
+
+    #[test]
+    fn msdf_item_scale_is_window_scale_for_ui_surfaces() {
+        // UI-node surfaces allocate ceil(logical * window_scale) textures,
+        // so the per-item scale recovers the window scale exactly.
+        assert_eq!(msdf_item_scale(512, 256.0), 2.0);
+        assert_eq!(msdf_item_scale(384, 256.0), 1.5);
+    }
+
+    #[test]
+    fn msdf_item_scale_is_one_for_world_space_panels() {
+        // Time-well cards/legend allocate 1:1 textures (world-space quads):
+        // their glyphs must NOT scale with window DPI — the regression that
+        // made card text overflow its board on the 4k machine.
+        assert_eq!(msdf_item_scale(256, 256.0), 1.0);
+    }
+
+    #[test]
+    fn msdf_item_scale_survives_degenerate_build_width() {
+        assert_eq!(msdf_item_scale(256, 0.0), 1.0);
     }
 
     // -- should_extract_msdf_block -----------------------------------------
