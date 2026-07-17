@@ -717,15 +717,27 @@ impl KaijutsuMcp {
         // `SubscriberHealth` server-side), the client is never told: the
         // broadcast channel stays open, just silent, and without this we'd
         // block the *entire* `timeout_secs` on a channel that may never fire
-        // again. So: if STALL_WINDOW passes with no watch progress while a
-        // command is still pending, assume delivery may be dead and force an
-        // authoritative catch-up rather than keep waiting on it blind.
-        const STALL_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-        let mut next_stall_check = std::time::Instant::now() + STALL_WINDOW;
+        // again. So: if the stall window passes with no watch progress while
+        // a command is still pending, assume delivery may be dead and force
+        // an authoritative catch-up rather than keep waiting on it blind.
+        //
+        // The window backs off exponentially within a stall episode (5s,
+        // 10s, 20s, capped at 30s) rather than firing flat every 5s. Dead-
+        // bridge discovery still lands fast — most shell commands finish
+        // under the 5s initial window — but a long, healthy, quiet command
+        // (a multi-minute build, `kj synth all`) doesn't pay for a full-
+        // context `get_context_sync` snapshot every 5s for its whole
+        // runtime; that per-call snapshot cost is already flagged as a perf
+        // issue (docs/issues.md) without piling a tight poll on top of it.
+        const STALL_INITIAL_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+        const STALL_MAX_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+        let mut stall_window = STALL_INITIAL_WINDOW;
+        let mut next_stall_check = std::time::Instant::now() + stall_window;
         // Resubscribing replaces a live bridge too (idempotent, but not
         // free — see `ActorHandle::resubscribe_blocks`), so fire it at most
         // once per stall episode; real watch progress (delivery is alive
-        // after all, just slow) clears this for the next one.
+        // after all, just slow) clears this — and the backed-off window —
+        // for the next one.
         let mut stall_resubscribed = false;
 
         let local = loop {
@@ -760,7 +772,8 @@ impl KaijutsuMcp {
                 Ok(Ok(()))
             );
             if watch_progressed {
-                next_stall_check = std::time::Instant::now() + STALL_WINDOW;
+                stall_window = STALL_INITIAL_WINDOW;
+                next_stall_check = std::time::Instant::now() + stall_window;
                 stall_resubscribed = false;
                 continue;
             }
@@ -768,13 +781,13 @@ impl KaijutsuMcp {
             if std::time::Instant::now() < next_stall_check {
                 continue;
             }
-            next_stall_check = std::time::Instant::now() + STALL_WINDOW;
             tracing::info!(
                 command = %command,
                 cmd_block = %cmd_block_id.to_key(),
                 elapsed_ms = start.elapsed().as_millis() as u64,
-                "shell poll stall fallback: no event-feed progress for {}s, forcing authoritative resync",
-                STALL_WINDOW.as_secs(),
+                "shell poll stall fallback: no event-feed progress for the current {}s \
+                 window, forcing authoritative resync",
+                stall_window.as_secs(),
             );
             // Pull the server's authoritative snapshot straight into the local
             // SyncedDocument — the same resync `resync_synced` performs after a
@@ -791,6 +804,11 @@ impl KaijutsuMcp {
                 }
                 stall_resubscribed = true;
             }
+            // Back off within this episode — see the comment above the
+            // window consts. Real watch progress (handled above) is the only
+            // thing that resets it.
+            stall_window = (stall_window * 2).min(STALL_MAX_WINDOW);
+            next_stall_check = std::time::Instant::now() + stall_window;
         };
 
         // Phase 2 — read the AUTHORITATIVE final block from the server. A shell
