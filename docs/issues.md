@@ -1810,9 +1810,6 @@ the *remaining* findings, triaged.
   (`crates/kaijutsu-client/src/synced_document.rs`): events buffered before a
   resync are never replayed against the new doc. Harmless if the server snapshot
   is always ahead of the buffered events; otherwise a silent loss.
-- **LOW — dead `push_to_server` on `KaijutsuMcp`** (lib.rs): nothing calls it
-  (the hook listener has its own `push_ops`); carries the same stale-frontier
-  bug. Delete or consolidate.
 - **LOW — `InvokePeerRequest.params` generates an untyped MCP schema property**
   (found 2026-07-17 while closing the double-encoding entry): the field is
   `serde_json::Value`, so the derived tool schema gives `params` no `type` at
