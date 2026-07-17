@@ -127,6 +127,82 @@ fn shell_returns_stdout() {
     });
 }
 
+/// Regression guard for the 2026-07-17 "MCP shell calls time out ~50% of the
+/// time" bug: if the client's event-delivery path goes dead mid-command (a
+/// reaped FlowBus bridge server-side, or — as simulated here — the client's
+/// own background listener dying), `execute_and_poll_shell` must not block
+/// the full request timeout waiting on a `change` channel that will never
+/// fire again. Its stall fallback should notice within a few seconds, pull
+/// an authoritative snapshot directly, and return promptly once the command
+/// actually completes server-side.
+///
+/// Caveat: this kills the CLIENT's listener task, not the SERVER's FlowBus
+/// bridge (there's no seam in this harness to force the server to reap a
+/// live subscription on demand). From `execute_and_poll_shell`'s point of
+/// view the two are indistinguishable — both manifest as "the `change` watch
+/// channel never advances again while a command is pending" — so this still
+/// exercises the exact client-side code path the bug lives in. It does NOT
+/// exercise the server's `SubscriberHealth` reap logic; that has its own
+/// dedicated unit tests in `kaijutsu-server/src/rpc.rs`.
+#[test]
+fn shell_survives_dead_event_feed() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+
+        register_with_retry(&mcp, "e2e-dead-feed").await;
+
+        // Kill the client's own event listener — `remote.change` now never
+        // advances again, exactly as if the server had reaped our FlowBus
+        // bridge and gone silent.
+        {
+            let kaijutsu_mcp::Backend::Remote(remote) = mcp.backend() else {
+                panic!("expected Remote backend");
+            };
+            let guard = remote.joined.read().await;
+            guard
+                .as_ref()
+                .expect("register_session must have joined a context")
+                .debug_kill_event_listener();
+        }
+
+        let started = std::time::Instant::now();
+        let out = mcp
+            .shell(Parameters(ShellRequest {
+                command: "echo still-alive".to_string(),
+                // Generous request timeout — the assertion below is what
+                // actually proves the stall fallback fired; a bare pass
+                // under a slack timeout would prove nothing.
+                timeout_secs: Some(60),
+            }))
+            .await;
+        let elapsed = started.elapsed();
+        let env: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(
+            env["status"].as_str(),
+            Some("done"),
+            "expected Done status despite the dead event feed, got envelope: {env}"
+        );
+        assert_eq!(
+            env["stdout"].as_str(),
+            Some("still-alive\n"),
+            "stdout did not replicate via the stall fallback's authoritative resync: {env}"
+        );
+        // The command itself completes in well under a second server-side.
+        // Without the stall fallback this would block on a dead channel for
+        // the full 60s timeout (then still fail, since resubscribe-on-timeout
+        // only helps the *next* call). A generous bound here just needs to be
+        // far below 60s to prove the fallback — not the full request
+        // timeout — is what unblocked this call.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "shell call took {elapsed:?} — stall fallback does not appear to have fired \
+             (expected well under the 60s request timeout)"
+        );
+    });
+}
+
 /// Sequential commands must each return their own stdout — guards against the
 /// store replica diverging after the first command (stale frontier, stranded
 /// text ops).

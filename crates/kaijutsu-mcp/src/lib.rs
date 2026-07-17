@@ -276,6 +276,19 @@ pub struct JoinedContext {
     _bg_task: Arc<AbortOnDrop>,
 }
 
+impl JoinedContext {
+    /// Testing seam: abort the background event listener without touching
+    /// the connection or joined state otherwise. `remote.change` then never
+    /// advances again for this context, reproducing the client-visible
+    /// symptom of a server-reaped FlowBus bridge (see `SubscriberHealth`)
+    /// without needing to actually starve a real one server-side. Exists for
+    /// `tests/e2e_shell.rs` to exercise `execute_and_poll_shell`'s stall
+    /// fallback end-to-end; production code never calls this.
+    pub fn debug_kill_event_listener(&self) {
+        self._bg_task.0.abort();
+    }
+}
+
 // ============================================================================
 // KaijutsuMcp Server
 // ============================================================================
@@ -696,6 +709,25 @@ impl KaijutsuMcp {
         // channel records the version, so a bump that lands between our check
         // and the `changed().await` below is still observed (no lost wakeup).
         let mut change_rx = remote.change.subscribe();
+
+        // Stall fallback: `change` is bumped only by the background listener,
+        // which only has something to bump when the server's FlowBus bridge
+        // delivers an event. If that bridge gets reaped mid-command (a burst
+        // of callback timeouts from one transient client stall — see
+        // `SubscriberHealth` server-side), the client is never told: the
+        // broadcast channel stays open, just silent, and without this we'd
+        // block the *entire* `timeout_secs` on a channel that may never fire
+        // again. So: if STALL_WINDOW passes with no watch progress while a
+        // command is still pending, assume delivery may be dead and force an
+        // authoritative catch-up rather than keep waiting on it blind.
+        const STALL_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+        let mut next_stall_check = std::time::Instant::now() + STALL_WINDOW;
+        // Resubscribing replaces a live bridge too (idempotent, but not
+        // free — see `ActorHandle::resubscribe_blocks`), so fire it at most
+        // once per stall episode; real watch progress (delivery is alive
+        // after all, just slow) clears this for the next one.
+        let mut stall_resubscribed = false;
+
         let local = loop {
             if let Some(snap) = find_terminal() {
                 break snap;
@@ -717,9 +749,48 @@ impl KaijutsuMcp {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 };
             }
+
             // Wait for the next applied event; the fallback tick is now just a
-            // safety net (the watch channel makes lost wakeups impossible).
-            let _ = tokio::time::timeout(fallback_interval, change_rx.changed()).await;
+            // safety net (the watch channel makes lost wakeups impossible) —
+            // UNLESS the bridge is dead, in which case it never fires and this
+            // always times out. That's exactly the case the stall check below
+            // exists to catch.
+            let watch_progressed = matches!(
+                tokio::time::timeout(fallback_interval, change_rx.changed()).await,
+                Ok(Ok(()))
+            );
+            if watch_progressed {
+                next_stall_check = std::time::Instant::now() + STALL_WINDOW;
+                stall_resubscribed = false;
+                continue;
+            }
+
+            if std::time::Instant::now() < next_stall_check {
+                continue;
+            }
+            next_stall_check = std::time::Instant::now() + STALL_WINDOW;
+            tracing::info!(
+                command = %command,
+                cmd_block = %cmd_block_id.to_key(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "shell poll stall fallback: no event-feed progress for {}s, forcing authoritative resync",
+                STALL_WINDOW.as_secs(),
+            );
+            // Pull the server's authoritative snapshot straight into the local
+            // SyncedDocument — the same resync `resync_synced` performs after a
+            // reconnect/lag. It flushes any locally-authored ops first, then
+            // folds the fetched state into `remote.synced`. If the command
+            // finished server-side while our delivery path was dead, the very
+            // next `find_terminal()` at the top of this loop picks it up
+            // exactly as if it had arrived locally — no separate fetch/decode
+            // path to keep in sync with Phase 2 below.
+            resync_synced(&remote.actor, &remote.synced, ctx_id).await;
+            if !stall_resubscribed {
+                if let Err(e) = remote.actor.resubscribe_blocks().await {
+                    tracing::warn!("{label}: stall-fallback resubscribe failed: {e}");
+                }
+                stall_resubscribed = true;
+            }
         };
 
         // Phase 2 — read the AUTHORITATIVE final block from the server. A shell
