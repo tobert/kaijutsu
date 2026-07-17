@@ -26,8 +26,8 @@ use kaijutsu_viz::layout::Band;
 
 use super::panel::commit_panel_glyphs;
 use super::scene::{
-    CARD_TEX_H, CARD_TEX_W, Card, HorizonLabel, LABEL_TEX_W, READING_TEX_H, READING_TEX_W,
-    ReadingCard, TimeWellState, accent_vec4,
+    CARD_TEX_H, CARD_TEX_W, Card, CardParams, HorizonLabel, LABEL_TEX_W, READING_TEX_H,
+    READING_TEX_W, ReadingCard, TimeWellState, accent_vec4,
 };
 use crate::shaders::WellCardMaterial;
 use crate::text::ShapingFonts;
@@ -317,19 +317,19 @@ pub fn ancestry_text(
 /// 0, running → 1 (breathing pulse), done → 2 (no rim), error → 3 (steady red).
 /// `drifting` (0/1) gates the drift sheen sweep. Time-based animation reads
 /// `globals.time` in the shader.
-fn card_params(card: &Card) -> Vec4 {
+fn card_params(params: &CardParams) -> Vec4 {
     use kaijutsu_types::Status;
-    let status = match card.status {
+    let status = match params.status {
         Some(Status::Running) => 1.0,
         Some(Status::Done) => 2.0,
         Some(Status::Error) => 3.0,
         _ => 0.0, // None or Pending
     };
     Vec4::new(
-        if card.selected { 1.0 } else { 0.0 },
-        if card.in_lineage { 1.0 } else { 0.0 },
+        if params.selected { 1.0 } else { 0.0 },
+        if params.in_lineage { 1.0 } else { 0.0 },
         status,
-        if card.drifting { 1.0 } else { 0.0 },
+        if params.drifting { 1.0 } else { 0.0 },
     )
 }
 
@@ -650,8 +650,13 @@ fn reading_card_glyphs(
     out
 }
 
-/// Rebuild a rim card's MSDF text glyphs + sync its material when its data
-/// changes. No vello — the shader draws the body; MSDF owns the text texture.
+/// Rebuild a rim card's MSDF text glyphs + sync its material's accent when its
+/// data changes. No vello — the shader draws the body; MSDF owns the text
+/// texture. Shader-param-only state (selection/lineage/drift/status) lives on
+/// the sibling [`CardParams`] component and syncs separately, via
+/// [`sync_card_material_params`] — split out (2026-07-17) so flipping those
+/// flags doesn't also trip *this* system's `Changed<Card>` gate and force a
+/// full glyph re-layout for text that never changed.
 ///
 /// Dived-only (Slice C, `lovely-swimming-prism.md`): at room scale the card
 /// text is unreadably small pixels, so this system doesn't even run while
@@ -701,11 +706,35 @@ pub fn build_card_scenes(
 
         if let Some(mat) = materials.get_mut(&mat_node.0) {
             mat.accent = accent_vec4(&card.data.accent);
-            mat.params = card_params(card);
         }
     }
     if rebuild_all {
         state.card_text_dirty = false;
+    }
+}
+
+/// Sync `WellCardMaterial.params` from [`CardParams`] — the shader-uniform-only
+/// half of the material sync [`build_card_scenes`] used to do in one pass.
+/// Split out (2026-07-17) so a selection/lineage/drift/status flip doesn't
+/// route through `build_card_scenes`'s `Changed<Card>` gate and force a full
+/// MSDF glyph re-layout for text that never changed — `card_params` is a few
+/// enum matches, cheap enough to skip that gate entirely. `CardParams`'s own
+/// write sites (`scene::highlight_selection`/`highlight_lineage`/
+/// `highlight_drift`, `sync::sync_time_well`'s status refresh) already guard
+/// their writes to fire only on a real flip, so gating on `Changed<CardParams>`
+/// here is free — no extra staleness, just a narrower rebuild trigger.
+///
+/// Same dived-only cadence as `build_card_scenes` (see its own doc): the rim
+/// card face isn't legible at room scale, so there is no ambient-tier variant
+/// to keep in sync with here either.
+pub fn sync_card_material_params(
+    mut materials: ResMut<Assets<WellCardMaterial>>,
+    query: Query<(&CardParams, &MeshMaterial3d<WellCardMaterial>), Changed<CardParams>>,
+) {
+    for (params, mat_node) in query.iter() {
+        if let Some(mat) = materials.get_mut(&mat_node.0) {
+            mat.params = card_params(params);
+        }
     }
 }
 
