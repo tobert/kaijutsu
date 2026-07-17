@@ -54,6 +54,10 @@ enum ConfigCommand {
         /// Emit a JSON object instead of a labelled view
         #[arg(long)]
         json: bool,
+        /// Emit exactly the stored content — no path/length header, no code
+        /// fence. Round-trips byte-identical through `kj config set`.
+        #[arg(long, conflicts_with = "json")]
+        raw: bool,
     },
     /// Replace a config file's content (direct CRDT write). Requires a body
     /// (`--content` or piped stdin) — use `edit` with no body to open an
@@ -196,7 +200,7 @@ impl KjDispatcher {
         };
         let result = match parsed.command {
             ConfigCommand::List { json } => self.config_list(json).await,
-            ConfigCommand::Show { path, json } => self.config_show(&path, json).await,
+            ConfigCommand::Show { path, json, raw } => self.config_show(&path, json, raw).await,
             ConfigCommand::Set { path, content } => {
                 self.config_set(&path, content.as_deref()).await
             }
@@ -314,7 +318,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    async fn config_show(&self, path: &str, json: bool) -> KjResult {
+    async fn config_show(&self, path: &str, json: bool, raw: bool) -> KjResult {
         let canonical = match config_canonical(path) {
             Ok(c) => c,
             Err(e) => return KjResult::Err(format!("kj config show: {e}")),
@@ -324,6 +328,13 @@ impl KjDispatcher {
             Ok(None) => return KjResult::Err(format!("kj config show: '{canonical}' not found")),
             Err(e) => return KjResult::Err(format!("kj config show: '{canonical}': {e}")),
         };
+
+        if raw {
+            // Exactly the stored content — no header, no fence — so piping it
+            // into a file and `kj config set`-ing it back round-trips
+            // byte-identical instead of storing the decoration as content.
+            return KjResult::ok(content);
+        }
 
         let name = canonical.rsplit('/').next().unwrap_or(&canonical);
         let record = serde_json::json!({
@@ -602,6 +613,66 @@ mod tests {
         match show {
             KjResult::Ok { data: Some(v), .. } => {
                 assert_eq!(v["content"].as_str(), Some("bg = \"#000000\""));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// `kj config show --raw` emits exactly the stored content — no
+    /// path/length header, no code fence — so piping it into `kj config set`
+    /// round-trips byte-identical instead of storing the decoration.
+    #[tokio::test]
+    async fn show_raw_round_trips_byte_identical_through_set() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let body = "bg = \"#123456\"\nfg = \"#abcdef\"\n";
+        let set = d
+            .dispatch(
+                &[
+                    s("config"),
+                    s("set"),
+                    s("theme.toml"),
+                    s("--content"),
+                    s(body),
+                ],
+                &c,
+            )
+            .await;
+        assert!(matches!(set, KjResult::Ok { .. }), "set failed: {set:?}");
+
+        let raw = d
+            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--raw")], &c)
+            .await;
+        let raw_message = match raw {
+            KjResult::Ok { message, .. } => message,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        assert_eq!(raw_message, body, "raw output must be exactly the content");
+
+        // Round-trip: set it right back using the raw output as the body.
+        let set_again = d
+            .dispatch(
+                &[
+                    s("config"),
+                    s("set"),
+                    s("theme.toml"),
+                    s("--content"),
+                    raw_message,
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            matches!(set_again, KjResult::Ok { .. }),
+            "round-trip set failed: {set_again:?}"
+        );
+
+        let show = d
+            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
+            .await;
+        match show {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["content"].as_str(), Some(body));
             }
             other => panic!("expected Ok, got {other:?}"),
         }
