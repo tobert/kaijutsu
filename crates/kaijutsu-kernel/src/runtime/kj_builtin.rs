@@ -537,8 +537,17 @@ impl Tool for KjBuiltin {
             }
         }
 
-        // Reconstruct boolean flags
-        for flag in &args.flags {
+        // Reconstruct boolean flags. `json` is skipped here — see below — so it
+        // never enters the flat argv at all: kaish's structured `args.flags`
+        // (a `HashSet<String>` of flag *names*, no dashes) unambiguously tells
+        // us the user set the global `--json` boolean flag, independent of
+        // whatever string literal happens to ride along as some other flag's
+        // *value* (e.g. `kj config set foo --content --json`, where "--json"
+        // is `--content`'s value, not a flag). Stripping "--json" tokens out of
+        // the already-flattened argv by string match (the old approach) could
+        // not tell those apart and ate the literal value too.
+        let json_requested = args.flags.contains("json");
+        for flag in args.flags.iter().filter(|f| f.as_str() != "json") {
             if flag.len() == 1 {
                 argv.push(format!("-{flag}"));
             } else {
@@ -549,14 +558,6 @@ impl Tool for KjBuiltin {
         // Extract --confirm <nonce> before dispatch
         let confirm_nonce = crate::kj::parse::extract_named_arg(&argv, &["--confirm"]);
         crate::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
-
-        // Extract the global --json flag before dispatch. The per-subcommand
-        // clap parsers don't declare it (it's a kj-wide presentation flag), so
-        // leaving it in argv would make `kj context list --json` fail with
-        // "unexpected argument". When set, the KjResult is rendered as a JSON
-        // envelope after dispatch instead of the human text.
-        let json_requested = crate::kj::parse::has_flag(&argv, &["--json"]);
-        argv.retain(|a| a != "--json");
 
         // Stdin → --content for `kj rc add`/`edit` and `kj config set`/`edit`.
         // Lets shell pipelines author multi-line .md / .kai scripts and load a
@@ -1782,6 +1783,84 @@ mod tests {
         assert!(
             stdout.contains("providers.lemonade"),
             "stdin content didn't reach config edit: {stdout}"
+        );
+    }
+
+    /// Regression: a literal `"--json"` string passed as a *value* (here,
+    /// `--content`'s body) must survive argv reconstruction untouched — it is
+    /// not the global `--json` presentation flag just because it matches the
+    /// same spelling. Before the fix, `argv.retain(|a| a != "--json")` struck
+    /// every token spelled "--json" out of the flattened argv, corrupting the
+    /// content and (worse) flipping `json_requested` on for a command that
+    /// never asked for it.
+    #[tokio::test]
+    async fn literal_json_content_value_survives_argv_reconstruction() {
+        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("jsonliteralhost"), None, principal);
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = r#"kj config set theme.toml --content "--json""#;
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "set with literal --json content failed: {res:?}");
+        // No --json flag was passed, so the result renders as kj's normal
+        // human text, not a JSON envelope.
+        assert!(
+            !serde_json::from_str::<serde_json::Value>(&res.text_out()).is_ok_and(|v| v
+                .get("ok")
+                .is_some()),
+            "unexpected JSON envelope with no --json flag: {}",
+            res.text_out()
+        );
+
+        let show = kaish
+            .execute_with_options("kj config show theme.toml --raw", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(show.ok(), "show --raw failed: {show:?}");
+        assert_eq!(
+            show.text_out(),
+            "--json",
+            "the literal content value must survive byte-for-byte"
+        );
+    }
+
+    /// The combined case: a literal `"--json"` content value AND a real
+    /// trailing `--json` presentation flag in the same call. Both must take
+    /// effect independently — the envelope renders as JSON (the flag was
+    /// really set) while the stored content is still the untouched literal.
+    #[tokio::test]
+    async fn literal_json_content_value_coexists_with_real_json_flag() {
+        let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("jsonbothhost"), None, principal);
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = r#"kj config set theme.toml --content "--json" --json"#;
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "set with literal + real --json failed: {res:?}");
+        let envelope: serde_json::Value = serde_json::from_str(&res.text_out())
+            .unwrap_or_else(|e| panic!("--json flag should render an envelope ({e}): {}", res.text_out()));
+        assert_eq!(envelope["ok"], serde_json::json!(true));
+
+        let show = kaish
+            .execute_with_options("kj config show theme.toml --raw", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert_eq!(
+            show.text_out(),
+            "--json",
+            "the literal content value must survive alongside a real --json flag"
         );
     }
 

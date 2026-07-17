@@ -65,8 +65,11 @@ enum ConfigCommand {
     Set {
         /// Config file name (e.g. models.toml) or full /etc/config path
         path: String,
-        /// Replacement body (stdin is piped here when omitted)
-        #[arg(long)]
+        /// Replacement body (stdin is piped here when omitted). Free text —
+        /// TOML/markdown bodies legitimately start with `-`, so this must
+        /// accept a hyphen-prefixed value without clap mistaking it for
+        /// another flag.
+        #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
     },
     /// Edit a config file. With `--content` (or piped stdin) it replaces the
@@ -77,8 +80,9 @@ enum ConfigCommand {
     Edit {
         /// Config file name (e.g. models.toml) or full /etc/config path
         path: String,
-        /// Replacement body (omit to open the editor instead)
-        #[arg(long)]
+        /// Replacement body (omit to open the editor instead). Same
+        /// hyphen-tolerant shape as `set`'s `--content`.
+        #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
     },
     /// Restore a config file to its embedded default. Errors if the path ships
