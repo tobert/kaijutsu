@@ -1091,6 +1091,22 @@ fn map_unique_violation(e: rusqlite::Error, msg: impl Into<String>) -> KernelDbE
     KernelDbError::Db(e)
 }
 
+/// True when `e` is SQLite's "duplicate column name" error — the expected,
+/// ignorable outcome of `apply_additive_migrations` re-running an `ALTER
+/// TABLE ... ADD COLUMN` against a DB that already has the column (either a
+/// fresh DB created from the current `SCHEMA`, or an already-migrated one).
+/// SQLite has no dedicated extended code for this (it's a generic
+/// `SQLITE_ERROR`, surfaced by rusqlite as `ErrorCode::Unknown`), so we match
+/// on the message text — the same shape SQLite itself uses across versions.
+fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, Some(msg))
+            if err.code == rusqlite::ErrorCode::Unknown
+                && msg.starts_with("duplicate column name")
+    )
+}
+
 // ============================================================================
 // KernelDb
 // ============================================================================
@@ -1114,8 +1130,10 @@ impl KernelDb {
     /// The project's stance is "schema is truth, bump = wipe", but a single
     /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
     /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the
-    /// column is already in `SCHEMA`) is expected and ignored.
-    fn apply_additive_migrations(conn: &Connection) {
+    /// column is already in `SCHEMA`) is expected and ignored. Anything else
+    /// — a locked file, a genuinely malformed ALTER — fails loud instead of
+    /// leaving the DB silently short a column that later code assumes exists.
+    fn apply_additive_migrations(conn: &Connection) -> KernelDbResult<()> {
         let alters = [
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
@@ -1128,10 +1146,14 @@ impl KernelDb {
             "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
         ];
         for sql in alters {
-            // Ignore "duplicate column name" (column already present); a real
-            // failure surfaces on the next read of the column.
-            let _ = conn.execute(sql, []);
+            if let Err(e) = conn.execute(sql, []) {
+                if is_duplicate_column_error(&e) {
+                    continue;
+                }
+                return Err(e.into());
+            }
         }
+        Ok(())
     }
 
     /// Open or create at the given path.
@@ -1150,7 +1172,7 @@ impl KernelDb {
         let conn = Connection::open(path)?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        Self::apply_additive_migrations(&conn);
+        Self::apply_additive_migrations(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
@@ -1160,7 +1182,7 @@ impl KernelDb {
         let conn = Connection::open_in_memory()?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        Self::apply_additive_migrations(&conn);
+        Self::apply_additive_migrations(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
@@ -4547,14 +4569,63 @@ mod tests {
         // in_memory() already ran apply_additive_migrations() once; running it
         // again must not error (duplicate-column guard) and the column must
         // still be queryable.
-        KernelDb::apply_additive_migrations(&db.conn);
-        KernelDb::apply_additive_migrations(&db.conn);
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
 
         let ws_id = setup_test_db(&db);
         let row = make_context_row(Some("mig-check"));
         insert_context_with_doc(&db, &row, ws_id);
         let loaded = db.get_context(row.context_id).unwrap().unwrap();
         assert_eq!(loaded.last_activity_at, None, "fresh row: never touched");
+    }
+
+    /// A real `ALTER TABLE` failure — not the expected/ignorable "duplicate
+    /// column name" case — must propagate loudly, not vanish behind a
+    /// swallowed `let _ = conn.execute(...)`. Drop a table one of the
+    /// migrations targets so its ALTER fails for a genuine reason ("no such
+    /// table"), and confirm `apply_additive_migrations` surfaces it as an
+    /// `Err` instead of silently continuing.
+    #[test]
+    fn apply_additive_migrations_propagates_real_errors() {
+        let db = KernelDb::in_memory().unwrap();
+        db.conn.execute_batch("DROP TABLE tracks").unwrap();
+        let result = KernelDb::apply_additive_migrations(&db.conn);
+        match result {
+            Err(KernelDbError::Db(rusqlite::Error::SqliteFailure(_, Some(msg)))) => {
+                assert!(
+                    msg.contains("no such table"),
+                    "expected a no-such-table failure, got: {msg}"
+                );
+            }
+            other => panic!("a real ALTER TABLE failure must propagate: {other:?}"),
+        }
+    }
+
+    /// `is_duplicate_column_error` is the guard that lets
+    /// `apply_additive_migrations` re-run safely against an already-migrated
+    /// DB — it must match SQLite's actual "duplicate column name" wording and
+    /// nothing else (a different message must not be misclassified as the
+    /// ignorable case and swallowed).
+    #[test]
+    fn duplicate_column_error_detection_is_specific() {
+        let db = KernelDb::in_memory().unwrap();
+        let dup = db
+            .conn
+            .execute(
+                "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
+                [],
+            )
+            .unwrap_err();
+        assert!(is_duplicate_column_error(&dup), "expected duplicate-column: {dup}");
+
+        let other = db
+            .conn
+            .execute("ALTER TABLE no_such_table ADD COLUMN x INTEGER", [])
+            .unwrap_err();
+        assert!(
+            !is_duplicate_column_error(&other),
+            "a no-such-table failure must not be misclassified as duplicate-column: {other}"
+        );
     }
 
     /// `touch_context_activity` stamps `last_activity_at`, and pre-touch rows
