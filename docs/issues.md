@@ -1010,12 +1010,21 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   ride in the MCP binary and are covered by `e2e_shell` until a session whose MCP
   binary is rebuilt confirms them in situ. Related: P3 above +
   `project_mcp_synceddocument_sync`.
-- **mcp-context default model is an invalid id (observed 2026-06-17).** A context
-  created via `register_session` (context_type `mcp`/`default`) defaulted to
-  `anthropic/claude-haiku-4-5-20250101` (also seen as `…-20250929`) — a wrong date;
-  the valid id is `claude-haiku-4-5-20251001`. Chat turns fail with
-  `not_found_error` after 3 attempts. Fix the default model id wherever mcp/default
-  contexts are seeded.
+- **Live-kernel follow-up: any long-lived kernel may still be serving a stale
+  mcp-default model id (verified 2026-07-17).** Re-checked the "mcp-context
+  default model is an invalid id" bug filed 2026-06-17: the bad ids
+  (`…-20250101`, `…-20250929`) don't exist anywhere in tracked source or
+  history except this doc's own bug report — `models.toml`'s
+  `default_model`/aliases and `DEFAULT_MODEL` have always read the valid
+  `claude-haiku-4-5-20251001` since the TOML config was introduced. But
+  `/etc/config/models.toml` is CRDT-owned and seeded absent-only
+  (`config_seed.rs`, `config_crdt_fs.rs:349-378`) — a kernel whose CRDT
+  config predates whatever earlier fix corrected this would still be
+  serving the stale value, since a context's model is baked in at creation
+  time from the live registry (`rpc.rs` `create_context_inner`) and restarts
+  never re-seed an already-present file. If `not_found_error` on mcp/default
+  contexts recurs, run `kj config reset models.toml` against the live kernel
+  rather than assuming a source fix will reach it.
 - **`builtin.file` hardening — remaining (small; the byte→char corruption fix +
   hashline addressing shipped 2026-06-17, story in devlog +
   `project_file_tools_hashline`):** (1) in-context recovery affordance — expose
@@ -1750,27 +1759,6 @@ comment, tracked here for stage 2+:
 Neither gap blocks Lane C (the Bevy world renderer): the snapshot tree itself
 is always structurally correct (real listings, real attrs); only the
 generation staleness signal and the ignored-styling hint have known slop.
-
-## kaijutsu-mcp — invoke_peer double-encodes object params (found 2026-06-23)
-
-Calling the `invoke_peer` MCP tool with an object `params` (e.g. `{"context_id":
-"019ec11b"}` for `switch_context`) fails: the app's `dispatch_peer_action`
-rejects it with `invalid type: string "{\"context_id\": ...}", expected struct
-Params`. Diagnosis: `InvokePeerRequest.params` is `serde_json::Value`
-(`models.rs:144`) and the server does the right thing
-(`serde_json::to_vec(&req.params)`, `lib.rs:1166`) — but `req.params` *arrives*
-as a `Value::String` holding the JSON text, not a `Value::Object`. So the
-tool-call layer stringified the object one extra time before it reached the
-server; `to_vec` then emits a quoted JSON string and the app's `from_slice`
-sees a string. Surfaced now because `invoke_peer` is rarely exercised (Amy:
-"we haven't used it much until now"). **Proposed fix (server-side, tolerant):**
-in `invoke_peer`, if `req.params` is a `Value::String`, attempt to parse it as
-JSON and use the result (accept either an object or a JSON-string-of-an-object);
-fail loud if neither parses. Real root may be client-side arg encoding for
-`serde_json::Value` fields — worth confirming. Blocked the isolated peer-path
-verification of the Screen-transition fix; verified instead via the
-server-pushed `ContextSwitched` path (`kj context switch`), which exercises the
-same `handle_context_switch` landing.
 
 ## kaijutsu-mcp — June 2026 SyncedDocument migration review
 
