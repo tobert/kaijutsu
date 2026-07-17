@@ -1756,6 +1756,13 @@ pub fn spin_rings(
     // recompute is only needed while spinning).
     let mut active = [false; super::card::N_BANDS];
     for i in 0..super::card::N_BANDS {
+        // An empty ring has no cards to move (and sync_time_well's
+        // `flen.max(1)` only gives it a synthetic single-slot gate target) —
+        // skip the easing so an empty ring doesn't spin every tick.
+        let flen = state.ring_cards[i].len();
+        if flen == 0 {
+            continue;
+        }
         let cur = state.ring_rotation[i];
         let tgt = state.ring_rotation_target[i];
         if cur != tgt {
