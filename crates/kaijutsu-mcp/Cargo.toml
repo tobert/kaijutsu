@@ -47,3 +47,6 @@ regex = { workspace = true }
 # store-replica + poll path against it (see tests/e2e_shell.rs).
 kaijutsu-server = { path = "../kaijutsu-server" }
 log = { workspace = true }
+# doc_task's unit tests implement DocSyncBackend for a fake backend, mirroring
+# the CasFetch test-double pattern in kaijutsu-client's sftp.rs.
+async-trait = { workspace = true }

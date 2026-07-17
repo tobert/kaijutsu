@@ -15,12 +15,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::Mutex as TokioMutex;
 
 use kaijutsu_crdt::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, ToolKind};
 use kaijutsu_kernel::SharedBlockStore;
 
 use crate::RemoteState;
+use crate::doc_task::AuthoredBlock;
 use crate::hook_types::{
     HookEvent, HookResponse, KAIJUTSU_MCP_TOOLS, PingResponse, normalize_tool_name,
     short_session_suffix,
@@ -48,12 +48,10 @@ pub struct HookListener {
     shared_context_id: Arc<Mutex<Option<ContextId>>>,
     /// Fixed context ID for local mode (not shared).
     local_context_id: Option<ContextId>,
-    /// Remote state for push_ops + drift (None in local mode).
+    /// Remote state for doc-task authoring + drift (None in local mode).
     remote: Option<RemoteState>,
     /// Max content size per block.
     max_block_size: usize,
-    /// Serializes push_ops to avoid concurrent pushes sending duplicate ops.
-    push_lock: TokioMutex<()>,
     /// Shared session ID — updated from hook events when detected.
     session_id: Arc<Mutex<Option<String>>>,
     /// Remote-only: the auto-register label, present only when it was
@@ -85,7 +83,6 @@ impl HookListener {
             local_context_id: Some(context_id),
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
-            push_lock: TokioMutex::new(()),
             session_id: Arc::new(Mutex::new(None)),
             pending_label_rename: Mutex::new(None),
             context_model_set: Mutex::new(false),
@@ -113,7 +110,6 @@ impl HookListener {
             local_context_id: None,
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
-            push_lock: TokioMutex::new(()),
             session_id,
             pending_label_rename: Mutex::new(pending_label_rename),
             context_model_set: Mutex::new(false),
@@ -226,7 +222,18 @@ impl HookListener {
         Ok(())
     }
 
-    /// Process a hook event: create blocks, push ops, check drift.
+    /// Process a hook event: create blocks, check drift.
+    ///
+    /// Block authoring now goes through the doc task's command channel (see
+    /// `crate::doc_task`) and is awaited before this returns — pushing to
+    /// the server happens INSIDE the doc task as a side effect of that, so
+    /// there's no separate "push ops" step here anymore. `author_error`
+    /// accumulates the first authoring failure across the event (there's at
+    /// most one insertion per event today, but this stays correct if that
+    /// changes): on failure we still return ALLOW (the mirror is ambient —
+    /// its failure must not block the user's action) but make it visible by
+    /// folding an error note into the response's `context` field alongside
+    /// (or instead of) any drift.
     async fn process_event(&self, event: &HookEvent) -> HookResponse {
         // 1. Filter self-referential kaijutsu MCP tools. Claude Code reports
         // MCP tool calls as `mcp__<server>__<tool>`, not the bare name.
@@ -241,6 +248,8 @@ impl HookListener {
             }
         }
 
+        let mut author_error: Option<String> = None;
+
         // 2. Create blocks based on event type
         match event.event.as_str() {
             "session.start" => {
@@ -250,7 +259,9 @@ impl HookListener {
                     "Session started: {}, model: {}, session: {}",
                     event.source, model_info, sid
                 );
-                self.insert_text_block(Role::System, &content);
+                if let Err(e) = self.insert_text_block(Role::System, &content).await {
+                    author_error = Some(e);
+                }
 
                 // Remote-only follow-ups, each at most once per process: tell
                 // the kernel which model this context is talking to, and
@@ -313,25 +324,33 @@ impl HookListener {
                     Some(reason) => format!("Session ended: {reason}"),
                     None => "Session ended".to_string(),
                 };
-                self.insert_text_block(Role::System, &content);
+                if let Err(e) = self.insert_text_block(Role::System, &content).await {
+                    author_error.get_or_insert(e);
+                }
             }
 
             "prompt.submit" => {
                 if let Some(ref prompt) = event.prompt {
                     let truncated = truncate(prompt, self.max_block_size);
-                    self.insert_text_block(Role::User, &truncated);
+                    if let Err(e) = self.insert_text_block(Role::User, &truncated).await {
+                        author_error.get_or_insert(e);
+                    }
                 }
             }
 
             "tool.after" => {
-                if let Some(ref tool) = event.tool {
-                    self.insert_tool_blocks(tool, false);
+                if let Some(ref tool) = event.tool
+                    && let Err(e) = self.insert_tool_blocks(tool, false).await
+                {
+                    author_error.get_or_insert(e);
                 }
             }
 
             "tool.error" => {
-                if let Some(ref tool) = event.tool {
-                    self.insert_tool_blocks(tool, true);
+                if let Some(ref tool) = event.tool
+                    && let Err(e) = self.insert_tool_blocks(tool, true).await
+                {
+                    author_error.get_or_insert(e);
                 }
             }
 
@@ -357,7 +376,9 @@ impl HookListener {
                 };
                 if let Some(text) = text {
                     let truncated = truncate(&text, self.max_block_size);
-                    self.insert_text_block(Role::Model, &truncated);
+                    if let Err(e) = self.insert_text_block(Role::Model, &truncated).await {
+                        author_error.get_or_insert(e);
+                    }
                 }
             }
 
@@ -366,7 +387,9 @@ impl HookListener {
                     Some(trigger) => format!("Context compaction ({trigger})"),
                     None => "Context compaction".to_string(),
                 };
-                self.insert_text_block(Role::System, &content);
+                if let Err(e) = self.insert_text_block(Role::System, &content).await {
+                    author_error.get_or_insert(e);
+                }
             }
 
             "file.edit" => {
@@ -382,46 +405,70 @@ impl HookListener {
                     } else {
                         format!("File edited: {}", file.path)
                     };
-                    self.insert_text_block(Role::Tool, &content);
+                    if let Err(e) = self.insert_text_block(Role::Tool, &content).await {
+                        author_error.get_or_insert(e);
+                    }
                 }
             }
 
             "subagent.start" => {
                 let agent = event.principal_id.as_deref().unwrap_or("unknown");
                 let kind = event.agent_type.as_deref().unwrap_or("subagent");
-                self.insert_text_block(
-                    Role::System,
-                    &format!("Subagent started: {agent} ({kind})"),
-                );
+                if let Err(e) = self
+                    .insert_text_block(Role::System, &format!("Subagent started: {agent} ({kind})"))
+                    .await
+                {
+                    author_error.get_or_insert(e);
+                }
             }
 
             "subagent.stop" => {
                 let agent = event.principal_id.as_deref().unwrap_or("unknown");
-                self.insert_text_block(Role::System, &format!("Subagent stopped: {agent}"));
+                if let Err(e) = self
+                    .insert_text_block(Role::System, &format!("Subagent stopped: {agent}"))
+                    .await
+                {
+                    author_error.get_or_insert(e);
+                }
             }
 
             // tool.before — no block
             _ => {}
         }
 
-        // 3. Push ops to server (serialized to avoid concurrent duplicate pushes)
-        if let Some(ref remote) = self.remote {
-            let _guard = self.push_lock.lock().await;
-            if let Err(e) = push_ops(remote).await {
-                tracing::warn!("Hook push_ops error: {e}");
+        // 3. Check for pending drift, then fold in any authoring failure —
+        // LOUD (the caller already `tracing::error!`'d it) and visible
+        // however the hook reply protocol permits: the `context` field,
+        // alongside any real drift.
+        let response = self.maybe_inject_drift().await;
+        match author_error {
+            Some(err) => {
+                let note = format!("[kaijutsu-mcp mirror error] {err}");
+                let context = match response.context {
+                    Some(existing) => format!("{existing}\n\n{note}"),
+                    None => note,
+                };
+                HookResponse::allow_with_context(context)
             }
+            None => response,
         }
-
-        // 4. Check for pending drift
-        self.maybe_inject_drift().await
     }
 
     // -- Block insertion helpers --
+    //
+    // Remote mode routes through the doc task's command channel (see
+    // `crate::doc_task`) — the ONLY writer of `remote.synced` now — and
+    // awaits its ack instead of touching the document directly. On failure:
+    // still LOUD (`tracing::error!`, not `warn!`; the caller folds the
+    // returned message into the hook's `context` field) but never fails the
+    // hook call itself — the mirror is ambient, its failure must not block
+    // the user's actual action. Local mode is unchanged (no doc task there;
+    // it writes the in-process `SharedBlockStore` directly, as before).
 
-    fn insert_text_block(&self, role: Role, content: &str) {
+    async fn insert_text_block(&self, role: Role, content: &str) -> Result<(), String> {
         let Some(ctx_id) = self.context_id() else {
             tracing::debug!("Hook insert_text_block: no context yet (register_session not called)");
-            return;
+            return Ok(());
         };
         if let Some(store) = &self.local_store {
             if let Err(e) = store.insert_block_as(
@@ -437,35 +484,35 @@ impl HookListener {
             ) {
                 tracing::warn!("Hook insert_block error: {e}");
             }
-            return;
+            return Ok(());
         }
-        // Remote mode: author into the joined SyncedDocument, then wake waiters.
-        if let Some(remote) = &self.remote {
-            let mut guard = remote.synced.lock();
-            if let Some(doc) = guard.as_mut()
-                && let Err(e) = doc.doc_mut().insert_block(
-                    None,
-                    None,
-                    role,
-                    BlockKind::Text,
-                    content,
-                    Status::Done,
-                    ContentType::Plain,
-                )
-            {
-                tracing::warn!("Hook insert_block error: {e}");
+        if self.remote.is_none() {
+            return Ok(());
+        }
+        let Some(handle) = self.doc_task_handle() else {
+            tracing::debug!("Hook insert_text_block: doc task not ready yet");
+            return Ok(());
+        };
+        let block = AuthoredBlock::Text { role, content: content.to_string() };
+        match handle.author_blocks(vec![block]).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::error!("Hook insert_text_block: AuthorBlocks failed — mirror desynced: {e}");
+                Err(format!("failed to mirror text block: {e}"))
             }
-            drop(guard);
-            remote.change.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
 
-    fn insert_tool_blocks(&self, tool: &crate::hook_types::ToolInfo, is_error: bool) {
+    async fn insert_tool_blocks(
+        &self,
+        tool: &crate::hook_types::ToolInfo,
+        is_error: bool,
+    ) -> Result<(), String> {
         let Some(ctx_id) = self.context_id() else {
             tracing::debug!(
                 "Hook insert_tool_blocks: no context yet (register_session not called)"
             );
-            return;
+            return Ok(());
         };
         let input = tool.input.clone();
         let content = if is_error {
@@ -491,7 +538,7 @@ impl HookListener {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!("Hook insert_tool_call error: {e}");
-                    return;
+                    return Ok(());
                 }
             };
             if let Err(e) = store.insert_tool_result_as(
@@ -517,47 +564,41 @@ impl HookListener {
             if let Err(e) = store.set_status(ctx_id, &call_id, final_status) {
                 tracing::warn!("Hook set_status (tool call) error: {e}");
             }
-            return;
+            return Ok(());
         }
-        // Remote mode: author the call + result into the SyncedDocument under
-        // one lock (sequentially, so the result's parent exists), then wake.
-        if let Some(remote) = &self.remote {
-            let mut guard = remote.synced.lock();
-            if let Some(doc) = guard.as_mut() {
-                let call_id = match doc.doc_mut().insert_tool_call(
-                    None,
-                    None,
-                    &tool.name,
-                    input,
-                    Some(ToolKind::Mcp),
-                    None,
-                ) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::warn!("Hook insert_tool_call error: {e}");
-                        return;
-                    }
-                };
-                if let Err(e) = doc.doc_mut().insert_tool_result_block(
-                    &call_id,
-                    None,
-                    &truncated,
-                    is_error,
-                    None,
-                    Some(ToolKind::Mcp),
-                ) {
-                    tracing::warn!("Hook insert_tool_result error: {e}");
-                }
-                // See the local-mode branch above: the call block defaults
-                // to Status::Running and must be explicitly completed.
-                let final_status = if is_error { Status::Error } else { Status::Done };
-                if let Err(e) = doc.doc_mut().set_status(&call_id, final_status) {
-                    tracing::warn!("Hook set_status (tool call) error: {e}");
-                }
+        if self.remote.is_none() {
+            return Ok(());
+        }
+        let Some(handle) = self.doc_task_handle() else {
+            tracing::debug!("Hook insert_tool_blocks: doc task not ready yet");
+            return Ok(());
+        };
+        let block = AuthoredBlock::ToolCallResult {
+            tool_name: tool.name.clone(),
+            tool_input: input,
+            result_content: truncated,
+            is_error,
+            tool_kind: Some(ToolKind::Mcp),
+        };
+        match handle.author_blocks(vec![block]).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::error!("Hook insert_tool_blocks: AuthorBlocks failed — mirror desynced: {e}");
+                Err(format!("failed to mirror tool call/result: {e}"))
             }
-            drop(guard);
-            remote.change.send_modify(|g| *g = g.wrapping_add(1));
         }
+    }
+
+    /// The doc task's command-channel handle, if `register_session` has
+    /// spawned one yet (remote mode only — `None` in local mode or before
+    /// registration completes).
+    fn doc_task_handle(&self) -> Option<crate::doc_task::DocTaskHandle> {
+        self.remote
+            .as_ref()?
+            .doc_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     // -- Drift injection --
@@ -617,20 +658,6 @@ impl HookListener {
 
         HookResponse::allow_with_context(context)
     }
-}
-
-/// Push local ops to the server.
-async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
-    let context_id = {
-        let guard = remote.joined.read().await;
-        guard
-            .as_ref()
-            .map(|j| j.context_id)
-            .ok_or_else(|| anyhow::anyhow!("No active context — register_session not called"))?
-    };
-    // Shared with resync's flush, so the two paths can't diverge.
-    crate::flush_local_ops(&remote.actor, &remote.synced, context_id).await;
-    Ok(())
 }
 
 /// Truncate a string to `max_len` bytes at a char boundary.

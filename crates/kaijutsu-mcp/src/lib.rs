@@ -15,6 +15,7 @@
 //! - `helpers`: Parsing and utility functions
 //! - `tree`: DAG visualization as ASCII tree
 
+pub mod doc_task;
 mod helpers;
 pub mod hook_listener;
 pub mod hook_types;
@@ -76,12 +77,12 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use kaijutsu_client::{
-    ActorHandle, ConnectionStatus, SshConfig, SyncEffect, SyncedDocument, connect_ssh, spawn_actor,
-};
+use kaijutsu_client::{ActorHandle, SshConfig, SyncedDocument, connect_ssh, spawn_actor};
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use tokio::sync::watch;
+
+use doc_task::{DocTaskHandle, ResyncReason, spawn_doc_task, spawn_event_bridge};
 
 // Re-export public types
 use helpers::*;
@@ -265,6 +266,12 @@ pub struct RemoteState {
     pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
     /// Shared context_id for hook listener (updated by register_session)
     pub shared_context_id: Arc<Mutex<Option<kaijutsu_crdt::ContextId>>>,
+    /// Handle to the sole-writer doc task's command channel — `None` until
+    /// `register_session` spawns the task (same lifecycle as `synced`/
+    /// `joined`). `HookListener` and `execute_and_poll_shell`'s stall
+    /// fallback send `DocCommand`s through this instead of touching
+    /// `synced` directly; only reads still go straight through the mutex.
+    pub doc_task: Arc<Mutex<Option<DocTaskHandle>>>,
 }
 
 /// State for a joined context — created by `register_session`.
@@ -272,20 +279,31 @@ pub struct RemoteState {
 pub struct JoinedContext {
     /// Context ID we joined
     pub context_id: kaijutsu_crdt::ContextId,
-    /// Abort handle for the background event listener.
-    _bg_task: Arc<AbortOnDrop>,
+    /// Abort handle for the event bridge (forwards the actor's broadcast
+    /// event/status streams into the doc task's command channel).
+    _bridge_task: Arc<AbortOnDrop>,
+    /// Abort handle for the sole-writer doc task itself. Kept separate from
+    /// `_bridge_task` so `debug_kill_event_listener` (below) can kill
+    /// delivery without killing the task that `execute_and_poll_shell`'s
+    /// stall fallback still needs to be alive and processing `Resync`
+    /// commands.
+    _doc_task: Arc<AbortOnDrop>,
 }
 
 impl JoinedContext {
-    /// Testing seam: abort the background event listener without touching
-    /// the connection or joined state otherwise. `remote.change` then never
-    /// advances again for this context, reproducing the client-visible
-    /// symptom of a server-reaped FlowBus bridge (see `SubscriberHealth`)
-    /// without needing to actually starve a real one server-side. Exists for
-    /// `tests/e2e_shell.rs` to exercise `execute_and_poll_shell`'s stall
-    /// fallback end-to-end; production code never calls this.
+    /// Testing seam: abort the event bridge (NOT the doc task itself)
+    /// without touching the connection or joined state otherwise.
+    /// `remote.change` then never advances on its own for this context,
+    /// reproducing the client-visible symptom of a server-reaped FlowBus
+    /// bridge (see `SubscriberHealth`) without needing to actually starve a
+    /// real one server-side. The doc task stays alive —
+    /// `execute_and_poll_shell`'s stall fallback still reaches it and can
+    /// still force a resync (which DOES bump `change`, uniformly with every
+    /// other mutation) even with delivery dead. Exists for
+    /// `tests/e2e_shell.rs` to exercise the stall fallback end-to-end;
+    /// production code never calls this.
     pub fn debug_kill_event_listener(&self) {
-        self._bg_task.0.abort();
+        self._bridge_task.0.abort();
     }
 }
 
@@ -445,6 +463,7 @@ impl KaijutsuMcp {
                 change: watch::channel(0u64).0,
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
+                doc_task: Arc::new(Mutex::new(None)),
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -730,14 +749,27 @@ impl KaijutsuMcp {
                 stall_window.as_secs(),
             );
             // Pull the server's authoritative snapshot straight into the local
-            // SyncedDocument — the same resync `resync_synced` performs after a
-            // reconnect/lag. It flushes any locally-authored ops first, then
+            // SyncedDocument — the same resync the doc task runs after a
+            // reconnect/lag, routed through its command channel like every
+            // other mutation now (not a direct call — the doc task is the
+            // sole writer). It flushes any locally-authored ops first, then
             // folds the fetched state into `remote.synced`. If the command
             // finished server-side while our delivery path was dead, the very
             // next `find_terminal()` at the top of this loop picks it up
             // exactly as if it had arrived locally — no separate fetch/decode
-            // path to keep in sync with Phase 2 below.
-            resync_synced(&remote.actor, &remote.synced, ctx_id).await;
+            // path to keep in sync with Phase 2 below. `change` bumps as
+            // part of this uniformly with every other doc-task mutation.
+            let doc_task = remote.doc_task.lock().ok().and_then(|g| g.clone());
+            match doc_task {
+                Some(handle) => {
+                    if let Err(e) = handle.resync(ResyncReason::StallFallback).await {
+                        tracing::warn!("{label}: stall-fallback resync failed: {e}");
+                    }
+                }
+                None => tracing::warn!(
+                    "{label}: stall-fallback resync skipped — doc task not ready"
+                ),
+            }
             if !stall_resubscribed {
                 if let Err(e) = remote.actor.resubscribe_blocks().await {
                     tracing::warn!("{label}: stall-fallback resubscribe failed: {e}");
@@ -1024,108 +1056,84 @@ impl KaijutsuMcp {
             *g = Some(synced_doc);
         }
 
-        // 5. Spawn the single background event listener — the PRIMARY writer of
-        // the SyncedDocument. It applies each event, then wakes waiters (the
-        // shell completion poll) via `change`. A `NeedsResync` effect, a
-        // broadcast `Lagged`, or a reconnect (`Connected`) triggers a full
-        // resync from the server snapshot. Single applier + wake-on-change
-        // replaces the old two-receiver race (poll read the store before the
-        // listener applied). NOT the sole writer anymore: HookListener authors
-        // blocks directly, and execute_and_poll_shell's stall fallback
-        // (2026-07-17) runs resync_synced too — both under the same mutex, so
-        // this is interleaving-safe but re-exposes resync_synced's documented
-        // flush→apply lost-update window (docs/issues.md, SyncedDocument
-        // review: the command-channel sole-writer rework is the real fix).
-        let bg_abort = {
-            let mut event_rx = remote.actor.subscribe_events();
-            let mut status_rx = remote.actor.subscribe_status();
-            let synced_bg = Arc::clone(&remote.synced);
-            let change_bg = remote.change.clone();
-            let actor_bg = remote.actor.clone();
-            let ctx_id_bg = context_id;
+        // 5. Spawn the sole-writer doc task — the ONLY thing that ever
+        // mutates `remote.synced` from here on. Every mutation (apply,
+        // author, resync) arrives as a `DocCommand` on one mpsc channel;
+        // see `doc_task` module docs for why this replaces the old
+        // three-writer arrangement (background listener + HookListener +
+        // stall fallback, all racing under the same mutex).
+        let (doc_task_handle, doc_task_join) = spawn_doc_task(
+            remote.actor.clone(),
+            context_id,
+            Arc::clone(&remote.synced),
+            remote.change.clone(),
+        );
+        {
+            let mut g = remote.doc_task.lock().unwrap_or_else(|e| e.into_inner());
+            *g = Some(doc_task_handle.clone());
+        }
 
-            let bg_handle = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        ev = event_rx.recv() => match ev {
-                            Ok(event) => {
-                                // Apply under the lock, drop it before any await.
-                                let effect = {
-                                    let mut g = synced_bg.lock();
-                                    g.as_mut().map(|s| s.apply_event(&event))
-                                };
-                                if matches!(effect, Some(SyncEffect::NeedsResync)) {
-                                    resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                }
-                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!("Missed {n} events, forcing full resync");
-                                resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
-                        st = status_rx.recv() => match st {
-                            Ok(ConnectionStatus::Connected { .. }) => {
-                                tracing::info!(
-                                    context_id = %ctx_id_bg,
-                                    "Reconnected — resyncing MCP synced document",
-                                );
-                                resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
-                            }
-                            // A lagged status stream may have DROPPED a Connected
-                            // transition — we can't tell, so resync to be safe.
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!(
-                                    context_id = %ctx_id_bg,
-                                    "Status stream lagged ({n}) — resyncing in case a reconnect was missed",
-                                );
-                                resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
-                            }
-                            Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
-                        },
-                    }
-                }
-            });
-            let abort = bg_handle.abort_handle();
-            // Supervise the listener. It is the sole writer of the
-            // SyncedDocument; if it panics or its event stream closes, the
-            // document stops updating and every shell poll silently degrades to
-            // its fallback timer (then a timeout). Surface that loudly instead
-            // of leaving it to look like a hang. The supervisor self-terminates
-            // when the listener resolves (including on teardown abort), so it
-            // needs no separate cancellation.
-            let sup_ctx = context_id;
-            tokio::spawn(async move {
-                match bg_handle.await {
-                    Ok(()) => tracing::warn!(
-                        context_id = %sup_ctx,
-                        "MCP event listener exited (server event stream closed); \
-                         synced document will no longer update — reconnect needed",
-                    ),
-                    Err(e) if e.is_cancelled() => tracing::debug!(
-                        context_id = %sup_ctx,
-                        "MCP event listener cancelled (session teardown)",
-                    ),
-                    Err(e) => tracing::error!(
-                        context_id = %sup_ctx,
-                        "MCP event listener PANICKED: {e}; synced document frozen — reconnect needed",
-                    ),
-                }
-            });
-            abort
-        };
+        // 6. Bridge the actor's block-events and connection-status broadcast
+        // streams into the doc task's command channel — a `NeedsResync`
+        // effect, a broadcast `Lagged`, or a reconnect (`Connected`) becomes
+        // a `Resync` command instead of running inline.
+        let bridge_join = spawn_event_bridge(remote.actor.clone(), doc_task_handle);
+        let bridge_abort = bridge_join.abort_handle();
+        let doc_task_abort = doc_task_join.abort_handle();
 
-        // 6. Write JoinedContext
+        // Supervise both tasks. The doc task is the sole writer of
+        // SyncedDocument; if it panics or its channel closes (impossible in
+        // practice — the handle stored in `remote.doc_task` keeps a sender
+        // alive), the document stops updating. The bridge is delivery only —
+        // if IT dies, the doc task keeps running (the stall fallback can
+        // still reach it), just without live server events. Surface either
+        // loudly instead of a silent hang. Self-terminating: no separate
+        // cancellation needed, they resolve (including on teardown abort)
+        // and the supervisor just logs.
+        let sup_ctx = context_id;
+        tokio::spawn(async move {
+            match doc_task_join.await {
+                Ok(()) => tracing::warn!(
+                    context_id = %sup_ctx,
+                    "MCP doc task exited (command channel closed); \
+                     synced document will no longer update — reconnect needed",
+                ),
+                Err(e) if e.is_cancelled() => tracing::debug!(
+                    context_id = %sup_ctx,
+                    "MCP doc task cancelled (session teardown)",
+                ),
+                Err(e) => tracing::error!(
+                    context_id = %sup_ctx,
+                    "MCP doc task PANICKED: {e}; synced document frozen — reconnect needed",
+                ),
+            }
+        });
+        tokio::spawn(async move {
+            match bridge_join.await {
+                Ok(()) => tracing::warn!(
+                    context_id = %sup_ctx,
+                    "MCP event bridge exited (server event stream closed); \
+                     synced document will no longer receive live updates — reconnect needed",
+                ),
+                Err(e) if e.is_cancelled() => tracing::debug!(
+                    context_id = %sup_ctx,
+                    "MCP event bridge cancelled (session teardown)",
+                ),
+                Err(e) => tracing::error!(
+                    context_id = %sup_ctx,
+                    "MCP event bridge PANICKED: {e}; synced document will no longer receive \
+                     live updates — reconnect needed",
+                ),
+            }
+        });
+
+        // 7. Write JoinedContext
         {
             let mut guard = remote.joined.write().await;
             *guard = Some(JoinedContext {
                 context_id,
-                _bg_task: Arc::new(AbortOnDrop(bg_abort)),
+                _bridge_task: Arc::new(AbortOnDrop(bridge_abort)),
+                _doc_task: Arc::new(AbortOnDrop(doc_task_abort)),
             });
         }
 
@@ -1708,90 +1716,6 @@ impl KaijutsuMcp {
         .with_description(format!("Editing assistant for block '{}'", args.block_id)))
     }
 }
-
-// ============================================================================
-// Background Event Listener
-// ============================================================================
-
-/// Push locally-authored ops (hook-captured blocks) to the server.
-///
-/// The base is the SyncManager's inbound frontier, so this re-sends every
-/// local op each call — wasteful but safe (server-side CRDT merge is
-/// idempotent). Eliminating the re-send needs a dedicated "pushed" frontier;
-/// that, plus making this the sole writer so a resync can't race local
-/// authoring, is the cohesive follow-up tracked in docs/issues.md.
-///
-/// Computes the payload under the lock, then releases it before the push await.
-pub(crate) async fn flush_local_ops(
-    actor: &ActorHandle,
-    synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    context_id: ContextId,
-) {
-    let ops = {
-        let guard = synced.lock();
-        let Some(doc) = guard.as_ref() else { return };
-        let frontier = doc.sync().frontier().cloned().unwrap_or_default();
-        doc.doc().ops_since(&frontier)
-    };
-    if ops.block_ops.is_empty()
-        && ops.new_blocks.is_empty()
-        && ops.updated_headers.is_empty()
-        && ops.deleted_blocks.is_empty()
-    {
-        return;
-    }
-    let bytes = match kaijutsu_types::codec::encode(&ops) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(%context_id, "flush_local_ops encode failed: {e}");
-            return;
-        }
-    };
-    if let Err(e) = actor.push_ops(context_id, &bytes).await {
-        tracing::warn!(%context_id, "flush_local_ops push failed: {e}");
-    }
-}
-
-/// Re-fetch the server's full snapshot and realign the SyncedDocument.
-///
-/// This is the catch-up that a bare re-subscribe skips. After a reconnect, a
-/// lag, or a `NeedsResync` effect, the client replica can diverge. Pulling
-/// `get_context_sync` and feeding it through `apply_sync_state` rebuilds the
-/// document from the server's current state and resets the frontier so future
-/// incremental ops merge cleanly. The async fetch happens with NO lock held;
-/// the apply re-takes the lock briefly.
-///
-/// We FLUSH locally-authored ops first: `apply_sync_state` replaces the document
-/// wholesale, so any hook-authored blocks the server hasn't seen would be wiped.
-/// Pushing them before the fetch means the snapshot reflects them and they
-/// survive. (Residual: a block authored in the flush→apply window is still lost
-/// — closing that needs the sole-writer restructure noted in docs/issues.md.)
-async fn resync_synced(
-    actor: &ActorHandle,
-    synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    context_id: ContextId,
-) {
-    flush_local_ops(actor, synced, context_id).await;
-    let sync_state = match actor.get_context_sync(context_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(%context_id, "resync get_context_sync failed: {e}");
-            return;
-        }
-    };
-    let mut guard = synced.lock();
-    let Some(doc) = guard.as_mut() else {
-        tracing::warn!(%context_id, "resync skipped — no synced document");
-        return;
-    };
-    match doc.apply_sync_state(&sync_state) {
-        Ok(effect) => {
-            tracing::info!(%context_id, ?effect, "MCP synced document resynced from server snapshot");
-        }
-        Err(e) => tracing::warn!(%context_id, "resync apply_sync_state failed: {e}"),
-    }
-}
-
 
 #[tool_handler]
 #[prompt_handler]
