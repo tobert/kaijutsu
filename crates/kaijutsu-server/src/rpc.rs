@@ -7951,14 +7951,27 @@ struct SubscriberHealth {
     /// Wall-clock time the current unbroken run of failures started. `None`
     /// when the last recorded outcome was a success — no streak in progress.
     streak_started_at: Option<std::time::Instant>,
+    /// Failures recorded in the current streak. Duration alone would let a
+    /// sparse subscriber (editor idle between edits) be reaped by just TWO
+    /// failures that happen to straddle the window — one blip, 15s of
+    /// silence, one blip. Requiring a minimum count too keeps the reap
+    /// meaning "kept failing the whole time", not "failed twice, far apart".
+    streak_failures: u32,
     /// How long a losing streak must run, unbroken, before `record` reaps it.
     min_streak_duration: std::time::Duration,
 }
+
+/// Failures a streak must also accumulate before reaping — see
+/// `streak_failures`. A wedged subscriber failing at the 5s
+/// `CALLBACK_TIMEOUT` cadence hits both this and the duration threshold on
+/// the same (fourth) failure, so this changes nothing for genuine wedges.
+const SUBSCRIBER_MIN_STREAK_FAILURES: u32 = 3;
 
 impl SubscriberHealth {
     fn new(min_streak_duration: std::time::Duration) -> Self {
         Self {
             streak_started_at: None,
+            streak_failures: 0,
             min_streak_duration,
         }
     }
@@ -7966,17 +7979,20 @@ impl SubscriberHealth {
     /// Record a callback outcome. Returns `true` to keep the subscription
     /// alive, `false` to reap it. A success clears the streak. A failure
     /// starts the streak (if none is running) or extends it, and reaps once
-    /// the streak has been running continuously for at least
-    /// `min_streak_duration`.
+    /// the streak has both run continuously for `min_streak_duration` AND
+    /// accumulated `SUBSCRIBER_MIN_STREAK_FAILURES` failures.
     fn record(&mut self, ok: bool) -> bool {
         if ok {
             self.streak_started_at = None;
+            self.streak_failures = 0;
             true
         } else {
             let started = *self
                 .streak_started_at
                 .get_or_insert_with(std::time::Instant::now);
+            self.streak_failures += 1;
             started.elapsed() < self.min_streak_duration
+                || self.streak_failures < SUBSCRIBER_MIN_STREAK_FAILURES
         }
     }
 }
@@ -8693,15 +8709,39 @@ mod subscriber_health_tests {
     #[test]
     fn failures_spanning_past_threshold_reap() {
         // A genuinely wedged/starved subscriber keeps failing every callback;
-        // once that losing streak has run continuously past the threshold,
-        // the *next* failure reaps it.
+        // once that losing streak has run continuously past the threshold
+        // (and isn't just a pair of blips — see the sparse test below), the
+        // next failure reaps it.
         let threshold = Duration::from_millis(30);
         let mut h = SubscriberHealth::new(threshold);
         assert!(h.record(false), "first failure starts the streak, not a reap");
+        assert!(h.record(false), "second failure inside the window survives");
         std::thread::sleep(threshold * 2);
         assert!(
             !h.record(false),
-            "a failure landing after the streak outlives the threshold reaps"
+            "a sustained streak past the threshold with enough failures reaps"
+        );
+    }
+
+    #[test]
+    fn two_sparse_failures_straddling_the_window_do_not_reap() {
+        // A low-frequency subscriber (editor idle between edits) can go 15s+
+        // between callbacks. One blip, a long quiet stretch, then another
+        // blip technically *spans* the duration threshold — but two isolated
+        // failures are not a wedge, and reaping here would be harsher than
+        // even the old 3-strike rule. The minimum-failure-count guard exists
+        // for exactly this shape (kaibo or-kimi review find, 2026-07-17).
+        let threshold = Duration::from_millis(30);
+        let mut h = SubscriberHealth::new(threshold);
+        assert!(h.record(false), "first blip survives");
+        std::thread::sleep(threshold * 2);
+        assert!(
+            h.record(false),
+            "a second, far-apart blip is not a sustained wedge — must not reap"
+        );
+        assert!(
+            !h.record(false),
+            "but a third failure in the same long-running streak does reap"
         );
     }
 

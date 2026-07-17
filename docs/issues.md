@@ -1778,6 +1778,17 @@ the *remaining* findings, triaged.
   where a block authored mid-resync is still lost — cleanest via a command
   channel that makes the bg task the true sole writer (authoring + push + resync
   all serialized in one task).
+  **PRIORITY RAISED 2026-07-17 (kaibo or-kimi review of the reply-timeout
+  fix):** `execute_and_poll_shell`'s stall fallback is now a SECOND
+  `resync_synced` caller (fires during event-delivery stalls), so the
+  flush→apply window and the two-concurrent-resyncs stale-snapshot-last-wins
+  interleaving are reachable in normal operation, not just reconnect/lag.
+  Judged net-positive to ship (window is one RPC round-trip, stall-only,
+  hook-authored blocks only — vs 50% of shell calls timing out), but the
+  command-channel rework should come off the back burner. Same review also
+  noted `apply_sync_state` still doesn't drain `pending_events` (tracked
+  below) and that resubscribe-acks-before-subscription-active leaves a
+  narrow incremental-event gap the stall resync covers for shell state.
 - **LOW — `renameContext` RPC has no structured result channel.** The 2026-07-17
   server-side handler (`kaijutsu-server/src/rpc.rs`) returns errors via
   `Promise::err` because `renameContext @29` declares no results — a caller can't

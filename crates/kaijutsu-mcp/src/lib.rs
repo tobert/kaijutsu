@@ -1024,12 +1024,18 @@ impl KaijutsuMcp {
             *g = Some(synced_doc);
         }
 
-        // 5. Spawn the single background event listener — the ONLY writer of the
-        // SyncedDocument. It applies each event, then wakes waiters (the shell
-        // completion poll) via `change`. A `NeedsResync` effect, a broadcast
-        // `Lagged`, or a reconnect (`Connected`) triggers a full resync from the
-        // server snapshot. Single applier + wake-on-change replaces the old
-        // two-receiver race (poll read the store before the listener applied).
+        // 5. Spawn the single background event listener — the PRIMARY writer of
+        // the SyncedDocument. It applies each event, then wakes waiters (the
+        // shell completion poll) via `change`. A `NeedsResync` effect, a
+        // broadcast `Lagged`, or a reconnect (`Connected`) triggers a full
+        // resync from the server snapshot. Single applier + wake-on-change
+        // replaces the old two-receiver race (poll read the store before the
+        // listener applied). NOT the sole writer anymore: HookListener authors
+        // blocks directly, and execute_and_poll_shell's stall fallback
+        // (2026-07-17) runs resync_synced too — both under the same mutex, so
+        // this is interleaving-safe but re-exposes resync_synced's documented
+        // flush→apply lost-update window (docs/issues.md, SyncedDocument
+        // review: the command-channel sole-writer rework is the real fix).
         let bg_abort = {
             let mut event_rx = remote.actor.subscribe_events();
             let mut status_rx = remote.actor.subscribe_status();
