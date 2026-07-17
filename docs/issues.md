@@ -1974,10 +1974,6 @@ upcasts its `EnterGuard` to `'static` (`otel.rs:28`); soundness rests on the
 leaked runtime outliving the guard.
 
 **`kaijutsu-client`:**
-- Backoff reset bug — `finish_closing` reads `self.state` *after* `mem::replace`
-  moved it to `Idle` (`actor.rs:1451`), so the attempt counter isn't preserved
-  through `Closing → Cooldown`; backoff always resets to 1 s after a post-connect
-  failure.
 - `is_disconnect_error` matches on the capnp error `Display` text
   (`actor.rs:1214`) — fragile; a capnp formatting change would stop triggering
   reconnect. Prefer a typed `ErrorKind::Disconnected` match.

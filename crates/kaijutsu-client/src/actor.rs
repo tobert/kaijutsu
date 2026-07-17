@@ -166,6 +166,7 @@ pub enum NotReadyReason {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Internal FSM state. Private — observers use `ConnectionStatus` instead.
+#[derive(Debug)]
 enum ActorState {
     /// Transient bootstrap state. The run loop dials immediately (eager
     /// connect), so the actor never rests here; it also serves as the
@@ -3077,5 +3078,121 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("connecting"), "got: {s}");
         assert!(s.contains("3"), "got: {s}");
+    }
+
+    /// Build a bare `RpcActor` for state-machine unit tests. No network I/O:
+    /// `RpcActor::new` only wires in-memory channels, so the state transition
+    /// methods (`start_closing`/`finish_closing`/...) are exercisable without
+    /// a live connection.
+    fn test_actor() -> RpcActor {
+        let (_tx, rx) = mpsc::channel(8);
+        let (event_tx, _) = broadcast::channel(8);
+        let (status_tx, _) = broadcast::channel(8);
+        let (status_watch_tx, _) = watch::channel(ConnectionStatus::Idle);
+        RpcActor::new(
+            SshConfig::default(),
+            None,
+            "test-actor".to_string(),
+            false,
+            rx,
+            event_tx,
+            status_tx,
+            status_watch_tx,
+        )
+    }
+
+    /// Regression test for the backoff reset bug: `finish_closing` used to
+    /// read `self.state` *after* `mem::replace` had already swapped it to
+    /// `Idle`, so the attempt count carried into `Closing` was always read
+    /// back as 0 and backoff reset to attempt 1 on every post-connect
+    /// failure. `start_closing` captures the leaving state's attempt count
+    /// into `Closing::attempt`; `finish_closing` must carry that value
+    /// through to the next `Cooldown::next_attempt`, not re-derive it from
+    /// the (already-Idle) `self.state`.
+    #[test]
+    fn finish_closing_carries_attempt_count_from_connecting_through_cooldown() {
+        let mut actor = test_actor();
+        // Simulate the 3rd handshake attempt in flight when the pipe dies.
+        actor.state = ActorState::Connecting {
+            attempt: 3,
+            started_at: Instant::now(),
+        };
+        actor.start_closing(CloseCause::RpcError("disconnected".into()));
+        assert!(
+            matches!(actor.state, ActorState::Closing { attempt: 3, .. }),
+            "start_closing should capture the in-flight attempt: {:?}",
+            actor.state
+        );
+
+        actor.finish_closing();
+        match actor.state {
+            ActorState::Cooldown { next_attempt, .. } => {
+                assert_eq!(
+                    next_attempt, 4,
+                    "backoff should climb to attempt 4, not reset to 1"
+                );
+            }
+            other => panic!("expected Cooldown, got {other:?}"),
+        }
+    }
+
+    /// Same carry-through, but leaving from `Cooldown` (a reconnect attempt
+    /// itself failed before ever reaching `Connecting` — e.g. the dial threw
+    /// immediately). `next_attempt` on the Cooldown we're leaving must carry
+    /// forward, not reset.
+    #[test]
+    fn finish_closing_carries_attempt_count_from_cooldown_through_cooldown() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Cooldown {
+            next_attempt: 5,
+            until: Instant::now(),
+            last_error: "prior failure".into(),
+        };
+        actor.start_closing(CloseCause::PingFailed("timeout".into()));
+        assert!(
+            matches!(actor.state, ActorState::Closing { attempt: 5, .. }),
+            "start_closing should carry the pending Cooldown attempt: {:?}",
+            actor.state
+        );
+
+        actor.finish_closing();
+        match actor.state {
+            ActorState::Cooldown { next_attempt, .. } => {
+                assert_eq!(next_attempt, 6);
+            }
+            other => panic!("expected Cooldown, got {other:?}"),
+        }
+    }
+
+    /// Closing from a healthy `Connected` carries attempt 0 — the next
+    /// reconnect is attempt 1, not a continuation of some prior backoff.
+    #[test]
+    fn finish_closing_starts_fresh_backoff_after_a_healthy_connection_drops() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Connected {
+            since: Instant::now(),
+        };
+        actor.start_closing(CloseCause::RpcError("disconnected".into()));
+        assert!(matches!(actor.state, ActorState::Closing { attempt: 0, .. }));
+
+        actor.finish_closing();
+        match actor.state {
+            ActorState::Cooldown { next_attempt, .. } => assert_eq!(next_attempt, 1),
+            other => panic!("expected Cooldown, got {other:?}"),
+        }
+    }
+
+    /// A terminal cause (`Shutdown`) skips backoff entirely and settles
+    /// `Terminal`, regardless of the carried attempt count.
+    #[test]
+    fn finish_closing_terminal_cause_ignores_attempt_count() {
+        let mut actor = test_actor();
+        actor.state = ActorState::Connecting {
+            attempt: 7,
+            started_at: Instant::now(),
+        };
+        actor.start_closing(CloseCause::Shutdown);
+        actor.finish_closing();
+        assert!(matches!(actor.state, ActorState::Terminal { .. }));
     }
 }
