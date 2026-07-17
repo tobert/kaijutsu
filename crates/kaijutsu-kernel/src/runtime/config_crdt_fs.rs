@@ -583,14 +583,26 @@ impl VfsOps for ConfigCrdtFs {
     }
 
     async fn mkdir(&self, path: &Path, _mode: u32) -> VfsResult<FileAttr> {
-        // Directories are virtual (synthesized from descendant paths). Creating
-        // one is a no-op success so that nested file creation "just works"; a
-        // path that already names a file is a conflict.
+        // Directories are virtual (synthesized from descendant paths) and
+        // never persisted themselves. If the directory already exists (some
+        // document lives under it), `mkdir` is a truthful no-op — same as
+        // `mkdir -p` on an existing directory elsewhere. But minting an
+        // *empty* one from nothing has nothing to record: `Ok` would report
+        // success while creating no observable effect — the path wouldn't
+        // even show up in a listing until a file landed under it. Fail loud
+        // instead of lying; a path that already names a file is a conflict.
         let canonical = self.canonical(path);
         if self.content_of(&canonical).is_some() {
             return Err(VfsError::already_exists(canonical));
         }
-        Ok(FileAttr::directory(0o755))
+        if self.is_dir(&canonical) {
+            return Ok(FileAttr::directory(0o755));
+        }
+        Err(VfsError::other(format!(
+            "mkdir unsupported on this CRDT-backed mount: \"{canonical}\" would be an \
+             empty virtual directory, which can't be persisted here — directories are \
+             synthesized from file paths, so create a file under this path instead"
+        )))
     }
 
     async fn unlink(&self, path: &Path) -> VfsResult<()> {
@@ -837,6 +849,51 @@ mod tests {
         assert!(matches!(
             fs.getattr(p("coder/create/missing.kai")).await,
             Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mkdir_on_a_never_populated_path_fails_loud() {
+        // Directories are virtual — synthesized from descendant file paths —
+        // so there is no way to durably record an *empty* one. The old
+        // behavior returned `Ok` unconditionally: `mkdir /etc/rc/foo`
+        // "succeeded" but created nothing, and `foo` never showed up in a
+        // listing. That's a silent no-op dressed as success; it must fail
+        // loud instead.
+        let fs = fs();
+        let err = fs
+            .mkdir(p("nobody/lives/here"), 0o755)
+            .await
+            .expect_err("mkdir of a directory with no descendants must error");
+        assert!(
+            !err.to_string().is_empty(),
+            "mkdir error message must not be empty"
+        );
+        assert!(!fs.exists(p("nobody/lives/here")).await);
+    }
+
+    #[tokio::test]
+    async fn mkdir_on_an_already_populated_path_is_idempotent() {
+        // A directory that already exists (something lives under it) is a
+        // truthful no-op — same as `mkdir -p` elsewhere in the VFS.
+        let fs = fs();
+        fs.write_all(p("coder/create/S00-stance.md"), b"x")
+            .await
+            .unwrap();
+        let attr = fs
+            .mkdir(p("coder/create"), 0o755)
+            .await
+            .expect("mkdir on an existing virtual directory must succeed");
+        assert!(attr.is_dir());
+    }
+
+    #[tokio::test]
+    async fn mkdir_on_an_existing_file_conflicts() {
+        let fs = fs();
+        fs.write_all(p("a/create/S00-x.kai"), b"data").await.unwrap();
+        assert!(matches!(
+            fs.mkdir(p("a/create/S00-x.kai"), 0o755).await,
+            Err(VfsError::AlreadyExists(_))
         ));
     }
 
