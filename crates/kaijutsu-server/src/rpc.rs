@@ -1086,7 +1086,7 @@ pub async fn create_shared_kernel(
         let mut db = kernel_db_arc.lock();
         let ws = db
             .get_or_create_default_workspace(PrincipalId::system())
-            .unwrap();
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
         // Seed the reserved factory fork presets (full/window/spawn) — the
         // floor pattern (insert only if absent). Fail loud on error rather than
         // ship a kernel where `kj fork --preset` has nothing to recall.
