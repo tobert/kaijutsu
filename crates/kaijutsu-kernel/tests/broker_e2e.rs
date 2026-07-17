@@ -156,7 +156,8 @@ async fn list_visible_tools_surfaces_expected_names() {
     let defs = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     let names: Vec<&str> = defs.iter().map(|(n, _, _)| n.as_str()).collect();
 
     // Sampling, not the full 13 (per-server tests cover exhaustive lists).
@@ -179,7 +180,8 @@ async fn tool_search_returns_scored_matches() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     let exec = fx
         .kernel
@@ -442,7 +444,8 @@ async fn no_first_touch_seeding_under_deny_by_default() {
     let defs = fx
         .kernel
         .list_tool_defs_via_broker(unbound, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     assert!(defs.is_empty(), "unbound context must see no tools");
     // list_visible_tools may write back a name_map, but it must NOT seed a
     // permissive (granting) binding — deny-by-default holds.
@@ -495,7 +498,8 @@ async fn tool_search_no_match_returns_empty() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     let exec = fx
         .kernel
@@ -535,7 +539,8 @@ async fn tool_search_tiebreak_is_alphabetical() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     let exec = fx
         .kernel
@@ -600,7 +605,8 @@ async fn policy_show_and_set_round_trip() {
     let _ = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
 
     // Show: builtin.kernel_info should have the default policy.
     let show = fx
@@ -664,6 +670,44 @@ async fn unknown_tool_name_surfaces_tool_not_found() {
     assert!(
         matches!(err, McpError::ToolNotFound { ref tool, .. } if tool == "does_not_exist"),
         "expected ToolNotFound(tool=does_not_exist), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn denied_tool_call_names_the_tool_and_context_not_an_empty_or_confusing_error() {
+    // A narrow loadout (the musician/toolie shape: only a couple of tool
+    // grants, no `*`) that hides `write` must not report a dispatch of it
+    // as "not found" — from the caller's side that reads like a typo, when
+    // it's really a capability decision. The error must be non-empty and
+    // name both the tool and the denying context so the caller (or a human
+    // debugging live) can act (`kj binding allow`).
+    use kaijutsu_kernel::mcp::Capability;
+    let fx = setup().await;
+
+    let mut binding = ContextToolBinding::new();
+    binding.grant(Capability::Tool {
+        instance: InstanceId::new("builtin.file"),
+        tool: "read".into(),
+    });
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+
+    let err = fx
+        .kernel
+        .dispatch_tool_via_broker("write", r#"{"path":"/x","content":"y"}"#, &fx.exec_ctx)
+        .await
+        .expect_err("ungranted-but-registered tool must error");
+
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "denial error message must not be empty");
+    assert!(msg.contains("write"), "error must name the denied tool: {msg}");
+    assert!(
+        msg.contains(&fx.ctx_id.to_string()),
+        "error must name the denying context: {msg}"
+    );
+    assert!(
+        matches!(err, McpError::LoadoutDenied { ref tool, context } if tool == "write" && context == fx.ctx_id),
+        "expected LoadoutDenied for a registered-but-ungranted tool (not ToolNotFound, \
+         which would read as a typo), got {err:?}"
     );
 }
 
@@ -859,7 +903,8 @@ async fn late_registration_visible_next_turn() {
     let defs_before = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     let names_before: Vec<&str> = defs_before.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
         names_before.contains(&"block_create"),
@@ -888,7 +933,8 @@ async fn late_registration_visible_next_turn() {
     let defs_after = fx
         .kernel
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
-        .await;
+        .await
+        .unwrap();
     let names_after: Vec<&str> = defs_after.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
         names_after.contains(&"fail"),

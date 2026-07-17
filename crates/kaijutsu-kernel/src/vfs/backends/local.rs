@@ -376,11 +376,30 @@ impl VfsOps for LocalBackend {
                 .map_err(VfsError::from)?;
         }
 
-        // Handle times (requires filetime crate for proper support)
-        // For now, we just touch mtime if needed
+        // Handle times via std's stable `File::set_times`/`FileTimes` — mtime
+        // is load-bearing for `FileDocumentCache` staleness detection, so a
+        // no-op here silently breaks cache coherence (the cache would keep
+        // serving a stale snapshot after an explicit setattr). tokio::fs has
+        // no async wrapper for set_times; run the syscall on the blocking
+        // pool the way tokio's own fs ops do internally.
         if attr.mtime.is_some() || attr.atime.is_some() {
-            // Best effort - touch the file
-            let _ = fs::OpenOptions::new().write(true).open(&full_path).await;
+            let full_path = full_path.clone();
+            let mtime = attr.mtime;
+            let atime = attr.atime;
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::OpenOptions::new().write(true).open(&full_path)?;
+                let mut times = std::fs::FileTimes::new();
+                if let Some(mtime) = mtime {
+                    times = times.set_modified(mtime);
+                }
+                if let Some(atime) = atime {
+                    times = times.set_accessed(atime);
+                }
+                file.set_times(times)
+            })
+            .await
+            .map_err(|e| VfsError::other(format!("setattr: blocking task join failed: {e}")))?
+            .map_err(VfsError::from)?;
         }
 
         // Handle uid/gid (requires nix crate or libc)
@@ -628,6 +647,37 @@ mod tests {
 
         let data = backend.read(Path::new("test.txt"), 0, 100).await.unwrap();
         assert_eq!(data, b"hello");
+    }
+
+    #[tokio::test]
+    async fn setattr_actually_sets_mtime() {
+        // Regression: setattr used to open the file and discard the handle
+        // without ever calling a timestamp syscall — a no-op dressed as
+        // success. mtime is load-bearing for FileDocumentCache staleness
+        // detection, so this must actually move the file's mtime.
+        let (backend, _dir) = setup().await;
+        backend.create(Path::new("test.txt"), 0o644).await.unwrap();
+
+        let before = backend
+            .getattr(Path::new("test.txt"))
+            .await
+            .unwrap()
+            .mtime;
+        let target = before + std::time::Duration::from_secs(3600);
+
+        let mut attr = SetAttr::new();
+        attr.mtime = Some(target);
+        backend
+            .setattr(Path::new("test.txt"), attr)
+            .await
+            .unwrap();
+
+        let after = backend
+            .getattr(Path::new("test.txt"))
+            .await
+            .unwrap()
+            .mtime;
+        assert_eq!(after, target, "setattr must actually set mtime, not no-op");
     }
 
     #[tokio::test]
