@@ -38,7 +38,8 @@ esac
 
 # Build kaijutsu payload — field map lives in claude-to-kaijutsu.jq (single
 # source of truth, tested by crates/kaijutsu-mcp/tests/adapter_mapping.rs).
-KJ_INPUT=$(echo "$INPUT" | jq --arg event "$KJ_EVENT" -f "$SCRIPT_DIR/claude-to-kaijutsu.jq")
+# -c is load-bearing: the hook socket listener reads ONE line per event.
+KJ_INPUT=$(echo "$INPUT" | jq -c --arg event "$KJ_EVENT" -f "$SCRIPT_DIR/claude-to-kaijutsu.jq")
 
 # Transform-only escape hatch: print the kaijutsu payload and exit without
 # touching the socket. Used to validate the mapping against a live session.
@@ -47,8 +48,10 @@ if [ -n "${KJ_HOOK_DRYRUN:-}" ]; then
     exit 0
 fi
 
-# Socket discovery: PPID-based default, env override
-SOCK="${KJ_HOOK_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/kaijutsu/hook-${PPID}.sock}"
+# Socket hint: PPID-based default, env override. No /tmp fallback — the
+# server never binds there (it disables the socket without XDG_RUNTIME_DIR),
+# and the hook client's ping-based discovery covers a wrong/missing hint.
+SOCK="${KJ_HOOK_SOCKET:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/kaijutsu/hook-${PPID}.sock}}"
 
 # Find kaijutsu-mcp binary — check PATH first, then common locations
 KJ_MCP="${KJ_MCP_BIN:-}"
@@ -63,8 +66,14 @@ if [ -z "$KJ_MCP" ]; then
     fi
 fi
 
-# Send to kaijutsu-mcp hook client — fail open on any error
-KJ_RESPONSE=$(echo "$KJ_INPUT" | "$KJ_MCP" hook --socket "$SOCK" 2>/dev/null) || true
+# Send to kaijutsu-mcp hook client — fail open on any error. The socket is
+# a hint: the client pings candidates and falls back to discovery, so a
+# wrong PPID here (intermediate shell layer) is survivable.
+SOCK_ARGS=()
+if [ -n "$SOCK" ]; then
+    SOCK_ARGS=(--socket "$SOCK")
+fi
+KJ_RESPONSE=$(echo "$KJ_INPUT" | "$KJ_MCP" hook "${SOCK_ARGS[@]}" 2>/dev/null) || true
 KJ_EXIT=${PIPESTATUS[1]:-0}
 
 # If kaijutsu denied the action, relay to Claude

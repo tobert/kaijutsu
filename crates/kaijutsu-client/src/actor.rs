@@ -326,6 +326,11 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    RenameContext {
+        context_id: ContextId,
+        label: String,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     PromoteContext {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
@@ -637,6 +642,7 @@ impl RpcCommand {
             Self::VfsSnapshot { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubscribeVfsActivity { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::RenameContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PromoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::DemoteContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextPaused { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -844,6 +850,13 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn conclude(&self, context_id: ContextId) -> Result<(), CallError> {
         self.send(|reply| RpcCommand::Conclude { context_id, reply }).await
+    }
+
+    /// Rename a context's human-friendly label.
+    #[tracing::instrument(skip(self))]
+    pub async fn rename_context(&self, context_id: ContextId, label: &str) -> Result<(), CallError> {
+        let label = label.to_string();
+        self.send(|reply| RpcCommand::RenameContext { context_id, label, reply }).await
     }
 
     /// Promote a context into the time-well's ring 0 ("active"). First-write-
@@ -2630,6 +2643,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::Conclude { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));
+        }
+        RpcCommand::RenameContext { context_id, label, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.rename_context(context_id, &label));
         }
         RpcCommand::PromoteContext { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.promote_context(context_id));

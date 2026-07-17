@@ -171,6 +171,8 @@ pub struct PingResponse {
 /// When Claude calls a kaijutsu MCP tool, the MCP server already creates the
 /// appropriate CRDT blocks. If the PostToolUse hook also fires for that same
 /// tool call, we'd create duplicate blocks. This list filters those out.
+/// Compare against [`normalize_tool_name`]'s output, not the raw hook payload
+/// name — Claude Code delivers MCP tool calls as `mcp__<server>__<tool>`.
 pub const KAIJUTSU_MCP_TOOLS: &[&str] = &[
     "block_create",
     "block_append",
@@ -194,4 +196,95 @@ pub const KAIJUTSU_MCP_TOOLS: &[&str] = &[
     "write_input",
     "edit_input",
     "submit_input",
+    "register_session",
+    "invoke_peer",
 ];
+
+/// Strip a leading `mcp__<server>__` prefix from a hook-reported tool name.
+///
+/// Claude Code delivers MCP tool calls as `mcp__<server>__<tool>` (e.g.
+/// `mcp__kaijutsu__shell`), but [`KAIJUTSU_MCP_TOOLS`] lists bare tool names.
+/// Names that aren't `mcp__`-prefixed (kaish invocations, other adapters)
+/// pass through unchanged.
+pub fn normalize_tool_name(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("mcp__") else {
+        return name;
+    };
+    match rest.find("__") {
+        Some(idx) => &rest[idx + 2..],
+        None => name,
+    }
+}
+
+/// First 8 chars (not bytes — session ids aren't guaranteed ASCII) of a
+/// session id, for building short suffixes like `-{first 8 chars}` in
+/// generated context labels.
+pub fn short_session_suffix(session_id: &str) -> &str {
+    match session_id.char_indices().nth(8) {
+        Some((idx, _)) => &session_id[..idx],
+        None => session_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_mcp_prefix() {
+        assert_eq!(normalize_tool_name("mcp__kaijutsu__shell"), "shell");
+        assert_eq!(
+            normalize_tool_name("mcp__kaijutsu__register_session"),
+            "register_session"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_any_server_name() {
+        // The prefix is `mcp__<anything>__` — not tied to "kaijutsu".
+        assert_eq!(normalize_tool_name("mcp__other-server__block_create"), "block_create");
+    }
+
+    #[test]
+    fn normalize_passes_through_bare_name() {
+        assert_eq!(normalize_tool_name("Bash"), "Bash");
+        assert_eq!(normalize_tool_name("Edit"), "Edit");
+    }
+
+    #[test]
+    fn normalize_handles_malformed_prefix_without_panicking() {
+        // Starts with `mcp__` but has no second `__` delimiter — not a real
+        // MCP-qualified name, so pass it through unchanged rather than panic
+        // or silently truncate.
+        assert_eq!(normalize_tool_name("mcp__onlyoneprefix"), "mcp__onlyoneprefix");
+    }
+
+    #[test]
+    fn kaijutsu_mcp_tools_includes_register_session_and_invoke_peer() {
+        assert!(KAIJUTSU_MCP_TOOLS.contains(&"register_session"));
+        assert!(KAIJUTSU_MCP_TOOLS.contains(&"invoke_peer"));
+    }
+
+    #[test]
+    fn short_session_suffix_truncates_to_8_chars() {
+        assert_eq!(
+            short_session_suffix("a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+            "a1b2c3d4"
+        );
+    }
+
+    #[test]
+    fn short_session_suffix_passes_through_shorter_ids() {
+        assert_eq!(short_session_suffix("abc"), "abc");
+    }
+
+    #[test]
+    fn short_session_suffix_is_char_safe_not_byte_safe() {
+        // Multi-byte chars near the boundary must not panic or split a
+        // codepoint — this session id has fewer than 8 *chars* even though
+        // it has more than 8 *bytes*.
+        let sid = "日本語テスト123456";
+        let suffix = short_session_suffix(sid);
+        assert_eq!(suffix.chars().count(), 8);
+    }
+}

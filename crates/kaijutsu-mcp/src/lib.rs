@@ -913,6 +913,24 @@ impl KaijutsuMcp {
         &self,
         Parameters(req): Parameters<RegisterSessionRequest>,
     ) -> String {
+        self.register_session_auto(req.label, req.context_type).await
+    }
+
+    /// Core of `register_session`, callable without the MCP tool call
+    /// machinery — `run_serve` uses this to auto-register a session at
+    /// startup so hook events land somewhere without requiring a model to
+    /// call the tool first. Same idempotency (`already_registered`) and
+    /// wire shape as the tool.
+    pub async fn register_session_auto(
+        &self,
+        label: Option<String>,
+        context_type: Option<String>,
+    ) -> String {
+        let req = RegisterSessionRequest { label, context_type };
+        self.register_session_impl(req).await
+    }
+
+    async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
         let remote = match self.remote() {
             Some(r) => r,
             None => {

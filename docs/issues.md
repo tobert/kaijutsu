@@ -19,6 +19,10 @@ not a restart one-off:
   after kernel restarts AND tens of minutes later; a parallel session's
   `kj rc list | grep` and `kj transport play` hit the same. Retries usually
   work instantly; `/mcp` reconnect sometimes helps, sometimes unneeded.
+  2026-07-17: two consecutive 300s shell timeouts right after a kernel
+  restart while `whoami` and `kernel_search` (kaish_exec route) answered
+  instantly in the same session — narrows it to the shell reply path, not
+  the RPC connection.
 - **Operational workaround (today's law)**: never re-run a mutating command
   on timeout — check `journalctl --user -u kaijutsu-server | grep "kaish
   returned"` first; the kernel almost certainly ran it.
@@ -596,6 +600,12 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   it as `Conversation` (warn-logged), and with the `DocKind::Kv` filter gone it
   now shows as a phantom doc in `kj doc list`. Fix when it annoys: a one-time
   row delete, or teach the fallback to hide retired kinds.
+- **LOW — one document skipped on every kernel start: oplog entry predates the
+  versioned-CBOR schema.** `document_id=824658110b5553129e46b5b4fbb94282 seq=1`
+  fails `cbor decode: missing field 'block_ops'`; the loader correctly skips the
+  whole document (crash-loud-not-corrupt) and has since at least 2026-07-16.
+  That document is unserved forever. Decide: migrate the row, or delete it if
+  it's a dead test document.
 - **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`) — slices 1+2
   shipped 2026-06-16/17 and long since exercised live** (`kj rc edit`/`kj config
   set` are the daily surface). Remaining: the deferred CRDT scratch mount.
@@ -1768,18 +1778,18 @@ the *remaining* findings, triaged.
   where a block authored mid-resync is still lost — cleanest via a command
   channel that makes the bg task the true sole writer (authoring + push + resync
   all serialized in one task).
-- **LOW — `agent.compact` hook event is mapped but unhandled.** The adapter maps
-  Claude `PreCompact` → `agent.compact`, but
-  `HookListener::process_event` has no arm for it (falls to `_ => {}`), so a
-  compaction boundary silently produces no block. Either author a System/Trace block
-  marking the compaction, or drop the mapping. (Found during the 2026-06-18 bitrot
-  pass; design pass in git history — `docs/mcp-hook-alignment.md`, deleted
-  2026-07-04.)
-- **LOW — `claude-hooks.json` uses a repo-relative adapter path.** `command:
-  "contrib/adapters/claude.sh"` only resolves when Claude Code's cwd is the kaijutsu
-  repo root. The adapter itself now resolves its own filter via `BASH_SOURCE` dir, so
-  only the settings.json entry is cwd-sensitive. Document the absolute-path
-  requirement in the sample, or have install copy an absolute path.
+- **LOW — `renameContext` RPC has no structured result channel.** The 2026-07-17
+  server-side handler (`kaijutsu-server/src/rpc.rs`) returns errors via
+  `Promise::err` because `renameContext @29` declares no results — a caller can't
+  distinguish "label taken" from "connection broken" (`conclude`/`promoteContext`
+  use `(success, error)` result fields). Fine while the only caller (hook
+  listener's session-suffix rename) just logs; add `-> (success :Bool, error
+  :Text)` if a caller ever needs to react. (kaibo deepseek review 2026-07-17.)
+- **LOW — `agent.stop` transcript read is unbounded.** `HookListener` reads the
+  whole transcript JSONL (`tokio::fs::read_to_string`) to extract the last
+  assistant message; long sessions reach tens of MB. Truncation applies only
+  after extraction. Cap the read or reverse-scan from the tail. (kaibo deepseek
+  review 2026-07-17.)
 - **MED — multi-context operations silently collapse to one in Remote.**
   `search_context`, `list_resources`, the `kaijutsu://docs` reader, and
   completions call `context_ids()`, which in Remote returns only the single

@@ -19,7 +19,12 @@
     tool: (if .tool_name then {
         name: .tool_name,
         input: .tool_input,
-        output: (.tool_output // null),
+        # Claude Code delivers results as `.tool_response` (string OR object);
+        # `.tool_output` is kept as a fallback for older/other producers.
+        output: ((.tool_response // .tool_output)
+                 | if . == null then null
+                   elif type == "string" then .
+                   else tojson end),
         error: (.error // null)
     } else null end),
     principal_id: .agent_id,

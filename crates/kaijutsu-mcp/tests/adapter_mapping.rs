@@ -65,7 +65,9 @@ fn map_claude(fixture: &str, kj_event: &str) -> HookEvent {
 
 #[test]
 fn post_tool_use_carries_tool_output() {
-    // Claude emits the tool result under `.tool_output` (NOT `.tool_response`).
+    // Legacy/fallback shape: some producers emit `.tool_output` as a plain
+    // string. The documented Claude Code field is `.tool_response` (see the
+    // companion test); the filter must accept both.
     let ev = map_claude("post_tool_use.json", "tool.after");
     assert_eq!(ev.event, "tool.after");
     assert_eq!(ev.source, "claude-code");
@@ -73,9 +75,67 @@ fn post_tool_use_carries_tool_output() {
     assert_eq!(tool.name, "Bash");
     assert!(
         tool.output.is_some(),
-        "tool.output dropped — adapter likely still reads .tool_response"
+        "tool.output dropped — adapter no longer reads .tool_output fallback"
     );
     assert!(tool.output.unwrap().contains("total 0"));
+}
+
+#[test]
+fn post_tool_use_carries_tool_response() {
+    // Current Claude Code delivers the result under `.tool_response`, often as
+    // a JSON object — the filter must map it (stringified when not a string).
+    let ev = map_claude("post_tool_use_response.json", "tool.after");
+    let tool = ev.tool.expect("tool present on tool.after");
+    assert_eq!(tool.name, "Write");
+    let output = tool
+        .output
+        .expect("tool.output dropped — adapter likely ignores .tool_response");
+    assert!(
+        output.contains("success"),
+        "object tool_response not stringified into output: {output}"
+    );
+}
+
+#[test]
+fn adapter_script_emits_single_line_json() {
+    // The hook socket listener reads exactly ONE line per event. The filter
+    // alone can't prove the script sends compact JSON, so run the real
+    // adapter in dry-run mode and assert its stdout is a single parseable
+    // line. Guards the `jq -c` in claude.sh.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = manifest.join("../../contrib/adapters/claude.sh");
+    let fixture = manifest.join("tests/fixtures/claude/post_tool_use_response.json");
+    let payload = std::fs::read(&fixture).expect("read fixture");
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("KJ_HOOK_DRYRUN", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(&payload)?;
+            child.wait_with_output()
+        })
+        .expect("run claude.sh");
+
+    assert!(
+        out.status.success(),
+        "claude.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let trimmed = stdout.trim();
+    assert!(
+        !trimmed.is_empty() && !trimmed.contains('\n'),
+        "adapter output is not a single line (listener reads one line per \
+         event; claude.sh must use jq -c):\n{stdout}"
+    );
+    let ev: HookEvent = serde_json::from_str(trimmed).expect("parse adapter output");
+    assert_eq!(ev.event, "tool.after");
+    assert!(ev.tool.and_then(|t| t.output).is_some());
 }
 
 #[test]

@@ -6107,6 +6107,49 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    fn rename_context(
+        self: Rc<Self>,
+        params: kernel::RenameContextParams,
+        _results: kernel::RenameContextResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let label = pry!(pry!(p.get_label()).to_str()).to_owned();
+
+        // DB is authoritative. A taken label surfaces as the UNIQUE-violation
+        // error rather than silently stealing it — label theft is `kj context
+        // retag`'s explicitly-confirmed job, not this RPC's.
+        {
+            let db = self.kernel.kernel_db.lock();
+            if let Err(e) = db.update_label(context_id, Some(&label)) {
+                return Promise::err(capnp::Error::failed(format!("rename_context: {e}")));
+            }
+        }
+
+        // Keep the live label index in step. try_write like conclude/promote:
+        // the DB is authoritative and a busy router only lags — never block
+        // the single-threaded RPC loop on it.
+        match self.kernel.kernel.drift().try_write() {
+            Some(mut drift) => {
+                if let Err(e) = drift.rename(context_id, Some(&label)) {
+                    log::error!("rename_context: drift rename failed: {e}");
+                }
+            }
+            None => {
+                log::warn!(
+                    "rename_context: drift router busy (write); DB renamed, router label lags"
+                );
+            }
+        }
+
+        log::info!("rename_context: context={} label={label}", context_id.short());
+        Promise::ok(())
+    }
+
     fn promote_context(
         self: Rc<Self>,
         params: kernel::PromoteContextParams,
