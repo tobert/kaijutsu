@@ -331,9 +331,9 @@ mod tests {
 
     #[test]
     fn parse_sparkline_floats() {
-        let input = "```sparkline\n1.5, 3.14, 7.0\n```";
+        let input = "```sparkline\n1.5, 3.5, 7.0\n```";
         let data = try_parse_sparkline(input).expect("should parse");
-        assert_eq!(data.values, vec![1.5, 3.14, 7.0]);
+        assert_eq!(data.values, vec![1.5, 3.5, 7.0]);
     }
 
     #[test]
