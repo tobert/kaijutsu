@@ -215,18 +215,6 @@ index/synthesis grooming, oplog/CRDT compaction, auto-memory grooming.
 Needs a design round before code — write the companion doc when the first
 consumer is real.
 
-## Pre-existing `clippy --all-targets` deny failure (found 2026-07-12, FSN lane C)
-
-The `kaijutsu-app`/sparkline half of this (found 2026-07-13, r-pump lane) shipped
-2026-07-17: `cargo clippy -p kaijutsu-kernel --all-targets` fails on
-`deny(clippy::reversed_empty_ranges)` in
-`crates/kaijutsu-kernel/src/llm/splice.rs` test code (`&[3..1]`, a deliberately
-reversed range exercising `plan_splice`'s edge-case handling) — pre-existing,
-only under `--all-targets`. Rewrite the fixture to express "empty range"
-without triggering the lint (e.g. `#[allow]` on the test, or a helper that
-constructs the range without a literal clippy can reverse-detect) rather than
-changing `plan_splice`'s actual behavior.
-
 ## FSN landscape follow-ups (updated 2026-07-13 post-slice-1, `docs/scenes/vfs.md`)
 
 Slice 1 (ambient world) shipped 2026-07-13: kernel-native heat digests,
@@ -776,11 +764,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   write), so the missing piece is kernel→client: a config-changed
   notification that re-triggers the theme fetch. Matches the still-open
   "live hot-reload-on-edit" note in config-crdt-ownership.md.
-- **kj config show needs a --raw flag** (2026-07-12): `show` decorates
-  output with a path/length header + toml code fences — piping it into a
-  backup file and later `kj config set`-ing that file stores the decoration
-  as content (the color pass did exactly this; the app's loud
-  parse-failure caught it). A `--raw` mode kills the round-trip footgun.
 - **Theme: tokenize the remaining compiled-only color families**
   (2026-07-12, follow-up to the color pass): `block_*` conversation text
   colors, `syntax` highlighting, `md_*` markdown, `sparkline_*`,
@@ -899,11 +882,16 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   shell's VFS cwd, and never hits VFS mounts/caches. Decide once for both:
   route `--out` through `VfsOps::write_all` (needs the block/cas dispatch arms
   async) or document host-side semantics loudly.
+- **kaish binder eats a literal `--json` inside trailing var-args** (found
+  2026-07-17 while fixing the kj-side strip): a literal `--json` token riding
+  a `trailing_var_arg`+`allow_hyphen_values` positional (e.g. `kj drift push
+  dst hello --json world`) is pulled into the global `--json` flag by kaish's
+  own binder *before* `ToolArgs` is built — the kj-side fix (which now reads
+  the structured `args.flags`) can't see it; the token is gone by then.
+  kaish-crate work (`~/src/kaish`), same family as the `local` reserved-word
+  lexer footgun below.
 - **`KjBuiltin` argv/stdin quirks (gemini-pro review 2026-07-04, both
-  pre-existing/low):** (a) the `--json` global flag is stripped with
-  `argv.retain(|a| a != "--json")` (`runtime/kj_builtin.rs:524`), which also
-  eats a literal `"--json"` passed as a *value* (e.g. `--content --json`) —
-  prefer a targeted named-arg strip; (b) `wants_stdin_content` promotion means
+  pre-existing/low):** (b) `wants_stdin_content` promotion means
   a forgotten `--content` on an interactive TTY blocks reading stdin until
   Ctrl+D instead of failing "missing content" — cat-like POSIX behavior, but a
   papercut worth a TTY check if it ever bites; (c) the `{other:?}` fallback
@@ -1324,8 +1312,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
       prereq (`docs/config-crdt-ownership.md` "Per-client config" → Open).
     - **Config-change push** — the app applies `metronome.toml` once per
       (re)connect; a live `kj config set` doesn't reach it without a reconnect.
-    - **`kj config list` omits `/etc/client`** — only readdirs `/etc/config`, so
-      the per-client files aren't discoverable via list.
 - **Metronome controller — graduate to PI/PID later.** The slosh was fixed
   (`d2b1f55c`, P-phase correction with feedforward tempo — diagnosis in
   `79c4b6b5`'s message). Remaining: graduate to a full PI/PID (damping + integral
@@ -1817,6 +1803,13 @@ the *remaining* findings, triaged.
 - **LOW — dead `push_to_server` on `KaijutsuMcp`** (lib.rs): nothing calls it
   (the hook listener has its own `push_ops`); carries the same stale-frontier
   bug. Delete or consolidate.
+- **LOW — `InvokePeerRequest.params` generates an untyped MCP schema property**
+  (found 2026-07-17 while closing the double-encoding entry): the field is
+  `serde_json::Value`, so the derived tool schema gives `params` no `type` at
+  all — which is likely why calling layers stringify objects into it (the
+  double-encode `normalize_peer_params` now tolerates). Upstream fix shape:
+  annotate the schema with `"type": "object"` so callers encode a real nested
+  object in the first place.
 - **PERF follow-up — the shell poll's authoritative read pulls the full context
   snapshot per command** (`execute_and_poll_shell`, Phase 2). Fine for short MCP
   contexts; a per-block read RPC (`actor.get_block(ctx, id)`) would avoid the
@@ -1829,16 +1822,14 @@ the *remaining* findings, triaged.
 ## Testing & Tooling
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
-- **`kj` help docs predate the clap migration.** The live top-level help is
-  `crates/kaijutsu-kernel/docs/help/kj.md` (`include_str!` at `kj/mod.rs:451`)
-  but its command table is stale — it still lists the retired `kj kv`, the
-  pre-preset `fork --shallow`, and the old `transport arm|play|…` verb set
-  (no `attach`/`detach`/`rotate`/`render`, no `config`/`play`/`binding exec`).
-  Its six siblings (`kj-cache/context/drift/fork/preset/workspace.md`) have
-  **no consumer** (only a doc-comment mention of `kj-cache.md`). Reconcile with
-  the clap-reflected reality: refresh `kj.md`, decide the siblings' fate
-  (delete, or wire as `kj <cmd> help` bodies). NB `docs/kj-help` is a symlink
-  into that dir — not a docs-cleanup candidate.
+- **`kj` help-doc siblings: no consumer, unaudited.** `kj.md`'s command table
+  was regenerated from the real clap tree 2026-07-17 (cleanup batch); the six
+  siblings (`kj-cache/context/drift/fork/preset/workspace.md`) still have
+  **no consumer** (only a doc-comment mention of `kj-cache.md`) and predate
+  the clap migration. Decide their fate: delete, or wire as `kj <cmd> help`
+  bodies — and audit against the clap tree first (start with `kj-context.md`
+  + `kj-fork.md`; those commands gained the most verbs). NB `docs/kj-help`
+  is a symlink into that dir — not a docs-cleanup candidate.
 - **Capnp schema change ⇒ three binaries to bounce:** the dev runner
   only rebuilds/restarts `kaijutsu-app`; `kaijutsu-server.service`
   (systemd user unit) and `~/bin/kaijutsu-mcp` (running MCP processes
@@ -1857,21 +1848,6 @@ the *remaining* findings, triaged.
 New observations from the crate-by-crate architecture sweep (see
 `docs/architecture/`). Not fixed; recorded for later. Items that confirm an
 existing entry are marked *(confirms above)*.
-
-**Silent fallbacks (violate the "crash over confuse" stance):**
-- `Kernel::list_tool_defs_via_broker` returns `Vec::new()` on *any* broker error
-  (`kaijutsu-kernel/src/kernel.rs:467`) — a broken binding silently presents the
-  LLM a tool-less context, no log/trace.
-- `dispatch_tool_via_broker` does `broker.binding(...).unwrap_or_default()`
-  (`kernel.rs:346`) — binding-fetch failure silently becomes deny-all; surfaces
-  later as a confusing `ToolNotFound`.
-- `MountBackend::read` falls through to raw on-disk content on *any*
-  `FileDocumentCache::read_content` error, not just "missing/binary"
-  (`kaijutsu-kernel/src/runtime/mount_backend.rs:267`) — a CRDT error could serve
-  stale bytes.
-- Additive `ALTER TABLE` migrations swallow SQL errors with `let _ =`
-  (`kaijutsu-kernel/src/kernel_db.rs:873`) — a real failure surfaces as a
-  confusing read-time error later.
 
 **CRDT data model:**
 - **Dual storage impls.** `BlockStore` (target) and `BlockDocument` (legacy) are
@@ -1892,10 +1868,6 @@ existing entry are marked *(confirms above)*.
   (`kaijutsu-kernel/src/file_tools/edit.rs:132`) while `FileDocumentCache` is
   careful to use **char** counts (`cache.rs:276`). Multi-byte content can corrupt
   the CRDT splice. Audit `edit_text`'s parameter semantics and unify.
-
-**`LocalBackend::setattr` mtime is a no-op** (`kaijutsu-kernel/src/vfs/backends/
-local.rs:354`) — it opens the file but doesn't set the timestamp, yet mtime is
-load-bearing for `FileDocumentCache` staleness detection.
 
 **`kj` single-source guarantee is manual** — `dispatch()` routing and
 `kj_command()` schema tree must be hand-kept in sync; a subcommand added to one
@@ -1922,10 +1894,6 @@ upcasts its `EnterGuard` to `'static` (`otel.rs:28`); soundness rests on the
 leaked runtime outliving the guard.
 
 **`kaijutsu-client`:**
-- Backoff reset bug — `finish_closing` reads `self.state` *after* `mem::replace`
-  moved it to `Idle` (`actor.rs:1451`), so the attempt counter isn't preserved
-  through `Closing → Cooldown`; backoff always resets to 1 s after a post-connect
-  failure.
 - `is_disconnect_error` matches on the capnp error `Display` text
   (`actor.rs:1214`) — fragile; a capnp formatting change would stop triggering
   reconnect. Prefer a typed `ErrorKind::Disconnected` match.
@@ -2062,12 +2030,6 @@ candidates, not commitments.
 - **Socket hook vs. Hook Table alignment.** The legacy MCP socket hook (for session mirroring) has drifted from core structures, causing silent data loss
   (e.g., `agent_id` vs `principal_id` mismatch, obsolete `tool_response` key, fragile PID-based socket discovery). Details in
   the design pass in git history (`docs/mcp-hook-alignment.md`, deleted 2026-07-04).
-- **Silent fallbacks in tool/binding lookup.** [Kernel::list_tool_defs_via_broker](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L465) maps lookup errors
-  to empty vectors, silently stripping the LLM of tools. [dispatch_tool_via_broker_with_cancel](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/kernel.rs#L336) defaults to empty bindings on lookup
-  failure, causing confusing `ToolNotFound` errors rather than propagating the underlying DB/resolver error.
-  Related quirk (found 2026-07-04): `Broker::list_visible_tools` reads the in-memory binding directly
-  (`unwrap_or_default`) instead of the lazy-loading `binding()`, so the FIRST dispatch in a fresh process
-  queries zero servers until `binding()` caches on that same call — self-heals, but a latent surprise.
 - **Latency overhead on visible tool scans.** [list_visible_tools](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/broker.rs#L1081) is called on **every single tool dispatch** to refresh naming resolutions, causing lock contention
   on `self.instances` and `self.bindings` and extra async hops. These resolutions should be cached per context and invalidated only when bindings change.
 - **Contradictory hook persistence documentation.** [BuiltinBindingsServer](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/servers/bindings_builtin.rs#L64) claims hooks are "in-memory only" when they are actually eagerly hydrated and written to SQLite in `broker.rs`.
