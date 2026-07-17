@@ -2192,7 +2192,7 @@ impl kernel::Server for KernelImpl {
                 let mut block_sub = block_flows.subscribe("block.*");
                 // Input flows are optional at this subscription site.
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
-                let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
+                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
                 log::debug!(
                     "Started FlowBus subscription for kernel {} (input_flows={})",
                     kernel_id.to_hex(),
@@ -2678,10 +2678,10 @@ impl kernel::Server for KernelImpl {
                     // first failure permanently severed delivery silently.
                     if !health.record(success) {
                         log::warn!(
-                            "FlowBus bridge task for kernel {} stopping: \
-                             {} consecutive callback failures — reaping subscriber",
+                            "FlowBus bridge task for kernel {} stopping: callback \
+                             failures continuous for over {:?} — reaping subscriber",
                             kernel_id,
-                            MAX_SUBSCRIBER_FAILURES,
+                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
                         );
                         break;
                     }
@@ -2815,7 +2815,7 @@ impl kernel::Server for KernelImpl {
 
             tokio::task::spawn_local(async move {
                 let mut sub = editor_flows.subscribe("editor.*");
-                let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
+                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
                 const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
                 log::debug!("Started editor subscription for kernel {}", kernel_id);
 
@@ -2844,10 +2844,10 @@ impl kernel::Server for KernelImpl {
 
                     if !health.record(success) {
                         log::warn!(
-                            "editor bridge for kernel {} stopping: {} consecutive \
-                             callback failures — reaping subscriber",
+                            "editor bridge for kernel {} stopping: callback \
+                             failures continuous for over {:?} — reaping subscriber",
                             kernel_id,
-                            MAX_SUBSCRIBER_FAILURES,
+                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
                         );
                         break;
                     }
@@ -2893,7 +2893,7 @@ impl kernel::Server for KernelImpl {
 
         tokio::task::spawn_local(async move {
             let mut cursor = ActivityCursor::default();
-            let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
+            let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
             const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms as u64));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2943,10 +2943,10 @@ impl kernel::Server for KernelImpl {
 
                         if !health.record(success) {
                             log::warn!(
-                                "vfs activity bridge for kernel {} stopping: {} consecutive \
-                                 callback failures — reaping subscriber",
+                                "vfs activity bridge for kernel {} stopping: callback \
+                                 failures continuous for over {:?} — reaping subscriber",
                                 kernel_id,
-                                MAX_SUBSCRIBER_FAILURES,
+                                SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
                             );
                             break;
                         }
@@ -5308,7 +5308,7 @@ impl kernel::Server for KernelImpl {
             let task = tokio::task::spawn_local(async move {
                 let mut block_sub = block_flows.subscribe(subscribe_pattern);
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
-                let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
+                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
                 log::debug!(
                     "Started filtered FlowBus subscription for kernel {} (filter_active={}, pattern={})",
                     kernel_id.to_hex(),
@@ -5788,17 +5788,21 @@ impl kernel::Server for KernelImpl {
 
                     // A single failed/timed-out callback is treated as a
                     // transient client-executor stall, not a dead peer: drop
-                    // this event and keep the subscription. Reap only after
-                    // MAX_SUBSCRIBER_FAILURES consecutive failures (a success
-                    // resets the count). Breaking on the first failure was the
+                    // this event and keep the subscription. Reap only once
+                    // failures have been landing continuously for
+                    // SUBSCRIBER_FAILURE_STREAK_TIMEOUT (a success resets the
+                    // streak). Breaking on the first failure was the
                     // 2026-06-17 "every shell call times out after restart"
                     // bug — it silently and permanently severed delivery.
                     if !health.record(success) {
                         log::warn!(
                             "Filtered FlowBus bridge task for kernel {} stopping: \
-                             {} consecutive callback failures — reaping subscriber",
+                             callback failures continuous for over {:?} — \
+                             reaping subscriber instance={} principal={:?}",
                             kernel_id,
-                            MAX_SUBSCRIBER_FAILURES,
+                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
+                            instance,
+                            principal_id,
                         );
                         break;
                     }
@@ -7869,23 +7873,6 @@ fn parse_block_event_filter(
     }
 }
 
-/// Failure tolerance for a FlowBus→client callback bridge.
-///
-/// The per-callback 5s timeout (see `CALLBACK_TIMEOUT`) is load-bearing: a
-/// stalled client must not pin the server's RpcSystem by blocking
-/// `promise.await` on the shared SSH socket. But a *single* timeout or error
-/// does NOT mean the peer is dead — it usually means the client's
-/// single-threaded executor was transiently busy (e.g. an MCP client mid
-/// `from_sync_state`, or burst-processing a kernel-wide event stream). The old
-/// behavior — `break` on the first failure — turned that transient stall into a
-/// *permanent, silent* loss of the subscription: the bridge task ended, the
-/// client was never told, and every later shell poll timed out forever (the
-/// 2026-06-17 "every external shell call times out after restart" bug).
-///
-/// This counter tolerates short bursts of failure and reaps only a
-/// *sustained* one. A truly-dead peer is still caught: each failed callback
-/// has already burned its 5s timeout, so `max_consecutive_failures` strikes
-/// bound the reap delay (3 × 5s = 15s), well under the ~90s SSH keepalive that
 /// Fill an `EditorState` capnp builder from the kernel's editor state + the
 /// session id (carried alongside, since the kernel state struct omits it).
 /// `mode: None` maps to `""` on the wire.
@@ -7928,43 +7915,79 @@ async fn await_editor_callback<T>(
     }
 }
 
-/// tears the whole connection down for a genuinely vanished peer. A single
-/// success resets the count.
+/// Failure tolerance for a FlowBus→client callback bridge.
+///
+/// The per-callback 5s timeout (see `CALLBACK_TIMEOUT`) is load-bearing: a
+/// stalled client must not pin the server's RpcSystem by blocking
+/// `promise.await` on the shared SSH socket. But a *single* timeout or error
+/// does NOT mean the peer is dead — it usually means the client's
+/// single-threaded executor was transiently busy (e.g. an MCP client mid
+/// `from_sync_state`, or burst-processing a kernel-wide event stream). The old
+/// behavior — `break` on the first failure — turned that transient stall into a
+/// *permanent, silent* loss of the subscription: the bridge task ended, the
+/// client was never told, and every later shell poll timed out forever (the
+/// 2026-06-17 "every external shell call times out after restart" bug).
+///
+/// A *consecutive-strike* counter (3 failures ⇒ reap) fixed that but created a
+/// second bug: a completed shell command fires a burst of ~4 events in quick
+/// succession (TextOps, two MetadataChanged, StatusChanged), each forwarded as
+/// its own callback. ONE transient write stall on the client's socket — busy
+/// decoding a large prior response, say — times out every callback in that
+/// burst, so 3 strikes land in under a second and the bridge is reaped even
+/// though the peer is perfectly healthy (the 2026-07-17 "MCP shell calls time
+/// out ~50% of the time" bug). A strike count can't tell "one blip that
+/// happened to repeat" from "sustained wedge" apart.
+///
+/// So this tracks *streak duration* instead: the timestamp of the first
+/// failure in the current unbroken losing streak, reaping only once a
+/// subsequent failure lands `SUBSCRIBER_FAILURE_STREAK_TIMEOUT` or later after
+/// that first failure. A burst-sized blip (well under a second) can no longer
+/// trip it. A truly wedged/starved peer is still caught — it keeps failing
+/// every callback, so the streak just keeps growing past the threshold,
+/// reaped well before the ~90s SSH keepalive would tear the whole connection
+/// down. A single success resets the streak.
 #[derive(Debug)]
 struct SubscriberHealth {
-    consecutive_failures: u32,
-    max_consecutive_failures: u32,
+    /// Wall-clock time the current unbroken run of failures started. `None`
+    /// when the last recorded outcome was a success — no streak in progress.
+    streak_started_at: Option<std::time::Instant>,
+    /// How long a losing streak must run, unbroken, before `record` reaps it.
+    min_streak_duration: std::time::Duration,
 }
 
 impl SubscriberHealth {
-    fn new(max_consecutive_failures: u32) -> Self {
+    fn new(min_streak_duration: std::time::Duration) -> Self {
         Self {
-            consecutive_failures: 0,
-            max_consecutive_failures,
+            streak_started_at: None,
+            min_streak_duration,
         }
     }
 
     /// Record a callback outcome. Returns `true` to keep the subscription
-    /// alive, `false` to reap it. A success resets the strike count; a failure
-    /// reaps only once `max_consecutive_failures` strikes accumulate
-    /// back-to-back.
+    /// alive, `false` to reap it. A success clears the streak. A failure
+    /// starts the streak (if none is running) or extends it, and reaps once
+    /// the streak has been running continuously for at least
+    /// `min_streak_duration`.
     fn record(&mut self, ok: bool) -> bool {
         if ok {
-            self.consecutive_failures = 0;
+            self.streak_started_at = None;
             true
         } else {
-            self.consecutive_failures += 1;
-            self.consecutive_failures < self.max_consecutive_failures
+            let started = *self
+                .streak_started_at
+                .get_or_insert_with(std::time::Instant::now);
+            started.elapsed() < self.min_streak_duration
         }
     }
 }
 
-/// Consecutive callback failures tolerated before a FlowBus bridge is reaped.
-/// At the 5s per-callback timeout, 3 strikes ≈ 15s of sustained failure — long
-/// enough to ride out a transient client-executor stall, short enough that a
-/// wedged subscriber is dropped well before the SSH keepalive reaps the
-/// connection.
-const MAX_SUBSCRIBER_FAILURES: u32 = 3;
+/// Minimum duration a FlowBus/editor callback failure streak must run,
+/// unbroken, before its subscriber is reaped. At the 5s per-callback
+/// `CALLBACK_TIMEOUT`, a completed shell command's ~4-event burst can only
+/// burn a few seconds even if every callback in it times out; 15s gives that
+/// generous headroom while still catching a genuinely wedged subscriber well
+/// inside the ~90s SSH keepalive window.
+const SUBSCRIBER_FAILURE_STREAK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Floor on `subscribeVfsActivity`'s requested tick interval (Lane K, FSN
 /// slice-1) — a client asking for anything tighter is silently clamped up
@@ -8634,46 +8657,73 @@ mod live_status_tests {
 
 #[cfg(test)]
 mod subscriber_health_tests {
-    //! `SubscriberHealth` — the strike counter that keeps a transient client
-    //! stall from permanently severing a FlowBus subscription (the 2026-06-17
-    //! "every external shell call times out after restart" regression). Reaping
-    //! is for *sustained* failure only; a success resets.
+    //! `SubscriberHealth` — tracks *streak duration*, not strike count, so a
+    //! transient client stall can't permanently sever a FlowBus subscription
+    //! (2026-06-17 "every external shell call times out after restart") NOR
+    //! can a completed shell command's ~4-event completion burst — all of
+    //! which can time out from one blip — trip a false reap (2026-07-17 "MCP
+    //! shell calls time out ~50% of the time"). Reaping is for a failure
+    //! streak that runs *continuously* past the threshold; a success resets.
     use super::SubscriberHealth;
+    use std::time::Duration;
 
     #[test]
     fn single_failure_does_not_reap() {
-        let mut h = SubscriberHealth::new(3);
+        let mut h = SubscriberHealth::new(Duration::from_secs(15));
         // One transient timeout must NOT kill the subscription — this is the
         // whole bug: the old code broke here and the MCP went silent forever.
         assert!(h.record(false), "a single failure must keep the bridge alive");
     }
 
     #[test]
-    fn sustained_failure_reaps_at_threshold() {
-        let mut h = SubscriberHealth::new(3);
-        assert!(h.record(false)); // strike 1
-        assert!(h.record(false)); // strike 2
+    fn burst_of_failures_within_window_does_not_reap() {
+        // A completed shell command fans out ~4 callbacks back-to-back; if a
+        // transient write stall times out all of them, that whole burst lands
+        // in well under a second. None of it should trip a threshold this
+        // much larger than the burst.
+        let mut h = SubscriberHealth::new(Duration::from_millis(200));
+        for n in 1..=4 {
+            assert!(
+                h.record(false),
+                "burst failure #{n} landed inside the window — must not reap"
+            );
+        }
+    }
+
+    #[test]
+    fn failures_spanning_past_threshold_reap() {
+        // A genuinely wedged/starved subscriber keeps failing every callback;
+        // once that losing streak has run continuously past the threshold,
+        // the *next* failure reaps it.
+        let threshold = Duration::from_millis(30);
+        let mut h = SubscriberHealth::new(threshold);
+        assert!(h.record(false), "first failure starts the streak, not a reap");
+        std::thread::sleep(threshold * 2);
         assert!(
             !h.record(false),
-            "the 3rd consecutive failure reaps the subscriber"
+            "a failure landing after the streak outlives the threshold reaps"
         );
     }
 
     #[test]
-    fn success_resets_the_strike_count() {
-        let mut h = SubscriberHealth::new(3);
-        assert!(h.record(false)); // strike 1
-        assert!(h.record(false)); // strike 2
-        assert!(h.record(true), "success keeps it alive and resets");
-        // Strikes were reset, so we can absorb two more before the third reaps.
-        assert!(h.record(false)); // strike 1 again
-        assert!(h.record(false)); // strike 2 again
-        assert!(!h.record(false), "reaps only on 3 *consecutive* failures");
+    fn success_resets_the_streak() {
+        let threshold = Duration::from_millis(30);
+        let mut h = SubscriberHealth::new(threshold);
+        assert!(h.record(false), "streak starts");
+        std::thread::sleep(threshold * 2);
+        assert!(h.record(true), "success clears the streak before it reaps");
+        // The streak restarted at the success above, so a fresh failure right
+        // now is well inside the threshold again — even though the *first*
+        // failure was long enough ago that an un-reset streak would reap.
+        assert!(
+            h.record(false),
+            "streak was reset by the success — a fresh failure must not reap"
+        );
     }
 
     #[test]
     fn steady_success_never_reaps() {
-        let mut h = SubscriberHealth::new(3);
+        let mut h = SubscriberHealth::new(Duration::from_secs(15));
         for _ in 0..100 {
             assert!(h.record(true));
         }
