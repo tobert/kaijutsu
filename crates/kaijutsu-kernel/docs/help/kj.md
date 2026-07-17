@@ -45,25 +45,41 @@ kj drift merge
 
 ```
 attach          Attach to an existing context and run its rc attach lifecycle
+                (distinct from `transport attach`, which attaches to a beat track)
 audio           beats — offline audio analysis (beat/downbeat tracking via beat-this)
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
-block           list, ls, inspect, count, read, cat, create, append, history, diff, edit, status
-cache           list, add, clear — Claude prompt-cache breakpoints
+                (cap tokens incl. rc-write, config-write, drive, fork, drift, transport,
+                operator, exec, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
+block           list, inspect, count, read, cat, append, history, diff, status, create,
+                edit (insert|delete|replace)
+cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
-context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag, hydrate
+config          list, show, set, edit, reset — CRDT-owned config at /etc/config
+                (models.toml, system.md, theme.toml, mcp.toml) + per-client at /etc/client
+context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,
+                rename, archive, conclude, promote, demote, pause, resume, remove,
+                retag, hydrate
+cp              Copy a file between VFS paths via the streaming pump (-r not implemented)
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
-drift           push, pull, merge, flush, queue, cancel, history
+drift           push, pull, merge, flush, queue, cancel, history, edge rm
 drive           Clock one autonomous turn on a context (--prompt)
-fork            Fork current context (--exclude, --shallow, --compact, --as, --switch)
+editor          open, keys, state, save, quit, list — kernel-owned vi editor sessions
+fork            Fork current context (--name, --prompt, --preset, --model,
+                --include/--exclude ranges, --compact, --as, --stage, --switch)
 model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
+play            Play a sample now, or commit it as a clip cell onto a track with
+                --track/--at/--label (docs/pcm.md)
 policy          show, set — a registered instance's per-call QoS policy
-preset          list, show, save, remove
+preset          list, show, save, remove, reseed
 rc              add, list, rm, show, edit, reset — lifecycle scripts (/etc/rc/<type>/<verb>/)
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 stage           commit, status, include, exclude — curate a staged (liminal) fork
-transport       play, pause, stop, tempo <bpm>, ooda <on|off> — musician beat/playhead control
-vfs             snapshot <path> (--depth, --max-entries) — recursive listing + generation stamps
+transport       attach, detach, play, pause, stop, tempo <bpm>, ooda <on|off>,
+                clock <system|modeled>, rotate, delete — a track's beat clock
+                (the musician playhead)
+vfs             snapshot <path> (--depth, --max-entries), activity [path] —
+                recursive listing + generation stamps / per-directory heat totals
 workspace (ws)  list, show, create, add, bind, remove
 ```
 
