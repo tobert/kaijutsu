@@ -98,6 +98,10 @@ pub enum DocTaskError {
     Insert(String),
     /// The resync's server fetch RPC (or the apply of its result) failed.
     Fetch(String),
+    /// A resync's PRE-FETCH flush (pushing unpushed local ops before
+    /// pulling the server's snapshot) failed, so the resync was aborted
+    /// before fetching or applying anything — see `do_coalesced_resync`.
+    Flush(String),
 }
 
 impl std::fmt::Display for DocTaskError {
@@ -107,6 +111,7 @@ impl std::fmt::Display for DocTaskError {
             Self::NoDocument => write!(f, "no synced document"),
             Self::Insert(e) => write!(f, "block insert failed: {e}"),
             Self::Fetch(e) => write!(f, "resync failed: {e}"),
+            Self::Flush(e) => write!(f, "resync aborted — pre-fetch flush failed: {e}"),
         }
     }
 }
@@ -245,7 +250,11 @@ async fn run_doc_task<B: DocSyncBackend>(
                 let ok = result.is_ok();
                 let _ = done.send(result);
                 if ok {
-                    push_new_ops(&backend, &synced, context_id, &mut pushed_frontier).await;
+                    // Routine "will retry later" on failure — the block is
+                    // already applied and acked; push_new_ops already logs.
+                    // (Unlike do_coalesced_resync's flush, there's no doc
+                    // swap here that a failed push would need to guard.)
+                    let _ = push_new_ops(&backend, &synced, context_id, &mut pushed_frontier).await;
                 }
             }
             DocCommand::Resync { reason, done } => {
@@ -334,15 +343,23 @@ fn author_blocks_sync(
 /// sync frontier (the old `flush_local_ops` bug: local authoring never
 /// advances the inbound frontier, so every push re-sent every local op ever
 /// made). Advances `pushed_frontier` to the doc's own current frontier on a
-/// successful push; leaves it alone on failure so the next push naturally
-/// retries the same (plus anything new) — safe because server-side CRDT
-/// merge is idempotent.
+/// successful push; leaves it alone on failure (returning `Err`) so the next
+/// push naturally retries the same ops (plus anything new) — safe because
+/// server-side CRDT merge is idempotent.
+///
+/// Callers differ on what a failure means: the plain `AuthorBlocks` arm in
+/// the main loop treats it as routine "will retry later" (the block is
+/// already applied and acked either way — only IGNORES the `Result`, relying
+/// on the `warn!` below). `do_coalesced_resync`'s pre-fetch flush is
+/// different: proceeding into a doc-replacing `apply_sync_state` while
+/// holding ops that failed to push would silently lose them, so THAT caller
+/// must abort on `Err` rather than continue.
 async fn push_new_ops<B: DocSyncBackend>(
     backend: &B,
     synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
     context_id: ContextId,
     pushed_frontier: &mut HashMap<BlockId, Frontier>,
-) {
+) -> Result<(), DocTaskError> {
     let Some((ops, new_frontier)) = ({
         let guard = synced.lock();
         guard.as_ref().map(|doc| {
@@ -351,31 +368,32 @@ async fn push_new_ops<B: DocSyncBackend>(
             (ops, new_frontier)
         })
     }) else {
-        return;
+        return Ok(());
     };
     if ops.block_ops.is_empty()
         && ops.new_blocks.is_empty()
         && ops.updated_headers.is_empty()
         && ops.deleted_blocks.is_empty()
     {
-        return;
+        return Ok(());
     }
     let bytes = match kaijutsu_types::codec::encode(&ops) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(%context_id, "doc task: push encode failed: {e}");
-            return;
+            return Err(DocTaskError::Flush(format!("encode failed: {e}")));
         }
     };
     match backend.push_ops(context_id, &bytes).await {
         Ok(_ack_version) => {
             *pushed_frontier = new_frontier;
+            Ok(())
         }
         Err(e) => {
-            // Not fatal — pushed_frontier stays put, so the NEXT push
-            // (triggered by the next authoring or resync) naturally
-            // re-includes these ops.
+            // pushed_frontier stays put, so the NEXT push (triggered by the
+            // next authoring or resync) naturally re-includes these ops.
             tracing::warn!(%context_id, "doc task: push failed, will retry: {e}");
+            Err(DocTaskError::Flush(e.to_string()))
         }
     }
 }
@@ -385,8 +403,13 @@ async fn push_new_ops<B: DocSyncBackend>(
 /// Lagged-status, or a stall fallback landing right behind a NeedsResync,
 /// shouldn't cost two fetches). `AuthorBlocks`/`ApplyEvent` commands found
 /// in that same pre-fetch drain are applied immediately to the CURRENT
-/// (about-to-be-replaced) doc — harmless, since the flush below pushes them
-/// before we fetch, so the snapshot we pull back already reflects them.
+/// (about-to-be-replaced) doc — harmless *as long as the flush below
+/// actually succeeds*, since a successful flush pushes them before we
+/// fetch, so the snapshot we pull back already reflects them. If the flush
+/// FAILS, the resync aborts entirely (no fetch, no apply, no frontier
+/// reset) rather than proceed into a doc swap that would silently lose
+/// those drained-but-unpushed ops with no way to retry them — see the
+/// flush step below.
 ///
 /// Commands that arrive WHILE the fetch RPC is actually in flight are NOT
 /// caught by the drain (the task isn't polling `rx` during the `.await`) —
@@ -462,8 +485,27 @@ async fn do_coalesced_resync<B: DocSyncBackend>(
     // Flush anything local not yet pushed — the fetch below pulls a
     // snapshot, and apply_sync_state replaces the doc wholesale, so any
     // local op that's neither pushed before this point NOR still queued in
-    // the channel (to be replayed after) would be lost.
-    push_new_ops(backend, synced, context_id, pushed_frontier).await;
+    // the channel (to be replayed after) would be lost. If the flush ITSELF
+    // fails, that loss is exactly what proceeding would cause: the drained
+    // pre-fetch AuthorBlocks above are sitting in the doc unpushed, and
+    // fetching+applying now would wipe them via the swap AND reset
+    // `pushed_frontier` to the fresh doc's frontier — erasing any record
+    // that a future push needs to retry them. So on flush failure, ABORT
+    // here: no fetch, no apply, no frontier touch. The unflushed ops stay
+    // exactly where `push_new_ops` left them (frontier untouched), so the
+    // NEXT resync's flush picks them up again. Callers recover on their own
+    // schedule — the stall fallback re-fires on its next backoff window, a
+    // Lagged bridge resync re-triggers on the next lag.
+    if let Err(e) = push_new_ops(backend, synced, context_id, pushed_frontier).await {
+        tracing::error!(
+            %context_id,
+            "doc task: {e} — refusing to swap the document while local ops are unflushed",
+        );
+        for done in dones {
+            let _ = done.send(Err(e.clone()));
+        }
+        return;
+    }
 
     let result = match backend.get_context_sync(context_id).await {
         Ok(state) => {
@@ -539,7 +581,13 @@ pub fn spawn_event_bridge(actor: ActorHandle, doc_task: DocTaskHandle) -> JoinHa
                         doc_task.resync_fire_and_forget(ResyncReason::StatusLagged(n)).await;
                     }
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Closed) => {}
+                    // Symmetric with the event_rx arm above: once a
+                    // broadcast sender side is gone, `recv()` resolves
+                    // `Closed` IMMEDIATELY on every subsequent poll rather
+                    // than pending — leaving this unhandled would leave the
+                    // `select!` spinning hot on a permanently-ready arm
+                    // instead of shutting the bridge down.
+                    Err(broadcast::error::RecvError::Closed) => break,
                 },
             }
         }
@@ -582,6 +630,9 @@ mod tests {
         fetch_entered: Arc<Notify>,
         fetch_calls: Arc<AtomicUsize>,
         push_payloads: Arc<parking_lot::Mutex<Vec<SyncPayload>>>,
+        /// Number of upcoming `push_ops` calls that should fail (return
+        /// `Err`) before succeeding again — decremented on each call.
+        push_fail_countdown: Arc<AtomicUsize>,
     }
 
     impl FakeBackend {
@@ -596,6 +647,7 @@ mod tests {
                 fetch_entered: Arc::new(Notify::new()),
                 fetch_calls: Arc::new(AtomicUsize::new(0)),
                 push_payloads: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                push_fail_countdown: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -617,6 +669,13 @@ mod tests {
         async fn wait_for_fetch_entered(&self) {
             self.fetch_entered.notified().await;
         }
+
+        /// Make the next `n` `push_ops` calls fail (return `Err`, touching
+        /// neither `server_doc` nor `push_payloads` — a failed push must
+        /// look exactly like it never happened) before succeeding again.
+        fn fail_next_pushes(&self, n: usize) {
+            self.push_fail_countdown.store(n, Ordering::SeqCst);
+        }
     }
 
     #[async_trait::async_trait]
@@ -637,6 +696,11 @@ mod tests {
 
         async fn push_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, CallError> {
             assert_eq!(context_id, self.ctx, "fake backend push for wrong context");
+            let remaining = self.push_fail_countdown.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.push_fail_countdown.store(remaining - 1, Ordering::SeqCst);
+                return Err(CallError::Rpc("simulated push failure".to_string()));
+            }
             let payload: SyncPayload =
                 kaijutsu_types::codec::decode(ops).expect("decode pushed SyncPayload");
             {
@@ -857,6 +921,122 @@ mod tests {
             backend.fetch_call_count(),
             1,
             "4 queued resyncs must coalesce into exactly one fetch"
+        );
+
+        task.abort();
+    }
+
+    /// Reviewer-flagged durability bug (second-voice review before merge):
+    /// if `do_coalesced_resync`'s PRE-FETCH `push_new_ops` fails, proceeding
+    /// into `get_context_sync` + `apply_sync_state` anyway would wipe the
+    /// drained local `AuthorBlocks` via the doc-replacing swap AND reset
+    /// `pushed_frontier` to the fresh doc's frontier — erasing any record
+    /// that a future push needs to retry them. The fix: abort the resync
+    /// entirely on flush failure (no fetch, no apply, no frontier touch).
+    ///
+    /// This test sends a `Resync` THEN an `AuthorBlocks` command
+    /// sequentially into the channel (not as racing concurrent tasks —
+    /// their RELATIVE order matters here) before the loop exists to
+    /// consume either, so the resync's pre-fetch drain — not the plain
+    /// `AuthorBlocks` arm, which has its own harmless "warn and retry
+    /// later" push — is what applies the block and owns the one flush
+    /// that's configured to fail.
+    #[tokio::test]
+    async fn resync_aborts_when_the_pre_fetch_flush_fails() {
+        let ctx = ContextId::new();
+        let synced = seeded_synced(ctx);
+        let (change_tx, _change_rx) = watch::channel(0u64);
+        let backend = FakeBackend::new(ctx);
+
+        let (tx, rx) = mpsc::channel(DOC_TASK_CHANNEL_CAPACITY);
+
+        let (resync_done, resync_ack) = oneshot::channel();
+        tx.send(DocCommand::Resync {
+            reason: ResyncReason::NeedsResync,
+            done: Some(resync_done),
+        })
+        .await
+        .unwrap();
+
+        let (author_done, author_ack) = oneshot::channel();
+        tx.send(DocCommand::AuthorBlocks {
+            blocks: vec![AuthoredBlock::Text {
+                role: Role::User,
+                content: "unpushed".to_string(),
+            }],
+            done: author_done,
+        })
+        .await
+        .unwrap();
+
+        // The ONE push this resync's flush will attempt must fail.
+        backend.fail_next_pushes(1);
+
+        let task = tokio::spawn(run_doc_task(
+            backend.clone(),
+            ctx,
+            Arc::clone(&synced),
+            change_tx,
+            rx,
+        ));
+
+        let author_result = tokio::time::timeout(Duration::from_secs(5), author_ack)
+            .await
+            .expect("author ack timed out")
+            .expect("author oneshot dropped");
+        assert!(
+            author_result.is_ok(),
+            "author, applied during the resync's pre-fetch drain, must still succeed: \
+             {author_result:?}"
+        );
+
+        let resync_result = tokio::time::timeout(Duration::from_secs(5), resync_ack)
+            .await
+            .expect("resync ack timed out")
+            .expect("resync oneshot dropped");
+        assert!(
+            matches!(resync_result, Err(DocTaskError::Flush(_))),
+            "resync must abort with a Flush error when its pre-fetch push fails, got: \
+             {resync_result:?}"
+        );
+
+        assert_eq!(
+            backend.fetch_call_count(),
+            0,
+            "an aborted resync must never fetch — proceeding into apply_sync_state while \
+             ops are unflushed is exactly the bug being guarded against"
+        );
+        assert!(
+            doc_contains(&synced, "unpushed"),
+            "the authored block must survive an aborted resync untouched"
+        );
+
+        // A subsequent resync — push now succeeding — must round-trip the
+        // block safely: it reaches the server AND survives the fetch+apply.
+        let handle = DocTaskHandle { tx };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.resync(ResyncReason::NeedsResync),
+        )
+        .await
+        .expect("second resync timed out")
+        .expect("second resync (push now succeeding) must succeed");
+
+        assert_eq!(
+            backend.fetch_call_count(),
+            1,
+            "the successful resync must fetch exactly once"
+        );
+        assert!(
+            doc_contains(&synced, "unpushed"),
+            "the block must still be present after a successful round-trip"
+        );
+        assert!(
+            backend
+                .push_payloads()
+                .iter()
+                .any(|p| p.new_blocks.iter().any(|b| b.content == "unpushed")),
+            "the block must have reached the server on the successful push"
         );
 
         task.abort();
