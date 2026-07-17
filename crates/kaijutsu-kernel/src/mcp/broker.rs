@@ -1083,11 +1083,13 @@ impl Broker {
         context_id: ContextId,
         ctx: &CallContext,
     ) -> McpResult<Vec<(String, KernelTool)>> {
-        // Snapshot binding + servers so we don't hold locks across awaits.
-        let binding = {
-            let guard = self.bindings.read().await;
-            guard.get(&context_id).cloned().unwrap_or_default()
-        };
+        // Use the lazy-loading accessor, not the in-memory map directly —
+        // `binding()` hydrates from the kernel DB on cache miss. Reading
+        // `self.bindings` here bypassed that hydration, so the FIRST
+        // dispatch in a fresh process saw an empty binding (deny-all) and
+        // queried zero servers, until some other caller's `binding()` call
+        // populated the cache. Self-healing, but a latent surprise.
+        let binding = self.binding(&context_id).await.unwrap_or_default();
         // Candidate servers span every instance referenced by a grant —
         // instance-wide *or* tool-granular — so a context that was granted a
         // single `instance:tool` still has that instance's server queried.
