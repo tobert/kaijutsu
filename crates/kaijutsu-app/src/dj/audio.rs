@@ -485,6 +485,7 @@ mod tests {
             payload: CuePayload::Inline(bytes.clone()),
             lead: Duration::from_millis(500),
             epoch_ns: 0, // unstamped: lead honored at face value
+            onset_beat: None,
         };
         dispatch_render_cue(&cue, now, 0, false, None, Some(&scheduler), &prefetch);
 
@@ -525,6 +526,7 @@ mod tests {
             payload: CuePayload::Inline(bytes),
             lead: Duration::from_millis(50),
             epoch_ns: stale_epoch_ns,
+            onset_beat: None,
         };
         dispatch_render_cue(&cue, Instant::now(), epoch, false, None, Some(&scheduler), &prefetch);
         assert!(rx.try_recv().is_err(), "a too-stale cue must not reach the scheduler");
@@ -542,6 +544,7 @@ mod tests {
             payload: CuePayload::Cas(ContentHash::from_str("00000000000000000000000000000000").unwrap()),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         };
         dispatch_render_cue(&cue, Instant::now(), 0, false, None, Some(&scheduler), &prefetch);
         assert!(rx.try_recv().is_err());
@@ -691,6 +694,7 @@ mod tests {
             payload: CuePayload::Cas(ContentHash::from_data(b"warm-me")),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         };
         dispatch_render_cue(&cue, Instant::now(), 0, false, None, Some(&scheduler), &prefetch);
         assert!(rx.try_recv().is_err(), "nothing ever reaches the scheduler for a prepare cue");
@@ -834,6 +838,7 @@ mod tests {
             payload: CuePayload::Inline(json.into_bytes()),
             lead: Duration::from_millis(50),
             epoch_ns: stale_epoch_ns,
+            onset_beat: None,
         };
         dispatch_render_cue(&cue, Instant::now(), epoch, false, None, Some(&scheduler), &prefetch);
         assert!(rx.try_recv().is_err());

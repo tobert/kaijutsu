@@ -81,7 +81,7 @@ pub trait RenderSink: Send {
 /// stray `tracing::debug!(?flow)` deriving down to this type would otherwise
 /// dump the whole buffer as an int array into a log line. We print the byte
 /// *count* instead (gemini-pro review, 2026-07-01).
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RenderCue {
     /// MIME of `payload` — the sink's dispatch key. e.g. `audio/wav`,
     /// `audio/midi`, `text/vnd.abc`, `application/vnd.kaijutsu.clip+json`.
@@ -104,6 +104,15 @@ pub struct RenderCue {
     /// deserializes (additive schema evolution; wire-only, no CBOR at rest).
     #[serde(default)]
     pub epoch_ns: u64,
+    /// The beat coordinate this cue is placed at — 1 tick == 1 beat, the
+    /// committed cell's own `Tick` (phase-align Slice 2, `docs/midi.md` "The
+    /// DJ thread"). `None` for directive cues with no track/beat association
+    /// (transport flush, `kj play`'s play-now, the `PREPARE_MIME` cache-warm
+    /// directive) — those always dispatch immediately regardless of a sink's
+    /// clock mode. `#[serde(default)]` for the same additive-evolution reason
+    /// as `epoch_ns` above.
+    #[serde(default)]
+    pub onset_beat: Option<f64>,
 }
 
 /// The two forms a cue's content takes on the wire: small content inline, or a
@@ -123,6 +132,7 @@ impl std::fmt::Debug for RenderCue {
             .field("mime", &self.mime)
             .field("lead", &self.lead)
             .field("epoch_ns", &self.epoch_ns)
+            .field("onset_beat", &self.onset_beat)
             .field("payload", &self.payload)
             .finish()
     }
@@ -149,6 +159,7 @@ impl RenderCue {
             payload: CuePayload::Inline(bytes),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         }
     }
 }
@@ -281,6 +292,7 @@ mod tests {
             payload: CuePayload::Inline(vec![1, 2, 3, 4, 5]),
             lead: Duration::from_millis(250),
             epoch_ns: 0,
+            onset_beat: None,
         };
         let s = format!("{cue:?}");
         assert!(s.contains("[5 bytes]"), "debug shows the byte count: {s}");
@@ -293,6 +305,7 @@ mod tests {
             payload: CuePayload::Cas(ContentHash::from_data(b"x")),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         };
         let cs = format!("{cas:?}");
         assert!(cs.contains("Cas"), "cas debug names the variant: {cs}");
@@ -311,6 +324,7 @@ mod tests {
             payload: CuePayload::Inline(vec![1, 2, 3]),
             lead: Duration::from_millis(500),
             epoch_ns: 123_456_789,
+            onset_beat: Some(4.0),
         };
         let json = serde_json::to_string(&cue).expect("serialize RenderCue");
         let back: RenderCue = serde_json::from_str(&json).expect("deserialize RenderCue");
@@ -322,6 +336,7 @@ mod tests {
             payload: CuePayload::Cas(ContentHash::from_data(b"clip")),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         };
         let json = serde_json::to_string(&cas).expect("serialize cas cue");
         let back: RenderCue = serde_json::from_str(&json).expect("deserialize cas cue");
@@ -341,6 +356,7 @@ mod tests {
             payload: CuePayload::Inline(vec![1, 2, 3]),
             lead: Duration::from_millis(500),
             epoch_ns: 999,
+            onset_beat: None,
         };
         let mut value: serde_json::Value =
             serde_json::to_value(&cue).expect("serialize to Value");
@@ -380,6 +396,7 @@ mod tests {
             payload: CuePayload::Cas(ContentHash::from_data(b"sample")),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         })
         .expect("emit should succeed");
 

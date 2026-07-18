@@ -176,6 +176,9 @@ impl KjDispatcher {
             // fired at receipt) — there's no phrase-boundary transfer latency
             // to back-date against, unlike the track render seam's cues.
             epoch_ns: 0,
+            // No track/beat association — play-now always dispatches
+            // immediately regardless of a sink's clock mode.
+            onset_beat: None,
         };
         let receivers = self.kernel().block_flows().publish(BlockFlow::RenderCue {
             context_id,

@@ -940,6 +940,7 @@ mod tests {
                 payload: CuePayload::Inline(vec![]),
                 lead: Duration::ZERO,
                 epoch_ns: 0,
+                onset_beat: None,
             },
         }));
         app.update();

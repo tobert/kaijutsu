@@ -353,6 +353,14 @@ struct RenderCue {
   # transfer latency can't walk the render out of phase with the click
   # (`docs/midi.md`).
   epochNs @4 :UInt64;
+  # The beat coordinate this cue is placed at (1 tick == 1 beat — see
+  # publishBeatSync's own doc comment), stamped by the kernel for a
+  # track-committed cell (phase-align Slice 2). Unset for directive cues with
+  # no track/beat association (transport flush, kj play's play-now, the
+  # PREPARE_MIME cache-warm directive) — those always dispatch immediately
+  # regardless of a sink's clock mode.
+  onsetBeat @5 :Float64;
+  hasOnsetBeat @6 :Bool;  # True if onsetBeat is set (distinguishes 0.0 from unset)
 }
 
 # A low-rate beat reference for a sink's continuous local timebase (docs/midi.md

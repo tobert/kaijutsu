@@ -593,6 +593,9 @@ fn publish_prepare_cue(kernel: &Kernel, media: ContentHash) {
             payload: CuePayload::Cas(media),
             lead: Duration::ZERO,
             epoch_ns,
+            // No track/beat association — a prepare cue is a cache-warm
+            // directive, not a musical placement.
+            onset_beat: None,
         },
     });
 }

@@ -851,6 +851,9 @@ impl BeatScheduler {
             // Unstamped: a flush is dispatch-on-receipt by meaning (drop the
             // queue NOW), there is nothing to back-date against.
             epoch_ns: 0,
+            // No track/beat association — a flush always dispatches
+            // immediately regardless of a sink's clock mode.
+            onset_beat: None,
         };
         self.kernel
             .block_flows()
@@ -1804,12 +1807,15 @@ impl BeatScheduler {
             return;
         };
         let cas = self.kernel.cas().clone();
-        // (mime, source bytes, fire instant) per crossed cell — mime-agnostic:
-        // the cell's own mime rides the cue and the sink dispatches on it. No
-        // UTF-8 gate here anymore (that was the ABC-only generation): the wire
-        // payload is bytes, and a text-consuming sink (midi.rs) does its own
-        // from_utf8 with a loud warn.
-        let mut rendered: Vec<(String, Vec<u8>, Instant)> = Vec::with_capacity(crossed.len());
+        // (mime, source bytes, fire instant, onset tick) per crossed cell —
+        // mime-agnostic: the cell's own mime rides the cue and the sink
+        // dispatches on it. No UTF-8 gate here anymore (that was the
+        // ABC-only generation): the wire payload is bytes, and a
+        // text-consuming sink (midi.rs) does its own from_utf8 with a loud
+        // warn. `start` (the cell's committed Tick) rides through to stamp
+        // `onset_beat` below — 1 tick == 1 beat, see `publish_beat_sync`'s
+        // doc comment.
+        let mut rendered: Vec<(String, Vec<u8>, Instant, Tick)> = Vec::with_capacity(crossed.len());
         for (cref, start) in crossed {
             let bytes = match cas.retrieve(&cref.hash) {
                 Ok(Some(b)) => b,
@@ -1832,7 +1838,7 @@ impl BeatScheduler {
                     continue;
                 }
             };
-            rendered.push((cref.mime, bytes, render_instant(base, period, start, playhead)));
+            rendered.push((cref.mime, bytes, render_instant(base, period, start, playhead), start));
         }
         if rendered.is_empty() {
             return;
@@ -1852,13 +1858,14 @@ impl BeatScheduler {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        for (mime, bytes, at) in rendered {
+        for (mime, bytes, at, start) in rendered {
             let lead = at.saturating_duration_since(now);
             let cue = kaijutsu_audio::RenderCue {
                 mime,
                 payload: kaijutsu_audio::CuePayload::Inline(bytes),
                 lead,
                 epoch_ns: now_epoch_ns,
+                onset_beat: Some(start.get() as f64),
             };
             self.kernel
                 .block_flows()
@@ -3355,6 +3362,11 @@ mod tests {
                 assert_eq!(context_id, score, "cue is keyed by the track's score context");
                 assert_eq!(cue.mime, kaijutsu_audio::ABC_MIME, "ABC cue mime");
                 assert!(cue.epoch_ns > 0, "a render cue is stamped with its emission wallclock");
+                assert_eq!(
+                    cue.onset_beat,
+                    Some(1.0),
+                    "onset_beat matches the committed cell's Tick (1 tick == 1 beat)"
+                );
                 match cue.payload {
                     kaijutsu_audio::CuePayload::Inline(bytes) => {
                         assert_eq!(bytes, abc.as_bytes(), "the resolved ABC rides inline");
@@ -3448,6 +3460,11 @@ mod tests {
                 assert_eq!(context_id, score, "cue is keyed by the track's score context");
                 assert_eq!(cue.mime, kaijutsu_audio::CLIP_MIME, "clip cue mime");
                 assert!(cue.epoch_ns > 0, "a render cue is stamped with its emission wallclock");
+                assert_eq!(
+                    cue.onset_beat,
+                    Some(1.0),
+                    "onset_beat matches the committed cell's Tick (1 tick == 1 beat)"
+                );
                 match cue.payload {
                     kaijutsu_audio::CuePayload::Inline(bytes) => {
                         assert_eq!(

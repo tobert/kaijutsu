@@ -876,6 +876,7 @@ mod tests {
             payload: CuePayload::Cas(kaijutsu_cas::ContentHash::from_data(b"a-score")),
             lead: Duration::ZERO,
             epoch_ns: 0,
+            onset_beat: None,
         };
         dispatch_midi_cue(&cue, 0, &mut sink);
         assert!(sink.scheduled.is_none());
@@ -893,6 +894,7 @@ mod tests {
             payload: CuePayload::Inline(CDEF.as_bytes().to_vec()),
             lead: Duration::from_millis(50),
             epoch_ns: stale_epoch_ns,
+            onset_beat: None,
         };
         dispatch_midi_cue(&cue, now_epoch_ns, &mut sink);
         assert!(sink.scheduled.is_none(), "a too-stale cue must not schedule");
