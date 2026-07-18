@@ -190,10 +190,13 @@ impl ShellCompletion {
                 // the source — see shell_execute). Empty string when unset.
                 let stdout = snapshot.content.clone();
                 let stderr = snapshot.stderr.clone().unwrap_or_default();
-                let data = snapshot
-                    .output
-                    .as_ref()
-                    .and_then(|o| serde_json::to_value(o).ok());
+                // `to_json()` is OutputData's semantic form — rich_json
+                // verbatim when the producer set one (e.g. `kj` structured
+                // payloads), else inferred from the node tree. The raw
+                // `serde_json::to_value(o)` struct shape (`{headers,root,
+                // rich_json}`) is an internal wire representation, not what
+                // agents want to consume.
+                let data = snapshot.output.as_ref().map(|o| o.to_json());
                 serde_json::json!({
                     "stdout": stdout,
                     "stderr": stderr,
@@ -2404,6 +2407,33 @@ mod tests {
         assert_eq!(json["ephemeral"], false);
         assert!(json["data"].is_null(), "no OutputData → data must be null");
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    /// `to_json()` must use `OutputData::to_json()`'s semantic form — a kj
+    /// structured payload (`rich_json`) rendered verbatim as its own array/
+    /// object — not the raw `{headers, root, rich_json}` wire struct that
+    /// `serde_json::to_value(&OutputData)` would produce. This is the wiring
+    /// this fix restores: `kj` commands populate `rich_json`, but before it
+    /// the MCP `shell` tool returned `data: null` for every kj command
+    /// because kj's payload never rode `.output` in the first place.
+    #[test]
+    fn test_shell_completion_done_rich_json_data_is_verbatim_array() {
+        let mut snap = make_result_snapshot("bass\nbassline\n", Some(0));
+        snap.output = Some(
+            kaijutsu_types::OutputData::new()
+                .with_rich_json(serde_json::json!(["bass", "bassline"])),
+        );
+        let completion = ShellCompletion::Done {
+            snapshot: snap,
+            elapsed_ms: 7,
+        };
+        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+
+        assert_eq!(
+            json["data"],
+            serde_json::json!(["bass", "bassline"]),
+            "data must be the rich_json array itself, not the {{headers,root,rich_json}} struct"
+        );
     }
 
     #[test]

@@ -2499,6 +2499,18 @@ pub(crate) fn parse_output_data(
     if let Some(headers) = headers {
         data = data.with_headers(headers);
     }
+    // richJson is "empty string = none" on the wire (see kaijutsu.capnp).
+    // Malformed JSON is a render-hint problem, not a snapshot-parse problem —
+    // warn and leave rich_json unset rather than failing the whole parse.
+    let rich_json_text = reader.get_rich_json()?.to_str()?;
+    if !rich_json_text.is_empty() {
+        match serde_json::from_str::<serde_json::Value>(rich_json_text) {
+            Ok(v) => data = data.with_rich_json(v),
+            Err(e) => {
+                log::warn!("parse_output_data: rich_json did not parse as JSON: {e}")
+            }
+        }
+    }
     Ok(data)
 }
 
@@ -3387,6 +3399,51 @@ mod tests {
             read_shell_value(reader).unwrap(),
             ShellValue::String("/v/cas/deadbeef".into())
         );
+    }
+
+    /// `OutputData::rich_json` — the kj / builtin structured-payload channel
+    /// wired through in the OutputData capnp round-trip fix — must survive
+    /// build → wire → `parse_output_data` intact. Manually sets the fields
+    /// `build_output_data` (kaijutsu-server/src/rpc.rs, private to that
+    /// crate) would set, then decodes through the real production
+    /// `parse_output_data`, mirroring `roundtrip_snapshot` below.
+    #[test]
+    fn parse_output_data_rich_json_round_trip() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::output_data::Builder>();
+        let rich = serde_json::json!(["a", "b"]);
+        builder.set_rich_json(serde_json::to_string(&rich).unwrap().as_str());
+        // root left empty — a rich_json-only payload (kj's shape).
+        builder.reborrow().init_root(0);
+
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::output_data::Reader>()
+            .unwrap();
+        let data = parse_output_data(reader).expect("parse_output_data");
+
+        assert_eq!(
+            data.rich_json,
+            Some(rich),
+            "rich_json must survive the capnp round trip intact"
+        );
+        assert!(data.root.is_empty(), "root was never set on the wire");
+    }
+
+    /// The "empty string = none" wire convention (kaijutsu.capnp comment on
+    /// `richJson`): a message that never touched `richJson` must decode to
+    /// `rich_json: None`, not `Some("")`.
+    #[test]
+    fn parse_output_data_no_rich_json_stays_none() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::output_data::Builder>();
+        builder.reborrow().init_root(0);
+
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::output_data::Reader>()
+            .unwrap();
+        let data = parse_output_data(reader).expect("parse_output_data");
+
+        assert_eq!(data.rich_json, None);
     }
 
     /// Helper: build a BlockSnapshot capnp message, set fields, then parse it back

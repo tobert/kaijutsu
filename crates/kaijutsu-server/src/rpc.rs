@@ -6784,6 +6784,135 @@ fn build_output_data(
             build_output_node(root.reborrow().get(i as u32), node);
         }
     }
+    if let Some(ref rich) = data.rich_json {
+        match serde_json::to_string(rich) {
+            Ok(s) => builder.set_rich_json(s.as_str()),
+            // Display hint only — never fail the whole block build over a
+            // JSON encode error (should be unreachable for serde_json::Value).
+            Err(e) => log::error!("build_output_data: rich_json serialize failed: {e}"),
+        }
+    }
+}
+
+/// The `OutputData` to persist on a shell result block.
+///
+/// Prefer the result's own `.output` (a builtin that set real OutputData),
+/// but kaish's output limiter runs `materialize()` on every result that
+/// passes through `spill_if_needed` — which unconditionally drops `.output`
+/// even when `.out` carries independent text (kaish-types
+/// `ExecResult::materialize`, `result.rs`). So for `kj`/most builtins the
+/// structured payload survives ONLY on the `.data` sideband. Bridge that
+/// into a rich_json `OutputData` so the structured value still reaches the
+/// block (→ app + MCP `data`). See `docs/issues.md`.
+fn block_output_data(
+    result: &kaish_kernel::interpreter::ExecResult,
+) -> Option<kaijutsu_types::OutputData> {
+    if let Some(od) = result.output() {
+        return Some(od.clone());
+    }
+    result.data.as_ref().map(|v| {
+        kaijutsu_types::OutputData::new()
+            .with_rich_json(kaish_kernel::interpreter::value_to_json(v))
+    })
+}
+
+#[cfg(test)]
+mod block_output_data_tests {
+    //! `block_output_data` is the `.data`→block bridge that replaces the
+    //! dead-end `.output` write kj_builtin used to attempt (see
+    //! `kj_output_channel_does_not_survive_the_kaish_output_limiter` in
+    //! kaijutsu-kernel and `docs/issues.md`): kaish's output limiter drops
+    //! `.output` before a result like this ever reaches the persistence
+    //! seam, so `.data` is the channel that actually carries a kj command's
+    //! structured payload out.
+    use super::block_output_data;
+    use kaish_kernel::ast::Value;
+    use kaish_kernel::interpreter::ExecResult;
+
+    #[test]
+    fn prefers_real_output_data_when_present() {
+        let od = kaijutsu_types::OutputData::new().with_rich_json(serde_json::json!("x"));
+        let result = ExecResult::with_output(od.clone());
+
+        let bridged = block_output_data(&result).expect("expected Some");
+        assert_eq!(
+            bridged.rich_json, od.rich_json,
+            "a builtin that set real .output must be used verbatim"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_data_sideband_as_rich_json() {
+        let data = Value::Json(serde_json::json!(["bass", "bassline"]));
+        let result = ExecResult::success_with_data("bass\nbassline", data);
+        assert!(
+            result.output().is_none(),
+            "test premise: no real .output, only .data"
+        );
+
+        let bridged = block_output_data(&result).expect("expected Some");
+        assert_eq!(
+            bridged.rich_json,
+            Some(serde_json::json!(["bass", "bassline"])),
+            "rich_json must equal the .data sideband, JSON-converted"
+        );
+    }
+
+    #[test]
+    fn neither_output_nor_data_yields_none() {
+        let result = ExecResult::success("plain text, no structure");
+        assert!(block_output_data(&result).is_none());
+    }
+}
+
+#[cfg(test)]
+mod build_output_data_tests {
+    //! Encode-side coverage for the OutputData→capnp `richJson` wiring: the
+    //! kj / builtin structured payload (`OutputData::rich_json`) must land on
+    //! the wire as JSON text, and stay unset (empty string, per the
+    //! kaijutsu.capnp "empty = none" convention) when absent. Decode-side
+    //! (`parse_output_data`) has the symmetric test in kaijutsu-client.
+    use super::build_output_data;
+    use capnp::message::Builder as MessageBuilder;
+
+    #[test]
+    fn rich_json_present_lands_on_wire_as_json_text() {
+        let data = kaijutsu_types::OutputData::new()
+            .with_rich_json(serde_json::json!(["bass", "bassline"]));
+
+        let mut message = MessageBuilder::new_default();
+        build_output_data(
+            message.init_root::<crate::kaijutsu_capnp::output_data::Builder>(),
+            &data,
+        );
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::output_data::Reader>()
+            .unwrap();
+
+        let wire_text = reader.get_rich_json().unwrap().to_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(wire_text).unwrap();
+        assert_eq!(parsed, serde_json::json!(["bass", "bassline"]));
+    }
+
+    #[test]
+    fn rich_json_absent_leaves_wire_field_empty() {
+        let data = kaijutsu_types::OutputData::new();
+
+        let mut message = MessageBuilder::new_default();
+        build_output_data(
+            message.init_root::<crate::kaijutsu_capnp::output_data::Builder>(),
+            &data,
+        );
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::output_data::Reader>()
+            .unwrap();
+
+        assert_eq!(
+            reader.get_rich_json().unwrap().to_str().unwrap(),
+            "",
+            "no rich_json → wire field must stay empty, never a stray value"
+        );
+    }
 }
 
 /// Fill a Cap'n Proto `BlockMetadata` builder from the typed metadata.
@@ -7194,11 +7323,11 @@ async fn execute_shell_command(
                     log::error!("Failed to set shell stderr: {}", e);
                 }
 
-                if let Some(output_data) = result.output()
+                if let Some(output_data) = block_output_data(&result)
                     && let Err(e) = documents_clone.set_output(
                         context_id,
                         &output_block_id_clone,
-                        Some(output_data),
+                        Some(&output_data),
                     )
                 {
                     log::error!("Failed to set output data: {}", e);

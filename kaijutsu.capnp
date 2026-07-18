@@ -729,6 +729,7 @@ struct OutputData {
   headers @0 :List(Text);
   hasHeaders @1 :Bool;       # None vs Some([]) distinction
   root @2 :List(OutputNode);
+  richJson @3 :Text;   # kj / builtin structured payload (JSON-encoded); empty = none. See OutputData::rich_json.
 }
 
 # ============================================================================

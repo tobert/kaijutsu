@@ -657,6 +657,19 @@ impl Tool for KjBuiltin {
                 // `for x in $(kj …)` iterates JSON arrays and `kaish-last`
                 // can read JSON objects. See `KjResult::Ok::data` for the
                 // shape conventions.
+                //
+                // This is the ONLY channel kj populates: the `.output`
+                // channel (OutputData::rich_json) looked like the right home
+                // for block persistence, but kaish's output limiter runs
+                // `ExecResult::materialize()` on every result that passes
+                // through `spill_if_needed` (kaish-types result.rs), which
+                // unconditionally drops `.output` even when `.out` already
+                // carries independent text (as it always does here, via
+                // `message`). So `.output` never survives to the caller —
+                // `.data` is the only channel that does. The server bridges
+                // `.data` into the block's OutputData at the persistence seam
+                // instead (`block_output_data` in kaijutsu-server/src/rpc.rs).
+                // See docs/issues.md.
                 if let Some(json) = data {
                     result.data = Some(kaish_kernel::interpreter::json_to_value(json));
                 }
@@ -1649,6 +1662,60 @@ mod tests {
             Some(Value::Int(0)),
             "expected scalar Int(0) in .data, got {:?}",
             res.data,
+        );
+    }
+
+    /// Regression pin for a real gotcha: it's tempting to also set `.output`
+    /// (OutputData::rich_json) here so structured `kj` payloads persist to
+    /// the block directly. That does NOT work — kaish's output limiter runs
+    /// `ExecResult::materialize()` on every result passing through
+    /// `spill_if_needed` (kaish-types `result.rs`), which unconditionally
+    /// clears `.output` even when `.out` already carries independent text
+    /// (which it always does here, via `message`). By the time
+    /// `execute_with_options` returns, `.output` is back to `None` — `.data`
+    /// is the only channel that survives the trip. Block persistence bridges
+    /// `.data` → OutputData at the server seam instead (`block_output_data`
+    /// in `kaijutsu-server/src/rpc.rs`). See `docs/issues.md`.
+    #[tokio::test]
+    async fn kj_output_channel_does_not_survive_the_kaish_output_limiter() {
+        use kaish_kernel::ast::Value;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = {
+            let c = register_context(&dispatcher, Some("solo"), None, principal);
+            dispatcher
+                .block_store()
+                .create_document(c, kaijutsu_types::DocKind::Conversation, None)
+                .expect("create_document");
+            c
+        };
+
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let res = kaish
+            .execute_with_options("kj block count", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "kj block count exit != 0: {res:?}");
+
+        // `.data` channel — the kaish $() sideband — this is the one that survives.
+        assert_eq!(
+            res.data,
+            Some(Value::Int(0)),
+            "expected scalar Int(0) in .data, got {:?}",
+            res.data,
+        );
+
+        // `.output()` — pinned `None`. If this starts failing, kaish's
+        // materialize()/spill_if_needed contract changed upstream and the
+        // `.data`→block bridge in kaijutsu-server may be revisitable.
+        assert!(
+            res.output().is_none(),
+            "expected .output() to be None (dropped by kaish's output limiter), got {:?}",
+            res.output(),
         );
     }
 

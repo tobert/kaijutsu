@@ -2441,6 +2441,42 @@ kernel process env into exec-granted shells.
 
 ---
 
+## `ExecResult.output` can't carry structured data past kaish's output limiter (found 2026-07-18, rich_json wire-through)
+
+`kaish-types::ExecResult::materialize()` (`result.rs`, invoked from
+`spill_if_needed` whenever `ctx.output_limit.is_enabled()` — true for every
+`EmbeddedKaish`, which always runs `OutputLimitConfig::agent()`)
+unconditionally clears `.output` at the end of the function, even when `.out`
+already carries independent text and `materialize()` therefore never actually
+consumed `.output` to build it. So `.output` cannot be used as an independent
+structured side-channel alongside a human-readable `.out` message — any
+builtin that sets both (as `kj` commands do: `message` for `.out`, `data` for
+structured payloads) has `.output` silently dropped before
+`execute_with_options` returns to the caller. Confirmed live: setting
+`.output` in `kj_builtin.rs`'s `KjResult::Ok` arm produced `ExecResult
+{ output: None, .. }` by the time kaish-kernel's `EmbeddedKaish` handed the
+result back (regression-pinned by
+`kj_output_channel_does_not_survive_the_kaish_output_limiter` in
+`crates/kaijutsu-kernel/src/runtime/kj_builtin.rs`).
+
+**Current workaround (shipped):** `kj` keeps writing only `.data` (the kaish
+`$()`/for-loop sideband, which does survive materialize/spill_if_needed
+intact). `crates/kaijutsu-server/src/rpc.rs`'s `block_output_data` bridges
+`.data` → a rich_json-only `OutputData` at the block-persistence seam in
+`execute_shell_command`, so the structured payload still reaches the block
+(→ MCP `shell` tool `data`, → the app's `block.output`) even though `.output`
+itself never carries it through the shell layer.
+
+**Cleaner fix (not done):** only clear `.output` in `materialize()` when it
+was actually consumed to populate `.out` (i.e. move `self.output = None;`
+inside the `if .out.is_empty()` branch, or add a distinct "detach" method for
+`spill_if_needed`'s disk-spill call site). Lives in the sibling `~/src/kaish`
+project (published as `kaish-kernel`/`kaish-types` 0.12.0), needs a version
+bump + `Cargo.lock` update in kaijutsu — worth doing if more callers want an
+`.output`-native structured channel independent of `.out`.
+
+---
+
 ## Context time awareness — per-type date/time injection (found 2026-07-03; slice 1 SHIPPED 2026-07-04)
 
 In-app contexts had no wall-clock source, so models hallucinated dates in

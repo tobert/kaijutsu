@@ -253,6 +253,17 @@ pub fn build_output_span_brushes(
 /// For tabular/tree/list data, returns a `RichContent::Output` with
 /// pre-computed layout for per-cell coloring.
 pub fn detect_output_content(output: &OutputData, _version: u64) -> Option<RichContent> {
+    // A rich_json-only payload (kj's structured `.output` sideband, wired
+    // through OutputData::rich_json) has an empty node tree — there is
+    // nothing here for the tree/table renderer to lay out. Rendering
+    // rich_json itself is a deliberate follow-up; for now this must fall
+    // through to the plain-text path deterministically rather than rely on
+    // the empty-plain-text check below (which happens to cover it, but
+    // doesn't say so).
+    if output.root.is_empty() {
+        return None;
+    }
+
     // Simple text gets no rich treatment
     if output.as_text().is_some() {
         return None;
@@ -472,6 +483,31 @@ pub fn detect_rich_content_typed(
     Some(RichContent {
         kind: RichContentKind::Markdown { spans, plain_text },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rich_json-only `OutputData` (kj's structured `.output` sideband —
+    /// see `KjBuiltin::execute`) has an empty `root`: there is no node tree
+    /// for the table/tree renderer to lay out. `detect_output_content` must
+    /// return `None` deterministically so the block falls through to the
+    /// plain-text path — rendering rich_json itself is a follow-up, not
+    /// this fix. Without the explicit `root.is_empty()` guard this
+    /// happened to work anyway (the empty-plain-text check below covers
+    /// it), but this test pins the behavior on purpose rather than by
+    /// accident.
+    #[test]
+    fn rich_json_only_output_falls_back_to_text_path() {
+        let output = OutputData::new().with_rich_json(serde_json::json!(["x"]));
+        assert!(output.root.is_empty(), "test premise: no node tree");
+
+        assert!(
+            detect_output_content(&output, 0).is_none(),
+            "rich_json-only OutputData must yield the text path (None), not a blank structured view"
+        );
+    }
 }
 
 // abc_summary() removed — ABC parse errors are now handled as structured
