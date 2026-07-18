@@ -385,7 +385,15 @@ stays exercised by real use instead of rotting untested:
   `Touch`-aged references (the free-running deadband doctrine); a cue
   without a beat stamp falls through to the wallclock ladder per-cue.
 - **Back to Wallclock** on: reference age past `REF_STALE_MAX`, transport
-  flush, or connection loss (the existing halt triggers).
+  flush, connection loss (the existing halt triggers), or the **free-run
+  cap** (`MAX_FREE_RUN`, ~10 s since the last actual *Fold*): sustained
+  `Touch` — every reference late enough to prove liveness but never correct
+  phase — must not keep an uncorrected, drifting phasor trusted forever
+  (2026-07-18 gemini-pro deliberation). Two mechanical notes from the same
+  round: the DJ's sleep is bounded by `next_stale_deadline()` so these
+  fallbacks fire *on time*, not at the next click; and the click timer wakes
+  as a beat **enters** the horizon (`beat − horizon`), not at the beat —
+  waking at the beat would schedule clicks with zero ALSA lead.
 
 Every transition emits telemetry (`kaijutsu.dj.clock_transition`, attrs
 `to` + `reason`: fold / stale / flush / disconnect) — the transition rate and

@@ -35,6 +35,19 @@ use std::time::{Duration, Instant};
 
 use kaijutsu_audio::{BeatRef, LocalBeat, REF_STALE_MAX, RefDisposition, Slew};
 
+/// How long BeatGrid may free-run on liveness alone — `Touch`-aged references
+/// proving the master is alive without ever correcting phase — before the DJ
+/// stops trusting the phasor (2026-07-18 gemini-pro deliberation, finding 2).
+/// Sustained Touch means every reference is 1–5 s late (persistent pipe
+/// backpressure): the liveness clock stays fresh forever while the phasor
+/// free-runs on its last feedforward tempo, drifting from kernel truth at
+/// crystal-offset rates (~ppm — roughly a millisecond per ten seconds at the
+/// bad end). 10 s caps that drift around the just-audible threshold; the
+/// deadband doctrine ("the local clock is the truth between references")
+/// spans reference *gaps*, not an unbounded correction embargo. Tune from
+/// the `kaijutsu.dj.clock_transition{reason="free_run_cap"}` rate, not vibes.
+pub const MAX_FREE_RUN: Duration = Duration::from_secs(10);
+
 /// Which timebase the DJ currently places cues/clicks against
 /// (`docs/midi.md` "The clock is modal, and transitions are first-class").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +100,12 @@ pub enum TransitionReason {
     /// network) — mirrors `Metronome::halt_on_connection_loss`: the kernel
     /// is gone and can send no flush, so this is a separate trigger.
     Disconnect,
+    /// BeatGrid → Wallclock: liveness stayed fresh but no `Fold` corrected
+    /// the phasor for [`MAX_FREE_RUN`] — sustained `Touch` under persistent
+    /// pipe backpressure would otherwise keep an uncorrected, drifting
+    /// phasor trusted forever (see `MAX_FREE_RUN`'s doc). Caught at the same
+    /// proactive click-check site as `Stale`.
+    FreeRunCap,
 }
 
 impl TransitionReason {
@@ -97,6 +116,7 @@ impl TransitionReason {
             TransitionReason::Stale => "stale",
             TransitionReason::Flush => "flush",
             TransitionReason::Disconnect => "disconnect",
+            TransitionReason::FreeRunCap => "free_run_cap",
         }
     }
 }
@@ -187,6 +207,12 @@ pub struct DjCore {
     /// `None` before the first reference ever anchors the phasor, and reset
     /// to `None` on every exit back to Wallclock.
     last_ref_at: Option<Instant>,
+    /// Instant of the last `Fold` — the last time the phasor was actually
+    /// *corrected*, as opposed to merely proven alive (`last_ref_at`). The
+    /// gap between the two is exactly the sustained-Touch failure mode
+    /// [`MAX_FREE_RUN`] bounds: liveness fresh, correction ancient. Same
+    /// lifecycle as `last_ref_at` (set on Fold, cleared on every exit).
+    last_fold_at: Option<Instant>,
     /// Click sound + gate. `pub` like `Metronome::config` — applied from the
     /// outside (an RPC-fetched `metronome.toml`), not derived here.
     pub metronome: MetronomeConfig,
@@ -199,6 +225,7 @@ impl Default for DjCore {
             beat: None,
             next_beat: None,
             last_ref_at: None,
+            last_fold_at: None,
             metronome: MetronomeConfig::default(),
         }
     }
@@ -237,6 +264,7 @@ impl DjCore {
         self.beat = None;
         self.next_beat = None;
         self.last_ref_at = None;
+        self.last_fold_at = None;
     }
 
     /// Enter `BeatGrid` if not already there; report a transition only on
@@ -292,6 +320,7 @@ impl DjCore {
         match beat_ref.disposition(now, now_epoch_ns) {
             RefDisposition::Fold(at) => {
                 self.last_ref_at = Some(now);
+                self.last_fold_at = Some(now);
                 let slew = self.fold(beat_ref, at);
                 let transition = self.enter_beat_grid(TransitionReason::Fold);
                 BeatObservation { slew, transition }
@@ -336,14 +365,44 @@ impl DjCore {
     /// `Metronome::schedule_due`.
     pub fn due_clicks(&mut self, now: Instant, horizon: Duration) -> DueClicks {
         if self.mode == ClockMode::BeatGrid {
+            // Stale first (total silence — the tighter signal), then the
+            // free-run cap (alive but never corrected, `MAX_FREE_RUN`'s
+            // sustained-Touch failure mode). Both are proactive: neither
+            // condition ever *arrives* as an event.
             if let Some(last) = self.last_ref_at {
                 if now.saturating_duration_since(last) > REF_STALE_MAX {
                     let transition = self.exit_beat_grid(TransitionReason::Stale);
                     return DueClicks { offsets: Vec::new(), transition };
                 }
             }
+            if let Some(folded) = self.last_fold_at {
+                if now.saturating_duration_since(folded) > MAX_FREE_RUN {
+                    let transition = self.exit_beat_grid(TransitionReason::FreeRunCap);
+                    return DueClicks { offsets: Vec::new(), transition };
+                }
+            }
         }
         DueClicks { offsets: self.schedule_due(now, horizon), transition: None }
+    }
+
+    /// The instant at which BeatGrid would fall back to Wallclock if no
+    /// further reference arrived — `min(last_ref_at + REF_STALE_MAX,
+    /// last_fold_at + MAX_FREE_RUN)`; `None` while not in BeatGrid (nothing
+    /// to fall back from). The thread bounds its `select!` sleep by this
+    /// (2026-07-18 deliberation, finding 5: with the staleness check living
+    /// inside `due_clicks`, a slow tempo would otherwise leave the mode
+    /// machine on a dead grid — placing cues against it, stamping telemetry
+    /// late — until the next click happened to wake the loop).
+    pub fn next_stale_deadline(&self) -> Option<Instant> {
+        if self.mode != ClockMode::BeatGrid {
+            return None;
+        }
+        let stale = self.last_ref_at.map(|t| t + REF_STALE_MAX);
+        let capped = self.last_fold_at.map(|t| t + MAX_FREE_RUN);
+        match (stale, capped) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Return the offsets-from-`now` at which to schedule a click for every
@@ -387,14 +446,22 @@ impl DjCore {
         offsets
     }
 
-    /// When the DJ thread's click timer should next wake — the instant of
-    /// the next not-yet-scheduled beat, or `None` while no phasor is running
-    /// (nothing to wake for; the thread's `select!` then waits only on its
-    /// other arms). Distinct from `due_clicks`'s horizon-bounded offsets:
-    /// this is the raw next-beat instant, unclamped, for the thread to sleep
-    /// against directly (`rx.recv_timeout`-as-sleep, the same idiom
-    /// `audio_sched.rs::run` already uses).
-    pub fn next_wake(&self, now: Instant) -> Option<Instant> {
+    /// When the DJ thread's click timer should next wake — the instant the
+    /// next not-yet-scheduled beat ENTERS the pre-schedule horizon
+    /// (`beat_instant − horizon`, clamped to `now`), or `None` while no
+    /// phasor is running (nothing to wake for; the thread's `select!` then
+    /// waits only on its other arms).
+    ///
+    /// The horizon lead is the point (2026-07-18 deliberation, finding 3 +
+    /// lead's confirmation): waking AT the beat would hand `due_clicks` an
+    /// offset of ~zero, scheduling the click into ALSA with no lead at all —
+    /// exactly the dispatch-jitter exposure pre-scheduling exists to remove
+    /// (`SCHEDULE_HORIZON`'s doc: "a beat is always queued *before* it
+    /// sounds"). The old metronome got its lead for free by running every
+    /// frame; a sleeping thread has to aim ahead deliberately. Waking as the
+    /// beat crosses into the horizon hands `due_clicks` an offset of
+    /// ~`horizon`, restoring the old path's full lead.
+    pub fn next_wake(&self, now: Instant, horizon: Duration) -> Option<Instant> {
         let beat = self.beat.as_ref()?;
         let tempo = beat.tempo_bps();
         if tempo <= 0.0 {
@@ -402,7 +469,7 @@ impl DjCore {
         }
         let cur = beat.position(now);
         let next = self.next_beat.map(|n| n as f64).unwrap_or_else(|| cur.floor() + 1.0);
-        let secs = ((next - cur) / tempo).max(0.0);
+        let secs = ((next - cur) / tempo - horizon.as_secs_f64()).max(0.0);
         Some(now + Duration::from_secs_f64(secs))
     }
 }
@@ -758,22 +825,40 @@ mod tests {
     #[test]
     fn next_wake_is_none_without_a_phasor() {
         let dj = DjCore::default();
-        assert_eq!(dj.next_wake(Instant::now()), None);
+        assert_eq!(dj.next_wake(Instant::now(), H), None);
     }
 
+    /// The horizon lead (2026-07-18 deliberation finding 3): waking AT the
+    /// beat would schedule the click with ~zero ALSA lead — the wake must
+    /// come as the beat ENTERS the horizon so `due_clicks` hands the sink a
+    /// full-lead offset.
     #[test]
-    fn next_wake_lands_within_one_beat_period() {
+    fn next_wake_leads_the_next_beat_by_the_horizon() {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // 120 BPM: 0.5s/beat
-        let wake = dj.next_wake(t0).expect("phasor is running");
-        assert!(wake > t0, "wakes strictly in the future");
-        assert!(
-            wake <= t0 + Duration::from_millis(501),
-            "the next beat is at most one period away, got {:?} after t0",
-            wake.duration_since(t0)
-        );
-        assert!(near(wake.duration_since(t0), 500.0), "wakes at the next whole beat (t0+500ms)");
+        let wake = dj.next_wake(t0, H).expect("phasor is running");
+        // Beat 1 sounds at t0+500ms; the wake aims at t0+500ms−250ms.
+        assert!(near(wake.duration_since(t0), 250.0), "wakes as beat 1 enters the horizon");
+        // And the offset a due-click check AT that wake would hand the sink
+        // is the full horizon — the lead pre-scheduling exists to provide.
+        let due = dj.due_clicks(wake, H);
+        assert_eq!(due.offsets.len(), 1);
+        assert!(near(due.offsets[0], 250.0), "the click is scheduled a full horizon ahead");
+    }
+
+    /// An overdue target clamps to `now` (never a past instant for
+    /// `sleep_until` to spin on) — and the overdue-collapse policy then owns
+    /// "now" at the next click-check.
+    #[test]
+    fn next_wake_clamps_an_overdue_beat_to_now() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        // Well past beat 1 with nothing ever scheduled.
+        let t1 = t0 + Duration::from_millis(900);
+        let wake = dj.next_wake(t1, H).expect("still running");
+        assert_eq!(wake, t1, "an already-due beat wakes immediately, never in the past");
     }
 
     #[test]
@@ -783,10 +868,76 @@ mod tests {
         dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
         dj.due_clicks(t0 + Duration::from_millis(300), H); // schedules beat 1
 
-        // After the point beat 1 has fired, the next wake should target beat 2.
+        // After the point beat 1 has fired, the next wake should target beat
+        // 2's horizon entry: beat 2 sounds at t0+1s, wake at t0+750ms.
         let t1 = t0 + Duration::from_millis(600);
-        let wake = dj.next_wake(t1).expect("still running");
-        assert!(near(wake.duration_since(t0), 1000.0), "targets beat 2 at t0+1s, got {:?}", wake);
+        let wake = dj.next_wake(t1, H).expect("still running");
+        assert!(near(wake.duration_since(t0), 750.0), "targets beat 2's horizon entry, got {:?}", wake);
+    }
+
+    // ── The free-run cap + the stale deadline (deliberation findings 2+5) ──
+
+    /// Sustained `Touch` keeps liveness fresh forever while the phasor never
+    /// corrects — without the cap, BeatGrid would trust an uncorrected,
+    /// drifting phasor indefinitely (`MAX_FREE_RUN`'s doc).
+    #[test]
+    fn sustained_touch_past_the_free_run_cap_falls_back_even_with_fresh_liveness() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // anchoring Fold
+        assert_eq!(dj.mode(), ClockMode::BeatGrid);
+
+        // Touch-aged refs (2s stale by their own stamp) arriving at t0+6s and
+        // t0+9s: liveness stays fresh, the phasor is never corrected again.
+        let base: u64 = 100_000_000_000;
+        for at_secs in [6u64, 9] {
+            let obs = dj.observe_beat_sync(
+                BeatRef { beat: 0.0, tempo_bps: 2.0, epoch_ns: base },
+                t0 + Duration::from_secs(at_secs),
+                base + 2_000_000_000, // ref is 2s old → Touch
+            );
+            assert_eq!(obs.transition, None, "Touch holds BeatGrid");
+        }
+        assert_eq!(dj.mode(), ClockMode::BeatGrid);
+
+        // A click-check at t0+10.5s: liveness is 1.5s fresh (well within
+        // REF_STALE_MAX) but the last FOLD is 10.5s old — past MAX_FREE_RUN.
+        let due = dj.due_clicks(t0 + Duration::from_millis(10_500), H);
+        assert_eq!(dj.mode(), ClockMode::Wallclock);
+        assert_eq!(
+            due.transition,
+            Some(ClockTransition {
+                to: ClockMode::Wallclock,
+                reason: TransitionReason::FreeRunCap
+            }),
+            "fresh liveness must not outlive an uncorrected phasor"
+        );
+        assert!(due.offsets.is_empty(), "no clicks from a phasor just declared untrusted");
+    }
+
+    #[test]
+    fn next_stale_deadline_is_none_in_wallclock_and_the_binding_ladder_in_beat_grid() {
+        let mut dj = DjCore::default();
+        assert_eq!(dj.next_stale_deadline(), None, "nothing to fall back from in Wallclock");
+
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        // Freshly anchored: stale (t0+5s) binds before the cap (t0+10s).
+        assert_eq!(dj.next_stale_deadline(), Some(t0 + REF_STALE_MAX));
+
+        // A Touch at t0+7s pushes the stale deadline to t0+12s — now the
+        // free-run cap (t0+10s) is the binding rung.
+        let base: u64 = 100_000_000_000;
+        dj.observe_beat_sync(
+            BeatRef { beat: 0.0, tempo_bps: 2.0, epoch_ns: base },
+            t0 + Duration::from_secs(7),
+            base + 2_000_000_000,
+        );
+        assert_eq!(
+            dj.next_stale_deadline(),
+            Some(t0 + MAX_FREE_RUN),
+            "sustained Touch hands the deadline to the free-run cap"
+        );
     }
 
     #[test]

@@ -118,6 +118,14 @@ pub(crate) struct DjSinks {
 pub(crate) trait ActorSource: Send + 'static {
     fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent>;
     fn watch_status(&self) -> watch::Receiver<ConnectionStatus>;
+    /// The status LEVEL at subscription time — the seed. `watch::subscribe`
+    /// marks the current value as seen, so `changed()` never fires for it: a
+    /// DJ resubscribing to an actor that already reached `Connected` (the
+    /// fast-local-handshake race `poll_bootstrap_results` documents) would
+    /// otherwise sit `connected = false` — dropping every CAS cue with a
+    /// "no live connection" warn — until the next real transition. Same
+    /// remedy as `poll_connection_status`'s `current_status()` seed.
+    fn current_status(&self) -> ConnectionStatus;
 }
 
 impl ActorSource for ActorHandle {
@@ -126,6 +134,9 @@ impl ActorSource for ActorHandle {
     }
     fn watch_status(&self) -> watch::Receiver<ConnectionStatus> {
         ActorHandle::watch_status(self)
+    }
+    fn current_status(&self) -> ConnectionStatus {
+        ActorHandle::current_status(self)
     }
 }
 
@@ -320,10 +331,23 @@ async fn run_loop<H, F>(
 
     loop {
         let now = Instant::now();
-        let wake = core.next_wake(now).unwrap_or_else(|| now + NO_PHASOR_SLEEP);
+        // The timer aims at whichever comes first: the next beat ENTERING the
+        // click horizon (`next_wake`'s lead — waking at the beat itself would
+        // schedule clicks with zero ALSA lead), or the instant BeatGrid goes
+        // stale/free-run-capped with no further reference
+        // (`next_stale_deadline` — without this bound, a slow tempo would
+        // leave the mode machine on a dead grid until the next click
+        // happened to wake the loop; 2026-07-18 deliberation, finding 5).
         // Recomputed every iteration (state changes retime it naturally —
         // e.g. a fresh Fold shortens it, a flush/disconnect lengthens it back
         // to `NO_PHASOR_SLEEP`).
+        let wake = core
+            .next_wake(now, SCHEDULE_HORIZON)
+            .unwrap_or_else(|| now + NO_PHASOR_SLEEP);
+        let wake = match core.next_stale_deadline() {
+            Some(deadline) => wake.min(deadline),
+            None => wake,
+        };
         let sleep_target = tokio::time::Instant::from(wake);
 
         tokio::select! {
@@ -337,6 +361,19 @@ async fn run_loop<H, F>(
                         status_rx = Some(handle.watch_status());
                         ssh_config = Some(cfg);
                         _generation = new_generation;
+                        // Seed from the LEVEL (`ActorSource::current_status`'s
+                        // doc): the watch marks its current value seen, so an
+                        // actor already Connected at resubscribe time would
+                        // never announce itself — the fast-local-handshake
+                        // race. The same read feeds the clock machine for
+                        // consistency (idempotent when already Wallclock).
+                        let status = handle.current_status();
+                        connected = matches!(status, ConnectionStatus::Connected { .. });
+                        if let Some(effect) =
+                            handle_status_change(&mut core, &status, Instant::now())
+                        {
+                            record_effect(effect);
+                        }
                     }
                     Some(DjCtl::MetronomeConfig(cfg)) => {
                         core.metronome = cfg;
@@ -815,6 +852,11 @@ mod tests {
         fn watch_status(&self) -> watch::Receiver<ConnectionStatus> {
             self.status.subscribe()
         }
+        fn current_status(&self) -> ConnectionStatus {
+            // The level, exactly as `ActorHandle::current_status` reads its
+            // own watch — so the seed path behaves identically under test.
+            self.status.borrow().clone()
+        }
     }
 
     /// Repeatedly (re)send `mk_event()` on `events` and poll `effect_rx`
@@ -841,6 +883,25 @@ mod tests {
                         panic!("no effect observed on the current subscription within {timeout:?}");
                     }
                 }
+            }
+        }
+    }
+
+    /// Wait for the next `Transition` effect, skipping `Slew` noise (the
+    /// send-until-observed harness can fold the same reference more than
+    /// once, and each extra fold emits a Slew). Bounded by `timeout`;
+    /// panics loud rather than hanging.
+    fn expect_transition(
+        effect_rx: &std::sync::mpsc::Receiver<DjEffect>,
+        timeout: Duration,
+    ) -> ClockTransition {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match effect_rx.recv_timeout(remaining) {
+                Ok(DjEffect::Transition(t)) => return t,
+                Ok(DjEffect::Slew(_)) => continue, // harness-induced, not the observable
+                Err(_) => panic!("no clock transition observed within {timeout:?}"),
             }
         }
     }
@@ -882,7 +943,14 @@ mod tests {
             "sub A must be live and processed for real through the actual thread"
         );
 
-        // Swap to subscription B.
+        // Swap to subscription B — whose status LEVEL is Idle at ActorReady
+        // time. The seed (`ActorSource::current_status`, the watch-marks-
+        // current-value-seen remedy) must read that level and halt the clock
+        // WITHOUT any watch change event ever being sent on B: the
+        // Wallclock/Disconnect transition below is produced by the ActorReady
+        // arm alone. This is also behavior parity with the old Bevy path,
+        // where poll_connection_status's current_status() seed rode into
+        // halt_on_connection_loss on every actor swap.
         let (events_b, _keep_b) = broadcast::channel(16);
         let (status_b, _keep_sb) = watch::channel(ConnectionStatus::Idle);
         ctl_tx
@@ -893,19 +961,30 @@ mod tests {
             })
             .expect("send ActorReady B");
 
-        // Confirm B is live (core is already BeatGrid from A, so a flush on B
-        // deterministically produces the Wallclock/Flush transition — proves
-        // processing continues on the NEW subscription).
-        let swapped = send_until_observed(&events_b, &effect_rx, flush_cue, Duration::from_secs(2));
+        let seeded = expect_transition(&effect_rx, Duration::from_secs(2));
         assert_eq!(
-            swapped,
-            DjEffect::Transition(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Flush }),
-            "sub B must be live and processed for real, continuing from the shared DjCore state"
+            seeded,
+            ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Disconnect },
+            "ActorReady must seed from the status LEVEL — no watch event was ever sent on B"
         );
+
+        // Confirm B's event subscription is live: a fresh anchor on B.
+        let reanchored = send_until_observed(&events_b, &effect_rx, || beat_sync(0.0, 2.0), Duration::from_secs(2));
+        assert_eq!(
+            reanchored,
+            DjEffect::Transition(ClockTransition { to: ClockMode::BeatGrid, reason: TransitionReason::Fold }),
+            "sub B must be live and processed for real through the actual thread"
+        );
+
+        // Drain any trailing effects (send_until_observed may have sent the
+        // anchoring BeatSync more than once; each extra one folds and emits a
+        // Slew) so the dropped-A quiet assertion below starts from silence.
+        while effect_rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
 
         // Now that the swap is CONFIRMED complete, a further send on the
         // dropped subscription A must produce nothing — the old receiver is
-        // gone, not merely deprioritized.
+        // gone, not merely deprioritized. (A fold on the live subscription
+        // would emit at least a Slew, so silence discriminates.)
         let _ = events_a.send(beat_sync(0.0, 2.0));
         assert!(
             effect_rx.recv_timeout(Duration::from_millis(200)).is_err(),
