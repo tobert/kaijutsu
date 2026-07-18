@@ -877,6 +877,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Control Plane & Navigation (kj)
 
+- **`kj db` read window into `kernel.db` — deferred, not built (feedback 2026-07-18,
+  DeepSeek tracks-discoverability).** When DeepSeek couldn't find a track-listing
+  surface it fell back to sqlite and hit a wall: the kaish sandbox blocks
+  `sqlite3`/`python3`/`node`, and there's no `kj db` verb — the DB is a black box
+  from inside the kernel. The *track* need is now met by `kj transport list`
+  (merged persisted+live roster), so this is no longer urgent. But a read-only
+  `kj db tables` / `kj db schema` / `kj db dump <table>` (NOT arbitrary SQL) would
+  turn other "the kernel has the answer but won't tell you" moments into a one-liner.
+  Shape: reflect over the same `KernelDb` connection, emit `.data` rows; keep it a
+  read (no write path) and out of the loadout's `transport`/config gates. Watch the
+  standing rule — never hand out raw SQLite; go through a typed `kj`/MCP surface
+  ([[feedback_no_direct_kernel_db_access]]).
 - **`kj transport restore` — only if delete accidents actually happen**
   (decided 2026-07-15 with the tombstone delete): recovery is sqlite-only by
   design (the one-line UPDATE is in `kj transport delete --help` +

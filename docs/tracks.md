@@ -280,12 +280,23 @@ Because the clock lives on the track, transport is a single operation on one
 clock domain:
 
 ```
+kj transport                                                 # (or `list`) roster of every track + live state
+kj transport list                                            # read-only; needs no `transport` capability
 kj transport attach --track bass [--wakeup N] [--rotate N]   # bind; track created stopped if new
 kj transport detach [--track bass]                           # unbind; track persists
 kj transport play|pause|stop|tempo --track bass [...]
 kj transport ooda|rotate --track bass on|off                 # separate knobs
 kj transport delete --track bass                             # tombstone; --track is REQUIRED
 ```
+
+- **list = the roster.** Bare `kj transport` (or `kj transport list`) answers
+  "what tracks exist right now and what are they doing?" It merges the persisted
+  `tracks` rows (durable, tombstone-filtered) with the live scheduler snapshot,
+  so a real track that hasn't been re-attached since the last kernel start shows
+  as `dormant` (in the DB, not loaded) rather than vanishing. `STATE` is
+  `playing` / `stopped` / `dormant`; the `SCORE` column carries each track's
+  score-context short id so the `score-*` contexts can be mapped back to their
+  tracks. It is a **read** — never gated on the `transport` capability.
 
 - **stop = stop the clock**, nothing else. Rotation is *suspended*, not cleared —
   the binding's `rotate` cadence is remembered; per-attachment OODA arming is
@@ -303,8 +314,9 @@ kj transport delete --track bass                             # tombstone; --trac
   attached to. It stops the clock, detaches every attached context through the
   same path `detach` uses (their playhead persists identically), tears down the
   track's live clock/timeline state (the first real track-teardown path — a
-  track was previously never disarmed), and hides it from `kj transport` /
-  `listTracks`. The **score context — the durable notation — is left
+  track was previously never disarmed), and hides it from `kj transport list`
+  (the persisted row is tombstoned, so `list_tracks` skips it). The **score
+  context — the durable notation — is left
   untouched**; it's the recovery payload, and attaching `--track <name>` again
   afterward starts a genuinely fresh track + score, never resurrecting the old
   one. The persisted `tracks` row is renamed to `{name}~tombstone-<epoch-ms>`

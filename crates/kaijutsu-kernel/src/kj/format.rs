@@ -65,6 +65,87 @@ pub fn format_context_tree(dag: &[(ContextRow, i64)], current: Option<ContextId>
     lines.join("\n")
 }
 
+/// Transport state of a track for `kj transport list`. `Dormant` is the
+/// restart-gap case DeepSeek hit: the track's row is in `kernel.db` but nothing
+/// has re-attached this kernel session, so the scheduler holds no live
+/// `TrackState` and the clock isn't rolling. A dormant track is real — its
+/// tempo/playhead persist — it just isn't loaded until a context re-attaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackListState {
+    /// Live in the scheduler, clock rolling.
+    Playing,
+    /// Live in the scheduler, clock held.
+    Stopped,
+    /// Persisted only — in the DB, not loaded into the running scheduler.
+    Dormant,
+}
+
+impl TrackListState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            TrackListState::Playing => "playing",
+            TrackListState::Stopped => "stopped",
+            TrackListState::Dormant => "dormant",
+        }
+    }
+}
+
+/// One rendered row of `kj transport list` — the merged persisted+live view of
+/// one track. Built by the transport dispatcher (which owns the DB + scheduler
+/// snapshot); kept a pure DTO here so the table rendering stays testable.
+#[derive(Debug, Clone)]
+pub struct TrackListRow {
+    pub track_id: String,
+    pub state: TrackListState,
+    pub clock_kind: String,
+    /// Beats per minute, derived from the effective period.
+    pub bpm: u64,
+    pub beats_per_phrase: u64,
+    pub attached: usize,
+    pub playhead: i64,
+    /// Short id of the track's score context, or `—` when it has none yet.
+    pub score_short: String,
+}
+
+/// Format the `kj transport list` roster as a fixed-column table — the answer
+/// to "what tracks exist right now and what are they doing." Every non-deleted
+/// track appears (deleted tracks are tombstoned out of `list_tracks`), so the
+/// orphaned `score-*` contexts a delete leaves behind never masquerade here.
+pub fn format_track_table(rows: &[TrackListRow]) -> String {
+    if rows.is_empty() {
+        return "(no tracks)".to_string();
+    }
+
+    // TRACK is the only variable-width column; pad to the widest id (or the
+    // header, whichever is longer) so the table stays aligned.
+    let track_w = rows
+        .iter()
+        .map(|r| r.track_id.len())
+        .max()
+        .unwrap_or(0)
+        .max("TRACK".len());
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{:<track_w$}  {:<7}  {:<7}  {:>5}  {:>6}  {:>8}  {:>8}  {}",
+        "TRACK", "STATE", "CLOCK", "BPM", "PHRASE", "ATTACHED", "PLAYHEAD", "SCORE",
+    ));
+    for r in rows {
+        lines.push(format!(
+            "{:<track_w$}  {:<7}  {:<7}  {:>5}  {:>6}  {:>8}  {:>8}  {}",
+            r.track_id,
+            r.state.label(),
+            r.clock_kind,
+            r.bpm,
+            r.beats_per_phrase,
+            r.attached,
+            r.playhead,
+            r.score_short,
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Render a 16-byte OTel trace id as 32 lowercase hex chars (no dashes) —
 /// the canonical W3C `trace-id` text form a trace viewer expects.
 pub(crate) fn hex32(bytes: [u8; 16]) -> String {
@@ -400,5 +481,45 @@ mod tests {
         assert_eq!(format_model(&Some("a".into()), &Some("b".into())), "a/b");
         assert_eq!(format_model(&None, &Some("b".into())), "b");
         assert_eq!(format_model(&None, &None), "(no model)");
+    }
+
+    #[test]
+    fn track_table_empty() {
+        assert_eq!(format_track_table(&[]), "(no tracks)");
+    }
+
+    #[test]
+    fn track_table_renders_state_and_columns() {
+        let rows = vec![
+            TrackListRow {
+                track_id: "bass".to_string(),
+                state: TrackListState::Playing,
+                clock_kind: "system".to_string(),
+                bpm: 120,
+                beats_per_phrase: 32,
+                attached: 1,
+                playhead: 384,
+                score_short: "a1b2c3d4".to_string(),
+            },
+            TrackListRow {
+                track_id: "oldtrack".to_string(),
+                state: TrackListState::Dormant,
+                clock_kind: "system".to_string(),
+                bpm: 90,
+                beats_per_phrase: 16,
+                attached: 0,
+                playhead: 37,
+                score_short: "—".to_string(),
+            },
+        ];
+        let out = format_track_table(&rows);
+        let lines: Vec<&str> = out.lines().collect();
+        // Header first, then one row per track.
+        assert!(lines[0].contains("TRACK") && lines[0].contains("PLAYHEAD"));
+        assert_eq!(lines.len(), 3, "header + two rows: {out}");
+        assert!(lines[1].contains("bass") && lines[1].contains("playing"));
+        assert!(lines[1].contains("384") && lines[1].contains("a1b2c3d4"));
+        // A persisted-but-not-live track reads `dormant`, not a fake `stopped`.
+        assert!(lines[2].contains("oldtrack") && lines[2].contains("dormant"));
     }
 }

@@ -12,13 +12,15 @@
 //! explicit user command, so it reports the failure rather than silently
 //! no-opping.
 
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, TrackId};
 
+use super::format::{format_track_table, TrackListRow, TrackListState};
 use super::refs;
-use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+use super::{KjCaller, KjDispatcher, KjResult};
 use crate::hyoushigi::{Attachment, BeatCommand, BeatPolicy, Cadence, ClockKind};
 
 #[derive(Parser, Debug)]
@@ -166,7 +168,8 @@ enum TransportCommand {
     /// caller's own attachment — deletion must never hit a track you merely
     /// happen to be attached to. Stops the clock, detaches every attached context
     /// (their playhead persists, same as `detach`), tears down the track's live
-    /// clock/timeline state, and hides it from `kj transport` and `listTracks`.
+    /// clock/timeline state, and hides it from `kj transport list` (the persisted
+    /// row is tombstoned, so `list_tracks` skips it).
     /// The **score context (the durable notation) is left untouched** —
     /// attaching `--track <name>` again after a delete starts a brand-new track
     /// with a brand-new score; it never resurrects the old one.
@@ -185,6 +188,13 @@ enum TransportCommand {
         #[arg(long)]
         track: String,
     },
+    /// List every track with its live state — the answer to "are there any
+    /// tracks set up right now?" (also what bare `kj transport` runs). READ-ONLY
+    /// (needs no `transport` capability). Merges the persisted `tracks` rows
+    /// (durable, tombstone-filtered — they survive a restart) with the live
+    /// scheduler snapshot (playhead/beat/attachment truth), so a track shows as
+    /// `dormant` when it's in the DB but nothing has re-attached it this session.
+    List,
 }
 
 impl TransportCommand {
@@ -205,7 +215,7 @@ impl TransportCommand {
             | TransportCommand::Ooda { context, .. }
             | TransportCommand::Clock { context, .. }
             | TransportCommand::Rotate { context, .. } => context.as_deref(),
-            TransportCommand::Delete { .. } => None,
+            TransportCommand::Delete { .. } | TransportCommand::List => None,
         }
     }
 
@@ -223,6 +233,7 @@ impl TransportCommand {
             | TransportCommand::Clock { track, .. }
             | TransportCommand::Rotate { track, .. } => track.as_deref(),
             TransportCommand::Delete { track } => Some(track.as_str()),
+            TransportCommand::List => None,
         }
     }
 
@@ -239,14 +250,18 @@ impl TransportCommand {
             TransportCommand::Clock { .. } => "clock",
             TransportCommand::Rotate { .. } => "rotate",
             TransportCommand::Delete { .. } => "delete",
+            TransportCommand::List => "list",
         }
     }
 }
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_transport(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        // Bare `kj transport` answers "what tracks exist?" — the first thing
+        // anyone tries (per feedback.md). The roster is a read, so it needs no
+        // `transport` capability; the footer points at the full verb list.
         if argv.is_empty() {
-            return clap_help_for::<TransportArgs>();
+            return self.transport_list(true).await;
         }
         let parsed = match TransportArgs::try_parse_from(argv) {
             Ok(p) => p,
@@ -262,6 +277,13 @@ impl KjDispatcher {
             }
         };
         let command = parsed.command;
+
+        // `list` is a read-only observability surface — never gate it behind the
+        // `transport` (write) capability. Short-circuit BEFORE the cap check so a
+        // context that can't drive the beat can still see what's on it.
+        if matches!(command, TransportCommand::List) {
+            return self.transport_list(false).await;
+        }
 
         // Driving the beat (play/pause/stop/tempo/ooda) is gated on `transport`.
         if let Err(denied) =
@@ -459,6 +481,12 @@ impl KjDispatcher {
                     let tid = track_id.as_str().to_string();
                     (BeatCommand::Delete { track: track_id }, verb, Some(tid))
                 }
+
+                // `list` is a read — dispatched (and returned) above, before this
+                // match ever runs. Kept only so the match stays exhaustive.
+                TransportCommand::List => {
+                    unreachable!("transport list is handled before the command match")
+                }
             };
 
         // Send and AWAIT the scheduler's verdict so the report reflects what
@@ -500,6 +528,122 @@ impl KjDispatcher {
                 "kj transport: the beat scheduler dropped the request without a reply".to_string(),
             ),
         }
+    }
+
+    /// Render `kj transport list`: the merged persisted+live roster of tracks.
+    ///
+    /// Two sources, unioned by track id:
+    /// - **Persisted** (`db.list_tracks()`) — the durable, tombstone-filtered set.
+    ///   This is what survives a restart, and it's the *only* source that sees a
+    ///   `dormant` track (a real track in the DB that nothing has re-attached this
+    ///   session, so the scheduler holds no live state for it).
+    /// - **Live** (`request_track_snapshot()`) — the in-memory scheduler truth:
+    ///   real playhead, live attachment count, whether the clock is actually
+    ///   rolling. The persisted row's playhead lags (written on transitions), so
+    ///   anything live must come from here.
+    ///
+    /// Live values win where a track appears in both; a persisted-only track is
+    /// `dormant`; a live-only track (a db-less/embedded store never persists) is
+    /// still shown. `.data` is the array of track-id strings so
+    /// `for t in $(kj transport list)` round-trips into `--track $t`.
+    ///
+    /// `show_footer` appends the "run `kj transport --help` for all verbs"
+    /// pointer — set only for the bare `kj transport` entry, kept off the
+    /// explicit `kj transport list` so scripted output stays a clean table.
+    async fn transport_list(&self, show_footer: bool) -> KjResult {
+        // Persisted set first (canonical). A corrupt row fails loud rather than
+        // rendering nonsense — same posture as `list_tracks` itself.
+        let persisted = {
+            let db = self.kernel_db().lock();
+            match db.list_tracks() {
+                Ok(t) => t,
+                Err(e) => return KjResult::Err(format!("kj transport list: reading tracks: {e}")),
+            }
+        };
+
+        // Live scheduler snapshot (empty when no scheduler is wired — embedded/
+        // test, or a cold kernel before anything re-attaches).
+        let live = match self.kernel().request_track_snapshot() {
+            Some(rx) => rx.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let live_by_id: HashMap<&str, &crate::hyoushigi::TrackSnapshot> =
+            live.iter().map(|s| (s.id.as_str(), s)).collect();
+        let persisted_by_id: HashMap<&str, &crate::kernel_db::PersistedTrack> =
+            persisted.iter().map(|p| (p.track_id.as_str(), p)).collect();
+
+        // Union of ids, sorted (BTreeSet) for deterministic output.
+        let ids: BTreeSet<&str> = persisted
+            .iter()
+            .map(|p| p.track_id.as_str())
+            .chain(live.iter().map(|s| s.id.as_str()))
+            .collect();
+
+        let mut rows = Vec::with_capacity(ids.len());
+        let mut handles = Vec::with_capacity(ids.len());
+        for id in ids {
+            let live = live_by_id.get(id).copied();
+            let pers = persisted_by_id.get(id).copied();
+
+            let state = match live {
+                Some(l) if l.playing => TrackListState::Playing,
+                Some(_) => TrackListState::Stopped,
+                None => TrackListState::Dormant,
+            };
+            // Effective period: live wins, else persisted. BPM is the integer
+            // inverse (matching `tempo`'s `period = 60000/bpm`); 0 ms → 0 (never
+            // divide by zero — a corrupt row would already have been rejected).
+            let period_ms = live
+                .map(|l| l.period.as_millis() as u64)
+                .or_else(|| pers.map(|p| p.period_ms))
+                .unwrap_or(0);
+            let bpm = if period_ms > 0 { 60_000 / period_ms } else { 0 };
+            let beats_per_phrase = live
+                .map(|l| l.beats_per_phrase)
+                .or_else(|| pers.map(|p| p.beats_per_phrase))
+                .unwrap_or(0);
+            let clock_kind = live
+                .map(|l| l.clock_kind.clone())
+                .or_else(|| pers.map(|p| p.clock_kind.clone()))
+                .unwrap_or_else(|| "system".to_string());
+            let playhead = live
+                .map(|l| l.playhead)
+                .or_else(|| pers.and_then(|p| p.playhead_tick))
+                .unwrap_or(0);
+            // Live attachment count is the scheduler's; a dormant track counts
+            // its persisted attachment rows (they're what a re-attach restores).
+            let attached = match live {
+                Some(l) => l.attached.len(),
+                None => self
+                    .kernel_db()
+                    .lock()
+                    .list_attachments_for_track(id)
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+            };
+            let score = live
+                .map(|l| Some(l.score_context))
+                .unwrap_or_else(|| pers.and_then(|p| p.score_context_id));
+            let score_short = score.map(|c| c.short()).unwrap_or_else(|| "—".to_string());
+
+            rows.push(TrackListRow {
+                track_id: id.to_string(),
+                state,
+                clock_kind,
+                bpm,
+                beats_per_phrase,
+                attached,
+                playhead,
+                score_short,
+            });
+            handles.push(serde_json::Value::String(id.to_string()));
+        }
+
+        let mut text = format_track_table(&rows);
+        if show_footer {
+            text.push_str("\n\n(run `kj transport --help` for all verbs)");
+        }
+        KjResult::ok_with_data(text, serde_json::Value::Array(handles))
     }
 
     /// Resolve the target [`TrackId`] for a clock-domain or per-attachment verb.
@@ -1339,6 +1483,183 @@ mod tests {
         assert!(
             result.message().contains("--every") && result.message().contains("off"),
             "should teach the two forms: {}",
+            result.message()
+        );
+    }
+
+    // ── list ──────────────────────────────────────────────────────────────────
+
+    /// Beat stub that answers `Snapshot` with a caller-supplied set of live
+    /// [`TrackSnapshot`]s (the running scheduler's truth). Commands are still
+    /// forwarded + acked, same as [`spawn_beat_stub`].
+    fn spawn_beat_stub_snap(
+        mut ingress: tokio::sync::mpsc::UnboundedReceiver<BeatRequest>,
+        ack: BeatAck,
+        snapshots: Vec<crate::hyoushigi::TrackSnapshot>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<BeatCommand> {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(req) = ingress.recv().await {
+                match req {
+                    BeatRequest::Command { command, reply } => {
+                        let _ = cmd_tx.send(command);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(ack.clone());
+                        }
+                    }
+                    BeatRequest::Snapshot { reply } => {
+                        let _ = reply.send(snapshots.clone());
+                    }
+                    BeatRequest::CommitCapture { reply, .. } => {
+                        let _ = reply.send(Err("beat stub: no tracks".into()));
+                    }
+                    BeatRequest::ClockEstimate { .. } => {}
+                }
+            }
+        });
+        cmd_rx
+    }
+
+    #[tokio::test]
+    async fn transport_list_empty_when_no_tracks() {
+        // No persisted tracks, no scheduler wired → a definitive "(no tracks)",
+        // not a scavenger hunt. This is the answer DeepSeek couldn't get.
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("c"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("transport"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        assert!(
+            result.message().contains("(no tracks)"),
+            "empty roster is explicit: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_list_shows_dormant_persisted_track() {
+        // The cold-kernel gap: a track in the DB but not re-attached this session
+        // has NO live snapshot. It must still appear — marked `dormant` — with its
+        // persisted tempo/phrase and attachment count. (Live snapshot is empty.)
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("bass"), None, PrincipalId::new());
+        seed_track_and_attachment(&d, ctx, "bass", None); // 500 ms → 120 BPM, phrase 16, 1 attach
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(rx, Ok(None)); // Snapshot → empty
+
+        let result = d.dispatch(&[s("transport"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        let m = result.message();
+        assert!(m.contains("bass"), "persisted track appears: {m}");
+        assert!(m.contains("dormant"), "not-live persisted track is `dormant`: {m}");
+        assert!(m.contains("120"), "persisted BPM (500 ms → 120): {m}");
+        // Columns: TRACK STATE CLOCK BPM PHRASE ATTACHED PLAYHEAD SCORE
+        let row = m.lines().find(|l| l.contains("bass")).expect("a bass row");
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols[5], "1", "dormant track counts its persisted attachment: {row}");
+    }
+
+    #[tokio::test]
+    async fn transport_list_shows_live_playing_track() {
+        // A track live in the scheduler renders `playing` with the scheduler's
+        // real playhead — even when it has no persisted row (embedded/db-less).
+        use crate::hyoushigi::TrackSnapshot;
+        use kaijutsu_types::{ContextId, TrackId};
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("lead"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let snap = TrackSnapshot {
+            id: TrackId::new("lead").unwrap(),
+            score_context: ContextId::new(),
+            playing: true,
+            playhead: 384,
+            period: Duration::from_millis(500),
+            beats_per_phrase: 32,
+            beat_count: 12,
+            last_epoch_ns: 0,
+            clock_kind: "system".to_string(),
+            attached: vec![ctx],
+        };
+        let _cmds = spawn_beat_stub_snap(rx, Ok(None), vec![snap]);
+
+        let result = d.dispatch(&[s("transport"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        let m = result.message();
+        assert!(m.contains("lead"), "live-only track appears: {m}");
+        assert!(m.contains("playing"), "live + playing → `playing`: {m}");
+        assert!(m.contains("384"), "shows the live playhead: {m}");
+    }
+
+    #[tokio::test]
+    async fn transport_list_data_is_track_id_array() {
+        // `.data` is the array of track-id strings, so `for t in $(kj transport
+        // list); do kj transport play --track $t; done` round-trips.
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("bass"), None, PrincipalId::new());
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(rx, Ok(None));
+
+        let result = d.dispatch(&[s("transport"), s("list")], &c).await;
+        match result {
+            crate::kj::KjResult::Ok { data: Some(serde_json::Value::Array(ids)), .. } => {
+                assert_eq!(
+                    ids,
+                    vec![serde_json::Value::String("bass".to_string())],
+                    "data carries the track ids for iteration"
+                );
+            }
+            other => panic!("expected Ok with array data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_transport_lists_with_help_footer_ungated() {
+        // Bare `kj transport` lists (DeepSeek's first instinct) AND appends the
+        // help footer. The caller is non-privileged with no `transport` binding —
+        // proving the roster is a read that needs no capability.
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("bass"), None, PrincipalId::new());
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx); // non-privileged, no cap
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(rx, Ok(None));
+
+        let result = d.dispatch(&[s("transport")], &c).await;
+        assert!(
+            result.is_ok(),
+            "bare transport must list (not error/deny): {}",
+            result.message()
+        );
+        let m = result.message();
+        assert!(m.contains("bass"), "bare transport lists tracks: {m}");
+        assert!(m.contains("--help"), "bare transport shows the help footer: {m}");
+    }
+
+    #[tokio::test]
+    async fn explicit_transport_list_has_no_footer() {
+        // The explicit verb is a clean table — no footer — so scripted callers
+        // get pure data. (Discovery footer is only for the bare entry.)
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("bass"), None, PrincipalId::new());
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub(rx, Ok(None));
+
+        let result = d.dispatch(&[s("transport"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        assert!(
+            !result.message().contains("--help"),
+            "explicit list has no footer: {}",
             result.message()
         );
     }
