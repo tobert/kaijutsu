@@ -26,7 +26,7 @@ pub mod geometry;
 
 use bevy::prelude::*;
 
-use crate::midi::RenderPortTraffic;
+use crate::dj::RenderPortTraffic;
 use crate::patch_graph::{EndpointInfo, PatchGraphReader, PatchGraphSnapshot, diff, without_plumbing};
 use crate::shaders::{ChordMaterial, WellCardMaterial};
 use crate::text::ShapingFonts;

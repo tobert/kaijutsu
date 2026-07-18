@@ -1,327 +1,93 @@
-//! MIDI render sink — the app is the first MIDI sink (`docs/midi.md` "Render is
-//! a wire cue"; `docs/pcm.md` slice 5c).
+//! The DJ thread's owned MIDI sink — ABC→MIDI dispatch, the ALSA render
+//! port, and the patch-bay auto-connect one-shot (`docs/midi.md` "The DJ
+//! thread", DJ-thread arc Task #4 — the demolition). Ported from the deleted
+//! `midi.rs` (the app's Bevy-side MIDI-out plugin, `MidiOutPlugin`) with one
+//! structural change: there is no Bevy here at all. [`MidiSink`] owns the
+//! ALSA `Seq` handle as **loop-local state inside [`super::thread::run_loop`]**
+//! rather than a `NonSend` Bevy resource — the same "the app is the sink"
+//! doctrine, minus the frame coupling this whole arc exists to remove.
 //!
-//! A `RenderCue { mime: "text/vnd.abc", payload: Inline(abc), lead }` carries a
-//! committed ABC score *symbolically*. The app renders it to MIDI with the same
-//! `kaijutsu_abc::midi::events` path the now-demolished server-side
-//! `AlsaMidiOut` used to use, and schedules the events into a local ALSA seq queue at
-//! `receipt + lead`. Rendering at the sink is fine here because the app already
-//! depends on `kaijutsu-abc` (its ABC→staff renderer), so the "keep the sink
-//! dumb, no ABC crate" reason for kernel-side rendering doesn't apply — the mime
-//! says which: a truly-dumb edge node later takes a pre-rendered `audio/midi`
-//! cue instead. `lead` absorbs wire latency exactly as the speculation lead does
-//! for scheduling (`docs/midi.md`): the app schedules ahead, never just-in-time.
+//! **Why loop-local, not a Bevy resource:** a real ALSA `Seq` handle is
+//! `!Send` (that's WHY it used to be a `NonSend` resource, pinned to Bevy's
+//! main thread). It holds nothing runtime-shaped though — no nested tokio
+//! runtime, no async state — so unlike [`super::prefetch::CasPrefetch`]
+//! (which must be built/dropped in `thread_main`'s sync frame around
+//! `rt.block_on`, never inside the async body, or its `Drop` panics)
+//! [`MidiSink`] has no such constraint. It is constructed once by
+//! `thread_main` — already running ON the DJ thread, since that function is
+//! only ever reached via `std::thread::Builder::spawn` — and handed into
+//! [`super::thread::run_loop`] as an owned parameter (mirroring how `sinks`
+//! and `prefetch` already arrive), so it never crosses a thread boundary and
+//! stays exactly one instance for the whole thread's life. Tests hand in
+//! their own [`MidiDispatch`] implementor the same way.
+//!
+//! **One app, one port.** [`MidiSink`] serves BOTH ABC-cue scheduling (the
+//! events arm, via [`dispatch_midi_cue`]) and metronome clicks (the
+//! click-timer arm, via [`super::thread::handle_due_clicks`]) through the
+//! SAME ALSA seq port — an `aconnect` to a synth wires up the music and the
+//! 拍子木 click in one wire, exactly as the pre-Task-#4 `midi.rs`/`metronome.rs`
+//! split already documented, now unified onto one owned sink instead of two
+//! cooperating Bevy resources.
+//!
+//! **The [`MidiDispatch`] seam.** `run_loop` is generic over `M:
+//! MidiDispatch` (mirroring its existing `H: ActorSource` genericity) so a
+//! test can inject a channel-backed recording double and drive the real
+//! `select!` loop end to end with no ALSA device — see `dj::thread`'s test
+//! module. The trait folds together everything the loop needs from a MIDI
+//! sink: clicking, ABC scheduling, flushing, traffic-flag draining, AND one
+//! tick of the auto-connect one-shot — broader than the old
+//! `dj::thread::ClickSink` it replaces (that seam only ever covered clicks;
+//! Task #4 is the task that gives the events arm a sink to dispatch ABC
+//! through too, so the seam grew to match).
+//!
+//! **Auto-connect moved from a Bevy `Timer` to a `tokio::time::interval`**
+//! ([`AUTOCONNECT_POLL`]) — [`super::thread::run_loop`] owns the cadence and
+//! the one-shot `done` latch as loop-local state; [`MidiSink::tick_autoconnect`]
+//! (via [`MidiDispatch`]) does exactly one attempt per call and reports
+//! whether to keep retrying, mirroring the old `auto_connect_render` Bevy
+//! system's per-tick body with the timer/latch bookkeeping lifted out to the
+//! caller. The settle semantics are UNCHANGED: `Connected` / `AlreadyWired` /
+//! `Unavailable` latch for the life of the process; `NoSynth` / `Failed`
+//! retry. **Never fight a deliberate wiring, and never reverse a later cut**
+//! — a hand `aconnect -d` after auto-connect settled stays cut; the one-shot
+//! never re-arms.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use bevy::prelude::*;
-use kaijutsu_audio::{CuePayload, ABC_MIME, RENDER_FLUSH_MIME};
-use kaijutsu_client::ServerEvent;
+use kaijutsu_audio::{ABC_MIME, CuePayload, RENDER_FLUSH_MIME, RenderCue};
+use tracing::{debug, warn};
 
-use crate::connection::actor_plugin::ServerEventMessage;
 use crate::patch_graph::{EndpointInfo, WireInfo};
 
-/// Bridges `ServerEvent::RenderCue` ABC cues into scheduled ALSA seq MIDI.
-pub struct MidiOutPlugin;
+// ── MidiDispatch — the seam run_loop is generic over ────────────────────────
 
-impl Plugin for MidiOutPlugin {
-    fn build(&self, app: &mut App) {
-        // NonSend: the ALSA `Seq` handle lives on the main thread with the sink
-        // system (a render sink is single-consumer; no cross-thread sharing).
-        app.insert_non_send_resource(MidiSink::default());
-        app.init_resource::<RenderAutoConnect>();
-        // Open the seq port eagerly at startup so it shows up in `aconnect -l`
-        // and can be wired to a synth *before* the first cue fires (the queue
-        // schedules ~now for a play-now cue, so a lazily-created port would miss
-        // its own first notes). Graceful on failure — no ALSA just means no MIDI.
-        app.add_systems(Startup, open_midi_sink);
-        app.add_systems(Update, play_midi_cues);
-        // Patch-bay slice 1: one-shot, patient-retry auto-connect of the render
-        // port to a detected GM synth — kills the re-`aconnect`-after-restart
-        // papercut (`docs/scenes/patchbay.md`). Additive and startup-once.
-        app.add_systems(Update, auto_connect_render);
-        // Patch-bay live layer: announce every render-port send so the scene can
-        // pulse the RENDER chord. Additive — the sink stamps a flag on send, this
-        // drains it into a message the patch bay reads (`docs/scenes/patchbay.md`).
-        app.add_message::<RenderPortTraffic>();
-        app.add_systems(Update, emit_render_traffic);
-    }
+/// Everything the DJ thread's `select!` loop dispatches through its one owned
+/// MIDI sink: clicks (the click-timer arm, via
+/// [`super::thread::handle_due_clicks`]), ABC-rendered cues (the events arm,
+/// via [`dispatch_midi_cue`]), a transport flush, the traffic-pulse flag, and
+/// one tick of the render-port auto-connect one-shot. [`MidiSink`] is the
+/// real (ALSA-backed) implementation; a recording double in `dj::thread`'s
+/// test module implements it too, so the whole dispatch path is exercised
+/// through the real `run_loop` with no ALSA device.
+pub(crate) trait MidiDispatch {
+    /// Schedule one metronome click `offset` from now — see
+    /// [`MidiSink::click_at`].
+    fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration);
+    /// Schedule a rendered ABC phrase's events, each already offset from
+    /// phrase start, `lead` ahead of now — see [`MidiSink::schedule_abc`].
+    fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration);
+    /// Drop every scheduled-but-unplayed event and silence sounding notes.
+    fn flush(&mut self);
+    /// Drain "did anything leave the render port since the last drain" —
+    /// the [`super::thread::DjPulse::RenderTraffic`] source.
+    fn take_traffic(&mut self) -> bool;
+    /// One attempt at the render-port auto-connect one-shot; `true` once the
+    /// decision has settled for good (latch), `false` to keep retrying on the
+    /// next timer fire. See [`MidiSink::tick_autoconnect`].
+    fn tick_autoconnect(&mut self) -> bool;
 }
 
-/// A render-port send just happened — the patch bay lights the RENDER chord. The
-/// app can only observe its OWN traffic (`docs/scenes/patchbay.md`, the live
-/// layer): every send out the render seq port — an ABC cue or a 拍子木 click — is
-/// one edge-observable event. Emitted here; consumed only by the patch bay.
-#[derive(Message)]
-pub struct RenderPortTraffic;
-
-/// Drain the sink's send flag into one `RenderPortTraffic` per frame that saw
-/// traffic — a burst of pre-scheduled clicks collapses to a single packet, which
-/// is the right read (one travelling pulse, not a strobe). Ungated: MIDI flows on
-/// every screen; the patch bay reads this only while it's up.
-fn emit_render_traffic(
-    mut sink: NonSendMut<MidiSink>,
-    mut traffic: MessageWriter<RenderPortTraffic>,
-) {
-    if std::mem::take(&mut sink.traffic) {
-        traffic.write(RenderPortTraffic);
-    }
-}
-
-/// Startup: try to open the ALSA seq sink so the port is connectable up front.
-fn open_midi_sink(mut sink: NonSendMut<MidiSink>) {
-    ensure_open(&mut sink);
-}
-
-/// Lazily-opened ALSA seq sink. Opened on the first MIDI cue; `failed` latches
-/// once an open attempt fails (no `/dev/snd/seq`) so we warn once, not per-cue.
-/// `pub(crate)` so the metronome (`crate::metronome`) can click through the SAME
-/// seq port the render cues use — one app, one port, so `aconnect`-ing to a synth
-/// wires up both the music and the 拍子木 click.
-#[derive(Default)]
-pub(crate) struct MidiSink {
-    #[cfg(target_os = "linux")]
-    out: Option<MidiOut>,
-    failed: bool,
-    /// Set whenever a send is actually issued out the render port (an ABC cue or
-    /// a metronome click); drained once per frame into a [`RenderPortTraffic`]
-    /// message by [`emit_render_traffic`]. The patch-bay live layer's only hook.
-    traffic: bool,
-}
-
-impl MidiSink {
-    /// Schedule one metronome click `offset` from now into the sink queue — so
-    /// ALSA fires it at the phasor's predicted beat time, not at the irregular
-    /// frame that scheduled it. Sound (`note`/`channel`/`velocity`) and `gate_ms`
-    /// come from the per-client metronome config. Opens the sink on first use.
-    /// No-op without ALSA.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn click_at(
-        &mut self,
-        note: u8,
-        channel: u8,
-        velocity: u8,
-        gate_ms: u64,
-        offset: std::time::Duration,
-    ) {
-        if !ensure_open(self) {
-            return;
-        }
-        if let Some(out) = self.out.as_mut() {
-            out.click_at(note, channel, velocity, gate_ms, offset);
-            self.traffic = true; // a click left the render port — pulse the chord
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn click_at(
-        &mut self,
-        _note: u8,
-        _channel: u8,
-        _velocity: u8,
-        _gate_ms: u64,
-        _offset: std::time::Duration,
-    ) {
-        ensure_open(self);
-    }
-
-    /// Patch-bay slice 1: observe the local seq graph through the render port's
-    /// own handle, decide (purely) whether/where to auto-connect, and — only if
-    /// there's a target — subscribe render → synth. Additive; never disconnects.
-    /// Assumes the caller has already opened the sink.
-    #[cfg(target_os = "linux")]
-    fn try_auto_connect(&self, patterns: &[&str]) -> AutoConnectOutcome {
-        let Some(out) = self.out.as_ref() else {
-            return AutoConnectOutcome::Unavailable;
-        };
-        let render = out.addr();
-        let (endpoints, wires) = out.observe();
-        match decide_autoconnect(&endpoints, &wires, render, patterns) {
-            Some((client, port)) => {
-                let name = endpoints
-                    .iter()
-                    .find(|e| (e.client_id, e.port_id) == (client, port))
-                    .map(|e| e.client_name.clone())
-                    .unwrap_or_else(|| "synth".into());
-                match out.connect_render_to(client, port) {
-                    Ok(()) => AutoConnectOutcome::Connected { name, client, port },
-                    Err(e) => AutoConnectOutcome::Failed(e),
-                }
-            }
-            // No target: separate "already wired → defer" (stop) from "no synth
-            // yet" (keep waiting) so the caller latches the one-shot correctly.
-            None if render_has_outbound_wire(&wires, render) => AutoConnectOutcome::AlreadyWired,
-            None => AutoConnectOutcome::NoSynth,
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn try_auto_connect(&self, _patterns: &[&str]) -> AutoConnectOutcome {
-        AutoConnectOutcome::Unavailable
-    }
-}
-
-// ── Patch-bay slice 1: render-port auto-connect ─────────────────────────────
-
-/// Case-insensitive substring patterns for a GM synth's ALSA client name. The
-/// one obvious config seam: symbolic-endpoint naming (a named-endpoint registry
-/// vs a substring list) is an open question in `docs/scenes/patchbay.md` —
-/// slice 1 deliberately keeps it a bare const, not a config surface.
-const SYNTH_PATTERNS: [&str; 2] = ["timidity", "fluidsynth"];
-
-/// Our own ALSA seq clients — never an auto-connect target even if a pattern
-/// somehow matched one (the render's own output, the ear, the patch-view
-/// reader). Matched by exact client name.
-const OWN_CLIENTS: [&str; 3] = ["kaijutsu-app", "kaijutsu-ear", "kaijutsu-patchview"];
-
-/// Retry cadence — the patch-bay's 2 s poll idiom, reused.
-const AUTOCONNECT_POLL_SECS: f32 = 2.0;
-
-/// One-shot latch for the render-port auto-connect. `done` latches for the life
-/// of the process once the decision settles — connected, found already-wired, or
-/// ALSA-less — and is never re-armed. That "startup-once" stance is the whole
-/// point: the metronome click rides the render port and has no off-switch yet,
-/// so Amy sometimes cuts this wire with `aconnect -d`; a continuously
-/// reconciling ensure would make the wire uncuttable. Continuous declared-wire
-/// reconciliation is slice 2's job (kernel-owned).
-#[derive(Resource)]
-struct RenderAutoConnect {
-    done: bool,
-    timer: Timer,
-}
-
-impl Default for RenderAutoConnect {
-    fn default() -> Self {
-        // Prime the timer to fire on the very next Update tick (the patch-bay's
-        // `arm_on_enter` idiom): the render port opens eagerly at Startup so a
-        // cue in the first couple seconds isn't dropped into an unwired port —
-        // but a cold `elapsed=0` repeating timer would still leave that exact
-        // window unwired by making the *first* attempt wait a full cadence. The
-        // 2 s cadence then governs retries only.
-        let mut timer = Timer::from_seconds(AUTOCONNECT_POLL_SECS, TimerMode::Repeating);
-        timer.set_elapsed(timer.duration());
-        Self { done: false, timer }
-    }
-}
-
-/// The outcome of one auto-connect attempt. `Connected` / `AlreadyWired` /
-/// `Unavailable` settle the one-shot for good; `NoSynth` / `Failed` retry.
-enum AutoConnectOutcome {
-    Connected { name: String, client: i32, port: i32 },
-    AlreadyWired,
-    NoSynth,
-    Failed(String),
-    Unavailable,
-}
-
-/// Tick the one-shot: on a slow cadence, until it settles, try to auto-connect
-/// the render port to a GM synth. Loud once on the connect, quiet while waiting.
-#[cfg(target_os = "linux")]
-fn auto_connect_render(
-    time: Res<Time>,
-    mut sink: NonSendMut<MidiSink>,
-    mut latch: ResMut<RenderAutoConnect>,
-) {
-    if latch.done {
-        return;
-    }
-    if !latch.timer.tick(time.delta()).just_finished() {
-        return;
-    }
-    // No ALSA seq → `ensure_open` warns once and we stand down: no synth will
-    // ever appear on a machine without a sequencer, so retrying is pure spam.
-    if !ensure_open(&mut sink) {
-        latch.done = true;
-        return;
-    }
-    match sink.try_auto_connect(&SYNTH_PATTERNS) {
-        AutoConnectOutcome::Connected { name, client, port } => {
-            info!("patch-bay slice 1: auto-connected render → {name}:{port} (client {client})");
-            latch.done = true;
-        }
-        AutoConnectOutcome::AlreadyWired => {
-            // A hand-patch already owns the render port's routing. Stand down —
-            // never fight a deliberate wiring, and never reverse a later cut.
-            debug!("patch-bay slice 1: render already wired; standing down");
-            latch.done = true;
-        }
-        AutoConnectOutcome::NoSynth => {
-            debug!("patch-bay slice 1: no GM synth yet; will retry");
-        }
-        AutoConnectOutcome::Failed(e) => {
-            debug!("patch-bay slice 1: connect failed, will retry: {e}");
-        }
-        AutoConnectOutcome::Unavailable => {
-            latch.done = true;
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn auto_connect_render(mut latch: ResMut<RenderAutoConnect>) {
-    // No ALSA off Linux — nothing to connect, ever.
-    latch.done = true;
-}
-
-/// True if the render port already feeds anyone. The deferential guard: if a
-/// human (or anything) has already wired render outbound, slice 1 does nothing.
-fn render_has_outbound_wire(wires: &[WireInfo], render: (i32, i32)) -> bool {
-    wires.iter().any(|w| w.src == render)
-}
-
-/// Pure decision core: the synth port the render port should auto-connect to,
-/// or `None`. `None` means either render is already wired outbound (defer) or no
-/// non-self synth matches. Additive only — this never considers a disconnect.
-///
-/// The target is the first writable-subscribable ("sink") port of the first
-/// matching synth; with `endpoints` sorted by `(client_id, port_id)` (as
-/// `MidiOut::observe` delivers them) that is the lowest-numbered synth's port 0.
-/// Own clients are excluded by name regardless of pattern; a pattern matches as
-/// a case-insensitive substring of the client name.
-fn decide_autoconnect(
-    endpoints: &[EndpointInfo],
-    wires: &[WireInfo],
-    render: (i32, i32),
-    patterns: &[&str],
-) -> Option<(i32, i32)> {
-    if render_has_outbound_wire(wires, render) {
-        return None;
-    }
-    endpoints.iter().find_map(|e| {
-        if !e.is_sink || OWN_CLIENTS.contains(&e.client_name.as_str()) {
-            return None;
-        }
-        let name = e.client_name.to_lowercase();
-        let matched = patterns.iter().any(|p| name.contains(&p.to_lowercase()));
-        matched.then_some((e.client_id, e.port_id))
-    })
-}
-
-/// Render ABC → a flat list of `(offset-from-phrase-start, raw channel-voice
-/// MIDI bytes)`, ready to schedule relative to a start instant. Reuses the exact
-/// `abc→events` path `AlsaMidiOut` used; the only sink step is tick→wall via the
-/// tune's own `Q:` tempo + the render PPQ. Meta/system events (status ≥ 0xF0)
-/// are dropped — they never went to the seq queue. Empty if the ABC parses to no
-/// tune (a producer bug upstream — logged loudly at the call site, not here).
-fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
-    let parsed = kaijutsu_abc::parse(abc);
-    let Some(tune) = parsed.value.first() else {
-        return Vec::new();
-    };
-    let params = kaijutsu_abc::MidiParams::default();
-    let bpm = tune.header.tempo.as_ref().map(|t| t.bpm).unwrap_or(120).max(1);
-    let secs_per_tick = 60.0 / bpm as f64 / params.ticks_per_beat.max(1) as f64;
-    kaijutsu_abc::midi::events(tune, &params)
-        .into_iter()
-        .filter(|ev| matches!(ev.data.first(), Some(&status) if status < 0xF0))
-        .map(|ev| {
-            (
-                Duration::from_secs_f64(ev.tick as f64 * secs_per_tick),
-                ev.data,
-            )
-        })
-        .collect()
-}
+// ── ABC render + the phase-align backdating ladder (pure) ──────────────────
 
 /// A cue older than this on receipt is rejected outright rather than
 /// back-dated — the pipe is backed up badly enough that "when this was true"
@@ -379,126 +145,86 @@ fn backdate_events(
     Some((survivors, Duration::ZERO))
 }
 
-/// Consume `RenderCue` ABC cues and schedule their MIDI into the ALSA seq queue.
-/// Reads the same message stream as the audio sink (`audio.rs`) — each system
-/// keeps its own cursor — and filters by mime, so the two never contend.
+/// Render ABC → a flat list of `(offset-from-phrase-start, raw channel-voice
+/// MIDI bytes)`, ready to schedule relative to a start instant. Reuses the
+/// exact `abc→events` path the demolished server-side `AlsaMidiOut` used; the
+/// only sink step is tick→wall via the tune's own `Q:` tempo + the render
+/// PPQ. Meta/system events (status ≥ 0xF0) are dropped — they never went to
+/// the seq queue. Empty if the ABC parses to no tune (a producer bug
+/// upstream — logged loudly at the call site, not here).
+fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
+    let parsed = kaijutsu_abc::parse(abc);
+    let Some(tune) = parsed.value.first() else {
+        return Vec::new();
+    };
+    let params = kaijutsu_abc::MidiParams::default();
+    let bpm = tune.header.tempo.as_ref().map(|t| t.bpm).unwrap_or(120).max(1);
+    let secs_per_tick = 60.0 / bpm as f64 / params.ticks_per_beat.max(1) as f64;
+    kaijutsu_abc::midi::events(tune, &params)
+        .into_iter()
+        .filter(|ev| matches!(ev.data.first(), Some(&status) if status < 0xF0))
+        .map(|ev| {
+            (
+                Duration::from_secs_f64(ev.tick as f64 * secs_per_tick),
+                ev.data,
+            )
+        })
+        .collect()
+}
+
+/// Consume one `RenderCue` off the DJ thread's events arm: flush the sink on
+/// a transport stop/pause, or render+schedule an ABC phrase. Everything else
+/// (audio/*, CLIP_MIME, PREPARE_MIME) is `dj::audio`'s own mime, ignored here
+/// — the two dispatch functions run side by side off the SAME events-arm
+/// iteration (`dj::thread::run_loop`), each reading `RENDER_FLUSH_MIME`
+/// independently, mirroring the pre-Task-#4 `audio.rs`/`midi.rs` split now
+/// folded onto one thread.
 ///
-/// `SystemTime::now()` is read ONCE per batch, above the loop — every cue this
-/// frame ages against the SAME receipt instant rather than one drifting per
-/// cue as the loop runs (a frame processing several buffered cues shouldn't
-/// see their relative ages skewed by loop-iteration time).
-fn play_midi_cues(
-    mut messages: MessageReader<ServerEventMessage>,
-    mut sink: NonSendMut<MidiSink>,
-) {
-    let now_epoch_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    for ServerEventMessage(event) in messages.read() {
-        let ServerEvent::RenderCue { cue, .. } = event else {
-            continue;
-        };
-        // A transport flush (stop/pause): drop the buffered phrase + silence.
-        if cue.mime == RENDER_FLUSH_MIME {
-            flush(&mut sink);
-            continue;
-        }
-        if cue.mime != ABC_MIME {
-            continue;
-        }
-        let CuePayload::Inline(bytes) = &cue.payload else {
-            // CAS-backed ABC (a large score by ref) is slice-5c prefetch too.
-            warn!("MIDI cue with a CAS payload not resolved yet (mime={})", cue.mime);
-            continue;
-        };
-        let Ok(abc) = std::str::from_utf8(bytes) else {
-            warn!("MIDI cue ABC payload was not UTF-8; skipping");
-            continue;
-        };
-        let events = abc_to_timed_events(abc);
-        if events.is_empty() {
-            warn!("MIDI cue ABC rendered to no events; skipping");
-            continue;
-        }
-        let age = (cue.epoch_ns != 0)
-            .then(|| Duration::from_nanos(now_epoch_ns.saturating_sub(cue.epoch_ns)));
-        let Some((events, lead)) = backdate_events(events, cue.lead, age) else {
-            kaijutsu_telemetry::record_stale_cue_dropped();
-            warn!(
-                "MIDI cue rejected — stale beyond {CUE_STALE_MAX:?} by the time it was \
-                 received; dropping the whole phrase rather than smear it"
-            );
-            continue;
-        };
-        if events.is_empty() {
-            warn!("MIDI cue backdated to no survivors (fully in the past); skipping");
-            continue;
-        }
-        schedule(&mut sink, events, lead);
-    }
-}
-
-/// Open the sink if it isn't already; `false` if it's unavailable (open failed
-/// once — latched, so we warn once, not per-cue).
-#[cfg(target_os = "linux")]
-fn ensure_open(sink: &mut MidiSink) -> bool {
-    if sink.out.is_some() {
-        return true;
-    }
-    if sink.failed {
-        return false;
-    }
-    match MidiOut::open() {
-        Ok(out) => {
-            info!("kaijutsu-app MIDI sink open on ALSA seq {:?}", out.addr());
-            sink.out = Some(out);
-            true
-        }
-        Err(e) => {
-            warn!("MIDI sink unavailable (no ALSA seq?): {e}");
-            sink.failed = true;
-            false
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ensure_open(sink: &mut MidiSink) -> bool {
-    if !sink.failed {
-        warn!("MIDI render sink is Linux/ALSA-only; ignoring MIDI cues on this platform");
-        sink.failed = true;
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn schedule(sink: &mut MidiSink, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
-    if !ensure_open(sink) {
+/// `now_epoch_ns` is the SAME read `dj::thread::handle_server_event` and
+/// `dj::audio::dispatch_render_cue` already used for this event (read once
+/// per receipt, `dj::thread`'s discipline) — so a cue's staleness math never
+/// drifts from the clock reaction to the same event.
+pub(crate) fn dispatch_midi_cue(cue: &RenderCue, now_epoch_ns: u64, sink: &mut dyn MidiDispatch) {
+    if cue.mime == RENDER_FLUSH_MIME {
+        sink.flush();
         return;
     }
-    if let Some(out) = sink.out.as_mut() {
-        out.schedule(&events, lead);
-        sink.traffic = true; // a cue left the render port — pulse the chord
+    if cue.mime != ABC_MIME {
+        return;
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn schedule(sink: &mut MidiSink, _events: Vec<(Duration, Vec<u8>)>, _lead: Duration) {
-    ensure_open(sink);
-}
-
-/// Transport flush (stop/pause): drop the buffered phrase + silence sounding
-/// notes. No-op if the sink was never opened (nothing scheduled).
-#[cfg(target_os = "linux")]
-fn flush(sink: &mut MidiSink) {
-    if let Some(out) = sink.out.as_mut() {
-        out.flush();
+    let CuePayload::Inline(bytes) = &cue.payload else {
+        // CAS-backed ABC (a large score by ref) is a recorded follow-up
+        // (docs/issues.md), not resolved yet — loud, not silently dropped.
+        warn!("MIDI cue with a CAS payload not resolved yet (mime={})", cue.mime);
+        return;
+    };
+    let Ok(abc) = std::str::from_utf8(bytes) else {
+        warn!("MIDI cue ABC payload was not UTF-8; skipping");
+        return;
+    };
+    let events = abc_to_timed_events(abc);
+    if events.is_empty() {
+        warn!("MIDI cue ABC rendered to no events; skipping");
+        return;
     }
+    let age = (cue.epoch_ns != 0)
+        .then(|| Duration::from_nanos(now_epoch_ns.saturating_sub(cue.epoch_ns)));
+    let Some((events, lead)) = backdate_events(events, cue.lead, age) else {
+        kaijutsu_telemetry::record_stale_cue_dropped();
+        warn!(
+            "MIDI cue rejected — stale beyond {CUE_STALE_MAX:?} by the time it was \
+             received; dropping the whole phrase rather than smear it"
+        );
+        return;
+    };
+    if events.is_empty() {
+        warn!("MIDI cue backdated to no survivors (fully in the past); skipping");
+        return;
+    }
+    sink.schedule_abc(events, lead);
 }
 
-#[cfg(not(target_os = "linux"))]
-fn flush(_sink: &mut MidiSink) {}
+// ── click byte-masking (pure) ────────────────────────────────────────────
 
 /// Build the (NoteOn, NoteOff) byte triples for one metronome click, masking
 /// every byte to its valid MIDI range first: channel to the low nibble (keeps
@@ -512,6 +238,243 @@ fn click_bytes(note: u8, channel: u8, velocity: u8) -> (Vec<u8>, Vec<u8>) {
     let note = note & 0x7F;
     let velocity = velocity & 0x7F;
     (vec![0x90 | ch, note, velocity], vec![0x80 | ch, note, 0])
+}
+
+// ── patch-bay slice 1: render-port auto-connect (pure decision core) ───────
+
+/// Case-insensitive substring patterns for a GM synth's ALSA client name. The
+/// one obvious config seam: symbolic-endpoint naming (a named-endpoint registry
+/// vs a substring list) is an open question in `docs/scenes/patchbay.md` —
+/// slice 1 deliberately keeps it a bare const, not a config surface.
+const SYNTH_PATTERNS: [&str; 2] = ["timidity", "fluidsynth"];
+
+/// Our own ALSA seq clients — never an auto-connect target even if a pattern
+/// somehow matched one (the render's own output, the ear, the patch-view
+/// reader). Matched by exact client name.
+const OWN_CLIENTS: [&str; 3] = ["kaijutsu-app", "kaijutsu-ear", "kaijutsu-patchview"];
+
+/// The DJ thread's auto-connect retry cadence (`super::thread::run_loop`'s
+/// `tokio::time::interval` arm) — the patch-bay's 2 s poll idiom, reused.
+/// `tokio::time::interval`'s own documented guarantee ("the first tick
+/// completes immediately") replaces the old Bevy `Timer`'s hand-primed
+/// `elapsed = duration` trick for a prompt cold-start attempt.
+pub(crate) const AUTOCONNECT_POLL: Duration = Duration::from_secs(2);
+
+/// The outcome of one auto-connect attempt. `Connected` / `AlreadyWired` /
+/// `Unavailable` settle the one-shot for good; `NoSynth` / `Failed` retry.
+enum AutoConnectOutcome {
+    Connected { name: String, client: i32, port: i32 },
+    AlreadyWired,
+    NoSynth,
+    Failed(String),
+    Unavailable,
+}
+
+/// True if the render port already feeds anyone. The deferential guard: if a
+/// human (or anything) has already wired render outbound, slice 1 does nothing.
+fn render_has_outbound_wire(wires: &[WireInfo], render: (i32, i32)) -> bool {
+    wires.iter().any(|w| w.src == render)
+}
+
+/// Pure decision core: the synth port the render port should auto-connect to,
+/// or `None`. `None` means either render is already wired outbound (defer) or no
+/// non-self synth matches. Additive only — this never considers a disconnect.
+///
+/// The target is the first writable-subscribable ("sink") port of the first
+/// matching synth; with `endpoints` sorted by `(client_id, port_id)` (as
+/// `MidiOut::observe` delivers them) that is the lowest-numbered synth's port 0.
+/// Own clients are excluded by name regardless of pattern; a pattern matches as
+/// a case-insensitive substring of the client name.
+fn decide_autoconnect(
+    endpoints: &[EndpointInfo],
+    wires: &[WireInfo],
+    render: (i32, i32),
+    patterns: &[&str],
+) -> Option<(i32, i32)> {
+    if render_has_outbound_wire(wires, render) {
+        return None;
+    }
+    endpoints.iter().find_map(|e| {
+        if !e.is_sink || OWN_CLIENTS.contains(&e.client_name.as_str()) {
+            return None;
+        }
+        let name = e.client_name.to_lowercase();
+        let matched = patterns.iter().any(|p| name.contains(&p.to_lowercase()));
+        matched.then_some((e.client_id, e.port_id))
+    })
+}
+
+// ── MidiSink — the real, loop-local, ALSA-backed sink ───────────────────────
+
+/// Lazily-opened ALSA seq sink, owned loop-local by [`super::thread::run_loop`]
+/// (never a Bevy resource — see the module doc). Opened on the first MIDI cue
+/// or click; `failed` latches once an open attempt fails (no `/dev/snd/seq`)
+/// so we warn once, not per-cue.
+#[derive(Default)]
+pub(crate) struct MidiSink {
+    #[cfg(target_os = "linux")]
+    out: Option<MidiOut>,
+    failed: bool,
+    /// Set whenever a send is actually issued out the render port (an ABC cue
+    /// or a metronome click); drained by [`Self::take_traffic`] once per
+    /// select!-iteration burst that touched the sink — see
+    /// [`super::thread::DjPulse::RenderTraffic`]'s doc for the coalescing
+    /// rationale.
+    traffic: bool,
+}
+
+impl MidiSink {
+    /// Open the sink if it isn't already; `false` if it's unavailable (open
+    /// failed once — latched, so we warn once, not per-cue/click).
+    #[cfg(target_os = "linux")]
+    fn ensure_open(&mut self) -> bool {
+        if self.out.is_some() {
+            return true;
+        }
+        if self.failed {
+            return false;
+        }
+        match MidiOut::open() {
+            Ok(out) => {
+                tracing::info!("kaijutsu-dj MIDI sink open on ALSA seq {:?}", out.addr());
+                self.out = Some(out);
+                true
+            }
+            Err(e) => {
+                warn!("MIDI sink unavailable (no ALSA seq?): {e}");
+                self.failed = true;
+                false
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ensure_open(&mut self) -> bool {
+        if !self.failed {
+            warn!("MIDI render sink is Linux/ALSA-only; ignoring MIDI cues on this platform");
+            self.failed = true;
+        }
+        false
+    }
+
+    /// Patch-bay slice 1: observe the local seq graph through the render
+    /// port's own handle, decide (purely) whether/where to auto-connect, and
+    /// — only if there's a target — subscribe render → synth. Additive; never
+    /// disconnects. Assumes the caller has already opened the sink.
+    #[cfg(target_os = "linux")]
+    fn try_auto_connect(&self, patterns: &[&str]) -> AutoConnectOutcome {
+        let Some(out) = self.out.as_ref() else {
+            return AutoConnectOutcome::Unavailable;
+        };
+        let render = out.addr();
+        let (endpoints, wires) = out.observe();
+        match decide_autoconnect(&endpoints, &wires, render, patterns) {
+            Some((client, port)) => {
+                let name = endpoints
+                    .iter()
+                    .find(|e| (e.client_id, e.port_id) == (client, port))
+                    .map(|e| e.client_name.clone())
+                    .unwrap_or_else(|| "synth".into());
+                match out.connect_render_to(client, port) {
+                    Ok(()) => AutoConnectOutcome::Connected { name, client, port },
+                    Err(e) => AutoConnectOutcome::Failed(e),
+                }
+            }
+            // No target: separate "already wired → defer" (stop) from "no
+            // synth yet" (keep waiting) so the caller latches the one-shot
+            // correctly.
+            None if render_has_outbound_wire(&wires, render) => AutoConnectOutcome::AlreadyWired,
+            None => AutoConnectOutcome::NoSynth,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn try_auto_connect(&self, _patterns: &[&str]) -> AutoConnectOutcome {
+        AutoConnectOutcome::Unavailable
+    }
+}
+
+impl MidiDispatch for MidiSink {
+    #[cfg(target_os = "linux")]
+    fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
+        if !self.ensure_open() {
+            return;
+        }
+        if let Some(out) = self.out.as_mut() {
+            out.click_at(note, channel, velocity, gate_ms, offset);
+            self.traffic = true; // a click left the render port — pulse the chord
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn click_at(&mut self, _note: u8, _channel: u8, _velocity: u8, _gate_ms: u64, _offset: Duration) {
+        self.ensure_open();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+        if !self.ensure_open() {
+            return;
+        }
+        if let Some(out) = self.out.as_mut() {
+            out.schedule(&events, lead);
+            self.traffic = true; // a cue left the render port — pulse the chord
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn schedule_abc(&mut self, _events: Vec<(Duration, Vec<u8>)>, _lead: Duration) {
+        self.ensure_open();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn flush(&mut self) {
+        if let Some(out) = self.out.as_mut() {
+            out.flush();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn flush(&mut self) {}
+
+    fn take_traffic(&mut self) -> bool {
+        std::mem::take(&mut self.traffic)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tick_autoconnect(&mut self) -> bool {
+        // No ALSA seq → `ensure_open` warns once and we stand down: no synth
+        // will ever appear on a machine without a sequencer, so retrying is
+        // pure spam.
+        if !self.ensure_open() {
+            return true;
+        }
+        match self.try_auto_connect(&SYNTH_PATTERNS) {
+            AutoConnectOutcome::Connected { name, client, port } => {
+                tracing::info!("patch-bay slice 1: auto-connected render → {name}:{port} (client {client})");
+                true
+            }
+            AutoConnectOutcome::AlreadyWired => {
+                // A hand-patch already owns the render port's routing. Stand
+                // down — never fight a deliberate wiring, and never reverse a
+                // later cut.
+                debug!("patch-bay slice 1: render already wired; standing down");
+                true
+            }
+            AutoConnectOutcome::NoSynth => {
+                debug!("patch-bay slice 1: no GM synth yet; will retry");
+                false
+            }
+            AutoConnectOutcome::Failed(e) => {
+                debug!("patch-bay slice 1: connect failed, will retry: {e}");
+                false
+            }
+            AutoConnectOutcome::Unavailable => true,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn tick_autoconnect(&mut self) -> bool {
+        // No ALSA off Linux — nothing to connect, ever.
+        true
+    }
 }
 
 /// An ALSA-sequencer MIDI-out sink: a subscribe-readable source port + a started
@@ -615,7 +578,7 @@ impl MidiOut {
         let mut encoder = match alsa::seq::MidiEvent::new(16) {
             Ok(e) => e,
             Err(e) => {
-                error!("MIDI encoder init failed: {e}");
+                tracing::error!("MIDI encoder init failed: {e}");
                 return;
             }
         };
@@ -631,18 +594,18 @@ impl MidiOut {
                     ev.set_subs();
                     ev.schedule_real(self.queue, true, when);
                     if let Err(e) = self.seq.event_output(&mut ev) {
-                        error!("MIDI event_output failed: {e}");
+                        tracing::error!("MIDI event_output failed: {e}");
                     }
                 }
                 Ok((_, None)) => continue, // incomplete message — shouldn't happen
                 Err(e) => {
-                    error!("MIDI encode failed: {e}");
+                    tracing::error!("MIDI encode failed: {e}");
                     continue;
                 }
             }
         }
         if let Err(e) = self.seq.drain_output() {
-            error!("MIDI drain_output failed: {e}");
+            tracing::error!("MIDI drain_output failed: {e}");
         }
     }
 
@@ -656,7 +619,7 @@ impl MidiOut {
             rm.set_queue(self.queue);
             rm.set_condition(Remove::OUTPUT);
             if let Err(e) = self.seq.remove_events(rm) {
-                error!("MIDI remove_events failed: {e}");
+                tracing::error!("MIDI remove_events failed: {e}");
             }
         }
         for channel in 0..16u8 {
@@ -845,6 +808,96 @@ mod tests {
         assert_eq!(out_events, events, "events untouched too");
     }
 
+    // ── dispatch_midi_cue: the events-arm entry point ───────────────────────
+
+    /// A tiny recording double for `dispatch_midi_cue`'s own tests — narrower
+    /// than `dj::thread`'s `RecordingMidiSink` (that one drives the whole
+    /// `run_loop`; this one just asserts what THIS function decided to do).
+    #[derive(Default)]
+    struct RecordingSink {
+        scheduled: Option<(Vec<(Duration, Vec<u8>)>, Duration)>,
+        flushed: bool,
+    }
+
+    impl MidiDispatch for RecordingSink {
+        fn click_at(&mut self, _: u8, _: u8, _: u8, _: u64, _: Duration) {
+            unreachable!("dispatch_midi_cue never clicks")
+        }
+        fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+            self.scheduled = Some((events, lead));
+        }
+        fn flush(&mut self) {
+            self.flushed = true;
+        }
+        fn take_traffic(&mut self) -> bool {
+            false
+        }
+        fn tick_autoconnect(&mut self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_flush_cue_flushes_the_sink_and_schedules_nothing() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
+        dispatch_midi_cue(&cue, 0, &mut sink);
+        assert!(sink.flushed);
+        assert!(sink.scheduled.is_none());
+    }
+
+    #[test]
+    fn a_non_abc_mime_is_ignored() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue::now_inline("audio/wav", vec![1, 2, 3]);
+        dispatch_midi_cue(&cue, 0, &mut sink);
+        assert!(!sink.flushed);
+        assert!(sink.scheduled.is_none());
+    }
+
+    #[test]
+    fn an_unstamped_zero_lead_abc_cue_schedules_events_untouched() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
+        dispatch_midi_cue(&cue, 0, &mut sink);
+        let (events, lead) = sink.scheduled.expect("ABC cue must schedule");
+        assert_eq!(events.len(), abc_to_timed_events(CDEF).len());
+        assert_eq!(lead, Duration::ZERO, "unstamped, zero-lead cue: lead untouched");
+    }
+
+    /// The CAS-payload warn is a deliberate, kept behavior — CAS-backed ABC
+    /// isn't resolved on the DJ thread yet (a recorded follow-up), so a CAS
+    /// cue must warn and schedule nothing, never panic or silently vanish.
+    #[test]
+    fn a_cas_payload_abc_cue_warns_and_schedules_nothing() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue {
+            mime: ABC_MIME.into(),
+            payload: CuePayload::Cas(kaijutsu_cas::ContentHash::from_data(b"a-score")),
+            lead: Duration::ZERO,
+            epoch_ns: 0,
+        };
+        dispatch_midi_cue(&cue, 0, &mut sink);
+        assert!(sink.scheduled.is_none());
+        assert!(!sink.flushed);
+    }
+
+    #[test]
+    fn a_stale_abc_cue_is_rejected_and_schedules_nothing() {
+        let mut sink = RecordingSink::default();
+        let now_epoch_ns: u64 = 100_000_000_000;
+        let stale_epoch_ns = now_epoch_ns
+            .saturating_sub((CUE_STALE_MAX + Duration::from_secs(2)).as_nanos() as u64);
+        let cue = RenderCue {
+            mime: ABC_MIME.into(),
+            payload: CuePayload::Inline(CDEF.as_bytes().to_vec()),
+            lead: Duration::from_millis(50),
+            epoch_ns: stale_epoch_ns,
+        };
+        dispatch_midi_cue(&cue, now_epoch_ns, &mut sink);
+        assert!(sink.scheduled.is_none(), "a too-stale cue must not schedule");
+    }
+
     /// Live ALSA loopback (needs `/dev/snd/seq`; `#[ignore]` so CI stays green —
     /// run with `--ignored` on a box with the sequencer, e.g. zorak). Opens the
     /// sink, subscribes a reader, schedules the CDEF phrase at a small lead, and
@@ -882,14 +935,12 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline && note_ons.len() < 4 {
             if input.event_input_pending(true).unwrap_or(0) > 0 {
-                if let Ok(ev) = input.event_input() {
-                    if ev.get_type() == EventType::Noteon {
-                        if let Some(n) = ev.get_data::<alsa::seq::EvNote>() {
-                            if n.velocity > 0 {
-                                note_ons.push(n.note);
-                            }
-                        }
-                    }
+                if let Ok(ev) = input.event_input()
+                    && ev.get_type() == EventType::Noteon
+                    && let Some(n) = ev.get_data::<alsa::seq::EvNote>()
+                    && n.velocity > 0
+                {
+                    note_ons.push(n.note);
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(5));
@@ -1017,18 +1068,6 @@ mod tests {
         assert!(render_has_outbound_wire(&[wire(RENDER, (128, 0))], RENDER));
         assert!(!render_has_outbound_wire(&[wire((14, 0), (128, 0))], RENDER));
         assert!(!render_has_outbound_wire(&[], RENDER));
-    }
-
-    // -- RenderAutoConnect::default timer priming --------------------------
-
-    #[test]
-    fn default_render_auto_connect_timer_fires_on_the_first_tick() {
-        let mut latch = RenderAutoConnect::default();
-        assert!(!latch.done);
-        assert!(
-            latch.timer.tick(Duration::from_millis(1)).just_finished(),
-            "the cold-start attempt must not wait a full retry cadence"
-        );
     }
 
     // -- click_bytes: metronome click byte masking --------------------------

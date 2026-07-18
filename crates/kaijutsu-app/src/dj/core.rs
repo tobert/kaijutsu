@@ -11,11 +11,11 @@
 //! bottom).
 //!
 //! **Two things compose here, both ported rather than newly invented:**
-//! - The **click policy** is `metronome.rs::Metronome::schedule_due` ported
-//!   verbatim (never-replay overdue collapse, un-strand re-seed, first-call
-//!   next-whole-beat). `metronome.rs` is untouched by this task — the
-//!   fold-in (metronome deletes its own copy once the DJ thread owns clicks
-//!   end to end) is Task #4.
+//! - The **click policy** is the deleted `metronome.rs::Metronome::schedule_due`
+//!   ported verbatim (never-replay overdue collapse, un-strand re-seed,
+//!   first-call next-whole-beat). Task #4 (the demolition) deleted
+//!   `metronome.rs` for good — this is now the ONLY copy of the click policy
+//!   in the codebase, not a parallel one kept in sync by hand.
 //! - The **clock mode machine** is new: `docs/midi.md`'s Wallclock/BeatGrid
 //!   ladder has no existing implementation to port from (the metronome is a
 //!   single always-on phasor with no notion of "fall back to wallclock cue
@@ -133,26 +133,42 @@ pub struct ClockTransition {
     pub reason: TransitionReason,
 }
 
-/// Click sound + gate config — duplicated from `metronome::MetronomeConfig`
-/// (same fields, same shipped default; see that type's doc for the
-/// `metronome.toml` contract). `metronome.rs` is untouched by this task, so
-/// this is a straight copy rather than a shared type; Task #4 folds the two
-/// together once the metronome stops owning its own copy of the click
-/// policy. Bevy-free already in the original (no `Resource` derive there
-/// either), so the copy needs nothing stripped.
+/// Click sound + gate config, resolved from the per-client `metronome.toml`
+/// (`docs/config-crdt-ownership.md` "Per-client config") and applied via
+/// `DjCtl::MetronomeConfig` (`dj::thread::forward_metronome_config_to_dj`).
+/// Was a straight copy of the deleted `metronome.rs::MetronomeConfig` while
+/// that type still existed side by side (Tasks #1–#3); Task #4 deleted the
+/// original, so this is now the SOLE definition — same fields, same shipped
+/// default, still validated against `assets/defaults/metronome.toml` by this
+/// module's own tests (see `config_parses_the_shipped_default_and_fills_partials`
+/// below; that coverage would otherwise have been lost along with
+/// `metronome.rs`'s own copy of the same test).
+///
+/// The click is a *pitched* note on a dedicated channel, not a drum: GM
+/// channel-9 percussion is silent under game soundfonts (the FF4 one on
+/// zorak), so `dj::midi::MidiSink::click_at` gates a melodic note instead.
+/// C6 (84) reads as a crisp tick.
 #[derive(serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetronomeConfig {
+    /// Whether the click sounds at all (on top of the always-on "only while a
+    /// live clock rolls" gate — [`DjCore::due_clicks`] returns nothing while
+    /// [`ClockMode::Wallclock`]).
     pub enabled: bool,
+    /// MIDI note number for the click.
     pub note: u8,
+    /// MIDI channel (0–15), off the music's channel 0.
     pub channel: u8,
+    /// Note-on velocity (1–127).
     pub velocity: u8,
+    /// Milliseconds the note sounds before note-off.
     pub gate_ms: u64,
 }
 
 impl Default for MetronomeConfig {
     fn default() -> Self {
-        // Must match assets/defaults/metronome.toml, same as metronome.rs's copy.
+        // Must match assets/defaults/metronome.toml — verified by
+        // `config_parses_the_shipped_default_and_fills_partials` below.
         Self { enabled: true, note: 84, channel: 15, velocity: 110, gate_ms: 60 }
     }
 }
@@ -785,6 +801,24 @@ mod tests {
         assert!(near(resumed.offsets[0], 250.0));
     }
 
+    /// Ported from the deleted `metronome.rs`'s
+    /// `a_large_forward_jump_still_clicks_at_most_once` (not merely a
+    /// duplicate of the 3-beat backlog above — a BIGGER backlog, 8 beats
+    /// missed, must STILL collapse to exactly one click; the invariant is "at
+    /// most one clamped click ever," not "one click per missed beat below
+    /// some threshold").
+    #[test]
+    fn a_large_forward_jump_still_clicks_at_most_once() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        dj.due_clicks(t0, H); // seeds next_beat = 1
+
+        let due = dj.due_clicks(t0 + Duration::from_millis(2000), H); // cur = 4.0
+        assert_eq!(due.offsets.len(), 1, "still exactly one click regardless of backlog size: {due:?}");
+        assert!(due.offsets[0].is_zero());
+    }
+
     #[test]
     fn a_stranded_next_beat_recovers_within_bounded_slack() {
         let mut dj = DjCore::default();
@@ -945,5 +979,33 @@ mod tests {
         // Pure sanity check that this file's staleness reasoning rests on:
         // if this ever inverted, the Touch band would be empty or negative.
         assert!(REF_FOLD_MAX < REF_STALE_MAX);
+    }
+
+    // ── MetronomeConfig: shipped-default + typo-rejection (ported from the
+    // deleted metronome.rs — this module is now the SOLE owner of the type,
+    // so this coverage would otherwise be lost entirely, not merely
+    // duplicated) ───────────────────────────────────────────────────────
+
+    /// The shipped `metronome.toml` seed must deserialize to exactly the
+    /// compiled-in `MetronomeConfig::default()` — otherwise a fresh client and a
+    /// no-config client would click differently. Partial files fill from default.
+    #[test]
+    fn config_parses_the_shipped_default_and_fills_partials() {
+        let shipped: MetronomeConfig =
+            toml::from_str(include_str!("../../../../assets/defaults/metronome.toml"))
+                .expect("shipped metronome.toml parses");
+        assert_eq!(shipped, MetronomeConfig::default(), "seed must match the Default impl");
+
+        let partial: MetronomeConfig = toml::from_str("note = 60\n").expect("partial parses");
+        assert_eq!(partial.note, 60);
+        assert_eq!(partial.channel, MetronomeConfig::default().channel);
+        assert_eq!(partial.velocity, MetronomeConfig::default().velocity);
+    }
+
+    /// A typo must fail loud, not silently default: `deny_unknown_fields` turns
+    /// `volume` (meant `velocity`) into a parse error the apply path logs.
+    #[test]
+    fn config_rejects_a_typo_rather_than_silently_defaulting() {
+        assert!(toml::from_str::<MetronomeConfig>("volume = 90\n").is_err());
     }
 }

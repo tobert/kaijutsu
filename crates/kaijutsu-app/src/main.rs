@@ -56,8 +56,6 @@ mod constants;
 mod dj;
 mod input;
 mod kaish;
-mod metronome;
-mod midi;
 mod midi_in;
 mod patch_graph;
 mod peers;
@@ -211,21 +209,19 @@ fn main() {
         // no-op plugin when no --share flag was given.
         .add_plugins(connection::ShareDialPlugin { ssh_config, share_config })
         // Render sinks (docs/pcm.md, docs/midi.md): ServerEvent::RenderCue,
-        // dispatched by mime. audio/* + CLIP_MIME + PREPARE_MIME dispatch off
-        // the DJ thread's own select! loop now (docs/midi.md "The DJ
-        // thread"), not a frame-coupled Bevy system — DjPlugin spawns both
-        // the DJ thread and the rodio scheduler thread it drives
-        // (`audio_sched.rs`; moved from the deleted `AudioOutPlugin`).
-        // text/vnd.abc still dispatches through MidiOutPlugin below (Task #4
-        // moves it onto the DJ thread too).
+        // dispatched by mime, ALL off the DJ thread's own select! loop now
+        // (docs/midi.md "The DJ thread") — not frame-coupled Bevy systems.
+        // DjPlugin spawns the DJ thread (which owns ABC→MIDI dispatch, the
+        // ALSA render sink + patch-bay auto-connect, and the metronome click
+        // policy end to end) and the rodio scheduler thread it drives
+        // (`audio_sched.rs`; moved from the deleted `AudioOutPlugin`). The
+        // demolished `midi::MidiOutPlugin` and `metronome::MetronomePlugin`
+        // are gone — `dj::midi::MidiSink`/`dj::DjCore` are their sole
+        // successors.
         .add_plugins(dj::DjPlugin)
-        .add_plugins(midi::MidiOutPlugin)
         // The ear (docs/midi.md M2): device MIDI → ring → windowed batches →
         // commitCapture, landing as data-only cells on the current context's track.
         .add_plugins(midi_in::MidiInPlugin)
-        // The metronome: the app's continuous local timebase made audible —
-        // a phasor slaved to ServerEvent::BeatSync, clicking through midi's port.
-        .add_plugins(metronome::MetronomePlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)
@@ -282,7 +278,10 @@ fn main() {
         // Power management — sleep between events instead of spinning every vsync tick.
         // Input events (keyboard, mouse, window) wake immediately with zero added latency.
         .insert_resource(WinitSettings {
-            focused_mode: UpdateMode::reactive(std::time::Duration::from_millis(100)), // 10Hz idle
+            // TEMP(scroll-tuning 2026-07-18): focused_mode forced Continuous to
+            // isolate whether reactive 10Hz idle is what makes smooth scrolling
+            // feel laggy. Revert to reactive(100ms) after the diagnostic.
+            focused_mode: UpdateMode::Continuous,
             unfocused_mode: UpdateMode::reactive_low_power(std::time::Duration::from_millis(500)), // 2Hz background
         })
         // Startup

@@ -35,8 +35,8 @@
 //! `docs/midi.md` "The DJ thread" names.
 //!
 //! **Backdating applies to every audio/clip cue**, not just the zero-lead
-//! case: [`crate::audio_sched::effective_deadline`] mirrors
-//! `midi.rs::backdate_events`'s epoch-backdating discipline (`docs/midi.md`
+//! case: [`crate::audio_sched::effective_deadline`] mirrors `dj::midi`'s own
+//! (private) `backdate_events`'s epoch-backdating discipline (`docs/midi.md`
 //! "The one timebase"). The deadline is snapshotted at CUE RECEIPT — before
 //! any CAS fetch is even dispatched — so fetch latency never folds into
 //! audio jitter (`docs/pcm.md` Decision 4): a CAS-resolved cue plays against
@@ -54,12 +54,13 @@
 //! clip payloads are supported — the latter is a two-stage resolve: fetch
 //! the record, parse it, then fetch its `media`.
 //!
-//! Non-audio, non-clip mimes (MIDI `text/vnd.abc`) are still owned by
-//! `midi.rs` off the Bevy-side `ServerEventMessage` stream (untouched this
-//! task — `docs/midi.md`'s staging note: ABC + clicks + `BeatSync` sinks stay
-//! on the old path until Task #4); `RENDER_FLUSH_MIME` is consumed by BOTH
-//! (the DJ's scheduler flush here, `midi.rs`'s own cursor there)
-//! independently, exactly as the deleted `audio.rs` already documented.
+//! Non-audio, non-clip mimes (MIDI `text/vnd.abc`) are owned by
+//! [`super::midi::dispatch_midi_cue`], called off this SAME events-arm
+//! iteration (`dj::thread::run_loop`, Task #4) rather than a separate Bevy
+//! system. `RENDER_FLUSH_MIME` is consumed independently by three listeners
+//! on one shared stream: this module's scheduler flush, `dj::midi`'s ALSA
+//! queue flush, and `DjCore::on_flush`'s clock-mode reset — mirroring the
+//! pre-Task-#4 `audio.rs`/`midi.rs` split, now three-way on one thread.
 
 use std::time::Instant;
 
@@ -173,18 +174,20 @@ fn handle_clip_cue(
 /// Consume one `RenderCue`: flush the scheduler on a transport stop/pause,
 /// dispatch `audio/*` and `CLIP_MIME` cues (inline or CAS) to it with their
 /// backdated deadline, dispatch `PREPARE_MIME` cache-warms, and leave
-/// everything else (ABC) to `midi.rs`'s own cursor on the same message
-/// stream. The DJ thread's events arm (`dj::thread::run_loop`) calls this
-/// once per `ServerEvent::RenderCue`, alongside (not instead of)
-/// `handle_server_event`'s clock-mode reaction to the same cue — mirrors how
-/// the deleted `audio.rs` and `midi.rs` already independently read
-/// `RENDER_FLUSH_MIME` off one shared stream.
+/// everything else (ABC) to `super::midi::dispatch_midi_cue`, called off the
+/// SAME events-arm iteration. The DJ thread's events arm
+/// (`dj::thread::run_loop`) calls this once per `ServerEvent::RenderCue`,
+/// alongside (not instead of) `handle_server_event`'s clock-mode reaction to
+/// the same cue — mirrors how the deleted `audio.rs` and `midi.rs` already
+/// independently read `RENDER_FLUSH_MIME` off one shared stream, now both
+/// folded onto this thread.
 ///
 /// `now`/`now_epoch_ns` are supplied by the caller rather than read here
 /// (`docs/midi.md`'s whole "everything takes an explicit `now`" discipline,
-/// already `DjCore`'s rule) — mirrors `midi.rs::play_midi_cues`'s discipline
-/// of reading the clock ONCE per receipt so several cues buffered into one
-/// wakeup age against the SAME instant rather than one drifting per cue.
+/// already `DjCore`'s rule) — mirrors the deleted `midi.rs::play_midi_cues`'s
+/// discipline of reading the clock ONCE per receipt, now even finer-grained:
+/// each `dj::thread::run_loop` events-arm iteration reads it once per EVENT
+/// rather than once per batch, since there's no per-frame batch anymore.
 pub(crate) fn dispatch_render_cue(
     cue: &RenderCue,
     now: Instant,
@@ -253,8 +256,8 @@ pub(crate) fn dispatch_render_cue(
     }
 
     if !cue.mime.starts_with("audio/") {
-        // ABC is midi.rs's own mime, read off its own cursor on the same
-        // stream. Anything else Cas-backed and genuinely unrecognized by
+        // ABC is dj::midi's own mime, dispatched off this same events-arm
+        // iteration. Anything else Cas-backed and genuinely unrecognized by
         // any known sink stays loud (the bytes would otherwise vanish
         // with no trace) — an unrecognized Inline mime is assumed to be
         // a foreign/future symbolic payload no sink here needs to touch.
@@ -663,7 +666,8 @@ mod tests {
     }
 
     /// A transport flush cue reaches the scheduler as `Flush` — wired to the
-    /// same `RENDER_FLUSH_MIME` midi.rs consumes off its own cursor.
+    /// same `RENDER_FLUSH_MIME` `dj::midi::dispatch_midi_cue` and
+    /// `DjCore::on_flush` also independently consume off this events arm.
     #[test]
     fn a_flush_cue_sends_flush_to_the_scheduler() {
         let (scheduler, rx) = audio_sched::test_handle();

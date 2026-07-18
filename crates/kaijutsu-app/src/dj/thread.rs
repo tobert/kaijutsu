@@ -15,19 +15,30 @@
 //! [`handle_status_change`]) — any decision logic beyond "what does this
 //! channel message mean to the clock" belongs in `core.rs`, not here.
 //!
-//! **Slice #2 was clock + clicks only.** This task (#3 of 4) is the first
-//! LIVE wiring: every `audio/*`, `CLIP_MIME`, and `PREPARE_MIME` `RenderCue`
-//! now dispatches for real, through [`super::audio::dispatch_render_cue`] /
-//! [`super::audio::handle_prefetch_outcome`] (ported from the deleted
-//! `audio.rs`) — the events arm calls the former for every `RenderCue`
-//! alongside (not instead of) [`handle_server_event`]'s clock reaction to
-//! the same cue, and a new prefetch-outcome `select!` arm calls the latter.
-//! [`DjSinks::audio`] is the real [`AudioSchedulerHandle`] now, spawned in
-//! [`DjPlugin::build`] (moved from the deleted `AudioOutPlugin`). ABC,
-//! clicks, and `BeatSync` sinks stay on the old Bevy-side path (`midi.rs`,
-//! `metronome.rs`) until Task #4 — `docs/midi.md`'s staged migration.
+//! **Slice #3** was the first LIVE wiring: every `audio/*`, `CLIP_MIME`, and
+//! `PREPARE_MIME` `RenderCue` dispatches through
+//! [`super::audio::dispatch_render_cue`] / [`super::audio::handle_prefetch_outcome`]
+//! (ported from the deleted `audio.rs`) — the events arm calls the former for
+//! every `RenderCue` alongside (not instead of) [`handle_server_event`]'s
+//! clock reaction to the same cue, and a prefetch-outcome `select!` arm calls
+//! the latter. [`DjSinks::audio`] is the real [`AudioSchedulerHandle`],
+//! spawned in [`DjPlugin::build`] (moved from the deleted `AudioOutPlugin`).
 //!
-//! [`DjPlugin`] is now registered in `main.rs`, replacing `AudioOutPlugin`.
+//! **Task #4 (the demolition) is this revision.** ABC→MIDI dispatch (events
+//! arm → [`super::midi::dispatch_midi_cue`]), the ALSA sink + patch-bay
+//! auto-connect (a loop-local [`super::midi::MidiSink`], generic parameter
+//! `M: MidiDispatch` — see that module's doc for why loop-local rather than a
+//! `DjSinks` field), and the click policy (already ported to [`DjCore`] in
+//! Task #1) all now live on this thread end to end. `midi.rs` and
+//! `metronome.rs` are DELETED — nothing outside this thread touches MIDI or
+//! the metronome anymore. The old `ClickSink` seam (click-only) is replaced
+//! by the broader [`super::midi::MidiDispatch`] (click + ABC-schedule +
+//! flush + traffic + auto-connect), reflecting that the events arm now
+//! dispatches through the same owned sink the click timer does — "one app,
+//! one port."
+//!
+//! [`DjPlugin`] is registered in `main.rs`, replacing `AudioOutPlugin`,
+//! `MidiOutPlugin`, and `MetronomePlugin`.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +55,7 @@ use crate::connection::actor_plugin::{RpcActor, RpcConnectionState, RpcResultMes
 
 use super::audio::{dispatch_render_cue, handle_prefetch_outcome};
 use super::core::{ClockTransition, DjCore, MetronomeConfig};
+use super::midi::{AUTOCONNECT_POLL, MidiDispatch, MidiSink, dispatch_midi_cue};
 use super::prefetch::{CasPrefetch, PrefetchOutcome};
 
 /// How far ahead the click timer pre-schedules — mirrors
@@ -65,41 +77,37 @@ const NO_PHASOR_SLEEP: Duration = Duration::from_secs(3600);
 
 /// One pulse mirrored DJ→Bevy — decorative back-flow only (`docs/midi.md`:
 /// "Back-flow from the DJ is one small crossbeam channel (patch-bay traffic
-/// pulses)"). `RenderTraffic` is defined now; nothing sends it until Task #4
-/// wires render/patch-bay dispatch into this thread. [`drain_dj_pulses`]
-/// already drains the (today empty) channel every frame so the plumbing is
-/// live and cheap before the first real payload arrives.
+/// pulses)"). [`drain_dj_pulses`] drains the channel every frame and folds
+/// each pulse into the Bevy-side [`RenderPortTraffic`] message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DjPulse {
+    /// Something left the render port — an ABC cue (events arm, via
+    /// [`dispatch_midi_cue`]) or a metronome click (the click-timer arm, via
+    /// [`handle_due_clicks`]). Sent at most once per select!-iteration burst
+    /// that touched the sink (`MidiSink::take_traffic`'s drain point in each
+    /// arm below) — the same "one travelling packet, not a strobe" collapse
+    /// `midi.rs`'s deleted per-Bevy-frame `emit_render_traffic` used, just at
+    /// select!-iteration granularity instead of frame granularity (finer, but
+    /// same rationale: a burst of clicks scheduled in one `due_clicks` call,
+    /// or one ABC cue's worth of scheduling, is one pulse, not N).
     RenderTraffic,
 }
 
-// ── Sinks — inert in this task ──────────────────────────────────────────────
+// ── Sinks ────────────────────────────────────────────────────────────────
 
-/// A click dispatcher — what `metronome.rs`'s `MidiSink::click_at` becomes
-/// once Task #4 folds the metronome's ALSA sink into this thread. `Send`
-/// because a real sink (an ALSA seq handle) will be built on Bevy's main
-/// thread and moved into the DJ thread's closure once Task #4 wires one up.
-pub(crate) trait ClickSink: Send {
-    fn click_at(&self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration);
-}
-
-/// External effects the DJ thread can drive. Every field is `None`/absent
-/// until its owning task lands (documented per field) — `DjSinks::default()`
-/// is what [`DjPlugin`] wires up today. Every call site that reads a field
-/// here already treats `None` as "compute the decision, skip the dispatch,"
-/// never as an error: a headless DJ (no ALSA device, no CAS) is a fully
+/// External effects the DJ thread can drive, beyond its own generic `M:
+/// MidiDispatch` sink (a separate `run_loop` parameter — see `dj::midi`'s
+/// module doc for why MIDI isn't a field here). `DjSinks::default()` is what
+/// the subscription-swap/shutdown tests use; every call site that reads
+/// `audio` already treats `None` as "compute the decision, skip the
+/// dispatch," never as an error: a headless DJ (no audio device) is a fully
 /// correct DJ, just a silent one.
 #[derive(Default)]
 pub(crate) struct DjSinks {
-    /// Click dispatch — Task #4.
-    pub(crate) clicks: Option<Box<dyn ClickSink>>,
     /// The rodio scheduler thread's handle (`audio_sched.rs`) — the real
-    /// thing as of this task, `Some` in production
-    /// ([`DjPlugin::build`] spawns it, moved from the deleted
-    /// `AudioOutPlugin`). `None` in tests that don't care about scheduler
-    /// dispatch — mirrors `clicks`'s headless-correctness stance: a DJ with
-    /// no audio device is still a fully correct DJ, just a silent one.
+    /// thing in production ([`DjPlugin::build`] spawns it, moved from the
+    /// deleted `AudioOutPlugin`). `None` in tests that don't care about
+    /// scheduler dispatch.
     pub(crate) audio: Option<AudioSchedulerHandle>,
 }
 
@@ -174,9 +182,15 @@ pub enum DjCtl<H = ActorHandle> {
 pub(crate) enum DjEffect {
     /// `kaijutsu.dj.clock_transition` (`to`/`reason` from [`ClockTransition`]).
     Transition(ClockTransition),
-    /// `kaijutsu.dj.phasor_slew`, consumer `"dj"` — `metronome`/`time_well`
-    /// are the other two consumers (`metronome.rs`, `view/time_well/live.rs`).
+    /// `kaijutsu.dj.phasor_slew`, consumer `"dj"` — `time_well` is the other
+    /// consumer (`view/time_well/live.rs`); `metronome` (the deleted
+    /// `metronome.rs`'s own consumer label) no longer reports — the DJ is now
+    /// the sole clicker, so `"dj"` is the intended replacement, not a gap.
     Slew(Slew),
+    /// `kaijutsu.metronome.click` — one per click actually dispatched to a
+    /// live sink (ported from the deleted `metronome.rs::click_on_beat`'s
+    /// per-offset counter; a global counter, no consumer label to carry).
+    Click,
 }
 
 /// Production `record_effect`: forward straight to `kaijutsu_telemetry`'s
@@ -189,6 +203,9 @@ fn record_effect_via_telemetry(effect: DjEffect) {
         }
         DjEffect::Slew(s) => {
             kaijutsu_telemetry::record_phasor_slew("dj", s.error_beats, s.deadbanded);
+        }
+        DjEffect::Click => {
+            kaijutsu_telemetry::record_metronome_click();
         }
     }
 }
@@ -251,36 +268,49 @@ fn handle_status_change(core: &mut DjCore, status: &ConnectionStatus, now: Insta
     core.on_disconnect(now).map(DjEffect::Transition)
 }
 
-/// Dispatch one `due_clicks` result to the click sink (if present, and only
-/// while clicks are enabled — mirrors `metronome.rs::click_on_beat`'s own
-/// `config.enabled` gate, which sits at the dispatch site rather than inside
-/// the click-policy math) and collect the resulting effects. Extracted for
-/// the same reason [`handle_server_event`] is: unit-testable without a tokio
-/// runtime or a real sink — including the "no sink" path, which is the
-/// production default in this task.
+/// Dispatch one `due_clicks` result to the MIDI sink (if present, and only
+/// while clicks are enabled — mirrors the deleted `metronome.rs::click_on_beat`'s
+/// own `config.enabled` gate, which sat at the dispatch site rather than
+/// inside the click-policy math) and collect the resulting effects,
+/// including one [`DjEffect::Click`] per offset actually dispatched (ported
+/// telemetry counter — see that variant's doc). Extracted for the same
+/// reason [`handle_server_event`] is: unit-testable without a tokio runtime
+/// or a real sink — including the "no sink" path, a headless DJ (no ALSA
+/// device) still reporting clock transitions correctly.
 fn handle_due_clicks(
     metronome: &MetronomeConfig,
-    sink: Option<&dyn ClickSink>,
+    sink: Option<&mut dyn MidiDispatch>,
     due: super::core::DueClicks,
 ) -> Vec<DjEffect> {
+    let mut effects = Vec::new();
     if metronome.enabled
         && let Some(sink) = sink
     {
         for offset in &due.offsets {
             sink.click_at(metronome.note, metronome.channel, metronome.velocity, metronome.gate_ms, *offset);
+            effects.push(DjEffect::Click);
         }
     }
-    due.transition.map(DjEffect::Transition).into_iter().collect()
+    effects.extend(due.transition.map(DjEffect::Transition));
+    effects
 }
 
 // ── run_loop — the thread's whole life ──────────────────────────────────────
 
 /// The DJ thread's whole life once the tokio runtime is up: one `select!`
-/// over {ctl, events, status, click timer, prefetch outcomes}. Generic over
-/// `H` (the [`ActorSource`] carried by `ActorReady`) and `F` (where effects
-/// go) so this same function drives both the real thread ([`thread_main`],
-/// with a real [`ActorHandle`] and telemetry) and the thread-level tests (a
-/// hand-built double and a plain channel).
+/// over {ctl, events, status, click timer, auto-connect timer, prefetch
+/// outcomes}. Generic over `H` (the [`ActorSource`] carried by `ActorReady`),
+/// `F` (where effects go), and `M` (the [`MidiDispatch`] sink) so this same
+/// function drives both the real thread ([`thread_main`], with a real
+/// [`ActorHandle`], telemetry, and a real ALSA-backed [`MidiSink`]) and the
+/// thread-level tests (hand-built doubles for all three).
+///
+/// `midi` is owned loop-local (see `dj::midi`'s module doc for why it isn't a
+/// `DjSinks` field: a real ALSA `Seq` is `!Send`, and `MidiSink` holds
+/// nothing runtime-shaped that would force it into `thread_main`'s sync frame
+/// the way `CasPrefetch` must be) — both the events arm's ABC dispatch and
+/// the click-timer arm's clicks go through this SAME sink, "one app, one
+/// port."
 ///
 /// `prefetch`/`prefetch_rx` are the two halves of one
 /// [`super::prefetch::CasPrefetch`] — split apart (rather than folded into
@@ -299,20 +329,34 @@ fn handle_due_clicks(
 /// prefetch-outcome `select!` arm needs no `Option`-guard/async-block idiom
 /// (see that arm's own comment for how this differs from the events arm's
 /// footgun).
-async fn run_loop<H, F>(
+async fn run_loop<H, F, M>(
     mut ctl_rx: mpsc::UnboundedReceiver<DjCtl<H>>,
+    mut midi: M,
     sinks: DjSinks,
     prefetch: &CasPrefetch,
     mut prefetch_rx: mpsc::UnboundedReceiver<PrefetchOutcome>,
-    _pulse_tx: crossbeam_channel::Sender<DjPulse>,
+    pulse_tx: crossbeam_channel::Sender<DjPulse>,
     mut record_effect: F,
 ) where
     H: ActorSource,
     F: FnMut(DjEffect),
+    M: MidiDispatch,
 {
     let mut core = DjCore::default();
     let mut events_rx: Option<broadcast::Receiver<ServerEvent>> = None;
     let mut status_rx: Option<watch::Receiver<ConnectionStatus>> = None;
+    // The render-port auto-connect one-shot (`dj::midi`'s module doc): its
+    // own `tokio::time::interval` arm below, cadence `AUTOCONNECT_POLL`. The
+    // `done` latch lives here (loop-local), not inside `midi` — `MidiSink`
+    // only ever reports "settled or not" per attempt (`tick_autoconnect`);
+    // the caller owns whether to keep asking.
+    let mut autoconnect_timer = tokio::time::interval(AUTOCONNECT_POLL);
+    // `Delay` (skip missed ticks, don't burst-catch-up): a DJ thread busy
+    // long enough to miss several 2s retries has no reason to then fire the
+    // auto-connect attempt several times back-to-back — one prompt retry
+    // once it's free again is exactly as good as N.
+    autoconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut autoconnect_done = false;
     // First real consumer as of this task: gates/feeds every CAS prefetch
     // dispatch (`dispatch_render_cue`'s `Option<&SshConfig>` parameter)
     // exactly as the deleted `audio.rs`'s `conn.ssh_config.clone()` did.
@@ -410,9 +454,10 @@ async fn run_loop<H, F>(
                         }
                         // Cue dispatch runs ALONGSIDE (not instead of)
                         // `handle_server_event`'s clock reaction to the same
-                        // event — mirrors how the deleted `audio.rs` and the
-                        // still-live `midi.rs` already independently read
-                        // `RENDER_FLUSH_MIME` off one shared stream.
+                        // event — mirrors how the deleted `audio.rs` and
+                        // `midi.rs` already independently read
+                        // `RENDER_FLUSH_MIME` off one shared stream, now both
+                        // folded onto this one events-arm iteration.
                         if let ServerEvent::RenderCue { cue, .. } = &ev {
                             dispatch_render_cue(
                                 cue,
@@ -423,6 +468,10 @@ async fn run_loop<H, F>(
                                 sinks.audio.as_ref(),
                                 prefetch,
                             );
+                            dispatch_midi_cue(cue, event_epoch_ns, &mut midi);
+                            if midi.take_traffic() {
+                                let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -459,9 +508,25 @@ async fn run_loop<H, F>(
 
             _ = tokio::time::sleep_until(sleep_target) => {
                 let due = core.due_clicks(Instant::now(), SCHEDULE_HORIZON);
-                for effect in handle_due_clicks(&core.metronome, sinks.clicks.as_deref(), due) {
+                for effect in handle_due_clicks(&core.metronome, Some(&mut midi), due) {
                     record_effect(effect);
                 }
+                if midi.take_traffic() {
+                    let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                }
+            }
+
+            // Patient one-shot retry of the render-port auto-connect
+            // (`dj::midi`'s module doc). `tokio::time::interval` fires
+            // immediately on its first `tick()` (its own documented
+            // guarantee), giving the cold-start attempt the same promptness
+            // the deleted Bevy `Timer`'s hand-primed `elapsed = duration`
+            // trick used to buy. The `if !autoconnect_done` guard permanently
+            // disables this arm once the one-shot settles — never re-armed,
+            // per `MidiSink::tick_autoconnect`'s "never reverse a later cut"
+            // doc.
+            _ = autoconnect_timer.tick(), if !autoconnect_done => {
+                autoconnect_done = midi.tick_autoconnect();
             }
 
             // No `Option`-guard/async-block wrapper needed here (contrast
@@ -521,9 +586,16 @@ fn thread_main(
         .build()
         .expect("build kaijutsu-dj tokio runtime");
     let (prefetch, prefetch_rx) = CasPrefetch::new();
-    let sinks = DjSinks { clicks: None, audio: Some(scheduler) };
+    let sinks = DjSinks { audio: Some(scheduler) };
+    // `MidiSink::default()` here — not inside `run_loop` — for the same
+    // reason it's a plain local at all: this function already runs ON the DJ
+    // thread (spawned by `DjPlugin::build` below), so building it here vs. as
+    // `run_loop`'s first local statement is purely stylistic; kept here to
+    // keep `thread_main`'s "everything this thread owns, assembled once" shape
+    // symmetric with `prefetch`.
     rt.block_on(run_loop(
         ctl_rx,
+        MidiSink::default(),
         sinks,
         &prefetch,
         prefetch_rx,
@@ -559,11 +631,23 @@ impl Drop for DjHandle {
     }
 }
 
+/// A render-port send just happened — the patch bay lights the RENDER chord.
+/// The app can only observe its OWN traffic (`docs/scenes/patchbay.md`, the
+/// live layer): every send out the render seq port — an ABC cue or a 拍子木
+/// click — is one edge-observable event. Moved here from the deleted
+/// `midi.rs` (Task #4): the DJ thread is the sole producer now, mirrored
+/// Bevy-side by [`drain_dj_pulses`] folding each [`DjPulse::RenderTraffic`]
+/// into one of these. Consumed only by the patch bay
+/// (`view/patch_bay/mod.rs`).
+#[derive(Message)]
+pub struct RenderPortTraffic;
+
 /// Spawns the DJ thread and wires the Bevy-side forwarding systems
-/// (`docs/midi.md` "The DJ thread"). Registered in `main.rs` as of this task
-/// (replacing the deleted `audio::AudioOutPlugin`) — the DJ now dispatches
-/// every `audio/*`/`CLIP_MIME`/`PREPARE_MIME` cue for real, so there is a
-/// live sink to make its output audible.
+/// (`docs/midi.md` "The DJ thread"). Registered in `main.rs`, replacing the
+/// deleted `AudioOutPlugin`/`MidiOutPlugin`/`MetronomePlugin` — the DJ
+/// dispatches every `audio/*`/`CLIP_MIME`/`PREPARE_MIME`/`text/vnd.abc` cue
+/// and every metronome click for real, so there is a live sink to make its
+/// output audible.
 pub struct DjPlugin;
 
 impl Plugin for DjPlugin {
@@ -583,6 +667,7 @@ impl Plugin for DjPlugin {
             .expect("spawn kaijutsu-dj thread");
 
         app.insert_resource(DjHandle { ctl_tx, pulse_rx });
+        app.add_message::<RenderPortTraffic>();
         app.add_systems(Update, (forward_actor_to_dj, forward_metronome_config_to_dj, drain_dj_pulses));
     }
 }
@@ -627,16 +712,18 @@ fn forward_metronome_config_to_dj(mut results: MessageReader<RpcResultMessage>, 
     }
 }
 
-/// Drain the DJ→Bevy mirror channel. Nothing writes to it yet (see
-/// [`DjPulse`]'s doc — Task #4 is the first producer), so this is an empty,
-/// cheap no-op today; registered now so the drain-and-forward posture is
-/// live and exercised (an unbounded producer with nobody draining would
-/// eventually be a leak) before real payloads arrive.
-fn drain_dj_pulses(dj: Res<DjHandle>) {
-    while dj.pulse_rx.try_recv().is_ok() {
-        // Task #4: fold each `DjPulse` into whatever Bevy-side resource/
-        // message the time-well / patch-bay consumer needs (`docs/midi.md`:
-        // "room glow, block sync" precedent from `poll_server_events`).
+/// Drain the DJ→Bevy mirror channel: fold each [`DjPulse`] into the Bevy-side
+/// message its consumer reads (`docs/midi.md`: "room glow, block sync"
+/// precedent from `poll_server_events`). The only pulse today is
+/// [`DjPulse::RenderTraffic`] → [`RenderPortTraffic`], consumed by the patch
+/// bay (`view/patch_bay/mod.rs::pulse_render_chords`).
+fn drain_dj_pulses(dj: Res<DjHandle>, mut traffic: MessageWriter<RenderPortTraffic>) {
+    while let Ok(pulse) = dj.pulse_rx.try_recv() {
+        match pulse {
+            DjPulse::RenderTraffic => {
+                traffic.write(RenderPortTraffic);
+            }
+        }
     }
 }
 
@@ -646,7 +733,7 @@ fn drain_dj_pulses(dj: Res<DjHandle>) {
 mod tests {
     use super::*;
     use crate::audio_sched::{self, SchedulerCmd};
-    use kaijutsu_audio::{BeatRef, CuePayload, RenderCue};
+    use kaijutsu_audio::{ABC_MIME, BeatRef, CuePayload, RenderCue};
     use kaijutsu_types::ContextId;
 
     use super::super::core::{ClockMode, DueClicks, TransitionReason};
@@ -784,41 +871,74 @@ mod tests {
 
     // ── handle_due_clicks ────────────────────────────────────────────────
 
-    struct RecordingClickSink {
-        calls: std::sync::Mutex<Vec<(u8, u8, u8, u64, Duration)>>,
+    /// One command a [`RecordingMidiSink`] recorded — the thread-level
+    /// double's whole vocabulary: clicks (`handle_due_clicks`'s tests below),
+    /// scheduled ABC phrases (`thread_dispatches_an_abc_cue_to_the_midi_sink`),
+    /// and flushes.
+    #[derive(Debug, Clone, PartialEq)]
+    enum MidiCmd {
+        ClickAt { note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration },
+        ScheduleAbc { events: Vec<(Duration, Vec<u8>)>, lead: Duration },
+        Flush,
     }
 
-    impl RecordingClickSink {
-        fn new() -> Self {
-            Self { calls: std::sync::Mutex::new(Vec::new()) }
+    /// A channel-backed [`MidiDispatch`] double — the MIDI-sink analog of
+    /// `audio_sched::test_handle()`: a real implementor of the production
+    /// trait, backed by a plain channel instead of ALSA, so `handle_due_clicks`
+    /// and the real `run_loop` can both be driven end to end with no device.
+    struct RecordingMidiSink {
+        tx: crossbeam_channel::Sender<MidiCmd>,
+    }
+
+    impl RecordingMidiSink {
+        fn new() -> (Self, crossbeam_channel::Receiver<MidiCmd>) {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            (Self { tx }, rx)
         }
     }
 
-    impl ClickSink for RecordingClickSink {
-        fn click_at(&self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
-            self.calls.lock().unwrap().push((note, channel, velocity, gate_ms, offset));
+    impl MidiDispatch for RecordingMidiSink {
+        fn click_at(&mut self, note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration) {
+            let _ = self.tx.send(MidiCmd::ClickAt { note, channel, velocity, gate_ms, offset });
+        }
+        fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
+            let _ = self.tx.send(MidiCmd::ScheduleAbc { events, lead });
+        }
+        fn flush(&mut self) {
+            let _ = self.tx.send(MidiCmd::Flush);
+        }
+        fn take_traffic(&mut self) -> bool {
+            false // not exercised by these tests; the pulse-coalescing is untested plumbing here
+        }
+        fn tick_autoconnect(&mut self) -> bool {
+            true // settle immediately — no ALSA graph for a recording double to introspect
         }
     }
 
     #[test]
     fn due_clicks_dispatch_to_the_sink_when_enabled() {
-        let sink = RecordingClickSink::new();
+        let (mut sink, rx) = RecordingMidiSink::new();
         let cfg = MetronomeConfig { enabled: true, note: 84, channel: 15, velocity: 110, gate_ms: 60 };
         let due = DueClicks { offsets: vec![Duration::from_millis(200)], transition: None };
 
-        let effects = handle_due_clicks(&cfg, Some(&sink as &dyn ClickSink), due);
-        assert!(effects.is_empty(), "no transition this time");
-        assert_eq!(sink.calls.lock().unwrap().as_slice(), &[(84, 15, 110, 60, Duration::from_millis(200))]);
+        let effects = handle_due_clicks(&cfg, Some(&mut sink), due);
+        assert_eq!(effects, vec![DjEffect::Click], "one Click effect per dispatched offset");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(MidiCmd::ClickAt { note: 84, channel: 15, velocity: 110, gate_ms: 60, offset: Duration::from_millis(200) })
+        );
+        assert!(rx.try_recv().is_err(), "exactly one dispatch");
     }
 
     #[test]
     fn due_clicks_skip_the_sink_when_disabled() {
-        let sink = RecordingClickSink::new();
+        let (mut sink, rx) = RecordingMidiSink::new();
         let cfg = MetronomeConfig { enabled: false, note: 84, channel: 15, velocity: 110, gate_ms: 60 };
         let due = DueClicks { offsets: vec![Duration::from_millis(200)], transition: None };
 
-        handle_due_clicks(&cfg, Some(&sink as &dyn ClickSink), due);
-        assert!(sink.calls.lock().unwrap().is_empty(), "disabled config must not dispatch, even with a sink present");
+        let effects = handle_due_clicks(&cfg, Some(&mut sink), due);
+        assert!(effects.is_empty(), "disabled config dispatches nothing, no Click effects either");
+        assert!(rx.try_recv().is_err(), "disabled config must not dispatch, even with a sink present");
     }
 
     #[test]
@@ -887,10 +1007,11 @@ mod tests {
         }
     }
 
-    /// Wait for the next `Transition` effect, skipping `Slew` noise (the
-    /// send-until-observed harness can fold the same reference more than
-    /// once, and each extra fold emits a Slew). Bounded by `timeout`;
-    /// panics loud rather than hanging.
+    /// Wait for the next `Transition` effect, skipping `Slew`/`Click` noise
+    /// (the send-until-observed harness can fold the same reference more than
+    /// once, and each extra fold emits a Slew; a live phasor can also click
+    /// in the background of this test). Bounded by `timeout`; panics loud
+    /// rather than hanging.
     fn expect_transition(
         effect_rx: &std::sync::mpsc::Receiver<DjEffect>,
         timeout: Duration,
@@ -900,7 +1021,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match effect_rx.recv_timeout(remaining) {
                 Ok(DjEffect::Transition(t)) => return t,
-                Ok(DjEffect::Slew(_)) => continue, // harness-induced, not the observable
+                Ok(DjEffect::Slew(_)) | Ok(DjEffect::Click) => continue, // harness-induced, not the observable
                 Err(_) => panic!("no clock transition observed within {timeout:?}"),
             }
         }
@@ -917,7 +1038,7 @@ mod tests {
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
-                rt.block_on(run_loop(ctl_rx, DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, move |effect| {
+                rt.block_on(run_loop(ctl_rx, MidiSink::default(), DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, move |effect| {
                     let _ = effect_tx.send(effect);
                 }));
             })
@@ -984,12 +1105,27 @@ mod tests {
         // Now that the swap is CONFIRMED complete, a further send on the
         // dropped subscription A must produce nothing — the old receiver is
         // gone, not merely deprioritized. (A fold on the live subscription
-        // would emit at least a Slew, so silence discriminates.)
+        // would emit at least a Slew, so silence-of-Slew-or-Transition
+        // discriminates.) `DjEffect::Click` is filtered rather than treated
+        // as silence-breaking: B's own phasor is dialed in and clicks
+        // enabled by default, so the click timer legitimately fires in the
+        // background on its own cadence, independent of anything sent on A
+        // or B — that's not the signal this assertion is checking for.
         let _ = events_a.send(beat_sync(0.0, 2.0));
-        assert!(
-            effect_rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "the DROPPED subscription A must no longer be polled after the swap to B"
-        );
+        let quiet_deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let remaining = quiet_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break; // true silence (aside from background clicks) — the expected outcome
+            }
+            match effect_rx.recv_timeout(remaining) {
+                Ok(DjEffect::Click) => continue, // background click-timer noise, not from A
+                Ok(other) => panic!(
+                    "the DROPPED subscription A must no longer be polled after the swap to B, got {other:?}"
+                ),
+                Err(_) => break,
+            }
+        }
 
         // Shutdown must join cleanly, not hang.
         ctl_tx.send(DjCtl::Shutdown).expect("send Shutdown");
@@ -1006,7 +1142,7 @@ mod tests {
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
-                rt.block_on(run_loop(ctl_rx, DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+                rt.block_on(run_loop(ctl_rx, MidiSink::default(), DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
             })
             .expect("spawn test dj thread");
 
@@ -1031,8 +1167,8 @@ mod tests {
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
-                let sinks = DjSinks { clicks: None, audio: Some(scheduler) };
-                rt.block_on(run_loop(ctl_rx, sinks, &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+                let sinks = DjSinks { audio: Some(scheduler) };
+                rt.block_on(run_loop(ctl_rx, MidiSink::default(), sinks, &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
             })
             .expect("spawn test dj thread");
 
@@ -1064,6 +1200,70 @@ mod tests {
                 Err(_) => {
                     if Instant::now() >= deadline {
                         panic!("no SchedulerCmd observed within 2s");
+                    }
+                }
+            }
+        }
+
+        ctl_tx.send(DjCtl::Shutdown).expect("send Shutdown");
+        join.join().expect("dj test thread panicked");
+    }
+
+    /// The Task #4 sibling of `thread_dispatches_a_render_cue_to_the_scheduler`:
+    /// feed an ABC `RenderCue` through the REAL `run_loop` and assert the
+    /// resulting `MidiCmd::ScheduleAbc` arrives on a [`RecordingMidiSink`]
+    /// receiver — proves the events arm's ABC-dispatch wiring
+    /// (`super::midi::dispatch_midi_cue`) end to end, not just that
+    /// function's own logic in isolation (`dj::midi`'s own test module
+    /// already covers that).
+    #[test]
+    fn thread_dispatches_an_abc_cue_to_the_midi_sink() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        let (midi, midi_rx) = RecordingMidiSink::new();
+
+        let join = std::thread::Builder::new()
+            .name("dj-test-midi".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                rt.block_on(run_loop(ctl_rx, midi, DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+            })
+            .expect("spawn test dj thread");
+
+        let (events, _keep_events) = broadcast::channel(16);
+        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        ctl_tx
+            .send(DjCtl::ActorReady {
+                handle: TestSource { events: events.clone(), status },
+                ssh_config: SshConfig::default(),
+                generation: 1,
+            })
+            .expect("send ActorReady");
+
+        // A brisk four-note phrase, unstamped + zero-lead — deterministic and
+        // connection-free, so this test only needs to prove the WIRING
+        // (events arm -> dispatch_midi_cue -> the owned sink), not re-cover
+        // ABC-render/backdate decisions `dj::midi`'s own suite already owns.
+        const CDEF: &str = "X:1\nT:t\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\nCDEF|\n";
+        let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = events.send(ServerEvent::RenderCue { context_id: ContextId::new(), cue: cue.clone() });
+            match midi_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(MidiCmd::ScheduleAbc { events, lead }) => {
+                    let note_ons = events
+                        .iter()
+                        .filter(|(_, d)| d.len() == 3 && d[0] & 0xF0 == 0x90 && d[2] > 0)
+                        .count();
+                    assert_eq!(note_ons, 4, "CDEF renders to four NoteOns: {events:?}");
+                    assert_eq!(lead, Duration::ZERO, "unstamped, zero-lead cue: lead untouched");
+                    break;
+                }
+                Ok(other) => panic!("expected ScheduleAbc, got {other:?}"),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        panic!("no MidiCmd observed within 2s");
                     }
                 }
             }
