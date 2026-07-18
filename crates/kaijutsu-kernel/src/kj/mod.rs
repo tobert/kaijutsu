@@ -686,16 +686,25 @@ pub(crate) fn kj_command() -> clap::Command {
                 .action(clap::ArgAction::Set)
                 .help("Latch confirmation nonce"),
         )
-        // Root-level (global) flag: like `--confirm`, kj extracts `--json` in
-        // KjBuiltin::execute before dispatch (the per-subcommand clap parsers
-        // don't declare it), so it isn't on any leaf's struct. Declaring it here
-        // puts it in the reflected top-level params and kaish's binder merges
-        // root params onto every leaf, so `kj context list --json` binds.
+        // Root-level (global) flag: kaish 0.13 owns `--json` entirely now
+        // (`GlobalFlags::apply_from_args` / `finalize_output` /
+        // `apply_output_format` format the `ExecResult` kj returns — see
+        // `KjBuiltin::schema`'s `owns_output` note). `params_from_clap`
+        // unconditionally excludes a "json"-id arg from the reflected schema
+        // at every level (same treatment as "help"/"version"), so this
+        // declaration contributes nothing to `KjBuiltin::schema()`'s output —
+        // kaish's binder already defaults any undeclared `--flag` to a bare
+        // boolean in `args.flags`, which is how `--json` binds regardless.
+        // Kept for parity with `--confirm` and as documentation of kj's root
+        // argv surface; `KjBuiltin::execute` still strips "json" out of the
+        // flags it re-adds to argv before `KjDispatcher::dispatch()`'s
+        // per-subcommand clap re-parse, since most leaves don't declare their
+        // own `json` field and would reject it as unrecognized.
         .arg(
             clap::Arg::new("json")
                 .long("json")
                 .action(clap::ArgAction::SetTrue)
-                .help("Emit a JSON envelope {ok, exit_code, message, data} instead of human text"),
+                .help("Emit output as JSON"),
         )
         .subcommand(context::ContextArgs::command())
         .subcommand(workspace::WorkspaceArgs::command())

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use kaish_kernel::ast::Value;
 use kaish_kernel::interpreter::ExecResult;
-use kaish_kernel::tools::{ToolArgs, ToolCtx, ToolSchema};
+use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
 
 use crate::kj::{KjCaller, KjDispatcher, KjResult};
@@ -417,14 +417,12 @@ impl Tool for KjBuiltin {
 
     fn schema(&self) -> ToolSchema {
         // Reflected from the composed clap `Command` tree — the single source of
-        // truth for both routing (`dispatch`) and schema. `with_owned_output()`
-        // marks the tree so the kernel skips its generic `--json` formatter (kj
-        // renders its own envelopes) and re-advertises `json` per node. See
+        // truth for both routing (`dispatch`) and schema. See
         // docs/monday-clap-upgrades.md §2.1/§2.4. This replaces the hand-written
         // flat `.param(...)` union that `11160e5` last reconciled; the `-t`
         // collision (cache `--target` vs context `--tree`) now resolves because
         // each lives on its own leaf.
-        kaish_kernel::tools::schema_tree_from_clap(
+        let mut schema = kaish_kernel::tools::schema_tree_from_clap(
             &crate::kj::kj_command(),
             "kj",
             "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.",
@@ -449,15 +447,40 @@ impl Tool for KjBuiltin {
                 ),
                 ("Bulk synthesize keywords", "kj synth all"),
             ],
-        )
-        // `with_owned_output()` also routes `--help` to kj's own dispatch (where
-        // the leaf clap parser renders subcommand help) rather than kaish's outer
-        // help router: kaish 0.11 gates `wants_help` on `!schema.owns_output`
-        // (tobert/kaish#51), so an owned-output tool is never intercepted. Older
-        // kaish needed a synthetic root `help` param to flip `schema_claims`;
-        // 0.11 made that redundant. Guarded by
-        // `owns_output_routes_leaf_help_through_kaish`.
-        .with_owned_output()
+        );
+
+        // `owns_output` stays at its default `false` (deliberately NOT calling
+        // `with_owned_output()` anymore): kaish 0.13 formats `--json` uniformly
+        // for every tool via `finalize_output`/`apply_output_format`, reading
+        // `.data`/`.output`/`.latch` straight off the `ExecResult` kj already
+        // returns from `execute()` below. kj no longer builds its own envelope
+        // (the old `render_json_envelope` is gone — see the kaish 0.13 `--json`
+        // migration in docs/issues.md). `owns_output && result.ok()` is exactly
+        // the case `finalize_output` uses to SKIP formatting, so setting it
+        // would silently turn off JSON rendering on every successful `kj`
+        // command — the opposite of what we want (uniform success + failure
+        // formatting, kaish-owned).
+        //
+        // The one behavior `owns_output` used to buy for free: routing
+        // `--help`/`-h` through kj's OWN clap parser (leaf help) instead of
+        // kaish's generic whole-tool help router (`wants_help` in kernel.rs is
+        // gated on `!schema.owns_output`) — `kj context create --help` must
+        // render `create`'s leaf help, not the generic schema-derived listing
+        // (tobert/kaish#51). `params_from_clap` can't express "this tool claims
+        // help" (it hard-skips a "help"-id arg at every level of the tree, the
+        // same treatment as "json"), so it's reclaimed directly here: a
+        // root-level "help" param (aliased "h") makes `wants_help`'s
+        // `schema_claims("help")`/`schema_claims("-h")` checks true
+        // unconditionally — independent of `owns_output` — mirroring how
+        // `ToolSchema::mark_owned_output` used to synthesize a "json" param.
+        // Guarded by `owns_output_routes_leaf_help_through_kaish` (renamed
+        // from the with-owned-output era; still asserts the same behavior).
+        schema.params.push(
+            ParamSchema::new("help", "bool")
+                .with_aliases(vec!["h".to_string()])
+                .with_description("Show command help (routed to the leaf's own clap help)"),
+        );
+        schema
     }
 
     async fn execute(&self, args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
@@ -537,16 +560,30 @@ impl Tool for KjBuiltin {
             }
         }
 
-        // Reconstruct boolean flags. `json` is skipped here — see below — so it
-        // never enters the flat argv at all: kaish's structured `args.flags`
-        // (a `HashSet<String>` of flag *names*, no dashes) unambiguously tells
-        // us the user set the global `--json` boolean flag, independent of
-        // whatever string literal happens to ride along as some other flag's
-        // *value* (e.g. `kj config set foo --content --json`, where "--json"
-        // is `--content`'s value, not a flag). Stripping "--json" tokens out of
-        // the already-flattened argv by string match (the old approach) could
-        // not tell those apart and ate the literal value too.
-        let json_requested = args.flags.contains("json");
+        // Reconstruct boolean flags. `json` is skipped here so the global
+        // `--json` flag never reaches `KjDispatcher::dispatch()`'s per-subcommand
+        // clap re-parse: kaish 0.13 owns `--json` entirely now
+        // (`GlobalFlags::apply_from_args`, called by the kaish kernel before
+        // `execute()` runs, reads kaish's OWN structured `args.flags` — a
+        // `HashSet<String>` of flag *names*, no dashes — to set
+        // `ctx.output_format`; `finalize_output`/`apply_output_format` then
+        // render this call's `ExecResult` after `execute()` returns — see
+        // `schema()`'s `owns_output` note). Most kj leaves don't declare their
+        // own `json` field, so handing "--json" to the re-parse below would
+        // make those leaves reject it as an unrecognized argument. (A handful
+        // of leaves — `doc list`, `config show`/`list`, `rc list`/`show`,
+        // `search` — DO carry their own local `json: bool` field for a
+        // differently-shaped internal message; that field is unreachable via
+        // this live kaish bridge either way, since --json never survives to
+        // here regardless of this filter — only `KjDispatcher::dispatch()`
+        // called directly, as the dispatcher-level unit tests do, ever sets
+        // it. See the kaish 0.13 `--json` migration audit in docs/issues.md.)
+        //
+        // Using kaish's structured `args.flags` (rather than string-matching
+        // "--json" tokens in already-flattened argv, the old approach) also
+        // keeps a literal `"--json"` *value* safe — e.g. `kj config set foo
+        // --content --json`, where "--json" is `--content`'s value, not a
+        // flag — since `args.flags` only ever contains flag *names*.
         for flag in args.flags.iter().filter(|f| f.as_str() != "json") {
             if flag.len() == 1 {
                 argv.push(format!("-{flag}"));
@@ -569,13 +606,20 @@ impl Tool for KjBuiltin {
         // papercuts, Fix 3) — the help text already promised piped stdin;
         // this is what makes that promise true. If more kj subcommands grow
         // stdin appetite, promote this to the dispatcher signature.
-        if wants_stdin_content(&argv)
-            && !crate::kj::parse::has_flag(&argv, &["--content"])
-            && let Some(body) = ctx.read_stdin_to_string().await
-            && !body.is_empty()
-        {
-            argv.push("--content".into());
-            argv.push(body);
+        if wants_stdin_content(&argv) && !crate::kj::parse::has_flag(&argv, &["--content"]) {
+            // kaish 0.13 split stdin reads into a `Result` so a read error
+            // (e.g. binary piped into a text-only verb) is explicit rather than
+            // folded into `None`. Surface it loudly instead of silently running
+            // without `--content` (which would fail downstream as a confusing
+            // "missing content").
+            match ctx.read_stdin_to_text().await {
+                Ok(Some(body)) if !body.is_empty() => {
+                    argv.push("--content".into());
+                    argv.push(body);
+                }
+                Ok(_) => {} // no stdin (or empty) — nothing to inject
+                Err(e) => return ExecResult::failure(1, format!("kj: reading piped stdin: {e}")),
+            }
         }
 
         // Recursion depth from the rc runner's `KJ_RC_DEPTH` overlay var (see
@@ -702,60 +746,16 @@ impl Tool for KjBuiltin {
             }
         };
 
-        // --json post-processing: re-render the ExecResult as a JSON envelope on
-        // stdout while preserving the exit code and the side effects already
-        // applied above (a `Switch` has switched, a `Latch` has latched). The
-        // structured `.data` rides along so `kaish-last` / for-loops still see
-        // it; the human-readable text moves into the envelope's `message`.
-        if json_requested {
-            return render_json_envelope(exec);
-        }
+        // `--json` formatting is entirely kaish's concern now (kaish 0.13):
+        // `finalize_output`/`apply_output_format` render this `ExecResult`
+        // after `execute()` returns, reading `.data`/`.output`/`.latch`
+        // exactly as set above — a `Switch` has already switched and a
+        // `Latch` has already latched by this point, so returning `exec`
+        // as-is preserves those side effects. kj no longer builds its own
+        // envelope (see `schema()`'s `owns_output` note and the kaish 0.13
+        // `--json` migration in docs/issues.md).
         exec
     }
-}
-
-/// Wrap an already-produced [`ExecResult`] in the `kj --json` envelope:
-/// `{ "ok", "exit_code", "message", "data" }`. The original exit code is
-/// preserved (nonzero on failure, 2 on a latch prompt) so `$?`/scripting still
-/// works; the body becomes the JSON object with `content_type=application/json`.
-fn render_json_envelope(exec: ExecResult) -> ExecResult {
-    let ok = exec.code == 0;
-    // On failure the human message lives in `.err`; on success it's stdout.
-    let stdout = exec.text_out().into_owned();
-    let message = if exec.err.is_empty() {
-        stdout
-    } else {
-        exec.err.clone()
-    };
-    let data_json = exec
-        .data
-        .as_ref()
-        .map(kaish_kernel::interpreter::value_to_json)
-        .unwrap_or(serde_json::Value::Null);
-    // A confirmation latch (exit 2) rides the typed request on the control-plane
-    // `.latch` field (kaish 0.11). Emit it under a dedicated `latch` key so a
-    // `kj … --json` caller reads `latch.nonce`/`.hint` structurally instead of
-    // parsing the confirmation prose out of `message`. `null` when not latched.
-    let latch_json = serde_json::to_value(exec.latch_request()).unwrap_or(serde_json::Value::Null);
-    let envelope = serde_json::json!({
-        "ok": ok,
-        "exit_code": exec.code,
-        "message": message,
-        "data": data_json,
-        "latch": latch_json,
-    });
-
-    let mut out = ExecResult::success(envelope.to_string());
-    out.code = exec.code;
-    out.content_type = Some("application/json".to_string());
-    // Preserve the iteration-friendly structured payload and any baggage
-    // (e.g. the ephemeral marker) the original result carried. The latch stays
-    // on the control-plane field too, so the MCP shell layer surfaces it even
-    // after this --json wrap.
-    out.data = exec.data;
-    out.baggage = exec.baggage;
-    out.latch = exec.latch;
-    out
 }
 
 /// Read the rc recursion depth from the shell scope's `KJ_RC_DEPTH`.
@@ -1203,9 +1203,13 @@ mod tests {
         let _ = beta; // touched above; keep the binding live
     }
 
-    /// `kj context list --json` (flag AFTER the subcommand) must emit the JSON
-    /// envelope, not error with "unexpected argument". The whole point of item 3:
-    /// `--json` binds at the leaf even though no leaf declares it.
+    /// `kj context list --json` (flag AFTER the subcommand) must emit valid
+    /// JSON, not error with "unexpected argument" — `--json` binds at the leaf
+    /// even though no leaf declares it (kaish's undeclared-flag-defaults-to-bool
+    /// fallback). kaish 0.13 owns `--json` rendering: on success with `.data`
+    /// set and no `.output`, `apply_output_format` serializes `.data` DIRECTLY
+    /// (no `{ok,...}` wrapper) — `kj context list`'s `.data` is the array of
+    /// context handles, so stdout is exactly that array.
     #[tokio::test]
     async fn json_flag_after_subcommand_emits_envelope() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -1224,20 +1228,26 @@ mod tests {
         let stdout = res.text_out();
         let parsed: serde_json::Value = serde_json::from_str(&stdout)
             .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
-        assert_eq!(parsed["ok"], serde_json::json!(true));
-        assert_eq!(parsed["exit_code"], serde_json::json!(0));
-        // `kj context list` emits a `data` array of context handles — it must
-        // survive into the envelope.
-        let data = parsed["data"].as_array().expect("data is an array");
+        // kaish's --json is kj's raw `.data` array verbatim — no envelope.
+        let data = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("stdout must be a bare JSON array, got: {parsed}"));
         let labels: Vec<&str> = data.iter().filter_map(|v| v.as_str()).collect();
         assert!(
             labels.contains(&"alpha") && labels.contains(&"beta"),
-            "envelope data must carry context handles: {labels:?}"
+            "kaish's --json output must carry the context handles: {labels:?}"
+        );
+        // res.data (the kaish sideband, independent of what stdout renders)
+        // must carry the same array too.
+        assert!(
+            res.data.is_some(),
+            "ExecResult.data must survive alongside the rendered stdout"
         );
     }
 
     /// `kj --json context list` (flag BEFORE the subcommand) is the other form
-    /// the issue called out — it must work identically.
+    /// the issue called out — it must work identically to the after-subcommand
+    /// form: a bare JSON array, no envelope.
     #[tokio::test]
     async fn json_flag_before_subcommand_emits_envelope() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -1253,11 +1263,20 @@ mod tests {
         assert!(res.ok(), "--json context list exit != 0: {res:?}");
         let parsed: serde_json::Value = serde_json::from_str(&res.text_out())
             .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {}", res.text_out()));
-        assert_eq!(parsed["ok"], serde_json::json!(true));
+        let data = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("stdout must be a bare JSON array, got: {parsed}"));
+        let labels: Vec<&str> = data.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            labels.contains(&"alpha"),
+            "leading --json must bind identically to the trailing form: {labels:?}"
+        );
     }
 
-    /// An error under `--json` still produces a parseable envelope with
-    /// `ok=false` and a nonzero exit code (the message moves into the envelope).
+    /// An error under `--json` still produces parseable JSON — kaish's
+    /// `{"error", "code"}` object (`apply_output_format`'s no-output-and-failed
+    /// branch), not kj's retired `{ok:false, message}` envelope — with the exit
+    /// code preserved.
     #[tokio::test]
     async fn json_flag_renders_errors_as_envelope() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -1278,12 +1297,22 @@ mod tests {
             !res.ok(),
             "errored command should keep nonzero exit: {res:?}"
         );
+        assert_eq!(res.code, 1, "kj's plain Err maps to exit 1: {res:?}");
         let parsed: serde_json::Value = serde_json::from_str(&res.text_out())
-            .unwrap_or_else(|e| panic!("error envelope not JSON ({e}): {}", res.text_out()));
-        assert_eq!(parsed["ok"], serde_json::json!(false));
+            .unwrap_or_else(|e| panic!("error output not JSON ({e}): {}", res.text_out()));
+        assert_eq!(
+            parsed["code"],
+            serde_json::json!(1),
+            "kaish's error envelope carries the exit code: {parsed}"
+        );
         assert!(
-            parsed["message"].as_str().is_some_and(|m| !m.is_empty()),
-            "error envelope must carry a message: {parsed}"
+            parsed["error"].as_str().is_some_and(|m| !m.is_empty()),
+            "kaish's error envelope must carry a nonempty `error` message: {parsed}"
+        );
+        // No leftover from the retired kj-owned shape.
+        assert!(
+            parsed.get("ok").is_none() && parsed.get("message").is_none(),
+            "must not resemble the retired {{ok,message}} envelope: {parsed}"
         );
     }
 
@@ -1899,8 +1928,13 @@ mod tests {
 
     /// The combined case: a literal `"--json"` content value AND a real
     /// trailing `--json` presentation flag in the same call. Both must take
-    /// effect independently — the envelope renders as JSON (the flag was
+    /// effect independently — the output is formatted as JSON (the flag was
     /// really set) while the stored content is still the untouched literal.
+    /// `kj config set` has no structured `.data` (a plain `KjResult::ok(..)`),
+    /// so kaish's `apply_output_format` hits its text-only branch: the human
+    /// message is wrapped as a JSON *string*, not an `{ok,...}` object — see
+    /// `json_flag_after_subcommand_emits_envelope`'s doc comment for the
+    /// shape table.
     #[tokio::test]
     async fn literal_json_content_value_coexists_with_real_json_flag() {
         let dispatcher = Arc::new(test_dispatcher_crdt_rc().await);
@@ -1916,9 +1950,14 @@ mod tests {
             .await
             .expect("kaish exec");
         assert!(res.ok(), "set with literal + real --json failed: {res:?}");
-        let envelope: serde_json::Value = serde_json::from_str(&res.text_out())
-            .unwrap_or_else(|e| panic!("--json flag should render an envelope ({e}): {}", res.text_out()));
-        assert_eq!(envelope["ok"], serde_json::json!(true));
+        let rendered: serde_json::Value = serde_json::from_str(&res.text_out())
+            .unwrap_or_else(|e| panic!("--json flag should render valid JSON ({e}): {}", res.text_out()));
+        assert!(
+            rendered
+                .as_str()
+                .is_some_and(|s| s.contains("set config") && s.contains("theme.toml")),
+            "text-only success under --json wraps the message as a JSON string: {rendered}"
+        );
 
         let show = kaish
             .execute_with_options("kj config show theme.toml --raw", ExecuteOptions::default())
@@ -2127,13 +2166,19 @@ mod tests {
     /// History: kaish's `dispatch_command` used to intercept `--help` (render
     /// the whole-tool help, skip the tool) unless the tool's **root** schema
     /// claimed the `help` flag. kj re-parses its argv with clap and wants
-    /// `--help` at the leaf, so it carried a synthetic root `help` param solely
-    /// to flip `schema_claims("help")` true. kaish 0.11 landed the real fix
-    /// (tobert/kaish#51): `wants_help` is now gated on `!schema.owns_output`, so
-    /// an owned-output tool (`with_owned_output()`) is never intercepted — the
-    /// synthetic param is gone and `owns_output` alone routes `--help` through.
-    /// This drives the actual behavior so it fails if either the upstream gate
-    /// regresses or kj stops owning its output.
+    /// `--help` at the leaf, so it originally carried a synthetic root `help`
+    /// param solely to flip `schema_claims("help")` true; kaish 0.11
+    /// (tobert/kaish#51) made that redundant by gating `wants_help` on
+    /// `!schema.owns_output` instead, so `with_owned_output()` alone routed
+    /// `--help` through. The kaish 0.13 `--json` migration retired
+    /// `with_owned_output()` (kj no longer builds its own `--json` envelope —
+    /// see `schema()`'s `owns_output` note; `owns_output` now needs to stay
+    /// `false` so kaish's uniform `--json` formatting applies on success too),
+    /// which resurrected the original problem: `owns_output=false` alone would
+    /// let the outer router intercept every `kj … --help`. `schema()` closes
+    /// the gap the same way the pre-0.11 code did — a manually-pushed root
+    /// `help`/`h` param — so this test's *assertions* are unchanged from the
+    /// with-owned-output era; only *how* `schema_claims` gets satisfied moved.
     #[tokio::test]
     async fn owns_output_routes_leaf_help_through_kaish() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -2230,56 +2275,67 @@ mod tests {
         }
     }
 
-    /// A latched `kj … --json` result must carry the confirmation nonce in the
-    /// envelope's `latch` object (not buried in the prose `message`) AND keep the
-    /// typed request on the outer `ExecResult.latch` so the MCP shell layer
-    /// surfaces it too. kaish 0.11 stamps `.latch`; this checks the `--json`
-    /// wrapper both emits and preserves it. Resolves the on-hold docs/issues.md
-    /// "latch nonce on stderr" entry.
-    #[test]
-    fn json_envelope_surfaces_and_preserves_latch() {
-        let mut exec = ExecResult::failure(
-            2,
-            "kj context remove: confirmation required\n\
-             To confirm, run: kj context remove doomed --confirm zzz999",
-        );
-        exec.latch = Some(Box::new(kaish_kernel::interpreter::LatchRequest {
-            nonce: "zzz999".to_string(),
-            command: "kj context remove".to_string(),
-            paths: vec!["doomed".to_string()],
-            hint: "kj context remove doomed --confirm zzz999".to_string(),
-            tool: "kj".to_string(),
-            argv: vec!["context".into(), "remove".into(), "doomed".into()],
-            ttl: 60,
-            job_id: None,
-        }));
+    /// A latched `kj … --json` result must carry the confirmation nonce in
+    /// kaish's OWN `--json` latch envelope — `{"error", "code", "latch":
+    /// {nonce, hint, ...}}`, `apply_output_format`'s `latch_envelope` (kaish
+    /// 0.13) — not buried in prose, AND keep the typed request on the outer
+    /// `ExecResult.latch` so the MCP shell layer surfaces it too. kj no
+    /// longer builds this itself (the retired `render_json_envelope`); this
+    /// drives a real latched command end-to-end through the kaish bridge to
+    /// prove kaish's own formatter picks the `.latch` field up ahead of
+    /// `.data`/`.out` — `apply_output_format` special-cases `result.latch`
+    /// before its has-output/no-output branches, so a latch always wins.
+    /// Resolves the on-hold docs/issues.md "latch nonce on stderr" entry
+    /// against kaish's shape now, rather than kj's retired one.
+    #[tokio::test]
+    async fn json_flag_surfaces_and_preserves_latch() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("latch-json-home"), None, principal);
+        let _doomed = register_context(&dispatcher, Some("doomed"), Some(home), principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
 
-        let out = render_json_envelope(exec);
-        assert_eq!(out.code, 2, "latch exit code is preserved for `$?`");
-
-        // The nonce rides the structured envelope body, not just the prose.
-        let body: serde_json::Value =
-            serde_json::from_str(&out.text_out()).expect("envelope is JSON");
-        assert_eq!(body["ok"], serde_json::json!(false));
-        assert_eq!(body["latch"]["nonce"], serde_json::json!("zzz999"));
+        let res = kaish
+            .execute_with_options(
+                "kj context remove doomed --json",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec");
         assert_eq!(
-            body["latch"]["hint"],
-            serde_json::json!("kj context remove doomed --confirm zzz999")
+            res.code, 2,
+            "an unconfirmed destructive kj op latches at exit 2 under --json too: out={} err={}",
+            res.text_out(),
+            res.err
         );
 
-        // The control-plane field survives the wrap so the MCP shell layer
+        // The nonce rides kaish's structured latch envelope body, not just prose.
+        let body: serde_json::Value = serde_json::from_str(&res.text_out())
+            .unwrap_or_else(|e| panic!("--json latch output not JSON ({e}): {}", res.text_out()));
+        let nonce = body["latch"]["nonce"]
+            .as_str()
+            .unwrap_or_else(|| panic!("latch.nonce missing from kaish's envelope: {body}"));
+        assert!(!nonce.is_empty(), "nonce must be nonempty: {body}");
+        assert!(
+            body["latch"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("--confirm") && h.contains("doomed")),
+            "latch.hint must be the ready-to-run confirmation: {body}"
+        );
+        // Not the retired kj-owned {ok,message} shape.
+        assert!(
+            body.get("ok").is_none(),
+            "must not resemble the retired envelope: {body}"
+        );
+
+        // The control-plane field survives so the MCP shell layer
         // (`shell_result_to_kernel`) still reads it from the returned result.
         assert_eq!(
-            out.latch_request().map(|l| l.nonce),
-            Some("zzz999".to_string()),
-            "render_json_envelope must preserve ExecResult.latch"
+            res.latch_request().map(|l| l.nonce),
+            Some(nonce.to_string()),
+            "ExecResult.latch must survive kaish's --json formatting"
         );
-
-        // A non-latched success carries an explicit null `latch`.
-        let plain = render_json_envelope(ExecResult::success("done"));
-        let pbody: serde_json::Value =
-            serde_json::from_str(&plain.text_out()).expect("envelope is JSON");
-        assert_eq!(pbody["latch"], serde_json::Value::Null);
     }
 
     /// End-to-end proof that a *real* latched kj command stamps `ExecResult.latch`

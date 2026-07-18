@@ -277,6 +277,25 @@ surfaces, the way `kaijutsu-mcp` exposes the kernel outward today. Deep work
 deliberately parked — noted while designing audio capture so the capture
 seams don't foreclose it.
 
+## MIDI seq topology unreachable from kj/kaish — wants patchbay slice 4 (noted 2026-07-18, "can you see MIDI devices via kj?")
+
+The observed ALSA seq graph (which MIDI devices exist + how they're patched) is
+read **only** by `kaijutsu-app` (`patch_graph.rs::PatchGraphReader` →
+`PatchBayState`) to render the patch-bay scene — slice 0. It's reachable by no
+`kj` verb, no kaish VFS mount, and not even BRP (`PatchBayState` is a plain
+`Resource`; `GroupPlate`/`PortLabel`/`SocketPeg` are `Component`-only, no
+`Reflect`). So an agent can't answer "what MIDI is on `<app-host>`?" today —
+only a same-box model can, via **pawlsa**.
+
+This is exactly **`docs/scenes/patchbay.md` slice 4** ("ship observed-graph
+snapshots kernel-ward so models and remote peers see the same fabric"),
+deferred behind the viz-first slices — surface it via `kj midi ls`/`kj seq`
+and/or a read-only kaish VFS mount (feeds the `kj midi` + `/run/midi/<device>`
+plan under *MIDI device profiles*; provider is the app-as-MCP-client work above,
+since the seq graph is edge-local to the app's machine, not the kernel's).
+Cheap app-only interim if wanted sooner: `Reflect`-register `PatchBayState` +
+the label components so BRP can read them (scene-dependent, no kernel round-trip).
+
 ## Grooming tracks — kaijutsu-style cron (seeded 2026-07-15, MIDI-profiles round)
 
 Scheduled background operations as **tracks**: a slow clock + probe
@@ -970,6 +989,41 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Control Plane & Navigation (kj)
 
+- **kaish 0.13 `--json` migration: kj's per-leaf `json: bool` fields are dead
+  code via the live kaish bridge (found + confirmed pre-existing 2026-07-18,
+  kaish 0.13 `--json` migration).** kj now adopts kaish 0.13's global `--json`
+  (kaish's `finalize_output`/`apply_output_format` render every `ExecResult`
+  from `.data`/`.output`/`.latch`; kj's own `render_json_envelope` is gone —
+  `runtime/kj_builtin.rs`). Auditing every subcommand's `.data` payload turned
+  up a pattern that predates this migration: `doc list`, `config
+  list`/`show`, `rc list`/`show`, and `search` each declare their OWN local
+  `json: bool` clap field and build a richer JSON *message* when it's true
+  (e.g. search's `{matches, total, truncated}` with full match context/lines,
+  vs. `.data`'s flat array of block ids). That field can only ever be `true`
+  when `KjDispatcher::dispatch()` is called directly (as the per-file unit
+  tests do) — `KjBuiltin::execute` has ALWAYS stripped `--json` out of the
+  argv it hands to `dispatch()` (needed so leaves that don't declare `json`
+  don't reject it as unrecognized), so the richer branch has never fired via
+  a real shell/MCP call, before or after this migration. Under kaish's
+  `--json` now, these commands emit exactly `.data` (the flat id array),
+  which is unchanged from what users already saw under the old
+  `render_json_envelope`'s `data` key — so nothing regressed — but the richer
+  object (`search`'s match context is the one with real information loss) is
+  worth either wiring for real (thread the subcommand's OWN `--json` local
+  flag through as `.data` instead of a discarded message, or drop the dead
+  branch + local `json` field entirely) next time one of these files is
+  touched.
+- **`kj config set`/`kj config edit` (write branch) and `kj rc edit`
+  (content branch)/`reset`/`rm` have no `.data` on success (found 2026-07-18,
+  kaish 0.13 `--json` migration).** They return a plain `KjResult::ok(msg)`.
+  Under kaish's `--json`, a text-only success with no `.data`/`.output` wraps
+  the human message as a JSON *string* (`"set config 'theme.toml' (7
+  bytes)"`), not a structured record — matches kaish's documented contract,
+  not a bug, but inconsistent with sibling verbs (`doc create`/`delete`,
+  `block append`, `rc show`) that already attach a small record. A
+  `{"path": ..., "bytes": N}`-shaped `ok_with_data` would bring these in
+  line if a caller ever wants `kj config set ... --json` to be
+  machine-parseable beyond "some JSON string came back".
 - **`kj db` read window into `kernel.db` — deferred, not built (feedback 2026-07-18,
   DeepSeek tracks-discoverability).** When DeepSeek couldn't find a track-listing
   surface it fell back to sqlite and hit a wall: the kaish sandbox blocks
