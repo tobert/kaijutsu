@@ -102,11 +102,9 @@ vs a stamp alongside `promoted_at`/`demoted_at`/`paused_at`.
 
 ## DJ thread arc (seeded 2026-07-18; design in `docs/midi.md` "The DJ thread")
 
-Slice 1 (move audio/MIDI/metronome dispatch onto the dedicated DJ thread) is
-IN PROGRESS — it also closes the long-standing "metronome stops when
-kaijutsu-app is backgrounded/stalled" symptom (cue dispatch + clicks rode
-Bevy `Update`; an unfocused window or a long text-shaping frame throttled
-them while the rodio/ALSA threads sat idle). Open after slice 1:
+Slice 1 SHIPPED + live-verified 2026-07-18 (`docs/midi.md` has the story
+and the click-jitter measurements; it also closed the "metronome stops
+when backgrounded" symptom). Open:
 
 - **Slice 2 — beat-grid placement**: additive `RenderCue` onset-beat field
   (capnp + kernel stamps the playhead beat at emission), BeatGrid rung in
@@ -136,6 +134,15 @@ them while the rodio/ALSA threads sat idle). Open after slice 1:
   own receiver is immune (own cursor), but the UI drain keeps the loop —
   if it still bites after the frame-cost arc, consider a bigger event
   capacity or delta-coalescing at the actor.
+- **Prefetch outcomes are not generation-guarded**: a CAS outcome dispatched
+  under a since-replaced actor still lands (the deadline gate still applies;
+  pre-existing posture, not a regression). Guard on `generation` if a stale
+  outcome ever observably misfires.
+- **Stale-architecture prose**: `docs/scenes/patchbay.md` + `docs/pcm.md`
+  still narrate `midi.rs`/`metronome.rs`/`AudioOutPlugin`; two doc-comment
+  mentions of `crate::metronome` sit in the parallel session's files
+  (`actor_plugin.rs:204` rustdoc link, `input/scroll_config.rs` prose) —
+  fold into the next docs pass / that session's next commit.
 
 ## Audio sink follow-ups (seeded 2026-07-16, clip-arc live verify)
 

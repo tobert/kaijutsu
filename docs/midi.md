@@ -332,7 +332,7 @@ tick-domain scheduling against the phasor — only if the metronome validator
 shows residual boundary error after this lands (PCM transients and multi-sink
 flam remain the likely triggers, as before).
 
-## The DJ thread — musical dispatch off the frame (2026-07-18, slice 1 in progress)
+## The DJ thread — musical dispatch off the frame (2026-07-18; slice 1 SHIPPED + live-verified same day)
 
 **The finding (Amy, by feel, confirmed by survey):** with a track playing,
 scene rebuilds interrupt the flow. The transport layer was never the problem —
@@ -403,9 +403,21 @@ phasor's slew histogram.
 **Slices:** (1) move the sinks — app-only, no wire change,
 behavior-equivalent (wallclock ladder only); receipt latency drops from
 frame-scale to thread-wakeup-scale, which also feeds the phasor cleaner
-references. (2) beat-grid placement — additive `RenderCue` onset-beat field
+references. **Shipped 2026-07-18** (`bb9224f1`→`2d377278`, net −433
+lines): `dj/{core,thread,audio,prefetch,midi}.rs`; `audio.rs`/`midi.rs`/
+`metronome.rs` deleted whole. Live-verified same day: with `bassline`
+rolling at 120 BPM, an `aseqdump` port tap measured **every click
+inter-arrival at 500 ms ± 2 ms through repeated zoomed-well opens (the
+heaviest scene build in the app), detaches, and context toggles** — the
+stutter Amy heard by ear is structurally gone, and the old
+"metronome stops when the app is backgrounded" issue died with it (clicks
+no longer touch the frame loop at all). Auto-connect wired render→TiMidity
+on its own; `kaijutsu.dj.clock_transition` flows.
+(2) beat-grid placement — additive `RenderCue` onset-beat field
 (capnp + kernel stamps the playhead beat at emission) + the BeatGrid rung in
-the DJ. The frame-cost work this surfaced (uncached markdown re-parse,
+the DJ; the ALSA-decoupling constraint (push placed cues just-in-time
+within the horizon, never fire-and-forget) is recorded in `docs/issues.md`.
+The frame-cost work this surfaced (uncached markdown re-parse,
 synchronous Parley shaping in `build_block_scenes`) is a separate arc —
 `docs/issues.md`.
 
