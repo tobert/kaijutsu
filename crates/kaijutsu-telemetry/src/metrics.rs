@@ -167,6 +167,13 @@ pub struct BeatMetrics {
     /// `kaijutsu.render_cue.stale_dropped` — render cues rejected outright by
     /// `midi.rs::backdate_events` as too stale to salvage even partially.
     stale_cues_dropped: Counter<u64>,
+    /// `kaijutsu.dj.clock_transition` — DJ-thread `ClockMode` transitions
+    /// (`dj::core::DjCore`), by `to` (`wallclock`|`beat_grid`) and `reason`
+    /// (`fold`|`stale`|`flush`|`disconnect`). The health signal for the
+    /// whole DJ clock path (`docs/midi.md` "The clock is modal") — same
+    /// stance as the phasor's slew histogram: watch the transition rate and
+    /// reasons before touching a knob blind.
+    dj_clock_transitions: Counter<u64>,
 }
 
 impl BeatMetrics {
@@ -208,6 +215,11 @@ impl BeatMetrics {
             .with_unit("{cue}")
             .with_description("Render cues rejected outright as too stale to back-date")
             .build();
+        let dj_clock_transitions = meter
+            .u64_counter("kaijutsu.dj.clock_transition")
+            .with_unit("{transition}")
+            .with_description("DJ-thread clock-mode transitions, by target mode and reason")
+            .build();
         Self {
             beats_fired,
             grid_reseeds,
@@ -215,6 +227,7 @@ impl BeatMetrics {
             metronome_clicks,
             phasor_slew,
             stale_cues_dropped,
+            dj_clock_transitions,
         }
     }
 
@@ -260,6 +273,18 @@ impl BeatMetrics {
     pub fn record_stale_cue_dropped(&self) {
         self.stale_cues_dropped.add(1, &[]);
     }
+
+    /// Record one DJ-thread `ClockMode` transition. `to` is `"wallclock"` or
+    /// `"beat_grid"`; `reason` is `"fold"` | `"stale"` | `"flush"` |
+    /// `"disconnect"` — callers pass `ClockTransition::to.as_str()` /
+    /// `reason.as_str()` (`dj::core`) rather than this crate depending on
+    /// `kaijutsu-app`, same hand-off stance as [`Self::record_phasor_slew`].
+    pub fn record_dj_clock_transition(&self, to: &str, reason: &str) {
+        self.dj_clock_transitions.add(
+            1,
+            &[KeyValue::new("to", to.to_owned()), KeyValue::new("reason", reason.to_owned())],
+        );
+    }
 }
 
 static BEAT_METRICS: LazyLock<BeatMetrics> =
@@ -295,6 +320,12 @@ pub fn record_phasor_slew(consumer: &str, error_beats: f64, deadbanded: bool) {
 /// Record one stale render cue dropped to the global meter provider.
 pub fn record_stale_cue_dropped() {
     BEAT_METRICS.record_stale_cue_dropped();
+}
+
+/// Record one DJ-thread clock-mode transition to the global meter provider —
+/// see [`BeatMetrics::record_dj_clock_transition`].
+pub fn record_dj_clock_transition(to: &str, reason: &str) {
+    BEAT_METRICS.record_dj_clock_transition(to, reason);
 }
 
 /// Process-wide LLM instruments, lazily bound to the global meter provider.
@@ -516,6 +547,9 @@ mod tests {
         metrics.record_phasor_slew("metronome", 0.05, false); // stepped
         metrics.record_phasor_slew("time_well", -0.5, false); // stepped, negative error
         metrics.record_stale_cue_dropped();
+        metrics.record_dj_clock_transition("beat_grid", "fold");
+        metrics.record_dj_clock_transition("wallclock", "stale");
+        metrics.record_dj_clock_transition("wallclock", "stale");
 
         provider.force_flush().expect("flush");
         let rm = exporter.get_finished_metrics().expect("metrics exported");
@@ -540,6 +574,16 @@ mod tests {
             histogram_row_count(&rm, "kaijutsu.phasor.slew_beats", "consumer", "time_well"),
             1,
             "the time_well-attributed observation is discoverable by consumer too"
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.dj.clock_transition", "to", "beat_grid"),
+            1,
+            "one beat_grid transition"
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.dj.clock_transition", "reason", "stale"),
+            2,
+            "two stale-reason transitions, discoverable by reason too"
         );
     }
 }

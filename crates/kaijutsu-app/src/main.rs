@@ -54,6 +54,7 @@ mod commands;
 mod config;
 mod connection;
 mod constants;
+mod dj;
 mod input;
 mod kaish;
 mod metronome;
