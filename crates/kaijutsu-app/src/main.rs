@@ -47,7 +47,6 @@ struct Cli {
     shares: Vec<kaijutsu_client::ShareArg>,
 }
 
-mod audio;
 mod audio_sched;
 mod cell;
 mod commands;
@@ -212,8 +211,14 @@ fn main() {
         // no-op plugin when no --share flag was given.
         .add_plugins(connection::ShareDialPlugin { ssh_config, share_config })
         // Render sinks (docs/pcm.md, docs/midi.md): ServerEvent::RenderCue,
-        // dispatched by mime — audio/* → AudioPlayer, text/vnd.abc → ALSA MIDI.
-        .add_plugins(audio::AudioOutPlugin)
+        // dispatched by mime. audio/* + CLIP_MIME + PREPARE_MIME dispatch off
+        // the DJ thread's own select! loop now (docs/midi.md "The DJ
+        // thread"), not a frame-coupled Bevy system — DjPlugin spawns both
+        // the DJ thread and the rodio scheduler thread it drives
+        // (`audio_sched.rs`; moved from the deleted `AudioOutPlugin`).
+        // text/vnd.abc still dispatches through MidiOutPlugin below (Task #4
+        // moves it onto the DJ thread too).
+        .add_plugins(dj::DjPlugin)
         .add_plugins(midi::MidiOutPlugin)
         // The ear (docs/midi.md M2): device MIDI → ring → windowed batches →
         // commitCapture, landing as data-only cells on the current context's track.

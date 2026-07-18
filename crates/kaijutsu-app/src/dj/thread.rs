@@ -15,21 +15,19 @@
 //! [`handle_status_change`]) — any decision logic beyond "what does this
 //! channel message mean to the clock" belongs in `core.rs`, not here.
 //!
-//! **This slice (#2 of 4) is clock + clicks only** — same scope `DjCore`
-//! itself declares. Cue dispatch (ABC→MIDI render, the ALSA `MidiSink`, CAS
-//! prefetch) is Tasks #3/#4: the sink seams below ([`ClickSink`],
-//! [`DjSinks::audio`]) exist now but are `None`/no-op, and every other
-//! `RenderCue` mime is ignored by [`handle_server_event`]. A headless DJ
-//! (every sink absent) still tracks the clock and emits telemetry correctly
-//! — that's the whole point of routing sinks through `Option`s rather than
-//! wiring the ALSA/CAS types in directly.
+//! **Slice #2 was clock + clicks only.** This task (#3 of 4) is the first
+//! LIVE wiring: every `audio/*`, `CLIP_MIME`, and `PREPARE_MIME` `RenderCue`
+//! now dispatches for real, through [`super::audio::dispatch_render_cue`] /
+//! [`super::audio::handle_prefetch_outcome`] (ported from the deleted
+//! `audio.rs`) — the events arm calls the former for every `RenderCue`
+//! alongside (not instead of) [`handle_server_event`]'s clock reaction to
+//! the same cue, and a new prefetch-outcome `select!` arm calls the latter.
+//! [`DjSinks::audio`] is the real [`AudioSchedulerHandle`] now, spawned in
+//! [`DjPlugin::build`] (moved from the deleted `AudioOutPlugin`). ABC,
+//! clicks, and `BeatSync` sinks stay on the old Bevy-side path (`midi.rs`,
+//! `metronome.rs`) until Task #4 — `docs/midi.md`'s staged migration.
 //!
-//! [`DjPlugin`] spawns the thread and wires the Bevy-side forwarding systems,
-//! but is **not registered in `main.rs` in this task** — Task #3 adds
-//! `.add_plugins(dj::DjPlugin)`, which is the named consumer that makes
-//! every item here reachable outside `#[cfg(test)]` (hence the blanket
-//! `dead_code` allow below — everything is exercised by this file's own
-//! tests today, just not by a running app yet).
+//! [`DjPlugin`] is now registered in `main.rs`, replacing `AudioOutPlugin`.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,9 +39,12 @@ use tracing::{debug, warn};
 use kaijutsu_audio::{Slew, RENDER_FLUSH_MIME};
 use kaijutsu_client::{ActorHandle, ConnectionStatus, ServerEvent, SshConfig};
 
+use crate::audio_sched::AudioSchedulerHandle;
 use crate::connection::actor_plugin::{RpcActor, RpcConnectionState, RpcResultMessage};
 
+use super::audio::{dispatch_render_cue, handle_prefetch_outcome};
 use super::core::{ClockTransition, DjCore, MetronomeConfig};
+use super::prefetch::{CasPrefetch, PrefetchOutcome};
 
 /// How far ahead the click timer pre-schedules — mirrors
 /// `metronome.rs::SCHEDULE_HORIZON` verbatim (same value, same reasoning:
@@ -93,11 +94,13 @@ pub(crate) trait ClickSink: Send {
 pub(crate) struct DjSinks {
     /// Click dispatch — Task #4.
     pub(crate) clicks: Option<Box<dyn ClickSink>>,
-    /// CAS prefetch dispatch outcomes — Task #3. Payload shape is Task #3's
-    /// call to make; `()` is a placeholder so the seam exists without
-    /// guessing at a shape nothing here uses yet.
-    #[allow(dead_code)]
-    pub(crate) audio: Option<crossbeam_channel::Sender<()>>,
+    /// The rodio scheduler thread's handle (`audio_sched.rs`) — the real
+    /// thing as of this task, `Some` in production
+    /// ([`DjPlugin::build`] spawns it, moved from the deleted
+    /// `AudioOutPlugin`). `None` in tests that don't care about scheduler
+    /// dispatch — mirrors `clicks`'s headless-correctness stance: a DJ with
+    /// no audio device is still a fully correct DJ, just a silent one.
+    pub(crate) audio: Option<AudioSchedulerHandle>,
 }
 
 // ── ActorSource — the testable seam around `ActorHandle` ───────────────────
@@ -262,14 +265,34 @@ fn handle_due_clicks(
 // ── run_loop — the thread's whole life ──────────────────────────────────────
 
 /// The DJ thread's whole life once the tokio runtime is up: one `select!`
-/// over {ctl, events, status, click timer}. Generic over `H` (the
-/// [`ActorSource`] carried by `ActorReady`) and `F` (where effects go) so
-/// this same function drives both the real thread ([`thread_main`], with a
-/// real [`ActorHandle`] and telemetry) and the thread-level tests (a
+/// over {ctl, events, status, click timer, prefetch outcomes}. Generic over
+/// `H` (the [`ActorSource`] carried by `ActorReady`) and `F` (where effects
+/// go) so this same function drives both the real thread ([`thread_main`],
+/// with a real [`ActorHandle`] and telemetry) and the thread-level tests (a
 /// hand-built double and a plain channel).
+///
+/// `prefetch`/`prefetch_rx` are the two halves of one
+/// [`super::prefetch::CasPrefetch`] — split apart (rather than folded into
+/// `sinks`) because only ONE task may ever drain a
+/// `tokio::mpsc::UnboundedReceiver`, and this loop's prefetch-outcome arm is
+/// that task; `prefetch` itself only ever needs to *send* (see that module's
+/// doc). `prefetch` is a BORROW, not owned: it holds its own separate
+/// multi-thread `tokio::runtime::Runtime`, and dropping a `Runtime` blocks
+/// the calling thread — tokio disallows that from within an async context
+/// (`Cannot drop a runtime in a context where blocking is not allowed`,
+/// found live running this loop's own tests). So `CasPrefetch::new()` is
+/// called by the SYNC caller ([`thread_main`]) before `rt.block_on` and
+/// dropped after it returns; this function only ever sees a reference. Both
+/// halves are held for the whole thread lifetime — unlike
+/// `events_rx`/`status_rx`, neither is ever swapped or cleared, so the
+/// prefetch-outcome `select!` arm needs no `Option`-guard/async-block idiom
+/// (see that arm's own comment for how this differs from the events arm's
+/// footgun).
 async fn run_loop<H, F>(
     mut ctl_rx: mpsc::UnboundedReceiver<DjCtl<H>>,
     sinks: DjSinks,
+    prefetch: &CasPrefetch,
+    mut prefetch_rx: mpsc::UnboundedReceiver<PrefetchOutcome>,
     _pulse_tx: crossbeam_channel::Sender<DjPulse>,
     mut record_effect: F,
 ) where
@@ -279,11 +302,21 @@ async fn run_loop<H, F>(
     let mut core = DjCore::default();
     let mut events_rx: Option<broadcast::Receiver<ServerEvent>> = None;
     let mut status_rx: Option<watch::Receiver<ConnectionStatus>> = None;
-    // Carried per `DjCtl::ActorReady`'s doc — unused until Task #3's CAS
-    // prefetch wiring; kept (underscore-prefixed, reassigned each
-    // `ActorReady`) so the ctl shape doesn't churn between tasks.
-    let mut _ssh_config: Option<SshConfig> = None;
+    // First real consumer as of this task: gates/feeds every CAS prefetch
+    // dispatch (`dispatch_render_cue`'s `Option<&SshConfig>` parameter)
+    // exactly as the deleted `audio.rs`'s `conn.ssh_config.clone()` did.
+    let mut ssh_config: Option<SshConfig> = None;
+    // Log/telemetry correlation only (`DjCtl::ActorReady`'s doc) — a genuine
+    // cross-generation guard on a prefetch outcome that started under a
+    // since-replaced actor is a real follow-up (`docs/issues.md`), not yet
+    // needed: `CasPrefetch` reconnects lazily per-dispatch `SshConfig`
+    // rather than holding a connection keyed to one actor generation.
     let mut _generation: u64 = 0;
+    // The other half of the old `conn.connected` check
+    // (`play_render_cues`/`drain_prefetch_results`'s `Some(conn) if
+    // conn.connected`) — read from the status-watch arm's *level*, exactly
+    // as `handle_status_change` already does for `on_disconnect`.
+    let mut connected = false;
 
     loop {
         let now = Instant::now();
@@ -302,7 +335,7 @@ async fn run_loop<H, F>(
                         // "drop any previous subscription" from the spec.
                         events_rx = Some(handle.subscribe_events());
                         status_rx = Some(handle.watch_status());
-                        _ssh_config = Some(cfg);
+                        ssh_config = Some(cfg);
                         _generation = new_generation;
                     }
                     Some(DjCtl::MetronomeConfig(cfg)) => {
@@ -328,8 +361,31 @@ async fn run_loop<H, F>(
             event = async { events_rx.as_mut().unwrap().recv().await }, if events_rx.is_some() => {
                 match event {
                     Ok(ev) => {
-                        for effect in handle_server_event(&mut core, &ev, Instant::now(), now_epoch_ns()) {
+                        // Read once per receipt (mirrors the deleted
+                        // `audio.rs::play_render_cues`'s "Instant::now() ...
+                        // read ONCE per batch" discipline) so the clock
+                        // reaction and the cue dispatch below age against
+                        // the SAME instant.
+                        let event_now = Instant::now();
+                        let event_epoch_ns = now_epoch_ns();
+                        for effect in handle_server_event(&mut core, &ev, event_now, event_epoch_ns) {
                             record_effect(effect);
+                        }
+                        // Cue dispatch runs ALONGSIDE (not instead of)
+                        // `handle_server_event`'s clock reaction to the same
+                        // event — mirrors how the deleted `audio.rs` and the
+                        // still-live `midi.rs` already independently read
+                        // `RENDER_FLUSH_MIME` off one shared stream.
+                        if let ServerEvent::RenderCue { cue, .. } = &ev {
+                            dispatch_render_cue(
+                                cue,
+                                event_now,
+                                event_epoch_ns,
+                                connected,
+                                ssh_config.as_ref(),
+                                sinks.audio.as_ref(),
+                                prefetch,
+                            );
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -349,6 +405,7 @@ async fn run_loop<H, F>(
                 match changed {
                     Ok(()) => {
                         let status = status_rx.as_ref().unwrap().borrow().clone();
+                        connected = matches!(status, ConnectionStatus::Connected { .. });
                         if let Some(effect) = handle_status_change(&mut core, &status, Instant::now()) {
                             record_effect(effect);
                         }
@@ -369,6 +426,27 @@ async fn run_loop<H, F>(
                     record_effect(effect);
                 }
             }
+
+            // No `Option`-guard/async-block wrapper needed here (contrast
+            // the events/status arms above): `prefetch_rx` is owned outright
+            // for the thread's whole life, never swapped or cleared, and its
+            // paired `tx` half lives in `prefetch` (also owned for the whole
+            // loop) — so `.recv()` can never spuriously return `None` while
+            // this loop runs; a real `None` would mean `prefetch` itself was
+            // dropped, which only happens when this function has already
+            // returned.
+            outcome = prefetch_rx.recv() => {
+                if let Some(outcome) = outcome {
+                    handle_prefetch_outcome(
+                        outcome,
+                        Instant::now(),
+                        connected,
+                        ssh_config.as_ref(),
+                        sinks.audio.as_ref(),
+                        prefetch,
+                    );
+                }
+            }
         }
     }
 }
@@ -379,12 +457,42 @@ async fn run_loop<H, F>(
 /// `connection/bootstrap.rs::bootstrap_thread`'s
 /// `Builder::new_current_thread().enable_all()` shape (no `LocalSet` needed
 /// here — nothing in this module is `!Send`, unlike the capnp actor).
-fn thread_main(ctl_rx: mpsc::UnboundedReceiver<DjCtl>, pulse_tx: crossbeam_channel::Sender<DjPulse>) {
+///
+/// `scheduler` arrives pre-spawned from [`DjPlugin::build`] (the rodio
+/// thread has no dependency on this one — `audio_sched::spawn` just needs to
+/// run once, somewhere, before the DJ starts dispatching cues).
+///
+/// `prefetch` is built and OWNED here, in this sync function, never inside
+/// [`run_loop`] itself — found live (this task's thread-level tests panicked
+/// on it before this was pinned down): [`super::prefetch::CasPrefetch`] owns
+/// its own separate multi-thread `tokio::runtime::Runtime`, and dropping a
+/// `Runtime` blocks the calling thread waiting for its workers to stop.
+/// Tokio disallows that *specific* blocking op from inside an async context
+/// (`Cannot drop a runtime in a context where blocking is not allowed`) —
+/// so if `prefetch` were owned by (and dropped inside) `run_loop`'s async
+/// stack frame, its `Drop` would fire while still polled by `rt.block_on`
+/// below and panic. Building AND dropping it out here, wrapped around
+/// `block_on` rather than inside it, keeps both firmly in sync-land; only a
+/// `&CasPrefetch` borrow crosses into the async world.
+fn thread_main(
+    ctl_rx: mpsc::UnboundedReceiver<DjCtl>,
+    pulse_tx: crossbeam_channel::Sender<DjPulse>,
+    scheduler: AudioSchedulerHandle,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build kaijutsu-dj tokio runtime");
-    rt.block_on(run_loop(ctl_rx, DjSinks::default(), pulse_tx, record_effect_via_telemetry));
+    let (prefetch, prefetch_rx) = CasPrefetch::new();
+    let sinks = DjSinks { clicks: None, audio: Some(scheduler) };
+    rt.block_on(run_loop(
+        ctl_rx,
+        sinks,
+        &prefetch,
+        prefetch_rx,
+        pulse_tx,
+        record_effect_via_telemetry,
+    ));
 }
 
 // ── Bevy-side: DjHandle resource + DjPlugin ─────────────────────────────────
@@ -415,19 +523,26 @@ impl Drop for DjHandle {
 }
 
 /// Spawns the DJ thread and wires the Bevy-side forwarding systems
-/// (`docs/midi.md` "The DJ thread"). **Not registered in `main.rs` in this
-/// task** — Task #3 adds `.add_plugins(dj::DjPlugin)` once a real sink
-/// exists to make the thread's output audible.
+/// (`docs/midi.md` "The DJ thread"). Registered in `main.rs` as of this task
+/// (replacing the deleted `audio::AudioOutPlugin`) — the DJ now dispatches
+/// every `audio/*`/`CLIP_MIME`/`PREPARE_MIME` cue for real, so there is a
+/// live sink to make its output audible.
 pub struct DjPlugin;
 
 impl Plugin for DjPlugin {
     fn build(&self, app: &mut App) {
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
         let (pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        // Spawning the rodio scheduler thread moves here from the deleted
+        // `AudioOutPlugin::build` (`docs/pcm.md` R5) — its Bevy `Resource`
+        // insertion disappears with it: `audio.rs`'s now-deleted systems
+        // were its only consumer, so the handle rides straight into the DJ
+        // thread's own sinks instead.
+        let scheduler = crate::audio_sched::spawn();
 
         std::thread::Builder::new()
             .name("kaijutsu-dj".into())
-            .spawn(move || thread_main(ctl_rx, pulse_tx))
+            .spawn(move || thread_main(ctl_rx, pulse_tx, scheduler))
             .expect("spawn kaijutsu-dj thread");
 
         app.insert_resource(DjHandle { ctl_tx, pulse_rx });
@@ -493,6 +608,7 @@ fn drain_dj_pulses(dj: Res<DjHandle>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_sched::{self, SchedulerCmd};
     use kaijutsu_audio::{BeatRef, CuePayload, RenderCue};
     use kaijutsu_types::ContextId;
 
@@ -739,7 +855,8 @@ mod tests {
             .name("dj-test".into())
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                rt.block_on(run_loop(ctl_rx, DjSinks::default(), pulse_tx, move |effect| {
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                rt.block_on(run_loop(ctl_rx, DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, move |effect| {
                     let _ = effect_tx.send(effect);
                 }));
             })
@@ -809,11 +926,71 @@ mod tests {
             .name("dj-test-close".into())
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                rt.block_on(run_loop(ctl_rx, DjSinks::default(), pulse_tx, |_effect: DjEffect| {}));
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                rt.block_on(run_loop(ctl_rx, DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
             })
             .expect("spawn test dj thread");
 
         drop(ctl_tx); // every sender gone — the ctl arm's `None` path
+        join.join().expect("dj test thread panicked");
+    }
+
+    /// The named thread-level test (`docs/midi.md` DJ-thread arc Task #3):
+    /// feed a `RenderCue` through the REAL `run_loop` (not the translation
+    /// function directly, unlike `dj::audio`'s own suite) and assert the
+    /// resulting `SchedulerCmd` arrives on a `audio_sched::test_handle`
+    /// receiver — proves the events arm's cue-dispatch wiring end to end,
+    /// not just `dispatch_render_cue`'s own logic in isolation.
+    #[test]
+    fn thread_dispatches_a_render_cue_to_the_scheduler() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        let (scheduler, scheduler_rx) = audio_sched::test_handle();
+
+        let join = std::thread::Builder::new()
+            .name("dj-test-audio".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                let sinks = DjSinks { clicks: None, audio: Some(scheduler) };
+                rt.block_on(run_loop(ctl_rx, sinks, &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+            })
+            .expect("spawn test dj thread");
+
+        let (events, _keep_events) = broadcast::channel(16);
+        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        ctl_tx
+            .send(DjCtl::ActorReady {
+                handle: TestSource { events: events.clone(), status },
+                ssh_config: SshConfig::default(),
+                generation: 1,
+            })
+            .expect("send ActorReady");
+
+        // A zero-lead, unstamped inline audio cue is the play-now fast path
+        // (mirrors `dj::audio::tests::inline_audio_cue_zero_lead_sends_one_play_now`)
+        // — deterministic and connection-free, so this test only needs to
+        // prove the WIRING (events arm -> dispatch_render_cue -> scheduler),
+        // not re-cover dispatch decisions the sibling suite already owns.
+        let cue = RenderCue::now_inline("audio/wav", vec![1, 2, 3, 4]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = events.send(ServerEvent::RenderCue { context_id: ContextId::new(), cue: cue.clone() });
+            match scheduler_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(SchedulerCmd::PlayNow { bytes }) => {
+                    assert_eq!(bytes, vec![1, 2, 3, 4]);
+                    break;
+                }
+                Ok(other) => panic!("expected PlayNow, got {other:?}"),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        panic!("no SchedulerCmd observed within 2s");
+                    }
+                }
+            }
+        }
+
+        ctl_tx.send(DjCtl::Shutdown).expect("send Shutdown");
         join.join().expect("dj test thread panicked");
     }
 
