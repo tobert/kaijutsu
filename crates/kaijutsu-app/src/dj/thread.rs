@@ -54,7 +54,7 @@ use crate::audio_sched::AudioSchedulerHandle;
 use crate::connection::actor_plugin::{RpcActor, RpcConnectionState, RpcResultMessage};
 
 use super::audio::{dispatch_render_cue, handle_prefetch_outcome};
-use super::core::{ClockTransition, DjCore, MetronomeConfig};
+use super::core::{ClockTransition, CuePlacement, DjCore, MetronomeConfig};
 use super::midi::{AUTOCONNECT_POLL, MidiDispatch, MidiSink, dispatch_midi_cue};
 use super::prefetch::{CasPrefetch, PrefetchOutcome};
 
@@ -191,6 +191,39 @@ pub(crate) enum DjEffect {
     /// live sink (ported from the deleted `metronome.rs::click_on_beat`'s
     /// per-offset counter; a global counter, no consumer label to carry).
     Click,
+    /// `kaijutsu.dj.cue_dropped` — a clock fallback (stale/free-run-cap
+    /// caught at a `settle` check, or a flush/disconnect via
+    /// `ClockFallback`) orphaned `count` beat-grid-buffered cues before
+    /// their onset beat arrived; `reason` is the SAME
+    /// `ClockTransition::reason.as_str()` the fallback also reports via
+    /// `DjEffect::Transition` (`docs/midi.md` "The DJ thread": dropped
+    /// silently, telemetry-counted, never rescued onto the wallclock
+    /// ladder).
+    ///
+    /// NOTE (documented gap, not silently swallowed): only the THREE
+    /// `dj::core::DjCore` entry points whose return type actually surfaces a
+    /// `dropped_cues` count — `on_flush`/`on_disconnect` (via
+    /// `ClockFallback`) and `due_cues` (via `DueCues`) — can produce this
+    /// effect below. Two OTHER entry points also run `settle()` internally
+    /// and can therefore ALSO trip a fallback that drops `pending_cues`, but
+    /// their return types don't carry a count out, so that drop goes
+    /// unreported when THEY are the call that trips it:
+    /// - `due_clicks` (`dj::core::DueClicks` has no `dropped_cues` field) —
+    ///   if its `settle` call trips first in a `sleep_until` iteration (it
+    ///   runs before `due_cues` in the arm below), `pending_cues` is already
+    ///   empty by the time `due_cues`'s own `settle` call runs, so `due_cues`
+    ///   reports nothing either.
+    /// - `decide_placement` (`(CuePlacement, Option<ClockTransition>)` has
+    ///   no `dropped_cues` slot either) — a cue arriving exactly as the
+    ///   clock goes stale settles (correctly) to `Immediate`, but any OTHER
+    ///   cues already buffered from earlier get dropped by that same
+    ///   `settle` call with no count surfacing here.
+    ///
+    /// Fixing either needs `dj::core` to grow a `dropped_cues` count on
+    /// `DueClicks` and/or `decide_placement`'s return shape — out of this
+    /// task's scope (constrained to `dj::thread` only; `docs/issues.md` "DJ
+    /// thread arc").
+    CueDropped { reason: &'static str, count: usize },
 }
 
 /// Production `record_effect`: forward straight to `kaijutsu_telemetry`'s
@@ -206,6 +239,9 @@ fn record_effect_via_telemetry(effect: DjEffect) {
         }
         DjEffect::Click => {
             kaijutsu_telemetry::record_metronome_click();
+        }
+        DjEffect::CueDropped { reason, count } => {
+            kaijutsu_telemetry::record_dj_cue_dropped(reason, count);
         }
     }
 }
@@ -247,13 +283,33 @@ fn handle_server_event(
             effects
         }
         ServerEvent::RenderCue { cue, .. } if cue.mime == RENDER_FLUSH_MIME => {
-            // `dropped_cues` (cue-buffer telemetry) is Task #3's wiring —
-            // discarded here for now, same task-3 boundary as the rest of
-            // slice 2's cue-placement machinery not being called yet.
-            core.on_flush(now).transition.map(DjEffect::Transition).into_iter().collect()
+            fallback_effects(core.on_flush(now))
         }
         _ => Vec::new(),
     }
+}
+
+/// Turn one `ClockFallback` report into its effects: the transition (if the
+/// fallback actually changed mode) plus a [`DjEffect::CueDropped`] when it
+/// also dropped buffered cues. `ClockFallback`'s own doc guarantees
+/// `dropped_cues > 0` implies `transition.is_some()` (a fallback only ever
+/// clears `pending_cues` as part of `exit_beat_grid`, which reports a
+/// transition unless mode was already `Wallclock` — and by construction
+/// `pending_cues` is only ever non-empty while `BeatGrid`) — the `.expect()`
+/// below is that invariant made loud rather than a silent `unwrap_or`
+/// (house fail-loud posture: if this invariant is ever violated, that's a
+/// `DjCore` bug worth a panic, not a quietly wrong `reason` label).
+fn fallback_effects(fallback: super::core::ClockFallback) -> Vec<DjEffect> {
+    let mut effects: Vec<DjEffect> = fallback.transition.map(DjEffect::Transition).into_iter().collect();
+    if fallback.dropped_cues > 0 {
+        let reason = fallback
+            .transition
+            .expect("a clock fallback only drops buffered cues alongside its own reported transition")
+            .reason
+            .as_str();
+        effects.push(DjEffect::CueDropped { reason, count: fallback.dropped_cues });
+    }
+    effects
 }
 
 /// Translate one connection-status level read into a `DjCore::on_disconnect`
@@ -264,13 +320,11 @@ fn handle_server_event(
 /// blip can be missed, but a status that's still non-`Connected` by the time
 /// this runs is still caught, and the level read is cheap and race-free
 /// against a late-subscribing DJ thread.
-fn handle_status_change(core: &mut DjCore, status: &ConnectionStatus, now: Instant) -> Option<DjEffect> {
+fn handle_status_change(core: &mut DjCore, status: &ConnectionStatus, now: Instant) -> Vec<DjEffect> {
     if matches!(status, ConnectionStatus::Connected { .. }) {
-        return None;
+        return Vec::new();
     }
-    // `dropped_cues` discarded here for the same task-3 boundary reason as
-    // the `RENDER_FLUSH_MIME` arm above.
-    core.on_disconnect(now).transition.map(DjEffect::Transition)
+    fallback_effects(core.on_disconnect(now))
 }
 
 /// Dispatch one `due_clicks` result to the MIDI sink (if present, and only
@@ -397,6 +451,14 @@ async fn run_loop<H, F, M>(
             Some(deadline) => wake.min(deadline),
             None => wake,
         };
+        // A third bound: the earliest buffered cue's own horizon-entry wake
+        // (`DjCore::next_cue_wake`'s doc) — without this, a buffered cue
+        // whose onset lands before the next click would sit unscheduled
+        // until the click timer happened to also wake the loop.
+        let wake = match core.next_cue_wake(now, SCHEDULE_HORIZON) {
+            Some(cue_wake) => wake.min(cue_wake),
+            None => wake,
+        };
         let sleep_target = tokio::time::Instant::from(wake);
 
         tokio::select! {
@@ -418,9 +480,7 @@ async fn run_loop<H, F, M>(
                         // consistency (idempotent when already Wallclock).
                         let status = handle.current_status();
                         connected = matches!(status, ConnectionStatus::Connected { .. });
-                        if let Some(effect) =
-                            handle_status_change(&mut core, &status, Instant::now())
-                        {
+                        for effect in handle_status_change(&mut core, &status, Instant::now()) {
                             record_effect(effect);
                         }
                     }
@@ -463,19 +523,54 @@ async fn run_loop<H, F, M>(
                         // `midi.rs` already independently read
                         // `RENDER_FLUSH_MIME` off one shared stream, now both
                         // folded onto this one events-arm iteration.
-                        if let ServerEvent::RenderCue { cue, .. } = &ev {
-                            dispatch_render_cue(
-                                cue,
-                                event_now,
-                                event_epoch_ns,
-                                connected,
-                                ssh_config.as_ref(),
-                                sinks.audio.as_ref(),
-                                prefetch,
-                            );
-                            dispatch_midi_cue(cue, event_epoch_ns, &mut midi);
-                            if midi.take_traffic() {
-                                let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                        //
+                        // `ev` is moved here (not re-borrowed with `&ev`) —
+                        // legal because `handle_server_event` above is the
+                        // only other reader of `ev` this iteration and has
+                        // already returned (NLL ends its borrow at last use),
+                        // and nothing touches `ev` again after this `if let`.
+                        // That makes `cue: RenderCue` an owned value at zero
+                        // extra cost (the broadcast channel already handed
+                        // this loop an owned `ServerEvent` per receive) —
+                        // `decide_placement` peeks `&cue` (no clone) to
+                        // choose Immediate/Buffer BEFORE `cue` is consumed by
+                        // whichever branch runs, so this whole arm stays
+                        // allocation-free on the hot (Immediate) path
+                        // (`docs/midi.md` "The DJ thread", allocation
+                        // posture — the only allocation slice 2 adds is the
+                        // MOVE into `pending_cues` on the `Buffer` branch,
+                        // never a clone).
+                        if let ServerEvent::RenderCue { cue, .. } = ev {
+                            // `decide_placement` runs its own `settle` check
+                            // internally and can trip a fallback that drops
+                            // whatever's ALREADY buffered — but its return
+                            // shape has no `dropped_cues` slot, so that drop
+                            // (unlike a flush/disconnect/`due_cues`-triggered
+                            // one) goes unreported here. Documented gap, see
+                            // `DjEffect::CueDropped`'s doc.
+                            let (placement, transition) = core.decide_placement(&cue, event_now);
+                            if let Some(t) = transition {
+                                record_effect(DjEffect::Transition(t));
+                            }
+                            match placement {
+                                CuePlacement::Immediate => {
+                                    dispatch_render_cue(
+                                        &cue,
+                                        event_now,
+                                        event_epoch_ns,
+                                        connected,
+                                        ssh_config.as_ref(),
+                                        sinks.audio.as_ref(),
+                                        prefetch,
+                                    );
+                                    dispatch_midi_cue(&cue, event_epoch_ns, &mut midi);
+                                    if midi.take_traffic() {
+                                        let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                                    }
+                                }
+                                CuePlacement::Buffer(beat) => {
+                                    core.enqueue_cue(beat, cue);
+                                }
                             }
                         }
                     }
@@ -497,7 +592,7 @@ async fn run_loop<H, F, M>(
                     Ok(()) => {
                         let status = status_rx.as_ref().unwrap().borrow().clone();
                         connected = matches!(status, ConnectionStatus::Connected { .. });
-                        if let Some(effect) = handle_status_change(&mut core, &status, Instant::now()) {
+                        for effect in handle_status_change(&mut core, &status, Instant::now()) {
                             record_effect(effect);
                         }
                     }
@@ -515,6 +610,71 @@ async fn run_loop<H, F, M>(
                 let due = core.due_clicks(Instant::now(), SCHEDULE_HORIZON);
                 for effect in handle_due_clicks(&core.metronome, Some(&mut midi), due) {
                     record_effect(effect);
+                }
+                if midi.take_traffic() {
+                    let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                }
+
+                // The cue-placement analog of the click dispatch above: any
+                // beat-grid-buffered cue whose predicted instant just
+                // entered the horizon fires now. NOTE: this call's own
+                // `settle` only ever reports a fallback (and drops cues) if
+                // `due_clicks`'s `settle` call just above did NOT already
+                // trip one — see `DjEffect::CueDropped`'s doc for the
+                // known, documented gap this leaves (a `due_clicks`-
+                // triggered fallback drops `pending_cues` silently, since by
+                // the time this call runs there's nothing left to report).
+                let due_cues = core.due_cues(Instant::now(), SCHEDULE_HORIZON);
+                if let Some(t) = due_cues.transition {
+                    record_effect(DjEffect::Transition(t));
+                }
+                if due_cues.dropped_cues > 0 {
+                    // `DueCues`'s own doc: `dropped_cues > 0` only ever
+                    // happens alongside `transition.is_some()` (a fallback
+                    // mid-`due_cues` always changes mode when it clears
+                    // `pending_cues`) — loud `.expect()`, not a silent
+                    // fallback label, same invariant `fallback_effects` above
+                    // already leans on.
+                    let reason = due_cues
+                        .transition
+                        .expect("due_cues only drops cues alongside its own reported transition")
+                        .reason
+                        .as_str();
+                    record_effect(DjEffect::CueDropped { reason, count: due_cues.dropped_cues });
+                }
+                // Reuse the SAME dispatch functions the events arm uses —
+                // never a bespoke redispatch path. Each due cue gets a FRESH
+                // `now`/`now_epoch_ns` read and is re-stamped with its own
+                // computed `lead`/`epoch_ns` before dispatch: `lead =
+                // offset` (the phasor's predicted instant, not the cue's
+                // original wallclock lead) and `epoch_ns = dispatch_epoch_ns`
+                // (nonzero and equal to `now_epoch_ns` at dispatch time, so
+                // `effective_deadline`/`backdate_events`'s age computes to
+                // zero — the backdating ladder becomes a no-op and the cue
+                // fires at exactly `dispatch_now + offset`). `cue.epoch_ns`
+                // staying nonzero also keeps `stamped == true` at the sink
+                // (`dj::audio`'s `let stamped = cue.epoch_ns != 0` line) —
+                // correct, since a beat-grid-placed cue genuinely IS
+                // musically placed for R4's skip-loud gate. Mutating the
+                // already-owned `cue` in place (not cloning) — no need to
+                // clone a value this loop already owns outright from the
+                // `Vec` `due_cues.due` was drained from.
+                for due_cue in due_cues.due {
+                    let dispatch_now = Instant::now();
+                    let dispatch_epoch_ns = now_epoch_ns();
+                    let mut cue = due_cue.cue;
+                    cue.lead = due_cue.offset;
+                    cue.epoch_ns = dispatch_epoch_ns;
+                    dispatch_render_cue(
+                        &cue,
+                        dispatch_now,
+                        dispatch_epoch_ns,
+                        connected,
+                        ssh_config.as_ref(),
+                        sinks.audio.as_ref(),
+                        prefetch,
+                    );
+                    dispatch_midi_cue(&cue, dispatch_epoch_ns, &mut midi);
                 }
                 if midi.take_traffic() {
                     let _ = pulse_tx.send(DjPulse::RenderTraffic);
@@ -817,15 +977,62 @@ mod tests {
             vec![DjEffect::Transition(ClockTransition {
                 to: ClockMode::Wallclock,
                 reason: TransitionReason::Flush
-            })]
+            })],
+            "nothing was ever buffered in this test, so no CueDropped effect rides along"
         );
     }
 
     #[test]
-    fn a_non_flush_render_cue_is_ignored_this_task() {
+    fn a_flush_with_a_buffered_cue_reports_the_transition_and_the_drop() {
+        let mut core = DjCore::default();
+        let t0 = Instant::now();
+        handle_server_event(&mut core, &beat_sync(0.0, 2.0), t0, 0);
+        assert_eq!(core.mode(), ClockMode::BeatGrid);
+
+        // Buffer two cues directly — proves `dropped_cues` counts the whole
+        // batch, not just "one cue was pending."
+        core.enqueue_cue(
+            4.0,
+            RenderCue {
+                mime: "text/vnd.abc".into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+                onset_beat: Some(4.0),
+            },
+        );
+        core.enqueue_cue(
+            6.0,
+            RenderCue {
+                mime: "text/vnd.abc".into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+                onset_beat: Some(6.0),
+            },
+        );
+
+        let effects = handle_server_event(&mut core, &flush_cue(), t0, 0);
+        assert_eq!(core.mode(), ClockMode::Wallclock);
+        assert_eq!(
+            effects,
+            vec![
+                DjEffect::Transition(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Flush }),
+                DjEffect::CueDropped { reason: "flush", count: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_flush_render_cue_is_ignored_by_handle_server_event() {
         let mut core = DjCore::default();
         let effects = handle_server_event(&mut core, &non_flush_cue(), Instant::now(), 0);
-        assert!(effects.is_empty(), "cue dispatch is Task #3/#4 — ignored here, not acted on");
+        assert!(
+            effects.is_empty(),
+            "cue placement/dispatch is decided separately by the events arm's own \
+             decide_placement call, not handle_server_event — this function's cue-facing scope \
+             stays flush-only"
+        );
         assert_eq!(core.mode(), ClockMode::Wallclock, "an ignored event must not touch the clock");
     }
 
@@ -846,17 +1053,18 @@ mod tests {
         handle_server_event(&mut core, &beat_sync(0.0, 2.0), t0, 0);
         assert_eq!(core.mode(), ClockMode::BeatGrid);
 
-        let effect = handle_status_change(
+        let effects = handle_status_change(
             &mut core,
             &ConnectionStatus::Closing { cause: "kernel restart".into() },
             t0,
         );
         assert_eq!(
-            effect,
-            Some(DjEffect::Transition(ClockTransition {
+            effects,
+            vec![DjEffect::Transition(ClockTransition {
                 to: ClockMode::Wallclock,
                 reason: TransitionReason::Disconnect
-            }))
+            })],
+            "nothing was ever buffered in this test, so no CueDropped effect rides along"
         );
         assert_eq!(core.mode(), ClockMode::Wallclock);
     }
@@ -867,13 +1075,51 @@ mod tests {
         let t0 = Instant::now();
         handle_server_event(&mut core, &beat_sync(0.0, 2.0), t0, 0);
 
-        let effect = handle_status_change(
+        let effects = handle_status_change(
             &mut core,
             &ConnectionStatus::Connected { kernel_id: kaijutsu_types::KernelId::new(), context_id: None, since_ms: 0 },
             t0,
         );
-        assert_eq!(effect, None);
+        assert!(effects.is_empty());
         assert_eq!(core.mode(), ClockMode::BeatGrid, "a healthy status must not disturb a running phasor");
+    }
+
+    #[test]
+    fn a_disconnect_with_a_buffered_cue_reports_the_transition_and_the_drop() {
+        let mut core = DjCore::default();
+        let t0 = Instant::now();
+        handle_server_event(&mut core, &beat_sync(0.0, 2.0), t0, 0);
+        assert_eq!(core.mode(), ClockMode::BeatGrid);
+
+        // Buffer a cue directly — this test only needs pending_cues
+        // non-empty to prove the disconnect-triggered drop is reported, not
+        // to re-prove decide_placement's own routing (covered elsewhere).
+        core.enqueue_cue(
+            4.0,
+            RenderCue {
+                mime: "text/vnd.abc".into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: 0,
+                onset_beat: Some(4.0),
+            },
+        );
+
+        let effects = handle_status_change(
+            &mut core,
+            &ConnectionStatus::Closing { cause: "kernel restart".into() },
+            t0,
+        );
+        assert_eq!(
+            effects,
+            vec![
+                DjEffect::Transition(ClockTransition {
+                    to: ClockMode::Wallclock,
+                    reason: TransitionReason::Disconnect
+                }),
+                DjEffect::CueDropped { reason: "disconnect", count: 1 },
+            ]
+        );
     }
 
     // ── handle_due_clicks ────────────────────────────────────────────────
@@ -1014,11 +1260,13 @@ mod tests {
         }
     }
 
-    /// Wait for the next `Transition` effect, skipping `Slew`/`Click` noise
-    /// (the send-until-observed harness can fold the same reference more than
-    /// once, and each extra fold emits a Slew; a live phasor can also click
-    /// in the background of this test). Bounded by `timeout`; panics loud
-    /// rather than hanging.
+    /// Wait for the next `Transition` effect, skipping `Slew`/`Click`/
+    /// `CueDropped` noise (the send-until-observed harness can fold the same
+    /// reference more than once, and each extra fold emits a Slew; a live
+    /// phasor can also click in the background of this test; nothing in
+    /// these particular tests buffers cues, but a background swap can still
+    /// drop an empty buffer's worth — harmless, not the observable either
+    /// way). Bounded by `timeout`; panics loud rather than hanging.
     fn expect_transition(
         effect_rx: &std::sync::mpsc::Receiver<DjEffect>,
         timeout: Duration,
@@ -1028,7 +1276,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match effect_rx.recv_timeout(remaining) {
                 Ok(DjEffect::Transition(t)) => return t,
-                Ok(DjEffect::Slew(_)) | Ok(DjEffect::Click) => continue, // harness-induced, not the observable
+                Ok(DjEffect::Slew(_)) | Ok(DjEffect::Click) | Ok(DjEffect::CueDropped { .. }) => continue, // harness-induced, not the observable
                 Err(_) => panic!("no clock transition observed within {timeout:?}"),
             }
         }
@@ -1201,6 +1449,192 @@ mod tests {
             match scheduler_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(SchedulerCmd::PlayNow { bytes }) => {
                     assert_eq!(bytes, vec![1, 2, 3, 4]);
+                    break;
+                }
+                Ok(other) => panic!("expected PlayNow, got {other:?}"),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        panic!("no SchedulerCmd observed within 2s");
+                    }
+                }
+            }
+        }
+
+        ctl_tx.send(DjCtl::Shutdown).expect("send Shutdown");
+        join.join().expect("dj test thread panicked");
+    }
+
+    /// Slice 2's core wiring proof: a `RenderCue` carrying `onset_beat` sent
+    /// while the DJ is dialed into BeatGrid does NOT reach the scheduler at
+    /// receipt — it's buffered against the phasor (`DjCore::decide_placement`
+    /// -> `CuePlacement::Buffer` -> `enqueue_cue`) — and fires exactly once,
+    /// as a `PlayAt` (never the zero-lead/unstamped `PlayNow` fast path),
+    /// once the timer arm's `due_cues` call schedules it at the
+    /// horizon-entry wake (`DjCore::next_cue_wake`).
+    #[test]
+    fn thread_buffers_a_beat_grid_cue_and_dispatches_it_once_at_the_horizon_entry_wake() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        let (scheduler, scheduler_rx) = audio_sched::test_handle();
+        let (effect_tx, effect_rx) = std::sync::mpsc::channel::<DjEffect>();
+
+        let join = std::thread::Builder::new()
+            .name("dj-test-cue-buffer".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                let sinks = DjSinks { audio: Some(scheduler) };
+                rt.block_on(run_loop(ctl_rx, MidiSink::default(), sinks, &prefetch, prefetch_rx, pulse_tx, move |effect| {
+                    let _ = effect_tx.send(effect);
+                }));
+            })
+            .expect("spawn test dj thread");
+
+        let (events, _keep_events) = broadcast::channel(16);
+        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        ctl_tx
+            .send(DjCtl::ActorReady {
+                handle: TestSource { events: events.clone(), status },
+                ssh_config: SshConfig::default(),
+                generation: 1,
+            })
+            .expect("send ActorReady");
+
+        // Anchor at 240 BPM (4 beats/sec, 250ms/beat) — SCHEDULE_HORIZON is
+        // exactly one beat at this tempo, keeping the whole test's timing
+        // budget small. `send_until_observed` also proves the events
+        // subscription is live by the time it returns (it blocks on the
+        // anchoring Fold transition), so the single RenderCue send right
+        // after needs no resend of its own — resending it would enqueue it
+        // more than once.
+        send_until_observed(&events, &effect_rx, || beat_sync(0.0, 4.0), Duration::from_secs(2));
+
+        // Onset beat 3.0 lands 750ms after the anchor (3.0 / 4.0 bps) — the
+        // horizon-entry wake for it fires at anchor + 500ms (750ms - the
+        // 250ms horizon), comfortably after the "nothing yet" check below.
+        let cue = RenderCue {
+            mime: "audio/wav".into(),
+            payload: CuePayload::Inline(vec![9, 9, 9, 9]),
+            lead: Duration::ZERO,
+            epoch_ns: 0,
+            onset_beat: Some(3.0),
+        };
+        let sent_at = Instant::now();
+        events
+            .send(ServerEvent::RenderCue { context_id: ContextId::new(), cue })
+            .expect("send buffered cue");
+
+        // Nothing reaches the sink right away — buffered against the
+        // phasor, not dispatched at receipt (well before the anchor+500ms
+        // horizon-entry wake computed above).
+        assert!(
+            scheduler_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a beat-grid onset-stamped cue must not reach the sink at receipt"
+        );
+
+        // It fires once, as a PlayAt — proving the re-stamped nonzero
+        // lead/epoch_ns path was used, not the zero-lead/unstamped PlayNow
+        // fast path a directly-dispatched copy of this same cue would
+        // otherwise take.
+        let wait_deadline = Instant::now() + Duration::from_secs(4);
+        let (fired_at, play_deadline) = loop {
+            match scheduler_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SchedulerCmd::PlayAt { bytes, deadline, .. }) => {
+                    assert_eq!(bytes, vec![9, 9, 9, 9]);
+                    break (Instant::now(), deadline);
+                }
+                Ok(other) => panic!("expected PlayAt, got {other:?}"),
+                Err(_) => {
+                    if Instant::now() >= wait_deadline {
+                        panic!("buffered cue never fired within 4s");
+                    }
+                }
+            }
+        };
+        assert!(
+            fired_at.duration_since(sent_at) >= Duration::from_millis(300),
+            "fired suspiciously close to receipt ({:?}) for a cue buffered until the horizon-entry \
+             wake ~750ms out",
+            fired_at.duration_since(sent_at)
+        );
+        // The dispatched deadline tracks the phasor's predicted instant for
+        // beat 3.0 (~750ms after `sent_at`, since the cue was sent right at
+        // anchor) — not some backdated wallclock ladder computation off the
+        // cue's original (zero) epoch_ns, which would instead have produced
+        // an immediate PlayNow (already ruled out above) or a deadline
+        // pinned to `sent_at` itself.
+        let expected = sent_at + Duration::from_millis(750);
+        let drift = play_deadline.max(expected) - play_deadline.min(expected);
+        assert!(
+            drift < Duration::from_millis(400),
+            "PlayAt deadline {play_deadline:?} should track the phasor's predicted instant \
+             ({expected:?}), not drift far off it: {drift:?}"
+        );
+
+        assert!(
+            scheduler_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "fires exactly once — no replay"
+        );
+
+        ctl_tx.send(DjCtl::Shutdown).expect("send Shutdown");
+        join.join().expect("dj test thread panicked");
+    }
+
+    /// The regression guard `decide_placement`'s own doc calls for: a
+    /// directive cue (`onset_beat: None`) must cut through immediately even
+    /// while BeatGrid is dialed in — flush/prepare/play-now have no
+    /// track/beat association, so clock mode must never gate them. Sibling
+    /// to `thread_dispatches_a_render_cue_to_the_scheduler` above, which
+    /// already covers the OTHER half of "still dispatches immediately,
+    /// unchanged from today's behavior" (Wallclock mode, never dialed in at
+    /// all).
+    #[test]
+    fn thread_dispatches_a_directive_cue_immediately_even_while_beat_grid_is_dialed_in() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        let (scheduler, scheduler_rx) = audio_sched::test_handle();
+        let (effect_tx, effect_rx) = std::sync::mpsc::channel::<DjEffect>();
+
+        let join = std::thread::Builder::new()
+            .name("dj-test-directive-in-grid".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                let sinks = DjSinks { audio: Some(scheduler) };
+                rt.block_on(run_loop(ctl_rx, MidiSink::default(), sinks, &prefetch, prefetch_rx, pulse_tx, move |effect| {
+                    let _ = effect_tx.send(effect);
+                }));
+            })
+            .expect("spawn test dj thread");
+
+        let (events, _keep_events) = broadcast::channel(16);
+        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        ctl_tx
+            .send(DjCtl::ActorReady {
+                handle: TestSource { events: events.clone(), status },
+                ssh_config: SshConfig::default(),
+                generation: 1,
+            })
+            .expect("send ActorReady");
+
+        // Dial into BeatGrid first, confirmed live via the anchoring
+        // transition — same liveness proof `send_until_observed` gives the
+        // sibling test above.
+        send_until_observed(&events, &effect_rx, || beat_sync(0.0, 2.0), Duration::from_secs(2));
+
+        // A zero-lead, unstamped, onset_beat: None cue — the directive shape
+        // (flush/prepare/play-now) — must still take the immediate PlayNow
+        // path despite BeatGrid being live. Resending is safe here (unlike
+        // the buffered-cue test above): each resend is decided independently
+        // and every one of them takes the SAME Immediate branch, so no
+        // buffering side effect could double up.
+        let cue = RenderCue::now_inline("audio/wav", vec![7, 7, 7, 7]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = events.send(ServerEvent::RenderCue { context_id: ContextId::new(), cue: cue.clone() });
+            match scheduler_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(SchedulerCmd::PlayNow { bytes }) => {
+                    assert_eq!(bytes, vec![7, 7, 7, 7]);
                     break;
                 }
                 Ok(other) => panic!("expected PlayNow, got {other:?}"),

@@ -106,20 +106,28 @@ Slice 1 SHIPPED + live-verified 2026-07-18 (`docs/midi.md` has the story
 and the click-jitter measurements; it also closed the "metronome stops
 when backgrounded" symptom). Open:
 
-- **Slice 2 — beat-grid placement**: additive `RenderCue` onset-beat field
-  (capnp + kernel stamps the playhead beat at emission), BeatGrid rung in
-  the DJ's modal clock (`docs/midi.md` for the ladder + telemetry). Wire
-  change; coordinate with whatever else is in flight on `kaijutsu.capnp`.
-  Design inputs from the 2026-07-18 gemini-pro deliberation: **placement
-  into ALSA is absolute** — a Fold that moves the phasor between placement
-  and fire time strands the event on the old grid, so beat-grid cues must
-  be buffered in the DJ and pushed just-in-time within the click horizon
-  (the horizon generalized), never fire-and-forget at receipt; and a cue
-  arriving mid-transition must atomically see the settled mode. Also noted:
-  host suspend/resume produces a legitimate Wallclock→BeatGrid flap in one
-  loop iteration (Instant-domain staleness trips, queued refs re-anchor) —
-  acceptable, shows as two adjacent telemetry rows; add a resume-specific
-  reason attr only if the histogram gets noisy.
+- **Slice 2 — beat-grid placement**: Tasks 1–3 SHIPPED (wire + kernel
+  stamping, `DjCore`'s placement core, `dj/thread.rs`'s `run_loop` wiring —
+  `decide_placement`/`enqueue_cue`/`due_cues`/`next_cue_wake` all live end to
+  end, `kaijutsu.dj.cue_dropped` telemetry added alongside
+  `kaijutsu.dj.clock_transition`). **Task 4 (live verify on the runner) still
+  open**: confirm musical phrase onsets lock to the click grid rather than
+  drifting with wallclock/network jitter, and watch `clock_transition` +
+  `cue_dropped` through a deliberate flush/disconnect mid-phrase.
+  - **Known reporting gap, left as-is (Task 3)**: `kaijutsu.dj.cue_dropped`
+    fires correctly off `on_flush`/`on_disconnect`/`due_cues`, but TWO other
+    `DjCore` entry points also run the internal `settle()` staleness/
+    free-run-cap check and can therefore ALSO drop `pending_cues` on their
+    own — `due_clicks` (`DueClicks` has no `dropped_cues` field) and
+    `decide_placement` (`(CuePlacement, Option<ClockTransition>)` has no
+    `dropped_cues` slot either). When one of THOSE is the call that trips
+    the fallback, the drop happens (no cue is ever resurrected — the
+    "dropped silently" half of the contract holds) but isn't
+    telemetry-counted. Fixing it means growing `DueClicks`/
+    `decide_placement`'s return shapes in `dj/core.rs` — small, but out of
+    `dj/thread.rs`-only scope; pick up alongside Task 4's live verify if the
+    gap turns out to matter in practice (`dj/thread.rs`'s `DjEffect::CueDropped`
+    doc has the full trace).
 - **Frame-cost arc (separate from DJ; visual smoothness + input latency)**:
   (a) rich/markdown parse results are re-computed on every block version
   bump — the `_version` params on `detect_rich_content_typed` /

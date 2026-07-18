@@ -174,6 +174,15 @@ pub struct BeatMetrics {
     /// stance as the phasor's slew histogram: watch the transition rate and
     /// reasons before touching a knob blind.
     dj_clock_transitions: Counter<u64>,
+    /// `kaijutsu.dj.cue_dropped` — beat-grid-buffered `RenderCue`s dropped
+    /// (never rescued onto the wallclock ladder) when a clock fallback
+    /// orphaned them before their onset beat arrived, by `reason` (mirrors
+    /// `dj_clock_transitions`' own `reason` values —
+    /// `stale`|`flush`|`disconnect`|`free_run_cap`; confirmed with Amy,
+    /// `docs/midi.md` "The DJ thread": dropped silently, telemetry-counted,
+    /// never resurrected). `count` (the add value, not always 1) is however
+    /// many cues one fallback dropped at once.
+    dj_cue_dropped: Counter<u64>,
 }
 
 impl BeatMetrics {
@@ -220,6 +229,14 @@ impl BeatMetrics {
             .with_unit("{transition}")
             .with_description("DJ-thread clock-mode transitions, by target mode and reason")
             .build();
+        let dj_cue_dropped = meter
+            .u64_counter("kaijutsu.dj.cue_dropped")
+            .with_unit("{cue}")
+            .with_description(
+                "Beat-grid-buffered render cues dropped by a clock fallback before their onset \
+                 beat arrived, by reason",
+            )
+            .build();
         Self {
             beats_fired,
             grid_reseeds,
@@ -228,6 +245,7 @@ impl BeatMetrics {
             phasor_slew,
             stale_cues_dropped,
             dj_clock_transitions,
+            dj_cue_dropped,
         }
     }
 
@@ -285,6 +303,14 @@ impl BeatMetrics {
             &[KeyValue::new("to", to.to_owned()), KeyValue::new("reason", reason.to_owned())],
         );
     }
+
+    /// Record `count` beat-grid-buffered cues dropped at once by a single
+    /// clock fallback. `reason` is `ClockTransition::reason.as_str()`
+    /// (`dj::core`) — the same fallback that dropped the cues also reports
+    /// this transition, so the two counters share one `reason` vocabulary.
+    pub fn record_dj_cue_dropped(&self, reason: &str, count: usize) {
+        self.dj_cue_dropped.add(count as u64, &[KeyValue::new("reason", reason.to_owned())]);
+    }
 }
 
 static BEAT_METRICS: LazyLock<BeatMetrics> =
@@ -326,6 +352,12 @@ pub fn record_stale_cue_dropped() {
 /// see [`BeatMetrics::record_dj_clock_transition`].
 pub fn record_dj_clock_transition(to: &str, reason: &str) {
     BEAT_METRICS.record_dj_clock_transition(to, reason);
+}
+
+/// Record `count` beat-grid-buffered cues dropped by one clock fallback to
+/// the global meter provider — see [`BeatMetrics::record_dj_cue_dropped`].
+pub fn record_dj_cue_dropped(reason: &str, count: usize) {
+    BEAT_METRICS.record_dj_cue_dropped(reason, count);
 }
 
 /// Process-wide LLM instruments, lazily bound to the global meter provider.
@@ -550,6 +582,8 @@ mod tests {
         metrics.record_dj_clock_transition("beat_grid", "fold");
         metrics.record_dj_clock_transition("wallclock", "stale");
         metrics.record_dj_clock_transition("wallclock", "stale");
+        metrics.record_dj_cue_dropped("stale", 3);
+        metrics.record_dj_cue_dropped("flush", 1);
 
         provider.force_flush().expect("flush");
         let rm = exporter.get_finished_metrics().expect("metrics exported");
@@ -584,6 +618,16 @@ mod tests {
             counter_sum(&rm, "kaijutsu.dj.clock_transition", "reason", "stale"),
             2,
             "two stale-reason transitions, discoverable by reason too"
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.dj.cue_dropped", "reason", "stale"),
+            3,
+            "one fallback dropping 3 cues at once sums to 3, not 1"
+        );
+        assert_eq!(
+            counter_sum(&rm, "kaijutsu.dj.cue_dropped", "reason", "flush"),
+            1,
+            "the flush-reason drop is discoverable separately from the stale one"
         );
     }
 }
