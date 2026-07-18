@@ -102,7 +102,10 @@ pub struct TrackListRow {
     pub bpm: u64,
     pub beats_per_phrase: u64,
     pub attached: usize,
-    pub playhead: i64,
+    /// Musical time reached; `None` when the track has never played (distinct
+    /// from `Some(0)`, played-and-stopped-at-tick-0). Rendered `—` when unset,
+    /// same convention as `score_short`.
+    pub playhead: Option<i64>,
     /// Short id of the track's score context, or `—` when it has none yet.
     pub score_short: String,
 }
@@ -131,6 +134,10 @@ pub fn format_track_table(rows: &[TrackListRow]) -> String {
         "TRACK", "STATE", "CLOCK", "BPM", "PHRASE", "ATTACHED", "PLAYHEAD", "SCORE",
     ));
     for r in rows {
+        let playhead = r
+            .playhead
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "—".to_string());
         lines.push(format!(
             "{:<track_w$}  {:<7}  {:<7}  {:>5}  {:>6}  {:>8}  {:>8}  {}",
             r.track_id,
@@ -139,7 +146,7 @@ pub fn format_track_table(rows: &[TrackListRow]) -> String {
             r.bpm,
             r.beats_per_phrase,
             r.attached,
-            r.playhead,
+            playhead,
             r.score_short,
         ));
     }
@@ -498,7 +505,7 @@ mod tests {
                 bpm: 120,
                 beats_per_phrase: 32,
                 attached: 1,
-                playhead: 384,
+                playhead: Some(384),
                 score_short: "a1b2c3d4".to_string(),
             },
             TrackListRow {
@@ -508,7 +515,7 @@ mod tests {
                 bpm: 90,
                 beats_per_phrase: 16,
                 attached: 0,
-                playhead: 37,
+                playhead: Some(37),
                 score_short: "—".to_string(),
             },
         ];
@@ -521,5 +528,28 @@ mod tests {
         assert!(lines[1].contains("384") && lines[1].contains("a1b2c3d4"));
         // A persisted-but-not-live track reads `dormant`, not a fake `stopped`.
         assert!(lines[2].contains("oldtrack") && lines[2].contains("dormant"));
+    }
+
+    #[test]
+    fn track_table_renders_dash_for_never_played_playhead() {
+        // `None` (never played) must render `—`, distinguishable from
+        // `Some(0)` (played and stopped exactly at tick 0).
+        let rows = vec![TrackListRow {
+            track_id: "fresh".to_string(),
+            state: TrackListState::Dormant,
+            clock_kind: "system".to_string(),
+            bpm: 120,
+            beats_per_phrase: 32,
+            attached: 0,
+            playhead: None,
+            score_short: "—".to_string(),
+        }];
+        let out = format_track_table(&rows);
+        let row = out.lines().nth(1).expect("a data row");
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(
+            cols[6], "—",
+            "never-played playhead reads `—`, not `0`: {row}"
+        );
     }
 }

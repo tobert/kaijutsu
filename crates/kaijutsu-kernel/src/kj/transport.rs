@@ -552,19 +552,51 @@ impl KjDispatcher {
     /// explicit `kj transport list` so scripted output stays a clean table.
     async fn transport_list(&self, show_footer: bool) -> KjResult {
         // Persisted set first (canonical). A corrupt row fails loud rather than
-        // rendering nonsense — same posture as `list_tracks` itself.
-        let persisted = {
+        // rendering nonsense — same posture as `list_tracks` itself. Pull every
+        // attachment row in the SAME lock scope (one query, not N+1 — one per
+        // dormant track) so a dormant track's ATTACHED count reads at the same
+        // instant as `list_tracks()` instead of risking disagreement with its
+        // own row.
+        let (persisted, attach_counts) = {
             let db = self.kernel_db().lock();
-            match db.list_tracks() {
+            let persisted = match db.list_tracks() {
                 Ok(t) => t,
                 Err(e) => return KjResult::Err(format!("kj transport list: reading tracks: {e}")),
+            };
+            let attachments = match db.list_all_attachments() {
+                Ok(a) => a,
+                Err(e) => {
+                    return KjResult::Err(format!(
+                        "kj transport list: reading attachments: {e}"
+                    ));
+                }
+            };
+            let mut attach_counts: HashMap<String, usize> = HashMap::new();
+            for a in attachments {
+                *attach_counts.entry(a.track_id).or_insert(0) += 1;
             }
+            (persisted, attach_counts)
         };
 
         // Live scheduler snapshot (empty when no scheduler is wired — embedded/
-        // test, or a cold kernel before anything re-attaches).
+        // test, or a cold kernel before anything re-attaches; that `None` case
+        // legitimately means everything is dormant). A *wired* scheduler that
+        // drops the reply is different — don't let `unwrap_or_default` fold it
+        // into "nothing is live," which would render every live track
+        // `dormant` and lie about it, contradicting the dormant-is-honest
+        // design. Same posture as the command path's `ack_rx.await` match
+        // above.
         let live = match self.kernel().request_track_snapshot() {
-            Some(rx) => rx.await.unwrap_or_default(),
+            Some(rx) => match rx.await {
+                Ok(v) => v,
+                Err(_) => {
+                    return KjResult::Err(
+                        "kj transport list: the beat scheduler dropped the snapshot request \
+                         without a reply"
+                            .to_string(),
+                    );
+                }
+            },
             None => Vec::new(),
         };
         let live_by_id: HashMap<&str, &crate::hyoushigi::TrackSnapshot> =
@@ -606,24 +638,21 @@ impl KjDispatcher {
                 .map(|l| l.clock_kind.clone())
                 .or_else(|| pers.map(|p| p.clock_kind.clone()))
                 .unwrap_or_else(|| "system".to_string());
+            // `None` distinguishes "never played" from "played to tick 0" —
+            // `format_track_table` renders it `—`, same convention as SCORE.
             let playhead = live
                 .map(|l| l.playhead)
-                .or_else(|| pers.and_then(|p| p.playhead_tick))
-                .unwrap_or(0);
+                .or_else(|| pers.and_then(|p| p.playhead_tick));
             // Live attachment count is the scheduler's; a dormant track counts
-            // its persisted attachment rows (they're what a re-attach restores).
+            // its persisted attachment rows (they're what a re-attach restores)
+            // — an O(1) lookup into the up-front map, not a per-row query.
             let attached = match live {
                 Some(l) => l.attached.len(),
-                None => self
-                    .kernel_db()
-                    .lock()
-                    .list_attachments_for_track(id)
-                    .map(|a| a.len())
-                    .unwrap_or(0),
+                None => attach_counts.get(id).copied().unwrap_or(0),
             };
             let score = live
-                .map(|l| Some(l.score_context))
-                .unwrap_or_else(|| pers.and_then(|p| p.score_context_id));
+                .map(|l| l.score_context)
+                .or_else(|| pers.and_then(|p| p.score_context_id));
             let score_short = score.map(|c| c.short()).unwrap_or_else(|| "—".to_string());
 
             rows.push(TrackListRow {
@@ -1617,6 +1646,65 @@ mod tests {
             }
             other => panic!("expected Ok with array data, got {other:?}"),
         }
+    }
+
+    /// Beat stub whose scheduler IS wired (commands ack normally) but that
+    /// silently DROPS the `Snapshot` reply sender instead of answering —
+    /// standing in for a scheduler that shut down between the request and
+    /// the reply. Distinct from `None` (no ingress at all), which
+    /// legitimately means "everything dormant."
+    fn spawn_beat_stub_snapshot_drops_reply(
+        mut ingress: tokio::sync::mpsc::UnboundedReceiver<BeatRequest>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<BeatCommand> {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(req) = ingress.recv().await {
+                match req {
+                    BeatRequest::Command { command, reply } => {
+                        let _ = cmd_tx.send(command);
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(None));
+                        }
+                    }
+                    // The bug under test: never send — the receiver sees the
+                    // sender drop, i.e. `rx.await` resolves to `Err`.
+                    BeatRequest::Snapshot { reply } => drop(reply),
+                    BeatRequest::CommitCapture { reply, .. } => {
+                        let _ = reply.send(Err("beat stub: no tracks".into()));
+                    }
+                    BeatRequest::ClockEstimate { .. } => {}
+                }
+            }
+        });
+        cmd_rx
+    }
+
+    #[tokio::test]
+    async fn transport_list_errors_when_scheduler_drops_snapshot_reply() {
+        // The scheduler IS wired (unlike `transport_list_empty_when_no_tracks`'s
+        // `None` case, which legitimately means "everything dormant") but
+        // drops the `Snapshot` reply. `kj transport list` must report that
+        // loudly rather than folding it into an empty live set and rendering
+        // every track `dormant` — a lie the dormant-is-honest design forbids.
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("bass"), None, PrincipalId::new());
+        seed_track_and_attachment(&d, ctx, "bass", None);
+        let c = caller_with_context(ctx);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+        let _cmds = spawn_beat_stub_snapshot_drops_reply(rx);
+
+        let result = d.dispatch(&[s("transport"), s("list")], &c).await;
+        assert!(
+            matches!(result, crate::kj::KjResult::Err(_)),
+            "a dropped Snapshot reply must surface as an error, not a lying dormant roster: {:?}",
+            result
+        );
+        assert!(
+            result.message().to_lowercase().contains("scheduler"),
+            "the error names the scheduler: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]

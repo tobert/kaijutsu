@@ -253,14 +253,16 @@ pub fn build_output_span_brushes(
 /// For tabular/tree/list data, returns a `RichContent::Output` with
 /// pre-computed layout for per-cell coloring.
 pub fn detect_output_content(output: &OutputData, _version: u64) -> Option<RichContent> {
-    // A rich_json-only payload (kj's structured `.output` sideband, wired
-    // through OutputData::rich_json) has an empty node tree — there is
-    // nothing here for the tree/table renderer to lay out. Rendering
+    // A rich_json-ONLY payload (kj's structured `.output` sideband, wired
+    // through OutputData::rich_json) has an empty node tree AND no headers —
+    // there is nothing here for the tree/table renderer to lay out. Rendering
     // rich_json itself is a deliberate follow-up; for now this must fall
     // through to the plain-text path deterministically rather than rely on
     // the empty-plain-text check below (which happens to cover it, but
-    // doesn't say so).
-    if output.root.is_empty() {
+    // doesn't say so). Headers alone (an empty-result table that still has
+    // columns) is real structure — it must NOT be caught by this guard, or a
+    // legitimate headers-only table loses its header rendering.
+    if output.root.is_empty() && output.headers.is_none() {
         return None;
     }
 
@@ -506,6 +508,26 @@ mod tests {
         assert!(
             detect_output_content(&output, 0).is_none(),
             "rich_json-only OutputData must yield the text path (None), not a blank structured view"
+        );
+    }
+
+    /// A headers-only `OutputData` (an empty-result table that still carries
+    /// its column names — `root` empty, `headers` some) is real structure, not
+    /// the "nothing here" shape the rich_json-only guard above targets. The
+    /// old `if output.root.is_empty() { return None; }` guard fired on this
+    /// too, before the headers check ever ran, so a legitimate empty-table-
+    /// with-columns lost its header rendering. It must proceed past the
+    /// empty-root guard.
+    #[test]
+    fn headers_only_output_is_not_dropped_by_the_empty_root_guard() {
+        let output = OutputData::new().with_headers(vec!["A".to_string()]);
+        assert!(output.root.is_empty(), "test premise: no rows");
+        assert!(output.headers.is_some(), "test premise: has columns");
+
+        assert!(
+            detect_output_content(&output, 0).is_some(),
+            "headers-only OutputData must proceed past the empty-root guard \
+             and render as a (header-only) table, not fall back to plain text"
         );
     }
 }

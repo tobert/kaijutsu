@@ -2500,14 +2500,16 @@ pub(crate) fn parse_output_data(
         data = data.with_headers(headers);
     }
     // richJson is "empty string = none" on the wire (see kaijutsu.capnp).
-    // Malformed JSON is a render-hint problem, not a snapshot-parse problem —
-    // warn and leave rich_json unset rather than failing the whole parse.
+    // The server is the sole encoder, so malformed JSON here means
+    // corruption or version-skew, not a routine condition — log loud, but
+    // still leave rich_json unset rather than failing the whole snapshot
+    // parse over a display-hint field.
     let rich_json_text = reader.get_rich_json()?.to_str()?;
     if !rich_json_text.is_empty() {
         match serde_json::from_str::<serde_json::Value>(rich_json_text) {
             Ok(v) => data = data.with_rich_json(v),
             Err(e) => {
-                log::warn!("parse_output_data: rich_json did not parse as JSON: {e}")
+                log::error!("parse_output_data: rich_json did not parse as JSON: {e}")
             }
         }
     }
@@ -2832,10 +2834,12 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.signature(s);
     }
 
-    // Structured output data
+    // Structured output data. A kj block's OutputData is exactly root-empty +
+    // headers-none + rich_json-some — without the rich_json arm here that
+    // shape was silently dropped (see parse_block_snapshot_attaches_rich_json_only_output).
     if let Ok(output_data_reader) = reader.get_output_data()
         && let Ok(data) = parse_output_data(output_data_reader)
-        && (!data.root.is_empty() || data.headers.is_some())
+        && (!data.root.is_empty() || data.headers.is_some() || data.rich_json.is_some())
     {
         builder = builder.output(data);
     }
@@ -3609,6 +3613,55 @@ mod tests {
             .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
             .unwrap();
         parse_block_snapshot(&reader).unwrap()
+    }
+
+    /// `roundtrip_snapshot` never sets `output_data` (no `snap.output` handling),
+    /// so this builds a `block_snapshot` capnp message directly — mirroring
+    /// `roundtrip_snapshot`'s field setup plus `parse_output_data_rich_json_round_trip`'s
+    /// output_data setup — to exercise `parse_block_snapshot`'s output-attach
+    /// guard with a rich_json-only `OutputData` (root empty, headers none): a kj
+    /// block's exact shape. The guard used to require `!root.is_empty() ||
+    /// headers.is_some()`, dropping this payload — the app store (populated from
+    /// getBlocks / onBlockInserted full snapshots, and any reconnect re-fetch)
+    /// lost it; it only survived via the live onBlockOutputChanged path.
+    #[test]
+    fn parse_block_snapshot_attaches_rich_json_only_output() {
+        let mut message = MessageBuilder::new_default();
+        let mut builder = message.init_root::<crate::kaijutsu_capnp::block_snapshot::Builder>();
+
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        {
+            let mut id_builder = builder.reborrow().init_id();
+            id_builder.set_context_id(id.context_id.as_bytes());
+            id_builder.set_principal_id(id.principal_id.as_bytes());
+            id_builder.set_seq(id.seq);
+        }
+        builder.set_kind(crate::kaijutsu_capnp::BlockKind::ToolResult);
+        builder.set_role(crate::kaijutsu_capnp::Role::Tool);
+        builder.set_status(crate::kaijutsu_capnp::Status::Done);
+        builder.set_content("bass\nbassline");
+
+        let rich = serde_json::json!(["bass", "bassline"]);
+        {
+            let mut od = builder.reborrow().init_output_data();
+            od.set_rich_json(serde_json::to_string(&rich).unwrap().as_str());
+            od.reborrow().init_root(0);
+        }
+
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
+            .unwrap();
+        let parsed = parse_block_snapshot(&reader).expect("parse_block_snapshot");
+
+        let output = parsed.output.expect(
+            "a rich_json-only OutputData must still attach — it is exactly a kj block's shape",
+        );
+        assert_eq!(output.rich_json, Some(rich), "rich_json must survive the round trip");
+        assert!(output.root.is_empty(), "test premise: no node tree on the wire");
     }
 
     #[test]

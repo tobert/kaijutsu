@@ -6804,16 +6804,27 @@ fn build_output_data(
 /// structured payload survives ONLY on the `.data` sideband. Bridge that
 /// into a rich_json `OutputData` so the structured value still reaches the
 /// block (→ app + MCP `data`). See `docs/issues.md`.
+///
+/// The two sidebands are MERGED, not chosen between: a real node-tree
+/// `.output` (app-renderable) plus an independent `.data` sideband both
+/// survive on the one `OutputData` — the tree in `root`, `.data` back-filled
+/// into `rich_json` only when `.output` didn't already set it. Today
+/// `.output` is nearly always `None` by the time a result reaches here (the
+/// limiter clears it), so this mostly degenerates to the rich_json-only
+/// path — but the contract shouldn't rely on that staying broken. Per
+/// deepseek's review: this does mean the app (renders the node tree) and MCP
+/// (returns `rich_json` verbatim) can show divergent views of the same
+/// block when both are set — an accepted caveat, not a bug.
 fn block_output_data(
     result: &kaish_kernel::interpreter::ExecResult,
 ) -> Option<kaijutsu_types::OutputData> {
-    if let Some(od) = result.output() {
-        return Some(od.clone());
+    let output = result.output().cloned();
+    let needs_rich_json = output.as_ref().is_none_or(|od| od.rich_json.is_none());
+    if needs_rich_json && let Some(v) = result.data.as_ref() {
+        let rich_json = kaish_kernel::interpreter::value_to_json(v);
+        return Some(output.unwrap_or_default().with_rich_json(rich_json));
     }
-    result.data.as_ref().map(|v| {
-        kaijutsu_types::OutputData::new()
-            .with_rich_json(kaish_kernel::interpreter::value_to_json(v))
-    })
+    output
 }
 
 #[cfg(test)]
@@ -6862,6 +6873,32 @@ mod block_output_data_tests {
     fn neither_output_nor_data_yields_none() {
         let result = ExecResult::success("plain text, no structure");
         assert!(block_output_data(&result).is_none());
+    }
+
+    #[test]
+    fn merges_data_sideband_onto_a_real_output_tree() {
+        // A builtin can set BOTH a real node-tree `.output` (the
+        // app-renderable shape) AND an independent `.data` sideband. The
+        // resulting OutputData must carry both — the tree in `root`, `.data`
+        // back-filled into `rich_json` — not one clobbering the other.
+        let tree = kaijutsu_types::OutputData::nodes(vec![kaijutsu_types::OutputNode::new("row")]);
+        assert!(
+            tree.rich_json.is_none(),
+            "test premise: the real tree carries no rich_json of its own"
+        );
+        let mut result = ExecResult::with_output(tree.clone());
+        result.data = Some(Value::Json(serde_json::json!({"k": "v"})));
+
+        let bridged = block_output_data(&result).expect("expected Some");
+        assert_eq!(
+            bridged.root, tree.root,
+            "the real node tree must survive untouched"
+        );
+        assert_eq!(
+            bridged.rich_json,
+            Some(serde_json::json!({"k": "v"})),
+            "rich_json must be back-filled from .data since .output didn't set its own"
+        );
     }
 }
 

@@ -308,6 +308,27 @@ whole-repo fmt commit), then re-enable fmt in the loop.
 
 ---
 
+## MCP `data` shape change + unbounded rich_json (seeded 2026-07-18, `kj transport list` / `OutputData.rich_json` 3-model review)
+
+Follow-ups noted but not done while fixing the review findings on `kj
+transport list` and the `OutputData.rich_json` wire-through
+(`crates/kaijutsu-client/src/rpc.rs` `parse_block_snapshot`,
+`crates/kaijutsu-server/src/rpc.rs` `block_output_data`):
+
+- **MCP `shell`/`context_shell` `data` field SHAPE CHANGED (breaking).**
+  `ShellCompletion::to_json` now emits `OutputData::to_json()` (rich_json
+  verbatim, or inferred row-objects) instead of the raw
+  `{headers, root, rich_json}` struct — affects `kj` AND node-tree builtins
+  (`ls`/`find`/`glob`). Flag for release notes: MCP agents are the consumers
+  you can't grep for.
+- **rich_json size is UNBOUNDED.** `.data` bypasses kaish's output limiter
+  (which only caps text), so `block_output_data` persists it whole and
+  `build_output_data` fans it out on every `OutputChanged` + context
+  snapshot. A huge `.data` (e.g. `kj block list` over a giant context) has
+  no cap anywhere. Follow-up: a size ceiling at `block_output_data` (fail
+  loud, doctrine-consistent) or route large payloads through CAS like
+  `RenderCue`'s `casHash`.
+
 ## SFTP over the VFS (slices 0–2 + extensions + tracing landed 2026-06-26; slice 3 dissolved; limits + TOCTOU open)
 
 Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,
