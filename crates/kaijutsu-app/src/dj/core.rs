@@ -33,7 +33,7 @@
 
 use std::time::{Duration, Instant};
 
-use kaijutsu_audio::{BeatRef, LocalBeat, REF_STALE_MAX, RefDisposition, Slew};
+use kaijutsu_audio::{BeatRef, LocalBeat, REF_STALE_MAX, RefDisposition, RenderCue, Slew};
 
 /// How long BeatGrid may free-run on liveness alone — `Touch`-aged references
 /// proving the master is alive without ever correcting phase — before the DJ
@@ -133,6 +133,29 @@ pub struct ClockTransition {
     pub reason: TransitionReason,
 }
 
+/// One `reset_clock()`-driven fallback's report: the resulting
+/// [`ClockTransition`] (mirrors `ClockTransition`'s own report-not-side-effect
+/// stance) PLUS how many buffered cues (`DjCore::pending_cues`) were dropped
+/// with it. `on_flush`/`on_disconnect` return this directly; `settle`'s
+/// internal `exit_beat_grid` calls carry it too, though `settle` itself only
+/// surfaces the transition half — `due_cues` (the one caller that cares about
+/// a cue-drop count from a mid-call settle) recovers the count itself by
+/// snapshotting `pending_cues.len()` before calling `settle`, since by
+/// definition every buffered cue is already gone once `exit_beat_grid` has
+/// run.
+///
+/// A beat-grid cue orphaned by a mode fallback (stale / flush / disconnect /
+/// free-run-cap) before its onset beat arrives is dropped silently,
+/// telemetry-counted via this field — never rescued onto the wallclock
+/// ladder (confirmed with Amy: mirrors flush's existing "drop pending,
+/// silence live" semantics; a resurrected cue could otherwise sound in the
+/// wrong position relative to whatever's already playing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockFallback {
+    pub transition: Option<ClockTransition>,
+    pub dropped_cues: usize,
+}
+
 /// Click sound + gate config, resolved from the per-client `metronome.toml`
 /// (`docs/config-crdt-ownership.md` "Per-client config") and applied via
 /// `DjCtl::MetronomeConfig` (`dj::thread::forward_metronome_config_to_dj`).
@@ -197,6 +220,56 @@ pub struct DueClicks {
     pub transition: Option<ClockTransition>,
 }
 
+/// [`DjCore::decide_placement`]'s verdict for one incoming [`RenderCue`]:
+/// dispatch through the wallclock backdating ladder right now, or hold it
+/// until its onset beat enters the click horizon. `Copy`, nothing owned — the
+/// decision only needs to peek at `cue.onset_beat`; the caller (not
+/// `DjCore`), not this type, moves the actual owned cue wherever it needs to
+/// go next (`docs/midi.md` "The DJ thread", allocation posture: only the
+/// `f64` beat coordinate rides this enum, never the cue itself).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CuePlacement {
+    /// Dispatch now through the existing wallclock ladder — either no phasor
+    /// is trusted (`Wallclock`), or the cue carries no onset-beat stamp (a
+    /// directive cue: flush/prepare/play-now).
+    Immediate,
+    /// Hold until the beat coordinate enters the click horizon — the
+    /// argument is the onset beat itself (also `cue.onset_beat`'s value),
+    /// handed back so the caller doesn't need to re-read the cue to enqueue
+    /// it.
+    Buffer(f64),
+}
+
+/// One `due_cues` call's report — the cue-placement analog of [`DueClicks`].
+/// `dropped_cues` is nonzero only when `settle` fell back mid-call (every
+/// buffered cue dropped at once, `due` is then always empty, mirroring
+/// `DueClicks`'s own "transition implies empty offsets" shape); otherwise
+/// it's the ready-to-fire set partitioned out of `pending_cues`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueCues {
+    pub due: Vec<DueCue>,
+    pub dropped_cues: usize,
+    pub transition: Option<ClockTransition>,
+}
+
+/// One cue ready to dispatch, with its schedule offset from `now` — mirrors
+/// `DueClicks::offsets`, but carrying the cue itself since (unlike a click,
+/// which is synthesized fresh at the sink) there's no substitute for the
+/// actual [`RenderCue`] the caller decided to buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueCue {
+    pub cue: RenderCue,
+    pub offset: Duration,
+}
+
+/// Pre-reserved [`DjCore::pending_cues`] capacity — sized for "a handful of
+/// cues clustered inside one click-horizon window," the realistic
+/// steady-state population, so the buffer doesn't have to walk the default
+/// `Vec` 0→1→2→4→8 reallocation stair-step as cues arrive (Amy, 2026-07-18:
+/// "allocationless or at least allocation-conscious, not wasteful" —
+/// `docs/midi.md` "The DJ thread", allocation posture).
+const PENDING_CUES_CAPACITY: usize = 8;
+
 /// The DJ thread's pure clock + click state machine.
 ///
 /// State mirrors `Metronome` (the phasor, the click cursor) PLUS the modal
@@ -232,6 +305,14 @@ pub struct DjCore {
     /// Click sound + gate. `pub` like `Metronome::config` — applied from the
     /// outside (an RPC-fetched `metronome.toml`), not derived here.
     pub metronome: MetronomeConfig,
+    /// Beat-grid-buffered cues not yet due: `(onset_beat, cue)`. Populated
+    /// only via [`Self::enqueue_cue`] (the `Buffer` branch of
+    /// [`Self::decide_placement`]) — the majority-Immediate case never
+    /// touches this `Vec` at all. Cleared by `reset_clock()`, whose caller
+    /// reports the drop count ([`ClockFallback`]/[`DueCues::dropped_cues`]) —
+    /// see [`ClockFallback`]'s doc for the "dropped silently,
+    /// telemetry-counted, never rescued" policy this implements.
+    pending_cues: Vec<(f64, RenderCue)>,
 }
 
 impl Default for DjCore {
@@ -243,6 +324,7 @@ impl Default for DjCore {
             last_ref_at: None,
             last_fold_at: None,
             metronome: MetronomeConfig::default(),
+            pending_cues: Vec::with_capacity(PENDING_CUES_CAPACITY),
         }
     }
 }
@@ -275,12 +357,21 @@ impl DjCore {
 
     /// Reset the phasor + click cursor + liveness clock — ported from
     /// `Metronome::reset`, plus `last_ref_at` (the field `Metronome` doesn't
-    /// have, since it has no liveness clock to clear).
-    fn reset_clock(&mut self) {
+    /// have, since it has no liveness clock to clear) — plus `pending_cues`
+    /// (the buffered-cue analog `Metronome` never had a notion of at all).
+    /// Returns how many buffered cues were dropped, for the caller
+    /// ([`Self::exit_beat_grid`]) to report onward via [`ClockFallback`].
+    /// `.clear()`, not reassigning a fresh `Vec` — keeps `pending_cues`'
+    /// pre-reserved capacity across the whole DJ thread's run (allocation
+    /// posture, `docs/midi.md` "The DJ thread").
+    fn reset_clock(&mut self) -> usize {
         self.beat = None;
         self.next_beat = None;
         self.last_ref_at = None;
         self.last_fold_at = None;
+        let dropped_cues = self.pending_cues.len();
+        self.pending_cues.clear();
+        dropped_cues
     }
 
     /// Enter `BeatGrid` if not already there; report a transition only on
@@ -294,18 +385,22 @@ impl DjCore {
         Some(ClockTransition { to: ClockMode::BeatGrid, reason })
     }
 
-    /// Reset the clock and fall back to `Wallclock` if not already there;
-    /// report a transition only on the actual change. Resetting
-    /// unconditionally (even when `mode` is already `Wallclock`) mirrors
-    /// `Metronome::reset`'s idempotence — a second flush/disconnect while
-    /// already silent is a harmless no-op, not an error.
-    fn exit_beat_grid(&mut self, reason: TransitionReason) -> Option<ClockTransition> {
-        self.reset_clock();
+    /// Reset the clock (dropping any buffered cues with it) and fall back to
+    /// `Wallclock` if not already there; report a transition only on the
+    /// actual change. Resetting unconditionally (even when `mode` is already
+    /// `Wallclock`) mirrors `Metronome::reset`'s idempotence — a second
+    /// flush/disconnect while already silent is a harmless no-op, not an
+    /// error (though a second call has nothing left to drop either).
+    fn exit_beat_grid(&mut self, reason: TransitionReason) -> ClockFallback {
+        let dropped_cues = self.reset_clock();
         if self.mode == ClockMode::Wallclock {
-            return None;
+            return ClockFallback { transition: None, dropped_cues };
         }
         self.mode = ClockMode::Wallclock;
-        Some(ClockTransition { to: ClockMode::Wallclock, reason })
+        ClockFallback {
+            transition: Some(ClockTransition { to: ClockMode::Wallclock, reason }),
+            dropped_cues,
+        }
     }
 
     /// Ingest one `BeatSync`-carried [`BeatRef`], dispositioned exactly as
@@ -350,36 +445,41 @@ impl DjCore {
     }
 
     /// A transport flush (`RENDER_FLUSH_MIME`): stop/pause ended the take, so
-    /// the phasor and click cursor reset. `now` is accepted for symmetry
-    /// with every other entry point here (`docs/midi.md`'s "everything takes
-    /// an explicit `now`") even though the reset itself is time-independent
-    /// — mirrors `Metronome::reset`'s own unconditional semantics.
-    pub fn on_flush(&mut self, now: Instant) -> Option<ClockTransition> {
+    /// the phasor, click cursor, and any buffered cues reset with it. `now`
+    /// is accepted for symmetry with every other entry point here
+    /// (`docs/midi.md`'s "everything takes an explicit `now`") even though
+    /// the reset itself is time-independent — mirrors `Metronome::reset`'s
+    /// own unconditional semantics. Returns [`ClockFallback`] rather than a
+    /// bare `Option<ClockTransition>` so the caller can also telemetry-count
+    /// any cues dropped with the flush.
+    pub fn on_flush(&mut self, now: Instant) -> ClockFallback {
         let _ = now;
         self.exit_beat_grid(TransitionReason::Flush)
     }
 
     /// The connection dropped (kernel restart/crash/network) — the kernel is
     /// gone and can send no flush, so this is a separate trigger, mirroring
-    /// `Metronome::halt_on_connection_loss`. Same `now`-for-symmetry note as
-    /// [`Self::on_flush`].
-    pub fn on_disconnect(&mut self, now: Instant) -> Option<ClockTransition> {
+    /// `Metronome::halt_on_connection_loss`. Same `now`-for-symmetry and
+    /// `ClockFallback`-return notes as [`Self::on_flush`].
+    pub fn on_disconnect(&mut self, now: Instant) -> ClockFallback {
         let _ = now;
         self.exit_beat_grid(TransitionReason::Disconnect)
     }
 
-    /// Click offsets due within `horizon` of `now`, PLUS the staleness check
-    /// that can fall BeatGrid back to Wallclock. The staleness check runs
-    /// first and short-circuits: a click-check that discovers the last live
-    /// reference is older than [`REF_STALE_MAX`] resets and reports the
-    /// transition instead of scheduling (there is no phasor left to trust by
-    /// the time this returns).
+    /// The staleness + free-run-cap ladder — the freshness check every
+    /// mode-sensitive decision in this module funnels through before
+    /// deciding anything, extracted from what used to be inlined at the top
+    /// of [`Self::due_clicks`] (a pure refactor: `due_clicks`'s own behavior
+    /// is unchanged by the split). Returns the transition if the check fell
+    /// BeatGrid back to Wallclock (dropping any buffered cues with it via
+    /// `exit_beat_grid`/`reset_clock`), else `None` — including while
+    /// already `Wallclock`, where there is nothing to check.
     ///
-    /// The click policy itself (once past the staleness gate, or while
-    /// already Wallclock — schedule_due is a no-op with no phasor either
-    /// way) is [`Self::schedule_due`], ported verbatim from
-    /// `Metronome::schedule_due`.
-    pub fn due_clicks(&mut self, now: Instant, horizon: Duration) -> DueClicks {
+    /// This is what makes "a cue arriving mid-transition atomically sees the
+    /// settled mode" true ([`Self::decide_placement`]'s doc): not a new
+    /// race-guard, just routing the decision through the one entry point
+    /// [`Self::due_clicks`] already used for the identical purpose.
+    fn settle(&mut self, now: Instant) -> Option<ClockTransition> {
         if self.mode == ClockMode::BeatGrid {
             // Stale first (total silence — the tighter signal), then the
             // free-run cap (alive but never corrected, `MAX_FREE_RUN`'s
@@ -387,16 +487,33 @@ impl DjCore {
             // condition ever *arrives* as an event.
             if let Some(last) = self.last_ref_at {
                 if now.saturating_duration_since(last) > REF_STALE_MAX {
-                    let transition = self.exit_beat_grid(TransitionReason::Stale);
-                    return DueClicks { offsets: Vec::new(), transition };
+                    return self.exit_beat_grid(TransitionReason::Stale).transition;
                 }
             }
             if let Some(folded) = self.last_fold_at {
                 if now.saturating_duration_since(folded) > MAX_FREE_RUN {
-                    let transition = self.exit_beat_grid(TransitionReason::FreeRunCap);
-                    return DueClicks { offsets: Vec::new(), transition };
+                    return self.exit_beat_grid(TransitionReason::FreeRunCap).transition;
                 }
             }
+        }
+        None
+    }
+
+    /// Click offsets due within `horizon` of `now`, PLUS the staleness check
+    /// that can fall BeatGrid back to Wallclock. [`Self::settle`] runs first
+    /// and short-circuits: a click-check that discovers the last live
+    /// reference is older than [`REF_STALE_MAX`] (or the phasor's gone
+    /// uncorrected past [`MAX_FREE_RUN`]) resets and reports the transition
+    /// instead of scheduling (there is no phasor left to trust by the time
+    /// this returns).
+    ///
+    /// The click policy itself (once past the staleness gate, or while
+    /// already Wallclock — schedule_due is a no-op with no phasor either
+    /// way) is [`Self::schedule_due`], ported verbatim from
+    /// `Metronome::schedule_due`.
+    pub fn due_clicks(&mut self, now: Instant, horizon: Duration) -> DueClicks {
+        if let Some(transition) = self.settle(now) {
+            return DueClicks { offsets: Vec::new(), transition: Some(transition) };
         }
         DueClicks { offsets: self.schedule_due(now, horizon), transition: None }
     }
@@ -488,6 +605,119 @@ impl DjCore {
         let secs = ((next - cur) / tempo - horizon.as_secs_f64()).max(0.0);
         Some(now + Duration::from_secs_f64(secs))
     }
+
+    /// Decide how to place one incoming [`RenderCue`]: dispatch immediately
+    /// through the wallclock ladder, or buffer it against the phasor.
+    /// [`Self::settle`] runs FIRST — a cue arriving while `mode` is nominally
+    /// `BeatGrid` but has actually gone stale/free-run-capped atomically sees
+    /// the settled (post-fallback) mode, never a false `Buffer` against a
+    /// clock this same call just declared untrusted. `&RenderCue`, not an
+    /// owned cue — a peek, since the decision only needs `cue.onset_beat`;
+    /// the caller moves the actual cue via [`Self::enqueue_cue`] only on the
+    /// `Buffer` branch (allocation posture, `docs/midi.md` "The DJ thread").
+    ///
+    /// `Buffer(beat)` iff `mode() == BeatGrid && cue.onset_beat.is_some()`;
+    /// `Immediate` otherwise — including a directive cue (`onset_beat: None`)
+    /// arriving while dialed in, which must always cut through regardless of
+    /// clock mode (flush/prepare/play-now have no track/beat association).
+    pub fn decide_placement(&mut self, cue: &RenderCue, now: Instant) -> (CuePlacement, Option<ClockTransition>) {
+        let transition = self.settle(now);
+        let placement = match cue.onset_beat {
+            Some(beat) if self.mode == ClockMode::BeatGrid => CuePlacement::Buffer(beat),
+            _ => CuePlacement::Immediate,
+        };
+        (placement, transition)
+    }
+
+    /// Buffer one already-decided [`CuePlacement::Buffer`] cue. Takes the cue
+    /// by value (move), never a clone — called only after the caller has
+    /// already committed to the `Buffer` branch, so the owned cue moves in
+    /// directly (allocation posture: the majority-`Immediate` case never
+    /// reaches this method, and `pending_cues` itself is pre-reserved via
+    /// [`PENDING_CUES_CAPACITY`]).
+    pub fn enqueue_cue(&mut self, beat: f64, cue: RenderCue) {
+        self.pending_cues.push((beat, cue));
+    }
+
+    /// Cues ready to fire within `horizon` of `now` — the cue-placement
+    /// analog of [`Self::due_clicks`]. [`Self::settle`] runs first: if it
+    /// falls back, every buffered cue is dropped with it (reported via
+    /// `dropped_cues`, snapshotted from `pending_cues.len()` before `settle`
+    /// runs, since `exit_beat_grid` has already cleared the buffer by the
+    /// time `settle` returns) and `due` is empty — mirrors `DueClicks`'s own
+    /// "transition implies nothing scheduled" shape.
+    ///
+    /// Otherwise partitions `pending_cues` by predicted-instant-within-
+    /// `horizon`, using the exact `(beat − cur_position) / tempo_bps` math
+    /// [`Self::schedule_due`]/[`Self::next_wake`] already use. **Partitions
+    /// in place with `swap_remove`** (walk by index, `swap_remove` each due
+    /// entry into the output, leave the rest) rather than
+    /// `Vec::partition`/`retain`-plus-collect — the latter would allocate
+    /// two fresh `Vec`s every call and reset `pending_cues`' pre-reserved
+    /// capacity; `swap_remove` never reallocates it (allocation posture,
+    /// `docs/midi.md` "The DJ thread").
+    ///
+    /// An overdue cue (predicted instant already past) still fires, clamped
+    /// to `offset: Duration::ZERO` — the same "missed collapses to one
+    /// immediate action, never silently dropped just for being late" policy
+    /// [`Self::schedule_due`]'s click logic already applies; there's no
+    /// reason for cues to invent a different one. While `self.beat` is
+    /// `None` (no phasor — shouldn't normally happen with a non-empty
+    /// `pending_cues`, since cues are only ever buffered while `BeatGrid`,
+    /// but handled defensively rather than assumed) or the phasor's tempo is
+    /// non-positive, nothing is due and nothing is dropped — the cues stay
+    /// buffered for the next call.
+    pub fn due_cues(&mut self, now: Instant, horizon: Duration) -> DueCues {
+        let pending_before = self.pending_cues.len();
+        if let Some(transition) = self.settle(now) {
+            return DueCues { due: Vec::new(), dropped_cues: pending_before, transition: Some(transition) };
+        }
+        let Some(beat) = &self.beat else {
+            return DueCues { due: Vec::new(), dropped_cues: 0, transition: None };
+        };
+        let tempo = beat.tempo_bps();
+        if tempo <= 0.0 {
+            return DueCues { due: Vec::new(), dropped_cues: 0, transition: None };
+        }
+        let cur = beat.position(now);
+        let horizon_secs = horizon.as_secs_f64();
+
+        let mut due = Vec::new();
+        let mut i = 0;
+        while i < self.pending_cues.len() {
+            let onset_beat = self.pending_cues[i].0;
+            let secs = (onset_beat - cur) / tempo;
+            if secs <= horizon_secs {
+                let (_, cue) = self.pending_cues.swap_remove(i);
+                due.push(DueCue { cue, offset: Duration::from_secs_f64(secs.max(0.0)) });
+                // Do not advance `i` — swap_remove moved the last element
+                // into this slot, and it still needs to be checked.
+            } else {
+                i += 1;
+            }
+        }
+        DueCues { due, dropped_cues: 0, transition: None }
+    }
+
+    /// When the DJ thread's cue timer should next wake — mirrors
+    /// [`Self::next_wake`] but keyed on the EARLIEST beat across
+    /// `pending_cues` instead of the click cursor's `next_beat`. `None` while
+    /// not in `BeatGrid`, `pending_cues` is empty, or no phasor is running
+    /// (nothing to wake for in any of those cases).
+    pub fn next_cue_wake(&self, now: Instant, horizon: Duration) -> Option<Instant> {
+        if self.mode != ClockMode::BeatGrid || self.pending_cues.is_empty() {
+            return None;
+        }
+        let beat = self.beat.as_ref()?;
+        let tempo = beat.tempo_bps();
+        if tempo <= 0.0 {
+            return None;
+        }
+        let cur = beat.position(now);
+        let earliest = self.pending_cues.iter().map(|(beat, _)| *beat).fold(f64::INFINITY, f64::min);
+        let secs = ((earliest - cur) / tempo - horizon.as_secs_f64()).max(0.0);
+        Some(now + Duration::from_secs_f64(secs))
+    }
 }
 
 // ── DjAction — sketch for Tasks #3/#4, not implemented here ────────────────
@@ -520,7 +750,7 @@ impl DjCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_audio::REF_FOLD_MAX;
+    use kaijutsu_audio::{CuePayload, REF_FOLD_MAX, ABC_MIME};
 
     const H: Duration = Duration::from_millis(250); // mirrors metronome.rs's SCHEDULE_HORIZON
 
@@ -662,11 +892,12 @@ mod tests {
         dj.due_clicks(t0, H); // seed next_beat
         assert_eq!(dj.mode(), ClockMode::BeatGrid);
 
-        let transition = dj.on_flush(t0 + Duration::from_millis(10));
+        let fallback = dj.on_flush(t0 + Duration::from_millis(10));
         assert_eq!(
-            transition,
+            fallback.transition,
             Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Flush })
         );
+        assert_eq!(fallback.dropped_cues, 0, "nothing was ever buffered in this test");
         assert_eq!(dj.mode(), ClockMode::Wallclock);
         assert!(dj.beat_position(t0).is_none(), "phasor dropped");
         assert!(dj.due_clicks(t0, H).offsets.is_empty(), "cursor reset — nothing pending");
@@ -676,7 +907,9 @@ mod tests {
     fn a_second_flush_while_already_wallclock_is_a_silent_no_op() {
         let mut dj = DjCore::default();
         let t0 = Instant::now();
-        assert_eq!(dj.on_flush(t0), None, "flushing an already-silent DJ reports nothing");
+        let fallback = dj.on_flush(t0);
+        assert_eq!(fallback.transition, None, "flushing an already-silent DJ reports nothing");
+        assert_eq!(fallback.dropped_cues, 0);
         assert_eq!(dj.mode(), ClockMode::Wallclock);
     }
 
@@ -688,14 +921,15 @@ mod tests {
         dj.due_clicks(t0, H);
         assert_eq!(dj.mode(), ClockMode::BeatGrid);
 
-        let transition = dj.on_disconnect(t0 + Duration::from_millis(10));
+        let fallback = dj.on_disconnect(t0 + Duration::from_millis(10));
         assert_eq!(
-            transition,
+            fallback.transition,
             Some(ClockTransition {
                 to: ClockMode::Wallclock,
                 reason: TransitionReason::Disconnect
             })
         );
+        assert_eq!(fallback.dropped_cues, 0, "nothing was ever buffered in this test");
         assert_eq!(dj.mode(), ClockMode::Wallclock);
         assert!(dj.beat_position(t0).is_none());
     }
@@ -979,6 +1213,256 @@ mod tests {
         // Pure sanity check that this file's staleness reasoning rests on:
         // if this ever inverted, the Touch band would be empty or negative.
         assert!(REF_FOLD_MAX < REF_STALE_MAX);
+    }
+
+    // ── Cue placement (decide_placement / enqueue_cue / due_cues /
+    // next_cue_wake) — slice 2, docs/midi.md "The DJ thread" ─────────────
+
+    /// A `RenderCue` with all fields listed (no `Default` impl, by design —
+    /// see `kaijutsu-audio/src/lib.rs::RenderCue`'s doc), mirroring how
+    /// `dj/thread.rs`'s own test module builds its fixtures.
+    fn test_cue(onset_beat: Option<f64>) -> RenderCue {
+        RenderCue {
+            mime: ABC_MIME.into(),
+            payload: CuePayload::Inline(Vec::new()),
+            lead: Duration::ZERO,
+            epoch_ns: 0,
+            onset_beat,
+        }
+    }
+
+    #[test]
+    fn decide_placement_is_always_immediate_in_wallclock_regardless_of_onset_beat() {
+        let mut dj = DjCore::default();
+        let now = Instant::now();
+        assert_eq!(dj.mode(), ClockMode::Wallclock);
+
+        let (placement, transition) = dj.decide_placement(&test_cue(Some(4.0)), now);
+        assert_eq!(placement, CuePlacement::Immediate, "no phasor trusted -> always immediate");
+        assert_eq!(transition, None);
+
+        let (placement, transition) = dj.decide_placement(&test_cue(None), now);
+        assert_eq!(placement, CuePlacement::Immediate);
+        assert_eq!(transition, None);
+    }
+
+    #[test]
+    fn decide_placement_is_immediate_when_onset_beat_is_none_even_in_beat_grid() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        assert_eq!(dj.mode(), ClockMode::BeatGrid);
+
+        let (placement, transition) = dj.decide_placement(&test_cue(None), t0);
+        assert_eq!(placement, CuePlacement::Immediate, "a directive cue must cut through regardless of mode");
+        assert_eq!(transition, None);
+    }
+
+    #[test]
+    fn decide_placement_buffers_a_beat_stamped_cue_in_beat_grid_until_horizon_entry() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // 120 BPM: beat 1 at +500ms
+        assert_eq!(dj.mode(), ClockMode::BeatGrid);
+
+        let (placement, transition) = dj.decide_placement(&test_cue(Some(1.0)), t0);
+        assert_eq!(placement, CuePlacement::Buffer(1.0));
+        assert_eq!(transition, None);
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+
+        // Well before horizon entry (t0+250ms with H=250ms): nothing due yet.
+        assert!(dj.due_cues(t0, H).due.is_empty(), "not yet within the horizon");
+
+        // At horizon entry, the buffered cue becomes due.
+        let due = dj.due_cues(t0 + Duration::from_millis(250), H);
+        assert_eq!(due.due.len(), 1);
+        assert_eq!(due.due[0].cue.onset_beat, Some(1.0));
+        assert!(near(due.due[0].offset, 250.0), "scheduled a full horizon ahead: {:?}", due.due[0].offset);
+    }
+
+    #[test]
+    fn a_buffered_cue_fires_exactly_once_never_replayed() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+
+        let due = dj.due_cues(t0 + Duration::from_millis(250), H);
+        assert_eq!(due.due.len(), 1);
+
+        let due2 = dj.due_cues(t0 + Duration::from_millis(300), H);
+        assert!(due2.due.is_empty(), "no replay of an already-fired cue");
+    }
+
+    #[test]
+    fn multiple_buffered_cues_fire_in_onset_order_as_each_enters_the_horizon() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // 120 BPM: beat n at n*500ms
+        // Enqueued out of onset order deliberately — placement order must not
+        // matter, only predicted-instant-within-horizon does.
+        dj.enqueue_cue(2.0, test_cue(Some(2.0))); // sounds +1000ms, horizon entry +750ms
+        dj.enqueue_cue(1.0, test_cue(Some(1.0))); // sounds +500ms, horizon entry +250ms
+
+        assert!(dj.due_cues(t0, H).due.is_empty(), "neither cue within the horizon yet");
+
+        let first = dj.due_cues(t0 + Duration::from_millis(250), H);
+        assert_eq!(first.due.len(), 1, "only beat 1's cue has entered the horizon: {first:?}");
+        assert_eq!(first.due[0].cue.onset_beat, Some(1.0));
+
+        let second = dj.due_cues(t0 + Duration::from_millis(750), H);
+        assert_eq!(second.due.len(), 1, "beat 2's cue enters only now, not earlier: {second:?}");
+        assert_eq!(second.due[0].cue.onset_beat, Some(2.0));
+    }
+
+    #[test]
+    fn decide_placement_settles_first_reporting_immediate_and_the_transition_when_stale() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        assert_eq!(dj.mode(), ClockMode::BeatGrid);
+
+        // A cue arrives nominally "in BeatGrid," but the clock has actually
+        // gone stale by the time it's evaluated — decide_placement must
+        // settle first and see the fallen-back mode, not a stale cached one.
+        let stale_now = t0 + REF_STALE_MAX + Duration::from_millis(1);
+        let (placement, transition) = dj.decide_placement(&test_cue(Some(4.0)), stale_now);
+        assert_eq!(placement, CuePlacement::Immediate, "settled to Wallclock -> no false Buffer");
+        assert_eq!(
+            transition,
+            Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Stale })
+        );
+        assert_eq!(dj.mode(), ClockMode::Wallclock);
+    }
+
+    #[test]
+    fn on_flush_drops_every_pending_cue_and_reports_the_count() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+
+        let fallback = dj.on_flush(t0);
+        assert_eq!(fallback.dropped_cues, 2, "both buffered cues dropped with the flush");
+        assert_eq!(
+            fallback.transition,
+            Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Flush })
+        );
+        assert!(dj.due_cues(t0, H).due.is_empty(), "buffer is empty, not merely unreachable");
+    }
+
+    #[test]
+    fn on_disconnect_drops_every_pending_cue_and_reports_the_count() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+
+        let fallback = dj.on_disconnect(t0);
+        assert_eq!(fallback.dropped_cues, 1);
+        assert_eq!(
+            fallback.transition,
+            Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Disconnect })
+        );
+    }
+
+    #[test]
+    fn a_due_cues_triggered_stale_fallback_drops_every_pending_cue_and_reports_the_count() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+
+        let due = dj.due_cues(t0 + REF_STALE_MAX + Duration::from_millis(1), H);
+        assert!(due.due.is_empty(), "a settle-fallback schedules nothing");
+        assert_eq!(due.dropped_cues, 2);
+        assert_eq!(
+            due.transition,
+            Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::Stale })
+        );
+    }
+
+    #[test]
+    fn a_due_cues_triggered_free_run_cap_fallback_drops_every_pending_cue_and_reports_the_count() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // anchoring Fold
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+
+        // Sustained Touch (mirrors
+        // sustained_touch_past_the_free_run_cap_falls_back_even_with_fresh_liveness
+        // above): liveness stays fresh, the phasor is never corrected again.
+        let base: u64 = 100_000_000_000;
+        for at_secs in [6u64, 9] {
+            dj.observe_beat_sync(
+                BeatRef { beat: 0.0, tempo_bps: 2.0, epoch_ns: base },
+                t0 + Duration::from_secs(at_secs),
+                base + 2_000_000_000,
+            );
+        }
+        assert_eq!(dj.mode(), ClockMode::BeatGrid);
+
+        let due = dj.due_cues(t0 + Duration::from_millis(10_500), H);
+        assert!(due.due.is_empty());
+        assert_eq!(due.dropped_cues, 1);
+        assert_eq!(
+            due.transition,
+            Some(ClockTransition { to: ClockMode::Wallclock, reason: TransitionReason::FreeRunCap })
+        );
+    }
+
+    #[test]
+    fn an_overdue_buffered_cue_still_fires_clamped_to_zero_offset() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0); // 120 BPM: beat 1 at +500ms
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+
+        // Checked well past the cue's onset beat, with the clock still fine
+        // (nowhere near REF_STALE_MAX/MAX_FREE_RUN) — this is lateness, not a
+        // fallback, so the cue must still fire, never be silently dropped.
+        let due = dj.due_cues(t0 + Duration::from_millis(900), H);
+        assert_eq!(due.due.len(), 1, "an overdue cue still fires");
+        assert_eq!(due.due[0].offset, Duration::ZERO);
+        assert_eq!(due.dropped_cues, 0, "not a fallback drop — the clock is fine, just late");
+    }
+
+    #[test]
+    fn pending_cues_capacity_survives_a_due_cues_call_that_empties_it() {
+        let mut dj = DjCore::default();
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        dj.enqueue_cue(2.0, test_cue(Some(2.0)));
+
+        let cap_before = dj.pending_cues.capacity();
+        let due = dj.due_cues(t0 + Duration::from_secs(2), H); // both long overdue -> both fire
+        assert_eq!(due.due.len(), 2);
+        assert!(dj.pending_cues.is_empty());
+        assert_eq!(
+            dj.pending_cues.capacity(),
+            cap_before,
+            "swap_remove partitioning must never reallocate pending_cues"
+        );
+    }
+
+    #[test]
+    fn next_cue_wake_mirrors_next_wake_over_the_earliest_pending_cue() {
+        let mut dj = DjCore::default();
+        assert_eq!(dj.next_cue_wake(Instant::now(), H), None, "nothing buffered, no phasor");
+
+        let t0 = Instant::now();
+        dj.observe_beat_sync(BeatRef::new(0.0, 2.0), t0, 0);
+        assert_eq!(dj.next_cue_wake(t0, H), None, "still nothing buffered");
+
+        // Two cues buffered out of onset order; the wake must key on the
+        // EARLIEST one (beat 1, sounding at +500ms), not insertion order.
+        dj.enqueue_cue(3.0, test_cue(Some(3.0)));
+        dj.enqueue_cue(1.0, test_cue(Some(1.0)));
+        let wake = dj.next_cue_wake(t0, H).expect("a cue is buffered and the phasor runs");
+        assert!(near(wake.duration_since(t0), 250.0), "leads beat 1's horizon entry, got {:?}", wake);
     }
 
     // ── MetronomeConfig: shipped-default + typo-rejection (ported from the

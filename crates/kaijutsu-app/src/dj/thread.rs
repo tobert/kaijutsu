@@ -247,7 +247,10 @@ fn handle_server_event(
             effects
         }
         ServerEvent::RenderCue { cue, .. } if cue.mime == RENDER_FLUSH_MIME => {
-            core.on_flush(now).map(DjEffect::Transition).into_iter().collect()
+            // `dropped_cues` (cue-buffer telemetry) is Task #3's wiring —
+            // discarded here for now, same task-3 boundary as the rest of
+            // slice 2's cue-placement machinery not being called yet.
+            core.on_flush(now).transition.map(DjEffect::Transition).into_iter().collect()
         }
         _ => Vec::new(),
     }
@@ -265,7 +268,9 @@ fn handle_status_change(core: &mut DjCore, status: &ConnectionStatus, now: Insta
     if matches!(status, ConnectionStatus::Connected { .. }) {
         return None;
     }
-    core.on_disconnect(now).map(DjEffect::Transition)
+    // `dropped_cues` discarded here for the same task-3 boundary reason as
+    // the `RENDER_FLUSH_MIME` arm above.
+    core.on_disconnect(now).transition.map(DjEffect::Transition)
 }
 
 /// Dispatch one `due_clicks` result to the MIDI sink (if present, and only
