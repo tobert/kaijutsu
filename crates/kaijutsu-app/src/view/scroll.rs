@@ -1,8 +1,10 @@
 //! Scroll system — smooth interpolation for conversation scrolling.
 
 use bevy::prelude::*;
+use bevy::winit::WinitSettings;
 
 use crate::cell::{ConversationScrollState, EditorEntities};
+use crate::input::ScrollConfig;
 
 /// Smooth scroll interpolation system.
 ///
@@ -12,6 +14,7 @@ use crate::cell::{ConversationScrollState, EditorEntities};
 pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
     time: Res<Time>,
+    config: Res<ScrollConfig>,
     entities: Res<EditorEntities>,
     mut scroll_positions: Query<
         (&mut ScrollPosition, &ComputedNode),
@@ -46,8 +49,7 @@ pub fn smooth_scroll(
             (old_offset, old_target)
         }
     } else {
-        const SCROLL_SPEED: f32 = 12.0;
-        let t = (time.delta_secs() * SCROLL_SPEED).min(1.0);
+        let t = (time.delta_secs() * config.smooth_speed).min(1.0);
         let new_offset = old_offset + (clamped_target - old_offset) * t;
 
         let snapped = if (new_offset - clamped_target).abs() < 0.5 {
@@ -93,5 +95,32 @@ pub fn smooth_scroll(
         if (pixel_offset - current_y).abs() > 0.01 {
             **scroll_pos = Vec2::new(scroll_pos.x, pixel_offset);
         }
+    }
+}
+
+/// Keep the render loop at full rate *only* while a wheel scroll is easing.
+///
+/// The app is reactive-idle (`main.rs` `WinitSettings`, ~10Hz focused), which
+/// starves the frame-by-frame glide in `smooth_scroll` — the ease needs a
+/// stream of frames to run. While `offset` is still chasing `target_offset`,
+/// force `Continuous`; once settled, restore reactive idle so we don't spin
+/// the GPU when nothing is moving. Follow mode snaps instantly (no ease), so
+/// it never trips this. (Generalizing this to one "animation active" gate the
+/// DJ thread shares is tracked in docs/issues.md, DJ thread arc.)
+pub fn scroll_render_mode(
+    scroll_state: Res<crate::cell::ConversationScrollState>,
+    mut winit: ResMut<WinitSettings>,
+) {
+    use bevy::winit::UpdateMode;
+    let easing = !scroll_state.following
+        && (scroll_state.offset - scroll_state.target_offset).abs() > 0.5;
+    let desired = if easing {
+        UpdateMode::Continuous
+    } else {
+        UpdateMode::reactive(std::time::Duration::from_millis(100))
+    };
+    // Only write when it actually changes, to avoid needless change-detection.
+    if winit.focused_mode != desired {
+        winit.focused_mode = desired;
     }
 }

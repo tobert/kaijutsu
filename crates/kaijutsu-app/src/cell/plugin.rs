@@ -200,6 +200,7 @@ impl Plugin for CellPlugin {
                 view_render::reorder_conversation_children
                     .after(view_render::update_block_cell_nodes),
                 view_scroll::smooth_scroll.after(view_render::layout_block_cells),
+                view_scroll::scroll_render_mode.after(view_scroll::smooth_scroll),
                 view_render::virtualize_conversation.after(view_scroll::smooth_scroll),
             )
                 .in_set(CellPhase::Layout),

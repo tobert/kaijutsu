@@ -204,6 +204,12 @@ pub enum RpcResultMessage {
     /// (re)connect. Drained by [`crate::metronome::apply_metronome_config`] into
     /// the `Metronome` resource. Carries the resolved TOML body.
     MetronomeConfigReceived(String),
+    /// The per-client mouse-wheel scroll config (`/etc/client/<id>/scroll.toml`,
+    /// cascading to the shared `/etc/client/scroll.toml`), fetched over RPC on
+    /// (re)connect. Drained by
+    /// [`crate::input::scroll_config::apply_scroll_config`] into the
+    /// `ScrollConfig` resource. Carries the resolved TOML body.
+    ScrollConfigReceived(String),
 }
 
 // ============================================================================
@@ -507,6 +513,31 @@ fn poll_bootstrap_results(
                                 Ok(_) => {}
                                 // Absent override (common) / read error: fall through.
                                 Err(e) => log::debug!("metronome config {path} unavailable: {e}"),
+                            }
+                        }
+
+                        // 0c. Fetch the per-client scroll-gain config (per-client
+                        // /etc/client/<id>/scroll.toml first, then the shared
+                        // /etc/client/scroll.toml default). Best-effort — a miss
+                        // keeps the compiled-in gains already on the ScrollConfig
+                        // resource. Runs before the context branches (which can
+                        // `return`) so it always fires.
+                        for path in [
+                            kaijutsu_types::paths::client_config_path(
+                                Some(&client_id),
+                                "scroll.toml",
+                            ),
+                            kaijutsu_types::paths::client_config_path(None, "scroll.toml"),
+                        ] {
+                            match h.get_config(path.clone()).await {
+                                Ok(toml) if !toml.trim().is_empty() => {
+                                    let _ = tx.send(RpcResultMessage::ScrollConfigReceived(toml));
+                                    break;
+                                }
+                                // Empty body: try the next (shared) layer.
+                                Ok(_) => {}
+                                // Absent override (common) / read error: fall through.
+                                Err(e) => log::debug!("scroll config {path} unavailable: {e}"),
                             }
                         }
 

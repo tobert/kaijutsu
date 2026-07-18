@@ -129,6 +129,20 @@ when backgrounded" symptom). Open:
   streaming burst dirties dozens of blocks in one frame — budget per frame
   or offload like MSDF generation already is. (c) O(N) geometry reconcile
   per doc-version bump (`view/geometry.rs:604`).
+- **Unify "animation active → continuous render" (from the 2026-07-18 scroll
+  work)**: the app is reactive-idle (`main.rs` `WinitSettings`, 10Hz focused),
+  which starves any frame-by-frame animation — smooth scroll eased at ~10Hz
+  felt laggy until the render loop was forced to 60Hz. The scroll fix bumps
+  `focused_mode` to `Continuous` only while a scroll ease is in flight, back
+  to reactive when settled (self-contained in the scroll systems). But the DJ
+  thread and other motion (playhead, time-well drift, metronome flash) want
+  the *same* "keep rendering while I'm animating" signal. Generalize to one
+  gate — an `AnimationActive` vote (ref-count / any-of) that maps to
+  `UpdateMode` — that each animating subsystem, DJ thread included, opts into,
+  so nothing hacks the render policy ad hoc. Amy's framing (2026-07-18): "maybe
+  something the DJ thread could handle independent of rendering" — caveat:
+  pixels still require the render loop to run, so this is a keep-awake/wake
+  gate, not a parallel draw path off the DJ thread.
 - **Broadcast-lag cascade watch item**: UI-side stall → 256-slot broadcast
   `Lagged` → generation bump → full re-sync → bigger dirty burst. The DJ's
   own receiver is immune (own cursor), but the UI drain keeps the loop —

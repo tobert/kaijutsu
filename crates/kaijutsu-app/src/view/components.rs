@@ -646,7 +646,9 @@ impl ConversationScrollState {
     }
 
     /// Scroll by a delta amount (positive = scroll down).
-    /// Instant - sets both offset and target for zero-frame-delay.
+    /// Moves only the TARGET — `smooth_scroll` eases the visible `offset`
+    /// toward it over subsequent frames, so wheel input glides instead of
+    /// teleporting.
     pub fn scroll_by(&mut self, delta: f32) {
         // Mark that user explicitly scrolled this frame
         // This prevents handle_block_events from re-enabling following
@@ -657,13 +659,18 @@ impl ConversationScrollState {
             self.following = false;
         }
 
-        // Set both for instant response
         self.target_offset += delta;
         self.clamp_target();
-        self.offset = self.target_offset;
 
-        // If scrolling down and we hit bottom, re-enable follow mode
-        if self.is_at_bottom() {
+        // If scrolling DOWN and we land at the bottom, re-enable follow mode.
+        // The `delta > 0.0` guard is load-bearing: without it, a small upward
+        // scroll that stays within the 50px `is_at_bottom()` band re-enables
+        // follow on the very same call that just disabled it (line above),
+        // and next frame `smooth_scroll` snaps back to the bottom. That ate
+        // small high-res wheel steps near the bottom until ~50px accumulated
+        // in one frame — "8 swipes before it responds; a flick zips" (MX
+        // Master 3, 2026-07-18). Only a downward scroll should re-follow.
+        if delta > 0.0 && self.is_at_bottom() {
             self.following = true;
         }
     }
@@ -1105,12 +1112,30 @@ mod tests {
     }
 
     #[test]
+    fn test_scroll_by_small_up_near_bottom_still_disables_following() {
+        // Regression (2026-07-18): a SMALL upward scroll while inside the 50px
+        // is_at_bottom() band must break follow. The old code re-enabled follow
+        // unconditionally when is_at_bottom(), so small high-res wheel steps
+        // near the bottom did nothing until ~50px accumulated in one frame
+        // ("8 swipes before it responds; a flick zips"). The big-delta sibling
+        // test (-100) escapes the band and never caught this.
+        let mut state = scroll_state(1000.0, 400.0, 600.0); // at the bottom
+        state.following = true;
+        state.scroll_by(-10.0); // still within 50px of max
+        assert!(
+            !state.following,
+            "small upward scroll near the bottom must disable follow"
+        );
+        assert_eq!(state.target_offset, 590.0, "target moved up");
+    }
+
+    #[test]
     fn test_scroll_by_positive_to_bottom_re_enables_following() {
         let mut state = scroll_state(1000.0, 400.0, 590.0);
         state.following = false;
         state.scroll_by(100.0); // would go past max, gets clamped
         assert!(state.following);
-        assert_eq!(state.offset, 600.0); // clamped to max
+        assert_eq!(state.target_offset, 600.0, "clamped to max");
     }
 
     #[test]

@@ -13,16 +13,40 @@
 //! Gamepad analog sticks → AnalogInput resource + continuous actions.
 //! Held fly keys / left stick → FlyAxis/FlyAltitude while FsnFly is active.
 
+use bevy::ecs::system::SystemParam;
 use bevy::input::gamepad::Gamepad;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 
 use super::action::Action;
 use super::binding::{InputSource, Modifiers};
 use super::context::{ActiveInputContexts, InputContext, KeyboardGrab};
 use super::events::{ActionFired, AnalogInput, GrabbedKey, LiteralPrefix};
 use super::map::InputMap;
+use super::scroll_config::{quantize_step, wheel_delta_px, ScrollConfig};
+
+/// Bundles the two scroll-gain inputs into a single `SystemParam` — `Res` +
+/// `Query` were pushed as separate params on `dispatch_input` and tipped it
+/// over Bevy's tuple-arity limit for `SystemParam`/`IntoSystem` impls (16);
+/// grouping them here keeps the function's own param count unchanged.
+#[derive(SystemParam)]
+pub(crate) struct ScrollInput<'w, 's> {
+    config: Res<'w, ScrollConfig>,
+    windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    /// Sub-quantum remainder for the `Pixel`-unit quantizer (see
+    /// [`quantize_step`]); `Line` events bypass this entirely.
+    accum: Local<'s, f32>,
+}
+
+impl ScrollInput<'_, '_> {
+    /// The primary window's scale factor (physical px per logical px), or
+    /// `1.0` if no primary window exists yet (headless tests, first frame).
+    fn scale_factor(&self) -> f32 {
+        self.windows.iter().next().map(|w| w.resolution.scale_factor()).unwrap_or(1.0)
+    }
+}
 
 /// The main input dispatch system.
 ///
@@ -43,6 +67,7 @@ pub fn dispatch_input(
     input_map: Res<InputMap>,
     active_contexts: Res<ActiveInputContexts>,
     grab: Res<KeyboardGrab>,
+    mut scroll: ScrollInput,
     mut prefix: ResMut<super::prefix::PrefixState>,
     mut action_writer: MessageWriter<ActionFired>,
     mut grab_writer: MessageWriter<GrabbedKey>,
@@ -61,10 +86,17 @@ pub fn dispatch_input(
     }
 
     // --- Mouse wheel → ScrollDelta ---
+    // `Pixel`-unit events carry PHYSICAL px (bevy_winit passes winit's
+    // `absolute.to_physical(scale_factor)`); downstream `ScrollPosition` is
+    // LOGICAL px, so `wheel_delta_px` converts before applying the gain.
+    let scale = scroll.scale_factor();
     for event in mouse_wheel.read() {
+        let desired = wheel_delta_px(event.unit, event.y, scale, &scroll.config);
         let delta = match event.unit {
-            bevy::input::mouse::MouseScrollUnit::Line => event.y * 40.0,
-            bevy::input::mouse::MouseScrollUnit::Pixel => event.y,
+            bevy::input::mouse::MouseScrollUnit::Pixel => {
+                quantize_step(&mut scroll.accum, desired, super::scroll_config::PIXEL_QUANTUM_PX)
+            }
+            bevy::input::mouse::MouseScrollUnit::Line => desired,
         };
         if delta.abs() > 0.001 {
             action_writer.write(ActionFired::new(

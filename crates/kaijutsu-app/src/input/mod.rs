@@ -41,6 +41,7 @@ pub mod focus;
 pub mod map;
 pub mod bindings_config;
 pub mod prefix;
+pub mod scroll_config;
 pub mod systems;
 pub mod tap;
 pub mod vim;
@@ -57,6 +58,8 @@ pub use events::{ActionFired, TextInputReceived};
 pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use map::InputMap;
+#[allow(unused_imports)]
+pub use scroll_config::ScrollConfig;
 
 use bevy::prelude::*;
 
@@ -118,6 +121,7 @@ impl Plugin for InputPlugin {
             .init_resource::<prefix::PrefixState>()
             .init_resource::<events::AnalogInput>()
             .init_resource::<interrupt::InterruptState>()
+            .init_resource::<scroll_config::ScrollConfig>()
             .insert_resource(vim::VimMachineResource::new())
             .init_resource::<vim::dispatch::VimMotionState>()
             .init_resource::<vim::dismiss::EscapeDismissState>();
@@ -135,7 +139,8 @@ impl Plugin for InputPlugin {
             .register_type::<action::Action>()
             .register_type::<binding::Binding>()
             .register_type::<binding::InputSource>()
-            .register_type::<binding::Modifiers>();
+            .register_type::<binding::Modifiers>()
+            .register_type::<scroll_config::ScrollConfig>();
 
         // Configure system ordering
         app.configure_sets(
@@ -170,6 +175,11 @@ impl Plugin for InputPlugin {
             )
                 .in_set(InputPhase::Dispatch),
         );
+
+        // Per-client scroll-gain config arrives over RPC on (re)connect;
+        // apply it independently of the dispatch pipeline (mirrors
+        // `metronome::MetronomePlugin`'s `apply_metronome_config` wiring).
+        app.add_systems(Update, scroll_config::apply_scroll_config);
 
         // Handle phase: consume ActionFired for focus management + domain actions
         app.add_systems(

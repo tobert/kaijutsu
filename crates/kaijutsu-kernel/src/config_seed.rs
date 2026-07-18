@@ -31,6 +31,11 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/s
 /// see [`CLIENT_VFS_ROOT`] and `docs/config-crdt-ownership.md` "Per-client config".
 pub const DEFAULT_METRONOME: &str = include_str!("../../../assets/defaults/metronome.toml");
 
+/// Embedded default mouse-wheel scroll-gain config (TOML). The shared
+/// *client* default; see [`CLIENT_VFS_ROOT`] and
+/// `docs/config-crdt-ownership.md` "Per-client config".
+pub const DEFAULT_SCROLL: &str = include_str!("../../../assets/defaults/scroll.toml");
+
 /// The VFS mount root the kernel-wide config singletons live under. Parallel to
 /// [`crate::seed_scripts::RC_VFS_ROOT`] (`/etc/rc`). Re-exported from
 /// [`kaijutsu_types::paths::CONFIG_ROOT`] — the single source of truth.
@@ -38,7 +43,7 @@ pub use kaijutsu_types::paths::CONFIG_ROOT as CONFIG_VFS_ROOT;
 
 /// The VFS mount root for **per-client** config (`docs/config-crdt-ownership.md`
 /// "Per-client config"). Client-facing config that is machine-local — the
-/// metronome click, later the patch bay — lives here, cascading
+/// metronome click, mouse-wheel scroll gains, later the patch bay — lives here, cascading
 /// `/etc/client/<client-id>/<file>` → `/etc/client/<file>` → embedded. The
 /// files seeded here (via [`client_seed_files`]) are the **shared defaults** at
 /// the mount root; per-client overrides at `<client-id>/…` are never seeded
@@ -66,10 +71,10 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
 /// /etc/client path, body)`. Only the mount-root shared defaults are seeded;
 /// per-client overrides (`/etc/client/<id>/…`) carry no compiled-in default.
 pub fn client_seed_files() -> Vec<(String, &'static str)> {
-    vec![(
-        kaijutsu_types::paths::client_config_path(None, "metronome.toml"),
-        DEFAULT_METRONOME,
-    )]
+    vec![
+        (kaijutsu_types::paths::client_config_path(None, "metronome.toml"), DEFAULT_METRONOME),
+        (kaijutsu_types::paths::client_config_path(None, "scroll.toml"), DEFAULT_SCROLL),
+    ]
 }
 
 /// The embedded default body for a canonical config path (`/etc/config/<file>`
@@ -127,11 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn client_seed_manifest_is_the_metronome_shared_default() {
+    fn client_seed_manifest_is_the_metronome_and_scroll_shared_defaults() {
         let files = client_seed_files();
-        assert_eq!(files.len(), 1, "just the metronome shared default for now");
+        assert_eq!(files.len(), 2, "the metronome + scroll shared defaults");
         assert_eq!(files[0].0, "/etc/client/metronome.toml");
         assert_eq!(files[0].1, DEFAULT_METRONOME);
+        assert_eq!(files[1].0, "/etc/client/scroll.toml");
+        assert_eq!(files[1].1, DEFAULT_SCROLL);
     }
 
     #[test]
@@ -141,6 +148,14 @@ mod tests {
             assert!(v.get(key).is_some(), "metronome default carries {key}");
         }
         assert_eq!(v["note"].as_integer(), Some(84), "ships the C6 click");
+    }
+
+    #[test]
+    fn scroll_default_parses_and_carries_the_gain_knobs() {
+        let v: toml::Value = toml::from_str(DEFAULT_SCROLL).expect("scroll default is TOML");
+        for key in ["line_gain", "pixel_gain"] {
+            assert!(v.get(key).is_some(), "scroll default carries {key}");
+        }
     }
 
     #[test]
@@ -156,6 +171,19 @@ mod tests {
         );
         // An override of an unknown client file still has nothing to reset to.
         assert!(config_seed_body("/etc/client/abc-123/nonesuch.toml").is_none());
+    }
+
+    #[test]
+    fn scroll_seed_body_resolves_client_shared_and_reset_of_an_override_falls_back() {
+        // The shared client default resolves to the scroll body.
+        assert_eq!(config_seed_body("/etc/client/scroll.toml"), Some(DEFAULT_SCROLL));
+        // A per-client override path carries NO seed of its own — reset-to-embedded
+        // restores it to the shared client default (same file name).
+        assert_eq!(
+            config_seed_body("/etc/client/abc-123/scroll.toml"),
+            Some(DEFAULT_SCROLL),
+            "resetting a per-client scroll override restores the shared default",
+        );
     }
 
     #[test]

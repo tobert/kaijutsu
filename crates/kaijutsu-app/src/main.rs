@@ -278,10 +278,7 @@ fn main() {
         // Power management — sleep between events instead of spinning every vsync tick.
         // Input events (keyboard, mouse, window) wake immediately with zero added latency.
         .insert_resource(WinitSettings {
-            // TEMP(scroll-tuning 2026-07-18): focused_mode forced Continuous to
-            // isolate whether reactive 10Hz idle is what makes smooth scrolling
-            // feel laggy. Revert to reactive(100ms) after the diagnostic.
-            focused_mode: UpdateMode::Continuous,
+            focused_mode: UpdateMode::reactive(std::time::Duration::from_millis(100)), // 10Hz idle
             unfocused_mode: UpdateMode::reactive_low_power(std::time::Duration::from_millis(500)), // 2Hz background
         })
         // Startup

@@ -1,0 +1,18 @@
+# Mouse-wheel scroll sensitivity — the app's scroll feel.
+# (docs/config-crdt-ownership.md "Per-client config".)
+#
+# This is the shared client default (/etc/client/scroll.toml). A specific
+# client overrides it at /etc/client/<client-id>/scroll.toml; the app reads
+# its own first, then falls back here, then to this compiled-in default.
+
+# Multiplier for winit Line-unit events (notched wheels / X11): px per notch.
+line_gain = 40.0
+
+# Multiplier for winit Pixel-unit events (Wayland high-res wheels /
+# touchpads), applied AFTER converting the physical-px delta to logical px.
+pixel_gain = 3.0
+
+# Exponential easing rate (per second) for smooth wheel scrolling; higher =
+# snappier glide. 45 tuned live with Amy (MX Master 3): a lone detent lands
+# in ~3 frames; 20 felt floaty/laggy, 60+ reads as a hard teleport.
+smooth_speed = 45.0
