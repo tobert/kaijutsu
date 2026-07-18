@@ -112,6 +112,16 @@ them while the rodio/ALSA threads sat idle). Open after slice 1:
   (capnp + kernel stamps the playhead beat at emission), BeatGrid rung in
   the DJ's modal clock (`docs/midi.md` for the ladder + telemetry). Wire
   change; coordinate with whatever else is in flight on `kaijutsu.capnp`.
+  Design inputs from the 2026-07-18 gemini-pro deliberation: **placement
+  into ALSA is absolute** — a Fold that moves the phasor between placement
+  and fire time strands the event on the old grid, so beat-grid cues must
+  be buffered in the DJ and pushed just-in-time within the click horizon
+  (the horizon generalized), never fire-and-forget at receipt; and a cue
+  arriving mid-transition must atomically see the settled mode. Also noted:
+  host suspend/resume produces a legitimate Wallclock→BeatGrid flap in one
+  loop iteration (Instant-domain staleness trips, queued refs re-anchor) —
+  acceptable, shows as two adjacent telemetry rows; add a resume-specific
+  reason attr only if the histogram gets noisy.
 - **Frame-cost arc (separate from DJ; visual smoothness + input latency)**:
   (a) rich/markdown parse results are re-computed on every block version
   bump — the `_version` params on `detect_rich_content_typed` /
