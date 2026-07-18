@@ -332,6 +332,75 @@ tick-domain scheduling against the phasor — only if the metronome validator
 shows residual boundary error after this lands (PCM transients and multi-sink
 flam remain the likely triggers, as before).
 
+## The DJ thread — musical dispatch off the frame (2026-07-18, slice 1 in progress)
+
+**The finding (Amy, by feel, confirmed by survey):** with a track playing,
+scene rebuilds interrupt the flow. The transport layer was never the problem —
+the RPC actor lives on its own thread, rodio has its own scheduler thread, and
+ALSA's seq queue fires MIDI precisely. But the *decision layer* between them
+rode the Bevy frame: `poll_server_events` drained the actor's broadcast once
+per `Update`, and `play_render_cues` / `play_midi_cues` / the metronome's
+phasor+clicks were all `Update` systems behind it. winit runs reactive (10 Hz
+idle), so "cue receipt" meant "whenever a frame ran." The whole back-dating
+doctrine above absorbed that jitter — but only up to the cue's lead, and the
+click horizon was 250 ms. A frame stalled past that by synchronous text
+shaping (a streaming turn dirtying dozens of blocks) audibly interrupted the
+music *while the data sat already-arrived on the actor thread*. Worse, the
+cascade: a long stall overflows the 256-slot broadcast → `Lagged` → generation
+bump → full CRDT re-sync → a bigger dirty burst → a longer stall.
+
+**The move:** a dedicated thread — the **DJ** — owns everything musically
+time-critical, end to end. ("Conductor" is reserved for the human at the
+instrument; the DJ is the one placing cues on a running clock.) It holds its
+*own* `broadcast::Receiver` off the `ActorHandle` (independent cursor — a
+stalled UI drain costs it nothing), and owns: RenderCue parse + deadline math
++ dispatch to the rodio thread, ABC→MIDI render + the ALSA `MidiSink` (incl.
+patch-bay auto-connect), the `LocalBeat` phasor + click scheduling, and CAS
+prefetch dispatch (that runtime moves in wholesale). Shape: one std thread,
+current-thread tokio, one `select!` over {events, a Bevy control channel
+(actor generation / metronome config / shutdown), the click-horizon timer,
+prefetch outcomes}. The decision core stays a pure state machine
+(`handle_event(now, now_epoch, event) → Vec<DjAction>`) so the TDD surface
+needs no threads and no devices — the existing pure ladder functions
+(`backdate_events`, `effective_deadline`, `schedule_due`, `decide_deadline`)
+slot in unchanged.
+
+**Bevy keeps the decorative copies.** `poll_server_events` still drains for
+the UI consumers (time-well live layer, room glow, block sync) — those are
+legitimately frame-coupled. Back-flow from the DJ is one small crossbeam
+channel (patch-bay traffic pulses); nothing else in the app read `Metronome`
+or `MidiSink`, so the migration is clean by construction.
+
+**The clock is modal, and transitions are first-class (Amy, 2026-07-18).**
+The DJ *starts on wallclock, dials into the beat grid, and falls back* — a
+regular transition, crossed on every track start/stop, so the fallback path
+stays exercised by real use instead of rotting untested:
+
+- **Wallclock** (anchor state): cue placement by the emission-stamp
+  back-dating ladder above; clicks silent (no phasor).
+- **BeatGrid** (dialed in): entered on the first `Fold`-fresh `BeatSync`.
+  Cues carrying an onset-beat stamp are placed at the phasor's predicted
+  instant for that beat — phrases and clicks lock to one grid by
+  construction, and inter-host wallclock skew cancels. Held through
+  `Touch`-aged references (the free-running deadband doctrine); a cue
+  without a beat stamp falls through to the wallclock ladder per-cue.
+- **Back to Wallclock** on: reference age past `REF_STALE_MAX`, transport
+  flush, or connection loss (the existing halt triggers).
+
+Every transition emits telemetry (`kaijutsu.dj.clock_transition`, attrs
+`to` + `reason`: fold / stale / flush / disconnect) — the transition rate and
+reasons are the health signal for the whole timing path, same stance as the
+phasor's slew histogram.
+
+**Slices:** (1) move the sinks — app-only, no wire change,
+behavior-equivalent (wallclock ladder only); receipt latency drops from
+frame-scale to thread-wakeup-scale, which also feeds the phasor cleaner
+references. (2) beat-grid placement — additive `RenderCue` onset-beat field
+(capnp + kernel stamps the playhead beat at emission) + the BeatGrid rung in
+the DJ. The frame-cost work this surfaced (uncached markdown re-parse,
+synchronous Parley shaping in `build_block_scenes`) is a separate arc —
+`docs/issues.md`.
+
 ## The topology (Amy's room, 2026-06-29)
 
 - **KeyStep Pro (KSP) — usual clock master**, on a long-range USB3 hub with the

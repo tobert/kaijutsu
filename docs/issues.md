@@ -45,6 +45,29 @@ armed-footer legend): needs a selection UX first. The overlay's
 mode are both unwired); when one lands, copy-on-selection to PRIMARY rides
 it — `InputOverlay::selection_range` is the read point.
 
+## Input: block-step scroll lane — Shift+wheel jumps block-to-block (seeded 2026-07-18, scroll-feel work)
+
+The *continuous* scroll lane got made crisp (follow-mode deadzone fixed;
+high-res `Pixel` stream row-quantized via `quantize_step` +
+`PIXEL_QUANTUM_PX`; `ScrollConfig` two-gain per-client config). The
+*contextual* lane is the deferred half: **Shift+wheel steps by whole
+blocks**, snapping a block top to the viewport — Amy's "zip / stop / skim /
+narrow-in" pattern wants to move by *meaning*, not pixels. Cheap: reuse the
+existing block-nav + `scroll_to_rect_visible` (`input/systems.rs:562`) and
+`handle_navigate_blocks`; `BlockKind` (`kaijutsu-types/src/block.rs:945`)
+is there if we ever want kind-awareness. Trigger decided: **Shift+wheel**
+(both lanes always live, no mode). Add a `ScrollBlockStep(dir)` action to
+the table so gamepad/rebind/`?`-legend come free (never read `MouseWheel`
+in a view — dispatch owns it).
+
+**Consciously fenced-off complexity traps** (do NOT pick these up without a
+deliberate decision — this is the rabbit warren): per-block *adaptive* gain
+that guesses granularity from what's under the viewport (unpredictable);
+momentum/inertia physics; animated scroll-snap settle; minimap /
+semantic-zoom skim (the time well already gestures at that —
+`docs/timewell.md`). Two explicit lanes beat one clever adaptive thing:
+the player picks the granularity, the instrument does not guess.
+
 ## msdfgen-rs `Shape::get_bound()` / `Contour::get_bound()` zero-seeded (seeded 2026-07-16, msdf-geometry lane; sidestepped 2026-07-16, msdf-bbox lane)
 
 `msdfgen-rs` (`/home/atobey/src/msdfgen-rs`, local path dep, do-not-modify)
@@ -77,17 +100,35 @@ demotion (placement, not intent) — as the hook for automation like
 layer above placement. Design question when picked up: a new `ContextState`
 vs a stamp alongside `promoted_at`/`demoted_at`/`paused_at`.
 
+## DJ thread arc (seeded 2026-07-18; design in `docs/midi.md` "The DJ thread")
+
+Slice 1 (move audio/MIDI/metronome dispatch onto the dedicated DJ thread) is
+IN PROGRESS — it also closes the long-standing "metronome stops when
+kaijutsu-app is backgrounded/stalled" symptom (cue dispatch + clicks rode
+Bevy `Update`; an unfocused window or a long text-shaping frame throttled
+them while the rodio/ALSA threads sat idle). Open after slice 1:
+
+- **Slice 2 — beat-grid placement**: additive `RenderCue` onset-beat field
+  (capnp + kernel stamps the playhead beat at emission), BeatGrid rung in
+  the DJ's modal clock (`docs/midi.md` for the ladder + telemetry). Wire
+  change; coordinate with whatever else is in flight on `kaijutsu.capnp`.
+- **Frame-cost arc (separate from DJ; visual smoothness + input latency)**:
+  (a) rich/markdown parse results are re-computed on every block version
+  bump — the `_version` params on `detect_rich_content_typed` /
+  `detect_output_content` are threaded but unused (`text/rich.rs:390`);
+  cache per (block, version). (b) Parley shaping in `build_block_scenes`
+  (`view/block_render.rs:247`) is synchronous on the main thread; a
+  streaming burst dirties dozens of blocks in one frame — budget per frame
+  or offload like MSDF generation already is. (c) O(N) geometry reconcile
+  per doc-version bump (`view/geometry.rs:604`).
+- **Broadcast-lag cascade watch item**: UI-side stall → 256-slot broadcast
+  `Lagged` → generation bump → full re-sync → bigger dirty burst. The DJ's
+  own receiver is immune (own cursor), but the UI drain keeps the loop —
+  if it still bites after the frame-cost arc, consider a bigger event
+  capacity or delta-coalescing at the actor.
+
 ## Audio sink follow-ups (seeded 2026-07-16, clip-arc live verify)
 
-- **Metronome stops when kaijutsu-app is backgrounded** (Amy, by ear): the
-  rodio scheduler thread free-runs, but cue dispatch + the metronome click
-  ride Bevy `Update` systems — an unfocused/minimized window throttles the
-  frame loop and the clicks stop. Confirms the sink's *dispatch* is tied to
-  the render loop; if background playback should keep time, the
-  ServerEvent→scheduler bridge (and the click) need a home that survives
-  frame throttling (the rodio thread itself is the obvious candidate). NOT
-  touched by R4's prepare-horizon work (`docs/pcm.md`) — this is
-  dispatch/`Update`-scheduling territory, a separate lane.
 - **CasResolver's SFTP session has no proactive keepalive** (seeded R4,
   2026-07-16): R4 (`docs/pcm.md`) bounded per-fetch recovery with a
   `FETCH_TIMEOUT` + logged redial, closing the "slow + silent" symptom the
