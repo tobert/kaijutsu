@@ -11,6 +11,9 @@
 #                     the kernel read credentials without them living in its
 #                     process environment.
 #   base_url        - Optional custom endpoint (for local/proxy servers)
+#   key_optional    - Register even with no resolvable API key, using a
+#                     placeholder value. For gateways where auth is network
+#                     identity rather than a bearer token.
 #   default_model   - Model to use when not specified
 #   max_output_tokens - Maximum response tokens (optional)
 #   default_tools   - Tool filter: { type = "all" } | { type = "allow", tools = [...] } | { type = "deny", tools = [...] }

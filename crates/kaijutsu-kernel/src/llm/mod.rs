@@ -402,6 +402,20 @@ pub fn unknown_provider_type_message(name: &str) -> String {
     )
 }
 
+/// Resolve a provider's API key, falling back to a placeholder when
+/// `key_optional` is set (for a gateway where auth is network identity, not
+/// the bearer token — the header still has to be present and non-empty,
+/// but nothing downstream reads its value).
+fn resolve_key_or_placeholder(config: &ProviderConfig, provider_label: &str) -> LlmResult<String> {
+    match config.resolve_api_key() {
+        Some(key) => Ok(key),
+        None if config.key_optional => Ok("key-optional-placeholder".to_string()),
+        None => Err(LlmError::AuthError(format!(
+            "No API key for {provider_label}"
+        ))),
+    }
+}
+
 impl Provider {
     /// Create a provider from configuration.
     ///
@@ -413,9 +427,7 @@ impl Provider {
     pub fn from_config(config: &ProviderConfig) -> LlmResult<Self> {
         match config.provider_type.as_str() {
             "anthropic" | "claude" => {
-                let api_key = config
-                    .resolve_api_key()
-                    .ok_or_else(|| LlmError::AuthError("No API key for Anthropic".into()))?;
+                let api_key = resolve_key_or_placeholder(config, "Anthropic")?;
                 let mut client = claude::Client::new(api_key);
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
@@ -423,9 +435,7 @@ impl Provider {
                 Ok(Self::Claude(client))
             }
             "deepseek" => {
-                let api_key = config
-                    .resolve_api_key()
-                    .ok_or_else(|| LlmError::AuthError("No API key for DeepSeek".into()))?;
+                let api_key = resolve_key_or_placeholder(config, "DeepSeek")?;
                 let mut client = deepseek::Client::new(api_key);
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);

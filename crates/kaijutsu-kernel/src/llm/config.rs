@@ -42,6 +42,13 @@ pub struct ProviderConfig {
     /// Maximum output tokens for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+
+    /// Skip the "no API key" auth error and register with a placeholder key
+    /// instead. For gateways where auth is network identity, not a bearer
+    /// token — the key header still gets sent (some providers require the
+    /// header be present) but its value is never checked downstream.
+    #[serde(default)]
+    pub key_optional: bool,
 }
 
 fn default_true() -> bool {
@@ -60,6 +67,7 @@ impl ProviderConfig {
             base_url: None,
             default_model: None,
             max_output_tokens: None,
+            key_optional: false,
         }
     }
 
@@ -90,6 +98,12 @@ impl ProviderConfig {
     /// Set default model.
     pub fn with_default_model(mut self, model: impl Into<String>) -> Self {
         self.default_model = Some(model.into());
+        self
+    }
+
+    /// Allow this provider to register without a resolvable API key.
+    pub fn with_key_optional(mut self, key_optional: bool) -> Self {
+        self.key_optional = key_optional;
         self
     }
 

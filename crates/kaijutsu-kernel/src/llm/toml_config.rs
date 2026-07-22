@@ -186,6 +186,9 @@ struct ProviderToml {
     #[serde(default)]
     max_output_tokens: Option<u64>,
 
+    #[serde(default)]
+    key_optional: bool,
+
     /// Phase 5 D-54: retired. Deserialized and ignored for backwards
     /// compatibility with existing models.toml files that still carry a
     /// `[providers.X.default_tools]` block. New configs should omit it.
@@ -276,6 +279,7 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
         config.base_url = p.base_url.clone();
         config.default_model = p.default_model.clone();
         config.max_output_tokens = p.max_output_tokens;
+        config.key_optional = p.key_optional;
         // Phase 5 D-54: any `default_tools` block in TOML is silently
         // dropped; tool visibility is now managed by the broker's
         // `ContextToolBinding` + `McpHookPhase::ListTools`.
