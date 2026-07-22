@@ -1059,6 +1059,16 @@ pub async fn create_shared_kernel(
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;
 
+    // /dev is opaque to ambient sweeps (longest-prefix wins over `/`): still
+    // directly browsable, but the FSN backdrop/world walk stops at the node
+    // rather than descending. `/dev/fd` is a live view of the kernel
+    // process's own open file descriptors on macOS/BSD — readdir + per-entry
+    // lstat races fd churn into a stray EBADF that used to fail the whole
+    // root snapshot (live-caught 2026-07-22, fsn view rendering empty).
+    kernel
+        .mount("/dev", LocalBackend::read_only("/dev").opaque(true))
+        .await;
+
     // Read-write ~/src (longest-prefix wins over /)
     let home = kaish_kernel::home_dir();
     let src_dir = home.join("src");
