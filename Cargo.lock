@@ -3519,8 +3519,7 @@ dependencies = [
 [[package]]
 name = "diamond-types-extended"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac5436b68716edc2ae07b6a5e8066ba41927947a0153b550ab4791ccdeb136a"
+source = "git+https://github.com/tobert/diamond-types-extended?rev=1304b24db229bf4cc66f1786963a184f3b0d651c#1304b24db229bf4cc66f1786963a184f3b0d651c"
 dependencies = [
  "bumpalo",
  "crc",
@@ -5806,7 +5805,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "ttf-parser 0.19.2",
+ "ttf-parser 0.18.1",
  "uuid",
  "vello",
  "vello_svg",
@@ -6736,15 +6735,18 @@ dependencies = [
 [[package]]
 name = "msdfgen"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91eabea74db188571e2a9df740d1784f0043e5dd558f2bf2f21f024e5b4fbbd8"
 dependencies = [
- "bytemuck",
  "msdfgen-sys",
- "ttf-parser 0.19.2",
+ "ttf-parser 0.18.1",
 ]
 
 [[package]]
 name = "msdfgen-sys"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a646a88333686049925e4e9af93e8529e42f6a1cfbacf0eeb675307321c63d30"
 dependencies = [
  "cc",
 ]
@@ -11361,9 +11363,9 @@ dependencies = [
 
 [[package]]
 name = "ttf-parser"
-version = "0.19.2"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49d64318d8311fc2668e48b63969f4343e0a85c4a109aa8460d6672e364b8bd1"
+checksum = "0609f771ad9c6155384897e1df4d948e692667cc0588548b68eb44d052b27633"
 
 [[package]]
 name = "ttf-parser"

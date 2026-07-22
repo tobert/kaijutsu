@@ -40,6 +40,12 @@ impl XorShift {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn main() -> Result<(), String> {
+    Err("kj-virtual-clock is Linux/ALSA-only".into())
+}
+
+#[cfg(target_os = "linux")]
 fn main() -> Result<(), String> {
     use alsa::seq::{Event, EventType, EvQueueControl, PortCap, PortType};
     use std::ffi::CString;

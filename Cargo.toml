@@ -143,3 +143,7 @@ tracing-opentelemetry = "0.32"
 # Testing
 tempfile = "3"
 
+# TEMP: macOS AsRawFd fix (tobert/diamond-types-extended#3), merged but unreleased on crates.io
+[patch.crates-io]
+diamond-types-extended = { git = "https://github.com/tobert/diamond-types-extended", rev = "1304b24db229bf4cc66f1786963a184f3b0d651c" }
+

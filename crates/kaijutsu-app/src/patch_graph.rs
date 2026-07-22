@@ -9,8 +9,10 @@
 //! the reader lives as a `NonSend` resource, same as `MidiSink`.
 
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 
+#[cfg(target_os = "linux")]
 use alsa::seq;
 
 /// One ALSA seq port, flattened for the scene.
@@ -56,18 +58,21 @@ impl GraphDelta {
 }
 
 /// Owns its own read-only `Seq` handle (client name "kaijutsu-patchview").
+#[cfg(target_os = "linux")]
 pub struct PatchGraphReader {
     seq: alsa::Seq,
 }
 
+#[cfg(target_os = "linux")]
 impl PatchGraphReader {
     /// Open a sequencer handle for topology reads.
-    pub fn open() -> Result<Self, alsa::Error> {
-        let seq = alsa::Seq::open(None, None, false)?;
+    pub fn open() -> Result<Self, String> {
+        let map = |e: alsa::Error| e.to_string();
+        let seq = alsa::Seq::open(None, None, false).map_err(map)?;
         // A static literal: it never contains an interior NUL, so this can't fail.
         let name =
             CString::new("kaijutsu-patchview").expect("\"kaijutsu-patchview\" has no interior NUL");
-        seq.set_client_name(&name)?;
+        seq.set_client_name(&name).map_err(map)?;
         Ok(Self { seq })
     }
 
@@ -80,7 +85,7 @@ impl PatchGraphReader {
     /// direction would miss a subscription that — for whatever reason
     /// (a client that exited uncleanly, a permission quirk) — only shows up
     /// from the other side.
-    pub fn snapshot(&self) -> Result<PatchGraphSnapshot, alsa::Error> {
+    pub fn snapshot(&self) -> Result<PatchGraphSnapshot, String> {
         let mut endpoints = Vec::new();
         let mut wires: BTreeSet<WireInfo> = BTreeSet::new();
 
@@ -122,6 +127,22 @@ impl PatchGraphReader {
         // iteration is already ascending.
         let wires = wires.into_iter().collect();
         Ok(PatchGraphSnapshot { endpoints, wires })
+    }
+}
+
+/// No ALSA seq off Linux — the patch-bay scene shows an empty table rather
+/// than failing to build (same stance as `MidiSink`/`spawn_capture_thread`).
+#[cfg(not(target_os = "linux"))]
+pub struct PatchGraphReader;
+
+#[cfg(not(target_os = "linux"))]
+impl PatchGraphReader {
+    pub fn open() -> Result<Self, String> {
+        Err("patch-bay topology reads are Linux/ALSA-only".into())
+    }
+
+    pub fn snapshot(&self) -> Result<PatchGraphSnapshot, String> {
+        Ok(PatchGraphSnapshot::default())
     }
 }
 

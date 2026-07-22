@@ -60,8 +60,8 @@ kurbo = "0.13.0"
 peniko = "0.6.0"
 pulldown-cmark.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
-msdfgen = { path = "/home/atobey/src/msdfgen-rs", default-features = false, features = ["ttf-parser"] }
-ttf-parser = "0.19"
+msdfgen = { version = "0.2.1", default-features = false, features = ["ttf-parser"] }
+ttf-parser = "0.18"
 rect_packer = "0.2"
 
 # Serialization
