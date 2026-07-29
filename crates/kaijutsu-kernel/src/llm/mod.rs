@@ -709,6 +709,22 @@ impl LlmRegistry {
             .and_then(|configs| configs.iter().find(|c| c.provider_type == name))
     }
 
+    /// Configured context window for a resolved `(provider, model)` pair,
+    /// or `None` when unconfigured.
+    ///
+    /// This is the one resolution path for "how big is this model's
+    /// context window" — it reads the same `provider_configs` that
+    /// [`Self::provider_config`] and `kj model`/`kj models` already resolve
+    /// through, so there is no second alias-aware lookup that could
+    /// disagree with [`Self::resolve_model`]. Callers pass an
+    /// already-resolved provider + model (e.g. the context row's columns,
+    /// or the registry default), not an alias name. `None` must be
+    /// rendered as an explicit "unknown" by every caller — never a
+    /// fabricated default.
+    pub fn context_window_for(&self, provider_name: &str, model: &str) -> Option<u64> {
+        self.provider_config(provider_name)?.context_window(model)
+    }
+
     /// Store provider configs for runtime queries (e.g. max_output_tokens).
     pub fn set_provider_configs(&mut self, configs: Vec<ProviderConfig>) {
         self.provider_configs = Some(configs);
@@ -1082,6 +1098,43 @@ mod tests {
         assert_eq!(prov, "anthropic");
         assert_eq!(model, "claude-haiku-4-5-20251001");
         assert!(registry.resolve_alias("nonexistent").is_none());
+    }
+
+    #[test]
+    fn context_window_for_resolves_via_provider_config() {
+        let mut registry = LlmRegistry::new();
+        let mut anthropic = ProviderConfig::new("anthropic");
+        anthropic.models.insert(
+            "claude-opus-4-8".to_string(),
+            config::ModelInfo {
+                context_window: Some(1_000_000),
+            },
+        );
+        registry.set_provider_configs(vec![anthropic]);
+
+        assert_eq!(
+            registry.context_window_for("anthropic", "claude-opus-4-8"),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn context_window_for_unconfigured_model_is_none_not_a_default() {
+        let mut registry = LlmRegistry::new();
+        let anthropic = ProviderConfig::new("anthropic"); // no models configured
+        registry.set_provider_configs(vec![anthropic]);
+
+        assert_eq!(
+            registry.context_window_for("anthropic", "claude-haiku-4-5-20251001"),
+            None,
+            "a model with no configured window must resolve to None, never a guessed default"
+        );
+    }
+
+    #[test]
+    fn context_window_for_unknown_provider_is_none() {
+        let registry = LlmRegistry::new(); // no provider_configs set at all
+        assert_eq!(registry.context_window_for("anthropic", "anything"), None);
     }
 
     // ── Hydration tests ───────────────────────────────────────────────

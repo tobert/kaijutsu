@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::ProviderConfig;
+use super::config::{ModelInfo, ProviderConfig};
 use super::{LlmError, LlmRegistry, LlmResult, Provider};
 
 // ---------------------------------------------------------------------------
@@ -186,11 +186,29 @@ struct ProviderToml {
     #[serde(default)]
     max_output_tokens: Option<u64>,
 
+    /// Per-model metadata, keyed by model id:
+    /// `[providers.<name>.models.<model-id>]`. A provider serves several
+    /// models with different context windows, so this is nested here
+    /// rather than living as a single provider-level field like
+    /// `max_output_tokens`.
+    #[serde(default)]
+    models: HashMap<String, ModelToml>,
+
     /// Phase 5 D-54: retired. Deserialized and ignored for backwards
     /// compatibility with existing models.toml files that still carry a
     /// `[providers.X.default_tools]` block. New configs should omit it.
     #[serde(default)]
     default_tools: Option<toml::Value>,
+}
+
+/// `[providers.<name>.models.<model-id>]` TOML section. Mirrors
+/// `config::ModelInfo` (the converted, internal type) — kept as a separate
+/// struct in the intermediate-shape layer for the same reason every other
+/// TOML section here is: it's the parse-time shape, not the canonical one.
+#[derive(Deserialize)]
+struct ModelToml {
+    #[serde(default)]
+    context_window: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -276,6 +294,18 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
         config.base_url = p.base_url.clone();
         config.default_model = p.default_model.clone();
         config.max_output_tokens = p.max_output_tokens;
+        config.models = p
+            .models
+            .iter()
+            .map(|(model_id, m)| {
+                (
+                    model_id.clone(),
+                    ModelInfo {
+                        context_window: m.context_window,
+                    },
+                )
+            })
+            .collect();
         // Phase 5 D-54: any `default_tools` block in TOML is silently
         // dropped; tool visibility is now managed by the broker's
         // `ContextToolBinding` + `McpHookPhase::ListTools`.
@@ -361,6 +391,121 @@ mod tests {
             .find(|p| p.provider_type == "gemini")
             .unwrap();
         assert!(!gemini.enabled);
+    }
+
+    #[test]
+    fn test_provider_model_context_window_parses() {
+        let toml = r#"
+default_provider = "anthropic"
+
+[providers.anthropic]
+enabled = true
+default_model = "claude-haiku-4-5-20251001"
+
+[providers.anthropic.models.claude-opus-4-8]
+context_window = 1000000
+
+[providers.anthropic.models.claude-haiku-4-5-20251001]
+context_window = 200000
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "anthropic")
+            .unwrap();
+        assert_eq!(
+            anthropic.context_window("claude-opus-4-8"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            anthropic.context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn test_model_table_entry_without_context_window_is_none() {
+        // A model can be listed (for future per-model fields) without a
+        // context_window — that must resolve to unknown, not a guess.
+        let toml = r#"
+default_provider = "anthropic"
+
+[providers.anthropic]
+enabled = true
+
+[providers.anthropic.models.some-model]
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "anthropic")
+            .unwrap();
+        assert_eq!(anthropic.context_window("some-model"), None);
+    }
+
+    #[test]
+    fn test_model_without_any_entry_is_none() {
+        let toml = r#"
+default_provider = "anthropic"
+
+[providers.anthropic]
+enabled = true
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "anthropic")
+            .unwrap();
+        assert_eq!(anthropic.context_window("never-mentioned"), None);
+    }
+
+    #[test]
+    fn test_default_models_toml_has_context_windows_for_known_models() {
+        // Regression guard for the deliberate choices made when populating
+        // assets/defaults/models.toml: models we're confident about carry a
+        // window; models.toml's own default alias target
+        // (claude-sonnet-4-20250514) is deliberately left unset because we
+        // couldn't confirm its context window from authoritative docs.
+        let config = load_models_config_toml(DEFAULT_TOML).unwrap();
+        let anthropic = config
+            .llm
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "anthropic")
+            .unwrap();
+        assert_eq!(
+            anthropic.context_window("claude-haiku-4-5-20251001"),
+            Some(200_000),
+            "haiku 4.5 is confirmed 200K"
+        );
+        assert_eq!(
+            anthropic.context_window("claude-opus-4-5-20251101"),
+            Some(200_000),
+            "opus 4.5 is confirmed 200K"
+        );
+        assert_eq!(
+            anthropic.context_window("claude-sonnet-4-20250514"),
+            None,
+            "the original Sonnet 4 snapshot's window is deliberately left unset (unconfirmed)"
+        );
+
+        let deepseek = config
+            .llm
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "deepseek")
+            .unwrap();
+        assert_eq!(
+            deepseek.context_window("deepseek-v4-flash"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            deepseek.context_window("deepseek-v4-pro"),
+            Some(1_000_000)
+        );
     }
 
     #[test]

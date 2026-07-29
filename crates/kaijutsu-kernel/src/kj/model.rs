@@ -109,12 +109,21 @@ impl KjDispatcher {
                 lines.push("- _(no models advertised)_".to_string());
             }
             for m in &models {
-                let mut marks = Vec::new();
+                let mut marks: Vec<String> = Vec::new();
                 if cfg_default.as_deref() == Some(m.as_str()) {
-                    marks.push("provider default");
+                    marks.push("provider default".to_string());
                 }
                 if is_default_provider && default_model.as_deref() == Some(m.as_str()) {
-                    marks.push("registry default");
+                    marks.push("registry default".to_string());
+                }
+                // Context window, when configured — the same resolution
+                // `kj model` uses (`ProviderConfig::context_window`), so
+                // this listing can never disagree with the single-context
+                // verb. Unconfigured models get no annotation here (silence
+                // is the "unknown" signal in this listing; `kj model`'s
+                // JSON is the surface that must say so explicitly).
+                if let Some(w) = registry.provider_config(name).and_then(|c| c.context_window(m)) {
+                    marks.push(format!("{w} ctx"));
                 }
                 let suffix = if marks.is_empty() {
                     String::new()
@@ -201,17 +210,28 @@ impl KjDispatcher {
         };
 
         // Effective model: the row's column when set, else the registry default
-        // the context falls through to at turn time.
+        // the context falls through to at turn time. Acquire the registry
+        // lock unconditionally (not just on the fallback branch) — the
+        // context-window lookup below needs it regardless of `source`.
+        let registry = self.kernel().llm().read().await;
         let (provider, model, source) = match row_model {
             Some(m) => (row_provider, Some(m), "context"),
-            None => {
-                let registry = self.kernel().llm().read().await;
-                (
-                    registry.default_provider_name().map(str::to_string),
-                    registry.default_model().map(str::to_string),
-                    "default",
-                )
-            }
+            None => (
+                registry.default_provider_name().map(str::to_string),
+                registry.default_model().map(str::to_string),
+                "default",
+            ),
+        };
+
+        // Context window for the effective model, via the SAME
+        // provider_configs the registry's own resolution already reads —
+        // never a second, possibly-diverging lookup. `None` here is a real
+        // "unknown", not a fabricated default: a consumer rendering a
+        // "% of context used" gauge must show "unknown" rather than compute
+        // a confidently wrong percentage against a guessed denominator.
+        let context_window = match (&provider, &model) {
+            (Some(p), Some(m)) => registry.context_window_for(p, m),
+            _ => None,
         };
 
         let display = match (&provider, &model) {
@@ -220,10 +240,18 @@ impl KjDispatcher {
             _ => "(none configured)".to_string(),
         };
 
+        let window_display = match context_window {
+            Some(w) => w.to_string(),
+            None => "unknown".to_string(),
+        };
+
         let message = if source == "context" {
-            format!("{}: {display}", ctx_id.short())
+            format!("{}: {display} [context: {window_display}]", ctx_id.short())
         } else {
-            format!("{}: {display} (registry default)", ctx_id.short())
+            format!(
+                "{}: {display} (registry default) [context: {window_display}]",
+                ctx_id.short()
+            )
         };
 
         KjResult::ok_ephemeral_with_data(
@@ -234,6 +262,7 @@ impl KjDispatcher {
                 "provider": provider,
                 "model": model,
                 "source": source,
+                "context_window": context_window,
             }),
         )
     }
@@ -265,6 +294,17 @@ mod tests {
             {
                 let mut c = ProviderConfig::new("anthropic");
                 c.default_model = Some("claude-opus-4-8".to_string());
+                // Only "claude-opus-4-8" carries a configured window — the
+                // "fast" alias below points at "claude-haiku-4-5-20251001",
+                // which is deliberately left unconfigured so tests can
+                // exercise the "no fabricated default" path through alias
+                // resolution too.
+                c.models.insert(
+                    "claude-opus-4-8".to_string(),
+                    crate::llm::config::ModelInfo {
+                        context_window: Some(1_000_000),
+                    },
+                );
                 c
             },
         ]);
@@ -361,6 +401,72 @@ mod tests {
         assert_eq!(data["model"], "deepseek-r1");
         assert_eq!(data["provider"], "deepseek");
         assert_eq!(data["source"], "context", "column-set → source=context");
+        // "deepseek" has no ProviderConfig at all in seed_registry — the
+        // window must be an explicit null, never a fabricated number.
+        assert!(
+            data["context_window"].is_null(),
+            "unconfigured provider → context_window is null, not a guess: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_reports_configured_context_window() {
+        let d = test_dispatcher().await;
+        seed_registry(&d).await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.update_model(ctx, Some("anthropic"), Some("claude-opus-4-8"))
+                .unwrap();
+        }
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("model")], &c).await;
+        assert!(result.is_ok(), "model failed: {}", result.message());
+        let message = result.message().to_string();
+        let data = match result {
+            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(data["context_window"], 1_000_000);
+        assert!(
+            message.contains("1000000"),
+            "human-readable text also surfaces the window: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_reports_unknown_context_window_explicitly_not_a_default() {
+        let d = test_dispatcher().await;
+        seed_registry(&d).await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        // "claude-haiku-4-5-20251001" is a real model on a configured
+        // provider, but seed_registry deliberately never gave it a
+        // context_window entry.
+        {
+            let db = d.kernel_db().lock();
+            db.update_model(ctx, Some("anthropic"), Some("claude-haiku-4-5-20251001"))
+                .unwrap();
+        }
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("model")], &c).await;
+        assert!(result.is_ok(), "model failed: {}", result.message());
+        let message = result.message().to_string();
+        let data = match result {
+            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert!(
+            data["context_window"].is_null(),
+            "an unconfigured model on a configured provider must still resolve to null: {data:?}"
+        );
+        assert!(
+            message.contains("unknown"),
+            "human-readable text says unknown, not a fabricated number: {message}"
+        );
     }
 
     #[tokio::test]
@@ -385,6 +491,67 @@ mod tests {
         assert_eq!(data["model"], "claude-opus-4-8", "uses registry default model");
         assert_eq!(data["provider"], "anthropic");
         assert_eq!(data["source"], "default", "no column → source=default");
+        assert_eq!(
+            data["context_window"], 1_000_000,
+            "the registry-default model has a configured window too"
+        );
+    }
+
+    /// `kj context set --model <alias>` resolves the alias to a concrete
+    /// provider+model BEFORE persisting (see `kj/context.rs`'s
+    /// `context_set_resolves_model_alias`). `kj model`'s context-window
+    /// answer must agree with the registry's own `resolve_alias` — this
+    /// guards against introducing a second, possibly-diverging resolution
+    /// path for "what model does this alias mean".
+    #[tokio::test]
+    async fn model_alias_resolution_agrees_with_registry_resolve_alias() {
+        let d = test_dispatcher().await;
+        seed_registry(&d).await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let set_result = d
+            .dispatch(&[s("context"), s("set"), s("--model"), s("fast")], &c)
+            .await;
+        assert!(set_result.is_ok(), "context set failed: {}", set_result.message());
+
+        let result = d.dispatch(&[s("model")], &c).await;
+        assert!(result.is_ok(), "model failed: {}", result.message());
+        let data = match result {
+            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
+            other => panic!("expected data, got {other:?}"),
+        };
+
+        let (expected_provider, expected_model) = {
+            let registry = d.kernel().llm().read().await;
+            let (p, m) = registry.resolve_alias("fast").expect("fast alias configured");
+            (p.to_string(), m.to_string())
+        };
+        assert_eq!(data["provider"], expected_provider);
+        assert_eq!(data["model"], expected_model);
+        assert_eq!(data["source"], "context", "alias set via context set → source=context");
+        // "fast" resolves to claude-haiku-4-5-20251001, which seed_registry
+        // leaves unconfigured — the alias path must not invent a window.
+        assert!(
+            data["context_window"].is_null(),
+            "alias-resolved model with no configured window is still null: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_annotates_a_model_with_its_configured_context_window() {
+        let d = test_dispatcher().await;
+        seed_registry(&d).await;
+        let c = test_caller();
+
+        let result = d.dispatch(&[s("models")], &c).await;
+        assert!(result.is_ok(), "models failed: {}", result.message());
+        let msg = result.message();
+        assert!(
+            msg.contains("claude-opus-4-8") && msg.contains("1000000"),
+            "listing annotates the configured model with its window: {msg}"
+        );
     }
 
     #[tokio::test]

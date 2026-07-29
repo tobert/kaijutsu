@@ -5,7 +5,38 @@
 //! per-provider `default_tools` field and the `ToolConfig` type that fed
 //! into it are gone.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+/// Per-model metadata nested under a provider, keyed by the model id as it
+/// appears in `default_model` / an alias's `model` field.
+///
+/// A provider often serves several models with different context windows
+/// (e.g. anthropic's haiku vs opus), so this is a per-model table rather
+/// than a single provider-level number — mirroring how `default_model` /
+/// `max_output_tokens` are already provider-level while the models
+/// themselves are named per-alias in `model_aliases`. Currently carries
+/// only `context_window`, but exists as its own struct (not a bare
+/// `HashMap<String, u64>`) so a future per-model knob doesn't need another
+/// schema migration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// Total context window (input + output) in tokens, if known.
+    ///
+    /// `None` means "not configured" — this is NOT a default. Computing a
+    /// percentage against a fabricated denominator is exactly the kind of
+    /// silent-wrong-answer this project rejects; callers must render an
+    /// explicit "unknown" instead.
+    ///
+    /// Must be a positive integer when set — `Some(0)` parses and resolves
+    /// like any other value (there is nothing in the type to reject it),
+    /// but no real model has a zero-token context window, and a consumer
+    /// dividing usage by it would get garbage. Treat `0` in `models.toml`
+    /// as a typo, not a legitimate "small" window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
 
 /// Configuration for an LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +73,13 @@ pub struct ProviderConfig {
     /// Maximum output tokens for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+
+    /// Per-model metadata (context window, ...), keyed by model id. See
+    /// `ModelInfo`. Absent entries — and entries present but with no
+    /// `context_window` — both resolve to `None` via `context_window()`,
+    /// never a guessed default.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: HashMap<String, ModelInfo>,
 }
 
 fn default_true() -> bool {
@@ -60,7 +98,20 @@ impl ProviderConfig {
             base_url: None,
             default_model: None,
             max_output_tokens: None,
+            models: HashMap::new(),
         }
+    }
+
+    /// Configured context window for one of this provider's models, or
+    /// `None` when not configured.
+    ///
+    /// Never guesses: a model absent from `models`, and a model present but
+    /// with `context_window: None`, both resolve to `None`. Callers (e.g.
+    /// `kj model`) must render that as an explicit "unknown" — never
+    /// substitute a default, because a fabricated denominator produces a
+    /// confidently wrong percentage.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.models.get(model)?.context_window
     }
 
     /// Set API key directly.
@@ -157,6 +208,38 @@ fn read_key_file(path: &str) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_resolves_configured_value() {
+        let mut config = ProviderConfig::new("anthropic");
+        config.models.insert(
+            "claude-opus-4-8".to_string(),
+            ModelInfo {
+                context_window: Some(1_000_000),
+            },
+        );
+        assert_eq!(config.context_window("claude-opus-4-8"), Some(1_000_000));
+    }
+
+    #[test]
+    fn context_window_is_none_for_an_unlisted_model() {
+        // A model absent from `models` entirely is unknown, not zero and
+        // not some provider-wide default.
+        let config = ProviderConfig::new("anthropic");
+        assert_eq!(config.context_window("claude-opus-4-8"), None);
+    }
+
+    #[test]
+    fn context_window_is_none_when_entry_present_but_unset() {
+        // A model that IS listed (e.g. for future metadata) but never had
+        // context_window configured must still resolve to None, not 0 or a
+        // guessed number — the entry existing is not itself a signal.
+        let mut config = ProviderConfig::new("anthropic");
+        config
+            .models
+            .insert("claude-sonnet-4-20250514".to_string(), ModelInfo::default());
+        assert_eq!(config.context_window("claude-sonnet-4-20250514"), None);
+    }
 
     #[test]
     fn test_provider_config_resolve_key() {
