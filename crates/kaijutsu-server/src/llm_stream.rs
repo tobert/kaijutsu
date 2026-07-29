@@ -20,6 +20,7 @@ use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent};
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
+use kaijutsu_kernel::mcp::{McpError, PolicyError};
 use kaijutsu_kernel::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
@@ -567,6 +568,105 @@ mod hydration_tests {
             "the archived middle must not reach the wire; got: {wire}"
         );
     }
+}
+
+/// Map a tool-dispatch outcome into the `(content, is_error, error_payload)`
+/// triple used both for the model-visible `ToolResult` and the block-store
+/// write. Pure/sync so it's unit-testable without spinning up a kernel.
+///
+/// A broker policy timeout (`McpError::Policy(PolicyError::Timeout { .. })`,
+/// raised by `Broker::call_tool` racing `policy.call_timeout` — mcp/broker.rs)
+/// gets its own arm so the model still sees a clear `code: "tool.timeout"`
+/// error, using the *real* `timeout_ms` from the broker instead of a
+/// hardcoded number. This preserves the shape the old outer
+/// `tokio::time::timeout` wrapper used to produce (see
+/// `dispatch_and_map_tool_result`'s doc for why that wrapper is gone) so any
+/// existing consumer matching on `code == "tool.timeout"` keeps working.
+fn map_tool_dispatch_result(
+    tool_name: &str,
+    result: Result<kaijutsu_kernel::ExecResult, McpError>,
+) -> (String, bool, Option<kaijutsu_types::ErrorPayload>) {
+    match result {
+        Ok(r) if r.success => {
+            log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
+            (r.stdout, false, None)
+        }
+        Ok(r) => {
+            log::warn!("Tool {} failed: {}", tool_name, r.stderr);
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Tool,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: Some(r.stderr.clone()),
+                span: None,
+                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+            };
+            (format!("Error: {}", r.stderr), true, Some(payload))
+        }
+        Err(McpError::Policy(PolicyError::Timeout { timeout_ms, .. })) => {
+            log::error!(
+                "Tool {} timed out after {}ms (per-instance policy call_timeout)",
+                tool_name,
+                timeout_ms
+            );
+            let secs = timeout_ms as f64 / 1000.0;
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Tool,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: Some("tool.timeout".into()),
+                detail: Some(format!("Tool '{}' timed out after {:.1}s", tool_name, secs)),
+                span: None,
+                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+            };
+            (
+                format!("Error: tool '{}' timed out after {:.1}s", tool_name, secs),
+                true,
+                Some(payload),
+            )
+        }
+        Err(e) => {
+            log::error!("Tool {} execution error: {}", tool_name, e);
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Tool,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: Some(e.to_string()),
+                span: None,
+                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+            };
+            (format!("Execution error: {}", e), true, Some(payload))
+        }
+    }
+}
+
+/// Dispatch one tool call through the broker and map the outcome for the
+/// conversation.
+///
+/// There is deliberately **no** timeout wrapper here. `Broker::call_tool`
+/// (mcp/broker.rs) already enforces the per-instance `InstancePolicy.call_
+/// timeout` itself — configurable live via `kj policy set` /
+/// `Broker::update_policy` — and races it against `cancel` with `select!
+/// { biased; ... }` so an externally-triggered hard interrupt (M2-B5) wins
+/// over a timeout that's about to fire and aborts the in-flight call
+/// promptly regardless of how long `call_timeout` is set to. A second,
+/// hardcoded ceiling here would silently override whatever the user
+/// configured — which is exactly what used to happen: a
+/// `const TOOL_TIMEOUT_SECS: u64 = 120` wrapped this call and clamped every
+/// policy timeout above 120s to 120s, with no way to raise it. Removing it
+/// does not reintroduce the wedge that const was guarding against: the
+/// interrupt-latency guarantee it protected comes from the cancel token
+/// racing the broker's own timeout, not from this now-removed second timer.
+async fn dispatch_and_map_tool_result(
+    kernel: &Arc<Kernel>,
+    tool_name: &str,
+    params: &str,
+    tool_ctx: &kaijutsu_kernel::ExecContext,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (String, bool, Option<kaijutsu_types::ErrorPayload>) {
+    let result = kernel
+        .dispatch_tool_via_broker_with_cancel(tool_name, params, tool_ctx, cancel)
+        .await;
+    map_tool_dispatch_result(tool_name, result)
 }
 
 /// Process LLM streaming in a background task with agentic loop.
@@ -1373,80 +1473,19 @@ async fn process_llm_stream(
                     // Step 3: Let BlockInserted flush to clients before text ops
                     tokio::task::yield_now().await;
 
-                    // Step 4: Execute tool via the Phase 1 broker. Outer
-                    // timeout is belt-and-suspenders alongside the broker's
-                    // per-instance InstancePolicy cap. interrupt.cancel
-                    // (M2-B5) flows through to the broker so a hard
-                    // interrupt aborts in-flight work — without this the
-                    // user waits the full 120s timeout.
-                    const TOOL_TIMEOUT_SECS: u64 = 120;
-                    let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        kernel.dispatch_tool_via_broker_with_cancel(
-                            &tool_name,
-                            &params,
-                            &tool_ctx,
-                            interrupt.cancel.clone(),
-                        ),
+                    // Step 4: Execute tool via the Phase 1 broker.
+                    // `interrupt.cancel` (M2-B5) flows through to the broker
+                    // so a hard interrupt aborts in-flight work promptly —
+                    // no outer timeout wrapper needed here; see
+                    // `dispatch_and_map_tool_result`'s doc for why.
+                    let (result_content, is_error, error_payload) = dispatch_and_map_tool_result(
+                        &kernel,
+                        &tool_name,
+                        &params,
+                        &tool_ctx,
+                        interrupt.cancel.clone(),
                     )
                     .await;
-
-                    let (result_content, is_error, error_payload) = match result {
-                        Err(_elapsed) => {
-                            log::error!(
-                                "Tool {} timed out after {}s",
-                                tool_name,
-                                TOOL_TIMEOUT_SECS
-                            );
-                            let payload = kaijutsu_types::ErrorPayload {
-                                category: kaijutsu_types::ErrorCategory::Tool,
-                                severity: kaijutsu_types::ErrorSeverity::Error,
-                                code: Some("tool.timeout".into()),
-                                detail: Some(format!(
-                                    "Tool '{}' timed out after {}s",
-                                    tool_name, TOOL_TIMEOUT_SECS
-                                )),
-                                span: None,
-                                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
-                            };
-                            (
-                                format!(
-                                    "Error: tool '{}' timed out after {}s",
-                                    tool_name, TOOL_TIMEOUT_SECS
-                                ),
-                                true,
-                                Some(payload),
-                            )
-                        }
-                        Ok(Ok(r)) if r.success => {
-                            log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
-                            (r.stdout, false, None)
-                        }
-                        Ok(Ok(r)) => {
-                            log::warn!("Tool {} failed: {}", tool_name, r.stderr);
-                            let payload = kaijutsu_types::ErrorPayload {
-                                category: kaijutsu_types::ErrorCategory::Tool,
-                                severity: kaijutsu_types::ErrorSeverity::Error,
-                                code: None,
-                                detail: Some(r.stderr.clone()),
-                                span: None,
-                                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
-                            };
-                            (format!("Error: {}", r.stderr), true, Some(payload))
-                        }
-                        Ok(Err(e)) => {
-                            log::error!("Tool {} execution error: {}", tool_name, e);
-                            let payload = kaijutsu_types::ErrorPayload {
-                                category: kaijutsu_types::ErrorCategory::Tool,
-                                severity: kaijutsu_types::ErrorSeverity::Error,
-                                code: None,
-                                detail: Some(e.to_string()),
-                                span: None,
-                                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
-                            };
-                            (format!("Execution error: {}", e), true, Some(payload))
-                        }
-                    };
 
                     // Step 5: Write result content via CRDT text ops
                     if let Some(ref rb_id) = result_block_id {
@@ -1851,5 +1890,299 @@ mod publish_tests {
                 );
             })
             .await;
+    }
+}
+
+/// Lane A1: the removed redundant `TOOL_TIMEOUT_SECS: u64 = 120` outer
+/// wrapper. `map_tool_dispatch_result` is tested directly (pure, sync — no
+/// kernel needed); `dispatch_and_map_tool_result` is tested against a real
+/// ephemeral `Kernel` + broker with a custom slow `McpServerLike`, using
+/// tokio's paused clock (`start_paused = true`) so multi-minute scenarios
+/// run instantly instead of burning real wall-clock time.
+#[cfg(test)]
+mod tool_dispatch_timeout_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
+
+    use kaijutsu_kernel::mcp::{
+        CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+        KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification,
+    };
+    use kaijutsu_types::SessionId;
+
+    use super::*;
+
+    // ─────────────────────────────────────────────────────────────────
+    // map_tool_dispatch_result — pure mapping, no I/O
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn map_success_passes_stdout_through() {
+        let (content, is_error, payload) =
+            map_tool_dispatch_result("echo", Ok(kaijutsu_kernel::ExecResult::success("hi")));
+        assert_eq!(content, "hi");
+        assert!(!is_error);
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn map_tool_failure_sets_generic_error_no_code() {
+        let (content, is_error, payload) = map_tool_dispatch_result(
+            "grep",
+            Ok(kaijutsu_kernel::ExecResult::failure(1, "no matches")),
+        );
+        assert!(is_error);
+        assert_eq!(content, "Error: no matches");
+        let payload = payload.expect("failure carries a payload");
+        assert!(payload.code.is_none(), "non-timeout tool failure has no `code`");
+    }
+
+    #[test]
+    fn map_generic_mcp_error_sets_no_code() {
+        let err = McpError::ToolNotFound {
+            instance: InstanceId::new("x"),
+            tool: "y".to_string(),
+        };
+        let (content, is_error, payload) = map_tool_dispatch_result("y", Err(err));
+        assert!(is_error);
+        assert!(content.starts_with("Execution error:"));
+        let payload = payload.expect("execution error carries a payload");
+        assert!(
+            payload.code.is_none(),
+            "a non-timeout McpError must not be mistaken for tool.timeout"
+        );
+    }
+
+    #[test]
+    fn map_policy_timeout_sets_tool_timeout_code_with_real_timeout_ms() {
+        // The core of the Problem 1 fix: a broker policy timeout must map
+        // to the SAME `code: "tool.timeout"` shape the old hardcoded-120s
+        // outer wrapper produced, but using the REAL timeout_ms from the
+        // broker's error, not a hardcoded number.
+        let err = McpError::Policy(PolicyError::Timeout {
+            instance: InstanceId::new("builtin.shell"),
+            timeout_ms: 4242,
+        });
+        let (content, is_error, payload) = map_tool_dispatch_result("shell", Err(err));
+        assert!(is_error);
+        assert!(
+            content.contains("shell") && content.contains("timed out"),
+            "got: {content:?}"
+        );
+        assert!(
+            content.contains("4.2"),
+            "message should reflect the real 4242ms timeout, not a hardcoded 120s: {content:?}"
+        );
+        let payload = payload.expect("timeout carries a payload");
+        assert_eq!(
+            payload.code.as_deref(),
+            Some("tool.timeout"),
+            "must keep the same code so existing consumers matching on it keep working"
+        );
+        assert!(
+            payload
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("4.2")),
+            "detail should carry the real timeout_ms-derived duration: {payload:?}"
+        );
+    }
+
+    #[test]
+    fn map_other_policy_errors_are_not_mistaken_for_timeout() {
+        // Only PolicyError::Timeout gets the tool.timeout code — a
+        // concurrency-cap or result-too-large policy error must still fall
+        // through to the generic path (no `code`), same as before.
+        let err = McpError::Policy(PolicyError::ConcurrencyCap {
+            instance: InstanceId::new("builtin.shell"),
+            max: 4,
+        });
+        let (_content, is_error, payload) = map_tool_dispatch_result("shell", Err(err));
+        assert!(is_error);
+        let payload = payload.expect("payload present");
+        assert!(payload.code.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // dispatch_and_map_tool_result — real kernel + broker, paused clock
+    // ─────────────────────────────────────────────────────────────────
+
+    /// A single-tool `McpServerLike` that sleeps for a fixed duration then
+    /// returns success — stands in for a slow shell command / cargo build.
+    struct SleepyServer {
+        id: InstanceId,
+        sleep_for: Duration,
+        notif_tx: broadcast::Sender<ServerNotification>,
+    }
+
+    impl SleepyServer {
+        fn new(id: &str, sleep_for: Duration) -> Self {
+            let (notif_tx, _) = broadcast::channel(4);
+            Self {
+                id: InstanceId::new(id),
+                sleep_for,
+                notif_tx,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpServerLike for SleepyServer {
+        fn instance_id(&self) -> &InstanceId {
+            &self.id
+        }
+
+        async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+            Ok(vec![KernelTool {
+                instance: self.id.clone(),
+                name: "sleep".to_string(),
+                description: None,
+                input_schema: serde_json::json!({ "type": "object" }),
+            }])
+        }
+
+        async fn call_tool(
+            &self,
+            _params: KernelCallParams,
+            _ctx: &CallContext,
+            _cancel: CancellationToken,
+        ) -> McpResult<KernelToolResult> {
+            tokio::time::sleep(self.sleep_for).await;
+            Ok(KernelToolResult::text("done"))
+        }
+
+        fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
+            self.notif_tx.subscribe()
+        }
+    }
+
+    /// Build an ephemeral kernel with `napper`/`sleep` registered under the
+    /// given `call_timeout`, bound into a fresh context. Returns
+    /// `(kernel, ExecContext)` ready for `dispatch_and_map_tool_result`.
+    async fn kernel_with_sleepy_tool(
+        name: &str,
+        sleep_for: Duration,
+        call_timeout: Duration,
+    ) -> (Arc<Kernel>, kaijutsu_kernel::ExecContext) {
+        let kernel = Arc::new(Kernel::new_ephemeral(name).await);
+        let ctx = ContextId::new();
+        let server = Arc::new(SleepyServer::new("napper", sleep_for));
+        kernel
+            .broker()
+            .register(
+                server,
+                InstancePolicy {
+                    call_timeout,
+                    max_result_bytes: 1024,
+                    max_concurrency: 4,
+                },
+            )
+            .await
+            .unwrap();
+        kernel
+            .broker()
+            .set_binding(
+                ctx,
+                ContextToolBinding::with_instances(vec![InstanceId::new("napper")]),
+            )
+            .await;
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            PrincipalId::new(),
+            ctx,
+            PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+        (kernel, tool_ctx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn low_policy_timeout_produces_tool_timeout_result() {
+        let (kernel, tool_ctx) =
+            kernel_with_sleepy_tool("timeout-low", Duration::from_secs(5), Duration::from_millis(50))
+                .await;
+
+        let (content, is_error, payload) = dispatch_and_map_tool_result(
+            &kernel,
+            "sleep",
+            "{}",
+            &tool_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(is_error, "a call exceeding the low policy timeout must error");
+        let payload = payload.expect("timeout carries a payload");
+        assert_eq!(payload.code.as_deref(), Some("tool.timeout"));
+        assert!(content.contains("timed out"), "got: {content:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn regression_call_exceeding_old_hardcoded_120s_succeeds_when_policy_allows_more() {
+        // The regression guard for the removed `TOOL_TIMEOUT_SECS = 120`
+        // const: with the per-instance policy timeout set ABOVE 120s, a
+        // call that runs LONGER than 120s (but under the policy timeout)
+        // must still succeed. Paused clock ⇒ this is instant, not a
+        // 125-second test.
+        let (kernel, tool_ctx) = kernel_with_sleepy_tool(
+            "timeout-regress",
+            Duration::from_secs(125),
+            Duration::from_secs(130),
+        )
+        .await;
+
+        let (content, is_error, payload) = dispatch_and_map_tool_result(
+            &kernel,
+            "sleep",
+            "{}",
+            &tool_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            !is_error,
+            "a call under the configured 130s policy timeout must succeed even though it \
+             exceeds the OLD hardcoded 120s wrapper — got error: {content:?} / {payload:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_policy_raising_timeout_above_120s_lets_the_call_through() {
+        // Mirrors the real `kj policy set` path (`Broker::update_policy`,
+        // the same mutation `kj policy set` performs): a timeout that
+        // starts low is raised live, past the old hardcoded 120s ceiling,
+        // and the very next call honors the new value.
+        let (kernel, tool_ctx) = kernel_with_sleepy_tool(
+            "timeout-update",
+            Duration::from_secs(125),
+            Duration::from_millis(50), // would fail outright if left as-is
+        )
+        .await;
+
+        kernel
+            .broker()
+            .update_policy(&InstanceId::new("napper"), Some(Duration::from_secs(130)), None)
+            .await
+            .unwrap();
+
+        let (content, is_error, _payload) = dispatch_and_map_tool_result(
+            &kernel,
+            "sleep",
+            "{}",
+            &tool_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            !is_error,
+            "`kj policy set` raising call_timeout above 120s must actually take effect once \
+             the redundant loop-level timeout is gone — got: {content:?}"
+        );
     }
 }

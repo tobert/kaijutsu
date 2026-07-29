@@ -1384,12 +1384,13 @@ impl Broker {
             Ok(Ok(result)) => {
                 // Size check — pathological output must not OOM the kernel.
                 // M3-D4: instead of erroring, truncate the result text in
-                // place with an explicit footer so the model still sees
-                // useful prefix data plus a clear note about what was cut.
+                // place (head + tail, see `truncate_result_to_budget`) so
+                // the model still sees useful data plus a clear note about
+                // what was cut, instead of losing the whole call.
                 let mut result = result;
                 let size = estimate_result_size(&result);
                 if size > policy.max_result_bytes {
-                    truncate_result_to_budget(&mut result, policy.max_result_bytes, size);
+                    truncate_result_to_budget(&mut result, policy.max_result_bytes);
                 }
                 match self
                     .evaluate_phase(
@@ -2743,57 +2744,117 @@ fn estimate_result_size(result: &KernelToolResult) -> usize {
     total
 }
 
+/// Round `idx` down to the nearest UTF-8 char boundary in `s` (never past
+/// `s.len()`). Used for the head cut — shrinking toward the start keeps the
+/// head strictly within budget.
+fn char_boundary_floor(s: &str, idx: usize) -> usize {
+    let mut idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Round `idx` up to the nearest UTF-8 char boundary in `s` (never past
+/// `s.len()`). Used for the tail cut — growing toward the end keeps the
+/// tail strictly within budget (a later start means a shorter tail).
+fn char_boundary_ceil(s: &str, idx: usize) -> usize {
+    let mut idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Build the middle-elision marker for `n` elided bytes.
+fn elision_marker(n: usize) -> String {
+    format!(
+        "\n\n[... truncated {} bytes from the middle — output exceeded max_result_bytes ...]\n\n",
+        n
+    )
+}
+
 /// Truncate a tool result so its serialized size fits inside `budget`,
-/// replacing tail content with a "[truncated N bytes]" footer (M3-D4).
+/// keeping a head *and* a tail with a "[... truncated N bytes from the
+/// middle ...]" marker in between (M3-D4, head+tail revision).
 ///
-/// Strategy: drop `structured`, walk `content` in order, keep whole
-/// items that fit. The first item that would overflow is byte-truncated
-/// to fill the remaining budget minus footer length. Subsequent items
-/// are dropped. A final Text item carries the footer.
-fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize, original_size: usize) {
+/// Compiler and test output put the useful part — errors, the summary line
+/// — at the *end*. The original prefix-only strategy threw exactly that
+/// away. This keeps roughly the first 30% and last 70% of the available
+/// body budget (after reserving room for the marker itself), favoring the
+/// tail without discarding the head entirely (early context, e.g. the
+/// invoked command line, still matters).
+///
+/// `structured` is dropped unconditionally — it's an indivisible blob and
+/// easier for the model to lose entirely than partially.
+///
+/// Both cut points are rounded to UTF-8 char boundaries
+/// (`char_boundary_floor`/`char_boundary_ceil`) so this never produces
+/// invalid UTF-8 mid-character, no matter where a multi-byte char happens
+/// to straddle the naive byte offset. The head cut rounds *down* and the
+/// tail cut rounds *up* — both directions only ever shrink what's kept, so
+/// the emitted result never exceeds `budget` even after rounding.
+///
+/// Degenerate cases are handled explicitly: if `budget` is smaller than the
+/// marker text itself, emit as much of the marker as fits (char-boundary
+/// safe) and nothing else — there's no room for real content either way.
+/// If `content` is only slightly over `budget`, the fixed marker overhead
+/// (~90 bytes) still applies; this mirrors the previous footer-based
+/// implementation's same fixed overhead and is inherent to any
+/// marker-based truncation scheme, not a new regression.
+fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize) {
     use super::types::ToolContent;
-    let dropped = original_size.saturating_sub(budget);
-    let footer = format!("\n\n[truncated {} bytes — output exceeded max_result_bytes]", dropped);
-    // Reserve room for the footer; if the budget is smaller than the
-    // footer itself, drop everything except the footer.
-    let footer_len = footer.len();
-    let body_budget = budget.saturating_sub(footer_len);
 
-    // Discard structured payload — it's an indivisible blob and easier
-    // for the model to lose entirely than partially.
+    // Flatten into one string — head+tail truncation needs to look across
+    // item boundaries, which the old per-item prefix walk couldn't do.
     result.structured = None;
-
-    let mut kept: Vec<ToolContent> = Vec::new();
-    let mut used = 0usize;
-    let original = std::mem::take(&mut result.content);
-    for item in original {
-        let item_text = match &item {
-            ToolContent::Text(s) => s.clone(),
+    let combined: String = std::mem::take(&mut result.content)
+        .into_iter()
+        .map(|c| match c {
+            ToolContent::Text(s) => s,
             ToolContent::Json(v) => v.to_string(),
-        };
-        let item_len = item_text.len();
-        if used + item_len <= body_budget {
-            kept.push(item);
-            used += item_len;
-            continue;
-        }
-        // Partial fit — slice item_text on a UTF-8 char boundary so we
-        // never produce invalid UTF-8 mid-truncation.
-        let remaining = body_budget.saturating_sub(used);
-        if remaining > 0 {
-            let mut cut = remaining.min(item_text.len());
-            while cut > 0 && !item_text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            if cut > 0 {
-                kept.push(ToolContent::Text(item_text[..cut].to_string()));
-            }
-        }
-        break;
+        })
+        .collect();
+
+    let total = combined.len();
+    if total <= budget {
+        result.content = vec![ToolContent::Text(combined)];
+        return;
     }
 
-    kept.push(ToolContent::Text(footer));
-    result.content = kept;
+    // Reserve room for the marker using `total` as the elided-byte-count
+    // placeholder. `elided` (computed below, after head/tail are chosen)
+    // can never exceed `total`, so its digit count — and therefore the
+    // real marker's length — can never exceed this placeholder's. That
+    // makes the reservation a safe upper bound in one pass, no reconcile
+    // needed (it can leave a few bytes of budget unused; it can never
+    // overflow it).
+    let placeholder_marker = elision_marker(total);
+    let marker_reserve = placeholder_marker.len();
+    if marker_reserve >= budget {
+        let cut = char_boundary_floor(&placeholder_marker, budget);
+        result.content = vec![ToolContent::Text(placeholder_marker[..cut].to_string())];
+        return;
+    }
+
+    let body_budget = budget - marker_reserve;
+    let head_budget = body_budget * 3 / 10;
+    let tail_budget = body_budget - head_budget;
+
+    let head_cut = char_boundary_floor(&combined, head_budget);
+    let tail_start_raw = total.saturating_sub(tail_budget).max(head_cut);
+    let tail_start = char_boundary_ceil(&combined, tail_start_raw);
+
+    let head = &combined[..head_cut];
+    let tail = &combined[tail_start..];
+    let elided = tail_start - head_cut;
+    let marker = elision_marker(elided);
+
+    let mut out = String::with_capacity(head.len() + marker.len() + tail.len());
+    out.push_str(head);
+    out.push_str(&marker);
+    out.push_str(tail);
+    result.content = vec![ToolContent::Text(out)];
 }
 
 #[cfg(test)]
@@ -3211,21 +3272,29 @@ mod tests {
 
     #[tokio::test]
     async fn policy_result_too_large_truncates() {
-        // M3-D4: oversized results truncate in place with a footer
-        // instead of erroring. The model gets useful prefix data plus a
-        // clear note about how much was cut.
+        // M3-D4 (head+tail revision): oversized results truncate in place
+        // with a middle-elision marker instead of erroring. The model gets
+        // both the head AND the tail — compiler/test output puts errors and
+        // the summary line at the END, so a prefix-only truncation (the old
+        // behaviour) threw away exactly the part that matters.
         let broker = Arc::new(Broker::new());
+        // Distinguishable head/tail regions: all 'A' at the start, all 'Z'
+        // at the end, so we can assert both survive independently.
+        let content = format!("{}{}", "A".repeat(1000), "Z".repeat(1000));
         let server = Arc::new(
             MockServer::new("chatty")
                 .with_tool("say")
-                .on_call(|_p| async { Ok(KernelToolResult::text("x".repeat(200))) }),
+                .on_call(move |_p| {
+                    let content = content.clone();
+                    async move { Ok(KernelToolResult::text(content)) }
+                }),
         );
         broker
             .register(
                 server,
                 InstancePolicy {
                     call_timeout: Duration::from_secs(5),
-                    max_result_bytes: 64,
+                    max_result_bytes: 300,
                     max_concurrency: 4,
                 },
             )
@@ -3251,17 +3320,170 @@ mod tests {
             })
             .collect();
         assert!(
-            combined.contains("[truncated"),
-            "truncation footer missing, got: {combined:?}"
+            combined.contains("truncated") && combined.contains("from the middle"),
+            "middle-elision marker missing, got: {combined:?}"
         );
         assert!(
-            combined.starts_with("xxx"),
-            "prefix preserved before footer, got: {combined:?}"
+            combined.starts_with("AAA"),
+            "head preserved before marker, got: {combined:?}"
+        );
+        assert!(
+            combined.ends_with("ZZZ"),
+            "tail preserved after marker — this is the whole point of head+tail \
+             over tail-drop; got: {combined:?}"
+        );
+        assert!(
+            combined.len() <= 300,
+            "must fit inside budget, got {} bytes: {combined:?}",
+            combined.len()
         );
         assert!(
             !result.is_error,
             "truncation must not flip is_error — model still gets data"
         );
+    }
+
+    #[test]
+    fn truncate_result_to_budget_never_exceeds_budget() {
+        // Property check across the early-return, normal, and degenerate
+        // (budget < marker) branches: the emitted result must never be
+        // larger than the requested budget, regardless of content shape.
+        for content_len in [0usize, 1, 50, 299, 300, 301, 1000, 50_000] {
+            for budget in [0usize, 1, 10, 50, 90, 100, 300, 1000, 50_000] {
+                let content = "q".repeat(content_len);
+                let mut result = KernelToolResult::text(content);
+                truncate_result_to_budget(&mut result, budget);
+                let combined: String = result
+                    .content
+                    .iter()
+                    .map(|c| match c {
+                        crate::mcp::ToolContent::Text(s) => s.clone(),
+                        crate::mcp::ToolContent::Json(v) => v.to_string(),
+                    })
+                    .collect();
+                assert!(
+                    combined.len() <= budget,
+                    "content_len={content_len} budget={budget}: emitted {} bytes > budget",
+                    combined.len()
+                );
+                assert!(result.structured.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_result_to_budget_degenerate_budget_smaller_than_marker() {
+        // Budget too small to hold even the marker text — must not panic
+        // and must still produce valid UTF-8 (falls out of the type system
+        // here, but the char-boundary cut on the marker itself is the part
+        // that could otherwise panic).
+        let mut result = KernelToolResult::text("x".repeat(10_000));
+        truncate_result_to_budget(&mut result, 10);
+        let combined: String = result
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::mcp::ToolContent::Text(s) => s.clone(),
+                crate::mcp::ToolContent::Json(v) => v.to_string(),
+            })
+            .collect();
+        assert!(combined.len() <= 10, "got {combined:?}");
+
+        // budget == 0 is the extreme case of the same branch.
+        let mut result0 = KernelToolResult::text("x".repeat(10_000));
+        truncate_result_to_budget(&mut result0, 0);
+        assert!(
+            result0
+                .content
+                .iter()
+                .map(|c| match c {
+                    crate::mcp::ToolContent::Text(s) => s.len(),
+                    crate::mcp::ToolContent::Json(v) => v.to_string().len(),
+                })
+                .sum::<usize>()
+                == 0
+        );
+    }
+
+    #[test]
+    fn truncate_result_to_budget_content_one_byte_over_budget() {
+        // Slightly-over-budget content still goes through the marker-based
+        // path (the fixed marker overhead applies regardless of how little
+        // was actually elided — inherited from the previous footer-based
+        // implementation, not a new regression) but must still be correct:
+        // no panic, valid, and internally consistent about what it kept.
+        let budget = 500;
+        let content = "y".repeat(budget + 1);
+        let mut result = KernelToolResult::text(content);
+        truncate_result_to_budget(&mut result, budget);
+        let combined: String = result
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::mcp::ToolContent::Text(s) => s.clone(),
+                crate::mcp::ToolContent::Json(v) => v.to_string(),
+            })
+            .collect();
+        assert!(combined.len() <= budget);
+        assert!(combined.contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_result_to_budget_preserves_whole_multibyte_head_and_tail_chars() {
+        // Japanese runs at both ends of the content, ASCII filler in the
+        // middle. If the head/tail cuts ever land mid-character without the
+        // char-boundary rounding, this panics (Rust rejects non-boundary
+        // `&str` slicing) — that panic IS the failure signal this test
+        // exists to catch.
+        let content = format!("{}{}{}", "あ".repeat(50), "x".repeat(3000), "い".repeat(50));
+        let mut result = KernelToolResult::text(content);
+        truncate_result_to_budget(&mut result, 400);
+        let combined: String = result
+            .content
+            .iter()
+            .map(|c| match c {
+                crate::mcp::ToolContent::Text(s) => s.clone(),
+                crate::mcp::ToolContent::Json(v) => v.to_string(),
+            })
+            .collect();
+        assert!(
+            combined.starts_with('あ'),
+            "head should start with a whole multi-byte char, got: {:?}",
+            &combined[..combined.len().min(30)]
+        );
+        assert!(
+            combined.ends_with('い'),
+            "tail should end with a whole multi-byte char, got: {:?}",
+            &combined[combined.len().saturating_sub(30)..]
+        );
+        assert!(combined.contains("from the middle"));
+    }
+
+    #[test]
+    fn truncate_result_to_budget_multibyte_sweep_never_panics() {
+        // Fuzz-ish sweep: dense multi-byte runs at both ends, swept across
+        // many budgets, so the head/tail cut is overwhelmingly likely to
+        // land mid-character for *some* budget in the range if the
+        // char-boundary rounding has an off-by-one.
+        let head_run = "あ".repeat(300); // 900 bytes
+        let filler = "x".repeat(4000);
+        let tail_run = "い".repeat(300); // 900 bytes
+        let content = format!("{head_run}{filler}{tail_run}");
+
+        for budget in (80..2000).step_by(7) {
+            let mut result = KernelToolResult::text(content.clone());
+            truncate_result_to_budget(&mut result, budget);
+            let combined: String = result
+                .content
+                .iter()
+                .map(|c| match c {
+                    crate::mcp::ToolContent::Text(s) => s.clone(),
+                    crate::mcp::ToolContent::Json(v) => v.to_string(),
+                })
+                .collect();
+            assert!(!combined.is_empty(), "budget {budget}: must emit something");
+            assert!(combined.len() <= budget, "budget {budget}: exceeded");
+        }
     }
 
     #[tokio::test]

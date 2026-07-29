@@ -34,7 +34,13 @@ impl Default for InstancePolicy {
     fn default() -> Self {
         Self {
             call_timeout: Duration::from_secs(120),
-            max_result_bytes: 64 * 1024 * 1024,
+            // ~16k tokens — generous for a normal tool result, but no longer
+            // ~16M tokens (the old 64 MiB default), which was large enough to
+            // let one `cargo build 2>&1` or stray `find /` blow the entire
+            // context window with no recovery. Still raisable per-instance
+            // via `kj policy set`. Oversized results truncate in place (see
+            // `truncate_result_to_budget`) rather than erroring.
+            max_result_bytes: 64 * 1024,
             max_concurrency: 16,
         }
     }
@@ -47,7 +53,8 @@ impl InstancePolicy {
     pub fn for_kernel(kernel: &crate::Kernel) -> Self {
         Self {
             call_timeout: kernel.timeouts().mcp_call_timeout_default,
-            max_result_bytes: 64 * 1024 * 1024,
+            // See the matching comment on `Default` above — 64 KiB, not 64 MiB.
+            max_result_bytes: 64 * 1024,
             max_concurrency: 16,
         }
     }
