@@ -38,8 +38,9 @@ pub struct SpanBrush {
 
 /// Rich content for a block cell — dispatches rendering by format.
 ///
-/// When present on a block cell entity, `build_block_scenes` renders
-/// the content into the per-block vello scene.
+/// When present on a block cell entity, `build_block_scenes` renders it:
+/// into MSDF glyphs (Markdown, Output), the per-block vello scene (Svg,
+/// Abc only), or plain UI rectangle children (Sparkline, Image).
 #[derive(Component)]
 pub struct RichContent {
     pub kind: RichContentKind,
