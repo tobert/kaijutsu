@@ -98,7 +98,23 @@ these are the ones that block *using* the thing.
   round-trip only, no client RPC verb exists to start a background job to
   exercise end-to-end); a hard-failure indicator is momentary (~5s poll, then
   the badge blends into the next state) with no "sticky until acknowledged"
-  treatment.
+  treatment. **Verified real (2026-07-30, feat/dock-errors merge): two
+  freshness models sit pixels apart in the south dock, for the SAME event.**
+  A background job's block (`background_exec.rs` inserts it `Status::Running`
+  and later `blocks.set_status(..., Done/Error)` at the same call site that
+  updates the registry, ~`background_exec.rs:691-699`) is one of the blocks
+  `count_block_activity` counts — so `block_activity` reflects a background
+  job's start/finish the instant the CRDT op broadcasts, sub-second, no
+  polling. `background_jobs` reads the *same* start/finish only through
+  `BackgroundRegistry::summary_by_context` via the 5s-throttled `DriftState`
+  poll (`ui/drift.rs:16`, `poll_drift_state`). Both badges can visibly
+  disagree about whether "something is running" for up to 5s at both the
+  start and the end of the identical job. Not a bug in either badge — each is
+  internally correct for its own data path — but a real, correlatable skew a
+  user watching a long build could notice. Closing it means giving background
+  job transitions a push path (a `ServerEvent` variant, mirroring
+  `BlockStatusChanged`) rather than polling; not done here since it's new
+  scope, not a merge fix.
 - **External MCP servers don't load at all** — see the dedicated *MCP subsystem*
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
