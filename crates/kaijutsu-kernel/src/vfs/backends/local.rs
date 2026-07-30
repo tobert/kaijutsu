@@ -23,6 +23,7 @@ use crate::vfs::types::{DirEntry, FileAttr, FileType, SetAttr, StatFs};
 pub struct LocalBackend {
     root: PathBuf,
     read_only: bool,
+    opaque: bool,
 }
 
 impl LocalBackend {
@@ -36,6 +37,7 @@ impl LocalBackend {
         Self {
             root,
             read_only: false,
+            opaque: false,
         }
     }
 
@@ -46,12 +48,26 @@ impl LocalBackend {
         Self {
             root,
             read_only: true,
+            opaque: false,
         }
     }
 
     /// Set whether this filesystem is read-only.
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    /// Mark this mount opaque to ambient sweeps (`opaque_to_sweeps` —
+    /// `docs/scenes/vfs.md`). The mount stays directly readable (`kj ls`,
+    /// SFTP, an explicit dive); only the FSN backdrop/world walk stops at
+    /// this node instead of descending. Intended for host directories whose
+    /// listing is a live view of kernel-process state rather than a real
+    /// tree — `/dev/fd` on macOS reflects the calling process's own open
+    /// file descriptors and races `readdir`+`lstat` into stray `EBADF`s
+    /// (live-caught 2026-07-22).
+    pub fn opaque(mut self, opaque: bool) -> Self {
+        self.opaque = opaque;
+        self
     }
 
     /// Get the root path.
@@ -446,6 +462,10 @@ impl VfsOps for LocalBackend {
         self.read_only
     }
 
+    fn opaque_to_sweeps(&self) -> bool {
+        self.opaque
+    }
+
     async fn statfs(&self) -> VfsResult<StatFs> {
         #[cfg(unix)]
         {
@@ -560,6 +580,13 @@ mod tests {
 
         let result = backend.create(Path::new("test.txt"), 0o644).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_opaque_defaults_false_and_is_settable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!LocalBackend::new(dir.path()).opaque_to_sweeps());
+        assert!(LocalBackend::new(dir.path()).opaque(true).opaque_to_sweeps());
     }
 
     #[tokio::test]

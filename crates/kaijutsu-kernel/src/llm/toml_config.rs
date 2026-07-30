@@ -193,6 +193,8 @@ struct ProviderToml {
     /// `max_output_tokens`.
     #[serde(default)]
     models: HashMap<String, ModelToml>,
+    #[serde(default)]
+    key_optional: bool,
 
     /// Phase 5 D-54: retired. Deserialized and ignored for backwards
     /// compatibility with existing models.toml files that still carry a
@@ -306,6 +308,7 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
                 )
             })
             .collect();
+        config.key_optional = p.key_optional;
         // Phase 5 D-54: any `default_tools` block in TOML is silently
         // dropped; tool visibility is now managed by the broker's
         // `ContextToolBinding` + `McpHookPhase::ListTools`.
