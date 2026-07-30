@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use vello_svg::usvg;
 
 /// Shared font database for SVG `<text>` rendering.
 ///

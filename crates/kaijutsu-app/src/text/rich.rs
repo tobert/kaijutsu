@@ -5,7 +5,8 @@
 //! - **Sparkline**: inline timeseries mini-charts — plain Bevy UI rectangle
 //!   geometry now, not Vello (see `text::sparkline`); only detection and the
 //!   `SparklineData` payload live here.
-//! - **SVG**: inline vector graphics (via `vello_svg` + `usvg`)
+//! - **SVG**: inline vector graphics, CPU-rasterized via `usvg` + `resvg` +
+//!   `tiny-skia` (`text::svg_raster`) to a Bevy `Image`/`ImageNode` — no vello
 //!
 //! Detection is centralized in `detect_rich_content()` — tries sparkline first
 //! (more specific fence pattern), then SVG, then falls back to markdown.
@@ -39,8 +40,9 @@ pub struct SpanBrush {
 /// Rich content for a block cell — dispatches rendering by format.
 ///
 /// When present on a block cell entity, `build_block_scenes` renders it:
-/// into MSDF glyphs (Markdown, Output), the per-block vello scene (Svg,
-/// Abc only), or plain UI rectangle children (Sparkline, Image).
+/// into MSDF glyphs (Markdown, Output), the per-block vello scene (Abc
+/// only), a CPU-rasterized `Image`/`ImageNode` child (Svg, via
+/// `text::svg_raster`), or plain UI rectangle children (Sparkline, Image).
 #[derive(Component)]
 pub struct RichContent {
     pub kind: RichContentKind,
@@ -58,20 +60,20 @@ pub enum RichContentKind {
     /// Inline timeseries mini-chart — rendered as plain UI rectangle
     /// geometry (`text::sparkline::build_sparkline_geometry`), not Vello.
     Sparkline(SparklineData),
-    /// Inline SVG vector graphic.
+    /// Inline SVG vector graphic — parsed once here, rasterized (and
+    /// re-rasterized on a physical-pixel-size change) by
+    /// `view::block_render` via `text::svg_raster`.
     Svg {
-        /// Pre-parsed Vello scene from the SVG content.
-        scene: Arc<vello::Scene>,
+        /// Pre-parsed usvg tree. `<text>` elements are already resolved to
+        /// outlines against whatever `SvgFontDb` was available at parse time.
+        tree: Arc<usvg::Tree>,
         /// Original SVG width (for aspect-ratio scaling).
         width: f32,
-        /// Display height (capped to a reasonable maximum).
+        /// Original SVG height (for aspect-ratio scaling).
         height: f32,
-        /// Raw SVG source for future re-parse (e.g. DPI-aware re-rendering).
-        #[allow(dead_code)] // Retained for the planned DPI-aware re-parse.
+        /// Raw SVG source, retained for diagnostics / future re-parse.
+        #[allow(dead_code)] // Not read yet — kept for error-path diagnostics.
         source: Arc<String>,
-        /// Scale factor at parse time (placeholder for future DPI re-parse).
-        #[allow(dead_code)] // Retained for the planned DPI-aware re-parse.
-        rendered_at_dpi: f32,
     },
     /// ABC music notation — rendered directly to vello from engraving IR.
     Abc {
@@ -317,7 +319,7 @@ pub const SVG_MAX_HEIGHT: f32 = 8192.0;
 fn try_parse_svg(
     text: &str,
     svg_fontdb: Option<&super::SvgFontDb>,
-) -> Option<(Arc<vello::Scene>, f32, f32, Arc<String>)> {
+) -> Option<(Arc<usvg::Tree>, f32, f32, Arc<String>)> {
     let svg_str = if text.trim_start().starts_with("<svg") {
         text.trim()
     } else if let Some(inner) = extract_fenced_block(text, "svg") {
@@ -332,15 +334,14 @@ fn try_parse_svg(
 
     let options = match svg_fontdb {
         Some(fdb) => fdb.usvg_options(),
-        None => vello_svg::usvg::Options::default(),
+        None => usvg::Options::default(),
     };
 
-    match vello_svg::usvg::Tree::from_str(svg_str, &options) {
+    match usvg::Tree::from_str(svg_str, &options) {
         Ok(tree) => {
-            let scene = vello_svg::render_tree(&tree);
             let size = tree.size();
             let source = Arc::new(svg_str.to_string());
-            Some((Arc::new(scene), size.width(), size.height(), source))
+            Some((Arc::new(tree), size.width(), size.height(), source))
         }
         Err(e) => {
             // During streaming (Status::Running), incomplete SVG is expected to
@@ -402,14 +403,13 @@ pub fn detect_rich_content_typed(
     // If content type is declared, use it directly
     match content_type {
         ContentType::Svg => {
-            if let Some((scene, width, height, source)) = try_parse_svg(text, svg_fontdb) {
+            if let Some((tree, width, height, source)) = try_parse_svg(text, svg_fontdb) {
                 return Some(RichContent {
                     kind: RichContentKind::Svg {
-                        scene,
+                        tree,
                         width,
                         height,
                         source,
-                        rendered_at_dpi: 1.0,
                     },
                 });
             }
@@ -461,14 +461,13 @@ pub fn detect_rich_content_typed(
     }
 
     // Try SVG
-    if let Some((scene, width, height, source)) = try_parse_svg(text, svg_fontdb) {
+    if let Some((tree, width, height, source)) = try_parse_svg(text, svg_fontdb) {
         return Some(RichContent {
             kind: RichContentKind::Svg {
-                scene,
+                tree,
                 width,
                 height,
                 source,
-                rendered_at_dpi: 1.0,
             },
         });
     }
