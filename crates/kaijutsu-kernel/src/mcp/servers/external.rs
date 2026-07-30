@@ -14,10 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, Content, LoggingLevel,
-    LoggingMessageNotificationParam, Meta, ProgressNotificationParam, ReadResourceRequestParams,
-    ResourceContents, SubscribeRequestParams, UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
+    ProgressNotificationParam, ReadResourceRequestParams, RequestMetaObject, ResourceContents,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
+// Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kept for now, see the
+// `enable_roots` comment on `BrokerClientHandler::new` below.
+#[allow(deprecated)]
+use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient};
@@ -85,6 +89,13 @@ struct BrokerClientHandler {
 }
 
 impl BrokerClientHandler {
+    // Roots is deprecated by SEP-2577 (rmcp 1.8.0+) with no replacement
+    // capability — the MCP spec is dropping client-side roots/sampling
+    // wholesale, not superseding them. Kaibo/bevy_brp still negotiate against
+    // it today, so keep advertising it rather than silently withdrawing a
+    // capability older or unmigrated peers may still probe for; revisit when
+    // rmcp actually removes the API (tracked in docs/issues.md).
+    #[allow(deprecated)]
     fn new(tx: broadcast::Sender<ServerNotification>) -> Self {
         let mut info = ClientInfo::default();
         info.client_info.name = "kaijutsu".into();
@@ -97,6 +108,9 @@ impl BrokerClientHandler {
     }
 }
 
+// Logging is deprecated by SEP-2577 (rmcp 1.8.0+); see the `enable_roots`
+// comment above — same rationale, kept for now.
+#[allow(deprecated)]
 fn rmcp_level_to_log_level(level: LoggingLevel) -> LogLevel {
     // rmcp's LoggingLevel values: Debug, Info, Notice, Warning, Error,
     // Critical, Alert, Emergency. Collapse to our 5-level enum.
@@ -113,6 +127,9 @@ impl ClientHandler for BrokerClientHandler {
         self.info.clone()
     }
 
+    // Logging is deprecated by SEP-2577 (rmcp 1.8.0+); kept for now — see the
+    // `enable_roots` comment on `BrokerClientHandler::new`.
+    #[allow(deprecated)]
     fn on_logging_message(
         &self,
         params: LoggingMessageNotificationParam,
@@ -416,8 +433,10 @@ impl ExternalMcpServer {
         }
     }
 
-    fn build_meta(&self, ctx: &CallContext) -> Meta {
-        // Meta is a newtype over JsonObject; populate the three kaijutsu
+    fn build_meta(&self, ctx: &CallContext) -> RequestMetaObject {
+        // RequestMetaObject wraps MetaObject wraps JsonObject (rmcp 3.x split
+        // the old flat `Meta` newtype into request/notification/result
+        // variants — this is the request one); populate the three kaijutsu
         // fields per §5.4.
         let mut obj = serde_json::Map::new();
         obj.insert(
@@ -437,7 +456,7 @@ impl ExternalMcpServer {
                 }),
             );
         }
-        Meta(obj)
+        RequestMetaObject::from(obj)
     }
 }
 
@@ -476,7 +495,7 @@ fn translate_result(result: CallToolResult) -> KernelToolResult {
     let content = result
         .content
         .into_iter()
-        .map(|c: Content| match c.as_text() {
+        .map(|c: ContentBlock| match c.as_text() {
             Some(text) => ToolContent::Text(text.text.clone()),
             None => match serde_json::to_value(&c) {
                 Ok(v) => ToolContent::Json(v),
@@ -569,11 +588,11 @@ impl McpServerLike for ExternalMcpServer {
             .into_iter()
             .map(|r| KernelResource {
                 instance: self.instance_id.clone(),
-                uri: r.raw.uri.clone(),
-                name: r.raw.name.clone(),
-                description: r.raw.description.clone(),
-                mime_type: r.raw.mime_type.clone(),
-                size: r.raw.size.map(|s| s as u64),
+                uri: r.uri.clone(),
+                name: r.name.clone(),
+                description: r.description.clone(),
+                mime_type: r.mime_type.clone(),
+                size: r.size,
             })
             .collect();
         Ok(KernelResourceList { resources: mapped })
@@ -619,11 +638,29 @@ impl McpServerLike for ExternalMcpServer {
                     mime_type,
                     blob_base64: blob,
                 },
+                // `ResourceContents` is `#[non_exhaustive]` upstream — the
+                // untagged deserializer only ever produces the two variants
+                // above from any wire payload today, so this can only be
+                // reached by a *future* rmcp bump adding a third shape.
+                // Silently dropping unrecognized content would hand back an
+                // incomplete resource read as if it were complete (data
+                // corruption); fail loudly instead so the next rmcp bump's
+                // author has to map the new shape here.
+                other => unreachable!(
+                    "rmcp::model::ResourceContents gained a variant this match doesn't \
+                     handle yet: {other:?} — add a KernelResourceContents mapping"
+                ),
             })
             .collect();
         Ok(KernelReadResource { contents })
     }
 
+    // resources/subscribe is legacy-only per SEP-2577 (superseded by
+    // `Peer::listen` / `subscriptions/listen` for peers on protocol version
+    // 2026-07-28) — but that's a real subscription-model migration, not a
+    // drop-in swap, and out of scope for this dependency bump. Kept for now;
+    // tracked in docs/issues.md.
+    #[allow(deprecated)]
     async fn subscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
         if self.down.load(Ordering::Relaxed) {
             return Err(self.instance_down_error());
@@ -644,6 +681,9 @@ impl McpServerLike for ExternalMcpServer {
         Ok(())
     }
 
+    // resources/unsubscribe is likewise legacy-only per SEP-2577 — see the
+    // `subscribe` comment above.
+    #[allow(deprecated)]
     async fn unsubscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
         if self.down.load(Ordering::Relaxed) {
             return Err(self.instance_down_error());
