@@ -527,6 +527,20 @@ pub fn build_block_scenes(
                 // rectangles (thin rotated `Node`s for the stroke, axis-
                 // aligned ones for fill/joints), spawned as children below.
                 *render_method = BlockRenderMethod::Msdf;
+
+                // A sparkline has NO text of its own, which makes it the one
+                // arm that must clear glyphs explicitly. Every text-bearing
+                // arm ASSIGNS `msdf_glyphs.glyphs = glyphs`, and that
+                // assignment is what drops the previous content's glyphs; an
+                // arm that never assigns silently inherits them. The
+                // transition is the ordinary streaming path, not an edge
+                // case: a block arrives as text, and only when its closing
+                // fence lands does `detect_rich_content_typed` reclassify it
+                // as a sparkline — so without this the partially-streamed
+                // source text stays composited behind the plot.
+                msdf_glyphs.glyphs.clear();
+                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+
                 let h = theme.sparkline_height;
                 content_height = h;
 
