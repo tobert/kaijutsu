@@ -1077,8 +1077,35 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     pre-shader Vello values exactly on paper; worth a glance since the
     label now goes through MSDF (a different glyph pipeline) rather than
     Vello's `draw_glyphs`.
-  - ABC (`text/abc.rs`) and SVG (`text/rich.rs`, `vello_svg`) are
-    unchanged/still vello, both explicitly out of scope for this pass.
+  - ABC (`text/abc.rs`) is unchanged/still vello, out of scope for this pass.
+
+- **SVG block rendering off vello — also needs a visual pass** (2026-07-30,
+  `feat/svg-cpu`, branched from `feat/devello`; same "no running app during
+  the change" caveat as the de-vello pass above). `text/rich.rs`'s
+  `RichContentKind::Svg` now carries a parsed `usvg::Tree` instead of a
+  pre-rendered vello `Scene`; `view::block_render`'s `Svg` arm rasterizes it
+  via `resvg`/`tiny-skia` (`text::svg_raster`) into a straight-alpha RGBA8
+  `Image`, uploaded as a child `ImageNode` (same `ContentGeometryChildren`
+  despawn/respawn convention as sparkline/image). `vello_svg` is gone from
+  `Cargo.toml` entirely — ABC is now the only conversation-view consumer of
+  vello. Round-trip pixel tests (`text::svg_raster::tests`) cover the
+  premultiplied→straight alpha math and a real resvg render of a small
+  shape, but not the on-screen result. Worth eyeballing:
+  - **Any SVG with `<text>` elements** — `SvgFontDb`'s fontdb still feeds
+    `usvg::Options`, unchanged in shape, but this is the first real exercise
+    of that path through the new raster (previously vello's own
+    `draw_glyphs` rendered usvg's resolved outlines; now resvg/tiny-skia
+    does).
+  - **HiDPI crispness** — the raster is sized from the block's PHYSICAL
+    pixel box (`ComputedNode` × `TextMetrics::scale_factor`) and
+    re-rasterized on a DPI-only change (`BlockScene::svg_raster_physical_size`
+    staleness check in `build_block_scenes`); confirm on an actual HiDPI
+    display or scale-factor change that SVGs stay crisp rather than
+    blurring or going stale.
+  - **Malformed/unparseable SVG** — unchanged fallback (parse failure logs
+    and falls through to the plain-text/markdown path), but worth a manual
+    poke with genuinely broken markup to confirm it still reads as "here's
+    the raw text," not a blank block.
 
 - **Beat-reference delivery + turn-cadence follow-ups** (deferred from the
   2026-07-15 timestamped-beat-refs fix, merged `0a39718b` + live-verified;

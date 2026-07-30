@@ -1,12 +1,16 @@
-//! Per-block texture rendering (MSDF + shader decoration; Vello only for SVG/ABC).
+//! Per-block texture rendering (MSDF + shader decoration; Vello only for ABC).
 //!
 //! Each conversation block renders its own texture. Text blocks use MSDF
-//! (shader-quality text); SVG and ABC notation still rasterize via Vello
-//! (a CPU vector rasterizer, out of this crate's de-vello scope — see
-//! `docs/issues.md`). Sparklines and the image placeholder are plain Bevy UI
-//! geometry (child `Node`+`BackgroundColor` rects), not vello, not a shader.
-//! Block cells use `MaterialNode<BlockFxMaterial>` for border/glow/label
-//! decoration — role-group dividers ride the same material now (see
+//! (shader-quality text); ABC notation still rasterizes via Vello (a GPU
+//! vector rasterizer) — it is the last conversation-view content that does.
+//! SVG rasterizes on the CPU instead (`text::svg_raster`: usvg + resvg +
+//! tiny-skia into a straight-alpha RGBA8 buffer, uploaded as a child
+//! `Image`/`ImageNode`, sized and re-rasterized from the block's PHYSICAL
+//! pixel box — see the `Svg` arm of `build_block_scenes`). Sparklines and the
+//! image placeholder are plain Bevy UI geometry (child `Node`+`BackgroundColor`
+//! rects), not vello, not a shader. Block cells use
+//! `MaterialNode<BlockFxMaterial>` for border/glow/label decoration —
+//! role-group dividers ride the same material now (see
 //! `sync_role_group_headers`). Bevy's UI system handles scroll, clip,
 //! z-order. `BackgroundColor` works again. No coordinate space mismatches.
 
@@ -16,7 +20,10 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_asset::RenderAssets,
-    render_resource::{CommandEncoder, CommandEncoderDescriptor, PipelineCache},
+    render_resource::{
+        CommandEncoder, CommandEncoderDescriptor, Extent3d, PipelineCache, TextureDimension,
+        TextureFormat, TextureUsages,
+    },
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
@@ -42,9 +49,10 @@ use crate::text::{
 use crate::text::components::rainbow_brush;
 use crate::text::markdown::MarkdownColors;
 use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_geometry};
+use crate::text::svg_raster::{fit_svg_to_box, rasterize_svg};
 use crate::ui::theme::Theme;
 use crate::view::fieldset;
-use crate::view::ui_rtt::{UiVectorScene, UiRttTexture};
+use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, ui_rtt_texture_dims};
 use bevy::math::Rot2;
 use bevy::ui::UiTransform;
 
@@ -73,6 +81,14 @@ pub struct BlockScene {
     pub text: String,
     /// Text color (set by sync_block_cell_buffers).
     pub color: Color,
+    /// Physical pixel dimensions the `Svg` content-geometry child was last
+    /// rasterized at, `(0, 0)` meaning never. Only meaningful while
+    /// `RichContent` is `RichContentKind::Svg` — unused (and left stale, but
+    /// harmless) otherwise. Lets `build_block_scenes` detect a DPI-only
+    /// change (no content edit, no logical-width change) that still leaves
+    /// the raster stale, since a CPU raster — unlike vello/MSDF — is only
+    /// crisp at the physical size it was rendered for. See `text::svg_raster`.
+    pub svg_raster_physical_size: (u32, u32),
 }
 
 impl Default for BlockScene {
@@ -83,15 +99,18 @@ impl Default for BlockScene {
             scene_version: 0,
             text: String::new(),
             color: Color::WHITE,
+            svg_raster_physical_size: (0, 0),
         }
     }
 }
 
-/// Child rectangle entities a block's content-drawing arm spawned (sparkline
-/// polyline, image placeholder background) that must be despawned before the
-/// arm rebuilds them for new content. Every child is a plain Bevy UI `Node` +
-/// `BackgroundColor` (+ `UiTransform` for rotated stroke segments) — no
-/// vello, no custom shader; Bevy's own UI rasterizer draws every pixel.
+/// Child entities a block's content-drawing arm spawned (sparkline polyline,
+/// image placeholder background, or the rasterized `Svg` bitmap) that must be
+/// despawned before the arm rebuilds them for new content. Sparkline/image
+/// children are a plain Bevy UI `Node` + `BackgroundColor` (+ `UiTransform`
+/// for rotated stroke segments); the `Svg` child is a `Node` + `ImageNode`
+/// sampling a CPU-rasterized `Image` (`text::svg_raster`). No vello, no
+/// custom shader in any case — Bevy's own UI rasterizer draws every pixel.
 #[derive(Component, Default)]
 pub struct ContentGeometryChildren(pub Vec<Entity>);
 
@@ -170,6 +189,64 @@ fn spawn_segment_child(
         .id();
     commands.entity(parent).add_child(child);
     child
+}
+
+/// Spawn a child `Node` + `ImageNode` displaying `image` at `rect` (local
+/// content-space coordinates, LOGICAL px — the `Image` asset itself may hold
+/// more physical pixels than `rect`'s size implies, on a HiDPI display; that
+/// mismatch is exactly what makes it crisp instead of blurry).
+fn spawn_image_child(
+    commands: &mut Commands,
+    parent: Entity,
+    image: Handle<Image>,
+    rect: (f32, f32, f32, f32), // x, y, width, height
+    offset: (f32, f32),
+) -> Entity {
+    let (x, y, w, h) = rect;
+    let child = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(x + offset.0),
+                top: Val::Px(y + offset.1),
+                width: Val::Px(w),
+                height: Val::Px(h),
+                ..default()
+            },
+            ImageNode::new(image),
+        ))
+        .id();
+    commands.entity(parent).add_child(child);
+    child
+}
+
+/// Upload a straight-alpha RGBA8 buffer (see
+/// `text::svg_raster::unpremultiply_to_straight_rgba`) as a static sampled
+/// `Image` — `Rgba8UnormSrgb` so the GPU treats the bytes as sRGB-encoded
+/// color (matching what `resvg` produces) and converts to linear when
+/// sampling, same as any asset-loaded PNG/JPEG. Not a render target (contrast
+/// `ui_rtt::create_ui_rtt_texture`) — no `RENDER_ATTACHMENT`/`STORAGE_BINDING`
+/// usage needed, just sampling.
+fn create_svg_raster_image(
+    images: &mut Assets<Image>,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Handle<Image> {
+    let size = Extent3d {
+        width: width.max(1),
+        height: height.max(1),
+        depth_or_array_layers: 1,
+    };
+    let mut image = Image::new(
+        size,
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    images.add(image)
 }
 
 /// Dark background for the image placeholder rect (no real CAS→decode
@@ -374,6 +451,8 @@ pub fn build_block_scenes(
     time: Res<Time>,
     mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
+    gpu_limits: Res<GpuTextureLimits>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let font = fonts.get(&font_handles.mono);
 
@@ -417,6 +496,22 @@ pub fn build_block_scenes(
             continue;
         }
 
+        // Compute border padding offsets. Moved ahead of the needs_rebuild
+        // gate below so `content_width` is available for the `Svg`
+        // DPI-staleness check — everything here is cheap and independent of
+        // whether a rebuild actually happens.
+        let (pad_top, pad_bottom, pad_left, pad_right) = if let Some(style) = border {
+            (
+                style.padding.top,
+                style.padding.bottom,
+                style.padding.left,
+                style.padding.right,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        let content_width = (width - pad_left - pad_right).max(0.0);
+
         // Check if rebuild is needed.
         // Rainbow/animation effects are shader-driven (globals.time / uniforms.time)
         // and don't need CPU-side scene rebuilds AFTER the first build. But we must
@@ -426,8 +521,45 @@ pub fn build_block_scenes(
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
         let never_built = block_scene.last_built_version == 0;
+
+        // An `Svg` block's CPU raster (`text::svg_raster`) is only crisp at
+        // the PHYSICAL pixel size it was rendered for — unlike vello/MSDF
+        // content, which the GPU rescales cheaply at render time, a raster
+        // bitmap does not adapt on its own. A DPI-only change (window
+        // dragged to a different-scale monitor) can leave `width` (logical)
+        // and `content_version` both unchanged while still invalidating the
+        // raster, so neither `version_changed` nor `width_changed` catches
+        // it — check the physical target size directly against what was
+        // last rasterized.
+        //
+        // Capped additionally by `SVG_RASTER_MAX_DIM`, not just the GPU's
+        // texture limit: `gpu_limits.max_texture_dim` bounds a GPU texture,
+        // but this raster is a plain CPU-side `Vec<u8>` — some GPUs report
+        // texture limits (16k+) that would make a straight RGBA8 buffer at
+        // that size a multi-hundred-megabyte allocation for a single block.
+        let svg_max_dim = gpu_limits
+            .max_texture_dim
+            .min(crate::text::svg_raster::SVG_RASTER_MAX_DIM);
+        let svg_dpi_stale = match rich.map(|r| &r.kind) {
+            Some(RichContentKind::Svg { width: svg_w, height: svg_h, .. }) => {
+                fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT)
+                    .map(|(_, draw_w, draw_h)| {
+                        let target = ui_rtt_texture_dims(
+                            draw_w,
+                            draw_h,
+                            text_metrics.scale_factor,
+                            svg_max_dim,
+                        );
+                        target != block_scene.svg_raster_physical_size
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+
         let needs_rebuild = version_changed
             || width_changed
+            || svg_dpi_stale
             || (never_built && (is_rainbow || has_animation));
 
         if !needs_rebuild {
@@ -439,19 +571,6 @@ pub fn build_block_scenes(
             continue;
         };
 
-        // Compute border padding offsets
-        let (pad_top, pad_bottom, pad_left, pad_right) = if let Some(style) = border {
-            (
-                style.padding.top,
-                style.padding.bottom,
-                style.padding.left,
-                style.padding.right,
-            )
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
-        };
-
-        let content_width = (width - pad_left - pad_right).max(0.0);
         let max_advance = if content_width > 0.0 {
             Some(content_width)
         } else {
@@ -586,38 +705,94 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Svg {
-                scene: svg_scene,
+                tree,
                 width: svg_w,
                 height: svg_h,
                 ..
             }) => {
-                *render_method = BlockRenderMethod::Vello;
-                if *svg_w <= 0.0 {
-                    content_height = 0.0;
-                } else {
-                    let w_scale = content_width / svg_w;
-                    let h_scale = SVG_MAX_HEIGHT / svg_h;
-                    let scale = w_scale.min(h_scale) as f64;
-                    let scaled_h = *svg_h as f64 * scale;
-                    content_height = scaled_h as f32;
+                // CPU-rasterized (text::svg_raster), not vello: no scene to
+                // build, so this is always an Msdf block — the rasterized
+                // bitmap is a plain child ImageNode (below), same shape as
+                // the Sparkline/Image arms.
+                *render_method = BlockRenderMethod::Msdf;
 
-                    let clip_rect = vello::kurbo::Rect::new(
-                        pad_left as f64,
-                        pad_top as f64,
-                        (pad_left + content_width) as f64,
-                        (pad_top + content_height) as f64,
-                    );
-                    scene.push_layer(
-                        Fill::NonZero,
-                        vello::peniko::Mix::Normal,
-                        1.0,
-                        Affine::IDENTITY,
-                        &clip_rect,
-                    );
-                    let transform =
-                        Affine::translate(text_offset) * Affine::scale(scale);
-                    scene.append(svg_scene, Some(transform));
-                    scene.pop_layer();
+                // Like the Sparkline arm, Svg has no text of its own — every
+                // text-bearing arm ASSIGNS `msdf_glyphs.glyphs`, and it's
+                // that assignment (not any explicit cleanup) that drops the
+                // previous content's glyphs. Without this, a block that
+                // arrives as plain text and is only reclassified as Svg once
+                // its closing fence lands would silently inherit the
+                // partially-streamed source text, which then composites
+                // behind the raster in any transparent/semi-transparent
+                // region.
+                msdf_glyphs.glyphs.clear();
+                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+
+                match fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT) {
+                    None => {
+                        // `text::rich::try_parse_svg` already rejects a
+                        // non-positive intrinsic SVG size at detection time
+                        // (falling through to the plain-text path instead of
+                        // ever constructing `RichContentKind::Svg`), so
+                        // `svg_w`/`svg_h` are always positive here — the only
+                        // way this fires is a degenerate content BOX
+                        // (`content_width <= 0`, e.g. a block whose layout
+                        // hasn't settled yet). That's a transient, benign
+                        // "no room to draw it this frame" — width_changed
+                        // will trigger a rebuild once real width lands — not
+                        // a content problem, so rendering as empty content
+                        // here is correct, not a silent-blank regression.
+                        content_height = 0.0;
+                        block_scene.svg_raster_physical_size = (0, 0);
+                    }
+                    Some((fit_scale, draw_w, draw_h)) => {
+                        content_height = draw_h;
+
+                        let dpi_scale = text_metrics.scale_factor;
+                        let target = ui_rtt_texture_dims(draw_w, draw_h, dpi_scale, svg_max_dim);
+                        // `fit_scale` maps SVG user units to LOGICAL px;
+                        // chaining the DPI scale on top maps them straight to
+                        // PHYSICAL px in one pass, so the raster is sized and
+                        // scaled for its actual on-screen resolution rather
+                        // than an intermediate logical-res bitmap that then
+                        // gets upscaled blurrily.
+                        let content_scale = fit_scale * dpi_scale as f64;
+
+                        match rasterize_svg(tree, target.0, target.1, content_scale) {
+                            Some(rgba) => {
+                                let handle = create_svg_raster_image(
+                                    &mut images, target.0, target.1, rgba,
+                                );
+                                let child = spawn_image_child(
+                                    &mut commands,
+                                    entity,
+                                    handle,
+                                    (0.0, 0.0, draw_w, draw_h),
+                                    (pad_left, pad_top),
+                                );
+                                commands
+                                    .entity(entity)
+                                    .insert(ContentGeometryChildren(vec![child]));
+                            }
+                            None => {
+                                // Defensive only: `target` is clamped to >= 1
+                                // by `ui_rtt_texture_dims`, so tiny-skia's
+                                // pixmap allocation should never actually
+                                // fail here — see `rasterize_svg`'s doc
+                                // comment. `svg_raster_physical_size` still
+                                // gets updated below so a persistent failure
+                                // at a stable size can't force a rebuild
+                                // every frame.
+                                error!(
+                                    "SVG rasterize failed at {}x{} physical px \
+                                     (should be unreachable)",
+                                    target.0, target.1,
+                                );
+                            }
+                        }
+
+                        block_scene.svg_raster_physical_size = target;
+                    }
                 }
             }
             Some(RichContentKind::Abc { tune, .. }) => {
