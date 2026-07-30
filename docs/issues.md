@@ -85,6 +85,20 @@ these are the ones that block *using* the thing.
   **Known gap, not worth closing here**: a child wedged in D state never dies on
   SIGKILL, so `child.wait()` blocks and its entry stays `Running` forever — the
   watchdog catches a panicking supervisor, not a hung one.
+  **App-visibility slice SHIPPED 2026-07-30**: the app had zero visibility into
+  this (a 10-minute `cargo build` was invisible until it finished) — closed via
+  `BackgroundRegistry::summary_by_context` (kernel-derived per-context
+  aggregate: running count, oldest-running start time, most-recently-finished
+  outcome), five new `ContextHandleInfo` fields (`kaijutsu.capnp` @23-@27,
+  `background*`), and a `background_jobs` dock badge
+  (`kaijutsu-app/src/ui/dock.rs`) on the existing ~5s `DriftState` poll. Display
+  only — killing a job stays a model-driven MCP tool call, no dock button.
+  Left for later: no full SSH-level e2e test for the new wire fields (matches
+  how `contextUsedPct` itself was tested — unit + wire-sentinel + capnp
+  round-trip only, no client RPC verb exists to start a background job to
+  exercise end-to-end); a hard-failure indicator is momentary (~5s poll, then
+  the badge blends into the next state) with no "sticky until acknowledged"
+  treatment.
 - **External MCP servers don't load at all** — see the dedicated *MCP subsystem*
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.

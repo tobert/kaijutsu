@@ -256,6 +256,30 @@ pub struct ContextInfo {
     /// (wire sentinel -1.0) — decoded here so no code above this boundary
     /// has to remember what -1.0 means.
     pub context_used_pct: Option<f32>,
+    /// Background processes (`kaijutsu_kernel::background_exec`) currently
+    /// `Running` in this context. `0` when none — the honest "nothing
+    /// running" state, not a sentinel (kernel:
+    /// `BackgroundRegistry::summary_by_context`).
+    pub background_running_count: u32,
+    /// Unix-millis `started_at` of the longest-running currently-`Running`
+    /// background process, or `None` when nothing is running (0 on the
+    /// wire) — the elapsed-time anchor the dock's "how long" formatting
+    /// subtracts `now` from.
+    pub background_oldest_running_started_at: Option<u64>,
+    /// Unix-millis the most-recently-finished background process ended, or
+    /// `None` when nothing has finished yet — including one that finished
+    /// more than the kernel's `DEFAULT_RETENTION` ago and has since been
+    /// reaped (the registry's own forgetting is this field's natural TTL,
+    /// no separate expiry tracked on the wire).
+    pub background_last_finished_at: Option<u64>,
+    /// `"exited"` or `"killed"` for the process `background_last_finished_at`
+    /// describes; `None` when nothing has finished (empty string on the
+    /// wire).
+    pub background_last_finished_status: Option<String>,
+    /// Exit code for an `"exited"` finish; `None` for a `"killed"` finish or
+    /// when nothing has finished (-1 sentinel on the wire — real exit
+    /// codes, including the `128 + signal` convention, are never negative).
+    pub background_last_exit_code: Option<i32>,
 }
 
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
@@ -2696,6 +2720,32 @@ fn parse_context_info(
         pct => Some(pct),
     };
 
+    let background_running_count = reader.get_background_running_count();
+    let background_oldest_running_started_at =
+        match reader.get_background_oldest_running_started_at() {
+            0 => None,
+            ts => Some(ts),
+        };
+    let background_last_finished_at = match reader.get_background_last_finished_at() {
+        0 => None,
+        ts => Some(ts),
+    };
+    let background_last_finished_status_str =
+        reader.get_background_last_finished_status()?.to_str().unwrap_or("");
+    let background_last_finished_status = if background_last_finished_status_str.is_empty() {
+        None
+    } else {
+        Some(background_last_finished_status_str.to_string())
+    };
+    // -1 is the dedicated "no exit code" sentinel (a killed process, or
+    // nothing finished yet) — real exit codes (including the `128 + signal`
+    // convention `background_exec.rs` uses) are never negative, so there is
+    // no collision the way there would be with a plain 0-means-none scheme.
+    let background_last_exit_code = match reader.get_background_last_exit_code() {
+        -1 => None,
+        code => Some(code),
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2719,6 +2769,11 @@ fn parse_context_info(
         context_window,
         context_used_tokens,
         context_used_pct,
+        background_running_count,
+        background_oldest_running_started_at,
+        background_last_finished_at,
+        background_last_finished_status,
+        background_last_exit_code,
     })
 }
 
@@ -4147,6 +4202,88 @@ mod tests {
         assert_eq!(parsed3.context_window, Some(200_000));
         assert_eq!(parsed3.context_used_tokens, Some(50_000));
         assert_eq!(parsed3.context_used_pct, Some(25.0));
+    }
+
+    /// Background-process ambient-state wire spine (`ContextHandleInfo`
+    /// `background*` fields @23-@27, `kaijutsu_kernel::background_exec`).
+    /// Two sentinels to pin down here, mirroring the `contextUsedPct`
+    /// coverage above: (1) an unset/no-history context decodes every field
+    /// as `None`/`0`, never a fabricated "0 running"-that-looks-intentional;
+    /// (2) a genuinely successful `exited(0)` must survive as `Some(0)`,
+    /// never collapsing into the `-1` "no exit code" sentinel a killed
+    /// process uses.
+    #[test]
+    fn test_parse_context_info_background_sentinel_roundtrip() {
+        // Nothing ever backgrounded in this context: every field must
+        // decode as the honest "none" sentinel.
+        let mut message = MessageBuilder::new_default();
+        let mut builder =
+            message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[11u8; 16]);
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed = parse_context_info(&reader).unwrap();
+        assert_eq!(parsed.background_running_count, 0);
+        assert_eq!(parsed.background_oldest_running_started_at, None);
+        assert_eq!(parsed.background_last_finished_at, None);
+        assert_eq!(parsed.background_last_finished_status, None);
+        assert_eq!(
+            parsed.background_last_exit_code, None,
+            "unset backgroundLastExitCode (-1 schema default) must decode as unknown, not Some(-1)"
+        );
+
+        // Two still running, anchored on the oldest one's start time.
+        let mut message2 = MessageBuilder::new_default();
+        let mut builder2 =
+            message2.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder2.set_id(&[11u8; 16]);
+        builder2.set_background_running_count(2);
+        builder2.set_background_oldest_running_started_at(1_000);
+        let reader2 = message2
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed2 = parse_context_info(&reader2).unwrap();
+        assert_eq!(parsed2.background_running_count, 2);
+        assert_eq!(parsed2.background_oldest_running_started_at, Some(1_000));
+        assert_eq!(parsed2.background_last_finished_at, None);
+
+        // A genuinely successful exit(0) must round-trip as Some(0), never
+        // confused with "killed"/"no exit code" (-1).
+        let mut message3 = MessageBuilder::new_default();
+        let mut builder3 =
+            message3.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder3.set_id(&[11u8; 16]);
+        builder3.set_background_last_finished_at(5_000);
+        builder3.set_background_last_finished_status("exited");
+        builder3.set_background_last_exit_code(0);
+        let reader3 = message3
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed3 = parse_context_info(&reader3).unwrap();
+        assert_eq!(parsed3.background_last_finished_at, Some(5_000));
+        assert_eq!(parsed3.background_last_finished_status, Some("exited".to_string()));
+        assert_eq!(
+            parsed3.background_last_exit_code,
+            Some(0),
+            "a genuinely successful exit(0) must NOT be confused with the -1 'no exit code' sentinel"
+        );
+
+        // A killed process: no exit code at all — must decode as None, not
+        // a fabricated 0 or the -1 wire sentinel leaking through.
+        let mut message4 = MessageBuilder::new_default();
+        let mut builder4 =
+            message4.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder4.set_id(&[11u8; 16]);
+        builder4.set_background_last_finished_at(6_000);
+        builder4.set_background_last_finished_status("killed");
+        builder4.set_background_last_exit_code(-1);
+        let reader4 = message4
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed4 = parse_context_info(&reader4).unwrap();
+        assert_eq!(parsed4.background_last_finished_status, Some("killed".to_string()));
+        assert_eq!(parsed4.background_last_exit_code, None);
     }
 
     /// Stage 3 (time-well) wire spine: `trackId` on `ContextHandleInfo`

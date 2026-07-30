@@ -103,6 +103,7 @@
 //! persistent and replicated to every connected viewer, so unbounded growth
 //! there is a much sharper cost.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -248,6 +249,44 @@ pub struct BackgroundSnapshot {
     pub finished_at_unix_ms: Option<u64>,
 }
 
+/// Per-context ambient-state summary for the APP's dock — not the MCP tools'
+/// per-process detail ([`BackgroundSnapshot`]), but the aggregate a human
+/// glances at: is anything running right now, for how long, and how did the
+/// last one end. Crosses the wire via `ContextHandleInfo`'s `background*`
+/// fields (`kaijutsu.capnp` @23-@27) — see
+/// `kaijutsu-server::rpc::resolve_background_wire_fields` for the sentinel
+/// encoding and `kaijutsu-client::rpc::parse_context_info` for the decode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackgroundSummary {
+    /// How many of this context's background processes are `Running` right
+    /// now. `0` when none are — the honest "nothing running" state, not a
+    /// sentinel.
+    pub running_count: u32,
+    /// Unix-ms `started_at` of the OLDEST still-`Running` entry — the
+    /// elapsed-time anchor for "how long has this been going". `None` when
+    /// nothing is running.
+    pub oldest_running_started_at_unix_ms: Option<u64>,
+    /// The most-recently-finished (`Exited`/`Killed`) entry, by
+    /// `finished_at`. `None` when nothing has finished yet — including a
+    /// process that finished more than [`DEFAULT_RETENTION`] ago and has
+    /// since been reaped: the registry's own forgetting is this field's
+    /// natural TTL, no separate expiry tracked here.
+    pub last_finished: Option<BackgroundFinishedSummary>,
+}
+
+/// The outcome half of [`BackgroundSummary`] — one finished background
+/// process, reduced to what the dock needs to say "how did it end".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundFinishedSummary {
+    /// `"exited"` or `"killed"` — the same tag [`BackgroundStatus::tag`]
+    /// produces, never `"running"` (a `Running` entry is never selected as
+    /// `last_finished`).
+    pub status: &'static str,
+    /// `Some(code)` for `"exited"`, `None` for `"killed"`.
+    pub exit_code: Option<i32>,
+    pub finished_at_unix_ms: u64,
+}
+
 /// Kernel-owned registry of background processes. See the module docs for the
 /// ownership/cleanup/output-bounding contract.
 pub struct BackgroundRegistry {
@@ -352,6 +391,70 @@ impl BackgroundRegistry {
             .get(&id)
             .filter(|e| e.context_id == context_id)
             .map(|e| e.snapshot())
+    }
+
+    /// Every context's [`BackgroundSummary`] in one pass — the dock's "one
+    /// query for the whole kernel" counterpart to [`Self::list_for_context`],
+    /// mirroring the `usage_map`/`track_of` batching convention
+    /// `kaijutsu-server::rpc::list_contexts` already uses for
+    /// per-context-usage and per-context-track lookups. A context with no
+    /// background processes at all (past or present) is simply absent from
+    /// the map — the caller treats a missing entry exactly like
+    /// [`BackgroundSummary::default`] (nothing running, nothing finished).
+    pub fn summary_by_context(&self) -> HashMap<ContextId, BackgroundSummary> {
+        self.reap_expired();
+
+        #[derive(Default)]
+        struct Accum {
+            running_count: u32,
+            oldest_running: Option<SystemTime>,
+            last_finished: Option<(SystemTime, BackgroundFinishedSummary)>,
+        }
+
+        let mut acc: HashMap<ContextId, Accum> = HashMap::new();
+        for e in self.entries.iter() {
+            let a = acc.entry(e.context_id).or_default();
+            if e.status.is_running() {
+                a.running_count += 1;
+                if a.oldest_running.map(|t| e.started_at < t).unwrap_or(true) {
+                    a.oldest_running = Some(e.started_at);
+                }
+                continue;
+            }
+            // Terminal entries always carry `finished_at` (set atomically
+            // with the status in `mark_exited`/`mark_killed`) — the `if let`
+            // is defensive, not an expected-empty case.
+            if let Some(finished_at) = e.finished_at {
+                let is_newer = a
+                    .last_finished
+                    .as_ref()
+                    .map(|(prev, _)| finished_at > *prev)
+                    .unwrap_or(true);
+                if is_newer {
+                    a.last_finished = Some((
+                        finished_at,
+                        BackgroundFinishedSummary {
+                            status: e.status.tag(),
+                            exit_code: e.status.exit_code(),
+                            finished_at_unix_ms: unix_millis(finished_at),
+                        },
+                    ));
+                }
+            }
+        }
+
+        acc.into_iter()
+            .map(|(ctx_id, a)| {
+                (
+                    ctx_id,
+                    BackgroundSummary {
+                        running_count: a.running_count,
+                        oldest_running_started_at_unix_ms: a.oldest_running.map(unix_millis),
+                        last_finished: a.last_finished.map(|(_, s)| s),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Signal a running process to stop. Returns `true` iff a running entry
@@ -1126,5 +1229,239 @@ mod tests {
         // No list_for_context/get_for_context call anywhere below — only the
         // periodic sweep can remove it.
         wait_for(StdDuration::from_secs(5), || (registry.len() == 0).then_some(())).await;
+    }
+
+    /// The dock's ambient-state ask: several processes running at once must
+    /// report the right count AND the OLDEST one's start time (the elapsed
+    /// anchor), not just "something is running".
+    #[tokio::test]
+    async fn summary_by_context_reports_running_count_and_oldest_started_at() {
+        let (blocks, ctx_id, principal) = setup();
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let block_a = running_block(&blocks, ctx_id, principal);
+        let id_a = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "sleep 5".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id: block_a,
+            },
+        )
+        .unwrap();
+
+        // Force a measurable (well above SystemTime's ms resolution) gap so
+        // "oldest" has an unambiguous answer.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        let block_b = running_block(&blocks, ctx_id, principal);
+        let id_b = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "sleep 5".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id: block_b,
+            },
+        )
+        .unwrap();
+
+        wait_for(StdDuration::from_secs(2), || {
+            registry.get_for_context(id_b, ctx_id).filter(|s| s.status == "running")
+        })
+        .await;
+
+        let a_started_at = registry.get_for_context(id_a, ctx_id).unwrap().started_at_unix_ms;
+
+        let summary = registry
+            .summary_by_context()
+            .get(&ctx_id)
+            .cloned()
+            .expect("ctx_id must have a summary while two processes are running");
+        assert_eq!(summary.running_count, 2, "both processes are still Running");
+        assert_eq!(
+            summary.oldest_running_started_at_unix_ms,
+            Some(a_started_at),
+            "the OLDEST running process (spawned first) anchors the elapsed-time reading"
+        );
+        assert!(summary.last_finished.is_none(), "nothing has finished yet");
+
+        // Clean up so the test doesn't leak two live `sleep 5`s.
+        registry.cancel(id_a, ctx_id);
+        registry.cancel(id_b, ctx_id);
+    }
+
+    /// A failed (nonzero exit) background process must surface as
+    /// `last_finished` with the real exit code — "how did it end" for the
+    /// dock's failure case.
+    #[tokio::test]
+    async fn summary_by_context_reports_nonzero_exit_as_last_finished() {
+        let (blocks, ctx_id, principal) = setup();
+        let registry = Arc::new(BackgroundRegistry::new());
+        let block_id = running_block(&blocks, ctx_id, principal);
+
+        let id = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "exit 9".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .unwrap();
+
+        wait_for(StdDuration::from_secs(5), || {
+            registry.get_for_context(id, ctx_id).filter(|s| s.status == "exited")
+        })
+        .await;
+
+        let summary = registry.summary_by_context().remove(&ctx_id).expect("ctx_id must have a summary");
+        assert_eq!(summary.running_count, 0);
+        let finished = summary.last_finished.expect("the exited process must be reported");
+        assert_eq!(finished.status, "exited");
+        assert_eq!(finished.exit_code, Some(9));
+    }
+
+    /// A killed process has no exit code — `last_finished.exit_code` must be
+    /// `None`, never a fabricated `0` or the signal's raw number.
+    #[tokio::test]
+    async fn summary_by_context_reports_killed_with_no_exit_code() {
+        let (blocks, ctx_id, principal) = setup();
+        let registry = Arc::new(BackgroundRegistry::new());
+        let block_id = running_block(&blocks, ctx_id, principal);
+
+        let id = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "sleep 30".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id,
+            },
+        )
+        .unwrap();
+
+        wait_for(StdDuration::from_secs(2), || {
+            registry.get_for_context(id, ctx_id).filter(|s| s.status == "running")
+        })
+        .await;
+        registry.cancel(id, ctx_id);
+
+        wait_for(StdDuration::from_secs(5), || {
+            registry.get_for_context(id, ctx_id).filter(|s| s.status == "killed")
+        })
+        .await;
+
+        let summary = registry.summary_by_context().remove(&ctx_id).expect("ctx_id must have a summary");
+        let finished = summary.last_finished.expect("the killed process must be reported");
+        assert_eq!(finished.status, "killed");
+        assert_eq!(finished.exit_code, None, "a killed process has no exit code to report");
+    }
+
+    /// Of several finished processes, `last_finished` must be the one that
+    /// finished MOST RECENTLY (by wall time), not the first one spawned or
+    /// the first one inserted into the map.
+    #[tokio::test]
+    async fn summary_by_context_last_finished_picks_the_most_recent_by_finish_time() {
+        let (blocks, ctx_id, principal) = setup();
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let block_fast = running_block(&blocks, ctx_id, principal);
+        spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "exit 3".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id: block_fast,
+            },
+        )
+        .unwrap();
+
+        let block_slow = running_block(&blocks, ctx_id, principal);
+        let id_slow = spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                // Comfortably longer than the fast command, so it finishes
+                // strictly later regardless of scheduler jitter.
+                command: "sleep 0.3; exit 5".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_id,
+                principal_id: principal,
+                block_id: block_slow,
+            },
+        )
+        .unwrap();
+
+        wait_for(StdDuration::from_secs(5), || {
+            registry.get_for_context(id_slow, ctx_id).filter(|s| s.status == "exited")
+        })
+        .await;
+
+        let summary = registry.summary_by_context().remove(&ctx_id).expect("ctx_id must have a summary");
+        let finished = summary.last_finished.expect("both processes have finished");
+        assert_eq!(
+            finished.exit_code,
+            Some(5),
+            "the LATER-finishing process (exit 5) must win over the earlier one (exit 3)"
+        );
+    }
+
+    /// A context with no background processes at all (past or present) is
+    /// simply absent from the map — the caller treats a missing entry like
+    /// `BackgroundSummary::default()`, and this must never leak another
+    /// context's summary.
+    #[tokio::test]
+    async fn summary_by_context_omits_contexts_with_no_background_history() {
+        let (blocks, ctx_a, principal) = setup();
+        let ctx_b = ContextId::new();
+        blocks.create_document(ctx_b, DocKind::Conversation, None).unwrap();
+        let registry = Arc::new(BackgroundRegistry::new());
+
+        let block_a = running_block(&blocks, ctx_a, principal);
+        spawn_background(
+            &registry,
+            &blocks,
+            SpawnBackgroundParams {
+                command: "true".to_string(),
+                cwd: std::env::temp_dir(),
+                env: test_env(),
+                context_id: ctx_a,
+                principal_id: principal,
+                block_id: block_a,
+            },
+        )
+        .unwrap();
+
+        wait_for(StdDuration::from_secs(5), || {
+            registry.summary_by_context().get(&ctx_a).filter(|s| s.last_finished.is_some()).cloned()
+        })
+        .await;
+
+        let by_ctx = registry.summary_by_context();
+        assert!(by_ctx.contains_key(&ctx_a), "ctx_a spawned a process, must be present");
+        assert!(
+            !by_ctx.contains_key(&ctx_b),
+            "ctx_b never spawned anything — must be absent, not a fabricated default entry"
+        );
     }
 }

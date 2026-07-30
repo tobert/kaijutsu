@@ -1274,6 +1274,11 @@ mod tests {
             context_window: None,
             context_used_tokens: None,
             context_used_pct: None,
+            background_running_count: 0,
+            background_oldest_running_started_at: None,
+            background_last_finished_at: None,
+            background_last_finished_status: None,
+            background_last_exit_code: None,
         }
     }
 

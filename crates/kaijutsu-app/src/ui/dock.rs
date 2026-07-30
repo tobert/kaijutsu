@@ -102,6 +102,12 @@ pub struct DockState {
     pub context_usage: DockText,
     pub agent_activity: DockText,
     pub block_activity: DockText,
+    /// Ambient visibility into `background_exec.rs`'s host-process registry
+    /// for the active context — "is anything backgrounded still running,
+    /// and how did the last one end" (docs/issues.md "Background shell +
+    /// process management"). Empty text = nothing running and nothing ever
+    /// finished, same "hidden when idle" convention as `block_activity`.
+    pub background_jobs: DockText,
     pub hints: DockText,
     pub contexts: ContextsState,
 }
@@ -147,6 +153,11 @@ impl Default for DockState {
                 font_size: 13.0,
             },
             block_activity: DockText {
+                text: String::new(),
+                color: Color::WHITE,
+                font_size: 13.0,
+            },
+            background_jobs: DockText {
                 text: String::new(),
                 color: Color::WHITE,
                 font_size: 13.0,
@@ -617,6 +628,20 @@ pub fn render_south_dock(
         x += w + gap;
     }
 
+    if !dock_state.background_jobs.text.is_empty() {
+        let brush = bevy_color_to_brush(dock_state.background_jobs.color);
+        let w = draw_dock_text(
+            &mut scene,
+            &dock_state.background_jobs.text,
+            x,
+            pad_v,
+            dock_state.background_jobs.font_size,
+            font,
+            &brush,
+        );
+        x += w + gap;
+    }
+
     // Context badges — between activity and hints
     let ctx = &dock_state.contexts;
     if let Some((ref source, ref preview)) = ctx.notification {
@@ -872,7 +897,10 @@ pub fn update_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_connection_error, format_context_usage, format_token_count};
+    use super::{
+        classify_connection_error, format_background_activity, format_context_usage,
+        format_elapsed_ms, format_token_count, BackgroundActivityLevel,
+    };
 
     #[test]
     fn format_token_count_below_thousand_is_exact() {
@@ -986,6 +1014,118 @@ mod tests {
             classify_connection_error("reconnect backoff (attempt 3, 4.0s remaining)"),
             None
         );
+    }
+
+    #[test]
+    fn format_elapsed_ms_seconds_only_under_a_minute() {
+        assert_eq!(format_elapsed_ms(0), "0s");
+        assert_eq!(format_elapsed_ms(59_000), "59s");
+    }
+
+    #[test]
+    fn format_elapsed_ms_minutes_and_seconds_under_an_hour() {
+        assert_eq!(format_elapsed_ms(60_000), "1m00s");
+        assert_eq!(format_elapsed_ms(192_000), "3m12s");
+    }
+
+    #[test]
+    fn format_elapsed_ms_hours_and_minutes_past_an_hour() {
+        assert_eq!(format_elapsed_ms(3_600_000), "1h00m");
+        assert_eq!(format_elapsed_ms(3_600_000 + 5 * 60_000), "1h05m");
+    }
+
+    /// Nothing running, nothing ever finished — the "hidden when idle"
+    /// state, same convention `block_activity` uses for its own empty text.
+    #[test]
+    fn background_activity_idle_when_nothing_running_or_finished() {
+        let (text, level) = format_background_activity(0, None, None, None, None, 10_000);
+        assert_eq!(text, "");
+        assert_eq!(level, BackgroundActivityLevel::Idle);
+    }
+
+    /// One process running: singular phrasing, elapsed anchored on its own
+    /// start time.
+    #[test]
+    fn background_activity_one_running_shows_elapsed_since_start() {
+        let (text, level) =
+            format_background_activity(1, Some(1_000), None, None, None, 1_000 + 5_000);
+        assert_eq!(text, "\u{2699} running 5s");
+        assert_eq!(level, BackgroundActivityLevel::Running);
+    }
+
+    /// Several running: count shown, elapsed anchored on the OLDEST one
+    /// (the wire's `oldest_running_started_at`), not an average or the
+    /// newest.
+    #[test]
+    fn background_activity_several_running_shows_count_and_oldest_elapsed() {
+        let (text, level) =
+            format_background_activity(3, Some(0), None, None, None, 192_000);
+        assert_eq!(text, "\u{2699} 3 running (3m12s)");
+        assert_eq!(level, BackgroundActivityLevel::Running);
+    }
+
+    /// A running process always wins over a stale finished outcome — there
+    /// IS something to watch right now, so the last-finished text must not
+    /// leak through while something is still going.
+    #[test]
+    fn background_activity_running_takes_precedence_over_last_finished() {
+        let (text, level) = format_background_activity(
+            1,
+            Some(9_000),
+            Some(1_000),
+            Some("exited"),
+            Some(1),
+            10_000,
+        );
+        assert!(text.starts_with("\u{2699} running"), "got: {text:?}");
+        assert_eq!(level, BackgroundActivityLevel::Running);
+    }
+
+    /// A clean exit(0) after everything else finished — the "just
+    /// succeeded" case, rendered calmly (Finished, not Failed).
+    #[test]
+    fn background_activity_clean_exit_is_finished_not_failed() {
+        let (text, level) =
+            format_background_activity(0, None, Some(5_000), Some("exited"), Some(0), 17_000);
+        assert_eq!(text, "\u{2699} exited 12s ago");
+        assert_eq!(level, BackgroundActivityLevel::Finished);
+    }
+
+    /// A nonzero exit is the "just failed" case the dock must call out —
+    /// Failed level, exit code visible.
+    #[test]
+    fn background_activity_nonzero_exit_is_failed_with_code() {
+        let (text, level) =
+            format_background_activity(0, None, Some(5_000), Some("exited"), Some(1), 17_000);
+        assert_eq!(text, "\u{2699} exited(1) 12s ago");
+        assert_eq!(level, BackgroundActivityLevel::Failed);
+    }
+
+    /// A killed process has no exit code — must read "killed", never a
+    /// fabricated exit code.
+    #[test]
+    fn background_activity_killed_is_failed_with_no_fabricated_code() {
+        let (text, level) =
+            format_background_activity(0, None, Some(5_000), Some("killed"), None, 17_000);
+        assert_eq!(text, "\u{2699} killed 12s ago");
+        assert_eq!(level, BackgroundActivityLevel::Failed);
+    }
+
+    /// The running -> terminal transition: once `running_count` drops to 0
+    /// and a finished outcome is reported, the badge must switch from the
+    /// "running" phrasing to the "how did it end" phrasing — never keep
+    /// showing "running" past the process's actual completion.
+    #[test]
+    fn background_activity_transitions_from_running_to_finished() {
+        let (running_text, running_level) =
+            format_background_activity(1, Some(1_000), None, None, None, 3_000);
+        assert_eq!(running_level, BackgroundActivityLevel::Running);
+        assert!(running_text.contains("running"));
+
+        let (done_text, done_level) =
+            format_background_activity(0, None, Some(4_000), Some("exited"), Some(0), 6_000);
+        assert_eq!(done_level, BackgroundActivityLevel::Finished);
+        assert!(!done_text.contains("running"), "must not still say 'running' after it finished");
     }
 }
 
@@ -1304,6 +1444,161 @@ fn format_abbreviated(value: f64, suffix: &str) -> String {
     }
 }
 
+/// Which of the dock's semantic theme colors the background-jobs badge
+/// should render with. Kept as a small enum (not `bevy::Color` itself) so
+/// `format_background_activity`'s state -> text mapping is unit-testable
+/// with no `Theme` resource involved — `update_background_jobs` maps this
+/// to a color at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundActivityLevel {
+    /// Nothing running, nothing ever finished (or it aged out of the
+    /// kernel's own retention and was reaped) — badge renders as empty text.
+    Idle,
+    /// At least one background process is still running.
+    Running,
+    /// The most-recently-finished process exited cleanly (code 0).
+    Finished,
+    /// The most-recently-finished process was killed or exited nonzero.
+    Failed,
+}
+
+/// Format the background-jobs dock badge from a context's background-process
+/// ambient-state wire fields (`ContextInfo::background_*`, decoded from
+/// `ContextHandleInfo` @23-@27 by `kaijutsu_client::parse_context_info`) —
+/// display only, no interaction (killing a job stays a model-driven MCP
+/// tool call, not a dock click), same spirit as `format_context_usage`.
+///
+/// Precedence: a still-running process always wins over a past one's
+/// outcome — there IS something to watch right now. Only once nothing is
+/// running does the last-finished outcome surface. Nothing ever
+/// running/finished renders as empty text (`BackgroundActivityLevel::Idle`)
+/// — never a fabricated "0 running".
+pub(crate) fn format_background_activity(
+    running_count: u32,
+    oldest_running_started_at_unix_ms: Option<u64>,
+    last_finished_at_unix_ms: Option<u64>,
+    last_finished_status: Option<&str>,
+    last_exit_code: Option<i32>,
+    now_unix_ms: u64,
+) -> (String, BackgroundActivityLevel) {
+    if running_count > 0 {
+        let elapsed = oldest_running_started_at_unix_ms
+            .map(|started| now_unix_ms.saturating_sub(started))
+            .unwrap_or(0);
+        let text = if running_count == 1 {
+            format!("\u{2699} running {}", format_elapsed_ms(elapsed))
+        } else {
+            format!("\u{2699} {running_count} running ({})", format_elapsed_ms(elapsed))
+        };
+        return (text, BackgroundActivityLevel::Running);
+    }
+
+    match (last_finished_at_unix_ms, last_finished_status) {
+        (None, None) => (String::new(), BackgroundActivityLevel::Idle),
+        (Some(finished_at), Some(status)) => {
+            let ago = format_elapsed_ms(now_unix_ms.saturating_sub(finished_at));
+            match status {
+                "exited" => match last_exit_code {
+                    Some(0) => (
+                        format!("\u{2699} exited {ago} ago"),
+                        BackgroundActivityLevel::Finished,
+                    ),
+                    Some(code) => (
+                        format!("\u{2699} exited({code}) {ago} ago"),
+                        BackgroundActivityLevel::Failed,
+                    ),
+                    // Shouldn't happen (an "exited" status always carries a
+                    // code) — shown rather than silently hidden, since a
+                    // display gap here would mask a real wire/decode bug.
+                    None => (
+                        format!("\u{2699} exited(?) {ago} ago"),
+                        BackgroundActivityLevel::Failed,
+                    ),
+                },
+                "killed" => (
+                    format!("\u{2699} killed {ago} ago"),
+                    BackgroundActivityLevel::Failed,
+                ),
+                // Unrecognized status string — an honest "something's off"
+                // marker rather than silently falling back to empty (a
+                // real state we CAN observe is inconsistent).
+                other => (format!("\u{2699} {other} {ago} ago"), BackgroundActivityLevel::Idle),
+            }
+        }
+        // Half-set wire pair (one of the two set, the other not) — the
+        // server always sets both or neither. Rendered rather than hidden,
+        // for the same "don't silently mask an inconsistent state" reason.
+        _ => ("\u{2699} ?".to_string(), BackgroundActivityLevel::Idle),
+    }
+}
+
+/// Bucket a millisecond duration for the dock's tight horizontal budget:
+/// `< 1min` -> seconds, `< 1hr` -> minutes+seconds, else hours+minutes.
+/// Not locale-aware — a legible-at-a-glance approximation, same spirit as
+/// `format_token_count`.
+fn format_elapsed_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Update the background-jobs badge — "is anything backgrounded still
+/// running, and how did the last one end" for the active context, Amy's ask
+/// for app visibility into `background_exec.rs` (docs/issues.md
+/// "Background shell + process management"). Reads the SAME kernel-derived
+/// `ContextInfo.background_*` fields the context-usage badge reads its own
+/// fields from — display only, no interaction. Refreshes on the same
+/// ~5s `DriftState` poll cadence the model badge and context-usage badge
+/// already use (`ui/drift.rs::DRIFT_POLL_INTERVAL`) — the elapsed-time text
+/// is therefore accurate to within one poll interval, not per-frame.
+pub fn update_background_jobs(
+    drift_state: Res<DriftState>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    theme: Res<Theme>,
+    mut dock: ResMut<DockState>,
+) {
+    if !drift_state.is_changed() && !doc_cache.is_changed() {
+        return;
+    }
+
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let (text, level) = doc_cache
+        .active_id()
+        .and_then(|active_id| drift_state.contexts.iter().find(|ctx| ctx.id == active_id))
+        .map(|ctx| {
+            format_background_activity(
+                ctx.background_running_count,
+                ctx.background_oldest_running_started_at,
+                ctx.background_last_finished_at,
+                ctx.background_last_finished_status.as_deref(),
+                ctx.background_last_exit_code,
+                now_unix_ms,
+            )
+        })
+        .unwrap_or((String::new(), BackgroundActivityLevel::Idle));
+
+    let color = match level {
+        BackgroundActivityLevel::Idle => theme.fg_dim,
+        BackgroundActivityLevel::Running => theme.accent,
+        BackgroundActivityLevel::Finished => theme.fg_dim,
+        BackgroundActivityLevel::Failed => theme.error,
+    };
+
+    if dock.background_jobs.text != text {
+        dock.background_jobs.text = text;
+        dock.background_jobs.color = color;
+    }
+}
+
 /// Tracks running block counts for the BlockActivity widget.
 #[derive(Default)]
 pub(crate) struct BlockActivityCounts {
@@ -1391,6 +1686,7 @@ impl Plugin for DockPlugin {
                     update_model_badge,
                     update_context_usage_badge,
                     update_block_activity,
+                    update_background_jobs,
                     // Conversation-only: the dock's ComputedNode/GlobalTransform
                     // survive Visibility::Hidden, so without the gate a click
                     // in the dock's footprint would switch contexts UNDER a

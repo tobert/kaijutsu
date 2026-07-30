@@ -3211,6 +3211,13 @@ impl kernel::Server for KernelImpl {
                 // lookup that could disagree with it.
                 let llm_registry = kernel_arc.llm().read().await;
 
+                // Background-process ambient state — one query for the whole
+                // kernel (same batching convention as usage_map/track_of
+                // above). A context absent from the map has no background
+                // history at all; `resolve_background_wire_fields` treats
+                // that identically to `BackgroundSummary::default()`.
+                let bg_by_ctx = kernel_arc.background_processes().summary_by_context();
+
                 // Read from the kernel's drift router — runtime authority for provider/model
                 let drift = kernel_arc.drift().read();
                 let contexts = drift.list_contexts();
@@ -3269,6 +3276,19 @@ impl kernel::Server for KernelImpl {
                     c.set_context_window(wire_window);
                     c.set_context_used_tokens(wire_used_tokens);
                     c.set_context_used_pct(wire_used_pct);
+
+                    // Background-process ambient state — app visibility into
+                    // `background_exec.rs` (kaijutsu.capnp ContextHandleInfo
+                    // doc comment). `resolve_background_wire_fields` is unit
+                    // tested directly (`background_wire_tests` below).
+                    let bg_summary = bg_by_ctx.get(&ctx.id).cloned().unwrap_or_default();
+                    let (bg_running, bg_oldest, bg_last_at, bg_last_status, bg_last_code) =
+                        resolve_background_wire_fields(&bg_summary);
+                    c.set_background_running_count(bg_running);
+                    c.set_background_oldest_running_started_at(bg_oldest);
+                    c.set_background_last_finished_at(bg_last_at);
+                    c.set_background_last_finished_status(bg_last_status);
+                    c.set_background_last_exit_code(bg_last_code);
 
                     // Supplement with synthesis data (keywords + preview)
                     if let Some(ref idx) = semantic_index
@@ -8379,6 +8399,140 @@ mod context_usage_wire_tests {
         assert_eq!(
             resolve_usage_wire_fields(Some(&u), Some(200_000)),
             (200_000, 50_000, 25.0)
+        );
+    }
+}
+
+/// Resolve one context's background-process ambient-state wire quintuple
+/// (`ContextHandleInfo.background*`, `kaijutsu.capnp` @23-@27) from its
+/// `BackgroundSummary` (`kaijutsu_kernel::background_exec`). Pulled out of
+/// `list_contexts` so the sentinel selection — `0`/empty-string/`-1` for
+/// "nothing running, nothing finished" — is unit-testable independent of
+/// the capnp builder (`background_wire_tests` below). Never fabricates: a
+/// context with no background history at all gets every field's honest
+/// "none" sentinel, same spirit as `resolve_usage_wire_fields` above.
+fn resolve_background_wire_fields(
+    summary: &kaijutsu_kernel::background_exec::BackgroundSummary,
+) -> (u32, u64, u64, &'static str, i32) {
+    let oldest_running = summary.oldest_running_started_at_unix_ms.unwrap_or(0);
+    match &summary.last_finished {
+        Some(f) => (
+            summary.running_count,
+            oldest_running,
+            f.finished_at_unix_ms,
+            f.status,
+            f.exit_code.unwrap_or(-1),
+        ),
+        None => (summary.running_count, oldest_running, 0, "", -1),
+    }
+}
+
+#[cfg(test)]
+mod background_wire_tests {
+    //! `resolve_background_wire_fields` — the exact plumbing `list_contexts`
+    //! uses to fill `ContextHandleInfo.background*`. Pins down the sentinel
+    //! convention: `0`/empty/`-1` mean "nothing to report", and must never
+    //! collide with a real (and legitimately zero-ish) value — mirroring
+    //! `context_usage_wire_tests` above for the `contextUsedPct` sentinel.
+    use super::resolve_background_wire_fields;
+    use kaijutsu_kernel::background_exec::{BackgroundFinishedSummary, BackgroundSummary};
+
+    #[test]
+    fn nothing_running_or_finished_is_every_sentinel() {
+        let summary = BackgroundSummary::default();
+        assert_eq!(
+            resolve_background_wire_fields(&summary),
+            (0, 0, 0, "", -1),
+            "a context with no background history must get every honest 'none' sentinel"
+        );
+    }
+
+    #[test]
+    fn running_only_reports_count_and_oldest_but_no_finished_fields() {
+        let summary = BackgroundSummary {
+            running_count: 2,
+            oldest_running_started_at_unix_ms: Some(1_000),
+            last_finished: None,
+        };
+        assert_eq!(
+            resolve_background_wire_fields(&summary),
+            (2, 1_000, 0, "", -1),
+            "running state must not fabricate a finished outcome"
+        );
+    }
+
+    /// The case the `-1` sentinel exists for: a real exit code of `0` (a
+    /// perfectly ordinary successful exit) must round-trip as `Some(0)`-shaped
+    /// wire data, never confused with "no exit code to report".
+    #[test]
+    fn exited_zero_is_a_real_zero_not_unknown() {
+        let summary = BackgroundSummary {
+            running_count: 0,
+            oldest_running_started_at_unix_ms: None,
+            last_finished: Some(BackgroundFinishedSummary {
+                status: "exited",
+                exit_code: Some(0),
+                finished_at_unix_ms: 5_000,
+            }),
+        };
+        assert_eq!(
+            resolve_background_wire_fields(&summary),
+            (0, 0, 5_000, "exited", 0),
+            "a genuinely successful exit(0) must NOT be confused with 'no exit code'"
+        );
+    }
+
+    #[test]
+    fn exited_nonzero_reports_the_real_code() {
+        let summary = BackgroundSummary {
+            running_count: 0,
+            oldest_running_started_at_unix_ms: None,
+            last_finished: Some(BackgroundFinishedSummary {
+                status: "exited",
+                exit_code: Some(9),
+                finished_at_unix_ms: 5_000,
+            }),
+        };
+        assert_eq!(resolve_background_wire_fields(&summary), (0, 0, 5_000, "exited", 9));
+    }
+
+    /// A killed process has no exit code at all — the wire must carry the
+    /// `-1` "none" sentinel, never a fabricated `0` or a signal number.
+    #[test]
+    fn killed_has_no_exit_code_wire_sentinel() {
+        let summary = BackgroundSummary {
+            running_count: 0,
+            oldest_running_started_at_unix_ms: None,
+            last_finished: Some(BackgroundFinishedSummary {
+                status: "killed",
+                exit_code: None,
+                finished_at_unix_ms: 5_000,
+            }),
+        };
+        assert_eq!(
+            resolve_background_wire_fields(&summary),
+            (0, 0, 5_000, "killed", -1),
+            "a killed process must report the -1 'no exit code' sentinel, not a fabricated 0"
+        );
+    }
+
+    /// Some still running AND a past finish both known at once (a job
+    /// finished while another is still going) — both halves must surface
+    /// together, neither one suppressing the other.
+    #[test]
+    fn running_and_last_finished_coexist() {
+        let summary = BackgroundSummary {
+            running_count: 1,
+            oldest_running_started_at_unix_ms: Some(2_000),
+            last_finished: Some(BackgroundFinishedSummary {
+                status: "exited",
+                exit_code: Some(1),
+                finished_at_unix_ms: 1_500,
+            }),
+        };
+        assert_eq!(
+            resolve_background_wire_fields(&summary),
+            (1, 2_000, 1_500, "exited", 1)
         );
     }
 }
