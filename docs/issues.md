@@ -6,6 +6,191 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Day-job coding readiness (2026-07-29, live-kernel probe + deepseek review)
+
+Amy: *"I want to get kaijutsu's coding functionality up to a level I can use for
+my day job."* Verified against a running kernel (probed via `kaijutsu-mcp
+--connect`) plus source. The **tool surface is not the gap** — `builtin.file`'s
+hashline anchors and CRDT-aware `grep` are ahead of Claude Code's equivalents.
+The gap is **context economics**: nothing measures or bounds what a turn costs.
+
+Complements the Gemini CLI comparison below (2026-06-23) — that pass found the
+same web/background/ask_user holes from a different angle. Don't duplicate;
+these are the ones that block *using* the thing.
+
+**Tier 0 — small fixes.** *A1/A2 SHIPPED 2026-07-29 (`4ed99bd3`).*
+
+- ~~**Redundant hardcoded tool timeout clamps the configurable one.**~~ **FIXED
+  `4ed99bd3`.** `llm_stream.rs`'s `const TOOL_TIMEOUT_SECS: u64 = 120` wrapped a
+  broker call that *already* enforced per-instance `policy.call_timeout`
+  (`broker.rs:1372`), so the const won and no build over 2 min could run.
+  Removed; `PolicyError::Timeout` now maps to the same `tool.timeout`
+  ErrorPayload using the real `timeout_ms`. **`kj policy set` is now the sole,
+  sufficient ceiling for a coder-context tool call** — verified: the LLM idle
+  (30s) and request (300s) timeouts only bound the *token stream* (tool calls
+  run strictly after it closes), kaish's own 1800s request timeout sits inside
+  the broker's call, and `kaijutsu-mcp`'s 300s/600s shell cap
+  (`kaijutsu-mcp/src/lib.rs:950`) governs the separate producer-seat path only.
+- **CORRECTION to the original claim, recorded because it changes the
+  priority.** This entry first read *"one `cargo build 2>&1` destroys the
+  context"*. That is **wrong for the shell path**: kaish already truncates and
+  spills. `OutputLimitConfig::agent()` is an **8 KiB cap, 1 KiB head, 512 B
+  tail, `SpillMode::Disk`** (`kaish-kernel-0.13.0/src/output_limit.rs:27-33`),
+  applied *inside* the broker's call — so the broker's `max_result_bytes` check
+  essentially never fires for `shell`. The other builtins are self-bounded too
+  (`read` 2000 lines / 2000 chars-per-line; `grep` 200 matches, skips >1 MB
+  files; search tools take `max_matches`). The 64 MiB default was a weak
+  backstop *behind* per-tool caps that were already doing the work — not the
+  open floodgate this entry implied. It still wanted fixing (64 KiB now, and
+  head+tail beats tail-drop since compiler errors live in the tail — both
+  shipped in `4ed99bd3`), but rank it below token accounting, not beside it.
+  The genuinely unbounded surface is `block_read` on a large block and external
+  MCP results — and external MCP doesn't load at all today.
+- **Pre-existing exit-code asymmetry, found during A1.** kaish remaps a spilled
+  (truncated) result to exit code 3. `rpc.rs:7450` classifies exit 2/3 as
+  `Status::Done`; `ShellServer::call_tool` (`mcp/servers/shell.rs`) treats exit
+  3 as `is_error = true`. So the same spilled-output outcome reads as success on
+  one path and failure on the other. Untouched by `4ed99bd3`. Decide which is
+  right — "ran fine, output spilled" is arguably `Done` with a pointer to the
+  spill file, and a model told `is_error` may retry a command that succeeded.
+- **No token accounting anywhere in the kernel.** `Usage { input_tokens,
+  output_tokens, cache_read.. }` (`llm/stream.rs:242`) is parsed off every
+  provider stream and consumed by *nothing*. The numbers already arrive; nobody
+  reads them.
+  - Denominator SHIPPED 2026-07-29 (`36f57547`) as hand-maintained per-model
+    `context_window` in models.toml, resolving to `Option<u64>` — never a
+    fabricated default. **Follow-up: stop hand-maintaining it for Anthropic.**
+    `GET /v1/models/{id}` returns the window live as **`max_input_tokens`**
+    (note: there is no `context_window` field — that name is ours), alongside
+    `max_tokens` (output cap) and a `capabilities` tree. A hand-kept table goes
+    stale on every model launch; the config should be the *override*, the API
+    the source. Non-Anthropic providers still need the config path, so this is
+    additive, not a replacement. Also: `claude-sonnet-4-20250514` (used by the
+    `balanced`/`default` aliases) is deliberately unset — an honest gap the
+    live lookup would close.
+- **Compaction triggers on block count, not tokens** (`kj/compact.rs:18`,
+  threshold 200). Wrong signal for coding: 20 blocks of build output blow the
+  window while 200 tiny blocks trigger a pointless summarize. `hydrate.rs` has
+  no budget either — it ships every non-compacted block.
+
+**Tier 1 — needed daily**
+
+- ~~**Background process management.**~~ **SHIPPED 2026-07-30.** `shell` takes
+  `background: true`, spawning `/bin/sh -c` directly on the host (bypassing the
+  per-call kaish materialization, which can't host a registry that outlives the
+  call) and streaming into a CRDT block; a kernel-owned `BackgroundRegistry`
+  (`background_exec.rs`) plus a `builtin.background` sibling server
+  (`list_background_processes` / `read_background_output` /
+  `kill_background_process`). Orphan-proof via `PR_SET_PDEATHSIG`.
+  **Known gap, not worth closing here**: a child wedged in D state never dies on
+  SIGKILL, so `child.wait()` blocks and its entry stays `Running` forever — the
+  watchdog catches a panicking supervisor, not a hung one.
+- **External MCP servers don't load at all** — see the dedicated *MCP subsystem*
+  section immediately below. This also closes the "BYO a scraper MCP" escape
+  hatch for the missing web tools.
+
+## MCP subsystem — audit 2026-07-29 (sonnet, read-only, verified against source + git history)
+
+Amy: *"we can add items to work on mcp servers, we haven't maintained that in a
+while and have changed a lot around it."* Ranked most-broken first. Entries the
+audit **disproved** were deleted from the Gemini-comparison section below rather
+than left to rot.
+
+- **External MCP is a complete implementation with no caller — HIGH.**
+  `mcp/servers/external.rs` (722 lines) is *solid*, not half-built: stdio/HTTP
+  transport, `connect`/`reconnect`, `_meta` propagation, correct `Health::Down`
+  handling that doesn't down an instance on `METHOD_NOT_FOUND`, unit tests. But
+  `McpServerConfig` is never constructed and `connect()` never called outside its
+  own tests; all ~130 `broker.register*` call sites register builtins
+  (`kernel.rs:598-720`). Cause is exact: `8e650fcb` (Phase 1 M3) built the new
+  type, then `cc5cb05a` (Phase 1 M5, *"aggressive deletions… no dual paths"*)
+  deleted the old `mcp_pool.rs` (~3046 LOC) and `mcp_config.rs` (221 LOC,
+  the TOML→config loader) wholesale — and the replacement caller was never
+  written. `ssh.rs:275` marks the spot.
+  **Fix (~real subsystem work, not a knob)**: rebuild the mcp.toml→
+  `Vec<McpServerConfig>` loader (~200 LOC, `mcp_config.rs`'s old job against the
+  new struct), call it at `ssh.rs:275`, extend the schema (below), and add a
+  `kj mcp reload` verb.
+- **`kj config set mcp.toml` silently does nothing — the exact pattern we reject.**
+  The write lands in the CRDT correctly and there is no watcher, no reload hook,
+  no consumer. The command succeeds and has zero runtime effect. (The config
+  layer itself is fine — seeded via `config_seed.rs:25,65`, `kj config`
+  list/show/set/edit/reset all correct and tested. The problem is purely that
+  nothing reads the file.) Also: mcp.toml's header documents a `fork` field
+  ("share"/"instance"/"exclude") that **has no corresponding field in
+  `McpServerConfig`** — vestigial doc for a feature never built.
+- **No per-server `call_timeout` in the schema — blocks the kaibo case.**
+  `InstancePolicy::for_kernel` (`policy.rs:44`) hands every instance the
+  kernel-wide 120s default (`kaijutsu-types/src/timeout.rs:84`); `McpServerConfig`
+  has no timeout override field at all. A 5–15 minute kaibo consultation dies at
+  120s *even after* the turn-loop clamp fix. `policy_set` can raise it live, but
+  see next item.
+- **No `InstancePolicy` persists across restart — undocumented.** `Broker.policies`
+  (`broker.rs:537`) is a bare in-memory `RwLock<HashMap<InstanceId,
+  InstancePolicy>>` with no DB table (contrast hooks, which *do* persist). Any
+  live-tuned `call_timeout_ms`/`max_result_bytes` silently reverts on restart.
+  Policy is keyed by instance globally, not per-context. **Cheaper fix than a
+  policy table**: source per-instance overrides from mcp.toml at registration so
+  restart re-derives them. (`max_concurrency` being registration-only is a
+  *documented, deliberate* choice to avoid racing in-flight semaphore permits —
+  that part is fine, leave it.)
+- **Hook self-lockout has no recovery path inside our own conventions.** A
+  `PreCall Deny("*")` locks out `builtin.hooks` itself — even `hook_list` and
+  `hook_remove` return `Denied` — and because hooks are hydrated from SQLite at
+  `Broker::set_db` (`broker.rs:275,283`, bridge in `mcp/hook_persist.rs`), it
+  **survives a restart**. Proven by an executable test,
+  `hooks_admin_is_subject_to_hooks` (`hooks_builtin.rs:1229`). There is no
+  `kj hook` CLI. The only documented recovery is hand-editing kernel SQLite,
+  which violates our own standing rule against touching that DB directly.
+  Two doc comments disagree about this; `bindings_builtin.rs:22-25` ("hooks are
+  in-memory", "restart to recover") is **stale and wrong** — `broker.rs:1465` is
+  right. Fix the comment (one line), then decide the real question: a hard-coded
+  carve-out so admin instances can always self-repair, **or** a `kj hook` path
+  that bypasses broker hook evaluation.
+- **`bevy_brp` and `invoke_peer` do NOT overlap** — settled, don't re-litigate.
+  `peers.rs` is a named-peer action registry (`switch_context`, `active_context`)
+  for drift navigation; BRP is entity introspection/screenshots. Orthogonal. The
+  kernel today has **no BRP access whatsoever** — the only thing reaching
+  `bevy_brp_mcp` is Claude Code's own MCP client, entirely outside the kernel.
+- **kaibo as a kernel-side MCP server — the credential/cwd worries are unfounded.**
+  It reads provider keys from `~/.config/kaibo/config.toml` directly, so with the
+  kernel running as the same unix user (shared-trust model) a spawned subprocess
+  authenticates with no env forwarding. Project root is an ordinary `--root <path>`
+  arg, already representable in `McpServerConfig.args`. `cwd` is wired correctly
+  (`external.rs:216`) and does **not** inherit the "headless turn cwd is `/`" bug
+  (that one is kaish `ExecContext`-specific). Only the timeout items above block it.
+- **Tool-name collisions fail safe — low priority.** `clean_visible_tool_name` is
+  not injective (`builtin.block__x` and `builtin_block__x` both clean to the
+  same), and `apply_resolutions` (`binding.rs:435`) *skips* rather than overwrites
+  a colliding second tool. So the failure mode is a tool going invisible, never a
+  call routing to the wrong instance. Untested for the cross-instance case; worth
+  a test, not a redesign.
+- Cosmetic: `hook_types.rs:3` points at `docs/hooks.md`, which doesn't exist.
+- **No project-instructions discovery** (CLAUDE.md/AGENTS.md analog).
+  `build_system_prompt` (`llm/system_prompt.rs:69`) assembles base + rc `.md` +
+  `<situation>` and never crawls the filesystem; `assets/defaults/system.md` is
+  13 lines. Every project convention must be hand-loaded into an rc script.
+  *(Two Gemini-pass entries below cover the design: JIT subdirectory injection +
+  filesystem memory-file discovery.)*
+
+**Tier 2 — velocity**
+
+- **Delegation has no join.** `kj fork --prompt` → `request_child_turn`
+  (`kj/fork.rs:1369`) publishes `TurnFlow::Requested` and returns; nothing waits
+  or notifies, and there is no `kj wait`. The parent must poll or manually
+  `kj drift pull`. Compare Claude Code's `Task`, which blocks or wakes the
+  caller. *(Relates to "Headless one-shot with JSONL streaming" below.)*
+- **No task/plan state.** No `BlockKind` variant, no tool. A model can only
+  `block_create` freeform text and re-read it. Compare TodoWrite.
+- **No LSP / diagnostics** — no go-to-definition, no type errors without paying
+  for a full compile.
+- **`register_session` hard-fails on label conflict** instead of reusing the
+  existing context: `KernelDb insert_context failed for <id>: label conflict:
+  label '<uuid>' already in use`. It stamps the caller's agent-session id as the
+  context label, so a reconnect after a dropped session is fatal until the label
+  is freed. Hit live 2026-07-29. Related to the known
+  "startup agent detection can report a previous session's id" gotcha.
+
 ## ⬆ NEXT UP (Amy, 2026-07-16): MCP shell reply timeouts — replies lost while execution succeeds
 
 Bumped to next-in-queue after ongoing work closes. Long dismissed as "the
@@ -2171,10 +2356,6 @@ candidates, not commitments.
   is LLM-API-only). Without a fetch primitive the instrument can't research anything
   not pre-loaded; every harness must BYO scraper MCP. Add a `builtin.web` server:
   HTML→text fetch (rate-limited, private-IP block, untrusted-content wrapper) + search.
-- **Background shell + process management.** `builtin.shell` is synchronous only —
-  no `is_background`, no PID registry, no tail-read companion. Long builds/test-suites/
-  service-starts can't be modeled without serializing. Add `is_background` +
-  `list_background_processes` / `read_background_output`.
 - **`read_many` (multi-glob batch read).** Today: glob then loop-read. gemini
   `read_many_files` expands patterns, reads all matches (incl. images/PDF/audio),
   returns one joined payload with per-file truncation markers. Saves turns on
@@ -2198,12 +2379,25 @@ candidates, not commitments.
   mid-session mode. gemini `enter_plan_mode`/`exit_plan_mode` flips to read-only with
   a visible reason. A lightweight plan-mode token (vs the heavier fork) for
   single-session exploration constraint, surfaced to the harness via a `KjResult` variant.
-- **Socket hook vs. Hook Table alignment.** The legacy MCP socket hook (for session mirroring) has drifted from core structures, causing silent data loss
-  (e.g., `agent_id` vs `principal_id` mismatch, obsolete `tool_response` key, fragile PID-based socket discovery). Details in
-  the design pass in git history (`docs/mcp-hook-alignment.md`, deleted 2026-07-04).
-- **Latency overhead on visible tool scans.** [list_visible_tools](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/broker.rs#L1081) is called on **every single tool dispatch** to refresh naming resolutions, causing lock contention
-  on `self.instances` and `self.bindings` and extra async hops. These resolutions should be cached per context and invalidated only when bindings change.
-- **Contradictory hook persistence documentation.** [BuiltinBindingsServer](file:///home/atobey/src/kaijutsu/crates/kaijutsu-kernel/src/mcp/servers/bindings_builtin.rs#L64) claims hooks are "in-memory only" when they are actually eagerly hydrated and written to SQLite in `broker.rs`.
+- **Caching visible-tool resolutions — future-proofing, NOT a live hot path.**
+  *(Downgraded 2026-07-29 audit; the previous entry claimed `list_visible_tools`
+  ran on every tool dispatch. It doesn't.)* `build_tool_definitions` →
+  `list_tool_defs_via_broker` (`kernel.rs:532`) runs **once per LLM turn**
+  (`llm_stream.rs:318`); the tool list is computed before the agentic loop and
+  reused unchanged through it. The only per-call retrigger is the model invoking
+  `tool_search`. The `RwLock`s are also never held across `list_tools().await`.
+  With only in-memory builtins registered this costs nothing — revisit when
+  Phase 2 lands external servers with genuinely slow `list_tools`.
+
+*(Deleted 2026-07-29: "Socket hook vs. Hook Table alignment" — verified FIXED in
+`6d45414c` (2026-06-18), before the entry was even written. `agent_id`→
+`principal_id` maps correctly in `contrib/adapters/claude-to-kaijutsu.jq:29`,
+`.tool_response // .tool_output` is handled at :23, and
+`crates/kaijutsu-mcp/tests/adapter_mapping.rs` round-trips real fixtures. The
+"fragile PID-based socket discovery" claim was also stale — `resolve_hook_socket`
+is now a 6-stage ladder with ping-based session disambiguation and a stale-socket
+sweep, with 10+ tests. "Contradictory hook persistence documentation" also
+deleted — folded into the hook-lockout entry below, which is the real issue.)*
 
 ### Safety, sandboxing & policy
 
