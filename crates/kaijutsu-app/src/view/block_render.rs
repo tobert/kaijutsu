@@ -211,10 +211,12 @@ impl Plugin for BlockRenderPlugin {
             return;
         };
 
-        // Block cells + MSDF text surfaces rasterize their vello scene via the
-        // generic UiRttPlugin (extract_vello_scenes / render_vello_scenes);
-        // this plugin owns only the MSDF compositing pass, which runs *after* the
-        // generic vello render so borders/content land in the texture first.
+        // SVG/ABC block cells rasterize their vello scene via the generic
+        // UiRttPlugin (extract_vello_scenes / render_vello_scenes); this
+        // plugin owns only the MSDF compositing pass, which runs *after* the
+        // generic vello render so SVG/ABC content lands in the texture
+        // first (borders are a separate BlockFxMaterial post-process, never
+        // part of this texture's contents).
         render_app
             .init_resource::<ExtractedMsdfAtlas>()
             .init_resource::<ExtractedMsdfBlockData>()
@@ -337,10 +339,13 @@ fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
     (logical * scale).round() / scale
 }
 
-/// Build vello scenes for block cells.
+/// Build each block cell's content: MSDF glyphs for text, a vello scene for
+/// SVG/ABC only, or plain UI rectangle children for sparkline/image content.
 ///
 /// Runs in PostUpdate after UiSystems::Layout. For each block with changed
-/// content or width, builds a complete vello scene (text + rich content + border).
+/// content or width, rebuilds whichever of those its `RichContent` calls for.
+/// Border/glow/label decoration is a separate `BlockFxMaterial` post-process
+/// (`shaders::sync_block_fx`), not built here.
 pub fn build_block_scenes(
     mut commands: Commands,
     mut block_cells: Query<
@@ -499,7 +504,7 @@ pub fn build_block_scenes(
                 );
                 let fallback_brush = bevy_color_to_brush(theme.block_assistant);
 
-                // MSDF renders text; Vello scene only gets borders
+                // MSDF renders text; `scene` stays empty for markdown blocks.
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
@@ -1138,8 +1143,10 @@ pub fn resize_block_textures(
 
 /// Render MSDF text glyphs to per-block textures.
 ///
-/// Runs after Vello rendering so borders are already present in the texture.
-/// MSDF text is composited on top with premultiplied alpha blending.
+/// Runs after Vello rendering so SVG/ABC content is already present in the
+/// texture for text-bearing blocks that have it (most blocks have none —
+/// see `has_vello_content` below). MSDF text is composited on top with
+/// premultiplied alpha blending.
 pub fn render_msdf_block_textures(
     msdf_renderer: Option<Res<MsdfBlockRenderer>>,
     msdf_atlas: Res<ExtractedMsdfAtlas>,
@@ -1232,7 +1239,9 @@ pub fn render_msdf_block_textures(
             gamma_correction: render_params.gamma_correction,
         };
 
-        // Clear if no Vello content (no border); composite if Vello drew borders first
+        // Clear if this block has no vello content (plain text/geometry
+        // block); composite on top if it's an SVG/ABC block and vello
+        // already rasterized it into the texture this frame.
         let clear = !item.has_vello_content;
         let rendered = msdf_renderer.encode_render(
             &device,
@@ -1326,7 +1335,10 @@ struct ExtractedMsdfBlockItem {
     scale: f32,
     version: u64,
     rainbow: bool,
-    /// Whether Vello rendered borders first (false = MSDF must clear).
+    /// Whether this is an SVG/ABC block that vello already rendered into
+    /// the texture this frame (false = the texture has no prior content and
+    /// MSDF must clear it before compositing; that covers everything else,
+    /// borders included — border decoration is never part of this texture).
     has_vello_content: bool,
 }
 
