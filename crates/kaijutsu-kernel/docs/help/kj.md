@@ -66,6 +66,8 @@ drive           Clock one autonomous turn on a context (--prompt)
 editor          open, keys, state, save, quit, list — kernel-owned vi editor sessions
 fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
+mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
+                bevy_brp, …); configured-vs-actually-running visibility + reconcile
 model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
 play            Play a sample now, or commit it as a clip cell onto a track with

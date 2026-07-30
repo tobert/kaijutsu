@@ -4,14 +4,40 @@
 # Each server entry specifies how to connect (stdio subprocess or HTTP).
 #
 # Server fields:
-#   enabled    - Whether to launch this server (default: true)
-#   transport  - "stdio" (default) or "streamable_http"
-#   command    - Executable path (stdio only)
-#   args       - Arguments array (stdio only)
-#   env        - Environment variables table
-#   cwd        - Working directory (stdio only)
-#   url        - Server URL (streamable_http only)
-#   fork       - Fork behavior: "share" (default), "instance", or "exclude"
+#   enabled         - Whether to launch this server (default: true)
+#   transport       - "stdio" (default) or "streamable_http"
+#   command         - Executable path (stdio only)
+#   args            - Arguments array (stdio only)
+#   env             - Environment variables table
+#   cwd             - Working directory (stdio only)
+#   url             - Server URL (streamable_http only)
+#   call_timeout_ms - Per-server override for how long a single tool call may
+#                     run before timing out (default: the kernel-wide
+#                     mcp_call_timeout_default, 120000ms). A long-running
+#                     consultation (e.g. kaibo) needs this raised well above
+#                     the default.
+#
+# `kj mcp reload` re-reads this file and reconciles it against what's
+# actually running; `kj mcp list` shows configured-vs-running with health.
+# Editing this file (`kj config set/edit mcp.toml`) has no live effect on its
+# own — run `kj mcp reload` afterward.
 
 [servers.bevy_brp]
 command = "bevy_brp_mcp"
+
+# kaibo is a sister project of kaijutsu (same author, same repo host) — we
+# dogfood our own `~/src/kaibo` build rather than a packaged release while
+# both are under active development. Only the debug binary exists today
+# (`cargo build` in ~/src/kaibo, not `--release`); the absolute path below
+# is a development-machine path, not a shipped-install path, and will need
+# revisiting (e.g. a `kaibo` on PATH) once kaibo has an install story.
+#
+# call_timeout_ms is 900000 (15 min) because a kaibo consultation is a real
+# model call — Gemini Pro / DeepSeek / Claude reading and reasoning over a
+# codebase — and routinely runs 5-15 minutes. The kernel-wide
+# mcp_call_timeout_default (120000ms / 2 min) would cut off every single
+# consultation before it finished.
+[servers.kaibo]
+command = "/home/atobey/src/kaibo/target/debug/kaibo"
+args = ["--root", "/home/atobey/src/kaijutsu"]
+call_timeout_ms = 900000

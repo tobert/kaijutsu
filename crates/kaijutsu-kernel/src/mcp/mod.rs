@@ -10,17 +10,23 @@ pub mod broker;
 pub mod coalescer;
 pub mod context;
 pub mod error;
+pub mod external_registry;
 pub mod hook_persist;
 pub mod hook_table;
 pub mod hooks_builtin;
 pub mod policy;
 pub mod server_like;
 pub mod servers;
+pub mod toml;
 pub mod types;
 
 pub use binding::{Capability, ContextToolBinding, ResolvedName};
 pub use broker::Broker;
 pub use coalescer::{CoalescePolicy, NotificationCoalescer};
+pub use external_registry::{
+    ExternalMcpReconcileReport, external_instance_id, reconcile_external_mcp_servers,
+};
+pub use toml::{McpConfigLoad, load_mcp_config_toml};
 pub use context::{CallContext, TraceContext};
 pub use error::{CoalescerError, HookId, McpError, McpResult, PolicyError};
 pub use hook_table::{

@@ -24,6 +24,7 @@ pub mod drift;
 pub mod drive;
 pub mod fork;
 pub mod format;
+pub mod mcp;
 pub mod parse;
 pub mod play;
 pub mod policy;
@@ -405,6 +406,12 @@ impl KjDispatcher {
         if cmd == "policy" {
             return self.dispatch_policy(&argv[1..], caller).await;
         }
+        // `kj mcp list/reload` is a broker-wide admin surface (external MCP
+        // servers from mcp.toml), not scoped to any context — same
+        // exemption rationale as `kj policy`/`kj config`.
+        if cmd == "mcp" {
+            return self.dispatch_mcp(&argv[1..], caller).await;
+        }
         // `kj search` accepts --context ref or --all, no active context
         // required. Same exemption rationale as `kj block`.
         if cmd == "search" {
@@ -719,6 +726,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(block::BlockArgs::command())
         .subcommand(binding::BindingArgs::command())
         .subcommand(policy::PolicyArgs::command())
+        .subcommand(mcp::McpArgs::command())
         .subcommand(search::SearchArgs::command())
         .subcommand(doc::DocArgs::command())
         .subcommand(attach::AttachArgs::command())

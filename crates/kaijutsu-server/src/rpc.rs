@@ -1347,8 +1347,33 @@ pub async fn create_shared_kernel(
     // Initialize LLM registry + embedding config from models.toml
     let embedding_config = initialize_kernel_models(&kernel_arc).await;
 
-    // External MCP admin (register_mcp / list_mcp / etc.) is offline
-    // until Phase 2 wires it onto the broker.
+    // External MCP servers configured in mcp.toml (kaibo, bevy_brp, …) start
+    // here — `ExternalMcpServer` (mcp/servers/external.rs) has been a
+    // complete, tested `McpServerLike` implementation with no caller since
+    // the old `mcp_pool`/`mcp_config` were deleted; this is that caller.
+    // Per-server failures are logged loudly and folded into the report
+    // below (also mirrored onto `Broker::external_mcp_failures` for
+    // `kj mcp list`) but never abort boot — a misconfigured kaibo entry
+    // must not take the kernel down, but staying silent about it would make
+    // an absent tool indistinguishable from one that was never configured.
+    let mcp_report =
+        kaijutsu_kernel::mcp::reconcile_external_mcp_servers(&kernel_arc).await;
+    if mcp_report.is_clean() {
+        log::info!(
+            "external MCP: {} server(s) registered from mcp.toml",
+            mcp_report.added.len()
+        );
+    } else {
+        log::error!(
+            "external MCP: {} registered, {} failed, {} malformed entries — see \
+             `kj mcp list` (failed: {:?}; warnings: {:?})",
+            mcp_report.added.len(),
+            mcp_report.failed.len(),
+            mcp_report.warnings.len(),
+            mcp_report.failed,
+            mcp_report.warnings,
+        );
+    }
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {

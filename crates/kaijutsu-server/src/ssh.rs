@@ -272,9 +272,12 @@ impl SshServer {
             log::warn!("Anonymous mode enabled - unknown keys will be auto-registered");
         }
 
-        // External MCP pool pre-init removed in Phase 1 M5; a Phase 2
-        // replacement will run ExternalMcpServer startup from mcp.toml
-        // via the broker.
+        // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start inside
+        // `create_shared_kernel` below, not here: they need the kernel's VFS
+        // (mounted + frozen) and broker to exist first, which this point in
+        // `run_on_listener` precedes. See
+        // `kaijutsu_kernel::mcp::reconcile_external_mcp_servers`, called
+        // from `create_shared_kernel`.
 
         // Create the shared kernel at server startup — 会の場所 (the meeting place).
         // All connections share this single kernel.
