@@ -123,11 +123,22 @@ pub fn try_parse_sparkline(text: &str) -> Option<SparklineData> {
         return None;
     }
 
+    // `is_finite` is load-bearing, not defensive noise: Rust's f64 parser
+    // ACCEPTS "NaN", "inf" and "-inf", so a sparkline fence containing any of
+    // them — which a model emitting a series with a missing sample will write
+    // sooner or later — otherwise reaches the geometry math. It survives the
+    // range guard too, because `f64::min`/`max` return the non-NaN operand, so
+    // min/max come back finite and `(NaN - min) / range` is still NaN. That
+    // NaN lands in a Bevy `Node`, and NaN in the layout phase is an
+    // unrecoverable panic — a model could crash the UI by writing a datapoint.
+    // Drop non-finite samples at the parse boundary, where "this is not a
+    // number we can plot" is still a local, honest judgment.
     let values: Vec<f64> = inner
         .split([',', ' ', '\n', '\t'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
         .collect();
 
     if values.is_empty() {
@@ -419,6 +430,57 @@ mod tests {
         let input = "```sparkline\n1, 3\n7, 2, 5\n```";
         let data = try_parse_sparkline(input).expect("should parse");
         assert_eq!(data.values, vec![1.0, 3.0, 7.0, 2.0, 5.0]);
+    }
+
+    /// Rust's f64 parser ACCEPTS "NaN"/"inf"/"-inf", so without an explicit
+    /// finite filter these reach the geometry math — and they survive the
+    /// range guard, because `f64::min`/`max` return the non-NaN operand, so
+    /// min/max come back finite and `(NaN - min) / range` is still NaN. A NaN
+    /// in a Bevy `Node` panics the layout phase, which means a model writing a
+    /// missing sample as `NaN` could crash the UI. Drop them at parse.
+    #[test]
+    fn parse_sparkline_drops_non_finite_samples() {
+        let input = "```sparkline\n1, NaN, 3, inf, -inf, 5\n```";
+        let data = try_parse_sparkline(input).expect("should parse");
+        assert_eq!(
+            data.values,
+            vec![1.0, 3.0, 5.0],
+            "NaN/inf must never reach the geometry math"
+        );
+        assert!(
+            data.values.iter().all(|v| v.is_finite()),
+            "every retained sample must be finite"
+        );
+    }
+
+    /// A fence of NOTHING but non-finite samples must parse as absent, not as
+    /// an empty sparkline that then divides by a degenerate range.
+    #[test]
+    fn parse_sparkline_all_non_finite_is_none() {
+        assert!(try_parse_sparkline("```sparkline\nNaN, inf\n```").is_none());
+    }
+
+    /// The geometry math itself must not produce non-finite coordinates for
+    /// any finite input, including the degenerate all-equal case where the
+    /// value range collapses to zero.
+    #[test]
+    fn sparkline_geometry_is_finite_for_degenerate_inputs() {
+        for values in [vec![5.0, 5.0, 5.0], vec![0.0], vec![-3.0, -3.0]] {
+            let data = SparklineData {
+                values,
+                label: None,
+            };
+            let geom = build_sparkline_geometry(&data, 120.0, 24.0, 4.0);
+            for seg in &geom.segments {
+                assert!(
+                    seg.cx.is_finite()
+                        && seg.cy.is_finite()
+                        && seg.length.is_finite()
+                        && seg.angle.is_finite(),
+                    "degenerate input produced a non-finite segment: {seg:?}"
+                );
+            }
+        }
     }
 
     #[test]

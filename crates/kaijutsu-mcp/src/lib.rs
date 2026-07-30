@@ -40,31 +40,25 @@ use rmcp::{
     },
     model::{
         // Resource types
-        AnnotateAble,
-        // Cancellation types
         CancelledNotificationParam,
         // Completion types
         CompleteRequestParams,
         CompleteResult,
         CompletionInfo,
         // Prompt types
-        GetPromptRequestParams,
         GetPromptResult,
-        ListPromptsResult,
         ListResourcesResult,
-        LoggingLevel,
         PaginatedRequestParams,
         PromptMessage,
-        PromptMessageRole,
-        RawResource,
         ReadResourceRequestParams,
+        ReadResourceResponse,
         ReadResourceResult,
+        Resource,
         ResourceContents,
+        Role,
         // Server types
         ServerCapabilities,
         ServerInfo,
-        // Logging types
-        SetLevelRequestParams,
         SubscribeRequestParams,
         UnsubscribeRequestParams,
     },
@@ -73,6 +67,12 @@ use rmcp::{
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
+// Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kaijutsu still wants to
+// advertise `logging/setLevel` support for older/unmigrated peers, so this
+// stays wired up rather than being silently dropped; see the matching
+// `#[allow(deprecated)]` at each use site below. Tracked in docs/issues.md.
+#[allow(deprecated)]
+use rmcp::model::{LoggingLevel, SetLevelRequestParams};
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -315,6 +315,9 @@ impl JoinedContext {
 // ============================================================================
 
 /// Shared state for server-side MCP features.
+// `LoggingLevel` is deprecated by SEP-2577 — see the import-site comment
+// above; kept for now so `logging/setLevel` keeps working.
+#[allow(deprecated)]
 #[derive(Clone)]
 pub struct McpServerState {
     /// Current logging level (default: info)
@@ -323,6 +326,7 @@ pub struct McpServerState {
     pub subscriptions: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
+#[allow(deprecated)]
 impl Default for McpServerState {
     fn default() -> Self {
         Self {
@@ -1518,7 +1522,7 @@ impl KaijutsuMcp {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             content,
         )])
         .with_description(format!("Analysis of document '{}'", args.document_id)))
@@ -1615,7 +1619,7 @@ impl KaijutsuMcp {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             content,
         )])
         .with_description(format!("Search results for '{}'", args.query)))
@@ -1713,7 +1717,7 @@ impl KaijutsuMcp {
         }
 
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             content,
         )])
         .with_description(format!("Editing assistant for block '{}'", args.block_id)))
@@ -1723,6 +1727,9 @@ impl KaijutsuMcp {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for KaijutsuMcp {
+    // `enable_logging` is deprecated by SEP-2577 — see the import-site
+    // comment above; kept for now so `logging/setLevel` keeps working.
+    #[allow(deprecated)]
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -1757,17 +1764,10 @@ impl ServerHandler for KaijutsuMcp {
 
             // Add root docs resource
             resources.push(
-                RawResource {
-                    uri: "kaijutsu://docs".to_string(),
-                    name: "documents".to_string(),
-                    title: Some("All Documents".to_string()),
-                    description: Some("List of all documents in the kernel".to_string()),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                }
-                .no_annotation(),
+                Resource::new("kaijutsu://docs", "documents")
+                    .with_title("All Documents")
+                    .with_description("List of all documents in the kernel")
+                    .with_mime_type("application/json"),
             );
 
             // Add each document as a resource
@@ -1776,55 +1776,41 @@ impl ServerHandler for KaijutsuMcp {
                 if let Some(blocks) = blocks {
                     let doc_hex = doc_id.to_hex();
                     resources.push(
-                        RawResource {
-                            uri: format!("kaijutsu://docs/{}", doc_hex),
-                            name: doc_hex.clone(),
-                            title: Some(format!("Document: {}", doc_hex)),
-                            description: Some(format!(
+                        Resource::new(format!("kaijutsu://docs/{}", doc_hex), doc_hex.clone())
+                            .with_title(format!("Document: {}", doc_hex))
+                            .with_description(format!(
                                 "Conversation document with {} blocks",
                                 blocks.len()
-                            )),
-                            mime_type: Some("application/json".to_string()),
-                            size: None,
-                            icons: None,
-                            meta: None,
-                        }
-                        .no_annotation(),
+                            ))
+                            .with_mime_type("application/json"),
                     );
 
                     // Add each block as a resource
                     for snapshot in blocks {
                         let block_key = snapshot.id.to_key();
                         resources.push(
-                            RawResource {
-                                uri: format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
-                                name: block_key.clone(),
-                                title: Some(format!(
-                                    "[{}/{}]",
-                                    snapshot.role.as_str(),
-                                    snapshot.kind.as_str()
-                                )),
-                                description: Some(format!(
-                                    "{} block, {} bytes",
-                                    snapshot.kind.as_str(),
-                                    snapshot.content.len()
-                                )),
-                                mime_type: Some("text/plain".to_string()),
-                                size: Some(snapshot.content.len() as u32),
-                                icons: None,
-                                meta: None,
-                            }
-                            .no_annotation(),
+                            Resource::new(
+                                format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
+                                block_key.clone(),
+                            )
+                            .with_title(format!(
+                                "[{}/{}]",
+                                snapshot.role.as_str(),
+                                snapshot.kind.as_str()
+                            ))
+                            .with_description(format!(
+                                "{} block, {} bytes",
+                                snapshot.kind.as_str(),
+                                snapshot.content.len()
+                            ))
+                            .with_mime_type("text/plain")
+                            .with_size(snapshot.content.len() as u64),
                         );
                     }
                 }
             }
 
-            Ok(ListResourcesResult {
-                meta: None,
-                next_cursor: None,
-                resources,
-            })
+            Ok(ListResourcesResult::with_all_items(resources))
         }
     }
 
@@ -1833,7 +1819,7 @@ impl ServerHandler for KaijutsuMcp {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
             let uri = &request.uri;
 
@@ -1861,7 +1847,8 @@ impl ServerHandler for KaijutsuMcp {
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     content,
                     uri.clone(),
-                )]));
+                )])
+                .into());
             }
 
             if let Some(doc_id_str) = uri.strip_prefix("kaijutsu://docs/") {
@@ -1910,7 +1897,8 @@ impl ServerHandler for KaijutsuMcp {
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     content,
                     uri.clone(),
-                )]));
+                )])
+                .into());
             }
 
             if let Some(rest) = uri.strip_prefix("kaijutsu://blocks/") {
@@ -1944,7 +1932,8 @@ impl ServerHandler for KaijutsuMcp {
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     snapshot.content.clone(),
                     uri.clone(),
-                )]));
+                )])
+                .into());
             }
 
             Err(McpError::invalid_params(
@@ -2061,6 +2050,13 @@ impl ServerHandler for KaijutsuMcp {
                         Vec::new()
                     }
                 }
+                // `Reference` is `#[non_exhaustive]` upstream — completion
+                // requests only ever carry a prompt or resource-template ref
+                // today, so a third variant would mean rmcp added a new
+                // completion target this handler doesn't know about yet.
+                // Returning no completions is safe here (unlike silently
+                // guessing a match), so this isn't a crash-worthy case.
+                _ => Vec::new(),
             };
 
             Ok(CompleteResult::new(
@@ -2074,6 +2070,10 @@ impl ServerHandler for KaijutsuMcp {
     // ========================================================================
 
     /// Set the logging level.
+    // `SetLevelRequestParams` (whole struct, including its `level` field) is
+    // deprecated by SEP-2577 — see the import-site comment above; kept for
+    // now so `logging/setLevel` keeps working.
+    #[allow(deprecated)]
     fn set_level(
         &self,
         request: SetLevelRequestParams,

@@ -89,6 +89,29 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## Error-grouping scaffolding runs but has no reader (found 2026-07-30, dock-error lane)
+
+`build_error_child_index` (`kaijutsu-app/src/view/components.rs:747`) is
+REGISTERED and running (`cell/plugin.rs:182`, with `:186` ordered after it). It
+gates on `LayoutGeneration` so it's per-layout-change, not per-frame — but on
+every bump it walks all geometry rows and rebuilds a `by_parent` HashMap that
+**nothing reads**: `ErrorChildIndex::has_errors`/`children` and
+`ExpandedErrorParents` are all `#[allow(dead_code)]`, and the only `has_errors`
+hit in the crate is an unrelated ABC parser test.
+
+It's scaffolding for a "collapse an error's parent block to a stub with the
+errors stacked below" treatment that was designed and never finished — a
+different, more elaborate feature than the dock indicator that shipped.
+`theme.block_error_accent` (`ui/theme.rs:131,435`, documented as the "stub
+strip" color) is inert for the same reason.
+
+**Decide**: finish the consumer, or rip the system out until someone wants it.
+Leaving a registered system doing work nobody consumes is the cost we keep
+paying for the option. Related: `BlockSnapshot::system_error`
+(`kaijutsu-types/src/block.rs:1867`) is called from nowhere in the workspace —
+it builds a context-attached error *block*, which is the opposite case from the
+context-free `GlobalErrorQueue` path that now renders.
+
 ## Compaction leftovers — inert infrastructure after the autocompaction delete (2026-07-30, deepseek review)
 
 Autocompaction was deleted with its call site; `summarize` correctly survives
@@ -212,6 +235,34 @@ than left to rot.
   context label, so a reconnect after a dropped session is fatal until the label
   is freed. Hit live 2026-07-29. Related to the known
   "startup agent detection can report a previous session's id" gotcha.
+
+## rmcp 1.7 → 3.0.1 bump left SEP-2577 deprecations papered over (2026-07-30)
+
+Landed to talk to kaibo (now on `rmcp 3.0.0-beta.5`, a newer MCP protocol
+revision). The bump itself was a clean, mechanical migration (`ContentBlock`
+replaces `Content`, `Annotated<Raw*>` wrappers flattened into plain structs
+with builder methods, `Meta` split into `MetaObject`/`RequestMetaObject`/
+`NotificationMetaObject`, `read_resource`/`call_tool` server-side responses
+wrap in `ReadResourceResponse`/`CallToolResponse` for MRTR). Negotiated
+protocol version stays `2025-11-25` (rmcp's `ProtocolVersion::LATEST` didn't
+move even though `V_2026_07_28` now exists in the enum) — no wire-visible
+protocol jump.
+
+What's papered over rather than migrated, each behind a scoped
+`#[allow(deprecated)]` with a comment: rmcp 1.8.0+ deprecates the whole
+Logging capability (`enable_logging`, `LoggingLevel`, `SetLevelRequestParams`,
+`LoggingMessageNotificationParam`) and Roots capability
+(`enable_roots`/`enable_roots_list_changed`) per SEP-2577, with **no
+replacement** — the spec is dropping them, not superseding them. Separately,
+`resources/subscribe`/`unsubscribe` (`ExternalMcpServer::subscribe`/
+`unsubscribe`, `crates/kaijutsu-kernel/src/mcp/servers/external.rs`) are
+legacy-only as of protocol `2026-07-28`, superseded by `Peer::listen` /
+`subscriptions/listen` — a real subscription-model migration, not a drop-in
+rename. Kept all three working as-is (straightforward migration, no
+opportunistic rewrite) since kaibo/bevy_brp still negotiate against them
+today. Revisit when rmcp actually removes the deprecated APIs, or when
+adopting the `Peer::listen` model becomes worth the redesign on its own
+merits.
 
 ## ⬆ NEXT UP (Amy, 2026-07-16): MCP shell reply timeouts — replies lost while execution succeeds
 
