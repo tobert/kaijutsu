@@ -1,8 +1,17 @@
 //! Boot-level coverage for external MCP server reconciliation
-//! (`kaijutsu_kernel::mcp::reconcile_external_mcp_servers`, called from
-//! `create_shared_kernel`): a misconfigured `mcp.toml` must never abort
-//! kernel startup, and a configured-but-unstartable server must be visibly
-//! failed rather than silently absent. Mirrors `genesis_bootstrap.rs`'s
+//! (`rpc::start_external_mcp_servers`, called from
+//! `SshServer::run_on_listener` immediately after the kernel is built): a
+//! misconfigured `mcp.toml` must never abort startup, and a
+//! configured-but-unstartable server must be visibly failed rather than
+//! silently absent.
+//!
+//! The reconcile is invoked EXPLICITLY here, exactly as the serving path
+//! does, instead of riding along inside `create_shared_kernel`. That
+//! separation is the point: constructing a kernel must not spawn host
+//! subprocesses, or every kernel-booting test in the workspace launches a
+//! real kaibo against `~/.local/state/kaibo/state.db`.
+//!
+//! Mirrors `genesis_bootstrap.rs`'s
 //! `config_dir` tempdir-override pattern (`config_seed_override` reads a
 //! host file as a one-time seed source only on a fresh, empty config
 //! namespace).
@@ -41,6 +50,18 @@ transport = "carrier_pigeon"
     )
     .await
     .expect("a bad mcp.toml entry must not fail kernel boot");
+
+    // Building the kernel must not have touched external MCP at all — the
+    // reconcile is the serving path's job. If this ever starts returning
+    // Some, construction has quietly regained the subprocess-spawning side
+    // effect this split exists to prevent.
+    assert!(
+        shared.kernel.broker().external_mcp_failures().await.is_none(),
+        "create_shared_kernel must not reconcile external MCP servers"
+    );
+
+    // Now do what `run_on_listener` does.
+    kaijutsu_server::rpc::start_external_mcp_servers(&shared.kernel).await;
 
     // Visibly failed, not silently absent: neither entry made it onto the
     // broker...

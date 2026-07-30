@@ -272,13 +272,6 @@ impl SshServer {
             log::warn!("Anonymous mode enabled - unknown keys will be auto-registered");
         }
 
-        // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start inside
-        // `create_shared_kernel` below, not here: they need the kernel's VFS
-        // (mounted + frozen) and broker to exist first, which this point in
-        // `run_on_listener` precedes. See
-        // `kaijutsu_kernel::mcp::reconcile_external_mcp_servers`, called
-        // from `create_shared_kernel`.
-
         // Create the shared kernel at server startup — 会の場所 (the meeting place).
         // All connections share this single kernel.
         let shared_kernel = crate::rpc::create_shared_kernel(
@@ -287,6 +280,15 @@ impl SshServer {
         )
         .await
         .map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
+
+        // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start HERE,
+        // not inside `create_shared_kernel`: they need the kernel's VFS
+        // (mounted + frozen) and broker to exist first, which is why this
+        // follows rather than precedes the call above. Keeping it on the
+        // serving path, out of kernel construction, is deliberate — building
+        // a kernel must never spawn host subprocesses as a side effect
+        // (see `rpc::start_external_mcp_servers`).
+        crate::rpc::start_external_mcp_servers(&shared_kernel.kernel).await;
 
         let registry = Arc::new(ServerRegistry {
             kernel: shared_kernel,
