@@ -89,6 +89,28 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## Compaction leftovers — inert infrastructure after the autocompaction delete (2026-07-30, deepseek review)
+
+Autocompaction was deleted with its call site; `summarize` correctly survives
+(`fork --compact`, `drift merge`/`pull` — all four call sites verified live).
+What's left behind is *inert*, not broken, so none of this is urgent — but it's
+dead weight that will confuse the next reader:
+
+- **`CompactionBoundary`** (`kaijutsu-types/src/compaction.rs:16`) is referenced
+  by nothing but its own re-export (`lib.rs:101`) and its own round-trip tests.
+  Delete it, or say in a comment what future reserves it.
+- **The `compacted` block flag is now never set in production.**
+  `BlockSnapshot.compacted` (`types/src/block.rs:140`),
+  `BlockFilter::exclude_compacted` (`block.rs:2353`), `set_compacted`
+  (`kernel/src/block_store.rs:1665`), and the skips in `llm/hydrate.rs:76`,
+  `llm/system_prompt.rs:153`, `index/src/content.rs:17` all still work — but
+  every caller that sets it is a test. Decide whether the flag earns its keep
+  as a manual/future primitive or comes out with the rest.
+- **`SyncReset`'s doc comment still says "compacted"** (`kernel/src/flows.rs:327`).
+  That event is about *CRDT oplog* compaction — unrelated to the deleted LLM
+  autocompaction — so the wording now implies a feature that no longer exists.
+  One-line fix.
+
 ## MCP subsystem — audit 2026-07-29 (sonnet, read-only, verified against source + git history)
 
 Amy: *"we can add items to work on mcp servers, we haven't maintained that in a

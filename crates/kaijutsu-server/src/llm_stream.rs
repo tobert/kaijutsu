@@ -1311,32 +1311,54 @@ async fn process_llm_stream(
                     // split (hit + miss == prompt_tokens — see
                     // `llm/openai/stream.rs` tests), so adding `cache_read`
                     // there would double-count.
-                    let total_input_tokens = input_tokens.unwrap_or(0)
-                        + if matches!(extra, Some(UsageExtra::Claude(_))) {
-                            cache_read + cache_write
-                        } else {
-                            0
-                        };
-                    let usage_row = kaijutsu_kernel::ContextUsageRow {
-                        context_id,
-                        provider: provider.name().to_string(),
-                        model: model_name.clone(),
-                        input_tokens: total_input_tokens as i64,
-                        output_tokens: output_tokens.unwrap_or(0) as i64,
-                        cache_read_tokens: cache_read as i64,
-                        cache_write_tokens: cache_write as i64,
-                        reasoning_tokens: reasoning as i64,
-                        updated_at: kaijutsu_types::now_millis() as i64,
-                    };
-                    if let Err(e) = kernel_db.lock().set_context_usage(&usage_row) {
-                        // Non-fatal: the turn itself succeeded; only the
-                        // usage gauge failed to persist. Loud log (not
-                        // silent) so a persistently-failing write is
-                        // observable, but the conversation must not fail
-                        // because a telemetry-adjacent counter didn't write.
-                        log::warn!(
-                            "Failed to persist context usage for {context_id}: {e}"
+                    // "The provider never told us" is NOT "the provider said
+                    // zero" — and the write below is an unconditional upsert
+                    // over the context's single row, so conflating the two
+                    // DESTROYS a good snapshot. The OpenAI-compatible path
+                    // only learns usage from a final chunk that never arrives
+                    // if the stream is cancelled first (`llm/openai/stream.rs`
+                    // yields `None` for both counts in that case), so a hard
+                    // interrupt would otherwise overwrite a real "234k/1M"
+                    // with "0" and leave the gauge quietly lying until the
+                    // next completed call. Claude reports `input_tokens` at
+                    // `message_start`, so a cancel there still carries real
+                    // numbers and still records — which is the behavior we
+                    // want and the reason this guard checks for the total
+                    // absence of data rather than keying off cancellation.
+                    if input_tokens.is_none() && output_tokens.is_none() {
+                        log::debug!(
+                            "context usage not recorded for {context_id}: provider \
+                             reported no token counts (stream ended before usage \
+                             arrived); keeping the previous snapshot"
                         );
+                    } else {
+                        let total_input_tokens = input_tokens.unwrap_or(0)
+                            + if matches!(extra, Some(UsageExtra::Claude(_))) {
+                                cache_read + cache_write
+                            } else {
+                                0
+                            };
+                        let usage_row = kaijutsu_kernel::ContextUsageRow {
+                            context_id,
+                            provider: provider.name().to_string(),
+                            model: model_name.clone(),
+                            input_tokens: total_input_tokens as i64,
+                            output_tokens: output_tokens.unwrap_or(0) as i64,
+                            cache_read_tokens: cache_read as i64,
+                            cache_write_tokens: cache_write as i64,
+                            reasoning_tokens: reasoning as i64,
+                            updated_at: kaijutsu_types::now_millis() as i64,
+                        };
+                        if let Err(e) = kernel_db.lock().set_context_usage(&usage_row) {
+                            // Non-fatal: the turn itself succeeded; only the
+                            // usage gauge failed to persist. Loud log (not
+                            // silent) so a persistently-failing write is
+                            // observable, but the conversation must not fail
+                            // because a telemetry-adjacent counter didn't write.
+                            log::warn!(
+                                "Failed to persist context usage for {context_id}: {e}"
+                            );
+                        }
                     }
 
                     if stream_cancelled {
@@ -2541,6 +2563,72 @@ mod usage_tests {
                     (150, 30),
                     "must equal the LAST iteration's usage only — summing (100+150, 20+30) \
                      would multiply-count the resent history"
+                );
+            })
+            .await;
+    }
+
+    /// A `Done` carrying NO token counts must NOT overwrite the context's
+    /// good snapshot with zeros.
+    ///
+    /// "The provider never told us" and "the provider said zero" are
+    /// different facts, and the persist is an unconditional upsert over the
+    /// context's single row — so conflating them DESTROYS real data. The
+    /// OpenAI-compatible path only learns usage from a final chunk that never
+    /// arrives when a stream is cancelled first (`llm/openai/stream.rs` yields
+    /// `None` for both counts), so before the guard a hard interrupt would
+    /// silently reset the dock gauge from a true "234k/1M" to "0" and leave
+    /// it lying until the next completed call.
+    ///
+    /// Scripts exactly that: a good first round-trip, then a second whose
+    /// `Done` reports nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn done_without_token_counts_does_not_clobber_a_good_snapshot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-nocounts").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![
+                        // Round-trip 1: a real, complete measurement.
+                        vec![
+                            StreamEvent::ToolUse {
+                                id: "call_1".into(),
+                                name: "nonexistent_tool".into(),
+                                input: serde_json::json!({}),
+                            },
+                            StreamEvent::Done {
+                                stop_reason: Some("tool_use".into()),
+                                input_tokens: Some(234_000),
+                                output_tokens: Some(1_200),
+                                extra: None,
+                            },
+                        ],
+                        // Round-trip 2: ends with no usage reported at all —
+                        // the cancelled-OpenAI-stream shape.
+                        vec![
+                            StreamEvent::TextStart,
+                            StreamEvent::TextDelta("interrupted".into()),
+                            StreamEvent::TextEnd,
+                            StreamEvent::Done {
+                                stop_reason: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                extra: None,
+                            },
+                        ],
+                    ],
+                ));
+
+                let (_documents, ctx, _player, kernel_db) =
+                    drive_turn_with(provider, 0, kernel.clone()).await;
+
+                let usage = kernel_db.lock().get_context_usage(ctx).unwrap().unwrap();
+                assert_eq!(
+                    (usage.input_tokens, usage.output_tokens),
+                    (234_000, 1_200),
+                    "a usage-less Done must leave the previous snapshot intact — writing \
+                     unwrap_or(0) here makes the gauge read 0 after any interrupted turn"
                 );
             })
             .await;

@@ -349,8 +349,18 @@ impl ContextUsageRow {
 /// (`ContextHandleInfo` in `kaijutsu.capnp`, populated in
 /// `kaijutsu-server/src/rpc.rs::list_contexts`) both call through here so
 /// the two surfaces can never disagree.
+///
+/// A window of `Some(0)` is treated as unknown rather than divided by: it
+/// would yield `NaN` (0 tokens) or `+Inf` (any tokens), and neither is
+/// caught downstream — the wire carries the percentage as `Float32` and the
+/// client's unknown-sentinel test is `pct < 0.0`, which is FALSE for both
+/// `NaN` and `+Inf`, so the garbage would sail through to the dock badge as
+/// a confident-looking `Some(...)`. A zero window is a config error, not a
+/// measurement, and "unknown" is the honest reading of it.
 pub fn context_used_pct(usage: &ContextUsageRow, window: Option<u64>) -> Option<f64> {
-    window.map(|w| usage.total_tokens() as f64 / w as f64 * 100.0)
+    window
+        .filter(|&w| w > 0)
+        .map(|w| usage.total_tokens() as f64 / w as f64 * 100.0)
 }
 
 /// Per-context environment variable.
@@ -5901,6 +5911,33 @@ mod tests {
             updated_at: 1,
         };
         assert_eq!(context_used_pct(&usage, Some(200_000)), Some(0.0));
+    }
+
+    /// A zero window is a config error, and dividing by it yields `NaN`
+    /// (with zero usage) or `+Inf` (with any usage). Neither is caught
+    /// downstream: the wire carries the percentage as `Float32` and the
+    /// client's unknown test is `pct < 0.0`, which is FALSE for both — so
+    /// garbage would reach the dock badge looking like a real number.
+    /// Treat it as unknown instead.
+    #[test]
+    fn context_used_pct_zero_window_is_none_not_nan_or_inf() {
+        let mut usage = ContextUsageRow {
+            context_id: ContextId::new(),
+            provider: "anthropic".into(),
+            model: "misconfigured".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        };
+        // 0/0 would be NaN — and NaN slips past every `< 0.0` sentinel test.
+        assert_eq!(context_used_pct(&usage, Some(0)), None);
+
+        // n/0 would be +Inf — same story.
+        usage.input_tokens = 1_000;
+        assert_eq!(context_used_pct(&usage, Some(0)), None);
     }
 
     #[test]
