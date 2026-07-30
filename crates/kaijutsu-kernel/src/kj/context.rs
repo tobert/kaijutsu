@@ -365,7 +365,9 @@ impl KjDispatcher {
 
         match parsed.command {
             ContextCommand::List { tree } => self.context_list(tree, caller).await,
-            ContextCommand::Info { context } => self.context_info(context.as_deref(), caller),
+            ContextCommand::Info { context } => {
+                self.context_info(context.as_deref(), caller).await
+            }
             ContextCommand::Current => self.context_current(caller).await,
             ContextCommand::Switch { context } => self.context_switch(&context, caller).await,
             ContextCommand::Create {
@@ -439,41 +441,118 @@ impl KjDispatcher {
         }
     }
 
-    fn context_info(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
-        let db = self.kernel_db().lock();
+    async fn context_info(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
+        // All KernelDb reads happen in this block, which ends before the
+        // `.await` below — `parking_lot::MutexGuard` is `!Send` in this
+        // workspace (the `send_guard` feature isn't enabled), so it must not
+        // be held across an await point.
+        let (
+            row,
+            children_count,
+            drift_from,
+            drift_to,
+            is_current,
+            trace_id,
+            shell,
+            env_vars,
+            usage,
+            workspace_paths,
+            workspace_label,
+        ) = {
+            let db = self.kernel_db().lock();
 
-        // Resolve target context (default: current)
-        let target_id = match super::refs::resolve_context_arg(context, caller, &db) {
-            Ok(id) => id,
-            Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+            // Resolve target context (default: current)
+            let target_id = match super::refs::resolve_context_arg(context, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+            };
+
+            let row = match db.get_context(target_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => return KjResult::Err("kj context info: not found".to_string()),
+                Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+            };
+
+            // Count structural children
+            let children_count = db
+                .edges_from(target_id, Some(EdgeKind::Structural))
+                .map(|edges| edges.len())
+                .unwrap_or(0);
+
+            // Count drift edges (both directions)
+            let drift_from = db
+                .edges_from(target_id, Some(EdgeKind::Drift))
+                .map(|edges| edges.len())
+                .unwrap_or(0);
+            let drift_to = db
+                .edges_to(target_id, Some(EdgeKind::Drift))
+                .map(|edges| edges.len())
+                .unwrap_or(0);
+
+            let is_current = Some(target_id) == caller.context_id;
+            // Long-running OTel trace id lives on the in-memory drift handle, not
+            // the persisted row — look it up so the umbrella trace is pasteable.
+            let trace_id = self.drift_router().read().trace_id_for_context(target_id);
+
+            // Shell config — captured into the structured record below as well.
+            let shell = db.get_context_shell(target_id).ok().flatten();
+
+            // Env vars
+            let env_vars = db.get_context_env(target_id).unwrap_or_default();
+
+            // Token usage — a SNAPSHOT of the last completed LLM call ("how
+            // full is this context right now"), not a running total; see
+            // `ContextUsageRow`. `None` for a context that has never
+            // completed a call — shown as absence, never a fabricated zero.
+            let usage = db.get_context_usage(target_id).ok().flatten();
+
+            // Workspace paths
+            let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
+            let workspace_label = row
+                .workspace_id
+                .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
+                .map(|ws| ws.label);
+
+            (
+                row,
+                children_count,
+                drift_from,
+                drift_to,
+                is_current,
+                trace_id,
+                shell,
+                env_vars,
+                usage,
+                workspace_paths,
+                workspace_label,
+            )
         };
 
-        let row = match db.get_context(target_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => return KjResult::Err("kj context info: not found".to_string()),
-            Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+        // Context-window denominator: resolved kernel-side (never shipped to
+        // the client as raw inputs to derive) via the same
+        // `LlmRegistry::context_window_for(provider, model)` `kj model`
+        // already uses. `None` when the model's window isn't configured
+        // (e.g. `claude-sonnet-4-20250514` deliberately has none) — the two
+        // fields below MUST both be `null` in that case, never a guessed
+        // denominator standing in for one. The percentage is computed
+        // against the LAST call's fill (`usage.input_tokens +
+        // usage.output_tokens`), not a running total across turns — see the
+        // `ContextUsageRow` / `context_usage` table doc comments. No
+        // clamping: an over-100% or otherwise surprising number is reported
+        // as-is, not silently capped.
+        let (context_window, context_used_pct) = match &usage {
+            Some(u) => {
+                let registry = self.kernel().llm().read().await;
+                let window = registry.context_window_for(&u.provider, &u.model);
+                let pct = window.map(|w| {
+                    let used = (u.input_tokens + u.output_tokens) as f64;
+                    used / (w as f64) * 100.0
+                });
+                (window, pct)
+            }
+            None => (None, None),
         };
 
-        // Count structural children
-        let children_count = db
-            .edges_from(target_id, Some(EdgeKind::Structural))
-            .map(|edges| edges.len())
-            .unwrap_or(0);
-
-        // Count drift edges (both directions)
-        let drift_from = db
-            .edges_from(target_id, Some(EdgeKind::Drift))
-            .map(|edges| edges.len())
-            .unwrap_or(0);
-        let drift_to = db
-            .edges_to(target_id, Some(EdgeKind::Drift))
-            .map(|edges| edges.len())
-            .unwrap_or(0);
-
-        let is_current = Some(target_id) == caller.context_id;
-        // Long-running OTel trace id lives on the in-memory drift handle, not
-        // the persisted row — look it up so the umbrella trace is pasteable.
-        let trace_id = self.drift_router().read().trace_id_for_context(target_id);
         let mut info = format_context_info(
             &row,
             children_count,
@@ -482,16 +561,12 @@ impl KjDispatcher {
             trace_id,
         );
 
-        // Shell config — captured into the structured record below as well.
-        let shell = db.get_context_shell(target_id).ok().flatten();
         if let Some(ref s) = shell
             && let Some(cwd) = &s.cwd
         {
             info.push_str(&format!("\nCwd:     {cwd}"));
         }
 
-        // Env vars
-        let env_vars = db.get_context_env(target_id).unwrap_or_default();
         if !env_vars.is_empty() {
             info.push_str("\nEnv:");
             for v in &env_vars {
@@ -499,14 +574,6 @@ impl KjDispatcher {
             }
         }
 
-        // Token usage — a SNAPSHOT of the last completed LLM call ("how full
-        // is this context right now"), not a running total; see
-        // `ContextUsageRow`. `None` for a context that has never completed a
-        // call — shown as absence, never a fabricated zero. No context-window
-        // denominator here by design: this crate reports raw counts only, so
-        // a later window attachment (keyed by provider/model) can't be
-        // silently wrong — the consumer decides what "unknown window" means.
-        let usage = db.get_context_usage(target_id).ok().flatten();
         if let Some(ref u) = usage {
             info.push_str(&format!(
                 "\nTokens:  {} in + {} out = {} (cache read {}, write {}; {}/{})",
@@ -518,14 +585,14 @@ impl KjDispatcher {
                 u.provider,
                 u.model,
             ));
+            match (context_window, context_used_pct) {
+                (Some(w), Some(pct)) => {
+                    info.push_str(&format!(" — {w} window, {pct:.1}% used"));
+                }
+                _ => info.push_str(" — window unknown"),
+            }
         }
 
-        // Workspace paths
-        let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
-        let workspace_label = row
-            .workspace_id
-            .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
-            .map(|ws| ws.label);
         if let Some(paths) = workspace_paths.as_ref().filter(|p| !p.is_empty()) {
             let ws_label = workspace_label.clone().unwrap_or_else(|| "?".into());
             info.push_str(&format!("\nWorkspace: {ws_label}"));
@@ -559,13 +626,13 @@ impl KjDispatcher {
                 .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
                 .collect::<serde_json::Map<_, _>>(),
             // `null` when this context has never completed an LLM call —
-            // honest absence, not a fabricated zero. No "context_window" /
-            // percentage here: the denominator is a separate concern
-            // (per-model window lookup), attached by a consumer that knows
-            // it — `provider`/`model` are included so that lookup is
-            // possible. Shape is intentionally flat and stable: a future
-            // window attachment adds a sibling field, it doesn't reshape
-            // this one.
+            // honest absence, not a fabricated zero. `context_window` /
+            // `context_used_pct` are resolved kernel-side (never derived
+            // client-side, per the thin-client convention) via
+            // `LlmRegistry::context_window_for(provider, model)`; both are
+            // `null` together whenever the window isn't configured for this
+            // model (e.g. `claude-sonnet-4-20250514` deliberately has none) —
+            // never a fabricated denominator standing in for an unknown one.
             "usage": usage.as_ref().map(|u| serde_json::json!({
                 "provider": u.provider,
                 "model": u.model,
@@ -576,6 +643,8 @@ impl KjDispatcher {
                 "cache_write_tokens": u.cache_write_tokens,
                 "reasoning_tokens": u.reasoning_tokens,
                 "updated_at_ms": u.updated_at,
+                "context_window": context_window,
+                "context_used_pct": context_used_pct,
             })),
         });
 
@@ -2764,6 +2833,163 @@ mod tests {
                 assert!(v["usage"].is_null(), "usage must be null, got {v}");
             }
             other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The single most important correctness property of the token-usage
+    /// gauge: a model with no configured context window (no `provider_configs`
+    /// registered at all, exactly like a fresh kernel, or a model deliberately
+    /// left unset such as `claude-sonnet-4-20250514`) must NEVER get a
+    /// fabricated denominator. `context_window` and `context_used_pct` must
+    /// both come back `null` — never a guessed window standing in, and never
+    /// a percentage computed against one.
+    #[tokio::test]
+    async fn context_info_usage_pct_null_when_window_unconfigured() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("usage-no-window"), None, principal);
+
+        {
+            let db = d.kernel_db().lock();
+            db.set_context_usage(&crate::kernel_db::ContextUsageRow {
+                context_id: ctx,
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+        // No provider_configs registered at all — `LlmRegistry::context_window_for`
+        // must resolve `None`, never a guessed default.
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        assert!(
+            result.message().contains("window unknown"),
+            "human text must say the window is unknown, not print a guessed pct: {}",
+            result.message()
+        );
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let usage = &v["usage"];
+                assert!(
+                    usage["context_window"].is_null(),
+                    "context_window must be null, got {usage}"
+                );
+                assert!(
+                    usage["context_used_pct"].is_null(),
+                    "context_used_pct must be null when the window is unknown — a non-null \
+                     percentage here would mean someone divided by a fabricated denominator, \
+                     got {usage}"
+                );
+            }
+            other => panic!("expected Ok with usage data, got {other:?}"),
+        }
+    }
+
+    /// The flip side: once `LlmRegistry::context_window_for` resolves a real
+    /// window (mirroring how it's populated from `models.toml` in
+    /// production), `kj context info --json` must compute the percentage
+    /// kernel-side from the LAST call's fill — not fabricate it, not leave it
+    /// null, and not clamp a result over 100% (this project's standing
+    /// preference against unnecessary clamping — a context genuinely over its
+    /// window is a fact worth surfacing as-is).
+    #[tokio::test]
+    async fn context_info_usage_pct_computed_when_window_known() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+
+        // A 100_000-token window on a "mock/big-model" pair — chosen so the
+        // fill fractions below (25%, 200%) are exactly representable in
+        // binary floating point, ruling out an epsilon-fudged assertion.
+        {
+            use crate::llm::config::ModelInfo;
+            use crate::llm::ProviderConfig;
+            let mut cfg = ProviderConfig::new("mock");
+            cfg.models.insert(
+                "big-model".to_string(),
+                ModelInfo {
+                    context_window: Some(100_000),
+                },
+            );
+            let mut registry = d.kernel().llm().write().await;
+            registry.set_provider_configs(vec![cfg]);
+        }
+
+        // Comfortably under the window: 20_000 + 5_000 = 25_000 / 100_000 = 25%.
+        let ctx_under = register_context(&d, Some("usage-window-under"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.set_context_usage(&crate::kernel_db::ContextUsageRow {
+                context_id: ctx_under,
+                provider: "mock".into(),
+                model: "big-model".into(),
+                input_tokens: 20_000,
+                output_tokens: 5_000,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+        let c_under = caller_with_context(ctx_under);
+        let result_under = d.dispatch(&[s("context"), s("info")], &c_under).await;
+        assert!(result_under.is_ok(), "info failed: {}", result_under.message());
+        assert!(
+            result_under.message().contains("100000 window"),
+            "human text should show the resolved window: {}",
+            result_under.message()
+        );
+        match result_under {
+            KjResult::Ok { data: Some(v), .. } => {
+                let usage = &v["usage"];
+                assert_eq!(usage["context_window"], 100_000);
+                assert_eq!(usage["context_used_pct"], 25.0);
+            }
+            other => panic!("expected Ok with usage data, got {other:?}"),
+        }
+
+        // Past the window: 150_000 + 50_000 = 200_000 / 100_000 = 200% — must
+        // be reported as 200, not clamped to 100.
+        let ctx_over = register_context(&d, Some("usage-window-over"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.set_context_usage(&crate::kernel_db::ContextUsageRow {
+                context_id: ctx_over,
+                provider: "mock".into(),
+                model: "big-model".into(),
+                input_tokens: 150_000,
+                output_tokens: 50_000,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+        let c_over = caller_with_context(ctx_over);
+        let result_over = d.dispatch(&[s("context"), s("info")], &c_over).await;
+        assert!(result_over.is_ok(), "info failed: {}", result_over.message());
+        match result_over {
+            KjResult::Ok { data: Some(v), .. } => {
+                let usage = &v["usage"];
+                assert_eq!(usage["context_window"], 100_000);
+                assert_eq!(
+                    usage["context_used_pct"], 200.0,
+                    "over-100% usage must be reported as-is, never clamped"
+                );
+            }
+            other => panic!("expected Ok with usage data, got {other:?}"),
         }
     }
 
