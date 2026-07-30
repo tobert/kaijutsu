@@ -1161,4 +1161,61 @@ mod tests {
         assert_eq!(state.target_offset, 600.0);
         assert!(state.following);
     }
+
+    // ------------------------------------------------------------------
+    // GlobalErrorQueue — the dock HUD's data source for context-free errors
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn global_error_queue_starts_empty() {
+        let queue = GlobalErrorQueue::default();
+        assert!(queue.entries.is_empty());
+    }
+
+    #[test]
+    fn global_error_queue_push_records_operation_message_and_time() {
+        let mut queue = GlobalErrorQueue::default();
+        queue.push("config", "theme.toml: bad TOML", 10.0);
+        assert_eq!(queue.entries.len(), 1);
+        let entry = &queue.entries[0];
+        assert_eq!(entry.operation, "config");
+        assert_eq!(entry.message, "theme.toml: bad TOML");
+        assert_eq!(entry.created_at, 10.0);
+    }
+
+    #[test]
+    fn global_error_queue_caps_at_five_dropping_oldest() {
+        let mut queue = GlobalErrorQueue::default();
+        for i in 0..8 {
+            queue.push("op", format!("error {i}"), i as f64);
+        }
+        assert_eq!(queue.entries.len(), 5);
+        // Oldest three (0, 1, 2) were evicted; 3..=7 remain, in order.
+        let messages: Vec<&str> = queue.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["error 3", "error 4", "error 5", "error 6", "error 7"]);
+    }
+
+    #[test]
+    fn global_error_queue_gc_drops_entries_older_than_max_age() {
+        let mut queue = GlobalErrorQueue::default();
+        queue.push("op", "old", 0.0);
+        queue.push("op", "recent", 8.0);
+        // now = 10.0, max_age = 10.0 -> "old" (age 10.0) is not < 10.0, gone;
+        // "recent" (age 2.0) survives.
+        queue.gc(10.0, 10.0);
+        assert_eq!(queue.entries.len(), 1);
+        assert_eq!(queue.entries[0].message, "recent");
+    }
+
+    #[test]
+    fn global_error_queue_gc_empties_out_once_everything_ages_past_max() {
+        // The "aged out" end state the HUD badge relies on: once GC has run
+        // long enough past every entry, the queue is fully empty again —
+        // not just thinned.
+        let mut queue = GlobalErrorQueue::default();
+        queue.push("op", "a", 0.0);
+        queue.push("op", "b", 1.0);
+        queue.gc(100.0, 10.0);
+        assert!(queue.entries.is_empty());
+    }
 }

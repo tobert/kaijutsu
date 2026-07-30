@@ -90,6 +90,11 @@ pub struct DockState {
     // North dock
     pub title: DockText,
     pub event_pulse: DockText,
+    /// Ambient HUD signal for `GlobalErrorQueue` — context-free failures
+    /// (bad `theme.toml`, failed context creation, other RPC errors with no
+    /// conversation to attach to). Empty when the queue is empty; see
+    /// `update_global_errors_badge`.
+    pub global_errors: DockText,
     pub connection: DockText,
 
     // North dock sparklines
@@ -116,6 +121,11 @@ impl Default for DockState {
             },
             event_pulse: DockText {
                 text: "quiet".into(),
+                color: Color::WHITE,
+                font_size: 13.0,
+            },
+            global_errors: DockText {
+                text: String::new(),
                 color: Color::WHITE,
                 font_size: 13.0,
             },
@@ -426,13 +436,23 @@ pub fn render_north_dock(
         font,
     );
 
+    // Ambient GlobalErrorQueue signal — sits between the pulse and the
+    // connection status; empty (width 0) when the queue has nothing to show,
+    // so it costs no space when there's nothing wrong.
+    let errors_brush = bevy_color_to_brush(dock_state.global_errors.color);
+    let errors_w = measure_text(
+        &dock_state.global_errors.text,
+        dock_state.global_errors.font_size,
+        font,
+    );
+
     // Sparkline dimensions
     let spark_w = 80.0_f64;
     let spark_h = 20.0_f64;
     let spark_gap = 8.0_f64;
     let sparks_total = spark_w + spark_gap + spark_w + gap;
 
-    let right_total = sparks_total + pulse_w + gap + conn_w;
+    let right_total = sparks_total + pulse_w + gap + errors_w + gap + conn_w;
     let right_x = (width - pad_h - right_total).max(pad_h);
 
     // Draw sparklines
@@ -472,10 +492,22 @@ pub fn render_north_dock(
         );
     }
 
+    if !dock_state.global_errors.text.is_empty() {
+        draw_dock_text(
+            &mut scene,
+            &dock_state.global_errors.text,
+            text_right_x + pulse_w + gap,
+            pad_v + 4.0, // same size class as the pulse text, same offset
+            dock_state.global_errors.font_size,
+            font,
+            &errors_brush,
+        );
+    }
+
     draw_dock_text(
         &mut scene,
         &dock_state.connection.text,
-        text_right_x + pulse_w + gap,
+        text_right_x + pulse_w + gap + errors_w + gap,
         pad_v,
         dock_state.connection.font_size,
         font,
@@ -870,9 +902,72 @@ pub fn update_connection(
     dock.connection.color = color;
 }
 
+/// Render text for the global-error badge — the ambient HUD signal for
+/// context-free failures (bad `theme.toml`, failed context creation, other
+/// RPC errors with no conversation to attach to). These never become
+/// conversation blocks because there's no context to attach them to, so
+/// without this badge they're log-only and invisible in the UI.
+///
+/// `GlobalErrorQueue` already auto-dismisses entries after 10s
+/// (`GlobalErrorQueue::gc`, driven from `update_connection_state`); this is
+/// pure display logic over whatever currently survives that GC — it never
+/// claims more than the queue holds, and returns `None` (nothing to show)
+/// once the queue is empty.
+///
+/// - empty queue -> `None`
+/// - one entry -> the operation + message, truncated to fit the dock
+/// - several -> a count plus the most recent message, so a burst doesn't
+///   just show a stale first error while newer ones silently pile up
+fn format_global_error_badge(
+    count: usize,
+    last_operation: &str,
+    last_message: &str,
+) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let msg = crate::text::truncate_chars(last_message, 40);
+    if count == 1 {
+        Some(format!("\u{26a0} {last_operation}: {msg}"))
+    } else {
+        Some(format!("\u{26a0} {count} errors (last: {msg})"))
+    }
+}
+
+/// Update the global-error badge from `GlobalErrorQueue`.
+///
+/// No `is_changed()` gate: `GlobalErrorQueue::gc` (called every frame from
+/// `update_connection_state`) mutates the resource — and so bumps its
+/// change tick — whether or not it actually removed anything, so gating on
+/// `queue.is_changed()` would not skip any real work. Instead this only
+/// touches `DockState` when the *displayed* text actually differs, which is
+/// what gates the vello rebuild in `render_north_dock`.
+pub fn update_global_errors_badge(
+    queue: Res<crate::view::components::GlobalErrorQueue>,
+    theme: Res<Theme>,
+    mut dock: ResMut<DockState>,
+) {
+    let text = match queue.entries.back() {
+        Some(last) => {
+            format_global_error_badge(queue.entries.len(), &last.operation, &last.message)
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    };
+
+    if dock.global_errors.text != text {
+        dock.global_errors.text = text;
+        dock.global_errors.color = theme.error;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{classify_connection_error, format_context_usage, format_token_count};
+    use super::{
+        BlockActivityCounts, classify_connection_error, format_block_activity,
+        format_context_usage, format_global_error_badge, format_token_count,
+    };
+    use crate::ui::theme::Theme;
 
     #[test]
     fn format_token_count_below_thousand_is_exact() {
@@ -986,6 +1081,129 @@ mod tests {
             classify_connection_error("reconnect backoff (attempt 3, 4.0s remaining)"),
             None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // format_global_error_badge — GlobalErrorQueue HUD rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn global_error_badge_empty_queue_shows_nothing() {
+        // No errors -> no badge, never a fabricated "0 errors".
+        assert_eq!(format_global_error_badge(0, "op", "msg"), None);
+    }
+
+    #[test]
+    fn global_error_badge_single_entry_shows_operation_and_message() {
+        assert_eq!(
+            format_global_error_badge(1, "config", "theme.toml: bad TOML"),
+            Some("\u{26a0} config: theme.toml: bad TOML".to_string())
+        );
+    }
+
+    #[test]
+    fn global_error_badge_several_entries_shows_count_and_last_message() {
+        assert_eq!(
+            format_global_error_badge(3, "context", "create failed"),
+            Some("\u{26a0} 3 errors (last: create failed)".to_string())
+        );
+    }
+
+    #[test]
+    fn global_error_badge_truncates_long_messages() {
+        let long = "x".repeat(80);
+        let badge = format_global_error_badge(1, "op", &long).unwrap();
+        // "⚠ op: " prefix + 40-char truncated message (39 chars + ellipsis).
+        let expected_msg = crate::text::truncate_chars(&long, 40);
+        assert_eq!(badge, format!("\u{26a0} op: {expected_msg}"));
+        assert!(badge.ends_with('…'));
+    }
+
+    // ------------------------------------------------------------------
+    // BlockActivityCounts / format_block_activity — Done-vs-Error split
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_status_running_increments_running_only() {
+        let mut counts = BlockActivityCounts::default();
+        counts.apply_status(&kaijutsu_crdt::Status::Running);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.failed, 0);
+    }
+
+    #[test]
+    fn apply_status_done_decrements_running_without_touching_failed() {
+        let mut counts = BlockActivityCounts::default();
+        counts.apply_status(&kaijutsu_crdt::Status::Running);
+        counts.apply_status(&kaijutsu_crdt::Status::Done);
+        assert_eq!(counts.running, 0);
+        assert_eq!(counts.failed, 0);
+    }
+
+    #[test]
+    fn apply_status_error_decrements_running_and_counts_as_failed() {
+        // This is the exact split the task asked for: Error must NOT fold
+        // into the same bucket as Done — it frees the running slot AND
+        // leaves a distinct, visible trace.
+        let mut counts = BlockActivityCounts::default();
+        counts.apply_status(&kaijutsu_crdt::Status::Running);
+        counts.apply_status(&kaijutsu_crdt::Status::Error);
+        assert_eq!(counts.running, 0);
+        assert_eq!(counts.failed, 1);
+    }
+
+    #[test]
+    fn apply_status_running_saturates_at_zero_on_underflow() {
+        // Defensive: an Error/Done arriving without a matching Running
+        // (e.g. missed event) must not wrap running to u32::MAX.
+        let mut counts = BlockActivityCounts::default();
+        counts.apply_status(&kaijutsu_crdt::Status::Error);
+        assert_eq!(counts.running, 0);
+        assert_eq!(counts.failed, 1);
+    }
+
+    #[test]
+    fn reset_clears_both_counters() {
+        let mut counts = BlockActivityCounts::default();
+        counts.apply_status(&kaijutsu_crdt::Status::Running);
+        counts.apply_status(&kaijutsu_crdt::Status::Error);
+        counts.reset();
+        assert_eq!(counts.running, 0);
+        assert_eq!(counts.failed, 0);
+    }
+
+    #[test]
+    fn format_block_activity_idle_is_empty() {
+        let theme = Theme::default();
+        let (text, color) = format_block_activity(0, 0, &theme);
+        assert_eq!(text, "");
+        assert_eq!(color, theme.accent);
+    }
+
+    #[test]
+    fn format_block_activity_running_only_is_accent_colored() {
+        let theme = Theme::default();
+        let (text, color) = format_block_activity(2, 0, &theme);
+        assert_eq!(text, "2 running");
+        assert_eq!(color, theme.accent);
+    }
+
+    #[test]
+    fn format_block_activity_failed_only_is_error_colored() {
+        let theme = Theme::default();
+        let (text, color) = format_block_activity(0, 1, &theme);
+        assert_eq!(text, "1 failed");
+        assert_eq!(color, theme.error);
+    }
+
+    #[test]
+    fn format_block_activity_running_and_failed_shows_both_error_colored() {
+        // A failure tints the WHOLE widget theme.error, even while blocks
+        // are still running — the failure is the more urgent signal.
+        let theme = Theme::default();
+        let (text, color) = format_block_activity(2, 1, &theme);
+        assert_eq!(text, "2 running, 1 failed");
+        assert_eq!(color, theme.error);
     }
 }
 
@@ -1304,15 +1522,73 @@ fn format_abbreviated(value: f64, suffix: &str) -> String {
     }
 }
 
-/// Tracks running block counts for the BlockActivity widget.
+/// Tracks running + failed block counts for the BlockActivity widget.
+///
+/// Both counters are scoped to "since you started viewing this document" —
+/// they reset on a doc switch (`reset`), same as the pre-existing
+/// `running` behavior. `failed` does not otherwise decay: it is a plain
+/// count of `Status::Error` transitions observed for the active document,
+/// so it never claims more than "N blocks failed while you were looking at
+/// this conversation."
 #[derive(Default)]
 pub(crate) struct BlockActivityCounts {
     running: u32,
+    failed: u32,
     last_active_doc: Option<String>,
     last_spark_sample: f64,
 }
 
-/// Update block activity — shows running block count for active document.
+impl BlockActivityCounts {
+    /// Apply one block-status transition. Split out from
+    /// `update_block_activity` so the Done-vs-Error bookkeeping is
+    /// unit-testable without a Bevy `App`: a `Done` block only frees up a
+    /// running slot, an `Error` block frees the slot *and* is counted as a
+    /// distinct, visible failure — previously both folded into the same
+    /// decrement and the error signal was discarded entirely.
+    fn apply_status(&mut self, status: &kaijutsu_crdt::Status) {
+        match status {
+            kaijutsu_crdt::Status::Running => {
+                self.running = self.running.saturating_add(1);
+            }
+            kaijutsu_crdt::Status::Done => {
+                self.running = self.running.saturating_sub(1);
+            }
+            kaijutsu_crdt::Status::Error => {
+                self.running = self.running.saturating_sub(1);
+                self.failed = self.failed.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Reset both counters — called on an active-document switch.
+    fn reset(&mut self) {
+        self.running = 0;
+        self.failed = 0;
+    }
+}
+
+/// Render the BlockActivity widget's (text, color) from running/failed
+/// counts. Any failures tint the whole widget `theme.error` — a red count
+/// alongside an otherwise-normal running count is more legible at a glance
+/// than a single color trying to average two different signals.
+fn format_block_activity(running: u32, failed: u32, theme: &Theme) -> (String, Color) {
+    if failed > 0 {
+        let text = if running > 0 {
+            format!("{running} running, {failed} failed")
+        } else {
+            format!("{failed} failed")
+        };
+        (text, theme.error)
+    } else if running > 0 {
+        (format!("{running} running"), theme.accent)
+    } else {
+        (String::new(), theme.accent)
+    }
+}
+
+/// Update block activity — shows running + failed block counts for the
+/// active document.
 pub fn update_block_activity(
     mut state: Local<BlockActivityCounts>,
     time: Res<Time>,
@@ -1324,7 +1600,7 @@ pub fn update_block_activity(
     let active_doc = doc_cache.active_id().map(|s| s.to_string());
 
     if active_doc != state.last_active_doc {
-        state.running = 0;
+        state.reset();
         state.last_active_doc = active_doc.clone();
     }
 
@@ -1334,27 +1610,14 @@ pub fn update_block_activity(
         } = &event.0
             && active_doc.as_deref() == Some(&context_id.to_string())
         {
-            match status {
-                kaijutsu_crdt::Status::Running => {
-                    state.running = state.running.saturating_add(1);
-                }
-                kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
-                    state.running = state.running.saturating_sub(1);
-                }
-                _ => {}
-            }
+            state.apply_status(status);
         }
     }
 
-    let text = if state.running > 0 {
-        format!("{} running", state.running)
-    } else {
-        String::new()
-    };
-
-    if dock.block_activity.text != text {
+    let (text, color) = format_block_activity(state.running, state.failed, &theme);
+    if dock.block_activity.text != text || dock.block_activity.color != color {
         dock.block_activity.text = text;
-        dock.block_activity.color = theme.accent;
+        dock.block_activity.color = color;
     }
 
     // Sample running block count for sparkline every 250ms
@@ -1385,6 +1648,7 @@ impl Plugin for DockPlugin {
                 (
                     update_mode,
                     update_connection,
+                    update_global_errors_badge,
                     update_contexts,
                     update_hints,
                     update_event_pulse,
