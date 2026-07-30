@@ -1002,6 +1002,44 @@ impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
 // Shared Kernel Creation
 // ============================================================================
 
+/// Start the external MCP servers configured in `mcp.toml` (kaibo, bevy_brp, …).
+///
+/// `ExternalMcpServer` (`mcp/servers/external.rs`) was a complete, tested
+/// `McpServerLike` implementation with no caller from the moment the old
+/// `mcp_pool`/`mcp_config` were deleted; this is that caller.
+///
+/// Deliberately separate from [`create_shared_kernel`] and called only from
+/// the serving path (`SshServer::run_on_listener`). Reconciling here spawns
+/// real host subprocesses, which must not be a side effect of merely
+/// constructing a kernel — that is what every kernel-booting test does, and
+/// folding it in made `cargo test` launch a real kaibo against its live
+/// state DB.
+///
+/// Per-server failures are logged loudly and mirrored onto
+/// `Broker::external_mcp_failures` (for `kj mcp list`) but never abort boot:
+/// a misconfigured kaibo entry must not take the kernel down, while staying
+/// silent would make an absent tool indistinguishable from one that was
+/// never configured.
+pub async fn start_external_mcp_servers(kernel: &Arc<kaijutsu_kernel::Kernel>) {
+    let report = kaijutsu_kernel::mcp::reconcile_external_mcp_servers(kernel).await;
+    if report.is_clean() {
+        log::info!(
+            "external MCP: {} server(s) registered from mcp.toml",
+            report.added.len()
+        );
+    } else {
+        log::error!(
+            "external MCP: {} registered, {} failed, {} malformed entries — see \
+             `kj mcp list` (failed: {:?}; warnings: {:?})",
+            report.added.len(),
+            report.failed.len(),
+            report.warnings.len(),
+            report.failed,
+            report.warnings,
+        );
+    }
+}
+
 /// Create the shared kernel at server startup.
 ///
 /// This performs all kernel initialization: VFS mounts, block store with DB
@@ -1347,8 +1385,17 @@ pub async fn create_shared_kernel(
     // Initialize LLM registry + embedding config from models.toml
     let embedding_config = initialize_kernel_models(&kernel_arc).await;
 
-    // External MCP admin (register_mcp / list_mcp / etc.) is offline
-    // until Phase 2 wires it onto the broker.
+    // External MCP servers (mcp.toml — kaibo, bevy_brp, …) are deliberately
+    // NOT started here. Spawning real subprocesses is a property of
+    // *serving*, not of *constructing a kernel*, and this function is what
+    // every kernel-booting test calls. Starting them here made `cargo test`
+    // spawn a real kaibo, which opens the shared state DB at
+    // `~/.local/state/kaibo/state.db` — a test suite reaching into a sibling
+    // project's live state, and a hard dependency on that project's build
+    // artifact existing. `SshServer::run_on_listener` calls
+    // [`start_external_mcp_servers`] immediately after this returns; a test
+    // that wants the reconcile calls it explicitly
+    // (`kaijutsu-server/tests/mcp_boot.rs`).
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {

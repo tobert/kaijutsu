@@ -613,6 +613,18 @@ transport list` and the `OutputData.rich_json` wire-through
   loud, doctrine-consistent) or route large payloads through CAS like
   `RenderCue`'s `casHash`.
 
+## External MCP servers — no `kj mcp restart <name>` (seeded 2026-07-30, `docs/external-mcp.md`)
+
+`reconcile_with_toml` (`crates/kaijutsu-kernel/src/mcp/external_registry.rs:23-35`)
+deliberately never reconnects an already-running external server on
+`kj mcp reload` — only its `InstancePolicy` (e.g. `call_timeout_ms`) is
+refreshed, even if `command`/`args`/`env` changed underneath it. Picking up
+such an edit today needs a full kernel restart. A name-scoped
+`kj mcp restart <name>` (unregister + reconnect one instance) would close
+that gap without touching the conservative reload-doesn't-reconnect default;
+the reload-vs-hot-swap tradeoff is written up in full in
+`docs/external-mcp.md` "The reload design fork."
+
 ## SFTP over the VFS (slices 0–2 + extensions + tracing landed 2026-06-26; slice 3 dissolved; limits + TOCTOU open)
 
 Read + write + OpenSSH extensions ship (`crates/kaijutsu-server/src/sftp.rs`,

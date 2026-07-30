@@ -177,6 +177,14 @@ pub struct Broker {
     /// *has* a binding is always enforced against it (an empty binding denies),
     /// regardless of this flag.
     enforce_unbound_deny: std::sync::atomic::AtomicBool,
+    /// `(server name, error)` for every entry the most recent external-MCP
+    /// reconcile pass (boot or `kj mcp reload`) could not bring up —
+    /// `external_registry::reconcile_with_toml`'s write side. `None` before
+    /// the first reconcile ever runs. Exists so a configured-but-unstartable
+    /// server (wrong binary path, crashed handshake) is queryable via
+    /// `kj mcp list` instead of requiring a log grep — "loud, not silent"
+    /// extends to *after* the boot log has scrolled by.
+    external_mcp_failures: RwLock<Option<Vec<(String, String)>>>,
 }
 
 impl Default for Broker {
@@ -213,6 +221,7 @@ impl Broker {
             kernel: RwLock::new(None),
             kj_dispatcher: RwLock::new(None),
             enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
+            external_mcp_failures: RwLock::new(None),
         }
     }
 
@@ -744,6 +753,20 @@ impl Broker {
             policy.max_result_bytes = b;
         }
         Ok(())
+    }
+
+    /// Record the most recent external-MCP reconcile pass's per-server
+    /// failures (`external_registry::reconcile_with_toml`'s write side).
+    /// Replaces whatever the previous pass recorded — a name that failed
+    /// last time and succeeds this time must not linger here.
+    pub async fn set_external_mcp_failures(&self, failures: Vec<(String, String)>) {
+        *self.external_mcp_failures.write().await = Some(failures);
+    }
+
+    /// The most recent external-MCP reconcile pass's failures, or `None` if
+    /// no reconcile has run yet this boot. See [`Self::set_external_mcp_failures`].
+    pub async fn external_mcp_failures(&self) -> Option<Vec<(String, String)>> {
+        self.external_mcp_failures.read().await.clone()
     }
 
     /// Clone of the instance registry for callers that want to call
@@ -3724,6 +3747,7 @@ mod tests {
                 kj_dispatcher: RwLock::new(None),
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
+                external_mcp_failures: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -3898,6 +3922,7 @@ mod tests {
                 kj_dispatcher: RwLock::new(None),
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
+                external_mcp_failures: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -5282,6 +5307,7 @@ mod tests {
                 kj_dispatcher: RwLock::new(None),
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
+                external_mcp_failures: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());

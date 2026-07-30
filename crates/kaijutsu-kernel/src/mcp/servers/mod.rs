@@ -28,7 +28,7 @@ pub mod tool_search;
 pub use background::BackgroundServer;
 pub use bindings_builtin::BuiltinBindingsServer;
 pub use block::BlockToolsServer;
-pub use external::ExternalMcpServer;
+pub use external::{ExternalMcpServer, McpServerConfig, McpTransport};
 pub use file::FileToolsServer;
 pub use hooks_builtin::BuiltinHooksServer;
 pub use kernel_info::KernelInfoServer;

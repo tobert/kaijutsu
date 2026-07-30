@@ -8,7 +8,12 @@ description = "Core kernel with VFS abstraction for kaijutsu"
 # "process" — tokio::process::Command/Child for background host-process
 # execution (background_exec.rs); the shell tool's synchronous path spawns
 # through the embedded kaish interpreter instead and doesn't need this.
-tokio = { version = "1", features = ["fs", "sync", "time", "io-util", "process"] }
+#
+# rt-multi-thread + macros: needed only by src/bin/mcp_stub_server.rs (a
+# minimal MCP stdio server used solely by this crate's own external-MCP
+# reconcile tests as a real-handshake fixture — see that file's doc
+# comment). Not exercised by the library itself.
+tokio = { version = "1", features = ["fs", "sync", "time", "io-util", "process", "rt-multi-thread", "macros"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -81,8 +86,9 @@ async-stream = "0.3"
 # Topic-partitioned pub/sub
 async-broadcast = "0.7"
 
-# MCP
-rmcp = { workspace = true, features = ["server", "macros"] }
+# MCP. "transport-io" (stdio()) is needed only by
+# src/bin/mcp_stub_server.rs — see that file's doc comment.
+rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }
 
 # JSON schema derivation for tool Params structs (Phase 1 tool redesign)
 schemars = { version = "1.0", features = ["chrono04"] }

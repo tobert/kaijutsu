@@ -50,6 +50,12 @@ pub enum McpTransport {
 
 /// Connection config for an external MCP server. Superset of what
 /// `rmcp::serve_client` needs; broker config loading populates this.
+///
+/// There used to be a documented `fork` field here (mcp.toml's header
+/// comment described "share"/"instance"/"exclude" fork behavior) — it was
+/// never implemented. Rather than leave documented-but-nonexistent config,
+/// the doc comment was deleted alongside rebuilding the loader
+/// (`mcp/toml.rs`); see that module's doc comment for the reasoning.
 #[derive(Clone, Debug, Default)]
 pub struct McpServerConfig {
     pub name: String,
@@ -59,6 +65,13 @@ pub struct McpServerConfig {
     pub cwd: Option<String>,
     pub transport: McpTransport,
     pub url: Option<String>,
+    /// Per-server `InstancePolicy::call_timeout` override, sourced from
+    /// mcp.toml's `call_timeout_ms` (component 3, `docs/external-mcp.md`). `None`
+    /// means "use the kernel-wide `TimeoutPolicy::mcp_call_timeout_default`"
+    /// (`InstancePolicy::for_kernel`'s existing behavior). A long-running
+    /// consult (kaibo routinely runs 5-15 minutes) needs this — the kernel
+    /// default of 120s would otherwise cut every such call off.
+    pub call_timeout: Option<std::time::Duration>,
 }
 
 /// Minimal `ClientHandler` that translates rmcp notifications onto a
@@ -717,5 +730,69 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::InstanceDown { .. }));
+    }
+
+    // ---- connect() against a real subprocess ---------------------------
+    //
+    // Neither `connect()` nor `reconnect()` had ANY test coverage before
+    // this module gained a caller (`mcp::external_registry`) — the tests
+    // above all construct `ExternalMcpServer` by hand, bypassing the spawn
+    // + rmcp handshake entirely. The two below close the "fails loudly"
+    // half of that gap (no real MCP-speaking process involved — just a
+    // missing binary and a silent one). The "connects and actually works"
+    // half needs `mcp_stub_server`'s `CARGO_BIN_EXE_mcp_stub_server`, which
+    // Cargo only defines for *integration* tests, not `--lib` unit tests —
+    // see `tests/external_mcp_stub.rs`.
+
+    #[tokio::test]
+    async fn connect_fails_loudly_on_a_missing_binary() {
+        let config = McpServerConfig {
+            name: "ghost".to_string(),
+            command: "/definitely/does/not/exist/mcp-server".to_string(),
+            ..Default::default()
+        };
+        match ExternalMcpServer::connect(
+            config,
+            InstanceId::new("external.ghost"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            // Configured-but-unstartable must be visibly a Protocol error
+            // (the caller logs it), never silently swallowed into an Ok.
+            Err(McpError::Protocol(_)) => {}
+            Err(other) => panic!("expected McpError::Protocol, got {other}"),
+            Ok(_) => panic!("a nonexistent binary must fail to connect, not hang or succeed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_on_a_process_that_never_speaks_mcp() {
+        // `sleep` spawns fine but never writes a byte, so the handshake
+        // hangs until the connect_timeout fires — exercises the *other*
+        // "unstartable" shape (a process that starts but doesn't answer),
+        // distinct from spawn failure above.
+        let config = McpServerConfig {
+            name: "silent".to_string(),
+            command: "/bin/sleep".to_string(),
+            args: vec!["5".to_string()],
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        match ExternalMcpServer::connect(
+            config,
+            InstanceId::new("external.silent"),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        {
+            Err(McpError::Protocol(_)) => {}
+            Err(other) => panic!("expected McpError::Protocol, got {other}"),
+            Ok(_) => panic!("a silent process must time out, not hang forever or succeed"),
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "connect() must respect connect_timeout, not the full `sleep 5`"
+        );
     }
 }
