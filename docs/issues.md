@@ -89,6 +89,29 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## Error-grouping scaffolding runs but has no reader (found 2026-07-30, dock-error lane)
+
+`build_error_child_index` (`kaijutsu-app/src/view/components.rs:747`) is
+REGISTERED and running (`cell/plugin.rs:182`, with `:186` ordered after it). It
+gates on `LayoutGeneration` so it's per-layout-change, not per-frame — but on
+every bump it walks all geometry rows and rebuilds a `by_parent` HashMap that
+**nothing reads**: `ErrorChildIndex::has_errors`/`children` and
+`ExpandedErrorParents` are all `#[allow(dead_code)]`, and the only `has_errors`
+hit in the crate is an unrelated ABC parser test.
+
+It's scaffolding for a "collapse an error's parent block to a stub with the
+errors stacked below" treatment that was designed and never finished — a
+different, more elaborate feature than the dock indicator that shipped.
+`theme.block_error_accent` (`ui/theme.rs:131,435`, documented as the "stub
+strip" color) is inert for the same reason.
+
+**Decide**: finish the consumer, or rip the system out until someone wants it.
+Leaving a registered system doing work nobody consumes is the cost we keep
+paying for the option. Related: `BlockSnapshot::system_error`
+(`kaijutsu-types/src/block.rs:1867`) is called from nowhere in the workspace —
+it builds a context-attached error *block*, which is the opposite case from the
+context-free `GlobalErrorQueue` path that now renders.
+
 ## Compaction leftovers — inert infrastructure after the autocompaction delete (2026-07-30, deepseek review)
 
 Autocompaction was deleted with its call site; `summarize` correctly survives
