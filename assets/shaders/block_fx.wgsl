@@ -14,7 +14,8 @@
 //   cursor_params    - [x_uv, y_uv, width_uv, height_uv] (all 0 = disabled)
 //   cursor_color     - RGBA color for cursor beam (linear)
 //   border_stroke    - [thickness_px, border_kind, label_inset_top, label_inset_bottom]
-//     border_kind: 0=none, 1=full, 2=top_accent, 3=dashed, 4=open_bottom, 5=open_top
+//     border_kind: 0=none, 1=full, 2=top_accent, 3=dashed, 4=open_bottom, 5=open_top,
+//       6=center_line (role-group divider — one full-width rule, no box)
 //     label_inset_top/bottom: >0 moves border inward for fieldset/legend labels; 0=default (1px)
 //   border_insets    - [pad_top, pad_bottom, pad_left, pad_right] in pixels
 //   border_color     - RGBA color for border stroke (linear)
@@ -46,6 +47,7 @@ const BK_TOP_ACCENT: f32 = 2.0;
 const BK_DASHED: f32 = 3.0;
 const BK_OPEN_BOTTOM: f32 = 4.0;
 const BK_OPEN_TOP: f32 = 5.0;
+const BK_CENTER_LINE: f32 = 6.0;
 
 // Rounded box SDF: negative inside, zero on edge, positive outside.
 fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
@@ -147,6 +149,15 @@ fn border_stroke_alpha(
         let dy = abs(bp.y - line_y);
         let in_x = smoothstep(line_x0 - aa, line_x0, bp.x) * (1.0 - smoothstep(line_x1, line_x1 + aa, bp.x));
         return (1.0 - smoothstep(thickness * 0.5, thickness * 0.5 + aa, dy)) * in_x;
+    }
+
+    if kind == BK_CENTER_LINE {
+        // Role-group divider: one full-width horizontal rule through the
+        // node's vertical center. No box, no insets — use `p` directly
+        // (not `bp`, which only means something for the box kinds' label-
+        // straddle inset).
+        let dy = abs(p.y);
+        return 1.0 - smoothstep(thickness * 0.5, thickness * 0.5 + aa, dy);
     }
 
     // SDF at the border rectangle (centered on bp)
@@ -279,18 +290,26 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
         let eff_inset_top = select(1.0, li_top, li_top > 0.0);
         let eff_inset_bottom = select(1.0, li_bottom, li_bottom > 0.0);
 
-        // Top label gap
-        if label_gaps.x > 0.0 || label_gaps.y > 0.0 {
-            let near_top = p.y < -half_size.y + eff_inset_top + b_thickness;
-            if near_top && px_x >= label_gaps.x && px_x <= label_gaps.y {
+        if b_kind == BK_CENTER_LINE {
+            // Single center line — there's no top/bottom distinction, so
+            // mask by x-range alone (the line itself already limits y).
+            if (label_gaps.x > 0.0 || label_gaps.y > 0.0) && px_x >= label_gaps.x && px_x <= label_gaps.y {
                 stroke_a = 0.0;
             }
-        }
-        // Bottom label gap
-        if label_gaps.z > 0.0 || label_gaps.w > 0.0 {
-            let near_bottom = p.y > half_size.y - eff_inset_bottom - b_thickness;
-            if near_bottom && px_x >= label_gaps.z && px_x <= label_gaps.w {
-                stroke_a = 0.0;
+        } else {
+            // Top label gap
+            if label_gaps.x > 0.0 || label_gaps.y > 0.0 {
+                let near_top = p.y < -half_size.y + eff_inset_top + b_thickness;
+                if near_top && px_x >= label_gaps.x && px_x <= label_gaps.y {
+                    stroke_a = 0.0;
+                }
+            }
+            // Bottom label gap
+            if label_gaps.z > 0.0 || label_gaps.w > 0.0 {
+                let near_bottom = p.y > half_size.y - eff_inset_bottom - b_thickness;
+                if near_bottom && px_x >= label_gaps.z && px_x <= label_gaps.w {
+                    stroke_a = 0.0;
+                }
             }
         }
 

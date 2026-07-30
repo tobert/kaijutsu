@@ -1,14 +1,19 @@
-//! Per-block texture rendering (Vello + MSDF).
+//! Per-block texture rendering (MSDF + shader decoration; Vello only for SVG).
 //!
 //! Each conversation block renders its own texture. Text blocks (Markdown,
-//! Output, PlainText) use MSDF (shader-quality text); SVG/sparkline/Image
-//! still use Vello (vector rasterizer). ABC renders through MSDF (glyphs)
-//! + flat-colored geometry (staff lines, beams, slurs, ties, repeat dots) —
-//! no vello at all; see `text::msdf::geometry` and
-//! `text::msdf::music_geometry_renderer`. Block cells use
-//! `MaterialNode<BlockFxMaterial>` for hybrid effects. Role group borders
-//! use plain `ImageNode`. Bevy's UI system handles scroll, clip, z-order.
-//! `BackgroundColor` works again. No coordinate space mismatches.
+//! Output, PlainText) use MSDF (shader-quality text); SVG still rasterizes
+//! via Vello (a CPU vector rasterizer, out of this crate's de-vello scope —
+//! see `docs/issues.md`) — the only remaining `BlockRenderMethod::Vello`
+//! site in the conversation view. ABC renders through MSDF (glyphs) +
+//! flat-colored geometry (staff lines, beams, slurs, ties, repeat dots) — no
+//! vello at all; see `text::msdf::geometry` and
+//! `text::msdf::music_geometry_renderer`. Sparklines and the image
+//! placeholder are plain Bevy UI geometry (child `Node`+`BackgroundColor`
+//! rects), not vello, not a shader. Block cells use
+//! `MaterialNode<BlockFxMaterial>` for border/glow/label decoration —
+//! role-group dividers ride the same material now (see
+//! `sync_role_group_headers`). Bevy's UI system handles scroll, clip,
+//! z-order. `BackgroundColor` works again. No coordinate space mismatches.
 
 use std::collections::HashMap;
 
@@ -24,7 +29,10 @@ use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextSt
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
-use crate::cell::block_border::{BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderLabelMetrics};
+use crate::cell::block_border::{
+    BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
+    BorderPadding,
+};
 use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
@@ -39,10 +47,12 @@ use crate::text::{
 };
 use crate::text::components::rainbow_brush;
 use crate::text::markdown::MarkdownColors;
-use crate::text::sparkline::{SparklineColors, build_sparkline_paths, render_sparkline_scene};
+use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_geometry};
 use crate::ui::theme::Theme;
 use crate::view::fieldset;
 use crate::view::ui_rtt::{UiVectorScene, UiRttTexture};
+use bevy::math::Rot2;
+use bevy::ui::UiTransform;
 
 // ============================================================================
 // COMPONENTS
@@ -83,6 +93,95 @@ impl Default for BlockScene {
     }
 }
 
+/// Child rectangle entities a block's content-drawing arm spawned (sparkline
+/// polyline, image placeholder background) that must be despawned before the
+/// arm rebuilds them for new content. Every child is a plain Bevy UI `Node` +
+/// `BackgroundColor` (+ `UiTransform` for rotated stroke segments) — no
+/// vello, no custom shader; Bevy's own UI rasterizer draws every pixel.
+#[derive(Component, Default)]
+pub struct ContentGeometryChildren(pub Vec<Entity>);
+
+/// Despawn any content-geometry children left over from a previous build.
+/// Called unconditionally at the top of each rebuilt block cell — arms that
+/// draw geometry (sparkline, image placeholder) respawn fresh children right
+/// after; arms that don't just leave the component removed.
+fn clear_content_geometry_children(
+    commands: &mut Commands,
+    entity: Entity,
+    existing: Option<&ContentGeometryChildren>,
+) {
+    let Some(children) = existing else {
+        return;
+    };
+    for &child in &children.0 {
+        commands.entity(child).try_despawn();
+    }
+    commands.entity(entity).remove::<ContentGeometryChildren>();
+}
+
+/// Spawn one axis-aligned rectangle child (fill bar, joint dot, or a plain
+/// background panel) at `offset`-relative local content-space coordinates.
+fn spawn_rect_child(
+    commands: &mut Commands,
+    parent: Entity,
+    rect: (f32, f32, f32, f32), // x, y, width, height
+    offset: (f32, f32),
+    color: Color,
+) -> Entity {
+    let (x, y, w, h) = rect;
+    let child = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(x + offset.0),
+                top: Val::Px(y + offset.1),
+                width: Val::Px(w),
+                height: Val::Px(h),
+                ..default()
+            },
+            BackgroundColor(color),
+        ))
+        .id();
+    commands.entity(parent).add_child(child);
+    child
+}
+
+/// Spawn one rotated rectangle child — a sparkline stroke segment — centered
+/// at `(segment.cx, segment.cy)` (local content space), `segment.length` px
+/// long, `thickness` px tall, rotated `segment.angle` radians about its own
+/// center via `UiTransform` (see the pivot note on `SparklineSegment::angle`).
+fn spawn_segment_child(
+    commands: &mut Commands,
+    parent: Entity,
+    segment: &SparklineSegment,
+    thickness: f32,
+    offset: (f32, f32),
+    color: Color,
+) -> Entity {
+    let left = segment.cx - segment.length * 0.5 + offset.0;
+    let top = segment.cy - thickness * 0.5 + offset.1;
+    let child = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(left),
+                top: Val::Px(top),
+                width: Val::Px(segment.length),
+                height: Val::Px(thickness),
+                ..default()
+            },
+            UiTransform::from_rotation(Rot2::radians(segment.angle)),
+            BackgroundColor(color),
+        ))
+        .id();
+    commands.entity(parent).add_child(child);
+    child
+}
+
+/// Dark background for the image placeholder rect (no real CAS→decode
+/// pipeline yet — see the `RichContentKind::Image` arm in `build_block_scenes`).
+const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
+
 // ============================================================================
 // PLUGIN
 // ============================================================================
@@ -105,12 +204,11 @@ impl Plugin for BlockRenderPlugin {
             PostUpdate,
             (
                 build_block_scenes.after(bevy::ui::UiSystems::Layout),
-                build_role_group_scenes.after(bevy::ui::UiSystems::Layout),
+                sync_role_group_headers.after(bevy::ui::UiSystems::Layout),
                 resize_block_textures
                     .after(build_block_scenes)
-                    .after(build_role_group_scenes)
+                    .after(sync_role_group_headers)
                     .after(crate::view::overlay::build_overlay_glyphs),
-                resize_role_group_textures.after(build_role_group_scenes),
             ),
         );
 
@@ -119,10 +217,12 @@ impl Plugin for BlockRenderPlugin {
             return;
         };
 
-        // Block cells + MSDF text surfaces rasterize their vello scene via the
-        // generic UiRttPlugin (extract_vello_scenes / render_vello_scenes);
-        // this plugin owns only the MSDF compositing pass, which runs *after* the
-        // generic vello render so borders/content land in the texture first.
+        // SVG block cells rasterize their vello scene via the generic
+        // UiRttPlugin (extract_vello_scenes / render_vello_scenes); this
+        // plugin owns only the MSDF compositing pass, which runs *after* the
+        // generic vello render so SVG content lands in the texture
+        // first (borders are a separate BlockFxMaterial post-process, never
+        // part of this texture's contents).
         render_app
             .init_resource::<ExtractedMsdfAtlas>()
             .init_resource::<ExtractedMsdfBlockData>()
@@ -249,10 +349,14 @@ fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
     (logical * scale).round() / scale
 }
 
-/// Build vello scenes for block cells.
+/// Build each block cell's content: MSDF glyphs for text, MSDF glyphs +
+/// flat-colored geometry for ABC notation, a vello scene for SVG only, or
+/// plain UI rectangle children for sparkline/image content.
 ///
 /// Runs in PostUpdate after UiSystems::Layout. For each block with changed
-/// content or width, builds a complete vello scene (text + rich content + border).
+/// content or width, rebuilds whichever of those its `RichContent` calls for.
+/// Border/glow/label decoration is a separate `BlockFxMaterial` post-process
+/// (`shaders::sync_block_fx`), not built here.
 pub fn build_block_scenes(
     mut commands: Commands,
     mut block_cells: Query<
@@ -271,6 +375,7 @@ pub fn build_block_scenes(
             &mut MsdfBlockGeometry,
             &mut BlockRenderMethod,
             Option<&BlockExcludedState>,
+            Option<&ContentGeometryChildren>,
         ),
         With<BlockCell>,
     >,
@@ -302,6 +407,7 @@ pub fn build_block_scenes(
     for (
         entity, mut block_scene, mut ui_scene, mut rtt, computed, mut node, rich, border, vis, effects,
         mut msdf_glyphs, mut msdf_geometry, mut render_method, excluded_state,
+        existing_geometry_children,
     ) in block_cells.iter_mut()
     {
         // Skip hidden blocks
@@ -365,6 +471,11 @@ pub fn build_block_scenes(
             None
         };
 
+        // Shed any content-geometry children (sparkline polyline / image
+        // placeholder rect) from a previous build — the arms below respawn
+        // fresh ones if this build is still one of those kinds.
+        clear_content_geometry_children(&mut commands, entity, existing_geometry_children);
+
         let mut scene = vello::Scene::new();
         let content_height: f32;
 
@@ -406,7 +517,7 @@ pub fn build_block_scenes(
                 );
                 let fallback_brush = bevy_color_to_brush(theme.block_assistant);
 
-                // MSDF renders text; Vello scene only gets borders
+                // MSDF renders text; `scene` stays empty for markdown blocks.
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
@@ -425,15 +536,52 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Sparkline(data)) => {
-                *render_method = BlockRenderMethod::Vello;
-                let w = content_width as f64;
-                let h = theme.sparkline_height as f64;
-                content_height = theme.sparkline_height;
-                if w > 0.0 && h > 0.0 {
-                    let paths = build_sparkline_paths(data, w, h, 4.0);
-                    let mut sub_scene = vello::Scene::new();
-                    render_sparkline_scene(&mut sub_scene, &paths, &sparkline_colors);
-                    scene.append(&sub_scene, Some(Affine::translate(text_offset)));
+                // No vello scene, no shader — the polyline is plain Bevy UI
+                // rectangles (thin rotated `Node`s for the stroke, axis-
+                // aligned ones for fill/joints), spawned as children below.
+                *render_method = BlockRenderMethod::Msdf;
+                let h = theme.sparkline_height;
+                content_height = h;
+
+                if content_width > 0.0 && h > 0.0 {
+                    let geometry = build_sparkline_geometry(data, content_width, h, 4.0);
+                    let offset = (pad_left, pad_top);
+                    let mut spawned = Vec::with_capacity(
+                        geometry.segments.len() + geometry.joints.len() + geometry.fill_bars.len(),
+                    );
+
+                    if let Some(fill_color) = sparkline_colors.fill {
+                        for bar in &geometry.fill_bars {
+                            spawned.push(spawn_rect_child(
+                                &mut commands,
+                                entity,
+                                (bar.x, bar.y, bar.width, bar.height),
+                                offset,
+                                fill_color,
+                            ));
+                        }
+                    }
+                    for segment in &geometry.segments {
+                        spawned.push(spawn_segment_child(
+                            &mut commands,
+                            entity,
+                            segment,
+                            crate::text::sparkline::SPARKLINE_STROKE_WIDTH,
+                            offset,
+                            sparkline_colors.line,
+                        ));
+                    }
+                    for joint in &geometry.joints {
+                        spawned.push(spawn_rect_child(
+                            &mut commands,
+                            entity,
+                            (joint.x, joint.y, joint.width, joint.height),
+                            offset,
+                            sparkline_colors.line,
+                        ));
+                    }
+
+                    commands.entity(entity).insert(ContentGeometryChildren(spawned));
                 }
             }
             Some(RichContentKind::Svg {
@@ -567,39 +715,59 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Image { hash }) => {
-                *render_method = BlockRenderMethod::Vello;
-                // Placeholder: dark rectangle with hash label.
-                // Full CAS→decode→ImageNode pipeline requires RpcCommand::CasRead
-                // and async image loading, which lands in a follow-up.
+                // Placeholder: dark rectangle (plain UI geometry, not vello)
+                // with an MSDF hash label. Full CAS→decode→ImageNode pipeline
+                // requires RpcCommand::CasRead and async image loading, which
+                // lands in a follow-up — this only drops vello, the
+                // placeholder itself is unchanged.
+                *render_method = BlockRenderMethod::Msdf;
                 let placeholder_h = 120.0_f32;
                 content_height = placeholder_h;
 
-                let rect = vello::kurbo::Rect::new(
-                    pad_left as f64,
-                    pad_top as f64,
-                    (pad_left + content_width) as f64,
-                    (pad_top + placeholder_h) as f64,
+                let rect_child = spawn_rect_child(
+                    &mut commands,
+                    entity,
+                    (0.0, 0.0, content_width, placeholder_h),
+                    (pad_left, pad_top),
+                    IMAGE_PLACEHOLDER_COLOR,
                 );
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    vello::peniko::Color::new([0.2, 0.2, 0.25, 1.0]),
-                    None,
-                    &rect,
-                );
+                commands
+                    .entity(entity)
+                    .insert(ContentGeometryChildren(vec![rect_child]));
 
                 let label = format!("[image: {}]", &hash[..8.min(hash.len())]);
                 let label_layout =
                     font.layout(&label, &style, VelloTextAlign::Left, max_advance);
                 let label_y = pad_top + placeholder_h / 2.0 - label_layout.height() / 2.0;
                 let label_brush = bevy_color_to_brush(theme.block_tool_result);
-                crate::text::rich::render_layout_with_brushes(
-                    &mut scene,
-                    &label_layout,
-                    &[],
-                    &label_brush,
-                    (pad_left as f64, label_y as f64),
-                );
+
+                if let Some(ref mut atlas) = atlas {
+                    for line in label_layout.lines() {
+                        for item in line.items() {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let glyphs = collect_msdf_glyphs(
+                        &label_layout,
+                        &[],
+                        &label_brush,
+                        (pad_left as f64, label_y as f64),
+                        atlas,
+                    );
+                    msdf_glyphs.glyphs = glyphs;
+                    // Derive from the field's OWN previous value, never
+                    // `scene_version` — see `MsdfBlockGlyphs::version`'s doc
+                    // comment for the bug this reintroduces otherwise
+                    // (staff-without-glyphs, msdf-music live verify
+                    // 2026-07-16). This arm didn't exist when that fix
+                    // landed; the devello rewrite of the Image placeholder
+                    // re-added the same anti-pattern independently.
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
+                    *render_method = BlockRenderMethod::Msdf;
+                }
             }
             None => {
                 // Plain text block
@@ -814,25 +982,53 @@ pub fn build_block_scenes(
     }
 }
 
-/// Build vello scenes for role group border entities.
-pub fn build_role_group_scenes(
+/// Sync role-group divider entities: an SDF center-line border (shader) plus
+/// an MSDF-rendered role label straddling a gap in it.
+///
+/// Replaces the old `build_role_group_scenes`, which drew both the line and
+/// the label into a per-entity `vello::Scene`. Role headers now carry the
+/// same `BlockBorderStyle` + `MsdfBlockGlyphs` + `MaterialNode<BlockFxMaterial>`
+/// bundle as an ordinary block cell — `BorderKind::CenterLine` draws the rule
+/// (`assets/shaders/block_fx.wgsl`, `sync_block_fx`), and the label glyphs go
+/// through the same `collect_msdf_glyphs` path as every other border label.
+/// No vello scene is ever built for a role header.
+pub fn sync_role_group_headers(
+    mut commands: Commands,
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut UiVectorScene, &mut UiRttTexture, &ComputedNode, &Node),
+        (
+            Entity,
+            &RoleGroupBorder,
+            &mut UiRttTexture,
+            &ComputedNode,
+            &Node,
+            &mut MsdfBlockGlyphs,
+            &mut BlockRenderMethod,
+            Option<&BlockBorderStyle>,
+        ),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     theme: Res<Theme>,
+    text_metrics: Res<TextMetrics>,
+    mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
 ) {
-    let font = fonts.get(&font_handles.mono);
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return;
+    };
+    let scale = text_metrics.scale_factor;
 
-    for (border, mut ui_scene, mut rtt, computed, node) in role_borders.iter_mut() {
+    for (
+        entity, border, mut rtt, computed, node, mut msdf_glyphs, mut render_method, existing_style,
+    ) in role_borders.iter_mut()
+    {
         // Virtualized-out headers are Display::None; skip explicitly rather
         // than relying on the incidental size.x==0 side effect.
         if node.display == Display::None {
             continue;
         }
-        // ComputedNode is physical px; the fieldset scene builds in logical.
+        // ComputedNode is physical px; everything below builds in logical.
         let size = crate::view::ui_rtt::logical_size(computed);
         if size.x < 1.0 {
             continue;
@@ -853,41 +1049,96 @@ pub fn build_role_group_scenes(
             kaijutsu_crdt::Role::Asset => "ASSET",
         };
 
-        let mut scene = vello::Scene::new();
-        let height = size.y.max(20.0);
-        fieldset::build_role_group_line(
-            &mut scene,
-            size.x as f64,
-            height as f64,
-            label,
-            color,
-            font,
-        );
+        let height = size.y.max(crate::view::lifecycle::ROLE_HEADER_HEIGHT);
 
-        ui_scene.scene = scene;
-        rtt.built_width = size.x;
-        rtt.built_height = height;
-        ui_scene.version = ui_scene.version.wrapping_add(1).max(1);
+        let brush = bevy_color_to_brush(color);
+        let label_style = VelloTextStyle {
+            brush: brush.clone(),
+            font_size: fieldset::ROLE_LABEL_FONT_SIZE,
+            ..default()
+        };
+        let label_layout = font.layout(label, &label_style, VelloTextAlign::Left, None);
+        let label_w = label_layout.width() as f64;
+        let label_h = label_layout.height();
+
+        let div_layout = fieldset::compute_role_divider_layout(
+            label_w,
+            theme.label_inset as f64,
+            theme.label_pad as f64,
+        );
+        // Vertically centered on the line, matching the pre-shader Vello
+        // fieldset's `text_y = y - line_height / 2`.
+        let label_y = ((height as f64 - label_h as f64) * 0.5).max(0.0);
+
+        if let Some(ref mut atlas) = atlas {
+            for line in label_layout.lines() {
+                for item in line.items() {
+                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                        font_data_map.register(gr.run().font());
+                    }
+                }
+            }
+            let glyphs = collect_msdf_glyphs(
+                &label_layout,
+                &[],
+                &brush,
+                (div_layout.label_x, label_y),
+                atlas,
+            );
+            msdf_glyphs.glyphs = glyphs;
+            msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1).max(1);
+            *render_method = BlockRenderMethod::Msdf;
+        }
+
+        let new_style = BlockBorderStyle {
+            kind: BorderKind::CenterLine,
+            color,
+            thickness: fieldset::ROLE_DIVIDER_THICKNESS,
+            corner_radius: 0.0,
+            padding: BorderPadding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            },
+            animation: BorderAnimation::None,
+            top_label: Some(label.to_string()),
+            bottom_label: None,
+        };
+        if existing_style != Some(&new_style) {
+            commands.entity(entity).insert(new_style);
+        }
+        commands.entity(entity).insert(BorderLabelMetrics {
+            top_gap_x0: div_layout.gap_x0 as f32,
+            top_gap_x1: div_layout.gap_x1 as f32,
+            bottom_gap_x0: 0.0,
+            bottom_gap_x1: 0.0,
+            border_inset_top: 0.0,
+            border_inset_bottom: 0.0,
+        });
+
+        rtt.built_width = round_to_physical_px(size.x, scale);
+        rtt.built_height = round_to_physical_px(height, scale);
     }
 }
 
 /// Resize block textures to match physical pixel dimensions.
 ///
-/// Runs after build_block_scenes so built_width/built_height are up to date.
-/// Block cells (and the MSDF overlay/shell-dock text surfaces) update their
-/// `BlockFxMaterial` texture binding alongside the `ImageNode`.
+/// Runs after build_block_scenes / sync_role_group_headers so
+/// built_width/built_height are up to date. Block cells, the MSDF
+/// overlay/shell-dock text surfaces, and role-group divider headers all
+/// carry `MaterialNode<BlockFxMaterial>` now, so one system covers all of
+/// them — update its texture binding alongside the `ImageNode`.
 pub fn resize_block_textures(
     mut block_query: Query<
         (&mut UiRttTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
-        (
-            Or<(
-                With<BlockCell>,
-                With<crate::view::components::MsdfOverlayText>,
-                With<crate::view::shell_dock::MsdfShellDockText>,
-                With<crate::view::editor::render::EditorSurface>,
-            )>,
-            Without<RoleGroupBorder>,
-        ),
+        Or<(
+            With<BlockCell>,
+            With<crate::view::components::MsdfOverlayText>,
+            With<crate::view::shell_dock::MsdfShellDockText>,
+            With<crate::view::editor::render::EditorSurface>,
+            With<RoleGroupBorder>,
+        )>,
     >,
     text_metrics: Res<TextMetrics>,
     gpu_limits: Res<GpuTextureLimits>,
@@ -931,56 +1182,16 @@ pub fn resize_block_textures(
     }
 }
 
-/// Size role-group-border textures to their measured content (physical pixels).
-///
-/// Role borders carry the generic `UiVectorScene`/`UiRttTexture` (plain
-/// `ImageNode`, no material), so this is the simple sibling of
-/// `resize_block_textures`'s former role branch — split out when the borders
-/// migrated onto the shared vello→texture primitive.
-pub fn resize_role_group_textures(
-    mut role_query: Query<
-        (&mut UiRttTexture, &mut ImageNode),
-        With<RoleGroupBorder>,
-    >,
-    text_metrics: Res<TextMetrics>,
-    gpu_limits: Res<GpuTextureLimits>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let scale = text_metrics.scale_factor;
-    let max_dim = gpu_limits.max_texture_dim;
-
-    for (mut texture, mut image_node) in role_query.iter_mut() {
-        if texture.built_width <= 0.0 || texture.built_height <= 0.0 {
-            continue;
-        }
-
-        let (target_w, target_h) =
-            crate::view::ui_rtt::ui_rtt_texture_dims(
-                texture.built_width,
-                texture.built_height,
-                scale,
-                max_dim,
-            );
-
-        if texture.width != target_w || texture.height != target_h {
-            let new_handle =
-                crate::view::ui_rtt::create_ui_rtt_texture(&mut images, target_w, target_h);
-            image_node.image = new_handle.clone();
-            texture.image = new_handle;
-            texture.width = target_w;
-            texture.height = target_h;
-        }
-    }
-}
-
 // ============================================================================
 // RENDER WORLD SYSTEMS
 // ============================================================================
 
 /// Render MSDF geometry + text glyphs to per-block textures.
 ///
-/// Runs after Vello rendering so borders are already present in the
-/// texture. Two composited passes run per item, in order: flat-colored
+/// Runs after Vello rendering so SVG content is already present in the
+/// texture for the blocks that have it (most blocks have none — see
+/// `has_vello_content` below; ABC no longer does either, see this module's
+/// doc comment). Two composited passes run per item, in order: flat-colored
 /// music geometry (staff lines, beams, slurs, ties, repeat dots) first,
 /// then MSDF glyphs on top — reproducing the "vello draws lines, MSDF
 /// composites glyphs on top" layering ABC used to get from vello, now with
@@ -1229,7 +1440,11 @@ struct ExtractedMsdfBlockItem {
     scale: f32,
     version: u64,
     rainbow: bool,
-    /// Whether Vello rendered borders first (false = MSDF must clear).
+    /// Whether this is an SVG block that vello already rendered into the
+    /// texture this frame (false = the texture has no prior content and
+    /// MSDF must clear it before compositing; that covers everything else,
+    /// ABC and borders included — border decoration is never part of this
+    /// texture).
     has_vello_content: bool,
 }
 
@@ -1308,7 +1523,7 @@ fn extract_msdf_blocks(
     query: Extract<
         Query<(
             &MsdfBlockGlyphs,
-            &MsdfBlockGeometry,
+            Option<&MsdfBlockGeometry>,
             &BlockRenderMethod,
             &UiRttTexture,
         )>,
@@ -1325,9 +1540,16 @@ fn extract_msdf_blocks(
 
         // Vello blocks have content rendered by the Vello pass — MSDF composites on top
         let has_vello = *render_method == BlockRenderMethod::Vello;
+        // `MsdfBlockGeometry` is only ever populated for ABC block cells —
+        // every other MSDF-glyph-bearing surface (role headers, the shell
+        // dock/compose overlay/editor text, time-well cards) has no reason
+        // to carry it, and mustn't be REQUIRED to just to satisfy this
+        // query: that would silently drop them from extraction entirely
+        // (a query mismatch, not a panic) the moment this component exists.
+        let geometry_vertices = msdf_geometry.map(|g| g.vertices.clone()).unwrap_or_default();
         extracted.items.push(ExtractedMsdfBlockItem {
             glyphs: msdf_glyphs.glyphs.clone(),
-            geometry: msdf_geometry.vertices.clone(),
+            geometry: geometry_vertices,
             image_handle: texture.image.clone(),
             width: texture.width,
             height: texture.height,

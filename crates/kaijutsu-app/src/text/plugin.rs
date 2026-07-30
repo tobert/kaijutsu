@@ -1,7 +1,12 @@
 //! Text rendering plugin for Bevy using Vello + MSDF.
 //!
-//! Vello handles vector content (SVG, sparkline, ABC, borders).
-//! MSDF handles text (plain, markdown, output) for shader-quality rendering.
+//! Vello handles vector content (SVG only, in this crate — the sole
+//! remaining `BlockRenderMethod::Vello` site in the conversation view).
+//! MSDF handles text (plain, markdown, output, border/role-divider labels)
+//! and, together with `msdf::geometry`'s flat-colored triangles, ABC music
+//! notation. Sparklines and the image placeholder are plain UI rectangle
+//! geometry (`text::sparkline`); block borders and the role-group divider
+//! are an SDF shader (`cell::block_border` + `shaders`).
 
 use std::collections::HashSet;
 
@@ -20,8 +25,8 @@ use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, Ve
 /// - MSDF atlas, generator, and font data map
 /// - Font loading and DPI-aware text metrics
 ///
-/// Vector rasterization (SVG, borders, ABC, sparklines) is owned by
-/// `VelloRasterizerPlugin` + `UiRttPlugin`.
+/// Vector rasterization (SVG only) is owned by `VelloRasterizerPlugin` +
+/// `UiRttPlugin`.
 pub struct KjTextPlugin;
 
 impl Plugin for KjTextPlugin {

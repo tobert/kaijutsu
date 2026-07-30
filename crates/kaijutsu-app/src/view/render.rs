@@ -779,7 +779,7 @@ pub fn readback_block_heights(
     }
 }
 
-// Role group scene building moved to block_render::build_role_group_scenes.
+// Role group divider styling lives in block_render::sync_role_group_headers.
 
 /// Highlight the focused block cell with a visual indicator.
 pub fn highlight_focused_block(

@@ -22,7 +22,8 @@ use bevy::shader::ShaderRef;
 ///   All zero = no cursor. Color comes from `cursor_color`.
 /// - `cursor_color`: RGBA color for the cursor beam (linear).
 /// - `border_stroke`: `[thickness_px, border_kind, 0, 0]`
-///   border_kind: 0=none, 1=full, 2=top_accent, 3=dashed, 4=open_bottom, 5=open_top
+///   border_kind: 0=none, 1=full, 2=top_accent, 3=dashed, 4=open_bottom, 5=open_top,
+///   6=center_line (role-group divider — one full-width rule, no box)
 /// - `border_insets`: `[pad_top, pad_bottom, pad_left, pad_right]` in pixels.
 /// - `border_color`: RGBA color for the border stroke (linear).
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]

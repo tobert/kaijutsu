@@ -1,8 +1,11 @@
 //! Text rendering module.
 //!
 //! GPU-accelerated text via two paths sharing one Parley shaping source: MSDF
-//! glyphs (shader-quality text) and Vello-rasterized vector content (SVG, ABC,
-//! sparklines, borders).
+//! glyphs (shader-quality text, plus ABC music notation together with
+//! `msdf::geometry`'s flat-colored triangles) and Vello-rasterized vector
+//! content (SVG only — sparklines are plain UI rectangle geometry, and block
+//! borders/role dividers are an SDF shader; see `sparkline` and
+//! `cell::block_border`/`shaders` respectively).
 
 pub mod abc;
 pub mod components;

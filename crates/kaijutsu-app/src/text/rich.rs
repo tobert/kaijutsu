@@ -2,15 +2,16 @@
 //!
 //! Supports multiple content formats via `RichContentKind`:
 //! - **Markdown**: per-span brush coloring (headings, code, bold, etc.)
-//! - **Sparkline**: inline timeseries mini-charts (pure Vello vector paths)
+//! - **Sparkline**: inline timeseries mini-charts — plain Bevy UI rectangle
+//!   geometry now, not Vello (see `text::sparkline`); only detection and the
+//!   `SparklineData` payload live here.
 //! - **SVG**: inline vector graphics (via `vello_svg` + `usvg`)
 //!
 //! Detection is centralized in `detect_rich_content()` — tries sparkline first
 //! (more specific fence pattern), then SVG, then falls back to markdown.
 
 use bevy::prelude::*;
-use vello::kurbo::Affine;
-use vello::peniko::{Brush, Fill};
+use vello::peniko::Brush;
 
 use std::sync::Arc;
 
@@ -36,8 +37,10 @@ pub struct SpanBrush {
 
 /// Rich content for a block cell — dispatches rendering by format.
 ///
-/// When present on a block cell entity, `build_block_scenes` renders
-/// the content into the per-block vello scene.
+/// When present on a block cell entity, `build_block_scenes` renders it:
+/// into MSDF glyphs (Markdown, Output), MSDF glyphs + `MsdfBlockGeometry`
+/// (Abc), the per-block vello scene (Svg only), or plain UI rectangle
+/// children (Sparkline, Image).
 #[derive(Component)]
 pub struct RichContent {
     pub kind: RichContentKind,
@@ -52,7 +55,8 @@ pub enum RichContentKind {
         spans: Vec<RichSpan>,
         plain_text: String,
     },
-    /// Inline timeseries mini-chart.
+    /// Inline timeseries mini-chart — rendered as plain UI rectangle
+    /// geometry (`text::sparkline::build_sparkline_geometry`), not Vello.
     Sparkline(SparklineData),
     /// Inline SVG vector graphic.
     Svg {
@@ -69,7 +73,9 @@ pub enum RichContentKind {
         #[allow(dead_code)] // Retained for the planned DPI-aware re-parse.
         rendered_at_dpi: f32,
     },
-    /// ABC music notation — rendered directly to vello from engraving IR.
+    /// ABC music notation — rendered via MSDF glyphs + flat-colored
+    /// geometry from engraving IR (see `text::msdf::music_bridge`), not
+    /// Vello.
     Abc {
         /// Raw ABC source text.
         #[allow(dead_code)] // Retained for re-parse / source inspection; render uses `tune`.
@@ -141,65 +147,6 @@ pub fn brush_at_offset(span_brushes: &[SpanBrush], offset: usize) -> Option<&Bru
         .iter()
         .find(|sb| offset >= sb.start && offset < sb.end)
         .map(|sb| &sb.brush)
-}
-
-/// Render a Parley layout to a vello Scene with per-span brushes.
-///
-/// Walks the Parley layout's glyph runs and emits them into the scene, using
-/// per-glyph-run brush lookup instead of a single global brush.
-pub fn render_layout_with_brushes(
-    scene: &mut vello::Scene,
-    layout: &parley::Layout<Brush>,
-    span_brushes: &[SpanBrush],
-    fallback_brush: &Brush,
-    offset: (f64, f64),
-) {
-    let transform = Affine::translate(offset);
-
-    for line in layout.lines() {
-        for item in line.items() {
-            let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                continue;
-            };
-
-            let mut x = glyph_run.offset();
-            let y = glyph_run.baseline();
-            let run = glyph_run.run();
-            let font = run.font();
-            let font_size = run.font_size();
-            let synthesis = run.synthesis();
-            let glyph_xform = synthesis
-                .skew()
-                .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
-
-            // Determine brush from the glyph run's text range
-            let text_range = run.text_range();
-            let run_brush =
-                brush_at_offset(span_brushes, text_range.start).unwrap_or(fallback_brush);
-
-            scene
-                .draw_glyphs(font)
-                .brush(run_brush)
-                .hint(true)
-                .transform(transform)
-                .glyph_transform(glyph_xform)
-                .font_size(font_size)
-                .normalized_coords(run.normalized_coords())
-                .draw(
-                    Fill::NonZero,
-                    glyph_run.glyphs().map(|glyph| {
-                        let gx = x + glyph.x;
-                        let gy = y - glyph.y;
-                        x += glyph.advance;
-                        vello::Glyph {
-                            id: glyph.id as _,
-                            x: gx,
-                            y: gy,
-                        }
-                    }),
-                );
-        }
-    }
 }
 
 /// Map an `OutputEntryType` to a theme color for the name column.
