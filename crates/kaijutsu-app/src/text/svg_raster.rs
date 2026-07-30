@@ -237,6 +237,30 @@ mod tests {
     }
 
     #[test]
+    fn rasterize_mid_tone_fill_passes_through_unchanged() {
+        // The red/green/transparent fixtures above are all values where sRGB
+        // and linear encodings are numerically IDENTICAL (0 and 255 are
+        // fixed points of any gamma curve) — they'd pass even if something
+        // in this pipeline mismatched sRGB vs linear interpretation. A
+        // genuine mid-tone exposes that: `resvg` paints a solid opaque fill
+        // directly with no gamma step, and `unpremultiply_to_straight_rgba`
+        // does none either for an opaque pixel (its `a == 255` fast path is
+        // a straight copy) — so 0x80 must come out as exactly 128, not
+        // shifted by the ~22 code points a linear<->sRGB round-trip would
+        // introduce. Pins today's correct behavior so a future refactor that
+        // adds an unneeded gamma conversion doesn't sail through unnoticed.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
+            <rect x="5" y="5" width="10" height="10" fill="#808080"/>
+        </svg>"##;
+        let options = usvg::Options::default();
+        let tree = usvg::Tree::from_str(svg, &options).expect("valid SVG must parse");
+
+        let rgba = rasterize_svg(&tree, 20, 20, 1.0).expect("rasterize should succeed");
+        let i = ((10 * 20 + 10) * 4) as usize; // center of the rect, deep inside the fill
+        assert_eq!(&rgba[i..i + 4], &[128, 128, 128, 255]);
+    }
+
+    #[test]
     fn rasterize_rejects_malformed_svg_at_the_parse_step() {
         // Confirms the error path is at parse time, not here — matches
         // `text::rich::try_parse_svg`'s contract (bad markup never reaches

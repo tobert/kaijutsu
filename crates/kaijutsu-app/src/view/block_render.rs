@@ -716,11 +716,32 @@ pub fn build_block_scenes(
                 // the Sparkline/Image arms.
                 *render_method = BlockRenderMethod::Msdf;
 
+                // Like the Sparkline arm, Svg has no text of its own — every
+                // text-bearing arm ASSIGNS `msdf_glyphs.glyphs`, and it's
+                // that assignment (not any explicit cleanup) that drops the
+                // previous content's glyphs. Without this, a block that
+                // arrives as plain text and is only reclassified as Svg once
+                // its closing fence lands would silently inherit the
+                // partially-streamed source text, which then composites
+                // behind the raster in any transparent/semi-transparent
+                // region.
+                msdf_glyphs.glyphs.clear();
+                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+
                 match fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT) {
                     None => {
-                        // Degenerate SVG (non-positive intrinsic size) — same
-                        // "renders as empty content" behavior the old vello
-                        // path had for `*svg_w <= 0.0`.
+                        // `text::rich::try_parse_svg` already rejects a
+                        // non-positive intrinsic SVG size at detection time
+                        // (falling through to the plain-text path instead of
+                        // ever constructing `RichContentKind::Svg`), so
+                        // `svg_w`/`svg_h` are always positive here — the only
+                        // way this fires is a degenerate content BOX
+                        // (`content_width <= 0`, e.g. a block whose layout
+                        // hasn't settled yet). That's a transient, benign
+                        // "no room to draw it this frame" — width_changed
+                        // will trigger a rebuild once real width lands — not
+                        // a content problem, so rendering as empty content
+                        // here is correct, not a silent-blank regression.
                         content_height = 0.0;
                         block_scene.svg_raster_physical_size = (0, 0);
                     }

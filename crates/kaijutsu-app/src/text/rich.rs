@@ -316,9 +316,17 @@ pub const SVG_MAX_HEIGHT: f32 = 8192.0;
 ///
 /// When `svg_fontdb` is provided, SVG `<text>` elements are rendered using
 /// the fonts in the database. Without it, text elements are silently dropped.
+///
+/// `is_streaming` is purely diagnostic (which log message an error takes,
+/// see below) — it changes no control flow. Both parse failure and a
+/// non-positive intrinsic size return `None` unconditionally either way, so
+/// the caller always falls through to the plain-text/markdown path: a
+/// malformed or zero-size SVG must render as *something visible* (the raw
+/// source), never a silently blank block.
 fn try_parse_svg(
     text: &str,
     svg_fontdb: Option<&super::SvgFontDb>,
+    is_streaming: bool,
 ) -> Option<(Arc<usvg::Tree>, f32, f32, Arc<String>)> {
     let svg_str = if text.trim_start().starts_with("<svg") {
         text.trim()
@@ -340,15 +348,41 @@ fn try_parse_svg(
     match usvg::Tree::from_str(svg_str, &options) {
         Ok(tree) => {
             let size = tree.size();
+            if size.width() <= 0.0 || size.height() <= 0.0 {
+                // Well-formed SVG (parses fine) but with no drawable area —
+                // a bare `<svg width="0" height="0">`, or a viewBox usvg
+                // couldn't resolve to a positive size. Left unchecked this
+                // reaches `view::block_render`'s `Svg` arm, whose
+                // `fit_svg_to_box` rejects a non-positive size too, but by
+                // then `detect_rich_content_typed` has already committed to
+                // `RichContentKind::Svg` — there's no falling back to plain
+                // text from inside that match arm, so the block would
+                // render as a silent zero-height blank instead of showing
+                // its source. Reject it here instead, at the single point
+                // that already owns "this SVG isn't renderable, show the
+                // text" for parse failures.
+                warn!(
+                    "SVG parsed but has non-positive intrinsic size ({}x{}) \
+                     — rendering as text instead",
+                    size.width(),
+                    size.height(),
+                );
+                return None;
+            }
             let source = Arc::new(svg_str.to_string());
             Some((Arc::new(tree), size.width(), size.height(), source))
         }
         Err(e) => {
-            // During streaming (Status::Running), incomplete SVG is expected to
-            // fail parsing — just return None and let the block render as text.
-            // After Status::Done, the kernel should have already validated and
-            // attached Error children; a parse failure here is a real divergence.
-            warn!("SVG parse failed (may be mid-stream): {e}");
+            if is_streaming {
+                // Status::Running: incomplete SVG is expected to fail
+                // parsing until the closing fence lands — routine, not a bug.
+                warn!("SVG parse failed (mid-stream, expected until the closing fence lands): {e}");
+            } else {
+                // Status::Done: the kernel should have already validated and
+                // attached Error children, so a parse failure here is a real
+                // divergence worth investigating, not a streaming artifact.
+                warn!("SVG parse failed at rest (not mid-stream — likely a real bug): {e}");
+            }
             None
         }
     }
@@ -379,7 +413,10 @@ fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 /// declared type directly. Falls back to sniffing when `content_type` is `None`.
 #[allow(dead_code)]
 pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
-    detect_rich_content_typed(text, 0, ContentType::Plain, None)
+    // No block status available at this (unused) call site — `is_streaming`
+    // only changes which diagnostic a parse failure logs, not behavior, so
+    // `false` ("treat as at rest") is a safe default here.
+    detect_rich_content_typed(text, 0, ContentType::Plain, None, false)
 }
 
 /// Detect rich content with a content type hint.
@@ -394,16 +431,23 @@ pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
 ///
 /// `svg_fontdb` provides fonts for SVG `<text>` rendering. Pass `None` if
 /// the resource isn't available (text elements will be dropped).
+///
+/// `is_streaming` should reflect `block.status == Status::Running` — it only
+/// changes which diagnostic an SVG parse failure logs (see `try_parse_svg`),
+/// never the returned content.
 pub fn detect_rich_content_typed(
     text: &str,
     _version: u64,
     content_type: ContentType,
     svg_fontdb: Option<&super::SvgFontDb>,
+    is_streaming: bool,
 ) -> Option<RichContent> {
     // If content type is declared, use it directly
     match content_type {
         ContentType::Svg => {
-            if let Some((tree, width, height, source)) = try_parse_svg(text, svg_fontdb) {
+            if let Some((tree, width, height, source)) =
+                try_parse_svg(text, svg_fontdb, is_streaming)
+            {
                 return Some(RichContent {
                     kind: RichContentKind::Svg {
                         tree,
@@ -461,7 +505,7 @@ pub fn detect_rich_content_typed(
     }
 
     // Try SVG
-    if let Some((tree, width, height, source)) = try_parse_svg(text, svg_fontdb) {
+    if let Some((tree, width, height, source)) = try_parse_svg(text, svg_fontdb, is_streaming) {
         return Some(RichContent {
             kind: RichContentKind::Svg {
                 tree,
@@ -532,6 +576,48 @@ mod tests {
             "headers-only OutputData must proceed past the empty-root guard \
              and render as a (header-only) table, not fall back to plain text"
         );
+    }
+
+    /// A well-formed SVG with non-positive intrinsic size (`width="0"
+    /// height="0"`) parses fine at the XML/usvg level — there is no `Err` to
+    /// catch. Left unchecked this would flow all the way to
+    /// `RichContentKind::Svg { width: 0.0, height: 0.0, .. }`, which
+    /// `view::block_render`'s `Svg` arm can't recover from (its
+    /// `fit_svg_to_box` rejects a non-positive size, but by then the match
+    /// has already committed to the `Svg` arm — there's no falling back to
+    /// plain text from inside it) — a silently blank, zero-height block.
+    /// `try_parse_svg` must reject it at the same point it already rejects a
+    /// genuine parse failure.
+    #[test]
+    fn try_parse_svg_rejects_non_positive_intrinsic_size() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0">
+            <rect width="10" height="10" fill="red"/>
+        </svg>"#;
+        assert!(
+            try_parse_svg(svg, None, false).is_none(),
+            "a zero-intrinsic-size SVG must be rejected, not carried into a \
+             Svg RichContent that then renders as a silently blank block"
+        );
+    }
+
+    /// End-to-end version of the test above, through the same
+    /// `ContentType::Svg`-declared path the kernel uses for a block it has
+    /// already typed as SVG: a zero-size SVG must never surface as
+    /// `RichContentKind::Svg` — whatever it falls through to instead
+    /// (markdown, or `None` for the caller's plain-text path), the raw
+    /// source stays visible rather than vanishing into an empty block.
+    #[test]
+    fn zero_size_svg_never_becomes_svg_rich_content() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0">
+            <rect width="10" height="10" fill="red"/>
+        </svg>"#;
+        let result = detect_rich_content_typed(svg, 0, ContentType::Svg, None, false);
+        if let Some(rich) = result {
+            assert!(
+                !matches!(rich.kind, RichContentKind::Svg { .. }),
+                "a zero-size SVG must not be classified as RichContentKind::Svg"
+            );
+        }
     }
 }
 
