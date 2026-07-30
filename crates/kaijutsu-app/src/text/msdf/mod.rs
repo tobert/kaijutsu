@@ -16,21 +16,26 @@
 //! BlockFxMaterial (post-processing: glow, animation)
 //! ```
 //!
-//! Vello continues to handle SVG, sparkline, ABC, and border rendering.
-//! MSDF replaces Vello only for text content (PlainText, Markdown, Output).
+//! Vello continues to handle SVG, sparkline, and Image placeholder
+//! rendering. MSDF replaces Vello for text content (PlainText, Markdown,
+//! Output) and, together with `geometry`'s flat-colored triangles, for ABC
+//! music notation — the one block kind with NO vello content at all.
 
 pub mod atlas;
 pub mod generator;
+pub mod geometry;
 pub mod glyph;
 pub mod layout_bridge;
 pub mod music_bridge;
+pub mod music_geometry_renderer;
 pub mod renderer;
 
 pub use atlas::MsdfAtlas;
 pub use generator::MsdfGenerator;
+pub use geometry::GeometryVertex;
 pub use glyph::{FontId, PositionedGlyph};
 pub use layout_bridge::collect_msdf_glyphs;
-pub use music_bridge::collect_music_glyphs;
+pub use music_bridge::{collect_music_geometry, collect_music_glyphs, collect_music_text_glyphs};
 // MsdfBlockRenderer is used directly in the render world via crate::text::msdf::renderer
 
 use bevy::prelude::*;
@@ -94,6 +99,23 @@ pub struct MsdfBlockGlyphs {
     /// glyphs bug, msdf-music live verify 2026-07-16).
     pub version: u64,
     pub rainbow: bool,
+}
+
+/// Per-block flat-colored geometry (staff lines, barlines, stems, ledgers,
+/// beams, slurs, ties, repeat dots — everything in an ABC block that isn't
+/// a glyph or text). Populated by `text::msdf::music_bridge::collect_music_geometry`
+/// alongside `MsdfBlockGlyphs`.
+///
+/// Deliberately has NO version field of its own. `MsdfBlockGlyphs.version`
+/// already survived a real two-writers-disagree bug (see its doc comment);
+/// giving geometry a second independent counter would just be a second
+/// chance to reintroduce that class of bug. Geometry and glyphs are always
+/// rebuilt together for the one block kind (ABC) that populates both, so
+/// they ride `MsdfBlockGlyphs.version` as a single shared gate — extraction
+/// reads both components whenever that version fires.
+#[derive(Component, Default)]
+pub struct MsdfBlockGeometry {
+    pub vertices: Vec<geometry::GeometryVertex>,
 }
 
 /// Which renderer handles a block's text content.

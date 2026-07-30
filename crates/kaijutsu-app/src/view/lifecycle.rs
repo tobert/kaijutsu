@@ -415,6 +415,7 @@ pub fn spawn_block_cells(
                     crate::view::ui_rtt::UiVectorScene::default(),
                     crate::view::ui_rtt::UiRttTexture::default(),
                     crate::text::msdf::MsdfBlockGlyphs::default(),
+                    crate::text::msdf::MsdfBlockGeometry::default(),
                     crate::text::msdf::BlockRenderMethod::default(),
                     ImageNode::default(),
                     MaterialNode(material_handle),
