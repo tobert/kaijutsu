@@ -14,7 +14,6 @@ pub mod binding;
 pub mod block;
 pub mod cache;
 pub mod cas;
-pub mod compact;
 pub mod cp;
 pub mod config;
 pub mod context;

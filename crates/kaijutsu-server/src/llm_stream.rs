@@ -201,7 +201,6 @@ pub(crate) async fn spawn_llm_for_prompt(
     let kernel_arc = kernel.kernel.clone();
     let kernel_db = kernel.kernel_db.clone();
     let conversation_cache = kernel.conversation_cache.clone();
-    let kj_dispatcher = kernel.kj_dispatcher.clone();
     // Create a fresh interrupt state for this prompt (replaces any previous entry).
     // The generation counter prevents the race where stream A's cleanup removes
     // stream B's interrupt state.
@@ -299,17 +298,6 @@ pub(crate) async fn spawn_llm_for_prompt(
             return Err(capnp::Error::failed(detail.into()));
         }
     };
-
-    // Compaction pressure (M1-A5): if the context's live block count is over
-    // threshold, summarize the older half into a Drift block and mark the
-    // originals compacted so the hydrator skips them. Logs but does not
-    // fail the prompt on summarization errors — better to ship a too-long
-    // history than to refuse the user's request.
-    match kj_dispatcher.auto_compact_if_needed(context_id).await {
-        Ok(true) => log::info!("Auto-compacted context {context_id} before prompt"),
-        Ok(false) => {}
-        Err(e) => log::warn!("Auto-compaction failed for {context_id}: {e}"),
-    }
 
     // Build tool definitions via the broker (binding + ListTools filter do
     // the curation — D-54 retired the legacy post-filter). A broker failure
@@ -1297,6 +1285,60 @@ async fn process_llm_stream(
                             reasoning,
                         },
                     );
+
+                    // Context-usage gauge: persist a SNAPSHOT of this call's
+                    // usage as "how full is this context right now" — NOT a
+                    // running sum (see `ContextUsageRow` / the `context_usage`
+                    // table doc comment). Every `Done` event overwrites the
+                    // previous value: each provider call resends the ENTIRE
+                    // growing conversation as input (the agentic loop below
+                    // appends tool results and re-sends `messages` in full on
+                    // every iteration), so the LAST `Done` event this turn
+                    // produces already reflects the whole history — summing
+                    // per-iteration `input_tokens` across a multi-tool-call
+                    // turn would multiply-count the same resent history N
+                    // times. Recorded before the cancel branch, same as
+                    // telemetry above: a cancelled call still spent tokens and
+                    // still tells us how full the context is.
+                    //
+                    // `total_input_tokens` normalizes a provider quirk:
+                    // Anthropic's `input_tokens` EXCLUDES cache_read/
+                    // cache_creation tokens (billed and reported separately
+                    // even though they were part of what was sent), so the
+                    // actual prompt size is input_tokens + cache_read +
+                    // cache_creation. DeepSeek/OpenAI-compatible
+                    // `prompt_tokens` already includes the cache hit/miss
+                    // split (hit + miss == prompt_tokens — see
+                    // `llm/openai/stream.rs` tests), so adding `cache_read`
+                    // there would double-count.
+                    let total_input_tokens = input_tokens.unwrap_or(0)
+                        + if matches!(extra, Some(UsageExtra::Claude(_))) {
+                            cache_read + cache_write
+                        } else {
+                            0
+                        };
+                    let usage_row = kaijutsu_kernel::ContextUsageRow {
+                        context_id,
+                        provider: provider.name().to_string(),
+                        model: model_name.clone(),
+                        input_tokens: total_input_tokens as i64,
+                        output_tokens: output_tokens.unwrap_or(0) as i64,
+                        cache_read_tokens: cache_read as i64,
+                        cache_write_tokens: cache_write as i64,
+                        reasoning_tokens: reasoning as i64,
+                        updated_at: kaijutsu_types::now_millis() as i64,
+                    };
+                    if let Err(e) = kernel_db.lock().set_context_usage(&usage_row) {
+                        // Non-fatal: the turn itself succeeded; only the
+                        // usage gauge failed to persist. Loud log (not
+                        // silent) so a persistently-failing write is
+                        // observable, but the conversation must not fail
+                        // because a telemetry-adjacent counter didn't write.
+                        log::warn!(
+                            "Failed to persist context usage for {context_id}: {e}"
+                        );
+                    }
+
                     if stream_cancelled {
                         // Hard interrupt confirmation: rig flushed its buffer cleanly.
                         // stop_reason is None on cancel (vs "end_turn"/"tool_use" normally).
@@ -2184,5 +2226,359 @@ mod tool_dispatch_timeout_tests {
             "`kj policy set` raising call_timeout above 120s must actually take effect once \
              the redundant loop-level timeout is gone — got: {content:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    //! Token-usage gauge coverage (`ContextUsageRow`, `kj context info
+    //! --json`'s `usage` field). Covers:
+    //! 1. a single completed call's usage lands on the context, with the
+    //!    Claude cache-token normalization applied (`input_tokens` excludes
+    //!    cache_read/cache_creation on the wire — the stored value must
+    //!    include them back in, since they were still part of the prompt);
+    //! 2. the OpenAI-compatible path's `prompt_tokens` is NOT double-counted
+    //!    with its cache-hit split (unlike Claude, it's already inclusive);
+    //! 3. a multi-iteration (tool-call) agentic turn persists only the FINAL
+    //!    call's usage, never a sum across iterations — the multiply-counting
+    //!    failure mode this feature exists to avoid (each call resends the
+    //!    whole growing conversation, so summing double/triple/N-tuple counts
+    //!    the same history);
+    //! 4. a context well past the old 200-block auto-compaction threshold is
+    //!    untouched by a turn — regression coverage for the deleted M1-A5
+    //!    auto-compaction (`kj/compact.rs`, removed along with its only call
+    //!    site in `spawn_llm_for_prompt`).
+    use super::*;
+    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
+    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_kernel::llm::{
+        ClaudeUsageExtra, MockClient, OpenAiCompatUsageExtra, Provider, UsageExtra,
+    };
+    use kaijutsu_types::SessionId;
+
+    use crate::interrupt::ContextInterruptState;
+    use crate::rpc::ConversationCache;
+
+    /// Build-and-drive helper: like `publish_tests::drive_one_turn` but takes
+    /// an explicit `Provider` (so a test can script `StreamEvent`s via
+    /// `MockClient::with_scripted_stream`) and hands back the `kernel_db`
+    /// handle so a test can inspect the persisted `ContextUsageRow`.
+    /// `pre_seed_blocks` inserts that many extra text blocks before the
+    /// turn's own seed block — used by the large-history regression test.
+    async fn drive_turn_with(
+        provider: Provider,
+        pre_seed_blocks: usize,
+        kernel: Arc<Kernel>,
+    ) -> (
+        SharedBlockStore,
+        ContextId,
+        PrincipalId,
+        Arc<parking_lot::Mutex<KernelDb>>,
+    ) {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let documents: SharedBlockStore =
+            Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let ctx = ContextId::new();
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let player = PrincipalId::new();
+
+        let mut last: Option<kaijutsu_crdt::BlockId> = None;
+        for i in 0..pre_seed_blocks {
+            let id = documents
+                .insert_block_as(
+                    ctx,
+                    None,
+                    last.as_ref(),
+                    Role::User,
+                    BlockKind::Text,
+                    format!("history block {i}"),
+                    Status::Done,
+                    ContentType::Plain,
+                    Some(player),
+                )
+                .unwrap();
+            last = Some(id);
+        }
+
+        // The user/seed block the turn anchors after.
+        let after = documents
+            .insert_block_as(
+                ctx,
+                None,
+                last.as_ref(),
+                Role::User,
+                BlockKind::Text,
+                "write a phrase",
+                Status::Done,
+                ContentType::Plain,
+                Some(player),
+            )
+            .unwrap();
+
+        let provider = Arc::new(provider);
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        // `set_context_usage` FK-references `contexts.context_id`, which
+        // FK-references `documents.document_id` — both rows must exist
+        // before a usage write will stick. Production always creates them
+        // at `kj context create`/fork time, well before any LLM call; this
+        // test harness talks to `documents` (the CRDT block store) directly
+        // and never goes through that path, so it must seed the same two
+        // rows by hand.
+        {
+            let db = kernel_db.lock();
+            let ws_id = db.get_or_create_default_workspace(player).unwrap();
+            db.insert_document(&kaijutsu_kernel::kernel_db::DocumentRow {
+                document_id: ctx,
+                workspace_id: ws_id,
+                doc_kind: kaijutsu_types::DocKind::Conversation,
+                language: None,
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: player,
+            })
+            .unwrap();
+            db.insert_context(&kaijutsu_kernel::ContextRow {
+                context_id: ctx,
+                label: None,
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: kaijutsu_types::ContextState::Live,
+                context_type: "default".to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: player,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+            })
+            .unwrap();
+        }
+        let conversation_cache = Arc::new(ConversationCache::new(8));
+        let interrupt = ContextInterruptState::new(1);
+        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            player,
+            ctx,
+            std::path::PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+
+        process_llm_stream(
+            provider,
+            documents.clone(),
+            ctx,
+            "mock-model".to_string(),
+            kernel.clone(),
+            kernel_db.clone(),
+            vec![],
+            after,
+            "system".to_string(),
+            1024,
+            conversation_cache,
+            player,
+            tool_ctx,
+            interrupt,
+            1,
+            context_interrupts,
+            true,
+        )
+        .await;
+
+        (documents, ctx, player, kernel_db)
+    }
+
+    #[tokio::test]
+    async fn single_call_usage_lands_on_context_with_claude_cache_normalized() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-single").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![vec![
+                        StreamEvent::TextStart,
+                        StreamEvent::TextDelta("ok".into()),
+                        StreamEvent::TextEnd,
+                        StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(42),
+                            output_tokens: Some(7),
+                            extra: Some(UsageExtra::Claude(ClaudeUsageExtra {
+                                cache_read_input_tokens: 10,
+                                cache_creation_input_tokens: 5,
+                            })),
+                        },
+                    ]],
+                ));
+
+                let (_documents, ctx, _player, kernel_db) =
+                    drive_turn_with(provider, 0, kernel.clone()).await;
+
+                let usage = kernel_db
+                    .lock()
+                    .get_context_usage(ctx)
+                    .unwrap()
+                    .expect("a completed call must record usage");
+                assert_eq!(
+                    usage.input_tokens, 57,
+                    "Claude's input_tokens excludes cache tokens — total prompt size is \
+                     42 + cache_read(10) + cache_creation(5) = 57"
+                );
+                assert_eq!(usage.output_tokens, 7);
+                assert_eq!(usage.cache_read_tokens, 10);
+                assert_eq!(usage.cache_write_tokens, 5);
+                assert_eq!(usage.provider, "mock");
+                assert_eq!(usage.model, "mock-model");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn openai_compat_prompt_tokens_already_include_cache_split() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-openai").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![vec![
+                        StreamEvent::TextStart,
+                        StreamEvent::TextDelta("ok".into()),
+                        StreamEvent::TextEnd,
+                        StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(100),
+                            output_tokens: Some(20),
+                            extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                                prompt_cache_hit_tokens: 80,
+                                prompt_cache_miss_tokens: 20,
+                                reasoning_tokens: 3,
+                            })),
+                        },
+                    ]],
+                ));
+
+                let (_documents, ctx, _player, kernel_db) =
+                    drive_turn_with(provider, 0, kernel.clone()).await;
+
+                let usage = kernel_db.lock().get_context_usage(ctx).unwrap().unwrap();
+                assert_eq!(
+                    usage.input_tokens, 100,
+                    "prompt_tokens (100) already includes the hit(80)+miss(20) split — \
+                     adding cache_read again would double-count to 180"
+                );
+                assert_eq!(usage.output_tokens, 20);
+                assert_eq!(usage.cache_read_tokens, 80);
+                assert_eq!(usage.reasoning_tokens, 3);
+            })
+            .await;
+    }
+
+    /// The critical accumulation-model test: a tool-call round-trip means TWO
+    /// LLM calls inside one user turn. The persisted usage must reflect only
+    /// the LAST call (150 in + 30 out), never the sum across iterations
+    /// (250 + 50) — each call resends the whole growing conversation, so
+    /// summing would multiply-count it.
+    #[tokio::test]
+    async fn multi_iteration_turn_keeps_only_final_call_usage() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-multi").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![
+                        // Iteration 1: a tool call, forcing a second round-trip.
+                        // The tool doesn't need to exist — dispatch against an
+                        // unbound test context gracefully errors (ToolNotFound),
+                        // which still produces a ToolResult and continues the
+                        // loop, exactly like a real failed tool call would.
+                        vec![
+                            StreamEvent::ToolUse {
+                                id: "call_1".into(),
+                                name: "nonexistent_tool".into(),
+                                input: serde_json::json!({}),
+                            },
+                            StreamEvent::Done {
+                                stop_reason: Some("tool_use".into()),
+                                input_tokens: Some(100),
+                                output_tokens: Some(20),
+                                extra: None,
+                            },
+                        ],
+                        // Iteration 2: final text, no more tool calls — the loop
+                        // stops here.
+                        vec![
+                            StreamEvent::TextStart,
+                            StreamEvent::TextDelta("done".into()),
+                            StreamEvent::TextEnd,
+                            StreamEvent::Done {
+                                stop_reason: Some("end_turn".into()),
+                                input_tokens: Some(150),
+                                output_tokens: Some(30),
+                                extra: None,
+                            },
+                        ],
+                    ],
+                ));
+
+                let (_documents, ctx, _player, kernel_db) =
+                    drive_turn_with(provider, 0, kernel.clone()).await;
+
+                let usage = kernel_db.lock().get_context_usage(ctx).unwrap().unwrap();
+                assert_eq!(
+                    (usage.input_tokens, usage.output_tokens),
+                    (150, 30),
+                    "must equal the LAST iteration's usage only — summing (100+150, 20+30) \
+                     would multiply-count the resent history"
+                );
+            })
+            .await;
+    }
+
+    /// Regression: M1-A5 auto-compaction (block-count threshold, LLM-summarize
+    /// the older half, mark `compacted=true`) was deleted along with its only
+    /// call site (`spawn_llm_for_prompt`, one layer above `process_llm_stream`
+    /// — too heavy a harness for a --lib test, per this file's own
+    /// `publish_tests` note about the SSH e2e harness). This proves the layer
+    /// under it stays inert: a context with 250 pre-existing blocks (well
+    /// past the old `DEFAULT_COMPACT_THRESHOLD = 200`) is untouched by a
+    /// turn — no block flips `compacted`, no Drift summary appears — where
+    /// the old `auto_compact_if_needed` call used to fire before every
+    /// prompt.
+    #[tokio::test]
+    async fn large_history_is_never_auto_compacted() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-no-compact").await);
+                let provider = Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n"));
+
+                let (documents, ctx, _player, _kernel_db) =
+                    drive_turn_with(provider, 250, kernel.clone()).await;
+
+                let blocks = documents.block_snapshots(ctx).unwrap();
+                assert!(
+                    blocks.iter().all(|b| !b.compacted),
+                    "no block should ever be marked compacted — auto-compaction is deleted"
+                );
+                assert!(
+                    !blocks.iter().any(|b| b.kind == BlockKind::Drift),
+                    "no Drift summary should appear — nothing collapses old history anymore"
+                );
+                // 250 history blocks + 1 turn seed + 1 model reply.
+                assert_eq!(blocks.len(), 252);
+            })
+            .await;
     }
 }

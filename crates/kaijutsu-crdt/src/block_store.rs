@@ -1149,9 +1149,10 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the compacted flag on a block. Used by auto-compaction to mark
-    /// older blocks as superseded by a Drift summary so the hydrator skips
-    /// them when reconstructing LLM history (M1-A5).
+    /// Set the compacted flag on a block — marks it superseded (e.g. by a
+    /// Drift summary) so the hydrator skips it when reconstructing LLM
+    /// history. Kernel-level primitive; see `kaijutsu_kernel::block_store`'s
+    /// `set_compacted` for the CRDT-op-journaling wrapper callers use.
     pub fn set_compacted(&mut self, id: &BlockId, compacted: bool) -> Result<()> {
         let ts = self.tick();
         let block = self

@@ -73,10 +73,13 @@ context recovery from KernelDb.
 ## LLM streaming (`src/llm_stream.rs`)
 
 `spawn_llm_for_prompt` (`:184`): resolve provider/model (explicit param >
-per-context > kernel default), trigger auto-compaction, build tool defs via the
-broker, assemble the system prompt (static base + rc sections + situational
-addendum), create a fresh `ContextInterruptState`, and `spawn_local`
-`process_llm_stream`.
+per-context > kernel default), build tool defs via the broker, assemble the
+system prompt (static base + rc sections + situational addendum), create a
+fresh `ContextInterruptState`, and `spawn_local` `process_llm_stream`.
+(Auto-compaction — M1-A5's block-count-triggered summarize-and-mark-compacted
+pass — was deleted: the project wants a token-usage gauge the user reads, not
+a mechanism that silently melts history. `process_llm_stream` now records
+usage from every `StreamEvent::Done` instead; see `kj context info`.)
 
 `process_llm_stream` (`:575`) is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox

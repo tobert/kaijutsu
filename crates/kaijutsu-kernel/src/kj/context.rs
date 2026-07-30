@@ -499,6 +499,27 @@ impl KjDispatcher {
             }
         }
 
+        // Token usage — a SNAPSHOT of the last completed LLM call ("how full
+        // is this context right now"), not a running total; see
+        // `ContextUsageRow`. `None` for a context that has never completed a
+        // call — shown as absence, never a fabricated zero. No context-window
+        // denominator here by design: this crate reports raw counts only, so
+        // a later window attachment (keyed by provider/model) can't be
+        // silently wrong — the consumer decides what "unknown window" means.
+        let usage = db.get_context_usage(target_id).ok().flatten();
+        if let Some(ref u) = usage {
+            info.push_str(&format!(
+                "\nTokens:  {} in + {} out = {} (cache read {}, write {}; {}/{})",
+                u.input_tokens,
+                u.output_tokens,
+                u.input_tokens + u.output_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens,
+                u.provider,
+                u.model,
+            ));
+        }
+
         // Workspace paths
         let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
         let workspace_label = row
@@ -537,6 +558,25 @@ impl KjDispatcher {
             "env": env_vars.iter()
                 .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
                 .collect::<serde_json::Map<_, _>>(),
+            // `null` when this context has never completed an LLM call —
+            // honest absence, not a fabricated zero. No "context_window" /
+            // percentage here: the denominator is a separate concern
+            // (per-model window lookup), attached by a consumer that knows
+            // it — `provider`/`model` are included so that lookup is
+            // possible. Shape is intentionally flat and stable: a future
+            // window attachment adds a sibling field, it doesn't reshape
+            // this one.
+            "usage": usage.as_ref().map(|u| serde_json::json!({
+                "provider": u.provider,
+                "model": u.model,
+                "input_tokens": u.input_tokens,
+                "output_tokens": u.output_tokens,
+                "total_tokens": u.input_tokens + u.output_tokens,
+                "cache_read_tokens": u.cache_read_tokens,
+                "cache_write_tokens": u.cache_write_tokens,
+                "reasoning_tokens": u.reasoning_tokens,
+                "updated_at_ms": u.updated_at,
+            })),
         });
 
         KjResult::ok_with_data(info, record)
@@ -2648,6 +2688,83 @@ mod tests {
         );
         assert!(msg.contains("Env:"), "should show env: {msg}");
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
+    }
+
+    /// `kj context info --json`'s `usage` field is the token-usage gauge's
+    /// public surface — an app-side gauge is built against this shape, so it
+    /// needs to expose exactly the persisted `ContextUsageRow`, both in the
+    /// human text and the structured `data` record.
+    #[tokio::test]
+    async fn context_info_shows_usage() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("usage-ctx"), None, principal);
+
+        {
+            let db = d.kernel_db().lock();
+            db.set_context_usage(&crate::kernel_db::ContextUsageRow {
+                context_id: ctx,
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                input_tokens: 1234,
+                output_tokens: 567,
+                cache_read_tokens: 800,
+                cache_write_tokens: 100,
+                reasoning_tokens: 0,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        let msg = result.message();
+        assert!(msg.contains("Tokens:"), "should show usage line: {msg}");
+        assert!(msg.contains("1234"), "should show input tokens: {msg}");
+        assert!(msg.contains("567"), "should show output tokens: {msg}");
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let usage = &v["usage"];
+                assert_eq!(usage["provider"], "anthropic");
+                assert_eq!(usage["model"], "claude-sonnet-4-6");
+                assert_eq!(usage["input_tokens"], 1234);
+                assert_eq!(usage["output_tokens"], 567);
+                assert_eq!(usage["total_tokens"], 1234 + 567);
+                assert_eq!(usage["cache_read_tokens"], 800);
+                assert_eq!(usage["cache_write_tokens"], 100);
+            }
+            other => panic!("expected Ok with usage data, got {other:?}"),
+        }
+    }
+
+    /// A context that never completed an LLM call must show `usage: null` —
+    /// honest absence, never a fabricated zero (which would be
+    /// indistinguishable from "measured and genuinely empty").
+    #[tokio::test]
+    async fn context_info_usage_null_when_absent() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("no-usage-ctx"), None, principal);
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        assert!(
+            !result.message().contains("Tokens:"),
+            "no usage line without a recorded call: {}",
+            result.message()
+        );
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert!(v["usage"].is_null(), "usage must be null, got {v}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]
