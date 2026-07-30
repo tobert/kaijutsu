@@ -1655,8 +1655,13 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the compacted flag on a block (auto-compaction marks older blocks
-    /// as superseded by a Drift summary so the hydrator skips them, M1-A5).
+    /// Set the compacted flag on a block — marks it superseded (e.g. by a
+    /// Drift summary) so the hydrator skips it when reconstructing LLM
+    /// history (see `llm/hydrate.rs`). There is no automatic caller of this
+    /// today (M1-A5's auto-compaction was deleted — the project chose a
+    /// gauge the user reads over a mechanism that silently melts history);
+    /// this stays as the general primitive future manual/explicit
+    /// compaction flows would use.
     pub fn set_compacted(
         &self,
         context_id: ContextId,

@@ -300,6 +300,34 @@ pub struct ContextShellRow {
     pub updated_at: i64,
 }
 
+/// A SNAPSHOT of the most recent completed LLM call this context made —
+/// see the `context_usage` table doc comment in `SCHEMA` for why this is a
+/// last-write-wins snapshot rather than a running total. Fields are `i64`
+/// (never negative in practice) to match the SQLite column type directly,
+/// matching the project's other persisted-row structs (e.g. `PersistedTrack`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextUsageRow {
+    pub context_id: ContextId,
+    /// The provider that served this call (`Provider::name()`, e.g.
+    /// "anthropic", "deepseek") — carried so a context-window denominator
+    /// can be attached later by (provider, model), not implemented here.
+    pub provider: String,
+    pub model: String,
+    /// Total prompt size on the last completed call, ALREADY normalized
+    /// across providers to include any cache-read/cache-creation tokens
+    /// (see the caller in `llm_stream.rs` for the per-provider math).
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// Informational cache breakdown of `input_tokens` — zero when the
+    /// provider reported none.
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// Informational — reasoning/thinking tokens the provider billed
+    /// separately from `output_tokens` (0 when not reported/applicable).
+    pub reasoning_tokens: i64,
+    pub updated_at: i64,
+}
+
 /// Per-context environment variable.
 #[derive(Debug, Clone)]
 pub struct ContextEnvRow {
@@ -491,6 +519,34 @@ CREATE TABLE IF NOT EXISTS context_shell (
     context_id  BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
     cwd         TEXT,
     updated_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
+
+-- ── Context Token Usage (token-usage gauge) ──────────────────────
+-- A SNAPSHOT of the most recent completed LLM call this context made — NOT
+-- a running total across turns. Every provider call resends the entire
+-- growing conversation as input, so the last `StreamEvent::Done` observed
+-- already reflects the whole history; summing per-call counts across a
+-- multi-tool-call turn (or across turns) would multiply-count the same
+-- resent history. One row per context, upserted (overwritten) on every
+-- `Done` event. `input_tokens` is already normalized across providers: it
+-- includes any Claude cache-read/cache-creation tokens (Anthropic reports
+-- those separately from `input_tokens` even though they were part of what
+-- was sent), so it's directly "total prompt size on the last call" for
+-- every provider. `provider`/`model` ride along so a context-window
+-- denominator can be attached later by model name — this table carries no
+-- window itself (unknown window is represented by its absence upstream,
+-- never assumed).
+CREATE TABLE IF NOT EXISTS context_usage (
+    context_id         BLOB    NOT NULL PRIMARY KEY
+        REFERENCES contexts(context_id) ON DELETE CASCADE,
+    provider           TEXT    NOT NULL,
+    model              TEXT    NOT NULL,
+    input_tokens       INTEGER NOT NULL,
+    output_tokens      INTEGER NOT NULL,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+    updated_at         INTEGER NOT NULL
 );
 
 -- ── Context Tool Bindings (Phase 5, D-54) ───────────────────────
@@ -2859,6 +2915,72 @@ impl KernelDb {
         };
         self.upsert_context_shell(&row)?;
         Ok(true)
+    }
+
+    // ========================================================================
+    // Context Token Usage (token-usage gauge)
+    // ========================================================================
+
+    /// Upsert the context-usage snapshot — overwrites whatever was there
+    /// (this is a snapshot of "the last call," not an accumulator; see the
+    /// `context_usage` table doc comment in `SCHEMA`).
+    pub fn set_context_usage(&self, row: &ContextUsageRow) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO context_usage (
+                context_id, provider, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(context_id) DO UPDATE SET
+                provider = excluded.provider,
+                model = excluded.model,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_write_tokens = excluded.cache_write_tokens,
+                reasoning_tokens = excluded.reasoning_tokens,
+                updated_at = excluded.updated_at",
+            params![
+                blob_param(row.context_id.as_bytes()),
+                row.provider,
+                row.model,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.reasoning_tokens,
+                row.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the context-usage snapshot for `context_id`, or `None` when this
+    /// context has never completed an LLM call (a fresh context, or one that
+    /// only ever failed/was interrupted before a `Done` event — honest
+    /// absence, not a fabricated zero).
+    pub fn get_context_usage(&self, context_id: ContextId) -> KernelDbResult<Option<ContextUsageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, provider, model, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens, updated_at
+             FROM context_usage WHERE context_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+            Ok(ContextUsageRow {
+                context_id: read_context_id(row, 0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cache_read_tokens: row.get(5)?,
+                cache_write_tokens: row.get(6)?,
+                reasoning_tokens: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     }
 
     // ========================================================================
@@ -5558,6 +5680,86 @@ mod tests {
     fn context_shell_get_unknown() {
         let db = KernelDb::in_memory().unwrap();
         assert!(db.get_context_shell(ContextId::new()).unwrap().is_none());
+    }
+
+    /// A fresh context has never completed an LLM call — absence must be
+    /// honest `None`, never a fabricated zero (a zero would be
+    /// indistinguishable from "measured and genuinely empty").
+    #[test]
+    fn context_usage_absent_by_default() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("usage-absent"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        assert!(db.get_context_usage(ctx.context_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn context_usage_set_and_get_round_trips() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("usage-roundtrip"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let row = ContextUsageRow {
+            context_id: ctx.context_id,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 1234,
+            output_tokens: 567,
+            cache_read_tokens: 800,
+            cache_write_tokens: 100,
+            reasoning_tokens: 0,
+            updated_at: now_millis() as i64,
+        };
+        db.set_context_usage(&row).unwrap();
+
+        let loaded = db.get_context_usage(ctx.context_id).unwrap().unwrap();
+        assert_eq!(loaded, row);
+    }
+
+    /// The whole point of the accumulation model: the second `set_context_usage`
+    /// call must REPLACE the first, never add to it. This is what makes the
+    /// stored value "how full is my context right now" instead of a lifetime
+    /// spend counter — see the `context_usage` table doc comment in `SCHEMA`.
+    #[test]
+    fn context_usage_upsert_overwrites_not_sums() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("usage-overwrite"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.set_context_usage(&ContextUsageRow {
+            context_id: ctx.context_id,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        })
+        .unwrap();
+        db.set_context_usage(&ContextUsageRow {
+            context_id: ctx.context_id,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 150,
+            output_tokens: 30,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 2,
+        })
+        .unwrap();
+
+        let loaded = db.get_context_usage(ctx.context_id).unwrap().unwrap();
+        assert_eq!(
+            (loaded.input_tokens, loaded.output_tokens),
+            (150, 30),
+            "second write must replace the first, not sum with it (100+150=250 would be wrong)"
+        );
     }
 
     #[test]

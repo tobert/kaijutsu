@@ -68,6 +68,13 @@ pub struct MockClient {
     /// can model a slow provider (e.g. exercising the distill `patient` hold).
     /// Zero by default; the streaming path ignores it.
     pub delay: std::time::Duration,
+    /// Optional scripted event sequence for the streaming path — lets a test
+    /// drive a real multi-iteration agentic turn (e.g. tool call → tool
+    /// result → final text, each `Done` carrying distinct usage numbers) to
+    /// exercise the context-usage accumulation model end-to-end, instead of
+    /// the default single-shot text+Done reply below. Each `Provider::stream`
+    /// call pops the next `Vec<StreamEvent>`; see `with_scripted_stream`.
+    scripted: Option<Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<stream::StreamEvent>>>>>,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -76,6 +83,7 @@ impl MockClient {
         Self {
             canned_response: response.into(),
             delay: std::time::Duration::ZERO,
+            scripted: None,
         }
     }
 
@@ -83,6 +91,20 @@ impl MockClient {
     /// returning the canned response.
     pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// Builder: script the streaming path's per-call event sequence. Each
+    /// `Provider::stream` call pops the next entry, in order. Popping past
+    /// the end panics loudly — a script that's too short is a test bug, not
+    /// something to paper over by silently falling back to the default
+    /// canned response (that would mask exactly the "how many LLM
+    /// round-trips did this turn make" question these tests exist to pin
+    /// down).
+    pub fn with_scripted_stream(mut self, calls: Vec<Vec<stream::StreamEvent>>) -> Self {
+        self.scripted = Some(Arc::new(parking_lot::Mutex::new(
+            std::collections::VecDeque::from(calls),
+        )));
         self
     }
 }
@@ -549,18 +571,28 @@ impl Provider {
             }
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
-                let events = std::collections::VecDeque::from(vec![
-                    StreamEvent::TextStart,
-                    StreamEvent::TextDelta(mock.canned_response.clone()),
-                    StreamEvent::TextEnd,
-                    StreamEvent::Done {
-                        stop_reason: Some("end_turn".into()),
-                        input_tokens: Some(0),
-                        output_tokens: Some(0),
-                        extra: None,
-                    },
-                ]);
-                Ok(ProviderStream::Mock(events))
+                let events = if let Some(script) = &mock.scripted {
+                    script.lock().pop_front().unwrap_or_else(|| {
+                        panic!(
+                            "MockClient scripted stream exhausted — the agentic loop called \
+                             stream() more times than the test scripted; add another call's \
+                             worth of events or fix the test's iteration expectations"
+                        )
+                    })
+                } else {
+                    vec![
+                        StreamEvent::TextStart,
+                        StreamEvent::TextDelta(mock.canned_response.clone()),
+                        StreamEvent::TextEnd,
+                        StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(0),
+                            output_tokens: Some(0),
+                            extra: None,
+                        },
+                    ]
+                };
+                Ok(ProviderStream::Mock(std::collections::VecDeque::from(events)))
             }
         }
     }
