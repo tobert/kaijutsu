@@ -4,6 +4,17 @@
 //! types, the `.ttf` loader, and the shared font context. `layout()` is the
 //! single shaping source for both text paths (MSDF extraction and
 //! scene-rendered rich text), which keeps their metrics identical.
+//!
+//! Nothing here calls into vello's renderer — `layout()` is pure parley.
+//! `VelloTextStyle`/`VelloFont` only *name* `Brush` as a color type, and
+//! that type now comes from the `peniko` crate directly (a direct
+//! dependency, not `vello::peniko`) — `peniko::Brush` and
+//! `vello::peniko::Brush` are the identical type (vello re-exports peniko
+//! verbatim), so this was a zero-risk import repoint, not a rename. The
+//! `Vello*` names themselves are left alone: renaming them would ripple
+//! into every consumer (including `ui/dock.rs`, off-limits mid-edit by
+//! another agent at the time of this pass) for a naming nicety, not a
+//! behavior change.
 
 mod context;
 mod font;

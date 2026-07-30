@@ -12,7 +12,7 @@ use bevy::{prelude::*, reflect::TypePath};
 use parley::{
     FontSettings, FontStyle, FontVariation, Layout, RangedBuilder, StyleProperty,
 };
-use vello::peniko::Brush;
+use peniko::Brush;
 
 use super::context::{LOCAL_FONT_CONTEXT, LOCAL_LAYOUT_CONTEXT, get_global_font_context};
 use super::types::{VelloFontAxes, VelloTextAlign, VelloTextStyle};

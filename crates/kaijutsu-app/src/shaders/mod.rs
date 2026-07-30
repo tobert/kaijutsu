@@ -24,7 +24,7 @@ pub use well_rings_material::WellRingsMaterial;
 use crate::cell::block_border::{
     BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
 };
-use crate::cell::BlockCell;
+use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::input::FocusArea;
 use crate::ui::theme::Theme;
 use crate::view::ui_rtt::UiRttTexture;
@@ -55,7 +55,12 @@ fn sync_block_fx(
             &UiRttTexture,
             Option<&BlockExcludedState>,
         ),
-        Or<(With<BlockCell>, With<MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
+        Or<(
+            With<BlockCell>,
+            With<MsdfOverlayText>,
+            With<crate::view::shell_dock::MsdfShellDockText>,
+            With<RoleGroupBorder>,
+        )>,
     >,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
     theme: Res<Theme>,
@@ -89,6 +94,12 @@ fn sync_block_fx(
                     theme.compose_palette_glow_radius,
                     theme.compose_palette_glow_intensity,
                 )
+            } else if style.kind == BorderKind::CenterLine {
+                // Role-group divider: a plain rule, not a glowing box — the
+                // shader's glow pass SDFs the *whole node rect*, independent
+                // of border kind, so a box glow would ring the entire header
+                // row rather than just the line.
+                (0.0, 0.0)
             } else {
                 (
                     theme.block_border_glow_radius,
@@ -117,6 +128,7 @@ fn sync_block_fx(
                 BorderKind::Dashed => 3.0,
                 BorderKind::OpenBottom => 4.0,
                 BorderKind::OpenTop => 5.0,
+                BorderKind::CenterLine => 6.0,
             };
             // .z/.w carry label border insets (0 = use default 1px AA inset)
             let (inset_top, inset_bottom) = label_metrics

@@ -1,8 +1,10 @@
-//! Vello-rendered block borders (fieldset/legend style).
+//! Shader-drawn block borders (fieldset/legend style).
 //!
-//! Each bordered block gets a `UiVelloScene` on the same entity, drawing a fieldset
-//! border. The scene is NOT a child entity — child entities would cause Taffy to
-//! ignore ContentSize from UiVelloText, collapsing block height to just padding.
+//! `BlockBorderStyle` is pure data — an SDF border description consumed by
+//! `shaders::sync_block_fx` and rasterized by `assets/shaders/block_fx.wgsl`
+//! against the block's MSDF-rendered content texture. No vello scene, no
+//! child entities: the border lives entirely in `MaterialNode<BlockFxMaterial>`
+//! uniforms on the block cell's own entity.
 
 use bevy::prelude::*;
 
@@ -96,6 +98,12 @@ pub enum BorderKind {
     OpenBottom,
     /// Left + right + bottom edges, horizontal divider at top (tool result connected to call above).
     OpenTop,
+    /// A single full-width horizontal rule through the node's vertical
+    /// center — no box, no insets. Used only by the role-group divider
+    /// (`view::block_render::sync_role_group_headers`); the label straddles
+    /// a gap in the line via the same `label_gaps` mechanism as fieldset
+    /// labels.
+    CenterLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
