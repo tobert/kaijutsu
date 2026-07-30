@@ -85,7 +85,8 @@ use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 #[cfg(test)]
 use kaijutsu_kernel::block_store::derive_context_live_status;
 use kaijutsu_kernel::kernel_db::{
-    ContextRow, ContextShellRow, DemoteOutcome, KernelDb, KernelDbError, PromoteOutcome,
+    context_used_pct, ContextRow, ContextShellRow, ContextUsageRow, DemoteOutcome, KernelDb,
+    KernelDbError, PromoteOutcome,
 };
 use kaijutsu_kernel::{
     // FlowBus
@@ -3193,6 +3194,23 @@ impl kernel::Server for KernelImpl {
                     }
                 };
 
+                // Context → last-call usage snapshot (one query for the whole
+                // kernel, same shape as db_map/track_of above). Absent for a
+                // context that has never completed an LLM call — honest
+                // absence, not a fabricated zero (see `ContextUsageRow`).
+                let usage_map: HashMap<ContextId, ContextUsageRow> = {
+                    let db = kernel_db_arc.lock();
+                    match db.list_all_context_usage() {
+                        Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
+                        Err(_) => HashMap::new(),
+                    }
+                };
+                // Context-window denominator, resolved ONCE for the whole
+                // listing via the same `LlmRegistry::context_window_for`
+                // `kj context info --json` uses — no second alias-aware
+                // lookup that could disagree with it.
+                let llm_registry = kernel_arc.llm().read().await;
+
                 // Read from the kernel's drift router — runtime authority for provider/model
                 let drift = kernel_arc.drift().read();
                 let contexts = drift.list_contexts();
@@ -3236,6 +3254,21 @@ impl kernel::Server for KernelImpl {
                         c.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
                     }
+
+                    // Context-window usage — the bottom-dock gauge's wire spine
+                    // (kaijutsu.capnp ContextHandleInfo doc comment). No usage
+                    // row = never completed an LLM call: honest sentinels,
+                    // never fabricated. `resolve_usage_wire_fields` is unit
+                    // tested directly (`context_usage_wire_tests` below) —
+                    // sentinel selection lives there, not re-derived here.
+                    let usage = usage_map.get(&ctx.id);
+                    let window = usage
+                        .and_then(|u| llm_registry.context_window_for(&u.provider, &u.model));
+                    let (wire_window, wire_used_tokens, wire_used_pct) =
+                        resolve_usage_wire_fields(usage, window);
+                    c.set_context_window(wire_window);
+                    c.set_context_used_tokens(wire_used_tokens);
+                    c.set_context_used_pct(wire_used_pct);
 
                     // Supplement with synthesis data (keywords + preview)
                     if let Some(ref idx) = semantic_index
@@ -8257,6 +8290,96 @@ fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Stat
         kaijutsu_crdt::Status::Running => crate::kaijutsu_capnp::Status::Running,
         kaijutsu_crdt::Status::Done => crate::kaijutsu_capnp::Status::Done,
         kaijutsu_crdt::Status::Error => crate::kaijutsu_capnp::Status::Error,
+    }
+}
+
+/// Resolve one context's `(contextWindow, contextUsedTokens, contextUsedPct)`
+/// wire triple (`ContextHandleInfo` in `kaijutsu.capnp`) from its optional
+/// usage snapshot and the window already resolved for it (via
+/// `LlmRegistry::context_window_for`, called by the caller since it needs
+/// the registry lock the loop in `list_contexts` holds once for the whole
+/// listing).
+///
+/// Pulled out of `list_contexts` so the sentinel selection — 0 = unknown
+/// window/no usage, -1.0 = unknown percentage — is unit-testable
+/// independent of the capnp builder (`context_usage_wire_tests` below).
+/// Never fabricates: no usage row means every field is the honest
+/// "unknown"/"absent" sentinel, never a guessed number.
+fn resolve_usage_wire_fields(
+    usage: Option<&ContextUsageRow>,
+    window: Option<u64>,
+) -> (u64, u64, f32) {
+    match usage {
+        Some(u) => {
+            let pct = context_used_pct(u, window);
+            (
+                window.unwrap_or(0),
+                u.total_tokens() as u64,
+                pct.map(|p| p as f32).unwrap_or(-1.0),
+            )
+        }
+        None => (0, 0, -1.0),
+    }
+}
+
+#[cfg(test)]
+mod context_usage_wire_tests {
+    //! `resolve_usage_wire_fields` — the exact plumbing `list_contexts` uses
+    //! to fill `ContextHandleInfo.contextWindow` / `contextUsedTokens` /
+    //! `contextUsedPct`. Pins down the sentinel selection this task's
+    //! `-1.0` convention exists for: a genuinely 0%-used KNOWN window must
+    //! never collide with "window unknown" or "no usage yet".
+    use super::{resolve_usage_wire_fields, ContextUsageRow};
+    use kaijutsu_types::ContextId;
+
+    fn usage(input_tokens: i64, output_tokens: i64) -> ContextUsageRow {
+        ContextUsageRow {
+            context_id: ContextId::new(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn no_usage_row_is_every_sentinel() {
+        assert_eq!(resolve_usage_wire_fields(None, None), (0, 0, -1.0));
+        // A window resolved with no usage would be a contradiction the
+        // caller shouldn't produce, but the helper still refuses to
+        // fabricate a percentage/token count from it.
+        assert_eq!(resolve_usage_wire_fields(None, Some(200_000)), (0, 0, -1.0));
+    }
+
+    #[test]
+    fn usage_present_window_unknown_shows_tokens_but_unknown_pct() {
+        let u = usage(40_000, 10_000);
+        assert_eq!(resolve_usage_wire_fields(Some(&u), None), (0, 50_000, -1.0));
+    }
+
+    /// The case the `-1.0` sentinel exists for: a genuinely 0%-used
+    /// context against a KNOWN window must be `Some(0.0)`-shaped
+    /// (`(window, 0, 0.0)`), never confused with the unknown triple above.
+    #[test]
+    fn zero_usage_known_window_is_real_zero_not_unknown() {
+        let u = usage(0, 0);
+        assert_eq!(
+            resolve_usage_wire_fields(Some(&u), Some(200_000)),
+            (200_000, 0, 0.0)
+        );
+    }
+
+    #[test]
+    fn usage_and_window_both_known_computes_pct() {
+        let u = usage(40_000, 10_000);
+        assert_eq!(
+            resolve_usage_wire_fields(Some(&u), Some(200_000)),
+            (200_000, 50_000, 25.0)
+        );
     }
 }
 

@@ -533,6 +533,21 @@ struct ContextHandleInfo {
   promotedAt @17 :UInt64;         # 0 = not promoted, else Unix millis of the explicit ring-0 promote (append-ordered, never restamped)
   demotedAt @18 :UInt64;          # 0 = not demoted, else Unix millis of the explicit push to the demoted ring
   pausedAt @19 :UInt64;           # 0 = not paused, else Unix millis of the explicit pause; gating deferred (see setContextPaused)
+
+  # Context-window usage — the bottom-dock gauge's wire spine. Resolved
+  # kernel-side from the SAME KernelDb::get_context_usage +
+  # LlmRegistry::context_window_for + shared percentage helper that
+  # `kj context info --json` uses, so the two surfaces can never disagree.
+  # `contextUsedTokens` is the LAST completed call's fill (input+output),
+  # NOT a running total across turns — see `ContextUsageRow`.
+  contextWindow     @20 :UInt64;         # 0 = unknown (no configured window for this model, or no usage yet)
+  contextUsedTokens @21 :UInt64;         # 0 = no usage yet (this context has never completed an LLM call)
+  contextUsedPct    @22 :Float32 = -1.0; # -1.0 = unknown (window unconfigured or no usage yet). This struct's
+                                         # usual "0 = unknown" convention doesn't work here because 0.0 is a
+                                         # legitimate value (a fresh context is genuinely 0% used), so -1.0 is
+                                         # the dedicated sentinel — never clamped, never fabricated. The schema
+                                         # default is -1.0 (not capnp's usual 0), so a builder that never calls
+                                         # setContextUsedPct decodes as "unknown", never a false Some(0.0).
 }
 
 struct PresetInfo {

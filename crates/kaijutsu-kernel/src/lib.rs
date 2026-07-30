@@ -144,7 +144,7 @@ pub use input_doc::InputDocEntry;
 pub use kernel_db::{
     ContextEdgeRow, ContextEnvRow, ContextRow, ContextShellRow, ContextUsageRow, DocSnapshotRow,
     DocumentRow, InputDocSnapshotRow, KernelDb, KernelDbError, KernelDbResult, PresetRow,
-    WorkspacePathRow, WorkspaceRow,
+    WorkspacePathRow, WorkspaceRow, context_used_pct,
 };
 pub use kj::{KjCaller, KjDispatcher, KjResult};
 

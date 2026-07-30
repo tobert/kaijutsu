@@ -534,20 +534,16 @@ impl KjDispatcher {
         // already uses. `None` when the model's window isn't configured
         // (e.g. `claude-sonnet-4-20250514` deliberately has none) — the two
         // fields below MUST both be `null` in that case, never a guessed
-        // denominator standing in for one. The percentage is computed
-        // against the LAST call's fill (`usage.input_tokens +
-        // usage.output_tokens`), not a running total across turns — see the
-        // `ContextUsageRow` / `context_usage` table doc comments. No
-        // clamping: an over-100% or otherwise surprising number is reported
-        // as-is, not silently capped.
+        // denominator standing in for one. The percentage itself comes from
+        // `context_used_pct` — the ONE percentage-math site, shared with the
+        // wire's `contextUsedPct` (`ContextHandleInfo` /
+        // `kaijutsu-server/src/rpc.rs::list_contexts`) so the two surfaces
+        // can never disagree.
         let (context_window, context_used_pct) = match &usage {
             Some(u) => {
                 let registry = self.kernel().llm().read().await;
                 let window = registry.context_window_for(&u.provider, &u.model);
-                let pct = window.map(|w| {
-                    let used = (u.input_tokens + u.output_tokens) as f64;
-                    used / (w as f64) * 100.0
-                });
+                let pct = crate::kernel_db::context_used_pct(u, window);
                 (window, pct)
             }
             None => (None, None),

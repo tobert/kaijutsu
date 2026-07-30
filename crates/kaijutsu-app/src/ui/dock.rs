@@ -99,6 +99,7 @@ pub struct DockState {
     // South dock
     pub mode: DockText,
     pub model_badge: DockText,
+    pub context_usage: DockText,
     pub agent_activity: DockText,
     pub block_activity: DockText,
     pub hints: DockText,
@@ -131,6 +132,11 @@ impl Default for DockState {
                 font_size: 16.0,
             },
             model_badge: DockText {
+                text: "—".into(),
+                color: Color::WHITE,
+                font_size: 13.0,
+            },
+            context_usage: DockText {
                 text: "—".into(),
                 color: Color::WHITE,
                 font_size: 13.0,
@@ -485,7 +491,7 @@ pub fn render_north_dock(
 
 /// Render the South dock scene.
 ///
-/// Layout: `[mode] [model] ... [activity] [block_activity] ... [contexts] ... [hints]`
+/// Layout: `[mode] [model] ... [activity] [block_activity] ... [contexts] ... [context_usage] [hints]`
 pub fn render_south_dock(
     dock_state: Res<DockState>,
     theme: Res<Theme>,
@@ -547,10 +553,29 @@ pub fn render_south_dock(
         x += model_w + gap;
     }
 
-    // === Right group: hints (right-aligned) ===
+    // === Right group: context_usage + hints (right-aligned) ===
     let hints_brush = bevy_color_to_brush(theme.fg_dim);
     let hints_w = measure_text(&dock_state.hints.text, dock_state.hints.font_size, font);
     let hints_x = (width - pad_h - hints_w).max(x + gap);
+
+    // context_usage sits immediately left of hints, in the same right-aligned group.
+    let usage_brush = bevy_color_to_brush(dock_state.context_usage.color);
+    let usage_w = measure_text(
+        &dock_state.context_usage.text,
+        dock_state.context_usage.font_size,
+        font,
+    );
+    let usage_x = (hints_x - gap - usage_w).max(x + gap);
+
+    draw_dock_text(
+        &mut scene,
+        &dock_state.context_usage.text,
+        usage_x,
+        pad_v,
+        dock_state.context_usage.font_size,
+        font,
+        &usage_brush,
+    );
 
     draw_dock_text(
         &mut scene,
@@ -847,7 +872,57 @@ pub fn update_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_connection_error;
+    use super::{classify_connection_error, format_context_usage, format_token_count};
+
+    #[test]
+    fn format_token_count_below_thousand_is_exact() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+    }
+
+    #[test]
+    fn format_token_count_thousands_abbreviate() {
+        assert_eq!(format_token_count(234_000), "234k");
+        assert_eq!(format_token_count(1_500), "1.5k");
+    }
+
+    #[test]
+    fn format_token_count_millions_abbreviate() {
+        assert_eq!(format_token_count(1_000_000), "1M");
+        assert_eq!(format_token_count(1_200_000), "1.2M");
+    }
+
+    /// No usage yet (never completed an LLM call) shows the SAME em-dash
+    /// placeholder as the model badge — never a fabricated "0/0" or "0".
+    #[test]
+    fn format_context_usage_no_usage_is_em_dash() {
+        assert_eq!(format_context_usage(None, None), "\u{2014}");
+        // Even a stray window with no usage must not claim a fraction —
+        // there is no observed fill to show.
+        assert_eq!(format_context_usage(None, Some(200_000)), "\u{2014}");
+    }
+
+    /// Usage exists but the model's window isn't configured — show the raw
+    /// count alone, never guess a denominator to build a fraction/percentage.
+    #[test]
+    fn format_context_usage_unknown_window_shows_raw_count_only() {
+        assert_eq!(format_context_usage(Some(45_231), None), "45.2k");
+    }
+
+    /// Both known — the fraction Amy asked for ("234k/1M").
+    #[test]
+    fn format_context_usage_known_window_shows_fraction() {
+        assert_eq!(format_context_usage(Some(234_000), Some(1_000_000)), "234k/1M");
+    }
+
+    /// A genuinely fresh, known-window context (0 used) must render `0/window`,
+    /// not fall back to the unknown em-dash — this is the exact distinction
+    /// the wire's `-1.0` percentage sentinel exists to protect (0% used is
+    /// real data, not an absence).
+    #[test]
+    fn format_context_usage_zero_used_known_window_is_not_em_dash() {
+        assert_eq!(format_context_usage(Some(0), Some(200_000)), "0/200k");
+    }
 
     #[test]
     fn agent_missing_classified() {
@@ -1155,6 +1230,80 @@ fn shorten_model_name(model: &str) -> String {
     m.to_string()
 }
 
+/// Update the context-usage badge — "how full is the active context",
+/// Amy's bottom-dock gauge ask. Reads the SAME kernel-derived numbers `kj
+/// context info --json` reports (`ContextInfo::context_window` /
+/// `context_used_tokens` / `context_used_pct`, decoded from the wire's
+/// honest sentinels by `kaijutsu-client::parse_context_info`) — display
+/// only, no interaction.
+pub fn update_context_usage_badge(
+    drift_state: Res<DriftState>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    theme: Res<Theme>,
+    mut dock: ResMut<DockState>,
+) {
+    if !drift_state.is_changed() && !doc_cache.is_changed() {
+        return;
+    }
+
+    let text = if let Some(active_id) = doc_cache.active_id() {
+        drift_state
+            .contexts
+            .iter()
+            .find(|ctx| ctx.id == active_id)
+            .map(|ctx| format_context_usage(ctx.context_used_tokens, ctx.context_window))
+            .unwrap_or_else(|| "\u{2014}".to_string())
+    } else {
+        "\u{2014}".to_string()
+    };
+
+    if dock.context_usage.text != text {
+        dock.context_usage.text = text;
+        dock.context_usage.color = theme.fg_dim;
+    }
+}
+
+/// Render text for the context-usage badge — never claims knowledge it
+/// doesn't have:
+/// - no usage yet (context never completed an LLM call) -> em-dash, same
+///   placeholder the model badge uses;
+/// - usage but no configured window for the model -> the raw token count
+///   alone, no fraction/percentage (there's nothing honest to divide by);
+/// - both known -> `used/window` in abbreviated form (e.g. `234k/1M`).
+fn format_context_usage(used_tokens: Option<u64>, window: Option<u64>) -> String {
+    match (used_tokens, window) {
+        (Some(used), Some(w)) => format!("{}/{}", format_token_count(used), format_token_count(w)),
+        (Some(used), None) => format_token_count(used),
+        (None, _) => "\u{2014}".to_string(),
+    }
+}
+
+/// Abbreviate a token count for the dock's tight horizontal budget:
+/// `999` -> `"999"`, `234_000` -> `"234k"`, `1_000_000` -> `"1M"`.
+/// Not locale-aware, not exact for display — a legible-at-a-glance
+/// approximation, same spirit as `shorten_model_name`.
+fn format_token_count(n: u64) -> String {
+    const K: f64 = 1_000.0;
+    const M: f64 = 1_000_000.0;
+    if n as f64 >= M {
+        format_abbreviated(n as f64 / M, "M")
+    } else if n as f64 >= K {
+        format_abbreviated(n as f64 / K, "k")
+    } else {
+        n.to_string()
+    }
+}
+
+/// One decimal place, dropped when it would just be `.0` (`1.0M` -> `1M`,
+/// `1.5M` stays `1.5M`).
+fn format_abbreviated(value: f64, suffix: &str) -> String {
+    if (value.round() - value).abs() < 0.05 {
+        format!("{:.0}{suffix}", value.round())
+    } else {
+        format!("{value:.1}{suffix}")
+    }
+}
+
 /// Tracks running block counts for the BlockActivity widget.
 #[derive(Default)]
 pub(crate) struct BlockActivityCounts {
@@ -1240,6 +1389,7 @@ impl Plugin for DockPlugin {
                     update_hints,
                     update_event_pulse,
                     update_model_badge,
+                    update_context_usage_badge,
                     update_block_activity,
                     // Conversation-only: the dock's ComputedNode/GlobalTransform
                     // survive Visibility::Hidden, so without the gate a click

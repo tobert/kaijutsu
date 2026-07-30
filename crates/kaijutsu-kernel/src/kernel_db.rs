@@ -328,6 +328,31 @@ pub struct ContextUsageRow {
     pub updated_at: i64,
 }
 
+impl ContextUsageRow {
+    /// Total tokens filled by the LAST completed call (input + output) —
+    /// the fill `context_used_pct` is computed against, never a running
+    /// total across turns.
+    pub fn total_tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
+/// How full a context is, as a percentage of `window` (0-100+, never
+/// clamped), computed from the LAST completed call's fill
+/// (`usage.total_tokens()`) — not a running total across turns. `None`
+/// when `window` is `None` (the model's context window isn't configured)
+/// — the caller must render that as an explicit "unknown", never a
+/// fabricated denominator standing in for one.
+///
+/// This is the ONE percentage-math site: `kj context info --json`
+/// (`kj/context.rs`) and the wire's `contextUsedPct`
+/// (`ContextHandleInfo` in `kaijutsu.capnp`, populated in
+/// `kaijutsu-server/src/rpc.rs::list_contexts`) both call through here so
+/// the two surfaces can never disagree.
+pub fn context_used_pct(usage: &ContextUsageRow, window: Option<u64>) -> Option<f64> {
+    window.map(|w| usage.total_tokens() as f64 / w as f64 * 100.0)
+}
+
 /// Per-context environment variable.
 #[derive(Debug, Clone)]
 pub struct ContextEnvRow {
@@ -2981,6 +3006,33 @@ impl KernelDb {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
+    }
+
+    /// Read every context's usage snapshot in one query — the bulk
+    /// counterpart to [`Self::get_context_usage`] for callers that need to
+    /// annotate a whole listing (e.g. `listContexts`'s wire response)
+    /// without one DB round-trip per context, mirroring
+    /// [`Self::list_all_contexts`] / [`Self::list_all_attachments`].
+    pub fn list_all_context_usage(&self) -> KernelDbResult<Vec<ContextUsageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, provider, model, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens, updated_at
+             FROM context_usage",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ContextUsageRow {
+                context_id: read_context_id(row, 0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cache_read_tokens: row.get(5)?,
+                cache_write_tokens: row.get(6)?,
+                reasoning_tokens: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
     // ========================================================================
@@ -5760,6 +5812,95 @@ mod tests {
             (150, 30),
             "second write must replace the first, not sum with it (100+150=250 would be wrong)"
         );
+    }
+
+    /// `list_all_context_usage` is the bulk counterpart to
+    /// `get_context_usage` — used by `listContexts` so the wire's
+    /// `contextWindow`/`contextUsedTokens`/`contextUsedPct` don't cost one
+    /// DB round-trip per context.
+    #[test]
+    fn list_all_context_usage_returns_every_row() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx_a = make_context_row(Some("usage-list-a"));
+        let ctx_b = make_context_row(Some("usage-list-b"));
+        insert_context_with_doc(&db, &ctx_a, ws_id);
+        insert_context_with_doc(&db, &ctx_b, ws_id);
+
+        // ctx_b never completes a call — must be absent from the bulk list,
+        // same honesty as get_context_usage's None.
+        db.set_context_usage(&ContextUsageRow {
+            context_id: ctx_a.context_id,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        })
+        .unwrap();
+
+        let rows = db.list_all_context_usage().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].context_id, ctx_a.context_id);
+    }
+
+    /// The one percentage-math site: `kj context info --json` and the
+    /// wire's `contextUsedPct` both resolve through `context_used_pct`, so
+    /// this pins down the definition itself (used / window * 100, no
+    /// clamping) and the honest-unknown short-circuit.
+    #[test]
+    fn context_used_pct_computes_from_last_call_fill() {
+        let usage = ContextUsageRow {
+            context_id: ContextId::new(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 40_000,
+            output_tokens: 10_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        };
+        assert_eq!(context_used_pct(&usage, Some(200_000)), Some(25.0));
+    }
+
+    #[test]
+    fn context_used_pct_unknown_window_is_none_not_zero() {
+        let usage = ContextUsageRow {
+            context_id: ContextId::new(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            input_tokens: 40_000,
+            output_tokens: 10_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        };
+        assert_eq!(context_used_pct(&usage, None), None);
+    }
+
+    /// A genuinely fresh usage row (0 tokens either side, e.g. right after
+    /// the first empty turn) against a known window must compute a real
+    /// `Some(0.0)` — this is the exact case the wire's `-1.0` sentinel
+    /// exists to keep distinct from "window unknown".
+    #[test]
+    fn context_used_pct_zero_usage_is_some_zero_not_none() {
+        let usage = ContextUsageRow {
+            context_id: ContextId::new(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            updated_at: 1,
+        };
+        assert_eq!(context_used_pct(&usage, Some(200_000)), Some(0.0));
     }
 
     #[test]

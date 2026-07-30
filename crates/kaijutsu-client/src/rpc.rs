@@ -189,7 +189,12 @@ pub struct ContextMembership {
 }
 
 /// Context within a kernel (rich info from ContextHandleInfo wire type)
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` only, not `Eq` — `context_used_pct` is an `Option<f32>` and
+/// `f32` isn't `Eq` (NaN isn't reflexive under `==`); the wire never
+/// produces NaN here (only the `-1.0` sentinel or a real division), so
+/// `PartialEq` is exact in practice.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContextInfo {
     pub id: ContextId,
     pub label: String,
@@ -237,6 +242,20 @@ pub struct ContextInfo {
     /// paused (0 on the wire). Design-only for now — no behavioral gating is
     /// wired yet.
     pub paused_at: Option<u64>,
+    /// Configured context-window size for the model that served the last
+    /// completed call, or `None` when unconfigured (0 on the wire) — never a
+    /// guessed denominator standing in for an unknown one.
+    pub context_window: Option<u64>,
+    /// Tokens filled by the LAST completed call (input + output), NOT a
+    /// running total across turns. `None` when this context has never
+    /// completed an LLM call (0 on the wire).
+    pub context_used_tokens: Option<u64>,
+    /// Percentage of `context_window` used by the last call (0-100+, never
+    /// clamped), kernel-derived via the same helper `kj context info --json`
+    /// uses. `None` when the window is unconfigured OR there's no usage yet
+    /// (wire sentinel -1.0) — decoded here so no code above this boundary
+    /// has to remember what -1.0 means.
+    pub context_used_pct: Option<f32>,
 }
 
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
@@ -2660,6 +2679,23 @@ fn parse_context_info(
         ts => Some(ts),
     };
 
+    let context_window = match reader.get_context_window() {
+        0 => None,
+        w => Some(w),
+    };
+    let context_used_tokens = match reader.get_context_used_tokens() {
+        0 => None,
+        t => Some(t),
+    };
+    // -1.0 is the dedicated "unknown" sentinel (0.0 is a legitimate value —
+    // a fresh context is genuinely 0% used — so it can't double as the
+    // sentinel the way 0 does for the fields above). Decoded once here so
+    // no caller above this boundary has to remember the wire convention.
+    let context_used_pct = match reader.get_context_used_pct() {
+        pct if pct < 0.0 => None,
+        pct => Some(pct),
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2680,6 +2716,9 @@ fn parse_context_info(
         promoted_at,
         demoted_at,
         paused_at,
+        context_window,
+        context_used_tokens,
+        context_used_pct,
     })
 }
 
@@ -4043,6 +4082,71 @@ mod tests {
             .unwrap();
         let parsed2 = parse_context_info(&reader2).unwrap();
         assert_eq!(parsed2.last_activity_at, None);
+    }
+
+    /// Bottom-dock gauge wire spine: `contextWindow` / `contextUsedTokens` /
+    /// `contextUsedPct` on `ContextHandleInfo` round-trip through
+    /// `parse_context_info`. The whole point of the `-1.0` sentinel is that
+    /// it must NOT collide with a real 0% — this pins both directions: an
+    /// unset/unknown window decodes as `None`, and a KNOWN window with a
+    /// genuinely empty context (0 tokens used, 0.0%) decodes as `Some(0.0)`,
+    /// never confused with "unknown". If someone "simplified" the sentinel
+    /// back to a plain 0-means-unknown convention, the second block here
+    /// would start failing.
+    #[test]
+    fn test_parse_context_info_usage_sentinel_roundtrip() {
+        // Unknown window: nothing set on the wire (old server, or the
+        // model has no configured window) — contextUsedPct's schema
+        // default (-1.0) must decode as None, never Some(0.0).
+        let mut message = MessageBuilder::new_default();
+        let mut builder =
+            message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[9u8; 16]);
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed = parse_context_info(&reader).unwrap();
+        assert_eq!(parsed.context_window, None);
+        assert_eq!(parsed.context_used_tokens, None);
+        assert_eq!(
+            parsed.context_used_pct, None,
+            "unset contextUsedPct must decode as unknown, not Some(0.0)"
+        );
+
+        // Known window, freshly-used context: a real Some(0.0) must
+        // survive intact.
+        let mut message2 = MessageBuilder::new_default();
+        let mut builder2 =
+            message2.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder2.set_id(&[9u8; 16]);
+        builder2.set_context_window(200_000);
+        builder2.set_context_used_pct(0.0);
+        let reader2 = message2
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed2 = parse_context_info(&reader2).unwrap();
+        assert_eq!(parsed2.context_window, Some(200_000));
+        assert_eq!(
+            parsed2.context_used_pct,
+            Some(0.0),
+            "a genuinely 0%-used known window must NOT be confused with unknown"
+        );
+
+        // A real mid-range usage value round-trips exactly too.
+        let mut message3 = MessageBuilder::new_default();
+        let mut builder3 =
+            message3.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder3.set_id(&[9u8; 16]);
+        builder3.set_context_window(200_000);
+        builder3.set_context_used_tokens(50_000);
+        builder3.set_context_used_pct(25.0);
+        let reader3 = message3
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed3 = parse_context_info(&reader3).unwrap();
+        assert_eq!(parsed3.context_window, Some(200_000));
+        assert_eq!(parsed3.context_used_tokens, Some(50_000));
+        assert_eq!(parsed3.context_used_pct, Some(25.0));
     }
 
     /// Stage 3 (time-well) wire spine: `trackId` on `ContextHandleInfo`

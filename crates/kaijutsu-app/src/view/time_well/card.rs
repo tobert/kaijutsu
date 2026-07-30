@@ -513,6 +513,9 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            context_window: None,
+            context_used_tokens: None,
+            context_used_pct: None,
         }
     }
 
