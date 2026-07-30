@@ -10,7 +10,7 @@ pub use parley::OverflowWrap;
 /// The font itself is the `VelloFont::layout` receiver, not part of the style.
 #[derive(Clone)]
 pub struct VelloTextStyle {
-    pub brush: vello::peniko::Brush,
+    pub brush: peniko::Brush,
     pub font_size: f32,
     /// Line height multiplier.
     pub line_height: f32,
@@ -29,7 +29,7 @@ pub struct VelloTextStyle {
 impl Default for VelloTextStyle {
     fn default() -> Self {
         Self {
-            brush: vello::peniko::Brush::Solid(vello::peniko::Color::WHITE),
+            brush: peniko::Brush::Solid(peniko::Color::WHITE),
             font_size: 24.0,
             line_height: 1.0,
             word_spacing: 0.0,

@@ -1,8 +1,12 @@
 //! Entity lifecycle — spawn and despawn block cell entities.
 //!
 //! Owns spawn_main_cell, spawn_block_cells, sync_role_headers, and
-//! track_conversation_container. Block cells use BlockScene + BlockTexture
-//! + ImageNode for CPU-rasterized Vello rendering with Bevy flex layout.
+//! track_conversation_container. Block cells (and role-group divider headers)
+//! carry BlockScene/RoleGroupBorder + UiRttTexture + MsdfBlockGlyphs +
+//! MaterialNode<BlockFxMaterial> + ImageNode: MSDF renders content into the
+//! texture, the shader material draws border/glow/label decoration on top,
+//! Bevy's flex layout places the node. Vello is a per-content-kind opt-in
+//! (SVG/ABC only) via `UiVectorScene`, not the baseline.
 
 use bevy::prelude::*;
 use crate::text::shaping::VelloFont;
@@ -490,6 +494,7 @@ pub fn sync_role_headers(
     role_header_query: Query<&RoleGroupBorder>,
     scroll_state: Res<crate::cell::ConversationScrollState>,
     mut layout_gen: ResMut<LayoutGeneration>,
+    mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -551,13 +556,19 @@ pub fn sync_role_headers(
     }
 
     for (role, block_id) in to_spawn {
+        // Same bundle shape as a block cell's MSDF/shader path (block_render
+        // ::sync_role_group_headers draws the center-line border + label into
+        // it) — no `UiVectorScene`, no vello scene is ever built here.
+        let material_handle = fx_materials.add(BlockFxMaterial::default());
         let entity = commands
             .spawn((
                 RoleGroupBorder { role, block_id },
                 RoleGroupBorderLayout::default(),
-                crate::view::ui_rtt::UiVectorScene::default(),
                 crate::view::ui_rtt::UiRttTexture::default(),
+                crate::text::msdf::MsdfBlockGlyphs::default(),
+                crate::text::msdf::BlockRenderMethod::default(),
                 ImageNode::default(),
+                MaterialNode(material_handle),
                 Node {
                     width: Val::Percent(100.0),
                     min_height: Val::Px(ROLE_HEADER_HEIGHT),

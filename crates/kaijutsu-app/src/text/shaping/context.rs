@@ -13,7 +13,7 @@ use parley::{
     FontContext, LayoutContext,
     fontique::{Collection, CollectionOptions, SourceCache},
 };
-use vello::peniko::Brush;
+use peniko::Brush;
 
 static GLOBAL_FONT_CONTEXT: std::sync::OnceLock<FontContext> = std::sync::OnceLock::new();
 
