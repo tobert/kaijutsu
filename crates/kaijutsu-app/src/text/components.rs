@@ -10,10 +10,16 @@ pub struct KjTextEffects {
     pub rainbow: bool,
 }
 
-/// Convert a Bevy `Color` to a Vello `Brush::Solid`.
-pub fn bevy_color_to_brush(color: Color) -> vello::peniko::Brush {
+/// Convert a Bevy `Color` to a `peniko::Brush::Solid`.
+///
+/// `Brush` is the shared color currency for parley glyph runs on both text
+/// paths (MSDF and vello) — most callers are MSDF-only (`collect_msdf_glyphs`
+/// spans, border/role-divider labels), so this names `peniko` directly
+/// rather than `vello::peniko` (the identical type; vello re-exports peniko
+/// verbatim) to avoid making pure-MSDF code paths name the vello crate.
+pub fn bevy_color_to_brush(color: Color) -> peniko::Brush {
     let srgba = color.to_srgba();
-    vello::peniko::Brush::Solid(vello::peniko::Color::from_rgba8(
+    peniko::Brush::Solid(peniko::Color::from_rgba8(
         (srgba.red * 255.0) as u8,
         (srgba.green * 255.0) as u8,
         (srgba.blue * 255.0) as u8,
@@ -28,12 +34,12 @@ pub fn bevy_color_to_brush(color: Color) -> vello::peniko::Brush {
 /// the gradient start point over time, creating a smooth scrolling effect.
 ///
 /// Uses `Extend::Repeat` so the palette tiles seamlessly across any text width.
-pub fn rainbow_brush(offset: f32, alpha: f32) -> vello::peniko::Brush {
-    use vello::peniko::color::DynamicColor;
-    use vello::peniko::{Extend, Gradient};
+pub fn rainbow_brush(offset: f32, alpha: f32) -> peniko::Brush {
+    use peniko::color::DynamicColor;
+    use peniko::{Extend, Gradient};
 
     fn c(r: u8, g: u8, b: u8, a: f32) -> DynamicColor {
-        vello::peniko::Color::from_rgba8(r, g, b, (a * 255.0) as u8).into()
+        peniko::Color::from_rgba8(r, g, b, (a * 255.0) as u8).into()
     }
 
     // Tokyo Night palette rainbow — vibrant but theme-cohesive.
