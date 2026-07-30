@@ -998,6 +998,37 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Conversation-view de-vello pass — needs a visual pass in the running
+  app** (2026-07-30, `feat/devello`; a validation pass is planned
+  separately, this records what to check first). Role-group dividers,
+  sparklines, and the image placeholder moved off vello onto a shader
+  center-line (`BorderKind::CenterLine`) and plain Bevy UI rectangle
+  geometry (`text::sparkline::build_sparkline_geometry`,
+  `view::block_render::spawn_segment_child`/`spawn_rect_child`); this pass
+  was done without running the app (the runner was down), so unit tests
+  cover the pure math but not pixels. Specifically worth eyeballing:
+  - **Sparkline segment rotation.** `spawn_segment_child` centers a thin
+    `Node` at each stroke segment's midpoint and rotates it via
+    `UiTransform::from_rotation(Rot2::radians(dy.atan2(dx)))`. Reasoned
+    through `bevy_ui`'s `ui_layout_system` source (rotation pivots the
+    node's own layout center) and pinned with a test that checks the
+    rotated endpoints land on the original data points
+    (`sparkline.rs::geometry_segment_endpoints_recover_via_rotation`) — but
+    that's bevy_math math, not a render. Watch for an upside-down or
+    mirrored polyline.
+  - **Sparkline fill shape.** The fill is now bar-tiled (each bar's top is
+    the midpoint height of the two points it spans), not the old smooth
+    linear-interpolation polygon — a deliberate simplification (no
+    triangles/rotation needed) that will look slightly different for noisy
+    data, more so for few, widely-spaced points.
+  - **Role divider label vertical centering + line thickness** —
+    `fieldset::ROLE_LABEL_FONT_SIZE`/`ROLE_DIVIDER_THICKNESS` preserve the
+    pre-shader Vello values exactly on paper; worth a glance since the
+    label now goes through MSDF (a different glyph pipeline) rather than
+    Vello's `draw_glyphs`.
+  - ABC (`text/abc.rs`) and SVG (`text/rich.rs`, `vello_svg`) are
+    unchanged/still vello, both explicitly out of scope for this pass.
+
 - **Beat-reference delivery + turn-cadence follow-ups** (deferred from the
   2026-07-15 timestamped-beat-refs fix, merged `0a39718b` + live-verified;
   the arc's story is in the devlog — "The beat learns to carry its own
