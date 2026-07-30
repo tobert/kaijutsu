@@ -1326,6 +1326,15 @@ impl KjDispatcher {
         // MCP subscription cleanup removed alongside the legacy MCP pool
         // in Phase 1 M5.
 
+        // Kill any background host processes this context still owns
+        // (`background_exec.rs`) before the document they stream into is
+        // deleted below — an orphaned `Running` entry pointing at a gone
+        // block would otherwise keep the OS process alive with nowhere for
+        // its output to land. Fire-and-forget: the supervising tasks tear
+        // the processes down independently, `context_remove` doesn't block
+        // on their exit.
+        self.kernel().background_processes().kill_all_for_context(target_id);
+
         // Delete from DB (CASCADE deletes edges)
         {
             let db = self.kernel_db().lock();

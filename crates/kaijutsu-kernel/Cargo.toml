@@ -5,7 +5,10 @@ edition.workspace = true
 description = "Core kernel with VFS abstraction for kaijutsu"
 
 [dependencies]
-tokio = { version = "1", features = ["fs", "sync", "time", "io-util"] }
+# "process" — tokio::process::Command/Child for background host-process
+# execution (background_exec.rs); the shell tool's synchronous path spawns
+# through the embedded kaish interpreter instead and doesn't need this.
+tokio = { version = "1", features = ["fs", "sync", "time", "io-util", "process"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -113,8 +116,11 @@ beat-this = "1.0"
 [features]
 test-mock = []
 
+# "process" — setpgid/kill_process_group/PR_SET_PDEATHSIG for background_exec.rs
+# (own process group for group-kill semantics; parent-death signal so a
+# spawned background process can never outlive a crashed/killed kernel).
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

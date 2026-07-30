@@ -129,6 +129,12 @@ pub struct Kernel {
     /// `editor_quit` publishes `Closed`; the server's `subscribe_editor` bridge
     /// serializes these onto the `EditorEvents` capnp callback.
     editor_flows: SharedEditorFlowBus,
+    /// Background host-process registry (`background_exec.rs`,
+    /// `docs/issues.md` "Background shell + process management"). Kernel-owned
+    /// (not per-materialized-shell) so a process started by one `shell`
+    /// tool call is still queryable/killable from the next — see the module
+    /// docs for the full ownership/cleanup contract.
+    background: Arc<crate::background_exec::BackgroundRegistry>,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -205,6 +211,17 @@ impl Kernel {
                 crate::editor::EditorSessions::new(),
             )),
             editor_flows: shared_editor_flow_bus(DEFAULT_FLOW_CAPACITY),
+            // spawn_reaper: a lightweight periodic sweep so terminal
+            // background-process entries are reaped even if nothing ever
+            // polls the registry again (e.g. a context is removed —
+            // cancelling its processes — and no other context ever calls
+            // list_background_processes/read_background_output afterward).
+            // See background_exec.rs's BackgroundRegistry::spawn_reaper docs.
+            background: {
+                let bg = Arc::new(crate::background_exec::BackgroundRegistry::new());
+                bg.spawn_reaper();
+                bg
+            },
         }
     }
 
@@ -267,6 +284,17 @@ impl Kernel {
                 crate::editor::EditorSessions::new(),
             )),
             editor_flows: shared_editor_flow_bus(DEFAULT_FLOW_CAPACITY),
+            // spawn_reaper: a lightweight periodic sweep so terminal
+            // background-process entries are reaped even if nothing ever
+            // polls the registry again (e.g. a context is removed —
+            // cancelling its processes — and no other context ever calls
+            // list_background_processes/read_background_output afterward).
+            // See background_exec.rs's BackgroundRegistry::spawn_reaper docs.
+            background: {
+                let bg = Arc::new(crate::background_exec::BackgroundRegistry::new());
+                bg.spawn_reaper();
+                bg
+            },
         }
     }
 
@@ -719,6 +747,19 @@ impl Kernel {
             .register_silently(read_only_shell_server, InstancePolicy::for_kernel(self))
             .await?;
 
+        // builtin.background — `list_background_processes` /
+        // `read_background_output` / `kill_background_process`, the
+        // companion tools for `shell`'s `background: true` jobs
+        // (`background_exec.rs`). Sibling of `builtin.shell`, riding the
+        // SAME `facade:shell` projection (FACADE_PROJECTED_INSTANCES) — no
+        // separate rc grant needed.
+        let background_server = Arc::new(
+            crate::mcp::servers::BackgroundServer::new(Arc::downgrade(&self.broker)),
+        );
+        self.broker
+            .register_silently(background_server, InstancePolicy::for_kernel(self))
+            .await?;
+
         Ok(())
     }
 
@@ -751,6 +792,12 @@ impl Kernel {
     /// Get the `/r` client-shares registry (`docs/slash-r.md`).
     pub fn share_registry(&self) -> &Arc<crate::vfs::ShareRegistry> {
         &self.share_registry
+    }
+
+    /// Get the background host-process registry (`background_exec.rs`). See
+    /// that module's docs for the ownership/cleanup/output-bounding contract.
+    pub fn background_processes(&self) -> &Arc<crate::background_exec::BackgroundRegistry> {
+        &self.background
     }
 
     /// Get the image backend registry.

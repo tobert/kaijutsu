@@ -77,9 +77,20 @@ pub const KNOWN_AUTHORITIES: &[&str] =
 /// `facade:shell`, so it sees one shell, not both. Broad `facade:*` roles match
 /// both projections and see both tools — a harmless strict subset, accepted to
 /// keep the gate single-axis.
+///
+/// `builtin.background` (`list_background_processes` /
+/// `read_background_output` / `kill_background_process`, `mcp/servers/
+/// background.rs`) rides the SAME `facade:shell` bit — it's a sibling of
+/// `shell` (companion tools for the `background: true` jobs `shell` starts),
+/// not a new capability axis, so whoever can shell out can also manage what
+/// they backgrounded, with no separate rc grant to add. Individual
+/// operations still re-check the `exec` authority where it matters (starting
+/// or killing a host process) — see `mcp/servers/shell.rs` and
+/// `mcp/servers/background.rs`.
 pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
     ("builtin.shell", "shell"),
     ("builtin.shell_readonly", "shell_readonly"),
+    ("builtin.background", "shell"),
 ];
 
 /// A single capability grant or query. The allow-set is the positive surface a
@@ -662,12 +673,16 @@ mod tests {
         assert!(b.allows(&Capability::Facade("shell".into())));
         assert!(!b.allows(&Capability::Facade("edit_input".into())));
 
-        // `builtin.shell` joins the candidates because `facade:shell` was
-        // granted above — the facade projects the in-kernel shell tool so the
-        // server is selected by list_visible_tools (FACADE_PROJECTED_INSTANCES).
+        // `builtin.shell` AND `builtin.background` join the candidates
+        // because `facade:shell` was granted above — the facade projects
+        // both the in-kernel shell tool and its background-job sibling, so
+        // both are selected by list_visible_tools (FACADE_PROJECTED_INSTANCES).
         let mut cands = b.candidate_instances();
         cands.sort();
-        assert_eq!(cands, vec![inst("block"), inst("builtin.shell"), inst("file")]);
+        assert_eq!(
+            cands,
+            vec![inst("block"), inst("builtin.background"), inst("builtin.shell"), inst("file")]
+        );
     }
 
     #[test]

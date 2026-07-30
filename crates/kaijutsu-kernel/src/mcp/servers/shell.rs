@@ -46,6 +46,19 @@ pub struct ShellParams {
     /// stdin ignores it.
     #[serde(default)]
     pub stdin: Option<String>,
+    /// Run `command` in the background instead of waiting for it to finish.
+    /// Returns immediately with a `background_id` + the `block_id` its
+    /// output streams into — never the full output. Poll with
+    /// `read_background_output`, list with `list_background_processes`, stop
+    /// with `kill_background_process` (same server, `builtin.background`).
+    ///
+    /// A backgrounded command runs as `/bin/sh -c <command>` directly on the
+    /// host — NOT through kaish — so shell syntax (`|`, `&&`, `>`) works but
+    /// `kj` verbs and kaish variables do not; use the foreground `shell` for
+    /// those. Requires the `exec` authority (same as any external command in
+    /// the foreground shell) and is never available on `read_only_shell`.
+    #[serde(default)]
+    pub background: bool,
 }
 
 const DESCRIPTION: &str =
@@ -116,6 +129,143 @@ impl ShellServer {
             reason: "broker dropped".to_string(),
         })
     }
+
+    /// `background: true` path — bypasses the kaish materialization entirely
+    /// (see `background_exec.rs` module docs for why: a per-call kaish
+    /// instance can't host a registry that outlives the call, and kaish's own
+    /// external-command capture isn't live). Spawns `command` as a direct
+    /// host process, streaming into a fresh `Running` block, and returns as
+    /// soon as it's registered — never the command's output.
+    async fn start_background(
+        &self,
+        command: &str,
+        dispatcher: &crate::kj::KjDispatcher,
+        ctx: &CallContext,
+    ) -> McpResult<KernelToolResult> {
+        // `read_only_shell` is structurally read-only (its materialized kaish
+        // pins `ExternalExec::Deny`) — background execution must be refused
+        // the same way, by construction, not left to the exec-authority
+        // check below (which a read-only role never holds anyway, but this
+        // keeps the refusal reason specific to the tool rather than a
+        // generic capability-denied).
+        if self.read_only {
+            return Err(McpError::Protocol(
+                "read_only_shell cannot start background processes (it never spawns host subprocesses)"
+                    .to_string(),
+            ));
+        }
+
+        // Same authority a synchronous external command requires — `exec` —
+        // never a weaker gate. `facade:shell` alone (which `builtin.background`
+        // rides too, see FACADE_PROJECTED_INSTANCES) only grants kj/builtins;
+        // spawning a real host process needs the dedicated `exec` authority on
+        // top, exactly like `ExternalExec::Allow` vs `Deny` in
+        // `kj/context_shell.rs`.
+        let broker = self.broker()?;
+        let exec_granted = broker
+            .binding(&ctx.context_id)
+            .await
+            .is_some_and(|b| b.allows(&crate::mcp::Capability::Exec));
+        if !exec_granted {
+            return Err(McpError::Protocol(
+                "background execution requires the `exec` authority (deny-by-default — see `kj binding allow exec`)"
+                    .to_string(),
+            ));
+        }
+
+        let kernel = dispatcher.kernel();
+        let kernel_db = dispatcher.kernel_db();
+
+        // cwd: mirror the synchronous shell's persisted `context_shell.cwd`,
+        // but validated as a REAL host directory. A background spawn goes
+        // straight to the host (bypassing kaish's VFS), so a virtual-only cwd
+        // like `/v/docs` can't be honored — surfaced as an error rather than
+        // silently landing somewhere else.
+        let persisted_cwd = {
+            let db = kernel_db.lock();
+            db.get_context_shell(ctx.context_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.cwd)
+        };
+        let cwd = match persisted_cwd {
+            Some(p) => {
+                let path = std::path::PathBuf::from(&p);
+                if path.is_dir() {
+                    path
+                } else {
+                    return Err(McpError::Protocol(format!(
+                        "background execution needs a host-real cwd; this context's cwd ({p}) doesn't resolve on the host filesystem"
+                    )));
+                }
+            }
+            None => kaish_kernel::home_dir(),
+        };
+
+        // env: hermetic like the synchronous shell — PATH is the kernel's
+        // startup capture, HOME is seeded, and the context's durable env vars
+        // are exported (mirrors `EmbeddedKaish::apply_context_config`).
+        let mut env = vec![(
+            "HOME".to_string(),
+            kaish_kernel::home_dir().to_string_lossy().into_owned(),
+        )];
+        if let Some(path) = kernel.host_path() {
+            env.push(("PATH".to_string(), path.to_string()));
+        }
+        {
+            let db = kernel_db.lock();
+            if let Ok(vars) = db.get_context_env(ctx.context_id) {
+                for v in vars {
+                    env.push((v.key, v.value));
+                }
+            }
+        }
+
+        let blocks = dispatcher.block_store();
+        let block_id = blocks
+            .insert_block_as(
+                ctx.context_id,
+                None,
+                None,
+                kaijutsu_crdt::Role::Tool,
+                kaijutsu_crdt::BlockKind::ToolResult,
+                String::new(),
+                kaijutsu_crdt::Status::Running,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(ctx.principal_id),
+            )
+            .map_err(|e| McpError::Protocol(format!("failed to create background output block: {e}")))?;
+
+        let registry = kernel.background_processes();
+        let bg_id = crate::background_exec::spawn_background(
+            registry,
+            blocks,
+            crate::background_exec::SpawnBackgroundParams {
+                command: command.to_string(),
+                cwd,
+                env,
+                context_id: ctx.context_id,
+                principal_id: ctx.principal_id,
+                block_id,
+            },
+        )
+        .map_err(|e| McpError::Protocol(format!("failed to start background process: {e}")))?;
+
+        Ok(KernelToolResult {
+            is_error: false,
+            content: vec![ToolContent::Text(format!(
+                "started background process {bg_id}; output streams into block {}. \
+                 Poll with read_background_output, list with list_background_processes, \
+                 stop with kill_background_process (builtin.background).",
+                block_id.to_key()
+            ))],
+            structured: Some(serde_json::json!({
+                "background_id": bg_id.to_string(),
+                "block_id": block_id.to_key(),
+                "status": "running",
+            })),
+        })
+    }
 }
 
 #[async_trait]
@@ -169,6 +319,10 @@ impl McpServerLike for ShellServer {
         // from the dispatcher (the server installs the index at bootstrap);
         // when embeddings aren't configured the index is `None` and `kj` falls
         // back to non-semantic search rather than failing.
+        if parsed.background {
+            return self.start_background(&parsed.command, &dispatcher, ctx).await;
+        }
+
         let semantic_index = dispatcher.semantic_index();
         let block_source = dispatcher.block_source();
         let kaish = if self.read_only {
@@ -619,5 +773,130 @@ mod tests {
             }
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    /// `background: true` requires the `exec` authority on top of
+    /// `facade:shell` — the same gate a synchronous external command hits,
+    /// never a weaker one. A context with `facade:shell` alone (no `exec`)
+    /// must be refused, not silently degrade to a foreground run.
+    #[tokio::test]
+    async fn background_true_is_denied_without_exec_authority() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-noexec"), None, principal);
+        d.block_store()
+            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({"command": "echo nope", "background": true}),
+        };
+        let err = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect_err("background execution must be denied without the exec authority");
+        assert!(
+            matches!(err, McpError::Protocol(_)),
+            "expected a Protocol denial explaining the missing exec authority, got {err:?}"
+        );
+    }
+
+    /// End-to-end: `shell(background: true)` with `facade:shell` + `exec`
+    /// returns IMMEDIATELY (a handle + block id, never the command's output),
+    /// and the command actually runs — its output shows up in the returned
+    /// block a moment later, proving the async path is really wired, not
+    /// just accepting the flag and doing nothing.
+    #[tokio::test]
+    async fn background_true_returns_immediately_and_streams_into_its_block() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("bg-ok"), None, principal);
+        d.block_store()
+            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
+            .unwrap();
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({"command": "echo streamed-bg-output", "background": true}),
+        };
+        let result = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect("background start should succeed");
+
+        assert!(!result.is_error, "starting a background process is not itself an error");
+        let structured = result.structured.expect("structured envelope");
+        assert_eq!(structured["status"], serde_json::json!("running"));
+        let block_key = structured["block_id"].as_str().expect("block_id present").to_string();
+        assert!(structured["background_id"].as_str().is_some(), "background_id present");
+        // The response body must be a short confirmation, never the command's
+        // full output — that's the whole point of backgrounding.
+        match result.content.first().unwrap() {
+            ToolContent::Text(s) => assert!(
+                !s.contains("streamed-bg-output"),
+                "the immediate response must not carry the command's output, got: {s:?}"
+            ),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        let block_id = kaijutsu_crdt::BlockId::from_key(&block_key).expect("valid block key");
+        let start = std::time::Instant::now();
+        loop {
+            let snap = d
+                .block_store()
+                .get_block_snapshot(ctx_id, &block_id)
+                .unwrap()
+                .expect("block exists");
+            if snap.content.contains("streamed-bg-output") {
+                break;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for background output to stream in");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `read_only_shell` must refuse `background: true` outright — it never
+    /// spawns host subprocesses by construction (its materialized kaish pins
+    /// `ExternalExec::Deny`), and background execution must not be a back
+    /// door around that.
+    #[tokio::test]
+    async fn read_only_shell_rejects_background_true() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("ro-bg"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_readonly".into()));
+        // Even granting `exec` (which no real read-only role would have)
+        // must not open the door — the refusal is structural on `read_only`,
+        // checked before the capability gate.
+        binding.grant(Capability::Exec);
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let params = KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE_READ_ONLY),
+            tool: ShellServer::TOOL_READ_ONLY.to_string(),
+            arguments: serde_json::json!({"command": "echo nope", "background": true}),
+        };
+        let err = broker
+            .call_tool(params, &cc, CancellationToken::new())
+            .await
+            .expect_err("read_only_shell must refuse background execution even with exec granted");
+        assert!(matches!(err, McpError::Protocol(_)), "expected a Protocol refusal, got {err:?}");
     }
 }
