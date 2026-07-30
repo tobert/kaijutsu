@@ -626,32 +626,43 @@ impl McpServerLike for ExternalMcpServer {
             .map(|c| match c {
                 ResourceContents::TextResourceContents {
                     uri, mime_type, text, ..
-                } => KernelResourceContents::Text {
+                } => Ok(KernelResourceContents::Text {
                     uri,
                     mime_type,
                     text,
-                },
+                }),
                 ResourceContents::BlobResourceContents {
                     uri, mime_type, blob, ..
-                } => KernelResourceContents::Blob {
+                } => Ok(KernelResourceContents::Blob {
                     uri,
                     mime_type,
                     blob_base64: blob,
-                },
+                }),
                 // `ResourceContents` is `#[non_exhaustive]` upstream — the
                 // untagged deserializer only ever produces the two variants
-                // above from any wire payload today, so this can only be
-                // reached by a *future* rmcp bump adding a third shape.
-                // Silently dropping unrecognized content would hand back an
-                // incomplete resource read as if it were complete (data
-                // corruption); fail loudly instead so the next rmcp bump's
-                // author has to map the new shape here.
-                other => unreachable!(
-                    "rmcp::model::ResourceContents gained a variant this match doesn't \
-                     handle yet: {other:?} — add a KernelResourceContents mapping"
-                ),
+                // above from any wire payload today, so this is reachable
+                // only after a *future* rmcp bump adds a third shape (and
+                // `#[non_exhaustive]` means the compiler cannot flag it for
+                // us at that point — hence a runtime guard at all).
+                //
+                // Dropping the unrecognized content would hand back an
+                // incomplete read as though it were complete, which is the
+                // data corruption this project ranks below crashing. But the
+                // choice isn't drop-or-crash: this function already has an
+                // error channel, so fail the CALL loudly and leave the kernel
+                // — and every other context sharing it — standing. A panic
+                // here would take down a turn (and under `panic = "abort"`
+                // the whole kernel) over one unmappable resource read from
+                // one external server.
+                other => Err(McpError::Protocol(format!(
+                    "external MCP server `{}` returned a ResourceContents shape this \
+                     kernel cannot map ({other:?}) — an rmcp upgrade added a variant; \
+                     add a KernelResourceContents mapping in \
+                     mcp/servers/external.rs::read_resource",
+                    self.instance_id
+                ))),
             })
-            .collect();
+            .collect::<McpResult<Vec<_>>>()?;
         Ok(KernelReadResource { contents })
     }
 
