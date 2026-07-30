@@ -312,12 +312,26 @@ fn parse_tempo(value: &str, collector: &mut FeedbackCollector) -> Tempo {
     }
 }
 
-/// Parse a fraction like "4/4" or "1/8"
+/// Parse a fraction like "4/4" or "1/8".
+///
+/// Rejects a `0` denominator (e.g. a stray "M:4/0" or "L:1/0") as if it
+/// hadn't parsed at all, so every caller's existing "invalid → warn +
+/// fall back to a sane default" path also catches it — a genuine `0` here
+/// is a valid `u8` parse, not an error, but it feeds `UnitLength`/`Meter`
+/// straight into `engrave::layout::absolute_ratio`'s denominator
+/// (`duration.denominator as f64 * unit.denominator as f64`), where zero
+/// silently becomes `f64::INFINITY` rather than a parse error, and that
+/// infinity reaches engraved coordinates and `kaijutsu-app`'s flat-geometry
+/// triangle math from there. Same non-finite-input-at-the-boundary lesson
+/// `sparkline.rs` learned for literal "NaN"/"inf" text.
 fn parse_fraction(s: &str) -> Option<(u8, u8)> {
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() == 2 {
         let num = parts[0].trim().parse().ok()?;
-        let den = parts[1].trim().parse().ok()?;
+        let den: u8 = parts[1].trim().parse().ok()?;
+        if den == 0 {
+            return None;
+        }
         Some((num, den))
     } else {
         None
@@ -514,6 +528,45 @@ mod tests {
                 denominator: 8
             }
         );
+    }
+
+    /// A stray "M:4/0" is a genuine `u8` parse (0 is a valid `u8`), not a
+    /// parse *failure* — so without an explicit zero-denominator guard in
+    /// `parse_fraction`, it would silently produce
+    /// `Meter::Simple{denominator: 0}` instead of falling into the existing
+    /// "invalid meter, assuming 4/4" warning path. See `parse_fraction`'s
+    /// doc comment for why a zero denominator here is the same
+    /// non-finite-input class `sparkline.rs` guards against for "NaN"/"inf".
+    #[test]
+    fn test_parse_meter_zero_denominator_falls_back_to_4_4() {
+        let mut collector = FeedbackCollector::new();
+        assert_eq!(
+            parse_meter("4/0", &mut collector),
+            Meter::Simple {
+                numerator: 4,
+                denominator: 4
+            }
+        );
+        assert!(!collector.feedback().is_empty(), "must warn about the invalid input");
+    }
+
+    #[test]
+    fn test_parse_unit_length_zero_denominator_falls_back_to_default() {
+        let mut collector = FeedbackCollector::new();
+        assert_eq!(
+            parse_unit_length("1/0", &mut collector),
+            UnitLength::default()
+        );
+        assert!(!collector.feedback().is_empty(), "must warn about the invalid input");
+    }
+
+    #[test]
+    fn test_parse_tempo_zero_denominator_beat_unit_falls_back_to_quarter() {
+        let mut collector = FeedbackCollector::new();
+        let tempo = parse_tempo("1/0=120", &mut collector);
+        assert_eq!(tempo.beat_unit, (1, 4));
+        assert_eq!(tempo.bpm, 120);
+        assert!(!collector.feedback().is_empty(), "must warn about the invalid input");
     }
 
     #[test]

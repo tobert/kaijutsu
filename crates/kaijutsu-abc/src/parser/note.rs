@@ -96,7 +96,20 @@ fn parse_divisor(input: &mut &str) -> PResult<Option<u16>> {
         // Pure slashes: denominator = 2^slashes (`/`→2, `//`→4, `///`→8).
         Ok(Some(2u16.saturating_pow(slashes)))
     } else {
-        Ok(den_str.parse().ok())
+        // Reject an explicit `0` denominator (e.g. `C/0`) the same way as a
+        // missing/unparseable one — fall through to the `Some(None) => 2`
+        // branch in `parse_duration` ("A/ means A/2") rather than producing
+        // `Duration { denominator: 0, .. }`. A duration divides *by* its
+        // denominator all the way down to `engrave::layout::duration_to_width`
+        // (`numerator as f64 / denominator as f64`); zero there is silent
+        // `f64::INFINITY`, not a parse error, and that infinity reaches
+        // engraved glyph/line coordinates and ultimately
+        // `text::msdf::geometry`'s triangle math in kaijutsu-app — the same
+        // "must never reach the geometry math" lesson `sparkline.rs` learned
+        // for literal "NaN"/"inf" text, just arriving via a zero denominator
+        // instead of a permissive float parse. Catch it here, where "this is
+        // not a valid duration" is unambiguous.
+        Ok(den_str.parse::<u16>().ok().filter(|&d| d != 0))
     }
 }
 
@@ -267,6 +280,22 @@ mod tests {
         // An explicit denominator still wins: `/3`.
         let mut input = "/3";
         assert_eq!(parse_duration(&mut input).unwrap(), Duration::new(1, 3));
+    }
+
+    /// A literal zero denominator (`C/0`) must never survive parsing:
+    /// `Duration{denominator: 0}` divides silently to `f64::INFINITY` in
+    /// `engrave::layout::duration_to_width` (no panic, no error — just an
+    /// infinite note width that propagates into engraved glyph/line
+    /// coordinates and from there into `kaijutsu-app`'s flat-geometry
+    /// triangle math). Falls back to `/2`, same as a bare trailing slash —
+    /// this is the parse-boundary half of that non-finite-input class, the
+    /// zero-denominator sibling of `sparkline.rs`'s "NaN"/"inf" text guard.
+    #[test]
+    fn zero_denominator_falls_back_to_two_not_zero() {
+        let mut input = "/0";
+        let duration = parse_duration(&mut input).unwrap();
+        assert_eq!(duration, Duration::new(1, 2));
+        assert_ne!(duration.denominator, 0, "a zero denominator must never survive parsing");
     }
 
     #[test]
