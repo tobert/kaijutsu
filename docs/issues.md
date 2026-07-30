@@ -236,6 +236,34 @@ than left to rot.
   is freed. Hit live 2026-07-29. Related to the known
   "startup agent detection can report a previous session's id" gotcha.
 
+## rmcp 1.7 → 3.0.1 bump left SEP-2577 deprecations papered over (2026-07-30)
+
+Landed to talk to kaibo (now on `rmcp 3.0.0-beta.5`, a newer MCP protocol
+revision). The bump itself was a clean, mechanical migration (`ContentBlock`
+replaces `Content`, `Annotated<Raw*>` wrappers flattened into plain structs
+with builder methods, `Meta` split into `MetaObject`/`RequestMetaObject`/
+`NotificationMetaObject`, `read_resource`/`call_tool` server-side responses
+wrap in `ReadResourceResponse`/`CallToolResponse` for MRTR). Negotiated
+protocol version stays `2025-11-25` (rmcp's `ProtocolVersion::LATEST` didn't
+move even though `V_2026_07_28` now exists in the enum) — no wire-visible
+protocol jump.
+
+What's papered over rather than migrated, each behind a scoped
+`#[allow(deprecated)]` with a comment: rmcp 1.8.0+ deprecates the whole
+Logging capability (`enable_logging`, `LoggingLevel`, `SetLevelRequestParams`,
+`LoggingMessageNotificationParam`) and Roots capability
+(`enable_roots`/`enable_roots_list_changed`) per SEP-2577, with **no
+replacement** — the spec is dropping them, not superseding them. Separately,
+`resources/subscribe`/`unsubscribe` (`ExternalMcpServer::subscribe`/
+`unsubscribe`, `crates/kaijutsu-kernel/src/mcp/servers/external.rs`) are
+legacy-only as of protocol `2026-07-28`, superseded by `Peer::listen` /
+`subscriptions/listen` — a real subscription-model migration, not a drop-in
+rename. Kept all three working as-is (straightforward migration, no
+opportunistic rewrite) since kaibo/bevy_brp still negotiate against them
+today. Revisit when rmcp actually removes the deprecated APIs, or when
+adopting the `Peer::listen` model becomes worth the redesign on its own
+merits.
+
 ## ⬆ NEXT UP (Amy, 2026-07-16): MCP shell reply timeouts — replies lost while execution succeeds
 
 Bumped to next-in-queue after ongoing work closes. Long dismissed as "the
