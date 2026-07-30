@@ -984,7 +984,9 @@ pub struct BlockCellLayout {
 // ============================================================================
 
 /// Role group border entity that appears before first block of each turn.
-/// Rendered as a Vello-drawn horizontal line with inset role label.
+/// Rendered via the shared `BlockFxMaterial`/MSDF block pipeline: a
+/// `BorderKind::CenterLine` shader rule with an MSDF role label straddling a
+/// gap in it (see `view::block_render::sync_role_group_headers`).
 ///
 /// Replaces the old text-based RoleHeader ("── USER ──────────").
 ///

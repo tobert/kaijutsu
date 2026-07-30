@@ -1,10 +1,14 @@
-//! Per-block texture rendering (Vello + MSDF).
+//! Per-block texture rendering (MSDF + shader decoration; Vello only for SVG/ABC).
 //!
 //! Each conversation block renders its own texture. Text blocks use MSDF
-//! (shader-quality text), while SVG/sparkline/ABC use Vello (vector rasterizer).
-//! Block cells use `MaterialNode<BlockFxMaterial>` for hybrid effects.
-//! Role group borders use plain `ImageNode`. Bevy's UI system handles scroll,
-//! clip, z-order. `BackgroundColor` works again. No coordinate space mismatches.
+//! (shader-quality text); SVG and ABC notation still rasterize via Vello
+//! (a CPU vector rasterizer, out of this crate's de-vello scope — see
+//! `docs/issues.md`). Sparklines and the image placeholder are plain Bevy UI
+//! geometry (child `Node`+`BackgroundColor` rects), not vello, not a shader.
+//! Block cells use `MaterialNode<BlockFxMaterial>` for border/glow/label
+//! decoration — role-group dividers ride the same material now (see
+//! `sync_role_group_headers`). Bevy's UI system handles scroll, clip,
+//! z-order. `BackgroundColor` works again. No coordinate space mismatches.
 
 use std::collections::HashMap;
 
@@ -20,7 +24,10 @@ use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextSt
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
-use crate::cell::block_border::{BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderLabelMetrics};
+use crate::cell::block_border::{
+    BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
+    BorderPadding,
+};
 use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
@@ -100,12 +107,11 @@ impl Plugin for BlockRenderPlugin {
             PostUpdate,
             (
                 build_block_scenes.after(bevy::ui::UiSystems::Layout),
-                build_role_group_scenes.after(bevy::ui::UiSystems::Layout),
+                sync_role_group_headers.after(bevy::ui::UiSystems::Layout),
                 resize_block_textures
                     .after(build_block_scenes)
-                    .after(build_role_group_scenes)
+                    .after(sync_role_group_headers)
                     .after(crate::view::overlay::build_overlay_glyphs),
-                resize_role_group_textures.after(build_role_group_scenes),
             ),
         );
 
@@ -779,25 +785,53 @@ pub fn build_block_scenes(
     }
 }
 
-/// Build vello scenes for role group border entities.
-pub fn build_role_group_scenes(
+/// Sync role-group divider entities: an SDF center-line border (shader) plus
+/// an MSDF-rendered role label straddling a gap in it.
+///
+/// Replaces the old `build_role_group_scenes`, which drew both the line and
+/// the label into a per-entity `vello::Scene`. Role headers now carry the
+/// same `BlockBorderStyle` + `MsdfBlockGlyphs` + `MaterialNode<BlockFxMaterial>`
+/// bundle as an ordinary block cell — `BorderKind::CenterLine` draws the rule
+/// (`assets/shaders/block_fx.wgsl`, `sync_block_fx`), and the label glyphs go
+/// through the same `collect_msdf_glyphs` path as every other border label.
+/// No vello scene is ever built for a role header.
+pub fn sync_role_group_headers(
+    mut commands: Commands,
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut UiVectorScene, &mut UiRttTexture, &ComputedNode, &Node),
+        (
+            Entity,
+            &RoleGroupBorder,
+            &mut UiRttTexture,
+            &ComputedNode,
+            &Node,
+            &mut MsdfBlockGlyphs,
+            &mut BlockRenderMethod,
+            Option<&BlockBorderStyle>,
+        ),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
     theme: Res<Theme>,
+    text_metrics: Res<TextMetrics>,
+    mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
 ) {
-    let font = fonts.get(&font_handles.mono);
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return;
+    };
+    let scale = text_metrics.scale_factor;
 
-    for (border, mut ui_scene, mut rtt, computed, node) in role_borders.iter_mut() {
+    for (
+        entity, border, mut rtt, computed, node, mut msdf_glyphs, mut render_method, existing_style,
+    ) in role_borders.iter_mut()
+    {
         // Virtualized-out headers are Display::None; skip explicitly rather
         // than relying on the incidental size.x==0 side effect.
         if node.display == Display::None {
             continue;
         }
-        // ComputedNode is physical px; the fieldset scene builds in logical.
+        // ComputedNode is physical px; everything below builds in logical.
         let size = crate::view::ui_rtt::logical_size(computed);
         if size.x < 1.0 {
             continue;
@@ -818,41 +852,96 @@ pub fn build_role_group_scenes(
             kaijutsu_crdt::Role::Asset => "ASSET",
         };
 
-        let mut scene = vello::Scene::new();
-        let height = size.y.max(20.0);
-        fieldset::build_role_group_line(
-            &mut scene,
-            size.x as f64,
-            height as f64,
-            label,
-            color,
-            font,
-        );
+        let height = size.y.max(crate::view::lifecycle::ROLE_HEADER_HEIGHT);
 
-        ui_scene.scene = scene;
-        rtt.built_width = size.x;
-        rtt.built_height = height;
-        ui_scene.version = ui_scene.version.wrapping_add(1).max(1);
+        let brush = bevy_color_to_brush(color);
+        let label_style = VelloTextStyle {
+            brush: brush.clone(),
+            font_size: fieldset::ROLE_LABEL_FONT_SIZE,
+            ..default()
+        };
+        let label_layout = font.layout(label, &label_style, VelloTextAlign::Left, None);
+        let label_w = label_layout.width() as f64;
+        let label_h = label_layout.height();
+
+        let div_layout = fieldset::compute_role_divider_layout(
+            label_w,
+            theme.label_inset as f64,
+            theme.label_pad as f64,
+        );
+        // Vertically centered on the line, matching the pre-shader Vello
+        // fieldset's `text_y = y - line_height / 2`.
+        let label_y = ((height as f64 - label_h as f64) * 0.5).max(0.0);
+
+        if let Some(ref mut atlas) = atlas {
+            for line in label_layout.lines() {
+                for item in line.items() {
+                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                        font_data_map.register(gr.run().font());
+                    }
+                }
+            }
+            let glyphs = collect_msdf_glyphs(
+                &label_layout,
+                &[],
+                &brush,
+                (div_layout.label_x, label_y),
+                atlas,
+            );
+            msdf_glyphs.glyphs = glyphs;
+            msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1).max(1);
+            *render_method = BlockRenderMethod::Msdf;
+        }
+
+        let new_style = BlockBorderStyle {
+            kind: BorderKind::CenterLine,
+            color,
+            thickness: fieldset::ROLE_DIVIDER_THICKNESS,
+            corner_radius: 0.0,
+            padding: BorderPadding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            },
+            animation: BorderAnimation::None,
+            top_label: Some(label.to_string()),
+            bottom_label: None,
+        };
+        if existing_style != Some(&new_style) {
+            commands.entity(entity).insert(new_style);
+        }
+        commands.entity(entity).insert(BorderLabelMetrics {
+            top_gap_x0: div_layout.gap_x0 as f32,
+            top_gap_x1: div_layout.gap_x1 as f32,
+            bottom_gap_x0: 0.0,
+            bottom_gap_x1: 0.0,
+            border_inset_top: 0.0,
+            border_inset_bottom: 0.0,
+        });
+
+        rtt.built_width = round_to_physical_px(size.x, scale);
+        rtt.built_height = round_to_physical_px(height, scale);
     }
 }
 
 /// Resize block textures to match physical pixel dimensions.
 ///
-/// Runs after build_block_scenes so built_width/built_height are up to date.
-/// Block cells (and the MSDF overlay/shell-dock text surfaces) update their
-/// `BlockFxMaterial` texture binding alongside the `ImageNode`.
+/// Runs after build_block_scenes / sync_role_group_headers so
+/// built_width/built_height are up to date. Block cells, the MSDF
+/// overlay/shell-dock text surfaces, and role-group divider headers all
+/// carry `MaterialNode<BlockFxMaterial>` now, so one system covers all of
+/// them — update its texture binding alongside the `ImageNode`.
 pub fn resize_block_textures(
     mut block_query: Query<
         (&mut UiRttTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
-        (
-            Or<(
-                With<BlockCell>,
-                With<crate::view::components::MsdfOverlayText>,
-                With<crate::view::shell_dock::MsdfShellDockText>,
-                With<crate::view::editor::render::EditorSurface>,
-            )>,
-            Without<RoleGroupBorder>,
-        ),
+        Or<(
+            With<BlockCell>,
+            With<crate::view::components::MsdfOverlayText>,
+            With<crate::view::shell_dock::MsdfShellDockText>,
+            With<crate::view::editor::render::EditorSurface>,
+            With<RoleGroupBorder>,
+        )>,
     >,
     text_metrics: Res<TextMetrics>,
     gpu_limits: Res<GpuTextureLimits>,
@@ -888,48 +977,6 @@ pub fn resize_block_textures(
             if let Some(mat) = fx_materials.get_mut(&mat_node.0) {
                 mat.texture = new_handle.clone();
             }
-            image_node.image = new_handle.clone();
-            texture.image = new_handle;
-            texture.width = target_w;
-            texture.height = target_h;
-        }
-    }
-}
-
-/// Size role-group-border textures to their measured content (physical pixels).
-///
-/// Role borders carry the generic `UiVectorScene`/`UiRttTexture` (plain
-/// `ImageNode`, no material), so this is the simple sibling of
-/// `resize_block_textures`'s former role branch — split out when the borders
-/// migrated onto the shared vello→texture primitive.
-pub fn resize_role_group_textures(
-    mut role_query: Query<
-        (&mut UiRttTexture, &mut ImageNode),
-        With<RoleGroupBorder>,
-    >,
-    text_metrics: Res<TextMetrics>,
-    gpu_limits: Res<GpuTextureLimits>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let scale = text_metrics.scale_factor;
-    let max_dim = gpu_limits.max_texture_dim;
-
-    for (mut texture, mut image_node) in role_query.iter_mut() {
-        if texture.built_width <= 0.0 || texture.built_height <= 0.0 {
-            continue;
-        }
-
-        let (target_w, target_h) =
-            crate::view::ui_rtt::ui_rtt_texture_dims(
-                texture.built_width,
-                texture.built_height,
-                scale,
-                max_dim,
-            );
-
-        if texture.width != target_w || texture.height != target_h {
-            let new_handle =
-                crate::view::ui_rtt::create_ui_rtt_texture(&mut images, target_w, target_h);
             image_node.image = new_handle.clone();
             texture.image = new_handle;
             texture.width = target_w;
