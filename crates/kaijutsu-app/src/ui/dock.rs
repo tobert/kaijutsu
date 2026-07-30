@@ -918,19 +918,29 @@ pub fn update_connection(
 /// - one entry -> the operation + message, truncated to fit the dock
 /// - several -> a count plus the most recent message, so a burst doesn't
 ///   just show a stale first error while newer ones silently pile up
+/// - `last_repeat_count > 1` -> a `(×N)` suffix, since `GlobalErrorQueue`
+///   collapses exact repeats into one entry rather than consuming new slots
+///   (a reconnect storm would otherwise read as a single, misleadingly
+///   unremarkable error).
 fn format_global_error_badge(
     count: usize,
     last_operation: &str,
     last_message: &str,
+    last_repeat_count: u32,
 ) -> Option<String> {
     if count == 0 {
         return None;
     }
     let msg = crate::text::truncate_chars(last_message, 40);
-    if count == 1 {
-        Some(format!("\u{26a0} {last_operation}: {msg}"))
+    let suffix = if last_repeat_count > 1 {
+        format!(" (\u{d7}{last_repeat_count})")
     } else {
-        Some(format!("\u{26a0} {count} errors (last: {msg})"))
+        String::new()
+    };
+    if count == 1 {
+        Some(format!("\u{26a0} {last_operation}: {msg}{suffix}"))
+    } else {
+        Some(format!("\u{26a0} {count} errors (last: {msg}{suffix})"))
     }
 }
 
@@ -948,10 +958,13 @@ pub fn update_global_errors_badge(
     mut dock: ResMut<DockState>,
 ) {
     let text = match queue.entries.back() {
-        Some(last) => {
-            format_global_error_badge(queue.entries.len(), &last.operation, &last.message)
-                .unwrap_or_default()
-        }
+        Some(last) => format_global_error_badge(
+            queue.entries.len(),
+            &last.operation,
+            &last.message,
+            last.repeat_count,
+        )
+        .unwrap_or_default(),
         None => String::new(),
     };
 
@@ -964,7 +977,7 @@ pub fn update_global_errors_badge(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockActivityCounts, classify_connection_error, format_block_activity,
+        classify_connection_error, count_block_activity, format_block_activity,
         format_context_usage, format_global_error_badge, format_token_count,
     };
     use crate::ui::theme::Theme;
@@ -1090,13 +1103,13 @@ mod tests {
     #[test]
     fn global_error_badge_empty_queue_shows_nothing() {
         // No errors -> no badge, never a fabricated "0 errors".
-        assert_eq!(format_global_error_badge(0, "op", "msg"), None);
+        assert_eq!(format_global_error_badge(0, "op", "msg", 1), None);
     }
 
     #[test]
     fn global_error_badge_single_entry_shows_operation_and_message() {
         assert_eq!(
-            format_global_error_badge(1, "config", "theme.toml: bad TOML"),
+            format_global_error_badge(1, "config", "theme.toml: bad TOML", 1),
             Some("\u{26a0} config: theme.toml: bad TOML".to_string())
         );
     }
@@ -1104,15 +1117,35 @@ mod tests {
     #[test]
     fn global_error_badge_several_entries_shows_count_and_last_message() {
         assert_eq!(
-            format_global_error_badge(3, "context", "create failed"),
+            format_global_error_badge(3, "context", "create failed", 1),
             Some("\u{26a0} 3 errors (last: create failed)".to_string())
+        );
+    }
+
+    #[test]
+    fn global_error_badge_repeat_count_shows_multiplier_suffix() {
+        // GlobalErrorQueue::push collapses exact repeats into one entry with
+        // a growing repeat_count rather than consuming new slots — the
+        // badge must surface that count, or a reconnect storm just looks
+        // like one unremarkable error forever.
+        assert_eq!(
+            format_global_error_badge(1, "ssh", "no SSH agent", 7),
+            Some("\u{26a0} ssh: no SSH agent (\u{d7}7)".to_string())
+        );
+    }
+
+    #[test]
+    fn global_error_badge_single_occurrence_has_no_multiplier_suffix() {
+        assert_eq!(
+            format_global_error_badge(1, "ssh", "no SSH agent", 1),
+            Some("\u{26a0} ssh: no SSH agent".to_string())
         );
     }
 
     #[test]
     fn global_error_badge_truncates_long_messages() {
         let long = "x".repeat(80);
-        let badge = format_global_error_badge(1, "op", &long).unwrap();
+        let badge = format_global_error_badge(1, "op", &long, 1).unwrap();
         // "⚠ op: " prefix + 40-char truncated message (39 chars + ellipsis).
         let expected_msg = crate::text::truncate_chars(&long, 40);
         assert_eq!(badge, format!("\u{26a0} op: {expected_msg}"));
@@ -1120,56 +1153,177 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // BlockActivityCounts / format_block_activity — Done-vs-Error split
+    // count_block_activity — pure counting logic over document state
     // ------------------------------------------------------------------
 
-    #[test]
-    fn apply_status_running_increments_running_only() {
-        let mut counts = BlockActivityCounts::default();
-        counts.apply_status(&kaijutsu_crdt::Status::Running);
-        assert_eq!(counts.running, 1);
-        assert_eq!(counts.failed, 0);
+    use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
+    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContentType, PrincipalId, Role, Status};
+
+    fn test_block_id() -> kaijutsu_types::BlockId {
+        kaijutsu_types::BlockId::new(
+            kaijutsu_types::ContextId::new(),
+            PrincipalId::new(),
+            0,
+        )
     }
 
     #[test]
-    fn apply_status_done_decrements_running_without_touching_failed() {
-        let mut counts = BlockActivityCounts::default();
-        counts.apply_status(&kaijutsu_crdt::Status::Running);
-        counts.apply_status(&kaijutsu_crdt::Status::Done);
-        assert_eq!(counts.running, 0);
-        assert_eq!(counts.failed, 0);
+    fn count_block_activity_counts_running_and_error_only() {
+        let blocks = vec![
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Running)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Running)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Error)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Done)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Pending)
+                .build(),
+        ];
+        assert_eq!(count_block_activity(&blocks), (2, 1));
     }
 
     #[test]
-    fn apply_status_error_decrements_running_and_counts_as_failed() {
-        // This is the exact split the task asked for: Error must NOT fold
-        // into the same bucket as Done — it frees the running slot AND
-        // leaves a distinct, visible trace.
-        let mut counts = BlockActivityCounts::default();
-        counts.apply_status(&kaijutsu_crdt::Status::Running);
-        counts.apply_status(&kaijutsu_crdt::Status::Error);
-        assert_eq!(counts.running, 0);
-        assert_eq!(counts.failed, 1);
+    fn count_block_activity_skips_excluded_blocks_for_both_counters() {
+        // Defect 2 (exclusion half): a user-excluded block is the "I've
+        // dealt with this" gesture and must not keep nagging the HUD, even
+        // though it's still visible (dimmed) in the transcript.
+        let blocks = vec![
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Error)
+                .excluded(true)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Running)
+                .excluded(true)
+                .build(),
+            BlockSnapshotBuilder::new(test_block_id(), BlockKind::Text)
+                .status(Status::Error)
+                .build(),
+        ];
+        assert_eq!(count_block_activity(&blocks), (0, 1));
+    }
+
+    // ------------------------------------------------------------------
+    // State-derivation proofs — these exercise the REAL join/resync code
+    // path (CrdtBlockStore -> StoreSnapshot -> SyncState ->
+    // SyncedDocument::from_sync_state / apply_sync_state), the same one
+    // `ContextJoined`/`ContextResynced` drive in `view/sync.rs`. No
+    // `ServerEvent::BlockStatusChanged` is ever constructed — proving the
+    // count no longer depends on having observed a transition event.
+    // ------------------------------------------------------------------
+
+    fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
+        kaijutsu_types::codec::encode(&store.snapshot()).expect("serialize snapshot")
     }
 
     #[test]
-    fn apply_status_running_saturates_at_zero_on_underflow() {
-        // Defensive: an Error/Done arriving without a matching Running
-        // (e.g. missed event) must not wrap running to u32::MAX.
-        let mut counts = BlockActivityCounts::default();
-        counts.apply_status(&kaijutsu_crdt::Status::Error);
-        assert_eq!(counts.running, 0);
-        assert_eq!(counts.failed, 1);
+    fn joining_a_context_with_preexisting_error_blocks_shows_nonzero_failed_count() {
+        // Defect 1: a document that already had Running/Error blocks BEFORE
+        // this client ever attached — the exact `ContextJoined.initial_sync`
+        // shape — must show a correct count from the first frame, with zero
+        // events in its history.
+        let ctx = kaijutsu_types::ContextId::new();
+        let principal = PrincipalId::new();
+        let mut store = CrdtBlockStore::new(ctx, principal);
+        store
+            .insert_block(None, None, Role::User, BlockKind::Text, "ok", Status::Done, ContentType::Plain)
+            .unwrap();
+        store
+            .insert_block(None, None, Role::Model, BlockKind::Text, "boom", Status::Error, ContentType::Plain)
+            .unwrap();
+        store
+            .insert_block(None, None, Role::Model, BlockKind::Text, "still going", Status::Running, ContentType::Plain)
+            .unwrap();
+
+        let state = kaijutsu_client::SyncState {
+            context_id: ctx,
+            version: 1,
+            ops: snapshot_bytes(&store),
+        };
+        let synced = kaijutsu_client::SyncedDocument::from_sync_state(&state, principal)
+            .expect("from_sync_state");
+
+        assert_eq!(count_block_activity(&synced.blocks()), (1, 1));
     }
 
     #[test]
-    fn reset_clears_both_counters() {
-        let mut counts = BlockActivityCounts::default();
-        counts.apply_status(&kaijutsu_crdt::Status::Running);
-        counts.apply_status(&kaijutsu_crdt::Status::Error);
-        counts.reset();
-        assert_eq!(counts.running, 0);
-        assert_eq!(counts.failed, 0);
+    fn a_resync_that_deletes_an_error_block_clears_it_from_the_count() {
+        // Defect 2 (deletion half), reached via the SAME resync path as
+        // defect 1 (no BlockDeleted event ever constructed): the server-side
+        // store deletes the failed block, and the next full resync — as
+        // `ContextResynced` would deliver after a reconnect — must drop it
+        // from the count, not just leave it stuck at 1 forever.
+        let ctx = kaijutsu_types::ContextId::new();
+        let principal = PrincipalId::new();
+        let mut server_store = CrdtBlockStore::new(ctx, principal);
+        let failed_id = server_store
+            .insert_block(None, None, Role::Model, BlockKind::Text, "boom", Status::Error, ContentType::Plain)
+            .unwrap();
+
+        let mut synced = kaijutsu_client::SyncedDocument::from_sync_state(
+            &kaijutsu_client::SyncState {
+                context_id: ctx,
+                version: 1,
+                ops: snapshot_bytes(&server_store),
+            },
+            principal,
+        )
+        .expect("initial from_sync_state");
+        assert_eq!(count_block_activity(&synced.blocks()), (0, 1), "sanity: starts failed");
+
+        // Server deletes the block; client receives a full resync (no event).
+        server_store.delete_block(&failed_id).unwrap();
+        synced
+            .apply_sync_state(&kaijutsu_client::SyncState {
+                context_id: ctx,
+                version: 2,
+                ops: snapshot_bytes(&server_store),
+            })
+            .expect("apply_sync_state (resync)");
+
+        assert_eq!(count_block_activity(&synced.blocks()), (0, 0));
+    }
+
+    #[test]
+    fn a_resync_that_excludes_an_error_block_clears_it_from_the_count() {
+        // Defect 2 (exclusion half) via the resync path: the block is not
+        // deleted, just excluded — same "must clear from the count without
+        // ever seeing BlockExcludedChanged" shape as the deletion case.
+        let ctx = kaijutsu_types::ContextId::new();
+        let principal = PrincipalId::new();
+        let mut server_store = CrdtBlockStore::new(ctx, principal);
+        let failed_id = server_store
+            .insert_block(None, None, Role::Model, BlockKind::Text, "boom", Status::Error, ContentType::Plain)
+            .unwrap();
+
+        let mut synced = kaijutsu_client::SyncedDocument::from_sync_state(
+            &kaijutsu_client::SyncState {
+                context_id: ctx,
+                version: 1,
+                ops: snapshot_bytes(&server_store),
+            },
+            principal,
+        )
+        .expect("initial from_sync_state");
+        assert_eq!(count_block_activity(&synced.blocks()), (0, 1), "sanity: starts failed");
+
+        server_store.set_excluded(&failed_id, true).unwrap();
+        synced
+            .apply_sync_state(&kaijutsu_client::SyncState {
+                context_id: ctx,
+                version: 2,
+                ops: snapshot_bytes(&server_store),
+            })
+            .expect("apply_sync_state (resync)");
+
+        assert_eq!(count_block_activity(&synced.blocks()), (0, 0));
     }
 
     #[test]
@@ -1522,50 +1676,70 @@ fn format_abbreviated(value: f64, suffix: &str) -> String {
     }
 }
 
-/// Tracks running + failed block counts for the BlockActivity widget.
+/// Cached running/failed counts for the BlockActivity widget, derived from
+/// document STATE rather than accumulated from the event stream.
 ///
-/// Both counters are scoped to "since you started viewing this document" —
-/// they reset on a doc switch (`reset`), same as the pre-existing
-/// `running` behavior. `failed` does not otherwise decay: it is a plain
-/// count of `Status::Error` transitions observed for the active document,
-/// so it never claims more than "N blocks failed while you were looking at
-/// this conversation."
+/// An earlier version of this counted `ServerEvent::BlockStatusChanged`
+/// transitions incrementally (`running += 1` / `-= 1` as events arrived). A
+/// kaibo review found that accumulator drifts from what's actually on
+/// screen in three ways:
+///
+/// 1. `ContextJoined`'s initial sync and a post-lag `ContextResynced` both
+///    replace document state directly (`view/sync.rs` -> `DocumentCache::
+///    apply_sync`) and emit NO events — so joining a context that already
+///    has Running/Error blocks left the badge blank. Worse for `failed`
+///    than `running`: a stuck Running block eventually gets a correcting
+///    Done/Error event, but a terminal Error never emits again, so the
+///    badge would disagree with the screen for the rest of the session.
+/// 2. `BlockDeleted` / `BlockExcludedChanged` were never matched by the old
+///    event loop — excluding or deleting a failed block left the count
+///    stuck.
+/// 3. A broadcast-lag drop (`connection/actor_plugin.rs`) loses whatever
+///    transitions were in flight, and per (1) the resync that follows
+///    doesn't regenerate them — the counters never recover.
+///
+/// Deriving the counts fresh from `SyncedDocument::blocks()` whenever the
+/// document's sync version changes makes all three impossible by
+/// construction: there is no accumulator to drift out of sync with the
+/// document, because there is no accumulator.
 #[derive(Default)]
-pub(crate) struct BlockActivityCounts {
+pub(crate) struct BlockActivityState {
+    /// `(active context, that document's sync version)` at the last
+    /// recompute — the cheap gate so the O(blocks) walk in
+    /// `count_block_activity` only runs when the document actually changed,
+    /// not on every frame.
+    last_seen: Option<(kaijutsu_types::ContextId, u64)>,
+    /// Cached from the last recompute; read every frame for the sparkline
+    /// sample even on frames the gate above skips recomputation.
     running: u32,
     failed: u32,
-    last_active_doc: Option<String>,
     last_spark_sample: f64,
 }
 
-impl BlockActivityCounts {
-    /// Apply one block-status transition. Split out from
-    /// `update_block_activity` so the Done-vs-Error bookkeeping is
-    /// unit-testable without a Bevy `App`: a `Done` block only frees up a
-    /// running slot, an `Error` block frees the slot *and* is counted as a
-    /// distinct, visible failure — previously both folded into the same
-    /// decrement and the error signal was discarded entirely.
-    fn apply_status(&mut self, status: &kaijutsu_crdt::Status) {
-        match status {
-            kaijutsu_crdt::Status::Running => {
-                self.running = self.running.saturating_add(1);
-            }
-            kaijutsu_crdt::Status::Done => {
-                self.running = self.running.saturating_sub(1);
-            }
-            kaijutsu_crdt::Status::Error => {
-                self.running = self.running.saturating_sub(1);
-                self.failed = self.failed.saturating_add(1);
-            }
+/// Count live Running/Error blocks in a document snapshot.
+///
+/// Excluded blocks are skipped for both counts: user exclusion (`docs`'
+/// remediate-a-poisoned-conversation flow — exclude, then fork) is the
+/// user's "I've dealt with this" gesture, so an excluded Error block should
+/// stop nagging the HUD even though it's still visible (dimmed) in the
+/// transcript. Deleted blocks never appear here at all —
+/// `BlockStore::blocks_ordered` (which `SyncedDocument::blocks` calls)
+/// already filters tombstones at the CRDT layer, so no explicit check is
+/// needed for those.
+fn count_block_activity(blocks: &[kaijutsu_types::BlockSnapshot]) -> (u32, u32) {
+    let mut running = 0u32;
+    let mut failed = 0u32;
+    for b in blocks {
+        if b.excluded {
+            continue;
+        }
+        match b.status {
+            kaijutsu_crdt::Status::Running => running += 1,
+            kaijutsu_crdt::Status::Error => failed += 1,
             _ => {}
         }
     }
-
-    /// Reset both counters — called on an active-document switch.
-    fn reset(&mut self) {
-        self.running = 0;
-        self.failed = 0;
-    }
+    (running, failed)
 }
 
 /// Render the BlockActivity widget's (text, color) from running/failed
@@ -1588,39 +1762,38 @@ fn format_block_activity(running: u32, failed: u32, theme: &Theme) -> (String, C
 }
 
 /// Update block activity — shows running + failed block counts for the
-/// active document.
+/// active document, re-derived from document state whenever its sync
+/// version changes (see `BlockActivityState`), never from the event stream.
 pub fn update_block_activity(
-    mut state: Local<BlockActivityCounts>,
+    mut state: Local<BlockActivityState>,
     time: Res<Time>,
-    mut events: MessageReader<ServerEventMessage>,
     doc_cache: Res<crate::cell::DocumentCache>,
     theme: Res<Theme>,
     mut dock: ResMut<DockState>,
 ) {
-    let active_doc = doc_cache.active_id().map(|s| s.to_string());
+    let active = doc_cache
+        .active_id()
+        .and_then(|id| doc_cache.get(id).map(|entry| (id, entry)));
+    let seen = active.as_ref().map(|(id, entry)| (*id, entry.synced.version()));
 
-    if active_doc != state.last_active_doc {
-        state.reset();
-        state.last_active_doc = active_doc.clone();
-    }
+    if seen != state.last_seen {
+        state.last_seen = seen;
+        let (running, failed) = active
+            .map(|(_, entry)| count_block_activity(&entry.synced.blocks()))
+            .unwrap_or_default();
+        state.running = running;
+        state.failed = failed;
 
-    for event in events.read() {
-        if let kaijutsu_client::ServerEvent::BlockStatusChanged {
-            context_id, status, ..
-        } = &event.0
-            && active_doc.as_deref() == Some(&context_id.to_string())
-        {
-            state.apply_status(status);
+        let (text, color) = format_block_activity(state.running, state.failed, &theme);
+        if dock.block_activity.text != text || dock.block_activity.color != color {
+            dock.block_activity.text = text;
+            dock.block_activity.color = color;
         }
     }
 
-    let (text, color) = format_block_activity(state.running, state.failed, &theme);
-    if dock.block_activity.text != text || dock.block_activity.color != color {
-        dock.block_activity.text = text;
-        dock.block_activity.color = color;
-    }
-
-    // Sample running block count for sparkline every 250ms
+    // Sample running block count for sparkline every 250ms. Reuses the
+    // cached count above rather than re-deriving — the gate already
+    // guarantees it's current as of the last real document change.
     let now = time.elapsed_secs_f64();
     if now - state.last_spark_sample >= 0.25 {
         state.last_spark_sample = now;

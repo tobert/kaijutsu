@@ -809,21 +809,50 @@ pub struct GlobalErrorQueue {
 
 /// A single transient error entry for dock HUD display.
 pub struct GlobalError {
-    #[allow(dead_code)] // Dock HUD toast fields; renderer reads `created_at` only so far.
     pub operation: String,
-    #[allow(dead_code)] // Dock HUD toast fields; renderer reads `created_at` only so far.
     pub message: String,
     pub created_at: f64,
+    /// Number of times this exact `(operation, message)` pair has recurred
+    /// since it first appeared. A reconnect storm (e.g. "no SSH agent" fired
+    /// once per retry) collapses into this counter instead of consuming a
+    /// new slot each time — see `push`.
+    pub repeat_count: u32,
 }
 
 impl GlobalErrorQueue {
+    /// Record an error. An exact repeat of an entry already in the queue
+    /// (same `operation` AND `message`, anywhere in the queue, not just the
+    /// most recent) bumps that entry's `repeat_count` and refreshes its
+    /// `created_at` (so a still-recurring problem doesn't quietly age out)
+    /// instead of pushing a new entry.
+    ///
+    /// This exists specifically so a cascade of IDENTICAL errors — a
+    /// reconnect storm hammering the same failure once per attempt — cannot
+    /// evict a distinct, earlier, still-relevant error: duplicates never
+    /// consume a slot. Only genuinely distinct errors compete for the 5
+    /// slots, and among those, oldest-first FIFO is the eviction rule (a
+    /// transient toast queue is not meant to pin the first error forever).
     pub fn push(&mut self, operation: impl Into<String>, message: impl Into<String>, time: f64) {
+        let operation = operation.into();
+        let message = message.into();
+
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.operation == operation && e.message == message)
+        {
+            existing.repeat_count = existing.repeat_count.saturating_add(1);
+            existing.created_at = time;
+            return;
+        }
+
         self.entries.push_back(GlobalError {
-            operation: operation.into(),
-            message: message.into(),
+            operation,
+            message,
             created_at: time,
+            repeat_count: 1,
         });
-        // Keep at most 5 visible errors
+        // Keep at most 5 visible DISTINCT errors.
         while self.entries.len() > 5 {
             self.entries.pop_front();
         }
@@ -1181,6 +1210,7 @@ mod tests {
         assert_eq!(entry.operation, "config");
         assert_eq!(entry.message, "theme.toml: bad TOML");
         assert_eq!(entry.created_at, 10.0);
+        assert_eq!(entry.repeat_count, 1);
     }
 
     #[test]
@@ -1193,6 +1223,56 @@ mod tests {
         // Oldest three (0, 1, 2) were evicted; 3..=7 remain, in order.
         let messages: Vec<&str> = queue.entries.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, vec!["error 3", "error 4", "error 5", "error 6", "error 7"]);
+    }
+
+    #[test]
+    fn global_error_queue_exact_repeat_bumps_count_instead_of_new_slot() {
+        let mut queue = GlobalErrorQueue::default();
+        queue.push("ssh", "no SSH agent", 0.0);
+        queue.push("ssh", "no SSH agent", 1.0);
+        queue.push("ssh", "no SSH agent", 2.0);
+
+        assert_eq!(queue.entries.len(), 1, "identical repeats must not consume new slots");
+        let entry = &queue.entries[0];
+        assert_eq!(entry.repeat_count, 3);
+        // Recency refreshes to the latest occurrence, so a still-recurring
+        // problem doesn't quietly age out between retries.
+        assert_eq!(entry.created_at, 2.0);
+    }
+
+    #[test]
+    fn global_error_queue_reconnect_storm_of_identical_errors_does_not_evict_a_distinct_earlier_one() {
+        // This is the exact scenario the review flagged: the diagnostic
+        // FIRST error (theme.toml) must survive a burst of many identical
+        // "no SSH agent" retries that would have filled a plain 5-slot FIFO
+        // and evicted it.
+        let mut queue = GlobalErrorQueue::default();
+        queue.push("config", "theme.toml: bad TOML", 0.0);
+        for i in 1..20 {
+            queue.push("ssh", "no SSH agent", i as f64);
+        }
+
+        let messages: Vec<&str> = queue.entries.iter().map(|e| e.message.as_str()).collect();
+        assert!(
+            messages.contains(&"theme.toml: bad TOML"),
+            "the distinct earlier error must still be present, got {messages:?}"
+        );
+        assert_eq!(queue.entries.len(), 2, "one distinct slot + one deduped repeat slot");
+        let ssh_entry = queue.entries.iter().find(|e| e.operation == "ssh").unwrap();
+        assert_eq!(ssh_entry.repeat_count, 19);
+    }
+
+    #[test]
+    fn global_error_queue_distinct_burst_still_evicts_oldest_once_slots_are_full() {
+        // A cascade of genuinely DISTINCT errors (not a repeat storm) still
+        // follows plain FIFO once all 5 slots are in use — dedup only
+        // protects against IDENTICAL repeats, not an unrelated cascade.
+        let mut queue = GlobalErrorQueue::default();
+        for i in 0..6 {
+            queue.push("op", format!("distinct {i}"), i as f64);
+        }
+        assert_eq!(queue.entries.len(), 5);
+        assert!(!queue.entries.iter().any(|e| e.message == "distinct 0"));
     }
 
     #[test]
