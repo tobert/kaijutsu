@@ -143,6 +143,18 @@ pub async fn reconcile_with_toml(
     }
     report.warnings = load.warnings;
 
+    // A structurally-invalid `[servers.X]` entry (bad transport, missing
+    // `command`/`url`) never makes it into `desired` below, so it would
+    // otherwise never be visited by the add/remove/unchanged logic at all —
+    // not connected, not registered, not recorded anywhere but a log line.
+    // Fold it into `failed` here so it's indistinguishable, to `kj mcp
+    // list`/`status` and `Broker::external_mcp_failures`, from a well-formed
+    // entry whose connect attempt failed: an explicitly FAILED server with a
+    // name and a reason, never a server that silently doesn't exist.
+    for invalid in &load.invalid {
+        report.failed.push((invalid.name.clone(), invalid.reason.clone()));
+    }
+
     let desired: HashMap<String, McpServerConfig> =
         load.servers.into_iter().map(|s| (s.name.clone(), s)).collect();
 
@@ -345,9 +357,61 @@ command = "/definitely/does/not/exist/mcp-server"
         assert_eq!(report.warnings.len(), 1, "the malformed entry is reported");
         assert!(report.warnings[0].contains("broken"));
         // The other, well-formed-but-unreachable entry still gets a real
-        // connect attempt (and fails loudly, not silently).
-        assert_eq!(report.failed.len(), 1);
-        assert_eq!(report.failed[0].0, "also_unreachable");
+        // connect attempt (and fails loudly, not silently). The malformed
+        // entry is ALSO recorded in `failed` now (in addition to
+        // `warnings`) — see `malformed_entry_is_surfaced_as_a_failed_server`
+        // for the dedicated test of that behavior.
+        assert_eq!(report.failed.len(), 2);
+        let failed_names: Vec<&str> = report.failed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(failed_names.contains(&"broken"));
+        assert!(failed_names.contains(&"also_unreachable"));
+    }
+
+    /// Component of defect 3 (`docs/issues.md`-style, fixed inline): a
+    /// structurally-invalid `[servers.X]` entry (bad transport, missing
+    /// `command`/`url`) is dropped by `load_mcp_config_toml` before it ever
+    /// reaches `desired` here, so — before this test's fix — it never
+    /// landed in `report.failed` or `Broker::external_mcp_failures`. To
+    /// `kj mcp list`/`status` the server simply didn't exist: no running
+    /// instance, no failure record, nothing an operator could grep for.
+    /// This proves the malformed entry is now surfaced exactly like a
+    /// well-formed-but-unreachable one.
+    #[tokio::test]
+    async fn malformed_entry_is_surfaced_as_a_failed_server() {
+        let kernel = fake_kernel().await;
+        let toml = r#"
+[servers.typo]
+transport = "carrier_pigeon"
+command = "/bin/whatever"
+"#;
+        let report = reconcile_with_toml(&kernel, toml).await;
+
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|(name, reason)| name == "typo" && reason.contains("carrier_pigeon")),
+            "expected 'typo' to be recorded as failed with its reason, got {:?}",
+            report.failed
+        );
+        assert!(
+            kernel
+                .broker()
+                .list_instances()
+                .await
+                .iter()
+                .all(|id| id.as_str() != "external.typo"),
+            "a malformed entry must never be half-registered"
+        );
+
+        // Observable via the broker (`kj mcp list`'s source of truth for
+        // `last_failure`), not just the report returned from this one call.
+        let failures = kernel.broker().external_mcp_failures().await.unwrap();
+        assert!(
+            failures.iter().any(|(name, _)| name == "typo"),
+            "Broker::external_mcp_failures must carry the malformed entry too, \
+             not just connect failures: {failures:?}"
+        );
     }
 
     #[tokio::test]

@@ -47,6 +47,26 @@ use super::servers::external::{McpServerConfig, McpTransport};
 pub struct McpConfigLoad {
     pub servers: Vec<ParsedServer>,
     pub warnings: Vec<String>,
+    /// Structured counterpart to `warnings`, one entry per dropped
+    /// `[servers.X]` table. `warnings` is free text for logging;
+    /// `invalid` exists so a caller that needs to know *which* server
+    /// failed and *why* — `kj mcp list`, `Broker::external_mcp_failures`
+    /// via `reconcile_with_toml` — doesn't have to string-match log lines.
+    /// Before this field existed, a malformed entry was dropped here and
+    /// never reached either of those, so it simply vanished instead of
+    /// showing up as a failed server (CLAUDE.md: silent fallbacks are a
+    /// mistake).
+    pub invalid: Vec<InvalidServer>,
+}
+
+/// One entry from `mcp.toml` that failed to parse semantically (missing
+/// `command`, unrecognized `transport`, …) — the structured (name, reason)
+/// pair callers surface as an explicitly FAILED server rather than letting
+/// it silently disappear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidServer {
+    pub name: String,
+    pub reason: String,
 }
 
 /// A cleanly-parsed `[servers.X]` entry. Alias kept distinct from
@@ -113,6 +133,7 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
 
     let mut servers = Vec::new();
     let mut warnings = Vec::new();
+    let mut invalid = Vec::new();
 
     for name in names {
         let srv = &raw.servers[name];
@@ -124,10 +145,11 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             "stdio" => McpTransport::Stdio,
             "streamable_http" => McpTransport::StreamableHttp,
             other => {
-                warnings.push(format!(
-                    "server '{name}': unrecognized transport '{other}' \
-                     (expected 'stdio' or 'streamable_http') — skipped"
-                ));
+                let reason = format!(
+                    "unrecognized transport '{other}' (expected 'stdio' or 'streamable_http')"
+                );
+                warnings.push(format!("server '{name}': {reason} — skipped"));
+                invalid.push(InvalidServer { name: name.clone(), reason });
                 continue;
             }
         };
@@ -136,20 +158,19 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
             McpTransport::Stdio => {
                 let command = srv.command.as_deref().unwrap_or("").trim();
                 if command.is_empty() {
-                    warnings.push(format!(
-                        "server '{name}': stdio transport requires a non-empty \
-                         'command' — skipped"
-                    ));
+                    let reason = "stdio transport requires a non-empty 'command'".to_string();
+                    warnings.push(format!("server '{name}': {reason} — skipped"));
+                    invalid.push(InvalidServer { name: name.clone(), reason });
                     continue;
                 }
             }
             McpTransport::StreamableHttp => {
                 let url = srv.url.as_deref().unwrap_or("").trim();
                 if url.is_empty() {
-                    warnings.push(format!(
-                        "server '{name}': streamable_http transport requires a \
-                         non-empty 'url' — skipped"
-                    ));
+                    let reason =
+                        "streamable_http transport requires a non-empty 'url'".to_string();
+                    warnings.push(format!("server '{name}': {reason} — skipped"));
+                    invalid.push(InvalidServer { name: name.clone(), reason });
                     continue;
                 }
             }
@@ -167,7 +188,7 @@ pub fn load_mcp_config_toml(content: &str) -> Result<McpConfigLoad, String> {
         });
     }
 
-    Ok(McpConfigLoad { servers, warnings })
+    Ok(McpConfigLoad { servers, warnings, invalid })
 }
 
 #[cfg(test)]
@@ -317,6 +338,9 @@ command = "/bin/fine"
         assert_eq!(load.warnings.len(), 1);
         assert!(load.warnings[0].contains("broken"));
         assert!(load.warnings[0].contains("command"));
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
+        assert!(load.invalid[0].reason.contains("command"));
     }
 
     #[test]
@@ -327,6 +351,8 @@ command = "/bin/fine"
         let load = load_mcp_config_toml(toml).unwrap();
         assert!(load.servers.is_empty());
         assert_eq!(load.warnings.len(), 1);
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
     }
 
     #[test]
@@ -344,6 +370,9 @@ command = "/bin/fine"
         assert_eq!(load.warnings.len(), 1);
         assert!(load.warnings[0].contains("broken"));
         assert!(load.warnings[0].contains("url"));
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
+        assert!(load.invalid[0].reason.contains("url"));
     }
 
     #[test]
@@ -362,6 +391,16 @@ command = "/bin/whatever"
         assert!(load.servers.is_empty());
         assert_eq!(load.warnings.len(), 1);
         assert!(load.warnings[0].contains("carrier_pigeon"));
+
+        // Defect: dropping the entry at parse time with only a free-text
+        // warning meant it never reached `reconcile_external_mcp_servers`
+        // and so was never recorded in `Broker::external_mcp_failures` — to
+        // `kj mcp list`/`status` it simply didn't exist. `invalid` is the
+        // structured (name, reason) counterpart callers use to surface a
+        // malformed entry as an explicitly FAILED server instead.
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
+        assert!(load.invalid[0].reason.contains("carrier_pigeon"));
     }
 
     #[test]
@@ -380,6 +419,8 @@ command = "/bin/b"
         let names: Vec<&str> = load.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
         assert_eq!(load.warnings.len(), 1);
+        assert_eq!(load.invalid.len(), 1);
+        assert_eq!(load.invalid[0].name, "broken");
     }
 
     #[test]

@@ -690,6 +690,29 @@ impl Broker {
         self.teardown_subscriptions_for_instance(id, server_arc.as_ref())
             .await;
 
+        // Explicitly stop the server rather than relying on its `Arc`
+        // eventually reaching a zero refcount. For `ExternalMcpServer` that
+        // distinction is a real subprocess: dropping the transport merely
+        // closes stdin/stdout, and many MCP servers do not exit on EOF, so
+        // without this the child could outlive `unregister` indefinitely —
+        // e.g. until an in-flight call holding its own `Arc` clone finishes,
+        // which may be much later or never. `shutdown()` is called on our
+        // own `Arc` clone, independent of any other holder; a concurrent
+        // in-flight call using a different clone of the same `Arc` may then
+        // see its call fail (the transport was just torn down) — that's the
+        // acceptable "fail loudly" outcome CLAUDE.md prefers over a silent
+        // hang, not something this call waits on or is blocked by.
+        if let Some(server) = &server_arc {
+            if let Err(e) = server.shutdown().await {
+                tracing::warn!(
+                    instance = %id,
+                    error = %e,
+                    "unregister: server shutdown failed — its process may outlive \
+                     unregister until every Arc clone is dropped",
+                );
+            }
+        }
+
         if !removed_tools.is_empty() {
             let names: Vec<String> = removed_tools.into_iter().map(|t| t.name).collect();
             let count = names.len();
@@ -2944,6 +2967,10 @@ mod tests {
                 + Sync,
         >,
         notif_tx: broadcast::Sender<ServerNotification>,
+        /// Counts `McpServerLike::shutdown` invocations — shared via `Arc` so
+        /// a test can keep observing it after the server itself is moved
+        /// into the broker (and, on `unregister`, dropped).
+        shutdown_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockServer {
@@ -2954,7 +2981,14 @@ mod tests {
                 tools: std::sync::Mutex::new(Vec::new()),
                 on_call: Arc::new(|_p| Box::pin(async { Ok(KernelToolResult::text("ok")) })),
                 notif_tx,
+                shutdown_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
+        }
+
+        /// A handle a test can keep past the point where the server itself
+        /// is handed to the broker (and later possibly dropped).
+        fn shutdown_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+            self.shutdown_calls.clone()
         }
 
         fn with_tool(self, name: &str) -> Self {
@@ -3016,6 +3050,11 @@ mod tests {
 
         fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
             self.notif_tx.subscribe()
+        }
+
+        async fn shutdown(&self) -> McpResult<()> {
+            self.shutdown_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -3699,6 +3738,88 @@ mod tests {
             matches!(err, McpError::InstanceNotFound(_)),
             "expected InstanceNotFound after unregister, got {err:?}"
         );
+    }
+
+    /// Defect 2: `unregister` used to only drop the instance from the
+    /// registry map. The underlying `Arc<dyn McpServerLike>` — and for
+    /// `ExternalMcpServer`, the child process it wraps — only actually went
+    /// away once every clone of that `Arc` was dropped, which could be much
+    /// later (or never, if something else kept a reference) rather than at
+    /// `unregister` time. On `kj mcp reload`, that meant a removed server's
+    /// subprocess kept running until the last `Arc` happened to drop —
+    /// dropping merely closes stdin/stdout, and many MCP servers don't exit
+    /// on EOF, so the process could leak indefinitely. `unregister` must
+    /// explicitly call `shutdown()` rather than relying on `Drop`.
+    #[tokio::test]
+    async fn unregister_shuts_down_the_server() {
+        let (broker, _store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let server = MockServer::new("svc").with_tool("ping");
+        let shutdown_calls = server.shutdown_counter();
+        broker.register(Arc::new(server), InstancePolicy::default()).await.unwrap();
+
+        assert_eq!(
+            shutdown_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shutdown must not fire just from registering"
+        );
+
+        broker.unregister(&InstanceId::new("svc")).await.unwrap();
+
+        assert_eq!(
+            shutdown_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unregister must explicitly shut the server down, not just drop its Arc"
+        );
+    }
+
+    /// Defect 2, ordering half: `unregister` must not block on (or be
+    /// broken by) a call that's already in flight against the same
+    /// instance. `resolve_instance` hands an in-flight call its own `Arc`
+    /// clone before `unregister` ever runs, so `unregister`'s `shutdown()`
+    /// call — which acts on a *different* clone of the same `Arc` — races
+    /// it. The in-flight call finishing on its own (never hanging) and
+    /// `unregister` returning promptly (never waiting on it) are both
+    /// required; CLAUDE.md accepts the call failing loudly as a side effect
+    /// of that race, just never a silent hang.
+    #[tokio::test]
+    async fn unregister_does_not_hang_with_a_call_in_flight() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("napper").with_tool("sleep").on_call(|_p| async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(KernelToolResult::text("done"))
+        }));
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+
+        let broker_for_call = broker.clone();
+        let call_task = tokio::spawn(async move {
+            broker_for_call
+                .call_tool(params("napper", "sleep"), &CallContext::test(), CancellationToken::new())
+                .await
+        });
+
+        // Give the call a moment to resolve the instance (clone its own
+        // `Arc`) and enter its sleep before we race `unregister` against it.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let unregister_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            broker.unregister(&InstanceId::new("napper")),
+        )
+        .await
+        .expect("unregister must not hang while a call is in flight");
+        assert!(unregister_result.is_ok(), "{unregister_result:?}");
+
+        // The in-flight call must also resolve on its own — not hang
+        // forever because unregister tore something out from under it.
+        let call_result = tokio::time::timeout(Duration::from_secs(2), call_task)
+            .await
+            .expect("in-flight call must not hang past unregister")
+            .expect("call task must not panic");
+        // Succeeding or failing loudly are both fine here (this mock's
+        // `shutdown()` doesn't touch anything the in-flight call reads) —
+        // only a hang or a panic would indicate unregister broke it.
+        let _ = call_result;
     }
 
     /// Exit criterion #4: Log burst produces one Coalesced summary block.

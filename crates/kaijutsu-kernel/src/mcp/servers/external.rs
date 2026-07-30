@@ -19,7 +19,7 @@ use rmcp::model::{
     ResourceContents, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::{NotificationContext, RunningService};
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient};
 use tokio::process::Command;
 use tokio::sync::broadcast;
@@ -185,6 +185,51 @@ fn propagate_host_env(cmd: &mut Command) {
     }
 }
 
+/// Harden a to-be-spawned external MCP subprocess `Command` against becoming
+/// an orphan if this kernel process dies — by any means, including a crash,
+/// a panic, or `kill -9`, none of which run `ExternalMcpServer::shutdown` or
+/// any other graceful-shutdown code path. Without this, the OS simply
+/// reparents the child to init on kernel death and it leaks permanently
+/// (every external MCP server — kaibo, bevy_brp, … — is exactly this
+/// shape).
+///
+/// Mirrors `background_exec::spawn_background`'s `pre_exec` exactly (see
+/// that module's "Ownership and cleanup" doc section for the full
+/// rationale, including why this was chosen over relying solely on
+/// `kill_on_drop` or `systemd`'s `KillMode=control-group`): its own process
+/// group (`setpgid`) plus Linux's `PR_SET_PDEATHSIG(SIGKILL)` so the OS
+/// kills the child the instant its parent dies, unconditionally.
+/// `kill_on_drop` stays as a secondary, weaker backstop — it only fires on a
+/// clean in-process `Drop`, which a crash or `kill -9` never triggers.
+fn harden_child_command(cmd: &mut Command) {
+    // Backstop only: kills the child if this process cleanly drops the
+    // `Child` (e.g. a panic unwind reaches a live `RunningService`/
+    // `TokioChildProcess`). The real orphan guard is PDEATHSIG below, which
+    // also covers `kill -9` and process crashes where no `Drop` ever runs.
+    cmd.kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        // SAFETY: `setpgid`/`set_parent_process_death_signal` are
+        // async-signal-safe per POSIX; safe to call between fork and exec.
+        // Own process group matches kaish's and `background_exec`'s own
+        // external-command spawn convention.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(|| {
+                rustix::process::setpgid(None, None)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+                #[cfg(target_os = "linux")]
+                rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::Kill,
+                ))
+                .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+                Ok(())
+            });
+        }
+    }
+}
+
 pub struct ExternalMcpServer {
     instance_id: InstanceId,
     config: McpServerConfig,
@@ -228,7 +273,8 @@ impl ExternalMcpServer {
                     if let Some(cwd) = &config.cwd {
                         cmd.current_dir(cwd);
                     }
-                    let transport = TokioChildProcess::new(cmd.configure(|_| {}))
+                    harden_child_command(&mut cmd);
+                    let transport = TokioChildProcess::new(cmd)
                         .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
                     rmcp::serve_client(handler, transport)
                         .await
@@ -307,7 +353,8 @@ impl ExternalMcpServer {
                     if let Some(cwd) = &self.config.cwd {
                         cmd.current_dir(cwd);
                     }
-                    let transport = TokioChildProcess::new(cmd.configure(|_| {}))
+                    harden_child_command(&mut cmd);
+                    let transport = TokioChildProcess::new(cmd)
                         .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
                     rmcp::serve_client(handler, transport)
                         .await
@@ -794,5 +841,61 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "connect() must respect connect_timeout, not the full `sleep 5`"
         );
+    }
+
+    // ---- orphan protection (defect fix) --------------------------------
+    //
+    // `connect()`/`reconnect()` route every spawned Command through
+    // `harden_child_command`, which sets `setpgid(None, None)` +
+    // `PR_SET_PDEATHSIG(SIGKILL)` in `pre_exec` (mirrors
+    // `background_exec::spawn_background` — see that module's "Ownership
+    // and cleanup" doc section). The test below exercises the exact same
+    // `harden_child_command` → `TokioChildProcess::new` seam `connect()`
+    // uses, without needing a real MCP handshake, and checks the ONE half
+    // of that closure's effect that's observable from outside the child:
+    // `setpgid` — a still-live process's group id is readable via
+    // `getpgid`. `PR_SET_PDEATHSIG` itself has NO such external observation
+    // point: `prctl(PR_GET_PDEATHSIG)` only ever reports the CALLING
+    // thread's own flag, so proving it fired would require either (a) the
+    // child process itself reading back its own flag and reporting it (this
+    // suite doesn't spawn a purpose-built reporter binary for that), or (b)
+    // an actual "kill this process and observe the child dies" system test,
+    // which means forking the test binary — a multithreaded tokio
+    // process — a genuinely risky thing to do inside `cargo test`.
+    // `background_exec.rs`'s own test suite makes the identical call: it
+    // has no direct PDEATHSIG test either, despite pre_exec setting it the
+    // exact same way. setpgid and PDEATHSIG are set back-to-back inside the
+    // SAME `pre_exec` closure, so a successful setpgid is the strongest
+    // indirect evidence available short of the two options above that the
+    // closure ran to completion and reached the PDEATHSIG call too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_child_command_gets_its_own_process_group() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("5");
+        harden_child_command(&mut cmd);
+
+        let mut transport = TokioChildProcess::new(cmd).expect("spawn sleep");
+        let pid = transport.id().expect("pid should be observable right after spawn");
+
+        let child_pgid = rustix::process::getpgid(rustix::process::Pid::from_raw(pid as i32))
+            .expect("getpgid must succeed for a just-spawned, still-live child");
+        let own_pgid = rustix::process::getpgid(None).expect("getpgid(None) is this process's own");
+
+        assert_eq!(
+            child_pgid.as_raw_nonzero().get() as u32,
+            pid,
+            "setpgid(None, None) in harden_child_command's pre_exec should make the \
+             child the leader of its own new process group (pgid == pid)"
+        );
+        assert_ne!(
+            child_pgid.as_raw_nonzero(),
+            own_pgid.as_raw_nonzero(),
+            "the child's process group must differ from this test process's — \
+             proves pre_exec actually ran rather than inheriting our group"
+        );
+
+        // Clean up so we don't leak a live `sleep 5` past this test.
+        let _ = transport.graceful_shutdown().await;
     }
 }

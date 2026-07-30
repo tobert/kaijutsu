@@ -125,11 +125,31 @@ impl KjDispatcher {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // A structurally-invalid `[servers.X]` entry (bad transport, missing
+        // `command`/`url`) never lands in `load.servers` — `load_mcp_config_toml`
+        // drops it before it's a `McpServerConfig` at all. Without this,
+        // such an entry had NO row here: not in `load.servers` (never
+        // parsed clean), not in `registered` (never even attempted). `list`
+        // reads mcp.toml directly rather than reconciling, so this must not
+        // depend on `kj mcp reload` having run first — the fresh parse
+        // result is the source of truth, `last_failures` is a fallback for
+        // names this pass doesn't know about.
+        let invalid: std::collections::HashMap<String, String> = load
+            .invalid
+            .iter()
+            .map(|i| (i.name.clone(), i.reason.clone()))
+            .collect();
 
-        // Union of configured names and anything still registered under
-        // `external.*` (e.g. a stale registration mid-reload race) — every
-        // name here is worth showing, not just the ones that agree.
+        // Union of configured names, malformed-but-named entries, and
+        // anything still registered under `external.*` (e.g. a stale
+        // registration mid-reload race) — every name here is worth
+        // showing, not just the ones that agree.
         let mut names: Vec<String> = load.servers.iter().map(|s| s.name.clone()).collect();
+        for name in invalid.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
         for r in &registered {
             if !names.contains(r) {
                 names.push(r.clone());
@@ -141,6 +161,7 @@ impl KjDispatcher {
         for name in &names {
             let cfg = load.servers.iter().find(|s| &s.name == name);
             let is_running = registered.contains(name);
+            let invalid_reason = invalid.get(name);
             let health = if is_running {
                 match broker.instances_snapshot().await.get(&external_instance_id(name)) {
                     Some(server) => Some(server.health().await),
@@ -149,18 +170,25 @@ impl KjDispatcher {
             } else {
                 None
             };
-            let status = match (cfg.is_some(), is_running) {
-                (true, true) => "running",
-                (true, false) => "failed", // configured, enabled, not registered
-                (false, true) => "orphaned", // registered but no longer configured (reload pending)
-                (false, false) => "unknown", // unreachable in practice — in `names` because of one of the two sets
+            let status = if invalid_reason.is_some() {
+                // Structurally malformed — never got a connect attempt, so
+                // it's never "running"/"orphaned"; surfaced exactly like a
+                // well-formed-but-unreachable entry rather than vanishing.
+                "failed"
+            } else {
+                match (cfg.is_some(), is_running) {
+                    (true, true) => "running",
+                    (true, false) => "failed", // configured, enabled, not registered
+                    (false, true) => "orphaned", // registered but no longer configured (reload pending)
+                    (false, false) => "unknown", // unreachable in practice — in `names` because of one of the two sets
+                }
             };
             rows.push((
                 name.clone(),
                 status,
                 cfg.map(|c| format!("{:?}", c.transport)),
                 health,
-                last_failures.get(name).cloned(),
+                invalid_reason.cloned().or_else(|| last_failures.get(name).cloned()),
             ));
         }
 
@@ -307,6 +335,45 @@ command = "/definitely/does/not/exist/mcp-server"
         let v: serde_json::Value = serde_json::from_str(&message).unwrap();
         assert_eq!(v["servers"][0]["name"], "ghost");
         assert_eq!(v["servers"][0]["status"], "failed");
+    }
+
+    /// Defect 3: a structurally-invalid `[servers.X]` entry (bad transport,
+    /// missing `command`/`url`) used to be dropped inside
+    /// `load_mcp_config_toml` with only a free-text warning — it never
+    /// landed in `load.servers`, so `list`'s `names` (built from
+    /// `load.servers` union what's registered) never contained it either.
+    /// To an operator running `kj mcp list`, a typo'd entry simply didn't
+    /// exist: no row, no reason, nothing to grep for. This must be visible
+    /// even when `kj mcp reload` has never run (list reads mcp.toml
+    /// directly, it doesn't reconcile).
+    #[tokio::test]
+    async fn list_shows_malformed_entry_as_failed_not_missing() {
+        let d = test_dispatcher(
+            r#"
+[servers.typo]
+transport = "streemable_http"
+url = "http://localhost:9"
+"#,
+        )
+        .await;
+        let caller = test_helpers::test_caller();
+
+        let result = d.dispatch_mcp(&[s("list"), s("--json")], &caller).await;
+        let KjResult::Ok { message, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        let v: serde_json::Value = serde_json::from_str(&message)
+            .unwrap_or_else(|e| panic!("expected JSON, got {e}: {message:?}"));
+        assert_eq!(v["servers"][0]["name"], "typo");
+        assert_eq!(v["servers"][0]["status"], "failed");
+        assert!(
+            v["servers"][0]["last_failure"]
+                .as_str()
+                .expect("last_failure should be a string")
+                .contains("streemable_http"),
+            "expected the reason to name the bad transport, got {:?}",
+            v["servers"][0]["last_failure"]
+        );
     }
 
     #[tokio::test]
