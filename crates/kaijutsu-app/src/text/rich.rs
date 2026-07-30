@@ -2,7 +2,9 @@
 //!
 //! Supports multiple content formats via `RichContentKind`:
 //! - **Markdown**: per-span brush coloring (headings, code, bold, etc.)
-//! - **Sparkline**: inline timeseries mini-charts (pure Vello vector paths)
+//! - **Sparkline**: inline timeseries mini-charts — plain Bevy UI rectangle
+//!   geometry now, not Vello (see `text::sparkline`); only detection and the
+//!   `SparklineData` payload live here.
 //! - **SVG**: inline vector graphics (via `vello_svg` + `usvg`)
 //!
 //! Detection is centralized in `detect_rich_content()` — tries sparkline first
@@ -52,7 +54,8 @@ pub enum RichContentKind {
         spans: Vec<RichSpan>,
         plain_text: String,
     },
-    /// Inline timeseries mini-chart.
+    /// Inline timeseries mini-chart — rendered as plain UI rectangle
+    /// geometry (`text::sparkline::build_sparkline_geometry`), not Vello.
     Sparkline(SparklineData),
     /// Inline SVG vector graphic.
     Svg {

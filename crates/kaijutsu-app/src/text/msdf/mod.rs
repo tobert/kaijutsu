@@ -16,8 +16,13 @@
 //! BlockFxMaterial (post-processing: glow, animation)
 //! ```
 //!
-//! Vello continues to handle SVG, sparkline, ABC, and border rendering.
-//! MSDF replaces Vello only for text content (PlainText, Markdown, Output).
+//! Vello still handles SVG and ABC notation (a CPU vector rasterizer, out of
+//! the conversation-view de-vello scope). Everything else in the
+//! conversation view is off vello: MSDF renders text content (PlainText,
+//! Markdown, Output, border/role-divider labels), sparklines and the image
+//! placeholder are plain UI rectangle geometry (`text::sparkline`), and
+//! block borders / role dividers are an SDF shader (`cell::block_border` +
+//! `shaders::BlockFxMaterial`).
 
 pub mod atlas;
 pub mod generator;
@@ -75,12 +80,16 @@ pub struct MsdfBlockGlyphs {
     pub rainbow: bool,
 }
 
-/// Which renderer handles a block's text content.
+/// Which renderer draws a block's base content into its texture (before the
+/// `BlockFxMaterial` shader post-processes border/glow/label decoration on
+/// top — that part is never Vello, regardless of this enum).
 #[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockRenderMethod {
-    /// Vello rasterizes the entire scene (SVG, sparkline, ABC, borders).
+    /// Vello rasterizes the block's content (SVG, ABC notation only).
     Vello,
-    /// MSDF renders text glyphs; Vello renders borders only.
+    /// MSDF renders text glyphs (or nothing, for a block whose content is
+    /// plain UI geometry — sparkline, image placeholder — spawned as
+    /// sibling child entities instead of texture content).
     #[default]
     Msdf,
 }

@@ -41,10 +41,12 @@ use crate::text::{
 };
 use crate::text::components::rainbow_brush;
 use crate::text::markdown::MarkdownColors;
-use crate::text::sparkline::{SparklineColors, build_sparkline_paths, render_sparkline_scene};
+use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_geometry};
 use crate::ui::theme::Theme;
 use crate::view::fieldset;
 use crate::view::ui_rtt::{UiVectorScene, UiRttTexture};
+use bevy::math::Rot2;
+use bevy::ui::UiTransform;
 
 // ============================================================================
 // COMPONENTS
@@ -84,6 +86,95 @@ impl Default for BlockScene {
         }
     }
 }
+
+/// Child rectangle entities a block's content-drawing arm spawned (sparkline
+/// polyline, image placeholder background) that must be despawned before the
+/// arm rebuilds them for new content. Every child is a plain Bevy UI `Node` +
+/// `BackgroundColor` (+ `UiTransform` for rotated stroke segments) — no
+/// vello, no custom shader; Bevy's own UI rasterizer draws every pixel.
+#[derive(Component, Default)]
+pub struct ContentGeometryChildren(pub Vec<Entity>);
+
+/// Despawn any content-geometry children left over from a previous build.
+/// Called unconditionally at the top of each rebuilt block cell — arms that
+/// draw geometry (sparkline, image placeholder) respawn fresh children right
+/// after; arms that don't just leave the component removed.
+fn clear_content_geometry_children(
+    commands: &mut Commands,
+    entity: Entity,
+    existing: Option<&ContentGeometryChildren>,
+) {
+    let Some(children) = existing else {
+        return;
+    };
+    for &child in &children.0 {
+        commands.entity(child).try_despawn();
+    }
+    commands.entity(entity).remove::<ContentGeometryChildren>();
+}
+
+/// Spawn one axis-aligned rectangle child (fill bar, joint dot, or a plain
+/// background panel) at `offset`-relative local content-space coordinates.
+fn spawn_rect_child(
+    commands: &mut Commands,
+    parent: Entity,
+    rect: (f32, f32, f32, f32), // x, y, width, height
+    offset: (f32, f32),
+    color: Color,
+) -> Entity {
+    let (x, y, w, h) = rect;
+    let child = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(x + offset.0),
+                top: Val::Px(y + offset.1),
+                width: Val::Px(w),
+                height: Val::Px(h),
+                ..default()
+            },
+            BackgroundColor(color),
+        ))
+        .id();
+    commands.entity(parent).add_child(child);
+    child
+}
+
+/// Spawn one rotated rectangle child — a sparkline stroke segment — centered
+/// at `(segment.cx, segment.cy)` (local content space), `segment.length` px
+/// long, `thickness` px tall, rotated `segment.angle` radians about its own
+/// center via `UiTransform` (see the pivot note on `SparklineSegment::angle`).
+fn spawn_segment_child(
+    commands: &mut Commands,
+    parent: Entity,
+    segment: &SparklineSegment,
+    thickness: f32,
+    offset: (f32, f32),
+    color: Color,
+) -> Entity {
+    let left = segment.cx - segment.length * 0.5 + offset.0;
+    let top = segment.cy - thickness * 0.5 + offset.1;
+    let child = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(left),
+                top: Val::Px(top),
+                width: Val::Px(segment.length),
+                height: Val::Px(thickness),
+                ..default()
+            },
+            UiTransform::from_rotation(Rot2::radians(segment.angle)),
+            BackgroundColor(color),
+        ))
+        .id();
+    commands.entity(parent).add_child(child);
+    child
+}
+
+/// Dark background for the image placeholder rect (no real CAS→decode
+/// pipeline yet — see the `RichContentKind::Image` arm in `build_block_scenes`).
+const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
 
 // ============================================================================
 // PLUGIN
@@ -267,6 +358,7 @@ pub fn build_block_scenes(
             &mut MsdfBlockGlyphs,
             &mut BlockRenderMethod,
             Option<&BlockExcludedState>,
+            Option<&ContentGeometryChildren>,
         ),
         With<BlockCell>,
     >,
@@ -297,7 +389,7 @@ pub fn build_block_scenes(
 
     for (
         entity, mut block_scene, mut ui_scene, mut rtt, computed, mut node, rich, border, vis, effects,
-        mut msdf_glyphs, mut render_method, excluded_state,
+        mut msdf_glyphs, mut render_method, excluded_state, existing_geometry_children,
     ) in block_cells.iter_mut()
     {
         // Skip hidden blocks
@@ -361,6 +453,11 @@ pub fn build_block_scenes(
             None
         };
 
+        // Shed any content-geometry children (sparkline polyline / image
+        // placeholder rect) from a previous build — the arms below respawn
+        // fresh ones if this build is still one of those kinds.
+        clear_content_geometry_children(&mut commands, entity, existing_geometry_children);
+
         let mut scene = vello::Scene::new();
         let content_height: f32;
 
@@ -421,15 +518,52 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Sparkline(data)) => {
-                *render_method = BlockRenderMethod::Vello;
-                let w = content_width as f64;
-                let h = theme.sparkline_height as f64;
-                content_height = theme.sparkline_height;
-                if w > 0.0 && h > 0.0 {
-                    let paths = build_sparkline_paths(data, w, h, 4.0);
-                    let mut sub_scene = vello::Scene::new();
-                    render_sparkline_scene(&mut sub_scene, &paths, &sparkline_colors);
-                    scene.append(&sub_scene, Some(Affine::translate(text_offset)));
+                // No vello scene, no shader — the polyline is plain Bevy UI
+                // rectangles (thin rotated `Node`s for the stroke, axis-
+                // aligned ones for fill/joints), spawned as children below.
+                *render_method = BlockRenderMethod::Msdf;
+                let h = theme.sparkline_height;
+                content_height = h;
+
+                if content_width > 0.0 && h > 0.0 {
+                    let geometry = build_sparkline_geometry(data, content_width, h, 4.0);
+                    let offset = (pad_left, pad_top);
+                    let mut spawned = Vec::with_capacity(
+                        geometry.segments.len() + geometry.joints.len() + geometry.fill_bars.len(),
+                    );
+
+                    if let Some(fill_color) = sparkline_colors.fill {
+                        for bar in &geometry.fill_bars {
+                            spawned.push(spawn_rect_child(
+                                &mut commands,
+                                entity,
+                                (bar.x, bar.y, bar.width, bar.height),
+                                offset,
+                                fill_color,
+                            ));
+                        }
+                    }
+                    for segment in &geometry.segments {
+                        spawned.push(spawn_segment_child(
+                            &mut commands,
+                            entity,
+                            segment,
+                            crate::text::sparkline::SPARKLINE_STROKE_WIDTH,
+                            offset,
+                            sparkline_colors.line,
+                        ));
+                    }
+                    for joint in &geometry.joints {
+                        spawned.push(spawn_rect_child(
+                            &mut commands,
+                            entity,
+                            (joint.x, joint.y, joint.width, joint.height),
+                            offset,
+                            sparkline_colors.line,
+                        ));
+                    }
+
+                    commands.entity(entity).insert(ContentGeometryChildren(spawned));
                 }
             }
             Some(RichContentKind::Svg {
@@ -538,39 +672,52 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Image { hash }) => {
-                *render_method = BlockRenderMethod::Vello;
-                // Placeholder: dark rectangle with hash label.
-                // Full CAS→decode→ImageNode pipeline requires RpcCommand::CasRead
-                // and async image loading, which lands in a follow-up.
+                // Placeholder: dark rectangle (plain UI geometry, not vello)
+                // with an MSDF hash label. Full CAS→decode→ImageNode pipeline
+                // requires RpcCommand::CasRead and async image loading, which
+                // lands in a follow-up — this only drops vello, the
+                // placeholder itself is unchanged.
+                *render_method = BlockRenderMethod::Msdf;
                 let placeholder_h = 120.0_f32;
                 content_height = placeholder_h;
 
-                let rect = vello::kurbo::Rect::new(
-                    pad_left as f64,
-                    pad_top as f64,
-                    (pad_left + content_width) as f64,
-                    (pad_top + placeholder_h) as f64,
+                let rect_child = spawn_rect_child(
+                    &mut commands,
+                    entity,
+                    (0.0, 0.0, content_width, placeholder_h),
+                    (pad_left, pad_top),
+                    IMAGE_PLACEHOLDER_COLOR,
                 );
-                scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    vello::peniko::Color::new([0.2, 0.2, 0.25, 1.0]),
-                    None,
-                    &rect,
-                );
+                commands
+                    .entity(entity)
+                    .insert(ContentGeometryChildren(vec![rect_child]));
 
                 let label = format!("[image: {}]", &hash[..8.min(hash.len())]);
                 let label_layout =
                     font.layout(&label, &style, VelloTextAlign::Left, max_advance);
                 let label_y = pad_top + placeholder_h / 2.0 - label_layout.height() / 2.0;
                 let label_brush = bevy_color_to_brush(theme.block_tool_result);
-                crate::text::rich::render_layout_with_brushes(
-                    &mut scene,
-                    &label_layout,
-                    &[],
-                    &label_brush,
-                    (pad_left as f64, label_y as f64),
-                );
+
+                if let Some(ref mut atlas) = atlas {
+                    for line in label_layout.lines() {
+                        for item in line.items() {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let glyphs = collect_msdf_glyphs(
+                        &label_layout,
+                        &[],
+                        &label_brush,
+                        (pad_left as f64, label_y as f64),
+                        atlas,
+                    );
+                    msdf_glyphs.glyphs = glyphs;
+                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
+                    *render_method = BlockRenderMethod::Msdf;
+                }
             }
             None => {
                 // Plain text block
