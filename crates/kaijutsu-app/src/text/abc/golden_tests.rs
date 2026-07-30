@@ -1,288 +1,136 @@
-//! Golden-image regression tests for ABC engraving.
+//! Structural regression tests for ABC engraving output.
 //!
-//! Rasterizes the same `vello::Scene` the app builds via a headless
-//! `vello::Renderer` and compares against PNG goldens in
-//! `src/text/abc_goldens/`. Set `UPDATE_GOLDENS=1` to regenerate.
+//! Snapshots the deterministic (glyph, geometry-vertex) data
+//! `text::msdf::music_bridge`'s `collect_music_glyphs`/`collect_music_geometry`
+//! produce for each ABC fixture — NOT rendered pixels. A pixel-perfect
+//! comparison stopped being meaningful once ABC moved off vello: noteheads
+//! render as MSDF atlas quads (an async GPU pipeline a plain `cargo test`
+//! can't drive) and geometry renders as flat-colored triangles with no
+//! path rasterizer at all — there is no `vello::Scene` left to rasterize.
 //!
-//! Snippets are pure-staff ABC (no T:/C: text fields) so the test
-//! never needs a `VelloFont`. If we later add lyric/title goldens
-//! we'll need to plumb a shaping `VelloFont` here.
+//! What IS deterministic and testable without a GPU is the position data
+//! both pipelines consume: glyph identity/x/y/font_size and geometry
+//! triangle vertices. Pinning that catches the same class of regression the
+//! old pixel goldens caught (octave mapping, beam/stem placement, barline
+//! counts, staff alignment) with MORE precision (no antialiasing/RMSE fuzz,
+//! no rasterizer-version drift) and less machinery (no headless GPU, no
+//! wgpu, no PNG — and no more silent `SKIP` when no GPU adapter is
+//! available, which the old harness could do even in CI).
+//!
+//! Text elements (titles/chord symbols) aren't covered here — none of the
+//! fixture tunes use `T:`/`C:` fields (see each `.abc` file), and
+//! `collect_music_text_glyphs` needs a real shaped `VelloFont`, which isn't
+//! worth plumbing into a unit test for fixtures that don't exercise it.
+//!
+//! Set `UPDATE_GOLDENS=1` to regenerate a snapshot after an intentional
+//! engraving change — inspect the diff before trusting it.
 
-use vello::wgpu;
-use image::{ImageBuffer, Rgba, RgbaImage};
+use bevy::prelude::{Assets, Image};
 use kaijutsu_abc::engrave::{layout, EngravingOptions};
 use kaijutsu_abc::parse;
-use std::num::NonZeroUsize;
+use peniko::{Brush, Color};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
-use vello::kurbo::Affine;
-use vello::peniko::{Brush, Color};
 
-use crate::text::TextMetrics;
-
-/// Render each engraving element at this multiplier of the intrinsic
-/// IR coordinates. Larger goldens catch finer geometry bugs at the
-/// cost of git size; 4x feels right for ABC at the default 10.0
-/// staff_spacing.
-const RENDER_SCALE: f64 = 4.0;
-
-/// Maximum allowed RMSE between the rendered image and the golden,
-/// expressed as a fraction of 255 (so 0.005 ≈ 0.5%).
-const MAX_RMSE: f64 = 0.005;
-
-/// Maximum per-channel delta any single pixel may exceed.
-const MAX_CHANNEL_DELTA: u8 = 2;
-
-struct Harness {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    renderer: Mutex<vello::Renderer>,
-}
-
-static HARNESS: OnceLock<Option<Harness>> = OnceLock::new();
-
-fn harness() -> Option<&'static Harness> {
-    HARNESS
-        .get_or_init(|| {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
-                flags: wgpu::InstanceFlags::from_build_config().with_env(),
-                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                backend_options: wgpu::BackendOptions::from_env_or_default(),
-            });
-            let adapter_fut =
-                wgpu::util::initialize_adapter_from_env_or_default(&instance, None);
-            let adapter = pollster::block_on(adapter_fut).ok()?;
-            let device_fut = adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("abc-golden"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            });
-            let (device, queue) = pollster::block_on(device_fut).ok()?;
-            let renderer = vello::Renderer::new(
-                &device,
-                vello::RendererOptions {
-                    use_cpu: false,
-                    num_init_threads: NonZeroUsize::new(1),
-                    antialiasing_support: vello::AaSupport::area_only(),
-                    pipeline_cache: None,
-                },
-            )
-            .ok()?;
-            Some(Harness {
-                device,
-                queue,
-                renderer: Mutex::new(renderer),
-            })
-        })
-        .as_ref()
-}
-
-fn rasterize(scene: &vello::Scene, width: u32, height: u32) -> Option<RgbaImage> {
-    let h = harness()?;
-    let texture = h.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("abc-target"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    h.renderer
-        .lock()
-        .unwrap()
-        .render_to_texture(
-            &h.device,
-            &h.queue,
-            scene,
-            &view,
-            &vello::RenderParams {
-                base_color: vello::peniko::Color::BLACK,
-                width,
-                height,
-                antialiasing_method: vello::AaConfig::Area,
-            },
-        )
-        .expect("vello render_to_texture");
-
-    // Texture → buffer copy. bytes_per_row must be a multiple of 256.
-    let bytes_per_pixel = 4u32;
-    let unpadded_bpr = width * bytes_per_pixel;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let padded_bpr = unpadded_bpr.div_ceil(align) * align;
-    let buffer_size = (padded_bpr as u64) * height as u64;
-    let buffer = h.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("abc-readback"),
-        size: buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = h
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("abc-copy"),
-        });
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_bpr),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    h.queue.submit(Some(encoder.finish()));
-
-    let slice = buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-    h.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("device poll");
-    rx.recv().unwrap().expect("buffer map");
-
-    let mapped = slice.get_mapped_range();
-    let mut pixels = Vec::with_capacity((unpadded_bpr * height) as usize);
-    for row in 0..height {
-        let start = (row * padded_bpr) as usize;
-        let end = start + unpadded_bpr as usize;
-        pixels.extend_from_slice(&mapped[start..end]);
-    }
-    drop(mapped);
-    buffer.unmap();
-
-    ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
-}
+use crate::text::msdf::{collect_music_geometry, collect_music_glyphs, MsdfAtlas};
 
 fn goldens_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/text/abc_goldens")
 }
 
-fn engrave_abc(source: &str) -> (vello::Scene, u32, u32) {
+/// Deterministic text snapshot of a tune's engraved glyph + geometry data,
+/// in block-local pixel space at `block_scale = 1.0` (i.e. the raw IR
+/// units, origin-shifted) — the same transform every render path applies,
+/// just without a particular block's width/scale-to-fit folded in, so the
+/// snapshot is independent of any UI layout decision.
+fn snapshot(source: &str) -> String {
     let parsed = parse(source);
     assert!(
         !parsed.has_errors(),
         "ABC parse errors:\n{:#?}",
         parsed.errors().collect::<Vec<_>>()
     );
-    let tune = parsed
-        .value
-        .first()
-        .expect("ABC source produced no tunes");
+    let tune = parsed.value.first().expect("ABC source produced no tunes");
 
     let opts = EngravingOptions::default();
     let elements = layout::engrave(tune, &opts);
+    let bounds = crate::text::abc::compute_engraving_bounds(&elements, opts.margin);
+    let origin = (bounds.origin_x, bounds.origin_y);
 
     let brush = Brush::Solid(Color::WHITE);
-    let metrics = TextMetrics::default();
-    let (inner_scene, w, h) = super::render_engraving_to_scene(
-        &elements,
-        opts.margin,
-        &brush,
-        None,
-        &metrics,
-    );
+    let mut images = Assets::<Image>::default();
+    let mut atlas = MsdfAtlas::new(&mut images, 64, 64);
 
-    // Scale up into the golden canvas so subpixel bugs are visible.
-    let mut scaled = vello::Scene::new();
-    scaled.append(&inner_scene, Some(Affine::scale(RENDER_SCALE)));
-    let canvas_w = (w * RENDER_SCALE).ceil() as u32;
-    let canvas_h = (h * RENDER_SCALE).ceil() as u32;
-    (scaled, canvas_w, canvas_h)
+    let glyphs = collect_music_glyphs(&elements, (0.0, 0.0), origin, 1.0, &brush, &mut atlas);
+    let geometry = collect_music_geometry(&elements, (0.0, 0.0), origin, 1.0, &brush);
+
+    let mut out = String::new();
+    out.push_str(&format!("bounds: {:.3} x {:.3}\n", bounds.width, bounds.height));
+
+    out.push_str(&format!("glyphs: {}\n", glyphs.len()));
+    for g in &glyphs {
+        out.push_str(&format!(
+            "  glyph_id={} x={:.2} y={:.2} size={:.3}\n",
+            g.key.glyph_id, g.x, g.y, g.font_size,
+        ));
+    }
+
+    let triangles = geometry.len() / 3;
+    out.push_str(&format!(
+        "geometry: {} vertices ({} triangles)\n",
+        geometry.len(),
+        triangles,
+    ));
+    for tri in geometry.chunks_exact(3) {
+        out.push_str(&format!(
+            "  ({:.2},{:.2}) ({:.2},{:.2}) ({:.2},{:.2})\n",
+            tri[0].x, tri[0].y, tri[1].x, tri[1].y, tri[2].x, tri[2].y,
+        ));
+    }
+
+    out
 }
 
-/// Compare `actual` against the golden at `goldens_dir()/<name>.png`.
+/// Compare `actual` against the golden at `goldens_dir()/<name>.snapshot.txt`.
 ///
-/// Behaviour:
 /// - `UPDATE_GOLDENS=1` set → overwrite the golden, succeed.
 /// - golden missing → write it, fail with a clear message (so CI can't
 ///   silently accept a new golden).
-/// - dimensions differ → fail.
-/// - RMSE > MAX_RMSE OR any channel delta > MAX_CHANNEL_DELTA → fail
-///   and dump an `<name>.actual.png` next to the golden for inspection.
-fn assert_matches_golden(name: &str, actual: &RgbaImage) {
-    let path = goldens_dir().join(format!("{name}.png"));
+/// - mismatch → fail with a line-level diff summary.
+fn assert_matches_golden(name: &str, actual: &str) {
+    let path = goldens_dir().join(format!("{name}.snapshot.txt"));
     let update = std::env::var_os("UPDATE_GOLDENS").is_some();
 
     if update {
-        actual.save(&path).expect("write updated golden");
+        std::fs::write(&path, actual).expect("write updated golden");
         eprintln!("UPDATE_GOLDENS: wrote {}", path.display());
         return;
     }
 
     if !path.exists() {
-        actual.save(&path).expect("write initial golden");
+        std::fs::write(&path, actual).expect("write initial golden");
         panic!(
             "golden missing — wrote initial {}. Inspect it, then re-run.",
             path.display()
         );
     }
 
-    let golden = image::open(&path)
-        .unwrap_or_else(|e| panic!("load golden {}: {e}", path.display()))
-        .to_rgba8();
+    let golden = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read golden {}: {e}", path.display()));
 
-    if golden.dimensions() != actual.dimensions() {
-        let actual_path = goldens_dir().join(format!("{name}.actual.png"));
-        actual.save(&actual_path).ok();
-        panic!(
-            "dimension mismatch for {name}: golden {:?}, actual {:?} (saved {})",
-            golden.dimensions(),
-            actual.dimensions(),
-            actual_path.display(),
-        );
-    }
-
-    let mut sq_sum = 0.0f64;
-    let mut worst_delta = 0u8;
-    let mut worst_pixel = (0u32, 0u32);
-    for (x, y, p) in actual.enumerate_pixels() {
-        let g = golden.get_pixel(x, y);
-        for c in 0..4 {
-            let d = (p.0[c] as i32 - g.0[c] as i32).unsigned_abs() as u8;
-            if d > worst_delta {
-                worst_delta = d;
-                worst_pixel = (x, y);
+    if golden != actual {
+        let golden_lines: Vec<&str> = golden.lines().collect();
+        let actual_lines: Vec<&str> = actual.lines().collect();
+        let mut diff = String::new();
+        for i in 0..golden_lines.len().max(actual_lines.len()) {
+            let g = golden_lines.get(i).copied().unwrap_or("<missing>");
+            let a = actual_lines.get(i).copied().unwrap_or("<missing>");
+            if g != a {
+                diff.push_str(&format!("  line {i}: golden={g:?} actual={a:?}\n"));
             }
-            sq_sum += (d as f64) * (d as f64);
         }
-    }
-    let n = (actual.width() as f64) * (actual.height() as f64) * 4.0;
-    let rmse = (sq_sum / n).sqrt() / 255.0;
-
-    let fail = rmse > MAX_RMSE || worst_delta > MAX_CHANNEL_DELTA;
-    if fail {
-        let actual_path = goldens_dir().join(format!("{name}.actual.png"));
-        actual.save(&actual_path).ok();
         panic!(
-            "golden mismatch for {name}: rmse={:.4} (max {:.4}), worst channel delta={} at {:?} (max {}) — saved {}",
-            rmse,
-            MAX_RMSE,
-            worst_delta,
-            worst_pixel,
-            MAX_CHANNEL_DELTA,
-            actual_path.display(),
+            "golden mismatch for {name} (set UPDATE_GOLDENS=1 to regenerate \
+             after inspecting this diff):\n{diff}"
         );
     }
 }
@@ -290,12 +138,8 @@ fn assert_matches_golden(name: &str, actual: &RgbaImage) {
 fn run_case(name: &str) {
     let source = std::fs::read_to_string(goldens_dir().join(format!("{name}.abc")))
         .unwrap_or_else(|e| panic!("read {name}.abc: {e}"));
-    let (scene, w, h) = engrave_abc(&source);
-    let Some(img) = rasterize(&scene, w, h) else {
-        eprintln!("SKIP {name}: no wgpu adapter (headless GPU unavailable)");
-        return;
-    };
-    assert_matches_golden(name, &img);
+    let actual = snapshot(&source);
+    assert_matches_golden(name, &actual);
 }
 
 #[test]

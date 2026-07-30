@@ -1154,11 +1154,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `color`). Name is misleading. Mechanical rename across `block_render.rs`,
   `lifecycle.rs`, `overlay.rs`, `shell_dock.rs`, `render.rs`.
 - **Verify two unexercised render surfaces:** (1) a Vello-content *cell*
-  (ABC/SVG/sparkline, `has_vello_content == true`) rasterizing via
+  (SVG/sparkline, `has_vello_content == true`) rasterizing via
   `render_vello_scenes` then compositing MSDF labels on top — needs a
   conversation with rich content; (2) the unfocused-pane summary, the one
   surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
   multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
+  (ABC dropped out of the "Vello-content cell" category on the msdf-music
+  branch — `text/abc.rs` makes no vello calls at all now; noteheads/text
+  render as MSDF glyph quads and staff lines/beams/slurs/ties/repeat-dots
+  as flat-colored geometry triangles via `text::msdf::geometry` +
+  `music_geometry_renderer`. `render_method` for ABC blocks is `Msdf` like
+  every other MSDF-rendered block kind now, not a `Vello`-tagged special
+  case.)
 - **Vi editor command mode (Slice 3, `docs/vi.md`) — steps 1–3 shipped; open
   remainders:** runner-verify the slice-3 polish (capnp `@6` ⇒ kernel+app
   rebuild+restart; eyeball `:r !cmd` splice, bad-`:cmd` E492 on the strip, `fg`
