@@ -847,13 +847,19 @@ pub fn compute_spacer_heights(shown: &[(f32, f32, f32)], content_height: f32) ->
     (top, bottom)
 }
 
-fn set_display(node: &mut Node, display: Display) {
+/// Apply the virtualization decision to one row's entity: `Display` drives
+/// taffy, `Visibility` is the second line of defense for the scene builders.
+/// Change-detection friendly — writes only when a field actually moves.
+fn set_row_shown(node: &mut Node, vis: &mut Visibility, shown: bool) {
+    let display = if shown { Display::Flex } else { Display::None };
     if node.display != display {
         node.display = display;
     }
-}
-
-fn set_visibility(vis: &mut Visibility, target: Visibility) {
+    let target = if shown {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
     if *vis != target {
         *vis = target;
     }
@@ -876,30 +882,42 @@ fn set_visibility(vis: &mut Visibility, target: Visibility) {
 /// during fast scroll — same predicate as the `Visibility`-only culling this
 /// replaces.
 ///
-/// One exception forces an entity `Display::Flex` regardless of the window:
-/// **streaming while offscreen** (`BlockCell.last_render_version >
-/// row.measured_version`): a block's measured height goes stale once it's
-/// `Display::None`, since `readback_block_heights` only remeasures
-/// `Display::Flex` entities. Forcing one extra frame of `Display::Flex`
-/// lets readback catch up before the block re-enters the window — otherwise
-/// the stale height would produce a visible scrollbar/content jump. In
-/// practice this is rare and geometrically local: streaming blocks are
-/// appended at the document tail, which is exactly where a follow-mode
-/// viewport already sits.
+/// **The shown set is always one contiguous document interval — no
+/// exceptions.** Two spacers can encode exactly one gap above the shown rows
+/// and one below; a second island would have an unrepresentable hole in
+/// front of it, and taffy would pack it directly under the in-window rows
+/// (wrong position, wrong scrollable extent, and `readback_block_heights`
+/// would then "measure" it there and feed that back into the model). So the
+/// window predicate alone decides, for blocks and headers alike.
 ///
-/// Never-measured rows get **no** exception (unlike the pre-geometry
-/// version of this system, which force-showed them and paid an O(N) layout
-/// pass on first load of a long conversation): their estimated
-/// height/y_offset from [`ConversationGeometry`] place them in or out of
-/// the window immediately, and the estimate is replaced by a real
-/// measurement just-in-time as the row scrolls into the window.
+/// Two categories of row therefore stay `Display::None` while offscreen,
+/// carrying a height the model knows is imprecise:
+///
+/// - **Never-measured rows** keep their [`ConversationGeometry`] estimate
+///   (unlike the pre-geometry version of this system, which force-showed
+///   them and paid an O(N) layout pass on first load of a long
+///   conversation).
+/// - **Rows that streamed while offscreen** keep the height last measured
+///   before they were hidden (`BlockCell.last_render_version >
+///   row.measured_version`), since `readback_block_heights` only remeasures
+///   `Display::Flex` entities.
+///
+/// Both are corrected the same just-in-time way, and the window's one-screen
+/// margin buys the frames to do it out of sight: the row flips to
+/// `Display::Flex` a screen before it can be seen, `build_block_scenes`
+/// re-measures the text and writes the new explicit `Node.height`, the next
+/// taffy pass uses it, `readback_block_heights` records it, and that pass's
+/// scroll-anchoring absorbs the delta for rows above the viewport. Until
+/// then the imprecision costs at most a slightly-off scrollbar extent — the
+/// accepted price of estimated heights everywhere else in this model, and
+/// far cheaper than visible layout corruption.
 pub fn virtualize_conversation(
     entities: Res<EditorEntities>,
     scroll_state: Res<ConversationScrollState>,
     containers: Query<&BlockCellContainer>,
     geometries: Query<&ConversationGeometry>,
     role_header_query: Query<&RoleGroupBorder>,
-    mut block_cells: Query<(&BlockCell, &mut Node, &mut Visibility), With<BlockCell>>,
+    mut block_cells: Query<(&mut Node, &mut Visibility), With<BlockCell>>,
     mut role_headers: Query<
         (&mut Node, &mut Visibility),
         (With<RoleGroupBorder>, Without<BlockCell>),
@@ -940,32 +958,18 @@ pub fn virtualize_conversation(
     for row in geom.rows() {
         let in_window = row.y_offset + row.height >= top && row.y_offset <= bottom;
 
+        // A row with no live entity (outside the spawn band, or spawn lag)
+        // is skipped entirely — it contributes nothing to `shown`, and the
+        // spacers stand in for it.
         match row.key {
             RowKey::Block(id) => {
                 let Some(entity) = container.get_entity(&id) else {
                     continue;
                 };
-                let Ok((block_cell, mut node, mut vis)) = block_cells.get_mut(entity) else {
+                let Ok((mut node, mut vis)) = block_cells.get_mut(entity) else {
                     continue;
                 };
-                let stale = block_cell
-                    .last_render_version
-                    .is_some_and(|v| v > row.measured_version);
-                let should_show = in_window || stale;
-
-                set_display(&mut node, if should_show { Display::Flex } else { Display::None });
-                set_visibility(
-                    &mut vis,
-                    if should_show {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    },
-                );
-
-                if should_show {
-                    shown.push((row.y_offset, row.height, row.margin_bottom));
-                }
+                set_row_shown(&mut node, &mut vis, in_window);
             }
             RowKey::Header(id) => {
                 let Some(&entity) = header_map.get(&id) else {
@@ -974,21 +978,12 @@ pub fn virtualize_conversation(
                 let Ok((mut node, mut vis)) = role_headers.get_mut(entity) else {
                     continue;
                 };
-
-                set_display(&mut node, if in_window { Display::Flex } else { Display::None });
-                set_visibility(
-                    &mut vis,
-                    if in_window {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    },
-                );
-
-                if in_window {
-                    shown.push((row.y_offset, row.height, row.margin_bottom));
-                }
+                set_row_shown(&mut node, &mut vis, in_window);
             }
+        }
+
+        if in_window {
+            shown.push((row.y_offset, row.height, row.margin_bottom));
         }
     }
 
@@ -1420,21 +1415,28 @@ mod tests {
         );
     }
 
-    /// The Slice-B invariant: on the very first frame of a long conversation
-    /// — nothing measured, every row an estimate — virtualize must show only
-    /// the viewport window, NOT force-show never-measured blocks. (The
-    /// pre-geometry implementation force-showed all N, which is exactly the
-    /// O(N) first-load layout pass this model exists to kill.)
-    #[test]
-    fn virtualize_first_frame_shows_window_not_all_blocks() {
+    // ------------------------------------------------------------------
+    // virtualize_conversation
+    // ------------------------------------------------------------------
+
+    /// A conversation of `block_count` blocks wired for
+    /// `virtualize_conversation`: geometry reconcile chained ahead of it,
+    /// block entities carrying the `Node`/`Visibility` it toggles, and both
+    /// spacers carrying the `Node` it sizes. Returns the block entities in
+    /// document order.
+    fn build_virtualize_app(
+        block_count: usize,
+        offset: f32,
+        visible_height: f32,
+    ) -> (App, Vec<Entity>) {
         let mut app = App::new();
         app.init_resource::<EditorEntities>();
         app.init_resource::<LayoutGeneration>();
         app.init_resource::<crate::text::TextMetrics>();
         app.init_resource::<Theme>();
         app.insert_resource(ConversationScrollState {
-            offset: 0.0,
-            visible_height: 300.0,
+            offset,
+            visible_height,
             ..default()
         });
         app.add_systems(
@@ -1446,11 +1448,9 @@ mod tests {
                 .chain(),
         );
 
-        let (ids, _conv) = seed_conversation(&mut app, 50);
+        let (ids, _conv) = seed_conversation(&mut app, block_count);
         let main_ent = app.world().resource::<EditorEntities>().main_cell.unwrap();
 
-        // Give block entities the components virtualize toggles, and the
-        // spacers the Node it writes.
         let block_ents: Vec<Entity> = {
             let container = app.world().get::<BlockCellContainer>(main_ent).unwrap();
             ids.iter().map(|id| container.get_entity(id).unwrap()).collect()
@@ -1467,19 +1467,47 @@ mod tests {
         app.world_mut().entity_mut(top_spacer).insert(Node::default());
         app.world_mut().entity_mut(bottom_spacer).insert(Node::default());
 
+        (app, block_ents)
+    }
+
+    /// Document-order indices of the blocks virtualize left `Display::Flex`.
+    fn shown_indices(app: &App, block_ents: &[Entity]) -> Vec<usize> {
+        block_ents
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| app.world().get::<Node>(**e).unwrap().display == Display::Flex)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Mark a block as mid-stream: `build_block_scenes` stamps
+    /// `last_render_version` on every *in-band* entity when the document
+    /// version moves, whether or not that entity is laid out, so a row that
+    /// is `Display::None` ends up with `last_render_version >
+    /// measured_version`.
+    fn mark_streaming(app: &mut App, ent: Entity, version: u64) {
+        app.world_mut()
+            .get_mut::<BlockCell>(ent)
+            .unwrap()
+            .last_render_version = Some(version);
+    }
+
+    /// The Slice-B invariant: on the very first frame of a long conversation
+    /// — nothing measured, every row an estimate — virtualize must show only
+    /// the viewport window, NOT force-show never-measured blocks. (The
+    /// pre-geometry implementation force-showed all N, which is exactly the
+    /// O(N) first-load layout pass this model exists to kill.)
+    #[test]
+    fn virtualize_first_frame_shows_window_not_all_blocks() {
+        let (mut app, block_ents) = build_virtualize_app(50, 0.0, 300.0);
+        let bottom_spacer = app.world().resource::<EditorEntities>().bottom_spacer.unwrap();
+
         app.update();
 
         // Estimates: header 20+4, each one-line block 30+12 → window
         // [-300, 600] shows the first ~14 blocks; the rest must be
         // Display::None on frame one, with the bottom spacer standing in.
-        let flex: Vec<usize> = block_ents
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                app.world().get::<Node>(**e).unwrap().display == Display::Flex
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let flex = shown_indices(&app, &block_ents);
         assert!(
             !flex.is_empty() && flex.len() < 20,
             "expected only the estimated window shown on frame one, got {} of {} blocks Flex",
@@ -1500,6 +1528,65 @@ mod tests {
             bottom_px > 1000.0,
             "bottom spacer must stand in for the ~36 estimated-out blocks, got {bottom_px}",
         );
+    }
+
+    /// P0 regression: the shown set is the *window*, never window ∪ islands.
+    ///
+    /// The viewport sits at the document head while a block far below streams
+    /// (the user scrolled up and away from a running turn, or left a block
+    /// focused — a focused block is exempt from band despawn, so its entity
+    /// survives arbitrarily far offscreen). The old `should_show = in_window
+    /// || stale` force-showed that row: taffy packs a `Display::Flex` row
+    /// immediately after the in-window rows, so the streaming block rendered
+    /// glued to the bottom of the window — thousands of px from where the
+    /// geometry says it lives — and the two spacers (which only ever encode
+    /// *one* gap above and *one* below) could not represent the hole between
+    /// the window and the island. Readback then "measured" the misplaced row
+    /// and fed that back into the model.
+    #[test]
+    fn virtualize_leaves_far_offscreen_streaming_row_hidden() {
+        let (mut app, block_ents) = build_virtualize_app(50, 0.0, 300.0);
+
+        // Block 40 sits ~1700px down — far outside the [-300, 600] window.
+        mark_streaming(&mut app, block_ents[40], 7);
+
+        app.update();
+
+        let flex = shown_indices(&app, &block_ents);
+        assert!(
+            !flex.contains(&40),
+            "a streaming row outside the show window must stay Display::None, got {flex:?}",
+        );
+        assert!(
+            flex.windows(2).all(|w| w[1] == w[0] + 1),
+            "shown set must be one contiguous run, got {flex:?}",
+        );
+    }
+
+    /// Property pin for the invariant itself: whatever the scroll position
+    /// and whichever rows are mid-stream, the set of shown rows is always a
+    /// single contiguous document interval — the only shape the two
+    /// `ConversationSpacer` nodes can faithfully represent.
+    #[test]
+    fn virtualize_shown_set_is_contiguous_at_every_scroll_position() {
+        for offset in [0.0_f32, 400.0, 900.0, 1500.0, 2000.0] {
+            let (mut app, block_ents) = build_virtualize_app(50, offset, 300.0);
+            for &i in &[0_usize, 7, 20, 33, 49] {
+                mark_streaming(&mut app, block_ents[i], 7);
+            }
+
+            app.update();
+
+            let flex = shown_indices(&app, &block_ents);
+            assert!(
+                !flex.is_empty(),
+                "offset {offset}: some row must be shown",
+            );
+            assert!(
+                flex.windows(2).all(|w| w[1] == w[0] + 1),
+                "offset {offset}: shown set must be one contiguous run, got {flex:?}",
+            );
+        }
     }
 
     #[test]
