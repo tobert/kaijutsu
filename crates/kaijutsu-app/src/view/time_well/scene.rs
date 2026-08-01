@@ -570,6 +570,24 @@ pub static STATION_CENTER_PLACEMENT: LazyLock<StationCenterPlacement> = LazyLock
     rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2 - super::card::WELL_TILT),
 });
 
+/// World Y that a funnel-local `depth` (the −Z coordinate every ring, card,
+/// ray and the horizon disc is placed at) lands on, through the REAL
+/// composition every well entity goes through: the funnel recline
+/// ([`super::card::well_tilt_quat`]) then [`STATION_CENTER_PLACEMENT`].
+///
+/// This is the whole vertical scheme in one function. Since the flatten pins
+/// the net rotation at exactly `-FRAC_PI_2` (local +Z → world +Y) it collapses
+/// to `translation.y + scale·depth` — but it goes through the real quaternions
+/// so a retune of either angle can't silently invalidate the callers.
+/// `#[cfg(test)] pub(super)`: the sibling modules that anchor something to a
+/// depth ([`super::rays`]'s ribbon, [`super::card`]'s label) assert against
+/// the room floor through this rather than each re-deriving the composition.
+#[cfg(test)]
+pub(super) fn world_y_at_depth(depth: f32) -> f32 {
+    let local = super::card::well_tilt_quat() * Vec3::new(0.0, 0.0, depth);
+    placement_to_room(&STATION_CENTER_PLACEMENT, local).y
+}
+
 /// The `Transform` for the placement/root entity that re-roots the well's
 /// whole subtree into room space — mirrors patch bay's `placement_transform`
 /// (`patch_bay/mod.rs:275-279`). [`spawn_well_furniture`] spawns
@@ -1290,21 +1308,6 @@ mod tests {
             STATION_CENTER_PLACEMENT.translation.y > crate::view::room::TABLE_TOP_Y,
             "the placement must lift the well above the table's own top face, not just to it"
         );
-    }
-
-    /// World Y a funnel-local `depth` (the −Z coordinate every ring, card and
-    /// deck is placed at) lands on, through the REAL composition every well
-    /// entity goes through: the funnel recline
-    /// ([`super::super::card::well_tilt_quat`]) then
-    /// [`STATION_CENTER_PLACEMENT`]. Since
-    /// `station_center_placement_seats_above_the_room_table` pins the net
-    /// rotation at exactly `-FRAC_PI_2` (local +Z → world +Y), this collapses
-    /// to `translation.y + scale·depth` — but it's computed through the real
-    /// quaternions here so a retune of either angle can't silently invalidate
-    /// the floor-clearance tests below.
-    fn world_y_at_depth(depth: f32) -> f32 {
-        let local = super::super::card::well_tilt_quat() * Vec3::new(0.0, 0.0, depth);
-        placement_to_room(&STATION_CENTER_PLACEMENT, local).y
     }
 
     #[test]

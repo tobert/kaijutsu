@@ -42,12 +42,24 @@ const TRACK_POLL_INTERVAL: f64 = 5.0;
 /// Ray ribbon width (well units) — a filament, not a wall.
 const RAY_WIDTH: f32 = 14.0;
 
+/// Clearance the ribbon's inner end keeps above the event-horizon disc, so it
+/// melts into the disc's glow instead of intersecting it. **Amy-tunable.**
+const RAY_DECK_CLEARANCE: f32 = 10.0;
+
 /// Funnel-local stations every ray's spiral interpolates between: from just
-/// above the throat floor (the ring deck sits at −850; the ribbon melts into
-/// its glow) out to just past the mouth ring. Radii bracket the ring stack
-/// (mouth ring radius 500, vortex core well inside 70).
-const RAY_INNER: (f32, f32) = (70.0, -840.0); // (radius, depth) at the throat
-const RAY_OUTER: (f32, f32) = (520.0, 10.0); // (radius, depth) past the mouth
+/// above the **event-horizon disc** (the ribbon melts into its glow) out to
+/// just past the top ring. Radii bracket the ring stack (top ring radius 500,
+/// vortex core well inside 70).
+///
+/// The inner depth is *derived* from [`super::scene::RING_DECK_DEPTH`], never
+/// written down: it used to name −840 against a deck at −850, and when the
+/// deck moved onto the room floor (2026-08-01) that literal would have sent
+/// every track ray plunging 260 world units into the basement
+/// (`the_ribbon_ends_on_the_horizon_disc_never_under_the_room_floor` catches
+/// exactly that). Anchored here, the ribbon follows wherever the horizon is
+/// tuned to.
+const RAY_INNER: (f32, f32) = (70.0, super::scene::RING_DECK_DEPTH + RAY_DECK_CLEARANCE);
+const RAY_OUTER: (f32, f32) = (520.0, 10.0); // (radius, depth) past the top ring
 
 /// How far (radians) the spiral ribbon winds from the mouth back to the
 /// throat. `0.0` would be a straight radial beam (the retired pentagram
@@ -512,6 +524,29 @@ mod tests {
         assert!((throat.z - z0).abs() < 1e-3, "throat depth: {throat:?}");
         assert!((mouth.xy().length() - r1).abs() < 1e-3, "mouth radius: {mouth:?}");
         assert!((mouth.z - z1).abs() < 1e-3, "mouth depth: {mouth:?}");
+    }
+
+    /// The ribbon lives in the same room as everything else. Its inner end
+    /// must land in the sliver of air between the event-horizon disc and the
+    /// lowest card ring — not through the disc, and not below the room floor,
+    /// which is exactly where the old hardcoded −840 put it once the disc
+    /// moved (world y −260, deep under the octagon).
+    #[test]
+    fn the_ribbon_ends_on_the_horizon_disc_never_under_the_room_floor() {
+        let inner_y = super::super::scene::world_y_at_depth(RAY_INNER.1);
+        let disc_y = super::super::scene::world_y_at_depth(super::super::scene::RING_DECK_DEPTH);
+        assert!(inner_y > 0.0, "the ribbon's inner end is under the room floor: y={inner_y}");
+        assert!(
+            inner_y > disc_y,
+            "…and must stop above the horizon disc ({disc_y}), not cut through it: {inner_y}"
+        );
+        for band in kaijutsu_viz::layout::ALL_BANDS {
+            let (_r, depth) = super::super::card::band_ring(band);
+            assert!(
+                inner_y < super::super::scene::world_y_at_depth(depth),
+                "…and below {band:?}'s ring, since the ray falls INTO the horizon"
+            );
+        }
     }
 
     #[test]
