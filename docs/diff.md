@@ -192,6 +192,37 @@ the plan of record.
    Diff intents don't, and a shared trait would couple their evolution.
 6. Minimap, folds, word-level highlight polish; multi-rect material slice.
 
+## Build notes — slices 0+1 SHIPPED 2026-08-01 (corrections to the plan above)
+
+Slices 0+1 are built (opus agent, worktree; slice 2 landed on main the same
+day: `richness()` extraction + `ContentType::Diff` + hydrate arm). What the
+build taught us, for the slices still to come:
+
+- **imara-diff 0.2 (crates.io) has no word tokenizer** — the survey's
+  `sources::words` lives in gitoxide's fork (`gix-imara-diff`), not upstream.
+  Ours is ~30 lines in `tokenize.rs`; the profile seam holds as designed.
+  The Myers fallback is *internal* to imara-diff's histogram (pathological
+  inputs drop to Myers automatically); the indent heuristic is exposed and on
+  by default.
+- **Dialect decisions pinned in the crate** (fixtures are the authority):
+  renames *represented, not detected* (detection waits for gix-diff); copies
+  rejected as `UnsupportedExtension`; `---`/`+++` authoritative over the
+  advisory `diff --git` line; `index`/mode/similarity headers accepted then
+  dropped (lossy canonicalization, documented); CRLF normalized on ingest —
+  a terminator-only change is `DiffError::LineEndingsOnly`, never an empty
+  diff. The truncation marker `#!kaijutsu-diff truncated: …` LEADS the output
+  and parses back into `DiffModel::truncated`.
+- **Slice 3**: `FileChange` is required input, not inferred —
+  `apply_edit_plan` must say added/deleted/modified/renamed via the `FileSpec`
+  constructors. Hydration projection = `truncate_to_bytes(&model,
+  limits::MAX_HYDRATION_BYTES)` (32 KiB) + `DiffStat::to_string()`; never the
+  char-count path.
+- **Slices 4/5**: `limits::MAX_RENDER_BYTES` 1 MiB, `DEFAULT_PREVIEW_LINES`
+  20. Freeze-on-open and declared-Diff-that-doesn't-parse contracts are in
+  the crate rustdoc — a parse failure is a visible error state, never an
+  empty viewer. `FoldState` on `DiffModel` is view state formatting ignores:
+  keep folds out of any equality/roundtrip check.
+
 ## Seam guidance (deepseek review, 2026-08-01)
 
 Consulted deepseek specifically on how the seams should evolve so this work

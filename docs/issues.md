@@ -798,6 +798,13 @@ new code instead. No committed `rustfmt.toml` exists. Fix: pin a rustfmt
 edition/config that matches the tree (or bite the bullet with one dedicated
 whole-repo fmt commit), then re-enable fmt in the loop.
 
+**2026-08-01 (diff slices 0+1):** house style keeps compact single-line
+struct literals that default rustfmt explodes — a `rustfmt.toml` raising
+`struct_lit_width` would reconcile most of the drift in one commit (32 diffs
+in kaijutsu-types, 5 in kaijutsu-cas, etc.). Note: the new `kaijutsu-diff`
+crate WAS formatted with stock rustfmt, so it's formatter-clean and slightly
+unlike its neighbors; whichever config lands should keep it clean too.
+
 ---
 
 ## MCP `data` shape change + unbounded rich_json (seeded 2026-07-18, `kj transport list` / `OutputData.rich_json` 3-model review)
