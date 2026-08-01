@@ -1,16 +1,17 @@
 //! Time-well context browser — the first concrete consumer of `kaijutsu-viz`.
 //!
 //! A radial 3D "well" of context cards, seated by **explicit ring placement**
-//! (`docs/timewell.md`, "Ring membership becomes explicit") — two hand-curated
-//! rings sandwiching two automatic ones: `Active` (mouth, `p`romoted) →
-//! `Recent` (automatic, most-recently-active) → `Bumped` (automatic overflow;
-//! concluded contexts compete only here) → `Demoted` (throat, `d`emoted).
-//! Every ring seats exactly 10 (`kaijutsu_viz::layout::RING_SLOTS`); anything
-//! past seat 9 is the event horizon — no card entity, a "+N" count at the
-//! throat. Each ring has its own radius/depth terrace with a visible step +
-//! gap at the boundary; within a terrace, angle encodes the ring's own seat
-//! order. `docs/time-well-concepts.md` holds the earlier UX record; the
-//! retired substrate design survives as the "Appendix: substrate notes" in
+//! (`docs/timewell.md`, "Ring membership becomes explicit") — **two rings and
+//! a floor**, hanging over the room's table: `Active` on top (the ten
+//! `p`romoted/visited contexts) and `Recent` just above the tabletop (the ten
+//! most-recently-active). Each ring seats exactly 10
+//! (`kaijutsu_viz::layout::RING_SLOTS`); everything else — demoted,
+//! concluded, and the overflow past those twenty seats — is **past the event
+//! horizon**: no card entity, a "+N" count lying on the accretion disc that
+//! rings the table plinth at floor level. Each ring has its own
+//! radius/height terrace; within a ring, angle encodes seat order.
+//! `docs/time-well-concepts.md` holds the earlier UX record; the retired
+//! substrate design survives as the "Appendix: substrate notes" in
 //! `docs/timewell.md` (full viz-substrate.md in git history).
 //!
 //! Module map:

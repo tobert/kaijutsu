@@ -115,7 +115,7 @@ pub fn sync_time_well(
         .collect();
     // Snapshot the cluster map so we can both feed the slot ordering and read
     // labels in the spawn/refresh loops below without re-borrowing `state`
-    // (which those loops mutate). It's Demoted-sized — a cheap clone.
+    // (which those loops mutate). It's Recent-sized — a cheap clone.
     let cluster_of = state.cluster_of.clone();
     // Each card's `(band, within_index)` position — what the ring geometry
     // (`ring_seat_rotated`/`card_base_scale`) keys on.

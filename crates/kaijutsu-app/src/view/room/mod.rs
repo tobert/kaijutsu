@@ -218,7 +218,7 @@ const TABLE_PEDESTAL_RADIUS: f32 = 55.0;
 /// almost exactly the circle the floor traces are forbidden from crossing —
 /// the traces stay clear of the console because the table is *physically
 /// standing there*, not by an arbitrary rule.
-const TABLE_PLINTH_RADIUS: f32 = 145.0;
+pub(crate) const TABLE_PLINTH_RADIUS: f32 = 145.0;
 const TABLE_PLINTH_HEIGHT: f32 = 16.0;
 // Table/pedestal/plinth colour (`ScenePalette::table`) and the rim torus's
 // gold trim brightness (`ScenePalette::gold` × `ScenePalette::trim`) moved

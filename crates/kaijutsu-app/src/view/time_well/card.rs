@@ -42,12 +42,14 @@ pub struct CardData {
     pub band: Band,
     /// Parent context for lineage overlay (`None` for a root).
     pub forked_from: Option<ContextId>,
-    /// Kernel-synthesized semantic-cluster label, set only for `Demoted` (ring
-    /// 3, the deepest ring that still seats cards — nearest analog to the old
-    /// haystack) cards that belong to a cluster. `None` for every shallower
-    /// ring and for unclustered `Demoted` cards. (Semantic clustering proper
-    /// is a Stage-3 concern; this mapping just keeps the one existing field
-    /// meaningful under the explicit-placement scheme.)
+    /// Kernel-synthesized semantic-cluster label, set only for [`Band::Recent`]
+    /// (the lowest ring that still seats cards — nearest analog to the old
+    /// haystack) cards that belong to a cluster. `None` for `Active` and for
+    /// unclustered `Recent` cards. (Semantic clustering proper is a Stage-3
+    /// concern; this mapping just keeps the one existing field meaningful
+    /// under the explicit-placement scheme. It rode `Demoted` until the ring
+    /// collapse of 2026-08-01 retired that ring — same rule, applied to the
+    /// ring that inherited "deepest with cards".)
     pub cluster_label: Option<String>,
     /// Whether `paused_at` is set. **Visuals only** — design-only state for
     /// now (see `ContextRow::paused_at` in kernel_db.rs): the card shows a
@@ -97,9 +99,9 @@ pub fn card_from(info: &ContextInfo, band: Band, cluster_label: Option<String>) 
         preview: info.top_block_preview.clone(),
         band,
         forked_from: info.forked_from,
-        // Only Demoted cards carry a cluster label; the caller passes `None`
-        // for shallower rings (their angle encodes a different axis).
-        cluster_label: if band == Band::Demoted {
+        // Only Recent cards carry a cluster label; the caller passes `None`
+        // for the Active ring (its angle encodes a different axis).
+        cluster_label: if band == Band::Recent {
             cluster_label
         } else {
             None
@@ -117,11 +119,11 @@ fn effective_activity(info: &ContextInfo) -> u64 {
 }
 
 /// Each ring's seated context ids in **seat order**, indexed by [`Band::index`]
-/// (`[Active, Recent, Bumped, Demoted]`). This is the single source of seat
-/// order: the layout derives every position from it (so angle == seat), and
-/// keyboard navigation walks the same vectors (so the keys match the visuals).
-/// Never longer than [`kaijutsu_viz::layout::RING_SLOTS`] per ring.
-pub type BandOrders = [Vec<ContextId>; 4];
+/// (`[Active, Recent]`). This is the single source of seat order: the layout
+/// derives every position from it (so angle == seat), and keyboard navigation
+/// walks the same vectors (so the keys match the visuals). Never longer than
+/// [`kaijutsu_viz::layout::RING_SLOTS`] per ring.
+pub type BandOrders = [Vec<ContextId>; 2];
 
 /// Adapt the app's [`ContextInfo`] poll into [`kaijutsu_viz::layout::assign_ring_seats`]'s
 /// pure `ContextLifecycle<ContextId>` model and run it: the one place that
@@ -238,14 +240,15 @@ pub fn well_tilt_quat() -> Quat {
 // STACKED BAND RINGS (one magic-ring per explicit/automatic ring — cards seated on it)
 // ============================================================================
 //
-// The well is a stack of concentric magic-circle rings, one per ring
-// (`Active` → `Recent` → `Bumped` → `Demoted`), receding into the funnel by
-// depth. Each ring's cards are seated **evenly around its ring**, on the ring
-// line, like slides in a Kodak Carousel tray (see [`ring_seat`]). This
-// SUPERSEDES the earlier spiral-within-terrace layout — cards moved from
-// *between* rings to *on* rings. A card's position keys only on its
-// `(band, within_index)` pair and the ring's card count, so appends spread
-// evenly around a ring without reflowing another ring. See `docs/timewell.md`.
+// The well is a stack of concentric magic-circle rings — `Active` on top,
+// `Recent` a step below it — hanging over the room's table, with the event
+// horizon lying flat on the floor beneath them (`scene::RING_DECK_DEPTH`).
+// Each ring's cards are seated **evenly around its ring**, on the ring line,
+// like slides in a Kodak Carousel tray (see [`ring_seat`]). This SUPERSEDES
+// the earlier spiral-within-terrace layout — cards moved from *between* rings
+// to *on* rings. A card's position keys only on its `(band, within_index)`
+// pair and the ring's card count, so appends spread evenly around a ring
+// without reflowing another ring. See `docs/timewell.md`.
 
 /// Outermost ring radius — the `Active` ring at the mouth. Expanded (was ~330)
 /// so the well reads big. **Amy-tunable.**
@@ -257,10 +260,20 @@ const SPIRAL_R_THROAT: f32 = 48.0;
 /// per-band shrink so the rings nest/stack without collapsing toward the axis.
 /// **Amy-tunable.**
 const RING_RADIUS_STEP: f32 = 0.85;
-/// Funnel-local depth (−Z) **step** per deeper band: `Active` sits at depth 0
-/// (the mouth) and each colder band steps this much deeper, so the rings stack
-/// as distinct planes (Up/Down will read as moving between them). **Amy-tunable.**
-const RING_DEPTH_STEP: f32 = -230.0;
+/// Funnel-local depth (−Z) **step** per lower band: `Active` sits at depth 0
+/// and each colder band steps this much deeper, so the rings stack as distinct
+/// planes (Up/Down reads as moving between them).
+///
+/// Since the rings were laid parallel to the floor
+/// (`scene::STATION_CENTER_PLACEMENT`'s rotation), funnel depth maps 1:1 onto
+/// world height: **`world_y = 160 + 0.5 · depth`** (160 =
+/// `room::TABLE_TOP_Y` + `scene::STATION_CENTER_LIFT`; 0.5 =
+/// `scene::STATION_CENTER_SCALE`). So this step is a *height* knob now, and
+/// −150 puts `Active` at world y=160 and `Recent` at y=85 — the lower ring
+/// hanging just clear of the tabletop (`room::TABLE_TOP_Y` = 70), the
+/// invariant `scene::every_band_ring_hangs_above_the_room_floor_and_its_table`
+/// guards. Steepen it and `Recent` sinks into the table. **Amy-tunable.**
+const RING_DEPTH_STEP: f32 = -150.0;
 /// Per-within-index geometric decay retained for [`spiral_scale`] (the
 /// within-band scale falloff); it no longer positions cards.
 const SPIRAL_DECAY: f32 = 0.93;
@@ -268,7 +281,8 @@ const SPIRAL_DECAY: f32 = 0.93;
 /// [`spiral_scale`]. Kept high so cards stay readable as they recede.
 const SPIRAL_SCALE_THROAT: f32 = 0.52;
 
-/// Number of bands / rings — one per [`Band`] variant.
+/// Number of bands / rings — one per [`Band`] variant (two, since the ring
+/// collapse of 2026-08-01: `Active` and `Recent`).
 const N_TERRACES: usize = ALL_BANDS.len();
 
 /// Number of band rings, exposed for the ring-centric nav state (array sizes in
@@ -284,8 +298,8 @@ pub const GATE_ANGLE: f32 = std::f32::consts::PI;
 
 /// The `(radius, depth)` of `band`'s ring, **funnel-local** (the
 /// [`well_tilt_quat`] recline is applied later, in [`ring_seat`] and the scene
-/// spawn). Radius shrinks modestly per deeper band ([`RING_RADIUS_STEP`],
-/// floored at [`SPIRAL_R_THROAT`]); depth steps clearly deeper per band
+/// spawn). Radius shrinks modestly per lower band ([`RING_RADIUS_STEP`],
+/// floored at [`SPIRAL_R_THROAT`]); depth steps clearly lower per band
 /// ([`RING_DEPTH_STEP`], `Active` at depth 0). Single source of ring geometry
 /// for both card seating ([`ring_seat`]) and the magic-circle ring visual
 /// (`terrace_ring_material`/`terrace_ring.wgsl`).
@@ -380,7 +394,7 @@ pub fn carry_ring_pos(pos: usize, new_len: usize) -> usize {
     }
 }
 
-/// One ring per band, in mouth→throat order (`Active` … `Demoted`), each a
+/// One ring per band, in top→down order (`Active`, `Recent`), each a
 /// funnel-local `(radius, depth)` via [`band_ring`]. The scene spawns one
 /// magic-circle ring quad per entry (sized to its own radius); cards are seated
 /// on each ring via [`ring_seat`]. Radii shrink and `|depth|` grows down the
@@ -406,24 +420,23 @@ pub fn spiral_scale(band: Band, within_index: usize) -> f32 {
     scale_inner + (scale_outer - scale_inner) * f
 }
 
-/// Multiplicative per-band scale step: each deeper band's cards are this factor
+/// Multiplicative per-band scale step: each lower band's cards are this factor
 /// smaller than the previous band's, layered on top of the within-terrace
 /// [`spiral_scale`] decay so the terraces read as distinctly-sized tiers
-/// (`Active` 1.0× → `Recent` 0.8× → `Bumped` 0.64× → `Demoted` 0.512×).
-/// **Amy-tunable.**
+/// (`Active` 1.0× → `Recent` 0.8×). **Amy-tunable.**
 pub const TERRACE_SCALE_STEP: f32 = 0.8;
 
 /// The card's **base render scale** at `(band, within_index)` — the single
 /// source for a card's `base_scale` field (the value the render-scale tween
 /// reads). Combines the within-terrace [`spiral_scale`] decay with the
-/// per-band [`TERRACE_SCALE_STEP`] tier step, so deeper bands are distinctly
+/// per-band [`TERRACE_SCALE_STEP`] tier step, so the lower band is distinctly
 /// smaller overall.
 pub fn card_base_scale(band: Band, within_index: usize) -> f32 {
     spiral_scale(band, within_index) * TERRACE_SCALE_STEP.powi(band.index() as i32)
 }
 
 /// Per-context `(Band, within-ring seat index)`, alongside the flat
-/// mouth→throat odometer order, derived from an already-seated [`BandOrders`]
+/// top→down odometer order, derived from an already-seated [`BandOrders`]
 /// (the [`assign_placement`] output's `rings`). `sync.rs` resolves each card's
 /// terraced position/scale (`ring_seat_rotated`/`card_base_scale`) from the
 /// `(band, within_index)` pair here.
@@ -446,24 +459,37 @@ pub fn spiral_positions(
 // shared this column were removed 2026-07-06 (the reading card's SPECS
 // `band` line carries band names). ──
 
-/// Amy-tunable: how far outside a band's ring the label parks, so it doesn't
-/// collide with that ring's seated cards.
-const LABEL_RADIUS_OFFSET: f32 = 40.0;
+/// Amy-tunable: funnel-local radius the "+N" count parks at, out on the
+/// event-horizon disc itself. Bounded on both sides: it must clear the room's
+/// table plinth (`room::TABLE_PLINTH_RADIUS` = 145 world = 290 funnel-local at
+/// `scene::STATION_CENTER_SCALE` 0.5) so the text lies on the disc rather than
+/// on the plinth, and stay inside the disc's own edge
+/// (`scene::RING_DECK_SIZE` / 2 = 550 local) so it doesn't float off into the
+/// room. `horizon_label_rides_the_horizon_disc` pins both bounds.
+const HORIZON_LABEL_RADIUS: f32 = 400.0;
 
-/// Amy-tunable: how far around the ring (radians) the label sits from
-/// [`GATE_ANGLE`], so it parks *beside* the gate seat rather than directly
-/// behind whatever card is eased to the gate.
-const LABEL_GATE_OFFSET: f32 = 0.45;
+/// Amy-tunable: how far the label floats above the horizon disc's own plane,
+/// in funnel-local units along the ring axis (which the placement stands up as
+/// world +Y). Deliberately tiny — just enough air to beat z-fighting against
+/// the disc it labels: 8 local = 4 world units.
+const HORIZON_LABEL_LIFT: f32 = 8.0;
 
-/// World position for the event-horizon "+N" label: parked one more depth-step
-/// beyond the deepest ring ([`Band::Demoted`]'s), gate-side so it sits where
-/// the camera looks, same recline as everything else ([`well_tilt_quat`]).
+/// World position for the event-horizon "+N" label: lying on the horizon disc
+/// ([`super::scene::RING_DECK_DEPTH`], the accretion disc on the room floor),
+/// gate-side so it sits where the camera looks, floated a hair off the disc
+/// plane by [`HORIZON_LABEL_LIFT`], same recline as everything else
+/// ([`well_tilt_quat`]).
+///
+/// Re-anchored 2026-08-01 with the ring collapse: it used to park one more
+/// depth-step past the (now-retired) `Demoted` ring, which — once the rings
+/// went parallel to the floor — meant an unreadable chip hanging in mid-air
+/// below the room floor. It now belongs to the disc, which is what the count
+/// has always been about.
 pub fn horizon_label_pos() -> Vec3 {
-    let (demoted_radius, demoted_depth) = band_ring(Band::Demoted);
-    let a = GATE_ANGLE - LABEL_GATE_OFFSET;
-    let r = demoted_radius + LABEL_RADIUS_OFFSET;
-    let local = Vec3::new(r * a.cos(), r * a.sin(), demoted_depth + RING_DEPTH_STEP);
-    well_tilt_quat() * local
+    let a = GATE_ANGLE;
+    let r = HORIZON_LABEL_RADIUS;
+    let depth = super::scene::RING_DECK_DEPTH + HORIZON_LABEL_LIFT;
+    well_tilt_quat() * Vec3::new(r * a.cos(), r * a.sin(), depth)
 }
 
 #[cfg(test)]
@@ -620,7 +646,7 @@ mod tests {
     // `effective_activity` fallback to `created_at`.
 
     #[test]
-    fn assign_placement_seats_promoted_demoted_and_recent() {
+    fn assign_placement_seats_promoted_and_recent_and_horizons_demoted() {
         let mut promoted = ctx(id_of(1), "");
         promoted.promoted_at = Some(100);
 
@@ -632,14 +658,16 @@ mod tests {
 
         let placement = assign_placement(&[promoted, demoted, recent]);
         assert_eq!(placement.rings[Band::Active.index()], vec![id_of(1)]);
-        assert_eq!(placement.rings[Band::Demoted.index()], vec![id_of(2)]);
         assert_eq!(placement.rings[Band::Recent.index()], vec![id_of(3)]);
-        assert!(placement.rings[Band::Bumped.index()].is_empty());
-        assert!(placement.horizon.is_empty());
+        assert_eq!(
+            placement.horizon,
+            vec![id_of(2)],
+            "the demoted context falls past the horizon, not onto a ring"
+        );
     }
 
     #[test]
-    fn assign_placement_concluded_context_seats_in_bumped_not_recent() {
+    fn assign_placement_concluded_context_goes_past_the_horizon() {
         let mut concluded = ctx(id_of(1), "");
         concluded.last_activity_at = Some(500);
         concluded.concluded_at = Some(500);
@@ -653,9 +681,9 @@ mod tests {
             "concluded is excluded from Recent even though it's more recent"
         );
         assert_eq!(
-            placement.rings[Band::Bumped.index()],
+            placement.horizon,
             vec![id_of(1)],
-            "the concluded context seats in Bumped instead"
+            "the concluded context is horizoned instead"
         );
     }
 
@@ -679,13 +707,13 @@ mod tests {
     #[test]
     fn band_ring_shrinks_radius_and_deepens_per_band() {
         let rings: Vec<(f32, f32)> = ALL_BANDS.iter().map(|&b| band_ring(b)).collect();
-        // Active at the mouth: full radius, depth 0.
-        assert!((rings[0].0 - SPIRAL_R_MOUTH).abs() < 1e-3, "mouth ring is the full radius");
-        assert!(rings[0].1.abs() < 1e-3, "mouth ring sits at depth 0");
+        // Active on top: full radius, depth 0.
+        assert!((rings[0].0 - SPIRAL_R_MOUTH).abs() < 1e-3, "top ring is the full radius");
+        assert!(rings[0].1.abs() < 1e-3, "top ring sits at depth 0");
         // Radius shrinks and |depth| grows down the stack.
         for pair in rings.windows(2) {
-            assert!(pair[0].0 > pair[1].0, "radius shrinks per deeper band: {} -> {}", pair[0].0, pair[1].0);
-            assert!(pair[0].1.abs() < pair[1].1.abs(), "|depth| grows per deeper band");
+            assert!(pair[0].0 > pair[1].0, "radius shrinks per lower band: {} -> {}", pair[0].0, pair[1].0);
+            assert!(pair[0].1.abs() < pair[1].1.abs(), "|depth| grows per lower band");
         }
         // The radius floor holds for every band.
         for (r, _d) in &rings {
@@ -722,10 +750,10 @@ mod tests {
         // Position keys only on (band, within_index, band_count).
         assert_eq!(ring_seat(Band::Recent, 2, 5), ring_seat(Band::Recent, 2, 5));
         // After the recline the funnel depth maps mostly to world-Y, so a
-        // deeper-band card sits lower in world space.
+        // lower-band card sits lower in world space.
         let near = ring_seat(Band::Active, 0, 4);
-        let far = ring_seat(Band::Demoted, 0, 4);
-        assert!(far.y < near.y, "a deeper-band ring sits lower after the recline");
+        let far = ring_seat(Band::Recent, 0, 4);
+        assert!(far.y < near.y, "a lower-band ring sits lower after the recline");
     }
 
     #[test]
@@ -805,35 +833,30 @@ mod tests {
     #[test]
     fn spiral_scale_shrinks_to_a_floor() {
         assert!(
-            spiral_scale(Band::Active, 0) > spiral_scale(Band::Demoted, 8),
-            "cards shrink from mouth to the deepest terrace"
+            spiral_scale(Band::Active, 0) > spiral_scale(Band::Recent, 8),
+            "cards shrink from the top ring to the lowest terrace"
         );
-        assert!(spiral_scale(Band::Active, 0) <= 1.0 + 1e-4, "mouth scale ~1.0");
+        assert!(spiral_scale(Band::Active, 0) <= 1.0 + 1e-4, "top-ring scale ~1.0");
         assert!(
-            spiral_scale(Band::Demoted, 500) >= SPIRAL_SCALE_THROAT - 1e-4,
+            spiral_scale(Band::Recent, 500) >= SPIRAL_SCALE_THROAT - 1e-4,
             "scale is floored at the throat"
         );
     }
 
     #[test]
-    fn spiral_positions_flattens_rings_mouth_to_throat() {
+    fn spiral_positions_flattens_rings_top_to_bottom() {
         // `spiral_positions` takes an already-seated `BandOrders`
         // (`assign_placement`'s `rings` — seating and within-ring order are
         // decided upstream, tested in `kaijutsu-viz`); this only checks the
-        // pure mouth→throat flatten, in given per-ring order, no re-sort.
-        let rings: BandOrders = [
-            vec![id_of(1)],
-            vec![id_of(2), id_of(3)],
-            vec![id_of(4)],
-            vec![id_of(5)],
-        ];
+        // pure top→down flatten, in given per-ring order, no re-sort.
+        let rings: BandOrders = [vec![id_of(1)], vec![id_of(2), id_of(3)]];
         let (order, _pos) = spiral_positions(&rings);
-        assert_eq!(order.first(), Some(&id_of(1)), "Active leads at the mouth");
-        assert_eq!(order.last(), Some(&id_of(5)), "Demoted trails at the throat");
+        assert_eq!(order.first(), Some(&id_of(1)), "Active leads on top");
+        assert_eq!(order.last(), Some(&id_of(3)), "Recent trails below it");
         assert_eq!(
             order,
-            vec![id_of(1), id_of(2), id_of(3), id_of(4), id_of(5)],
-            "Active -> Recent -> Bumped -> Demoted, each ring's own order preserved"
+            vec![id_of(1), id_of(2), id_of(3)],
+            "Active -> Recent, each ring's own order preserved"
         );
     }
 
@@ -927,22 +950,20 @@ mod tests {
     }
 
     #[test]
-    fn cluster_label_set_only_for_demoted() {
+    fn cluster_label_set_only_for_the_lowest_ring() {
         let info = ctx(id_of(1), "x");
-        // Demoted card carries the label.
-        let deep = card_from(&info, Band::Demoted, Some("rust".to_string()));
+        // The lowest ring that still seats cards carries the label.
+        let deep = card_from(&info, Band::Recent, Some("rust".to_string()));
         assert_eq!(deep.cluster_label.as_deref(), Some("rust"));
-        // Every shallower ring never carries a cluster label, even if one is passed.
-        for band in [Band::Active, Band::Recent, Band::Bumped] {
-            let c = card_from(&info, band, Some("rust".to_string()));
-            assert_eq!(c.cluster_label, None, "{band:?} must not carry a cluster label");
-        }
+        // The top ring never carries a cluster label, even if one is passed.
+        let c = card_from(&info, Band::Active, Some("rust".to_string()));
+        assert_eq!(c.cluster_label, None, "Active must not carry a cluster label");
     }
 
     #[test]
     fn terrace_ring_geometry_is_one_ring_per_band() {
         let rings = terrace_ring_geometry();
-        // One ring per band, in mouth→throat order.
+        // One ring per band, in top→down order.
         assert_eq!(rings.len(), ALL_BANDS.len(), "one ring per band");
 
         // Every radius sits within the mouth→throat span; each ring matches its
@@ -956,11 +977,11 @@ mod tests {
             );
         }
 
-        // |depth| strictly increases per deeper band (the rings stack + recede).
+        // |depth| strictly increases per lower band (the rings stack + recede).
         for pair in rings.windows(2) {
             assert!(
                 pair[0].1.abs() < pair[1].1.abs(),
-                "|depth| must strictly increase per deeper band: {} then {}",
+                "|depth| must strictly increase per lower band: {} then {}",
                 pair[0].1.abs(),
                 pair[1].1.abs()
             );
@@ -968,18 +989,53 @@ mod tests {
     }
 
     #[test]
-    fn horizon_label_sits_deeper_than_the_demoted_ring() {
-        // The +N parks one depth-step past the deepest ring in the same
-        // gate-side column; under the shared recline that extra depth must
-        // read as lower world Y (guards the tilt/depth sign conventions).
-        let (radius, depth) = band_ring(Band::Demoted);
-        let a = GATE_ANGLE - LABEL_GATE_OFFSET;
-        let r = radius + LABEL_RADIUS_OFFSET;
-        let demoted_col = well_tilt_quat() * Vec3::new(r * a.cos(), r * a.sin(), depth);
-        let horizon = horizon_label_pos();
+    fn horizon_label_rides_the_horizon_disc() {
+        let label = horizon_label_pos();
+        // Funnel-local again, so the radius/plane checks read in the units the
+        // constants are written in.
+        let local = well_tilt_quat().inverse() * label;
+
+        // Floating just above the disc's own plane — never in it (z-fight),
+        // never a chip hanging in mid-air the way the pre-2026-08-01 anchor
+        // (one depth-step past the retired Demoted ring) left it.
+        let above = local.z - super::super::scene::RING_DECK_DEPTH;
+        assert!(above > 0.0, "the label must float above the disc plane, not sink into it");
         assert!(
-            horizon.y < demoted_col.y,
-            "the horizon label must sit lower (deeper) than Demoted's ring column: {horizon:?} vs {demoted_col:?}"
+            above <= HORIZON_LABEL_LIFT + 1e-3,
+            "…but only a hair above it: {above} local units"
         );
+
+        // Out on the disc: clear of the room's table plinth, inside the disc edge.
+        let r = (local.x * local.x + local.y * local.y).sqrt();
+        let plinth_local =
+            crate::view::room::TABLE_PLINTH_RADIUS / super::super::scene::STATION_CENTER_SCALE;
+        let disc_edge_local = super::super::scene::RING_DECK_SIZE * 0.5;
+        assert!(
+            r > plinth_local,
+            "the label must clear the table plinth ({plinth_local} local), got {r}"
+        );
+        assert!(
+            r < disc_edge_local,
+            "the label must stay inside the disc's edge ({disc_edge_local} local), got {r}"
+        );
+
+        // Gate side: the seat the camera frames.
+        let angle = local.y.atan2(local.x);
+        let off = (angle - GATE_ANGLE).rem_euclid(std::f32::consts::TAU);
+        let off = off.min(std::f32::consts::TAU - off);
+        assert!(off < 1e-3, "the label parks on the gate side, off by {off} rad");
+    }
+
+    #[test]
+    fn horizon_label_sits_below_every_ring_that_still_seats_cards() {
+        // The horizon is *under* the well now — the floor the rings hang over.
+        let label = horizon_label_pos();
+        for band in ALL_BANDS {
+            let seat = ring_seat(band, 0, 4);
+            assert!(
+                label.y < seat.y,
+                "the horizon label must sit below {band:?}'s ring: {label:?} vs {seat:?}"
+            );
+        }
     }
 }

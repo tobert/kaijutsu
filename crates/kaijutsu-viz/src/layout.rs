@@ -9,7 +9,14 @@
 //! membership becomes explicit." [`assign_ring_seats`] is the pure core: given
 //! every context's lifecycle stamps, it seats up to [`RING_SLOTS`] (10) ids
 //! per ring and returns everything left over as an unseated `horizon` list.
-//! Four rings, mouth → throat:
+//!
+//! **Two rings and a floor** (2026-08-01). The scheme was four rings until the
+//! well's rings were laid parallel to the room floor and funnel depth started
+//! mapping 1:1 onto world height: the two deepest rings landed *below* the
+//! floor, and the fix wasn't to lift them but to admit they were never worth
+//! the space. Demoted, concluded and overflow contexts are all the same thing
+//! to the eye — work you have pushed away — so they now share one destination:
+//! past the horizon.
 //!
 //! - **[`Band::Active`]** (ring 0, explicit) — `promoted_at` set. Ordered
 //!   `promoted_at` ascending (append order, so a seat holds its position for
@@ -17,14 +24,16 @@
 //!   10-seat cap (`ACTIVE_RING_CAPACITY` in `kernel_db.rs`); this fn degrades
 //!   sanely if that invariant is ever violated (rule 2 below).
 //! - **[`Band::Recent`]** (ring 1, automatic) — the 10 most-recently-active
-//!   non-concluded contexts of the remaining ("auto") pool.
-//! - **[`Band::Bumped`]** (ring 2, automatic overflow) — the next 10 of the
-//!   same pool by the same recency order; concluded contexts compete *only*
-//!   here, never for `Recent`.
-//! - **[`Band::Demoted`]** (ring 3, explicit) — `demoted_at` set. Ordered
-//!   `demoted_at` descending (most recently demoted first).
-//! - **event horizon** — everything past seat 9 of any ring: no card entity,
-//!   just an unseated id the caller renders as a "+N" count at the throat.
+//!   **non-concluded** contexts of the remaining ("auto") pool.
+//! - **event horizon** — everyone else: every `demoted_at` context, every
+//!   concluded one, and the auto pool's overflow past `Recent`'s ten seats.
+//!   No card entity, just an unseated id the caller renders as a "+N" count
+//!   on the horizon disc.
+//!
+//! This is presentation only. The kernel's placement verbs (`p`/`d`/`z`/`a`/
+//! `c`) and its stored `promoted_at`/`demoted_at`/`concluded_at` stamps are
+//! unchanged — `demoted_at` still means "explicitly pushed away," it simply
+//! no longer earns a ring of its own.
 //!
 //! There is no `now` parameter and no age math anywhere in this module —
 //! placement depends only on each context's own stamps and its rank among
@@ -46,7 +55,8 @@
 //!
 //! 1. A context should never carry both `promoted_at` and `demoted_at` — the
 //!    kernel clears one when it sets the other. If it ever happens anyway,
-//!    demoted wins (rule 1 below is checked first, unconditionally).
+//!    demoted wins (rule 1 below is checked first, unconditionally) — which
+//!    now means the context goes to the horizon rather than taking a seat.
 //! 2. Ring 0 should never receive more than [`RING_SLOTS`] promotions (the
 //!    kernel enforces `ACTIVE_RING_CAPACITY`) — an overflow spills to the
 //!    horizon rather than silently dropping ids or growing the ring past its
@@ -56,38 +66,36 @@
 
 /// Which ring a context is seated on.
 ///
-/// Declared mouth→throat so the derived [`Ord`] (used nowhere load-bearing
-/// today, kept for free) agrees with [`Band::index`].
+/// Declared top→down so the derived [`Ord`] (used nowhere load-bearing
+/// today, kept for free) agrees with [`Band::index`]. There is no band for
+/// the event horizon: a horizoned context has no seat and no card entity at
+/// all, so it is carried as [`WellPlacement::horizon`] rather than as a
+/// fourth-wall `Band` variant nothing could render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Band {
-    /// Ring 0, explicit: `promoted_at` set. Mouth (index 0).
+    /// Ring 0, explicit: `promoted_at` set. The top ring (index 0).
     Active,
     /// Ring 1, automatic: the most-recently-active non-concluded contexts.
+    /// The lower ring (index 1), just above the tabletop.
     Recent,
-    /// Ring 2, automatic overflow from `Recent`; concluded contexts compete
-    /// only here.
-    Bumped,
-    /// Ring 3, explicit: `demoted_at` set. Throat (index 3).
-    Demoted,
 }
 
 impl Band {
-    /// Numeric band index, mouth→throat: `Active` = 0 (shallowest) …
-    /// `Demoted` = 3 (deepest). The single source `card.rs`'s terracing and
-    /// slot-order code key off — see `docs/timewell.md`, "The bowl, revisited".
+    /// Numeric band index, top→down: `Active` = 0 (highest) … `Recent` = 1
+    /// (lowest ring that still seats cards). The single source `card.rs`'s
+    /// terracing and slot-order code key off — see `docs/timewell.md`, "The
+    /// bowl, revisited".
     pub fn index(self) -> usize {
         match self {
             Band::Active => 0,
             Band::Recent => 1,
-            Band::Bumped => 2,
-            Band::Demoted => 3,
         }
     }
 }
 
-/// All four bands, mouth→throat. The single source for "walk every band in
-/// order" call sites (`card.rs`'s ring-seat/geometry code).
-pub const ALL_BANDS: [Band; 4] = [Band::Active, Band::Recent, Band::Bumped, Band::Demoted];
+/// Both bands, top→down. The single source for "walk every band in order"
+/// call sites (`card.rs`'s ring-seat/geometry code).
+pub const ALL_BANDS: [Band; 2] = [Band::Active, Band::Recent];
 
 // ─── assign_ring_seats ──────────────────────────────────────────────────────
 
@@ -113,8 +121,8 @@ pub struct ContextLifecycle<Id> {
     /// somewhere to carry it (see `card.rs::effective_activity`).
     pub created_at: i64,
     /// Unix-millisecond conclusion time, or `None` if still open. A concluded
-    /// context competes only for [`Band::Bumped`], never [`Band::Recent`]
-    /// (rule 3 on [`assign_ring_seats`]).
+    /// context never competes for a seat at all — it goes straight past the
+    /// horizon (rule 3 on [`assign_ring_seats`]).
     pub concluded_at: Option<i64>,
     /// Unix-millisecond timestamp of the most recent block activity — the
     /// recency key for the auto pool (rule 3).
@@ -123,19 +131,22 @@ pub struct ContextLifecycle<Id> {
     /// exclusive with `demoted_at` (see the module's fail-loud stance); ranks
     /// [`Band::Active`] ascending (append order).
     pub promoted_at: Option<i64>,
-    /// Unix-millisecond explicit push to the demoted ring, or `None`. Ranks
-    /// [`Band::Demoted`] descending (most recently demoted first).
+    /// Unix-millisecond explicit push away from the rings, or `None`. Set →
+    /// straight past the horizon (rule 1 on [`assign_ring_seats`]); the
+    /// timestamp itself no longer orders anything, since the horizon is a
+    /// count, not a ring.
     pub demoted_at: Option<i64>,
 }
 
-/// One ring per band ([`Band::index`]) plus the unseated overflow.
+/// One ring per band ([`Band::index`]) plus everything past the horizon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WellPlacement<Id> {
     /// Each ring's seated ids, in seat order (seat 0 first), indexed by
     /// [`Band::index`]. Never longer than [`RING_SLOTS`].
-    pub rings: [Vec<Id>; 4],
-    /// Ids that fit no ring — the event horizon. No seat order is promised;
-    /// render as a "+N" count, never as cards.
+    pub rings: [Vec<Id>; 2],
+    /// Ids that take no seat — the event horizon: demoted, concluded, and
+    /// the auto pool's overflow. No order is promised; render as a "+N"
+    /// count on the horizon disc, never as cards.
     pub horizon: Vec<Id>,
 }
 
@@ -143,10 +154,9 @@ pub struct WellPlacement<Id> {
 /// context's own lifecycle stamps and its rank among the others.
 ///
 /// Rules, in order:
-/// 1. **Demoted**: `demoted_at.is_some()` → [`Band::Demoted`] candidates,
-///    ranked `demoted_at` descending (id tiebreak). First [`RING_SLOTS`]
-///    seated; the rest spill to the horizon — an ordinary overflow (nothing
-///    else competes for this ring, so no `debug_assert` here).
+/// 1. **Demoted**: `demoted_at.is_some()` → straight past the horizon. No
+///    ring, no card, no ordering — an explicit push-away is a push *out of
+///    the rings*, and the horizon is a count.
 /// 2. **Active**: of what's left, `promoted_at.is_some()` → [`Band::Active`]
 ///    candidates, ranked `promoted_at` ascending (id tiebreak) — append
 ///    order, so a seat holds its position as long as it's occupied. The
@@ -157,22 +167,20 @@ pub struct WellPlacement<Id> {
 /// 3. **Auto pool** (the remainder — neither promoted nor demoted): ranked
 ///    `last_activity_at` descending (id tiebreak). Non-concluded contexts
 ///    compete for [`Band::Recent`]'s [`RING_SLOTS`] seats; everyone left over
-///    (every concluded context, plus any non-concluded overflow) competes for
-///    [`Band::Bumped`]'s [`RING_SLOTS`] seats in the same recency order (a
-///    stable subsequence of an already-sorted list stays sorted); the rest
-///    spill to the horizon.
+///    — every concluded context, plus any non-concluded overflow once those
+///    ten seats are full — goes past the horizon.
 ///
 /// A context should never carry both `promoted_at` and `demoted_at` — the
 /// kernel clears one when it sets the other. `debug_assert`ed (fail loud in
 /// dev); if it ever happens anyway, demoted wins (rule 1 is checked first,
-/// unconditionally).
+/// unconditionally), so the row lands on the horizon rather than in ring 0.
 pub fn assign_ring_seats<Id>(contexts: &[ContextLifecycle<Id>]) -> WellPlacement<Id>
 where
     Id: Clone + std::fmt::Debug + Eq + Ord,
 {
-    let mut demoted_candidates: Vec<&ContextLifecycle<Id>> = Vec::new();
     let mut active_candidates: Vec<&ContextLifecycle<Id>> = Vec::new();
     let mut auto_pool: Vec<&ContextLifecycle<Id>> = Vec::new();
+    let mut horizon: Vec<Id> = Vec::new();
 
     for c in contexts {
         debug_assert!(
@@ -181,8 +189,9 @@ where
              should clear one when it sets the other; demoted wins here",
             c.id
         );
+        // Rule 1: demoted → past the horizon, unconditionally and first.
         if c.demoted_at.is_some() {
-            demoted_candidates.push(c);
+            horizon.push(c.id.clone());
         } else if c.promoted_at.is_some() {
             active_candidates.push(c);
         } else {
@@ -190,14 +199,7 @@ where
         }
     }
 
-    let mut rings: [Vec<Id>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut horizon: Vec<Id> = Vec::new();
-
-    // Rule 1: Demoted, demoted_at descending, id tiebreak.
-    demoted_candidates.sort_by(|a, b| b.demoted_at.cmp(&a.demoted_at).then_with(|| a.id.cmp(&b.id)));
-    let (seated, overflow) = seat(demoted_candidates, RING_SLOTS);
-    rings[Band::Demoted.index()] = seated;
-    horizon.extend(overflow);
+    let mut rings: [Vec<Id>; 2] = [Vec::new(), Vec::new()];
 
     // Rule 2: Active, promoted_at ascending (append order), id tiebreak.
     active_candidates.sort_by(|a, b| a.promoted_at.cmp(&b.promoted_at).then_with(|| a.id.cmp(&b.id)));
@@ -212,31 +214,27 @@ where
     horizon.extend(overflow);
 
     // Rule 3: auto pool, last_activity_at descending, id tiebreak. Walking in
-    // that order, non-concluded contexts fill Recent first; everything else
-    // (concluded, plus any non-concluded overflow once Recent is full) falls
-    // through to the Bumped pool, which — as a stable subsequence of the
-    // recency-sorted walk — is already in recency order, no re-sort needed.
+    // that order, non-concluded contexts fill Recent; everything else
+    // (concluded, plus any non-concluded overflow once Recent is full) goes
+    // past the horizon.
     auto_pool.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at).then_with(|| a.id.cmp(&b.id)));
     let mut recent: Vec<&ContextLifecycle<Id>> = Vec::new();
-    let mut bumped_pool: Vec<&ContextLifecycle<Id>> = Vec::new();
     for c in auto_pool {
         if c.concluded_at.is_none() && recent.len() < RING_SLOTS {
             recent.push(c);
         } else {
-            bumped_pool.push(c);
+            horizon.push(c.id.clone());
         }
     }
     rings[Band::Recent.index()] = recent.into_iter().map(|c| c.id.clone()).collect();
-    let (seated, overflow) = seat(bumped_pool, RING_SLOTS);
-    rings[Band::Bumped.index()] = seated;
-    horizon.extend(overflow);
 
     WellPlacement { rings, horizon }
 }
 
 /// Split `candidates` (already ranked in seat order) into the first `n` seated
-/// ids and the rest, spilled to the horizon as ids. A thin helper so the three
-/// rings that seat-then-spill (`Demoted`, `Active`, `Bumped`) share one line.
+/// ids and the rest, spilled to the horizon as ids. Only [`Band::Active`]
+/// seats-then-spills now (the kernel should never let it), but the split is
+/// worth its own tested line rather than an inline `split_off` in the rule.
 fn seat<Id: Clone>(mut candidates: Vec<&ContextLifecycle<Id>>, n: usize) -> (Vec<Id>, Vec<Id>) {
     let overflow = if candidates.len() > n {
         candidates.split_off(n)
@@ -291,16 +289,14 @@ mod tests {
     // ── Band::index / ALL_BANDS ─────────────────────────────────────────────
 
     #[test]
-    fn band_index_is_mouth_to_throat() {
-        assert_eq!(Band::Active.index(), 0, "Active is the mouth");
-        assert_eq!(Band::Recent.index(), 1);
-        assert_eq!(Band::Bumped.index(), 2);
-        assert_eq!(Band::Demoted.index(), 3, "Demoted is the throat");
+    fn band_index_is_top_to_bottom() {
+        assert_eq!(Band::Active.index(), 0, "Active is the top ring");
+        assert_eq!(Band::Recent.index(), 1, "Recent is the lower ring");
     }
 
     #[test]
-    fn all_bands_is_mouth_to_throat_order() {
-        assert_eq!(ALL_BANDS, [Band::Active, Band::Recent, Band::Bumped, Band::Demoted]);
+    fn all_bands_is_top_to_bottom_order() {
+        assert_eq!(ALL_BANDS, [Band::Active, Band::Recent]);
     }
 
     // ── Empty input ──────────────────────────────────────────────────────────
@@ -314,33 +310,30 @@ mod tests {
         assert!(placement.horizon.is_empty());
     }
 
-    // ── Rule 1: Demoted ──────────────────────────────────────────────────────
+    // ── Rule 1: demoted → past the horizon ───────────────────────────────────
 
     #[test]
-    fn demoted_orders_most_recently_demoted_first() {
+    fn demoted_contexts_go_past_the_horizon_never_onto_a_ring() {
         let contexts = vec![demoted_ctx(1, 100), demoted_ctx(2, 300), demoted_ctx(3, 200)];
         let placement = assign_ring_seats(&contexts);
-        assert_eq!(
-            placement.rings[Band::Demoted.index()],
-            vec![2, 3, 1],
-            "demoted_at descending: most recently demoted first"
-        );
-        assert!(placement.horizon.is_empty());
+        for ring in &placement.rings {
+            assert!(ring.is_empty(), "a demoted context takes no ring seat");
+        }
+        let mut horizoned = placement.horizon.clone();
+        horizoned.sort();
+        assert_eq!(horizoned, vec![1, 2, 3], "all three fall past the horizon");
     }
 
     #[test]
-    fn demoted_overflow_past_ring_slots_spills_to_horizon() {
-        // 12 demoted contexts, demoted_at = id so higher id = more recently demoted.
-        let contexts: Vec<ContextLifecycle<u32>> =
-            (1..=12u32).map(|i| demoted_ctx(i, i as i64)).collect();
+    fn a_demoted_context_is_horizoned_however_recently_active_it_is() {
+        // Recency does not rescue a demotion: the explicit push-away wins over
+        // the auto pool's recency ranking, exactly as `d` promises.
+        let mut demoted = demoted_ctx(1, 10);
+        demoted.last_activity_at = 9_999;
+        let contexts = vec![demoted, auto_ctx(2, 1, false)];
         let placement = assign_ring_seats(&contexts);
-        let seated = &placement.rings[Band::Demoted.index()];
-        assert_eq!(seated.len(), RING_SLOTS, "only the first 10 seats fill");
-        assert_eq!(seated, &vec![12, 11, 10, 9, 8, 7, 6, 5, 4, 3], "most recent 10 seated");
-        assert_eq!(placement.horizon.len(), 2, "the oldest 2 demotions spill to the horizon");
-        for id in [1u32, 2] {
-            assert!(placement.horizon.contains(&id), "id {id} should be in the horizon");
-        }
+        assert_eq!(placement.rings[Band::Recent.index()], vec![2]);
+        assert_eq!(placement.horizon, vec![1]);
     }
 
     // ── Rule 2: Active ───────────────────────────────────────────────────────
@@ -413,22 +406,23 @@ mod tests {
         assign_ring_seats(&[pathological]);
     }
 
-    // ── Rule 3: auto pool (Recent / Bumped) ──────────────────────────────────
+    // ── Rule 3: auto pool (Recent / horizon) ─────────────────────────────────
 
     #[test]
     fn recent_orders_most_recently_active_first() {
         let contexts = vec![auto_ctx(1, 100, false), auto_ctx(2, 300, false), auto_ctx(3, 200, false)];
         let placement = assign_ring_seats(&contexts);
         assert_eq!(placement.rings[Band::Recent.index()], vec![2, 3, 1]);
-        assert!(placement.rings[Band::Bumped.index()].is_empty());
+        assert!(placement.horizon.is_empty());
     }
 
     #[test]
-    fn concluded_is_excluded_from_recent_but_seated_in_bumped_by_recency() {
-        // id 1 is concluded and the MOST recently active — it must not appear
-        // in Recent, but it should still lead Bumped (recency order preserved).
+    fn concluded_goes_past_the_horizon_however_recent_it_is() {
+        // id 1 is concluded and the MOST recently active — concluded work is
+        // finished work, so it leaves the rings entirely rather than sinking
+        // one ring (the old `Bumped` behaviour).
         let contexts = vec![
-            auto_ctx(1, 500, true),  // concluded, most recent -> Bumped seat 0
+            auto_ctx(1, 500, true),  // concluded, most recent -> horizon
             auto_ctx(2, 300, false), // open -> Recent
             auto_ctx(3, 400, false), // open -> Recent
         ];
@@ -438,39 +432,21 @@ mod tests {
             vec![3, 2],
             "Recent excludes the concluded context even though it's the most recent"
         );
-        assert_eq!(
-            placement.rings[Band::Bumped.index()],
-            vec![1],
-            "the concluded context is seated in Bumped instead"
-        );
+        assert_eq!(placement.horizon, vec![1], "the concluded context is horizoned instead");
     }
 
     #[test]
-    fn auto_pool_overflow_past_recent_spills_into_bumped_in_recency_order() {
-        // 15 open (non-concluded) contexts: newest 10 -> Recent, next 5 -> Bumped.
+    fn auto_pool_overflow_past_recent_goes_to_the_horizon() {
+        // 15 open (non-concluded) contexts: newest 10 -> Recent, the rest out.
         let contexts: Vec<ContextLifecycle<u32>> =
             (1..=15u32).map(|i| auto_ctx(i, i as i64, false)).collect();
         let placement = assign_ring_seats(&contexts);
         let recent = &placement.rings[Band::Recent.index()];
-        let bumped = &placement.rings[Band::Bumped.index()];
         assert_eq!(recent.len(), RING_SLOTS);
         assert_eq!(recent, &vec![15, 14, 13, 12, 11, 10, 9, 8, 7, 6], "the 10 most recent");
-        assert_eq!(bumped, &vec![5, 4, 3, 2, 1], "recency-ordered overflow, no re-sort surprises");
-        assert!(placement.horizon.is_empty());
-    }
-
-    #[test]
-    fn auto_pool_overflow_past_bumped_spills_to_the_horizon() {
-        // 25 open contexts: 10 Recent, 10 Bumped, 5 horizon.
-        let contexts: Vec<ContextLifecycle<u32>> =
-            (1..=25u32).map(|i| auto_ctx(i, i as i64, false)).collect();
-        let placement = assign_ring_seats(&contexts);
-        assert_eq!(placement.rings[Band::Recent.index()].len(), RING_SLOTS);
-        assert_eq!(placement.rings[Band::Bumped.index()].len(), RING_SLOTS);
-        assert_eq!(placement.horizon.len(), 5);
-        for id in 1u32..=5 {
-            assert!(placement.horizon.contains(&id), "the oldest 5 spill to the horizon");
-        }
+        let mut horizoned = placement.horizon.clone();
+        horizoned.sort();
+        assert_eq!(horizoned, vec![1, 2, 3, 4, 5], "the five oldest fall past the horizon");
     }
 
     // ── Ties ─────────────────────────────────────────────────────────────────
@@ -487,29 +463,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn demoted_ties_break_on_id_ascending() {
-        let contexts = vec![demoted_ctx(5, 100), demoted_ctx(2, 100), demoted_ctx(9, 100)];
-        let placement = assign_ring_seats(&contexts);
-        assert_eq!(placement.rings[Band::Demoted.index()], vec![2, 5, 9]);
-    }
-
     // ── Combined scenario ────────────────────────────────────────────────────
 
     #[test]
-    fn all_four_rules_compose_without_cross_talk() {
+    fn all_three_rules_compose_without_cross_talk() {
         let contexts = vec![
             promoted_ctx(1, 10),      // Active
-            demoted_ctx(2, 10),       // Demoted
+            demoted_ctx(2, 10),       // horizon (explicit push-away)
             auto_ctx(3, 500, false),  // Recent
-            auto_ctx(4, 500, true),   // concluded, same recency -> Bumped only
+            auto_ctx(4, 500, true),   // concluded, same recency -> horizon
         ];
         let placement = assign_ring_seats(&contexts);
         assert_eq!(placement.rings[Band::Active.index()], vec![1]);
-        assert_eq!(placement.rings[Band::Demoted.index()], vec![2]);
         assert_eq!(placement.rings[Band::Recent.index()], vec![3]);
-        assert_eq!(placement.rings[Band::Bumped.index()], vec![4]);
-        assert!(placement.horizon.is_empty());
+        let mut horizoned = placement.horizon.clone();
+        horizoned.sort();
+        assert_eq!(horizoned, vec![2, 4], "demoted and concluded share one destination");
     }
 
     // ── Property test: conservation ─────────────────────────────────────────
@@ -528,7 +497,7 @@ mod tests {
         // `promoted_ts` is capped at RING_SLOTS entries so it never trips the
         // rule-2 debug_assert (that's exercised deliberately, and separately,
         // by `promoted_overflow_trips_the_debug_assert` above); demoted counts
-        // are uncapped since Demoted has no such cap.
+        // are uncapped — the horizon they land on has no cap at all.
         //
         // Timestamps draw from a deliberately dense 0..10 range so equal
         // stamps actually occur — the id-tiebreak arms of every sort are
@@ -608,8 +577,8 @@ mod tests {
             let placement = assign_ring_seats(&contexts);
 
             assert!(
-                placement.rings[Band::Demoted.index()].contains(&4),
-                "demoted wins on a both-stamps row"
+                placement.horizon.contains(&4),
+                "demoted wins on a both-stamps row — the row goes past the horizon"
             );
             assert!(
                 !placement.rings[Band::Active.index()].contains(&4),

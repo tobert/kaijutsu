@@ -96,30 +96,35 @@ pub struct TimeWellRoot;
 #[derive(Component)]
 pub struct ReadingCard;
 
-/// The well's base ring deck: a flat disc behind the cards (XY plane) that
-/// renders the concentric rings + spiral core + activity ripples (the well's
-/// "pulse"). Driven by [`WellRingsMaterial`] uniforms from [`tick_and_sync_rings`].
-/// Despawned on exit alongside the root.
+/// The **event horizon**: the well's ring deck, a flat disc lying on the room
+/// floor ([`RING_DECK_DEPTH`]) rendering the concentric rings, spiral core and
+/// activity ripples (the well's "pulse"). Renamed from `WellRingsDeck` on
+/// 2026-08-01, when it stopped being a "throat floor" hanging below a
+/// four-ring funnel and became the accretion disc encircling the table plinth
+/// — the place demoted, concluded and overflow contexts fall past. Its
+/// `well_rings.wgsl` visuals were already accretion-shaped; only its depth
+/// and its name changed. Driven by [`crate::shaders::WellRingsMaterial`]
+/// uniforms from [`sync_deck_material`]. Despawned on exit alongside the root.
 #[derive(Component)]
-pub struct WellRingsDeck;
+pub struct EventHorizonDeck;
 
 /// A magic-circle ring for one band (the Konosuba/"Explosion"-spell aesthetic —
-/// concentric glyph rings, counter-rotating, receding into the funnel). One
-/// entity per band ring (see [`super::card::terrace_ring_geometry`]), driven by
+/// concentric glyph rings, counter-rotating). One entity per band ring (see
+/// [`super::card::terrace_ring_geometry`]), driven by
 /// [`crate::shaders::TerraceRingMaterial`]. Carries its **ring index** (= band
-/// index, 0 = `Active` … `N_BANDS-1` = `Demoted`) so [`dim_nonfocused_rings`]
-/// can brighten the focused ring and dim the rest. Despawned on exit alongside
-/// the rest of the well.
+/// index, 0 = `Active` on top … `N_BANDS-1` = `Recent` just over the
+/// tabletop) so [`dim_nonfocused_rings`] can brighten the focused ring and dim
+/// the rest. Despawned on exit alongside the rest of the well.
 #[derive(Component)]
 pub struct TerraceRing(pub usize);
 
-/// The event-horizon "+N" count label, parked at the funnel center beyond the
-/// deepest ring ([`super::card::horizon_label_pos`]). Its text changes (the
-/// horizon count), refreshed by [`super::text::build_horizon_label`] only when
-/// the count actually changes. Despawned on exit alongside the rest of the
-/// well. (The per-band "ACTIVE"/"RECENT" ring labels that once shared this
-/// path were removed 2026-07-06 — the reading card's SPECS `band` line
-/// carries that information without cluttering the rings.)
+/// The event-horizon "+N" count label, lying on the horizon disc itself
+/// ([`super::card::horizon_label_pos`]). Its text changes (the horizon count),
+/// refreshed by [`super::text::build_horizon_label`] only when the count
+/// actually changes. Despawned on exit alongside the rest of the well. (The
+/// per-band "ACTIVE"/"RECENT" ring labels that once shared this path were
+/// removed 2026-07-06 — the reading card's SPECS `band` line carries that
+/// information without cluttering the rings.)
 #[derive(Component)]
 pub struct HorizonLabel;
 
@@ -161,18 +166,19 @@ pub struct TimeWellState {
     /// seats 0-9 of the focused ring directly. Rebuilt each layout tick from
     /// [`super::card::assign_placement`]'s `rings`.
     pub ring_cards: [Vec<ContextId>; super::card::N_BANDS],
-    /// Count of contexts past seat 9 of `Recent`/`Bumped`/`Demoted` (plus
-    /// already-filtered archived contexts) — the event horizon. No card
-    /// entity ever exists for these; the throat renders this as a "+N" count.
-    /// Rebuilt each layout tick alongside `ring_cards`.
+    /// Count of contexts past the event horizon — demoted, concluded, and
+    /// `Recent`'s overflow past seat 9 (plus already-filtered archived
+    /// contexts). No card entity ever exists for these; the horizon disc
+    /// renders this as a "+N" count. Rebuilt each layout tick alongside
+    /// `ring_cards`.
     pub horizon_count: usize,
     /// The `visible` (non-archived) context count as of the last layout tick
     /// — `sync_time_well`'s change-detection dodge. Compared against
     /// `visible.len()`, not `join.len()`, because horizon contexts never
     /// enter the join, so the two can legitimately differ.
     pub last_seen_visible_count: usize,
-    /// Which band ring is currently focused (0 = `Active` at the mouth …
-    /// `N_BANDS-1` = `Demoted` at the throat). Up/Down change it.
+    /// Which band ring is currently focused (0 = `Active` on top …
+    /// `N_BANDS-1` = `Recent` just over the tabletop). Up/Down change it.
     pub focused_ring: usize,
     /// Position within the focused ring (Left/Right walk it, wrapping). Carried
     /// across Up/Down (clamped to the new ring's size).
@@ -192,7 +198,7 @@ pub struct TimeWellState {
     /// via `room/shot.rs`'s `well_local_shot`, which now owns that math.
     pub focused: bool,
     /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
-    /// the `get_clusters` poll. Drives the cluster label on `Demoted` cards
+    /// the `get_clusters` poll. Drives the cluster label on `Recent` cards
     /// (Stage 3 will extend this to cluster-grouped angle within a band; for
     /// now it's label-only — see `card::card_from`). Empty when the kernel has
     /// no semantic index.
@@ -302,13 +308,13 @@ pub const FOCUS_QUAD_H: f32 = 237.5;
 pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
 
 /// In-world label quad size (well units) — modest, well under a rim card's
-/// [`CARD_WIDTH`]/[`CARD_HEIGHT`], so the four ring labels and the "+N" horizon
-/// count read as passive structural annotations, not competing content.
+/// [`CARD_WIDTH`]/[`CARD_HEIGHT`], so the "+N" horizon count reads as a
+/// passive structural annotation, not competing content.
 const LABEL_QUAD_W: f32 = 120.0;
 const LABEL_QUAD_H: f32 = 38.0;
 
 /// Label texture size (logical px). Small and wide — short strings only
-/// ("ACTIVE"/"RECENT"/"BUMPED"/"DEMOTED"/"+N"). `pub` (like [`CARD_TEX_W`]/
+/// ("ACTIVE"/"RECENT"/"+N"). `pub` (like [`CARD_TEX_W`]/
 /// [`READING_TEX_W`]) so `text.rs`'s label-layout systems can size to it.
 pub const LABEL_TEX_W: f32 = 220.0;
 pub const LABEL_TEX_H: f32 = 70.0;
@@ -320,18 +326,30 @@ pub const LABEL_TEX_H: f32 = 70.0;
 /// so it stays dim and constant rather than reactive to focus.
 const LABEL_DIM: f32 = 0.85;
 
-/// Side length of the square ring-deck quad (world units). Comfortably larger
-/// than the hot rim (`total_radius` 420) so the unit disc the shader draws fills
-/// the well; the corners outside the disc are transparent.
-const RING_DECK_SIZE: f32 = 1100.0;
+/// Side length of the square ring-deck quad (funnel-local units, so ×
+/// [`STATION_CENTER_SCALE`] in the room). Comfortably larger than the mouth
+/// ring so the unit disc the shader draws fills the well; the corners outside
+/// the disc are transparent. `pub(super)`: `card::horizon_label_pos` sizes the
+/// "+N" label's radius against the disc's edge. At 1100 local × 0.5 the disc
+/// is 275 world units in radius — wider than `room::TABLE_PLINTH_RADIUS`
+/// (145), so it reads as a ring of accretion *around* the table's foot.
+pub(super) const RING_DECK_SIZE: f32 = 1100.0;
 
-/// Depth (along the funnel's local −Z) of the ring deck: just past the deepest
-/// band ring (`Horizon` sits at ≈ −690 under the per-band `band_ring` stack) so
-/// the vortex/spiral core is the **throat floor** all the rings spiral down
-/// into — on the same funnel axis, below every ring. Lifted + tilted by the
-/// shared [`super::card::well_tilt_quat`] so the core sits at the low, receded
-/// throat and faces up toward the camera. **Amy-tunable.**
-const RING_DECK_DEPTH: f32 = -850.0;
+/// Depth (along the funnel's local −Z) of the ring deck — **the event horizon:
+/// exactly on the room floor (world y = 0)**.
+///
+/// With the rings laid parallel to the floor
+/// ([`STATION_CENTER_PLACEMENT`]'s rotation) funnel depth maps 1:1 onto world
+/// height — `world_y = TABLE_TOP_Y + STATION_CENTER_LIFT + STATION_CENTER_SCALE
+/// · depth` = `160 + 0.5 · depth` — so −320 lands the disc dead on the floor
+/// plane, encircling the table plinth the rings hang over. Its
+/// `well_rings.wgsl` visuals (spiral core, ripples, throat glow) already read
+/// as an accretion disc; nothing about the shader changed, only where the disc
+/// lives. It was −850 (world y = −265, buried under the floor) while it was
+/// playing "throat floor" for a four-ring funnel.
+/// `the_event_horizon_deck_lies_exactly_on_the_room_floor` pins the y=0.
+/// **Amy-tunable — but retune it against that test, not by feel alone.**
+pub(super) const RING_DECK_DEPTH: f32 = -320.0;
 
 /// Terrace-ring quad side length, as a multiple of the ring radius. The quad is
 /// comfortably larger than the ring (side = scale × radius) so the annulus band
@@ -390,8 +408,6 @@ fn card_tilt(band: Band) -> f32 {
     match band {
         Band::Active => 0.0,
         Band::Recent => 0.0,
-        Band::Bumped => 0.0,
-        Band::Demoted => 0.0,
     }
 }
 
@@ -472,22 +488,28 @@ pub const IDENTITY_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
 /// the room's other furniture at the first guess. **Still a live-tuning
 /// value** (lovely-swimming-prism.md, Slice C), same spirit as
 /// `patch_bay::STATION_W_SCALE`'s own 0.34 → 0.66 retune.
-const STATION_CENTER_SCALE: f32 = 0.5;
+/// `pub(super)`: `card::horizon_label_pos`'s own doc/test converts between
+/// funnel-local and world units through it.
+pub(super) const STATION_CENTER_SCALE: f32 = 0.5;
 
-/// Extra lift stacked on top of [`crate::view::room::TABLE_TOP_Y`] (the
-/// room table's top face) for [`STATION_CENTER_PLACEMENT`]'s translation.
-/// Needed because the mouth ring's *center of rotation* sits at local y=0
-/// (band 0's `depth` is 0 in [`super::card::band_ring`]), but its actual
-/// seated cards do NOT — the funnel recline ([`super::card::well_tilt_quat`],
-/// `WELL_TILT ≈ -0.95` rad) tips the ring so its seats swing roughly
-/// `±(mouth_radius × cos(WELL_TILT))` ≈ ±290 world-units in **local y** around
-/// that center (verified by hand against `ring_seat_rotated`'s rotation
-/// matrix), not just sitting flat at y=0. Scaled by
-/// [`STATION_CENTER_SCALE`] that dip is ≈ ∓87 units — left unlifted, the
-/// bottom of the mouth ring would clip a little way into the tabletop.
-/// **First guess — live-tune over BRP**, same as the scale above; this
-/// isn't meant to be derived to the millimeter here, just kept in the right
-/// ballpark with the reasoning written down for whoever tunes it next.
+/// Extra lift stacked on top of [`crate::view::room::TABLE_TOP_Y`] (the room
+/// table's top face) for [`STATION_CENTER_PLACEMENT`]'s translation — in
+/// plain terms, **how high the `Active` ring floats over the table**.
+///
+/// Once the rings went parallel to the floor (that placement's rotation), the
+/// well's whole vertical layout collapsed to one line:
+/// `world_y = TABLE_TOP_Y + STATION_CENTER_LIFT + STATION_CENTER_SCALE·depth`.
+/// `Active` sits at depth 0, so this constant alone sets its height:
+/// 70 + 90 = **160**. Every other ring hangs below it by
+/// `card::RING_DEPTH_STEP` × 0.5, and the event horizon ([`RING_DECK_DEPTH`])
+/// lies on the floor at y=0. Raise this and the whole well rises off the
+/// table — rings only, since the horizon disc is pinned to the floor by its
+/// own depth.
+///
+/// (This doc used to derive 90 from the mouth ring's ±290-unit swing under a
+/// *partial* recline — geometry that stopped existing when the flatten
+/// landed. The number survived the derivation; the reasoning didn't.)
+/// **Live-tune over BRP**, same as the scale above.
 const STATION_CENTER_LIFT: f32 = 90.0;
 
 /// The well's production placement (Slice C, `lovely-swimming-prism.md`):
@@ -518,12 +540,13 @@ pub static STATION_CENTER_PLACEMENT: LazyLock<StationCenterPlacement> = LazyLock
     // tilt (same-axis rotations add: net angle = this + WELL_TILT) to land
     // the net rotation at exactly `-FRAC_PI_2` — local +Z all the way to
     // world +Y, the deck flat and face-up toward the overview camera sitting
-    // above it. First live-tuning pass, not a final answer: this ALSO
-    // re-reads each band's depth step (`card::RING_DEPTH_STEP`, along local
-    // Z) as a vertical stack rather than a receding tilt-plane depth — watch
-    // for whether that reads as "concentric flat rings" or "a tiered stack"
-    // once it's on screen, and back off the angle (partial recline instead
-    // of full flatten) if the stacking reads wrong.
+    // above it. KEPT (2026-08-01): the flatten also re-reads each band's
+    // depth step (`card::RING_DEPTH_STEP`, along local Z) as pure world
+    // height, which is now the design rather than a side effect — two rings
+    // hanging over the table, the horizon disc lying on the floor beneath
+    // them (`RING_DECK_DEPTH`). Retuning this angle re-breaks that whole
+    // vertical arithmetic; the two floor-clearance tests below are the
+    // tripwire.
     rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2 - super::card::WELL_TILT),
 });
 
@@ -602,10 +625,12 @@ pub(crate) fn spawn_well_furniture(
     }
     let root = root_entity.id();
 
-    // Base ring deck: a flat disc behind the cards that renders the well's pulse
-    // (concentric rings + spiral core + activity ripples). Driven per-frame by
-    // `tick_and_sync_rings`. Not billboarded — it faces the camera (+Z) as a
-    // fixed floor; the shader fades its square corners to nothing.
+    // The event-horizon disc: a flat accretion disc lying ON the room floor
+    // (`RING_DECK_DEPTH` = world y 0), encircling the table plinth the rings
+    // hang over, rendering the well's pulse (concentric rings + spiral core +
+    // activity ripples). Driven per-frame by `sync_deck_material`. Not
+    // billboarded — under the placement's flatten it lies face-up; the shader
+    // fades its square corners to nothing.
     let deck_mesh = meshes.add(Rectangle::new(RING_DECK_SIZE, RING_DECK_SIZE));
     // Warm gold core (`ScenePalette::gold` — was `[1.0, 0.62, 0.20]`, the
     // concept-art palette's own warm gold; leaned the rest of the way onto the
@@ -617,13 +642,14 @@ pub(crate) fn spawn_well_furniture(
         Vec4::new(palette.gold.red, palette.gold.green, palette.gold.blue, 1.0),
         ScenePalette::vec3(palette.neon).extend(1.0),
     ));
-    // Tilt + place the deck on the same reclined funnel axis as the cards: its
-    // center rides to the throat (lifted depth) and its face tips up toward the
-    // camera, so the spiral core reads as the bottom of the vortex.
+    // Tilt + place the deck on the same funnel axis as the cards: its center
+    // rides down to the horizon depth and, under the placement's flatten, its
+    // face lies level with the floor — so the spiral core reads as an
+    // accretion disc, not a wall.
     let tilt = super::card::well_tilt_quat();
     let deck_pos = tilt * Vec3::new(0.0, 0.0, RING_DECK_DEPTH);
     commands.spawn((
-        WellRingsDeck,
+        EventHorizonDeck,
         Mesh3d(deck_mesh),
         MeshMaterial3d(deck_material),
         Transform {
@@ -632,7 +658,7 @@ pub(crate) fn spawn_well_furniture(
             scale: Vec3::ONE,
         },
         Visibility::Inherited,
-        Name::new("WellRingsDeck"),
+        Name::new("EventHorizonDeck"),
         ChildOf(root),
     ));
 
@@ -712,13 +738,12 @@ pub(crate) fn spawn_well_furniture(
         ChildOf(root),
     ));
 
-    // Event-horizon "+N" count label: parked at the funnel center beyond the
-    // deepest ring. Refreshed by `text::build_horizon_label` whenever the
-    // count changes (it starts blank — nothing polled yet on first enter).
-    // Spawns `Visibility::Inherited`, but the ambient `apply_horizon_label_lod`
-    // corrects it to Hidden at room scale every frame (freeze-fix slice,
-    // 2026-07-11) — left ungated it stood as an unreadable dark chip
-    // floating over the well outside the dive (live-observed).
+    // Event-horizon "+N" count label: lying on the horizon disc, gate-side.
+    // Refreshed by `text::build_horizon_label` whenever the count changes (it
+    // starts blank — nothing polled yet on first enter). The ambient
+    // `apply_horizon_label_lod` owns its visibility from here on — see
+    // `HORIZON_LABEL_AT_ROOM_SCALE` for why the old always-hidden-at-room-
+    // scale behaviour was retired with the re-anchor.
     let label_mesh = meshes.add(Rectangle::new(LABEL_QUAD_W, LABEL_QUAD_H));
     let (horizon_image, horizon_panel) =
         create_msdf_panel(images, LABEL_TEX_W as u32, LABEL_TEX_H as u32);
@@ -953,10 +978,11 @@ pub fn well_keyboard(
                 }
             }
 
-            // Up/Down: change the focused ring (clamp 0..N_BANDS-1), carry the
-            // position onto the new ring, spin the new ring to the gate. The
-            // camera follows because `ease_shell_camera` keys on
-            // `focused_ring` via `shot::WellShotInput`. Up at the mouth ring
+            // Up/Down: change the focused ring (clamp 0..N_BANDS-1 — two
+            // rings since 2026-08-01, so this ladder is exactly one rung),
+            // carry the position onto the new ring, spin the new ring to the
+            // gate. The camera follows because `ease_shell_camera` keys on
+            // `focused_ring` via `shot::WellShotInput`. Up at the top ring
             // (already the shallowest — nothing to clamp INTO) rises into the
             // hero pose instead of a dead-end no-op (`TimeWellState::hero`'s
             // own doc). The old speedbumped double-tap-to-Room edge
@@ -1015,8 +1041,8 @@ pub fn well_keyboard(
             }
 
     // `c`: conclude the selected context (fire-and-forget over RPC; the
-            // next DriftState poll seats it in Bumped, never Recent — see
-            // `assign_placement`).
+            // next DriftState poll sends it past the horizon — concluded work
+            // never competes for a ring seat, see `assign_placement`).
             Action::Conclude => {
                 if let Some(id) = state.selected
                     && let Some(actor) = actor.as_ref()
@@ -1234,6 +1260,61 @@ mod tests {
         );
     }
 
+    /// World Y a funnel-local `depth` (the −Z coordinate every ring, card and
+    /// deck is placed at) lands on, through the REAL composition every well
+    /// entity goes through: the funnel recline
+    /// ([`super::super::card::well_tilt_quat`]) then
+    /// [`STATION_CENTER_PLACEMENT`]. Since
+    /// `station_center_placement_seats_above_the_room_table` pins the net
+    /// rotation at exactly `-FRAC_PI_2` (local +Z → world +Y), this collapses
+    /// to `translation.y + scale·depth` — but it's computed through the real
+    /// quaternions here so a retune of either angle can't silently invalidate
+    /// the floor-clearance tests below.
+    fn world_y_at_depth(depth: f32) -> f32 {
+        let local = super::super::card::well_tilt_quat() * Vec3::new(0.0, 0.0, depth);
+        placement_to_room(&STATION_CENTER_PLACEMENT, local).y
+    }
+
+    #[test]
+    fn every_band_ring_hangs_above_the_room_floor_and_its_table() {
+        // The rings-parallel-to-floor placement made funnel depth map 1:1 onto
+        // world height, which put the two deepest of the old four rings BELOW
+        // the room floor (y=0) — cards buried in the plinth and under the
+        // floor plane. Every ring the well still seats cards on must hang
+        // clear above the tabletop it rides over.
+        for band in kaijutsu_viz::layout::ALL_BANDS {
+            let (_radius, depth) = super::super::card::band_ring(band);
+            let y = world_y_at_depth(depth);
+            assert!(
+                y > crate::view::room::TABLE_TOP_Y,
+                "{band:?}'s ring sits at world y={y}, at or below the tabletop \
+                 ({}) — a card ring must hang over the table, never inside it",
+                crate::view::room::TABLE_TOP_Y
+            );
+        }
+    }
+
+    #[test]
+    fn the_event_horizon_deck_lies_exactly_on_the_room_floor() {
+        // The ring deck IS the event horizon now: an accretion disc lying flat
+        // on the room floor, encircling the table plinth. Exactly y=0 — not
+        // "about zero" — so the disc reads as part of the floor rather than a
+        // sheet hovering over (or sunk into) it.
+        let deck_y = world_y_at_depth(RING_DECK_DEPTH);
+        assert!(
+            deck_y.abs() < 1e-3,
+            "the event-horizon deck must lie on the room floor (world y=0), got {deck_y}"
+        );
+        // …and below every ring that still seats cards.
+        for band in kaijutsu_viz::layout::ALL_BANDS {
+            let (_radius, depth) = super::super::card::band_ring(band);
+            assert!(
+                deck_y < world_y_at_depth(depth),
+                "the horizon must lie below {band:?}'s ring"
+            );
+        }
+    }
+
     // -- well_zoomed (Slice C's dived-only run_if gate) --
 
     #[test]
@@ -1384,7 +1465,19 @@ mod tests {
         let focused = 1;
         assert_eq!(ring_dim_factor(true, focused, focused), 1.0, "the focused band stays full-bright");
         assert_eq!(ring_dim_factor(true, focused, 0), DIM_NONFOCUSED, "a different band dims");
-        assert_eq!(ring_dim_factor(true, focused, 3), DIM_NONFOCUSED, "and another");
+    }
+
+    #[test]
+    fn horizon_label_shows_at_room_scale_by_default_and_always_in_the_dive() {
+        assert!(horizon_label_visible(true), "the dive always shows the count");
+        assert_eq!(
+            horizon_label_visible(false),
+            HORIZON_LABEL_AT_ROOM_SCALE,
+            "room scale follows the tunable — shipped on, since the re-anchor \
+             put the label on the floor disc instead of mid-air. Deliberately \
+             NOT pinned to `true`: it's a live-tuning knob, and a test that \
+             breaks when Amy flips it protects nothing."
+        );
     }
 
     #[test]
@@ -1568,18 +1661,44 @@ pub fn sync_focus_card_visibility(
     }
 }
 
-/// Show/hide the [`HorizonLabel`] with the well's zoom state — mirrors
-/// `crate::view::patch_bay`'s `apply_patch_lod` exactly (the original pattern
-/// both copied): ambient, not dived-only, so it reacts to a zoom-OUT too, not
-/// just zoom-in. At room scale the in-world "+N" event-horizon count stands
-/// as an unreadable dark chip floating over the well (live-observed,
-/// freeze-fix slice, 2026-07-11) — hidden until the next dive. Change-guarded
-/// like every other LOD gate here.
+/// **Amy-tunable**: whether the event-horizon "+N" count stays readable at
+/// room scale (walking past the well) or only inside the dive.
+///
+/// It was hard-off (dived-only) from the freeze-fix slice, 2026-07-11, for a
+/// concrete reason: anchored one depth-step past the old `Demoted` ring, the
+/// label floated in mid-air as an unreadable dark chip over the well. The
+/// 2026-08-01 re-anchor fixes exactly that — the label now lies ON the
+/// horizon disc, at floor level, where it reads as a caption for a piece of
+/// room furniture. So the default flips to **visible at room scale**: the
+/// count is ambient information about work you've pushed away, and the
+/// overview is where you'd want to notice it.
+///
+/// Live-tune: if it turns out to be visual noise from across the octagon,
+/// flip this to `false` and it's dived-only again — nothing else depends on
+/// the choice. (A real LOD *threshold* — visible from the room, hidden from
+/// the far wall — wants a camera-distance term this gate doesn't have yet;
+/// this boolean is the honest version of the knob until then.)
+const HORIZON_LABEL_AT_ROOM_SCALE: bool = true;
+
+/// Whether the [`HorizonLabel`] should be visible, given the well's zoom
+/// state. Pure so the tunable above is testable without a `World`.
+fn horizon_label_visible(zoomed: bool) -> bool {
+    zoomed || HORIZON_LABEL_AT_ROOM_SCALE
+}
+
+/// Show/hide the [`HorizonLabel`] per [`horizon_label_visible`] — ambient, not
+/// dived-only (mirrors `crate::view::patch_bay`'s `apply_patch_lod`), so it
+/// reacts to a zoom-OUT too, not just zoom-in. Change-guarded like every other
+/// LOD gate here.
 pub fn apply_horizon_label_lod(
     room: Res<crate::view::room::RoomState>,
     mut label: Query<&mut Visibility, With<HorizonLabel>>,
 ) {
-    let want = if well_zoomed(&room) { Visibility::Inherited } else { Visibility::Hidden };
+    let want = if horizon_label_visible(well_zoomed(&room)) {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
     if let Ok(mut vis) = label.single_mut()
         && *vis != want
     {
@@ -1639,7 +1758,7 @@ pub fn sync_deck_material(
     activity: Res<super::activity::RingActivity>,
     beats: Res<super::live::WellBeats>,
     mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
-    deck: Query<&MeshMaterial3d<crate::shaders::WellRingsMaterial>, With<WellRingsDeck>>,
+    deck: Query<&MeshMaterial3d<crate::shaders::WellRingsMaterial>, With<EventHorizonDeck>>,
 ) {
     let Ok(handle) = deck.single() else {
         return;

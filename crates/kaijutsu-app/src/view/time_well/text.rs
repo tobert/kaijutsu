@@ -242,8 +242,6 @@ fn band_label(band: Band) -> &'static str {
     match band {
         Band::Active => "active",
         Band::Recent => "recent",
-        Band::Bumped => "bumped",
-        Band::Demoted => "demoted",
     }
 }
 
@@ -991,7 +989,7 @@ mod tests {
 
     #[test]
     fn specs_text_shows_cluster_only_when_present() {
-        let mut d = card_data(Band::Demoted);
+        let mut d = card_data(Band::Recent);
         d.cluster_label = Some("storage".into());
         let s = specs_text(&d, None);
         assert!(s.contains("cluster  ◇ storage"), "cluster line present: {s}");
