@@ -1,0 +1,21 @@
+diff --git a/src/main.rs b/src/main.rs
+index 3b18e51..8d0e4f1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-hello
++world
+diff --git a/src/created.rs b/src/created.rs
+new file mode 100644
+index 0000000..e69de29
+--- /dev/null
++++ b/src/created.rs
+@@ -0,0 +1 @@
++pub fn created() {}
+diff --git a/src/removed.rs b/src/removed.rs
+deleted file mode 100644
+index e69de29..0000000
+--- a/src/removed.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-pub fn removed() {}

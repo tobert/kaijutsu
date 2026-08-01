@@ -1,0 +1,10 @@
+diff --git a/src/greet.rs b/src/greet.rs
+--- a/src/greet.rs
++++ b/src/greet.rs
+@@ -1,4 +1,5 @@
+ fn main() {
+-    println!("hello");
++    println!("hello, world");
++    greet();
+ }
+ fn greet() {}

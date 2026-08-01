@@ -1,0 +1,8 @@
+#!kaijutsu-diff truncated: 2 file(s), 3 hunk(s), 41 line(s) omitted
+diff --git a/kept.txt b/kept.txt
+--- a/kept.txt
++++ b/kept.txt
+@@ -1,2 +1,2 @@
+ alpha
+-beta
++gamma

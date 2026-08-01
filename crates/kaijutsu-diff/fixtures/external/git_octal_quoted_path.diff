@@ -1,0 +1,6 @@
+diff --git "a/caf\303\251.txt" "b/caf\303\251.txt"
+--- "a/caf\303\251.txt"
++++ "b/caf\303\251.txt"
+@@ -1 +1 @@
+-un
++deux

@@ -1,0 +1,7 @@
+diff --git a/script.sh b/script.sh
+mode change 100644 => 100755
+--- a/script.sh
++++ b/script.sh
+@@ -1 +1 @@
+-echo old
++echo new
