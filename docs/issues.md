@@ -1778,17 +1778,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   grammar applied to angle — same-track contexts gravitate toward their
   track's ray (`rays::ray_angle`) within each ring, unattached trailing.
   Needs care against the "predictable motion" bar.
-- **In-world band labels — still TODO (Stage 1 residue, re-anchored to rings).**
-  "HOT NOW" / "THIS WEEK" / "30 DAYS" / "HORIZON" floating at each ring, per
-  `docs/timewell.md` "The bowl, revisited". The pure helpers
-  (`card::band_label_pos`, `card::band_label_text`, the `LABEL_RADIUS_OFFSET`
-  placeholder) exist and are tested, but no entity spawns/renders them — wiring
-  is an MSDF panel per band (`panel::create_msdf_panel`, the `ReadingCard`
-  pattern), gated on font-asset load the same way `text::build_card_scenes` is,
-  and — landmine — pass the brush explicitly to `VelloFont::layout`/
-  `collect_msdf_glyphs` or the text renders black. The band-boundary constants
-  (`HOT_NOW_MILLIS`/`THIS_WEEK_MILLIS`/`THIRTY_DAYS_MILLIS`, `layout.rs`) are
-  placeholders Amy tunes live once labels are on screen.
+- **In-world ring labels — still TODO, and now cheap.** "ACTIVE" / "RECENT"
+  floating at each ring, per `docs/timewell.md` "The bowl, revisited". The old
+  pure helpers (`card::band_label_pos`/`band_label_text` + their radius
+  offset) were deleted with the labels themselves 2026-07-06 and finally with
+  the ring collapse 2026-08-01 — nothing to resurrect, and only two labels to
+  write. Wiring is an MSDF panel per ring (`panel::create_msdf_panel`, the
+  `HorizonLabel` pattern, which already parks a label in world space), gated
+  on font-asset load the same way `text::build_card_scenes` is, and —
+  landmine — pass the brush explicitly to `VelloFont::layout`/
+  `collect_msdf_glyphs` or the text renders black. Open question first: with
+  two rings and the reading card's SPECS `band` line, is a label earning its
+  clutter?
 - **HDR bloom follow-on:** drive the well cards' SDF rims/pulses to HDR (>1.0)
   so they bloom brightly (`WellCardMaterial` `params`/emissive). (The shared
   single-camera HDR+Bloom fix itself shipped 2026-06-17; devlog.)
@@ -1816,12 +1817,19 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     arcs/particles *between* the source/target cards, not just the per-card
     shimmer already shipped. Needs a new context→context drift-edge *list* wire
     (the per-card shimmer rode the existing staged-queue poll; arcs can't).
-  - *Ring 3-down is unreadable at the gate framing* (Amy, 2026-07-06). With
-    the camera framed on the focused ring's gate, the third ring down
-    (Bumped when focused on Active) sits too oblique/deep to read its cards.
-    Needs a different angle or framing idea — maybe steepen `RING_CAM_LIFT`
-    per focus depth, or tilt deeper rings' cards toward the camera
-    (`card_tilt` is the parked per-band knob).
+- **Horizon dive — front door built, room behind it isn't (2026-08-01).** The
+  ring collapse made the event horizon a real place (the accretion disc on the
+  room floor) and bound `h` → `Action::ActivateHorizon` in the well, but the
+  handler only logs `"horizon dive: not yet built (see docs/horizon-dive.md)"`
+  — and **that doc does not exist yet**; the prototype is in flight elsewhere.
+  Two things to close: write/land `docs/horizon-dive.md`, and replace the stub
+  arm in `time_well::scene::well_keyboard`. This is where Stage 5's
+  search-at-the-horizon should surface (`docs/timewell.md`, Stage 5).
+- **Horizon sediment arcs.** The "+N" is a bare count. Stage 5's original
+  bullet wanted per-track sediment arcs on the disc so the mass reads as
+  *whose* — now genuinely cheap, since the disc is a first-class floor
+  feature with the well's activity data already flowing into its material
+  (`well_rings.wgsl` ripples). Wants Amy's eyes before anyone builds it.
 - **Time-well ring-carousel — review findings (2026-07-03, gemini-pro batch +
   deepseek).** The ring-per-band carousel (`band_ring`/`ring_seat_rotated`,
   ring-centric nav, projector spin-to-gate, focus dimming) got a two-model
@@ -1835,8 +1843,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     `ATTRIBUTE_NORMAL` (front ≈ `[0,0,1]`, sides ⟂ Z) instead of index ranges.
   - *Passive-aging short-circuit* (gemini, design). `sync_time_well` early-exits
     on an empty join diff, so cards don't re-band as wall-clock time passes — a
-    context won't demote to a deeper ring on idle alone until some *other* diff
-    arrives. Ties to the ring-MEMBERSHIP / coarse auto-decay thread (explicit
+    context won't drop out of RECENT (past the horizon) on idle alone until
+    some *other* diff arrives. Ties to the ring-MEMBERSHIP / coarse auto-decay thread (explicit
     hot-row + coarse decay, see `signoff.md`): the band derivation likely needs a
     coarse timer independent of the block diff.
   - *Spin chaining on rapid reversal* (deepseek, medium → downgraded on code-read).

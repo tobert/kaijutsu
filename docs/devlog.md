@@ -297,6 +297,32 @@ as the one panel with no scene-native home, reborn as a transient `?` toggle
 (dismissed by `?`, zoom-out, or leaving the room). Every readout now lives on
 the thing that owns it; the well's mouth is open browser space again.
 
+**Four rings become two and a floor (August 1).** The well moved into the
+room's center as furniture, and Amy asked for the magic circles to lie
+parallel to the floor. That one rotation quietly turned funnel depth into
+plain height — `world_y = 160 + 0.5·depth` — and the arithmetic indicted the
+design: BUMPED landed at world y −70 and DEMOTED at −185, two rings of cards
+rendering in the room's basement, with the deck and the "+N" label deeper
+still. The fix wasn't to lift them. Asked what those two rings were *for*, the
+honest answer was: the same thing. Demoted, concluded and overflow contexts
+all read as one category to the eye — work you have pushed away — and the
+four-ring scheme had been paying two rings of prime real estate for a
+distinction nobody navigates by. So ACTIVE stayed on top, RECENT rose to just
+clear the tabletop, and the two lower rings collapsed into the destination
+they had always been heading for. The ring deck moved to world y exactly 0.0
+and stopped being a "throat floor": it became the **event horizon**, an
+accretion disc lying on the room floor, encircling the plinth of the table the
+rings hover over — a shader that had always looked like accretion finally put
+where that reading is literal. The "+N" moved onto the disc it counts, which
+is also why it stopped being hidden at room scale (it used to float mid-air as
+an unreadable chip). None of it touched the kernel: `p`/`d`/`z`/`a`/`c`, the
+demote ladder and the stamps are unchanged — `d` still means "pushed away," it
+just stopped earning a ring. Card entities halved to ≤20, and `h` went in as
+the front door to a horizon dive nobody has built yet. The reusable lesson: a
+geometry change is a *proof obligation* against the design it renders, and the
+test that catches it is the one composing the real placement math to assert a
+card ring never sinks below the floor it hangs over.
+
 **Conversation view hardening (July 3).** Two long-standing irritations fell
 in one arc. Error blocks stuck to the bottom traced to Bevy child-ordering
 choreography: three mutations changed order without bumping the re-sort gate,

@@ -123,7 +123,7 @@ exactly one action.
 | Context | Bindings |
 |---|---|
 | RoomNav (octagon) | `←/→/Tab` cycle stations · `Enter/↓` dive · `Esc` pop |
-| WellZoomed | `0–9` seat of *focused* ring · `←/→/Tab` spin · `↑/↓` ring (Up at mouth → hero pose) · `Enter` focus/commit · `p d c z a` verbs · `?` legend · `Esc` pop |
+| WellZoomed | `0–9` seat of *focused* ring · `←/→/Tab` spin · `↑/↓` ring (Up at the top ring → hero pose) · `Enter` focus/commit · `p d c z a` verbs · `h` horizon dive (stub) · `?` legend · `Esc` pop |
 | PatchBayZoomed | `←/→/Tab` wires · `r` rescan · `↑/Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
 | FsnFly | arrows + WASD fly (WASD kept until the keys are needed elsewhere) · `PgUp/PgDn` altitude · `Esc` pop |

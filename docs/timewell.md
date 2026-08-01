@@ -1,19 +1,19 @@
 # Time Well — Evolution Plan
 
-2026-07-03. The time well (`crates/kaijutsu-app/src/view/time_well/`) is now a
-**carousel of four per-band magic-circle rings** — HotNow / ThisWeek /
-ThirtyDays / Horizon, stacked by depth and receding into a central
-vortex/throat glow on a shared tilted funnel axis (Konosuba-"Explosion"
-HDR/bloom aesthetic). This supersedes the continuous log-spiral prototype this
-doc was originally written against: the spiral read well and the musician
-swarm falling toward the event horizon was the right feeling, but at 56 live
-contexts the assumptions the whole well was built on had broken, and its real
-job had come into focus. Keyboard nav is now ring-centric
-(`(focused_ring, ring_pos)`, spin-to-gate + camera dolly) rather than the
-spiral's odometer walk, but the two-stage Enter survived the rebuild intact.
-This doc remains the forward plan: what the time well is *for*, the ontology
-it navigates, and the staged evolution from fundamental fixes (now landed) to
-a professional-feeling instrument.
+2026-08-01. The time well (`crates/kaijutsu-app/src/view/time_well/`) is
+**two magic-circle rings hanging over the room's table, and an event horizon
+lying on the floor beneath them** (Konosuba-"Explosion" HDR/bloom aesthetic).
+ACTIVE rides on top, RECENT a step below it just clear of the tabletop, ten
+seats each; everything else — demoted, concluded, overflow — is *past the
+horizon*, counted on the accretion disc that rings the table plinth, with no
+card entity at all. This supersedes first the continuous log-spiral prototype
+this doc was originally written against, then the four-ring carousel that
+replaced it (see "Two rings and a floor" below for why four became two).
+Keyboard nav is ring-centric (`(focused_ring, ring_pos)`, spin-to-gate +
+camera dolly) rather than the spiral's odometer walk, and the two-stage Enter
+has survived every rebuild intact. This doc remains the forward plan: what
+the time well is *for*, the ontology it navigates, and the staged evolution
+from fundamental fixes (now landed) to a professional-feeling instrument.
 
 **Relationship to the other docs.** `docs/time-well-concepts.md` stays as the UX
 design record (the 40 mockups, the visual grammar). `docs/viz-substrate.md` was
@@ -23,7 +23,7 @@ folded into the "Substrate notes" appendix below; its superseded halves (the
 three-band layout thesis, the build order, the spiral) live only in git history.
 New open questions land here.
 
-## Status (2026-07-03)
+## Status (2026-08-01)
 
 What's actually built, so the staged plan below isn't mistaken for vaporware:
 
@@ -35,23 +35,24 @@ What's actually built, so the staged plan below isn't mistaken for vaporware:
   as pure derivations of `now − last_activity_at`. No expiry daemon.
 - **Stage 1, app half** — shipped, but not as originally planned below (which
   described terracing the continuous spiral). The app instead went through
-  the spiral and out the other side: idle-age bands now render as **four
-  discrete magic-circle rings**, one per band, each seated with its own cards
-  as perpendicular 3D "slides," navigated ring-centric —
-  `(focused_ring, ring_pos)` — with left/right spinning the focused ring to a
-  fixed gate angle and up/down changing the focused ring while the camera
-  dollies to frame it. `CompactingBandLayout`/`RadialBands`-layout is deleted;
-  the geometry substrate for every stage below is now rings, not a spiral.
+  the spiral and out the other side: bands render as **discrete magic-circle
+  rings**, each seated with its own cards as perpendicular 3D "slides,"
+  navigated ring-centric — `(focused_ring, ring_pos)` — with left/right
+  spinning the focused ring to a fixed gate angle and up/down changing the
+  focused ring while the camera dollies to frame it.
+  `CompactingBandLayout`/`RadialBands`-layout is deleted; the geometry
+  substrate for every stage below is rings, not a spiral. (Four rings then;
+  two since 2026-08-01.)
 - **Stages 2–6** — still the forward plan, mostly unbuilt (read them as
   designed against ring geometry, not the spiral this doc originally
   described) — with one exception: **Stage 3's wire slice shipped 2026-07-04**
   (`TrackInfo` + `listTracks @92` + `ContextHandleInfo.trackId @16`, answered
   from the beat scheduler's in-memory state), ahead of its layout half.
 - **Ring membership** — rebuilt 2026-07-05 as **explicit placement** (see "Ring
-  membership becomes explicit" below): 10 seats per ring, ring 0 hand-curated,
-  ring 3 hand-demoted, the two middle rings automatic by recency, overflow past
-  the seats falls to the event horizon (no card). Supersedes the Stage 1
-  idle-age banding and lands the core of Stage 2's rank as ring 0.
+  membership becomes explicit" below), then narrowed 2026-08-01 to **two rings
+  and a floor**: 10 seats each, ring 0 hand-curated, ring 1 automatic by
+  recency, and everything else past the event horizon (no card). Supersedes the
+  Stage 1 idle-age banding and lands the core of Stage 2's rank as ring 0.
 - **Live-state layer** — shipped 2026-07-04 (explore-live-time-well-action),
   a layer this plan hadn't staged: the well reacts *between* polls.
   `view/time_well/live.rs` ingests the kernel-wide event stream ungated —
@@ -223,13 +224,13 @@ diagnosed. The two-surface split below is still the target; only the
   `Ctrl+A 0–9` reaches ring-0 seats without entering the well
   (`docs/input.md`, 2026-07-16). The table-edge rail rendering at the mouth
   is still open.
-- **The rings** (arrows): pure recency river, now four discrete terraces
-  instead of a continuous spiral. Newest activity sits in the `HotNow` ring at
-  the mouth; everything sinks band by band toward `Horizon` at the throat as
-  it idles. Left/Right spin the focused ring so the selected card eases to the
-  gate; Up/Down change which ring is focused and dolly the camera to frame it.
-  No stability contract at all — it's for *skimming*, not addressing. Rank
-  members would also appear in the rings (the rank is an index, not a place).
+- **The rings** (arrows): pure recency river, now two discrete terraces
+  instead of a continuous spiral. Newest activity sits in `RECENT`; work you
+  push away leaves the rings entirely for the floor's horizon. Left/Right spin
+  the focused ring so the selected card eases to the gate; Up/Down change which
+  ring is focused and dolly the camera to frame it. No stability contract at
+  all — it's for *skimming*, not addressing. Rank members would also appear in
+  the rings (the rank is an index, not a place).
 
 Effort scales with coldness, as the original design said: keystroke (rank) →
 skim (rings) → search (horizon). The change is that the keystroke surface is no
@@ -239,19 +240,61 @@ longer *derived from* the skim surface.
 
 The idle-age bands lasted two days as the sorting rule. Live use surfaced what
 the ring rebuild had deferred: **placement you can't control isn't an
-instrument.** Amy's model, designed and built this session, replaces derived
-banding with explicit placement — two hand-curated rings sandwiching two
-automatic ones, every ring exactly **10 seats** (digits `0–9` address the
-seats of the *focused* ring; jump-and-commit unchanged), the whole well ≤40
-cards:
+instrument.** Amy's model replaces derived banding with explicit placement,
+every ring exactly **10 seats** (digits `0–9` address the seats of the
+*focused* ring; jump-and-commit unchanged):
 
 | Ring | Name | Membership |
 |---|---|---|
 | 0 | ACTIVE | explicit: `p` or visiting a context; append-ordered by `promoted_at` (stable seats); kernel-capped at 10 |
-| 1 | RECENT | automatic: the 10 most-recently-active eligible contexts |
-| 2 | BUMPED | automatic: LRU overflow from ring 1; concluded contexts compete here, never for ring 1 |
-| 3 | DEMOTED | explicit: `d`; ordered `demoted_at` descending |
-| — | event horizon | archived ∪ everything past seat 9 of rings 2/3 — **no card entity**, a "+N" count at the throat |
+| 1 | RECENT | automatic: the 10 most-recently-active **non-concluded** contexts |
+| — | event horizon | archived ∪ demoted ∪ concluded ∪ everything past RECENT's seat 9 — **no card entity**, a "+N" count on the floor disc |
+
+### Two rings and a floor (2026-08-01)
+
+It shipped as four rings — ACTIVE / RECENT / BUMPED / DEMOTED — and the fourth
+ring is where geometry caught the design lying. Once the rings were laid
+**parallel to the room floor** (Amy, live: "the magic rings can be parallel to
+the floor"), funnel depth stopped being perspective and became plain height:
+`world_y = 160 + 0.5·depth`. At the old depth step that put BUMPED at world
+y=−70 and DEMOTED at y=−185 — *underneath the floor* — with the ring deck at
+−265 and the "+N" label deeper still. Two rings of cards were being rendered
+inside the room's basement.
+
+The fix wasn't to lift them. Asked what BUMPED and DEMOTED were actually *for*,
+the honest answer was: the same thing. Demoted, concluded and overflow contexts
+all read as one category to the eye — **work you have pushed away** — and
+giving that category two whole rings of prime real estate was the four-ring
+scheme paying rent on a distinction nobody navigates by. So they collapsed into
+the destination they were always heading for:
+
+- **ACTIVE** stays at world y=160, unchanged.
+- **RECENT** rises to y=85 (`RING_DEPTH_STEP` −230 → −150) — hanging just clear
+  of the tabletop at 70, close enough to read as sitting *on* the table's air.
+- **The event horizon becomes a place.** The ring deck moves to world y exactly
+  **0.0** (`RING_DECK_DEPTH` −850 → −320): an accretion disc lying flat on the
+  floor, encircling the table plinth the rings hover over. Its
+  `well_rings.wgsl` visuals — spiral core, ripples, throat glow — already read
+  as accretion; nothing about the shader changed, only where the disc lives.
+  The component followed the meaning: `WellRingsDeck` → `EventHorizonDeck`.
+  The "+N" count re-anchored onto the disc itself, which is also why it stopped
+  being hidden at room scale — it used to float mid-air as an unreadable chip,
+  and now it's a caption on a piece of room furniture.
+- **BUMPED and DEMOTED are deleted.** `Band` is two variants; `WellPlacement`
+  carries two rings and a horizon list.
+
+**This is presentation only.** The kernel's placement verbs (`p`/`d`/`z`/`a`/
+`c`), its `promoted_at`/`demoted_at`/`concluded_at` stamps, the demote ladder
+and `ACTIVE_RING_CAPACITY` are all untouched. `d` still means "explicitly
+pushed away" — it simply no longer earns a ring of its own, and a demoted card
+now exits the join and despawns rather than sinking one terrace. The ceiling on
+card entities halved with it: ≤20 cards, not ≤40.
+
+Nav shrinks to match: Up/Down is one rung, and Up at ACTIVE still rises into
+the hero pose. `h` (`ActivateHorizon`) is wired in the well's action table as
+the **front door to a horizon dive** — the past-the-horizon set is a count
+today, not a place you can go, so v1 logs and does nothing; the binding exists
+so the prototype lands on a real key instead of inventing one later.
 
 The verbs (keys provisional; the in-well legend — the transient `?` toggle,
 `legend.rs` — is their source of truth):
@@ -268,8 +311,10 @@ The verbs (keys provisional; the in-well legend — the transient `?` toggle,
   it's the recovery path the Stage-5 search will feed. Only explicit `p`
   resurrects; visits never do.
 - **`d` demote** — one step outward per press, kernel-owned ladder:
-  promoted → automatic placement; automatic → DEMOTED; already demoted →
-  **archived** (single context, no subtree, no latch — past the horizon).
+  promoted → automatic placement; automatic → demoted; already demoted →
+  **archived** (single context, no subtree, no latch). The kernel's ladder is
+  unchanged by the ring collapse; what changed is that its middle rung now
+  *renders* as the horizon rather than as a ring of its own.
 - **`a` archive** — straight past the horizon from anywhere (same unlatched
   single-card semantics; `kj context archive` keeps its latched subtree form).
 - **`z` pause** — *suspend activity*, *designed now, gated later*: the
@@ -277,14 +322,17 @@ The verbs (keys provisional; the in-well legend — the transient `?` toggle,
   the behavioral gate (skip hyoushigi wakeups; reject turn-starts loudly) is
   deferred, seams documented on the column.
 - **`c` conclude** — unchanged verb, new consequence: concluding clears the
-  ring-0 seat (the mux-exit). Archive clears both placement stamps.
+  ring-0 seat (the mux-exit) and, since 2026-08-01, sends the context past the
+  horizon rather than onto a lower ring — finished work stops competing for
+  seats at all. Archive clears both placement stamps.
 - **Sticky**: demoted and concluded contexts are never re-promoted by visits —
   only an explicit `p` brings them back.
 
 What died: the `HOT_NOW`/`THIS_WEEK`/`THIRTY_DAYS` age constants, the
-running-forces-hot override, conclude-demotes-one-band, and the
-`DEV_SPREAD_RINGS` dev stand-in (its reason — everything hot — is fixed).
-Liveness shows as *light* (chatter/beat lanes, rays), never as placement.
+running-forces-hot override, conclude-demotes-one-band, the
+`DEV_SPREAD_RINGS` dev stand-in (its reason — everything hot — is fixed), and
+(2026-08-01) the BUMPED and DEMOTED rings themselves. Liveness shows as
+*light* (chatter/beat lanes, rays), never as placement.
 
 Kernel/wire state (all additive): `contexts.promoted_at/demoted_at/paused_at`;
 `ContextHandleInfo` `promotedAt @17` / `demotedAt @18` / `pausedAt @19`;
@@ -321,13 +369,14 @@ middle path this section originally proposed, but a fuller return to mockup
 27's ring grammar: one magic-circle ring per idle-age band, receding into the
 throat. What 27 taught, now built:
 
-- **Terraced bands, not continuous depth.** The eye finds "THIS WEEK" /
-  "MONTHS AGO" / "YEARS OF HISTORY" because band boundaries are *steps*, not a
-  smooth gradient — now literally four separate rings at four depths, rather
-  than a quantized spiral. Cards seat evenly around their own band's ring
-  (perpendicular 3D "slides"), smaller per deeper ring. In-world band
-  *labels* are not built — the terrace step/gap and each ring's own size carry
-  the boundary today.
+- **Terraced bands, not continuous depth.** The eye finds a boundary because
+  it's a *step*, not a smooth gradient — literally separate rings at separate
+  heights, rather than a quantized spiral. Cards seat evenly around their own
+  band's ring (perpendicular 3D "slides"), smaller per lower ring. In-world
+  band *labels* are not built — the terrace step/gap and each ring's own size
+  carry the boundary today. (27 drew many terraces; live use bought two, plus
+  the horizon. The grammar is the same; the count is what the population
+  actually earns.)
 - **The mouth stays open.** In 27 the center is calm — sediment glow, no
   cards. The built well keeps a radius floor per ring and reserves the shared
   vortex core for the throat glow, so the axis never fills with cards.
@@ -398,21 +447,19 @@ Make "recent" a real, cheap, wire-visible fact.
 - **App half — landed differently than planned: discrete rings, not a
   terraced spiral.** Where this stage originally proposed quantizing
   depth/radius on the continuous spiral (a step + gap per band boundary,
-  spiral ordering continuing within each terrace), what actually shipped is
-  four separate magic-circle rings — one per idle-age band
-  (`assign_idle_band` over `HotNow|ThisWeek|ThirtyDays|Horizon`), stacked by
-  depth on a shared tilted funnel axis, receding into a central vortex/throat
-  glow. Cards seat evenly around their band's ring as perpendicular 3D
-  "slides," smaller per deeper ring. Navigation became ring-centric
-  `(focused_ring, ring_pos)` rather than the odometer walk: Left/Right spin
-  the focused ring so the selected card eases to a fixed gate angle; Up/Down
-  change the focused ring and dolly the camera to frame it. In-world band
-  *labels* were not built. The radius floor that keeps the mouth open
-  survived into the ring geometry.
+  spiral ordering continuing within each terrace), what shipped was separate
+  magic-circle rings — one per band, stacked on a shared funnel axis — with
+  cards seated evenly around their band's ring as perpendicular 3D "slides,"
+  smaller per lower ring, and ring-centric navigation
+  (`(focused_ring, ring_pos)`) replacing the odometer walk. In-world band
+  *labels* were not built. The radius floor that keeps the center open
+  survived into the ring geometry. The band *set* has been reworked twice
+  since (explicit placement, then the two-ring collapse); the ring geometry
+  itself is what this stage actually bought.
 
-Acceptance (met): touch an old context via kj; its card surfaces at the mouth
-on the next poll — and a screenshot shows four legible rings, receding into
-the throat, with an open center.
+Acceptance (met): touch an old context via kj; its card surfaces on the top
+ring at the next poll — and a screenshot shows legible rings with an open
+center.
 
 ### Stage 2 — The rank (replaces the mux)
 
@@ -511,28 +558,34 @@ under 30 seconds without touching the mouse.
 
 ### Stage 5 — The event horizon becomes real
 
-> **2026-07-05:** the cutoff arrived early — contexts past their ring's 10
-> seats (and archived ones) get no card entity, and the throat shows a "+N"
-> count. Still this stage's to-do: search at the horizon (`/`), the
-> `listContexts` `since` valve, and LOD chips for the seated-but-deep cards.
+> **2026-08-01:** most of this stage arrived early. The cutoff landed
+> 2026-07-05 (no card entity past the seats, a "+N" count), and the ring
+> collapse gave the horizon a *body*: the accretion disc on the room floor,
+> now holding demoted and concluded contexts too, with `h`
+> (`ActivateHorizon`) already bound in the well as the dive's front door
+> (stubbed — see "Two rings and a floor"). Still open: what's behind that door
+> — search at the horizon (`/`) — plus the `listContexts` `since` valve. LOD
+> chips are moot for the seated cards now that there are only twenty of them.
 
 Old contexts stop being geometry and become an archive.
 
-- **Cutoff**: past the 30-day idle band (and for archived contexts), contexts
-  get **no card entity**. They render as the horizon's accretion mass —
-  per-track sediment arcs feeding the existing ring deck (counts, not cards).
-  The `Join` already diffs enter/exit; the cutoff is a filter on which ids get
-  entities. Archived stops meaning "vanished": it means "past the horizon,
-  search-only" — same recovery surface as aged-out contexts.
+- **Cutoff** — ✅ SHIPPED. Past the twenty seats (and for demoted, concluded,
+  and archived contexts), contexts get **no card entity**: they are the
+  horizon's accretion mass, a count on the floor disc. The `Join` already
+  diffs enter/exit; the cutoff is a filter on which ids get entities. Archived
+  stops meaning "vanished": it means "past the horizon, search-only". Still
+  unbuilt from this bullet: per-track sediment arcs on the disc, so the mass
+  reads as *whose* mass.
 - **Scaling valve**: once the horizon is real, the 5s poll shouldn't ship the
   whole history — add a `since` (activity-window) filter to `listContexts` so
   the steady-state payload is the visible well only; the archive is fetched by
   the search form on demand. Additive wire change, deferrable until payload
   size actually hurts.
-- **LOD between mouth and horizon**: mid-river cards drop to instanced chips
-  (`MeshTag` + shared material, per the appendix's validated rendering notes) —
-  fixes the throat overlap and the 50-entity texture cost.
-- **Search at the horizon**: `/` opens the archive form — query over
+- ~~**LOD between mouth and horizon**~~ — dissolved by the ring collapse: with
+  ≤20 seated cards there is no mid-river to chip down, and no throat overlap
+  left to fix.
+- **Search at the horizon**: `/` (or `h`, whose binding already exists) opens
+  the archive form — query over
   label/keywords/`search_similar`/`get_clusters` (the RPCs exist and are
   already client-exposed), results as a flat legible list, Enter
   resurrects (select / fork / `rank add`). Archived contexts become reachable
