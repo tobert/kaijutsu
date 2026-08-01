@@ -115,11 +115,16 @@ const FOCUS_DOLLY: f32 = 430.0;
 /// from proportionally further back (neighbor rings bleed off the top/bottom
 /// edges).
 const RING_CAM_BACK: f32 = 1.8;
-/// World-Y lift of the well's ring-overview camera. With the gate-normal
-/// framing the gate card's face points down-and-forward, so the normal
-/// back-off pulls the camera below the gate; this lift raises it back to
-/// roughly level / gently looking down. Higher = steeper look-down onto the
-/// ring. **Amy-tunable.**
+/// Well-local lift of the well's ring-overview camera. Since the rings were
+/// laid parallel to the floor, backing off along the gate normal keeps the eye
+/// *exactly level* with the ring it frames (the normal lies in the ring plane,
+/// and that plane is now horizontal) — so this constant no longer "raises the
+/// camera back to level" as its old doc claimed: it is now the sole source of
+/// the shot's look-down angle. At 450 local (× `STATION_CENTER_SCALE`) it
+/// lifts the eye ≈183 world units over the gate, ≈30° down at the well's
+/// framing distance. Higher = steeper look-down onto the ring.
+/// **Amy-tunable** — and the first thing to reach for if the two rings, only
+/// 75 world units apart in height now, crowd each other in frame.
 const RING_CAM_LIFT: f32 = 450.0;
 /// How far in front of the focused ring's center (along the axis, × radius)
 /// the well's ring-overview look-point leads — 0 looks straight at the ring
@@ -250,6 +255,15 @@ fn well_local_shot(input: WellShotInput) -> (Vec3, Vec3) {
     let pos = gate + normal * (radius * RING_CAM_BACK) + Vec3::Y * RING_CAM_LIFT;
     let look = gate + Vec3::Y * RING_CAM_LOOK_LEAD;
     (pos, look)
+}
+
+/// Room-space world Y the camera would sit at for `ring`'s overview shot.
+/// Pure helper for the floor-clearance test below (and readable enough to be
+/// worth keeping around when the framing is next live-tuned).
+#[cfg(test)]
+fn well_ring_overview_eye(ring: usize) -> Vec3 {
+    let input = WellShotInput { focused: false, focused_ring: ring };
+    resolve(RoomShot::WellOverview(input)).0
 }
 
 /// The **approach** pose for a wall station: a LEVEL wall-viewing shot
@@ -541,6 +555,32 @@ mod tests {
             let (local_eye, local_look) = well_local_shot(input);
             assert_eq!(eye, placement_to_room(&STATION_CENTER_PLACEMENT, local_eye));
             assert_eq!(look, placement_to_room(&STATION_CENTER_PLACEMENT, local_look));
+        }
+    }
+
+    #[test]
+    fn well_ring_overview_stands_above_its_ring_and_never_under_the_floor() {
+        // Post-flatten (2026-08-01) the gate normal lies in a HORIZONTAL ring
+        // plane, so backing off along it holds the eye level with the ring and
+        // `RING_CAM_LIFT` alone supplies the look-down. Two things must hold
+        // for every ring: the eye stays above the room floor (a camera under
+        // the floor sees the underside of everything), and it stands above the
+        // ring it is framing (looking DOWN onto the carousel, per the shot's
+        // own doc), not below it looking up.
+        for ring in 0..card::N_BANDS {
+            let eye = well_ring_overview_eye(ring);
+            let look = resolve(RoomShot::WellOverview(WellShotInput {
+                focused: false,
+                focused_ring: ring,
+            }))
+            .1;
+            assert!(eye.y > 0.0, "ring {ring}: eye at y={} is under the room floor", eye.y);
+            assert!(
+                eye.y > look.y,
+                "ring {ring}: eye ({}) must sit above the gate it frames ({})",
+                eye.y,
+                look.y
+            );
         }
     }
 
