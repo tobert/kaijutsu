@@ -1,4 +1,7 @@
-//! Text rendering resources for Vello-based text.
+//! Text rendering resources: the `usvg` font database backing SVG `<text>`
+//! (still Vello-drawn), the shared MSDF shaping font handles, and DPI-aware
+//! text metrics. Text itself is MSDF-rendered now (`text::msdf`) except ABC
+//! notation, which stays on the Vello scene path.
 
 use std::sync::Arc;
 
