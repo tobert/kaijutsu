@@ -147,6 +147,7 @@ pub fn sync_block_cell_buffers(
                 doc_version,
                 block.content_type,
                 Some(&svg_fontdb),
+                block.status == kaijutsu_crdt::Status::Running,
             )
         {
             // For sparklines and SVGs: clear text so Parley doesn't re-measure
@@ -172,6 +173,7 @@ pub fn sync_block_cell_buffers(
                 doc_version,
                 block.content_type,
                 Some(&svg_fontdb),
+                block.status == kaijutsu_crdt::Status::Running,
             )
         {
             commands.entity(entity).insert(rich);

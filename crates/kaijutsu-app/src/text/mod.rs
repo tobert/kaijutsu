@@ -2,10 +2,13 @@
 //!
 //! GPU-accelerated text via two paths sharing one Parley shaping source: MSDF
 //! glyphs (shader-quality text, plus ABC music notation together with
-//! `msdf::geometry`'s flat-colored triangles) and Vello-rasterized vector
-//! content (SVG only — sparklines are plain UI rectangle geometry, and block
-//! borders/role dividers are an SDF shader; see `sparkline` and
-//! `cell::block_border`/`shaders` respectively).
+//! `msdf::geometry`'s flat-colored triangles) and CPU-rasterized inline SVG
+//! (`svg_raster`: usvg + resvg + tiny-skia → a Bevy `Image`/`ImageNode`).
+//! Sparklines are plain UI rectangle geometry (`sparkline`); block
+//! borders/role dividers are an SDF shader (`cell::block_border`/`shaders`).
+//! Nothing here rasterizes through vello any more — ABC and SVG were its last
+//! two consumers and came off on separate branches; vello survives only as
+//! the Parley shaping / `Brush` source behind the MSDF path.
 
 pub mod abc;
 pub mod components;
@@ -16,6 +19,7 @@ mod resources;
 pub mod rich;
 pub mod shaping;
 pub mod sparkline;
+pub mod svg_raster;
 
 pub use components::{KjTextEffects, bevy_color_to_brush};
 pub use plugin::KjTextPlugin;

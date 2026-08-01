@@ -174,7 +174,7 @@ fn load_fonts(
 /// are silently dropped from rendered SVGs.
 fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::theme::Theme>) {
     use std::sync::Arc;
-    use vello_svg::usvg::fontdb;
+    use usvg::fontdb;
 
     let mut db = fontdb::Database::new();
 
