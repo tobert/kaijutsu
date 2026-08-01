@@ -1173,6 +1173,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## User Interface (kaijutsu-app) & UX
 
+- **`build_block_scenes` version-bump pattern diverges per arm** (2026-08-01,
+  deepseek seam review for `docs/diff.md` — verify line refs before fixing).
+  `MsdfBlockGlyphs.version`'s doc (`text/msdf/mod.rs:~100`) says never derive
+  the bump from another counter, and the text-bearing arms (Markdown/Abc/
+  Output/Image) bump from their own previous — but the text-*clearing* arms
+  (Sparkline `block_render.rs:~677`, Svg `:~745`) bump from
+  `block_scene.scene_version` instead. Unify on bump-from-own; the planned
+  Diff arm follows bump-from-own and must not copy the deviation.
+
 - **Conversation-view de-vello pass — needs a visual pass in the running
   app** (2026-07-30, `feat/devello`; a validation pass is planned
   separately, this records what to check first). Role-group dividers,
@@ -1690,7 +1699,8 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **`builtin.file` hardening — remaining (small; the byte→char corruption fix +
   hashline addressing shipped 2026-06-17, story in devlog +
   `project_file_tools_hashline`):** (1) in-context recovery affordance — expose
-  `git`/a revert or `kj block diff --original` in the kaish shell; (2) the
+  `git`/a revert or `kj block diff --original` in the kaish shell *(subsumed by
+  the `kj diff` plan in `docs/diff.md`, designed 2026-08-01)*; (2) the
   post-write verification reads the CRDT cache, not the VFS disk, so a faulty
   flush is only caught by `flush_one`'s own error (documented in `edit.rs`);
   (3) `FileDocumentCache` CRDT-native pass-through (tracked under Persistence &
