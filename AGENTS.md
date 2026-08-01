@@ -57,6 +57,18 @@ beat/clock/cue code with that section open.
 
 `block exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) queue in a per-context mailbox and flush on the next turn. The mailbox is also the atomicity gate that keeps tool_use+tool_result pairs (and other must-travel-together blocks) from being split by unrelated writers.
 
+## Machines
+
+Kaijutsu is hacked on across three machines — `hostname` tells you where you are:
+
+- **moltar** — Amy's office PC / gaming rig (Arch, real GPU). She is often at its
+  controls; the eurorack is connected here and VR is coming. Live GUI runs,
+  BRP-driven testing, and heavy builds belong here.
+- **zorak** — AMD Strix Halo; increasingly the kaijutsu *server and inference*
+  machine. Prefer not to burden it with builds.
+- **Amy's work MacBook Pro** — macOS client, already works via Bevy. Mac support
+  is expected: no Linux-only assumptions in the app without a mac story.
+
 ## Autonomous Development Loop
 
 Most testing happens on a Linux server with a real GPU that the user can connect to with remote desktop.

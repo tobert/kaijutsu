@@ -200,6 +200,25 @@ sitting inert and are a smaller, separate decision:
 
 **Decide**: finish the stub-strip treatment, or delete these two remnants too.
 
+## Vello may now be fully droppable from kaijutsu-app (2026-08-01, post msdf-music merge)
+
+After ABC moved onto the MSDF geometry renderer, `text/abc.rs` makes zero
+`vello::` calls, and every `BlockRenderMethod` assignment site in
+`block_render.rs` now writes `::Msdf` — nothing observed *producing*
+`BlockRenderMethod::Vello` anymore, yet the enum variant, its two consumer
+branches (`block_render.rs` ~1171, ~1734), `view/vello_rasterizer.rs`, its
+`ui_rtt`/`plugin`/`main` wiring, and the `vello = "0.7"` dependency all remain.
+The enum variant's own doc comment still claims "SVG only", but SVG moved to
+CPU resvg in `742c6f75` — the comment looks stale, not the evidence.
+
+**Verify then drop**: confirm no default/init path leaves a block in `::Vello`
+(check `BlockRenderMethod`'s Default impl and spawn sites), confirm the
+rasterizer isn't reachable some other way, then delete the variant, both
+consumer branches, `vello_rasterizer.rs`, and the dependency — and rename the
+`VelloTextStyle`/`VelloFont*` shaping types whose prefix stops meaning anything
+(already flagged in the cleanup survey). Big win: a whole GPU dependency off
+the build. Do it as its own slice with a visual pass on ABC + SVG blocks.
+
 ## Compaction leftovers — inert infrastructure after the autocompaction delete (2026-07-30, deepseek review)
 
 Autocompaction was deleted with its call site; `summarize` correctly survives
