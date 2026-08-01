@@ -1,14 +1,28 @@
-//! Per-block texture rendering (MSDF + shader decoration; Vello only for SVG/ABC).
+//! Per-block texture rendering (MSDF + shader decoration; no vello).
 //!
-//! Each conversation block renders its own texture. Text blocks use MSDF
-//! (shader-quality text); SVG and ABC notation still rasterize via Vello
-//! (a CPU vector rasterizer, out of this crate's de-vello scope — see
-//! `docs/issues.md`). Sparklines and the image placeholder are plain Bevy UI
-//! geometry (child `Node`+`BackgroundColor` rects), not vello, not a shader.
-//! Block cells use `MaterialNode<BlockFxMaterial>` for border/glow/label
-//! decoration — role-group dividers ride the same material now (see
-//! `sync_role_group_headers`). Bevy's UI system handles scroll, clip,
-//! z-order. `BackgroundColor` works again. No coordinate space mismatches.
+//! Each conversation block renders its own texture. Text blocks (Markdown,
+//! Output, PlainText) use MSDF (shader-quality text). ABC renders through
+//! MSDF (glyphs) + flat-colored geometry (staff lines, beams, slurs, ties,
+//! repeat dots); see `text::msdf::geometry` and
+//! `text::msdf::music_geometry_renderer`. SVG rasterizes on the CPU
+//! (`text::svg_raster`: usvg + resvg + tiny-skia into a straight-alpha RGBA8
+//! buffer, uploaded as a child `Image`/`ImageNode`, sized and re-rasterized
+//! from the block's PHYSICAL pixel box — see the `Svg` arm of
+//! `build_block_scenes`). Sparklines and the image placeholder are plain Bevy
+//! UI geometry (child `Node`+`BackgroundColor` rects), not vello, not a
+//! shader. Block cells use `MaterialNode<BlockFxMaterial>` for
+//! border/glow/label decoration — role-group dividers ride the same material
+//! now (see `sync_role_group_headers`). Bevy's UI system handles scroll,
+//! clip, z-order. `BackgroundColor` works again. No coordinate space
+//! mismatches.
+//!
+//! ABC and SVG were the last two `BlockRenderMethod::Vello` producers, and
+//! they came off vello on separate branches — this module reached zero only
+//! when those two merged. Nothing assigns that variant any more; the
+//! conversation view now touches vello solely for Parley text SHAPING
+//! (`VelloFont` layout, `Brush` colors), never for rasterization. Retiring
+//! the dead variant and its `UiVectorScene` plumbing is tracked in
+//! `docs/issues.md`.
 
 use std::collections::HashMap;
 
@@ -16,7 +30,10 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_asset::RenderAssets,
-    render_resource::{CommandEncoder, CommandEncoderDescriptor, PipelineCache},
+    render_resource::{
+        CommandEncoder, CommandEncoderDescriptor, Extent3d, PipelineCache, TextureDimension,
+        TextureFormat, TextureUsages,
+    },
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
@@ -31,8 +48,9 @@ use crate::cell::block_border::{
 use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
-    BlockRenderMethod, FontDataMap, MsdfBlockGlyphs,
-    collect_msdf_glyphs,
+    BlockRenderMethod, FontDataMap, GeometryVertex, MsdfBlockGeometry, MsdfBlockGlyphs,
+    collect_msdf_glyphs, collect_music_geometry, collect_music_glyphs, collect_music_text_glyphs,
+    music_geometry_renderer::MusicGeometryRenderer,
     renderer::{ExtractedMsdfAtlas, MsdfBlockRenderer, MsdfBlockUniforms},
 };
 use crate::text::rich::{RichContent, RichContentKind, SVG_MAX_HEIGHT};
@@ -42,9 +60,10 @@ use crate::text::{
 use crate::text::components::rainbow_brush;
 use crate::text::markdown::MarkdownColors;
 use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_geometry};
+use crate::text::svg_raster::{fit_svg_to_box, rasterize_svg};
 use crate::ui::theme::Theme;
 use crate::view::fieldset;
-use crate::view::ui_rtt::{UiVectorScene, UiRttTexture};
+use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, ui_rtt_texture_dims};
 use bevy::math::Rot2;
 use bevy::ui::UiTransform;
 
@@ -73,6 +92,14 @@ pub struct BlockScene {
     pub text: String,
     /// Text color (set by sync_block_cell_buffers).
     pub color: Color,
+    /// Physical pixel dimensions the `Svg` content-geometry child was last
+    /// rasterized at, `(0, 0)` meaning never. Only meaningful while
+    /// `RichContent` is `RichContentKind::Svg` — unused (and left stale, but
+    /// harmless) otherwise. Lets `build_block_scenes` detect a DPI-only
+    /// change (no content edit, no logical-width change) that still leaves
+    /// the raster stale, since a CPU raster — unlike vello/MSDF — is only
+    /// crisp at the physical size it was rendered for. See `text::svg_raster`.
+    pub svg_raster_physical_size: (u32, u32),
 }
 
 impl Default for BlockScene {
@@ -83,15 +110,18 @@ impl Default for BlockScene {
             scene_version: 0,
             text: String::new(),
             color: Color::WHITE,
+            svg_raster_physical_size: (0, 0),
         }
     }
 }
 
-/// Child rectangle entities a block's content-drawing arm spawned (sparkline
-/// polyline, image placeholder background) that must be despawned before the
-/// arm rebuilds them for new content. Every child is a plain Bevy UI `Node` +
-/// `BackgroundColor` (+ `UiTransform` for rotated stroke segments) — no
-/// vello, no custom shader; Bevy's own UI rasterizer draws every pixel.
+/// Child entities a block's content-drawing arm spawned (sparkline polyline,
+/// image placeholder background, or the rasterized `Svg` bitmap) that must be
+/// despawned before the arm rebuilds them for new content. Sparkline/image
+/// children are a plain Bevy UI `Node` + `BackgroundColor` (+ `UiTransform`
+/// for rotated stroke segments); the `Svg` child is a `Node` + `ImageNode`
+/// sampling a CPU-rasterized `Image` (`text::svg_raster`). No vello, no
+/// custom shader in any case — Bevy's own UI rasterizer draws every pixel.
 #[derive(Component, Default)]
 pub struct ContentGeometryChildren(pub Vec<Entity>);
 
@@ -172,6 +202,64 @@ fn spawn_segment_child(
     child
 }
 
+/// Spawn a child `Node` + `ImageNode` displaying `image` at `rect` (local
+/// content-space coordinates, LOGICAL px — the `Image` asset itself may hold
+/// more physical pixels than `rect`'s size implies, on a HiDPI display; that
+/// mismatch is exactly what makes it crisp instead of blurry).
+fn spawn_image_child(
+    commands: &mut Commands,
+    parent: Entity,
+    image: Handle<Image>,
+    rect: (f32, f32, f32, f32), // x, y, width, height
+    offset: (f32, f32),
+) -> Entity {
+    let (x, y, w, h) = rect;
+    let child = commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(x + offset.0),
+                top: Val::Px(y + offset.1),
+                width: Val::Px(w),
+                height: Val::Px(h),
+                ..default()
+            },
+            ImageNode::new(image),
+        ))
+        .id();
+    commands.entity(parent).add_child(child);
+    child
+}
+
+/// Upload a straight-alpha RGBA8 buffer (see
+/// `text::svg_raster::unpremultiply_to_straight_rgba`) as a static sampled
+/// `Image` — `Rgba8UnormSrgb` so the GPU treats the bytes as sRGB-encoded
+/// color (matching what `resvg` produces) and converts to linear when
+/// sampling, same as any asset-loaded PNG/JPEG. Not a render target (contrast
+/// `ui_rtt::create_ui_rtt_texture`) — no `RENDER_ATTACHMENT`/`STORAGE_BINDING`
+/// usage needed, just sampling.
+fn create_svg_raster_image(
+    images: &mut Assets<Image>,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Handle<Image> {
+    let size = Extent3d {
+        width: width.max(1),
+        height: height.max(1),
+        depth_or_array_layers: 1,
+    };
+    let mut image = Image::new(
+        size,
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    images.add(image)
+}
+
 /// Dark background for the image placeholder rect (no real CAS→decode
 /// pipeline yet — see the `RichContentKind::Image` arm in `build_block_scenes`).
 const IMAGE_PLACEHOLDER_COLOR: Color = Color::srgb(0.2, 0.2, 0.25);
@@ -211,10 +299,10 @@ impl Plugin for BlockRenderPlugin {
             return;
         };
 
-        // SVG/ABC block cells rasterize their vello scene via the generic
+        // SVG block cells rasterize their vello scene via the generic
         // UiRttPlugin (extract_vello_scenes / render_vello_scenes); this
         // plugin owns only the MSDF compositing pass, which runs *after* the
-        // generic vello render so SVG/ABC content lands in the texture
+        // generic vello render so SVG content lands in the texture
         // first (borders are a separate BlockFxMaterial post-process, never
         // part of this texture's contents).
         render_app
@@ -262,14 +350,18 @@ impl Plugin for BlockRenderPlugin {
 
         // Initialize MSDF renderer in the render world (needs RenderDevice + PipelineCache).
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            let renderer = {
+            let (renderer, geometry_renderer) = {
                 let world = render_app.world();
                 let device = world.resource::<RenderDevice>();
                 let pipeline_cache = world.resource::<PipelineCache>();
                 let asset_server = world.resource::<AssetServer>();
-                MsdfBlockRenderer::init(device, pipeline_cache, asset_server)
+                (
+                    MsdfBlockRenderer::init(device, pipeline_cache, asset_server),
+                    MusicGeometryRenderer::init(pipeline_cache, asset_server),
+                )
             };
             render_app.insert_resource(renderer);
+            render_app.insert_resource(geometry_renderer);
             info!("Initialized MSDF block renderer in render world");
         }
     }
@@ -339,8 +431,9 @@ fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
     (logical * scale).round() / scale
 }
 
-/// Build each block cell's content: MSDF glyphs for text, a vello scene for
-/// SVG/ABC only, or plain UI rectangle children for sparkline/image content.
+/// Build each block cell's content: MSDF glyphs for text, MSDF glyphs +
+/// flat-colored geometry for ABC notation, a vello scene for SVG only, or
+/// plain UI rectangle children for sparkline/image content.
 ///
 /// Runs in PostUpdate after UiSystems::Layout. For each block with changed
 /// content or width, rebuilds whichever of those its `RichContent` calls for.
@@ -361,6 +454,7 @@ pub fn build_block_scenes(
             &Visibility,
             Option<&KjTextEffects>,
             &mut MsdfBlockGlyphs,
+            &mut MsdfBlockGeometry,
             &mut BlockRenderMethod,
             Option<&BlockExcludedState>,
             Option<&ContentGeometryChildren>,
@@ -374,6 +468,8 @@ pub fn build_block_scenes(
     time: Res<Time>,
     mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
     mut font_data_map: ResMut<FontDataMap>,
+    gpu_limits: Res<GpuTextureLimits>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let font = fonts.get(&font_handles.mono);
 
@@ -394,7 +490,8 @@ pub fn build_block_scenes(
 
     for (
         entity, mut block_scene, mut ui_scene, mut rtt, computed, mut node, rich, border, vis, effects,
-        mut msdf_glyphs, mut render_method, excluded_state, existing_geometry_children,
+        mut msdf_glyphs, mut msdf_geometry, mut render_method, excluded_state,
+        existing_geometry_children,
     ) in block_cells.iter_mut()
     {
         // Skip hidden blocks
@@ -417,6 +514,22 @@ pub fn build_block_scenes(
             continue;
         }
 
+        // Compute border padding offsets. Moved ahead of the needs_rebuild
+        // gate below so `content_width` is available for the `Svg`
+        // DPI-staleness check — everything here is cheap and independent of
+        // whether a rebuild actually happens.
+        let (pad_top, pad_bottom, pad_left, pad_right) = if let Some(style) = border {
+            (
+                style.padding.top,
+                style.padding.bottom,
+                style.padding.left,
+                style.padding.right,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        let content_width = (width - pad_left - pad_right).max(0.0);
+
         // Check if rebuild is needed.
         // Rainbow/animation effects are shader-driven (globals.time / uniforms.time)
         // and don't need CPU-side scene rebuilds AFTER the first build. But we must
@@ -426,8 +539,45 @@ pub fn build_block_scenes(
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
         let never_built = block_scene.last_built_version == 0;
+
+        // An `Svg` block's CPU raster (`text::svg_raster`) is only crisp at
+        // the PHYSICAL pixel size it was rendered for — unlike vello/MSDF
+        // content, which the GPU rescales cheaply at render time, a raster
+        // bitmap does not adapt on its own. A DPI-only change (window
+        // dragged to a different-scale monitor) can leave `width` (logical)
+        // and `content_version` both unchanged while still invalidating the
+        // raster, so neither `version_changed` nor `width_changed` catches
+        // it — check the physical target size directly against what was
+        // last rasterized.
+        //
+        // Capped additionally by `SVG_RASTER_MAX_DIM`, not just the GPU's
+        // texture limit: `gpu_limits.max_texture_dim` bounds a GPU texture,
+        // but this raster is a plain CPU-side `Vec<u8>` — some GPUs report
+        // texture limits (16k+) that would make a straight RGBA8 buffer at
+        // that size a multi-hundred-megabyte allocation for a single block.
+        let svg_max_dim = gpu_limits
+            .max_texture_dim
+            .min(crate::text::svg_raster::SVG_RASTER_MAX_DIM);
+        let svg_dpi_stale = match rich.map(|r| &r.kind) {
+            Some(RichContentKind::Svg { width: svg_w, height: svg_h, .. }) => {
+                fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT)
+                    .map(|(_, draw_w, draw_h)| {
+                        let target = ui_rtt_texture_dims(
+                            draw_w,
+                            draw_h,
+                            text_metrics.scale_factor,
+                            svg_max_dim,
+                        );
+                        target != block_scene.svg_raster_physical_size
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+
         let needs_rebuild = version_changed
             || width_changed
+            || svg_dpi_stale
             || (never_built && (is_rainbow || has_animation));
 
         if !needs_rebuild {
@@ -439,19 +589,6 @@ pub fn build_block_scenes(
             continue;
         };
 
-        // Compute border padding offsets
-        let (pad_top, pad_bottom, pad_left, pad_right) = if let Some(style) = border {
-            (
-                style.padding.top,
-                style.padding.bottom,
-                style.padding.left,
-                style.padding.right,
-            )
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
-        };
-
-        let content_width = (width - pad_left - pad_right).max(0.0);
         let max_advance = if content_width > 0.0 {
             Some(content_width)
         } else {
@@ -517,7 +654,7 @@ pub fn build_block_scenes(
                         &layout, &span_brushes, &fallback_brush, text_offset, atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
@@ -527,6 +664,20 @@ pub fn build_block_scenes(
                 // rectangles (thin rotated `Node`s for the stroke, axis-
                 // aligned ones for fill/joints), spawned as children below.
                 *render_method = BlockRenderMethod::Msdf;
+
+                // A sparkline has NO text of its own, which makes it the one
+                // arm that must clear glyphs explicitly. Every text-bearing
+                // arm ASSIGNS `msdf_glyphs.glyphs = glyphs`, and that
+                // assignment is what drops the previous content's glyphs; an
+                // arm that never assigns silently inherits them. The
+                // transition is the ordinary streaming path, not an edge
+                // case: a block arrives as text, and only when its closing
+                // fence lands does `detect_rich_content_typed` reclassify it
+                // as a sparkline — so without this the partially-streamed
+                // source text stays composited behind the plot.
+                msdf_glyphs.glyphs.clear();
+                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+
                 let h = theme.sparkline_height;
                 content_height = h;
 
@@ -572,79 +723,160 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Svg {
-                scene: svg_scene,
+                tree,
                 width: svg_w,
                 height: svg_h,
                 ..
             }) => {
-                *render_method = BlockRenderMethod::Vello;
-                if *svg_w <= 0.0 {
-                    content_height = 0.0;
-                } else {
-                    let w_scale = content_width / svg_w;
-                    let h_scale = SVG_MAX_HEIGHT / svg_h;
-                    let scale = w_scale.min(h_scale) as f64;
-                    let scaled_h = *svg_h as f64 * scale;
-                    content_height = scaled_h as f32;
+                // CPU-rasterized (text::svg_raster), not vello: no scene to
+                // build, so this is always an Msdf block — the rasterized
+                // bitmap is a plain child ImageNode (below), same shape as
+                // the Sparkline/Image arms.
+                *render_method = BlockRenderMethod::Msdf;
 
-                    let clip_rect = vello::kurbo::Rect::new(
-                        pad_left as f64,
-                        pad_top as f64,
-                        (pad_left + content_width) as f64,
-                        (pad_top + content_height) as f64,
-                    );
-                    scene.push_layer(
-                        Fill::NonZero,
-                        vello::peniko::Mix::Normal,
-                        1.0,
-                        Affine::IDENTITY,
-                        &clip_rect,
-                    );
-                    let transform =
-                        Affine::translate(text_offset) * Affine::scale(scale);
-                    scene.append(svg_scene, Some(transform));
-                    scene.pop_layer();
+                // Like the Sparkline arm, Svg has no text of its own — every
+                // text-bearing arm ASSIGNS `msdf_glyphs.glyphs`, and it's
+                // that assignment (not any explicit cleanup) that drops the
+                // previous content's glyphs. Without this, a block that
+                // arrives as plain text and is only reclassified as Svg once
+                // its closing fence lands would silently inherit the
+                // partially-streamed source text, which then composites
+                // behind the raster in any transparent/semi-transparent
+                // region.
+                msdf_glyphs.glyphs.clear();
+                msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+
+                match fit_svg_to_box(*svg_w, *svg_h, content_width, SVG_MAX_HEIGHT) {
+                    None => {
+                        // `text::rich::try_parse_svg` already rejects a
+                        // non-positive intrinsic SVG size at detection time
+                        // (falling through to the plain-text path instead of
+                        // ever constructing `RichContentKind::Svg`), so
+                        // `svg_w`/`svg_h` are always positive here — the only
+                        // way this fires is a degenerate content BOX
+                        // (`content_width <= 0`, e.g. a block whose layout
+                        // hasn't settled yet). That's a transient, benign
+                        // "no room to draw it this frame" — width_changed
+                        // will trigger a rebuild once real width lands — not
+                        // a content problem, so rendering as empty content
+                        // here is correct, not a silent-blank regression.
+                        content_height = 0.0;
+                        block_scene.svg_raster_physical_size = (0, 0);
+                    }
+                    Some((fit_scale, draw_w, draw_h)) => {
+                        content_height = draw_h;
+
+                        let dpi_scale = text_metrics.scale_factor;
+                        let target = ui_rtt_texture_dims(draw_w, draw_h, dpi_scale, svg_max_dim);
+                        // `fit_scale` maps SVG user units to LOGICAL px;
+                        // chaining the DPI scale on top maps them straight to
+                        // PHYSICAL px in one pass, so the raster is sized and
+                        // scaled for its actual on-screen resolution rather
+                        // than an intermediate logical-res bitmap that then
+                        // gets upscaled blurrily.
+                        let content_scale = fit_scale * dpi_scale as f64;
+
+                        match rasterize_svg(tree, target.0, target.1, content_scale) {
+                            Some(rgba) => {
+                                let handle = create_svg_raster_image(
+                                    &mut images, target.0, target.1, rgba,
+                                );
+                                let child = spawn_image_child(
+                                    &mut commands,
+                                    entity,
+                                    handle,
+                                    (0.0, 0.0, draw_w, draw_h),
+                                    (pad_left, pad_top),
+                                );
+                                commands
+                                    .entity(entity)
+                                    .insert(ContentGeometryChildren(vec![child]));
+                            }
+                            None => {
+                                // Defensive only: `target` is clamped to >= 1
+                                // by `ui_rtt_texture_dims`, so tiny-skia's
+                                // pixmap allocation should never actually
+                                // fail here — see `rasterize_svg`'s doc
+                                // comment. `svg_raster_physical_size` still
+                                // gets updated below so a persistent failure
+                                // at a stable size can't force a rebuild
+                                // every frame.
+                                error!(
+                                    "SVG rasterize failed at {}x{} physical px \
+                                     (should be unreachable)",
+                                    target.0, target.1,
+                                );
+                            }
+                        }
+
+                        block_scene.svg_raster_physical_size = target;
+                    }
                 }
             }
             Some(RichContentKind::Abc { tune, .. }) => {
-                *render_method = BlockRenderMethod::Vello;
+                // ABC renders entirely through MSDF + geometry now — no
+                // vello scene content at all, same as Markdown/Output/
+                // PlainText below. `render_method` stays `Msdf` (the
+                // default) so `ui_scene.version` is never bumped for these
+                // blocks and the generic vello extract skips their (empty)
+                // scene, exactly like every other MSDF-rendered block kind.
                 let default_opts = kaijutsu_abc::engrave::EngravingOptions::default();
                 let elements =
                     kaijutsu_abc::engrave::layout::engrave(tune, &default_opts);
 
                 let notation_brush = bevy_color_to_brush(theme.block_assistant);
-                let (abc_scene, intrinsic_w, intrinsic_h) =
-                    crate::text::abc::render_engraving_to_scene(
+                let bounds =
+                    crate::text::abc::compute_engraving_bounds(&elements, default_opts.margin);
+
+                let w_scale = content_width as f64 / bounds.width;
+                let h_scale = SVG_MAX_HEIGHT as f64 / bounds.height;
+                let scale = w_scale.min(h_scale);
+                content_height = (bounds.height * scale) as f32;
+
+                if let Some(ref mut atlas) = atlas {
+                    let origin = (bounds.origin_x, bounds.origin_y);
+
+                    let geometry_vertices = collect_music_geometry(
                         &elements,
-                        default_opts.margin,
+                        text_offset,
+                        origin,
+                        scale,
+                        &notation_brush,
+                    );
+                    msdf_geometry.vertices = geometry_vertices;
+
+                    let mut glyphs = collect_music_glyphs(
+                        &elements,
+                        text_offset,
+                        origin,
+                        scale,
+                        &notation_brush,
+                        atlas,
+                    );
+                    let text_glyphs = collect_music_text_glyphs(
+                        &elements,
+                        text_offset,
+                        origin,
+                        scale,
                         &notation_brush,
                         Some(font),
-                        &text_metrics,
+                        atlas,
+                        &mut font_data_map,
                     );
+                    glyphs.extend(text_glyphs);
 
-                let w_scale = content_width as f64 / intrinsic_w;
-                let h_scale = SVG_MAX_HEIGHT as f64 / intrinsic_h;
-                let scale = w_scale.min(h_scale);
-                content_height = (intrinsic_h * scale) as f32;
-
-                let clip_rect = vello::kurbo::Rect::new(
-                    pad_left as f64,
-                    pad_top as f64,
-                    (pad_left + content_width) as f64,
-                    (pad_top + content_height) as f64,
-                );
-                scene.push_layer(
-                    Fill::NonZero,
-                    vello::peniko::Mix::Normal,
-                    1.0,
-                    Affine::IDENTITY,
-                    &clip_rect,
-                );
-                scene.append(
-                    &abc_scene,
-                    Some(Affine::translate(text_offset) * Affine::scale(scale)),
-                );
-                scene.pop_layer();
+                    msdf_glyphs.glyphs = glyphs;
+                    // Single shared version gate for BOTH glyphs and
+                    // geometry — see `MsdfBlockGeometry`'s doc comment on
+                    // why it deliberately carries no version of its own.
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
+                }
+                // No atlas yet (startup ordering): skip this rebuild, same
+                // as every other MSDF block kind below — retried on the
+                // next content/width change or, in practice, the next
+                // frame (the atlas is inserted in `Startup`, before this
+                // system ever runs).
             }
             Some(RichContentKind::Output { layout, plain_text }) => {
                 let parley_layout = font.layout(
@@ -671,7 +903,7 @@ pub fn build_block_scenes(
                         &parley_layout, &span_brushes, &fallback_brush, text_offset, atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
@@ -719,7 +951,14 @@ pub fn build_block_scenes(
                         atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    // Derive from the field's OWN previous value, never
+                    // `scene_version` — see `MsdfBlockGlyphs::version`'s doc
+                    // comment for the bug this reintroduces otherwise
+                    // (staff-without-glyphs, msdf-music live verify
+                    // 2026-07-16). This arm didn't exist when that fix
+                    // landed; the devello rewrite of the Image placeholder
+                    // re-added the same anti-pattern independently.
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
@@ -746,7 +985,7 @@ pub fn build_block_scenes(
                         &layout, &[], &text_brush, text_offset, atlas,
                     );
                     msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
@@ -1141,14 +1380,24 @@ pub fn resize_block_textures(
 // RENDER WORLD SYSTEMS
 // ============================================================================
 
-/// Render MSDF text glyphs to per-block textures.
+/// Render MSDF geometry + text glyphs to per-block textures.
 ///
-/// Runs after Vello rendering so SVG/ABC content is already present in the
-/// texture for text-bearing blocks that have it (most blocks have none —
-/// see `has_vello_content` below). MSDF text is composited on top with
-/// premultiplied alpha blending.
+/// Runs after Vello rendering so SVG content is already present in the
+/// texture for the blocks that have it (most blocks have none — see
+/// `has_vello_content` below; ABC no longer does either, see this module's
+/// doc comment). Two composited passes run per item, in order: flat-colored
+/// music geometry (staff lines, beams, slurs, ties, repeat dots) first,
+/// then MSDF glyphs on top — reproducing the "vello draws lines, MSDF
+/// composites glyphs on top" layering ABC used to get from vello, now with
+/// geometry as the first layer instead. A block is only considered
+/// "settled" (its `version` advances into `last_rendered`, stopping
+/// re-extraction) once EVERY non-empty layer it has has rendered
+/// successfully this frame — a block with geometry ready but glyphs still
+/// atlas-pending must keep re-extracting every frame, not have its pending
+/// glyphs silently forgotten because geometry alone "counted" as done.
 pub fn render_msdf_block_textures(
     msdf_renderer: Option<Res<MsdfBlockRenderer>>,
+    geometry_renderer: Option<Res<MusicGeometryRenderer>>,
     msdf_atlas: Res<ExtractedMsdfAtlas>,
     mut msdf_data: ResMut<ExtractedMsdfBlockData>,
     render_params: Res<ExtractedMsdfRenderParams>,
@@ -1157,7 +1406,7 @@ pub fn render_msdf_block_textures(
     gpu_images: Res<RenderAssets<GpuImage>>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let Some(msdf_renderer) = msdf_renderer else {
+    let (Some(msdf_renderer), Some(geometry_renderer)) = (msdf_renderer, geometry_renderer) else {
         return;
     };
 
@@ -1178,85 +1427,133 @@ pub fn render_msdf_block_textures(
     let mut encoded_any = false;
 
     for item in items {
-        if item.glyphs.is_empty() {
-            // Glyphs went from non-empty to empty — clear stale pixels.
-            let cleared = msdf_renderer.encode_clear(&mut encoder, &gpu_images, &item.image_handle);
-            if cleared {
-                encoded_any = true;
-                msdf_data.last_rendered.insert(item.image_handle.id(), item.version);
-                msdf_data.skip_attempts.remove(&item.image_handle.id());
-            } else {
-                // Same skip-tracking as the render path below: a one-frame
-                // GpuImage-not-ready is expected (asset prepare lag), but a
-                // clear that never lands must escalate, not spin silently.
-                let attempts = msdf_data
-                    .skip_attempts
-                    .entry(item.image_handle.id())
-                    .or_insert(0);
-                *attempts += 1;
-                if *attempts > 2 {
-                    warn!(
-                        "MSDF clear skipped {} consecutive frames: {}x{} target_gpu not ready",
-                        attempts, item.width, item.height,
-                    );
-                }
-            }
-            continue;
-        }
-
         // Physical texture size (item.width/height) + the item's OWN
         // logical→physical scale, not the window scale: UI-node surfaces
         // size textures ceil(logical*window_scale) so the two agree, but
         // world-space MSDF panels (time well) allocate 1:1 textures whose
         // scale is 1.0 at any DPI (Fix 3 + per-surface scale — see
         // build_vertices' doc comment and msdf_item_scale).
-        let vertices = MsdfBlockRenderer::build_vertices(
-            &item.glyphs,
-            &msdf_atlas,
+        let geometry_vertices = MusicGeometryRenderer::build_vertices(
+            &item.geometry,
             item.width as f32,
             item.height as f32,
             item.scale,
-            item.rainbow,
         );
+        // Geometry has no atlas — unlike glyphs it never goes "pending",
+        // so `geometry_vertices` is empty iff `item.geometry` was empty.
+        let has_geometry = !geometry_vertices.is_empty();
 
-        if vertices.is_empty() {
+        let glyph_vertices = if item.glyphs.is_empty() {
+            Vec::new()
+        } else {
+            MsdfBlockRenderer::build_vertices(
+                &item.glyphs,
+                &msdf_atlas,
+                item.width as f32,
+                item.height as f32,
+                item.scale,
+                item.rainbow,
+            )
+        };
+        // Unlike geometry, glyphs CAN be source-non-empty but
+        // vertices-empty (every glyph is still atlas-pending) — that's a
+        // "not ready yet", not a "nothing to draw", case.
+        let has_glyphs = !glyph_vertices.is_empty();
+
+        if !has_geometry && !has_glyphs {
+            if item.glyphs.is_empty() {
+                // Both layers are genuinely empty (not just pending) —
+                // clear stale pixels.
+                let cleared =
+                    msdf_renderer.encode_clear(&mut encoder, &gpu_images, &item.image_handle);
+                if cleared {
+                    encoded_any = true;
+                    msdf_data.last_rendered.insert(item.image_handle.id(), item.version);
+                    msdf_data.skip_attempts.remove(&item.image_handle.id());
+                } else {
+                    // Same skip-tracking as the render path below: a one-frame
+                    // GpuImage-not-ready is expected (asset prepare lag), but a
+                    // clear that never lands must escalate, not spin silently.
+                    let attempts = msdf_data
+                        .skip_attempts
+                        .entry(item.image_handle.id())
+                        .or_insert(0);
+                    *attempts += 1;
+                    if *attempts > 2 {
+                        warn!(
+                            "MSDF clear skipped {} consecutive frames: {}x{} target_gpu not ready",
+                            attempts, item.width, item.height,
+                        );
+                    }
+                }
+            }
+            // Else: glyphs exist but are all still atlas-pending — skip
+            // silently this frame, naturally retried next frame since
+            // `last_rendered` stays behind `item.version`.
             continue;
         }
 
-        let uniforms = MsdfBlockUniforms {
-            resolution: [item.width as f32, item.height as f32],
-            msdf_range: msdf_atlas.msdf_range,
-            time: render_params.time,
-            sdf_texel: [
-                1.0 / msdf_atlas.width as f32,
-                1.0 / msdf_atlas.height as f32,
-            ],
-            hint_amount: render_params.hint_amount,
-            stem_darkening: render_params.stem_darkening,
-            horz_scale: render_params.horz_scale,
-            vert_scale: render_params.vert_scale,
-            text_bias: render_params.text_bias,
-            gamma_correction: render_params.gamma_correction,
-        };
+        // At least one layer has something to draw this frame. Each
+        // non-empty layer must independently succeed before the item
+        // counts as settled.
+        let mut geometry_ok = !has_geometry;
+        let mut glyph_ok = !has_glyphs;
 
-        // Clear if this block has no vello content (plain text/geometry
-        // block); composite on top if it's an SVG/ABC block and vello
-        // already rasterized it into the texture this frame.
-        let clear = !item.has_vello_content;
-        let rendered = msdf_renderer.encode_render(
-            &device,
-            &mut encoder,
-            &pipeline_cache,
-            &gpu_images,
-            &msdf_atlas.texture,
-            &item.image_handle,
-            &vertices,
-            &uniforms,
-            clear,
-        );
+        if has_geometry {
+            // Clear only if nothing (vello) drew to this texture already
+            // this frame — geometry is always the first MSDF-world layer.
+            let clear = !item.has_vello_content;
+            if geometry_renderer.encode_render(
+                &device,
+                &mut encoder,
+                &pipeline_cache,
+                &gpu_images,
+                &item.image_handle,
+                &geometry_vertices,
+                clear,
+            ) {
+                geometry_ok = true;
+                encoded_any = true;
+            }
+        }
 
-        if rendered {
-            encoded_any = true;
+        if has_glyphs {
+            let uniforms = MsdfBlockUniforms {
+                resolution: [item.width as f32, item.height as f32],
+                msdf_range: msdf_atlas.msdf_range,
+                time: render_params.time,
+                sdf_texel: [
+                    1.0 / msdf_atlas.width as f32,
+                    1.0 / msdf_atlas.height as f32,
+                ],
+                hint_amount: render_params.hint_amount,
+                stem_darkening: render_params.stem_darkening,
+                horz_scale: render_params.horz_scale,
+                vert_scale: render_params.vert_scale,
+                text_bias: render_params.text_bias,
+                gamma_correction: render_params.gamma_correction,
+            };
+
+            // Clear only if NEITHER vello NOR a just-drawn geometry layer
+            // put anything in the texture first this frame.
+            let clear = !item.has_vello_content && !(has_geometry && geometry_ok);
+            if msdf_renderer.encode_render(
+                &device,
+                &mut encoder,
+                &pipeline_cache,
+                &gpu_images,
+                &msdf_atlas.texture,
+                &item.image_handle,
+                &glyph_vertices,
+                &uniforms,
+                clear,
+            ) {
+                glyph_ok = true;
+                encoded_any = true;
+            }
+        }
+
+        if geometry_ok && glyph_ok {
             msdf_data
                 .last_rendered
                 .insert(item.image_handle.id(), item.version);
@@ -1278,32 +1575,29 @@ pub fn render_msdf_block_textures(
                 .or_insert(0);
             *attempts += 1;
 
-            let pipe_ok = pipeline_cache
+            let geom_pipe_ok = pipeline_cache
+                .get_render_pipeline(geometry_renderer.pipeline)
+                .is_some();
+            let glyph_pipe_ok = pipeline_cache
                 .get_render_pipeline(msdf_renderer.pipeline)
                 .is_some();
-            let pipe_state = pipeline_cache
-                .get_render_pipeline_state(msdf_renderer.pipeline);
             let target_ok = gpu_images.get(&item.image_handle).is_some();
             let atlas_ok = gpu_images.get(&msdf_atlas.texture).is_some();
 
+            let msg = format!(
+                "MSDF render skipped (attempt {}): {}x{} \
+                 geometry={}/{} (ok={}) glyphs={}/{} (ok={}) \
+                 geom_pipeline={} glyph_pipeline={} target_gpu={} atlas_gpu={}",
+                attempts,
+                item.width, item.height,
+                item.geometry.len(), geometry_vertices.len(), geometry_ok,
+                item.glyphs.len(), glyph_vertices.len(), glyph_ok,
+                geom_pipe_ok, glyph_pipe_ok, target_ok, atlas_ok,
+            );
             if *attempts > 2 {
-                warn!(
-                    "MSDF render skipped {} consecutive frames: {}x{} glyphs={} verts={} pipeline={} ({:?}) target_gpu={} atlas_gpu={}",
-                    attempts,
-                    item.width, item.height,
-                    item.glyphs.len(), vertices.len(),
-                    pipe_ok, pipe_state,
-                    target_ok, atlas_ok,
-                );
+                warn!("{msg}");
             } else {
-                debug!(
-                    "MSDF render skipped (attempt {}): {}x{} glyphs={} verts={} pipeline={} ({:?}) target_gpu={} atlas_gpu={}",
-                    attempts,
-                    item.width, item.height,
-                    item.glyphs.len(), vertices.len(),
-                    pipe_ok, pipe_state,
-                    target_ok, atlas_ok,
-                );
+                debug!("{msg}");
             }
         }
     }
@@ -1320,6 +1614,11 @@ pub fn render_msdf_block_textures(
 /// Extracted MSDF block data for the render world.
 struct ExtractedMsdfBlockItem {
     glyphs: Vec<crate::text::msdf::PositionedGlyph>,
+    /// Flat-colored music geometry (staff lines, beams, slurs, ties, repeat
+    /// dots) — empty for every block kind except ABC. See
+    /// `MsdfBlockGeometry`'s doc comment for why this rides the SAME
+    /// `version` gate as `glyphs` rather than carrying its own.
+    geometry: Vec<GeometryVertex>,
     image_handle: Handle<Image>,
     /// Physical pixel dims of the render target (`ceil(logical * scale)`,
     /// see `ui_rtt::ui_rtt_texture_dims`) — also what `build_vertices` maps
@@ -1335,10 +1634,11 @@ struct ExtractedMsdfBlockItem {
     scale: f32,
     version: u64,
     rainbow: bool,
-    /// Whether this is an SVG/ABC block that vello already rendered into
-    /// the texture this frame (false = the texture has no prior content and
+    /// Whether this is an SVG block that vello already rendered into the
+    /// texture this frame (false = the texture has no prior content and
     /// MSDF must clear it before compositing; that covers everything else,
-    /// borders included — border decoration is never part of this texture).
+    /// ABC and borders included — border decoration is never part of this
+    /// texture).
     has_vello_content: bool,
 }
 
@@ -1417,6 +1717,7 @@ fn extract_msdf_blocks(
     query: Extract<
         Query<(
             &MsdfBlockGlyphs,
+            Option<&MsdfBlockGeometry>,
             &BlockRenderMethod,
             &UiRttTexture,
         )>,
@@ -1424,7 +1725,7 @@ fn extract_msdf_blocks(
 ) {
     extracted.items.clear();
 
-    for (msdf_glyphs, render_method, texture) in query.iter() {
+    for (msdf_glyphs, msdf_geometry, render_method, texture) in query.iter() {
         let asset_id = texture.image.id();
         let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
         if !should_extract_msdf_block(msdf_glyphs.version, msdf_glyphs.glyphs.is_empty(), last) {
@@ -1433,8 +1734,16 @@ fn extract_msdf_blocks(
 
         // Vello blocks have content rendered by the Vello pass — MSDF composites on top
         let has_vello = *render_method == BlockRenderMethod::Vello;
+        // `MsdfBlockGeometry` is only ever populated for ABC block cells —
+        // every other MSDF-glyph-bearing surface (role headers, the shell
+        // dock/compose overlay/editor text, time-well cards) has no reason
+        // to carry it, and mustn't be REQUIRED to just to satisfy this
+        // query: that would silently drop them from extraction entirely
+        // (a query mismatch, not a panic) the moment this component exists.
+        let geometry_vertices = msdf_geometry.map(|g| g.vertices.clone()).unwrap_or_default();
         extracted.items.push(ExtractedMsdfBlockItem {
             glyphs: msdf_glyphs.glyphs.clone(),
+            geometry: geometry_vertices,
             image_handle: texture.image.clone(),
             width: texture.width,
             height: texture.height,

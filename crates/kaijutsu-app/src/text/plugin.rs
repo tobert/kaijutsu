@@ -1,10 +1,12 @@
 //! Text rendering plugin for Bevy using Vello + MSDF.
 //!
-//! Vello handles vector content (SVG, ABC notation only, in this crate).
+//! Vello handles vector content (SVG only, in this crate — the sole
+//! remaining `BlockRenderMethod::Vello` site in the conversation view).
 //! MSDF handles text (plain, markdown, output, border/role-divider labels)
-//! for shader-quality rendering. Sparklines and the image placeholder are
-//! plain UI rectangle geometry (`text::sparkline`); block borders and the
-//! role-group divider are an SDF shader (`cell::block_border` + `shaders`).
+//! and, together with `msdf::geometry`'s flat-colored triangles, ABC music
+//! notation. Sparklines and the image placeholder are plain UI rectangle
+//! geometry (`text::sparkline`); block borders and the role-group divider
+//! are an SDF shader (`cell::block_border` + `shaders`).
 
 use std::collections::HashSet;
 
@@ -12,7 +14,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 
-use super::msdf::glyph::GlyphKey;
+use super::msdf::glyph::{FontId, GlyphKey};
 use super::msdf::{FontDataMap, MsdfGenerator, PositionedGlyph};
 use super::resources::{ShapingFonts, SvgFontDb, TextMetrics};
 use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
@@ -23,8 +25,8 @@ use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, Ve
 /// - MSDF atlas, generator, and font data map
 /// - Font loading and DPI-aware text metrics
 ///
-/// Vector rasterization (SVG, ABC notation) is owned by
-/// `VelloRasterizerPlugin` + `UiRttPlugin`.
+/// Vector rasterization (SVG only) is owned by `VelloRasterizerPlugin` +
+/// `UiRttPlugin`.
 pub struct KjTextPlugin;
 
 impl Plugin for KjTextPlugin {
@@ -35,7 +37,7 @@ impl Plugin for KjTextPlugin {
             .init_resource::<SvgFontDb>()
             .insert_resource(MsdfGenerator::new())
             .init_resource::<FontDataMap>()
-            .add_systems(Startup, (load_fonts, load_svg_fontdb))
+            .add_systems(Startup, (load_fonts, load_svg_fontdb, register_music_font))
             .add_systems(
                 Update,
                 (
@@ -138,6 +140,17 @@ fn block_touches(inserted: &HashSet<GlyphKey>, glyphs: &[PositionedGlyph]) -> bo
     glyphs.iter().any(|g| inserted.contains(&g.key))
 }
 
+/// Register the embedded music font (Bravura, via `kaijutsu-abc`) under a
+/// static `FontId` so the async MSDF generator can always resolve it — ABC
+/// notation glyphs are keyed from the start (see
+/// `text::msdf::music_bridge::collect_music_glyphs`) rather than waiting on
+/// a Parley layout to run first, the way `FontDataMap::register` needs for
+/// text fonts.
+fn register_music_font(mut font_data_map: ResMut<FontDataMap>) {
+    let bytes = kaijutsu_abc::engrave::font::font_bytes();
+    font_data_map.register_static(FontId::from_static(bytes), bytes);
+}
+
 /// Load bundled fonts for the kaijutsu-owned shaping path (`ShapingFonts`).
 fn load_fonts(
     asset_server: Res<AssetServer>,
@@ -161,7 +174,7 @@ fn load_fonts(
 /// are silently dropped from rendered SVGs.
 fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::theme::Theme>) {
     use std::sync::Arc;
-    use vello_svg::usvg::fontdb;
+    use usvg::fontdb;
 
     let mut db = fontdb::Database::new();
 

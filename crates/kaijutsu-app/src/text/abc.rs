@@ -1,34 +1,45 @@
-//! ABC notation → Vello scene rendering.
+//! ABC notation intrinsic bounding-box math.
 //!
-//! Converts `Vec<EngravingElement>` from `kaijutsu-abc` into a `vello::Scene`.
-//! Lives in kaijutsu-app (which has both the vello render deps and
-//! kaijutsu-abc) so kaijutsu-abc stays a leaf crate.
-
-use bevy::prelude::default;
-use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use vello::kurbo::{Affine, BezPath, Cap, Line, Stroke};
-use vello::peniko::{Brush, Fill};
+//! `kaijutsu-abc`'s engraving IR (`Vec<EngravingElement>`) is
+//! renderer-agnostic by design (glyph codepoint/x/y/scale, lines, paths,
+//! text — all with source spans). This module supplies the ONE piece of
+//! shared math every ABC render path needs before it can draw anything:
+//! the content's intrinsic bounding box (for scale-to-fit) and the origin
+//! it must translate by so content lands at (0, 0).
+//!
+//! No vello here — noteheads/clefs/rests/accidentals/text render through
+//! `text::msdf::music_bridge` (MSDF atlas quads), and staff
+//! lines/barlines/stems/ledgers/beams/slurs/ties/repeat-dots render through
+//! `text::msdf::geometry` (flat-colored triangles). Lives in kaijutsu-app
+//! (rather than kaijutsu-abc) only because `compute_engraving_bounds` reads
+//! `kaijutsu_abc::engrave::font::font_cache()` for glyph advances, and
+//! that's simplest to keep alongside its callers.
 
 use kaijutsu_abc::engrave::font::font_cache;
 use kaijutsu_abc::engrave::EngravingElement;
 
-use super::TextMetrics;
+/// Intrinsic bounding box of a set of engraving elements: the content
+/// extent (all element kinds, including glyphs) padded by `margin` on every
+/// side, plus the origin the content must be translated by so it lands at
+/// (0, 0). Every render path — `text::msdf::music_bridge`'s
+/// `collect_music_glyphs`/`collect_music_geometry`/`collect_music_text_glyphs`
+/// — shares this so glyph quads, geometry triangles, and text glyphs all
+/// agree on where (0, 0) is and how big the content is.
+pub struct EngravingBounds {
+    pub width: f64,
+    pub height: f64,
+    pub origin_x: f64,
+    pub origin_y: f64,
+}
 
-/// Render engraving elements to a vello Scene.
-///
-/// Returns `(scene, width, height)` where width/height are the intrinsic
-/// dimensions of the notation content (including margin).
-pub fn render_engraving_to_scene(
-    elements: &[EngravingElement],
-    margin: f64,
-    color: &Brush,
-    font: Option<&VelloFont>,
-    _text_metrics: &TextMetrics,
-) -> (vello::Scene, f64, f64) {
+/// Compute `EngravingBounds` for `elements`, mirroring the logic from
+/// `engrave/svg.rs`. Counts every element kind (glyphs included) regardless
+/// of which render path ends up drawing them — the bounding box must be the
+/// same whether glyphs are drawn as MSDF quads or not, since the
+/// MSDF-glyph-plus-geometry hybrid still needs to scale-to-fit and position
+/// against the *full* content extent.
+pub fn compute_engraving_bounds(elements: &[EngravingElement], margin: f64) -> EngravingBounds {
     let fc = font_cache();
-    let mut scene = vello::Scene::new();
-
-    // Compute bounding box — mirrors logic from engrave/svg.rs
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
 
     for elem in elements {
@@ -73,91 +84,80 @@ pub fn render_engraving_to_scene(
         max_y = 100.0;
     }
 
-    let width = (max_x - min_x) + margin * 2.0;
-    let height = (max_y - min_y) + margin * 2.0;
-    let origin_x = min_x - margin;
-    let origin_y = min_y - margin;
-
-    // Render elements with origin offset so (origin_x, origin_y) maps to (0,0)
-    let offset = Affine::translate((-origin_x, -origin_y));
-
-    for elem in elements {
-        match elem {
-            EngravingElement::Glyph {
-                codepoint,
-                x,
-                y,
-                scale,
-                ..
-            } => {
-                if let Some(bezpath) = fc.glyph_bezpath(*codepoint) {
-                    let transform =
-                        offset * Affine::translate((*x, *y)) * Affine::scale(*scale);
-                    scene.fill(Fill::NonZero, transform, color, None, bezpath);
-                }
-            }
-            EngravingElement::Line {
-                x1,
-                y1,
-                x2,
-                y2,
-                width: line_width,
-                ..
-            } => {
-                let line = Line::new((*x1, *y1), (*x2, *y2));
-                // Butt caps: stroked lines (barlines, stems, ledgers, staff
-                // lines) end exactly at their endpoints instead of overhanging
-                // by half the stroke width via the default round cap.
-                let stroke = Stroke::new(*line_width).with_caps(Cap::Butt);
-                scene.stroke(&stroke, offset, color, None, &line);
-            }
-            EngravingElement::Path { d, fill, .. } => {
-                if let Ok(bezpath) = BezPath::from_svg(d) {
-                    if *fill {
-                        scene.fill(Fill::NonZero, offset, color, None, &bezpath);
-                    } else {
-                        scene.stroke(&Stroke::new(0.5), offset, color, None, &bezpath);
-                    }
-                }
-            }
-            EngravingElement::Text {
-                content,
-                x,
-                y,
-                size,
-                ..
-            } => {
-                // Render text using Parley via VelloFont if available
-                if let Some(vello_font) = font {
-                    let style = VelloTextStyle {
-                        font_size: *size as f32,
-                        brush: color.clone(),
-                        ..default()
-                    };
-                    let layout = vello_font.layout(
-                        content,
-                        &style,
-                        VelloTextAlign::Left,
-                        None,
-                    );
-                    // Parley baseline is at y=0 of the layout; ABC puts y at the baseline
-                    let text_offset = (-origin_x + x, -origin_y + y - *size);
-                    super::rich::render_layout_with_brushes(
-                        &mut scene,
-                        &layout,
-                        &[],
-                        color,
-                        text_offset,
-                    );
-                }
-                // If no font available, text is silently dropped (matches SVG path behavior)
-            }
-        }
+    EngravingBounds {
+        width: (max_x - min_x) + margin * 2.0,
+        height: (max_y - min_y) + margin * 2.0,
+        origin_x: min_x - margin,
+        origin_y: min_y - margin,
     }
-
-    (scene, width, height)
 }
 
 #[cfg(test)]
 mod golden_tests;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn treble_clef(x: f64, y: f64, scale: f64) -> EngravingElement {
+        EngravingElement::Glyph {
+            codepoint: 0xE050,
+            x,
+            y,
+            scale,
+            source_span: (0, 0),
+        }
+    }
+
+    /// Hand-computed against Bravura's real metrics (upem=1000,
+    /// glyph_advance(0xE050)=671.0 — the treble clef; confirmed via
+    /// `kaijutsu_abc::engrave::font::font_cache()`):
+    ///   glyph at (0,0), scale=0.04: advance=671*0.04=26.84,
+    ///     glyph_height=1000*0.04=40 → contributes x:[0, 26.84], y:[-40, 20]
+    ///   line (0,-10)-(50,-10): contributes x:[0, 50], y:[-10, -10]
+    ///   combined extent: x:[0, 50], y:[-40, 20]
+    ///   width = 50 + margin*2 = 60; height = 60 + margin*2 = 70
+    ///   origin = (0 - margin, -40 - margin) = (-5, -45)
+    #[test]
+    fn compute_engraving_bounds_matches_hand_computed_values() {
+        let elements = vec![
+            treble_clef(0.0, 0.0, 0.04),
+            EngravingElement::Line {
+                x1: 0.0,
+                y1: -10.0,
+                x2: 50.0,
+                y2: -10.0,
+                width: 0.5,
+                source_span: (0, 0),
+            },
+        ];
+
+        let bounds = compute_engraving_bounds(&elements, 5.0);
+
+        assert!((bounds.width - 60.0).abs() < 1e-6, "width = {}", bounds.width);
+        assert!((bounds.height - 70.0).abs() < 1e-6, "height = {}", bounds.height);
+        assert!(
+            (bounds.origin_x - -5.0).abs() < 1e-6,
+            "origin_x = {}",
+            bounds.origin_x
+        );
+        assert!(
+            (bounds.origin_y - -45.0).abs() < 1e-6,
+            "origin_y = {}",
+            bounds.origin_y
+        );
+    }
+
+    /// The bbox must count Glyph elements even though they render as MSDF
+    /// quads rather than vello fills — every render path needs to agree on
+    /// intrinsic dimensions and origin regardless of which one actually
+    /// draws the glyphs.
+    #[test]
+    fn glyph_only_elements_still_produce_a_nonzero_bbox() {
+        let elements = vec![treble_clef(0.0, 0.0, 0.04)];
+
+        let bounds = compute_engraving_bounds(&elements, 0.0);
+        assert!(bounds.width > 0.0);
+        assert!(bounds.height > 0.0);
+    }
+}

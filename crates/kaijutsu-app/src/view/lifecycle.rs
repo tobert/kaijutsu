@@ -6,7 +6,8 @@
 //! MaterialNode<BlockFxMaterial> + ImageNode: MSDF renders content into the
 //! texture, the shader material draws border/glow/label decoration on top,
 //! Bevy's flex layout places the node. Vello is a per-content-kind opt-in
-//! (SVG/ABC only) via `UiVectorScene`, not the baseline.
+//! (SVG only) via `UiVectorScene`, not the baseline — ABC notation renders
+//! through MSDF + `MsdfBlockGeometry` instead (see `view::block_render`).
 
 use bevy::prelude::*;
 use crate::text::shaping::VelloFont;
@@ -419,6 +420,7 @@ pub fn spawn_block_cells(
                     crate::view::ui_rtt::UiVectorScene::default(),
                     crate::view::ui_rtt::UiRttTexture::default(),
                     crate::text::msdf::MsdfBlockGlyphs::default(),
+                    crate::text::msdf::MsdfBlockGeometry::default(),
                     crate::text::msdf::BlockRenderMethod::default(),
                     ImageNode::default(),
                     MaterialNode(material_handle),

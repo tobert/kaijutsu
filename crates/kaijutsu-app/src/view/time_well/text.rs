@@ -7,7 +7,7 @@
 //! (`BlockRenderMethod::Msdf`). The card **body** — accent rounded-rect,
 //! selection/lineage rings — is drawn by `well_card.wgsl` (SDF), driven by the
 //! `WellCardMaterial` uniforms this module keeps in sync from `Card`. So vello no
-//! longer touches card textures at all (it stays for SVG/ABC elsewhere).
+//! longer touches card textures at all (it stays for SVG elsewhere).
 //!
 //! **HUD-melt slice 3** (`docs/timewell.md`): [`reading_card_glyphs`] absorbs
 //! the reference material the retired edge HUD's East (specs) and West

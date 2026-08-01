@@ -665,6 +665,83 @@ mod tests {
         );
     }
 
+    // -- go/no-go: CFF outlines through the msdfgen/ttf-parser bridge -----
+    //
+    // Bravura.otf (the embedded SMuFL music font, kaijutsu-abc's
+    // `engrave::font`) is OpenType with **CFF** outlines, not TrueType
+    // `glyf`. `generate_glyph` above gets its shape from
+    // `ttf_parser::Face::glyph_shape` via msdfgen's `FontExt` bridge — if
+    // that bridge only reads `glyf` and can't extract CFF, every music
+    // glyph comes back a placeholder and rendering Bravura through this
+    // atlas is a dead end. This test proves (or disproves) that the
+    // pipeline produces real ink from Bravura's CFF glyphs, not just from
+    // the TrueType test font used above.
+
+    #[test]
+    fn bravura_cff_glyph_produces_real_msdf_ink() {
+        let font_data = kaijutsu_abc::engrave::font::font_bytes();
+
+        let face = ttf_parser::Face::parse(font_data, 0).expect("Bravura.otf must parse");
+
+        let glyph_id = face.glyph_index('\u{E050}').unwrap_or_else(|| {
+            panic!("Bravura's cmap doesn't map U+E050 (SMuFL gClef / treble clef)")
+        });
+
+        let key = GlyphKey::new(FontId::for_test(1), glyph_id.0);
+        let generated = generate_glyph(
+            key,
+            font_data,
+            glyph_id.0,
+            /* msdf_range */ 4.0,
+            /* px_per_em */ 64.0,
+            /* angle_threshold */ 3.0,
+        );
+
+        assert!(
+            !generated.is_placeholder,
+            "GO/NO-GO: the msdfgen/ttf-parser bridge produced no shape from \
+             Bravura's CFF outlines — glyph_shape() returned None for the \
+             treble clef, so this pipeline cannot render SMuFL music glyphs"
+        );
+        assert!(
+            generated.width >= 16 && generated.height >= 16,
+            "treble clef bitmap too small: {}x{}",
+            generated.width,
+            generated.height,
+        );
+        assert_eq!(
+            generated.data.len(),
+            (generated.width * generated.height * 4) as usize,
+            "MTSDF data length must match width*height*4 (RGBA8)"
+        );
+
+        // The MTSDF alpha channel (byte offset 3, stride 4) is the true
+        // signed-distance channel (median-corrected). Real ink must show
+        // both clearly-interior pixels (near 255) and clearly-exterior
+        // pixels (near 0) — a degenerate/empty shape would leave the whole
+        // field flat near the default fill value instead.
+        let alpha_values: Vec<u8> = generated
+            .data
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .copied()
+            .collect();
+        let max_alpha = alpha_values.iter().copied().max().unwrap_or(0);
+        let min_alpha = alpha_values.iter().copied().min().unwrap_or(0);
+
+        assert!(
+            max_alpha > 200,
+            "no clearly-interior pixel found in the treble clef's alpha \
+             channel (max={max_alpha}) — the distance field has no real ink"
+        );
+        assert!(
+            min_alpha < 50,
+            "no clearly-exterior pixel found in the treble clef's alpha \
+             channel (min={min_alpha}) — the distance field has no real ink"
+        );
+    }
+
     #[test]
     fn record_landed_includes_a_successful_placeholder() {
         let mut images = Assets::<Image>::default();

@@ -1107,8 +1107,65 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     pre-shader Vello values exactly on paper; worth a glance since the
     label now goes through MSDF (a different glyph pipeline) rather than
     Vello's `draw_glyphs`.
-  - ABC (`text/abc.rs`) and SVG (`text/rich.rs`, `vello_svg`) are
-    unchanged/still vello, both explicitly out of scope for this pass.
+  - ABC (`text/abc.rs`) moved off vello too, in the `msdf-music` branch —
+    it now renders through MSDF glyphs + `MsdfBlockGeometry`'s flat-colored
+    triangles, no vello scene at all. The music-notation merge needs its own
+    visual pass — same "unit tests cover the math, not pixels" caveat applies
+    to staff lines/beams/slurs/ties and glyph placement. It surfaced two
+    merge-only bugs worth knowing about if something regresses further:
+    `extract_msdf_blocks`'s render-world query briefly required
+    `&MsdfBlockGeometry` unconditionally, which would have silently dropped
+    role headers, the shell dock, the compose overlay, the editor surface,
+    and time-well cards from MSDF extraction (none of them carry that
+    component) — fixed to `Option<&MsdfBlockGeometry>` before it shipped.
+    Separately, devello's MSDF rewrite of the `Image` placeholder label
+    independently reintroduced the exact `scene_version`-derived
+    `MsdfBlockGlyphs.version` bug the `msdf-music` branch had already fixed
+    elsewhere (see that component's doc comment) — also fixed before it
+    shipped.
+
+- **Retire the dead `BlockRenderMethod::Vello` variant + `UiVectorScene`
+  plumbing** (2026-08-01, opened when `msdf-music` merged into main's
+  `feat/svg-cpu` work). ABC and SVG were the last two vello producers in the
+  conversation view and they came off on *separate* branches, so the count
+  only reached zero at that merge: nothing assigns
+  `BlockRenderMethod::Vello` any more. The variant, the `has_vello_content`
+  extract field and its `clear`-ordering logic, and the per-block
+  `UiVectorScene`/vello-scene plumbing in `view::block_render` are all
+  now-constant dead weight (`has_vello` is unconditionally `false`, so the
+  MSDF composite's "did vello already draw here" branch never takes).
+  Correct as-is, just vestigial — a demolition, not a fix. Vello itself
+  stays: it is still the Parley shaping and `Brush` source behind the MSDF
+  path, and the time well / FSN scenes are separate consumers that this
+  entry does not cover.
+
+- **SVG block rendering off vello — also needs a visual pass** (2026-07-30,
+  `feat/svg-cpu`, branched from `feat/devello`; same "no running app during
+  the change" caveat as the de-vello pass above). `text/rich.rs`'s
+  `RichContentKind::Svg` now carries a parsed `usvg::Tree` instead of a
+  pre-rendered vello `Scene`; `view::block_render`'s `Svg` arm rasterizes it
+  via `resvg`/`tiny-skia` (`text::svg_raster`) into a straight-alpha RGBA8
+  `Image`, uploaded as a child `ImageNode` (same `ContentGeometryChildren`
+  despawn/respawn convention as sparkline/image). `vello_svg` is gone from
+  `Cargo.toml` entirely. Round-trip pixel tests (`text::svg_raster::tests`)
+  cover the
+  premultiplied→straight alpha math and a real resvg render of a small
+  shape, but not the on-screen result. Worth eyeballing:
+  - **Any SVG with `<text>` elements** — `SvgFontDb`'s fontdb still feeds
+    `usvg::Options`, unchanged in shape, but this is the first real exercise
+    of that path through the new raster (previously vello's own
+    `draw_glyphs` rendered usvg's resolved outlines; now resvg/tiny-skia
+    does).
+  - **HiDPI crispness** — the raster is sized from the block's PHYSICAL
+    pixel box (`ComputedNode` × `TextMetrics::scale_factor`) and
+    re-rasterized on a DPI-only change (`BlockScene::svg_raster_physical_size`
+    staleness check in `build_block_scenes`); confirm on an actual HiDPI
+    display or scale-factor change that SVGs stay crisp rather than
+    blurring or going stale.
+  - **Malformed/unparseable SVG** — unchanged fallback (parse failure logs
+    and falls through to the plain-text/markdown path), but worth a manual
+    poke with genuinely broken markup to confirm it still reads as "here's
+    the raw text," not a blank block.
 
 - **Beat-reference delivery + turn-cadence follow-ups** (deferred from the
   2026-07-15 timestamped-beat-refs fix, merged `0a39718b` + live-verified;
@@ -1266,11 +1323,18 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `color`). Name is misleading. Mechanical rename across `block_render.rs`,
   `lifecycle.rs`, `overlay.rs`, `shell_dock.rs`, `render.rs`.
 - **Verify two unexercised render surfaces:** (1) a Vello-content *cell*
-  (ABC/SVG/sparkline, `has_vello_content == true`) rasterizing via
+  (SVG/sparkline, `has_vello_content == true`) rasterizing via
   `render_vello_scenes` then compositing MSDF labels on top — needs a
   conversation with rich content; (2) the unfocused-pane summary, the one
   surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
   multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
+  (ABC dropped out of the "Vello-content cell" category on the msdf-music
+  branch — `text/abc.rs` makes no vello calls at all now; noteheads/text
+  render as MSDF glyph quads and staff lines/beams/slurs/ties/repeat-dots
+  as flat-colored geometry triangles via `text::msdf::geometry` +
+  `music_geometry_renderer`. `render_method` for ABC blocks is `Msdf` like
+  every other MSDF-rendered block kind now, not a `Vello`-tagged special
+  case.)
 - **Vi editor command mode (Slice 3, `docs/vi.md`) — steps 1–3 shipped; open
   remainders:** runner-verify the slice-3 polish (capnp `@6` ⇒ kernel+app
   rebuild+restart; eyeball `:r !cmd` splice, bad-`:cmd` E492 on the strip, `fg`

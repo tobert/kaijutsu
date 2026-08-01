@@ -800,7 +800,23 @@ fn try_parse_tuplet(input: &mut &str, collector: &mut FeedbackCollector) -> Opti
         let q: u8 = if q_str.is_empty() {
             default_q
         } else {
-            q_str.parse().unwrap_or(default_q)
+            // `(3:0` parses as a perfectly valid `u8` zero — not a parse
+            // failure — and `q` is the numerator of the tuplet's time
+            // compression (`engrave::layout` takes
+            // `scale_factor = q / p.max(1)`), so a zero collapses every note
+            // in the tuplet onto one x position rather than erroring. Same
+            // silent-zero class as the `C/0` / `M:4/0` denominators, one site
+            // further along; reject it at the parse boundary and say so
+            // instead of defaulting quietly.
+            match q_str.parse() {
+                Ok(0) | Err(_) => {
+                    collector.warning(format!(
+                        "Tuplet time ratio `:{q_str}` is invalid — assuming {default_q}"
+                    ));
+                    default_q
+                }
+                Ok(v) => v,
+            }
         };
 
         let r = if input.starts_with(':') {
@@ -1134,6 +1150,35 @@ mod tests {
         assert_eq!(tuplets[0].p, 3);
         assert_eq!(tuplets[0].q, 2);
         assert_eq!(tuplets[0].elements.len(), 3);
+    }
+
+    #[test]
+    fn tuplet_rejects_a_zero_time_ratio() {
+        // `(3:0` is a valid `u8` parse of a literal zero, not a parse
+        // failure. `q` is the numerator of the tuplet's time compression
+        // (`engrave::layout` takes `scale_factor = q / p.max(1)`), so a zero
+        // here collapses every note in the tuplet onto one x position
+        // instead of erroring — the same silent-zero class as the
+        // `C/0` / `M:4/0` denominators, one site further along.
+        let mut collector = FeedbackCollector::new();
+        let elements = parse_body("(3:0cde", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
+
+        let tuplets: Vec<_> = elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Tuplet(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tuplets.len(), 1);
+        assert_ne!(tuplets[0].q, 0, "a zero tuplet ratio must never reach engraving");
+        // Falls back to the ABC-standard default for this `p`, and says so.
+        assert_eq!(tuplets[0].q, 2);
+        assert!(
+            !collector.feedback().is_empty(),
+            "a rejected tuplet ratio must be reported, not silently defaulted"
+        );
     }
 
     #[test]
