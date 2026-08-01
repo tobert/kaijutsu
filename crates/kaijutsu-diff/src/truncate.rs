@@ -19,22 +19,48 @@
 //! The budget itself is the caller's: [`crate::limits`] names the render and
 //! hydration ceilings, but only the caller knows which one applies.
 
-use crate::format::{format_file, format_hunk};
+use crate::format::{format, format_file, format_hunk};
 use crate::model::{DiffModel, FileDiff, Hunk, Truncation};
 
-/// Bytes held back from the budget so the truncation marker itself fits.
+/// Bytes the truncation marker for `model` can possibly need, including its
+/// newline.
 ///
-/// The marker's length depends on how many digits the omitted counts take;
-/// 96 bytes covers counts far past any diff a human will read.
-const MARKER_RESERVE_BYTES: usize = 96;
+/// Computed, not estimated. The omitted counts can never exceed what the model
+/// actually holds (plus whatever a previous truncation already dropped), so
+/// formatting the marker at those maxima gives a true upper bound — and a
+/// bound is what the "never exceeds its budget" guarantee needs. A fixed
+/// constant would have been a guess that large counts could quietly outgrow.
+fn marker_reserve_bytes(model: &DiffModel) -> usize {
+    let prior = model.truncated.unwrap_or_default();
+    let worst = Truncation {
+        omitted_files: prior.omitted_files + model.files.len(),
+        omitted_hunks: prior.omitted_hunks
+            + model.files.iter().map(|f| f.hunks.len()).sum::<usize>(),
+        omitted_lines: prior.omitted_lines + model.line_count(),
+    };
+    crate::format::truncation_marker(&worst).len() + 1
+}
 
 /// Project `model` down to at most `budget` bytes of formatted output.
 ///
 /// Returns `model` unchanged (clone) when it already fits.
+///
+/// # The one budget that cannot be honored
+///
+/// A budget smaller than the truncation marker itself has no honest answer:
+/// the marker is the floor, because output that omits it would claim to be a
+/// complete patch. Such a budget returns just the marker and therefore exceeds
+/// the number asked for. Every budget at or above
+/// [`crate::limits::MAX_HYDRATION_BYTES`] is far past that floor.
 pub fn truncate_to_bytes(model: &DiffModel, budget: usize) -> DiffModel {
+    // Checked against the *real* formatted size, so a model that fits exactly
+    // is never truncated merely to make room for a marker it will not need.
+    if format(model).len() <= budget {
+        return model.clone();
+    }
     project(
         model,
-        budget.saturating_sub(MARKER_RESERVE_BYTES),
+        budget.saturating_sub(marker_reserve_bytes(model)),
         |file| {
             let mut buf = String::new();
             let headers_only = FileDiff {
@@ -58,6 +84,9 @@ pub fn truncate_to_bytes(model: &DiffModel, budget: usize) -> DiffModel {
 /// reader (or a viewport) has to take in, and headers are the part that makes
 /// the rest legible.
 pub fn truncate_to_lines(model: &DiffModel, budget: usize) -> DiffModel {
+    if model.line_count() <= budget {
+        return model.clone();
+    }
     project(model, budget, |_| 0, |hunk| hunk.lines.len())
 }
 
@@ -147,6 +176,31 @@ mod tests {
     }
 
     #[test]
+    fn the_marker_reserve_is_an_upper_bound_not_an_estimate() {
+        let model = sample();
+        let reserve = marker_reserve_bytes(&model);
+        // Whatever budget we pick, the marker the result actually carries must
+        // fit in the reserve we held back for it. A fixed constant could not
+        // promise this; a bound computed from the model's own totals can.
+        for budget in [0, 1, 64, 100, 200, 500, 1000, 2000] {
+            let cut = truncate_to_bytes(&model, budget);
+            if let Some(t) = cut.truncated {
+                let marker = crate::format::truncation_marker(&t).len() + 1;
+                assert!(marker <= reserve, "marker {marker} > reserve {reserve}");
+            }
+        }
+        // And the bound is derived, not guessed: a model with counts big enough
+        // to need more digits demands a bigger reserve.
+        let mut huge = model.clone();
+        huge.truncated = Some(Truncation {
+            omitted_files: 12_345_678,
+            omitted_hunks: 90_123_456,
+            omitted_lines: 78_901_234,
+        });
+        assert!(marker_reserve_bytes(&huge) > reserve);
+    }
+
+    #[test]
     fn a_model_that_fits_comes_back_complete() {
         let model = sample();
         let out = truncate_to_bytes(&model, 1_000_000);
@@ -192,7 +246,7 @@ mod tests {
         };
         format_file(&mut buf, &headers_only);
         // Room for the first file's headers but not its first hunk.
-        let out = truncate_to_bytes(&model, MARKER_RESERVE_BYTES + buf.len() + 4);
+        let out = truncate_to_bytes(&model, marker_reserve_bytes(&model) + buf.len() + 4);
         assert!(out.files.is_empty());
         assert_eq!(out.truncated.unwrap().omitted_files, 2);
     }

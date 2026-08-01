@@ -157,8 +157,9 @@ pub fn diff(specs: &[FileSpec<'_>], options: &DiffOptions) -> Result<DiffModel, 
 /// - [`DiffError::TooLarge`] when either side exceeds
 ///   [`DiffOptions::max_input_bytes`].
 /// - [`DiffError::LineEndingsOnly`] when the two sides differ *only* in line
-///   terminators. CRLF is normalized on ingest, so this change would otherwise
-///   produce an empty diff for a file that genuinely changed.
+///   terminators. `\r\n` and bare `\r` are both normalized to `\n` on ingest,
+///   so this change would otherwise produce an empty diff for a file that
+///   genuinely changed.
 pub fn diff_file(spec: &FileSpec<'_>, options: &DiffOptions) -> Result<FileDiff, DiffError> {
     for (what, side) in [("pre-image", spec.before), ("post-image", spec.after)] {
         if side.len() > options.max_input_bytes {
@@ -436,6 +437,51 @@ mod tests {
     fn crlf_only_change_is_a_loud_error_not_an_empty_diff() {
         let err = diff_file(
             &FileSpec::modified("a", "x\r\ny\r\n", "x\ny\n"),
+            &DiffOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DiffError::LineEndingsOnly { .. }));
+    }
+
+    #[test]
+    fn bare_cr_line_endings_become_real_lines() {
+        // Classic-Mac terminators. Before the fix these survived into
+        // `DiffLine::text` as invisible control characters.
+        let file = diff_file(
+            &FileSpec::modified("a", "x\ry\rz", "x\rY\rz"),
+            &DiffOptions::default(),
+        )
+        .unwrap();
+        let lines = &file.hunks[0].lines;
+        assert!(lines.iter().all(|l| !l.text.contains('\r')), "{lines:#?}");
+        assert_eq!(
+            lines.iter().filter(|l| l.kind == LineKind::Delete).count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .find(|l| l.kind == LineKind::Insert)
+                .unwrap()
+                .text,
+            "Y"
+        );
+    }
+
+    #[test]
+    fn mixed_terminators_leave_no_cr_in_the_model() {
+        let file = diff_file(
+            &FileSpec::modified("a", "one\r\ntwo\rthree\n", "one\r\n2\rthree\n"),
+            &DiffOptions::default(),
+        )
+        .unwrap();
+        assert!(file.hunks[0].lines.iter().all(|l| !l.text.contains('\r')));
+    }
+
+    #[test]
+    fn cr_only_change_is_a_loud_error_too() {
+        let err = diff_file(
+            &FileSpec::modified("a", "x\ry\r", "x\ny\n"),
             &DiffOptions::default(),
         )
         .unwrap_err();

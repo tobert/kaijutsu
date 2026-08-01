@@ -47,6 +47,11 @@ fn line_strategy() -> impl Strategy<Value = String> {
         Just("+++ b/x".to_string()),
         Just("diff --git a/x b/x".to_string()),
         Just("#!kaijutsu-diff truncated: 1 file(s), 1 hunk(s), 1 line(s) omitted".to_string()),
+        // Bare CRs: normalization turns these into line breaks, so they must
+        // never reach a model. Running them through every roundtrip property
+        // is stronger than asserting it once.
+        Just("cr\rinside".to_string()),
+        Just("trailing\r".to_string()),
         "[a-z ()=;{}]{0,24}",
         "[\\p{Hiragana}\\p{Han}]{0,8}",
     ]
@@ -96,7 +101,10 @@ fn model_strategy() -> impl Strategy<Value = Vec<FileInput>> {
     proptest::collection::vec(file_input_strategy(), 0..4)
 }
 
-fn build(inputs: &[FileInput]) -> DiffModel {
+/// Build a model, or `None` when the generator happened to produce a
+/// terminator-only change — which `diff_file` refuses by design rather than
+/// returning an empty diff. Every other error is a real failure.
+fn build(inputs: &[FileInput]) -> Option<DiffModel> {
     let specs: Vec<FileSpec<'_>> = inputs
         .iter()
         .map(|(old, new, change, before, after)| match change {
@@ -109,7 +117,27 @@ fn build(inputs: &[FileInput]) -> DiffModel {
             FileChange::Renamed => FileSpec::renamed(old, new, before, after),
         })
         .collect();
-    diff(&specs, &DiffOptions::default()).expect("generated inputs never hit a ceiling")
+    match diff(&specs, &DiffOptions::default()) {
+        Ok(model) => Some(model),
+        Err(kaijutsu_diff::DiffError::LineEndingsOnly { .. }) => None,
+        Err(e) => panic!("unexpected generation failure: {e}"),
+    }
+}
+
+/// No `\r` may survive into any line of any model — the claim the crate docs
+/// make, checked on every generated model rather than on a handful of cases.
+fn assert_no_carriage_returns(model: &DiffModel) {
+    for file in &model.files {
+        for hunk in &file.hunks {
+            for line in &hunk.lines {
+                assert!(
+                    !line.text.contains('\r'),
+                    "CR survived into {:?}",
+                    line.text
+                );
+            }
+        }
+    }
 }
 
 // ── the properties ──────────────────────────────────────────────────────────
@@ -123,15 +151,21 @@ proptest! {
     #[test]
     fn parse_after_format_is_identity_on_models(inputs in model_strategy()) {
         let model = build(&inputs);
+        prop_assume!(model.is_some());
+        let model = model.unwrap();
+        assert_no_carriage_returns(&model);
         let text = format(&model);
         let reparsed = parse(&text).unwrap_or_else(|e| panic!("{e}\n--- text ---\n{text}"));
+        assert_no_carriage_returns(&reparsed);
         prop_assert_eq!(reparsed, model);
     }
 
     /// Property 2: canonical text survives a parse/format round trip byte for byte.
     #[test]
     fn format_after_parse_is_identity_on_canonical_text(inputs in model_strategy()) {
-        let text = format(&build(&inputs));
+        let model = build(&inputs);
+        prop_assume!(model.is_some());
+        let text = format(&model.unwrap());
         let round = format(&parse(&text).unwrap());
         prop_assert_eq!(round, text);
     }
@@ -143,7 +177,9 @@ proptest! {
         inputs in model_strategy(),
         variant in 0usize..4,
     ) {
-        let canonical = format(&build(&inputs));
+        let model = build(&inputs);
+        prop_assume!(model.is_some());
+        let canonical = format(&model.unwrap());
         let external = decanonicalize(&canonical, variant);
         let once = format(&parse(&external).unwrap_or_else(|e| {
             panic!("variant {variant}: {e}\n--- text ---\n{external}")
@@ -162,6 +198,8 @@ proptest! {
         variant in prop_oneof![Just(0usize), Just(1), Just(3)],
     ) {
         let model = build(&inputs);
+        prop_assume!(model.is_some());
+        let model = model.unwrap();
         let external = decanonicalize(&format(&model), variant);
         prop_assert_eq!(parse(&external).unwrap(), model);
     }
@@ -174,6 +212,8 @@ proptest! {
         budget in 256usize..4096,
     ) {
         let model = build(&inputs);
+        prop_assume!(model.is_some());
+        let model = model.unwrap();
         let cut = truncate_to_bytes(&model, budget);
         let text = format(&cut);
         prop_assert!(text.len() <= budget, "{} bytes over a {budget} budget", text.len());
@@ -300,7 +340,8 @@ fn content_that_looks_like_diff_syntax_survives() {
         FileChange::Modified,
         before.into(),
         after.into(),
-    )]);
+    )])
+    .unwrap();
     let text = format(&model);
     assert_eq!(parse(&text).unwrap(), model);
 }

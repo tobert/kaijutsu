@@ -47,7 +47,8 @@
 //!   There is no lenient mode and nothing is ever silently skipped: a parser
 //!   that drops a section produces a *smaller diff that still looks complete*,
 //!   which is the most dangerous thing a diff viewer can do.
-//! - CRLF is normalized to `\n` **on ingest**, so no `\r` ever enters a model
+//! - Line terminators — `\r\n`, a bare `\r`, and `\n` alike — are normalized to
+//!   `\n` **on ingest**, so no `\r` ever enters a model
 //!   and emission is unconditionally LF. A change consisting only of line
 //!   terminators is therefore not representable — [`diff_file`] returns
 //!   [`DiffError::LineEndingsOnly`] rather than an empty diff.
@@ -135,7 +136,7 @@ mod tokenize;
 mod truncate;
 
 pub use engine::{DiffAlgorithm, DiffOptions, FileSpec, diff, diff_file};
-pub use error::{DiffError, Side};
+pub use error::DiffError;
 pub use format::{TRUNCATION_MARKER_PREFIX, format, format_file, format_hunk, truncation_marker};
 pub use model::{
     DiffLine, DiffModel, FileChange, FileDiff, FoldState, Hunk, LineKind, Truncation, WordSpan,
@@ -144,5 +145,5 @@ pub use parse::{parse, parse_with};
 pub use profile::DiffProfile;
 pub use refine::refine_hunk;
 pub use stat::DiffStat;
-pub use tokenize::{Words, normalize_newlines, split_lines};
+pub use tokenize::{Words, normalize_newlines};
 pub use truncate::{truncate_to_bytes, truncate_to_lines};

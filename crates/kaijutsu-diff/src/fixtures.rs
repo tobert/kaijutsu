@@ -73,5 +73,6 @@ pub const INVALID: &[(&str, &str)] = &[
     ("invalid/copy_headers.diff", "UnsupportedExtension"),
     ("invalid/garbage_preamble.diff", "ExpectedFileHeader"),
     ("invalid/stray_no_newline.diff", "StrayNoNewline"),
+    ("invalid/bad_no_newline_marker.diff", "UnexpectedHunkLine"),
     ("invalid/missing_post_image.diff", "MissingPostImageHeader"),
 ];

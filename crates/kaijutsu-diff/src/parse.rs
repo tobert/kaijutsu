@@ -53,7 +53,7 @@
 //! - `@@ -1 +1 @@` and `@@ -1,1 +1,1 @@` both parse; only the former is emitted.
 
 use crate::engine::DiffOptions;
-use crate::error::{DiffError, Side};
+use crate::error::DiffError;
 use crate::format::TRUNCATION_MARKER_PREFIX;
 use crate::limits::MAX_PARSE_BYTES;
 use crate::model::{
@@ -62,6 +62,10 @@ use crate::model::{
 use crate::paths::unquote;
 use crate::refine::refine_hunk;
 use crate::tokenize::normalize_newlines;
+
+/// The stable head of the no-newline marker. Producers vary after this point
+/// ("at end of file" vs svn's "at end of property"), so only this is required.
+const NO_NEWLINE_MARKER_HEAD: &str = "\\ No newline";
 
 /// Parse unified-diff text with default options.
 pub fn parse(text: &str) -> Result<DiffModel, DiffError> {
@@ -146,8 +150,9 @@ impl<'a> Parser<'a> {
         let Some(rest) = line.strip_prefix(TRUNCATION_MARKER_PREFIX) else {
             return Ok(None);
         };
-        let malformed = || DiffError::MalformedTruncationMarker {
-            line: 1,
+        let lineno = self.lineno();
+        let malformed = move || DiffError::MalformedTruncationMarker {
+            line: lineno,
             found: line.to_string(),
         };
         let mut counts = rest.split(", ").map(|part| {
@@ -361,13 +366,16 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Look past a satisfied hunk for body lines that should not be there.
+    /// Count body lines from the current position that a satisfied hunk did not
+    /// account for, as `(old, new)`.
     ///
-    /// Returns the side that overran and by how many lines, or `None` when the
-    /// next line legitimately starts a hunk or a file section. A line beginning
-    /// `--- ` is treated as a section start, not a deletion: the declared counts
-    /// are what disambiguate the two, and they say this hunk is over.
-    fn count_overrun(&self) -> Option<(Side, u32)> {
+    /// Scanning stops at a line that starts a hunk or a file section, or at
+    /// anything that is not a body line. A line beginning `--- ` is treated as
+    /// a section start, not a deletion: the declared counts are what
+    /// disambiguate the two, and by the time this runs they say the hunk is
+    /// over. Both sides are counted so the error can name both — a context line
+    /// overruns *both*, and reporting only one of them tells half a truth.
+    fn scan_body_overrun(&self) -> (u32, u32) {
         let mut old_extra = 0u32;
         let mut new_extra = 0u32;
         for line in &self.lines[self.at..] {
@@ -386,11 +394,30 @@ impl<'a> Parser<'a> {
                 Some(_) => break,
             }
         }
-        match (old_extra, new_extra) {
-            (0, 0) => None,
-            (o, n) if o >= n => Some((Side::Old, o)),
-            (_, n) => Some((Side::New, n)),
+        (old_extra, new_extra)
+    }
+
+    /// Consume a `\ No newline …` marker and attach it to the last body line.
+    ///
+    /// The content is checked, not just the `\` prefix: `\` means exactly one
+    /// thing in this dialect, and accepting `\ anything` would let a malformed
+    /// line silently flip `no_newline` — a one-character difference in the
+    /// emitted patch that nothing downstream could see. The trailing wording
+    /// varies between producers (git says "at end of file", svn says "at end of
+    /// property"), so only the stable head is required.
+    fn take_no_newline_marker(&mut self, lines: &mut [DiffLine]) -> Result<(), DiffError> {
+        let line = self.lineno();
+        let raw = self.peek().expect("caller checked");
+        if !raw.starts_with(NO_NEWLINE_MARKER_HEAD) {
+            return Err(DiffError::UnexpectedHunkLine {
+                line,
+                found: raw.to_string(),
+            });
         }
+        let last = lines.last_mut().ok_or(DiffError::StrayNoNewline { line })?;
+        last.no_newline = true;
+        self.at += 1;
+        Ok(())
     }
 
     fn parse_hunk(&mut self) -> Result<Hunk, DiffError> {
@@ -422,13 +449,15 @@ impl<'a> Parser<'a> {
         while old_left > 0 || new_left > 0 {
             let lineno = self.lineno();
             let Some(raw_line) = self.peek() else {
-                return Err(count_mismatch(
-                    header_line,
-                    old_count,
-                    new_count,
-                    old_left,
-                    new_left,
-                ));
+                // At EOF there is nothing left to scan, so what we consumed is
+                // exactly what the body held.
+                return Err(DiffError::HunkCountMismatch {
+                    line: header_line,
+                    declared_old: old_count,
+                    actual_old: old_count - old_left,
+                    declared_new: new_count,
+                    actual_new: new_count - new_left,
+                });
             };
             let (kind, text) = match raw_line.chars().next() {
                 None => (LineKind::Context, ""),
@@ -436,11 +465,7 @@ impl<'a> Parser<'a> {
                 Some('-') => (LineKind::Delete, &raw_line[1..]),
                 Some('+') => (LineKind::Insert, &raw_line[1..]),
                 Some('\\') => {
-                    let last = lines
-                        .last_mut()
-                        .ok_or(DiffError::StrayNoNewline { line: lineno })?;
-                    last.no_newline = true;
-                    self.at += 1;
+                    self.take_no_newline_marker(&mut lines)?;
                     continue;
                 }
                 Some(_) => {
@@ -453,13 +478,17 @@ impl<'a> Parser<'a> {
             let consumes_old = matches!(kind, LineKind::Context | LineKind::Delete);
             let consumes_new = matches!(kind, LineKind::Context | LineKind::Insert);
             if (consumes_old && old_left == 0) || (consumes_new && new_left == 0) {
-                return Err(count_mismatch(
-                    header_line,
-                    old_count,
-                    new_count,
-                    old_left,
-                    new_left,
-                ));
+                // One side is already full while the other is not. Scan the
+                // rest of the body so the error reports what the hunk really
+                // held on *both* sides rather than where we happened to stop.
+                let (extra_old, extra_new) = self.scan_body_overrun();
+                return Err(DiffError::HunkCountMismatch {
+                    line: header_line,
+                    declared_old: old_count,
+                    actual_old: old_count - old_left + extra_old,
+                    declared_new: new_count,
+                    actual_new: new_count - new_left + extra_new,
+                });
             }
             let mut line = match kind {
                 LineKind::Context => DiffLine::context(text, old_no, new_no),
@@ -480,27 +509,20 @@ impl<'a> Parser<'a> {
         }
         // A trailing `\ No newline` belongs to the hunk's last line.
         if self.peek().is_some_and(|l| l.starts_with('\\')) {
-            let lineno = self.lineno();
-            let last = lines
-                .last_mut()
-                .ok_or(DiffError::StrayNoNewline { line: lineno })?;
-            last.no_newline = true;
-            self.at += 1;
+            self.take_no_newline_marker(&mut lines)?;
         }
         // Body lines beyond the declared counts would otherwise be misread as
         // the next file section. Catch the over-count here, where we can name
-        // it — and count how far the overrun actually goes, so the error says
-        // something true rather than "at least one more".
-        if let Some((side, extra)) = self.count_overrun() {
-            let (declared, actual) = match side {
-                Side::Old => (old_count, old_count + extra),
-                Side::New => (new_count, new_count + extra),
-            };
+        // it — and count how far the overrun actually goes on each side, so the
+        // error says something true rather than "at least one more".
+        let (extra_old, extra_new) = self.scan_body_overrun();
+        if extra_old > 0 || extra_new > 0 {
             return Err(DiffError::HunkCountMismatch {
                 line: header_line,
-                side,
-                declared,
-                actual,
+                declared_old: old_count,
+                actual_old: old_count + extra_old,
+                declared_new: new_count,
+                actual_new: new_count + extra_new,
             });
         }
 
@@ -515,30 +537,6 @@ impl<'a> Parser<'a> {
             refine_hunk(&mut hunk, self.options.max_refine_region_bytes);
         }
         Ok(hunk)
-    }
-}
-
-fn count_mismatch(
-    line: usize,
-    old_count: u32,
-    new_count: u32,
-    old_left: u32,
-    new_left: u32,
-) -> DiffError {
-    if old_left > 0 {
-        DiffError::HunkCountMismatch {
-            line,
-            side: Side::Old,
-            declared: old_count,
-            actual: old_count - old_left,
-        }
-    } else {
-        DiffError::HunkCountMismatch {
-            line,
-            side: Side::New,
-            declared: new_count,
-            actual: new_count - new_left,
-        }
     }
 }
 
@@ -730,36 +728,49 @@ mod tests {
     }
 
     #[test]
-    fn short_hunk_body_is_rejected() {
+    fn short_hunk_body_is_rejected_and_reports_both_sides() {
         let err = parse("--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n").unwrap_err();
-        assert!(
-            matches!(
-                err,
-                DiffError::HunkCountMismatch {
-                    side: Side::Old,
-                    declared: 3,
-                    actual: 2,
-                    ..
-                }
-            ),
-            "{err:?}"
+        assert_eq!(
+            err,
+            DiffError::HunkCountMismatch {
+                line: 3,
+                declared_old: 3,
+                actual_old: 2,
+                declared_new: 3,
+                actual_new: 2,
+            }
         );
     }
 
     #[test]
-    fn long_hunk_body_is_rejected_and_names_the_side_that_overran() {
+    fn long_hunk_body_is_rejected_and_reports_both_sides() {
         let err = parse("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n+c\n+d\n").unwrap_err();
-        assert!(
-            matches!(
-                err,
-                DiffError::HunkCountMismatch {
-                    side: Side::New,
-                    declared: 1,
-                    actual: 3,
-                    ..
-                }
-            ),
-            "{err:?}"
+        assert_eq!(
+            err,
+            DiffError::HunkCountMismatch {
+                line: 3,
+                declared_old: 1,
+                actual_old: 1,
+                declared_new: 1,
+                actual_new: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn a_context_line_overrun_is_reported_on_both_sides() {
+        // A context line belongs to both sides; the old reporting named only
+        // one of them and left the reader guessing about the other.
+        let err = parse("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n c\n d\n").unwrap_err();
+        assert_eq!(
+            err,
+            DiffError::HunkCountMismatch {
+                line: 3,
+                declared_old: 1,
+                actual_old: 3,
+                declared_new: 1,
+                actual_new: 3,
+            }
         );
     }
 
@@ -777,6 +788,27 @@ mod tests {
         let err = parse("diff --git a/x b/x\nindex a..b 100644\n").unwrap_err();
         assert!(
             matches!(err, DiffError::MissingPaths { line: 1 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_backslash_line_that_is_not_the_marker_is_rejected() {
+        // `\` is only ever the no-newline marker in this dialect. Accepting
+        // any `\`-prefixed line would let `\ garbage` silently set no_newline
+        // — a one-character difference in the emitted patch, invisible.
+        let err = parse("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n\\ garbage\n+b\n").unwrap_err();
+        assert!(
+            matches!(err, DiffError::UnexpectedHunkLine { line: 5, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_backslash_line_that_is_not_the_marker_is_rejected() {
+        let err = parse("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n\\ nonsense\n").unwrap_err();
+        assert!(
+            matches!(err, DiffError::UnexpectedHunkLine { line: 6, .. }),
             "{err:?}"
         );
     }

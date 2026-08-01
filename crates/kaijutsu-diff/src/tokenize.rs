@@ -14,19 +14,44 @@ use imara_diff::TokenSource;
 
 /// Normalize line terminators to `\n`.
 ///
-/// CRLF is normalized **on ingest**, not at emission, so no `\r` ever reaches
-/// a [`crate::DiffLine`] and formatting is unconditionally LF. The cost is that
-/// a change consisting only of line terminators becomes invisible; callers get
-/// [`crate::DiffError::LineEndingsOnly`] rather than an empty diff.
+/// Handles **all three** conventions: `\r\n` (DOS), a bare `\r` (classic Mac,
+/// and what a mangled transfer leaves behind), and `\n`. The output is
+/// guaranteed to contain no `\r` at all — that is what lets the rest of the
+/// crate state flatly that no `\r` ever reaches a [`crate::DiffLine`], and it
+/// is why this handles the bare case rather than only the common one: a single
+/// stray `\r` surviving into a model would put an invisible control character
+/// into rendered output and into a yanked patch.
+///
+/// Normalization happens **on ingest**, not at emission. The cost is that a
+/// change consisting only of line terminators becomes invisible; callers get
+/// [`crate::DiffError::LineEndingsOnly`] rather than an empty diff. A bare `\r`
+/// used as data *within* a line is indistinguishable from one used as a
+/// terminator, so it becomes a line break — the same trade every text tool
+/// makes.
 ///
 /// Returns a borrowed slice when there is nothing to do, so the common case
 /// does not allocate.
 pub fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains('\r') {
-        std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
-    } else {
-        std::borrow::Cow::Borrowed(text)
+    if !text.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
     }
+    let mut out = String::with_capacity(text.len());
+    let mut after_cr = false;
+    for c in text.chars() {
+        match c {
+            '\r' => {
+                out.push('\n');
+                after_cr = true;
+            }
+            // The LF half of a CRLF pair: the CR already emitted the break.
+            '\n' if after_cr => after_cr = false,
+            c => {
+                out.push(c);
+                after_cr = false;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// A [`TokenSource`] over the words of a string.
@@ -89,21 +114,6 @@ impl<'a> TokenSource for Words<'a> {
     }
 }
 
-/// Split `text` into lines **without** terminators, plus whether the text ends
-/// with a newline.
-///
-/// `""` is zero lines. `"a"` is one line without a final newline. `"a\n"` is
-/// one line with one. `"a\n\n"` is two lines (the second empty) with one.
-pub fn split_lines(text: &str) -> (Vec<&str>, bool) {
-    if text.is_empty() {
-        return (Vec::new(), true);
-    }
-    match text.strip_suffix('\n') {
-        Some(body) => (body.split('\n').collect(), true),
-        None => (text.split('\n').collect(), false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,10 +154,27 @@ mod tests {
     }
 
     #[test]
-    fn split_lines_distinguishes_final_newline() {
-        assert_eq!(split_lines(""), (vec![], true));
-        assert_eq!(split_lines("a"), (vec!["a"], false));
-        assert_eq!(split_lines("a\n"), (vec!["a"], true));
-        assert_eq!(split_lines("a\n\n"), (vec!["a", ""], true));
+    fn normalize_newlines_handles_bare_cr() {
+        // Classic-Mac line endings, and stray CRs from a mangled transfer.
+        assert_eq!(normalize_newlines("a\rb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn normalize_newlines_handles_mixed_terminators() {
+        assert_eq!(normalize_newlines("a\r\nb\rc\nd"), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn normalize_newlines_handles_a_trailing_lone_cr() {
+        assert_eq!(normalize_newlines("a\r"), "a\n");
+        assert_eq!(normalize_newlines("a\r\r"), "a\n\n");
+    }
+
+    #[test]
+    fn no_carriage_return_survives_normalization() {
+        for input in ["\r", "\r\n", "\n\r", "\r\r\n", "a\r\n\rb", "\r\n\r\n"] {
+            let out = normalize_newlines(input);
+            assert!(!out.contains('\r'), "{input:?} left a CR behind: {out:?}");
+        }
     }
 }

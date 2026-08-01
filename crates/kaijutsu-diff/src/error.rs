@@ -7,28 +7,13 @@
 
 use thiserror::Error;
 
-/// Which side of a hunk a count disagreement was found on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    /// The `-` (pre-image) side.
-    Old,
-    /// The `+` (post-image) side.
-    New,
-}
-
-impl std::fmt::Display for Side {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Side::Old => f.write_str("old"),
-            Side::New => f.write_str("new"),
-        }
-    }
-}
-
 /// Everything that can go wrong producing or reading a diff.
 ///
-/// Line numbers are 1-based positions in the *input text* (after CRLF
-/// normalization, which never changes the line count).
+/// Line numbers are 1-based positions in the input text **as normalized** (see
+/// [`crate::normalize_newlines`]). For `\r\n` and `\n` input that is the same
+/// as the raw position; input containing a bare `\r` gains a line break there,
+/// so the two can differ — normalized positions are the useful ones, since
+/// they match what the model holds.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DiffError {
     /// Top-level input did not start a file section where one was required.
@@ -80,16 +65,25 @@ pub enum DiffError {
     },
 
     /// A hunk header promised more (or fewer) lines than the hunk body held.
-    #[error("line {line}: hunk declared {declared} {side}-side line(s) but the body held {actual}")]
+    ///
+    /// Both sides are always reported. A context line belongs to both, so a
+    /// single stray one overruns both counts — naming only one side would tell
+    /// half the truth about where the patch went wrong.
+    #[error(
+        "line {line}: hunk declared {declared_old} old / {declared_new} new line(s) \
+         but the body held {actual_old} / {actual_new}"
+    )]
     HunkCountMismatch {
         /// 1-based line number of the hunk header.
         line: usize,
-        /// Which side disagreed.
-        side: Side,
-        /// The count from the `@@` header.
-        declared: u32,
-        /// The count actually present in the body.
-        actual: u32,
+        /// Pre-image count from the `@@` header.
+        declared_old: u32,
+        /// Pre-image lines actually present in the body.
+        actual_old: u32,
+        /// Post-image count from the `@@` header.
+        declared_new: u32,
+        /// Post-image lines actually present in the body.
+        actual_new: u32,
     },
 
     /// A line inside a hunk body started with something other than
@@ -159,10 +153,11 @@ pub enum DiffError {
 
     /// The two sides differ only in line terminators.
     ///
-    /// CRLF is normalized to `\n` on the way into the model, so a
-    /// CRLF-vs-LF-only change would otherwise diff to *nothing* — a silent
-    /// empty result for a real change. We refuse instead.
-    #[error("{path}: the two versions differ only in line endings (CRLF is normalized to LF)")]
+    /// `\r\n` and bare `\r` are both normalized to `\n` on the way into the
+    /// model, so a terminator-only change (CRLF→LF, CR→LF, CRLF→CR …) would
+    /// otherwise diff to *nothing* — a silent empty result for a real change.
+    /// We refuse instead.
+    #[error("{path}: the two versions differ only in line endings (all are normalized to LF)")]
     LineEndingsOnly {
         /// The path that was being diffed.
         path: String,

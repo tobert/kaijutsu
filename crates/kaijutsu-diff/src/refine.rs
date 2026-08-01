@@ -111,7 +111,15 @@ fn collect(text: &str, n_tokens: usize, changed: impl Fn(u32) -> bool) -> Vec<Ra
     let mut out: Vec<Range<usize>> = Vec::new();
     let mut offset = 0usize;
     for (idx, word) in Words::new(text).enumerate() {
-        debug_assert!(idx < n_tokens, "tokenizer disagreed with the interner");
+        // Not a `debug_assert`: `changed` indexes imara-diff's per-token
+        // bitsets, which were sized from the interner's view of this same
+        // string. If the tokenizer ever disagreed with the interner, a release
+        // build would index out of bounds. Crashing beats corruption.
+        assert!(
+            idx < n_tokens,
+            "word tokenizer produced more tokens ({}) than the interner holds ({n_tokens})",
+            idx + 1
+        );
         let end = offset + word.len();
         if changed(idx as u32) {
             match out.last_mut() {

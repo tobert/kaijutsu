@@ -56,4 +56,5 @@ Every one of these must produce a typed `DiffError`, never a partial model.
 | `copy_headers.diff` | `UnsupportedExtension` (copies are not modelled) |
 | `garbage_preamble.diff` | `ExpectedFileHeader` (this is a `format-patch` mailbox, not a diff) |
 | `stray_no_newline.diff` | `StrayNoNewline` |
+| `bad_no_newline_marker.diff` | `UnexpectedHunkLine` (a `\` line that is not the no-newline marker) |
 | `missing_post_image.diff` | `MissingPostImageHeader` |
