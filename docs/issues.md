@@ -182,6 +182,17 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## kaijutsu-crdt `cargo clippy --tests` fails to compile (found 2026-08-01, diff slice 2)
+
+Pre-existing on main (confirmed via stash before the slice-2 changes):
+deny-level `reversed_empty_ranges` / `single_range_in_vec_init` lints in test
+code in `crates/kaijutsu-crdt/src/selection.rs` (~lines 348, 471, 475, 489,
+495) break `cargo clippy --tests -p kaijutsu-crdt` outright. `cargo test`
+itself is green — only clippy-with-tests trips. Either the ranges are
+genuinely reversed on purpose (then `#[allow]` with a comment) or they're
+latent test bugs. Small, self-contained fix; unrelated to the diff work that
+surfaced it.
+
 ## Error-block-collapse remnants, post scaffolding removal (2026-08-01)
 
 The unread `build_error_child_index`/`ErrorChildIndex`/`ExpandedErrorParents`
