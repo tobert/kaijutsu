@@ -66,20 +66,6 @@ impl BlockCursor {
 // CELL EDITOR COMPONENT
 // ============================================================================
 
-/// Cached cursor screen position (row, col).
-///
-/// This avoids O(N) string scans every frame by caching the computed
-/// position until the document version changes.
-#[derive(Clone, Copy, Debug, Default, Reflect)]
-pub struct CursorCache {
-    /// Cached row (0-indexed)
-    pub row: usize,
-    /// Cached column (0-indexed)
-    pub col: usize,
-    /// Document version when cache was computed
-    pub version: u64,
-}
-
 /// Text editor state for a cell.
 ///
 /// The `store` field (BlockStore) is the local editor buffer — one DTE instance
@@ -97,9 +83,6 @@ pub struct CellEditor {
 
     /// Cursor position within the document.
     pub cursor: BlockCursor,
-
-    /// Cached screen position for cursor rendering.
-    pub cursor_cache: CursorCache,
 }
 
 impl Default for CellEditor {
@@ -114,7 +97,6 @@ impl CellEditor {
         Self {
             store: kaijutsu_crdt::BlockStore::new(ContextId::new(), PrincipalId::new()),
             cursor: BlockCursor::default(),
-            cursor_cache: CursorCache::default(),
         }
     }
 
@@ -247,34 +229,6 @@ pub struct FocusedBlockCell;
 
 /// Marker for a block cell that is currently being edited.
 ///
-/// When this marker is present on a BlockCell entity, the block receives
-/// keyboard input and the cursor is displayed within it. This is the core
-/// of the "any block can be edited" model.
-///
-/// Added when: User presses `i` with a FocusedBlockCell active
-/// Removed when: User presses `Escape` to exit edit mode
-#[derive(Component)]
-#[allow(dead_code)]
-pub struct EditingBlockCell;
-
-/// Tracks the edit cursor position within an editing block.
-///
-/// This is separate from CellEditor's cursor because BlockCells don't have
-/// a full CellEditor - they render from the MainCell's BlockStore.
-/// The cursor is an offset within the block's content string.
-/// Phase N: inline block editing — restore FocusArea::EditingBlock to reactivate.
-#[derive(Component, Default)]
-#[allow(dead_code)]
-pub struct BlockEditCursor {
-    /// Byte offset within the block's content.
-    pub offset: usize,
-    /// Selection anchor (byte offset). When Some, selection spans anchor..offset.
-    pub selection_anchor: Option<usize>,
-    /// Per-block CRDT frontiers captured when editing started.
-    /// Used to extract ops_since() for push to server on exit.
-    pub edit_frontier: Option<std::collections::HashMap<BlockId, kaijutsu_crdt::Frontier>>,
-}
-
 // ============================================================================
 // CONVERSATION UI LAYOUT COMPONENTS
 // ============================================================================
