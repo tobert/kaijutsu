@@ -548,6 +548,26 @@ struct ContextHandleInfo {
                                          # the dedicated sentinel — never clamped, never fabricated. The schema
                                          # default is -1.0 (not capnp's usual 0), so a builder that never calls
                                          # setContextUsedPct decodes as "unknown", never a false Some(0.0).
+
+  # Background-process ambient state — the app's visibility into
+  # `background_exec.rs`'s host-process registry (docs/issues.md
+  # "Background shell + process management"). Kernel-derived from
+  # `BackgroundRegistry::summary_by_context`, scoped to exactly the
+  # processes THIS context started (same isolation the
+  # `list_background_processes`/`read_background_output`/
+  # `kill_background_process` MCP tools already enforce). This is the
+  # aggregate ambient signal for a human glancing at the dock, not the
+  # per-process detail those tools return.
+  backgroundRunningCount @23 :UInt32;           # 0 = none running right now
+  backgroundOldestRunningStartedAt @24 :UInt64; # Unix ms of the OLDEST still-running process; 0 = nothing running
+  backgroundLastFinishedAt @25 :UInt64;         # Unix ms the most-recently-finished process ended; 0 = none finished yet
+                                                 # (including one that finished >DEFAULT_RETENTION ago and was reaped —
+                                                 # the registry's own forgetting is this field's natural TTL)
+  backgroundLastFinishedStatus @26 :Text;       # "exited"/"killed" for the process backgroundLastFinishedAt describes;
+                                                 # empty = none finished yet
+  backgroundLastExitCode @27 :Int32 = -1;       # exit code for an "exited" finish; -1 sentinel = "killed" or none
+                                                 # (real exit codes, incl. 128+signal, are never negative — see
+                                                 # background_exec.rs's exit_code_from_status)
 }
 
 struct PresetInfo {
