@@ -546,11 +546,16 @@ viewport band). New accepted limits of the geometry model, carried here:
   rows — visible corruption, and readback then measures it there. If the
   drift ever matters, fix it by re-estimating on version change, never by
   breaking contiguity.
-- **Height corrections landing on a row that straddles the viewport top**
-  are not scroll-anchored: `readback_block_heights` only compensates rows
-  *fully* above the viewport, so a partially-visible row's correction shifts
-  the content below it. Pre-existing, and small — a row entering the window
-  is at least one screen from the viewport edge.
+- **Height corrections landing on a partially-visible row are not
+  scroll-anchored**: `readback_block_heights` only compensates rows *fully*
+  above the viewport (measured against pre-measure offsets), so a straddling
+  row's correction shifts the content below it. Normal scrolling can't reach
+  this — a row enters the show window a full screen before it is visible, so
+  it is measured while still fully above/below — but a jump-scroll (scrollbar
+  drag, jump-to-block) can drop the viewport straight onto a row whose height
+  went stale, and the snap is then visible for a frame or two. Converges,
+  never oscillates (heights are deterministic); worst case is a block that
+  grew hugely while offscreen.
 - **ToolCall at the outer band edge** can briefly render CloseBottom while
   its ToolResult is still outside the band (border joins are computed from
   in-band snapshots only); corrects as the pair scrolls in.

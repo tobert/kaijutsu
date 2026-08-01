@@ -902,13 +902,15 @@ fn set_row_shown(node: &mut Node, vis: &mut Visibility, shown: bool) {
 ///   row.measured_version`), since `readback_block_heights` only remeasures
 ///   `Display::Flex` entities.
 ///
-/// Both are corrected the same just-in-time way: the row becomes
-/// `Display::Flex` when it enters the window, readback measures it, and the
-/// scroll-anchoring in `readback_block_heights` absorbs the delta if the row
-/// sits above the viewport. Until then the imprecision costs at most a
-/// slightly-off scrollbar extent — the accepted price of estimated heights
-/// everywhere else in this model, and far cheaper than visible layout
-/// corruption.
+/// Both are corrected the same just-in-time way, and the window's one-screen
+/// margin buys the frames to do it out of sight: the row flips to
+/// `Display::Flex` a screen before it can be seen, `build_block_scenes`
+/// re-measures the text and writes the new explicit `Node.height`, the next
+/// taffy pass uses it, `readback_block_heights` records it, and that pass's
+/// scroll-anchoring absorbs the delta for rows above the viewport. Until
+/// then the imprecision costs at most a slightly-off scrollbar extent — the
+/// accepted price of estimated heights everywhere else in this model, and
+/// far cheaper than visible layout corruption.
 pub fn virtualize_conversation(
     entities: Res<EditorEntities>,
     scroll_state: Res<ConversationScrollState>,
