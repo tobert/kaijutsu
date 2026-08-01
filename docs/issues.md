@@ -115,6 +115,69 @@ these are the ones that block *using* the thing.
   job transitions a push path (a `ServerEvent` variant, mirroring
   `BlockStatusChanged`) rather than polling; not done here since it's new
   scope, not a merge fix.
+  **CORRECTED 2026-08-01 by the or-kimi review** (run after the branch merged;
+  findings verified against the code before recording): the 5s skew *is* only
+  cosmetic and self-healing, exactly because the kernel writes the block status
+  and the registry entry in the same `match final_status` arm — the next poll
+  always sees a matching terminal state. But the two badges measure genuinely
+  different things (visible CRDT block status vs. OS process registry lifetime),
+  and there are three ways they diverge **permanently**, which the entry above
+  understated:
+  1. **Kernel restart.** `BackgroundRegistry` is in-memory, so a restarted
+     kernel reports zero background processes while the persisted CRDT document
+     may still hold `Running` blocks — `background_jobs` goes idle,
+     `block_activity` keeps counting. Non-transient.
+  2. **`set_status` fails while the registry update succeeds** (same call site;
+     e.g. the document was removed). Registry says exited, block stays
+     `Running`.
+  3. **Block excluded or deleted while the process runs.** `block_activity`
+     skips excluded blocks and never sees deleted ones; the registry keeps
+     tracking the live process.
+  A push path fixes the 5s skew but NOT these — they need the two views
+  reconciled at their source, or the badges labelled as measuring different
+  things.
+- **`background_jobs` conflates "no data yet" with "nothing running"**
+  (2026-08-01, or-kimi review, verified). `format_background_activity`
+  (`ui/dock.rs:1870-1920`) returns an empty string both when the first poll
+  hasn't landed and when the context genuinely has nothing running and nothing
+  finished — the badge just hides. The "never fabricate a zero" rule is
+  honored (it never shows a fake `0 running`), but unknown and known-idle are
+  still the same pixels. `DriftState.loaded` already exists and is maintained
+  (`ui/drift.rs:154,160`) and is **never read anywhere in `ui/`** — gating the
+  empty state on it and rendering a placeholder until the first successful poll
+  is the fix. Same class as the `contextUsedPct` `-1.0` sentinel work, one
+  surface further out.
+- **Dock papercuts from the dock-errors/bg-jobs merge** (2026-08-01, or-kimi
+  review, all three verified against the code):
+  - **`agent_activity` is a dead badge.** Declared (`ui/dock.rs:108`),
+    defaulted (`:160`), and drawn (`:635-642`) — and **no system anywhere
+    writes it**. Harmless (the draw is guarded on non-empty) but it is a
+    leftover from an earlier branch; delete it.
+  - **Draw-order overlap hazard in `render_south_dock`.** The right group
+    (`context_usage`, `hints`) is positioned and drawn FIRST, then the middle
+    area (`block_activity`, `background_jobs`, context badges) is drawn after
+    it. Right-alignment means no overlap at normal widths, but a middle area
+    wide enough to reach `usage_x` will overdraw the right group rather than
+    being clipped. Compute the middle area first, or clamp it so it cannot
+    reach. The layout comment at `:537` is also stale — it names `activity`
+    and `block_activity` and omits `background_jobs`.
+  - **Badge colors go stale across a theme change.** `update_background_jobs`
+    and `update_block_activity` run only on `DriftState`/`DocumentCache`
+    change, but they are what compute the badge color; `render_south_dock`
+    rebuilds on theme change and uses the color already stored in `DockState`.
+    Switch themes without touching the data and the badge keeps its old color
+    until the next poll.
+- **`poll_drift_state`'s "prevent stacking" comment overpromises**
+  (2026-08-01, or-kimi review, verified at `ui/drift.rs:96-112`). `last_poll`
+  is set before the async task spawns, which debounces the fast path but does
+  NOT prevent concurrent polls: a call slower than the 5s interval lets another
+  spawn, and with `RPC_CALL_TIMEOUT` at 30s that allows up to ~6 overlapping
+  `list_contexts` tasks. Nothing leaks (each completes or times out) and the
+  no-actor early-return means nothing spawns after disconnect — so this is a
+  stampede risk against a struggling kernel, not a correctness bug. Either hold
+  an `AbortHandle` and abort the previous poll, or set `last_poll` on
+  completion; at minimum fix the comment, which currently claims a guarantee
+  the code does not provide.
 - **External MCP servers don't load at all** — see the dedicated *MCP subsystem*
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
