@@ -1227,7 +1227,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `Cargo.toml` entirely. Round-trip pixel tests (`text::svg_raster::tests`)
   cover the
   premultiplied→straight alpha math and a real resvg render of a small
-  shape, but not the on-screen result. Worth eyeballing:
+  shape, but not the on-screen result. **First live sighting (2026-08-01)
+  found two real defects, both fixed on `fix/svg-cat-sizing`:**
+  `fit_svg_to_box` filled the box rather than fitting into it, blowing a
+  200x200 cat SVG up 4.74x to 948x948; and block cells spawned with Bevy's
+  default `flex_shrink: 1.0`, so the SVG cell — whose content is an
+  absolutely-positioned child, giving it a zero automatic minimum size —
+  absorbed the whole scroll column's shrink pressure and collapsed to
+  `ComputedNode.size = [1896, 0]`, letting its raster paint straight
+  through the neighbouring blocks' text. Still worth eyeballing:
   - **Any SVG with `<text>` elements** — `SvgFontDb`'s fontdb still feeds
     `usvg::Options`, unchanged in shape, but this is the first real exercise
     of that path through the new raster (previously vello's own

@@ -229,6 +229,39 @@ pub fn ensure_conversation_spacers(
     }
 }
 
+/// The `Node` every BlockCell spawns with: full container width, and a
+/// height that `view::block_render` writes each time it rebuilds the block
+/// (`node.height = Val::Px(total_height)`).
+///
+/// `flex_shrink: 0.0` is load-bearing, not tidiness. Block cells are flex
+/// items in the conversation column, which is `flex_direction: Column` with
+/// `overflow_y: Scroll` — a column that always overflows, because scrolling
+/// is the entire point. With Bevy's default `flex_shrink: 1.0`, taffy tries
+/// to close that overflow by squeezing the items, and each cell resists only
+/// as far as its automatic minimum size. A cell's minimum comes from its
+/// `ImageNode` measure, so a normal MSDF/RTT block is pinned by its own
+/// texture and survives — but a block whose content is a *child* node
+/// (`Svg`, `Sparkline`, `Image`: absolutely-positioned children, contributing
+/// nothing to the parent's minimum) has an automatic minimum of zero, so it
+/// absorbs the whole column's shrink pressure and collapses to `0` height.
+/// That was the other half of the "giant cat" bug: the SVG cell measured
+/// `Node.height = Px(948)` and `ComputedNode.size = [1896, 0]` live, so it
+/// reserved no space at all and its raster child painted straight through
+/// the neighbouring blocks' text.
+///
+/// It is also the layout that matches the rest of the model: the block's
+/// height is *computed* by `block_render` and *depended on* by
+/// `view::render`'s virtualization + spacer geometry, which assume each row
+/// occupies exactly `row.height`. A shrinkable cell silently breaks that
+/// agreement. The column scrolls; it does not compress.
+fn block_cell_node() -> Node {
+    Node {
+        width: Val::Percent(100.0),
+        flex_shrink: 0.0,
+        ..default()
+    }
+}
+
 /// Spawn or update BlockCell entities to match the MainCell's BlockStore.
 ///
 /// This system diffs the current block IDs against existing BlockCell entities:
@@ -424,10 +457,7 @@ pub fn spawn_block_cells(
                     crate::text::msdf::BlockRenderMethod::default(),
                     ImageNode::default(),
                     MaterialNode(material_handle),
-                    Node {
-                        width: Val::Percent(100.0),
-                        ..default()
-                    },
+                    block_cell_node(),
                     TimelineVisibility {
                         // Persisted in the geometry row so a despawned block
                         // respawns with its true creation version (timeline
@@ -599,6 +629,27 @@ mod tests {
     use crate::cell::ConversationContainer;
     use crate::ui::tiling::PaneFocus;
     use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+
+    /// A block cell's height is authoritative: `block_render` computes it
+    /// and `view::render`'s virtualization spends it. The conversation
+    /// column permanently overflows (it scrolls), so a shrinkable cell lets
+    /// taffy re-negotiate that height behind everyone's back — and the cells
+    /// whose content lives in absolutely-positioned children (Svg,
+    /// Sparkline, Image) have a zero automatic minimum, so they absorb the
+    /// entire column's shrink pressure and collapse to nothing. That is
+    /// exactly how the 200x200 SVG cat came to sit in a 0-height cell,
+    /// painting through its neighbours' text. Bevy's `Node` default is
+    /// `flex_shrink: 1.0`, so `..default()` silently reintroduces the bug —
+    /// which is what this test is here to catch.
+    #[test]
+    fn block_cell_node_never_shrinks_below_its_computed_height() {
+        let node = block_cell_node();
+        assert_eq!(node.flex_shrink, 0.0, "block cell height must be authoritative");
+        assert_eq!(node.width, Val::Percent(100.0));
+        // Height is deliberately left to block_render; nothing here should
+        // be pre-seeding it.
+        assert_eq!(node.height, Val::Auto);
+    }
 
     /// The Slice-C invariant: entities beyond the keep band despawn (their
     /// render resources with them) while the geometry rows retain every

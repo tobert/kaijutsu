@@ -23,10 +23,22 @@
 pub const SVG_RASTER_MAX_DIM: u32 = 8192;
 
 /// Fit an SVG's intrinsic size into a `(max_width, max_height)` box,
-/// preserving aspect ratio — width-bound content fills `max_width` exactly;
-/// height-bound (tall/narrow) content fills `max_height` exactly and is
-/// narrower than `max_width` (left-aligned when drawn — same policy the old
-/// vello path used via `w_scale.min(h_scale)`).
+/// preserving aspect ratio. **Shrink-only**: the box is a CEILING, not a
+/// target. Content that already fits draws at its intrinsic size (scale
+/// 1.0); oversized content shrinks until whichever axis binds first fits
+/// exactly, and is narrower/shorter than the box on the other axis
+/// (left-aligned when drawn).
+///
+/// The `.min(1.0)` is the whole law and it is not cosmetic. An SVG's
+/// `width`/`height` are real px — a 200x200 cat is a 200x200 cat, the same
+/// contract an `<img>` has in a browser. Scaling it up to whatever the
+/// conversation column happens to be produced the "giant cat" bug: a 4.74x
+/// blow-up to 948x948, wider than the window, painting through every
+/// neighbouring block's text. Note this differs deliberately from the `Abc`
+/// arm in `view::block_render`, which reuses the same `min(w, h)` shape but
+/// *does* fill the width — an engraved score has no intrinsic px size, only
+/// an aspect ratio, so stretching it to the column is right there and wrong
+/// here.
 ///
 /// Returns `(fit_scale, draw_width, draw_height)` in the same units as
 /// `max_width`/`max_height` (LOGICAL px when called from `block_render`).
@@ -44,7 +56,7 @@ pub fn fit_svg_to_box(
     }
     let w_scale = (max_width / svg_width) as f64;
     let h_scale = (max_height / svg_height) as f64;
-    let fit_scale = w_scale.min(h_scale);
+    let fit_scale = w_scale.min(h_scale).min(1.0);
     let draw_width = (svg_width as f64 * fit_scale) as f32;
     let draw_height = (svg_height as f64 * fit_scale) as f32;
     Some((fit_scale, draw_width, draw_height))
@@ -126,7 +138,46 @@ mod tests {
     // -- fit_svg_to_box ------------------------------------------------
 
     #[test]
-    fn fit_width_bound_fills_max_width_exactly() {
+    fn fit_never_upscales_an_svg_that_already_fits() {
+        // The live "giant cat" bug, with the real numbers off the running
+        // app: a 200x200 SVG in a 948-logical-px-wide conversation column
+        // was scaled 4.74x to 948x948 — wider than the whole window and
+        // taller than the scroll viewport, painting through the text of
+        // every neighbouring block. An SVG carries a real intrinsic size in
+        // px; the box is a CEILING, not a target.
+        let (scale, w, h) = fit_svg_to_box(200.0, 200.0, 948.0, 8192.0).unwrap();
+        assert_eq!(scale, 1.0);
+        assert_eq!(w, 200.0);
+        assert_eq!(h, 200.0);
+    }
+
+    #[test]
+    fn fit_never_upscales_when_only_the_height_has_room() {
+        // Width-bound content is the case that already shrank correctly;
+        // this pins the other half — a wide-but-short SVG must not grow
+        // into the (deliberately enormous) SVG_MAX_HEIGHT ceiling either.
+        let (scale, w, h) = fit_svg_to_box(300.0, 50.0, 300.0, 8192.0).unwrap();
+        assert_eq!(scale, 1.0);
+        assert_eq!(w, 300.0);
+        assert_eq!(h, 50.0);
+    }
+
+    #[test]
+    fn fit_result_is_always_contained_by_the_box() {
+        // The containment law itself, swept over both orientations and both
+        // over- and under-sized content: whatever comes back must fit
+        // inside the box AND never exceed the SVG's own intrinsic size.
+        for &(sw, sh) in &[(200.0f32, 200.0f32), (2000.0, 300.0), (60.0, 4000.0), (17.0, 3.0)] {
+            for &(mw, mh) in &[(948.0f32, 8192.0f32), (100.0, 100.0), (5.0, 900.0)] {
+                let (_, w, h) = fit_svg_to_box(sw, sh, mw, mh).unwrap();
+                assert!(w <= mw + 1e-3 && h <= mh + 1e-3, "{sw}x{sh} in {mw}x{mh} -> {w}x{h} overflows the box");
+                assert!(w <= sw + 1e-3 && h <= sh + 1e-3, "{sw}x{sh} in {mw}x{mh} -> {w}x{h} upscaled past intrinsic size");
+            }
+        }
+    }
+
+    #[test]
+    fn fit_oversized_width_bound_fills_max_width_exactly() {
         let (scale, w, h) = fit_svg_to_box(200.0, 100.0, 100.0, 1000.0).unwrap();
         assert_eq!(scale, 0.5);
         assert_eq!(w, 100.0);
@@ -134,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn fit_height_bound_fills_max_height_exactly_and_is_narrower() {
+    fn fit_oversized_height_bound_fills_max_height_exactly_and_is_narrower() {
         let (scale, w, h) = fit_svg_to_box(100.0, 400.0, 300.0, 200.0).unwrap();
         assert_eq!(scale, 0.5);
         assert_eq!(w, 50.0);
