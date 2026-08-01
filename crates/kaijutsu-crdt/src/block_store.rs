@@ -4247,6 +4247,62 @@ mod tests {
         assert_eq!(ha.status, hb.status, "stores must converge");
     }
 
+    /// Per-field LWW tiebreaker for `content_type`: equal Lamport timestamp,
+    /// the richer type (per `ContentType::richness()`) wins, and both peers
+    /// converge. This is the CRDT-level companion to
+    /// `content_type_richness_order_is_pinned` in kaijutsu-types — that test
+    /// pins the rank table, this one proves the merge path actually consults
+    /// it (via `field_wins`'s `Ord` bound) rather than declaration order.
+    #[test]
+    fn test_per_field_lww_tiebreaker_content_type() {
+        let ctx = ContextId::new();
+        let agent_a = PrincipalId::new();
+        let agent_b = PrincipalId::new();
+
+        let mut store_a = BlockStore::new(ctx, agent_a);
+        let block_id = store_a
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "test",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let mut store_b = BlockStore::new(ctx, agent_b);
+        let payload = store_a.ops_since(&HashMap::new());
+        store_b.merge_ops(payload).unwrap();
+
+        // Both peers set content_type at the same Lamport tick.
+        // A sets Markdown, B sets Svg. Svg is richer, so Svg should win.
+        store_a
+            .set_content_type(&block_id, ContentType::Markdown)
+            .unwrap();
+        store_b
+            .set_content_type(&block_id, ContentType::Svg)
+            .unwrap();
+
+        // Merge A→B then B→A
+        let payload_a = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload_a).unwrap();
+        let payload_b = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(payload_b).unwrap();
+
+        let ha = store_a.blocks.get(&block_id).unwrap().header();
+        let hb = store_b.blocks.get(&block_id).unwrap().header();
+
+        // Both converge to Svg (greater richness wins on tie)
+        assert_eq!(
+            ha.content_type,
+            ContentType::Svg,
+            "Svg.richness() > Markdown.richness() on tiebreak"
+        );
+        assert_eq!(ha.content_type, hb.content_type, "stores must converge");
+    }
+
     // ── Order/tick decoupling + seq lanes (design §2, §3) ─────────────────
 
     /// Build a canonical-keyed, ticked snapshot under an explicit principal.

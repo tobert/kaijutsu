@@ -298,14 +298,14 @@ impl std::fmt::Display for Role {
 
 /// Content type for block rendering.
 ///
-/// Discriminant order matters for LWW tiebreaking (same pattern as `Status`).
-/// When two peers write at the same Lamport timestamp, the greater value wins.
-/// `Image > Abc > Svg > Markdown > Plain` — richer types win ties.
+/// `Ord` is implemented manually in terms of [`ContentType::richness`] — see
+/// that method for why. Declaration order below no longer has merge meaning;
+/// it's purely presentational (roughly least → most structured).
 ///
 /// For `Image`, the block's text content is a CAS hash (32 hex chars), not the
 /// image bytes. The real MIME type lives in CAS sidecar metadata; `as_mime()`
 /// returns a generic fallback (`"image/png"`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentType {
     /// No explicit type — heuristic detection still runs.
@@ -322,6 +322,33 @@ pub enum ContentType {
 }
 
 impl ContentType {
+    /// LWW merge tiebreak authority for `ContentType`.
+    ///
+    /// `BlockHeader::merge_header` (kaijutsu-crdt `content.rs`) resolves a
+    /// concurrent `content_type` write at equal Lamport timestamps by keeping
+    /// whichever value is greater under `Ord` — and `Ord` for `ContentType` is
+    /// defined entirely in terms of this rank (see the manual `impl Ord`
+    /// below), never the enum's declaration order. This is the *same pattern*
+    /// `Status` uses (`Error > Done > Running > Pending`), but pulled into an
+    /// explicit method: adding a new variant to the enum can't silently
+    /// reorder existing ranks the way inserting a line into a derived-`Ord`
+    /// enum could.
+    ///
+    /// Higher rank = "richer" = wins ties. Current order:
+    /// `Plain < Markdown < Svg < Abc < Image`. When adding a variant, choose
+    /// its rank deliberately (see `docs/diff.md` Decision 7 for the `Diff`
+    /// precedent) and update `content_type_richness_order_is_pinned` below —
+    /// that test exists so a future insertion can't reorder this silently.
+    pub const fn richness(&self) -> u8 {
+        match self {
+            ContentType::Plain => 0,
+            ContentType::Markdown => 1,
+            ContentType::Svg => 2,
+            ContentType::Abc => 3,
+            ContentType::Image => 4,
+        }
+    }
+
     /// Convert from a MIME type string.
     pub fn from_mime(mime: &str) -> Self {
         match mime {
@@ -347,6 +374,21 @@ impl ContentType {
             ContentType::Abc => "text/vnd.abc",
             ContentType::Image => "image/png",
         }
+    }
+}
+
+// `PartialOrd`/`Ord` are hand-rolled (not derived) so the LWW tiebreak order
+// is pinned to `richness()`, not to the enum's textual declaration order —
+// see the doc comment on `richness()`.
+impl PartialOrd for ContentType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContentType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.richness().cmp(&other.richness())
     }
 }
 
@@ -2635,6 +2677,60 @@ mod tests {
         assert_eq!(Status::from_str("active"), Some(Status::Running));
         assert_eq!(Status::from_str("complete"), Some(Status::Done));
         assert_eq!(Status::from_str("completed"), Some(Status::Done));
+    }
+
+    // ── ContentType ─────────────────────────────────────────────────────
+
+    /// Pins the LWW tiebreak order so a future variant insertion cannot
+    /// silently reorder existing ranks. If this test forces you to touch it,
+    /// that's the point — the rank for the new variant must be chosen
+    /// deliberately (see `richness()`'s doc comment).
+    #[test]
+    fn content_type_richness_order_is_pinned() {
+        assert_eq!(ContentType::Plain.richness(), 0);
+        assert_eq!(ContentType::Markdown.richness(), 1);
+        assert_eq!(ContentType::Svg.richness(), 2);
+        assert_eq!(ContentType::Abc.richness(), 3);
+        assert_eq!(ContentType::Image.richness(), 4);
+
+        let ascending = [
+            ContentType::Plain,
+            ContentType::Markdown,
+            ContentType::Svg,
+            ContentType::Abc,
+            ContentType::Image,
+        ];
+        for pair in ascending.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{:?} must be < {:?} in the LWW tiebreak order",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// `Ord` must agree with `richness()` in both directions, not just the
+    /// ascending-list spot check above — this is what `field_wins` in
+    /// `kaijutsu-crdt` actually calls on a merge tie.
+    #[test]
+    fn content_type_ord_matches_richness_both_directions() {
+        let all = [
+            ContentType::Plain,
+            ContentType::Markdown,
+            ContentType::Svg,
+            ContentType::Abc,
+            ContentType::Image,
+        ];
+        for &a in &all {
+            for &b in &all {
+                assert_eq!(
+                    a.cmp(&b),
+                    a.richness().cmp(&b.richness()),
+                    "Ord for {a:?} vs {b:?} must match richness() exactly"
+                );
+            }
+        }
     }
 
     // ── BlockKind ───────────────────────────────────────────────────────
