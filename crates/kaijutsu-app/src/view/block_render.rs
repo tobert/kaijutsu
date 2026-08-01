@@ -38,8 +38,6 @@ use bevy::render::{
     texture::GpuImage,
 };
 use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
-use vello::kurbo::Affine;
-use vello::peniko::Fill;
 
 use crate::cell::block_border::{
     BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
@@ -600,7 +598,7 @@ pub fn build_block_scenes(
         // fresh ones if this build is still one of those kinds.
         clear_content_geometry_children(&mut commands, entity, existing_geometry_children);
 
-        let mut scene = vello::Scene::new();
+        let scene = vello::Scene::new();
         let content_height: f32;
 
         // Determine the brush for plain text
