@@ -164,6 +164,11 @@ pub enum Action {
     PauseToggle,
     /// `a` — straight past the event horizon.
     Archive,
+    /// `h` — dive into the event horizon: the "+N" past-the-horizon set is a
+    /// count today, not a place you can go. This is its front door. See
+    /// `time_well::scene::well_keyboard`'s own arm — v1 logs and does nothing
+    /// while the prototype is in flight.
+    ActivateHorizon,
 
     /// `r` in the patch bay — rescan the ALSA graph.
     Rescan,

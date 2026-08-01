@@ -467,6 +467,15 @@ pub fn default_bindings() -> Vec<Binding> {
         Action::Archive,
         "Archive past the horizon",
     ));
+    // `h` for horizon — the one free mnemonic left in the well's verb row
+    // (p/d/c/z/a taken, and h never meant "left" here: the well navigates on
+    // arrows/Tab, not hjkl).
+    b.push(Binding::key(
+        KeyCode::KeyH,
+        InputContext::WellZoomed,
+        Action::ActivateHorizon,
+        "Dive into the event horizon",
+    ));
     // `?` legend — bind both bare Slash and Shift+Slash so the shifted
     // glyph on every layout that puts ? over / keeps working.
     b.push(Binding::key(
@@ -686,4 +695,56 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::binding::InputSource;
+
+    /// Every key the well's dived context binds, with its modifiers.
+    fn well_keys() -> Vec<(KeyCode, Modifiers)> {
+        default_bindings()
+            .into_iter()
+            .filter(|b| b.context == InputContext::WellZoomed)
+            .filter_map(|b| match b.source {
+                InputSource::Key(k) => Some((k, b.modifiers)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The well's verb row is hand-picked mnemonics (`p d c z a h`) sharing one
+    /// context with the nav keys and the digits. A collision doesn't error —
+    /// the dispatcher just takes a match and the other verb goes quietly dead —
+    /// so it has to be a test.
+    #[test]
+    fn no_two_well_bindings_claim_the_same_key() {
+        let keys = well_keys();
+        let mut seen: Vec<(KeyCode, Modifiers)> = Vec::new();
+        for k in keys {
+            assert!(
+                !seen.contains(&k),
+                "two WellZoomed bindings claim {k:?} — one of them is dead"
+            );
+            seen.push(k);
+        }
+    }
+
+    /// The horizon dive's front door exists on a key, even while the room
+    /// behind it doesn't (`well_keyboard`'s stub arm). Bound to `h` for
+    /// horizon: the well navigates on arrows/Tab, never hjkl, so the letter
+    /// was free.
+    #[test]
+    fn the_horizon_dive_is_bound_in_the_well() {
+        let bound: Vec<_> = default_bindings()
+            .into_iter()
+            .filter(|b| {
+                b.context == InputContext::WellZoomed && b.action == Action::ActivateHorizon
+            })
+            .collect();
+        assert_eq!(bound.len(), 1, "exactly one binding opens the horizon");
+        assert_eq!(bound[0].source, InputSource::Key(KeyCode::KeyH));
+        assert_eq!(bound[0].modifiers, Modifiers::NONE);
+    }
 }

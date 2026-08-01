@@ -66,8 +66,8 @@ fn legend_text() -> String {
      p promote      d demote\n\
      z pause        a archive\n\
      c conclude     0-9 seat\n\
-     \u{23ce} enter        esc back\n\
-     ? legend"
+     h horizon      ? legend\n\
+     \u{23ce} enter        esc back"
         .to_string()
 }
 
@@ -254,7 +254,7 @@ mod tests {
         assert!(text.starts_with("CONTROLS"));
         for verb in [
             "p promote", "d demote", "z pause", "a archive", "c conclude", "0-9 seat", "esc back",
-            "? legend",
+            "? legend", "h horizon",
         ] {
             assert!(text.contains(verb), "legend must mention {verb:?}: {text}");
         }

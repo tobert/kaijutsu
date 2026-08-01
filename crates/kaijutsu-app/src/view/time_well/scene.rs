@@ -908,6 +908,8 @@ pub fn handle_go_to_well(
 /// - `Activate` (**Enter**, South) focuses then commits; `Conclude` (`c`),
 ///   `Promote` (`p`), `Demote` (`d`), `PauseToggle` (`z`), `Archive` (`a`) —
 ///   see the verb arms below (fire-and-forget RPC).
+/// - `ActivateHorizon` (`h`) — dive into the event horizon. A stub in v1:
+///   logs, does nothing (see its arm below).
 ///
 /// PopLevel/Esc (focus-aware) is handled below: from focus it backs out to the ring
 /// overview; from the overview it leaves the well — `room.zoomed = None`,
@@ -1176,6 +1178,16 @@ pub fn well_keyboard(
                         .detach();
                     info!("well: archive {}", id.short());
                 }
+            }
+
+            // `h`: dive into the event horizon. The horizon is a count today
+            // — demoted, concluded and overflow contexts have no card and no
+            // way in — so this is a **front door with nothing behind it
+            // yet**, deliberately wired now so the prototype lands on a real
+            // binding instead of inventing one later. No selection needed:
+            // the horizon is a place, not a verb on a card.
+            Action::ActivateHorizon => {
+                info!("horizon dive: not yet built (see docs/horizon-dive.md)");
             }
 
             _ => {}
