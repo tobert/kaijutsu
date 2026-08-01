@@ -196,13 +196,20 @@ impl HydrationState {
                 // Other Asset content types stay skipped (no current producer).
             }
             (BlockRole::Tool, BlockKind::Text) => {
-                // Tool-authored rich content (svg_block / abc_block).
-                // Surface as a user message envelope so the model can read
-                // back its own output on the next turn (A1). Plain text from
-                // tools stays skipped — only typed content (Svg/Abc) is
-                // worth round-tripping.
+                // Tool-authored rich content (svg_block / abc_block /
+                // diff_block). Surface as a user message envelope so the
+                // model can read back its own output on the next turn (A1).
+                // Plain text from tools stays skipped — only typed content
+                // (Svg/Abc/Diff) is worth round-tripping.
                 match block.content_type {
-                    ContentType::Svg | ContentType::Abc => {
+                    ContentType::Svg | ContentType::Abc | ContentType::Diff => {
+                        // TODO(diff slice 3): hydration projection. Diff
+                        // currently rides format_tool_content_for_llm's plain
+                        // char-count truncation like Svg/Abc, but docs/diff.md
+                        // slice 3 calls for a diffstat header + hunk-bounded
+                        // truncation instead — the char truncation here can
+                        // cut mid-hunk and leave a plausible-looking partial
+                        // patch, which is actively misleading for a diff.
                         let envelope = kaijutsu_types::format_tool_content_for_llm(block);
                         self.flush_all();
                         self.messages.push(Message::user(envelope));

@@ -439,6 +439,10 @@ pub fn detect_rich_content_typed(
             }
         }
         ContentType::Plain => {} // Fall through to heuristic detection
+        // TODO(diff slice 4): render as a diff preview (Parley + SpanBrush
+        // per docs/diff.md App section). Routed like Plain for now — falls
+        // through to heuristic detection, which just renders it as text.
+        ContentType::Diff => {}
     }
     // Try sparkline first — more specific pattern
     if let Some(data) = try_parse_sparkline(text) {

@@ -2730,6 +2730,39 @@ mod tests {
         }
 
         #[test]
+        fn tool_text_diff_block_hydrates_with_envelope() {
+            // docs/diff.md slice 2: diff_block follows the same (Tool, Text)
+            // rail as svg_block/abc_block. Hydration is raw-text passthrough
+            // for now (slice 3 adds diffstat + hunk-bounded projection —
+            // see the TODO in hydrate.rs) but a diff block must round-trip
+            // back to the model like Svg/Abc already do.
+            let c = ctx();
+            let m = model();
+            let diff = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n";
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content(diff)
+            .content_type(kaijutsu_types::ContentType::Diff)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "(Tool, Text, Diff) block must hydrate");
+            assert_eq!(msgs[0].role, Role::User);
+            let text = msgs[0].as_text().expect("envelope is text");
+            assert!(
+                text.contains("x-diff"),
+                "envelope mentions the diff content_type, got: {text}"
+            );
+            assert!(
+                text.contains(diff),
+                "envelope includes diff source, got: {text}"
+            );
+        }
+
+        #[test]
         fn tool_text_plain_still_skipped() {
             // Tool-role text blocks without a rich content_type are noise (not
             // produced by any current engine); skip them so we don't surface

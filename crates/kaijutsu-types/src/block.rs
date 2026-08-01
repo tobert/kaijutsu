@@ -317,6 +317,9 @@ pub enum ContentType {
     Svg,
     /// text/vnd.abc
     Abc,
+    /// text/x-diff — a unified diff (`docs/diff.md`). Content is standard
+    /// unified-diff text; old clients degrade to plain text.
+    Diff,
     /// Raster image (PNG, JPEG, WebP, etc.) stored in CAS by hash.
     Image,
 }
@@ -335,17 +338,21 @@ impl ContentType {
     /// enum could.
     ///
     /// Higher rank = "richer" = wins ties. Current order:
-    /// `Plain < Markdown < Svg < Abc < Image`. When adding a variant, choose
-    /// its rank deliberately (see `docs/diff.md` Decision 7 for the `Diff`
-    /// precedent) and update `content_type_richness_order_is_pinned` below —
-    /// that test exists so a future insertion can't reorder this silently.
+    /// `Plain < Markdown < Svg < Abc < Diff < Image`. `Diff`'s placement is
+    /// `docs/diff.md` Decision 7 (Amy, 2026-08-01): a deliberate diff typing
+    /// is highly structured and beats almost any competing claim in a tie;
+    /// it ranks just under `Image` because a diff may someday *contain*
+    /// image diffing. When adding a variant, choose its rank deliberately
+    /// and update `content_type_richness_order_is_pinned` below — that test
+    /// exists so a future insertion can't reorder this silently.
     pub const fn richness(&self) -> u8 {
         match self {
             ContentType::Plain => 0,
             ContentType::Markdown => 1,
             ContentType::Svg => 2,
             ContentType::Abc => 3,
-            ContentType::Image => 4,
+            ContentType::Diff => 4,
+            ContentType::Image => 5,
         }
     }
 
@@ -355,6 +362,7 @@ impl ContentType {
             "text/markdown" => ContentType::Markdown,
             "image/svg+xml" => ContentType::Svg,
             "text/vnd.abc" => ContentType::Abc,
+            "text/x-diff" => ContentType::Diff,
             "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/avif" => {
                 ContentType::Image
             }
@@ -372,6 +380,7 @@ impl ContentType {
             ContentType::Markdown => "text/markdown",
             ContentType::Svg => "image/svg+xml",
             ContentType::Abc => "text/vnd.abc",
+            ContentType::Diff => "text/x-diff",
             ContentType::Image => "image/png",
         }
     }
@@ -2691,13 +2700,15 @@ mod tests {
         assert_eq!(ContentType::Markdown.richness(), 1);
         assert_eq!(ContentType::Svg.richness(), 2);
         assert_eq!(ContentType::Abc.richness(), 3);
-        assert_eq!(ContentType::Image.richness(), 4);
+        assert_eq!(ContentType::Diff.richness(), 4);
+        assert_eq!(ContentType::Image.richness(), 5);
 
         let ascending = [
             ContentType::Plain,
             ContentType::Markdown,
             ContentType::Svg,
             ContentType::Abc,
+            ContentType::Diff,
             ContentType::Image,
         ];
         for pair in ascending.windows(2) {
@@ -2710,6 +2721,17 @@ mod tests {
         }
     }
 
+    /// `ContentType::Diff` (`docs/diff.md` Decision 1) round-trips through
+    /// its MIME string, and an unrecognized MIME still falls back to `Plain`
+    /// (the old-client degrade path — an old peer reading a `text/x-diff`
+    /// block back before it knew the type existed).
+    #[test]
+    fn content_type_diff_mime_round_trips() {
+        assert_eq!(ContentType::from_mime("text/x-diff"), ContentType::Diff);
+        assert_eq!(ContentType::Diff.as_mime(), "text/x-diff");
+        assert_eq!(ContentType::from_mime("bogus/unknown"), ContentType::Plain);
+    }
+
     /// `Ord` must agree with `richness()` in both directions, not just the
     /// ascending-list spot check above — this is what `field_wins` in
     /// `kaijutsu-crdt` actually calls on a merge tie.
@@ -2720,6 +2742,7 @@ mod tests {
             ContentType::Markdown,
             ContentType::Svg,
             ContentType::Abc,
+            ContentType::Diff,
             ContentType::Image,
         ];
         for &a in &all {
