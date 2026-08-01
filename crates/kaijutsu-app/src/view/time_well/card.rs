@@ -281,12 +281,12 @@ const SPIRAL_DECAY: f32 = 0.93;
 /// [`spiral_scale`]. Kept high so cards stay readable as they recede.
 const SPIRAL_SCALE_THROAT: f32 = 0.52;
 
-/// Number of bands / rings — one per [`Band`] variant (two, since the ring
-/// collapse of 2026-08-01: `Active` and `Recent`).
-const N_TERRACES: usize = ALL_BANDS.len();
-
-/// Number of band rings, exposed for the ring-centric nav state (array sizes in
-/// `scene::TimeWellState`). Same count as [`N_TERRACES`].
+/// Number of band rings — one per [`Band`] variant (two, since the ring
+/// collapse of 2026-08-01: `Active` and `Recent`). Exposed for the
+/// ring-centric nav state (array sizes in `scene::TimeWellState`) and read by
+/// [`spiral_scale`] to divide its scale envelope. Was duplicated as a private
+/// `N_TERRACES` — same expression, same value, two names left over from the
+/// four-terrace era.
 pub const N_BANDS: usize = ALL_BANDS.len();
 
 /// The **gate** angle: the seat angle a ring is spun to so the selected card
@@ -403,15 +403,18 @@ pub fn terrace_ring_geometry() -> Vec<(f32, f32)> {
     ALL_BANDS.iter().map(|&band| band_ring(band)).collect()
 }
 
-/// Per-card **within-terrace** scale at `(band, within_index)`: 1.0 at the
-/// mouth, shrinking toward [`SPIRAL_SCALE_THROAT`] at the deepest terrace's
-/// inner edge, same per-band envelope-division as [`terrace_envelope`] (no gap
-/// needed — scale has no "visible step" requirement, just continuous
-/// recession). This is the continuous decay *inside* a band; the per-band
-/// terrace step ([`TERRACE_SCALE_STEP`]) is layered on top in
-/// [`card_base_scale`], which is what a card's `base_scale` actually reads.
+/// Per-card **within-terrace** scale at `(band, within_index)`: 1.0 on the top
+/// ring, shrinking toward [`SPIRAL_SCALE_THROAT`] at the lowest terrace's
+/// inner edge, the `1/N_BANDS`-of-the-envelope-per-band division (no gap needed
+/// — scale has no "visible step" requirement, just continuous recession). This
+/// is the continuous decay *inside* a band; the per-band terrace step
+/// ([`TERRACE_SCALE_STEP`]) is layered on top in [`card_base_scale`], which is
+/// what a card's `base_scale` actually reads.
+///
+/// (The doc cited a `terrace_envelope` fn as the sibling divider; no such fn
+/// has existed since the terracing moved onto [`band_ring`].)
 pub fn spiral_scale(band: Band, within_index: usize) -> f32 {
-    let n = N_TERRACES as f32;
+    let n = N_BANDS as f32;
     let i = band.index() as f32;
     let scale_span = (1.0 - SPIRAL_SCALE_THROAT) / n;
     let scale_outer = 1.0 - i * scale_span;

@@ -1410,7 +1410,10 @@ mod tests {
         // isn't tied to any entity, so it should survive a room round-trip
         // the same way `arm_dive` leaves ring rotation alone.
         let (mut state, mut tracks) = persisted_after_a_room_visit();
-        state.focused_ring = 2;
+        // The LAST valid ring, not an arbitrary number: `arm_well` doesn't
+        // index by `focused_ring` today, but a test that parks it out of
+        // bounds is a landmine for whoever adds the first read that does.
+        state.focused_ring = super::super::card::N_BANDS - 1;
         state.ring_pos = 5;
         let before = (state.focused_ring, state.ring_pos);
 

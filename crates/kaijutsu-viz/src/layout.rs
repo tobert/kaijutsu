@@ -294,9 +294,30 @@ mod tests {
         assert_eq!(Band::Recent.index(), 1, "Recent is the lower ring");
     }
 
+    /// The load-bearing invariant, not a restatement of the constant:
+    /// [`WellPlacement::rings`] and every geometry consumer in `card.rs` index
+    /// by [`Band::index`], while several of them *walk* [`ALL_BANDS`] in array
+    /// order. Let those two disagree and cards silently seat on the wrong
+    /// ring. This is the only thing standing between them.
     #[test]
-    fn all_bands_is_top_to_bottom_order() {
-        assert_eq!(ALL_BANDS, [Band::Active, Band::Recent]);
+    fn all_bands_walks_in_band_index_order() {
+        for (i, band) in ALL_BANDS.iter().enumerate() {
+            assert_eq!(
+                band.index(),
+                i,
+                "ALL_BANDS[{i}] is {band:?}, but its index() says {}",
+                band.index()
+            );
+        }
+    }
+
+    /// …and the other half of that pairing: `rings` is a fixed-size array, so
+    /// a new [`Band`] variant that nobody widened it for would `panic` on
+    /// `rings[band.index()]` at runtime rather than fail to compile.
+    #[test]
+    fn the_rings_array_has_a_slot_for_every_band() {
+        let placement = assign_ring_seats::<u32>(&[]);
+        assert_eq!(placement.rings.len(), ALL_BANDS.len());
     }
 
     // ── Empty input ──────────────────────────────────────────────────────────
