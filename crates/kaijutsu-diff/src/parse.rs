@@ -361,6 +361,38 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// Look past a satisfied hunk for body lines that should not be there.
+    ///
+    /// Returns the side that overran and by how many lines, or `None` when the
+    /// next line legitimately starts a hunk or a file section. A line beginning
+    /// `--- ` is treated as a section start, not a deletion: the declared counts
+    /// are what disambiguate the two, and they say this hunk is over.
+    fn count_overrun(&self) -> Option<(Side, u32)> {
+        let mut old_extra = 0u32;
+        let mut new_extra = 0u32;
+        for line in &self.lines[self.at..] {
+            if line.starts_with("@@") || line.starts_with("diff --git ") || line.starts_with("--- ")
+            {
+                break;
+            }
+            match line.chars().next() {
+                None | Some(' ') => {
+                    old_extra += 1;
+                    new_extra += 1;
+                }
+                Some('-') => old_extra += 1,
+                Some('+') => new_extra += 1,
+                Some('\\') => {}
+                Some(_) => break,
+            }
+        }
+        match (old_extra, new_extra) {
+            (0, 0) => None,
+            (o, n) if o >= n => Some((Side::Old, o)),
+            (_, n) => Some((Side::New, n)),
+        }
+    }
+
     fn parse_hunk(&mut self) -> Result<Hunk, DiffError> {
         let header_line = self.lineno();
         let raw = self.peek().expect("caller checked");
@@ -456,20 +488,20 @@ impl<'a> Parser<'a> {
             self.at += 1;
         }
         // Body lines beyond the declared counts would otherwise be misread as
-        // the next file section. Catch the under-count here, where we can name it.
-        if let Some(next) = self.peek() {
-            let starts_section = next.starts_with("@@")
-                || next.starts_with("diff --git ")
-                || next.starts_with("--- ");
-            let looks_like_body = next.is_empty() || next.starts_with([' ', '+', '-', '\\']);
-            if !starts_section && looks_like_body {
-                return Err(DiffError::HunkCountMismatch {
-                    line: header_line,
-                    side: Side::Old,
-                    declared: old_count,
-                    actual: old_count + 1,
-                });
-            }
+        // the next file section. Catch the over-count here, where we can name
+        // it — and count how far the overrun actually goes, so the error says
+        // something true rather than "at least one more".
+        if let Some((side, extra)) = self.count_overrun() {
+            let (declared, actual) = match side {
+                Side::Old => (old_count, old_count + extra),
+                Side::New => (new_count, new_count + extra),
+            };
+            return Err(DiffError::HunkCountMismatch {
+                line: header_line,
+                side,
+                declared,
+                actual,
+            });
         }
 
         let mut hunk = Hunk {
@@ -715,10 +747,18 @@ mod tests {
     }
 
     #[test]
-    fn long_hunk_body_is_rejected() {
-        let err = parse("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n+c\n").unwrap_err();
+    fn long_hunk_body_is_rejected_and_names_the_side_that_overran() {
+        let err = parse("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n+c\n+d\n").unwrap_err();
         assert!(
-            matches!(err, DiffError::HunkCountMismatch { .. }),
+            matches!(
+                err,
+                DiffError::HunkCountMismatch {
+                    side: Side::New,
+                    declared: 1,
+                    actual: 3,
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }
