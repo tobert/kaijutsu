@@ -427,7 +427,7 @@ pub struct GpuTextureLimits {
 /// any drift here shows up as sub-pixel stretch. Rounding both dimensions
 /// through this function keeps `ceil` in `ui_rtt_texture_dims` a no-op
 /// (the value is already an integer physical pixel count).
-fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
+pub(crate) fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
     (logical * scale).round() / scale
 }
 

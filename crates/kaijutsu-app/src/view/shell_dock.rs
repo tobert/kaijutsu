@@ -16,7 +16,7 @@ use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
-use crate::view::block_render::BlockScene;
+use crate::view::block_render::{BlockScene, round_to_physical_px};
 use crate::view::ui_rtt::UiRttTexture;
 use crate::view::components::OverlayCursorGeometry;
 use crate::view::overlay::OverlayStyle;
@@ -330,7 +330,7 @@ pub fn build_shell_dock_glyphs(
 
                 // Round to physical pixel boundary — see block_render.rs comment.
                 let scale = text_metrics.scale_factor;
-                let total_height = ((content_height + pad.top + pad.bottom) * scale).round() / scale;
+                let total_height = round_to_physical_px(content_height + pad.top + pad.bottom, scale);
                 rtt.built_width = width;
                 rtt.built_height = total_height;
                 block_scene.text = display;
