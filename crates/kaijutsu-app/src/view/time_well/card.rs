@@ -424,10 +424,9 @@ pub fn card_base_scale(band: Band, within_index: usize) -> f32 {
 
 /// Per-context `(Band, within-ring seat index)`, alongside the flat
 /// mouth→throat odometer order, derived from an already-seated [`BandOrders`]
-/// (the [`assign_placement`] output's `rings`). Single source: [`spiral_order`]
-/// derives its flat `Vec` from this; `sync.rs` resolves each card's terraced
-/// position/scale (`ring_seat_rotated`/`card_base_scale`) from the `(band,
-/// within_index)` pair here.
+/// (the [`assign_placement`] output's `rings`). `sync.rs` resolves each card's
+/// terraced position/scale (`ring_seat_rotated`/`card_base_scale`) from the
+/// `(band, within_index)` pair here.
 pub fn spiral_positions(
     rings: &BandOrders,
 ) -> (Vec<ContextId>, std::collections::HashMap<ContextId, (Band, usize)>) {
@@ -440,17 +439,6 @@ pub fn spiral_positions(
         }
     }
     (flat, pos)
-}
-
-/// The whole well as one ordered spiral, **mouth → throat**: `Active` first,
-/// then `Recent`, `Bumped`, `Demoted` — each ring in its own seat order (see
-/// [`assign_placement`]). Not called by `sync.rs` today (ring-seat digit
-/// addressing replaced the flat odometer — see `scene::well_keyboard`); kept
-/// live and unit-tested as the simpler pure entry point for a future
-/// flat-order-only caller.
-#[allow(dead_code)] // superseded by ring-seat digit addressing; kept as a tested pure primitive
-pub fn spiral_order(rings: &BandOrders) -> Vec<ContextId> {
-    spiral_positions(rings).0
 }
 
 // ── Horizon label (the "+N" count; spawned by `scene::spawn_well_furniture`,
@@ -828,8 +816,8 @@ mod tests {
     }
 
     #[test]
-    fn spiral_order_flattens_rings_mouth_to_throat() {
-        // `spiral_order`/`spiral_positions` take an already-seated `BandOrders`
+    fn spiral_positions_flattens_rings_mouth_to_throat() {
+        // `spiral_positions` takes an already-seated `BandOrders`
         // (`assign_placement`'s `rings` — seating and within-ring order are
         // decided upstream, tested in `kaijutsu-viz`); this only checks the
         // pure mouth→throat flatten, in given per-ring order, no re-sort.
@@ -839,7 +827,7 @@ mod tests {
             vec![id_of(4)],
             vec![id_of(5)],
         ];
-        let order = spiral_order(&rings);
+        let (order, _pos) = spiral_positions(&rings);
         assert_eq!(order.first(), Some(&id_of(1)), "Active leads at the mouth");
         assert_eq!(order.last(), Some(&id_of(5)), "Demoted trails at the throat");
         assert_eq!(

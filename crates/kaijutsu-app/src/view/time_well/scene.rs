@@ -189,7 +189,7 @@ pub struct TimeWellState {
     /// Whether the well is *focused* on the selection: Enter (from the overview)
     /// dollies the camera into the focus card; Esc backs out; a second Enter
     /// (while focused) commits — switches to the context. Drives the camera pose
-    /// in [`ease_camera_to_selection`].
+    /// via `room/shot.rs`'s `well_local_shot`, which now owns that math.
     pub focused: bool,
     /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
     /// the `get_clusters` poll. Drives the cluster label on `Demoted` cards
