@@ -2730,12 +2730,10 @@ mod tests {
         }
 
         #[test]
-        fn tool_text_diff_block_hydrates_with_envelope() {
-            // docs/diff.md slice 2: diff_block follows the same (Tool, Text)
-            // rail as svg_block/abc_block. Hydration is raw-text passthrough
-            // for now (slice 3 adds diffstat + hunk-bounded projection —
-            // see the TODO in hydrate.rs) but a diff block must round-trip
-            // back to the model like Svg/Abc already do.
+        fn tool_text_diff_block_hydrates_with_diffstat_and_hunk_bounded_body() {
+            // Producer 1 of 2: `diff_block` writes a (Tool, Text) block, the
+            // svg_block/abc_block rail. Slice 3 replaces slice 2's passthrough
+            // with a projection — the diffstat leads and the body is canonical.
             let c = ctx();
             let m = model();
             let diff = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n";
@@ -2757,8 +2755,222 @@ mod tests {
                 "envelope mentions the diff content_type, got: {text}"
             );
             assert!(
-                text.contains(diff),
-                "envelope includes diff source, got: {text}"
+                text.contains("1 file, +1 \u{2212}1"),
+                "the diffstat leads the body, got: {text}"
+            );
+            assert!(text.contains("-old"), "got: {text}");
+            assert!(text.contains("+new"), "got: {text}");
+            assert!(
+                !text.contains("...[truncated]"),
+                "a small diff must not be truncated at all: {text}"
+            );
+        }
+
+        /// A unified diff big enough to blow the hydration budget, plus the
+        /// stat it should report. Built through the real engine so the text is
+        /// canonical and the hunk structure is real.
+        fn oversized_diff() -> (String, kaijutsu_diff::DiffStat) {
+            let before: String = (1..=4000).map(|i| format!("line {i}\n")).collect();
+            // Change every tenth line: many well-separated hunks, so a
+            // whole-hunk cut has plenty of legal boundaries to land on.
+            let after: String = (1..=4000)
+                .map(|i| {
+                    if i % 10 == 0 {
+                        format!("CHANGED {i}\n")
+                    } else {
+                        format!("line {i}\n")
+                    }
+                })
+                .collect();
+            let file = kaijutsu_diff::diff_file(
+                &kaijutsu_diff::FileSpec::modified("big.txt", &before, &after),
+                &kaijutsu_diff::DiffOptions::default(),
+            )
+            .expect("diff");
+            let model = kaijutsu_diff::DiffModel::new(vec![file]);
+            let text = kaijutsu_diff::format(&model);
+            assert!(
+                text.len() > kaijutsu_diff::limits::MAX_HYDRATION_BYTES,
+                "fixture must exceed the hydration budget"
+            );
+            (text, model.stat())
+        }
+
+        #[test]
+        fn an_oversized_diff_hydrates_truncated_on_hunk_boundaries() {
+            let c = ctx();
+            let m = model();
+            let (diff, stat) = oversized_diff();
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content(&diff)
+            .content_type(kaijutsu_types::ContentType::Diff)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            let text = msgs[0].as_text().expect("envelope is text");
+
+            // The stat describes the WHOLE diff, not the surviving fragment —
+            // that is how the model learns the true size of the change.
+            assert!(
+                text.contains(&stat.to_string()),
+                "full diffstat must lead, got: {}",
+                &text[..text.len().min(200)]
+            );
+            // Incompleteness is explicit, and it leads the diff body.
+            let body = text
+                .split_once(&format!("{}\n", stat))
+                .expect("stat line then body")
+                .1
+                .strip_suffix("\n</tool_output>")
+                .expect("envelope closes");
+            assert!(
+                body.starts_with(kaijutsu_diff::TRUNCATION_MARKER_PREFIX),
+                "the truncation marker must lead the diff text, got: {}",
+                &body[..body.len().min(120)]
+            );
+            // Never the char-count path: this is the marker that would appear
+            // if the generic truncation had run.
+            assert!(
+                !text.contains("...[truncated]"),
+                "a diff must never ride the char-count truncation"
+            );
+            // And the projection is still a parseable diff — every surviving
+            // `@@` count matches its body, which a mid-hunk cut would break.
+            let reparsed = kaijutsu_diff::parse(body).expect("projection must parse");
+            assert!(
+                !reparsed.is_complete(),
+                "the reparsed projection must know it is incomplete"
+            );
+            assert!(
+                body.len() <= kaijutsu_diff::limits::MAX_HYDRATION_BYTES,
+                "projection must fit the budget"
+            );
+        }
+
+        #[test]
+        fn a_declared_diff_that_does_not_parse_hydrates_as_plain_text() {
+            // Content and content_type are separate LWW registers, so this is a
+            // legitimate state, not corruption. Dropping the block would lose
+            // the model's own output; crashing would take down the turn.
+            let c = ctx();
+            let m = model();
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content("this is definitely not a unified diff")
+            .content_type(kaijutsu_types::ContentType::Diff)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "a malformed diff block must still hydrate");
+            let text = msgs[0].as_text().expect("envelope is text");
+            assert!(
+                text.contains("does not parse"),
+                "the model must be told what happened, got: {text}"
+            );
+            assert!(
+                text.contains("this is definitely not a unified diff"),
+                "the content itself must survive, got: {text}"
+            );
+        }
+
+        /// Producer 2 of 2: `kj diff` output rides a **ToolResult** block with
+        /// `content_type = text/x-diff`, a different hydration branch entirely.
+        /// The projection has to be applied on both roads or one producer
+        /// silently ships an unbounded diff into the context window.
+        #[test]
+        fn kj_diff_tool_result_hydrates_through_the_projection() {
+            let c = ctx();
+            let m = model();
+            let s = system();
+            let (diff, stat) = oversized_diff();
+
+            let call_id = BlockId::new(c, m, 0);
+            let tool_call = BlockSnapshot::tool_call(
+                call_id,
+                None,
+                ToolKind::Shell,
+                "shell",
+                serde_json::json!({"code": "kj diff /mnt/p/big.txt"}),
+                BlockRole::Model,
+                Some("toolu_diff".to_string()),
+            );
+            let mut tool_result = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0),
+                call_id,
+                ToolKind::Shell,
+                &diff,
+                false,
+                Some(0),
+                Some("toolu_diff".to_string()),
+            );
+            tool_result.content_type = kaijutsu_types::ContentType::Diff;
+
+            let msgs = hydrate_from_blocks(&[tool_call, tool_result]);
+            let MessageContent::Blocks(blocks) = &msgs[1].content else {
+                panic!("expected tool_result blocks, got {:?}", msgs[1].content);
+            };
+            let ContentBlock::ToolResult { content, .. } = &blocks[0] else {
+                panic!("expected a ToolResult block");
+            };
+            assert!(
+                content.starts_with(&stat.to_string()),
+                "kj diff output must hydrate with its diffstat, got: {}",
+                &content[..content.len().min(120)]
+            );
+            assert!(
+                content.contains(kaijutsu_diff::TRUNCATION_MARKER_PREFIX),
+                "and with the explicit truncation marker"
+            );
+            assert!(
+                content.len() < diff.len(),
+                "the projection must be smaller than the canonical block"
+            );
+        }
+
+        #[test]
+        fn user_run_kj_diff_hydrates_through_the_projection() {
+            // The same ToolResult arm, other sub-branch: a human typed it at
+            // the kaish prompt, so it lands as `[User ran ...]`.
+            let c = ctx();
+            let u = user();
+            let s = system();
+            let diff = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n";
+
+            let call_id = BlockId::new(c, u, 0);
+            let tool_call = BlockSnapshot::tool_call(
+                call_id,
+                None,
+                ToolKind::Shell,
+                "shell",
+                serde_json::json!({"code": "kj diff /mnt/p/foo.txt"}),
+                BlockRole::User,
+                None,
+            );
+            let mut tool_result = BlockSnapshot::tool_result(
+                BlockId::new(c, s, 0),
+                call_id,
+                ToolKind::Shell,
+                diff,
+                false,
+                Some(0),
+                None,
+            );
+            tool_result.content_type = kaijutsu_types::ContentType::Diff;
+
+            let msgs = hydrate_from_blocks(&[tool_call, tool_result]);
+            assert_eq!(msgs.len(), 1);
+            let text = msgs[0].as_text().unwrap();
+            assert!(text.contains("[User ran `kj diff /mnt/p/foo.txt`]"), "got: {text}");
+            assert!(
+                text.contains("1 file, +1 \u{2212}1"),
+                "the diffstat must reach the model here too, got: {text}"
             );
         }
 

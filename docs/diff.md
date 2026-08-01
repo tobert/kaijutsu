@@ -8,10 +8,12 @@ block type.
 
 ## Status
 
-**Designed 2026-08-01 (research + survey session), not built.** The `text/`
-branch gate this design queued behind lifted the same day (msdf-music + de-vello
-landed on main), so the slices below are ready to start, in order. This doc is
-the plan of record.
+**Designed 2026-08-01 (research + survey session). Slices 0–3 SHIPPED
+2026-08-01** — the `kaijutsu-diff` crate, `ContentType::Diff`, and the whole
+kernel surface (`kj diff`, `diff_block`, hydration-as-projection). Slices 4–6
+(app preview, `Screen::Diff` + `DiffCore`, minimap/folds) are next, in order.
+This doc is the plan of record; the per-slice "Build notes" sections below
+correct it where the build disagreed.
 
 ## Decisions (Amy, 2026-08-01)
 
@@ -158,7 +160,7 @@ the plan of record.
    (deepseek seam review 2026-08-01: discriminant-order-as-merge-rule is
    fragile; ~20 lines, decouples merge semantics from declaration order
    before the new variant lands).
-3. Kernel: `kj diff` + `diff_block`, wire e2e asserting a typed block lands.
+3. **SHIPPED.** Kernel: `kj diff` + `diff_block`, wire e2e asserting a typed block lands.
    Source resolution is **ownership-aware from day one** — the
    `resolve_editor_target` pattern (config-owned docs answer through the
    mount table; never raw `get_or_load` for a config path, which would mint a
@@ -231,6 +233,51 @@ build taught us, for the slices still to come:
   the main thread survives. Map `ContentType` → `DiffProfile` through an
   exhaustive `match` at the app edge so a future ContentType variant is a
   compile error, not a silent fallback profile.
+
+## Build notes — slice 3 SHIPPED 2026-08-01 (kernel)
+
+`kj diff`, `diff_block`, and the hydration projection are built. What the
+build settled, for slices 4/5:
+
+- **Source descriptor**: `kj/diff.rs`'s `DiffSource` is `Disk(path)` /
+  `Document(path)` / `DocumentAt { path, seq }`. The CLI stayed two
+  positionals: one path = disk vs document (the recovery view), two paths =
+  document vs document, `--from/--to` = history. Git lands as a variant.
+- **Ownership**: both document sources call
+  `editor_target()`, a one-line delegate to `resolve_editor_target` — the
+  editor and `kj diff` cannot drift on what owns a path. Pinned by a test that
+  asserts the *absence* of a `file_context_id()` document after diffing an rc
+  script (`file_context_id` is now `pub(crate)` for exactly that).
+- **History is real, and bounded**: `BlockStore::block_content_at_seq` replays
+  the latest compaction snapshot + oplog up to a seq into a throwaway store;
+  `oplog_seq_range` reports what is addressable and rides in every `kj diff`
+  `.data` payload (there is no `kj doc history` surface, so this is how a
+  caller discovers a seq). It refuses loudly on: no DB, a seq past head, a seq
+  older than the newest snapshot, a block that didn't exist yet.
+- **Provenance can't ride in the diff text** — block content must be canonical
+  unified text — so `disk:/p` / `doc:/p` / `doc:/p@N` travel in `.data`
+  alongside the diffstat. **Two different paths format as a rename**: a
+  `Modified` section with differing paths re-parses as `Renamed`, so that is
+  the only shape that survives its own roundtrip.
+- **An empty diff is plain text, not a Diff block.** A bare file header means
+  "renamed, contents identical" in this dialect; `kj diff` says "no
+  differences" instead.
+- **Two hydration branches, one projection.** `diff_block` writes
+  `(Tool, Text)`; `kj diff` output is a **ToolResult** block whose
+  `content_type` the RPC shell path stamps from `ExecResult.content_type` —
+  a different arm of `translate_block` entirely, and the user-shell
+  (`[User ran …]`) and agent-tool-result sub-branches inside it are two more.
+  All of them go through `hydrate::project_diff_for_hydration`. The
+  `<tool_output>` envelope is now reusable via
+  `kaijutsu_types::format_tool_content_envelope(block, body)`.
+- **The stat describes the whole diff, the body is what fits.** Projection =
+  `DiffStat` of the complete model + `truncate_to_bytes(MAX_HYDRATION_BYTES)`,
+  whose marker leads the body and re-parses. A declared-Diff block that does
+  not parse hydrates as plain text with a `[declared as a diff but does not
+  parse …]` note — never dropped, never fatal.
+- **Not validated on `Done`**: `validate_content_and_attach_errors` still
+  matches only Abc/Svg. Tracked in issues.md; the fix wants slice 4's error
+  state to render into.
 
 ## Seam guidance (deepseek review, 2026-08-01)
 

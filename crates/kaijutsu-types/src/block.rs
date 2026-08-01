@@ -799,9 +799,12 @@ pub const TOOL_CONTENT_HYDRATION_BUDGET: usize = 4096;
 /// </tool_output>
 /// ```
 /// Body is truncated to `TOOL_CONTENT_HYDRATION_BUDGET` chars.
+///
+/// Content types whose truncation must respect internal structure supply their
+/// own body and call [`format_tool_content_envelope`] directly — a diff, for
+/// one, cannot be cut by character count without leaving a plausible-looking
+/// partial patch (`docs/diff.md`).
 pub fn format_tool_content_for_llm(block: &BlockSnapshot) -> String {
-    let kind = block.content_type.as_mime();
-    let block_key = block.id.to_key();
     let body = if block.content.chars().count() > TOOL_CONTENT_HYDRATION_BUDGET {
         let truncated: String = block
             .content
@@ -812,9 +815,21 @@ pub fn format_tool_content_for_llm(block: &BlockSnapshot) -> String {
     } else {
         block.content.clone()
     };
+    format_tool_content_envelope(block, &body)
+}
+
+/// Wrap an already-prepared `body` in the `<tool_output>` envelope for `block`.
+///
+/// Split out from [`format_tool_content_for_llm`] so a caller that knows how to
+/// project its own content type — hydration's diff projection, which spends its
+/// budget on whole hunks and prepends a diffstat — reuses the exact envelope
+/// every other rich block gets instead of inventing a second one.
+pub fn format_tool_content_envelope(block: &BlockSnapshot, body: &str) -> String {
     format!(
         "<tool_output content_type=\"{}\" block=\"{}\">\n{}\n</tool_output>",
-        kind, block_key, body
+        block.content_type.as_mime(),
+        block.id.to_key(),
+        body
     )
 }
 

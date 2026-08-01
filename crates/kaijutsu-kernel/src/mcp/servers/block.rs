@@ -195,6 +195,12 @@ pub struct AbcBlockParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DiffBlockParams {
+    /// Unified diff text (`diff --git` / `---` / `+++` / `@@` sections).
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ImgBlockParams {
     /// Hex-encoded CAS hash of an image already stored in the CAS.
     pub hash: String,
@@ -280,6 +286,7 @@ impl McpServerLike for BlockToolsServer {
             tool_def::<KernelSearchParams>(&self.instance_id, "kernel_search", "Search across all blocks using regex, with filters and context")?,
             tool_def::<SvgBlockParams>(&self.instance_id, "svg_block", "Append an SVG block to the current context. Renders as vector graphics inline.")?,
             tool_def::<AbcBlockParams>(&self.instance_id, "abc_block", "Append an ABC music notation block. Validates parse; renders as sheet music inline.")?,
+            tool_def::<DiffBlockParams>(&self.instance_id, "diff_block", "Append a unified-diff block to the current context. Validates the diff parses strictly; renders as a diff view inline.")?,
             tool_def::<ImgBlockParams>(&self.instance_id, "img_block", "Append an image block referencing content already in the CAS by hash.")?,
             tool_def::<ImgBlockFromPathParams>(&self.instance_id, "img_block_from_path", "Read an image file, store it in the CAS, and append an image block.")?,
         ])
@@ -716,6 +723,27 @@ impl McpServerLike for BlockToolsServer {
                 let res_json = serde_json::json!({ "block_id": key });
                 ExecResult::success(res_json.to_string())
             }
+            "diff_block" => {
+                let p: DiffBlockParams = serde_json::from_value(params.arguments)
+                    .map_err(McpError::InvalidParams)?;
+
+                // Validate before storing, the abc_block pattern. A block that
+                // *declares* itself a diff but holds text the dialect rejects
+                // is worse than no block: the viewer has to render an error
+                // state and a model reads a patch that cannot be applied. The
+                // parser is strict on purpose and never silently skips a
+                // section, so a failure here is real.
+                if let Err(e) = kaijutsu_diff::parse(&p.content) {
+                    return Ok(from_exec_result(ExecResult::failure(
+                        1,
+                        format!("diff parse error: {e}"),
+                    )));
+                }
+
+                let key = self.append_block(&tool_ctx, Role::Tool, &p.content, ContentType::Diff)?;
+                let res_json = serde_json::json!({ "block_id": key });
+                ExecResult::success(res_json.to_string())
+            }
             "img_block" => {
                 let p: ImgBlockParams = serde_json::from_value(params.arguments)
                     .map_err(McpError::InvalidParams)?;
@@ -1047,7 +1075,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_tools_exposes_all_thirteen() {
+    async fn list_tools_exposes_all_fourteen() {
         let (broker, ctx, _db, _store) = setup().await;
         let visible = {
             let mut binding = crate::mcp::ContextToolBinding::new();
@@ -1068,6 +1096,7 @@ mod tests {
             "kernel_search",
             "svg_block",
             "abc_block",
+            "diff_block",
             "img_block",
             "img_block_from_path",
         ] {
@@ -1670,6 +1699,65 @@ mod tests {
         .await;
         assert!(res2.is_error, "expected failure for invalid ABC");
         assert!(text_of(&res2).contains("ABC parse error"), "got: {}", text_of(&res2));
+    }
+
+    #[tokio::test]
+    async fn test_diff_block_validates_parse() {
+        let (broker, ctx, _db, store) = setup().await;
+
+        let patch = "diff --git a/a.txt b/a.txt\n\
+                     --- a/a.txt\n\
+                     +++ b/a.txt\n\
+                     @@ -1,2 +1,2 @@\n\
+                     \x20one\n\
+                     -two\n\
+                     +2\n";
+        let res1 = call(
+            &broker,
+            &ctx,
+            "diff_block",
+            serde_json::json!({ "content": patch }),
+        )
+        .await;
+        assert!(!res1.is_error, "expected success, got: {}", text_of(&res1));
+
+        {
+            let doc = store.get(ctx.context_id).unwrap();
+            let ordered = doc.doc.blocks_ordered();
+            let last = ordered.last().unwrap();
+            assert_eq!(last.content_type, ContentType::Diff);
+            assert_eq!(last.content, patch, "the block keeps the diff verbatim");
+        }
+
+        // Garbage must not become a block. A block that declares itself a diff
+        // and holds text the dialect rejects forces every consumer into an
+        // error state it can do nothing about — validate first (abc_block's
+        // pattern) so the bad block is never created.
+        let res2 = call(
+            &broker,
+            &ctx,
+            "diff_block",
+            serde_json::json!({ "content": "@@ this is not a diff @@" }),
+        )
+        .await;
+        assert!(res2.is_error, "expected failure for garbage");
+        assert!(
+            text_of(&res2).contains("diff parse error"),
+            "got: {}",
+            text_of(&res2)
+        );
+
+        // …and nothing was appended by the failed call.
+        let doc = store.get(ctx.context_id).unwrap();
+        let ordered = doc.doc.blocks_ordered();
+        assert_eq!(
+            ordered
+                .iter()
+                .filter(|b| b.content_type == ContentType::Diff)
+                .count(),
+            1,
+            "the rejected diff must not have been stored"
+        );
     }
 
     #[tokio::test]

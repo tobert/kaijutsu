@@ -23,6 +23,54 @@ use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Role as Blo
 
 use super::{ContentBlock, Message, MessageContent, Role};
 
+/// Project a declared-`Diff` block's content into the body a model reads.
+///
+/// **Hydration is a projection, not a passthrough.** The canonical block always
+/// keeps the whole diff; this is what one consumer — the model — gets, and it
+/// is built to three rules (`docs/diff.md`, `kaijutsu_diff`'s truncation
+/// contract):
+///
+/// 1. **The diffstat leads, and it describes the *whole* diff.** A model that
+///    reads `12 files, +900 −40` knows the size of the change even when the
+///    body below it is a fraction of that.
+/// 2. **The budget is spent on whole hunks** via
+///    [`truncate_to_bytes`](kaijutsu_diff::truncate_to_bytes), never on
+///    characters. A character-count cut leaves a `@@` header whose counts no
+///    longer match its body: a patch that looks real and applies wrong, which
+///    for a diff is worse than showing nothing. When anything is dropped the
+///    formatter's `#!kaijutsu-diff truncated:` marker leads the text and the
+///    result still parses — incompleteness is explicit, not inferred.
+/// 3. **Content that does not parse is still shown, as plain text.** Content
+///    and content-type are separate LWW registers, so a block can honestly
+///    declare itself a diff while holding something else. Dropping it would
+///    lose the model's own output; crashing hydration over it would take down
+///    the turn. It gets a note saying what happened and rides the ordinary
+///    character budget — at that point it *is* plain text, and the whole-hunk
+///    rule has nothing to protect.
+pub(crate) fn project_diff_for_hydration(content: &str) -> String {
+    match kaijutsu_diff::parse(content) {
+        Ok(model) => {
+            // Stat of the complete model, deliberately — the projection below
+            // may drop hunks, but the size of the change is not a detail the
+            // model should have to infer from what survived.
+            let stat = model.stat();
+            let projected =
+                kaijutsu_diff::truncate_to_bytes(&model, kaijutsu_diff::limits::MAX_HYDRATION_BYTES);
+            format!("{stat}\n{}", kaijutsu_diff::format(&projected))
+        }
+        Err(e) => {
+            let budget = kaijutsu_types::TOOL_CONTENT_HYDRATION_BUDGET;
+            let body = if content.chars().count() > budget {
+                let head: String = content.chars().take(budget).collect();
+                format!("{head}\n...[truncated]")
+            } else {
+                content.to_string()
+            };
+            format!("[declared as a diff but does not parse ({e}); shown as plain text]\n{body}")
+        }
+    }
+}
+
 /// Accumulates blocks into outgoing `Message`s. Held across multiple
 /// `translate_block` calls; consumed by `into_messages`.
 ///
@@ -202,14 +250,17 @@ impl HydrationState {
                 // Plain text from tools stays skipped — only typed content
                 // (Svg/Abc/Diff) is worth round-tripping.
                 match block.content_type {
-                    ContentType::Svg | ContentType::Abc | ContentType::Diff => {
-                        // TODO(diff slice 3): hydration projection. Diff
-                        // currently rides format_tool_content_for_llm's plain
-                        // char-count truncation like Svg/Abc, but docs/diff.md
-                        // slice 3 calls for a diffstat header + hunk-bounded
-                        // truncation instead — the char truncation here can
-                        // cut mid-hunk and leave a plausible-looking partial
-                        // patch, which is actively misleading for a diff.
+                    // Diff gets the same envelope but its own body: a diffstat
+                    // plus whole-hunk-bounded content. See
+                    // [`project_diff_for_hydration`] for why the generic
+                    // char-count truncation is unsafe here specifically.
+                    ContentType::Diff => {
+                        let body = project_diff_for_hydration(&block.content);
+                        let envelope = kaijutsu_types::format_tool_content_envelope(block, &body);
+                        self.flush_all();
+                        self.messages.push(Message::user(envelope));
+                    }
+                    ContentType::Svg | ContentType::Abc => {
                         let envelope = kaijutsu_types::format_tool_content_for_llm(block);
                         self.flush_all();
                         self.messages.push(Message::user(envelope));
@@ -220,13 +271,27 @@ impl HydrationState {
                 }
             }
             (BlockRole::Tool, BlockKind::ToolResult) => {
+                // A shell command can emit typed content — `kj diff` sets the
+                // ToolResult block's content_type to `text/x-diff`. That is the
+                // *other* producer of diff blocks, and it enters hydration here
+                // rather than through the (Tool, Text) arm above, so the same
+                // projection has to be applied on both roads. Everything else
+                // passes through as the command wrote it.
+                // Empty content is left alone: an interrupted or still-empty
+                // ToolResult is not a zero-file diff, and saying "0 files,
+                // +0 −0" would invent a fact.
+                let projected = (block.content_type == ContentType::Diff
+                    && !block.content.is_empty())
+                .then(|| project_diff_for_hydration(&block.content));
+                let stdout = projected.as_deref().unwrap_or(&block.content);
+
                 let user_code = block
                     .tool_call_id
                     .and_then(|id| self.user_shell_pending.remove(&id));
                 if let Some(code) = user_code {
                     // User-initiated shell result → emit as a single user message
                     self.flush_all();
-                    let output = block.content.trim();
+                    let output = stdout.trim();
                     if output.is_empty() {
                         self.messages
                             .push(Message::user(format!("[User ran `{}`]", code)));
@@ -258,11 +323,11 @@ impl HydrationState {
                     // model needs both — merge them back the way they were
                     // before stderr was split off (stdout, then stderr).
                     let content = match block.stderr.as_deref() {
-                        Some(err) if !err.is_empty() && !block.content.is_empty() => {
-                            format!("{}\n{}", block.content, err)
+                        Some(err) if !err.is_empty() && !stdout.is_empty() => {
+                            format!("{stdout}\n{err}")
                         }
                         Some(err) if !err.is_empty() => err.to_string(),
-                        _ => block.content.clone(),
+                        _ => stdout.to_string(),
                     };
                     self.tool_results.push(ContentBlock::ToolResult {
                         tool_use_id,
