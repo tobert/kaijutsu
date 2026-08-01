@@ -8,9 +8,10 @@ block type.
 
 ## Status
 
-**Designed 2026-08-01 (research + survey session), not built.** All code waits
-for the in-flight `text/` branches to land (signoff gate). This doc is the plan
-of record; slices below.
+**Designed 2026-08-01 (research + survey session), not built.** The `text/`
+branch gate this design queued behind lifted the same day (msdf-music + de-vello
+landed on main), so the slices below are ready to start, in order. This doc is
+the plan of record.
 
 ## Decisions (Amy, 2026-08-01)
 
@@ -165,8 +166,7 @@ of record; slices below.
    plausible-looking partial patch). Test hydration end-to-end for **both**
    producers — `kj diff` output and `diff_block` may enter different
    role/kind hydration branches.
-4. App preview (post-branch-landing): rich-content arm + render arm + fence
-   sniff + theme.
+4. App preview: rich-content arm + render arm + fence sniff + theme.
 5. `Screen::Diff` + `DiffCore` + grab/bindings + yank→clipboard.
    **Freeze-on-open**: the viewer binds to `(block_id, content
    version/hash)`; if the block changes underneath, show a stale banner with
