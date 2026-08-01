@@ -410,8 +410,8 @@ pub fn detect_rich_content_typed(
         }
         ContentType::Abc => {
             // Always render whatever the generous parser returned.
-            // Errors are attached as child Error blocks by the kernel
-            // and rendered via the ErrorChildIndex stacking path.
+            // Errors are attached as child Error blocks by the kernel and
+            // rendered as ordinary sibling blocks in the conversation stream.
             let result = kaijutsu_abc::parse(text);
             // TODO(multi-tune): RichContent::Abc currently holds a single
             // Tune. When a file contains multiple tunes (e.g. §13 sample

@@ -67,9 +67,6 @@ pub struct GeomRow {
     pub kind: BlockKind,
     /// Whether the block rendered collapsed at seed time.
     pub collapsed: bool,
-    /// Parent block (DAG nesting). Sources the indent level and the
-    /// error-child index without a document snapshot.
-    pub parent_id: Option<BlockId>,
     /// Indent level (parent nesting), mirrored to `BlockCellLayout`.
     pub indent_level: u32,
     /// Document version when this row was first created. Persisted here so a
@@ -267,7 +264,6 @@ impl ConversationGeometry {
                         role: seed.role,
                         kind: seed.kind,
                         collapsed: seed.collapsed,
-                        parent_id: seed.parent_id,
                         indent_level,
                         created_at_version: doc_version,
                     }
@@ -292,7 +288,6 @@ impl ConversationGeometry {
                         role: block_row.role,
                         kind: block_row.kind,
                         collapsed: false,
-                        parent_id: None,
                         indent_level: 0,
                         created_at_version: doc_version,
                     });
