@@ -38,6 +38,10 @@ pub enum InputContext {
     StationZoomed,
     /// Screen::Fsn — landscape camera fly + select
     FsnFly,
+    /// Screen::HorizonDive — snap navigation over the horizon search space
+    /// (`docs/horizon-dive.md`). Active only while the query line does NOT
+    /// hold the keyboard; typing is a grab, not a context.
+    HorizonDive,
 }
 
 /// Exclusive keyboard capture — who receives raw keyboard events that the
@@ -58,6 +62,11 @@ pub enum KeyboardGrab {
     ComposeVim,
     /// The in-app vi editor forwarding to a kernel editor session.
     EditorSession,
+    /// The horizon dive's query line (`view::horizon_dive`). A text field
+    /// needs the whole alphabet; asking for it as a declared grab is the
+    /// sanctioned way (docs/input.md, "Keyboard grabs are explicit") and it
+    /// keeps the Ctrl+A prefix, F1 and F12 alive while you type.
+    HorizonQuery,
 }
 
 /// Resource tracking which input contexts are currently active.
@@ -80,10 +89,15 @@ impl ActiveInputContexts {
 ///
 /// Kept free of ECS types on the input side so it unit-tests without a
 /// schedule (see `gotcha_bevy_b0001`: unit suites never init schedules).
+/// `dive_typing` is the horizon dive's query-line mode. It is a parameter
+/// rather than something derived from `screen` because it is genuinely a
+/// third axis: the same screen has two keyboard regimes, exactly like
+/// `Screen::Conversation` does across `FocusArea`.
 pub fn derive_contexts(
     screen: Screen,
     zoomed: Option<Station>,
     focus: &FocusArea,
+    dive_typing: bool,
 ) -> (Vec<InputContext>, KeyboardGrab) {
     let mut contexts = vec![InputContext::Global];
 
@@ -114,6 +128,19 @@ pub fn derive_contexts(
             return (contexts, KeyboardGrab::None);
         }
 
+        // The dive's two regimes. While the query line has the keyboard the
+        // navigation context is NOT active — that's what stops `p` (surface)
+        // and `h/j/k/l` (snap) from firing out from under the letters you
+        // meant to type, without a single "am I typing?" check inside a
+        // domain handler.
+        Screen::HorizonDive => {
+            if dive_typing {
+                return (contexts, KeyboardGrab::HorizonQuery);
+            }
+            contexts.push(InputContext::HorizonDive);
+            return (contexts, KeyboardGrab::None);
+        }
+
         Screen::Conversation => {}
     }
 
@@ -141,15 +168,24 @@ pub fn sync_input_context(
     focus: Res<FocusArea>,
     screen: Res<State<Screen>>,
     room: Res<crate::view::room::RoomState>,
+    // The dive's query-line mode. Its own small resource, not a field on
+    // `HorizonDiveState`: that one changes every frame the lights do, and
+    // reading the mode off it would defeat the change-detection gate below.
+    dive: Res<crate::view::horizon_dive::DiveTyping>,
     mut active: ResMut<ActiveInputContexts>,
     mut grab: ResMut<KeyboardGrab>,
 ) {
     // Only update if an input changed (RoomState changes on zoom/unzoom).
-    if !focus.is_changed() && !screen.is_changed() && !room.is_changed() && !active.is_added() {
+    if !focus.is_changed()
+        && !screen.is_changed()
+        && !room.is_changed()
+        && !dive.is_changed()
+        && !active.is_added()
+    {
         return;
     }
 
-    let (contexts, new_grab) = derive_contexts(*screen.get(), room.zoomed, &focus);
+    let (contexts, new_grab) = derive_contexts(*screen.get(), room.zoomed, &focus, dive.0);
     active.0 = contexts;
     // Avoid spurious change-detection on the grab resource.
     if *grab != new_grab {
@@ -163,7 +199,7 @@ mod tests {
 
     #[test]
     fn conversation_compose_grabs_for_vim() {
-        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Compose);
+        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Compose, false);
         assert!(ctxs.contains(&InputContext::Global));
         assert!(ctxs.contains(&InputContext::TextInput));
         assert_eq!(grab, KeyboardGrab::ComposeVim);
@@ -171,7 +207,7 @@ mod tests {
 
     #[test]
     fn conversation_navigation_no_grab() {
-        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Conversation, false);
         assert!(ctxs.contains(&InputContext::Navigation));
         assert!(!ctxs.contains(&InputContext::TextInput));
         assert_eq!(grab, KeyboardGrab::None);
@@ -179,7 +215,7 @@ mod tests {
 
     #[test]
     fn dialog_gets_both_contexts() {
-        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Dialog);
+        let (ctxs, grab) = derive_contexts(Screen::Conversation, None, &FocusArea::Dialog, false);
         assert!(ctxs.contains(&InputContext::Dialog));
         assert!(ctxs.contains(&InputContext::TextInput));
         assert_eq!(grab, KeyboardGrab::None);
@@ -189,14 +225,14 @@ mod tests {
     fn editor_is_a_grab_with_global_only() {
         // Focus parks on Conversation while the editor owns the screen —
         // the grab must not depend on focus (the Ctrl+1/2/3 stray bug).
-        let (ctxs, grab) = derive_contexts(Screen::Editor, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Editor, None, &FocusArea::Conversation, false);
         assert_eq!(ctxs, vec![InputContext::Global]);
         assert_eq!(grab, KeyboardGrab::EditorSession);
     }
 
     #[test]
     fn room_unzoomed_is_carousel() {
-        let (ctxs, grab) = derive_contexts(Screen::Room, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Room, None, &FocusArea::Conversation, false);
         assert!(ctxs.contains(&InputContext::RoomNav));
         assert!(!ctxs.contains(&InputContext::Navigation));
         assert_eq!(grab, KeyboardGrab::None);
@@ -208,6 +244,7 @@ mod tests {
             Screen::Room,
             Some(Station::TimeWell),
             &FocusArea::Conversation,
+            false,
         );
         assert!(ctxs.contains(&InputContext::WellZoomed));
         assert!(!ctxs.contains(&InputContext::RoomNav));
@@ -219,6 +256,7 @@ mod tests {
             Screen::Room,
             Some(Station::PatchBay),
             &FocusArea::Conversation,
+            false,
         );
         assert!(ctxs.contains(&InputContext::PatchBayZoomed));
     }
@@ -229,6 +267,7 @@ mod tests {
             Screen::Room,
             Some(Station::Tracks),
             &FocusArea::Conversation,
+            false,
         );
         assert!(ctxs.contains(&InputContext::StationZoomed));
         assert!(!ctxs.contains(&InputContext::WellZoomed));
@@ -238,9 +277,42 @@ mod tests {
     fn fsn_has_its_own_context_not_navigation() {
         // The old suppression list forgot Fsn — Navigation leaked in and
         // central Esc→pop double-fired with fsn_keyboard's Esc.
-        let (ctxs, grab) = derive_contexts(Screen::Fsn, None, &FocusArea::Conversation);
+        let (ctxs, grab) = derive_contexts(Screen::Fsn, None, &FocusArea::Conversation, false);
         assert!(ctxs.contains(&InputContext::FsnFly));
         assert!(!ctxs.contains(&InputContext::Navigation));
         assert_eq!(grab, KeyboardGrab::None);
+    }
+
+    #[test]
+    fn horizon_dive_navigating_is_a_context_not_a_grab() {
+        let (ctxs, grab) =
+            derive_contexts(Screen::HorizonDive, None, &FocusArea::Conversation, false);
+        assert!(ctxs.contains(&InputContext::HorizonDive));
+        assert!(!ctxs.contains(&InputContext::Navigation));
+        assert_eq!(grab, KeyboardGrab::None);
+    }
+
+    #[test]
+    fn horizon_dive_typing_takes_the_grab_and_drops_the_nav_context() {
+        // The whole point of routing the query line through a grab: while
+        // you're typing, `p` must insert a letter, not surface a context.
+        let (ctxs, grab) =
+            derive_contexts(Screen::HorizonDive, None, &FocusArea::Conversation, true);
+        assert_eq!(grab, KeyboardGrab::HorizonQuery);
+        assert_eq!(
+            ctxs,
+            vec![InputContext::Global],
+            "only Global survives a grab — F1/F12/tiling stay live while typing"
+        );
+    }
+
+    #[test]
+    fn the_dive_mode_does_not_leak_into_other_screens() {
+        // `dive_typing` is only meaningful on `Screen::HorizonDive`; a stale
+        // `true` must not grab the keyboard anywhere else.
+        for screen in [Screen::Conversation, Screen::Room, Screen::Fsn] {
+            let (_, grab) = derive_contexts(screen, None, &FocusArea::Conversation, true);
+            assert_ne!(grab, KeyboardGrab::HorizonQuery, "{screen:?} took the dive's grab");
+        }
     }
 }

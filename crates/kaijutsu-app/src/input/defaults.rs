@@ -30,6 +30,15 @@ pub fn default_bindings() -> Vec<Binding> {
         Action::Screenshot,
         "Save screenshot",
     ));
+    // Debug entry for the horizon-dive spike (`docs/horizon-dive.md`). Global
+    // so the spike is reachable from any screen; the real entry is activating
+    // the well's "+N" horizon chip, which this prototype does not wire.
+    b.push(Binding::key(
+        KeyCode::F2,
+        InputContext::Global,
+        Action::DiveHorizon,
+        "Dive the event horizon (debug)",
+    ));
 
     // Tiling: Alt+hjkl pane focus
     b.push(Binding::key_mod(
@@ -467,6 +476,14 @@ pub fn default_bindings() -> Vec<Binding> {
         Action::Archive,
         "Archive past the horizon",
     ));
+    // `h` — dive the event horizon from the well you're already looking at
+    // (the spike's in-place entry; see the Global F2 above).
+    b.push(Binding::key(
+        KeyCode::KeyH,
+        InputContext::WellZoomed,
+        Action::DiveHorizon,
+        "Dive past the event horizon",
+    ));
     // `?` legend — bind both bare Slash and Shift+Slash so the shifted
     // glyph on every layout that puts ? over / keeps working.
     b.push(Binding::key(
@@ -553,6 +570,43 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
+    // HorizonDive (Screen::HorizonDive, navigating — NOT typing)
+    // ====================================================================
+    //
+    // Reuses the scene vocabulary wholesale rather than minting four new
+    // actions: `StepPrev`/`StepNext` are "move within the level" (here:
+    // across the stream) and `LevelUp`/`LevelDown` are "shallower/deeper"
+    // (here: up and down the stream, which is literally what depth means).
+    // Gamepad, `bindings.toml`, and the legend then cover the dive for free.
+    // The query line is NOT bound here — it's a keyboard grab; `/` only asks
+    // for it (`docs/horizon-dive.md`, "Typing and moving are different
+    // modes").
+    for (key, action, desc) in [
+        (KeyCode::ArrowLeft, Action::StepPrev, "Snap left"),
+        (KeyCode::KeyH, Action::StepPrev, "Snap left"),
+        (KeyCode::ArrowRight, Action::StepNext, "Snap right"),
+        (KeyCode::KeyL, Action::StepNext, "Snap right"),
+        (KeyCode::ArrowUp, Action::LevelUp, "Snap up (shallower)"),
+        (KeyCode::KeyK, Action::LevelUp, "Snap up (shallower)"),
+        (KeyCode::ArrowDown, Action::LevelDown, "Snap down (deeper)"),
+        (KeyCode::KeyJ, Action::LevelDown, "Snap down (deeper)"),
+        (KeyCode::Enter, Action::Activate, "Open the selected context"),
+        (KeyCode::KeyP, Action::Promote, "Surface it back onto a ring"),
+        (KeyCode::Slash, Action::EditQuery, "Edit the query line"),
+        (KeyCode::Escape, Action::PopLevel, "Leave the dive"),
+    ] {
+        b.push(Binding::key(key, InputContext::HorizonDive, action, desc));
+    }
+    // `?` — same both-bindings trick the well uses for shifted-slash layouts.
+    b.push(Binding::key_mod(
+        KeyCode::Slash,
+        Modifiers::SHIFT,
+        InputContext::HorizonDive,
+        Action::ToggleLegend,
+        "Toggle legend",
+    ));
+
+    // ====================================================================
     // Gamepad bindings
     // ====================================================================
 
@@ -606,6 +660,21 @@ pub fn default_bindings() -> Vec<Binding> {
         Action::Activate,
         "Dive into station",
     ));
+
+    // The dive is fully pad-navigable: the dpad snaps, South opens. (East
+    // pops via the Global binding below; the query line still needs a
+    // keyboard — an on-screen keyboard is a later slice's problem, noted in
+    // `docs/horizon-dive.md`.)
+    for (button, action, desc) in [
+        (GamepadButton::DPadLeft, Action::StepPrev, "Snap left"),
+        (GamepadButton::DPadRight, Action::StepNext, "Snap right"),
+        (GamepadButton::DPadUp, Action::LevelUp, "Snap up"),
+        (GamepadButton::DPadDown, Action::LevelDown, "Snap down"),
+        (GamepadButton::South, Action::Activate, "Open the selected context"),
+        (GamepadButton::West, Action::Promote, "Surface it back onto a ring"),
+    ] {
+        b.push(Binding::gamepad(button, InputContext::HorizonDive, action, desc));
+    }
 
     // South (A/X) — context-dependent activate
     b.push(Binding::gamepad(

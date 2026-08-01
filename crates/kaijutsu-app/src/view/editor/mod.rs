@@ -16,7 +16,10 @@ use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEven
 use crate::input::focus::{ActiveSurface, FocusArea};
 use crate::ui::screen::Screen;
 
-mod keys;
+// `pub(crate)`: `view::horizon_dive` reuses the layout-aware key→char and
+// modifier predicates for its query line rather than keeping a second copy
+// of that law (its own MSDF surface, the same keyboard).
+pub(crate) mod keys;
 mod pipe;
 pub mod render;
 

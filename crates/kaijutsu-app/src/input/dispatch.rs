@@ -371,7 +371,8 @@ fn context_priority(ctx: InputContext) -> usize {
         | InputContext::WellZoomed
         | InputContext::PatchBayZoomed
         | InputContext::StationZoomed
-        | InputContext::FsnFly => 1,
+        | InputContext::FsnFly
+        | InputContext::HorizonDive => 1,
         InputContext::Dialog => 2, // Dialog beats everything
     }
 }

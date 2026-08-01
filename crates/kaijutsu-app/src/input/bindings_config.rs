@@ -335,6 +335,7 @@ fn context_to_str(ctx: InputContext) -> String {
         InputContext::PatchBayZoomed => "PatchBayZoomed",
         InputContext::StationZoomed => "StationZoomed",
         InputContext::FsnFly => "FsnFly",
+        InputContext::HorizonDive => "HorizonDive",
     }
     .to_string()
 }
@@ -350,6 +351,7 @@ fn parse_context(s: &str) -> Result<InputContext, String> {
         "PatchBayZoomed" => Ok(InputContext::PatchBayZoomed),
         "StationZoomed" => Ok(InputContext::StationZoomed),
         "FsnFly" => Ok(InputContext::FsnFly),
+        "HorizonDive" => Ok(InputContext::HorizonDive),
         _ => Err(format!("unknown context '{s}'")),
     }
 }
@@ -431,6 +433,8 @@ fn action_to_str(a: &Action) -> String {
         Action::PromptContextSwitch => "PromptContextSwitch".into(),
         Action::FlyAxis { x, y } => format!("FlyAxis:{x},{y}"),
         Action::FlyAltitude(v) => format!("FlyAltitude:{v}"),
+        Action::DiveHorizon => "DiveHorizon".into(),
+        Action::EditQuery => "EditQuery".into(),
     }
 }
 
@@ -497,6 +501,8 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "Archive" => Ok(Action::Archive),
         "Rescan" => Ok(Action::Rescan),
         "ToggleLegend" => Ok(Action::ToggleLegend),
+        "DiveHorizon" => Ok(Action::DiveHorizon),
+        "EditQuery" => Ok(Action::EditQuery),
         "SwitchToPreviousContext" => Ok(Action::SwitchToPreviousContext),
         "CloseAndDemoteContext" => Ok(Action::CloseAndDemoteContext),
         "GoToWell" => Ok(Action::GoToWell),

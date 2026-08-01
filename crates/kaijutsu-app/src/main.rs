@@ -262,6 +262,10 @@ fn main() {
         // `RoomState::zoomed` station, so it has no ordering dependency on
         // `RoomPlugin` the way the zoomable stations above do.
         .add_plugins(view::fsn::FsnPlugin)
+        // The horizon-dive spike (`docs/horizon-dive.md`). After
+        // `TimeWellPlugin`, which registers the `WellCardMaterial` pipeline
+        // the dive's cards reuse rather than registering a second copy.
+        .add_plugins(view::horizon_dive::HorizonDivePlugin)
         // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
         .add_plugins(view::editor::EditorPlugin)
         // Timeline navigation - temporal scrubbing through history

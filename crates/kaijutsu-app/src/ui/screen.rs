@@ -49,6 +49,14 @@ pub enum Screen {
     /// to `Screen::Room`, not `Conversation` — the room is the level directly
     /// below, same as every other dive.
     Fsn,
+    /// The horizon dive (`view::horizon_dive`, `docs/horizon-dive.md`) — the
+    /// search space over everything past the time well's event horizon. Like
+    /// [`Screen::Fsn`] it is an unbounded world rather than room furniture,
+    /// so reaching it is a real screen transition; unlike Fsn it can be
+    /// entered from anywhere (the debug `F2`), so it remembers its origin
+    /// screen in `HorizonDiveState` and `Esc` returns *there* rather than to
+    /// a hardcoded level.
+    HorizonDive,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -98,6 +106,15 @@ impl Plugin for ScreenPlugin {
         // in `view::fsn::scene`, not here — this only owns the chrome.
         app.add_systems(
             OnEnter(Screen::Fsn),
+            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+        );
+
+        // ── HorizonDive ──
+        // Full-viewport 3D, same chrome contract as Room/Fsn/Editor. The
+        // dive's own entities spawn/despawn in `view::horizon_dive::scene`
+        // on the same transitions; this only owns the chrome.
+        app.add_systems(
+            OnEnter(Screen::HorizonDive),
             (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
     }

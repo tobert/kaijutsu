@@ -821,7 +821,11 @@ pub fn update_mode(
         // 4–5. `Room` covers a station zoom too now — including the well,
         // which has no second screen left of its own since Slice D. `Fsn`
         // reads raw keys like the room, same reasoning.)
-        Screen::Editor | Screen::Room | Screen::Fsn => (theme.mode_normal, &theme.mode_label_normal),
+        // `HorizonDive` joins them: it owns the viewport the same way, and
+        // its query line is its own MSDF surface, not the compose overlay.
+        Screen::Editor | Screen::Room | Screen::Fsn | Screen::HorizonDive => {
+            (theme.mode_normal, &theme.mode_label_normal)
+        }
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -1498,6 +1502,9 @@ pub fn update_hints(
         },
         Screen::Fsn => {
             "WASD/\u{2190}\u{2192}\u{2191}\u{2193}: fly \u{2502} PgUp/PgDn: altitude \u{2502} Esc: room"
+        }
+        Screen::HorizonDive => {
+            "/: query \u{2502} hjkl/\u{2190}\u{2192}\u{2191}\u{2193}: snap \u{2502} Enter: open \u{2502} p: surface \u{2502} Esc: back"
         }
     };
 

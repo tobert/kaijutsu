@@ -19,6 +19,7 @@ pub mod fieldset;
 pub mod format;
 pub mod fsn;
 pub mod geometry;
+pub mod horizon_dive;
 pub mod lifecycle;
 pub mod overlay;
 pub mod palette;

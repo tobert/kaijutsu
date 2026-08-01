@@ -18,7 +18,7 @@ use bevy::prelude::*;
 /// The single character a key event resolves to, layout-aware via `logical_key`.
 /// `None` for non-character keys (named keys, function keys) and for multi-char
 /// dead-key compose sequences we can't forward as one keystroke.
-fn pressed_char(event: &KeyboardInput) -> Option<char> {
+pub fn pressed_char(event: &KeyboardInput) -> Option<char> {
     let Key::Character(s) = &event.logical_key else {
         return None;
     };

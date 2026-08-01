@@ -167,6 +167,16 @@ pub enum Action {
 
     /// `r` in the patch bay — rescan the ALSA graph.
     Rescan,
+
+    // Horizon dive (`view::horizon_dive`, docs/horizon-dive.md)
+    /// `F2` anywhere, or `h` in the zoomed well — activate the event horizon
+    /// and dive into the search space behind it. Debug entry for the spike.
+    DiveHorizon,
+    /// `/` in the dive — hand the keyboard to the query line. Leaving it
+    /// (Esc/Enter) is the query line's own job, not an action: while it holds
+    /// the grab there are no bindings to fire.
+    EditQuery,
+
     /// `?` — toggle the in-scene keyboard legend.
     ToggleLegend,
 
