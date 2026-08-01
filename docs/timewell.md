@@ -273,8 +273,9 @@ the destination they were always heading for:
   of the tabletop at 70, close enough to read as sitting *on* the table's air.
 - **The event horizon becomes a place.** The ring deck moves onto the room
   floor (`RING_DECK_DEPTH` −850 → −320, the depth at which world y is exactly
-  0, plus `room::TRACE_Y` of clearance so it doesn't z-fight the floor disc
-  that is *also* at y=0): an accretion disc lying flat, encircling the table
+  0, plus half of `room::TRACE_Y` — the floor plane is crowded, and the disc
+  takes the layer between `RoomFloor` at y=0 and the gold `ConsoleRingInlay`
+  and circuit routes at `TRACE_Y`): an accretion disc lying flat, encircling the table
   plinth the rings hover over. Its `well_rings.wgsl` visuals — spiral core,
   ripples, throat glow — already read as accretion; nothing about the shader
   changed, only where the disc lives. The component followed the meaning:

@@ -303,8 +303,16 @@ pub const READING_TEX_H: f32 = 320.0;
 pub const FOCUS_QUAD_W: f32 = 380.0;
 pub const FOCUS_QUAD_H: f32 = 237.5;
 
-/// World position of the focus card: lower-center and forward (+Z, toward the
-/// camera) so it floats in front of the rings at the mouth of the well.
+/// **Funnel-local** position of the focus card — not world, despite the name
+/// this doc used to give it. Since the flatten, local +Z is world **up**, so
+/// the 260 here lifts the card *above* the ring stack (world y ≈ 219, over the
+/// table's center) rather than pulling it "forward toward the camera" as the
+/// pre-flatten doc claimed. That still works, and is the reason it works:
+/// `shot::well_local_shot`'s focus dolly backs off along the same local +Z, so
+/// the camera rises with it and looks down, and `billboard_cards` turns the
+/// card to face wherever the camera ended up. **Amy-tunable** — and worth a
+/// look on screen, since "floating over the well" is a different read from the
+/// "pedestal at the mouth" it was originally placed for.
 pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
 
 /// In-world label quad size (well units) — modest, well under a rim card's
@@ -358,18 +366,30 @@ const HORIZON_FLOOR_DEPTH: f32 = -320.0;
 /// −265, buried under the floor) while it was playing "throat floor" for a
 /// four-ring funnel.
 ///
-/// **Not** literally [`HORIZON_FLOOR_DEPTH`]: `room::spawn_floor`'s
-/// `RoomFloor` disc sits at exactly y=0, so a coplanar horizon disc would
-/// z-fight across its whole 275-unit radius, every frame. The room already
-/// has one answer for this — `room::TRACE_Y`, "trace ribbon height above the
-/// floor (avoids z-fighting)" — so the disc borrows it rather than inventing
-/// a second epsilon, converted into funnel-local units by
-/// [`STATION_CENTER_SCALE`]. Sub-pixel at any real framing; the disc still
-/// reads as lying on the floor.
+/// **Not** literally [`HORIZON_FLOOR_DEPTH`]. The room's floor is a crowded
+/// plane and the disc has to take its place in the stack:
+///
+/// - `room::spawn_floor`'s `RoomFloor` disc sits at exactly **y=0**, so a
+///   coplanar horizon disc risks fighting it across its whole 275-unit radius.
+/// - The room's own floor decoration — the gold `ConsoleRingInlay` at radius
+///   230, and every circuit-board route ribbon — sits at **`room::TRACE_Y`**
+///   (0.6), which the disc at 275 radius overlaps. Landing *on* `TRACE_Y`
+///   would put two surfaces in one plane again, and drawing *over* it would
+///   bury the room's gold ring under the well's glow.
+///
+/// So the disc takes the layer **between** them: `TRACE_Y × 0.5`, converted
+/// into funnel-local units by [`STATION_CENTER_SCALE`]. The accretion glow
+/// reads as coming up *through* the room's etched circuitry rather than
+/// pasted over it — and `well_rings.wgsl` is alpha-blended and mostly
+/// transparent, so the floor's own gradient still reads through the disc.
+/// `the_event_horizon_deck_lies_between_the_floor_and_the_rooms_trace_layer`
+/// pins the sandwich.
 ///
 /// **Amy-tunable — but retune against the floor tests, not by feel alone.**
+/// Which of the disc and the room's gold inlay should be on top is a taste
+/// call she has not made yet.
 pub(super) const RING_DECK_DEPTH: f32 =
-    HORIZON_FLOOR_DEPTH + crate::view::room::TRACE_Y / STATION_CENTER_SCALE;
+    HORIZON_FLOOR_DEPTH + (crate::view::room::TRACE_Y * 0.5) / STATION_CENTER_SCALE;
 
 /// Terrace-ring quad side length, as a multiple of the ring radius. The quad is
 /// comfortably larger than the ring (side = scale × radius) so the annulus band
@@ -1340,21 +1360,23 @@ mod tests {
     }
 
     #[test]
-    fn the_event_horizon_deck_lies_on_the_room_floor_without_z_fighting_it() {
+    fn the_event_horizon_deck_lies_between_the_floor_and_the_rooms_trace_layer() {
         // The ring deck IS the event horizon now: an accretion disc lying flat
-        // on the room floor, encircling the table plinth. On the floor — but
-        // NOT coplanar with `room::spawn_floor`'s own y=0 disc, which would
-        // z-fight across the whole 275-unit radius. It borrows the room's
-        // established floor-decoration clearance (`room::TRACE_Y`).
+        // on the room floor, encircling the table plinth. The room floor plane
+        // is crowded — `RoomFloor` at exactly y=0, and the gold
+        // `ConsoleRingInlay` plus every circuit route at `room::TRACE_Y` — and
+        // the disc's 275-unit radius overlaps both. It has to sit strictly
+        // between them: clear of the floor, under the room's own etched
+        // circuitry.
         let deck_y = world_y_at_depth(RING_DECK_DEPTH);
         assert!(
             deck_y > 0.0,
             "the deck must clear the room floor, not sink into or below it: {deck_y}"
         );
         assert!(
-            deck_y <= crate::view::room::TRACE_Y + 1e-3,
-            "…by no more than the room's own floor-decoration clearance ({}), \
-             or it stops reading as lying on the floor: {deck_y}",
+            deck_y < crate::view::room::TRACE_Y,
+            "…and stay under the room's trace layer ({}), or it lands in that \
+             plane / buries the gold inlay: {deck_y}",
             crate::view::room::TRACE_Y
         );
         // …and below every ring that still seats cards.
