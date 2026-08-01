@@ -333,23 +333,43 @@ const LABEL_DIM: f32 = 0.85;
 /// "+N" label's radius against the disc's edge. At 1100 local × 0.5 the disc
 /// is 275 world units in radius — wider than `room::TABLE_PLINTH_RADIUS`
 /// (145), so it reads as a ring of accretion *around* the table's foot.
+///
+/// **Live-tune note:** the flip side of lying on the floor is that the
+/// plinth (a solid cylinder, y=0..16, radius 145) stands *through* the disc,
+/// so the shader's spiral core — drawn at the disc's center — is occluded,
+/// and only the 145..275 annulus is visible. That is the intended read
+/// ("accretion around the table's foot"), but if the core turns out to be
+/// missed, this size and `well_rings.wgsl`'s core radius are the two knobs.
 pub(super) const RING_DECK_SIZE: f32 = 1100.0;
 
-/// Depth (along the funnel's local −Z) of the ring deck — **the event horizon:
-/// exactly on the room floor (world y = 0)**.
+/// The room floor, in funnel-local depth. With the rings laid parallel to the
+/// floor ([`STATION_CENTER_PLACEMENT`]'s rotation) funnel depth maps 1:1 onto
+/// world height — `world_y = TABLE_TOP_Y + STATION_CENTER_LIFT +
+/// STATION_CENTER_SCALE·depth` = `160 + 0.5·depth` — so −320 is world y
+/// exactly 0. The design number the event horizon is defined against;
+/// `the_horizon_floor_depth_is_the_room_floor` pins it.
+const HORIZON_FLOOR_DEPTH: f32 = -320.0;
+
+/// Depth (along the funnel's local −Z) of the ring deck — **the event
+/// horizon: the accretion disc lying on the room floor**, encircling the
+/// table plinth the rings hang over. Its `well_rings.wgsl` visuals (spiral
+/// core, ripples, throat glow) already read as an accretion disc; nothing
+/// about the shader changed, only where the disc lives. It was −850 (world y
+/// −265, buried under the floor) while it was playing "throat floor" for a
+/// four-ring funnel.
 ///
-/// With the rings laid parallel to the floor
-/// ([`STATION_CENTER_PLACEMENT`]'s rotation) funnel depth maps 1:1 onto world
-/// height — `world_y = TABLE_TOP_Y + STATION_CENTER_LIFT + STATION_CENTER_SCALE
-/// · depth` = `160 + 0.5 · depth` — so −320 lands the disc dead on the floor
-/// plane, encircling the table plinth the rings hang over. Its
-/// `well_rings.wgsl` visuals (spiral core, ripples, throat glow) already read
-/// as an accretion disc; nothing about the shader changed, only where the disc
-/// lives. It was −850 (world y = −265, buried under the floor) while it was
-/// playing "throat floor" for a four-ring funnel.
-/// `the_event_horizon_deck_lies_exactly_on_the_room_floor` pins the y=0.
-/// **Amy-tunable — but retune it against that test, not by feel alone.**
-pub(super) const RING_DECK_DEPTH: f32 = -320.0;
+/// **Not** literally [`HORIZON_FLOOR_DEPTH`]: `room::spawn_floor`'s
+/// `RoomFloor` disc sits at exactly y=0, so a coplanar horizon disc would
+/// z-fight across its whole 275-unit radius, every frame. The room already
+/// has one answer for this — `room::TRACE_Y`, "trace ribbon height above the
+/// floor (avoids z-fighting)" — so the disc borrows it rather than inventing
+/// a second epsilon, converted into funnel-local units by
+/// [`STATION_CENTER_SCALE`]. Sub-pixel at any real framing; the disc still
+/// reads as lying on the floor.
+///
+/// **Amy-tunable — but retune against the floor tests, not by feel alone.**
+pub(super) const RING_DECK_DEPTH: f32 =
+    HORIZON_FLOOR_DEPTH + crate::view::room::TRACE_Y / STATION_CENTER_SCALE;
 
 /// Terrace-ring quad side length, as a multiple of the ring radius. The quad is
 /// comfortably larger than the ring (side = scale × radius) so the annulus band
@@ -1307,15 +1327,32 @@ mod tests {
     }
 
     #[test]
-    fn the_event_horizon_deck_lies_exactly_on_the_room_floor() {
+    fn the_horizon_floor_depth_is_the_room_floor() {
+        // The design number the event horizon is defined against: funnel depth
+        // -320 is world y exactly 0, given TABLE_TOP_Y + STATION_CENTER_LIFT
+        // and the flatten. Retuning the placement rotation, the lift, or the
+        // scale without moving this breaks the whole horizon.
+        let y = world_y_at_depth(HORIZON_FLOOR_DEPTH);
+        assert!(y.abs() < 1e-3, "HORIZON_FLOOR_DEPTH must map to world y=0, got {y}");
+    }
+
+    #[test]
+    fn the_event_horizon_deck_lies_on_the_room_floor_without_z_fighting_it() {
         // The ring deck IS the event horizon now: an accretion disc lying flat
-        // on the room floor, encircling the table plinth. Exactly y=0 — not
-        // "about zero" — so the disc reads as part of the floor rather than a
-        // sheet hovering over (or sunk into) it.
+        // on the room floor, encircling the table plinth. On the floor — but
+        // NOT coplanar with `room::spawn_floor`'s own y=0 disc, which would
+        // z-fight across the whole 275-unit radius. It borrows the room's
+        // established floor-decoration clearance (`room::TRACE_Y`).
         let deck_y = world_y_at_depth(RING_DECK_DEPTH);
         assert!(
-            deck_y.abs() < 1e-3,
-            "the event-horizon deck must lie on the room floor (world y=0), got {deck_y}"
+            deck_y > 0.0,
+            "the deck must clear the room floor, not sink into or below it: {deck_y}"
+        );
+        assert!(
+            deck_y <= crate::view::room::TRACE_Y + 1e-3,
+            "…by no more than the room's own floor-decoration clearance ({}), \
+             or it stops reading as lying on the floor: {deck_y}",
+            crate::view::room::TRACE_Y
         );
         // …and below every ring that still seats cards.
         for band in kaijutsu_viz::layout::ALL_BANDS {

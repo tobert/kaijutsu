@@ -271,15 +271,17 @@ the destination they were always heading for:
 - **ACTIVE** stays at world y=160, unchanged.
 - **RECENT** rises to y=85 (`RING_DEPTH_STEP` −230 → −150) — hanging just clear
   of the tabletop at 70, close enough to read as sitting *on* the table's air.
-- **The event horizon becomes a place.** The ring deck moves to world y exactly
-  **0.0** (`RING_DECK_DEPTH` −850 → −320): an accretion disc lying flat on the
-  floor, encircling the table plinth the rings hover over. Its
-  `well_rings.wgsl` visuals — spiral core, ripples, throat glow — already read
-  as accretion; nothing about the shader changed, only where the disc lives.
-  The component followed the meaning: `WellRingsDeck` → `EventHorizonDeck`.
-  The "+N" count re-anchored onto the disc itself, which is also why it stopped
-  being hidden at room scale — it used to float mid-air as an unreadable chip,
-  and now it's a caption on a piece of room furniture.
+- **The event horizon becomes a place.** The ring deck moves onto the room
+  floor (`RING_DECK_DEPTH` −850 → −320, the depth at which world y is exactly
+  0, plus `room::TRACE_Y` of clearance so it doesn't z-fight the floor disc
+  that is *also* at y=0): an accretion disc lying flat, encircling the table
+  plinth the rings hover over. Its `well_rings.wgsl` visuals — spiral core,
+  ripples, throat glow — already read as accretion; nothing about the shader
+  changed, only where the disc lives. The component followed the meaning:
+  `WellRingsDeck` → `EventHorizonDeck`. The "+N" count re-anchored onto the
+  disc itself, which is also why it stopped being hidden at room scale — it
+  used to float mid-air as an unreadable chip, and now it's a caption on a
+  piece of room furniture.
 - **BUMPED and DEMOTED are deleted.** `Band` is two variants; `WellPlacement`
   carries two rings and a horizon list.
 

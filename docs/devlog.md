@@ -309,8 +309,8 @@ all read as one category to the eye — work you have pushed away — and the
 four-ring scheme had been paying two rings of prime real estate for a
 distinction nobody navigates by. So ACTIVE stayed on top, RECENT rose to just
 clear the tabletop, and the two lower rings collapsed into the destination
-they had always been heading for. The ring deck moved to world y exactly 0.0
-and stopped being a "throat floor": it became the **event horizon**, an
+they had always been heading for. The ring deck moved onto the room floor and
+stopped being a "throat floor": it became the **event horizon**, an
 accretion disc lying on the room floor, encircling the plinth of the table the
 rings hover over — a shader that had always looked like accretion finally put
 where that reading is literal. The "+N" moved onto the disc it counts, which

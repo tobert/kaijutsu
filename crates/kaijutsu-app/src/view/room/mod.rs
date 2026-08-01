@@ -290,8 +290,12 @@ const WALL_THREAD_BRIGHTNESS_RANGE: (f32, f32) = (0.3, 0.9);
 // ── Circuit-board floor (the wiring — static LDR engravings; Amy-tunable) ───
 
 /// Trace ribbon height above the floor (avoids z-fighting) and base width
-/// (each route scales this by its own `width_scale`, 0.5–1.2).
-const TRACE_Y: f32 = 0.6;
+/// (each route scales this by its own `width_scale`, 0.5–1.2). `TRACE_Y` is
+/// `pub(crate)`: it is the room's one answer to "how far off the floor does
+/// floor decoration sit", and the time well's event-horizon disc
+/// (`time_well::scene::RING_DECK_DEPTH`) derives its own clearance from it
+/// rather than inventing a second epsilon.
+pub(crate) const TRACE_Y: f32 = 0.6;
 const TRACE_WIDTH: f32 = 7.0;
 // Etched fabric hues (crimson = MIDI, cyan = PCM, green = VFS, gold = the
 // well) moved onto `ScenePalette::trace_crimson`/`trace_cyan`/`trace_green`/
