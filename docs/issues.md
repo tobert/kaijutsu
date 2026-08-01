@@ -1825,6 +1825,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   Two things to close: write/land `docs/horizon-dive.md`, and replace the stub
   arm in `time_well::scene::well_keyboard`. This is where Stage 5's
   search-at-the-horizon should surface (`docs/timewell.md`, Stage 5).
+- **Two of four terrace centerpiece variants are now unreachable.**
+  `assets/shaders/terrace_ring.wgsl` picks a ring's centerpiece with
+  `ring_index % N_VARIANTS` (N_VARIANTS = 4: barcode, rosette, moiré dial,
+  and the fourth). With two rings only variants 0 and 1 ever draw. Nothing is
+  broken — `GLYPH_FORCE` already exists to audition any of them — but the
+  pairing is now a *choice* rather than a rotation, and Amy hasn't picked
+  which two she wants. (While in there: the material passes `ring_count` as
+  `glyph.y` and the shader never reads it — a dead uniform channel that
+  predates the collapse.)
 - **Horizon sediment arcs.** The "+N" is a bare count. Stage 5's original
   bullet wanted per-track sediment arcs on the disc so the mass reads as
   *whose* — now genuinely cheap, since the disc is a first-class floor
