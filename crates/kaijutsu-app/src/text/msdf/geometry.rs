@@ -53,16 +53,22 @@ pub fn stroke_line_quad(x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: [
     let dy = y2 - y1;
     let len = (dx * dx + dy * dy).sqrt();
     let half = width / 2.0;
-    let (nx, ny) = if len > 1e-9 {
-        (-dy / len * half, dx / len * half)
+    // The quad is `(sx1,sy1)-(sx2,sy2)` extruded by the half-width normal
+    // `(nx,ny)`. A zero-length line has no direction to take a normal from,
+    // so it becomes a `width` square centered on the point: extruding the
+    // zero-length segment itself would give a finite but zero-AREA quad,
+    // which the rasterizer drops — silently swallowing the anomalous input
+    // instead of showing it.
+    let (sx1, sy1, sx2, sy2, nx, ny) = if len > 1e-9 {
+        (x1, y1, x2, y2, -dy / len * half, dx / len * half)
     } else {
-        (half, 0.0)
+        (x1 - half, y1, x1 + half, y1, 0.0, half)
     };
 
-    let a = Point::new(x1 + nx, y1 + ny);
-    let b = Point::new(x2 + nx, y2 + ny);
-    let c = Point::new(x2 - nx, y2 - ny);
-    let d = Point::new(x1 - nx, y1 - ny);
+    let a = Point::new(sx1 + nx, sy1 + ny);
+    let b = Point::new(sx2 + nx, sy2 + ny);
+    let c = Point::new(sx2 - nx, sy2 - ny);
+    let d = Point::new(sx1 - nx, sy1 - ny);
 
     [
         GeometryVertex::new(a, color),
@@ -288,12 +294,29 @@ mod tests {
 
     #[test]
     fn zero_length_line_still_produces_a_finite_quad() {
-        // Guards against NaN/div-by-zero rather than asserting a specific
-        // shape — a zero-length engraving line is unexpected input, not a
-        // rendering contract.
+        // Guards against NaN/div-by-zero — a zero-length engraving line is
+        // unexpected input, but it must not poison the vertex stream.
         let quad = stroke_line_quad(5.0, 5.0, 5.0, 5.0, 2.0, WHITE);
         for v in &quad {
             assert!(v.x.is_finite() && v.y.is_finite());
+        }
+    }
+
+    #[test]
+    fn zero_length_line_draws_a_visible_dot_not_an_empty_quad() {
+        // Extruding a zero-length segment along one normal yields a quad with
+        // zero HEIGHT — finite, but zero-area, so the rasterizer drops it and
+        // the anomalous input disappears silently. A `width` square makes it
+        // visible instead, which is what the fallback is for.
+        let quad = stroke_line_quad(5.0, 5.0, 5.0, 5.0, 2.0, WHITE);
+        let tri_area = |a: GeometryVertex, b: GeometryVertex, c: GeometryVertex| {
+            0.5 * ((b.x - a.x) as f64 * (c.y - a.y) as f64 - (c.x - a.x) as f64 * (b.y - a.y) as f64).abs()
+        };
+        let total = tri_area(quad[0], quad[1], quad[2]) + tri_area(quad[3], quad[4], quad[5]);
+        assert!((total - 4.0).abs() < 1e-6, "expected a 2x2 dot, got area {total}");
+        // …and it must be centered on the point, not offset to one side.
+        for v in &quad {
+            assert!((v.x - 5.0).abs() <= 1.0 + 1e-6 && (v.y - 5.0).abs() <= 1.0 + 1e-6);
         }
     }
 
