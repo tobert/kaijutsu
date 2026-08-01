@@ -1,0 +1,10 @@
+diff --git a/src/old_name.rs b/src/new_name.rs
+rename from src/old_name.rs
+rename to src/new_name.rs
+--- a/src/old_name.rs
++++ b/src/new_name.rs
+@@ -1,3 +1,3 @@
+ // header
+-fn old_name() {}
++fn new_name() {}
+ // footer

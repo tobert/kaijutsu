@@ -1,0 +1,8 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,3 +10,3 @@ impl Widget for Thing
+     fn draw(&self) {
+-        old();
++        new();
+     }

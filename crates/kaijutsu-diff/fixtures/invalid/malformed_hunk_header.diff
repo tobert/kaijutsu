@@ -1,0 +1,6 @@
+diff --git a/x.txt b/x.txt
+--- a/x.txt
++++ b/x.txt
+@@ -1,2 +oops @@
+-a
++b

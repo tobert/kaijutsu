@@ -4,6 +4,7 @@ members = [
     "crates/kaijutsu-types",
     "crates/kaijutsu-editor",
     "crates/kaijutsu-crdt",
+    "crates/kaijutsu-diff",
     "crates/kaijutsu-kernel",
     "crates/kaijutsu-client",
     "crates/kaijutsu-server",
@@ -35,6 +36,7 @@ kaijutsu-viz = { path = "crates/kaijutsu-viz" }
 kaijutsu-types = { path = "crates/kaijutsu-types" }
 kaijutsu-editor = { path = "crates/kaijutsu-editor" }
 kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
+kaijutsu-diff = { path = "crates/kaijutsu-diff" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
@@ -112,6 +114,11 @@ kurbo = "0.13"
 # Text rendering
 cosmic-text = "0.16"   # pinned by Bevy 0.18
 pulldown-cmark = "0.13"
+
+# Diff engine (Apache-2.0) — the engine inside gitoxide and Helix. Histogram +
+# Myers over *arbitrary* token streams, so word-level refinement is the same
+# engine with a different tokenizer. `kaijutsu-diff` writes no diff algorithm.
+imara-diff = "0.2"
 
 # CRDT + Persistence
 diamond-types-extended = "0.2"

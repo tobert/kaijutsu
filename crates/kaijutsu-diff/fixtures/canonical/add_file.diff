@@ -1,0 +1,7 @@
+diff --git a/notes/todo.md b/notes/todo.md
+--- /dev/null
++++ b/notes/todo.md
+@@ -0,0 +1,3 @@
++# Todo
++- write the parser
++- write the tests

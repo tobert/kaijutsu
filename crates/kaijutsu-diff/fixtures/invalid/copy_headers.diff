@@ -1,0 +1,4 @@
+diff --git a/src/a.rs b/src/b.rs
+similarity index 100%
+copy from src/a.rs
+copy to src/b.rs

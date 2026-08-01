@@ -1,0 +1,5 @@
+diff --git a/docs/a.md b/docs/b.md
+rename from docs/a.md
+rename to docs/b.md
+--- a/docs/a.md
++++ b/docs/b.md

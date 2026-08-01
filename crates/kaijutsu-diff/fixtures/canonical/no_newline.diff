@@ -1,0 +1,9 @@
+diff --git a/eof.txt b/eof.txt
+--- a/eof.txt
++++ b/eof.txt
+@@ -1,2 +1,2 @@
+ keep
+-last line
+\ No newline at end of file
++last line changed
+\ No newline at end of file

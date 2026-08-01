@@ -1,0 +1,6 @@
+diff --git "a/dir/two words.txt" "b/dir/two words.txt"
+--- "a/dir/two words.txt"
++++ "b/dir/two words.txt"
+@@ -1 +1 @@
+-alpha
++beta
