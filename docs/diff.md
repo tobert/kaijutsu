@@ -222,6 +222,15 @@ build taught us, for the slices still to come:
   the crate rustdoc — a parse failure is a visible error state, never an
   empty viewer. `FoldState` on `DiffModel` is view state formatting ignores:
   keep folds out of any equality/roundtrip check.
+- **Review warnings for slices 4/5** (gemini-pro deliberate, 2026-08-01,
+  pre-merge review — approved): `WordSpan` indexes **bytes** of
+  `DiffLine::text` — verify Parley span styling consumes byte ranges (it
+  should; if it wants char/grapheme indices, translate at the edge or
+  multibyte text misaligns). Apply `truncate_to_bytes(MAX_RENDER_BYTES)`
+  **before** any Parley layout — parse ceilings are 16 MiB, far past what
+  the main thread survives. Map `ContentType` → `DiffProfile` through an
+  exhaustive `match` at the app edge so a future ContentType variant is a
+  compile error, not a silent fallback profile.
 
 ## Seam guidance (deepseek review, 2026-08-01)
 
