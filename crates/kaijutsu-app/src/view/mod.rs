@@ -12,7 +12,6 @@
 pub mod block_render;
 pub mod brp_methods;
 pub mod components;
-pub mod cursor;
 pub mod document;
 pub mod editor;
 pub mod fieldset;
