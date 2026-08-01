@@ -58,7 +58,12 @@ the plan of record.
    issues.md "minimap / semantic-zoom" fence was written about *conversation*
    scroll; a diff is a bounded document — deliberately decided in-scope, fence
    acknowledged.
-7. **Color is semantic, not baked.** Diff block content carries no escape
+7. **Richness rank (2026-08-01): `Plain < Markdown < Svg < Abc < Diff < Image`** —
+   sol's placement. A deliberate diff typing is highly structured and beats
+   almost any competing claim in a tie; and someday a diff may *contain* image
+   diffing, so it ranks just under `Image`. Pinned via the explicit
+   `richness()` extraction (slice 2), tested at equal timestamps.
+8. **Color is semantic, not baked.** Diff block content carries no escape
    codes; the renderer colors it from the theme via `SpanBrush` spans (the
    mechanism markdown already uses). A `ContentType::Ansi` (SGR → span parser)
    is a worthwhile *adjacent* feature for terminal output generally, but the
@@ -141,7 +146,7 @@ the plan of record.
    `format∘parse == id` on canonical text, external text canonicalizes);
    CRLF normalized to `\n` at emission; size ceilings for
    generation/render/hydration; the freeze-on-open viewer snapshot contract;
-   the LWW richness rank for `Diff` (Amy decides). Golden fixtures shared by
+   the LWW richness rank for `Diff` (decided — Decision 7). Golden fixtures shared by
    kernel and app tests so the two sides cannot invent divergent dialects.
 1. `kaijutsu-diff`: engine wrapper + `DiffModel` + unified format/parse +
    refinement + `DiffProfile` + diffstat + **hunk-aware projection/truncation
@@ -179,8 +184,11 @@ the plan of record.
    headers or not exist. Clipboard access must not block the Bevy main
    thread. The one
    honest share with `EditorCore`/compose: extract the Bevy→modalkit
-   key-notation mapping (pure data, no modalkit-version coupling); do NOT
-   share the intent-drain types — Editor intents carry write semantics,
+   key-notation mapping (pure data, no modalkit-version coupling) — and home
+   it where a non-Bevy client could reach it (NOT buried in `kaijutsu-app`;
+   a future TUI client would pair `modalkit-ratatui`'s crossterm mapping with
+   the same notation data — decide the exact crate when this slice lands);
+   do NOT share the intent-drain types — Editor intents carry write semantics,
    Diff intents don't, and a shared trait would couple their evolution.
 6. Minimap, folds, word-level highlight polish; multi-rect material slice.
 
@@ -222,7 +230,8 @@ model-facing projection — the #1 product risk), **LWW rank must be pinned,
 not appended**, and the **slice 5/6 selection-rendering inversion** (fixed:
 line-wise `V` only until multi-rect). Still open:
 
-- **`Diff`'s richness rank — Amy decides.** The reviewers split: gemini says
+- **`Diff`'s richness rank — DECIDED 2026-08-01 (Decision 7): sol's placement,
+  above `Abc`, below `Image`.** The reviewers split: gemini says
   between `Markdown` and `Svg` (a diff is still text); sol says between
   `Image` and `Abc`. With `richness()` explicit (slice 2) this is just
   picking a number, but pick it deliberately and test equal-timestamp ties.
