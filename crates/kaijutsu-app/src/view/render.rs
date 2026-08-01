@@ -847,13 +847,19 @@ pub fn compute_spacer_heights(shown: &[(f32, f32, f32)], content_height: f32) ->
     (top, bottom)
 }
 
-fn set_display(node: &mut Node, display: Display) {
+/// Apply the virtualization decision to one row's entity: `Display` drives
+/// taffy, `Visibility` is the second line of defense for the scene builders.
+/// Change-detection friendly — writes only when a field actually moves.
+fn set_row_shown(node: &mut Node, vis: &mut Visibility, shown: bool) {
+    let display = if shown { Display::Flex } else { Display::None };
     if node.display != display {
         node.display = display;
     }
-}
-
-fn set_visibility(vis: &mut Visibility, target: Visibility) {
+    let target = if shown {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
     if *vis != target {
         *vis = target;
     }
@@ -876,30 +882,40 @@ fn set_visibility(vis: &mut Visibility, target: Visibility) {
 /// during fast scroll — same predicate as the `Visibility`-only culling this
 /// replaces.
 ///
-/// One exception forces an entity `Display::Flex` regardless of the window:
-/// **streaming while offscreen** (`BlockCell.last_render_version >
-/// row.measured_version`): a block's measured height goes stale once it's
-/// `Display::None`, since `readback_block_heights` only remeasures
-/// `Display::Flex` entities. Forcing one extra frame of `Display::Flex`
-/// lets readback catch up before the block re-enters the window — otherwise
-/// the stale height would produce a visible scrollbar/content jump. In
-/// practice this is rare and geometrically local: streaming blocks are
-/// appended at the document tail, which is exactly where a follow-mode
-/// viewport already sits.
+/// **The shown set is always one contiguous document interval — no
+/// exceptions.** Two spacers can encode exactly one gap above the shown rows
+/// and one below; a second island would have an unrepresentable hole in
+/// front of it, and taffy would pack it directly under the in-window rows
+/// (wrong position, wrong scrollable extent, and `readback_block_heights`
+/// would then "measure" it there and feed that back into the model). So the
+/// window predicate alone decides, for blocks and headers alike.
 ///
-/// Never-measured rows get **no** exception (unlike the pre-geometry
-/// version of this system, which force-showed them and paid an O(N) layout
-/// pass on first load of a long conversation): their estimated
-/// height/y_offset from [`ConversationGeometry`] place them in or out of
-/// the window immediately, and the estimate is replaced by a real
-/// measurement just-in-time as the row scrolls into the window.
+/// Two categories of row therefore stay `Display::None` while offscreen,
+/// carrying a height the model knows is imprecise:
+///
+/// - **Never-measured rows** keep their [`ConversationGeometry`] estimate
+///   (unlike the pre-geometry version of this system, which force-showed
+///   them and paid an O(N) layout pass on first load of a long
+///   conversation).
+/// - **Rows that streamed while offscreen** keep the height last measured
+///   before they were hidden (`BlockCell.last_render_version >
+///   row.measured_version`), since `readback_block_heights` only remeasures
+///   `Display::Flex` entities.
+///
+/// Both are corrected the same just-in-time way: the row becomes
+/// `Display::Flex` when it enters the window, readback measures it, and the
+/// scroll-anchoring in `readback_block_heights` absorbs the delta if the row
+/// sits above the viewport. Until then the imprecision costs at most a
+/// slightly-off scrollbar extent — the accepted price of estimated heights
+/// everywhere else in this model, and far cheaper than visible layout
+/// corruption.
 pub fn virtualize_conversation(
     entities: Res<EditorEntities>,
     scroll_state: Res<ConversationScrollState>,
     containers: Query<&BlockCellContainer>,
     geometries: Query<&ConversationGeometry>,
     role_header_query: Query<&RoleGroupBorder>,
-    mut block_cells: Query<(&BlockCell, &mut Node, &mut Visibility), With<BlockCell>>,
+    mut block_cells: Query<(&mut Node, &mut Visibility), With<BlockCell>>,
     mut role_headers: Query<
         (&mut Node, &mut Visibility),
         (With<RoleGroupBorder>, Without<BlockCell>),
@@ -940,32 +956,18 @@ pub fn virtualize_conversation(
     for row in geom.rows() {
         let in_window = row.y_offset + row.height >= top && row.y_offset <= bottom;
 
+        // A row with no live entity (outside the spawn band, or spawn lag)
+        // is skipped entirely — it contributes nothing to `shown`, and the
+        // spacers stand in for it.
         match row.key {
             RowKey::Block(id) => {
                 let Some(entity) = container.get_entity(&id) else {
                     continue;
                 };
-                let Ok((block_cell, mut node, mut vis)) = block_cells.get_mut(entity) else {
+                let Ok((mut node, mut vis)) = block_cells.get_mut(entity) else {
                     continue;
                 };
-                let stale = block_cell
-                    .last_render_version
-                    .is_some_and(|v| v > row.measured_version);
-                let should_show = in_window || stale;
-
-                set_display(&mut node, if should_show { Display::Flex } else { Display::None });
-                set_visibility(
-                    &mut vis,
-                    if should_show {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    },
-                );
-
-                if should_show {
-                    shown.push((row.y_offset, row.height, row.margin_bottom));
-                }
+                set_row_shown(&mut node, &mut vis, in_window);
             }
             RowKey::Header(id) => {
                 let Some(&entity) = header_map.get(&id) else {
@@ -974,21 +976,12 @@ pub fn virtualize_conversation(
                 let Ok((mut node, mut vis)) = role_headers.get_mut(entity) else {
                     continue;
                 };
-
-                set_display(&mut node, if in_window { Display::Flex } else { Display::None });
-                set_visibility(
-                    &mut vis,
-                    if in_window {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    },
-                );
-
-                if in_window {
-                    shown.push((row.y_offset, row.height, row.margin_bottom));
-                }
+                set_row_shown(&mut node, &mut vis, in_window);
             }
+        }
+
+        if in_window {
+            shown.push((row.y_offset, row.height, row.margin_bottom));
         }
     }
 

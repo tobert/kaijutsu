@@ -1002,9 +1002,10 @@ pub struct BlockCellLayout {
     /// Indentation level (for nested tool results).
     pub indent_level: u32,
     /// `BlockCell.last_render_version` at the time `height` was last
-    /// measured from `ComputedNode`. Used by `virtualize_conversation` to
-    /// detect a block whose content changed while it was `Display::None` —
-    /// see the streaming-offscreen stale-height guard.
+    /// measured from `ComputedNode`. A mirror of `GeomRow.measured_version`
+    /// for consumers that already hold the entity — the geometry row is the
+    /// source of truth, and virtualization decides purely on the window (see
+    /// `virtualize_conversation`), never on this staleness signal.
     pub last_measured_version: u64,
 }
 

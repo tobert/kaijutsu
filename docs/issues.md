@@ -535,10 +535,22 @@ Both `6504fafe` follow-ups shipped (estimated-height placeholders killed the
 O(N) first-load pass; band despawn/respawn bounds entities + VRAM to the
 viewport band). New accepted limits of the geometry model, carried here:
 
-- **Offscreen-streamed rows keep stale estimates** until they enter the
-  spawn band (re-measured there, before visibility) — the scrollbar/spacers
-  drift a little while text streams into rows you've scrolled away from.
-  If it ever matters: re-estimate estimated rows on version change.
+- **Offscreen-streamed rows keep stale heights** until they re-enter the
+  virtualize show window (±1 screen around the viewport, so still one full
+  screen before they can be seen) — the scrollbar/spacers drift a little
+  while text streams into rows you've scrolled away from. This is the safe
+  side of the trade: virtualize's shown set must always be **one contiguous
+  document interval**, because the two `ConversationSpacer` nodes can encode
+  exactly one gap above it and one below. Force-showing an offscreen stale
+  row (what we used to do) makes taffy pack it directly under the in-window
+  rows — visible corruption, and readback then measures it there. If the
+  drift ever matters, fix it by re-estimating on version change, never by
+  breaking contiguity.
+- **Height corrections landing on a row that straddles the viewport top**
+  are not scroll-anchored: `readback_block_heights` only compensates rows
+  *fully* above the viewport, so a partially-visible row's correction shifts
+  the content below it. Pre-existing, and small — a row entering the window
+  is at least one screen from the viewport edge.
 - **ToolCall at the outer band edge** can briefly render CloseBottom while
   its ToolResult is still outside the band (border joins are computed from
   in-band snapshots only); corrects as the pair scrolls in.
