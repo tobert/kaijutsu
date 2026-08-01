@@ -2558,6 +2558,124 @@ impl BlockStore {
     }
 
     // =========================================================================
+    // History (oplog replay) — the `kj diff --from` substrate
+    // =========================================================================
+
+    /// The oplog sequence range this document can still be replayed over:
+    /// `(oldest, head)`.
+    ///
+    /// `oldest` is the seq of the latest compaction snapshot (0 when there is
+    /// none) — everything before it has been folded into the snapshot and is
+    /// gone. `head` is the newest journalled seq. Both ends are inclusive and
+    /// reconstructable; `oldest == head` means there is no history to diff yet.
+    pub fn oplog_seq_range(&self, context_id: ContextId) -> BlockStoreResult<(i64, i64)> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let head = self
+            .get(context_id)
+            .map(|e| e.next_journal_seq.load(Ordering::SeqCst) as i64)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let oldest = db
+            .lock()
+            .load_latest_snapshot(context_id)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?
+            .map(|s| s.seq)
+            .unwrap_or(0);
+        Ok((oldest, head))
+    }
+
+    /// Reconstruct one block's text as it stood at oplog sequence `seq`.
+    ///
+    /// Replays the document's durable history — the latest compaction snapshot
+    /// at or before `seq`, then every journalled op up to and including it —
+    /// into a throwaway store. Nothing about the live document is touched.
+    /// This is what makes any historical pair of a file document derivable, and
+    /// therefore what `kj diff --from` stands on.
+    ///
+    /// It fails loud rather than approximating, because every approximation
+    /// here produces a diff against a version that never existed:
+    /// - no database → [`BlockStoreError::NoDatabaseConfigured`]: a kernel
+    ///   without persistence keeps no history at all.
+    /// - a compaction snapshot *newer* than `seq` → [`BlockStoreError::Validation`]:
+    ///   the requested point has been compacted away, and the snapshot is not
+    ///   a substitute for it.
+    /// - the block absent at that point → [`BlockStoreError::Validation`]: it
+    ///   had not been created yet (an empty string would read as "the file was
+    ///   empty then", which is a different and false claim).
+    /// - a `seq` past the journal head → [`BlockStoreError::Validation`]:
+    ///   replaying everything and calling the result "seq 99999" would answer a
+    ///   question about a version that does not exist with the current one.
+    pub fn block_content_at_seq(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        seq: i64,
+    ) -> BlockStoreResult<String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let head = self
+            .get(context_id)
+            .map(|e| e.next_journal_seq.load(Ordering::SeqCst) as i64)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        if seq > head {
+            return Err(BlockStoreError::Validation(format!(
+                "seq {seq} is past document {}'s journal head ({head})",
+                context_id.short()
+            )));
+        }
+        let db_guard = db.lock();
+        let principal_id = self.principal_id();
+
+        let (mut replay, base_seq) = match db_guard
+            .load_latest_snapshot(context_id)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?
+        {
+            Some(snap_row) if snap_row.seq > seq => {
+                return Err(BlockStoreError::Validation(format!(
+                    "history at seq {seq} for document {} has been compacted away \
+                     (oldest reconstructable seq is {})",
+                    context_id.short(),
+                    snap_row.seq
+                )));
+            }
+            Some(snap_row) => {
+                let store_snapshot = codec::decode::<StoreSnapshot>(&snap_row.state)
+                    .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+                let store = CrdtBlockStore::from_snapshot(store_snapshot, principal_id)?;
+                (store, snap_row.seq)
+            }
+            None => (CrdtBlockStore::new(context_id, principal_id), 0),
+        };
+
+        for (entry_seq, payload_bytes) in db_guard
+            .load_oplog_since(context_id, base_seq)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?
+        {
+            if entry_seq > seq {
+                break;
+            }
+            let payload = codec::decode::<SyncPayload>(&payload_bytes)
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+            replay.merge_ops(payload)?;
+        }
+
+        replay
+            .get_block_snapshot(block_id)
+            .map(|s| s.content)
+            .ok_or_else(|| {
+                BlockStoreError::Validation(format!(
+                    "block {} did not exist in document {} at seq {seq}",
+                    block_id.to_key(),
+                    context_id.short()
+                ))
+            })
+    }
+
+    // =========================================================================
     // Input Document Operations
     // =========================================================================
 

@@ -5977,6 +5977,7 @@ dependencies = [
  "kaijutsu-audio",
  "kaijutsu-cas",
  "kaijutsu-crdt",
+ "kaijutsu-diff",
  "kaijutsu-editor",
  "kaijutsu-hyoushigi",
  "kaijutsu-index",

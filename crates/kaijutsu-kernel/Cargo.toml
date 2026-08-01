@@ -59,6 +59,10 @@ toml = { workspace = true }
 # ABC music notation
 kaijutsu-abc.workspace = true
 
+# Diff model/dialect — `kj diff`, the `diff_block` tool, and the hydration
+# projection all speak this crate's unified-diff dialect (docs/diff.md).
+kaijutsu-diff.workspace = true
+
 # SVG validation (kernel-side)
 usvg = "0.46"
 

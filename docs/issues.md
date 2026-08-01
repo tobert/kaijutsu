@@ -182,6 +182,21 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## kaijutsu-mcp: workspace autoshare (seeded 2026-08-01, MCP-config session)
+
+`--share` is app-only today (`kaijutsu-app --share`, `share_dial.rs` /
+`share_server.rs` in kaijutsu-client) — kaijutsu-mcp has no share flag at
+all, discovered wiring the Claude Code MCP config. Two pieces:
+
+- **Port the share plumbing into kaijutsu-mcp** so an MCP client can offer
+  reverse-SFTP shares like the app does (the client-side machinery in
+  `kaijutsu-client` should be reusable; it's the same SSH connection).
+- **Amy's ask: a nice *autoshare* of the workspace** — when kaijutsu-mcp
+  connects from inside a project directory (the common Claude Code case),
+  automatically offer the workspace (cwd or repo root) as a share, so the
+  kernel side sees `/r/<client>/workspace` with zero flags. Needs the usual
+  `/r` decisions: share name, ro vs `:rw` default, and an opt-out.
+
 ## kaijutsu-crdt `cargo clippy --tests` fails to compile (found 2026-08-01, diff slice 2)
 
 Pre-existing on main (confirmed via stash before the slice-2 changes):
@@ -192,6 +207,20 @@ itself is green — only clippy-with-tests trips. Either the ranges are
 genuinely reversed on purpose (then `#[allow]` with a comment) or they're
 latent test bugs. Small, self-contained fix; unrelated to the diff work that
 surfaced it.
+
+## Diff blocks get no kernel-side validation on Done (found 2026-08-01, diff slice 3)
+
+`BlockStore::validate_content_and_attach_errors` (fired from `set_status` when
+a block reaches `Done`) matches only `ContentType::Abc | ContentType::Svg`, so a
+`ContentType::Diff` block never gets Error children attached for malformed
+content. Slice 3 covers the *producers* — `diff_block` refuses to create a block
+whose text doesn't parse, `kj diff` only ever emits `format()` output — and
+hydration degrades a bad diff to plain text with a note rather than dropping it.
+The gap is a block typed `Diff` by some *other* route (a hand-written
+`block_create` + `set_content_type`, a concurrent LWW type flip, a client): it
+lands with no visible error. Adding a `ContentType::Diff => validate_diff(...)`
+arm is ~10 lines and reuses `kaijutsu_diff::parse`; do it when slice 4 gives the
+app an error state to render into.
 
 ## Error-block-collapse remnants, post scaffolding removal (2026-08-01)
 
@@ -1716,13 +1745,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   rather than assuming a source fix will reach it.
 - **`builtin.file` hardening — remaining (small; the byte→char corruption fix +
   hashline addressing shipped 2026-06-17, story in devlog +
-  `project_file_tools_hashline`):** (1) in-context recovery affordance — expose
-  `git`/a revert or `kj block diff --original` in the kaish shell *(subsumed by
-  the `kj diff` plan in `docs/diff.md`, designed 2026-08-01)*; (2) the
-  post-write verification reads the CRDT cache, not the VFS disk, so a faulty
-  flush is only caught by `flush_one`'s own error (documented in `edit.rs`);
-  (3) `FileDocumentCache` CRDT-native pass-through (tracked under Persistence &
-  Sync) would let `read`'s hashes anchor `/etc/rc` cleanly.
+  `project_file_tools_hashline`):** the in-context recovery affordance
+  *shipped* 2026-08-01 as `kj diff` (`docs/diff.md` slice 3) — one path diffs
+  disk against the CRDT document that owns it, and `--from <seq>` replays the
+  journal, so "what did the agent change, and what did it used to say?" is
+  answerable in the shell. Still open: (1) the post-write verification reads the
+  CRDT cache, not the VFS disk, so a faulty flush is only caught by
+  `flush_one`'s own error (documented in `edit.rs`); (2) `FileDocumentCache`
+  CRDT-native pass-through (tracked under Persistence & Sync) would let `read`'s
+  hashes anchor `/etc/rc` cleanly.
   - **kaish-side build-out — design direction (not yet built).** The hash is an
     *edit-addressing* feature, so the kaish read surface wants **two read modes**:
     keep `cat`/`tail`/`sed`/`grep` streaming + **hash-free** (logs/huge files; never

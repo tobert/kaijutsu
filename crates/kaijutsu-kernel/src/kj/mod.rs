@@ -18,6 +18,7 @@ pub mod cp;
 pub mod config;
 pub mod context;
 pub mod context_shell;
+pub mod diff;
 pub mod doc;
 pub mod drift;
 pub mod drive;
@@ -390,6 +391,12 @@ impl KjDispatcher {
         if cmd == "config" {
             return self.dispatch_config(&argv[1..], caller).await;
         }
+        // `kj diff` addresses both sides by VFS path (and, for history, by that
+        // path's own oplog), never by context — same exemption rationale as
+        // `kj vfs`/`kj cp`.
+        if cmd == "diff" {
+            return self.dispatch_diff(&argv[1..], caller).await;
+        }
         // `kj block` operates by --context ref when given one, so it can
         // run without an active context.
         if cmd == "block" {
@@ -738,6 +745,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(drift::DriftArgs::command())
         .subcommand(cache::CacheArgs::command())
         .subcommand(vfs::VfsArgs::command())
+        .subcommand(diff::DiffArgs::command())
 }
 
 #[cfg(test)]

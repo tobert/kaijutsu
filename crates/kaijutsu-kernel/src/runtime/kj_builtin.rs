@@ -2373,4 +2373,50 @@ mod tests {
             latch.hint
         );
     }
+    /// The wire half of `kj diff`: `content_type` has to survive the
+    /// kj → KjBuiltin → ExecResult bridge as the `text/x-diff` MIME string,
+    /// because that string — and nothing else — is what the RPC shell path
+    /// stamps onto the output block (`rpc.rs`, `set_content_type`). A typed
+    /// block that loses its type here degrades to plain text everywhere: no
+    /// diff rendering, no hydration projection.
+    #[tokio::test]
+    async fn kj_diff_carries_the_diff_mime_through_the_bridge() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let home = register_context(&dispatcher, Some("diff-home"), None, principal);
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("w.txt"), "before\n").expect("write");
+        dispatcher
+            .kernel()
+            .mount("/mnt/wire", crate::vfs::LocalBackend::new(dir.path()))
+            .await;
+
+        // Diverge the CRDT copy from disk so there is something to show.
+        {
+            let blocks = dispatcher.block_store();
+            let cache = dispatcher.kernel().file_cache(blocks);
+            let (ctx, block) = cache.get_or_load("/mnt/wire/w.txt").await.expect("load");
+            blocks
+                .edit_text(ctx, &block, 0, "after\n", "before\n".chars().count())
+                .expect("edit");
+            cache.mark_dirty("/mnt/wire/w.txt");
+        }
+
+        let kaish = embedded_with_kj(dispatcher.clone(), home).await;
+        let res = kaish
+            .execute_with_options("kj diff /mnt/wire/w.txt", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "kj diff failed: out={} err={}", res.text_out(), res.err);
+        assert_eq!(
+            res.content_type.as_deref(),
+            Some("text/x-diff"),
+            "kj diff must reach the block layer typed"
+        );
+        let out = res.text_out().into_owned();
+        assert!(out.contains("-before") && out.contains("+after"), "got: {out}");
+        kaijutsu_diff::parse(&out).expect("what lands on the block must parse as a diff");
+    }
 }

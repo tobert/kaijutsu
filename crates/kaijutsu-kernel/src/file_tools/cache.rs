@@ -696,7 +696,12 @@ impl FileDocumentCache {
 ///
 /// File documents aren't real contexts, but BlockStore is keyed by ContextId.
 /// We use UUIDv5 (namespace: URL) so the same path always maps to the same ID.
-fn file_context_id(path: &str) -> ContextId {
+///
+/// `pub(crate)` so ownership tests can assert the *absence* of a document at
+/// this id: for a config-owned path the file-doc id must never be minted at all
+/// (`docs/config-crdt-ownership.md`), and only this function knows where such a
+/// shadow would live.
+pub(crate) fn file_context_id(path: &str) -> ContextId {
     let uuid = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("kaijutsu:file:{}", path).as_bytes(),
