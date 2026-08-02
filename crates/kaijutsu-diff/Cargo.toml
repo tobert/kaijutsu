@@ -6,9 +6,18 @@ license.workspace = true
 repository.workspace = true
 description = "Pure diff model, unified-diff dialect, and word-level refinement for kaijutsu"
 
+[features]
+default = []
+# The vi-motion viewer core (`DiffCore`). Off by default and gated because
+# `kaijutsu-kernel` depends on this crate for parse/validation ONLY: the kernel
+# must never compile modalkit. `kaijutsu-app` turns it on.
+viewer = ["dep:modalkit", "dep:editor-types"]
+
 [dependencies]
 imara-diff = { workspace = true }
 thiserror = { workspace = true }
+modalkit = { workspace = true, optional = true }
+editor-types = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"

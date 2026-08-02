@@ -120,6 +120,8 @@
 //! Callers map their own content types onto a profile at the edge — that is
 //! why this crate does not know what a `ContentType` is.
 
+#[cfg(feature = "viewer")]
+pub mod core;
 pub mod error;
 pub mod fixtures;
 pub mod limits;
@@ -135,6 +137,8 @@ mod refine;
 mod tokenize;
 mod truncate;
 
+#[cfg(feature = "viewer")]
+pub use core::{DiffCore, DiffIntent, DiffRow, RowKind};
 pub use engine::{DiffAlgorithm, DiffOptions, FileSpec, diff, diff_file};
 pub use error::DiffError;
 pub use format::{TRUNCATION_MARKER_PREFIX, format, format_file, format_hunk, truncation_marker};
