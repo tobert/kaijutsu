@@ -1658,45 +1658,6 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the compacted flag on a block — marks it superseded (e.g. by a
-    /// Drift summary) so the hydrator skips it when reconstructing LLM
-    /// history (see `llm/hydrate.rs`). There is no automatic caller of this
-    /// today (M1-A5's auto-compaction was deleted — the project chose a
-    /// gauge the user reads over a mechanism that silently melts history);
-    /// this stays as the general primitive future manual/explicit
-    /// compaction flows would use.
-    pub fn set_compacted(
-        &self,
-        context_id: ContextId,
-        block_id: &BlockId,
-        compacted: bool,
-    ) -> BlockStoreResult<()> {
-        let ops = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let frontier_before = entry.doc.frontier();
-            entry.doc.set_compacted(block_id, compacted)?;
-            entry.touch(self.principal_id());
-            entry.doc.ops_since(&frontier_before)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            source: OpSource::Local,
-        });
-
-        Ok(())
-    }
-
     /// Set the content_type hint on a block (e.g., Markdown, Svg, Abc).
     pub fn set_content_type(
         &self,
@@ -3056,11 +3017,7 @@ impl BlockStore {
                 .doc
                 .blocks_ordered()
                 .into_iter()
-                .filter(|b| {
-                    b.kind == BlockKind::Error
-                        && b.parent_id == Some(*block_id)
-                        && !b.compacted
-                })
+                .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(*block_id))
                 .collect()
         };
 
@@ -5981,7 +5938,7 @@ mod tests {
             .block_snapshots(ctx)
             .unwrap()
             .into_iter()
-            .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block) && !b.compacted)
+            .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block))
             .collect()
     }
 
@@ -6062,7 +6019,7 @@ mod tests {
             .block_snapshots(ctx)
             .unwrap()
             .into_iter()
-            .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block) && !b.compacted)
+            .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block))
             .collect();
         assert_eq!(errors.len(), 1, "validation must be idempotent");
     }

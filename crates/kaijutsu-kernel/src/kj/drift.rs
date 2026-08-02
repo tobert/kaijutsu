@@ -1111,6 +1111,75 @@ mod tests {
         );
     }
 
+    /// End-to-end coverage for `summarize`'s pull path — the sibling
+    /// error-path tests (`drift_pull_missing_source`, `_no_blocks_error`,
+    /// `_cannot_pull_from_self`) never exercise a successful distillation, so
+    /// nothing here proved `summarize` actually runs and its result lands as
+    /// a Drift block. A MockClient stands in for the LLM (the real
+    /// `summarize` call goes through the same `prompt_with_system` path
+    /// `fork --compact` uses — see `fork_compact_distill_uses_calling_context_provider`).
+    #[tokio::test]
+    async fn drift_pull_summarizes_and_inserts_drift_block() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        let dest = register_context(&d, Some("dest"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(dest, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                "material to distill",
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "mock",
+                Arc::new(Provider::Mock(MockClient::new("PULL-SUMMARY"))),
+            );
+            reg.set_default("mock");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "mock", "mock-model");
+        }
+
+        let c = caller_with_context(dest);
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("source")], &c)
+            .await;
+        assert!(result.is_ok(), "drift pull failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dest).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_crdt::BlockKind::Drift);
+        assert!(
+            drift_block.is_some(),
+            "drift pull must insert a Drift block into the caller's context: {blocks:?}"
+        );
+        assert!(
+            drift_block.unwrap().content.contains("PULL-SUMMARY"),
+            "drift block should carry the LLM's distilled summary: {:?}",
+            drift_block.unwrap().content
+        );
+    }
+
     #[tokio::test]
     async fn drift_merge_no_parent() {
         let d = test_dispatcher().await;
@@ -1149,6 +1218,70 @@ mod tests {
             result.message().contains("no blocks"),
             "msg: {}",
             result.message()
+        );
+    }
+
+    /// End-to-end coverage for `summarize`'s merge path (mirrors
+    /// `drift_pull_summarizes_and_inserts_drift_block` above) — the
+    /// sibling error-path tests (`drift_merge_no_parent`,
+    /// `_no_blocks_error`) never exercise a successful distillation.
+    #[tokio::test]
+    async fn drift_merge_summarizes_and_inserts_drift_block() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
+        d.block_store()
+            .create_document(parent, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(child, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                child,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                "child material to distill",
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "mock",
+                Arc::new(Provider::Mock(MockClient::new("MERGE-SUMMARY"))),
+            );
+            reg.set_default("mock");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(child, "mock", "mock-model");
+        }
+
+        let c = caller_with_context(child);
+        let result = d.dispatch(&[s("drift"), s("merge")], &c).await;
+        assert!(result.is_ok(), "drift merge failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(parent).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_crdt::BlockKind::Drift);
+        assert!(
+            drift_block.is_some(),
+            "drift merge must insert a Drift block into the parent context: {blocks:?}"
+        );
+        assert!(
+            drift_block.unwrap().content.contains("MERGE-SUMMARY"),
+            "drift block should carry the LLM's distilled summary: {:?}",
+            drift_block.unwrap().content
         );
     }
 

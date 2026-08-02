@@ -511,7 +511,10 @@ struct BlockFilter {
   hasRoles @3 :Bool;
   statuses @4 :List(Status);
   hasStatuses @5 :Bool;
-  excludeCompacted @6 :Bool;
+  # Retired 2026-08-02 with the dead `compacted` block flag it filtered on.
+  # Cap'n Proto ordinals must stay sequential, so the slot is kept — unread,
+  # unwritten — rather than reused.
+  unusedExcludeCompacted @6 :Bool;
   limit @7 :UInt32;
   maxDepth @8 :UInt32;
   parentId @9 :BlockId;

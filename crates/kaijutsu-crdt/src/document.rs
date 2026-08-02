@@ -41,7 +41,6 @@ const KEY_STATUS: &str = "status";
 const KEY_CONTENT: &str = "content";
 const KEY_CONTENT_FINAL: &str = "content_final";
 const KEY_COLLAPSED: &str = "collapsed";
-const KEY_COMPACTED: &str = "compacted";
 const KEY_CREATED_AT: &str = "created_at";
 const KEY_PARENT_ID: &str = "parent_id";
 
@@ -357,11 +356,6 @@ impl BlockDocument {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let compacted = block_map
-            .get(KEY_COMPACTED)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         let parent_id = block_map
             .get(KEY_PARENT_ID)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -486,7 +480,6 @@ impl BlockDocument {
             kind,
             content,
             collapsed,
-            compacted,
             ephemeral: false, // Legacy document predates ephemeral
             excluded: false,  // Legacy document predates excluded
             created_at,
@@ -517,7 +510,6 @@ impl BlockDocument {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
         })
     }
@@ -709,7 +701,6 @@ impl BlockDocument {
             None,  // tool_call_id
             None,  // exit_code
             false, // is_error
-            false, // compacted
             None,  // output
             None,  // source_context
             None,  // source_model
@@ -748,7 +739,6 @@ impl BlockDocument {
             None,
             None,
             false,
-            false, // compacted
             None,  // output
             None,  // source_context
             None,  // source_model
@@ -788,7 +778,6 @@ impl BlockDocument {
             Some(*tool_call_id),
             exit_code,
             is_error,
-            false, // compacted
             None,  // output
             None,  // source_context
             None,  // source_model
@@ -829,7 +818,6 @@ impl BlockDocument {
             None,  // tool_call_id
             None,  // exit_code
             false, // is_error
-            false, // compacted
             None,  // output
             Some(source_context),
             source_model,
@@ -866,7 +854,6 @@ impl BlockDocument {
             None,  // tool_call_id
             None,  // exit_code
             false, // is_error
-            false, // compacted
             None,  // output
             None,  // source_context
             None,  // source_model
@@ -907,7 +894,6 @@ impl BlockDocument {
             snapshot.tool_call_id,
             snapshot.exit_code,
             snapshot.is_error,
-            snapshot.compacted,
             snapshot
                 .output
                 .as_ref()
@@ -938,7 +924,6 @@ impl BlockDocument {
         tool_call_id: Option<BlockId>,
         exit_code: Option<i32>,
         is_error: bool,
-        compacted: bool,
         output_json: Option<String>,
         source_context: Option<ContextId>,
         source_model: Option<String>,
@@ -1000,11 +985,6 @@ impl BlockDocument {
                 block_map.set(KEY_ROLE, role.as_str());
                 block_map.set(KEY_STATUS, status.as_str());
                 block_map.set(KEY_COLLAPSED, false);
-
-                // Store compacted flag (only when true)
-                if compacted {
-                    block_map.set(KEY_COMPACTED, true);
-                }
 
                 // Store parent_id if present
                 if let Some(parent) = parent_id {
@@ -1477,7 +1457,6 @@ impl BlockDocument {
                 new_tool_call_id,
                 block.exit_code,
                 block.is_error,
-                block.compacted,
                 block
                     .output
                     .as_ref()
@@ -1621,7 +1600,6 @@ impl BlockDocument {
                     block_snap.tool_call_id,
                     block_snap.exit_code,
                     block_snap.is_error,
-                    block_snap.compacted,
                     block_snap
                         .output
                         .as_ref()

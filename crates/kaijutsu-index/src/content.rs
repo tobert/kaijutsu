@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 /// Extract indexable text from a context's blocks and compute a content hash.
 ///
-/// Filters to non-compacted, terminal-status, text/thinking blocks.
+/// Filters to terminal-status, text/thinking blocks.
 /// Concatenates with role prefixes. Truncates to `max_chars`.
 ///
 /// Returns `(text, sha256_hex)`.
@@ -13,10 +13,7 @@ pub fn extract_context_content(blocks: &[BlockSnapshot], max_chars: usize) -> (S
     let mut buf = String::new();
 
     for block in blocks {
-        // Skip non-terminal, compacted, or irrelevant blocks
-        if block.compacted {
-            continue;
-        }
+        // Skip non-terminal or irrelevant blocks
         if !block.status.is_terminal() {
             continue;
         }
@@ -77,7 +74,6 @@ mod tests {
             kind,
             status: Status::Done,
             content: content.to_string(),
-            compacted: false,
             ephemeral: false,
             excluded: false,
             collapsed: false,
@@ -105,7 +101,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
             error: None,
@@ -130,15 +125,6 @@ mod tests {
         assert!(text.contains("[Assistant]: Rust is a systems"));
         assert!(!hash.is_empty());
         assert_eq!(hash.len(), 64); // SHA-256 hex
-    }
-
-    #[test]
-    fn test_skips_compacted() {
-        let mut block = test_block(Role::User, BlockKind::Text, "compacted");
-        block.compacted = true;
-
-        let (text, _) = extract_context_content(&[block], 10000);
-        assert!(text.is_empty());
     }
 
     #[test]

@@ -93,7 +93,10 @@ pub enum ServerEvent {
         block_id: BlockId,
         after_id: Option<BlockId>,
     },
-    /// Document was compacted — client must re-sync from full oplog.
+    /// The document's CRDT oplog was compacted (generation bump) — client
+    /// must re-sync from the full oplog. Not to be confused with the
+    /// (deleted) LLM auto-summarization feature — this is oplog compaction,
+    /// a still-live, unrelated mechanism.
     SyncReset {
         context_id: ContextId,
         generation: u64,

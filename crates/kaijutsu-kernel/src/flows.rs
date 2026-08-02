@@ -324,7 +324,10 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-    /// Document was compacted — clients must re-sync from full oplog.
+    /// The document's CRDT oplog was compacted (generation bump) — clients
+    /// must re-sync from the full oplog. Not to be confused with the
+    /// (deleted) LLM auto-summarization feature — this is oplog compaction,
+    /// a still-live, unrelated mechanism.
     SyncReset {
         /// The context ID.
         context_id: ContextId,

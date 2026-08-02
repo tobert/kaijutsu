@@ -2635,15 +2635,16 @@ mod usage_tests {
     }
 
     /// Regression: M1-A5 auto-compaction (block-count threshold, LLM-summarize
-    /// the older half, mark `compacted=true`) was deleted along with its only
+    /// the older half, mark it superseded) was deleted along with its only
     /// call site (`spawn_llm_for_prompt`, one layer above `process_llm_stream`
     /// — too heavy a harness for a --lib test, per this file's own
-    /// `publish_tests` note about the SSH e2e harness). This proves the layer
-    /// under it stays inert: a context with 250 pre-existing blocks (well
-    /// past the old `DEFAULT_COMPACT_THRESHOLD = 200`) is untouched by a
-    /// turn — no block flips `compacted`, no Drift summary appears — where
-    /// the old `auto_compact_if_needed` call used to fire before every
-    /// prompt.
+    /// `publish_tests` note about the SSH e2e harness). The `compacted` block
+    /// flag it used to set was itself removed later (2026-08-02) as inert
+    /// residue — a block can no longer even represent that state. This proves
+    /// the layer under it stays inert: a context with 250 pre-existing blocks
+    /// (well past the old `DEFAULT_COMPACT_THRESHOLD = 200`) is untouched by
+    /// a turn — no Drift summary appears — where the old
+    /// `auto_compact_if_needed` call used to fire before every prompt.
     #[tokio::test]
     async fn large_history_is_never_auto_compacted() {
         let local = tokio::task::LocalSet::new();
@@ -2656,10 +2657,6 @@ mod usage_tests {
                     drive_turn_with(provider, 250, kernel.clone()).await;
 
                 let blocks = documents.block_snapshots(ctx).unwrap();
-                assert!(
-                    blocks.iter().all(|b| !b.compacted),
-                    "no block should ever be marked compacted — auto-compaction is deleted"
-                );
                 assert!(
                     !blocks.iter().any(|b| b.kind == BlockKind::Drift),
                     "no Drift summary should appear — nothing collapses old history anymore"

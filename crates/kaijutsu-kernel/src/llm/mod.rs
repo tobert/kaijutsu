@@ -951,7 +951,7 @@ pub async fn resolve_image_blocks_from_cas(
 /// Reconstruct LLM conversation history from stored blocks.
 ///
 /// Walks blocks in order and produces the `Message` sequence expected by the
-/// LLM API. Skips thinking, file, compacted, and empty blocks.
+/// LLM API. Skips thinking, file, and empty blocks.
 /// Drift blocks are included as User messages with a provenance prefix.
 ///
 /// Preserves `tool_use_id` from blocks when available, falling back to
@@ -1363,7 +1363,7 @@ mod tests {
         }
 
         #[test]
-        fn skips_thinking_file_compacted_empty_but_includes_drift() {
+        fn skips_thinking_file_empty_but_includes_drift() {
             let c = ctx();
             let u = user();
             let m = model();
@@ -1381,17 +1381,11 @@ mod tests {
                     kaijutsu_types::DriftKind::Push,
                 ),
                 BlockSnapshot::file(BlockId::new(c, u, 1), None, "/foo", "content"),
-                {
-                    let mut b =
-                        BlockSnapshot::text(BlockId::new(c, m, 2), None, BlockRole::Model, "old");
-                    b.compacted = true;
-                    b
-                },
                 BlockSnapshot::text(BlockId::new(c, m, 3), None, BlockRole::Model, ""),
             ];
 
             let msgs = hydrate_from_blocks(&blocks);
-            // user + assistant + drift (as user) = 3; thinking/file/compacted/empty skipped
+            // user + assistant + drift (as user) = 3; thinking/file/empty skipped
             assert_eq!(msgs.len(), 3);
             assert_eq!(msgs[0].as_text(), Some("Hello"));
             assert_eq!(msgs[1].as_text(), Some("Hi"));

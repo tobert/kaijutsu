@@ -423,7 +423,6 @@ mod tests {
             kind: BlockKind::Text,
             content: "A".to_string(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: 0,
@@ -454,7 +453,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
         };
         let snap_b = BlockSnapshot {
@@ -465,7 +463,6 @@ mod tests {
             kind: BlockKind::Text,
             content: "B".to_string(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: 0,
@@ -496,7 +493,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
         };
 

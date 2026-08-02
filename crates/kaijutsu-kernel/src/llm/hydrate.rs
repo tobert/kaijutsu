@@ -121,9 +121,6 @@ impl HydrationState {
         parent: Option<&BlockSnapshot>,
     ) {
         // Skip blocks that shouldn't appear in LLM history
-        if block.compacted {
-            return;
-        }
         if block.ephemeral {
             return;
         }

@@ -137,7 +137,6 @@ pub struct BlockHeader {
     pub role: Role,
     pub kind: BlockKind,
     pub status: Status,
-    pub compacted: bool,
     /// Whether this block is collapsed (mutable, LWW via `updated_at`).
     pub collapsed: bool,
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
@@ -180,8 +179,6 @@ pub struct BlockHeader {
     pub ephemeral_at: u64,
     /// Lamport timestamp for `excluded` field.
     pub excluded_at: u64,
-    /// Lamport timestamp for `compacted` field.
-    pub compacted_at: u64,
     /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
     pub tool_meta_at: u64,
     /// Lamport timestamp for `content_type` field.
@@ -197,7 +194,6 @@ impl BlockHeader {
             role: snap.role,
             kind: snap.kind,
             status: snap.status,
-            compacted: snap.compacted,
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
             excluded: snap.excluded,
@@ -211,7 +207,6 @@ impl BlockHeader {
             collapsed_at: snap.collapsed_at,
             ephemeral_at: snap.ephemeral_at,
             excluded_at: snap.excluded_at,
-            compacted_at: snap.compacted_at,
             tool_meta_at: snap.tool_meta_at,
             content_type_at: snap.content_type_at,
         }
@@ -223,7 +218,6 @@ impl BlockHeader {
             .max(self.collapsed_at)
             .max(self.ephemeral_at)
             .max(self.excluded_at)
-            .max(self.compacted_at)
             .max(self.tool_meta_at)
             .max(self.content_type_at)
     }
@@ -1248,10 +1242,6 @@ pub struct BlockSnapshot {
     /// Whether this block is collapsed (only meaningful for Thinking).
     #[serde(default)]
     pub collapsed: bool,
-    /// Whether this block has been superseded by a compaction summary.
-    /// Compacted blocks are retained for history but excluded from active views.
-    #[serde(default)]
-    pub compacted: bool,
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
     /// Use for human-only output (help text, status info) that wastes model context.
     ///
@@ -1419,9 +1409,6 @@ pub struct BlockSnapshot {
     /// Lamport timestamp for `excluded` field.
     #[serde(default)]
     pub excluded_at: u64,
-    /// Lamport timestamp for `compacted` field.
-    #[serde(default)]
-    pub compacted_at: u64,
     /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
     #[serde(default)]
     pub tool_meta_at: u64,
@@ -1485,7 +1472,6 @@ impl BlockSnapshot {
             kind: BlockKind::Text,
             content: content.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1515,7 +1501,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1535,7 +1520,6 @@ impl BlockSnapshot {
             kind: BlockKind::Thinking,
             content: content.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1565,7 +1549,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1597,7 +1580,6 @@ impl BlockSnapshot {
             kind: BlockKind::ToolCall,
             content: input_json.clone(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1627,7 +1609,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1659,7 +1640,6 @@ impl BlockSnapshot {
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1689,7 +1669,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1728,7 +1707,6 @@ impl BlockSnapshot {
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1758,7 +1736,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1785,7 +1762,6 @@ impl BlockSnapshot {
             kind: BlockKind::Drift,
             content: content.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1815,7 +1791,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1840,7 +1815,6 @@ impl BlockSnapshot {
             kind: BlockKind::File,
             content: content.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1870,7 +1844,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1895,7 +1868,6 @@ impl BlockSnapshot {
             kind: BlockKind::Error,
             content: summary.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1925,7 +1897,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -1946,7 +1917,6 @@ impl BlockSnapshot {
             kind: BlockKind::Error,
             content: summary.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -1976,7 +1946,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -2008,7 +1977,6 @@ impl BlockSnapshot {
             kind: BlockKind::Resource,
             content: summary.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -2038,7 +2006,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -2068,7 +2035,6 @@ impl BlockSnapshot {
             kind: BlockKind::Notification,
             content: summary.into(),
             collapsed: false,
-            compacted: false,
             ephemeral: false,
             excluded: false,
             created_at: crate::now_millis(),
@@ -2098,7 +2064,6 @@ impl BlockSnapshot {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
         }
@@ -2136,7 +2101,6 @@ impl BlockSnapshot {
             && self.kind == other.kind
             && self.content == other.content
             && self.collapsed == other.collapsed
-            && self.compacted == other.compacted
             && self.ephemeral == other.ephemeral
             && self.tool_kind == other.tool_kind
             && self.tool_name == other.tool_name
@@ -2196,7 +2160,6 @@ impl BlockSnapshotBuilder {
                 kind,
                 content: String::new(),
                 collapsed: false,
-                compacted: false,
                 ephemeral: false,
                 excluded: false,
                 created_at: crate::now_millis(),
@@ -2226,7 +2189,6 @@ impl BlockSnapshotBuilder {
                 collapsed_at: 0,
                 ephemeral_at: 0,
                 excluded_at: 0,
-                compacted_at: 0,
                 tool_meta_at: 0,
                 content_type_at: 0,
             },
@@ -2255,11 +2217,6 @@ impl BlockSnapshotBuilder {
 
     pub fn collapsed(mut self, collapsed: bool) -> Self {
         self.snap.collapsed = collapsed;
-        self
-    }
-
-    pub fn compacted(mut self, compacted: bool) -> Self {
-        self.snap.compacted = compacted;
         self
     }
 
@@ -2418,8 +2375,6 @@ pub struct BlockFilter {
     pub roles: Vec<Role>,
     /// Only include blocks with these statuses (empty = all statuses).
     pub statuses: Vec<Status>,
-    /// Exclude blocks marked as compacted.
-    pub exclude_compacted: bool,
     /// Maximum number of results (0 = unlimited).
     pub limit: u32,
     /// Maximum DAG depth from parent_id (0 = unlimited). Only meaningful when
@@ -2437,7 +2392,6 @@ impl BlockFilter {
         !self.kinds.is_empty()
             || !self.roles.is_empty()
             || !self.statuses.is_empty()
-            || self.exclude_compacted
             || self.limit > 0
             || self.max_depth > 0
             || self.parent_id.is_some()
@@ -2468,9 +2422,6 @@ impl BlockFilter {
             return false;
         }
         if !self.statuses.is_empty() && !self.statuses.contains(&block.status) {
-            return false;
-        }
-        if self.exclude_compacted && block.compacted {
             return false;
         }
         true
@@ -3242,7 +3193,6 @@ mod tests {
             .status(Status::Error)
             .content("error output")
             .collapsed(true)
-            .compacted(true)
             .tool_kind(ToolKind::Shell)
             .tool_name("shell")
             .tool_input("{\"cmd\":\"ls\"}")
@@ -3262,7 +3212,6 @@ mod tests {
         assert_eq!(snap.status, Status::Error);
         assert_eq!(snap.content, "error output");
         assert!(snap.collapsed);
-        assert!(snap.compacted);
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
         assert_eq!(snap.tool_name, Some("shell".to_string()));
         assert_eq!(snap.tool_input, Some("{\"cmd\":\"ls\"}".to_string()));
@@ -3291,36 +3240,6 @@ mod tests {
         assert!(a.content_eq(&b)); // content_eq ignores it
     }
 
-    // ── compacted ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_compacted_defaults_to_false() {
-        let id = BlockId::new(test_context(), test_agent(), 1);
-        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        assert!(!snap.compacted);
-    }
-
-    #[test]
-    fn test_compacted_cbor_roundtrip_false() {
-        let id = BlockId::new(test_context(), test_agent(), 1);
-        let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        assert!(!snap.compacted);
-        let bytes = crate::codec::encode(&snap).unwrap();
-        let parsed: BlockSnapshot = crate::codec::decode(&bytes).unwrap();
-        assert!(!parsed.compacted);
-    }
-
-    #[test]
-    fn test_compacted_roundtrip_when_true() {
-        let id = BlockId::new(test_context(), test_agent(), 1);
-        let mut snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        snap.compacted = true;
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains("\"compacted\":true"));
-        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
-        assert!(parsed.compacted);
-    }
-
     // ── BlockHeader ────────────────────────────────────────────────────
 
     #[test]
@@ -3337,7 +3256,6 @@ mod tests {
         assert_eq!(header.role, snap.role);
         assert_eq!(header.kind, snap.kind);
         assert_eq!(header.status, snap.status);
-        assert_eq!(header.compacted, snap.compacted);
         assert_eq!(header.created_at, snap.created_at);
         assert_eq!(header.updated_at, 0); // Lamport default: no local mutations
         assert_eq!(header.tool_kind, None);
@@ -3799,42 +3717,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_filters_old_blocks() {
-        // Simulate compaction: mark old blocks compacted, create summary,
-        // verify filtering by compacted flag.
-        let ctx = test_context();
-        let agent = test_agent();
-
-        // Build 100 blocks, compact the first 80
-        let (mut snaps, _) = build_chain(ctx, agent, 100);
-        for snap in snaps.iter_mut().take(80) {
-            snap.compacted = true;
-        }
-
-        // Create summary block for the compacted range
-        let summary = BlockSnapshot::text(
-            BlockId::new(ctx, PrincipalId::system(), 0),
-            None,
-            Role::System,
-            "Summary of blocks 0-79: user and model discussed...",
-        );
-
-        // Active view: summary + non-compacted blocks
-        let active: Vec<_> = std::iter::once(&summary)
-            .chain(snaps.iter().filter(|s| !s.compacted))
-            .collect();
-
-        assert_eq!(active.len(), 21); // 1 summary + 20 live blocks
-
-        // Headers preserve compacted flag
-        let headers: Vec<_> = snaps.iter().map(BlockHeader::from_snapshot).collect();
-        let compacted_count = headers.iter().filter(|h| h.compacted).count();
-        let live_count = headers.iter().filter(|h| !h.compacted).count();
-        assert_eq!(compacted_count, 80);
-        assert_eq!(live_count, 20);
-    }
-
-    #[test]
     fn test_multi_agent_interleaved() {
         // Three agents (user, claude, gemini) interleaving blocks in one context.
         // This is the kaijutsu multi-model scenario.
@@ -4133,26 +4015,10 @@ mod tests {
     }
 
     #[test]
-    fn test_block_filter_exclude_compacted() {
-        let f = BlockFilter {
-            exclude_compacted: true,
-            ..Default::default()
-        };
-        assert!(f.has_active_constraint());
-        let ctx = test_context();
-        let agent = test_agent();
-        let mut block = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, "hi");
-        assert!(f.matches(&block));
-        block.compacted = true;
-        assert!(!f.matches(&block));
-    }
-
-    #[test]
     fn test_block_filter_combined_constraints() {
         let f = BlockFilter {
             kinds: vec![BlockKind::Text],
             roles: vec![Role::Model],
-            exclude_compacted: true,
             ..Default::default()
         };
         let ctx = test_context();
