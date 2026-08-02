@@ -208,6 +208,16 @@ genuinely reversed on purpose (then `#[allow]` with a comment) or they're
 latent test bugs. Small, self-contained fix; unrelated to the diff work that
 surfaced it.
 
+## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
+
+From the slice-4 post-ship review (gemini deliberate, low severity): the
+kernel attaches `DiffError::line()` spans to the ErrorPayload on `Done`
+(`block_store.rs` `validate_diff`), but the app's diff error preview is a
+generic banner — the line anchor is never pointed at visually. Inline line
+annotation (squiggle/marker on the offending line) is high-value polish once
+slice 5's full-screen error surface exists to render into. Small, app-side
+only; the data already travels.
+
 ## Error-block-collapse remnants, post scaffolding removal (2026-08-01)
 
 The unread `build_error_child_index`/`ErrorChildIndex`/`ExpandedErrorParents`

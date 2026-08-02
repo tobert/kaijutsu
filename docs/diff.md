@@ -327,10 +327,11 @@ discoveries only:
   in `validate_content_and_attach_errors` + the `Diff` gate in `set_status`,
   with `DiffError::line()` added so the `ErrorPayload` gets a real span.
 
-## Post-ship review — slice 4 (deepseek, 2026-08-02; gemini-pro deliberate pending)
+## Post-ship review — slice 4 (deepseek + gemini-pro deliberate, 2026-08-02)
 
-Holistic read of the shipped files (no diff). Both pointed questions resolved
-in favor of what shipped: the unconditional `msdf_geometry.vertices.clear()`
+Holistic reads of the shipped files (no diff), independent casts, convergent
+verdicts — slice 4 is clean, no defects found in the slice itself. Both
+pointed questions resolved in favor of what shipped: the unconditional `msdf_geometry.vertices.clear()`
 is *correct and necessary* (clearing an empty Vec is one branch + a len store;
 geometry and glyphs rebuild atomically in one system pass, so no flicker; the
 narrower per-arm fix is the error-prone shape), and the declared-vs-sniffed
@@ -356,6 +357,11 @@ Findings deferred to their slices:
   `text_start` is fixed; a `WordSpan` past the cut would index garbage. Filter
   spans against the cut point when word coloring lands. (The band geometry
   path is unaffected — bands stay per-line under word coloring.)
+- **Follow-up (gemini, low, in issues.md): line-anchored parse errors render
+  as a generic banner.** The kernel attaches `DiffError::line()` spans to the
+  ErrorPayload, but the preview's error state doesn't point at the offending
+  line. Inline line annotation is high-value polish once slice 5's error
+  surface exists.
 
 ## Seam guidance (deepseek review, 2026-08-01)
 
