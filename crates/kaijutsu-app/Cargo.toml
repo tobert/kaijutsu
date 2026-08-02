@@ -17,6 +17,7 @@ kaijutsu-audio.workspace = true
 kaijutsu-cas.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-client.workspace = true
+kaijutsu-diff.workspace = true
 kaijutsu-kernel.workspace = true
 crossbeam-channel = "0.5"
 kaijutsu-types.workspace = true

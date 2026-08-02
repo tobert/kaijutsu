@@ -12,6 +12,7 @@
 
 pub mod abc;
 pub mod components;
+pub mod diff;
 pub mod markdown;
 pub mod msdf;
 mod plugin;

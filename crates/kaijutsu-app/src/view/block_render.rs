@@ -430,8 +430,8 @@ pub(crate) fn round_to_physical_px(logical: f32, scale: f32) -> f32 {
 }
 
 /// Build each block cell's content: MSDF glyphs for text, MSDF glyphs +
-/// flat-colored geometry for ABC notation, a vello scene for SVG only, or
-/// plain UI rectangle children for sparkline/image content.
+/// flat-colored geometry for ABC notation and diff previews, a CPU raster
+/// child for SVG, or plain UI rectangle children for sparkline/image content.
 ///
 /// Runs in PostUpdate after UiSystems::Layout. For each block with changed
 /// content or width, rebuilds whichever of those its `RichContent` calls for.
@@ -597,6 +597,15 @@ pub fn build_block_scenes(
         // placeholder rect) from a previous build — the arms below respawn
         // fresh ones if this build is still one of those kinds.
         clear_content_geometry_children(&mut commands, entity, existing_geometry_children);
+
+        // Shed any flat-colored geometry from a previous build. Two arms
+        // populate `MsdfBlockGeometry` (ABC engraving, Diff bands) and both
+        // refill it below; every other arm must not inherit it. Geometry has
+        // no version of its own — it rides `MsdfBlockGlyphs.version`, which
+        // the arms bump — so a stale `vertices` from a block that used to be
+        // a diff and is now plain text would keep compositing bands behind
+        // the new content. Cheap: a `clear()` on an already-empty Vec.
+        msdf_geometry.vertices.clear();
 
         let scene = vello::Scene::new();
         let content_height: f32;
@@ -875,6 +884,73 @@ pub fn build_block_scenes(
                 // next content/width change or, in practice, the next
                 // frame (the atlas is inserted in `Startup`, before this
                 // system ever runs).
+            }
+            Some(RichContentKind::Diff(preview)) => {
+                // Modeled on the Markdown arm — Parley layout + `SpanBrush`
+                // coloring — plus ABC's second half: flat-colored geometry
+                // for the per-line background bands, built from the same
+                // layout and published under the same shared version gate.
+                // `text::diff` already spent the render byte budget and the
+                // preview line budget before this point; what reaches Parley
+                // here is bounded by construction.
+                let layout = font.layout(
+                    &preview.plain_text,
+                    &style,
+                    VelloTextAlign::Left,
+                    max_advance,
+                );
+                content_height = layout.height();
+
+                let span_brushes = crate::text::rich::build_diff_span_brushes(preview, &theme);
+                // Context is the quietest class, so it is the right fallback
+                // for any run a span somehow misses.
+                let fallback_brush = bevy_color_to_brush(theme.diff_context_fg);
+
+                if let Some(ref mut atlas) = atlas {
+                    for line in layout.lines() {
+                        for item in line.items() {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+
+                    // One row per WRAPPED visual line, addressed by its start
+                    // byte — a long `+` line that wraps must be tinted across
+                    // every row it occupies. `min_coord`/`max_coord` are the
+                    // line's top/bottom in the same block-local LOGICAL space
+                    // the glyphs use.
+                    let rows: Vec<crate::text::diff::PreviewRow> = layout
+                        .lines()
+                        .map(|line| {
+                            let m = line.metrics();
+                            crate::text::diff::PreviewRow {
+                                text_offset: line.text_range().start,
+                                top: m.min_coord,
+                                bottom: m.max_coord,
+                            }
+                        })
+                        .collect();
+                    msdf_geometry.vertices = crate::text::diff::build_diff_band_geometry(
+                        preview,
+                        &rows,
+                        content_width,
+                        (pad_left, pad_top),
+                        &crate::text::rich::diff_band_colors(&theme),
+                    );
+
+                    let glyphs = collect_msdf_glyphs(
+                        &layout, &span_brushes, &fallback_brush, text_offset, atlas,
+                    );
+                    msdf_glyphs.glyphs = glyphs;
+                    // Bump from the field's OWN previous value (ABC's
+                    // pattern), never from `scene_version` — see
+                    // `MsdfBlockGlyphs::version`. Geometry and glyphs ride
+                    // this single gate together.
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
+                    *render_method = BlockRenderMethod::Msdf;
+                }
             }
             Some(RichContentKind::Output { layout, plain_text }) => {
                 let parley_layout = font.layout(
@@ -1612,10 +1688,10 @@ pub fn render_msdf_block_textures(
 /// Extracted MSDF block data for the render world.
 struct ExtractedMsdfBlockItem {
     glyphs: Vec<crate::text::msdf::PositionedGlyph>,
-    /// Flat-colored music geometry (staff lines, beams, slurs, ties, repeat
-    /// dots) — empty for every block kind except ABC. See
-    /// `MsdfBlockGeometry`'s doc comment for why this rides the SAME
-    /// `version` gate as `glyphs` rather than carrying its own.
+    /// Flat-colored geometry — ABC engraving (staff lines, beams, slurs,
+    /// ties, repeat dots) or Diff background bands; empty for every other
+    /// block kind. See `MsdfBlockGeometry`'s doc comment for why this rides
+    /// the SAME `version` gate as `glyphs` rather than carrying its own.
     geometry: Vec<GeometryVertex>,
     image_handle: Handle<Image>,
     /// Physical pixel dims of the render target (`ceil(logical * scale)`,
@@ -1732,8 +1808,9 @@ fn extract_msdf_blocks(
 
         // Vello blocks have content rendered by the Vello pass — MSDF composites on top
         let has_vello = *render_method == BlockRenderMethod::Vello;
-        // `MsdfBlockGeometry` is only ever populated for ABC block cells —
-        // every other MSDF-glyph-bearing surface (role headers, the shell
+        // `MsdfBlockGeometry` is only ever populated for the block cells that
+        // draw flat-colored shapes (ABC engraving, Diff bands) — every other
+        // MSDF-glyph-bearing surface (role headers, the shell
         // dock/compose overlay/editor text, time-well cards) has no reason
         // to carry it, and mustn't be REQUIRED to just to satisfy this
         // query: that would silently drop them from extraction entirely

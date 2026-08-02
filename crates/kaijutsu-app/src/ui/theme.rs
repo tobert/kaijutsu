@@ -262,6 +262,44 @@ pub struct Theme {
     pub md_strong_color: Option<Color>,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Diff Rendering — docs/diff.md Decision 8: color is SEMANTIC, not baked.
+    //
+    // Diff block content is plain unified text with no escape codes; every
+    // color below is applied by the renderer from the theme, which is what
+    // keeps a diff re-diffable at word level, foldable, minimap-derivable,
+    // and clean when a model hydrates it.
+    //
+    // Chosen mid-luminance and saturated so they read against a light ground
+    // as well as this theme's near-black one, and the two band tints carry
+    // low alpha so they *compose* over whatever background they land on
+    // rather than assuming one. (The app ships a single dark lane today;
+    // like the markdown/sparkline colors above, these are compiled-in and
+    // not exposed through `ThemeData`/`theme.toml` yet.)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Diffstat header line (`3 files, +42 −17`).
+    pub diff_stat: Color,
+    /// Per-file path header.
+    pub diff_file_header: Color,
+    /// `@@ … @@` hunk header.
+    pub diff_hunk_header: Color,
+    /// Added (`+`) line text.
+    pub diff_insert_fg: Color,
+    /// Removed (`−`) line text.
+    pub diff_delete_fg: Color,
+    /// Unchanged context line text.
+    pub diff_context_fg: Color,
+    /// Truncation/omission notes ("… 12 more lines").
+    pub diff_meta: Color,
+    /// Background band behind an added line. Alpha, by design.
+    pub diff_insert_bg: Color,
+    /// Background band behind a removed line. Alpha, by design.
+    pub diff_delete_bg: Color,
+    /// Banner text for a block declared `Diff` whose content does not parse.
+    pub diff_error_fg: Color,
+    /// Background band behind that banner. Alpha, by design.
+    pub diff_error_bg: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Sparkline Rendering
     // ═══════════════════════════════════════════════════════════════════════
     /// Height of sparkline mini-charts in pixels.
@@ -557,6 +595,19 @@ impl Default for Theme {
             md_code_fg: Color::srgb(0.620, 0.808, 0.416),       // #9ece6a green
             md_code_block_fg: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             md_strong_color: None,
+
+            // Diff rendering (docs/diff.md Decision 8 — semantic, theme-owned)
+            diff_stat: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
+            diff_file_header: Color::srgb(0.725, 0.549, 0.961), // #b98cf5 violet
+            diff_hunk_header: Color::srgb(0.357, 0.722, 0.910), // #5bb8e8 cyan
+            diff_insert_fg: Color::srgb(0.275, 0.788, 0.541), // #46c98a green
+            diff_delete_fg: Color::srgb(0.957, 0.404, 0.498), // #f4677f rose
+            diff_context_fg: Color::srgb(0.561, 0.533, 0.659), // #8f88a8 muted
+            diff_meta: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
+            diff_insert_bg: Color::srgba(0.275, 0.788, 0.541, 0.12),
+            diff_delete_bg: Color::srgba(0.957, 0.404, 0.498, 0.12),
+            diff_error_fg: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a red
+            diff_error_bg: Color::srgba(1.000, 0.176, 0.431, 0.20),
 
             // Sparkline rendering
             sparkline_height: 48.0,

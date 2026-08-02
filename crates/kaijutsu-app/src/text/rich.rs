@@ -7,9 +7,13 @@
 //!   `SparklineData` payload live here.
 //! - **SVG**: inline vector graphics, CPU-rasterized via `usvg` + `resvg` +
 //!   `tiny-skia` (`text::svg_raster`) to a Bevy `Image`/`ImageNode` — no vello
+//! - **Diff**: a collapsed unified-diff preview — diffstat header plus the
+//!   first N lines, semantically colored from the theme (`text::diff` builds
+//!   the preview; this module only maps its classes to brushes)
 //!
 //! Detection is centralized in `detect_rich_content()` — tries sparkline first
-//! (more specific fence pattern), then SVG, then falls back to markdown.
+//! (more specific fence pattern), then SVG, then a ` ```diff ` fence, then
+//! falls back to markdown.
 
 use bevy::prelude::*;
 use vello::peniko::Brush;
@@ -85,6 +89,15 @@ pub enum RichContentKind {
         /// Parsed AST (avoids re-parsing on resize).
         tune: Arc<kaijutsu_abc::Tune>,
     },
+    /// A unified diff, previewed inline: diffstat header + the first N lines,
+    /// collapsed (`docs/diff.md` Decision 5). Rendered as MSDF glyphs +
+    /// `MsdfBlockGeometry` background bands, the same pair ABC uses.
+    ///
+    /// Always present for a block declaring `ContentType::Diff`, including one
+    /// whose content does not parse — that case carries an error preview
+    /// (`DiffPreview::is_error`), because content and content-type are
+    /// separate LWW registers and a visible error beats an empty cell.
+    Diff(Box<super::diff::DiffPreview>),
     /// Structured OutputData with per-cell coloring by EntryType.
     Output {
         /// Pre-computed column→byte mapping for per-cell brushes.
@@ -194,6 +207,62 @@ pub fn build_output_span_brushes(
     }
 
     result
+}
+
+/// Build `SpanBrush` vec for a diff preview — one span per preview line.
+///
+/// Diff color is **semantic** (`docs/diff.md` Decision 8): the block's content
+/// is plain unified text with no escape codes, and every color below comes
+/// from the theme. Spans are contiguous by construction (see
+/// `text::diff::PreviewLine`), which matters because `collect_msdf_glyphs`
+/// resolves a brush from each shaping *run's start byte* — a gap would fall
+/// through to the fallback brush mid-line.
+pub fn build_diff_span_brushes(
+    preview: &super::diff::DiffPreview,
+    theme: &crate::ui::theme::Theme,
+) -> Vec<SpanBrush> {
+    use super::diff::DiffLineClass;
+
+    preview
+        .lines
+        .iter()
+        .map(|line| {
+            let color = match line.class {
+                DiffLineClass::Stat => theme.diff_stat,
+                DiffLineClass::FileHeader => theme.diff_file_header,
+                DiffLineClass::HunkHeader => theme.diff_hunk_header,
+                DiffLineClass::Insert => theme.diff_insert_fg,
+                DiffLineClass::Delete => theme.diff_delete_fg,
+                DiffLineClass::Context => theme.diff_context_fg,
+                DiffLineClass::Meta => theme.diff_meta,
+                DiffLineClass::Error => theme.diff_error_fg,
+            };
+            SpanBrush {
+                start: line.start,
+                end: line.end,
+                brush: bevy_color_to_brush(color),
+            }
+        })
+        .collect()
+}
+
+/// Resolve the diff band colors from the theme, as RGBA8 for the geometry
+/// vertex format.
+pub fn diff_band_colors(theme: &crate::ui::theme::Theme) -> super::diff::DiffBandColors {
+    fn rgba8(color: Color) -> [u8; 4] {
+        let c = color.to_srgba();
+        [
+            (c.red.clamp(0.0, 1.0) * 255.0) as u8,
+            (c.green.clamp(0.0, 1.0) * 255.0) as u8,
+            (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
+            (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
+        ]
+    }
+    super::diff::DiffBandColors {
+        insert: rgba8(theme.diff_insert_bg),
+        delete: rgba8(theme.diff_delete_bg),
+        error: rgba8(theme.diff_error_bg),
+    }
 }
 
 /// Detect rich content from structured OutputData.
@@ -439,10 +508,23 @@ pub fn detect_rich_content_typed(
             }
         }
         ContentType::Plain => {} // Fall through to heuristic detection
-        // TODO(diff slice 4): render as a diff preview (Parley + SpanBrush
-        // per docs/diff.md App section). Routed like Plain for now — falls
-        // through to heuristic detection, which just renders it as text.
-        ContentType::Diff => {}
+        ContentType::Diff => {
+            // Unconditionally `Some` — including for content that does not
+            // parse, which becomes an error preview rather than falling
+            // through. That is deliberate and the opposite of the SVG arm
+            // above: an SVG that won't parse still *reads* as its source
+            // text, but a diff that won't parse rendered as plain text is
+            // indistinguishable from a diff we simply chose not to color.
+            // Content and content_type are separate LWW registers, so this
+            // state is legitimate and must say so out loud
+            // (`kaijutsu-diff`'s viewer contract).
+            return Some(RichContent {
+                kind: RichContentKind::Diff(Box::new(crate::text::diff::build_diff_preview(
+                    text,
+                    ContentType::Diff,
+                ))),
+            });
+        }
     }
     // Try sparkline first — more specific pattern
     if let Some(data) = try_parse_sparkline(text) {
@@ -460,6 +542,22 @@ pub fn detect_rich_content_typed(
                 height,
                 source,
             },
+        });
+    }
+
+    // Try a ` ```diff ` fence. Both mechanisms exist for the same reason SVG
+    // has both: a *declared* type is authoritative, but a model writing prose
+    // fences its diffs like everything else. Unlike the declared arm above,
+    // a fence whose body doesn't parse falls through untouched — sniffing may
+    // never promote a block into an error state it didn't ask for.
+    //
+    // Must precede the markdown fallback: markdown would otherwise claim the
+    // fence as an ordinary code block and render it in one flat color.
+    if let Some(inner) = extract_fenced_block(text, "diff")
+        && let Some(preview) = crate::text::diff::try_build_diff_preview(inner, ContentType::Plain)
+    {
+        return Some(RichContent {
+            kind: RichContentKind::Diff(Box::new(preview)),
         });
     }
 
@@ -565,6 +663,90 @@ mod tests {
                 "a zero-size SVG must not be classified as RichContentKind::Svg"
             );
         }
+    }
+
+    // ── Diff (docs/diff.md slice 4) ────────────────────────────────────────
+
+    fn diff_preview(rich: Option<RichContent>) -> Option<Box<crate::text::diff::DiffPreview>> {
+        match rich?.kind {
+            RichContentKind::Diff(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// A block the kernel typed `Diff` renders as a diff preview, not as text
+    /// and not as markdown.
+    #[test]
+    fn declared_diff_content_becomes_a_diff_preview() {
+        let text = kaijutsu_diff::fixtures::read("canonical/single_file_modify.diff");
+        let preview = diff_preview(detect_rich_content_typed(
+            &text,
+            0,
+            ContentType::Diff,
+            None,
+            false,
+        ))
+        .expect("declared Diff must produce RichContentKind::Diff");
+        assert!(!preview.is_error);
+        assert_eq!(preview.stat.files_changed, 1);
+    }
+
+    /// The contract that makes the error state reachable at all: a block
+    /// *declared* Diff whose content doesn't parse must still come back as a
+    /// Diff — carrying the error preview — rather than falling through to the
+    /// plain/markdown path where nothing would say the block is broken.
+    #[test]
+    fn declared_diff_that_does_not_parse_still_renders_as_a_diff_error() {
+        let preview = diff_preview(detect_rich_content_typed(
+            "I am not a diff.\n",
+            0,
+            ContentType::Diff,
+            None,
+            false,
+        ))
+        .expect("a declared Diff must never fall through to the text path");
+        assert!(preview.is_error, "must be the visible error treatment");
+    }
+
+    /// A declared Diff is never `None` — that would render an empty cell,
+    /// which the crate's viewer contract forbids explicitly.
+    #[test]
+    fn declared_diff_is_never_empty_even_for_empty_content() {
+        assert!(
+            detect_rich_content_typed("", 0, ContentType::Diff, None, false).is_some(),
+            "an empty declared-Diff block must still render something"
+        );
+    }
+
+    /// The second mechanism: a model writing prose fences its diff. SVG has
+    /// both a declared arm and a fence sniff; so does this.
+    #[test]
+    fn a_fenced_diff_block_is_sniffed_from_plain_content() {
+        let body = kaijutsu_diff::fixtures::read("canonical/single_file_modify.diff");
+        let fenced = format!("```diff\n{body}```\n");
+        let preview = diff_preview(detect_rich_content_typed(
+            &fenced,
+            0,
+            ContentType::Plain,
+            None,
+            false,
+        ))
+        .expect("a ```diff fence must sniff as a diff");
+        assert!(!preview.is_error);
+    }
+
+    /// Sniffing must not hijack: a fence tagged `diff` whose body isn't one
+    /// falls through to the ordinary text/markdown path. Promoting it to a
+    /// diff *error* would be the app inventing a problem the author never
+    /// declared.
+    #[test]
+    fn a_fenced_block_that_is_not_a_diff_falls_through() {
+        let fenced = "```diff\nnot actually a diff\n```\n";
+        let rich = detect_rich_content_typed(fenced, 0, ContentType::Plain, None, false);
+        assert!(
+            diff_preview(rich).is_none(),
+            "a non-diff ```diff fence must not become a diff preview"
+        );
     }
 }
 

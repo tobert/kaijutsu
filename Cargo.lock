@@ -5794,6 +5794,7 @@ dependencies = [
  "kaijutsu-cas",
  "kaijutsu-client",
  "kaijutsu-crdt",
+ "kaijutsu-diff",
  "kaijutsu-kernel",
  "kaijutsu-telemetry",
  "kaijutsu-types",

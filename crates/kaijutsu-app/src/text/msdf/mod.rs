@@ -106,18 +106,23 @@ pub struct MsdfBlockGlyphs {
     pub rainbow: bool,
 }
 
-/// Per-block flat-colored geometry (staff lines, barlines, stems, ledgers,
-/// beams, slurs, ties, repeat dots — everything in an ABC block that isn't
-/// a glyph or text). Populated by `text::msdf::music_bridge::collect_music_geometry`
-/// alongside `MsdfBlockGlyphs`.
+/// Per-block flat-colored geometry — anything a block draws that is neither
+/// a glyph nor text. Producer-agnostic by construction; two block kinds fill
+/// it today:
+///
+/// - **ABC**: staff lines, barlines, stems, ledgers, beams, slurs, ties,
+///   repeat dots, via `text::msdf::music_bridge::collect_music_geometry`.
+/// - **Diff**: per-line add/remove background bands, via
+///   `text::diff::build_diff_band_geometry`.
 ///
 /// Deliberately has NO version field of its own. `MsdfBlockGlyphs.version`
 /// already survived a real two-writers-disagree bug (see its doc comment);
 /// giving geometry a second independent counter would just be a second
-/// chance to reintroduce that class of bug. Geometry and glyphs are always
-/// rebuilt together for the one block kind (ABC) that populates both, so
-/// they ride `MsdfBlockGlyphs.version` as a single shared gate — extraction
-/// reads both components whenever that version fires.
+/// chance to reintroduce that class of bug. Every producer rebuilds geometry
+/// and glyphs together in one arm of `build_block_scenes`, so they ride
+/// `MsdfBlockGlyphs.version` as a single shared gate — extraction reads both
+/// components whenever that version fires. A new producer must hold that
+/// same rule: fill both, bump once.
 #[derive(Component, Default)]
 pub struct MsdfBlockGeometry {
     pub vertices: Vec<geometry::GeometryVertex>,
