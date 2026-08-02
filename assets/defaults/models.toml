@@ -29,12 +29,17 @@
 #                     provider-level field.
 #
 #                     Leave a model out of this table (or its context_window
-#                     unset) when the window isn't confirmed — the resolver
-#                     returns an explicit "unknown" for anything unlisted,
-#                     never a guess. A fabricated denominator would make a
-#                     "% of context used" gauge confidently wrong, which is
-#                     worse than the gauge saying "unknown". Must be a
-#                     positive integer when set — 0 parses fine but is
+#                     unset) when you don't want to hand-pin it — this value
+#                     is always an OVERRIDE, checked first. For Anthropic
+#                     models specifically, an entry left unset falls through
+#                     to a live `GET /v1/models/{id}` lookup (cached) before
+#                     landing on "unknown"; every other provider stays
+#                     config-only, so leaving one of THOSE unset really does
+#                     mean unknown until someone fills it in. Either way, the
+#                     resolver never guesses — a fabricated denominator would
+#                     make a "% of context used" gauge confidently wrong,
+#                     which is worse than the gauge saying "unknown". Must be
+#                     a positive integer when set — 0 parses fine but is
 #                     nonsense (no real model has a zero-token window) and
 #                     will produce garbage wherever it's divided into.
 #                     Cloud model
@@ -87,6 +92,14 @@ context_window = 1000000
 # generation's context window isn't consistent enough to extrapolate — e.g.
 # Sonnet 4.5 is 200K but Sonnet 4.6 is 1M. `kj model` will report this
 # alias's window as unknown until someone confirms the number and adds it.
+#
+# UPDATE 2026-08-02: confirmed live against the API — this model has been
+# RETIRED (GET /v1/models/claude-sonnet-4-20250514 404s), not just
+# unconfirmed. The live-lookup fallback (see the comment on context_window
+# above) can't recover a window for a model that no longer exists, so it
+# correctly stays "unknown" here too. This means the balanced/default
+# aliases below now point at a dead model, independent of anything in this
+# file — see docs/issues.md's token-accounting entry for the follow-up.
 
 [providers.gemini]
 enabled = false

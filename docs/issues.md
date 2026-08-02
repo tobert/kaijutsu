@@ -59,15 +59,42 @@ these are the ones that block *using* the thing.
   reads them.
   - Denominator SHIPPED 2026-07-29 (`36f57547`) as hand-maintained per-model
     `context_window` in models.toml, resolving to `Option<u64>` — never a
-    fabricated default. **Follow-up: stop hand-maintaining it for Anthropic.**
-    `GET /v1/models/{id}` returns the window live as **`max_input_tokens`**
-    (note: there is no `context_window` field — that name is ours), alongside
-    `max_tokens` (output cap) and a `capabilities` tree. A hand-kept table goes
-    stale on every model launch; the config should be the *override*, the API
-    the source. Non-Anthropic providers still need the config path, so this is
-    additive, not a replacement. Also: `claude-sonnet-4-20250514` (used by the
-    `balanced`/`default` aliases) is deliberately unset — an honest gap the
-    live lookup would close.
+    fabricated default.
+  - **Live Anthropic lookup SHIPPED (feat/ctx-window-live).** Config still
+    wins as an override (`LlmRegistry::context_window_for`, sync,
+    config-only); when it has no entry, `context_window_for_live` (async)
+    falls through to `GET /v1/models/{id}` for Anthropic providers only,
+    reading the wire's `max_input_tokens` (NOT `max_tokens`, the output cap —
+    the field-name confusion this shipped a regression test against).
+    Non-Anthropic providers are untouched — additive, not a replacement.
+    Cache lives on `claude::Client` (one per registered provider = one per
+    kernel process): `Ok(_)` results (including `Ok(None)` — "the API
+    doesn't know this model either") cache for the process lifetime, `Err`
+    results (network/auth failure) are NOT cached so a transient outage
+    heals on the next call. The HTTP call sits behind a
+    `ModelCapabilitySource` trait seam (`llm/claude/models_api.rs`) so
+    `cargo test --workspace` never touches the network — a
+    `FakeModelCapabilitySource` is injected everywhere a test needs a
+    `Provider::Claude` with an unconfigured model.
+  - **Correction to the "closes the honest gap" claim above:** as of
+    2026-08-02, `claude-sonnet-4-20250514` — the model backing the shipped
+    `balanced`/`default` model aliases, and models.toml's canonical example
+    of a deliberately-unset window — has been **retired**, not merely
+    deprecated (`shared/model-migration.md`'s deprecation table gives its
+    retirement date as June 15, 2026, now past). `GET /v1/models/claude-sonnet-4-20250514`
+    404s for real (confirmed live against the API, not simulated); the live
+    lookup correctly resolves it to `None` — same honest "unknown" config
+    already gave it — because there is nothing left to look up. The
+    mechanism is proven to close *real* gaps (verified live against
+    `claude-sonnet-5`, absent from models.toml since it postdates the file,
+    resolves to `Some(1_000_000)`); it just can't resurrect a retired model.
+    **Separate, more urgent follow-up this surfaced: the shipped
+    `balanced`/`default` aliases point at a model Anthropic's API no longer
+    serves.** `assets/defaults/models.toml`'s `[model_aliases]` needs
+    `balanced`/`default` repointed at a current model (`claude-sonnet-4-6`
+    or `claude-sonnet-5` are both live and already carry/would carry a
+    configured or live-resolved window) — not fixed here since it's a
+    default-config content decision, not a mechanism change.
 - **Compaction triggers on block count, not tokens** (`kj/compact.rs:18`,
   threshold 200). Wrong signal for coding: 20 blocks of build output blow the
   window while 200 tiny blocks trigger a pointless summarize. `hydrate.rs` has

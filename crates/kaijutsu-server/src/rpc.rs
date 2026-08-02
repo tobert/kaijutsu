@@ -3328,11 +3328,36 @@ impl kernel::Server for KernelImpl {
                         Err(_) => HashMap::new(),
                     }
                 };
-                // Context-window denominator, resolved ONCE for the whole
-                // listing via the same `LlmRegistry::context_window_for`
-                // `kj context info --json` uses — no second alias-aware
-                // lookup that could disagree with it.
-                let llm_registry = kernel_arc.llm().read().await;
+                // Context-window denominator, via the same
+                // `LlmRegistry::context_window_for_live` `kj context info
+                // --json` uses (config wins as an override; a live, cached
+                // Anthropic lookup fills the honest gaps config never had) —
+                // no second, possibly-diverging lookup. Resolved ONCE per
+                // distinct (provider, model) pair, up front — not per row
+                // inside the loop below — because that loop holds a
+                // synchronous `RwLockReadGuard` (`drift.read()`, not the
+                // async kind) across its body; awaiting a live network
+                // lookup while holding that guard would block any writer
+                // for the duration of the call (clippy `await_holding_lock`
+                // caught this). A cache miss here awaits the network once
+                // per unique model; every other row (and every later poll,
+                // once the client's own cache is warm) is a synchronous hit.
+                let window_by_model: HashMap<(String, String), Option<u64>> = {
+                    let llm_registry = kernel_arc.llm().read().await;
+                    let mut resolved = HashMap::new();
+                    for u in usage_map.values() {
+                        let key = (u.provider.clone(), u.model.clone());
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            resolved.entry(key)
+                        {
+                            let window = llm_registry
+                                .context_window_for_live(&u.provider, &u.model)
+                                .await;
+                            e.insert(window);
+                        }
+                    }
+                    resolved
+                };
 
                 // Background-process ambient state — one query for the whole
                 // kernel (same batching convention as usage_map/track_of
@@ -3392,8 +3417,12 @@ impl kernel::Server for KernelImpl {
                     // tested directly (`context_usage_wire_tests` below) —
                     // sentinel selection lives there, not re-derived here.
                     let usage = usage_map.get(&ctx.id);
-                    let window = usage
-                        .and_then(|u| llm_registry.context_window_for(&u.provider, &u.model));
+                    let window = usage.and_then(|u| {
+                        window_by_model
+                            .get(&(u.provider.clone(), u.model.clone()))
+                            .copied()
+                            .flatten()
+                    });
                     let (wire_window, wire_used_tokens, wire_used_pct) =
                         resolve_usage_wire_fields(usage, window);
                     c.set_context_window(wire_window);
@@ -8615,9 +8644,9 @@ fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Stat
 /// Resolve one context's `(contextWindow, contextUsedTokens, contextUsedPct)`
 /// wire triple (`ContextHandleInfo` in `kaijutsu.capnp`) from its optional
 /// usage snapshot and the window already resolved for it (via
-/// `LlmRegistry::context_window_for`, called by the caller since it needs
-/// the registry lock the loop in `list_contexts` holds once for the whole
-/// listing).
+/// `LlmRegistry::context_window_for_live`, awaited by the caller since it
+/// needs the registry lock the loop in `list_contexts` holds once for the
+/// whole listing).
 ///
 /// Pulled out of `list_contexts` so the sentinel selection — 0 = unknown
 /// window/no usage, -1.0 = unknown percentage — is unit-testable

@@ -530,11 +530,14 @@ impl KjDispatcher {
 
         // Context-window denominator: resolved kernel-side (never shipped to
         // the client as raw inputs to derive) via the same
-        // `LlmRegistry::context_window_for(provider, model)` `kj model`
-        // already uses. `None` when the model's window isn't configured
-        // (e.g. `claude-sonnet-4-20250514` deliberately has none) — the two
-        // fields below MUST both be `null` in that case, never a guessed
-        // denominator standing in for one. The percentage itself comes from
+        // `LlmRegistry::context_window_for_live(provider, model)` `kj model`
+        // already uses — config (models.toml) wins as an override; absent
+        // that, a live Anthropic `GET /v1/models/{id}` lookup (cached) fills
+        // the honest gaps config never had (e.g. `claude-sonnet-4-20250514`,
+        // deliberately unset in models.toml). `None` when neither source
+        // knows the window — the two fields below MUST both be `null` in
+        // that case, never a guessed denominator standing in for one. The
+        // percentage itself comes from
         // `context_used_pct` — the ONE percentage-math site, shared with the
         // wire's `contextUsedPct` (`ContextHandleInfo` /
         // `kaijutsu-server/src/rpc.rs::list_contexts`) so the two surfaces
@@ -542,7 +545,7 @@ impl KjDispatcher {
         let (context_window, context_used_pct) = match &usage {
             Some(u) => {
                 let registry = self.kernel().llm().read().await;
-                let window = registry.context_window_for(&u.provider, &u.model);
+                let window = registry.context_window_for_live(&u.provider, &u.model).await;
                 let pct = crate::kernel_db::context_used_pct(u, window);
                 (window, pct)
             }

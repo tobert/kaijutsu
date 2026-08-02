@@ -12,19 +12,23 @@
 //! `prompt()` does the non-streaming form, returning concatenated text.
 
 pub mod build;
+pub mod models_api;
 pub mod sse;
 pub mod stream;
 pub mod types;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::stream::{BuildOpts, StreamEvent};
 use crate::llm::{LlmError, LlmResult, Message};
 
+use self::models_api::{HttpModelCapabilitySource, ModelCapabilitySource};
 use self::sse::{ClaudeSseEvent, decode_event};
 use self::stream::StateMachine;
 use self::types::{MessagesResponse, ResponseContent, Thinking};
@@ -39,10 +43,30 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// client makes is properly authenticated by construction. The shared
 /// `Client` lets reqwest pool TCP connections across multiple stream
 /// calls within a session.
+///
+/// `model_window_cache` + `capability_source` back the live
+/// `GET /v1/models/{id}` context-window lookup (see [`Self::context_window`])
+/// — models.toml's hand-maintained `context_window` is checked first by the
+/// caller (`LlmRegistry::context_window_for_live`); this is the fallback
+/// when that's absent. `capability_source` is the test seam: production
+/// code gets `HttpModelCapabilitySource` (a real network call), tests inject
+/// a fake via [`Self::with_capability_source`] so `cargo test` never
+/// touches the network.
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    /// Per-model-id cache of resolved live context windows, scoped to this
+    /// `Client` instance (one per registered Anthropic provider, i.e. one
+    /// per kernel process — restart to pick up a model launched after boot,
+    /// same convention as credential reload). Populated lazily on first
+    /// live lookup. `Some`/`Ok(None)` results are cached for the process
+    /// lifetime — a model's context window does not change under you, so
+    /// there is no TTL to get wrong. A lookup that *errors* (network/auth
+    /// failure) is deliberately NOT cached, so a transient outage heals
+    /// itself on the next call instead of pinning "unknown" until restart.
+    model_window_cache: Arc<AsyncRwLock<HashMap<String, Option<u64>>>>,
+    capability_source: Arc<dyn ModelCapabilitySource>,
 }
 
 impl Client {
@@ -72,16 +96,87 @@ impl Client {
             .default_headers(headers)
             .build()
             .expect("reqwest::Client::builder must succeed on healthy host");
+        let base_url = ANTHROPIC_DEFAULT_BASE_URL.to_string();
+        let capability_source: Arc<dyn ModelCapabilitySource> = Arc::new(
+            HttpModelCapabilitySource::new(http.clone(), base_url.clone()),
+        );
         Self {
             http,
-            base_url: ANTHROPIC_DEFAULT_BASE_URL.to_string(),
+            base_url,
+            model_window_cache: Arc::new(AsyncRwLock::new(HashMap::new())),
+            capability_source,
         }
     }
 
     /// Override the API base URL (for proxies or local mocks).
+    ///
+    /// Rebuilds `capability_source` to point at the new base URL too, so a
+    /// proxy/mock override applies uniformly to `/v1/messages` and
+    /// `/v1/models/{id}` alike. Call [`Self::with_capability_source`]
+    /// *after* this in a test builder chain if you need to override the
+    /// rebuilt source instead.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self.capability_source = Arc::new(HttpModelCapabilitySource::new(
+            self.http.clone(),
+            self.base_url.clone(),
+        ));
         self
+    }
+
+    /// Test seam: inject a fake [`ModelCapabilitySource`] so
+    /// [`Self::context_window`] never touches the network. Production
+    /// callers never need this — `new()`/`with_base_url()` always wire the
+    /// real HTTP-backed source.
+    #[cfg(any(test, feature = "test-mock"))]
+    pub fn with_capability_source(mut self, source: Arc<dyn ModelCapabilitySource>) -> Self {
+        self.capability_source = source;
+        self
+    }
+
+    /// Live context-window lookup for `model`, cached for the life of this
+    /// `Client`. Checked by [`crate::llm::LlmRegistry::context_window_for_live`]
+    /// only after the config path (`models.toml`'s `context_window`) came up
+    /// empty — config is always the override, this is the fallback.
+    ///
+    /// A cache hit never touches the network. On a miss, awaits
+    /// `capability_source.max_input_tokens(model)` (the real implementation
+    /// hits `GET /v1/models/{id}`, reading the wire's `max_input_tokens`
+    /// field — there is no `context_window` field on the API; that name is
+    /// ours, and `max_tokens` is a different number, the output cap).
+    ///
+    /// Never fabricates: an `Ok(None)` (model unknown to the API, e.g. a
+    /// 404) resolves to `None` and IS cached, same as a genuine window —
+    /// repeat lookups for a bad id shouldn't hammer the network either. An
+    /// `Err` (network/auth/parse failure) also resolves to `None` but is
+    /// NOT cached (see the field doc), and is bubbled at `warn` — `None` is
+    /// a legitimate, documented outcome here, so this is an informational
+    /// log, not a silently swallowed failure.
+    pub async fn context_window(&self, model: &str) -> Option<u64> {
+        {
+            let cache = self.model_window_cache.read().await;
+            if let Some(cached) = cache.get(model) {
+                return *cached;
+            }
+        }
+        match self.capability_source.max_input_tokens(model).await {
+            Ok(window) => {
+                self.model_window_cache
+                    .write()
+                    .await
+                    .insert(model.to_string(), window);
+                window
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model,
+                    error = %e,
+                    "live context-window lookup failed; resolving as unknown \
+                     (not cached — will retry on the next call)"
+                );
+                None
+            }
+        }
     }
 
     /// Available Claude model IDs surfaced by this provider.
@@ -122,7 +217,7 @@ impl Client {
             .await
             .map_err(http_error)?;
 
-        let response = self.error_for_status(response).await?;
+        let response = error_for_status(response).await?;
 
         let parsed: MessagesResponse = response
             .json()
@@ -178,45 +273,46 @@ impl Client {
             .await
             .map_err(http_error)?;
 
-        let response = self.error_for_status(response).await?;
+        let response = error_for_status(response).await?;
 
         Ok(Stream::from_response(response))
     }
-
-    /// Map an Anthropic 4xx/5xx response body into [`LlmError`].
-    ///
-    /// Anthropic returns JSON `{"type": "error", "error": {"type":
-    /// "...", "message": "..."}}` for known failure modes. We decode
-    /// the inner error to map onto kaijutsu-typed variants. Unparseable
-    /// bodies fall back to raw status text — never silently swallow.
-    async fn error_for_status(
-        &self,
-        response: reqwest::Response,
-    ) -> LlmResult<reqwest::Response> {
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("(failed to read body: {e})"));
-        // Parse the error JSON if we can; otherwise pass through.
-        let detail = serde_json::from_str::<sse::SseError>(&body)
-            .map(|e| format!("{}: {}", e.error.kind, e.error.message))
-            .unwrap_or(body);
-        let mapped = match status.as_u16() {
-            401 | 403 => LlmError::AuthError(detail),
-            429 => LlmError::RateLimited(detail),
-            400..=499 => LlmError::InvalidRequest(detail),
-            500..=599 => LlmError::ApiError(detail),
-            _ => LlmError::ApiError(format!("unexpected HTTP {status}: {detail}")),
-        };
-        Err(mapped)
-    }
 }
 
-fn http_error(e: reqwest::Error) -> LlmError {
+/// Map an Anthropic 4xx/5xx response body into [`LlmError`].
+///
+/// Anthropic returns JSON `{"type": "error", "error": {"type":
+/// "...", "message": "..."}}` for known failure modes. We decode
+/// the inner error to map onto kaijutsu-typed variants. Unparseable
+/// bodies fall back to raw status text — never silently swallow.
+///
+/// Free function (not a `Client` method) so [`models_api::HttpModelCapabilitySource`]
+/// can reuse the same mapping for `GET /v1/models/{id}` without needing a
+/// `Client` reference — it's pure over the response.
+pub(crate) async fn error_for_status(response: reqwest::Response) -> LlmResult<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(failed to read body: {e})"));
+    // Parse the error JSON if we can; otherwise pass through.
+    let detail = serde_json::from_str::<sse::SseError>(&body)
+        .map(|e| format!("{}: {}", e.error.kind, e.error.message))
+        .unwrap_or(body);
+    let mapped = match status.as_u16() {
+        401 | 403 => LlmError::AuthError(detail),
+        429 => LlmError::RateLimited(detail),
+        400..=499 => LlmError::InvalidRequest(detail),
+        500..=599 => LlmError::ApiError(detail),
+        _ => LlmError::ApiError(format!("unexpected HTTP {status}: {detail}")),
+    };
+    Err(mapped)
+}
+
+pub(crate) fn http_error(e: reqwest::Error) -> LlmError {
     if e.is_timeout() {
         LlmError::NetworkError(format!("timeout: {e}"))
     } else if e.is_connect() {
@@ -572,5 +668,109 @@ data: {\"type\":\"message_stop\"}
             saw_thinking_end_signature,
             "thinking block must carry a signature for multi-turn replay"
         );
+    }
+
+    // ── Client::context_window: cache + failure-degradation behavior ─────
+    //
+    // `LlmRegistry::context_window_for_live`'s own tests (`llm/mod.rs`)
+    // cover config-override precedence and the None/unknown-model paths at
+    // the registry level. These tests exercise `Client::context_window`
+    // directly so a cache hit skipping the seam entirely can be asserted
+    // via `FakeModelCapabilitySource::call_count` — the registry's
+    // `Arc<dyn ModelCapabilitySource>` type-erasure makes that awkward to
+    // reach from the registry-level tests.
+
+    mod context_window_cache_tests {
+        use super::*;
+        use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn second_call_for_same_model_hits_cache_not_the_seam() {
+            let fake = FakeModelCapabilitySource::always_none()
+                .with_response("claude-opus-4-8", Ok(Some(1_000_000)));
+            let fake = Arc::new(fake);
+            let client = Client::new("fake-key").with_capability_source(fake.clone());
+
+            let first = client.context_window("claude-opus-4-8").await;
+            assert_eq!(first, Some(1_000_000));
+            assert_eq!(fake.call_count(), 1);
+
+            let second = client.context_window("claude-opus-4-8").await;
+            assert_eq!(second, Some(1_000_000), "cached value must be stable");
+            assert_eq!(
+                fake.call_count(),
+                1,
+                "a cache hit must not call the capability source a second time"
+            );
+        }
+
+        #[tokio::test]
+        async fn unknown_model_result_is_cached_too() {
+            // Ok(None) — "the live API doesn't know this model either" — is
+            // a real, cacheable answer, not a failure. Repeat lookups for a
+            // bad id shouldn't hammer the network.
+            let fake = Arc::new(FakeModelCapabilitySource::always_none());
+            let client = Client::new("fake-key").with_capability_source(fake.clone());
+
+            assert_eq!(client.context_window("bogus-model").await, None);
+            assert_eq!(fake.call_count(), 1);
+            assert_eq!(client.context_window("bogus-model").await, None);
+            assert_eq!(fake.call_count(), 1, "Ok(None) must be cached, same as Ok(Some(_))");
+        }
+
+        #[tokio::test]
+        async fn failed_lookup_degrades_to_none_and_is_not_cached() {
+            let fake = Arc::new(FakeModelCapabilitySource::always_none().with_response(
+                "claude-opus-4-8",
+                Err(LlmError::NetworkError("connect refused".into())),
+            ));
+            let client = Client::new("fake-key").with_capability_source(fake.clone());
+
+            assert_eq!(
+                client.context_window("claude-opus-4-8").await,
+                None,
+                "a failed live lookup must degrade to None, never panic, never fabricate"
+            );
+            assert_eq!(fake.call_count(), 1);
+
+            // Retried on the next call (not poisoned by the earlier failure) —
+            // simulates the transient outage healing without a restart.
+            assert_eq!(
+                client.context_window("claude-opus-4-8").await,
+                None,
+                "still None because the fake is still scripted to fail"
+            );
+            assert_eq!(
+                fake.call_count(),
+                2,
+                "an Err result must NOT be cached — each call retries the seam"
+            );
+        }
+
+        #[tokio::test]
+        async fn distinct_models_cache_independently() {
+            let fake = Arc::new(
+                FakeModelCapabilitySource::always_none()
+                    .with_response("claude-opus-4-8", Ok(Some(1_000_000)))
+                    .with_response("claude-haiku-4-5-20251001", Ok(Some(200_000))),
+            );
+            let client = Client::new("fake-key").with_capability_source(fake.clone());
+
+            assert_eq!(client.context_window("claude-opus-4-8").await, Some(1_000_000));
+            assert_eq!(
+                client.context_window("claude-haiku-4-5-20251001").await,
+                Some(200_000)
+            );
+            assert_eq!(fake.call_count(), 2);
+
+            // Both now cached independently.
+            assert_eq!(client.context_window("claude-opus-4-8").await, Some(1_000_000));
+            assert_eq!(
+                client.context_window("claude-haiku-4-5-20251001").await,
+                Some(200_000)
+            );
+            assert_eq!(fake.call_count(), 2, "both hits should come from cache");
+        }
     }
 }
