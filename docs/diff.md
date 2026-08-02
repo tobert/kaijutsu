@@ -443,6 +443,49 @@ block to open, yank to the system clipboard. Corrections and discoveries only:
   strip's placement against the dock, and the stale banner firing on a live
   block edit.
 
+### Pre-merge review — slice 5 (gemini deliberate + deepseek, 2026-08-02)
+
+Gemini approved outright. Deepseek found four real issues (no crash, no data
+loss); all four fixed before merge. What they changed:
+
+- **The viewer is now line-wise all the way down.** Column motions (`w` `b`
+  `e` `0` `$` `|` `f`/`t`) moved modalkit's real column while the drawn cursor
+  stayed at line start — invisible state a later yank would read from. Two
+  mechanisms now, deliberately belt-and-braces: `is_line_wise` drops
+  column-only `EditTarget`s (a **positive** list, so an unclassified
+  `MoveType` is rejected — the conservative direction), and
+  `snap_to_line_start` forces column 0 after every action so the invariant
+  holds by construction for whatever the list misses or a modalkit bump adds.
+  The snap alone was tried first and rejected: it makes `b` wrap to the
+  previous *line* (a real move) while `w` usually doesn't — coherent-looking
+  code, incoherent behavior. Text objects are held to the same rule, so `yiw`
+  cannot yank a fragment of a line. **Column motions come back with slice 6's
+  word-level rendering**, which is what would make them visible.
+- **The row window was doing nothing for the cursor.** One `BuildKey`
+  including `cursor_row` meant every `j` re-ran the whole Parley + glyph +
+  band pipeline — the window slid correctly and bought nothing. Split into
+  `LayoutKey` (content, band, viewport → gates shaping) and `CursorKey`
+  (cursor, selection, status, cursor shape → gates a cheap pass over the
+  cached layout). Body glyphs and `+`/`-` bands are now the *prefix* of each
+  buffer and the cheap pass truncates-and-appends, so no reallocation either.
+  The cursor is placed from the cached visual rows rather than from Parley —
+  in a line-wise viewer it is a row box, nothing more. Honest limitation
+  documented on `WINDOW_SLACK_ROWS`: walking off the *bottom edge* still
+  re-shapes one band per row, because the surface draws from the top with no
+  scroll offset. Fixing that means caching the parley `Layout` and moving the
+  glyph offset; not worth it until a profile says so.
+- **The cursor shape was `Beam`** — the insert-mode shape, on a surface that
+  is never in insert mode. Now `mode_kind(core.mode())`: block in normal,
+  hidden in visual (the selection bands are the visible thing there), hidden
+  in the error state, which has no cursor at all.
+- **An empty diff said `1/1`.** The counter is omitted when there are no rows.
+
+Verified fine, no action: the truncate-vs-parse ordering (we parse *then*
+truncate the model, so the ceiling applies to a real model), the intent drain
+order (yank before close, refresh deferred to the end of the batch), and
+clipboard ownership ending at process exit (platform reality, tracked with the
+PRIMARY entry in `docs/issues.md`).
+
 ## Seam guidance (deepseek review, 2026-08-01)
 
 Consulted deepseek specifically on how the seams should evolve so this work
