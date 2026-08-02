@@ -153,7 +153,23 @@ fn validate_config_write(canonical: &str, content: &str) -> Result<(), String> {
     let Some(providers) = value.get("providers").and_then(toml::Value::as_table) else {
         return Ok(());
     };
-    for name in providers.keys() {
+    for (name, table) in providers {
+        // Mirror the LOAD path: `initialize_llm_registry` skips a disabled
+        // provider (`toml_config.rs:69`) BEFORE resolving its type, so an
+        // `enabled = false` block never has to name a type the kernel knows.
+        // Validation must agree, or an inert template makes the whole file
+        // unwritable — which is exactly what the shipped default's disabled
+        // `[providers.gemini]` did: `models.toml` loaded fine and then
+        // rejected every `kj config set`, including a byte-identical
+        // round-trip (found 2026-08-02 repointing the model aliases).
+        // `enabled` defaults to true, matching `ProviderToml`'s serde default.
+        let enabled = table
+            .get("enabled")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
         if !crate::llm::SUPPORTED_PROVIDER_TYPES.contains(&name.as_str()) {
             return Err(crate::llm::unknown_provider_type_message(name));
         }
@@ -841,6 +857,36 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    /// A DISABLED provider of an unknown type must validate, because the load
+    /// path skips disabled providers before it ever resolves their type. Found
+    /// live 2026-08-02: the shipped default's `enabled = false`
+    /// `[providers.gemini]` template loaded fine and then made `models.toml`
+    /// unwritable — every `kj config set` was rejected, including a
+    /// byte-identical round-trip of the file the kernel was already running.
+    #[tokio::test]
+    async fn set_models_toml_accepts_disabled_unknown_provider_type() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        // `gemini` is not a Provider variant; `enabled = false` makes it inert.
+        let toml = "[providers.gemini]\nenabled = false\ndefault_model = \"gemini-2.0-flash\"\n";
+        let result = d
+            .dispatch(
+                &[
+                    s("config"),
+                    s("set"),
+                    s("models.toml"),
+                    s("--content"),
+                    s(toml),
+                ],
+                &c,
+            )
+            .await;
+        assert!(
+            matches!(result, KjResult::Ok { .. }),
+            "a disabled provider of an unknown type must not block the write: {result:?}"
+        );
     }
 
     /// The flip side: a real supported type still writes fine — validation

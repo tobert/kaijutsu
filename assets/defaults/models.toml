@@ -81,12 +81,12 @@ context_window = 1000000
 [providers.anthropic.models.claude-sonnet-4-6]
 context_window = 1000000
 
-# claude-sonnet-4-20250514 ("Sonnet 4", used by the balanced/default aliases
-# below) is deliberately NOT listed here: it doesn't appear in Anthropic's
-# current models overview (superseded by Sonnet 4.5/4.6/5), and the
-# generation's context window isn't consistent enough to extrapolate — e.g.
-# Sonnet 4.5 is 200K but Sonnet 4.6 is 1M. `kj model` will report this
-# alias's window as unknown until someone confirms the number and adds it.
+# claude-sonnet-4-20250514 ("Sonnet 4") is gone, not merely unlisted:
+# `GET /v1/models/claude-sonnet-4-20250514` returns a real 404 (confirmed
+# live 2026-08-02), as does claude-opus-4-20250514. It used to back the
+# balanced/default aliases, which meant a fresh kernel shipped pointing at a
+# model Anthropic no longer serves. Those aliases now point at deepseek.
+# Left here as a marker: don't reintroduce either id.
 
 [providers.gemini]
 enabled = false
@@ -173,8 +173,8 @@ type = "all"
 [model_aliases]
 fast     = { provider = "anthropic", model = "claude-haiku-4-5-20251001" }
 cheap    = { provider = "anthropic", model = "claude-haiku-4-5-20251001" }
-balanced = { provider = "anthropic", model = "claude-sonnet-4-20250514" }
-default  = { provider = "anthropic", model = "claude-sonnet-4-20250514" }
+balanced = { provider = "deepseek",  model = "deepseek-v4-flash" }
+default  = { provider = "deepseek",  model = "deepseek-v4-pro" }
 smart    = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
 best     = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
 deepseek    = { provider = "deepseek", model = "deepseek-v4-flash" }
