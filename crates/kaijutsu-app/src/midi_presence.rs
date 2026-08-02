@@ -155,6 +155,17 @@ pub struct MidiPresenceState {
     /// Ambiguous-match warning latch, keyed by port address, so a permanent
     /// profile collision warns once per port rather than every frame.
     warned_ambiguous: BTreeMap<String, Vec<String>>,
+    /// device → the backend addresses of its currently matched ports. The
+    /// *local* half of what matching produces: `reported` is what we told the
+    /// kernel, this is what THIS sink can actually reach — the routing table
+    /// a device-addressed control cue (`kj midi send`) resolves through
+    /// (`docs/midi-next.md` slice 1 step 4).
+    ///
+    /// Kept beside `reported` rather than derived from it because they
+    /// genuinely differ: `reported` is a *diff* against the kernel's belief
+    /// (silent when nothing changed), while routing needs the whole current
+    /// picture every time.
+    routes: BTreeMap<String, Vec<String>>,
 }
 
 impl MidiPresenceState {
@@ -162,6 +173,13 @@ impl MidiPresenceState {
     /// the shared truth).
     pub fn reported(&self) -> &BTreeMap<String, bool> {
         &self.reported
+    }
+
+    /// device → matched port addresses on THIS machine — how `kj midi send`
+    /// finds a port (`crate::dj::thread::forward_midi_routes_to_dj` ships it
+    /// to the DJ thread). Empty until the first match.
+    pub fn routes(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.routes
     }
 }
 
@@ -297,6 +315,8 @@ fn reconcile_presence(
     let ports = topology.ports();
     let report = match_ports(&state.profiles, &ports);
 
+    state.routes = routes_from_match(&report.devices);
+
     // An ambiguous port is refused, loudly and once: two profiles claiming
     // one port is an authoring bug, and guessing would put a wrong device
     // name in front of every player on the rig.
@@ -365,6 +385,30 @@ fn reconcile_presence(
             }
         })
         .detach();
+}
+
+/// The local routing table for device-addressed control cues (`kj midi
+/// send`, `docs/midi-next.md` slice 1 step 4): device → its matched ports'
+/// backend addresses, in match order.
+///
+/// The WHOLE current picture, computed fresh from each match and installed
+/// outright — never merged into the previous one. A device that stopped
+/// matching must stop being routable in the same instant: its address may
+/// already belong to different gear, and a stale route would send at whatever
+/// moved in. (Contrast [`diff_presence`], which is deliberately a *diff*: the
+/// kernel wants changes, the router wants the state.)
+pub fn routes_from_match(
+    matched: &BTreeMap<String, Vec<MatchedPort>>,
+) -> BTreeMap<String, Vec<String>> {
+    matched
+        .iter()
+        .map(|(device, ports)| {
+            (
+                device.clone(),
+                ports.iter().map(|p| p.facts.address.clone()).collect(),
+            )
+        })
+        .collect()
 }
 
 /// The pure diff between "what the kernel believes" and "what we just
@@ -550,6 +594,39 @@ mod tests {
         assert!(!out[0].present);
         assert_eq!(out[1].device, "minibrute");
         assert!(out[1].present);
+    }
+
+    // ── the local routing table (docs/midi-next.md slice 1 step 4) ────────
+
+    /// The routing table names the ports of every matched device — this is
+    /// what turns `kj midi send minibrute …` into bytes at a real port.
+    #[test]
+    fn routes_carry_every_matched_ports_address() {
+        let mut m = matched("keystep-pro", &[facts("KeyStep Pro", "MIDI 1", "24:0")]);
+        m.extend(matched(
+            "keylab-88-mkii",
+            &[
+                facts("KeyLab mkII 88", "KeyLab mkII 88 MIDI", "28:0"),
+                facts("KeyLab mkII 88", "KeyLab mkII 88 DAW", "28:1"),
+            ],
+        ));
+        let routes = routes_from_match(&m);
+        assert_eq!(routes["keystep-pro"], vec!["24:0".to_string()]);
+        assert_eq!(
+            routes["keylab-88-mkii"],
+            vec!["28:0".to_string(), "28:1".to_string()],
+            "match order preserved — slice 1 routes to the first, slice 2 picks by role"
+        );
+    }
+
+    /// An unplugged device must stop being routable in the same instant: the
+    /// table is the whole current picture, never merged with the last one.
+    /// Its address may already belong to something else.
+    #[test]
+    fn an_unmatched_device_has_no_route_at_all() {
+        assert!(routes_from_match(&BTreeMap::new()).is_empty());
+        let routes = routes_from_match(&matched("minibrute", &[facts("MiniBrute", "MIDI 1", "26:0")]));
+        assert!(!routes.contains_key("keystep-pro"), "routes: {routes:?}");
     }
 
     /// The "where" we report is the machine's real name or nothing at all —

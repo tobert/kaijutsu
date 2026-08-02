@@ -24,6 +24,11 @@ pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};
 pub mod clockin;
 pub use clockin::{ClockEstimate, ClockEstimator, ClockEvent, PULSES_PER_BEAT};
 
+pub mod midi_control;
+pub use midi_control::{
+    MidiControl, MidiControlError, MidiControlEvent, MIDI_CONTROL_MIME, MIDI_CONTROL_VERSION,
+};
+
 pub mod timebase;
 pub use timebase::{
     beat_onsets_in, stamp_age, BeatRef, LocalBeat, RefDisposition, Slew, REF_FOLD_MAX,

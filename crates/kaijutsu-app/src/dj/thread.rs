@@ -55,7 +55,7 @@ use crate::connection::actor_plugin::{RpcActor, RpcConnectionState, RpcResultMes
 
 use super::audio::{dispatch_render_cue, handle_prefetch_outcome};
 use super::core::{ClockTransition, CuePlacement, DjCore, MetronomeConfig};
-use super::midi::{AUTOCONNECT_POLL, MidiDispatch, MidiSink, dispatch_midi_cue};
+use super::midi::{AUTOCONNECT_POLL, MidiDispatch, MidiRoutes, MidiSink, dispatch_midi_cue};
 use super::prefetch::{CasPrefetch, PrefetchOutcome};
 
 /// How far ahead the click timer pre-schedules — mirrors
@@ -165,6 +165,14 @@ pub enum DjCtl<H = ActorHandle> {
     /// A freshly parsed per-client `metronome.toml` — applied verbatim to
     /// [`DjCore`]'s click config.
     MetronomeConfig(MetronomeConfig),
+    /// The app's current device→port picture, from
+    /// [`crate::midi_presence`]'s matcher — how a device-addressed control
+    /// cue (`kj midi send`, `docs/midi-next.md` slice 1 step 4) finds a real
+    /// port on THIS machine. Replaces the whole table each time rather than
+    /// patching it: the matcher already computes the complete picture, and a
+    /// merge could leave an unplugged device routable (a send to a port that
+    /// belongs to something else now).
+    MidiRoutes(MidiRoutes),
     /// Exit the `select!` loop cleanly. The ctl channel closing (every
     /// sender dropped) has the same effect — see [`run_loop`]'s ctl arm.
     Shutdown,
@@ -416,6 +424,13 @@ async fn run_loop<H, F, M>(
     // once it's free again is exactly as good as N.
     autoconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut autoconnect_done = false;
+    // The device→port picture for device-addressed control cues
+    // (`DjCtl::MidiRoutes`). Loop-local for the same reason `autoconnect_done`
+    // is: it's the loop's own state, and the sink only ever needs the ONE
+    // address `dispatch_midi_cue` already resolved. Empty until the app's
+    // matcher reports — and an empty table means every control cue is dropped
+    // with a loud warn, never fanned out to the render port.
+    let mut midi_routes = MidiRoutes::new();
     // First real consumer as of this task: gates/feeds every CAS prefetch
     // dispatch (`dispatch_render_cue`'s `Option<&SshConfig>` parameter)
     // exactly as the deleted `audio.rs`'s `conn.ssh_config.clone()` did.
@@ -486,6 +501,10 @@ async fn run_loop<H, F, M>(
                     }
                     Some(DjCtl::MetronomeConfig(cfg)) => {
                         core.metronome = cfg;
+                    }
+                    Some(DjCtl::MidiRoutes(routes)) => {
+                        debug!("kaijutsu-dj: MIDI routes updated — {} device(s) routable", routes.len());
+                        midi_routes = routes;
                     }
                     Some(DjCtl::Shutdown) | None => {
                         debug!("kaijutsu-dj: shutting down ({})", if ctl_rx.is_closed() { "ctl channel closed" } else { "Shutdown" });
@@ -563,7 +582,7 @@ async fn run_loop<H, F, M>(
                                         sinks.audio.as_ref(),
                                         prefetch,
                                     );
-                                    dispatch_midi_cue(&cue, event_epoch_ns, &mut midi);
+                                    dispatch_midi_cue(&cue, event_epoch_ns, &midi_routes, &mut midi);
                                     if midi.take_traffic() {
                                         let _ = pulse_tx.send(DjPulse::RenderTraffic);
                                     }
@@ -674,7 +693,7 @@ async fn run_loop<H, F, M>(
                         sinks.audio.as_ref(),
                         prefetch,
                     );
-                    dispatch_midi_cue(&cue, dispatch_epoch_ns, &mut midi);
+                    dispatch_midi_cue(&cue, dispatch_epoch_ns, &midi_routes, &mut midi);
                 }
                 if midi.take_traffic() {
                     let _ = pulse_tx.send(DjPulse::RenderTraffic);
@@ -833,7 +852,15 @@ impl Plugin for DjPlugin {
 
         app.insert_resource(DjHandle { ctl_tx, pulse_rx });
         app.add_message::<RenderPortTraffic>();
-        app.add_systems(Update, (forward_actor_to_dj, forward_metronome_config_to_dj, drain_dj_pulses));
+        app.add_systems(
+            Update,
+            (
+                forward_actor_to_dj,
+                forward_metronome_config_to_dj,
+                forward_midi_routes_to_dj,
+                drain_dj_pulses,
+            ),
+        );
     }
 }
 
@@ -875,6 +902,27 @@ fn forward_metronome_config_to_dj(mut results: MessageReader<RpcResultMessage>, 
             }
         }
     }
+}
+
+/// Forward the app's device→port picture to the DJ thread — how a
+/// device-addressed control cue (`kj midi send`, `docs/midi-next.md` slice 1
+/// step 4) finds a real port on this machine.
+///
+/// The matcher (`crate::midi_presence`) is the one place that knows both the
+/// profiles and the live rig, and it already recomputes the whole picture on
+/// every topology change; this system just ships it across the same ctl
+/// channel the actor and metronome config use. Change-detection gated, so a
+/// steady rig costs one `is_changed()` read per frame — and the DJ replaces
+/// its table wholesale, so an unplug removes routability immediately.
+fn forward_midi_routes_to_dj(
+    presence: Option<Res<crate::midi_presence::MidiPresenceState>>,
+    dj: Res<DjHandle>,
+) {
+    let Some(presence) = presence else { return };
+    if !presence.is_changed() {
+        return;
+    }
+    let _ = dj.ctl_tx.send(DjCtl::MidiRoutes(presence.routes().clone()));
 }
 
 /// Drain the DJ→Bevy mirror channel: fold each [`DjPulse`] into the Bevy-side
@@ -1132,6 +1180,7 @@ mod tests {
     enum MidiCmd {
         ClickAt { note: u8, channel: u8, velocity: u8, gate_ms: u64, offset: Duration },
         ScheduleAbc { events: Vec<(Duration, Vec<u8>)>, lead: Duration },
+        SendControl { address: String, events: Vec<(Duration, Vec<u8>)> },
         Flush,
     }
 
@@ -1156,6 +1205,9 @@ mod tests {
         }
         fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
             let _ = self.tx.send(MidiCmd::ScheduleAbc { events, lead });
+        }
+        fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>) {
+            let _ = self.tx.send(MidiCmd::SendControl { address: address.to_string(), events });
         }
         fn flush(&mut self) {
             let _ = self.tx.send(MidiCmd::Flush);
@@ -1741,6 +1793,7 @@ mod tests {
                 assert_eq!(cfg, MetronomeConfig { enabled: false, note: 72, channel: 9, velocity: 40, gate_ms: 30 });
             }
             Ok(DjCtl::ActorReady { .. }) => panic!("expected MetronomeConfig, got ActorReady"),
+            Ok(DjCtl::MidiRoutes(_)) => panic!("expected MetronomeConfig, got MidiRoutes"),
             Ok(DjCtl::Shutdown) => panic!("expected MetronomeConfig, got Shutdown"),
             Err(e) => panic!("expected a forwarded MetronomeConfig, got error: {e:?}"),
         }
@@ -1765,5 +1818,49 @@ mod tests {
             ctl_rx.try_recv().is_err(),
             "a parse failure must forward nothing — the DJ thread keeps its current config"
         );
+    }
+
+    // ── MIDI routes → DJ thread (docs/midi-next.md slice 1 step 4) ────────
+
+    /// The matcher's device→port picture reaches the DJ thread, which is the
+    /// only way a device-addressed `kj midi send` finds a real port.
+    #[test]
+    fn forward_midi_routes_ships_the_matchers_picture_to_the_ctl_channel() {
+        use crate::midi_presence::MidiPresenceState;
+
+        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
+        let (_pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+
+        let mut app = App::new();
+        app.insert_resource(DjHandle { ctl_tx, pulse_rx })
+            .init_resource::<MidiPresenceState>()
+            .add_systems(Update, forward_midi_routes_to_dj);
+        // A freshly inserted resource counts as changed, so the first frame
+        // already ships the (empty) picture — correct: "this sink routes
+        // nothing" is a fact the DJ needs, not an absence.
+        app.update();
+        match ctl_rx.try_recv() {
+            Ok(DjCtl::MidiRoutes(routes)) => assert!(routes.is_empty(), "routes: {routes:?}"),
+            Ok(_) => panic!("expected MidiRoutes"),
+            Err(e) => panic!("expected a forwarded MidiRoutes, got error: {e:?}"),
+        }
+
+        // A steady rig is silent: no change, no ctl traffic.
+        app.update();
+        assert!(ctl_rx.try_recv().is_err(), "an unchanged picture must forward nothing");
+    }
+
+    /// With no presence plugin registered at all (a headless/GUI-less build
+    /// path), the forwarder is a no-op rather than a panic on the missing
+    /// resource.
+    #[test]
+    fn forward_midi_routes_is_a_no_op_without_the_presence_resource() {
+        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
+        let (_pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
+        let mut app = App::new();
+        app.insert_resource(DjHandle { ctl_tx, pulse_rx })
+            .add_systems(Update, forward_midi_routes_to_dj);
+        app.update();
+        assert!(ctl_rx.try_recv().is_err());
     }
 }

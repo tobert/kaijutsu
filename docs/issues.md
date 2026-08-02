@@ -689,8 +689,10 @@ body + narrow loadout + cheap model), `kj midi` emit verbs + provenance-tagged
 `/run/midi/<device>` state, SysEx via a sink `exchange()` method (transfer
 job shape deferred). Slice 1 steps 1–3 have landed (seeds + `kj midi
 list/show`; sink-fed presence: in-app profile matching, `reportMidiPresence`,
-the ephemeral `/run/midi/<device>` store, presence column). Slice order in the
-doc; next: `kj midi send`/`panic`, then `exchange()` + `kj midi identify`.
+the ephemeral `/run/midi/<device>` store, presence column) — as has step 4
+(`kj midi send`/`panic`: a device-addressed control cue on the existing
+`RenderCue` wire, emitted DIRECT to the matched ALSA port). Slice order in the
+doc; next: `exchange()` + `kj midi identify`.
 First real consumer: Minibrute on the laptop app, then the per-track
 channel-routing fix (this file → Hyoushigi/Musician area; `docs/chameleon.md`
 open items) built on profile vocabulary.
@@ -709,6 +711,24 @@ open items) built on profile vocabulary.
   (identical names, distinct USB paths) is the case that will force it — and
   will also need something finer than `vendor:product`, which is per-model,
   not per-unit.
+- **`kj midi send` routes to a device's FIRST matched port** (deferred
+  2026-08-02, slice 1 step 4). `dj::midi::resolve_route` takes
+  `routes[device][0]`; for a two-port device (KeyLab: MIDI + DAW) that is the
+  MIDI port, which is right today but is a positional accident, not a
+  decision. Slice 2's *device.role* vocabulary is the fix — the routing table
+  already carries every matched address, so only the picker changes
+  (`a_multi_port_device_routes_to_its_first_matched_port` is the tripwire).
+- **`kj midi send` writes no `/run/midi` sent-provenance** (deferred
+  2026-08-02, slice 1 step 4). `docs/midi-next.md` says every emit should
+  record `{value, source: sent, at}` so relative commands ("-25%") have a
+  baseline to work from. Slice 3 (device contexts) is where that pays off;
+  slice 1 emits raw absolutes only, so there is nothing to be relative to yet.
+- **CoreMIDI control-cue addressing** (deferred 2026-08-02, slice 1 step 4).
+  `dj::midi::parse_alsa_addr` refuses anything that isn't `client:port` rather
+  than guessing, so a CoreMIDI-shaped address reaching the ALSA sink is a loud
+  drop. The mac backend will need its own address parse + emit alongside the
+  ALSA one — the envelope and the routing table are already backend-neutral
+  (device names and opaque address strings), so nothing above the sink changes.
 
 ## App (and headless sink) as MCP clients offered back to the kernel (seeded 2026-07-15)
 

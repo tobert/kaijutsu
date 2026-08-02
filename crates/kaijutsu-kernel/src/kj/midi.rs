@@ -7,11 +7,39 @@
 //! `crate::midi_seed`) bootstrap a fresh kernel once — see `docs/midi-next.md`
 //! "Storage and identity" (slice 1 step 2).
 //!
-//! Read-only for now: `list` enumerates the devices tree, `show` prints one
-//! profile document. Write verbs (`kj midi send`/`cc`/`identify`/`pull`) are
-//! later slices in `docs/midi-next.md` — this noun exists so building it now
-//! doesn't fragment `kj` discovery later (the `kj audio`/`kj transport`
-//! precedent this file follows).
+//! `list` enumerates the devices tree, `show` prints one profile document,
+//! `send`/`panic` emit raw control cues at a named device (slice 1 step 4,
+//! below). Profile-resolved control *names* (`kj midi cc subh vco1-level
+//! -25%`), `identify`, and `pull` are later slices in `docs/midi-next.md` —
+//! this noun exists so building them doesn't fragment `kj` discovery later
+//! (the `kj audio`/`kj transport` precedent this file follows).
+//!
+//! ## Emit (slice 1 step 4): `send` and `panic`
+//!
+//! **The kernel never touches hardware** (`docs/midi.md` "Render is a wire
+//! cue; the sink owns the hardware"). `kj midi send` composes MIDI bytes,
+//! wraps them in a [`MidiControl`] envelope naming the *device*, and
+//! publishes a play-now [`RenderCue`] (`lead == 0`) on the SAME FlowBus
+//! `kj play` uses — same path, different payload. Every attached sink
+//! receives it; the one that has that device matched resolves the name to a
+//! real port and emits. This is what retires the whipped-up-python pattern:
+//! a kaish script anywhere on the rig can play gear attached to a laptop,
+//! with zero ALSA in the script.
+//!
+//! Three deliberate stances:
+//!
+//! - **The profile is the gate; presence is not.** An unknown `<device>` (no
+//!   `/etc/midi/devices/<name>`) is a loud error — there is nothing to route
+//!   and no honest guess. A device the presence store says is *absent* or
+//!   *unknown* is still sent, with the warning in the result: presence is a
+//!   sink's report, a sink may have connected since, and the kernel does not
+//!   gate players (`CLAUDE.md` "crosstalk-as-feature"). The sink drops what
+//!   it can't route, loudly, in its own logs.
+//! - **Channels are 1–16 at the surface**, `channel − 1` on the wire — the
+//!   profile documents' convention, and what a device's front panel says.
+//! - **Raw only.** `send` takes numbers a human or a manual already decided
+//!   on. No profile-resolved names, no relative values, no `/run/midi`
+//!   provenance write — all slice 2/3.
 //!
 //! ## Presence (slice 1 step 3)
 //!
@@ -33,15 +61,18 @@
 //! no presence entry (the ear still captures from it regardless).
 
 use clap::{Parser, Subcommand};
+use kaijutsu_audio::{CuePayload, MIDI_CONTROL_MIME, MidiControl, MidiControlEvent, RenderCue};
 use kaijutsu_types::ContentType;
 use kaijutsu_types::paths::{MIDI_ROOT, midi_device_path};
 
+use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
+use crate::flows::BlockFlow;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "midi",
-    about = "CRDT-owned MIDI device profiles at /etc/midi/devices/<name>",
+    about = "MIDI device profiles (/etc/midi/devices/<name>) and raw emit at a named device",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -71,6 +102,273 @@ enum MidiCommand {
         #[arg(long, conflicts_with = "json")]
         raw: bool,
     },
+    /// Emit raw MIDI at a named device (the sink resolves the port).
+    Send {
+        /// Device name — a profile key under /etc/midi/devices
+        device: String,
+        #[command(subcommand)]
+        message: SendMessage,
+        /// Target context: . (default) | <label> | <hex prefix>. Mirrors
+        /// `kj play`: every attached sink receives the cue regardless.
+        #[arg(long, short = 'c', global = true)]
+        context: Option<String>,
+    },
+    /// All-notes-off + all-sound-off on all 16 channels of <device>, or of
+    /// every device the rig currently reports live when omitted.
+    Panic {
+        /// Device name; omitted = every live device
+        device: Option<String>,
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+    },
+}
+
+/// The raw message grammar of `kj midi send <device> …`. Every value is a
+/// literal a human read off a manual or a front panel — profile-resolved
+/// names are slice 2 (`docs/midi-next.md`).
+#[derive(Subcommand, Debug)]
+enum SendMessage {
+    /// Note On, optionally gated by a scheduled Note Off.
+    Note {
+        /// MIDI channel, 1-16 (front-panel numbering)
+        channel: u8,
+        /// Note number, 0-127 (60 = middle C)
+        note: u8,
+        /// Velocity, 0-127
+        velocity: u8,
+        /// Also send the matching Note Off this many ms later. Omitted = a
+        /// bare Note On that sustains until something else stops it (drone,
+        /// or a later `kj midi panic`).
+        #[arg(long)]
+        off_ms: Option<u64>,
+    },
+    /// Control Change.
+    Cc {
+        /// MIDI channel, 1-16
+        channel: u8,
+        /// Controller number, 0-127
+        controller: u8,
+        /// Value, 0-127
+        value: u8,
+    },
+    /// Program Change.
+    Pc {
+        /// MIDI channel, 1-16
+        channel: u8,
+        /// Program number, 0-127 (raw MIDI numbering — gear that prints
+        /// 1-128 on its panel is one higher than this)
+        program: u8,
+    },
+    /// Fire-and-forget System Exclusive bytes — the day-one escape hatch for
+    /// everything the other verbs don't cover (`docs/midi-next.md` "SysEx:
+    /// the exchange pattern"). No reply is collected; that's `kj midi
+    /// identify`/`pull`, a later slice.
+    Sysex {
+        /// Hex bytes (`f07e7f0601f7`; spaces, commas and 0x prefixes are
+        /// tolerated) or `@<path>` to read a raw `.syx` file. Multiple
+        /// concatenated F0…F7 messages are split and sent in order.
+        data: String,
+    },
+}
+
+// ── message composition (pure) ───────────────────────────────────────────────
+
+/// Surface channel (1-16, what the front panel says) → wire nibble (0-15).
+/// A loud error rather than a silent clamp: channel 0 is a typo for 1 often
+/// enough that guessing would send a whole phrase to the wrong instrument.
+fn wire_channel(channel: u8) -> Result<u8, String> {
+    match channel {
+        1..=16 => Ok(channel - 1),
+        _ => Err(format!(
+            "channel {channel} out of range — MIDI channels are 1-16 at this surface \
+             (the wire byte is channel-1)"
+        )),
+    }
+}
+
+/// A 7-bit MIDI data byte. Anything ≥ 0x80 IS a status byte on the wire, so an
+/// out-of-range value doesn't merely mis-sound — it injects a rogue message
+/// into the stream. Refuse, name the field.
+fn data_byte(name: &str, value: u8) -> Result<u8, String> {
+    match value {
+        0..=127 => Ok(value),
+        _ => Err(format!("{name} {value} out of range (0-127)")),
+    }
+}
+
+/// Compose one `send` message into wire events. `Note` yields two events when
+/// gated (the Off carries the offset — one cue, not two, so a dropped second
+/// cue can never strand a sounding note).
+fn compose_send(message: &SendMessage) -> Result<Vec<MidiControlEvent>, String> {
+    Ok(match message {
+        SendMessage::Note { channel, note, velocity, off_ms } => {
+            let ch = wire_channel(*channel)?;
+            let note = data_byte("note", *note)?;
+            let velocity = data_byte("velocity", *velocity)?;
+            let mut events = vec![MidiControlEvent::now(&[0x90 | ch, note, velocity])];
+            if let Some(ms) = off_ms {
+                events.push(MidiControlEvent::new(*ms, &[0x80 | ch, note, 0]));
+            }
+            events
+        }
+        SendMessage::Cc { channel, controller, value } => {
+            let ch = wire_channel(*channel)?;
+            let controller = data_byte("controller", *controller)?;
+            let value = data_byte("value", *value)?;
+            vec![MidiControlEvent::now(&[0xB0 | ch, controller, value])]
+        }
+        SendMessage::Pc { channel, program } => {
+            let ch = wire_channel(*channel)?;
+            let program = data_byte("program", *program)?;
+            vec![MidiControlEvent::now(&[0xC0 | ch, program])]
+        }
+        SendMessage::Sysex { data } => sysex_messages(data)?
+            .iter()
+            .map(|m| MidiControlEvent::now(m))
+            .collect(),
+    })
+}
+
+/// A human-readable one-liner for what a `send` is about to do — the result
+/// message's subject. Built from the parsed args, not from the composed
+/// bytes, so it reads the way the operator typed it.
+fn describe_send(message: &SendMessage) -> String {
+    match message {
+        SendMessage::Note { channel, note, velocity, off_ms } => match off_ms {
+            Some(ms) => format!("note {note} vel {velocity} ch {channel} ({ms}ms gate)"),
+            None => format!("note {note} vel {velocity} ch {channel} (no note-off)"),
+        },
+        SendMessage::Cc { channel, controller, value } => {
+            format!("cc {controller} = {value} ch {channel}")
+        }
+        SendMessage::Pc { channel, program } => format!("program change {program} ch {channel}"),
+        SendMessage::Sysex { data } => match data.strip_prefix('@') {
+            Some(path) => format!("sysex from {path}"),
+            None => format!("sysex ({} hex chars)", data.len()),
+        },
+    }
+}
+
+/// The panic sequence for one device: **all-notes-off (CC 123) then
+/// all-sound-off (CC 120) on every one of the 16 channels**. Both, in that
+/// order, deliberately: 123 releases held notes so envelopes finish naturally
+/// (the musical stop), 120 then kills anything still sounding (the honest
+/// stop, for gear that ignores 123 or is stuck mid-release). 32 messages, all
+/// at offset 0.
+fn panic_messages() -> Vec<MidiControlEvent> {
+    let mut events = Vec::with_capacity(32);
+    for ch in 0..16u8 {
+        events.push(MidiControlEvent::now(&[0xB0 | ch, 123, 0]));
+        events.push(MidiControlEvent::now(&[0xB0 | ch, 120, 0]));
+    }
+    events
+}
+
+/// Parse the `sysex` argument into complete F0…F7 messages.
+///
+/// Two forms, distinguished at the grammar (never sniffed): `@<path>` reads a
+/// file as **raw bytes** (the universal `.syx` format), anything else is hex
+/// text with human separators tolerated (`"F0 7E 7F 06 01 F7"`, `0xF0,0x7E`).
+/// The byte stream is then split into individual messages and validated —
+/// leading F0, terminating F7, and 7-bit payload throughout. A malformed
+/// SysEx is refused here rather than shipped: a truncated dialogue can leave
+/// real gear waiting mid-transfer, which is worse than not sending.
+fn sysex_messages(spec: &str) -> Result<Vec<Vec<u8>>, String> {
+    let bytes = match spec.strip_prefix('@') {
+        Some(path) => std::fs::read(path).map_err(|e| format!("sysex file '{path}': {e}"))?,
+        None => {
+            let normalized: String = spec
+                .replace("0x", "")
+                .replace("0X", "")
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',' && *c != ':')
+                .collect();
+            kaijutsu_audio::midi_control::from_hex(&normalized)
+                .map_err(|e| format!("sysex hex: {e}"))?
+        }
+    };
+    split_sysex(&bytes)
+}
+
+/// Split a raw byte stream into complete SysEx messages, refusing anything
+/// malformed. Separate from [`sysex_messages`] so the validation is testable
+/// without touching the filesystem.
+fn split_sysex(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if bytes.is_empty() {
+        return Err("sysex payload is empty".to_string());
+    }
+    let mut messages = Vec::new();
+    let mut current: Option<Vec<u8>> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match (b, current.as_mut()) {
+            (0xF0, None) => current = Some(vec![0xF0]),
+            (0xF0, Some(_)) => {
+                return Err(format!("sysex: unterminated message — a second F0 at byte {i}"));
+            }
+            (_, None) => {
+                return Err(format!(
+                    "sysex: byte {i} is 0x{b:02x}, but a SysEx message must start with F0"
+                ));
+            }
+            (0xF7, Some(msg)) => {
+                msg.push(0xF7);
+                messages.push(current.take().expect("just matched Some"));
+            }
+            (b, Some(_)) if b >= 0x80 => {
+                return Err(format!(
+                    "sysex: byte {i} is 0x{b:02x} — SysEx payload bytes must be 7-bit (00-7F)"
+                ));
+            }
+            (b, Some(msg)) => msg.push(b),
+        }
+    }
+    if current.is_some() {
+        return Err("sysex: unterminated message — the stream never reached F7".to_string());
+    }
+    Ok(messages)
+}
+
+/// The shared result shape for `send`/`panic`: what went where, how many
+/// sinks heard it, and every warning that didn't stop it.
+///
+/// **Zero listeners is itself a warning.** A kernel with no sink attached
+/// publishes happily into nothing, and a player who just turned a knob with
+/// no sound deserves to be told that up front rather than debugging their
+/// cable. It is not an error — the cue is genuinely emitted, and a sink can
+/// be attached next second (it just won't get *this* cue: control cues are
+/// fire-and-forget, never replayed).
+fn emit_result(
+    device: &str,
+    subject: &str,
+    messages: usize,
+    receivers: usize,
+    mut warnings: Vec<String>,
+) -> KjResult {
+    if receivers == 0 {
+        warnings.push(
+            "no render sink is attached to this kernel — the cue was published to 0 listeners, \
+             so nothing will sound"
+                .to_string(),
+        );
+    }
+    let data = serde_json::json!({
+        "device": device,
+        "subject": subject,
+        "messages": messages,
+        "receivers": receivers,
+        "warnings": warnings,
+    });
+    let mut message = format!("{device}: {subject} — {messages} message(s), {receivers} sink(s)");
+    for w in &warnings {
+        message.push_str("\nwarning: ");
+        message.push_str(w);
+    }
+    // NOT ephemeral, unlike `kj play`'s "playing …": the `kj midi` verbs ARE
+    // a device context's tools (`docs/midi-next.md` "one emit surface"), so
+    // the model turning the knob has to see whether its send actually landed
+    // — an ephemeral warning is one no model ever reads.
+    KjResult::ok_typed_with_data(message, ContentType::Plain, data)
 }
 
 /// The `/etc/midi/devices` directory path.
@@ -137,7 +435,7 @@ fn doc_title(content: &str) -> String {
 }
 
 impl KjDispatcher {
-    pub(crate) async fn dispatch_midi(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_midi(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<MidiArgs>();
         }
@@ -157,7 +455,174 @@ impl KjDispatcher {
         match parsed.command {
             MidiCommand::List { json } => self.midi_list(json).await,
             MidiCommand::Show { name, json, raw } => self.midi_show(&name, json, raw).await,
+            MidiCommand::Send { device, message, context } => {
+                self.midi_send(&device, &message, context.as_deref(), caller).await
+            }
+            MidiCommand::Panic { device, context } => {
+                self.midi_panic(device.as_deref(), context.as_deref(), caller).await
+            }
         }
+    }
+
+    /// A `<device>` must name a real profile before anything is emitted at
+    /// it. There is no honest fallback: an unknown name has no port to
+    /// resolve at any sink, so guessing would mean either silence dressed as
+    /// success, or bytes at the wrong instrument.
+    async fn midi_device_must_exist(&self, verb: &str, name: &str) -> Result<String, String> {
+        use crate::vfs::{VfsError, VfsOps};
+        let canonical = midi_device_canonical(name).map_err(|e| format!("kj midi {verb}: {e}"))?;
+        match self.kernel().vfs().read_all(std::path::Path::new(&canonical)).await {
+            Ok(_) => Ok(canonical),
+            Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Err(format!(
+                "kj midi {verb}: unknown device '{name}' (no profile at {canonical}) \
+                 — `kj midi list` shows what this kernel knows"
+            )),
+            Err(e) => Err(format!("kj midi {verb}: '{canonical}': {e}")),
+        }
+    }
+
+    /// What the presence store has to say about `device`, as a warning — or
+    /// `None` when it is live. **Never a gate.** A device the rig hasn't
+    /// reported may well be plugged into a sink that connected a moment ago,
+    /// and the kernel doesn't referee between players
+    /// (`CLAUDE.md` "crosstalk-as-feature"). The cue goes out either way; the
+    /// sink drops what it can't route, loudly, in its own logs.
+    fn presence_warning(&self, device: &str) -> Option<String> {
+        match self.kernel().midi_presence().get(device) {
+            Some(r) if r.present => None,
+            Some(_) => Some(format!(
+                "'{device}' was last reported ABSENT — sending anyway; \
+                 a sink that can't route it will drop the cue"
+            )),
+            None => Some(format!(
+                "presence of '{device}' is UNKNOWN to this kernel (no sink has reported it) \
+                 — sending anyway; a sink that can't route it will drop the cue"
+            )),
+        }
+    }
+
+    /// Wrap composed messages in a [`MidiControl`] envelope and push it down
+    /// the existing render-cue wire as a play-now [`RenderCue`] — the same
+    /// FlowBus, the same bridge, the same sinks as `kj play`. Returns the
+    /// listener count so the caller can tell a player "0 listeners" instead of
+    /// letting a sinkless rig look like a successful send.
+    fn publish_control(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        device: &str,
+        events: Vec<MidiControlEvent>,
+    ) -> usize {
+        let envelope = MidiControl::new(device, events);
+        let cue = RenderCue {
+            mime: MIDI_CONTROL_MIME.to_string(),
+            payload: CuePayload::Inline(envelope.to_bytes()),
+            // Onset now: a control send has no musical placement to hit, and
+            // a lead would only add latency between a knob-turn and the gear.
+            lead: std::time::Duration::ZERO,
+            // Unstamped, like `kj play`'s play-now: there is no phrase
+            // boundary to back-date against, and the sink must never DROP a
+            // panic for staleness.
+            epoch_ns: 0,
+            // No track/beat association — dispatches immediately regardless
+            // of a sink's clock mode.
+            onset_beat: None,
+        };
+        self.kernel()
+            .block_flows()
+            .publish(BlockFlow::RenderCue { context_id, cue })
+    }
+
+    /// `kj midi send <device> note|cc|pc|sysex …`
+    async fn midi_send(
+        &self,
+        device: &str,
+        message: &SendMessage,
+        context: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        if let Err(e) = self.midi_device_must_exist("send", device).await {
+            return KjResult::Err(e);
+        }
+        let events = match compose_send(message) {
+            Ok(e) => e,
+            Err(e) => return KjResult::Err(format!("kj midi send: {e}")),
+        };
+        let context_id = {
+            let db = self.kernel_db().lock();
+            match refs::resolve_context_arg(context, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj midi send: {e}")),
+            }
+        };
+        let warning = self.presence_warning(device);
+        let count = events.len();
+        let receivers = self.publish_control(context_id, device, events);
+        let subject = describe_send(message);
+        emit_result(device, &subject, count, receivers, warning.into_iter().collect())
+    }
+
+    /// `kj midi panic [device]` — all-notes-off + all-sound-off on every
+    /// channel. With no `<device>`, every device the rig currently reports
+    /// **live** gets its own cue: panic is the "stop everything" reflex, so
+    /// it fans out rather than making a player name the offender.
+    async fn midi_panic(
+        &self,
+        device: Option<&str>,
+        context: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let devices: Vec<String> = match device {
+            Some(name) => {
+                if let Err(e) = self.midi_device_must_exist("panic", name).await {
+                    return KjResult::Err(e);
+                }
+                vec![name.to_string()]
+            }
+            None => {
+                let live: Vec<String> = self
+                    .kernel()
+                    .midi_presence()
+                    .snapshot()
+                    .into_iter()
+                    .filter(|r| r.present)
+                    .map(|r| r.device)
+                    .collect();
+                if live.is_empty() {
+                    // Loud, not a cheerful no-op: the player asked for
+                    // everything to stop and nothing was told to. Naming a
+                    // device explicitly still works (presence never gates).
+                    return KjResult::Err(
+                        "kj midi panic: no device is reported live on this rig — \
+                         name one explicitly (`kj midi panic <device>`) to send anyway, \
+                         or check `kj midi list`"
+                            .to_string(),
+                    );
+                }
+                live
+            }
+        };
+        let context_id = {
+            let db = self.kernel_db().lock();
+            match refs::resolve_context_arg(context, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj midi panic: {e}")),
+            }
+        };
+
+        let mut warnings = Vec::new();
+        let mut receivers = 0usize;
+        let count = panic_messages().len();
+        for name in &devices {
+            warnings.extend(self.presence_warning(name));
+            receivers = receivers.max(self.publish_control(context_id, name, panic_messages()));
+        }
+        emit_result(
+            &devices.join(", "),
+            "panic (all-notes-off + all-sound-off, all 16 channels)",
+            count * devices.len(),
+            receivers,
+            warnings,
+        )
     }
 
     async fn midi_list(&self, json: bool) -> KjResult {
@@ -911,6 +1376,523 @@ mod tests {
         assert_eq!(doc["present"]["value"], true);
         assert_eq!(doc["present"]["source"], "sink");
         assert_eq!(doc["present"]["at"], 5);
+    }
+
+    // ── emit: send / panic (docs/midi-next.md slice 1 step 4) ─────────────
+
+    use kaijutsu_audio::{CuePayload, MIDI_CONTROL_MIME, MidiControl};
+
+    /// Subscribe to the render-cue topic and return the receiver. The FlowBus
+    /// is a live broadcast, not a queue — subscribe BEFORE dispatching.
+    fn cue_sub(d: &crate::kj::KjDispatcher) -> crate::flows::Subscription<crate::flows::BlockFlow> {
+        d.kernel().block_flows().subscribe("block.render_cue")
+    }
+
+    /// Pull the one published control cue off the bus and decode its
+    /// envelope. Panics loudly if nothing was published — a silent
+    /// no-publish is exactly the failure these tests exist to catch.
+    fn expect_control_cue(sub: &mut crate::flows::Subscription<crate::flows::BlockFlow>) -> (MidiControl, RenderCue) {
+        let msg = sub.try_recv().expect("a RenderCue should have been published");
+        match msg.payload {
+            crate::flows::BlockFlow::RenderCue { cue, .. } => {
+                assert_eq!(cue.mime, MIDI_CONTROL_MIME, "control cues get their own mime");
+                assert_eq!(
+                    cue.lead,
+                    std::time::Duration::ZERO,
+                    "a control send is onset-now (lead 0)"
+                );
+                let CuePayload::Inline(bytes) = &cue.payload else {
+                    panic!("control cues are always inline, never CAS: {:?}", cue.payload);
+                };
+                let envelope = MidiControl::parse(std::str::from_utf8(bytes).expect("utf8"))
+                    .expect("the published envelope must parse");
+                (envelope, cue)
+            }
+            other => panic!("expected RenderCue, got {other:?}"),
+        }
+    }
+
+    /// The core of step 4: a `send` puts a device-ADDRESSED cue on the same
+    /// wire `kj play` uses, carrying the device name (the sink's only routing
+    /// key) and the composed bytes. The gated note's Note Off rides the SAME
+    /// cue at an offset — one cue, so a lost second cue can never strand a
+    /// sounding note.
+    #[tokio::test]
+    async fn send_note_publishes_a_device_addressed_control_cue() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+
+        let result = d
+            .dispatch(
+                &[
+                    s("midi"), s("send"), s("minibrute"), s("note"),
+                    s("1"), s("60"), s("100"), s("--off-ms"), s("250"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "send failed: {result:?}");
+
+        let (envelope, _cue) = expect_control_cue(&mut sub);
+        assert_eq!(envelope.device, "minibrute", "the cue names the DEVICE, not a port");
+        assert_eq!(
+            envelope.decoded().unwrap(),
+            vec![(0, vec![0x90, 60, 100]), (250, vec![0x80, 60, 0])],
+        );
+    }
+
+    /// Channel 1-16 at the surface, `channel - 1` on the wire (the profile
+    /// documents' convention). Channel 16 is the interesting end: it must be
+    /// nibble 0xF, not a wrapped 0x0.
+    #[tokio::test]
+    async fn send_uses_front_panel_channel_numbering_on_the_wire() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("cc"), s("16"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "send failed: {result:?}");
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(envelope.decoded().unwrap(), vec![(0, vec![0xBF, 74, 64])]);
+    }
+
+    #[tokio::test]
+    async fn send_pc_is_a_two_byte_program_change() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(&[s("midi"), s("send"), s("timidity"), s("pc"), s("2"), s("40")], &c)
+            .await;
+        assert!(result.is_ok(), "send failed: {result:?}");
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(envelope.device, "timidity");
+        assert_eq!(envelope.decoded().unwrap(), vec![(0, vec![0xC1, 40])]);
+    }
+
+    /// A note with no `--off-ms` is a bare Note On that sustains — one event,
+    /// no invented note-off. Making one up would be a different instruction
+    /// than the one typed.
+    #[tokio::test]
+    async fn an_ungated_note_sends_exactly_one_message() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("note"), s("1"), s("60"), s("100")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "send failed: {result:?}");
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(envelope.decoded().unwrap(), vec![(0, vec![0x90, 60, 100])]);
+    }
+
+    /// The profile IS the gate: an unknown device is a loud error and NOTHING
+    /// reaches the wire. There is no port to resolve at any sink, so a
+    /// cheerful "sent!" would be a lie.
+    #[tokio::test]
+    async fn send_to_an_unknown_device_errors_and_publishes_nothing() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("nonesuch"), s("cc"), s("1"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("unknown device"), "msg: {msg}");
+                assert!(msg.contains("nonesuch"), "msg: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+        assert!(sub.try_recv().is_none(), "an unknown device must publish no cue");
+    }
+
+    /// Presence is NOT a gate (`CLAUDE.md` "crosstalk-as-feature"): a device
+    /// nobody has reported still gets its cue, with the warning riding the
+    /// result. The sink drops what it can't route, loudly, in its own logs.
+    #[tokio::test]
+    async fn send_to_an_unreported_device_warns_but_still_sends() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("cc"), s("1"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        match &result {
+            KjResult::Ok { message, data: Some(v), .. } => {
+                assert!(message.contains("warning"), "message: {message}");
+                let warnings = v["warnings"].as_array().expect("warnings array");
+                assert!(
+                    warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("UNKNOWN"))),
+                    "warnings: {warnings:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(envelope.device, "minibrute", "the cue went out regardless");
+    }
+
+    /// A live device carries no presence warning — only the genuine ones, so
+    /// the warning stays worth reading.
+    #[tokio::test]
+    async fn send_to_a_live_device_carries_no_presence_warning() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("minibrute", true, 1))
+            .unwrap();
+        let _sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("cc"), s("1"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let warnings = v["warnings"].as_array().expect("warnings array");
+                assert!(
+                    !warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("UNKNOWN")
+                        || w.contains("ABSENT"))),
+                    "a live device needs no presence warning: {warnings:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// A device a sink watched leave says so specifically — "absent" and
+    /// "unknown" are different facts all the way to the CLI.
+    #[tokio::test]
+    async fn send_to_an_absent_device_says_absent_not_unknown() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("minibrute", false, 1))
+            .unwrap();
+        let _sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("cc"), s("1"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let warnings = v["warnings"].as_array().expect("warnings array");
+                assert!(
+                    warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("ABSENT"))),
+                    "warnings: {warnings:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The `kj midi` verbs are a device context's TOOLS — a model turning a
+    /// knob must be able to read whether the send landed, so the result (and
+    /// especially its warnings) is never ephemeral.
+    #[tokio::test]
+    async fn a_send_result_is_visible_to_the_model_not_ephemeral() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("cc"), s("1"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { ephemeral, .. } => {
+                assert!(!ephemeral, "a device context's tool result must reach the model")
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// A kernel nobody's sink is attached to publishes into nothing — say so,
+    /// rather than let a player debug a cable that's fine.
+    #[tokio::test]
+    async fn a_send_with_no_attached_sink_warns_about_zero_listeners() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        // Deliberately NO subscriber.
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("cc"), s("1"), s("74"), s("64")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["receivers"], 0);
+                let warnings = v["warnings"].as_array().expect("warnings array");
+                assert!(
+                    warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("0 listeners"))),
+                    "warnings: {warnings:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// `kj midi panic <device>` = CC 123 then CC 120 on all 16 channels.
+    #[tokio::test]
+    async fn panic_sends_all_notes_off_then_all_sound_off_on_every_channel() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d.dispatch(&[s("midi"), s("panic"), s("minibrute")], &c).await;
+        assert!(result.is_ok(), "panic failed: {result:?}");
+
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(envelope.device, "minibrute");
+        let messages = envelope.decoded().unwrap();
+        assert_eq!(messages.len(), 32, "16 channels x 2 controllers");
+        for ch in 0..16u8 {
+            assert_eq!(messages[ch as usize * 2], (0, vec![0xB0 | ch, 123, 0]));
+            assert_eq!(messages[ch as usize * 2 + 1], (0, vec![0xB0 | ch, 120, 0]));
+        }
+    }
+
+    /// Bare `kj midi panic` is the stop-everything reflex: it fans out to
+    /// every device the rig reports LIVE, one cue each, without making the
+    /// player name the offender.
+    #[tokio::test]
+    async fn panic_with_no_device_fans_out_to_every_live_device() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let presence = d.kernel().midi_presence();
+        presence.record(sink_report("minibrute", true, 1)).unwrap();
+        presence.record(sink_report("keystep-pro", true, 1)).unwrap();
+        // An absent device is not panicked at: nothing there is sounding.
+        presence.record(sink_report("timidity", false, 1)).unwrap();
+        let mut sub = cue_sub(&d);
+
+        let result = d.dispatch(&[s("midi"), s("panic")], &c).await;
+        assert!(result.is_ok(), "panic failed: {result:?}");
+
+        let mut devices = vec![expect_control_cue(&mut sub).0.device, expect_control_cue(&mut sub).0.device];
+        devices.sort();
+        assert_eq!(devices, vec!["keystep-pro".to_string(), "minibrute".to_string()]);
+        assert!(sub.try_recv().is_none(), "exactly one cue per live device");
+    }
+
+    /// Nothing live means nothing was told to stop — a loud error, not a
+    /// cheerful no-op that leaves a droning synth droning.
+    #[tokio::test]
+    async fn panic_with_nothing_live_is_a_loud_error() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        match d.dispatch(&[s("midi"), s("panic")], &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("no device is reported live"), "msg: {msg}");
+                assert!(msg.contains("kj midi panic <device>"), "names the escape hatch: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+        assert!(sub.try_recv().is_none());
+    }
+
+    /// A NAMED panic works even when presence says nothing — presence never
+    /// gates, it only warns (the same rule `send` follows).
+    #[tokio::test]
+    async fn a_named_panic_works_on_an_unreported_device() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d.dispatch(&[s("midi"), s("panic"), s("timidity")], &c).await;
+        assert!(result.is_ok(), "panic failed: {result:?}");
+        assert_eq!(expect_control_cue(&mut sub).0.device, "timidity");
+    }
+
+    #[tokio::test]
+    async fn panic_on_an_unknown_device_errors_and_publishes_nothing() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        match d.dispatch(&[s("midi"), s("panic"), s("nonesuch")], &c).await {
+            KjResult::Err(msg) => assert!(msg.contains("unknown device"), "msg: {msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+        assert!(sub.try_recv().is_none());
+    }
+
+    /// `--context` is `global` on `send` so it can be written where a player
+    /// naturally types it — after the message, not wedged between the device
+    /// and the verb. Pinned by a test because "global" is the kind of clap
+    /// detail that silently stops working.
+    #[test]
+    fn the_context_flag_is_accepted_after_the_message_verb() {
+        // `no_binary_name` — the dispatcher hands the noun's ARGV, not "midi".
+        let args =
+            MidiArgs::try_parse_from(["send", "minibrute", "cc", "1", "74", "64", "-c", "scratch"])
+                .expect("parse");
+        match args.command {
+            MidiCommand::Send { device, context, message } => {
+                assert_eq!(device, "minibrute");
+                assert_eq!(context.as_deref(), Some("scratch"));
+                assert!(matches!(message, SendMessage::Cc { channel: 1, controller: 74, value: 64 }));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    // ── range validation (pure) ───────────────────────────────────────────
+
+    /// Channel 0 is the classic off-by-one typo. Refuse rather than clamp: a
+    /// clamped channel sends a whole phrase to the wrong instrument.
+    #[test]
+    fn channel_numbering_refuses_zero_and_seventeen() {
+        assert_eq!(wire_channel(1), Ok(0));
+        assert_eq!(wire_channel(16), Ok(15));
+        assert!(wire_channel(0).is_err());
+        assert!(wire_channel(17).is_err());
+    }
+
+    /// A data byte ≥ 0x80 IS a status byte on the wire — an unmasked typo
+    /// wouldn't just mis-sound, it would inject a rogue message. Refuse it,
+    /// naming the field.
+    #[test]
+    fn a_data_byte_above_seven_bits_is_refused_by_name() {
+        assert_eq!(data_byte("velocity", 127), Ok(127));
+        let err = data_byte("velocity", 200).unwrap_err();
+        assert!(err.contains("velocity"), "err: {err}");
+        assert!(err.contains("0-127"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_value_is_refused_before_anything_is_published() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        match d
+            .dispatch(
+                &[s("midi"), s("send"), s("minibrute"), s("note"), s("0"), s("60"), s("100")],
+                &c,
+            )
+            .await
+        {
+            KjResult::Err(msg) => assert!(msg.contains("channel 0 out of range"), "msg: {msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+        assert!(sub.try_recv().is_none(), "a rejected message publishes nothing");
+    }
+
+    // ── sysex (pure + wired) ──────────────────────────────────────────────
+
+    #[test]
+    fn sysex_splits_a_stream_into_complete_messages() {
+        let stream = [0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7, 0xF0, 0x00, 0x20, 0x6B, 0xF7];
+        assert_eq!(
+            split_sysex(&stream).unwrap(),
+            vec![
+                vec![0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7],
+                vec![0xF0, 0x00, 0x20, 0x6B, 0xF7],
+            ]
+        );
+    }
+
+    /// A truncated SysEx can leave real gear waiting mid-transfer — worse
+    /// than not sending at all. Refuse every malformed shape by name.
+    #[test]
+    fn malformed_sysex_is_refused_by_name() {
+        assert!(split_sysex(&[]).unwrap_err().contains("empty"));
+        assert!(split_sysex(&[0xF0, 0x7E]).unwrap_err().contains("never reached F7"));
+        assert!(split_sysex(&[0x7E, 0xF7]).unwrap_err().contains("must start with F0"));
+        assert!(split_sysex(&[0xF0, 0xF0, 0xF7]).unwrap_err().contains("second F0"));
+        // A status byte inside the payload corrupts the dialogue.
+        assert!(split_sysex(&[0xF0, 0x90, 0xF7]).unwrap_err().contains("7-bit"));
+    }
+
+    /// Manuals print SysEx as "F0 7E 7F 06 01 F7" — accept that verbatim,
+    /// plus the comma/0x forms code tends to produce.
+    #[test]
+    fn sysex_hex_tolerates_the_separators_manuals_use() {
+        let want = vec![vec![0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7]];
+        assert_eq!(sysex_messages("F0 7E 7F 06 01 F7").unwrap(), want);
+        assert_eq!(sysex_messages("0xF0,0x7E,0x7F,0x06,0x01,0xF7").unwrap(), want);
+        assert_eq!(sysex_messages("f07e7f0601f7").unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn send_sysex_publishes_the_bytes_verbatim() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[s("midi"), s("send"), s("keystep-pro"), s("sysex"), s("F0 7E 7F 06 01 F7")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "sysex send failed: {result:?}");
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(
+            envelope.decoded().unwrap(),
+            vec![(0, vec![0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7])]
+        );
+    }
+
+    /// `@<path>` reads a raw `.syx` file — the universal interchange format,
+    /// and the whole point of the day-one escape hatch.
+    #[tokio::test]
+    async fn send_sysex_reads_a_raw_syx_file() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("identity.syx");
+        std::fs::write(&path, [0xF0u8, 0x7E, 0x7F, 0x06, 0x01, 0xF7]).expect("write syx");
+        let mut sub = cue_sub(&d);
+        let result = d
+            .dispatch(
+                &[
+                    s("midi"), s("send"), s("keystep-pro"), s("sysex"),
+                    format!("@{}", path.display()),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "sysex file send failed: {result:?}");
+        let (envelope, _) = expect_control_cue(&mut sub);
+        assert_eq!(
+            envelope.decoded().unwrap(),
+            vec![(0, vec![0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7])]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_sysex_file_is_a_loud_error() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        match d
+            .dispatch(
+                &[s("midi"), s("send"), s("keystep-pro"), s("sysex"), s("@/nope/missing.syx")],
+                &c,
+            )
+            .await
+        {
+            KjResult::Err(msg) => assert!(msg.contains("sysex file"), "msg: {msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 
     /// `kj midi list` on a kernel with no `/etc/midi` mount at all answers

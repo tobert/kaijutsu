@@ -462,8 +462,26 @@ Three moves change that:
       kernel with no sinks connected knows nothing and says so. Deferred with
       a seam in place: USB `vendor:product` enrichment (`PortFacts::usb_id` is
       never filled on Linux yet — matching runs on name substrings).
-   4. **`kj midi send`/`panic`** — raw control cues incl. fire-and-forget
-      sysex bytes, kaish-scriptable.
+   4. ~~**`kj midi send`/`panic`**~~ — **done 2026-08-02**. Raw control cues
+      ride the EXISTING `RenderCue` wire under a new mime,
+      `application/vnd.kaijutsu.midi-control+json`
+      (`kaijutsu-audio/src/midi_control.rs`): a small JSON envelope carrying
+      the **device name** plus hex-encoded complete MIDI messages, each with
+      an `offset_ms` (how a gated note's Note Off rides the same cue). Zero
+      capnp change — the envelope lives inside the existing inline payload,
+      and the port-anonymous score path is untouched. Kernel side
+      (`kj/midi.rs`): `send <device> note|cc|pc|sysex`, `panic [device]`;
+      channels 1-16 at the surface; the **profile** is the gate (unknown
+      device = loud error), **presence is not** (absent/unknown warns and
+      sends anyway — the sink drops what it can't route). Sink side
+      (`dj/midi.rs`): the app's matcher ships a device→address table to the DJ
+      thread (`DjCtl::MidiRoutes`), and a control cue is emitted **DIRECT** to
+      that ALSA address — no standing subscription, so addressing a device
+      never leaks the score into it. Unroutable = loud warn + drop, **never**
+      a fallback to the auto-connected render port. Deferred with the seam in
+      place: role-aware port choice (slice 1 takes the device's *first*
+      matched port), `/run/midi` sent-provenance (slice 3), CoreMIDI address
+      forms (`parse_alsa_addr` refuses them rather than guessing).
    5. The **`exchange()` sink method** + `kj midi identify`
       (Identity-Request fingerprint). Step 3 already spent the slice's first
       capnp change (`MidiPortFact` + `reportMidiPresence`), so this is the

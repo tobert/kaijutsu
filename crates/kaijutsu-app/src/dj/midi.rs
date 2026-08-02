@@ -52,12 +52,54 @@
 //! — a hand `aconnect -d` after auto-connect settled stays cut; the one-shot
 //! never re-arms.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use kaijutsu_audio::{ABC_MIME, CuePayload, RENDER_FLUSH_MIME, RenderCue};
+use kaijutsu_audio::{
+    ABC_MIME, CuePayload, MIDI_CONTROL_MIME, MidiControl, RENDER_FLUSH_MIME, RenderCue,
+};
 use tracing::{debug, warn};
 
 use crate::patch_graph::{EndpointInfo, WireInfo};
+
+// ── device-addressed control routing (docs/midi-next.md slice 1 step 4) ─────
+
+/// device name → its matched ports' backend addresses, in match order
+/// (`"24:0"` under ALSA). Fed from the app's own presence/topology state
+/// (`crate::midi_presence`), which is the only place that knows both the
+/// profiles and the live rig; the DJ thread receives it as
+/// [`super::thread::DjCtl::MidiRoutes`] and holds it loop-local.
+///
+/// Deliberately a *name → addresses* map and not "the one port": a
+/// multi-port device (KeyLab: MIDI + DAW) already resolves to several, and
+/// slice 2's role-aware routing picks among them without changing this shape.
+pub(crate) type MidiRoutes = BTreeMap<String, Vec<String>>;
+
+/// Which port a device-addressed cue goes out of, or `None` when this sink
+/// can't route it right now.
+///
+/// **Slice 1 rule: the device's first matched port.** For single-port gear
+/// that is the only answer; for a two-port device it is the MIDI port (the
+/// lower address), which is what `kj midi send` means today. Role-aware
+/// selection (`send <device>.<role> …`) is slice 2 — recorded, not guessed
+/// at here.
+///
+/// Never falls back to anything. A device-ADDRESSED cue that can't be
+/// resolved must be dropped, not sprayed at the auto-connected synth port:
+/// mis-delivery to whatever happens to be wired is the exact failure the
+/// control mime exists to prevent.
+fn resolve_route<'a>(routes: &'a MidiRoutes, device: &str) -> Option<&'a str> {
+    routes.get(device)?.first().map(String::as_str)
+}
+
+/// Parse an ALSA sequencer address (`"client:port"`) into its numeric pair.
+/// `None` for anything else — including a CoreMIDI-shaped handle, which this
+/// Linux path genuinely cannot address (a wrong guess would be a send to
+/// somebody else's port).
+fn parse_alsa_addr(address: &str) -> Option<(i32, i32)> {
+    let (client, port) = address.split_once(':')?;
+    Some((client.trim().parse().ok()?, port.trim().parse().ok()?))
+}
 
 // ── MidiDispatch — the seam run_loop is generic over ────────────────────────
 
@@ -76,6 +118,13 @@ pub(crate) trait MidiDispatch {
     /// Schedule a rendered ABC phrase's events, each already offset from
     /// phrase start, `lead` ahead of now — see [`MidiSink::schedule_abc`].
     fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration);
+    /// Emit device-addressed control messages at an **already-resolved**
+    /// backend port address (`"24:0"` under ALSA) — see
+    /// [`MidiSink::send_control`]. The device→address resolution happened in
+    /// [`dispatch_midi_cue`] (pure, testable); by the time it reaches the
+    /// sink there is a real port to address, so an unaddressable string here
+    /// is a backend mismatch, not a routing miss.
+    fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>);
     /// Drop every scheduled-but-unplayed event and silence sounding notes.
     fn flush(&mut self);
     /// Drain "did anything leave the render port since the last drain" —
@@ -184,9 +233,22 @@ fn abc_to_timed_events(abc: &str) -> Vec<(Duration, Vec<u8>)> {
 /// `dj::audio::dispatch_render_cue` already used for this event (read once
 /// per receipt, `dj::thread`'s discipline) — so a cue's staleness math never
 /// drifts from the clock reaction to the same event.
-pub(crate) fn dispatch_midi_cue(cue: &RenderCue, now_epoch_ns: u64, sink: &mut dyn MidiDispatch) {
+///
+/// `routes` is the sink's device→port picture (`MidiRoutes`), consulted only
+/// by the [`MIDI_CONTROL_MIME`] branch — the score path is port-anonymous and
+/// stays completely untouched by it.
+pub(crate) fn dispatch_midi_cue(
+    cue: &RenderCue,
+    now_epoch_ns: u64,
+    routes: &MidiRoutes,
+    sink: &mut dyn MidiDispatch,
+) {
     if cue.mime == RENDER_FLUSH_MIME {
         sink.flush();
+        return;
+    }
+    if cue.mime == MIDI_CONTROL_MIME {
+        dispatch_control_cue(cue, routes, sink);
         return;
     }
     if cue.mime != ABC_MIME {
@@ -222,6 +284,79 @@ pub(crate) fn dispatch_midi_cue(cue: &RenderCue, now_epoch_ns: u64, sink: &mut d
         return;
     }
     sink.schedule_abc(events, lead);
+}
+
+/// The [`MIDI_CONTROL_MIME`] branch: decode the envelope, resolve the named
+/// device to one of THIS sink's ports, and emit — or drop it, loudly.
+///
+/// Four ways this refuses, all of them logged with the device name, none of
+/// them silent (`docs/midi-next.md` slice 1 step 4; `CLAUDE.md`
+/// "silent fallbacks are often a mistake"):
+///
+/// 1. a CAS payload (control cues are always inline),
+/// 2. a payload that isn't UTF-8 JSON, or an envelope that fails validation,
+/// 3. a device this sink has no match for right now — **the common one**, and
+///    the whole reason it's a warn rather than a hard error: a rig spread
+///    across machines has every sink seeing every cue, so the sinks without
+///    that device are *supposed* to ignore it. One of them has the gear.
+/// 4. a matched device whose address this backend can't parse.
+///
+/// Never a fallback to the auto-connected render port. A cue addressed to a
+/// Subharmonicon must not come out of TiMidity because the Subharmonicon
+/// wasn't there.
+///
+/// **No staleness gate.** Unlike the ABC path, a control cue is never
+/// backdated or dropped for age: the one control cue you least want silently
+/// discarded is a `panic`, and a late all-notes-off is still exactly the
+/// right message. Every event's offset is honoured relative to receipt.
+fn dispatch_control_cue(cue: &RenderCue, routes: &MidiRoutes, sink: &mut dyn MidiDispatch) {
+    let CuePayload::Inline(bytes) = &cue.payload else {
+        warn!("MIDI control cue carried a CAS payload — control cues are always inline; dropping");
+        return;
+    };
+    let json = match std::str::from_utf8(bytes) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("MIDI control cue payload was not UTF-8 ({e}); dropping");
+            return;
+        }
+    };
+    let envelope = match MidiControl::parse(json) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("MIDI control cue refused: {e}; dropping");
+            return;
+        }
+    };
+    let events = match envelope.decoded() {
+        Ok(events) => events,
+        Err(e) => {
+            warn!("MIDI control cue for '{}' refused: {e}; dropping", envelope.device);
+            return;
+        }
+    };
+    let Some(address) = resolve_route(routes, &envelope.device) else {
+        warn!(
+            "MIDI control cue for '{}' dropped — this sink has no port matched to that device \
+             (known: {:?}). Never routed to the render port: an addressed cue goes to its \
+             device or nowhere.",
+            envelope.device,
+            routes.keys().collect::<Vec<_>>()
+        );
+        return;
+    };
+    debug!(
+        "MIDI control: {} message(s) → '{}' at {address}",
+        events.len(),
+        envelope.device
+    );
+    sink.send_control(
+        address,
+        events
+            .into_iter()
+            .map(|(offset_ms, data)| (Duration::from_millis(offset_ms), data))
+            .collect(),
+    );
 }
 
 // ── click byte-masking (pure) ────────────────────────────────────────────
@@ -416,12 +551,36 @@ impl MidiDispatch for MidiSink {
             return;
         }
         if let Some(out) = self.out.as_mut() {
-            out.schedule(&events, lead);
+            out.schedule(&events, lead, None);
             self.traffic = true; // a cue left the render port — pulse the chord
         }
     }
     #[cfg(not(target_os = "linux"))]
     fn schedule_abc(&mut self, _events: Vec<(Duration, Vec<u8>)>, _lead: Duration) {
+        self.ensure_open();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>) {
+        let Some(dest) = parse_alsa_addr(address) else {
+            // The routing table said this device lives here, and this backend
+            // can't address it — a real mismatch (a CoreMIDI handle reaching
+            // the ALSA sink), never something to paper over.
+            warn!("MIDI control: '{address}' is not an ALSA seq address; dropping the cue");
+            return;
+        };
+        if !self.ensure_open() {
+            return;
+        }
+        if let Some(out) = self.out.as_mut() {
+            out.schedule(&events, Duration::ZERO, Some(dest));
+            // Direct-addressed traffic is still traffic out of our client —
+            // the patch bay's RENDER chord lights for it too.
+            self.traffic = true;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn send_control(&mut self, _address: &str, _events: Vec<(Duration, Vec<u8>)>) {
         self.ensure_open();
     }
 
@@ -574,7 +733,26 @@ impl MidiOut {
 
     /// Schedule each event at `lead + offset` relative to now (real-time queue),
     /// so we never sync the app clock to the ALSA queue's clock.
-    fn schedule(&mut self, events: &[(Duration, Vec<u8>)], lead: Duration) {
+    ///
+    /// `dest` selects the delivery mode, and it is the ONE structural
+    /// difference between the score path and `kj midi send`:
+    ///
+    /// - `None` — **subscription delivery** (`set_subs`): out the render port
+    ///   to whoever is wired to it. The score/click path, unchanged.
+    /// - `Some((client, port))` — **direct addressing** (`set_dest`): ALSA
+    ///   seq delivers to exactly that port with no standing subscription, so
+    ///   a device-addressed control cue reaches its device without wiring the
+    ///   render port to it (and without that wiring then leaking the whole
+    ///   score into a synth nobody asked to play).
+    ///
+    /// Both ride the same queue, so a gated note's Note Off still lands on
+    /// time either way.
+    fn schedule(
+        &mut self,
+        events: &[(Duration, Vec<u8>)],
+        lead: Duration,
+        dest: Option<(i32, i32)>,
+    ) {
         let mut encoder = match alsa::seq::MidiEvent::new(16) {
             Ok(e) => e,
             Err(e) => {
@@ -591,7 +769,12 @@ impl MidiOut {
                 Ok((_, Some(mut ev))) => {
                     let when = lead + *offset;
                     ev.set_source(self.port);
-                    ev.set_subs();
+                    match dest {
+                        Some((client, port)) => {
+                            ev.set_dest(alsa::seq::Addr { client, port });
+                        }
+                        None => ev.set_subs(),
+                    }
                     ev.schedule_real(self.queue, true, when);
                     if let Err(e) = self.seq.event_output(&mut ev) {
                         tracing::error!("MIDI event_output failed: {e}");
@@ -652,6 +835,7 @@ impl MidiOut {
         self.schedule(
             &[(offset, on), (offset + Duration::from_millis(gate_ms), off)],
             Duration::ZERO,
+            None,
         );
     }
 }
@@ -816,6 +1000,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         scheduled: Option<(Vec<(Duration, Vec<u8>)>, Duration)>,
+        /// Every device-addressed control emit, in order: `(address, events)`.
+        controls: Vec<(String, Vec<(Duration, Vec<u8>)>)>,
         flushed: bool,
     }
 
@@ -825,6 +1011,9 @@ mod tests {
         }
         fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
             self.scheduled = Some((events, lead));
+        }
+        fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>) {
+            self.controls.push((address.to_string(), events));
         }
         fn flush(&mut self) {
             self.flushed = true;
@@ -841,7 +1030,7 @@ mod tests {
     fn a_flush_cue_flushes_the_sink_and_schedules_nothing() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline(RENDER_FLUSH_MIME, Vec::new());
-        dispatch_midi_cue(&cue, 0, &mut sink);
+        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
         assert!(sink.flushed);
         assert!(sink.scheduled.is_none());
     }
@@ -850,7 +1039,7 @@ mod tests {
     fn a_non_abc_mime_is_ignored() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline("audio/wav", vec![1, 2, 3]);
-        dispatch_midi_cue(&cue, 0, &mut sink);
+        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
         assert!(!sink.flushed);
         assert!(sink.scheduled.is_none());
     }
@@ -859,7 +1048,7 @@ mod tests {
     fn an_unstamped_zero_lead_abc_cue_schedules_events_untouched() {
         let mut sink = RecordingSink::default();
         let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
-        dispatch_midi_cue(&cue, 0, &mut sink);
+        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
         let (events, lead) = sink.scheduled.expect("ABC cue must schedule");
         assert_eq!(events.len(), abc_to_timed_events(CDEF).len());
         assert_eq!(lead, Duration::ZERO, "unstamped, zero-lead cue: lead untouched");
@@ -878,7 +1067,7 @@ mod tests {
             epoch_ns: 0,
             onset_beat: None,
         };
-        dispatch_midi_cue(&cue, 0, &mut sink);
+        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
         assert!(sink.scheduled.is_none());
         assert!(!sink.flushed);
     }
@@ -896,8 +1085,194 @@ mod tests {
             epoch_ns: stale_epoch_ns,
             onset_beat: None,
         };
-        dispatch_midi_cue(&cue, now_epoch_ns, &mut sink);
+        dispatch_midi_cue(&cue, now_epoch_ns, &MidiRoutes::new(), &mut sink);
         assert!(sink.scheduled.is_none(), "a too-stale cue must not schedule");
+    }
+
+    // ── device-addressed control cues (docs/midi-next.md slice 1 step 4) ──
+
+    use kaijutsu_audio::{MIDI_CONTROL_MIME, MidiControl, MidiControlEvent};
+
+    fn routes(pairs: &[(&str, &[&str])]) -> MidiRoutes {
+        pairs
+            .iter()
+            .map(|(d, addrs)| {
+                (d.to_string(), addrs.iter().map(|a| a.to_string()).collect())
+            })
+            .collect()
+    }
+
+    fn control_cue(device: &str, events: Vec<MidiControlEvent>) -> RenderCue {
+        RenderCue::now_inline(MIDI_CONTROL_MIME, MidiControl::new(device, events).to_bytes())
+    }
+
+    /// The step-4 anchor: a control cue naming a device this sink has matched
+    /// goes out THAT device's port, with its offsets preserved.
+    #[test]
+    fn a_control_cue_for_a_matched_device_emits_at_its_port() {
+        let mut sink = RecordingSink::default();
+        let cue = control_cue(
+            "minibrute",
+            vec![
+                MidiControlEvent::now(&[0x90, 60, 100]),
+                MidiControlEvent::new(250, &[0x80, 60, 0]),
+            ],
+        );
+        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+
+        assert_eq!(sink.controls.len(), 1, "exactly one emit: {:?}", sink.controls);
+        let (address, events) = &sink.controls[0];
+        assert_eq!(address, "26:0", "routed to the device's own port");
+        assert_eq!(
+            events,
+            &vec![
+                (Duration::ZERO, vec![0x90, 60, 100]),
+                (Duration::from_millis(250), vec![0x80, 60, 0]),
+            ]
+        );
+        assert!(sink.scheduled.is_none(), "the score path is untouched");
+        assert!(!sink.flushed);
+    }
+
+    /// **The rule that matters most.** A device this sink can't route is a
+    /// DROP — never a fallback to the auto-connected render port. A cue
+    /// addressed to a Subharmonicon must not come out of TiMidity because the
+    /// Subharmonicon wasn't there.
+    #[test]
+    fn a_control_cue_for_an_unmatched_device_is_dropped_never_rerouted() {
+        let mut sink = RecordingSink::default();
+        let cue = control_cue("subharmonicon", vec![MidiControlEvent::now(&[0xB0, 74, 64])]);
+        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        assert!(sink.controls.is_empty(), "unroutable = dropped: {:?}", sink.controls);
+        assert!(sink.scheduled.is_none(), "and NEVER onto the render port");
+    }
+
+    /// A sink that has matched nothing at all (fresh app, no rig) drops every
+    /// control cue — the same rule, at the empty-table boundary. This is the
+    /// normal state of every OTHER machine on a multi-machine rig.
+    #[test]
+    fn a_sink_with_no_routes_drops_every_control_cue() {
+        let mut sink = RecordingSink::default();
+        let cue = control_cue("minibrute", vec![MidiControlEvent::now(&[0xB0, 74, 64])]);
+        dispatch_midi_cue(&cue, 0, &MidiRoutes::new(), &mut sink);
+        assert!(sink.controls.is_empty());
+    }
+
+    /// Slice 1's routing rule: the device's FIRST matched port (the MIDI port
+    /// of a two-port device, not its DAW port). Role-aware selection is slice
+    /// 2 — this test is the tripwire when that lands.
+    #[test]
+    fn a_multi_port_device_routes_to_its_first_matched_port() {
+        assert_eq!(
+            resolve_route(&routes(&[("keylab-88-mkii", &["28:0", "28:1"])]), "keylab-88-mkii"),
+            Some("28:0")
+        );
+        assert_eq!(resolve_route(&routes(&[("d", &[])]), "d"), None, "matched, but no ports");
+        assert_eq!(resolve_route(&MidiRoutes::new(), "d"), None);
+    }
+
+    /// A control cue is NEVER dropped for staleness — the one you least want
+    /// silently discarded is a `panic`, and a late all-notes-off is still
+    /// exactly the right message. (The ABC path deliberately does the
+    /// opposite; see `a_stale_abc_cue_is_rejected_and_schedules_nothing`.)
+    #[test]
+    fn a_stale_control_cue_still_emits() {
+        let mut sink = RecordingSink::default();
+        let now_epoch_ns: u64 = 100_000_000_000;
+        let mut cue = control_cue("minibrute", vec![MidiControlEvent::now(&[0xB0, 123, 0])]);
+        cue.epoch_ns = now_epoch_ns
+            .saturating_sub((CUE_STALE_MAX + Duration::from_secs(60)).as_nanos() as u64);
+        dispatch_midi_cue(&cue, now_epoch_ns, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        assert_eq!(sink.controls.len(), 1, "a panic must never be dropped for age");
+    }
+
+    /// A malformed envelope is refused whole, loudly — never half-played.
+    #[test]
+    fn a_malformed_control_envelope_is_dropped_not_partially_played() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue::now_inline(MIDI_CONTROL_MIME, b"{not json".to_vec());
+        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        assert!(sink.controls.is_empty());
+
+        // A version this build doesn't understand is refused too.
+        let cue = RenderCue::now_inline(
+            MIDI_CONTROL_MIME,
+            br#"{"v":99,"device":"minibrute","events":[{"data":"b07b00"}]}"#.to_vec(),
+        );
+        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        assert!(sink.controls.is_empty());
+    }
+
+    /// Control cues are always inline; a CAS payload is protocol misuse and
+    /// gets a warn + drop, never a silent vanish or a panic.
+    #[test]
+    fn a_cas_payload_control_cue_is_refused() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue {
+            mime: MIDI_CONTROL_MIME.into(),
+            payload: CuePayload::Cas(kaijutsu_cas::ContentHash::from_data(b"nope")),
+            lead: Duration::ZERO,
+            epoch_ns: 0,
+            onset_beat: None,
+        };
+        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        assert!(sink.controls.is_empty());
+    }
+
+    /// The score path must not learn about routing: an ABC cue schedules
+    /// exactly as before even with a full routing table in hand.
+    #[test]
+    fn the_score_path_is_unchanged_by_the_routing_table() {
+        let mut sink = RecordingSink::default();
+        let cue = RenderCue::now_inline(ABC_MIME, CDEF.as_bytes().to_vec());
+        dispatch_midi_cue(&cue, 0, &routes(&[("minibrute", &["26:0"])]), &mut sink);
+        let (events, lead) = sink.scheduled.expect("ABC still schedules");
+        assert_eq!(events.len(), abc_to_timed_events(CDEF).len());
+        assert_eq!(lead, Duration::ZERO);
+        assert!(sink.controls.is_empty(), "and never through the control path");
+    }
+
+    /// A whole 32-message panic envelope survives the round trip and reaches
+    /// one port in one emit.
+    #[test]
+    fn a_panic_envelope_reaches_the_device_as_thirty_two_messages() {
+        let mut sink = RecordingSink::default();
+        let events: Vec<MidiControlEvent> = (0..16u8)
+            .flat_map(|ch| {
+                [
+                    MidiControlEvent::now(&[0xB0 | ch, 123, 0]),
+                    MidiControlEvent::now(&[0xB0 | ch, 120, 0]),
+                ]
+            })
+            .collect();
+        dispatch_midi_cue(
+            &control_cue("keystep-pro", events),
+            0,
+            &routes(&[("keystep-pro", &["24:0"])]),
+            &mut sink,
+        );
+        assert_eq!(sink.controls.len(), 1);
+        assert_eq!(sink.controls[0].1.len(), 32);
+        assert_eq!(sink.controls[0].1[0], (Duration::ZERO, vec![0xB0, 123, 0]));
+    }
+
+    // ── address parsing (pure) ────────────────────────────────────────────
+
+    #[test]
+    fn an_alsa_address_parses_to_its_client_port_pair() {
+        assert_eq!(parse_alsa_addr("24:0"), Some((24, 0)));
+        assert_eq!(parse_alsa_addr("128:12"), Some((128, 12)));
+    }
+
+    /// A handle this backend can't address (a CoreMIDI id reaching the ALSA
+    /// sink) refuses rather than guessing — a wrong guess is a send to
+    /// somebody else's port.
+    #[test]
+    fn a_non_alsa_address_refuses_rather_than_guessing() {
+        assert_eq!(parse_alsa_addr("IOService:1234"), None);
+        assert_eq!(parse_alsa_addr("24"), None);
+        assert_eq!(parse_alsa_addr(""), None);
+        assert_eq!(parse_alsa_addr("a:b"), None);
     }
 
     /// Live ALSA loopback (needs `/dev/snd/seq`; `#[ignore]` so CI stays green —
@@ -930,7 +1305,7 @@ mod tests {
         subs.set_dest(Addr { client: reader.client_id().unwrap(), port: in_port });
         reader.subscribe_port(&subs).expect("subscribe reader");
 
-        out.schedule(&abc_to_timed_events(CDEF), Duration::from_millis(20));
+        out.schedule(&abc_to_timed_events(CDEF), Duration::from_millis(20), None);
 
         let mut note_ons: Vec<u8> = Vec::new();
         let mut input = reader.input();
@@ -950,6 +1325,62 @@ mod tests {
         }
         assert_eq!(note_ons.len(), 4, "four NoteOns through the loopback: {note_ons:?}");
         assert!(note_ons.windows(2).all(|w| w[0] < w[1]), "ascending: {note_ons:?}");
+    }
+
+    /// Live ALSA proof of the ONE platform assumption slice 1 step 4 rests on:
+    /// **a direct-addressed event reaches a port with NO standing
+    /// subscription.** Deliberately never calls `subscribe_port` — if ALSA
+    /// ever required a subscription for direct delivery, this fails and
+    /// `kj midi send`'s whole routing model needs rethinking (the alternative
+    /// would be subscribe-per-device, which leaks the score into every
+    /// device we've ever addressed).
+    ///
+    /// `#[ignore]`d like its sibling above; run with `--ignored` on a box
+    /// with `/dev/snd/seq`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a live ALSA sequencer (/dev/snd/seq); run on the moltar/zorak runner"]
+    fn direct_addressing_reaches_an_unsubscribed_port() {
+        use alsa::seq::{EventType, PortCap, PortType};
+        use std::ffi::CString;
+
+        let mut out = MidiOut::open().expect("open ALSA sink");
+        let reader = alsa::Seq::open(None, None, true).expect("open reader");
+        reader
+            .set_client_name(&CString::new("kj-app-test-direct").unwrap())
+            .unwrap();
+        let in_port = reader
+            .create_simple_port(
+                &CString::new("in").unwrap(),
+                PortCap::WRITE | PortCap::SUBS_WRITE,
+                PortType::MIDI_GENERIC | PortType::APPLICATION,
+            )
+            .unwrap();
+        let dest = (reader.client_id().unwrap(), in_port);
+
+        // NOTE: no subscribe_port call — that is the point of this test.
+        out.schedule(&[(Duration::ZERO, vec![0xB0, 74, 64])], Duration::ZERO, Some(dest));
+
+        let mut input = reader.input();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got = None;
+        while std::time::Instant::now() < deadline && got.is_none() {
+            if input.event_input_pending(true).unwrap_or(0) > 0 {
+                if let Ok(ev) = input.event_input()
+                    && ev.get_type() == EventType::Controller
+                    && let Some(c) = ev.get_data::<alsa::seq::EvCtrl>()
+                {
+                    got = Some((c.channel, c.param, c.value));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(
+            got,
+            Some((0, 74, 64)),
+            "a direct-addressed CC must arrive with no subscription"
+        );
     }
 
     // -- patch-bay slice 1: auto-connect decision core --------------------
