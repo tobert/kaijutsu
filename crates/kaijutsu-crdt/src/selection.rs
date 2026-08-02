@@ -333,6 +333,10 @@ pub fn parse_range(spec: &str, len: usize) -> Result<Range<usize>, RangeError> {
 }
 
 #[cfg(test)]
+// IntervalSet fixtures are built from single-run range slices throughout
+// this module (e.g. set(&[4..6])) — a genuine one-run selection, not an
+// array of ints. Clippy's suggested rewrites would be less readable.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -350,6 +354,11 @@ mod tests {
     }
 
     #[test]
+    // `10..8` below is a genuinely reversed range, not a typo — the test
+    // exercises `from_ranges`'s `r.start < r.end` filter, which drops both
+    // empty (start == end) and reversed (start > end) ranges. Clippy's
+    // `.rev()` rewrite would iterate 8,9 instead, testing something else.
+    #[allow(clippy::reversed_empty_ranges)]
     fn from_ranges_sorts_merges_and_drops_degenerate() {
         // unsorted + overlapping + adjacent + empty + reversed
         let s = set(&[3..5, 0..3, 2..2, 5..7, 10..8, 6..6]);

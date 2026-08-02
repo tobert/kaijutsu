@@ -197,17 +197,6 @@ all, discovered wiring the Claude Code MCP config. Two pieces:
   kernel side sees `/r/<client>/workspace` with zero flags. Needs the usual
   `/r` decisions: share name, ro vs `:rw` default, and an opt-out.
 
-## kaijutsu-crdt `cargo clippy --tests` fails to compile (found 2026-08-01, diff slice 2)
-
-Pre-existing on main (confirmed via stash before the slice-2 changes):
-deny-level `reversed_empty_ranges` / `single_range_in_vec_init` lints in test
-code in `crates/kaijutsu-crdt/src/selection.rs` (~lines 348, 471, 475, 489,
-495) break `cargo clippy --tests -p kaijutsu-crdt` outright. `cargo test`
-itself is green — only clippy-with-tests trips. Either the ranges are
-genuinely reversed on purpose (then `#[allow]` with a comment) or they're
-latent test bugs. Small, self-contained fix; unrelated to the diff work that
-surfaced it.
-
 ## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
 
 From the slice-4 post-ship review (gemini deliberate, low severity): the

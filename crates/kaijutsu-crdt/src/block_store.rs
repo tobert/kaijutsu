@@ -519,6 +519,10 @@ impl BlockStore {
     /// Insert a new block.
     ///
     /// Author is implicit — derived from `self.principal_id` via the BlockId.
+    // Constructor-shaped: each argument is a distinct block field, mirroring
+    // the wire snapshot. A builder would change the public API for no
+    // behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_block(
         &mut self,
         parent_id: Option<&BlockId>,
@@ -1729,6 +1733,9 @@ impl SyncPayload {
 // =========================================================================
 
 #[cfg(test)]
+// IntervalSet::from_ranges([lo..hi]) is a genuine single-run selection
+// fixture, not an array of ints — clippy's rewrite would be less readable.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -2511,7 +2518,7 @@ mod tests {
                     Some(&first),
                     Role::User,
                     BlockKind::Text,
-                    &format!("Middle-{i}"),
+                    format!("Middle-{i}"),
                     Status::Done,
                     ContentType::Plain,
                 )
@@ -3517,8 +3524,10 @@ mod tests {
             "Block should be compacted"
         );
 
-        let mut filter = ForkBlockFilter::default();
-        filter.exclude_compacted = true;
+        let filter = ForkBlockFilter {
+            exclude_compacted: true,
+            ..Default::default()
+        };
 
         let new_ctx = ContextId::new();
         let new_agent = PrincipalId::new();

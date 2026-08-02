@@ -1057,7 +1057,7 @@ impl BlockDocument {
                 }
 
                 // Error-specific fields
-                if let Some(ref ep) = error_payload {
+                if let Some(ep) = error_payload {
                     block_map.set(KEY_ERROR_CATEGORY, ep.category.as_str());
                     block_map.set(KEY_ERROR_SEVERITY, ep.severity.as_str());
                     if let Some(ref code) = ep.code {
@@ -2452,7 +2452,7 @@ mod tests {
                     Some(&first),
                     Role::User,
                     BlockKind::Text,
-                    &format!("Middle-{}", i),
+                    format!("Middle-{i}"),
                     Status::Done,
                 )
                 .unwrap();
@@ -2634,21 +2634,17 @@ mod tests {
     fn test_order_midpoint_basic() {
         let mid = order_midpoint("A", "Z");
         assert!(
-            mid > "A".to_string() && mid < "Z".to_string(),
+            mid.as_str() > "A" && mid.as_str() < "Z",
             "midpoint {} should be between A and Z",
             mid
         );
 
         let mid2 = order_midpoint("", "V");
-        assert!(
-            mid2 < "V".to_string(),
-            "midpoint {} should be before V",
-            mid2
-        );
+        assert!(mid2.as_str() < "V", "midpoint {} should be before V", mid2);
 
         let mid3 = order_midpoint("A", "B");
         assert!(
-            mid3 > "A".to_string() && mid3 < "B".to_string(),
+            mid3.as_str() > "A" && mid3.as_str() < "B",
             "midpoint {} should be between A and B",
             mid3
         );
