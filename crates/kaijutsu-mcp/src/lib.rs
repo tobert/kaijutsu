@@ -146,7 +146,10 @@ pub enum Backend {
 /// have useful diagnostic info (block id, elapsed time).
 enum ShellCompletion {
     Done {
-        snapshot: kaijutsu_crdt::BlockSnapshot,
+        // Boxed: BlockSnapshot dwarfs the other variants' payloads (984 vs
+        // 56 bytes), so every ShellCompletion value would otherwise pay for
+        // the largest variant (large_enum_variant).
+        snapshot: Box<kaijutsu_crdt::BlockSnapshot>,
         elapsed_ms: u64,
     },
     Timeout {
@@ -816,7 +819,7 @@ impl KaijutsuMcp {
                             "{label} completed"
                         );
                         return ShellCompletion::Done {
-                            snapshot: snap,
+                            snapshot: Box::new(snap),
                             elapsed_ms,
                         };
                     }
@@ -830,7 +833,7 @@ impl KaijutsuMcp {
         }
         // Fallback to the local terminal snapshot if the authoritative read failed.
         ShellCompletion::Done {
-            snapshot: local,
+            snapshot: Box::new(local),
             elapsed_ms: start.elapsed().as_millis() as u64,
         }
     }
@@ -1754,227 +1757,213 @@ impl ServerHandler for KaijutsuMcp {
     /// - `kaijutsu://docs` - List all documents
     /// - `kaijutsu://docs/{doc_id}` - Document metadata and block list
     /// - `kaijutsu://blocks/{doc_id}/{block_key}` - Block content
-    fn list_resources(
+    async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async move {
-            let mut resources = Vec::new();
+    ) -> Result<ListResourcesResult, McpError> {
+        let mut resources = Vec::new();
 
-            // Add root docs resource
-            resources.push(
-                Resource::new("kaijutsu://docs", "documents")
-                    .with_title("All Documents")
-                    .with_description("List of all documents in the kernel")
-                    .with_mime_type("application/json"),
-            );
+        // Add root docs resource
+        resources.push(
+            Resource::new("kaijutsu://docs", "documents")
+                .with_title("All Documents")
+                .with_description("List of all documents in the kernel")
+                .with_mime_type("application/json"),
+        );
 
-            // Add each document as a resource
-            for doc_id in self.context_ids() {
-                let blocks = self.with_doc(doc_id, |doc| doc.blocks_ordered());
-                if let Some(blocks) = blocks {
-                    let doc_hex = doc_id.to_hex();
+        // Add each document as a resource
+        for doc_id in self.context_ids() {
+            let blocks = self.with_doc(doc_id, |doc| doc.blocks_ordered());
+            if let Some(blocks) = blocks {
+                let doc_hex = doc_id.to_hex();
+                resources.push(
+                    Resource::new(format!("kaijutsu://docs/{}", doc_hex), doc_hex.clone())
+                        .with_title(format!("Document: {}", doc_hex))
+                        .with_description(format!(
+                            "Conversation document with {} blocks",
+                            blocks.len()
+                        ))
+                        .with_mime_type("application/json"),
+                );
+
+                // Add each block as a resource
+                for snapshot in blocks {
+                    let block_key = snapshot.id.to_key();
                     resources.push(
-                        Resource::new(format!("kaijutsu://docs/{}", doc_hex), doc_hex.clone())
-                            .with_title(format!("Document: {}", doc_hex))
-                            .with_description(format!(
-                                "Conversation document with {} blocks",
-                                blocks.len()
-                            ))
-                            .with_mime_type("application/json"),
+                        Resource::new(
+                            format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
+                            block_key.clone(),
+                        )
+                        .with_title(format!(
+                            "[{}/{}]",
+                            snapshot.role.as_str(),
+                            snapshot.kind.as_str()
+                        ))
+                        .with_description(format!(
+                            "{} block, {} bytes",
+                            snapshot.kind.as_str(),
+                            snapshot.content.len()
+                        ))
+                        .with_mime_type("text/plain")
+                        .with_size(snapshot.content.len() as u64),
                     );
-
-                    // Add each block as a resource
-                    for snapshot in blocks {
-                        let block_key = snapshot.id.to_key();
-                        resources.push(
-                            Resource::new(
-                                format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
-                                block_key.clone(),
-                            )
-                            .with_title(format!(
-                                "[{}/{}]",
-                                snapshot.role.as_str(),
-                                snapshot.kind.as_str()
-                            ))
-                            .with_description(format!(
-                                "{} block, {} bytes",
-                                snapshot.kind.as_str(),
-                                snapshot.content.len()
-                            ))
-                            .with_mime_type("text/plain")
-                            .with_size(snapshot.content.len() as u64),
-                        );
-                    }
                 }
             }
-
-            Ok(ListResourcesResult::with_all_items(resources))
         }
+
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     /// Read a specific resource.
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
-        async move {
-            let uri = &request.uri;
+    ) -> Result<ReadResourceResponse, McpError> {
+        let uri = &request.uri;
 
-            // Parse URI: kaijutsu://docs, kaijutsu://docs/{id}, kaijutsu://blocks/{id}/{key}
-            if uri == "kaijutsu://docs" {
-                // Return list of all documents
-                let docs: Vec<serde_json::Value> = self
-                    .context_ids()
+        // Parse URI: kaijutsu://docs, kaijutsu://docs/{id}, kaijutsu://blocks/{id}/{key}
+        if uri == "kaijutsu://docs" {
+            // Return list of all documents
+            let docs: Vec<serde_json::Value> = self
+                .context_ids()
+                .iter()
+                .map(|id| {
+                    let block_count = self
+                        .with_doc(*id, |doc| doc.blocks_ordered().len())
+                        .unwrap_or(0);
+                    serde_json::json!({
+                        "id": id.to_hex(),
+                        "kind": "Conversation",
+                        "block_count": block_count
+                    })
+                })
+                .collect();
+
+            let content = serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".to_string());
+
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into(),
+            );
+        }
+
+        if let Some(doc_id_str) = uri.strip_prefix("kaijutsu://docs/") {
+            let doc_ctx_id = ContextId::parse(doc_id_str).map_err(|e| {
+                McpError::invalid_params(
+                    format!("Invalid document ID '{}': {}", doc_id_str, e),
+                    None,
+                )
+            })?;
+            // Return document metadata and block list
+            let extracted = self.with_doc(doc_ctx_id, |doc| {
+                let blocks: Vec<serde_json::Value> = doc
+                    .blocks_ordered()
                     .iter()
-                    .map(|id| {
-                        let block_count = self
-                            .with_doc(*id, |doc| doc.blocks_ordered().len())
-                            .unwrap_or(0);
+                    .map(|s| {
                         serde_json::json!({
-                            "id": id.to_hex(),
-                            "kind": "Conversation",
-                            "block_count": block_count
+                            "id": s.id.to_key(),
+                            "role": s.role.as_str(),
+                            "kind": s.kind.as_str(),
+                            "status": s.status.as_str(),
+                            "content_preview": if s.content.len() > 100 {
+                                format!("{}...", &s.content[..100])
+                            } else {
+                                s.content.clone()
+                            }
                         })
                     })
                     .collect();
+                (blocks, doc.version())
+            });
+            let (blocks, version) = extracted.ok_or_else(|| {
+                McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
+            })?;
 
-                let content =
-                    serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".to_string());
+            let result = serde_json::json!({
+                "id": doc_id_str,
+                "kind": "Conversation",
+                "language": serde_json::Value::Null,
+                "version": version,
+                "blocks": blocks
+            });
 
-                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    content,
-                    uri.clone(),
-                )])
-                .into());
-            }
+            let content =
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
-            if let Some(doc_id_str) = uri.strip_prefix("kaijutsu://docs/") {
-                let doc_ctx_id = ContextId::parse(doc_id_str).map_err(|e| {
-                    McpError::invalid_params(
-                        format!("Invalid document ID '{}': {}", doc_id_str, e),
-                        None,
-                    )
-                })?;
-                // Return document metadata and block list
-                let extracted = self.with_doc(doc_ctx_id, |doc| {
-                    let blocks: Vec<serde_json::Value> = doc
-                        .blocks_ordered()
-                        .iter()
-                        .map(|s| {
-                            serde_json::json!({
-                                "id": s.id.to_key(),
-                                "role": s.role.as_str(),
-                                "kind": s.kind.as_str(),
-                                "status": s.status.as_str(),
-                                "content_preview": if s.content.len() > 100 {
-                                    format!("{}...", &s.content[..100])
-                                } else {
-                                    s.content.clone()
-                                }
-                            })
-                        })
-                        .collect();
-                    (blocks, doc.version())
-                });
-                let (blocks, version) = extracted.ok_or_else(|| {
-                    McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
-                })?;
-
-                let result = serde_json::json!({
-                    "id": doc_id_str,
-                    "kind": "Conversation",
-                    "language": serde_json::Value::Null,
-                    "version": version,
-                    "blocks": blocks
-                });
-
-                let content =
-                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
-
-                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    content,
-                    uri.clone(),
-                )])
-                .into());
-            }
-
-            if let Some(rest) = uri.strip_prefix("kaijutsu://blocks/") {
-                // Parse doc_id/block_key
-                let parts: Vec<&str> = rest.splitn(2, '/').collect();
-                if parts.len() != 2 {
-                    return Err(McpError::invalid_params(
-                        format!("Invalid block URI format: {}", uri),
-                        None,
-                    ));
-                }
-
-                let doc_id_str = parts[0];
-                let block_key = parts[1];
-
-                let (found_ctx_id, block_id) =
-                    self.locate_block(block_key).ok_or_else(|| {
-                        McpError::invalid_params(
-                            format!(
-                                "Block '{}' not found in document '{}'",
-                                block_key, doc_id_str
-                            ),
-                            None,
-                        )
-                    })?;
-
-                let snapshot = self
-                    .read_block(found_ctx_id, &block_id)
-                    .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
-
-                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    snapshot.content.clone(),
-                    uri.clone(),
-                )])
-                .into());
-            }
-
-            Err(McpError::invalid_params(
-                format!("Unknown resource URI: {}", uri),
-                None,
-            ))
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into(),
+            );
         }
+
+        if let Some(rest) = uri.strip_prefix("kaijutsu://blocks/") {
+            // Parse doc_id/block_key
+            let parts: Vec<&str> = rest.splitn(2, '/').collect();
+            if parts.len() != 2 {
+                return Err(McpError::invalid_params(
+                    format!("Invalid block URI format: {}", uri),
+                    None,
+                ));
+            }
+
+            let doc_id_str = parts[0];
+            let block_key = parts[1];
+
+            let (found_ctx_id, block_id) = self.locate_block(block_key).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!(
+                        "Block '{}' not found in document '{}'",
+                        block_key, doc_id_str
+                    ),
+                    None,
+                )
+            })?;
+
+            let snapshot = self
+                .read_block(found_ctx_id, &block_id)
+                .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
+
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                snapshot.content.clone(),
+                uri.clone(),
+            )])
+            .into());
+        }
+
+        Err(McpError::invalid_params(
+            format!("Unknown resource URI: {}", uri),
+            None,
+        ))
     }
 
     /// Subscribe to resource updates.
-    fn subscribe(
+    async fn subscribe(
         &self,
         request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
-        async move {
-            let mut subs = self
-                .server_state
-                .subscriptions
-                .lock()
-                .map_err(|_| McpError::internal_error("Lock error", None))?;
-            subs.insert(request.uri);
-            Ok(())
-        }
+    ) -> Result<(), McpError> {
+        let mut subs = self
+            .server_state
+            .subscriptions
+            .lock()
+            .map_err(|_| McpError::internal_error("Lock error", None))?;
+        subs.insert(request.uri);
+        Ok(())
     }
 
     /// Unsubscribe from resource updates.
-    fn unsubscribe(
+    async fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
-        async move {
-            let mut subs = self
-                .server_state
-                .subscriptions
-                .lock()
-                .map_err(|_| McpError::internal_error("Lock error", None))?;
-            subs.remove(&request.uri);
-            Ok(())
-        }
+    ) -> Result<(), McpError> {
+        let mut subs = self
+            .server_state
+            .subscriptions
+            .lock()
+            .map_err(|_| McpError::internal_error("Lock error", None))?;
+        subs.remove(&request.uri);
+        Ok(())
     }
 
     // ========================================================================
@@ -1982,87 +1971,85 @@ impl ServerHandler for KaijutsuMcp {
     // ========================================================================
 
     /// Provide completions for prompts and resources.
-    fn complete(
+    async fn complete(
         &self,
         request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
-        async move {
-            let values = match &request.r#ref {
-                rmcp::model::Reference::Prompt(prompt_ref) => {
-                    // Complete prompt arguments
-                    match prompt_ref.name.as_str() {
-                        "analyze_document" | "editing_assistant" => {
-                            if request.argument.name == "document_id"
-                                || request.argument.name == "block_id"
-                            {
-                                // Complete document IDs
-                                self.context_ids()
-                                    .into_iter()
-                                    .map(|id| id.to_hex())
-                                    .filter(|id| id.contains(&request.argument.value))
-                                    .take(10)
-                                    .collect()
-                            } else if request.argument.name == "focus" {
-                                // Complete focus values
-                                vec!["all", "structure", "content", "activity"]
-                                    .into_iter()
-                                    .filter(|v| v.contains(&request.argument.value))
-                                    .map(String::from)
-                                    .collect()
-                            } else if request.argument.name == "edit_type" {
-                                // Complete edit types
-                                vec!["refine", "expand", "summarize", "fix"]
-                                    .into_iter()
-                                    .filter(|v| v.contains(&request.argument.value))
-                                    .map(String::from)
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            }
+    ) -> Result<CompleteResult, McpError> {
+        let values = match &request.r#ref {
+            rmcp::model::Reference::Prompt(prompt_ref) => {
+                // Complete prompt arguments
+                match prompt_ref.name.as_str() {
+                    "analyze_document" | "editing_assistant" => {
+                        if request.argument.name == "document_id"
+                            || request.argument.name == "block_id"
+                        {
+                            // Complete document IDs
+                            self.context_ids()
+                                .into_iter()
+                                .map(|id| id.to_hex())
+                                .filter(|id| id.contains(&request.argument.value))
+                                .take(10)
+                                .collect()
+                        } else if request.argument.name == "focus" {
+                            // Complete focus values
+                            vec!["all", "structure", "content", "activity"]
+                                .into_iter()
+                                .filter(|v| v.contains(&request.argument.value))
+                                .map(String::from)
+                                .collect()
+                        } else if request.argument.name == "edit_type" {
+                            // Complete edit types
+                            vec!["refine", "expand", "summarize", "fix"]
+                                .into_iter()
+                                .filter(|v| v.contains(&request.argument.value))
+                                .map(String::from)
+                                .collect()
+                        } else {
+                            Vec::new()
                         }
-                        "search_context" => {
-                            if request.argument.name == "document_id" {
-                                self.context_ids()
-                                    .into_iter()
-                                    .map(|id| id.to_hex())
-                                    .filter(|id| id.contains(&request.argument.value))
-                                    .take(10)
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            }
+                    }
+                    "search_context" => {
+                        if request.argument.name == "document_id" {
+                            self.context_ids()
+                                .into_iter()
+                                .map(|id| id.to_hex())
+                                .filter(|id| id.contains(&request.argument.value))
+                                .take(10)
+                                .collect()
+                        } else {
+                            Vec::new()
                         }
-                        _ => Vec::new(),
                     }
+                    _ => Vec::new(),
                 }
-                rmcp::model::Reference::Resource(resource_ref) => {
-                    // Complete resource URIs
-                    let prefix = &resource_ref.uri;
-                    if prefix.starts_with("kaijutsu://docs") {
-                        self.context_ids()
-                            .into_iter()
-                            .map(|id| format!("kaijutsu://docs/{}", id.to_hex()))
-                            .filter(|uri| uri.contains(&request.argument.value))
-                            .take(10)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    }
+            }
+            rmcp::model::Reference::Resource(resource_ref) => {
+                // Complete resource URIs
+                let prefix = &resource_ref.uri;
+                if prefix.starts_with("kaijutsu://docs") {
+                    self.context_ids()
+                        .into_iter()
+                        .map(|id| format!("kaijutsu://docs/{}", id.to_hex()))
+                        .filter(|uri| uri.contains(&request.argument.value))
+                        .take(10)
+                        .collect()
+                } else {
+                    Vec::new()
                 }
-                // `Reference` is `#[non_exhaustive]` upstream — completion
-                // requests only ever carry a prompt or resource-template ref
-                // today, so a third variant would mean rmcp added a new
-                // completion target this handler doesn't know about yet.
-                // Returning no completions is safe here (unlike silently
-                // guessing a match), so this isn't a crash-worthy case.
-                _ => Vec::new(),
-            };
+            }
+            // `Reference` is `#[non_exhaustive]` upstream — completion
+            // requests only ever carry a prompt or resource-template ref
+            // today, so a third variant would mean rmcp added a new
+            // completion target this handler doesn't know about yet.
+            // Returning no completions is safe here (unlike silently
+            // guessing a match), so this isn't a crash-worthy case.
+            _ => Vec::new(),
+        };
 
-            Ok(CompleteResult::new(
-                CompletionInfo::new(values).map_err(|e| McpError::invalid_params(e, None))?,
-            ))
-        }
+        Ok(CompleteResult::new(
+            CompletionInfo::new(values).map_err(|e| McpError::invalid_params(e, None))?,
+        ))
     }
 
     // ========================================================================
@@ -2074,21 +2061,19 @@ impl ServerHandler for KaijutsuMcp {
     // deprecated by SEP-2577 — see the import-site comment above; kept for
     // now so `logging/setLevel` keeps working.
     #[allow(deprecated)]
-    fn set_level(
+    async fn set_level(
         &self,
         request: SetLevelRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
-        async move {
-            let mut level = self
-                .server_state
-                .log_level
-                .lock()
-                .map_err(|_| McpError::internal_error("Lock error", None))?;
-            *level = request.level;
-            tracing::info!("Log level set to {:?}", request.level);
-            Ok(())
-        }
+    ) -> Result<(), McpError> {
+        let mut level = self
+            .server_state
+            .log_level
+            .lock()
+            .map_err(|_| McpError::internal_error("Lock error", None))?;
+        *level = request.level;
+        tracing::info!("Log level set to {:?}", request.level);
+        Ok(())
     }
 
     // ========================================================================
@@ -2096,19 +2081,17 @@ impl ServerHandler for KaijutsuMcp {
     // ========================================================================
 
     /// Handle cancellation notifications.
-    fn on_cancelled(
+    async fn on_cancelled(
         &self,
         notification: CancelledNotificationParam,
         _context: NotificationContext<RoleServer>,
-    ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        async move {
-            tracing::info!(
-                request_id = ?notification.request_id,
-                reason = ?notification.reason,
-                "Request cancelled"
-            );
-            // Future: track in-flight operations and cancel them
-        }
+    ) -> () {
+        tracing::info!(
+            request_id = ?notification.request_id,
+            reason = ?notification.reason,
+            "Request cancelled"
+        );
+        // Future: track in-flight operations and cancel them
     }
 }
 
@@ -2393,7 +2376,7 @@ mod tests {
         let snap = make_result_snapshot("hello world\n", Some(0));
         let block_key = snap.id.to_key();
         let completion = ShellCompletion::Done {
-            snapshot: snap,
+            snapshot: Box::new(snap),
             elapsed_ms: 42,
         };
         let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
@@ -2424,7 +2407,7 @@ mod tests {
                 .with_rich_json(serde_json::json!(["bass", "bassline"])),
         );
         let completion = ShellCompletion::Done {
-            snapshot: snap,
+            snapshot: Box::new(snap),
             elapsed_ms: 7,
         };
         let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
@@ -2441,18 +2424,23 @@ mod tests {
         // A successful-with-warnings command: stdout + stderr + exit 0. The
         // envelope keeps them apart (the old merge would have hidden stderr
         // inside stdout).
-        let snap = make_result_snapshot_with_stderr(
-            "build ok\n",
-            "warning: unused variable\n",
-            Some(0),
-        );
-        let json: serde_json::Value =
-            serde_json::from_str(&ShellCompletion::Done { snapshot: snap, elapsed_ms: 3 }.to_json())
-                .unwrap();
+        let snap =
+            make_result_snapshot_with_stderr("build ok\n", "warning: unused variable\n", Some(0));
+        let json: serde_json::Value = serde_json::from_str(
+            &ShellCompletion::Done {
+                snapshot: Box::new(snap),
+                elapsed_ms: 3,
+            }
+            .to_json(),
+        )
+        .unwrap();
 
         assert_eq!(json["stdout"], "build ok\n");
         assert_eq!(json["stderr"], "warning: unused variable\n");
-        assert_eq!(json["exit_code"], 0, "stderr present does not imply failure");
+        assert_eq!(
+            json["exit_code"], 0,
+            "stderr present does not imply failure"
+        );
         assert_eq!(json["status"], "done");
     }
 
@@ -2461,7 +2449,7 @@ mod tests {
         // `false` builtin or `kj` Err — non-zero exit_code persisted on block.
         let snap = make_result_snapshot("error: something broke\n", Some(7));
         let completion = ShellCompletion::Done {
-            snapshot: snap,
+            snapshot: Box::new(snap),
             elapsed_ms: 5,
         };
         let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
@@ -2478,9 +2466,14 @@ mod tests {
         // that produced the empty-stdout-after-reconnect bug; `null` is self-
         // announcing so callers don't trust a fabricated success.
         let snap = make_result_snapshot("ok\n", None);
-        let json: serde_json::Value =
-            serde_json::from_str(&ShellCompletion::Done { snapshot: snap, elapsed_ms: 1 }.to_json())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &ShellCompletion::Done {
+                snapshot: Box::new(snap),
+                elapsed_ms: 1,
+            }
+            .to_json(),
+        )
+        .unwrap();
         assert!(
             json["exit_code"].is_null(),
             "missing exit_code must be null, got {}",

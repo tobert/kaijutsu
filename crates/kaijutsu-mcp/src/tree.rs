@@ -30,6 +30,11 @@ pub fn format_dag_tree(
 }
 
 /// Recursively format a DAG node and its children.
+// Each argument is either recursion state (depth, prefix, is_last) or a
+// render option threaded through every call (max_depth, expand_tools) plus
+// the output accumulator; bundling them into a struct would just relocate
+// the same fields without changing the recursive shape.
+#[allow(clippy::too_many_arguments)]
 fn format_dag_node(
     dag: &ConversationDAG,
     block_id: &BlockId,
