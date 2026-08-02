@@ -1,8 +1,10 @@
 # TiMidity++ (zorak) — device profile
 
-> Draft seed, authored 2026-07-15 (`docs/midi-next.md` slice 1); the
-> `/etc/midi/devices/` namespace is not wired yet. Convention: MIDI channels
-> are **1–16** in every profile (the wire byte is channel−1). This is the
+> Draft seed, authored 2026-07-15 (`docs/midi-next.md` slice 1); seeded to
+> `/etc/midi/devices/timidity` since 2026-08-02. Convention: MIDI channels
+> are **1–16** in every profile (the wire byte is channel−1). Match strings
+> are **backend-neutral** — port display-name substrings only for a software
+> synth (2026-08-02 amendment; never ALSA client numbers). This is the
 > cheap proof that profiles aren't hardware-only: a software synth the jam
 > already plays through. **Destined to become an rc-style bucket** (same
 > design round): the host-current facts below (which box, which client) will
@@ -24,7 +26,9 @@ the number, describe the sound with your ears, not the name.
   "display_name": "TiMidity++ ALSA synth (zorak, FF4 soundfont)",
   "kind": "software-synth",
   "match": {
-    "alsa_client_names": ["TiMidity"],
+    "usb_ids": [],
+    "_note_usb_ids": "software synth — no USB identity; empty on purpose",
+    "port_name_substrings": ["TiMidity"],
     "identity_reply": null,
     "_note": "software synth; no identity reply expected — name match is the fingerprint"
   }
@@ -32,16 +36,18 @@ the number, describe the sound with your ears, not the name.
 ```
 
 **The ALSA client number is DYNAMIC** — it changes across TiMidity restarts.
-Always resolve by client *name* (`aconnect -l`), never by a remembered
-number. (This has bitten us; it is why profiles match on names.)
+Always resolve by client *name*, never by a remembered number. (This has
+bitten us; it is why profiles match on names — the sink's presence matching
+does exactly this, `docs/midi-next.md` "Presence is sink-fed".)
 
 ## Settings (device is ground truth — a pull overwrites this section)
 
 Empty by design: TiMidity has no MIDI-settable configuration. Its real
 config (soundfont, launch flags) lives host-side — the bucket split will
-grow a `.kai` here that detects a local TiMidity and snoops its config
-(`aconnect -l`, `/proc/<pid>/cmdline`, `timidity.cfg`) instead of baking
-host facts into this seed.
+grow a `.kai` here that locates a running TiMidity **from the sink-fed
+`/run/midi` presence store** (2026-08-02 amendment: kai reads kernel state,
+never shells host commands — the kernel is usually not on the box running
+TiMidity) instead of baking host facts into this seed.
 
 ```json
 { "v": 1, "source": "authored", "pulled_at": null }

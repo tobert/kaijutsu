@@ -1,10 +1,12 @@
 # Arturia MiniBrute (original) — device profile
 
-> Draft seed, authored 2026-07-15 (`docs/midi-next.md` slice 1); the
-> `/etc/midi/devices/` namespace is not wired yet. Convention: MIDI channels
-> are **1–16** in every profile (the wire byte is channel−1). Fields listed
-> in `unverified` are best-knowledge drafts — confirm against Amy's unit and
-> delete from the list as they're verified.
+> Draft seed, authored 2026-07-15 (`docs/midi-next.md` slice 1); seeded to
+> `/etc/midi/devices/minibrute` since 2026-08-02. Convention: MIDI channels
+> are **1–16** in every profile (the wire byte is channel−1). Match strings
+> are **backend-neutral** — port display-name substrings and USB
+> `vendor:product` IDs only, never ALSA client numbers (2026-08-02
+> amendment). Fields listed in `unverified` are best-knowledge drafts —
+> confirm against Amy's unit and delete from the list as they're verified.
 
 You are playing an **analog monosynth with no memory and no MIDI-controllable
 panel**. Every knob and switch is physical and only human hands can move
@@ -23,11 +25,13 @@ help, if the panel's mod routing is set up for it).
   "display_name": "Arturia MiniBrute (original, 2012)",
   "kind": "hardware-synth",
   "match": {
-    "alsa_client_names": ["MiniBrute", "Arturia MiniBrute"],
+    "usb_ids": [],
+    "_note_usb_ids": "Arturia vendor is 1c75; the original MiniBrute's product id is unknown here — capture it (lsusb) when the unit is on the bench rather than guessing",
+    "port_name_substrings": ["MiniBrute", "Arturia MiniBrute"],
     "identity_reply": null,
-    "_note": "identity_reply: capture via `kj midi identify` once slice 1 lands"
+    "_note": "identity_reply: capture via `kj midi identify` once slice 1.5 lands (F0 7E 7F 06 01 F7)"
   },
-  "unverified": ["match.alsa_client_names"]
+  "unverified": ["match.usb_ids", "match.port_name_substrings"]
 }
 ```
 

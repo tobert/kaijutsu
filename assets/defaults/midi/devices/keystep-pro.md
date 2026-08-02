@@ -1,11 +1,10 @@
 # Arturia KeyStep Pro — device profile
 
-> Draft seed, authored 2026-08-02 (`docs/midi-next.md` slice 1.2); the
-> `/etc/midi/devices/` namespace is not wired yet. Convention: MIDI channels
+> Draft seed, authored 2026-08-02 (`docs/midi-next.md` slice 1.2); seeded to
+> `/etc/midi/devices/keystep-pro`. Convention: MIDI channels
 > are **1–16** in every profile (the wire byte is channel−1). Match strings are
 > **backend-neutral** — port display-name substrings and USB `vendor:product`
-> IDs only, never ALSA client numbers (2026-08-02 amendment; the older
-> `alsa_client_names` key in the minibrute/timidity seeds is superseded).
+> IDs only, never ALSA client numbers (2026-08-02 amendment).
 > Fields listed in `unverified` are best-knowledge drafts — confirm against
 > Amy's unit on the bench and delete from the list as they're verified.
 > **Observed live on moltar 2026-08-02**: USB `1c75:0218`, one MIDI port.
