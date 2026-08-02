@@ -1503,7 +1503,10 @@ impl BlockStore {
                 .get(context_id)
                 .and_then(|e| e.doc.get_block_snapshot(block_id))
                 .map(|s| s.content_type);
-            if matches!(content_type, Some(ContentType::Abc) | Some(ContentType::Svg)) {
+            if matches!(
+                content_type,
+                Some(ContentType::Abc) | Some(ContentType::Svg) | Some(ContentType::Diff)
+            ) {
                 let _ = self.validate_content_and_attach_errors(context_id, block_id);
             }
         }
@@ -3019,8 +3022,8 @@ impl BlockStore {
     /// Validate content and attach/update Error child blocks.
     ///
     /// Called when a block's status transitions to Done and its content_type
-    /// is Abc or Svg. Runs the appropriate parser, compares results against
-    /// existing Error children, and inserts/compacts to stay in sync.
+    /// is Abc, Svg, or Diff. Runs the appropriate parser, compares results
+    /// against existing Error children, and inserts/compacts to stay in sync.
     pub fn validate_content_and_attach_errors(
         &self,
         context_id: ContextId,
@@ -3040,6 +3043,7 @@ impl BlockStore {
         let new_errors = match snap.content_type {
             ContentType::Abc => validate_abc(&snap.content),
             ContentType::Svg => validate_svg(&snap.content),
+            ContentType::Diff => validate_diff(&snap.content),
             _ => return Ok(()),
         };
 
@@ -3367,6 +3371,45 @@ fn validate_svg(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
             vec![(payload, summary)]
         }
     }
+}
+
+/// Validate unified-diff content via `kaijutsu_diff::parse`, returning an
+/// `ErrorPayload` when it does not parse.
+///
+/// The *producers* already refuse bad input — `diff_block` pre-validates and
+/// `kj diff` only ever emits `format()` output — so this arm exists for the
+/// block typed `Diff` by some other route: a hand-rolled `block_create` +
+/// content-type set, a client, or a concurrent LWW type flip (content and
+/// content_type are separate registers, so "declared a diff, holds something
+/// else" is a legitimate CRDT state, not a bug to be assumed away). Such a
+/// block used to land with nothing visible saying so.
+///
+/// One error at most: [`kaijutsu_diff::parse`] refuses at the first construct
+/// it cannot model rather than accumulating diagnostics, and that is
+/// deliberate — a parser that skips a section produces a smaller diff that
+/// still looks complete.
+fn validate_diff(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
+    let Err(e) = kaijutsu_diff::parse(content) else {
+        return vec![];
+    };
+    let summary = format!("Diff parse error: {e}");
+    let payload = kaijutsu_types::ErrorPayload {
+        category: kaijutsu_types::ErrorCategory::Parse,
+        severity: kaijutsu_types::ErrorSeverity::Error,
+        code: Some(format!("diff.{}", e.variant_name())),
+        detail: Some(e.to_string()),
+        // `DiffError::line` is 1-based in the *normalized* text (CRLF and bare
+        // CR both become LF on ingest), which is the position the app's model
+        // holds too. Column is not tracked — a diff rejection is about a whole
+        // line's shape, never a character within it.
+        span: e.line().map(|line| kaijutsu_types::ErrorSpan {
+            line: line as u32,
+            column: 0,
+            length: 0,
+        }),
+        source_kind: Some(BlockKind::Text),
+    };
+    vec![(payload, summary)]
 }
 
 fn compute_descendants(
@@ -5898,5 +5941,125 @@ mod tests {
             "fork snapshot content missing block 2: {:?}",
             snap.content
         );
+    }
+
+    // ========================================================================
+    // Declared-Diff validation on Done (docs/diff.md slice 4)
+    //
+    // The producers (`diff_block`, `kj diff`) can't emit a bad diff, but
+    // content and content_type are separate LWW registers — a block CAN
+    // legitimately declare itself a diff while holding text that doesn't
+    // parse. That block used to land with nothing visible saying so.
+    // ========================================================================
+
+    /// Insert `content` as a `Diff`-typed Running block, flip it to Done, and
+    /// return the Error children the validator attached.
+    fn diff_errors_after_done(content: &str) -> Vec<BlockSnapshot> {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::Text,
+                content,
+                Status::Running,
+                ContentType::Diff,
+            )
+            .unwrap();
+        store.set_status(ctx, &block, Status::Done).unwrap();
+        store
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block) && !b.compacted)
+            .collect()
+    }
+
+    #[test]
+    fn a_valid_diff_block_attaches_no_errors_on_done() {
+        let text = kaijutsu_diff::fixtures::read("canonical/multi_file.diff");
+        assert!(
+            diff_errors_after_done(&text).is_empty(),
+            "a canonical fixture must validate clean — the app and the kernel \
+             share this corpus precisely so they cannot invent divergent dialects"
+        );
+    }
+
+    #[test]
+    fn a_declared_diff_that_does_not_parse_attaches_a_visible_error() {
+        // The whole point of the arm: this block was NOT produced by
+        // `diff_block` (which refuses) — it is what a hand-rolled create or a
+        // concurrent content/content_type race leaves behind.
+        let errors = diff_errors_after_done("this is not a diff at all\n");
+        assert_eq!(errors.len(), 1, "expected exactly one parse error child");
+        let err = errors[0].error.as_ref().expect("Error block carries payload");
+        assert_eq!(err.category, kaijutsu_types::ErrorCategory::Parse);
+        assert_eq!(err.code.as_deref(), Some("diff.ExpectedFileHeader"));
+        assert_eq!(
+            err.span.as_ref().map(|s| s.line),
+            Some(1),
+            "the diagnostic must point at the offending line, not line 0"
+        );
+        assert!(
+            errors[0].content.contains("Diff parse error"),
+            "summary should read as a diff problem: {:?}",
+            errors[0].content
+        );
+    }
+
+    /// The dialect rejects binary patches loudly (`DiffError::BinaryPatch`),
+    /// and that rejection must reach the reader as an Error child rather than
+    /// being swallowed as "well, it's still text".
+    #[test]
+    fn a_binary_patch_declared_as_a_diff_is_reported() {
+        let text = kaijutsu_diff::fixtures::read("invalid/binary_git.diff");
+        let errors = diff_errors_after_done(&text);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].error.as_ref().unwrap().code.as_deref(),
+            Some("diff.BinaryPatch"),
+        );
+    }
+
+    /// Re-running the validator over an unchanged bad block must not stack a
+    /// second identical Error child — the dedup path is shared with Abc/Svg,
+    /// but nothing pinned it for Diff.
+    #[test]
+    fn revalidating_an_unchanged_bad_diff_does_not_duplicate_the_error() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::Text,
+                "not a diff\n",
+                Status::Running,
+                ContentType::Diff,
+            )
+            .unwrap();
+        store.set_status(ctx, &block, Status::Done).unwrap();
+        store
+            .validate_content_and_attach_errors(ctx, &block)
+            .unwrap();
+
+        let errors: Vec<_> = store
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block) && !b.compacted)
+            .collect();
+        assert_eq!(errors.len(), 1, "validation must be idempotent");
     }
 }

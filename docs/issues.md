@@ -208,20 +208,6 @@ genuinely reversed on purpose (then `#[allow]` with a comment) or they're
 latent test bugs. Small, self-contained fix; unrelated to the diff work that
 surfaced it.
 
-## Diff blocks get no kernel-side validation on Done (found 2026-08-01, diff slice 3)
-
-`BlockStore::validate_content_and_attach_errors` (fired from `set_status` when
-a block reaches `Done`) matches only `ContentType::Abc | ContentType::Svg`, so a
-`ContentType::Diff` block never gets Error children attached for malformed
-content. Slice 3 covers the *producers* — `diff_block` refuses to create a block
-whose text doesn't parse, `kj diff` only ever emits `format()` output — and
-hydration degrades a bad diff to plain text with a note rather than dropping it.
-The gap is a block typed `Diff` by some *other* route (a hand-written
-`block_create` + `set_content_type`, a concurrent LWW type flip, a client): it
-lands with no visible error. Adding a `ContentType::Diff => validate_diff(...)`
-arm is ~10 lines and reuses `kaijutsu_diff::parse`; do it when slice 4 gives the
-app an error state to render into.
-
 ## Error-block-collapse remnants, post scaffolding removal (2026-08-01)
 
 The unread `build_error_child_index`/`ErrorChildIndex`/`ExpandedErrorParents`

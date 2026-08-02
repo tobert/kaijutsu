@@ -189,4 +189,71 @@ impl DiffError {
             DiffError::LineEndingsOnly { .. } => "LineEndingsOnly",
         }
     }
+
+    /// The 1-based line in the normalized input the rejection points at, when
+    /// the variant carries one.
+    ///
+    /// Every *parse* rejection knows its line; the two whole-input rejections
+    /// ([`DiffError::TooLarge`], [`DiffError::LineEndingsOnly`]) do not, and
+    /// say so with `None` rather than a misleading `0`. Consumers that attach
+    /// a span to a diagnostic — the kernel's `ErrorPayload::span` on a
+    /// declared-`Diff` block, a viewer's error banner — want exactly this and
+    /// should not have to match fourteen variants to get it.
+    pub fn line(&self) -> Option<usize> {
+        match self {
+            DiffError::ExpectedFileHeader { line, .. }
+            | DiffError::MissingPostImageHeader { line, .. }
+            | DiffError::MissingPaths { line }
+            | DiffError::ConflictingFileHeaders { line, .. }
+            | DiffError::MalformedHunkHeader { line, .. }
+            | DiffError::HunkCountMismatch { line, .. }
+            | DiffError::UnexpectedHunkLine { line, .. }
+            | DiffError::StrayNoNewline { line }
+            | DiffError::BinaryPatch { line, .. }
+            | DiffError::UnsupportedExtension { line, .. }
+            | DiffError::MalformedPath { line, .. }
+            | DiffError::MalformedTruncationMarker { line, .. } => Some(*line),
+            DiffError::TooLarge { .. } | DiffError::LineEndingsOnly { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{fixtures, parse};
+
+    /// Every rejection the *parser* can produce points at a line, because a
+    /// diagnostic that can't say where is a diagnostic a reader can't act on.
+    /// Driven off the shared INVALID corpus so a new rejecting fixture is
+    /// covered the day it lands.
+    #[test]
+    fn every_parse_rejection_carries_a_line() {
+        for (relative, variant) in fixtures::INVALID {
+            let text = fixtures::read(relative);
+            let err = parse(&text).expect_err(relative);
+            assert_eq!(err.variant_name(), *variant, "{relative}");
+            assert!(
+                err.line().is_some_and(|l| l >= 1),
+                "{relative}: {variant} must report a 1-based line, got {:?}",
+                err.line(),
+            );
+        }
+    }
+
+    /// The two whole-input rejections have no line to point at. `None` beats a
+    /// plausible-looking `0` that a caller would render as "line 0".
+    #[test]
+    fn whole_input_rejections_report_no_line() {
+        let too_large = DiffError::TooLarge {
+            what: "diff text",
+            limit: 1,
+            actual: 2,
+        };
+        assert_eq!(too_large.line(), None);
+        let endings = DiffError::LineEndingsOnly {
+            path: "a.txt".into(),
+        };
+        assert_eq!(endings.line(), None);
+    }
 }
