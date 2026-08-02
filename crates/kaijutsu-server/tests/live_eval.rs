@@ -403,10 +403,9 @@ async fn shell_exec_wait_timeout_inner(
         if let Some(output) = blocks
             .iter()
             .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_block_id))
+            && matches!(output.status, Status::Done | Status::Error)
         {
-            if matches!(output.status, Status::Done | Status::Error) {
-                return (cmd_block_id, output.content.clone(), output.status);
-            }
+            return (cmd_block_id, output.content.clone(), output.status);
         }
     }
 }
@@ -512,10 +511,9 @@ fn live_eval_conversation_session_slice_a() {
                     .unwrap_or_default();
                 if let Some(output) = blocks.iter().find(|b| {
                     b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_block_id)
-                }) {
-                    if matches!(output.status, Status::Done | Status::Error) {
-                        break (cmd_block_id, output.id, output.content.clone(), output.status);
-                    }
+                }) && matches!(output.status, Status::Done | Status::Error)
+                {
+                    break (cmd_block_id, output.id, output.content.clone(), output.status);
                 }
             }
         };
@@ -553,30 +551,33 @@ fn live_eval_conversation_session_slice_a() {
         let reply2 =
             wait_for_nth_assistant_text(&kernel, ctx_shell, prior, Duration::from_secs(60)).await;
 
+        let ok = reply2.to_lowercase().contains(&sentinel.to_lowercase());
+        if !ok {
+            // Dump the full block log for ctx_shell so we can see what
+            // the model actually had access to. Helps tell "shell output
+            // never landed in the block log" from "shell output landed
+            // but hydrate didn't translate it into a user message."
+            let blocks = kernel
+                .get_blocks(ctx_shell, &BlockQuery::All)
+                .await
+                .unwrap_or_default();
+            eprintln!("=== shell-visibility block log ===");
+            for b in &blocks {
+                eprintln!(
+                    "  [{role:>6}/{kind:>10}/{status:>6}] {head}",
+                    role = b.role.as_str(),
+                    kind = b.kind.as_str(),
+                    status = b.status.as_str(),
+                    head = b.content.chars().take(120).collect::<String>(),
+                );
+            }
+            eprintln!("=== end block log ===");
+        }
+        // Lock scoped to the assertion only — the diagnostic dump above awaits
+        // (kernel.get_blocks), and a std MutexGuard must never be held across
+        // an .await point.
         {
             let mut t = tap_for_async.lock().unwrap();
-            let ok = reply2.to_lowercase().contains(&sentinel.to_lowercase());
-            if !ok {
-                // Dump the full block log for ctx_shell so we can see what
-                // the model actually had access to. Helps tell "shell output
-                // never landed in the block log" from "shell output landed
-                // but hydrate didn't translate it into a user message."
-                let blocks = kernel
-                    .get_blocks(ctx_shell, &BlockQuery::All)
-                    .await
-                    .unwrap_or_default();
-                eprintln!("=== shell-visibility block log ===");
-                for b in &blocks {
-                    eprintln!(
-                        "  [{role:>6}/{kind:>10}/{status:>6}] {head}",
-                        role = b.role.as_str(),
-                        kind = b.kind.as_str(),
-                        status = b.status.as_str(),
-                        head = b.content.chars().take(120).collect::<String>(),
-                    );
-                }
-                eprintln!("=== end block log ===");
-            }
             t.assert_contains_ci(
                 &reply2,
                 sentinel,
@@ -747,10 +748,9 @@ fn live_eval_conversation_session_slice_a() {
                     .unwrap_or_default();
                 if let Some(output) = blocks.iter().find(|b| {
                     b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_block_id)
-                }) {
-                    if matches!(output.status, Status::Done | Status::Error) {
-                        break (cmd_block_id, output.content.clone(), output.status);
-                    }
+                }) && matches!(output.status, Status::Done | Status::Error)
+                {
+                    break (cmd_block_id, output.content.clone(), output.status);
                 }
             }
         };

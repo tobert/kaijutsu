@@ -251,11 +251,7 @@ fn poison_action(failures: u32) -> PoisonAction {
 fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(String, String); 3] {
     // Phrases elapsed while playing (0-based). A zero `beats_per_phrase` has no
     // phrasing → phrase 0, never a divide-by-zero (mirrors `is_phrase_boundary`).
-    let phrase = if policy.beats_per_phrase > 0 {
-        beat_count / policy.beats_per_phrase
-    } else {
-        0
-    };
+    let phrase = beat_count.checked_div(policy.beats_per_phrase).unwrap_or(0);
     // BPM from the beat period. Tempos are whole numbers in practice (the
     // `kj transport tempo` verb takes integer BPM); round to the nearest.
     let secs = policy.period.as_secs_f64();
@@ -555,12 +551,12 @@ impl BeatScheduler {
         // with another's facts; `beat_attach_payload` erroring on the ambiguous
         // `many` case). Rotation is unaffected: a forked child isn't in the index yet,
         // so this never fires for it.
-        if let Some(old) = self.track_of(context_id) {
-            if old != track_id {
-                self.detach(&old, context_id);
-                if let Some(db) = self.documents.db() {
-                    let _ = db.lock().delete_attachment(old.as_str(), context_id);
-                }
+        if let Some(old) = self.track_of(context_id)
+            && old != track_id
+        {
+            self.detach(&old, context_id);
+            if let Some(db) = self.documents.db() {
+                let _ = db.lock().delete_attachment(old.as_str(), context_id);
             }
         }
         // Read the attaching context's committed high-water ONCE — both seeds below
@@ -1024,10 +1020,10 @@ impl BeatScheduler {
 
     /// Arm or disarm one attached context's OODA loop, without touching the clock.
     pub fn set_ooda(&mut self, track_id: &TrackId, context_id: ContextId, armed: bool) {
-        if let Some(track) = self.tracks.get_mut(track_id) {
-            if let Some(ac) = track.attached.get_mut(&context_id) {
-                ac.attachment.ooda_armed = armed;
-            }
+        if let Some(track) = self.tracks.get_mut(track_id)
+            && let Some(ac) = track.attached.get_mut(&context_id)
+        {
+            ac.attachment.ooda_armed = armed;
         }
         let _ = self.persist_attachment(track_id, context_id);
     }
@@ -1041,10 +1037,10 @@ impl BeatScheduler {
         context_id: ContextId,
         every: Option<Cadence>,
     ) {
-        if let Some(track) = self.tracks.get_mut(track_id) {
-            if let Some(ac) = track.attached.get_mut(&context_id) {
-                ac.attachment.rotate = every.filter(|c| c.every > 0);
-            }
+        if let Some(track) = self.tracks.get_mut(track_id)
+            && let Some(ac) = track.attached.get_mut(&context_id)
+        {
+            ac.attachment.rotate = every.filter(|c| c.every > 0);
         }
         // Persist so a restart restores the page-turn cadence.
         let _ = self.persist_attachment(track_id, context_id);
@@ -1393,7 +1389,7 @@ impl BeatScheduler {
             let Some(track) = self.tracks.get_mut(track_id) else {
                 return;
             };
-            track.playhead = track.playhead + STEP;
+            track.playhead += STEP;
             track.beat_count += 1;
             track.last_epoch_ns = epoch_ns;
             let ids: Vec<ContextId> = track.attached.keys().cloned().collect();
@@ -1436,11 +1432,7 @@ impl BeatScheduler {
             // its page-turn. A rotating context retires this beat (detached below) and
             // does NOT also fire ooda/phrase.
             let phrase_due = policy.is_phrase_boundary(beat_count);
-            let phrase = if policy.beats_per_phrase > 0 {
-                beat_count / policy.beats_per_phrase
-            } else {
-                0
-            };
+            let phrase = beat_count.checked_div(policy.beats_per_phrase).unwrap_or(0);
             let rotate_due = phrase_due
                 && policy.beats_per_phrase > 0
                 && att.rotate.is_some_and(|c| c.is_due(phrase));
@@ -2115,6 +2107,7 @@ impl BeatScheduler {
     ///          the structural shield against re-crystallizing our own output.
     ///       2. track-bearing (`track.is_some()`) — came off the timeline.
     ///       3. beat()-authored — a legacy transport block.
+    ///
     ///     A carried id that trips any guard is a BUG (the publish site should
     ///     only ever carry a real player Model block), so each is a loud
     ///     `log::error!`, refused, never silently skipped.
@@ -3732,7 +3725,7 @@ mod tests {
             "the error names the unknown clock_kind, got: {err}"
         );
         assert!(
-            sched.tracks.get(&keys).is_none(),
+            !sched.tracks.contains_key(&keys),
             "a failed clock reconstruction leaves no half-armed track"
         );
     }

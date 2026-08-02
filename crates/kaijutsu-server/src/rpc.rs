@@ -2284,7 +2284,7 @@ impl kernel::Server for KernelImpl {
                     s.set_name(name);
                     s.set_description(description.as_deref().unwrap_or(""));
                     s.set_category("mcp");
-                    s.set_input_schema(&schema.to_string());
+                    s.set_input_schema(schema.to_string());
                 }
                 Ok(())
             }
@@ -3055,7 +3055,7 @@ impl kernel::Server for KernelImpl {
                             let mut entries = req.get().init_entries(digest.entries.len() as u32);
                             for (i, (path, total)) in digest.entries.iter().enumerate() {
                                 let mut entry = entries.reborrow().get(i as u32);
-                                entry.set_path(&path.to_string_lossy());
+                                entry.set_path(path.to_string_lossy());
                                 entry.set_total(*total);
                                 entry.set_generation(vfs.generation_of(path));
                             }
@@ -4353,12 +4353,12 @@ impl kernel::Server for KernelImpl {
                             results.get().set_content("");
                             results
                                 .get()
-                                .set_error(&format!("config {canonical} is not UTF-8: {e}"));
+                                .set_error(format!("config {canonical} is not UTF-8: {e}"));
                         }
                     },
                     Err(e) => {
                         results.get().set_content("");
-                        results.get().set_error(&format!("{e}"));
+                        results.get().set_error(format!("{e}"));
                     }
                 }
                 Ok(())
@@ -4870,7 +4870,7 @@ impl kernel::Server for KernelImpl {
         let mut b = results.get();
         match view {
             Some(context_id) => {
-                b.set_context_id(&context_id.to_string());
+                b.set_context_id(context_id.to_string());
                 b.set_found(true);
             }
             None => {
@@ -6014,15 +6014,15 @@ impl kernel::Server for KernelImpl {
                 let mut reg = registry.lock();
                 reg.insert(dedupe_key.clone(), new_handle)
             };
-            if let Some(prior) = prior {
-                if !prior.is_finished() {
-                    log::info!(
-                        "Replacing live FlowBus subscription for kernel {} \
-                         instance={} principal={:?}",
-                        kernel_id, dedupe_key.1, dedupe_key.0,
-                    );
-                    prior.abort();
-                }
+            if let Some(prior) = prior
+                && !prior.is_finished()
+            {
+                log::info!(
+                    "Replacing live FlowBus subscription for kernel {} \
+                     instance={} principal={:?}",
+                    kernel_id, dedupe_key.1, dedupe_key.0,
+                );
+                prior.abort();
             }
         }
         Promise::ok(())
@@ -6130,7 +6130,7 @@ impl kernel::Server for KernelImpl {
                 results.get().set_success(false);
                 results
                     .get()
-                    .set_error(&format!("unknown state '{state_str}'"));
+                    .set_error(format!("unknown state '{state_str}'"));
                 return Promise::ok(());
             }
         };
@@ -6158,7 +6158,7 @@ impl kernel::Server for KernelImpl {
                         results.get().set_success(false);
                         results
                             .get()
-                            .set_error(&format!("transition {from} → {to} not allowed"));
+                            .set_error(format!("transition {from} → {to} not allowed"));
                         return Promise::ok(());
                     }
                 }
@@ -6181,7 +6181,7 @@ impl kernel::Server for KernelImpl {
             };
             if let Err(e) = drift.set_state(context_id, new_state) {
                 results.get().set_success(false);
-                results.get().set_error(&e.to_string());
+                results.get().set_error(e.to_string());
                 return Promise::ok(());
             }
         }
@@ -6267,7 +6267,7 @@ impl kernel::Server for KernelImpl {
                 }
                 Err(e) => {
                     results.get().set_success(false);
-                    results.get().set_error(&e.to_string());
+                    results.get().set_error(e.to_string());
                     return Promise::ok(());
                 }
             }
@@ -6358,7 +6358,7 @@ impl kernel::Server for KernelImpl {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     results.get().set_success(false);
-                    results.get().set_error(&e.to_string());
+                    results.get().set_error(e.to_string());
                     return Promise::ok(());
                 }
             }
@@ -6418,7 +6418,7 @@ impl kernel::Server for KernelImpl {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     results.get().set_success(false);
-                    results.get().set_error(&e.to_string());
+                    results.get().set_error(e.to_string());
                     return Promise::ok(());
                 }
             }
@@ -6480,7 +6480,7 @@ impl kernel::Server for KernelImpl {
             }
             Err(e) => {
                 results.get().set_success(false);
-                results.get().set_error(&e.to_string());
+                results.get().set_error(e.to_string());
             }
         }
         Promise::ok(())
@@ -6522,13 +6522,13 @@ impl kernel::Server for KernelImpl {
                     }
                     Err(e) => {
                         results.get().set_success(false);
-                        results.get().set_error(&e.to_string());
+                        results.get().set_error(e.to_string());
                         return Promise::ok(());
                     }
                 },
                 Err(e) => {
                     results.get().set_success(false);
-                    results.get().set_error(&e.to_string());
+                    results.get().set_error(e.to_string());
                     return Promise::ok(());
                 }
             }
@@ -7246,7 +7246,7 @@ fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, c
     }
     match &cue.payload {
         kaijutsu_audio::CuePayload::Inline(bytes) => builder.set_inline(bytes),
-        kaijutsu_audio::CuePayload::Cas(hash) => builder.set_cas_hash(&hash.to_string()),
+        kaijutsu_audio::CuePayload::Cas(hash) => builder.set_cas_hash(hash.to_string()),
     }
 }
 
@@ -7445,29 +7445,29 @@ fn persist_shell_state(
 
     // cwd: write only when the command moved it, so we never clobber a
     // concurrent peer's cwd with a value this command never touched.
-    if after.cwd != before.cwd {
-        if let Err(e) = db.upsert_context_shell(&ContextShellRow {
+    if after.cwd != before.cwd
+        && let Err(e) = db.upsert_context_shell(&ContextShellRow {
             context_id,
             cwd: Some(after.cwd.to_string_lossy().into_owned()),
             updated_at: kaijutsu_types::now_millis() as i64,
-        }) {
-            log::warn!("failed to persist context cwd: {}", e);
-        }
+        })
+    {
+        log::warn!("failed to persist context cwd: {}", e);
     }
 
     // exported env: upsert added/changed keys, delete keys the command unset.
     for (key, value) in &after.env {
-        if before.env.get(key) != Some(value) {
-            if let Err(e) = db.set_context_env(context_id, key, value) {
-                log::warn!("failed to persist context env {}: {}", key, e);
-            }
+        if before.env.get(key) != Some(value)
+            && let Err(e) = db.set_context_env(context_id, key, value)
+        {
+            log::warn!("failed to persist context env {}: {}", key, e);
         }
     }
     for key in before.env.keys() {
-        if !after.env.contains_key(key) {
-            if let Err(e) = db.delete_context_env(context_id, key) {
-                log::warn!("failed to delete context env {}: {}", key, e);
-            }
+        if !after.env.contains_key(key)
+            && let Err(e) = db.delete_context_env(context_id, key)
+        {
+            log::warn!("failed to delete context env {}: {}", key, e);
         }
     }
 }
@@ -7632,12 +7632,11 @@ async fn execute_shell_command(
 
                 if let Some(ref ct_str) = result.content_type {
                     let ct = ContentType::from_mime(ct_str);
-                    if ct != ContentType::Plain {
-                        if let Err(e) =
+                    if ct != ContentType::Plain
+                        && let Err(e) =
                             documents_clone.set_content_type(context_id, &output_block_id_clone, ct)
-                        {
-                            log::error!("Failed to set content_type: {}", e);
-                        }
+                    {
+                        log::error!("Failed to set content_type: {}", e);
                     }
                 }
 
@@ -8682,9 +8681,6 @@ mod background_wire_tests {
         );
     }
 }
-
-/// Parse a BlockSnapshot from a Cap'n Proto reader.
-// SeatHandle interface removed — replaced by ContextMembership.
 
 // ============================================================================
 // VFS Implementation

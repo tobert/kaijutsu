@@ -233,10 +233,12 @@ pub(crate) async fn spawn_llm_for_prompt(
     let (ctx_model, ctx_provider_name, ctx_label, ctx_state) = {
         let drift = kernel_arc.drift().read();
         // Guard: block LLM invocation while context is in Staging state
-        if let Some(h) = drift.get(context_id) {
-            if h.state == kaijutsu_types::ContextState::Staging {
-                // Insert an ephemeral system block explaining why the prompt was rejected
-                let _ = documents.insert_block_as(
+        if let Some(h) = drift.get(context_id)
+            && h.state == kaijutsu_types::ContextState::Staging
+        {
+            // Insert an ephemeral system block explaining why the prompt was rejected
+            let _ = documents
+                .insert_block_as(
                     context_id,
                     None,
                     Some(after_block_id),
@@ -246,11 +248,11 @@ pub(crate) async fn spawn_llm_for_prompt(
                     kaijutsu_crdt::Status::Done,
                     kaijutsu_crdt::ContentType::Plain,
                     Some(PrincipalId::system()),
-                ).and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
-                return Err(capnp::Error::failed(
-                    "context is in staging mode — commit to enable LLM prompts".into(),
-                ));
-            }
+                )
+                .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
+            return Err(capnp::Error::failed(
+                "context is in staging mode — commit to enable LLM prompts".into(),
+            ));
         }
         match drift.get(context_id) {
             Some(h) => (
@@ -684,6 +686,10 @@ async fn dispatch_and_map_tool_result(
         llm.response.stop_reason = tracing::field::Empty,
     )
 )]
+// The full turn context (provider, target block, interrupt/cache/kernel
+// handles) has to reach the stream loop somehow; a params struct would just
+// relocate these 17 fields without changing the shape of the problem.
+#[allow(clippy::too_many_arguments)]
 async fn process_llm_stream(
     provider: Arc<Provider>,
     documents: SharedBlockStore,
@@ -1584,22 +1590,16 @@ async fn process_llm_stream(
                     }
 
                     // Step 6b: Emit structured Error child block if tool failed
-                    if let (Some(rb_id), Some(payload)) =
-                        (&result_block_id, &error_payload)
-                    {
-                        if let Err(e) = documents.insert_error_block_as(
+                    if let (Some(rb_id), Some(payload)) = (&result_block_id, &error_payload)
+                        && let Err(e) = documents.insert_error_block_as(
                             context_id,
                             rb_id,
                             payload,
                             payload.summary_line(),
                             Some(PrincipalId::system()),
-                        ) {
-                            log::warn!(
-                                "Failed to insert error block for tool {}: {}",
-                                tool_name,
-                                e
-                            );
-                        }
+                        )
+                    {
+                        log::warn!("Failed to insert error block for tool {}: {}", tool_name, e);
                     }
 
                     // Step 7: Return for conversation history

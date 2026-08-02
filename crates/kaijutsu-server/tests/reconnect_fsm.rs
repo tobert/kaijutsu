@@ -764,18 +764,13 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         // counts as "noticed" too.
         proxy.cut();
         let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
-        loop {
-            match tokio::time::timeout(Duration::from_secs(3), reader.whoami()).await {
-                Ok(Ok(_)) => {
-                    if tokio::time::Instant::now() >= drop_deadline {
-                        panic!("reader never noticed the cut");
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                // Ok(Err) = call errored, Err = our timeout: the drop surfaced.
-                _ => break,
+        while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), reader.whoami()).await {
+            if tokio::time::Instant::now() >= drop_deadline {
+                panic!("reader never noticed the cut");
             }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        // Ok(Err) = call errored, Err = our timeout: the drop surfaced.
 
         // During the outage the writer (kernel still alive) appends a block.
         let pre_gap = block_count(&writer, ctx).await;
