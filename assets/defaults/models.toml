@@ -29,12 +29,17 @@
 #                     provider-level field.
 #
 #                     Leave a model out of this table (or its context_window
-#                     unset) when the window isn't confirmed — the resolver
-#                     returns an explicit "unknown" for anything unlisted,
-#                     never a guess. A fabricated denominator would make a
-#                     "% of context used" gauge confidently wrong, which is
-#                     worse than the gauge saying "unknown". Must be a
-#                     positive integer when set — 0 parses fine but is
+#                     unset) when you don't want to hand-pin it — this value
+#                     is always an OVERRIDE, checked first. For Anthropic
+#                     models specifically, an entry left unset falls through
+#                     to a live `GET /v1/models/{id}` lookup (cached) before
+#                     landing on "unknown"; every other provider stays
+#                     config-only, so leaving one of THOSE unset really does
+#                     mean unknown until someone fills it in. Either way, the
+#                     resolver never guesses — a fabricated denominator would
+#                     make a "% of context used" gauge confidently wrong,
+#                     which is worse than the gauge saying "unknown". Must be
+#                     a positive integer when set — 0 parses fine but is
 #                     nonsense (no real model has a zero-token window) and
 #                     will produce garbage wherever it's divided into.
 #                     Cloud model
@@ -109,7 +114,9 @@ context_window = 1000000
 # live 2026-08-02), as does claude-opus-4-20250514. It used to back the
 # balanced/default aliases, which meant a fresh kernel shipped pointing at a
 # model Anthropic no longer serves. Those aliases now point at deepseek.
-# Left here as a marker: don't reintroduce either id.
+# Left here as a marker: don't reintroduce either id. Note the live-lookup
+# fallback can't rescue these — there is no window to fetch for a model that
+# no longer exists, so a retired id stays honestly "unknown".
 
 # Gemini support in kaijutsu is INCOMPLETE — `gemini` is not a `Provider`
 # variant (llm/mod.rs: Claude / DeepSeek / OpenAi), so this block can only ever

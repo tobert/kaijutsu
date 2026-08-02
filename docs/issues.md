@@ -59,15 +59,46 @@ these are the ones that block *using* the thing.
   reads them.
   - Denominator SHIPPED 2026-07-29 (`36f57547`) as hand-maintained per-model
     `context_window` in models.toml, resolving to `Option<u64>` — never a
-    fabricated default. **Follow-up: stop hand-maintaining it for Anthropic.**
-    `GET /v1/models/{id}` returns the window live as **`max_input_tokens`**
-    (note: there is no `context_window` field — that name is ours), alongside
-    `max_tokens` (output cap) and a `capabilities` tree. A hand-kept table goes
-    stale on every model launch; the config should be the *override*, the API
-    the source. Non-Anthropic providers still need the config path, so this is
-    additive, not a replacement. Also: `claude-sonnet-4-20250514` (used by the
-    `balanced`/`default` aliases) is deliberately unset — an honest gap the
-    live lookup would close.
+    fabricated default.
+  - **Live Anthropic lookup SHIPPED (feat/ctx-window-live).** Config still
+    wins as an override (`LlmRegistry::context_window_for`, sync,
+    config-only); when it has no entry, `context_window_for_live` (async)
+    falls through to `GET /v1/models/{id}` for Anthropic providers only,
+    reading the wire's `max_input_tokens` (NOT `max_tokens`, the output cap —
+    the field-name confusion this shipped a regression test against).
+    Non-Anthropic providers are untouched — additive, not a replacement.
+    Cache lives on `claude::Client` (one per registered provider = one per
+    kernel process): `Ok(_)` results (including `Ok(None)` — "the API
+    doesn't know this model either") cache for the process lifetime, `Err`
+    results (network/auth failure) are NOT cached so a transient outage
+    heals on the next call. The HTTP call sits behind a
+    `ModelCapabilitySource` trait seam (`llm/claude/models_api.rs`) so
+    `cargo test --workspace` never touches the network — a
+    `FakeModelCapabilitySource` is injected everywhere a test needs a
+    `Provider::Claude` with an unconfigured model.
+  - **Correction to the "closes the honest gap" claim above:** as of
+    2026-08-02, `claude-sonnet-4-20250514` — the model backing the shipped
+    `balanced`/`default` model aliases, and models.toml's canonical example
+    of a deliberately-unset window — has been **retired**, not merely
+    deprecated (`shared/model-migration.md`'s deprecation table gives its
+    retirement date as June 15, 2026, now past). `GET /v1/models/claude-sonnet-4-20250514`
+    404s for real (confirmed live against the API, not simulated); the live
+    lookup correctly resolves it to `None` — same honest "unknown" config
+    already gave it — because there is nothing left to look up. The
+    mechanism is proven to close *real* gaps (verified live against
+    `claude-sonnet-5`, absent from models.toml since it postdates the file,
+    resolves to `Some(1_000_000)`); it just can't resurrect a retired model.
+    **The more urgent thing this surfaced — shipped aliases pointing at a
+    dead model — is FIXED 2026-08-02** (`ceea246b`): `default` →
+    `deepseek-v4-pro`, `balanced` → `deepseek-v4-flash`, per Amy ("lean on
+    deepseek for affordable experimentation and we can call on
+    anthropic/others when we need their power"). Every Anthropic id in
+    `models.toml` is now UNDATED, which is the durable lesson: both dead ids
+    we found were dated snapshots. Windows were re-read live rather than
+    trusted. `claude-opus-4-20250514` is also a 404, and kaibo's
+    `list_models` — the right tool for this question — confirms Haiku 4.5 is
+    still the newest Haiku and turned up `claude-sonnet-5` /
+    `claude-opus-4-6`, which we were missing.
 - **Hydration has no token budget.** `hydrate.rs` ships every live block into
   the LLM context unconditionally — no cap, no summarization trigger. (The
   automatic block-count-threshold compaction that used to catch this was
@@ -378,11 +409,55 @@ today. Revisit when rmcp actually removes the deprecated APIs, or when
 adopting the `Peer::listen` model becomes worth the redesign on its own
 merits.
 
-## ⬆ NEXT UP (Amy, 2026-07-16): MCP shell reply timeouts — replies lost while execution succeeds
+## ⬆ NEXT UP: MCP shell delay — DIAGNOSED 2026-08-02, one-line fix, not yet written
 
-Bumped to next-in-queue after ongoing work closes. Long dismissed as "the
-stale-FlowBus quirk"; 2026-07-16's clip-arc sessions showed it's chronic,
-not a restart one-off:
+**Root of it: every `kaijutsu-mcp` process claims the SAME subscription slot,
+so they steal the block-event bridge from each other.**
+`crates/kaijutsu-mcp/src/lib.rs:459` passes a hardcoded literal:
+
+```rust
+let actor = spawn_actor(config, None, "mcp-server".to_string(), true);
+```
+
+The server dedupes subscriptions by **(principal, instance)** — correct design,
+so a reconnect from one client replaces its own prior subscription instead of
+stacking. But with a constant `instance`, every MCP process for one principal
+is the same client. Whoever subscribes last silently evicts the rest, and an
+evicted client is never told: its broadcast channel stays open, just forever
+silent. The app has the identical bug with `"bevy-client"`
+(`kaijutsu-app/src/connection/actor_plugin.rs:239,633`) — **two app windows
+trample each other the same way.**
+
+**The fix already exists in-tree, one layer over.** `app_peer_instance()`
+(`actor_plugin.rs:27`) mints a per-process id: "minted once, stable for the
+window's life", distinct across processes, surviving reconnect. That is exactly
+the right shape — the block subscription just never got it. Give both clients a
+per-process instance (a UUID at startup) and the whole class goes away.
+
+**Measured, not inferred** (zorak, 5 live MCP processes at the time, ages 21h
+to 13m): `echo probe-1` took **5419 ms** while the journal shows the kernel
+finished it in **146 ms** (`shell_execute` 19:11:53.649 → `kaish returned`
+19:11:53.795); the client's stall-fallback resubscribe lands at 19:11:59.134,
+exactly +5.2s. probe-2 and probe-3, run immediately after, took 336 ms and
+256 ms — because probe-1's resubscribe stole the bridge back. `SubscriberHealth`
+reaped nothing all session, so the bridge was never unhealthy; it was taken.
+
+This explains every symptom the old entry listed: the ~5s tax is idle-driven
+(someone stole it while you were quiet), historical "~half of calls" tracked
+how many MCP processes were running, retries "work instantly" because the
+first call repaired delivery, and `/mcp reconnect` "sometimes helps" because
+it re-steals the slot.
+
+**Also worth doing:** the server should warn when it replaces a subscription
+from a *different connection* with the same (principal, instance) — that
+signal would have surfaced this in a minute rather than an afternoon.
+
+The 30–300s hangs in the original report are a **separate, already-fixed**
+bug: `SubscriberHealth` was rewritten 2026-07-17 (`rpc.rs:8529`) from
+strike-count to streak-duration precisely because a completed shell command
+fires ~4 callbacks at once, so one transient client stall burned 3 strikes in
+under a second and reaped a healthy bridge. Original report below, kept for
+the symptom record:
 
 - **Symptom**: the MCP `shell` tool call times out (30s–300s, whatever the
   client timeout) while the kernel executes the command fine — journal

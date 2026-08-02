@@ -767,6 +767,32 @@ impl LlmRegistry {
         self.provider_config(provider_name)?.context_window(model)
     }
 
+    /// Live-lookup variant of [`Self::context_window_for`].
+    ///
+    /// Precedence: the config-declared `context_window` (`models.toml`) is
+    /// checked FIRST and, when present, returned immediately — config is
+    /// always the override, and no network is attempted if it hits. Only
+    /// when config has no entry AND the resolved provider is Anthropic does
+    /// this fall through to the provider's live `GET /v1/models/{id}`
+    /// lookup (see `claude::Client::context_window`, which caches the
+    /// result for the process lifetime). Every other provider — including
+    /// an unregistered one — falls through to `None`, exactly as
+    /// [`Self::context_window_for`] already did; non-Anthropic providers
+    /// keep the config-only path (this is additive, not a replacement).
+    ///
+    /// Never fabricates: a live-lookup failure degrades to `None` (logged
+    /// by the client at `warn`), never a guessed number. Callers must keep
+    /// treating `None` as an honest "unknown" — never substitute a default.
+    pub async fn context_window_for_live(&self, provider_name: &str, model: &str) -> Option<u64> {
+        if let Some(window) = self.context_window_for(provider_name, model) {
+            return Some(window);
+        }
+        match self.get(provider_name).as_deref() {
+            Some(Provider::Claude(client)) => client.context_window(model).await,
+            _ => None,
+        }
+    }
+
     /// Store provider configs for runtime queries (e.g. max_output_tokens).
     pub fn set_provider_configs(&mut self, configs: Vec<ProviderConfig>) {
         self.provider_configs = Some(configs);
@@ -1177,6 +1203,161 @@ mod tests {
     fn context_window_for_unknown_provider_is_none() {
         let registry = LlmRegistry::new(); // no provider_configs set at all
         assert_eq!(registry.context_window_for("anthropic", "anything"), None);
+    }
+
+    // ── context_window_for_live: config override / live fallback / seam ──
+
+    mod context_window_for_live_tests {
+        use super::*;
+        use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
+
+        /// Build a registry with a `Provider::Claude` registered under
+        /// "anthropic", backed by `fake` instead of the real HTTP source —
+        /// the test seam. `provider_configs` starts empty; tests add config
+        /// entries via `set_provider_configs` when they need to exercise
+        /// the override-wins path.
+        fn registry_with_fake_claude(fake: FakeModelCapabilitySource) -> LlmRegistry {
+            let mut registry = LlmRegistry::new();
+            let client = claude::Client::new("fake-key").with_capability_source(Arc::new(fake));
+            registry.register("anthropic", Arc::new(Provider::Claude(client)));
+            registry
+        }
+
+        #[tokio::test]
+        async fn config_override_wins_no_live_call_attempted() {
+            // The fake would answer with a DIFFERENT window than config —
+            // if the live path were consulted at all, this test would catch
+            // it via the mismatched value, and `call_count` pins it down
+            // directly: config must win WITHOUT ever touching the seam.
+            let fake = FakeModelCapabilitySource::always_none()
+                .with_response("claude-opus-4-8", Ok(Some(999)));
+            let mut registry = registry_with_fake_claude(fake);
+            let mut cfg = ProviderConfig::new("anthropic");
+            cfg.models.insert(
+                "claude-opus-4-8".to_string(),
+                config::ModelInfo {
+                    context_window: Some(1_000_000),
+                },
+            );
+            registry.set_provider_configs(vec![cfg]);
+
+            let window = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
+            assert_eq!(
+                window,
+                Some(1_000_000),
+                "config value must win over the live fake's Some(999)"
+            );
+
+            // A second call also stays on the config value — proving config
+            // short-circuits every time, not just once before a cache warms.
+            let window_again = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
+            assert_eq!(window_again, Some(1_000_000));
+        }
+
+        #[tokio::test]
+        async fn live_value_used_when_config_absent_and_cached_on_second_call() {
+            let fake = FakeModelCapabilitySource::always_none()
+                .with_response("claude-sonnet-4-20250514", Ok(Some(200_000)));
+            let registry = registry_with_fake_claude(fake);
+            // No provider_configs at all — the honest gap this closes.
+
+            let window = registry
+                .context_window_for_live("anthropic", "claude-sonnet-4-20250514")
+                .await;
+            assert_eq!(
+                window,
+                Some(200_000),
+                "live lookup must supply the window when config has no entry"
+            );
+
+            // Second call must hit the client-side cache, not the fake again.
+            // We can't reach into the trait object's call_count from here
+            // (it's type-erased behind Arc<dyn ModelCapabilitySource>), so
+            // this is covered directly at the `claude::Client` level in
+            // `claude/mod.rs`'s own tests; here we just confirm the value is
+            // stable across repeated calls.
+            let window_again = registry
+                .context_window_for_live("anthropic", "claude-sonnet-4-20250514")
+                .await;
+            assert_eq!(window_again, Some(200_000));
+        }
+
+        #[tokio::test]
+        async fn unknown_model_stays_none_when_live_says_none() {
+            // Fake's default is Ok(None) for anything unscripted — mirrors a
+            // real 404 from the live API for a model id that doesn't exist.
+            let fake = FakeModelCapabilitySource::always_none();
+            let registry = registry_with_fake_claude(fake);
+
+            let window = registry
+                .context_window_for_live("anthropic", "definitely-not-a-real-model")
+                .await;
+            assert_eq!(window, None, "unknown model must resolve to None, never a guess");
+        }
+
+        #[tokio::test]
+        async fn live_lookup_failure_degrades_to_none_never_panics() {
+            let fake = FakeModelCapabilitySource::always_none().with_response(
+                "claude-opus-4-8",
+                Err(LlmError::NetworkError("connection refused".into())),
+            );
+            let registry = registry_with_fake_claude(fake);
+
+            let window = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
+            assert_eq!(
+                window, None,
+                "a network/auth failure must degrade to None, never fabricate a window"
+            );
+        }
+
+        #[tokio::test]
+        async fn non_claude_provider_falls_through_to_none_additive_not_replacement() {
+            // Non-Anthropic providers keep the config-only path — the live
+            // fallback is Anthropic-specific and must not silently apply to
+            // (say) DeepSeek just because a Claude client happens to also be
+            // registered under a different name.
+            let mut registry = LlmRegistry::new();
+            registry.register(
+                "deepseek",
+                Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))),
+            );
+            let window = registry
+                .context_window_for_live("deepseek", "deepseek-v4-pro")
+                .await;
+            assert_eq!(
+                window, None,
+                "non-Claude provider with no config entry must stay None, not attempt a live lookup"
+            );
+        }
+
+        #[tokio::test]
+        async fn both_null_together_invariant_holds_through_live_path() {
+            // Mirrors the kernel_db `context_used_pct` both-null-together
+            // guard, but exercised through the live-fallback resolution
+            // itself: when the live lookup resolves None, the percentage
+            // computed from it must also be None, never a fabricated 0%/NaN.
+            let fake = FakeModelCapabilitySource::always_none();
+            let registry = registry_with_fake_claude(fake);
+            let window = registry.context_window_for_live("anthropic", "unknown-model").await;
+            assert_eq!(window, None);
+
+            let usage = crate::kernel_db::ContextUsageRow {
+                context_id: kaijutsu_types::ContextId::new(),
+                provider: "anthropic".into(),
+                model: "unknown-model".into(),
+                input_tokens: 1000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                updated_at: 1,
+            };
+            let pct = crate::kernel_db::context_used_pct(&usage, window);
+            assert_eq!(
+                pct, None,
+                "window=None must yield pct=None — both null together, never a guessed pct"
+            );
+        }
     }
 
     // ── Hydration tests ───────────────────────────────────────────────

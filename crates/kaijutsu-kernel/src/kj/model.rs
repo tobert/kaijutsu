@@ -224,13 +224,15 @@ impl KjDispatcher {
         };
 
         // Context window for the effective model, via the SAME
-        // provider_configs the registry's own resolution already reads —
-        // never a second, possibly-diverging lookup. `None` here is a real
+        // config-then-live resolution `context info` uses (config wins as
+        // an override; a live Anthropic lookup fills the gaps config never
+        // had — see `LlmRegistry::context_window_for_live`) — never a
+        // second, possibly-diverging lookup. `None` here is a real
         // "unknown", not a fabricated default: a consumer rendering a
         // "% of context used" gauge must show "unknown" rather than compute
         // a confidently wrong percentage against a guessed denominator.
         let context_window = match (&provider, &model) {
-            (Some(p), Some(m)) => registry.context_window_for(p, m),
+            (Some(p), Some(m)) => registry.context_window_for_live(p, m).await,
             _ => None,
         };
 
@@ -274,6 +276,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::kj::test_helpers::*;
+    use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
     use crate::llm::toml_config::ModelAlias;
     use crate::llm::{Provider, ProviderConfig, claude, deepseek};
     use kaijutsu_types::PrincipalId;
@@ -284,9 +287,25 @@ mod tests {
 
     /// Seed the test kernel's registry with two providers, a config default,
     /// and an alias so the discovery verbs have something to report.
+    ///
+    /// `dispatch_model` now resolves context windows via
+    /// `context_window_for_live`, which falls through to a real
+    /// `GET /v1/models/{id}` call for any Anthropic model config leaves
+    /// unconfigured (exactly the "claude-haiku-4-5-20251001" scenario the
+    /// tests below deliberately exercise) — so the registered Claude client
+    /// gets a `FakeModelCapabilitySource` instead of the real HTTP source.
+    /// It answers `Ok(None)` for everything, matching what these tests
+    /// already expect ("unconfigured → null"): the fake stands in for "the
+    /// live API doesn't know this model either," not for exercising the
+    /// live-value-found path (that's covered in `llm/mod.rs` and
+    /// `llm/claude/mod.rs`'s own tests). This is the seam from
+    /// `docs/issues.md`'s test-isolation lesson — not a flag — so
+    /// `cargo test` never touches the network here.
     async fn seed_registry(d: &crate::kj::KjDispatcher) {
         let mut reg = d.kernel().llm().write().await;
-        reg.register("anthropic", Arc::new(Provider::Claude(claude::Client::new("fake"))));
+        let claude_client = claude::Client::new("fake")
+            .with_capability_source(Arc::new(FakeModelCapabilitySource::always_none()));
+        reg.register("anthropic", Arc::new(Provider::Claude(claude_client)));
         reg.register("deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))));
         reg.set_default("anthropic");
         reg.set_default_model("claude-opus-4-8");
@@ -466,6 +485,50 @@ mod tests {
         assert!(
             message.contains("unknown"),
             "human-readable text says unknown, not a fabricated number: {message}"
+        );
+    }
+
+    /// End-to-end wiring check (unlike the registry/client-level tests in
+    /// `llm/mod.rs` and `llm/claude/mod.rs`): a model config leaves
+    /// unconfigured resolves through `kj model`'s live fallback when the
+    /// (faked) Anthropic API knows about it — closing the exact gap
+    /// `claude-sonnet-4-20250514` has in production models.toml.
+    #[tokio::test]
+    async fn model_resolves_context_window_via_live_fallback_when_config_absent() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        {
+            let mut reg = d.kernel().llm().write().await;
+            let fake = FakeModelCapabilitySource::always_none()
+                .with_response("claude-sonnet-4-20250514", Ok(Some(200_000)));
+            let client = claude::Client::new("fake").with_capability_source(Arc::new(fake));
+            reg.register("anthropic", Arc::new(Provider::Claude(client)));
+            // Deliberately NO provider_configs entry for this model — the
+            // honest-gap scenario the live fallback exists to close.
+            reg.set_provider_configs(vec![ProviderConfig::new("anthropic")]);
+        }
+        let ctx = register_context(&d, Some("c"), None, principal);
+        {
+            let db = d.kernel_db().lock();
+            db.update_model(ctx, Some("anthropic"), Some("claude-sonnet-4-20250514"))
+                .unwrap();
+        }
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("model")], &c).await;
+        assert!(result.is_ok(), "model failed: {}", result.message());
+        let message = result.message().to_string();
+        let data = match result {
+            crate::kj::KjResult::Ok { data: Some(d), .. } => d,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(
+            data["context_window"], 200_000,
+            "config has no entry, so the live fallback must supply the window: {data:?}"
+        );
+        assert!(
+            message.contains("200000"),
+            "human-readable text also surfaces the live-resolved window: {message}"
         );
     }
 
