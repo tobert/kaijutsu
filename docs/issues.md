@@ -1221,6 +1221,38 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Persistence & Sync
 
+- **No backup or restore, at all** (seeded 2026-08-02, Amy: *"maybe we should
+  look into backup/restore tools soon… perhaps some easy way to quiesce for a
+  btrfs snapshot or file copy or dump"*). `kernel.db` is 287 MB of conversation
+  history on zorak with no dump verb, no export, no snapshot story — a single
+  file between us and every context we've ever had. The pieces are mostly here
+  already:
+  - **A hot `cp` is unsafe and quietly so.** WAL mode means committed history
+    can live in `kernel.db-wal` (1.5 MB right now) while the main file lags —
+    exactly the 2026-06-11 journaling-forensics misread, where nothing was lost
+    but the main file was simply stale. Copying `kernel.db` alone can therefore
+    produce a torn or backdated backup that *looks* fine.
+  - **We already have the quiesce primitive.** `KernelDb::checkpoint()`
+    (`kernel_db.rs:1621`) runs `PRAGMA wal_checkpoint(TRUNCATE)` and reports
+    `busy`. Compaction already calls it. A `kj` verb wrapping it — flush WAL,
+    report busy honestly, optionally hold writers briefly — is most of what a
+    safe `btrfs subvolume snapshot` or `cp` needs.
+  - **`VACUUM INTO '<path>'` is the SQLite-native hot backup** and needs no
+    quiesce at all: one consistent file, safe against a live writer, and it
+    compacts as it goes. Probably the right default for a `kj db backup` verb,
+    with the checkpoint+snapshot path for people who want btrfs/ZFS to do the
+    work.
+  - **Restore is the harder half** and shouldn't be hand-waved: the kernel
+    holds in-memory state (BlockStore documents, registries) that a
+    swap-the-file-underneath restore would desynchronize. Restore probably
+    means "stop kernel, replace file, start kernel", and that should be
+    *stated* rather than discovered.
+  - **Side benefit worth naming:** an export/import that round-trips through
+    decode→encode rewrites every record in the current format. That bounds how
+    long at-rest compatibility shims have to live (see the frozen-payload test
+    in `kaijutsu-types/src/codec.rs`) — today they must live forever, because
+    compaction is threshold-triggered and a quiet document may never be
+    re-snapshotted.
 - **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`) — slices 1+2
   shipped 2026-06-16/17 and long since exercised live** (`kj rc edit`/`kj config
   set` are the daily surface). Remaining: the deferred CRDT scratch mount.
