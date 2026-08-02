@@ -3388,6 +3388,10 @@ fn validate_svg(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
 /// it cannot model rather than accumulating diagnostics, and that is
 /// deliberate — a parser that skips a section produces a smaller diff that
 /// still looks complete.
+///
+/// Default options are fine here even though the app parses with an explicit
+/// `DiffProfile`: options only steer word-span refinement, never whether text
+/// parses, so validity is profile-independent by construction.
 fn validate_diff(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
     let Err(e) = kaijutsu_diff::parse(content) else {
         return vec![];

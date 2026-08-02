@@ -327,6 +327,36 @@ discoveries only:
   in `validate_content_and_attach_errors` + the `Diff` gate in `set_status`,
   with `DiffError::line()` added so the `ErrorPayload` gets a real span.
 
+## Post-ship review — slice 4 (deepseek, 2026-08-02; gemini-pro deliberate pending)
+
+Holistic read of the shipped files (no diff). Both pointed questions resolved
+in favor of what shipped: the unconditional `msdf_geometry.vertices.clear()`
+is *correct and necessary* (clearing an empty Vec is one branch + a len store;
+geometry and glyphs rebuild atomically in one system pass, so no flicker; the
+narrower per-arm fix is the error-prone shape), and the declared-vs-sniffed
+asymmetry is *coherent policy* (its table of per-type fallback contracts is
+now in `detect_rich_content_typed`'s doc comment). Two small fixes applied
+same-day: that doc comment, and a comment on `validate_diff` pinning why
+default parse options are equivalent to the app's explicit profile (options
+steer word-span refinement, never validity).
+
+Findings deferred to their slices:
+
+- **Slice 5 must decide: re-parse-on-open vs retained model.** `DiffPreview`
+  deliberately drops the parsed `DiffModel` (and `PreviewLine` carries no
+  hunk/file indices), so the viewer cannot be driven from the preview.
+  Freeze-on-open already wants its own snapshot bound to `(block_id, content
+  hash)`, so parse-at-open is the natural shape — but it re-pays an O(n) parse
+  (16 MiB ceiling) possibly on the main thread; a resident model per diff
+  block in the conversation is the memory-side trade. Yank must re-`format()`
+  from the frozen model either way, never scrape `file_header`/`hunk_header`
+  strings.
+- **Slice 6: preview-line truncation cuts word spans.** `error_preview` and
+  the normal path truncate lines at `MAX_PREVIEW_LINE_CHARS` (500) *after*
+  `text_start` is fixed; a `WordSpan` past the cut would index garbage. Filter
+  spans against the cut point when word coloring lands. (The band geometry
+  path is unaffected — bands stay per-line under word coloring.)
+
 ## Seam guidance (deepseek review, 2026-08-01)
 
 Consulted deepseek specifically on how the seams should evolve so this work

@@ -434,12 +434,21 @@ pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
 /// Detect rich content with a content type hint.
 ///
 /// When `content_type` is a specific variant, the declared type takes priority over sniffing:
-/// - `ContentType::Svg` → parse as SVG directly
-/// - `ContentType::Markdown` → parse as markdown directly
-/// - `ContentType::Abc` → parse as ABC notation directly
+/// - `ContentType::Svg` → parse as SVG directly; on parse failure falls
+///   through to the heuristics (SVG source still reads as text)
+/// - `ContentType::Markdown` → parse as markdown directly (cannot fail)
+/// - `ContentType::Abc` → parse as ABC notation directly (generous parser,
+///   never fails; kernel attaches errors as child blocks)
+/// - `ContentType::Image` → CAS hash; an invalid hash falls through to the
+///   heuristics
+/// - `ContentType::Diff` → **always** returns `Some`, even for content that
+///   does not parse (error preview, never falls through — see the arm's
+///   comment for why Diff inverts the SVG policy)
 /// - `ContentType::Plain` → fall through to heuristic detection
 ///
-/// With `ContentType::Plain`, tries sparkline, then SVG, then markdown heuristics.
+/// With `ContentType::Plain`, tries sparkline, then SVG, then the
+/// ` ```diff ` fence sniff (which may enrich but never accuses — a fence
+/// that doesn't parse falls through untouched), then markdown.
 ///
 /// `svg_fontdb` provides fonts for SVG `<text>` rendering. Pass `None` if
 /// the resource isn't available (text elements will be dropped).
