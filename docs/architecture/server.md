@@ -50,7 +50,8 @@ CRDT** (`subscribe_blocks[_filtered]`, `push_ops`, `get_blocks`, `move_block`,
 `set_block_excluded`, `cherry_pick_block`), **LLM** (`prompt`, `configure_llm`,
 `drift_queue`/`cancel`), **context ops** (`get_context_state`/`sync`,
 `create`/`join`/`leave`/`conclude`/`compact`/`interrupt_context`), MCP, peers,
-kaish (`shell_execute`, cwd/vars), **KV** (`kv_get`/`set`/`delete`/`keys`/`watch`),
+kaish (`shell_execute`, cwd/vars), **per-client view state**
+(`set_last_context`/`get_client_view`),
 **input doc** (`edit_input`/`submit_input`/`clear_input`), semantic index, config,
 and dead letters.
 

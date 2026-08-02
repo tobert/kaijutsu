@@ -628,7 +628,7 @@ thinking, roughly by priority:
   currently a hardcoded default — there is no per-context or models.toml
   route to say "thinking off for this context" or "effort: low here".
   Natural homes: a per-model options table in models.toml, or context config
-  KV (`/etc/client`-style cascade). Decide once, then the same pipe carries
+  (`/etc/client`-style cascade). Decide once, then the same pipe carries
   future knobs (effort, `output_config`, fast mode).
 - **Model capability knowledge is string-parsing.** `Thinking::default_for_model`
   parses `claude-<family>-<major>-<minor>` and gates on `>= 4.6`. Fine for
@@ -1221,19 +1221,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Persistence & Sync
 
-- **Phantom KV document row on pre-2026-07-04 DBs (cosmetic).** The KV store
-  deletion (`6301e033`) intentionally left live data alone, so a long-lived DB
-  keeps one `documents` row with `doc_kind='kv'` (the reserved KV doc every
-  startup used to mint). `doc_kind_from_sql`'s unknown-variant fallback loads
-  it as `Conversation` (warn-logged), and with the `DocKind::Kv` filter gone it
-  now shows as a phantom doc in `kj doc list`. Fix when it annoys: a one-time
-  row delete, or teach the fallback to hide retired kinds.
-- **LOW — one document skipped on every kernel start: oplog entry predates the
-  versioned-CBOR schema.** `document_id=824658110b5553129e46b5b4fbb94282 seq=1`
-  fails `cbor decode: missing field 'block_ops'`; the loader correctly skips the
-  whole document (crash-loud-not-corrupt) and has since at least 2026-07-16.
-  That document is unserved forever. Decide: migrate the row, or delete it if
-  it's a dead test document.
 - **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`) — slices 1+2
   shipped 2026-06-16/17 and long since exercised live** (`kj rc edit`/`kj config
   set` are the daily surface). Remaining: the deferred CRDT scratch mount.
@@ -2145,7 +2132,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   musician stance + ABC primer (`musician/create/S00-stance.md`, `S15-abc-primer.md`)
   both say "your chair, key, tune, and register come from your stance and the
   chart the producer has set" — but **there is no chart**. A search of every
-  document + KV finds the Chameleon spec (B♭ Dorian, B♭m7–E♭7 vamp, bass chair)
+  document finds the Chameleon spec (B♭ Dorian, B♭m7–E♭7 vamp, bass chair)
   only in `docs/chameleon.md`; **nothing writes it into a musician context**, and
   no `create` script seeds it. So a freshly-created player arms correctly, hears
   itself + siblings via `KJ_HEARD`, and drives on the beat — but does **not know
@@ -3020,7 +3007,7 @@ rc create/fork/drift (`project_cache_breakpoint_policy`); `usage.cache_*` parsed
     invent a parallel protocol); payload = **stdout → block** (the `rc .kai` stdout-
     producer idiom — stdout becomes an *appended* block, so a hook physically cannot
     rewrite the prefix; System/Text → mid-conversation system note, Trace → model-hidden
-    usage capture for the EMA); side effects = the script calling builtins (KV, drift),
+    usage capture for the EMA); side effects = the script calling builtins (drift, VFS),
     its own business, *not* the verdict path (a tool call as the return path is a
     reentrancy trap). stdin carries the event-kind + assembled-request metadata (model,
     context_type, token estimate).

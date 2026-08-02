@@ -475,7 +475,8 @@ center.
 The `0–9` ordered active list, decoupled from spiral index. Semantics per "Two
 navigation surfaces": append-on-join, compact-on-conclude, rule over address.
 
-- `rank: Vec<ContextId>` (≤10 addressable) — **kernel-owned** (KV or a column),
+- `rank: Vec<ContextId>` (≤10 addressable) — **kernel-owned** (a column or a
+  `/run` file — not KV, which is retired),
   not app state: the rank must survive app restarts, be visible to kj
   (`kj rank`, `kj rank add|drop|move <ref>`), and be shared by any peer/app.
   Thin client rule applies.

@@ -326,8 +326,8 @@ state, never KV.** It shows the participant's **current acting context** read fr
 the live state the kernel already tracks: `SessionContextMap`
 (`runtime/context_engine.rs:31`, an ephemeral `DashMap<SessionId, ContextId>` the
 shell resolves per-op). Deliberately the *ephemeral* value — a disconnected session
-has no live context, nothing to render. KV is **not** the source (KV is being
-retired — `docs/shared-state.md`); KV's one real job, **durable** per-client
+has no live context, nothing to render. KV is **not** the source (KV was retired
+2026-07-04 — `docs/shared-state.md`); KV's one real job, **durable** per-client
 restoration, survives disconnect and therefore lives in a typed per-client store
 (*Future: `/v/clients`* below), not here — this tree only ever shows who is live
 *right now*. No symlink-to-arm, no TTL — see "Capability".
@@ -435,7 +435,7 @@ This rides the **per-operation-join** write model above: a steer is an
 ambient-context write in the shared-trust kernel (anyone connected can drive a
 display; that's the collaborative point, not a hole — there is no ownership). Open,
 for the dedicated session: how a steered client *observes* the change (poll
-`generation` vs. a notify — KV's `kvWatch` is being deleted); whether `context` is
+`generation` vs. a notify — KV's `kvWatch` is gone); whether `context` is
 the only steerable field (theme, layout, a "spotlight this block" pointer all fit);
 and the exact typed-RPC vs. file-write split (the file is the *projection*; the RPC
 is canonical). Reserved as a direction now; `/v/ctx` + `/v/session` land first.
@@ -529,7 +529,7 @@ Track V (`/v/ctx` + `/v/session`):
 - `crates/kaijutsu-types/src/ids.rs:54` — all ids are `Uuid::now_v7()` (the trailing-byte sharding rule)
 - `crates/kaijutsu-kernel/src/peers.rs:50,103` — `PeerInfo` / `PeerRegistry` (the session seed; `PeerInfo` needs a `kind` field)
 - `crates/kaijutsu-kernel/src/runtime/context_engine.rs:31` — `SessionContextMap` (the live acting-context source `context` renders; KV is retired, see `docs/shared-state.md`)
-- `crates/kaijutsu-app/src/connection/actor_plugin.rs:301,319` — the app's *durable* per-client restore (today via KV; migrates to a typed per-client store, **not** `/v/session`)
+- `crates/kaijutsu-app/src/connection/actor_plugin.rs:301,319` — the app's *durable* per-client restore (via the typed per-client store `set_last_context`/`get_client_view`, **not** `/v/session`)
 - `crates/kaijutsu-types/src/block.rs:67,134` — `BlockId::to_key()`; `BlockHeader` (gains `content_len`)
 - `crates/kaijutsu-crdt/src/block_store.rs:199` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
 - `crates/kaijutsu-kernel/src/block_store.rs:182,153,2020` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write, restored on remote `merge_ops`)

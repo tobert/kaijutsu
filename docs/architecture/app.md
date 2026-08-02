@@ -69,7 +69,7 @@ background (`main.rs:181`).
   single-threaded tokio `LocalSet` thread (for `!Send` capnp) running the
   `ActorHandle`. `actor_plugin.rs` owns the live handle + reactive connection
   state, polls server events/status/results each frame, and persists the current
-  context to kernel KV.
+  context via `set_last_context`.
 - **`peers/`** — peer registry + `invoke_peer` transport (`PeerInvocationChannel`;
   dispatches `"switch_context"`/`"active_context"`).
 - **`kaish/`** — in-process kaish syntax validation (lexer/parser, no subprocess)
@@ -121,12 +121,12 @@ handle atomically.
 `main.rs` parses `--host/--port/--insecure`. `ActorPlugin` spawns the bootstrap
 thread and a `SpawnActor` command; on `ActorReady`, an `IoTaskPool` task waits for
 `Connected`, calls `whoami` (→ identity), `attach_peer(nick="kaijutsu-app")`
-(funnels invocations to `PeerInvocationChannel`), then `list_contexts` + reads
-kernel KV `<client-id>.current_context` to restore the last-viewed context.
+(funnels invocations to `PeerInvocationChannel`), then `list_contexts` +
+`get_client_view` to restore the last-viewed context.
 Context switches travel `ContextSwitchRequested → handle_context_switch` (join on
 cache miss). Ongoing block events drain from `subscribe_events` each frame and
 route by `context_id` into the matching `SyncedDocument`. `persist_current_context`
-writes the active id back to kernel KV on change.
+writes the active id back via `set_last_context` on change.
 
 ---
 

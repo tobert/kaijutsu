@@ -17,7 +17,7 @@ Arc<MountTable>`, `state: RwLock<KernelState>`, `llm: RwLock<LlmRegistry>`,
 `turn_flows`, input via the broker), `drift: SharedDriftRouter`, `cas:
 Arc<FileStore>`, `image_backends`, `broker: Arc<Broker>`, `timeouts`,
 `file_cache: OnceLock<Arc<FileDocumentCache>>`, `nonce_stores`, `timelines:
-DashMap<ContextId, SharedTimeline>`, `beat_ingress`, and `kv: OnceLock<Arc<Kv>>`.
+DashMap<ContextId, SharedTimeline>`, and `beat_ingress`.
 
 Notably the `Kernel` **does not own a `BlockStore`** — it receives one at
 `register_builtin_mcp_servers` (`kernel.rs:480`) and routes it into the broker.
@@ -59,13 +59,6 @@ DocumentEntry>`, threaded with the `DbHandle` for journaling.
 `insert_block`/`insert_tool_call`/`insert_tool_result`, `set_excluded` (`:1474`),
 `edit_text` (`:1388`), `ops_since`/`merge_ops`, and cold-start
 `load_from_db`/`load_one_from_db` (`:2142`/`:2271`).
-
-### KV — `Kv` (`src/kv.rs:122`)
-
-Persistent CRDT KV: a `KvDocument` (LWW per key) with values in a versioned JSON
-`Envelope`. Journals to the oplog under a deterministic `root_context_id()`
-(UUIDv5); compaction at 200 ops. `subscribe` yields a `broadcast::Receiver<KvChange>`.
-In embedded/test kernels `kv()` returns `None` — callers must degrade.
 
 ### Context registry + drift — `DriftRouter` (`src/drift.rs:130`)
 

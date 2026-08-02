@@ -14,7 +14,7 @@ older doc disagree, the code wins and this document tries to say so.
 - **[foundation.md](foundation.md)** — `kaijutsu-types` + `kaijutsu-crdt` + the
   Cap'n Proto wire schema. The shared vocabulary and the CRDT data model.
 - **[kernel.md](kernel.md)** — `kaijutsu-kernel`: the instrument's body (VFS,
-  block store, MCP broker, LLM, drift, KV, persistence, the embedded shell).
+  block store, MCP broker, LLM, drift, persistence, the embedded shell).
 - **[server.md](server.md)** — `kaijutsu-server`: SSH transport, the Cap'n Proto
   RPC surface, LLM streaming, the beat scheduler, auth.
 - **[client.md](client.md)** — `kaijutsu-client`: the `Send+Sync` actor bridge and
@@ -100,9 +100,8 @@ together:
 | Models | `LlmRegistry` | Named providers + default; alias resolution. |
 | Peers | `PeerRegistry` | Reverse-RPC callbacks (the Bevy app, external MCP) for `invoke_peer`. |
 | Blobs | `Arc<FileStore>` (CAS) | Content-addressed binary store (images, large payloads). |
-| KV | `Arc<Kv>` | Persistent CRDT key-value store (client current-context, etc.). |
 | Timelines | `DashMap<ContextId, SharedTimeline>` | Per-context hyoushigi beat engines (armed musician contexts only). |
-| Persistence | `KernelDb` (SQLite) | ~20 tables: contexts, edges, documents, oplog+snapshots, bindings, hooks, KV journal. |
+| Persistence | `KernelDb` (SQLite) | ~20 tables: contexts, edges, documents, oplog+snapshots, bindings, hooks. |
 
 The kernel **does not run an LLM turn itself** — that is the server's job
 (`llm_stream.rs`). The kernel supplies everything a turn needs: tool dispatch,
@@ -260,9 +259,8 @@ retroactively).
 | Store | Backed by | Holds |
 |---|---|---|
 | `KernelDb` | SQLite (WAL) | Contexts, edges, presets, workspaces, document registry, CRDT **oplog + snapshots**, input-doc oplog, per-context shell cwd/env, tool bindings, hooks, cache breakpoints, hydration markers. |
-| CRDT documents | in-memory + oplog | Live block stores and the KV doc; cold start = latest snapshot + oplog replay. |
+| CRDT documents | in-memory + oplog | Live block stores; cold start = latest snapshot + oplog replay. |
 | CAS (`FileStore`) | sharded files | Content-addressed blobs (BLAKE3-truncated 128-bit hash), images, large bodies. |
-| `Kv` | CRDT doc in oplog | Kernel key-value store (JSON envelopes, advisory TTL, compaction at 200 ops). |
 | Config | CRDT doc → TOML | `theme.toml`, `models.toml`, `mcp.toml`, `system.md`; CRDT is source of truth, disk is a debounced flush + reload-on-change. |
 | rc scripts | real files | `~/.config/kaijutsu/rc/...` lifecycle scripts; seeded once from embedded defaults. |
 | `auth.db` | SQLite | Principals + SSH credentials. |

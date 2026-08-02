@@ -83,7 +83,7 @@ Interfaces:
 - **`World`** (line 879) — entry point: `whoami`, `listKernels`, `bindKernel`.
 - **`Kernel`** (line 888) — the main surface, ~84 methods: kaish exec, VFS, CRDT
   sync (`pushOps`/`getContextSync`), block queries, subscriptions, MCP, peers,
-  timeline nav, KV, context lifecycle.
+  timeline nav, context lifecycle.
 - **`BlockEvents`** (line 373) — server→client callback (13 events; carries
   `seqNum` for dropped-event detection).
 - **`Vfs`** (line 1237) — 16-method filesystem interface.
@@ -127,9 +127,6 @@ write-once snapshot fields. DTE ops are wrapped in `catch_unwind`
 
 ### Other documents
 
-- **`KvDocument`** (`kv_document.rs:28`) — flat `key → String` LWW map (DTE),
-  `Nil`-tombstone deletes; backs the kernel KV store. Snapshot sorts by key for
-  deterministic rebuild.
 - **`ConversationDAG`** (`dag.rs:15`) — an *ephemeral computed index* (not a CRDT)
   over an ordered `Vec<BlockSnapshot>`; DFS/BFS, subtree, ancestors, depth, all
   circuit-broken at `MAX_DAG_DEPTH`.
@@ -140,7 +137,9 @@ write-once snapshot fields. DTE ops are wrapped in `catch_unwind`
 a conceptual gap (the CRDT crate doesn't map kinds to backends; the kernel does).
 Variants: **Conversation** (the dialog block log), **Code** (file-tool cache, one
 doc per tracked file), **Text** (static markdown), **Config** (theme/models TOML),
-**Kv** (the degenerate flat-map). Legacy string aliases map onto these.
+**Symlink** (content *is* the link target). Legacy string aliases map onto these;
+the retired `kv` tag is deliberately never reused (see the tombstone in
+`enums.rs`).
 
 ### Smells (not fixed — see [issues](../issues.md))
 
