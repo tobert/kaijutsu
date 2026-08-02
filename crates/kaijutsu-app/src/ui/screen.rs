@@ -38,6 +38,12 @@ pub enum Screen {
     /// (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
     /// fullscreening a panel," superseding the earlier `Screen::PatchBay`).
     Room,
+    /// The full diff viewer — an MSDF panel over a **frozen** `DiffCore`
+    /// (`docs/diff.md` slice 5, `view::diff_view`). Full-viewport, chrome
+    /// hidden, exactly like `Editor`; entered by `Action::OpenDiffViewer` on a
+    /// focused diff block in the conversation, left by `q`/`ZQ`/`:q` (never by
+    /// Esc — the vi surface owns Esc while it is live).
+    Diff,
     /// The FSN landscape (`docs/scenes/vfs.md` slice 0, `view::fsn`) — the
     /// VFS-as-terrain world behind the room's N archway ("DATA HORIZON").
     /// Unlike the room's bounded, furnished stations (patch bay, the well),
@@ -76,6 +82,17 @@ impl Plugin for ScreenPlugin {
         // double-apply every keystroke to the hidden chat overlay.
         app.add_systems(
             OnEnter(Screen::Editor),
+            (hide_conversation_root, hide_cell_text, set_focus_conversation),
+        );
+
+        // ── Diff ──
+        // The full diff viewer (`view::diff_view`): full-viewport MSDF panel
+        // over a frozen model, owning the keyboard as an explicit grab —
+        // same chrome/focus treatment as the editor above, and for the same
+        // reasons (the grab forwards every key itself; leaving focus on
+        // Compose would double-apply them to the hidden chat overlay).
+        app.add_systems(
+            OnEnter(Screen::Diff),
             (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
 

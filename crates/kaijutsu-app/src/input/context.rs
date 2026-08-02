@@ -58,6 +58,11 @@ pub enum KeyboardGrab {
     ComposeVim,
     /// The in-app vi editor forwarding to a kernel editor session.
     EditorSession,
+    /// The full diff viewer's app-local `DiffCore` (`view::diff_view`) — the
+    /// `ComposeVim` precedent: a modalkit machine behind the grab, so Global
+    /// bindings and the Ctrl+A prefix still win, and Esc reaches the vi
+    /// surface instead of popping the screen.
+    DiffView,
 }
 
 /// Resource tracking which input contexts are currently active.
@@ -91,6 +96,12 @@ pub fn derive_contexts(
         // The vi editor owns the keyboard as an explicit grab; only Global
         // bindings stay matchable (F12 screenshot in the editor still works).
         Screen::Editor => return (contexts, KeyboardGrab::EditorSession),
+
+        // The diff viewer is the editor's shape exactly: an explicit grab
+        // feeding a vi machine, Global bindings still matchable. Its `q`
+        // closes the screen and its Esc does NOT — both are the grab
+        // owner's calls, not the dispatcher's.
+        Screen::Diff => return (contexts, KeyboardGrab::DiffView),
 
         // The room derives its context from the zoom state: the carousel at
         // room scale, a per-station context while zoomed. The old rule
@@ -192,6 +203,26 @@ mod tests {
         let (ctxs, grab) = derive_contexts(Screen::Editor, None, &FocusArea::Conversation);
         assert_eq!(ctxs, vec![InputContext::Global]);
         assert_eq!(grab, KeyboardGrab::EditorSession);
+    }
+
+    #[test]
+    fn diff_view_is_a_grab_with_global_only() {
+        // Same contract as the editor: focus parks on Conversation while the
+        // viewer owns the screen, so the grab must not depend on focus. Only
+        // Global stays matchable — in particular Navigation must NOT, or `q`
+        // would fire the app's Quit binding instead of reaching DiffCore.
+        let (ctxs, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Conversation);
+        assert_eq!(ctxs, vec![InputContext::Global]);
+        assert_eq!(grab, KeyboardGrab::DiffView);
+    }
+
+    #[test]
+    fn diff_view_grab_holds_even_with_compose_focus() {
+        // A stale FocusArea::Compose (e.g. the viewer opened from a state that
+        // hadn't parked focus yet) must not hand the keyboard to the compose
+        // VimMachine — the screen decides, not the focus.
+        let (_, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Compose);
+        assert_eq!(grab, KeyboardGrab::DiffView);
     }
 
     #[test]

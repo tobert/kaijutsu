@@ -193,6 +193,17 @@ pub fn default_bindings() -> Vec<Binding> {
         "Activate focused block",
     ));
 
+    // Expand a focused diff block into the full vi-motion viewer
+    // (docs/diff.md Decision 5 — expansion is a screen change). `v` is the
+    // mnemonic that was free in Navigation; inside the viewer `v` is
+    // deliberately inert, so the two never fight.
+    b.push(Binding::key(
+        KeyCode::KeyV,
+        InputContext::Navigation,
+        Action::OpenDiffViewer,
+        "View diff full-screen",
+    ));
+
     // Escape — pop (Compose→Conversation, etc.)
     b.push(Binding::key(
         KeyCode::Escape,

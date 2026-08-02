@@ -401,7 +401,7 @@ fn try_parse_svg(
 }
 
 /// Extract content from a fenced code block with the given language tag.
-fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
+pub(crate) fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
     let fence_start = format!("```{}", lang);
     let trimmed = text.trim();
     if !trimmed.starts_with(&fence_start) {

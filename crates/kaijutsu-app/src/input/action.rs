@@ -50,6 +50,12 @@ pub enum Action {
     FocusLastBlock,
     /// Tab on thinking block — toggle collapse
     CollapseToggle,
+    /// v (in Navigation) — expand the focused diff block into `Screen::Diff`.
+    ///
+    /// `docs/diff.md` Decision 5: expansion is a *screen change*, never an
+    /// out-of-band conversation row. No-ops on a block that is not a diff
+    /// (declared `ContentType::Diff` or a sniffed ` ```diff ` fence).
+    OpenDiffViewer,
 
     // ========================================================================
     // Scrolling

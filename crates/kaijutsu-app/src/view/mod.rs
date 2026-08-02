@@ -22,6 +22,7 @@ pub mod block_render;
 pub mod brp_methods;
 pub mod components;
 pub mod document;
+pub mod diff_view;
 pub mod editor;
 pub mod fieldset;
 pub mod format;

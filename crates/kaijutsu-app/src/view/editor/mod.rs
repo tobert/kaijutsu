@@ -16,7 +16,7 @@ use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEven
 use crate::input::focus::{ActiveSurface, FocusArea};
 use crate::ui::screen::Screen;
 
-mod keys;
+pub(crate) mod keys;
 mod pipe;
 pub mod render;
 

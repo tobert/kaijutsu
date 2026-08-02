@@ -349,6 +349,12 @@ fn omission_note(model: &DiffModel, shown: &DiffModel) -> Option<String> {
 /// `Context` rather than guessed at — nothing here parsed, so claiming a line
 /// is an insertion would be a fabrication.
 fn error_preview(text: &str, reason: &str) -> DiffPreview {
+    error_preview_with(text, reason, DEFAULT_PREVIEW_LINES)
+}
+
+/// [`error_preview`] with an explicit source-line budget — the full viewer
+/// shows far more of the offending text than an inline row can.
+fn error_preview_with(text: &str, reason: &str, max_lines: usize) -> DiffPreview {
     let mut b = PreviewBuilder::new();
     b.push(
         DiffLineClass::Error,
@@ -358,7 +364,7 @@ fn error_preview(text: &str, reason: &str) -> DiffPreview {
 
     let mut shown = 0usize;
     let total = text.lines().count();
-    for line in text.lines().take(DEFAULT_PREVIEW_LINES) {
+    for line in text.lines().take(max_lines) {
         b.push(
             DiffLineClass::Context,
             0,
@@ -379,6 +385,91 @@ fn error_preview(text: &str, reason: &str) -> DiffPreview {
     }
 
     b.finish(DiffStat::default(), true)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The full viewer's projection
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Longest single line the FULL viewer lays out before eliding it.
+///
+/// Wider than the inline preview's budget — the full screen is where you go to
+/// actually read a line — but still bounded, for the same reason: one minified
+/// bundle line inside the byte budget is a screenful of wrapped text and a
+/// Parley stall. Elision is *display only*; yank reads `DiffCore`'s canonical
+/// text, which is never elided.
+pub const MAX_VIEW_LINE_CHARS: usize = 2_000;
+
+/// What a [`kaijutsu_diff::RowKind`] means to the renderer.
+///
+/// Exhaustive on purpose, like [`diff_profile_for`]: a new row kind in
+/// `kaijutsu-diff` must be a compile error here rather than silently painting
+/// itself context-colored.
+pub fn class_for_row(kind: kaijutsu_diff::RowKind) -> DiffLineClass {
+    use kaijutsu_diff::RowKind;
+    match kind {
+        RowKind::Marker => DiffLineClass::Meta,
+        RowKind::FileHeader => DiffLineClass::FileHeader,
+        RowKind::HunkHeader => DiffLineClass::HunkHeader,
+        RowKind::Body(LineKind::Insert) => DiffLineClass::Insert,
+        RowKind::Body(LineKind::Delete) => DiffLineClass::Delete,
+        RowKind::Body(LineKind::Context) => DiffLineClass::Context,
+        RowKind::NoNewline => DiffLineClass::Meta,
+    }
+}
+
+/// Project a frozen [`DiffCore`] into the classed, laid-out form the renderer
+/// already knows how to draw.
+///
+/// The same [`DiffPreview`] shape the inline preview produces, so the full
+/// screen reuses `build_diff_span_brushes` and [`build_diff_band_geometry`]
+/// verbatim instead of growing a parallel rendering path. Two differences from
+/// the inline preview, both deliberate:
+///
+/// - **No stat header.** The text is byte-for-byte `DiffCore::text()` — the
+///   canonical diff — so a row index means the same thing to the renderer and
+///   to the cursor. The stat is drawn in its own header strip instead.
+/// - **No line budget.** The whole diff is shown; only absurd single lines are
+///   elided ([`MAX_VIEW_LINE_CHARS`]). The byte budget was already spent when
+///   the core was built.
+///
+/// **`preview.lines[i]` is `core.rows()[rows.start + i]`**, one for one — the
+/// projection never adds, drops, or reorders a line. Everything the viewer
+/// needs (cursor row → laid-out line, selection rows → bands) is that index,
+/// so an elided line changes what is *drawn* and nothing about what is
+/// addressed. Yank is unaffected either way: it reads the core's canonical
+/// text, never this.
+///
+/// It takes a **window** rather than the whole diff because a diff bounded
+/// only by `MAX_RENDER_BYTES` is up to a megabyte of text, and Parley-shaping
+/// a megabyte to draw forty visible lines is a frame no GPU saves you from.
+/// The viewer lays out a band of rows around the cursor and rebuilds it when
+/// the cursor leaves; the caller owns `rows.start`.
+pub fn view_rows(core: &kaijutsu_diff::DiffCore, rows: std::ops::Range<usize>) -> DiffPreview {
+    let mut b = PreviewBuilder::new();
+    let text = core.text();
+    let end = rows.end.min(core.rows().len());
+    let start = rows.start.min(end);
+
+    for row in &core.rows()[start..end] {
+        let raw = text[row.start..row.end].trim_end_matches('\n');
+        let shown = crate::text::truncate_chars(raw, MAX_VIEW_LINE_CHARS);
+        // The prefix byte only exists if it survived elision (it always does —
+        // the budget is thousands of chars — but derive it rather than assume).
+        let prefix_bytes = (row.text_start - row.start).min(shown.len());
+        b.push(class_for_row(row.kind), prefix_bytes, &shown);
+    }
+
+    b.finish(core.model().stat(), false)
+}
+
+/// The full viewer's error state: a block that declares itself a diff and
+/// holds something that does not parse.
+///
+/// The crate contract is explicit that this is a *visible* state and never an
+/// empty viewer. Shows the banner and a generous window on the source.
+pub fn error_view(text: &str, reason: &str) -> DiffPreview {
+    error_preview_with(text, reason, 500)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -457,6 +548,54 @@ pub fn build_diff_band_geometry(
         let Some(color) = band_color(class, colors) else {
             continue;
         };
+        let cy = (row.top + row.bottom) * 0.5 + offset.1;
+        out.extend_from_slice(&stroke_line_quad(
+            offset.0 as f64,
+            cy as f64,
+            (offset.0 + width) as f64,
+            cy as f64,
+            height as f64,
+            color,
+        ));
+    }
+    out
+}
+
+/// Build the visual-line selection highlight as full-width bands.
+///
+/// Line bands are what the renderer can draw *today* — which is exactly why
+/// the viewer's visual mode is line-wise only until the multi-rect
+/// `BlockFxMaterial` extension lands (`docs/diff.md` slices 5/6). `rows` is the
+/// same wrapped-visual-row list the diff bands use, so a selected line that
+/// wraps is highlighted across every row it occupies.
+///
+/// `selected` is an inclusive range of **logical line indices** into
+/// `preview.lines` — the viewer's row range, straight from
+/// `DiffCore::selection_rows`.
+pub fn build_selection_band_geometry(
+    preview: &DiffPreview,
+    rows: &[PreviewRow],
+    selected: (usize, usize),
+    width: f32,
+    offset: (f32, f32),
+    color: [u8; 4],
+) -> Vec<GeometryVertex> {
+    let (first, last) = selected;
+    if width <= 0.0 || first > last || first >= preview.lines.len() {
+        return Vec::new();
+    }
+    let last = last.min(preview.lines.len() - 1);
+    let (start, end) = (preview.lines[first].start, preview.lines[last].end);
+
+    let mut out = Vec::new();
+    for row in rows {
+        if row.text_offset < start || row.text_offset >= end {
+            continue;
+        }
+        let height = row.bottom - row.top;
+        if height <= 0.0 {
+            continue;
+        }
         let cy = (row.top + row.bottom) * 0.5 + offset.1;
         out.extend_from_slice(&stroke_line_quad(
             offset.0 as f64,
@@ -714,6 +853,113 @@ mod tests {
         );
     }
 
+    // ── the full viewer's projection ────────────────────────────────────────
+
+    fn core(relative: &str) -> kaijutsu_diff::DiffCore {
+        let model = kaijutsu_diff::parse(&fixtures::read(relative)).expect("fixture parses");
+        kaijutsu_diff::DiffCore::new(model)
+    }
+
+    /// The whole document as one window — what every assertion below wants.
+    fn whole(c: &kaijutsu_diff::DiffCore) -> DiffPreview {
+        view_rows(c, 0..c.rows().len())
+    }
+
+    /// The projection's load-bearing property: one laid-out line per core row,
+    /// in order. The cursor row, the selection range, and the band lookup are
+    /// all that index — get this wrong and the cursor draws on the wrong line.
+    #[test]
+    fn the_full_view_is_one_line_per_core_row_in_order() {
+        let c = core("canonical/multi_file.diff");
+        let v = whole(&c);
+        assert_eq!(v.lines.len(), c.rows().len());
+        assert_eq!(v.plain_text, c.text().trim_end_matches('\n'));
+        assert_contiguous(&v);
+
+        for (i, (line, row)) in v.lines.iter().zip(c.rows()).enumerate() {
+            assert_eq!(line.class, class_for_row(row.kind), "row {i}");
+            assert_eq!(line.start, row.start, "row {i} starts elsewhere");
+        }
+    }
+
+    /// Unlike the inline preview, the full view has no line budget and no stat
+    /// header — its text IS the canonical diff, so a row index means the same
+    /// thing to the renderer and to the cursor.
+    #[test]
+    fn the_full_view_shows_every_line_and_leads_with_the_diff_itself() {
+        // Change every tenth line, so the diff is genuinely long rather than
+        // one small hunk in a long file.
+        let before: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let after: String = (1..=200)
+            .map(|i| {
+                if i % 10 == 0 {
+                    format!("CHANGED {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let file = kaijutsu_diff::diff_file(
+            &kaijutsu_diff::FileSpec::modified("big.txt", &before, &after),
+            &kaijutsu_diff::DiffOptions::default(),
+        )
+        .unwrap();
+        let c = kaijutsu_diff::DiffCore::new(DiffModel::new(vec![file]));
+        let v = whole(&c);
+
+        assert!(
+            v.lines.len() > DEFAULT_PREVIEW_LINES,
+            "the full view must not stop at the preview budget",
+        );
+        assert_eq!(v.lines[0].class, DiffLineClass::FileHeader);
+        assert!(v.plain_text.starts_with("diff --git"), "{}", v.plain_text);
+        assert!(v.lines.iter().all(|l| l.class != DiffLineClass::Stat));
+    }
+
+    /// A truncated model's marker leads the canonical text, so it leads the
+    /// view — and reads as meta, not as content.
+    #[test]
+    fn a_truncated_model_shows_its_marker_first() {
+        let c = core("canonical/truncated.diff");
+        let v = whole(&c);
+        assert_eq!(v.lines[0].class, DiffLineClass::Meta);
+        assert!(
+            v.plain_text
+                .starts_with(kaijutsu_diff::TRUNCATION_MARKER_PREFIX)
+        );
+    }
+
+    /// One absurd line must not reach Parley whole, even in the full view —
+    /// and eliding it must not disturb the one-line-per-row correspondence.
+    #[test]
+    fn an_enormous_line_is_elided_without_losing_a_row() {
+        let long = "x".repeat(50_000);
+        let raw = format!("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-short\n+{long}\n");
+        let model = kaijutsu_diff::parse(&raw).expect("parses");
+        let c = kaijutsu_diff::DiffCore::new(model);
+        let v = whole(&c);
+        assert_eq!(v.lines.len(), c.rows().len(), "elision dropped a row");
+        assert!(v.plain_text.len() < 20_000, "{} bytes", v.plain_text.len());
+        assert!(v.plain_text.contains('\u{2026}'));
+        assert_contiguous(&v);
+    }
+
+    /// The declared-Diff-that-doesn't-parse contract, at full-screen scale:
+    /// named, visible, source still readable — never an empty viewer.
+    #[test]
+    fn the_error_view_names_the_problem_and_keeps_the_source() {
+        let source: String = (1..=200).map(|i| format!("not a diff {i}\n")).collect();
+        let v = error_view(&source, "expected a file header");
+        assert!(v.is_error);
+        assert_eq!(v.lines[0].class, DiffLineClass::Error);
+        assert!(v.plain_text.contains("expected a file header"));
+        assert!(
+            v.plain_text.contains("not a diff 150"),
+            "shows more than a preview would"
+        );
+        assert_contiguous(&v);
+    }
+
     // ── bands ───────────────────────────────────────────────────────────────
 
     fn test_colors() -> DiffBandColors {
@@ -808,6 +1054,79 @@ mod tests {
 
         let flat = vec![PreviewRow { text_offset: insert.start, top: 5.0, bottom: 5.0 }];
         assert!(build_diff_band_geometry(&p, &flat, 50.0, (0.0, 0.0), &test_colors()).is_empty());
+    }
+
+    // ── selection bands ─────────────────────────────────────────────────────
+
+    /// Line-wise selection: every visual row of every selected logical line
+    /// gets a band, and nothing outside the range does.
+    #[test]
+    fn selection_bands_cover_exactly_the_selected_rows() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let rows: Vec<PreviewRow> = v
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| PreviewRow {
+                text_offset: l.start,
+                top: i as f32 * 10.0,
+                bottom: i as f32 * 10.0 + 10.0,
+            })
+            .collect();
+
+        let verts = build_selection_band_geometry(&v, &rows, (1, 3), 100.0, (0.0, 0.0), [7; 4]);
+        assert_eq!(verts.len(), 3 * 6, "three rows × one quad × six vertices");
+        let ys: Vec<f32> = verts.iter().map(|x| x.y).collect();
+        let min = ys.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!((min - 10.0).abs() < 0.01, "starts at line 1");
+        assert!((max - 40.0).abs() < 0.01, "ends at the bottom of line 3");
+    }
+
+    /// A wrapped selected line is highlighted across every row it occupies —
+    /// the same byte-offset addressing the diff bands use.
+    #[test]
+    fn a_wrapped_selected_line_is_banded_on_every_row() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let line = v.lines[2];
+        let rows = vec![
+            PreviewRow {
+                text_offset: line.start,
+                top: 0.0,
+                bottom: 10.0,
+            },
+            PreviewRow {
+                text_offset: line.start + 2,
+                top: 10.0,
+                bottom: 20.0,
+            },
+        ];
+        let verts = build_selection_band_geometry(&v, &rows, (2, 2), 50.0, (0.0, 0.0), [7; 4]);
+        assert_eq!(verts.len(), 12);
+    }
+
+    #[test]
+    fn a_degenerate_or_out_of_range_selection_draws_nothing() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let rows = vec![PreviewRow {
+            text_offset: 0,
+            top: 0.0,
+            bottom: 10.0,
+        }];
+        // Inverted, out of range, and zero-width all draw nothing.
+        assert!(
+            build_selection_band_geometry(&v, &rows, (3, 1), 50.0, (0.0, 0.0), [7; 4]).is_empty()
+        );
+        assert!(
+            build_selection_band_geometry(&v, &rows, (9_999, 9_999), 50.0, (0.0, 0.0), [7; 4])
+                .is_empty()
+        );
+        assert!(
+            build_selection_band_geometry(&v, &rows, (0, 0), 0.0, (0.0, 0.0), [7; 4]).is_empty()
+        );
     }
 
     /// Parley reports a trailing empty line for text ending in a newline. We

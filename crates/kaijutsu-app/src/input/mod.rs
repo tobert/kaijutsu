@@ -71,6 +71,62 @@ use bevy::prelude::*;
 #[derive(Resource)]
 pub struct SystemClipboard(pub arboard::Clipboard);
 
+/// Non-blocking **writes** to the system clipboard.
+///
+/// [`SystemClipboard`] is read from the schedule, which is fine — a `get` is
+/// a round-trip to whoever owns the selection and returns. A `set` is not the
+/// mirror image of that: on X11 and Wayland alike, taking ownership means
+/// *becoming* the selection owner and answering requests for as long as you
+/// hold it, so the `arboard::Clipboard` doing the writing has to outlive the
+/// call. Doing that from a Bevy system would put clipboard-protocol latency
+/// on the frame.
+///
+/// So writes go to a dedicated thread that owns its own `Clipboard` for the
+/// life of the process: send a `String`, return immediately. The thread is
+/// also the ownership holder, which is what makes a yanked hunk still
+/// pasteable a minute later.
+///
+/// Absent (like [`SystemClipboard`]) when no clipboard is available; senders
+/// then no-op, and a yank logs rather than silently vanishing.
+#[derive(Resource)]
+pub struct ClipboardWriter(crossbeam_channel::Sender<String>);
+
+impl ClipboardWriter {
+    /// Queue `text` for the clipboard. Returns immediately; failures are
+    /// logged by the writer thread, never swallowed.
+    pub fn write(&self, text: String) {
+        if let Err(e) = self.0.send(text) {
+            warn!("clipboard writer thread is gone: {e}");
+        }
+    }
+
+    /// Start the writer thread, or `None` when the clipboard is unavailable.
+    fn spawn() -> Option<Self> {
+        let (tx, rx) = crossbeam_channel::unbounded::<String>();
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("System clipboard unavailable for writes: {e}. Yank disabled.");
+                return None;
+            }
+        };
+        std::thread::Builder::new()
+            .name("kaijutsu-clipboard".into())
+            .spawn(move || {
+                // Blocks here, not on the frame. Ends when the app drops the
+                // resource and the channel closes.
+                while let Ok(text) = rx.recv() {
+                    if let Err(e) = clipboard.set_text(text) {
+                        warn!("clipboard write failed: {e}");
+                    }
+                }
+            })
+            .inspect_err(|e| warn!("could not start the clipboard writer thread: {e}"))
+            .ok()?;
+        Some(Self(tx))
+    }
+}
+
 /// SystemSet for input dispatch — runs before all domain input handling.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InputPhase {
@@ -110,6 +166,13 @@ impl Plugin for InputPlugin {
             Err(e) => {
                 warn!("System clipboard unavailable: {e}. Copy/paste disabled.");
             }
+        }
+
+        // Writes get their own thread + their own Clipboard — see
+        // `ClipboardWriter`. Separate from the read resource on purpose: the
+        // writer must own the selection for the life of the process.
+        if let Some(writer) = ClipboardWriter::spawn() {
+            app.insert_resource(writer);
         }
 
         // Register resources

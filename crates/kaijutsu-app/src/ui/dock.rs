@@ -846,7 +846,12 @@ pub fn update_mode(
         // 4–5. `Room` covers a station zoom too now — including the well,
         // which has no second screen left of its own since Slice D. `Fsn`
         // reads raw keys like the room, same reasoning.)
-        Screen::Editor | Screen::Room | Screen::Fsn => (theme.mode_normal, &theme.mode_label_normal),
+        // The diff viewer is a vi surface with a mode of its own; it draws
+        // that on its own status strip (like the editor), so the dock just
+        // stays coherent instead of guessing.
+        Screen::Editor | Screen::Diff | Screen::Room | Screen::Fsn => {
+            (theme.mode_normal, &theme.mode_label_normal)
+        }
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -1621,6 +1626,9 @@ pub fn update_hints(
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
         Screen::Editor => "Esc: back to conversation \u{2502} (editor)",
+        Screen::Diff => {
+            "j/k: line \u{2502} ]c/[c: hunk \u{2502} V: select \u{2502} y: yank \u{2502} q: close"
+        }
         Screen::Room => match room.zoomed {
             None => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: zoom \u{2502} Esc: conversation",
             Some(crate::view::room::nav::Station::PatchBay) => {

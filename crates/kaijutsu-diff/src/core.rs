@@ -251,6 +251,14 @@ pub struct DiffCore {
     cmdline_prefix: String,
     cmdline: EditBuffer<DiffInfo>,
     cmdline_group: CursorGroupId,
+    /// Cursor row and visual-line selection as of the last action.
+    ///
+    /// Cached because modalkit's cursor accessors want `&mut`, and a
+    /// *renderer* asking where the cursor is has no business holding a mutable
+    /// borrow of the viewer. Refreshed after every action, so it is never
+    /// behind by more than the keystroke currently being processed.
+    cursor_row: usize,
+    selection: Option<(usize, usize)>,
 }
 
 impl DiffCore {
@@ -282,6 +290,8 @@ impl DiffCore {
             cmdline_prefix: String::new(),
             cmdline,
             cmdline_group,
+            cursor_row: 0,
+            selection: None,
         }
     }
 
@@ -303,20 +313,29 @@ impl DiffCore {
     }
 
     /// The cursor's row index (0-based), clamped into `rows`.
-    pub fn cursor_row(&mut self) -> usize {
-        let y = self.buffer.get_leader(self.group).get_y();
-        y.min(self.rows.len().saturating_sub(1))
+    pub fn cursor_row(&self) -> usize {
+        self.cursor_row
     }
 
     /// The inclusive row range covered by the visual-line selection, if any.
     ///
     /// Line-wise (`V`) is the only visual mode the viewer offers, so a
     /// selection is always whole rows.
-    pub fn selection_rows(&mut self) -> Option<(usize, usize)> {
-        let (start, end, _shape) = self.buffer.get_leader_selection(self.group)?;
+    pub fn selection_rows(&self) -> Option<(usize, usize)> {
+        self.selection
+    }
+
+    /// Re-read the cursor and selection out of modalkit into the cache.
+    fn sync_cursor(&mut self) {
         let last = self.rows.len().saturating_sub(1);
-        let (a, b) = (start.get_y().min(last), end.get_y().min(last));
-        Some((a.min(b), a.max(b)))
+        self.cursor_row = self.buffer.get_leader(self.group).get_y().min(last);
+        self.selection =
+            self.buffer
+                .get_leader_selection(self.group)
+                .map(|(start, end, _shape)| {
+                    let (a, b) = (start.get_y().min(last), end.get_y().min(last));
+                    (a.min(b), a.max(b))
+                });
     }
 
     /// The vim mode banner (`None` in normal mode, `Some("-- VISUAL LINE --")`
@@ -347,6 +366,9 @@ impl DiffCore {
             self.machine.input_key(key);
             while let Some((action, ctx)) = self.machine.pop() {
                 self.handle(action, &ctx, &mut out);
+                // Keep the cache fresh *within* a batch: a `j]c` must see the
+                // cursor the `j` moved, not the one the batch started on.
+                self.sync_cursor();
             }
         }
         out

@@ -5907,7 +5907,9 @@ dependencies = [
 name = "kaijutsu-diff"
 version = "0.1.0"
 dependencies = [
+ "editor-types",
  "imara-diff",
+ "modalkit",
  "proptest",
  "thiserror 2.0.18",
 ]
