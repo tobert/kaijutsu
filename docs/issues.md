@@ -2601,6 +2601,15 @@ the *remaining* findings, triaged.
 ## Testing & Tooling
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
+- **`vfs::backends::local::tests::test_normal_paths_succeed` is flaky under
+  full-workspace parallelism** (found 2026-08-02 verifying the compaction
+  removal). It failed once in a `cargo test --workspace` run, then passed in
+  isolation and in two full `-p kaijutsu-kernel --lib` runs (worktree and
+  main). So it's order- or parallelism-dependent, not a real regression —
+  most likely shared temp-dir or process-CWD state between tests. Worth
+  chasing: a test that fails only sometimes trains us to ignore red, which
+  is the expensive failure mode. Note also that `cargo test … | tail` hides
+  this — the pipe's exit status is `tail`'s, so the run reads as passing.
 - **`kj` help-doc siblings: no consumer, unaudited.** `kj.md`'s command table
   was regenerated from the real clap tree 2026-07-17 (cleanup batch); the six
   siblings (`kj-cache/context/drift/fork/preset/workspace.md`) still have

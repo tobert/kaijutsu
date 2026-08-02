@@ -183,4 +183,81 @@ mod tests {
         assert_eq!(old.content, "hello");
         assert_eq!(old.tick, Some(crate::Tick::new(42)));
     }
+
+    // ── Compacted-flag removal (2026-08-02) ─────────────────────────────────
+    //
+    // The same additive-evolution contract, for fields that came OUT rather
+    // than in. A long-lived kernel holds oplog and snapshot rows encoded while
+    // `compacted`/`compacted_at` were real fields; the current `BlockSnapshot`
+    // has neither. Decoding must tolerate and drop them. If anyone ever adds
+    // `deny_unknown_fields` to this crate, THIS test fails instead of a real
+    // conversation history silently failing to load.
+
+    /// Old-shape mimic carrying the retired `compacted`/`compacted_at` keys
+    /// alongside the still-live required fields.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct CompactedEraSnapshotMimic {
+        id: crate::BlockId,
+        role: crate::Role,
+        status: crate::Status,
+        kind: BlockKind,
+        content: String,
+        created_at: u64,
+        tick: Option<crate::Tick>,
+        compacted: bool,
+        compacted_at: u64,
+    }
+
+    /// FROZEN compacted-era CBOR: a snapshot encoded while `compacted`
+    /// (true) and `compacted_at` (99) were real fields. Captured once from
+    /// `encode(&CompactedEraSnapshotMimic{..})` on 2026-08-02, the day the
+    /// fields were removed. It must keep decoding forever.
+    const FROZEN_COMPACTED_ERA_SNAPSHOT: &[u8] = &[
+        1, 169, 98, 105, 100, 163, 106, 99, 111, 110, 116, 101, 120, 116, 95, 105, 100, 80, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 108, 112, 114, 105, 110, 99, 105, 112, 97, 108,
+        95, 105, 100, 80, 252, 64, 80, 153, 161, 152, 94, 64, 153, 72, 246, 250, 30, 85, 216, 78,
+        99, 115, 101, 113, 3, 100, 114, 111, 108, 101, 101, 109, 111, 100, 101, 108, 102, 115, 116,
+        97, 116, 117, 115, 100, 100, 111, 110, 101, 100, 107, 105, 110, 100, 100, 116, 101, 120,
+        116, 103, 99, 111, 110, 116, 101, 110, 116, 101, 104, 101, 108, 108, 111, 106, 99, 114,
+        101, 97, 116, 101, 100, 95, 97, 116, 27, 0, 0, 1, 139, 207, 229, 104, 0, 100, 116, 105, 99,
+        107, 24, 42, 105, 99, 111, 109, 112, 97, 99, 116, 101, 100, 245, 108, 99, 111, 109, 112,
+        97, 99, 116, 101, 100, 95, 97, 116, 24, 99,
+    ];
+
+    /// A pre-removal payload still decodes into the current, compacted-free
+    /// `BlockSnapshot`: the two retired keys are tolerated and dropped, and
+    /// every surviving field arrives intact. This is the guard on real
+    /// on-disk history — the removal is only safe as long as this passes.
+    #[test]
+    fn frozen_compacted_era_snapshot_still_decodes() {
+        let snap: BlockSnapshot = decode(FROZEN_COMPACTED_ERA_SNAPSHOT)
+            .expect("a pre-removal payload must still decode after the field removal");
+        assert_eq!(snap.id, fixture_id());
+        assert_eq!(snap.kind, BlockKind::Text);
+        assert_eq!(snap.content, "hello");
+        assert_eq!(snap.tick, Some(crate::Tick::new(42)));
+        assert_eq!(snap.status, crate::Status::Done);
+    }
+
+    /// Guards that the frozen literal is the genuine compacted-era encoding,
+    /// so the blob above can't quietly rot into something that proves nothing.
+    #[test]
+    fn frozen_compacted_era_literal_matches_its_encoding() {
+        let old = CompactedEraSnapshotMimic {
+            id: fixture_id(),
+            role: crate::Role::Model,
+            status: crate::Status::Done,
+            kind: BlockKind::Text,
+            content: "hello".to_string(),
+            created_at: 1_700_000_000_000,
+            tick: Some(crate::Tick::new(42)),
+            compacted: true,
+            compacted_at: 99,
+        };
+        let bytes = encode(&old).expect("encode compacted-era mimic");
+        assert_eq!(
+            bytes, FROZEN_COMPACTED_ERA_SNAPSHOT,
+            "frozen literal drifted from the current encoding — re-freeze intentionally"
+        );
+    }
 }
