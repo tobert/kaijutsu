@@ -360,16 +360,16 @@ fn render_staff(
     cursor_x += sp * 0.4;
 
     // 2. Clef glyph.
-    if let Some((cp, line_pos)) = clef_glyph(ctx.clef) {
-        if font.glyph_path(cp).is_some() {
-            elements.push(EngravingElement::Glyph {
-                codepoint: cp,
-                x: cursor_x,
-                y: ctx.y_at(line_pos),
-                scale: ctx.scale,
-                source_span: (0, 0),
-            });
-        }
+    if let Some((cp, line_pos)) = clef_glyph(ctx.clef)
+        && font.glyph_path(cp).is_some()
+    {
+        elements.push(EngravingElement::Glyph {
+            codepoint: cp,
+            x: cursor_x,
+            y: ctx.y_at(line_pos),
+            scale: ctx.scale,
+            source_span: (0, 0),
+        });
     }
     cursor_x += sp * 3.5;
 
@@ -381,11 +381,7 @@ fn render_staff(
     } else {
         flat_octaves(ctx.clef)
     };
-    for i in 0..count as usize {
-        if i >= 7 {
-            break;
-        }
-        let (note, oct) = placements[i];
+    for &(note, oct) in placements.iter().take(count as usize) {
         let pos = ctx.pos_for(&note, oct);
         elements.push(EngravingElement::Glyph {
             codepoint: acc_codepoint,
@@ -401,13 +397,13 @@ fn render_staff(
     }
 
     // 4. Time signature. Free meter (`M:none`) draws none.
-    if let Some(meter) = &header.meter {
-        if !matches!(meter, Meter::None) {
-            let (num, den) = meter.to_fraction();
-            emit_time_sig_digit(elements, num, cursor_x, ctx.y_at(1.0), ctx.scale);
-            emit_time_sig_digit(elements, den, cursor_x, ctx.y_at(3.0), ctx.scale);
-            cursor_x += sp * 2.5;
-        }
+    if let Some(meter) = &header.meter
+        && !matches!(meter, Meter::None)
+    {
+        let (num, den) = meter.to_fraction();
+        emit_time_sig_digit(elements, num, cursor_x, ctx.y_at(1.0), ctx.scale);
+        emit_time_sig_digit(elements, den, cursor_x, ctx.y_at(3.0), ctx.scale);
+        cursor_x += sp * 2.5;
     }
 
     cursor_x += sp * 0.5; // padding before first note
@@ -484,16 +480,16 @@ fn render_staff(
 
     for (token_idx, token) in tokens.iter().enumerate() {
         let element: &Element = match token {
-            LayoutToken::Real(e) => *e,
+            LayoutToken::Real(e) => e,
             LayoutToken::SlurStart => {
                 slur_stack.push(None);
                 continue;
             }
             LayoutToken::SlurEnd => {
-                if let Some(Some(start)) = slur_stack.pop() {
-                    if let Some(end) = last_anchor {
-                        emit_tie_or_slur(elements, start, end, ctx, /*is_tie=*/ false);
-                    }
+                if let Some(Some(start)) = slur_stack.pop()
+                    && let Some(end) = last_anchor
+                {
+                    emit_tie_or_slur(elements, start, end, ctx, /*is_tie=*/ false);
                 }
                 // SlurEnd with no matching open (or empty group): drop
                 // silently. The parser already warns on unbalanced slurs.
@@ -519,10 +515,11 @@ fn render_staff(
                 };
 
                 // Resolve any pending tie before the new notehead lands.
-                if let Some(prev) = pending_tie.take() {
-                    if prev.pitch == anchor.pitch && prev.octave == anchor.octave {
-                        emit_tie_or_slur(elements, prev, anchor, ctx, /*is_tie=*/ true);
-                    }
+                if let Some(prev) = pending_tie.take()
+                    && prev.pitch == anchor.pitch
+                    && prev.octave == anchor.octave
+                {
+                    emit_tie_or_slur(elements, prev, anchor, ctx, /*is_tie=*/ true);
                 }
                 // Bind any pending slur opens to this note's anchor.
                 for slot in slur_stack.iter_mut() {
@@ -644,30 +641,30 @@ fn render_staff(
                 }
 
                 // Stem on the chord (highest to lowest note).
-                if absolute_ratio(&chord.duration, &unit_length) < 1.0 {
-                    if let (Some(first), Some(last)) = (chord.notes.first(), chord.notes.last()) {
-                        let top_pos = ctx.pos_for(&first.pitch, first.octave);
-                        let bot_pos = ctx.pos_for(&last.pitch, last.octave);
-                        let (stem_top, stem_bot) = if top_pos < bot_pos {
-                            (top_pos, bot_pos)
-                        } else {
-                            (bot_pos, top_pos)
-                        };
-                        let cp = notehead_codepoint(&chord.duration, &unit_length);
-                        let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-                        let avg_pos = (stem_top + stem_bot) / 2.0;
-                        let up = avg_pos > 2.0;
-                        let stem_x = stem_center_x(cursor_x, nw, up);
-                        let stem_dir = if up { -1.0 } else { 1.0 };
-                        elements.push(EngravingElement::Line {
-                            x1: stem_x,
-                            y1: ctx.y_at(stem_top),
-                            x2: stem_x,
-                            y2: ctx.y_at(stem_bot) + stem_dir * sp * 3.5,
-                            width: STEM_WIDTH,
-                            source_span: span,
-                        });
-                    }
+                if absolute_ratio(&chord.duration, &unit_length) < 1.0
+                    && let (Some(first), Some(last)) = (chord.notes.first(), chord.notes.last())
+                {
+                    let top_pos = ctx.pos_for(&first.pitch, first.octave);
+                    let bot_pos = ctx.pos_for(&last.pitch, last.octave);
+                    let (stem_top, stem_bot) = if top_pos < bot_pos {
+                        (top_pos, bot_pos)
+                    } else {
+                        (bot_pos, top_pos)
+                    };
+                    let cp = notehead_codepoint(&chord.duration, &unit_length);
+                    let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+                    let avg_pos = (stem_top + stem_bot) / 2.0;
+                    let up = avg_pos > 2.0;
+                    let stem_x = stem_center_x(cursor_x, nw, up);
+                    let stem_dir = if up { -1.0 } else { 1.0 };
+                    elements.push(EngravingElement::Line {
+                        x1: stem_x,
+                        y1: ctx.y_at(stem_top),
+                        x2: stem_x,
+                        y2: ctx.y_at(stem_bot) + stem_dir * sp * 3.5,
+                        width: STEM_WIDTH,
+                        source_span: span,
+                    });
                 }
                 cursor_x += dur_width;
             }
@@ -865,19 +862,19 @@ fn render_staff(
                 let new_key = crate::parser::key::parse_key_field(val, &mut fc);
                 cursor_x += sp * 0.5;
 
-                if let Some(new_clef) = new_key.clef {
-                    if new_clef != ctx.clef {
-                        ctx.clef = new_clef;
-                        if let Some((cp, line_pos)) = clef_glyph(ctx.clef) {
-                            elements.push(EngravingElement::Glyph {
-                                codepoint: cp,
-                                x: cursor_x,
-                                y: ctx.y_at(line_pos),
-                                scale: ctx.scale,
-                                source_span: (0, 0),
-                            });
-                            cursor_x += sp * 3.0;
-                        }
+                if let Some(new_clef) = new_key.clef
+                    && new_clef != ctx.clef
+                {
+                    ctx.clef = new_clef;
+                    if let Some((cp, line_pos)) = clef_glyph(ctx.clef) {
+                        elements.push(EngravingElement::Glyph {
+                            codepoint: cp,
+                            x: cursor_x,
+                            y: ctx.y_at(line_pos),
+                            scale: ctx.scale,
+                            source_span: (0, 0),
+                        });
+                        cursor_x += sp * 3.0;
                     }
                 }
 
@@ -945,10 +942,8 @@ fn render_staff(
             })
             .map(|e| matches!(e, Element::Note(_)))
             .unwrap_or(false);
-        if ends_on_note {
-            if let Some(a) = last_anchor {
-                cursor_x = cursor_x.min(a.x_right + sp * 0.7);
-            }
+        if ends_on_note && let Some(a) = last_anchor {
+            cursor_x = cursor_x.min(a.x_right + sp * 0.7);
         }
         let gap = sp * 0.3;
         vertical_bar(elements, cursor_x, BAR_THIN, ctx);
@@ -1146,19 +1141,17 @@ fn emit_grace_notes(
         x += grace_step;
     }
 
-    if acciaccatura {
-        if let Some((stem_x, y)) = first_grace_anchor {
-            // Slash crossing the stem at roughly mid-stem height.
-            let slash_half = ctx.sp * 0.5;
-            elements.push(EngravingElement::Line {
-                x1: stem_x - slash_half,
-                y1: y - ctx.sp * 0.5,
-                x2: stem_x + slash_half,
-                y2: y - ctx.sp * 1.7,
-                width: 0.7,
-                source_span: (0, 0),
-            });
-        }
+    if acciaccatura && let Some((stem_x, y)) = first_grace_anchor {
+        // Slash crossing the stem at roughly mid-stem height.
+        let slash_half = ctx.sp * 0.5;
+        elements.push(EngravingElement::Line {
+            x1: stem_x - slash_half,
+            y1: y - ctx.sp * 0.5,
+            x2: stem_x + slash_half,
+            y2: y - ctx.sp * 1.7,
+            width: 0.7,
+            source_span: (0, 0),
+        });
     }
 
     // Leave a small gap between the grace group and the principal note.
@@ -1477,11 +1470,11 @@ fn format_nth_label(nums: &[u8]) -> String {
     }
     let mut runs: Vec<(u8, u8)> = Vec::new(); // (start, end) inclusive
     for &n in nums {
-        if let Some(last) = runs.last_mut() {
-            if n == last.1 + 1 {
-                last.1 = n;
-                continue;
-            }
+        if let Some(last) = runs.last_mut()
+            && n == last.1 + 1
+        {
+            last.1 = n;
+            continue;
         }
         runs.push((n, n));
     }
@@ -1732,13 +1725,13 @@ fn dot_count(duration: &Duration) -> usize {
     let g = gcd(n, d);
     n /= g;
     d /= g;
-    while d % 2 == 0 {
+    while d.is_multiple_of(2) {
         d /= 2;
     }
     if d != 1 {
         return 0; // not a plain power-of-two value (e.g. a tuplet ratio)
     }
-    while n % 2 == 0 {
+    while n.is_multiple_of(2) {
         n /= 2;
     }
     match n {

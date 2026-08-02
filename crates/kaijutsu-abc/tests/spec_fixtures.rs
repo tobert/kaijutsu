@@ -122,7 +122,7 @@ fn collect_fixtures() -> Vec<(String, PathBuf)> {
         };
         let mut files: Vec<_> = files
             .flatten()
-            .filter(|f| f.path().extension().map_or(false, |e| e == "abc"))
+            .filter(|f| f.path().extension().is_some_and(|e| e == "abc"))
             .collect();
         files.sort_by_key(|f| f.file_name());
         for file in files {
@@ -244,7 +244,7 @@ fn spec_fixture_landscape() {
         }
     }
     let mut patterns: Vec<_> = pattern_counts.into_iter().collect();
-    patterns.sort_by(|a, b| b.1.cmp(&a.1));
+    patterns.sort_by_key(|b| std::cmp::Reverse(b.1));
     let total_warnings: usize = patterns.iter().map(|(_, n)| *n).sum();
 
     println!(
@@ -265,15 +265,15 @@ fn spec_fixture_landscape() {
     let mut char_counts: BTreeMap<char, usize> = BTreeMap::new();
     for o in &outcomes {
         for msg in &o.raw_warnings {
-            if let Some(rest) = msg.strip_prefix("Skipping unknown character '") {
-                if let Some(c) = rest.chars().next() {
-                    *char_counts.entry(c).or_default() += 1;
-                }
+            if let Some(rest) = msg.strip_prefix("Skipping unknown character '")
+                && let Some(c) = rest.chars().next()
+            {
+                *char_counts.entry(c).or_default() += 1;
             }
         }
     }
     let mut chars: Vec<_> = char_counts.into_iter().collect();
-    chars.sort_by(|a, b| b.1.cmp(&a.1));
+    chars.sort_by_key(|b| std::cmp::Reverse(b.1));
     println!("\n=== unknown chars hitting the body.rs fallback ===\n");
     for (c, n) in chars.iter().take(15) {
         let codepoint = format!("U+{:04X}", *c as u32);
@@ -290,8 +290,11 @@ fn spec_fixture_landscape() {
         total_warns, MAX_TOTAL_WARNINGS, total_errors, MAX_TOTAL_ERRORS
     );
 
+    // MAX_TOTAL_ERRORS is 0 (usize), so `<=` and `==` are equivalent here —
+    // `==` says what's actually meant (the ratchet is "no errors, ever")
+    // without tripping absurd_extreme_comparisons on an unsigned <= MIN.
     assert!(
-        total_errors <= MAX_TOTAL_ERRORS,
+        total_errors == MAX_TOTAL_ERRORS,
         "Spec fixtures emitted {} errors (baseline {}). Either fix the regression \
          or, if this is intentional, raise MAX_TOTAL_ERRORS with justification.",
         total_errors,

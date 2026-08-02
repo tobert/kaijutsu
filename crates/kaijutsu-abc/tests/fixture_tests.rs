@@ -1085,8 +1085,8 @@ f'|
     );
 
     // All voices should have produced notes
-    for i in 1..19 {
-        let voice_notes: Vec<_> = tracks[i].iter().filter(|e| e.is_note_on).collect();
+    for (i, track) in tracks.iter().enumerate().take(19).skip(1) {
+        let voice_notes: Vec<_> = track.iter().filter(|e| e.is_note_on).collect();
         assert!(!voice_notes.is_empty(), "Voice {} should have notes", i);
     }
 }

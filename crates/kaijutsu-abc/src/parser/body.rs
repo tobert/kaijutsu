@@ -117,22 +117,22 @@ fn parse_body_inner(
                 // An inline `I:linebreak …` field updates the active
                 // linebreak mode mid-body so `$` recognition can be
                 // toggled per spec §6.1.
-                if field.field_type == 'I' {
-                    if let Some(rest) = field.value.trim().strip_prefix("linebreak") {
-                        linebreak = match rest.trim() {
-                            "$" => LinebreakMode::Dollar,
-                            "!" => LinebreakMode::Bang,
-                            "<none>" | "none" => LinebreakMode::None,
-                            _ => LinebreakMode::Eol,
-                        };
-                    }
+                if field.field_type == 'I'
+                    && let Some(rest) = field.value.trim().strip_prefix("linebreak")
+                {
+                    linebreak = match rest.trim() {
+                        "$" => LinebreakMode::Dollar,
+                        "!" => LinebreakMode::Bang,
+                        "<none>" | "none" => LinebreakMode::None,
+                        _ => LinebreakMode::Eol,
+                    };
                 }
                 // Inline `U:` assignments (re)bind a redefinable
                 // symbol mid-body per spec §4.16.
-                if field.field_type == 'U' {
-                    if let Some((k, v)) = super::parse_u_assignment(&field.value) {
-                        user_symbols.insert(k, v);
-                    }
+                if field.field_type == 'U'
+                    && let Some((k, v)) = super::parse_u_assignment(&field.value)
+                {
+                    user_symbols.insert(k, v);
                 }
                 elements.push(Element::InlineField(field));
                 at_line_start = false;
@@ -238,11 +238,11 @@ fn parse_body_inner(
         // the following note for the shortening half. If no previous
         // note or no follow-up note, leaves `remaining` alone so the
         // chars hit the unknown-character fallback below.
-        if remaining.starts_with('>') || remaining.starts_with('<') {
-            if try_broken_rhythm(&mut remaining, &mut elements) {
-                at_line_start = false;
-                continue;
-            }
+        if (remaining.starts_with('>') || remaining.starts_with('<'))
+            && try_broken_rhythm(&mut remaining, &mut elements)
+        {
+            at_line_start = false;
+            continue;
         }
 
         // Check for comment or directive
@@ -296,31 +296,30 @@ fn parse_body_inner(
         // the expansion in via a recursive body parse. Recursion is
         // depth-capped so a self-referential definition can't blow
         // the stack.
-        if let Some(c) = remaining.chars().next() {
-            if c.is_ascii_alphabetic() {
-                if let Some(expansion) = user_symbols.get(&c).cloned() {
-                    remaining = &remaining[c.len_utf8()..];
-                    if expansion_depth < MAX_U_EXPANSION_DEPTH {
-                        let expanded = parse_body_inner(
-                            &expansion,
-                            collector,
-                            mode,
-                            linebreak,
-                            user_symbols,
-                            expansion_depth + 1,
-                            voice_defs,
-                        );
-                        elements.extend(expanded);
-                    } else {
-                        collector.warning(format!(
-                            "U:{} expansion exceeded depth {} — dropped",
-                            c, MAX_U_EXPANSION_DEPTH
-                        ));
-                    }
-                    at_line_start = false;
-                    continue;
-                }
+        if let Some(c) = remaining.chars().next()
+            && c.is_ascii_alphabetic()
+            && let Some(expansion) = user_symbols.get(&c).cloned()
+        {
+            remaining = &remaining[c.len_utf8()..];
+            if expansion_depth < MAX_U_EXPANSION_DEPTH {
+                let expanded = parse_body_inner(
+                    &expansion,
+                    collector,
+                    mode,
+                    linebreak,
+                    user_symbols,
+                    expansion_depth + 1,
+                    voice_defs,
+                );
+                elements.extend(expanded);
+            } else {
+                collector.warning(format!(
+                    "U:{} expansion exceeded depth {} — dropped",
+                    c, MAX_U_EXPANSION_DEPTH
+                ));
             }
+            at_line_start = false;
+            continue;
         }
 
         // Try to parse an element
@@ -579,10 +578,10 @@ fn try_parse_element(
     }
 
     // Try chord symbol "G"
-    if input.starts_with('"') {
-        if let Ok(symbol) = parse_chord_symbol.parse_next(input) {
-            return Some(Element::ChordSymbol(symbol));
-        }
+    if input.starts_with('"')
+        && let Ok(symbol) = parse_chord_symbol.parse_next(input)
+    {
+        return Some(Element::ChordSymbol(symbol));
     }
 
     // Try chord [CEG]
@@ -592,18 +591,18 @@ fn try_parse_element(
             // Check for voice switch [V:id]. The bracketed form can also
             // carry attributes (`[V:T clef=bass]`); split the id from them
             // so the switch target stays a bare id and the clef is recorded.
-            if input.starts_with("[V:") {
-                if let Some(field) = try_parse_inline_field(input) {
-                    let value = field.value.trim();
-                    let (voice_id, attrs) = match value.find(char::is_whitespace) {
-                        Some(sp) => (value[..sp].to_string(), value[sp..].trim()),
-                        None => (value.to_string(), ""),
-                    };
-                    if !attrs.is_empty() {
-                        record_voice_def(voice_defs, &voice_id, attrs, collector);
-                    }
-                    return Some(Element::VoiceSwitch(voice_id));
+            if input.starts_with("[V:")
+                && let Some(field) = try_parse_inline_field(input)
+            {
+                let value = field.value.trim();
+                let (voice_id, attrs) = match value.find(char::is_whitespace) {
+                    Some(sp) => (value[..sp].to_string(), value[sp..].trim()),
+                    None => (value.to_string(), ""),
+                };
+                if !attrs.is_empty() {
+                    record_voice_def(voice_defs, &voice_id, attrs, collector);
                 }
+                return Some(Element::VoiceSwitch(voice_id));
             }
             // Other inline field [M:3/4]
             if let Some(field) = try_parse_inline_field(input) {
@@ -616,17 +615,17 @@ fn try_parse_element(
     }
 
     // Try rest (z/x visible/invisible; Z/X multi-measure visible/invisible, §4.5)
-    if input.starts_with(['z', 'x', 'Z', 'X']) {
-        if let Ok(rest) = parse_rest.parse_next(input) {
-            return Some(Element::Rest(rest));
-        }
+    if input.starts_with(['z', 'x', 'Z', 'X'])
+        && let Ok(rest) = parse_rest.parse_next(input)
+    {
+        return Some(Element::Rest(rest));
     }
 
     // Try grace notes
-    if input.starts_with('{') {
-        if let Some(grace) = try_parse_grace_notes(input) {
-            return Some(grace);
-        }
+    if input.starts_with('{')
+        && let Some(grace) = try_parse_grace_notes(input)
+    {
+        return Some(grace);
     }
 
     // Try decoration
@@ -726,7 +725,7 @@ fn parse_ending_list(input: &str) -> (Vec<u8>, usize) {
     loop {
         match bytes.get(i) {
             Some(b) if b.is_ascii_digit() => {
-                let digit = (b - b'0') as u8;
+                let digit = b - b'0';
                 current = Some(current.unwrap_or(0).saturating_mul(10).saturating_add(digit));
                 i += 1;
             }
@@ -1056,7 +1055,7 @@ fn matched_long_form_decoration(input: &str) -> Option<usize> {
     // decoration, just a stray `+` (e.g. an inline math char) and we
     // bail so it can hit other handlers.
     let after = &input[1..];
-    let end = after.find(|c| c == delim || c == '\n')?;
+    let end = after.find([delim, '\n'])?;
     if after.as_bytes()[end] != delim as u8 {
         return None;
     }

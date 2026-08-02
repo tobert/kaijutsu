@@ -172,11 +172,11 @@ impl KeyAttrs {
         // Bare clef shorthand: "bass", "treble", "alto", "tenor" with
         // optional ±8 suffix. Only treated as a clef if we don't already
         // have one (lets explicit `clef=foo` win on conflict).
-        if self.clef.is_none() {
-            if let Some(c) = parse_clef_name(tok) {
-                self.clef = Some(c);
-                return true;
-            }
+        if self.clef.is_none()
+            && let Some(c) = parse_clef_name(tok)
+        {
+            self.clef = Some(c);
+            return true;
         }
         false
     }

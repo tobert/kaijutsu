@@ -341,10 +341,10 @@ fn build_single_track_writer(tune: &Tune, params: &MidiParams) -> MidiWriter {
                     }
 
                     // A tie carries the effective accidental to the next note.
-                    if note.tie {
-                        if let Some(acc) = eff_acc {
-                            tie_carry.insert((note.pitch, note.octave), acc);
-                        }
+                    if note.tie
+                        && let Some(acc) = eff_acc
+                    {
+                        tie_carry.insert((note.pitch, note.octave), acc);
                     }
 
                     // Update bar accidentals if note has explicit accidental
@@ -605,10 +605,10 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
                         writer.note_channel(midi_pitch, params.velocity, ticks, channel);
                     }
 
-                    if note.tie {
-                        if let Some(acc) = eff_acc {
-                            tie_carry.insert((note.pitch, note.octave), acc);
-                        }
+                    if note.tie
+                        && let Some(acc) = eff_acc
+                    {
+                        tie_carry.insert((note.pitch, note.octave), acc);
                     }
 
                     if let Some(acc) = note.accidental {
@@ -950,11 +950,10 @@ impl MidiWriter {
     fn tempo(&mut self, beat_unit: (u8, u8), bpm: u16) {
         let (num, den) = beat_unit;
         let denom = (bpm as u64) * (num as u64) * 4;
-        let us_per_quarter = if denom == 0 {
-            500_000
-        } else {
-            (60_000_000u64 * den as u64 / denom) as u32
-        };
+        let us_per_quarter = (60_000_000u64 * den as u64)
+            .checked_div(denom)
+            .map(|v| v as u32)
+            .unwrap_or(500_000);
         self.meta_event(
             0x51,
             vec![

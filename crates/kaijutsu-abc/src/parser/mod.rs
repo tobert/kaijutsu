@@ -37,10 +37,10 @@ pub(super) fn build_user_symbols(
 ) -> HashMap<char, String> {
     let mut map = HashMap::new();
     for f in file_header.other_fields.iter().chain(tune_header.other_fields.iter()) {
-        if f.field_type == 'U' {
-            if let Some((k, v)) = parse_u_assignment(&f.value) {
-                map.insert(k, v);
-            }
+        if f.field_type == 'U'
+            && let Some((k, v)) = parse_u_assignment(&f.value)
+        {
+            map.insert(k, v);
         }
     }
     map
