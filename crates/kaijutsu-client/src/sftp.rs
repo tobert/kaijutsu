@@ -229,10 +229,10 @@ impl Drop for FlightGuard<'_> {
         // A Drop must not panic (a double-panic aborts); the std `Mutex` here is
         // only ever held for these O(1) map ops and never across user code, so
         // it can't actually be poisoned — but tolerate it defensively.
-        if let Ok(mut locks) = self.locks.lock() {
-            if Arc::strong_count(&self.lock) <= 2 {
-                locks.remove(&self.hash);
-            }
+        if let Ok(mut locks) = self.locks.lock()
+            && Arc::strong_count(&self.lock) <= 2
+        {
+            locks.remove(&self.hash);
         }
     }
 }

@@ -305,7 +305,7 @@ mod tests {
                     None,
                     Role::User,
                     BlockKind::Text,
-                    &format!("b{i}"),
+                    format!("b{i}"),
                     Status::Done,
                     ContentType::Plain,
                 )

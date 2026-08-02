@@ -1809,7 +1809,7 @@ impl KernelHandle {
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.set_last_context_request();
         request.get().set_client_id(client_id);
-        request.get().set_context_id(&context_id.to_string());
+        request.get().set_context_id(context_id.to_string());
         request.send().promise.await?;
         Ok(())
     }
@@ -3533,6 +3533,69 @@ pub enum RpcError {
     Other(String),
 }
 
+// ============================================================================
+// PeerCommands capnp server (client-side callback)
+// ============================================================================
+
+/// Implements the `PeerCommands` Cap'n Proto interface on the client side.
+///
+/// Lives in `spawn_local` (is `!Send`). Forwards invocations to the caller
+/// via an mpsc channel so they can be processed on any thread.
+struct PeerCommandsImpl {
+    tx: std::sync::mpsc::Sender<crate::actor::PeerInvocation>,
+}
+
+impl crate::kaijutsu_capnp::peer_commands::Server for PeerCommandsImpl {
+    async fn invoke(
+        self: capnp::capability::Rc<Self>,
+        params: crate::kaijutsu_capnp::peer_commands::InvokeParams,
+        mut results: crate::kaijutsu_capnp::peer_commands::InvokeResults,
+    ) -> Result<(), capnp::Error> {
+        let action = params
+            .get()?
+            .get_action()?
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        let invoke_params = params.get()?.get_params()?.to_vec();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let invocation = crate::actor::PeerInvocation {
+            action,
+            params: invoke_params,
+            reply: reply_tx,
+        };
+
+        // std::sync::mpsc::Sender::send is non-blocking and works from any executor
+        self.tx
+            .send(invocation)
+            .map_err(|_| capnp::Error::failed("peer handler disconnected".into()))?;
+
+        // Await the reply with timeout — prevents indefinite hang if the app
+        // stalls or crashes. 15s is generous for a frame-rate-driven poll loop.
+        let response = tokio::time::timeout(
+            crate::constants::PEER_INVOCATION_TIMEOUT,
+            reply_rx,
+        )
+        .await
+        .map_err(|_| {
+            capnp::Error::failed(format!(
+                "peer invocation timed out after {}s waiting for app dispatch",
+                crate::constants::PEER_INVOCATION_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|_| capnp::Error::failed("peer handler dropped reply".into()))?;
+
+        match response {
+            Ok(data) => {
+                results.get().set_result(&data);
+                Ok(())
+            }
+            Err(e) => Err(capnp::Error::failed(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4434,68 +4497,5 @@ mod tests {
             parsed.attached,
             vec![ContextId::from_bytes([1u8; 16]), ContextId::from_bytes([2u8; 16])]
         );
-    }
-}
-
-// ============================================================================
-// PeerCommands capnp server (client-side callback)
-// ============================================================================
-
-/// Implements the `PeerCommands` Cap'n Proto interface on the client side.
-///
-/// Lives in `spawn_local` (is `!Send`). Forwards invocations to the caller
-/// via an mpsc channel so they can be processed on any thread.
-struct PeerCommandsImpl {
-    tx: std::sync::mpsc::Sender<crate::actor::PeerInvocation>,
-}
-
-impl crate::kaijutsu_capnp::peer_commands::Server for PeerCommandsImpl {
-    async fn invoke(
-        self: capnp::capability::Rc<Self>,
-        params: crate::kaijutsu_capnp::peer_commands::InvokeParams,
-        mut results: crate::kaijutsu_capnp::peer_commands::InvokeResults,
-    ) -> Result<(), capnp::Error> {
-        let action = params
-            .get()?
-            .get_action()?
-            .to_str()
-            .unwrap_or_default()
-            .to_string();
-        let invoke_params = params.get()?.get_params()?.to_vec();
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let invocation = crate::actor::PeerInvocation {
-            action,
-            params: invoke_params,
-            reply: reply_tx,
-        };
-
-        // std::sync::mpsc::Sender::send is non-blocking and works from any executor
-        self.tx
-            .send(invocation)
-            .map_err(|_| capnp::Error::failed("peer handler disconnected".into()))?;
-
-        // Await the reply with timeout — prevents indefinite hang if the app
-        // stalls or crashes. 15s is generous for a frame-rate-driven poll loop.
-        let response = tokio::time::timeout(
-            crate::constants::PEER_INVOCATION_TIMEOUT,
-            reply_rx,
-        )
-        .await
-        .map_err(|_| {
-            capnp::Error::failed(format!(
-                "peer invocation timed out after {}s waiting for app dispatch",
-                crate::constants::PEER_INVOCATION_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|_| capnp::Error::failed("peer handler dropped reply".into()))?;
-
-        match response {
-            Ok(data) => {
-                results.get().set_result(&data);
-                Ok(())
-            }
-            Err(e) => Err(capnp::Error::failed(e)),
-        }
     }
 }

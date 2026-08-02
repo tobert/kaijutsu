@@ -295,7 +295,7 @@ impl SshClient {
             let result = session
                 .authenticate_publickey_with(
                     &self.config.username,
-                    key.public_key().into_owned().into(),
+                    key.public_key().into_owned(),
                     hash_alg,
                     &mut agent,
                 )

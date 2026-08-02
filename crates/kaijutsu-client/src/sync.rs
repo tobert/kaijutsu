@@ -907,7 +907,7 @@ mod tests {
         // new block as a full snapshot in new_blocks. The client store will
         // reconstruct it from the snapshot.
         // If somehow it fails, fall through to recovery path.
-        if let Err(_) = &result {
+        if result.is_err() {
             assert!(sync.needs_full_sync(ctx));
             assert!(sync.frontier().is_none());
 
