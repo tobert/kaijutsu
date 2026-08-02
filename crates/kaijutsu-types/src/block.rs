@@ -1699,6 +1699,9 @@ impl BlockSnapshot {
     ///
     /// Output data enables per-viewer rendering (e.g., ANSI terminal output,
     /// table formatting) without baking presentation into content.
+    // Constructor mirrors the BlockSnapshot wire fields 1:1; a builder would
+    // change the public API shape for no behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn tool_result_with_output(
         id: BlockId,
         tool_call_id: BlockId,
@@ -3824,10 +3827,7 @@ mod tests {
         assert_eq!(active.len(), 21); // 1 summary + 20 live blocks
 
         // Headers preserve compacted flag
-        let headers: Vec<_> = snaps
-            .iter()
-            .map(|s| BlockHeader::from_snapshot(s))
-            .collect();
+        let headers: Vec<_> = snaps.iter().map(BlockHeader::from_snapshot).collect();
         let compacted_count = headers.iter().filter(|h| h.compacted).count();
         let live_count = headers.iter().filter(|h| !h.compacted).count();
         assert_eq!(compacted_count, 80);
@@ -3927,11 +3927,11 @@ mod tests {
             "kubectl apply",
         ];
         let mut parent = prompt.id;
-        let mut model_seq = 1u64;
-        let mut sys_seq = 0u64;
         let mut all_blocks: Vec<BlockSnapshot> = vec![prompt];
 
-        for tool_name in &tools {
+        for (i, tool_name) in tools.iter().enumerate() {
+            let model_seq = i as u64 + 1;
+            let sys_seq = i as u64;
             let call = BlockSnapshot::tool_call(
                 BlockId::new(ctx, model, model_seq),
                 Some(parent),
@@ -3941,7 +3941,6 @@ mod tests {
                 Role::Model,
                 None,
             );
-            model_seq += 1;
 
             let result = BlockSnapshot::tool_result(
                 BlockId::new(ctx, system, sys_seq),
@@ -3952,7 +3951,6 @@ mod tests {
                 Some(0),
                 None,
             );
-            sys_seq += 1;
 
             // Verify call→result linkage at construction time
             assert_eq!(

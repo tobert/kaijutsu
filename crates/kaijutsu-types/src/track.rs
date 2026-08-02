@@ -80,7 +80,7 @@ impl TrackId {
                 None
             };
             match lowered {
-                Some(c) if c == '-' => {
+                Some('-') => {
                     // Collapse runs of '-' (whether original or mapped).
                     if !prev_dash {
                         out.push('-');
