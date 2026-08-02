@@ -8,10 +8,11 @@ block type.
 
 ## Status
 
-**Designed 2026-08-01 (research + survey session). Slices 0–3 SHIPPED
-2026-08-01** — the `kaijutsu-diff` crate, `ContentType::Diff`, and the whole
-kernel surface (`kj diff`, `diff_block`, hydration-as-projection). Slices 4–6
-(app preview, `Screen::Diff` + `DiffCore`, minimap/folds) are next, in order.
+**Designed 2026-08-01 (research + survey session). Slices 0–4 SHIPPED
+2026-08-01** — the `kaijutsu-diff` crate, `ContentType::Diff`, the whole
+kernel surface (`kj diff`, `diff_block`, hydration-as-projection, `Done`
+validation), and the inline app preview. Slices 5–6 (`Screen::Diff` +
+`DiffCore`, then minimap/folds/word highlight) are next, in order.
 This doc is the plan of record; the per-slice "Build notes" sections below
 correct it where the build disagreed.
 
@@ -173,7 +174,7 @@ correct it where the build disagreed.
    plausible-looking partial patch). Test hydration end-to-end for **both**
    producers — `kj diff` output and `diff_block` may enter different
    role/kind hydration branches.
-4. App preview: rich-content arm + render arm + fence sniff + theme.
+4. **SHIPPED.** App preview: rich-content arm + render arm + fence sniff + theme.
 5. `Screen::Diff` + `DiffCore` + grab/bindings + yank→clipboard.
    **Freeze-on-open**: the viewer binds to `(block_id, content
    version/hash)`; if the block changes underneath, show a stale banner with
@@ -278,6 +279,53 @@ build settled, for slices 4/5:
 - **Not validated on `Done`**: `validate_content_and_attach_errors` still
   matches only Abc/Svg. Tracked in issues.md; the fix wants slice 4's error
   state to render into.
+
+## Build notes — slice 4 SHIPPED 2026-08-01 (app preview)
+
+The inline preview is built: `RichContentKind::Diff`, the render arm, the
+fence sniff, theme colors, and the kernel's `Done` validation. Corrections and
+discoveries only:
+
+- **Parley span styling is BYTE-indexed** — `RangedBuilder::push(property,
+  range)` takes byte ranges into the text, and so does the app's own
+  `SpanBrush`. `WordSpan` needs no translation. **But** the app does not use
+  parley ranged styles at all: `collect_msdf_glyphs` colors *per shaping run*,
+  looking the brush up from `run.text_range().start`. Runs never span a line
+  break, so line-level coloring is exact — and **slice 6's word-level
+  highlight cannot ride this path as-is**: a span starting mid-run is ignored.
+  Slice 6 must either push real parley `StyleProperty::Brush` ranges at build
+  time (parley then splits runs) or track per-cluster offsets in the bridge.
+  Decide there; nothing in slice 4 blocks either.
+- **`PreviewLine::text_start`** is the translation slice 6 wants: a body line's
+  own text starts one ASCII byte past the line start (the `+`/`-`/space
+  prefix), so a `WordSpan` maps by adding it. Pinned by a multibyte test.
+- **Preview line ranges tile the text** (contiguous, no gaps). Both lookups
+  are by byte offset — the brush from a run's start, the background band from
+  a *wrapped visual row's* start (`Line::text_range().start`, with
+  `min_coord`/`max_coord` for the row box). A gap would fall through to the
+  fallback brush mid-line; index-based row lookup would tint only the first
+  row of a wrapped `+` line.
+- **Two mechanisms, two failure policies.** Declared `Diff` always renders as
+  a diff, error preview included. A sniffed ` ```diff ` fence that does not
+  parse falls through untouched — sniffing may enrich, never accuse. (SVG's
+  fall-through is right for SVG and wrong here: for a diff, plain text is
+  indistinguishable from "we chose not to color it".)
+- **A per-line elision was needed on top of the two budgets.**
+  `truncate_to_bytes(MAX_RENDER_BYTES)` + `truncate_to_lines(20)` bound the
+  total and the count but not the *shape*: twenty lines of a minified bundle
+  fits both and is a megabyte of wrapped text. `MAX_PREVIEW_LINE_CHARS` = 500.
+- **`MsdfBlockGeometry` had a latent staleness bug**, not just an outdated
+  comment: nothing ever cleared it, so a block that stopped being ABC (now:
+  ABC *or* Diff) kept compositing old shapes behind new content. It is now
+  cleared at the top of every rebuild; the producers refill it in the same
+  pass under the shared `MsdfBlockGlyphs.version` gate. Bands reuse
+  `stroke_line_quad` — a band *is* a butt-capped horizontal stroke.
+- **Theme colors are compiled-in**, like the markdown and sparkline colors
+  beside them — `ThemeData`/`theme.toml` exposes neither. Wiring rich-content
+  colors through the CRDT-owned theme is its own (unscheduled) piece of work.
+- **The kernel arm landed with this slice**, not after it: `validate_diff`
+  in `validate_content_and_attach_errors` + the `Diff` gate in `set_status`,
+  with `DiffError::line()` added so the `ErrorPayload` gets a real span.
 
 ## Seam guidance (deepseek review, 2026-08-01)
 
