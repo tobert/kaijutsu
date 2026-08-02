@@ -54,8 +54,16 @@ slice-4 pull machinery should mostly transfer; the reference decoder is
         "role": "control-surface"
       }
     },
-    "identity_reply": null,
-    "_note": "identity_reply: capture via `kj midi identify` once slice 1.5 lands (F0 7E 7F 06 01 F7). Both ports live behind one USB ID, so the USB match identifies the DEVICE and the name substrings disambiguate the PORTS — a two-port device is why match strings need both levels"
+    "identity_reply": {
+      "raw": "f07e7f060200206b0200056854010301f7",
+      "manufacturer": "00206b",
+      "family": 2,
+      "model": 13317,
+      "version": "54010301",
+      "pulled_at": "2026-08-02",
+      "_note": "captured live by `kj midi identify keylab-88-mkii` on moltar (first-matched-port = the MIDI port answered). Version bytes are the unit's firmware at capture time, not a match criterion"
+    },
+    "_note": "both ports live behind one USB ID, so the USB match identifies the DEVICE and the name substrings disambiguate the PORTS — a two-port device is why match strings need both levels"
   },
   "observed": {
     "at": "2026-08-02",

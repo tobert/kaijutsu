@@ -803,6 +803,13 @@ open items) built on profile vocabulary.
   2026-08-02, slice 1 step 5). Same positional accident as `kj midi send`, same
   slice-2 fix: `midi_exchange::resolve_exchange_address` takes
   `routes[device][0]`. A KeyLab answers on its MIDI port, which is right today.
+  **No longer hypothetical (2026-08-02 evening):** the MiniBrute answers
+  Universal Identity ONLY on its port 1 ('MiniBrute MIDI Interface', the
+  SysEx/control port) while routing asks port 0 (the synth) — so
+  `kj midi identify minibrute` times out against a device that answers.
+  First-matched-port now demonstrably picks the wrong port for a real device;
+  the slice-2 role vocabulary (port roles in the profile: synth vs control)
+  is the fix, and the minibrute profile already records which port answers.
 - **No CoreMIDI exchange backend** (deferred 2026-08-02, slice 1 step 5). The
   worker is ALSA-only and says so in its answer (a mac sink refuses with "not
   this backend" rather than timing out, so another sink on the rig can have the

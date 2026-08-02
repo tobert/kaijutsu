@@ -47,8 +47,15 @@ whose KSP support covers device settings but **not** sequencer banks).
         "_note": "observed ALSA port display name is 'KeyStep Pro MIDI 1'; the ' MIDI 1' suffix is an ALSA-ism, so the bare 'KeyStep Pro' substring is the portable match and the long form is only a disambiguation hint"
       }
     },
-    "identity_reply": null,
-    "_note": "identity_reply: capture via `kj midi identify` once slice 1.5 lands (F0 7E 7F 06 01 F7)"
+    "identity_reply": {
+      "raw": "f07e7f060200206b020009005d010002f7",
+      "manufacturer": "00206b",
+      "family": 2,
+      "model": 9,
+      "version": "5d010002",
+      "pulled_at": "2026-08-02",
+      "_note": "captured live by `kj midi identify keystep-pro` on moltar, the project's first device round-trip; version bytes are the unit's firmware at capture time, not a match criterion"
+    }
   },
   "observed": {
     "at": "2026-08-02",
@@ -63,22 +70,26 @@ whose KSP support covers device settings but **not** sequencer banks).
 
 ## Settings (device is ground truth — a pull overwrites this section)
 
-Every value here is an **authored draft of factory defaults**, not a reading
+Most values here are an **authored draft of factory defaults**, not a reading
 from Amy's unit — the KSP is the first device where that distinction bites,
-because its track channels are exactly the thing a previous session may have
-moved in MIDI Control Center. Treat these as a hypothesis until
+because its track channels are exactly the thing a session may move in MIDI
+Control Center or on the panel. Treat drafts as hypotheses until
 `kj midi pull keystep-pro` lands (slice 4) and rewrites the section.
+**Exception — `track_channels` is bench-observed 2026-08-02**: Amy reassigned
+MIDI in to channels 11–14 at the bench and each was verified by ear through
+`kj midi send` (drum lanes fired on 11; arps latched external chords on
+12–14).
 
 ```json
 {
   "v": 1,
-  "source": "authored-draft",
+  "source": "authored-draft (track_channels: bench-observed 2026-08-02)",
   "pulled_at": null,
   "track_channels": {
-    "track1": 1,
-    "track2": 2,
-    "track3": 3,
-    "track4": 4
+    "track1": 11,
+    "track2": 12,
+    "track3": 13,
+    "track4": 14
   },
   "drum_track_channel": "@settings.track_channels.track1",
   "_note_drum_track_channel": "the drum track may be independently assignable in MCC; if it is, this becomes a plain int and ch 10 is the useful value when the target is a GM drum map",
@@ -95,7 +106,7 @@ moved in MIDI Control Center. Treat these as a hypothesis until
   "knob_catch_mode": "hook",
   "tempo_bpm": 120,
   "unverified": [
-    "track_channels", "drum_track_channel", "clock_source",
+    "drum_track_channel", "clock_source",
     "clock_out_ppqn", "sync_out_format", "transport_sends.song_position",
     "midi_thru", "sustain_pedal_polarity", "velocity_curve",
     "aftertouch_curve", "touch_strip_mode", "knob_catch_mode", "tempo_bpm"
@@ -128,7 +139,7 @@ moved in MIDI Control Center. Treat these as a hypothesis until
     "transport": true,
     "program_change": true,
     "cc": {},
-    "_note": "MIDI-in feeds track recording and transpose; whether incoming notes on a track channel drive that track's CV/gate jacks (i.e. KSP as a 4-channel MIDI-to-CV bridge for the eurorack) is UNVERIFIED and worth a bench test"
+    "_note": "VERIFIED 2026-08-02 at the bench: incoming notes on a track's channel reach that track's ENGINE — drum-track notes fire lanes (heard through the patch, incl. rear-trig side effects), and an arp in hold latches/replaces its chord from external notes while the arp clock free-runs (played the layered-arp texture this way). The engines drive the CV/gate jacks, so the MIDI-to-CV bridge direction works via the engines; whether notes ALSO pass to CV when a track is plain (no arp/seq active) is still worth one more test"
   },
   "sends": {
     "notes": true,
@@ -201,7 +212,7 @@ moved in MIDI Control Center. Treat these as a hypothesis until
   "relative_safe": [],
   "unverified": [
     "keys.count", "keys.note_range", "controls.drum_lanes",
-    "receives.notes", "receives.program_change", "sends.channel_pressure",
+    "receives.program_change", "sends.channel_pressure",
     "sends.pitch_bend", "sends.cc.1", "clock.ppqn", "sysex.passthru",
     "ports.din_in", "ports.din_out", "ports.sync_in", "ports.sync_out",
     "ports.cv_gate_out", "ports.drum_gate_out", "ports.sustain_pedal_in",
