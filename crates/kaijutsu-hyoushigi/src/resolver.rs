@@ -14,7 +14,7 @@ use thiserror::Error;
 ///
 /// A resolver is *only* ever handed committed context — an uncommitted cell
 /// simply has no view to give. That is how "a speculation reads committed + past
-/// + ambient, never another speculation" is enforced *structurally* rather than
+/// \+ ambient, never another speculation" is enforced *structurally* rather than
 /// by a runtime check.
 pub trait ResolverCtx {
     /// The playhead position this resolve targets.

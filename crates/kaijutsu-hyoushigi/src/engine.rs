@@ -405,10 +405,11 @@ impl Timeline {
             // Find the earliest pending action at or before `target`.
             let mut next: Option<(usize, Tick)> = None;
             for (i, s) in self.future.iter().enumerate() {
-                if let Some(at) = s.next_at() {
-                    if at <= target && next.is_none_or(|(_, best)| at < best) {
-                        next = Some((i, at));
-                    }
+                if let Some(at) = s.next_at()
+                    && at <= target
+                    && next.is_none_or(|(_, best)| at < best)
+                {
+                    next = Some((i, at));
                 }
             }
             let Some((idx, at)) = next else { break };
