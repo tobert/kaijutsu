@@ -38,6 +38,15 @@ pub const CONFIG_ROOT: &str = "/etc/config";
 /// is one client's override.
 pub const CLIENT_ROOT: &str = "/etc/client";
 
+/// Root of the CRDT-owned MIDI device profile tree
+/// (`docs/midi-next.md` "Storage and identity"): kernel sole owner, no host
+/// file, optional embedded seeds for gear we ship knowledge of. Devices live
+/// under `/etc/midi/devices/<name>` — today a single `.md` document per
+/// device, but the tree is directory-capable on the same CRDT-native backend
+/// as `/etc/rc`, so a device can grow into an rc-style bucket of
+/// `SXX-*.{md,kai}` files later without a storage migration.
+pub const MIDI_ROOT: &str = "/etc/midi";
+
 /// Root of the read-only content-addressed object pool
 /// (`/v/cas/<shard>/<hash>`).
 pub const CAS_ROOT: &str = "/v/cas";
@@ -88,6 +97,11 @@ pub fn client_config_path(client_id: Option<&str>, name: &str) -> String {
     }
 }
 
+/// One MIDI device profile's canonical path: `/etc/midi/devices/<name>`.
+pub fn midi_device_path(name: &str) -> String {
+    format!("{MIDI_ROOT}/devices/{name}")
+}
+
 /// A live client's root under `/r`: `/r/<client_id>`.
 pub fn r_client_path(client_id: &str) -> String {
     format!("{R_ROOT}/{client_id}")
@@ -130,6 +144,12 @@ pub fn is_client_path(path: &str) -> bool {
     is_or_under(path, CLIENT_ROOT)
 }
 
+/// True if `path` is under the MIDI device profile tree (`/etc/midi` or
+/// `/etc/midi/...`).
+pub fn is_midi_path(path: &str) -> bool {
+    is_or_under(path, MIDI_ROOT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +187,14 @@ mod tests {
     }
 
     #[test]
+    fn midi_builder_joins_the_devices_namespace() {
+        assert_eq!(
+            midi_device_path("minibrute"),
+            "/etc/midi/devices/minibrute"
+        );
+    }
+
+    #[test]
     fn predicates_match_root_and_children_only() {
         assert!(is_rc_path("/etc/rc"));
         assert!(is_rc_path("/etc/rc/coder/create/S00-stance.md"));
@@ -182,9 +210,13 @@ mod tests {
         assert!(is_client_path("/etc/client/metronome.toml"));
         assert!(is_client_path("/etc/client/abc-123/metronome.toml"));
         assert!(!is_client_path("/etc/clientele"));
+
+        assert!(is_midi_path("/etc/midi"));
+        assert!(is_midi_path("/etc/midi/devices/minibrute"));
+        assert!(!is_midi_path("/etc/midifoo"));
     }
 
-    /// The rc/config/client trees never falsely overlap each other, even
+    /// The rc/config/client/midi trees never falsely overlap each other, even
     /// though they share the `/etc` parent and near-identical names.
     #[test]
     fn trees_do_not_cross_match() {
@@ -192,5 +224,10 @@ mod tests {
         assert!(!is_config_path(RC_ROOT));
         assert!(!is_client_path(CONFIG_ROOT));
         assert!(!is_config_path(CLIENT_ROOT));
+        assert!(!is_midi_path(RC_ROOT));
+        assert!(!is_midi_path(CONFIG_ROOT));
+        assert!(!is_midi_path(CLIENT_ROOT));
+        assert!(!is_rc_path(MIDI_ROOT));
+        assert!(!is_config_path(MIDI_ROOT));
     }
 }

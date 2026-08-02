@@ -30,6 +30,7 @@ pub mod kernel_db;
 pub mod kj;
 pub mod llm;
 pub mod mcp;
+pub mod midi_seed;
 pub mod peers;
 pub mod runtime;
 pub mod seed_presets;

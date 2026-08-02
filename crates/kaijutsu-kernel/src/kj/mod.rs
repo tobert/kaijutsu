@@ -25,6 +25,7 @@ pub mod drive;
 pub mod fork;
 pub mod format;
 pub mod mcp;
+pub mod midi;
 pub mod parse;
 pub mod play;
 pub mod policy;
@@ -362,6 +363,11 @@ impl KjDispatcher {
         // `kj cas put`), not a context — same exemption rationale.
         if cmd == "audio" {
             return self.dispatch_audio(&argv[1..], caller).await;
+        }
+        // `kj midi` reads the device profile library by name/path, not by
+        // context — same exemption rationale as `kj audio`/`kj config`.
+        if cmd == "midi" {
+            return self.dispatch_midi(&argv[1..], caller).await;
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.
@@ -724,6 +730,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(audio::AudioArgs::command())
+        .subcommand(midi::MidiArgs::command())
         .subcommand(cp::CpArgs::command())
         .subcommand(play::PlayArgs::command())
         .subcommand(rc::RcArgs::command())
@@ -754,7 +761,7 @@ pub(crate) mod test_helpers {
     use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::drift::shared_drift_router;
     use crate::kernel_db::KernelDb;
-    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, RC_ROOT};
+    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, RC_ROOT};
 
     /// Create a KjDispatcher with in-memory state for testing.
     ///
@@ -808,11 +815,12 @@ pub(crate) mod test_helpers {
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 
-    /// A dispatcher whose `/etc/rc` is the **real CRDT-native backend**
-    /// ([`ConfigCrdtFs`]), seeded from the embedded defaults — the production
-    /// wiring. Use this for `kj rc` / lifecycle tests that must exercise the
-    /// CRDT path end-to-end (readdir over the `documents` manifest + VFS-direct
-    /// reads/writes), not just the backend-agnostic kj layer.
+    /// A dispatcher whose `/etc/rc` (plus `/etc/config`, `/etc/client`, and
+    /// `/etc/midi`) is the **real CRDT-native backend** ([`ConfigCrdtFs`]),
+    /// seeded from the embedded defaults — the production wiring. Use this for
+    /// `kj rc` / `kj config` / `kj midi` / lifecycle tests that must exercise
+    /// the CRDT path end-to-end (readdir over the `documents` manifest +
+    /// VFS-direct reads/writes), not just the backend-agnostic kj layer.
     ///
     /// It uses a **DB-backed block store** (the manifest needs the `documents`
     /// table populated). That is faithful to production but currently deadlocks
@@ -861,6 +869,15 @@ pub(crate) mod test_helpers {
             .seed_entries(crate::config_seed::client_seed_files())
             .expect("seed client config into CRDT");
         kernel.mount(CLIENT_ROOT, client_fs).await;
+        // MIDI device profiles live on the same backend type at /etc/midi
+        // (docs/midi-next.md "Storage and identity") — seed and mount it too
+        // so `kj midi list/show` tests exercise the real path.
+        let midi_fs =
+            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), MIDI_ROOT);
+        midi_fs
+            .seed_entries(crate::midi_seed::seed_files())
+            .expect("seed midi devices into CRDT");
+        kernel.mount(MIDI_ROOT, midi_fs).await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 

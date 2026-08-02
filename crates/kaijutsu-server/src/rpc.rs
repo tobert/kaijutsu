@@ -1231,6 +1231,24 @@ pub async fn create_shared_kernel(
     }
     kernel.mount(paths::CLIENT_ROOT, client_fs).await;
 
+    // MIDI device profiles at /etc/midi/devices/<name> are CRDT-owned too
+    // (docs/midi-next.md "Storage and identity"): the SAME backend type as
+    // rc/config/client, one more mount. Seeded from the embedded profiles
+    // (`assets/defaults/midi/devices/*.md`, `kaijutsu_kernel::midi_seed`) only
+    // when the namespace is still empty (a genuinely fresh kernel); after that
+    // the CRDT owns the content. `kj midi list`/`show` read it.
+    let midi_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+        documents.clone(),
+        paths::MIDI_ROOT,
+    );
+    if midi_fs.is_empty() {
+        let n = midi_fs
+            .seed_entries(kaijutsu_kernel::midi_seed::seed_files())
+            .map_err(|e| capnp::Error::failed(format!("midi seed into CRDT failed: {e}")))?;
+        log::info!("seeded {n} midi device profile(s) into the CRDT (fresh kernel)");
+    }
+    kernel.mount(paths::MIDI_ROOT, midi_fs).await;
+
     // Mount the CAS object pool read-only at /v/cas (docs/slash-v.md track B).
     // A CasFs over the kernel's FileStore renders every stored object as an
     // immutable file, sharded on the hash's leading two hex chars to match the

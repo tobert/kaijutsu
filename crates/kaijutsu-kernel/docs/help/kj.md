@@ -71,6 +71,8 @@ fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
                 bevy_brp, …); configured-vs-actually-running visibility + reconcile
+midi            list, show — CRDT-owned MIDI device profiles at
+                /etc/midi/devices/<name> (docs/midi-next.md)
 model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
 play            Play a sample now, or commit it as a clip cell onto a track with
