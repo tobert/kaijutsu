@@ -504,6 +504,7 @@ async fn run_loop<H, F, M>(
                     }
                     Some(DjCtl::MidiRoutes(routes)) => {
                         debug!("kaijutsu-dj: MIDI routes updated — {} device(s) routable", routes.len());
+                        midi.routes_updated(&routes);
                         midi_routes = routes;
                     }
                     Some(DjCtl::Shutdown) | None => {
@@ -1206,7 +1207,7 @@ mod tests {
         fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
             let _ = self.tx.send(MidiCmd::ScheduleAbc { events, lead });
         }
-        fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>) {
+        fn send_control(&mut self, _device: &str, address: &str, events: Vec<(Duration, Vec<u8>)>) {
             let _ = self.tx.send(MidiCmd::SendControl { address: address.to_string(), events });
         }
         fn flush(&mut self) {

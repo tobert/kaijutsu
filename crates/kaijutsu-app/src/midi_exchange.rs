@@ -303,8 +303,9 @@ fn parse_alsa_addr(address: &str) -> Option<(i32, i32)> {
     Some((client.trim().parse().ok()?, port.trim().parse().ok()?))
 }
 
-/// The dedicated ALSA client: a duplex port used to send a request direct and
-/// to hear the reply through a temporary subscription.
+/// The dedicated ALSA client: a duplex port that runs each dialogue over a
+/// pair of temporary subscriptions — send side (opens the device's rawmidi
+/// substream) and reply side (hears the answer).
 #[cfg(target_os = "linux")]
 struct ExchangeClient {
     seq: alsa::Seq,
@@ -343,13 +344,21 @@ impl ExchangeClient {
         alsa::seq::Addr { client: self.client_id, port: self.port }
     }
 
-    /// Send `payload` direct to `dest` and collect the first complete SysEx
+    /// Send `payload` to `dest` and collect the first complete SysEx
     /// starting with `reply_match`, or fail by `timeout`.
     ///
-    /// The subscription to the device's port is taken for the duration and
-    /// dropped afterwards, **including on every error path** — a subscription
-    /// that outlived a failed exchange would leave this client quietly
-    /// hearing that device forever.
+    /// BOTH directions ride temporary subscriptions taken for the duration
+    /// and dropped afterwards, **including on every error path** — a
+    /// subscription that outlived a failed exchange would leave this client
+    /// quietly hearing (or feeding) that device forever.
+    ///
+    /// The send-side subscription is load-bearing, not politeness: the ALSA
+    /// seq→rawmidi bridge only opens a hardware port's OUTPUT substream while
+    /// some subscription targets the port, and events sent to a closed
+    /// substream are silently discarded — `set_dest` direct addressing
+    /// included (proved at the bench 2026-08-02 against `/proc/asound`
+    /// Tx counters; user-client ports don't share the trap, which is why the
+    /// loopback tests never caught it).
     fn exchange(
         &mut self,
         dest: (i32, i32),
@@ -357,11 +366,15 @@ impl ExchangeClient {
         reply_match: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, String> {
-        let source = alsa::seq::Addr { client: dest.0, port: dest.1 };
-        let subscribed = self.subscribe_from(source);
-        let result = self.exchange_subscribed(dest, payload, reply_match, timeout);
-        if subscribed {
-            self.unsubscribe_from(source);
+        let device = alsa::seq::Addr { client: dest.0, port: dest.1 };
+        let hearing = self.subscribe_from(device);
+        let feeding = self.subscribe_to(device);
+        let result = self.exchange_subscribed(dest, payload, reply_match, timeout, feeding);
+        if feeding {
+            self.unsubscribe_to(device);
+        }
+        if hearing {
+            self.unsubscribe_from(device);
         }
         result
     }
@@ -372,11 +385,12 @@ impl ExchangeClient {
         payload: &[u8],
         reply_match: &[u8],
         timeout: Duration,
+        feeding: bool,
     ) -> Result<Vec<u8>, String> {
         // Anything already queued predates the question — drain it, or a
         // stale message could be mistaken for this exchange's answer.
         self.drain_pending();
-        self.send_direct(dest, payload)?;
+        self.send_request(dest, payload, feeding)?;
 
         let decoder = alsa::seq::MidiEvent::new(4096)
             .map_err(|e| format!("MIDI decoder init failed: {e}"))?;
@@ -423,10 +437,15 @@ impl ExchangeClient {
         }
     }
 
-    /// Emit `payload` DIRECT to `dest` — no queue (there is nothing to
-    /// schedule) and no standing subscription (asking a device a question
-    /// must never wire the score into it).
-    fn send_direct(&mut self, dest: (i32, i32), payload: &[u8]) -> Result<(), String> {
+    /// Emit `payload` to `dest` — no queue (there is nothing to schedule).
+    /// When the send-side subscription is up (`feeding`), delivery rides it
+    /// (`set_subs`; the worker is serialized, so the one outbound
+    /// subscription IS the device). When the device's port refused the
+    /// subscription, fall back to `set_dest` direct addressing — that still
+    /// reaches user-client ports (a software synth with odd caps), and the
+    /// timeout is the honest backstop for hardware, where an unsubscribed
+    /// send cannot arrive.
+    fn send_request(&mut self, dest: (i32, i32), payload: &[u8], feeding: bool) -> Result<(), String> {
         let mut encoder = alsa::seq::MidiEvent::new(u32::try_from(payload.len()).unwrap_or(u32::MAX).max(64))
             .map_err(|e| format!("MIDI encoder init failed: {e}"))?;
         encoder.enable_running_status(false);
@@ -434,7 +453,11 @@ impl ExchangeClient {
         match encoder.encode(payload) {
             Ok((_, Some(mut ev))) => {
                 ev.set_source(self.port);
-                ev.set_dest(alsa::seq::Addr { client: dest.0, port: dest.1 });
+                if feeding {
+                    ev.set_subs();
+                } else {
+                    ev.set_dest(alsa::seq::Addr { client: dest.0, port: dest.1 });
+                }
                 ev.set_direct();
                 self.seq
                     .event_output(&mut ev)
@@ -478,6 +501,38 @@ impl ExchangeClient {
             debug!(
                 "MIDI exchange: could not drop the temporary subscription to {}:{}: {e}",
                 source.client, source.port
+            );
+        }
+    }
+
+    /// Send-side pin: subscribe our port → the device for the dialogue.
+    /// Required for hardware — the seq→rawmidi bridge only opens the output
+    /// substream under a subscription (see [`Self::exchange`]). `false` when
+    /// the port refuses; [`Self::send_request`] then falls back to direct.
+    fn subscribe_to(&self, device: alsa::seq::Addr) -> bool {
+        let Ok(subs) = alsa::seq::PortSubscribe::empty() else {
+            return false;
+        };
+        subs.set_sender(self.addr());
+        subs.set_dest(device);
+        match self.seq.subscribe_port(&subs) {
+            Ok(()) => true,
+            Err(e) => {
+                debug!(
+                    "MIDI exchange: could not subscribe the send side to {}:{} ({e}); \
+                     sending direct — hardware behind a closed substream will not hear it",
+                    device.client, device.port
+                );
+                false
+            }
+        }
+    }
+
+    fn unsubscribe_to(&self, device: alsa::seq::Addr) {
+        if let Err(e) = self.seq.unsubscribe_port(self.addr(), device) {
+            debug!(
+                "MIDI exchange: could not drop the send-side subscription to {}:{}: {e}",
+                device.client, device.port
             );
         }
     }

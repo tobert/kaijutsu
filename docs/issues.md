@@ -747,7 +747,9 @@ job shape deferred). Slice 1 steps 1–3 have landed (seeds + `kj midi
 list/show`; sink-fed presence: in-app profile matching, `reportMidiPresence`,
 the ephemeral `/run/midi/<device>` store, presence column) — as has step 4
 (`kj midi send`/`panic`: a device-addressed control cue on the existing
-`RenderCue` wire, emitted DIRECT to the matched ALSA port) and step 5 — the
+`RenderCue` wire, riding a per-device `ctl:` port wired by subscription —
+the original DIRECT emit shipped but no hardware could hear it, see the
+2026-08-02 bench story in `docs/midi-next.md` step 4) and step 5 — the
 `exchange()` round-trip + `kj midi identify`, which closes slice 1. Slice
 order in the doc; next: slice 2 (routing consumes profiles).
 First real consumer: Minibrute on the laptop app, then the per-track
@@ -812,6 +814,27 @@ open items) built on profile vocabulary.
   drop. The mac backend will need its own address parse + emit alongside the
   ALSA one — the envelope and the routing table are already backend-neutral
   (device names and opaque address strings), so nothing above the sink changes.
+- **`kj midi identify` timeout is a MUTE error** (found live 2026-08-02, bench
+  verification). When no reply arrives, the `tool_result` block lands with
+  `status: error, exit_code 1` and **zero content** — no "timeout waiting
+  for reply from keystep-pro", nothing in stderr, nothing kernel-side. The app
+  log is the only witness (`midi_exchange: … waiting 2s` then silence). Loud
+  over silent: the timeout should say which device, which port, how long it
+  waited, and that presence said the device was live. The mute error cost real
+  diagnosis time: the actual fault was host-side silent drop (next entry), and
+  a mid-session hypothesis ("Arturias ignore identity requests") stood for an
+  hour before wire counters disproved it — the KSP answers identity fine
+  (`F0 7E 7F 06 02 00 20 6B 02 00 09 00 5D 01 00 02 F7` captured live).
+- **Arturia SysEx vocabulary in kaijutsu — make settings readable** (wished
+  2026-08-02, Amy, bench session). Probing the MiniBrute's settings today means
+  hand-rolled `aseqsend` hex guesses at the Arturia frame
+  (`F0 00 20 6B <dev> 01 <seq> <op> <param> F7` family). Amy wants a clever
+  encoding in kaijutsu for these request/reply frames — device profiles could
+  then *declare* their parameter maps (receive channel, knob assignments) and
+  `kj midi pull`/device contexts could read real settings instead of trusting
+  the profile's static claims. Makes configs easier to build; pairs with the
+  `exchange()` machinery that already exists and with `docs/midi-next.md`'s
+  settings-vs-capabilities ground-truth split.
 
 ## App (and headless sink) as MCP clients offered back to the kernel (seeded 2026-07-15)
 

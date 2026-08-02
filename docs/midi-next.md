@@ -475,13 +475,22 @@ Three moves change that:
       device = loud error), **presence is not** (absent/unknown warns and
       sends anyway — the sink drops what it can't route). Sink side
       (`dj/midi.rs`): the app's matcher ships a device→address table to the DJ
-      thread (`DjCtl::MidiRoutes`), and a control cue is emitted **DIRECT** to
-      that ALSA address — no standing subscription, so addressing a device
-      never leaks the score into it. Unroutable = loud warn + drop, **never**
-      a fallback to the auto-connected render port. Deferred with the seam in
-      place: role-aware port choice (slice 1 takes the device's *first*
-      matched port), `/run/midi` sent-provenance (slice 3), CoreMIDI address
-      forms (`parse_alsa_addr` refuses them rather than guessing).
+      thread (`DjCtl::MidiRoutes`), and a control cue rides a **per-device
+      `ctl:<name>` port wired to its device by subscription** — visible in
+      `aconnect -l`, exact (its one subscription IS the device, so the score
+      never leaks in), and load-bearing: the first live bench session
+      (2026-08-02) proved the original design's DIRECT `set_dest` emit is
+      silently discarded by hardware — the ALSA seq→rawmidi bridge only opens
+      a kernel port's output substream while a subscription targets it
+      (user-client ports don't share the trap, which is why loopback tests
+      passed while no instrument ever heard a note; diagnosed against
+      `/proc/asound/*/midi0` Tx counters). The wire is re-verified per cue
+      (one query at control-cue pace) so replug self-heals; routes updates
+      prune stale ports. Unroutable = loud warn + drop, **never** a fallback
+      to the auto-connected render port. Deferred with the seam in place:
+      role-aware port choice (slice 1 takes the device's *first* matched
+      port), `/run/midi` sent-provenance (slice 3), CoreMIDI address forms
+      (`parse_alsa_addr` refuses them rather than guessing).
    5. ~~The **`exchange()` sink method** + `kj midi identify`~~ — **done
       2026-08-02**, and it closes slice 1. The wire is one appended method on
       the existing subscriber callback (`BlockEvents.exchange @15
@@ -496,9 +505,10 @@ Three moves change that:
       turns a channel request into the capnp call — the kernel still holds no
       capnp capability and no hardware. App side: a **third** ALSA client
       (`kaijutsu-exchange`, alongside render and the ear) on its own thread,
-      one dialogue at a time, request sent DIRECT to the matched port and the
-      reply heard through a subscription taken and dropped inside the
-      exchange, so the ear never sees request/reply traffic. Timeouts are a
+      one dialogue at a time, the request and reply each riding a temporary
+      subscription taken and dropped inside the exchange (send-side pin
+      required by the same seq→rawmidi substream rule as control cues), so
+      the ear never sees request/reply traffic. Timeouts are a
       ladder (app 2 s, then +0.5/+0.75/+1 s outward) so the layer that
       actually wedged is the layer whose error a player reads; every failure
       — unknown device, absent device, sink not serving exchanges, silent

@@ -101,6 +101,22 @@ fn parse_alsa_addr(address: &str) -> Option<(i32, i32)> {
     Some((client.trim().parse().ok()?, port.trim().parse().ok()?))
 }
 
+/// Which cached control-port addresses no route names any more — the pure
+/// decision inside [`MidiOut::prune_control_routes`]. An address survives if
+/// ANY device's first matched port still parses to it (first-port is the
+/// slice-1 routing rule; see [`resolve_route`]).
+fn stale_control_routes(
+    cached: impl Iterator<Item = (i32, i32)>,
+    routes: &MidiRoutes,
+) -> Vec<(i32, i32)> {
+    let wanted: std::collections::BTreeSet<(i32, i32)> = routes
+        .values()
+        .filter_map(|addrs| addrs.first())
+        .filter_map(|a| parse_alsa_addr(a))
+        .collect();
+    cached.filter(|dest| !wanted.contains(dest)).collect()
+}
+
 // ── MidiDispatch — the seam run_loop is generic over ────────────────────────
 
 /// Everything the DJ thread's `select!` loop dispatches through its one owned
@@ -123,8 +139,14 @@ pub(crate) trait MidiDispatch {
     /// [`MidiSink::send_control`]. The device→address resolution happened in
     /// [`dispatch_midi_cue`] (pure, testable); by the time it reaches the
     /// sink there is a real port to address, so an unaddressable string here
-    /// is a backend mismatch, not a routing miss.
-    fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>);
+    /// is a backend mismatch, not a routing miss. `device` is the profile
+    /// name — it labels the per-device control port (`ctl:<device>`) so the
+    /// wiring reads in `aconnect -l` and the patch bay.
+    fn send_control(&mut self, device: &str, address: &str, events: Vec<(Duration, Vec<u8>)>);
+    /// The routing picture changed (`DjCtl::MidiRoutes`): drop control ports
+    /// pinned to devices that are no longer routed. Default no-op so test
+    /// doubles that never route stay small.
+    fn routes_updated(&mut self, _routes: &MidiRoutes) {}
     /// Drop every scheduled-but-unplayed event and silence sounding notes.
     fn flush(&mut self);
     /// Drain "did anything leave the render port since the last drain" —
@@ -351,6 +373,7 @@ fn dispatch_control_cue(cue: &RenderCue, routes: &MidiRoutes, sink: &mut dyn Mid
         envelope.device
     );
     sink.send_control(
+        &envelope.device,
         address,
         events
             .into_iter()
@@ -561,7 +584,7 @@ impl MidiDispatch for MidiSink {
     }
 
     #[cfg(target_os = "linux")]
-    fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>) {
+    fn send_control(&mut self, device: &str, address: &str, events: Vec<(Duration, Vec<u8>)>) {
         let Some(dest) = parse_alsa_addr(address) else {
             // The routing table said this device lives here, and this backend
             // can't address it — a real mismatch (a CoreMIDI handle reaching
@@ -573,15 +596,33 @@ impl MidiDispatch for MidiSink {
             return;
         }
         if let Some(out) = self.out.as_mut() {
-            out.schedule(&events, Duration::ZERO, Some(dest));
-            // Direct-addressed traffic is still traffic out of our client —
-            // the patch bay's RENDER chord lights for it too.
-            self.traffic = true;
+            match out.ensure_control_route(device, dest) {
+                Ok(ctl) => {
+                    out.schedule(&events, Duration::ZERO, Some(ctl));
+                    // Control traffic is still traffic out of our client —
+                    // the patch bay's RENDER chord lights for it too.
+                    self.traffic = true;
+                }
+                // The device is routed but its port won't take our wire — the
+                // cue CANNOT arrive (hardware discards unsubscribed sends),
+                // so this is a drop and it says so.
+                Err(e) => warn!("MIDI control: cannot wire '{device}' at {address} ({e}); dropping the cue"),
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
-    fn send_control(&mut self, _address: &str, _events: Vec<(Duration, Vec<u8>)>) {
+    fn send_control(&mut self, _device: &str, _address: &str, _events: Vec<(Duration, Vec<u8>)>) {
         self.ensure_open();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn routes_updated(&mut self, routes: &MidiRoutes) {
+        // Prune only — never force the sink open just to hold pins. A route
+        // whose first cue arrives before any routes update is wired lazily by
+        // `send_control` either way.
+        if let Some(out) = self.out.as_mut() {
+            out.prune_control_routes(routes);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -645,6 +686,17 @@ struct MidiOut {
     seq: alsa::Seq,
     port: i32,
     queue: i32,
+    /// Device-addressed control routing: one local port per routed device,
+    /// wired to it by subscription (`ctl:<device>` in `aconnect -l`). Keyed
+    /// by the device's parsed ALSA address. The subscription — not the port —
+    /// is what makes hardware reachable: the seq→rawmidi bridge only opens a
+    /// kernel port's output substream while a subscription targets it, and
+    /// events into a closed substream are silently discarded, direct
+    /// addressing included (bench-proved 2026-08-02, `/proc/asound` Tx
+    /// counters; the old `set_dest` model emitted into that void). A
+    /// dedicated port per device keeps `set_subs` delivery exact and keeps
+    /// the render port's score out of every device.
+    control_ports: BTreeMap<(i32, i32), i32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -669,7 +721,7 @@ impl MidiOut {
             .map_err(map)?;
         seq.control_queue(queue, EventType::Start, 0, None).map_err(map)?;
         seq.drain_output().map_err(map)?;
-        Ok(Self { seq, port, queue })
+        Ok(Self { seq, port, queue, control_ports: BTreeMap::new() })
     }
 
     fn addr(&self) -> (i32, i32) {
@@ -731,19 +783,80 @@ impl MidiOut {
         Ok(())
     }
 
+    /// The control port for `device` at `dest`, created and wired on first
+    /// use, its subscription re-verified on EVERY use. The verify is one
+    /// query against our own port's subscription list — cheap at control-cue
+    /// pace — and it is the self-heal for replug: when a device drops off the
+    /// bus the kernel silently removes every subscription that targeted it,
+    /// so a cached "wired" flag would emit into the void exactly like the
+    /// `set_dest` model this replaced.
+    fn ensure_control_route(&mut self, device: &str, dest: (i32, i32)) -> Result<i32, String> {
+        use alsa::seq::{Addr, PortCap, PortSubscribe, PortType};
+        use std::ffi::CString;
+
+        let map = |e: alsa::Error| format!("{e}");
+        let ctl = match self.control_ports.get(&dest) {
+            Some(&p) => p,
+            None => {
+                let name = CString::new(format!("ctl:{device}")).map_err(|e| e.to_string())?;
+                let p = self
+                    .seq
+                    .create_simple_port(
+                        &name,
+                        PortCap::READ | PortCap::SUBS_READ,
+                        PortType::MIDI_GENERIC | PortType::APPLICATION,
+                    )
+                    .map_err(map)?;
+                self.control_ports.insert(dest, p);
+                p
+            }
+        };
+        let sender = Addr { client: self.seq.client_id().map_err(map)?, port: ctl };
+        let target = Addr { client: dest.0, port: dest.1 };
+        let wired = alsa::seq::PortSubscribeIter::new(&self.seq, sender, alsa::seq::QuerySubsType::READ)
+            .any(|s| s.get_dest() == target);
+        if !wired {
+            let subs = PortSubscribe::empty().map_err(map)?;
+            subs.set_sender(sender);
+            subs.set_dest(target);
+            self.seq
+                .subscribe_port(&subs)
+                .map_err(|e| format!("subscribing ctl:{device} → {}:{} failed: {e}", dest.0, dest.1))?;
+        }
+        Ok(ctl)
+    }
+
+    /// Drop control ports for devices the routing picture no longer names.
+    /// The kernel already killed their subscriptions when the device left (or
+    /// the profile unmatched); this reclaims our side so `aconnect -l` shows
+    /// only live wiring.
+    fn prune_control_routes(&mut self, routes: &MidiRoutes) {
+        for dest in stale_control_routes(self.control_ports.keys().copied(), routes) {
+            if let Some(port) = self.control_ports.remove(&dest)
+                && let Err(e) = self.seq.delete_port(port)
+            {
+                debug!("MIDI control: deleting the port for {}:{} failed: {e}", dest.0, dest.1);
+            }
+        }
+    }
+
     /// Schedule each event at `lead + offset` relative to now (real-time queue),
     /// so we never sync the app clock to the ALSA queue's clock.
     ///
-    /// `dest` selects the delivery mode, and it is the ONE structural
+    /// Everything is **subscription delivery** (`set_subs`); `from_port`
+    /// selects WHOSE subscriptions carry it, and that is the ONE structural
     /// difference between the score path and `kj midi send`:
     ///
-    /// - `None` — **subscription delivery** (`set_subs`): out the render port
-    ///   to whoever is wired to it. The score/click path, unchanged.
-    /// - `Some((client, port))` — **direct addressing** (`set_dest`): ALSA
-    ///   seq delivers to exactly that port with no standing subscription, so
-    ///   a device-addressed control cue reaches its device without wiring the
-    ///   render port to it (and without that wiring then leaking the whole
-    ///   score into a synth nobody asked to play).
+    /// - `None` — out the render port to whoever is wired to it. The
+    ///   score/click path, unchanged.
+    /// - `Some(port)` — out that device's dedicated control port
+    ///   ([`Self::ensure_control_route`]), which is subscribed to exactly its
+    ///   device: the cue reaches its device and only its device, and the
+    ///   render port's score never leaks into gear nobody asked to play.
+    ///   (`set_dest` direct addressing looked like it did this with less
+    ///   state — but hardware ports silently discard direct events unless a
+    ///   subscription holds their substream open, so the subscription was
+    ///   never optional; see `control_ports`.)
     ///
     /// Both ride the same queue, so a gated note's Note Off still lands on
     /// time either way.
@@ -751,7 +864,7 @@ impl MidiOut {
         &mut self,
         events: &[(Duration, Vec<u8>)],
         lead: Duration,
-        dest: Option<(i32, i32)>,
+        from_port: Option<i32>,
     ) {
         let mut encoder = match alsa::seq::MidiEvent::new(16) {
             Ok(e) => e,
@@ -768,13 +881,8 @@ impl MidiOut {
             match encoder.encode(data) {
                 Ok((_, Some(mut ev))) => {
                     let when = lead + *offset;
-                    ev.set_source(self.port);
-                    match dest {
-                        Some((client, port)) => {
-                            ev.set_dest(alsa::seq::Addr { client, port });
-                        }
-                        None => ev.set_subs(),
-                    }
+                    ev.set_source(from_port.unwrap_or(self.port));
+                    ev.set_subs();
                     ev.schedule_real(self.queue, true, when);
                     if let Err(e) = self.seq.event_output(&mut ev) {
                         tracing::error!("MIDI event_output failed: {e}");
@@ -1001,6 +1109,8 @@ mod tests {
     struct RecordingSink {
         scheduled: Option<(Vec<(Duration, Vec<u8>)>, Duration)>,
         /// Every device-addressed control emit, in order: `(address, events)`.
+        /// (`device` rides along in real dispatch to label the control port;
+        /// these tests assert routing, so the address is the interesting half.)
         controls: Vec<(String, Vec<(Duration, Vec<u8>)>)>,
         flushed: bool,
     }
@@ -1012,7 +1122,7 @@ mod tests {
         fn schedule_abc(&mut self, events: Vec<(Duration, Vec<u8>)>, lead: Duration) {
             self.scheduled = Some((events, lead));
         }
-        fn send_control(&mut self, address: &str, events: Vec<(Duration, Vec<u8>)>) {
+        fn send_control(&mut self, _device: &str, address: &str, events: Vec<(Duration, Vec<u8>)>) {
             self.controls.push((address.to_string(), events));
         }
         fn flush(&mut self) {
@@ -1275,6 +1385,40 @@ mod tests {
         assert_eq!(parse_alsa_addr("a:b"), None);
     }
 
+    // ── control-port prune (pure half of prune_control_routes) ─────────────
+
+    /// A cached control wire survives exactly while some device's FIRST
+    /// matched port still names its address (first-port is the slice-1
+    /// routing rule, so a second-slot address is stale even though the
+    /// routes still mention it).
+    #[test]
+    fn a_control_wire_survives_only_while_a_first_matched_port_names_it() {
+        let r = routes(&[("keystep-pro", &["20:0"]), ("keylab-88-mkii", &["16:0", "16:1"])]);
+        let cached = [(20, 0), (16, 0), (16, 1), (48, 0)];
+        assert_eq!(
+            stale_control_routes(cached.into_iter(), &r),
+            vec![(16, 1), (48, 0)],
+            "the DAW slot (16:1) and the unplugged Brute (48:0) are stale"
+        );
+    }
+
+    #[test]
+    fn an_empty_routing_picture_prunes_every_control_wire() {
+        let cached = [(20, 0), (16, 0)];
+        assert_eq!(
+            stale_control_routes(cached.into_iter(), &MidiRoutes::new()),
+            vec![(20, 0), (16, 0)]
+        );
+    }
+
+    #[test]
+    fn a_non_alsa_first_port_pins_nothing() {
+        // A CoreMIDI-shaped first port parses to no ALSA address, so it keeps
+        // no wire alive — same refusal as `parse_alsa_addr`, same reason.
+        let r = routes(&[("mac-device", &["IOService:1234"])]);
+        assert_eq!(stale_control_routes([(20, 0)].into_iter(), &r), vec![(20, 0)]);
+    }
+
     /// Live ALSA loopback (needs `/dev/snd/seq`; `#[ignore]` so CI stays green —
     /// run with `--ignored` on a box with the sequencer, e.g. zorak). Opens the
     /// sink, subscribes a reader, schedules the CDEF phrase at a small lead, and
@@ -1327,27 +1471,33 @@ mod tests {
         assert!(note_ons.windows(2).all(|w| w[0] < w[1]), "ascending: {note_ons:?}");
     }
 
-    /// Live ALSA proof of the ONE platform assumption slice 1 step 4 rests on:
-    /// **a direct-addressed event reaches a port with NO standing
-    /// subscription.** Deliberately never calls `subscribe_port` — if ALSA
-    /// ever required a subscription for direct delivery, this fails and
-    /// `kj midi send`'s whole routing model needs rethinking (the alternative
-    /// would be subscribe-per-device, which leaks the score into every
-    /// device we've ever addressed).
+    /// Live ALSA proof of the platform truth slice 1 step 4 NOW rests on:
+    /// **a control cue rides its device's dedicated `ctl:` port, wired by
+    /// subscription** ([`MidiOut::ensure_control_route`]).
+    ///
+    /// This test's ancestor asserted the opposite model — that a
+    /// direct-addressed (`set_dest`) event reaches an unsubscribed port. It
+    /// even passed: user-client ports like this reader DO receive direct
+    /// events. The trap is that HARDWARE ports don't: the seq→rawmidi bridge
+    /// only opens a kernel port's output substream while a subscription
+    /// targets it, and silently discards everything otherwise — so the model
+    /// the old test "proved" shipped a `kj midi send` no instrument could
+    /// hear (bench-diagnosed 2026-08-02 against `/proc/asound` Tx counters;
+    /// a loopback test cannot catch it, which is why this one didn't).
     ///
     /// `#[ignore]`d like its sibling above; run with `--ignored` on a box
     /// with `/dev/snd/seq`.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs a live ALSA sequencer (/dev/snd/seq); run on the moltar/zorak runner"]
-    fn direct_addressing_reaches_an_unsubscribed_port() {
+    fn a_control_cue_rides_its_devices_subscribed_ctl_port() {
         use alsa::seq::{EventType, PortCap, PortType};
         use std::ffi::CString;
 
         let mut out = MidiOut::open().expect("open ALSA sink");
         let reader = alsa::Seq::open(None, None, true).expect("open reader");
         reader
-            .set_client_name(&CString::new("kj-app-test-direct").unwrap())
+            .set_client_name(&CString::new("kj-app-test-ctl").unwrap())
             .unwrap();
         let in_port = reader
             .create_simple_port(
@@ -1358,8 +1508,12 @@ mod tests {
             .unwrap();
         let dest = (reader.client_id().unwrap(), in_port);
 
-        // NOTE: no subscribe_port call — that is the point of this test.
-        out.schedule(&[(Duration::ZERO, vec![0xB0, 74, 64])], Duration::ZERO, Some(dest));
+        let ctl = out.ensure_control_route("fake-device", dest).expect("wire the control route");
+        assert_ne!(ctl, out.port, "control cues never ride the render port");
+        // Idempotent: a second ensure reuses the port and the wire.
+        assert_eq!(out.ensure_control_route("fake-device", dest).unwrap(), ctl);
+
+        out.schedule(&[(Duration::ZERO, vec![0xB0, 74, 64])], Duration::ZERO, Some(ctl));
 
         let mut input = reader.input();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1370,17 +1524,23 @@ mod tests {
                     && ev.get_type() == EventType::Controller
                     && let Some(c) = ev.get_data::<alsa::seq::EvCtrl>()
                 {
-                    got = Some((c.channel, c.param, c.value));
+                    got = Some((c.channel, c.param, c.value, ev.get_source()));
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+        let (channel, param, value, source) = got.expect("the CC arrives through the subscription");
+        assert_eq!((channel, param, value), (0, 74, 64));
         assert_eq!(
-            got,
-            Some((0, 74, 64)),
-            "a direct-addressed CC must arrive with no subscription"
+            (source.client, source.port),
+            (out.addr().0, ctl),
+            "and it left from the device's ctl port, not the render port"
         );
+
+        // Prune: with no routes naming this device, the ctl port is reclaimed.
+        out.prune_control_routes(&MidiRoutes::new());
+        assert!(out.control_ports.is_empty(), "pruned: {:?}", out.control_ports);
     }
 
     // -- patch-bay slice 1: auto-connect decision core --------------------
