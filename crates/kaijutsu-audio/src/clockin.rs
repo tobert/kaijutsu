@@ -20,7 +20,7 @@
 //!   interval/k feeds the EMA once.
 //! - <0.75× → late-then-early jitter pair: count += 1, EMA unfed (the pair's
 //!   second interval would drag tempo sharp).
-//! - >4.5× → a discontinuity (stalled master): re-anchor timing at this
+//! - \>4.5× → a discontinuity (stalled master): re-anchor timing at this
 //!   pulse, count += 1, flag it — position vs a silently-stalled sender is
 //!   unknowable, so we surface it rather than guess (`discontinuities`).
 //!
