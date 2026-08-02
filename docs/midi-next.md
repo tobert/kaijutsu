@@ -480,7 +480,20 @@ Three moves change that:
   `din_children` entry.
 - **Role vocabulary** — how rich is a profile "role"? (`notes` / `kick` /
   `voice[3]` / KSP `track2`?) Grow from the routing consumer; resist
-  generality (the Cubase lesson).
+  generality (the Cubase lesson). **Convention seeded 2026-08-02** (gemini
+  review concurred): `direction` describes *wire physics* (source /
+  destination / bidirectional), `musical` describes *intent* (may a track
+  ever render to it?) — the KeyLab `daw` role is the motivating case
+  (bidirectional wire, `musical: false`). Keep them separate; never infer
+  one from the other.
+- **Device instance vs device model** (gemini review, 2026-08-02) — the
+  presence store keys on profile name, so two identical units (or two sinks
+  claiming one device) collide at `/run/midi/<device>`. Slice-1 stance:
+  first-available-instance, acceptable for this rig today. When a second
+  identical unit arrives, presence needs instance identity
+  (`<sink>/<device>`-shaped or similar) and bindings need to name an
+  instance, not a model. Deliberately deferred — grow it from the real
+  collision, not before (the Cubase lesson again).
 - **Pull conflicts** — a settings pull disagrees with an in-flight binding
   (device receive channel changed under a live track): who wins, how loud?
   Leaning: the pull commits; the binding's resolution goes stale loudly at

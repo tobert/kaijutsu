@@ -700,8 +700,12 @@ open items) built on profile vocabulary.
   2026-08-02, slice 1 step 3). `midi_match::PortFacts::usb_id` exists and the
   matcher already ranks a USB hit above any name match, but nothing fills the
   field: on Linux it needs an ALSA-card → sysfs walk
-  (`/sys/class/sound/cardN/device/{idVendor,idProduct}`), on macOS the
-  CoreMIDI device properties. Until then matching is name-substring only,
+  (`/sys/class/sound/cardN/device/{idVendor,idProduct}`). On macOS it is
+  costlier than it looks (gemini review, 2026-08-02): CoreMIDI endpoints do
+  NOT expose USB ids — the sink must bridge into IOKit
+  (`IORegistryEntryCreateCFProperty`) and walk the hardware tree to find
+  `idVendor`/`idProduct`; port-name substrings are the saving grace since
+  they absorb per-OS suffix differences. Until then matching is name-substring only,
   which the shipped profiles all support. Two same-model units on one rig
   (identical names, distinct USB paths) is the case that will force it — and
   will also need something finer than `vendor:product`, which is per-model,
