@@ -560,6 +560,13 @@ pub struct ConnectionState {
     /// the connection rather than outlive it as a lie. `None` on a connection
     /// that never reported presence, which is most of them.
     midi_presence: Option<Arc<kaijutsu_kernel::midi_presence::MidiPresenceStore>>,
+    /// The kernel's MIDI exchange registry, attached when this connection
+    /// registered a sink bridge (`docs/midi-next.md` "SysEx: the exchange
+    /// pattern"). Held for the same reason as `midi_presence`: a sink that
+    /// crashes never gets to withdraw itself, and a registry entry nobody is
+    /// draining would make every exchange wait for the kernel's deadline
+    /// instead of answering "that sink is gone" at once.
+    midi_exchange: Option<Arc<kaijutsu_kernel::midi_exchange::MidiExchangeRegistry>>,
 }
 
 impl ConnectionState {
@@ -578,6 +585,7 @@ impl ConnectionState {
             elicitation_subscribers: Vec::new(),
             conn_cancel: CancellationToken::new(),
             midi_presence: None,
+            midi_exchange: None,
         }
     }
 
@@ -593,6 +601,20 @@ impl ConnectionState {
     ) {
         if self.midi_presence.is_none() {
             self.midi_presence = Some(store);
+        }
+    }
+
+    /// Remember the exchange registry this connection registered a sink in,
+    /// so `Drop` can withdraw it. Idempotent, and called from the subscribe
+    /// path for the same reason `attach_midi_presence` is called from the
+    /// report path: only a connection that actually registered has anything
+    /// to withdraw.
+    fn attach_midi_exchange(
+        &mut self,
+        registry: Arc<kaijutsu_kernel::midi_exchange::MidiExchangeRegistry>,
+    ) {
+        if self.midi_exchange.is_none() {
+            self.midi_exchange = Some(registry);
         }
     }
 
@@ -698,6 +720,19 @@ impl Drop for ConnectionState {
                     reaped.join(", ")
                 );
             }
+        }
+        // Withdraw this connection's MIDI exchange sink. The bridge task
+        // does this too on its way out, but only Drop is guaranteed to run
+        // when the RPC system is torn down mid-flight — and a registered sink
+        // nobody drains turns every exchange into a full-deadline wait
+        // instead of an immediate, honest "that sink is gone".
+        if let Some(registry) = &self.midi_exchange
+            && registry.unregister(self.session_id)
+        {
+            log::info!(
+                "midi exchange: connection {} closed — its sink no longer answers exchanges",
+                self.session_id.short()
+            );
         }
         // Clean up per-session context tracking. Mirrors the explicit
         // remove that used to live at the tail of `run_rpc`; the Drop
@@ -2303,6 +2338,22 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let _span = tracing::info_span!("rpc", method = "subscribe_blocks").entered();
         let callback = pry!(pry!(params.get()).get_callback());
+
+        // The same callback the FlowBus bridge pushes events at is the one the
+        // kernel calls BACK for a MIDI exchange (`docs/midi-next.md` "SysEx:
+        // the exchange pattern"). Registered here — where a client first
+        // proves it is holding a sink callback — and keyed by this
+        // connection's SessionId, the same key presence attribution uses.
+        {
+            let registry = self.kernel.kernel.midi_exchange().clone();
+            let connection = {
+                let mut conn = self.connection.borrow_mut();
+                conn.attach_midi_exchange(registry.clone());
+                conn.session_id
+            };
+            let conn_cancel = self.connection.borrow().cancel_token();
+            spawn_midi_exchange_bridge(registry, connection, callback.clone(), conn_cancel);
+        }
 
         {
             // Get the FlowBus instances from the kernel
@@ -5478,6 +5529,18 @@ impl kernel::Server for KernelImpl {
         // safe for a lone directive filter (see `filtered_subscribe_pattern`).
         let subscribe_pattern = filtered_subscribe_pattern(&filter.event_types);
 
+        // Reverse direction on the same callback: see `subscribe_blocks`.
+        {
+            let registry = self.kernel.kernel.midi_exchange().clone();
+            let connection = {
+                let mut conn = self.connection.borrow_mut();
+                conn.attach_midi_exchange(registry.clone());
+                conn.session_id
+            };
+            let conn_cancel = self.connection.borrow().cancel_token();
+            spawn_midi_exchange_bridge(registry, connection, callback.clone(), conn_cancel);
+        }
+
         {
             let block_flows = self.kernel.kernel.block_flows().clone();
             let input_flows = self.kernel.documents.input_flows().cloned();
@@ -7248,6 +7311,97 @@ fn set_render_cue(mut builder: crate::kaijutsu_capnp::render_cue::Builder<'_>, c
         kaijutsu_audio::CuePayload::Inline(bytes) => builder.set_inline(bytes),
         kaijutsu_audio::CuePayload::Cas(hash) => builder.set_cas_hash(hash.to_string()),
     }
+}
+
+/// How much longer this bridge waits for the sink's `exchange` promise than
+/// the sink was told to wait for the device. Sits deliberately BETWEEN the
+/// client-side worker slack (0.5s) and the kernel's outer deadline (1s), so
+/// whichever layer actually wedged is the layer whose error the player reads.
+const EXCHANGE_CALL_SLACK: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Bridge the kernel's [`MidiExchangeRegistry`](kaijutsu_kernel::midi_exchange::MidiExchangeRegistry)
+/// to ONE connection's sink callback (`docs/midi-next.md` "SysEx: the exchange
+/// pattern", slice 1 step 5).
+///
+/// This is the reverse-direction twin of the FlowBus bridges above, and the
+/// two differ in exactly the way the doc says an exchange differs from a cue:
+/// a FlowBus bridge fans an event out to every subscriber and forgets it; this
+/// one carries a *call* to the single connection the kernel addressed, and
+/// carries its answer back. It lives here rather than in the kernel because
+/// the callback capability is `!Send` and pinned to this connection's
+/// `LocalSet` — which is the whole reason the kernel talks to a channel
+/// instead of holding the capability itself.
+///
+/// Exits on connection cancel or when the registration is replaced (its
+/// channel closes), and withdraws only its OWN registration epoch on the way
+/// out so a re-subscribe's live sink is never torn down by the task it
+/// replaced.
+fn spawn_midi_exchange_bridge(
+    registry: Arc<kaijutsu_kernel::midi_exchange::MidiExchangeRegistry>,
+    connection: SessionId,
+    callback: crate::kaijutsu_capnp::block_events::Client,
+    conn_cancel: CancellationToken,
+) {
+    let registration = registry.register(connection);
+    let epoch = registration.epoch;
+    let mut rx = registration.receiver;
+    tokio::task::spawn_local(async move {
+        log::debug!(
+            "midi exchange: connection {} now answers exchanges",
+            connection.short()
+        );
+        loop {
+            let req = tokio::select! {
+                _ = conn_cancel.cancelled() => break,
+                req = rx.recv() => match req {
+                    Some(req) => req,
+                    // Registration replaced (a re-subscribe) or the kernel
+                    // dropped the registry: nothing more will arrive here.
+                    None => break,
+                },
+            };
+            let mut call = callback.exchange_request();
+            {
+                let mut p = call.get();
+                p.set_port_or_device(&req.port_or_device);
+                p.set_payload(&req.payload[..]);
+                p.set_reply_match(&req.reply_match[..]);
+                p.set_timeout_ms(req.timeout_ms);
+            }
+            let deadline =
+                std::time::Duration::from_millis(u64::from(req.timeout_ms)) + EXCHANGE_CALL_SLACK;
+            // Cancellation is checked BETWEEN requests, not during one: a
+            // connection that dies mid-exchange is bounded by `deadline`
+            // rather than woken by `conn_cancel`. Deliberate — capnp fails an
+            // outstanding promise on teardown anyway, so the slack is a
+            // backstop for the case it doesn't, and racing a cancel against a
+            // half-sent hardware dialogue buys nothing (the sink's own
+            // timeout still governs the device).
+            // Exchanges are serialized per connection by construction: this
+            // loop awaits each answer before taking the next request. That is
+            // the "serialized per port" rule at its coarsest safe grain — a
+            // sink's own worker enforces it on the hardware side too.
+            let answer = match tokio::time::timeout(deadline, call.send().promise).await {
+                Ok(Ok(response)) => response
+                    .get()
+                    .and_then(|r| r.get_reply())
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|e| format!("malformed exchange reply from the sink: {e}")),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(_) => Err(format!(
+                    "the sink did not answer the exchange within {deadline:?}"
+                )),
+            };
+            // Nobody to answer = the kernel-side caller gave up first; that
+            // is its own error already, so this is not worth a warning.
+            let _ = req.reply.send(answer);
+        }
+        registry.unregister_epoch(connection, epoch);
+        log::debug!(
+            "midi exchange bridge for connection {} ended",
+            connection.short()
+        );
+    });
 }
 
 /// Fill a Cap'n Proto `BeatRef` builder from the typed reference (docs/midi.md

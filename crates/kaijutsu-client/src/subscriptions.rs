@@ -213,6 +213,36 @@ pub enum ConnectionStatus {
 /// callback into a `broadcast::Sender<ServerEvent>`.
 pub(crate) struct BlockEventsForwarder {
     pub event_tx: broadcast::Sender<ServerEvent>,
+    /// Where an `exchange` call is run (`docs/midi-next.md` "SysEx: the
+    /// exchange pattern"). Late-bindable and shared: a MIDI-capable client
+    /// installs its hardware worker whenever that worker is ready, with no
+    /// re-subscribe. Empty on every client that holds no MIDI hardware, which
+    /// is most of them — and an empty slot REFUSES loudly rather than
+    /// pretending the device was silent.
+    pub midi_exchange: std::sync::Arc<crate::midi_exchange::MidiExchangeSlot>,
+}
+
+/// Build a `BlockEvents` callback client plus the receiver its pushes land
+/// on, with an explicit MIDI exchange seat.
+///
+/// The app builds its forwarder inside the actor (which owns the seat and
+/// re-seats it across reconnects); this is the same wiring for callers that
+/// drive the subscription themselves — the headless e2e tests, and any future
+/// non-Bevy sink. Pass [`MidiExchangeSlot::new()`](crate::MidiExchangeSlot) and
+/// leave it empty for a client that holds no MIDI hardware: an empty seat
+/// refuses an exchange loudly rather than looking like a silent device.
+pub fn block_events_channel(
+    capacity: usize,
+    midi_exchange: std::sync::Arc<crate::midi_exchange::MidiExchangeSlot>,
+) -> (
+    crate::kaijutsu_capnp::block_events::Client,
+    broadcast::Receiver<ServerEvent>,
+) {
+    let (tx, rx) = broadcast::channel(capacity);
+    let client: crate::kaijutsu_capnp::block_events::Client = capnp_rpc::new_client(
+        BlockEventsForwarder { event_tx: tx, midi_exchange },
+    );
+    (client, rx)
 }
 
 /// Extract a String from a capnp text reader, mapping errors to capnp::Error.
@@ -952,6 +982,58 @@ impl block_events::Server for BlockEventsForwarder {
             tracing::warn!("Event channel closed, dropping BeatSync event");
         }
         Promise::ok(())
+    }
+
+    /// The one CALL on this otherwise push-only interface: run a bounded MIDI
+    /// request/reply on this client's hardware and answer with the bytes
+    /// (`docs/midi-next.md` "SysEx: the exchange pattern").
+    ///
+    /// Everything else here forwards into a broadcast and returns
+    /// immediately; this one holds the kernel's promise open until the local
+    /// sink answers. Failures are `Promise::err` — the kernel turns each into
+    /// a named `kj` error — because an empty reply and a hang are the two
+    /// things an exchange must never be.
+    fn exchange(
+        self: Rc<Self>,
+        params: block_events::ExchangeParams,
+        mut results: block_events::ExchangeResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let port_or_device = match p.get_port_or_device().and_then(read_text) {
+            Ok(v) => v,
+            Err(e) => return Promise::err(e),
+        };
+        let payload = match p.get_payload() {
+            Ok(b) => b.to_vec(),
+            Err(e) => return Promise::err(e),
+        };
+        let reply_match = match p.get_reply_match() {
+            Ok(b) => b.to_vec(),
+            Err(e) => return Promise::err(e),
+        };
+        // 0 would mean "wait forever" to a worker reading it literally, which
+        // is the one thing a bounded call may not do. Refuse at the boundary
+        // rather than substituting a default the caller never asked for.
+        let timeout_ms = p.get_timeout_ms();
+        if timeout_ms == 0 {
+            return Promise::err(capnp::Error::failed(
+                "exchange: timeoutMs must be > 0 — an exchange is a BOUNDED call".into(),
+            ));
+        }
+        let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+        let slot = self.midi_exchange.clone();
+        Promise::from_future(async move {
+            match slot.run(port_or_device, payload, reply_match, timeout).await {
+                Ok(reply) => {
+                    results.get().set_reply(&reply[..]);
+                    Ok(())
+                }
+                Err(e) => Err(capnp::Error::failed(e)),
+            }
+        })
     }
 }
 

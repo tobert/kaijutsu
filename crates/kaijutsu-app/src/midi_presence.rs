@@ -177,9 +177,19 @@ impl MidiPresenceState {
 
     /// device → matched port addresses on THIS machine — how `kj midi send`
     /// finds a port (`crate::dj::thread::forward_midi_routes_to_dj` ships it
-    /// to the DJ thread). Empty until the first match.
+    /// to the DJ thread) and how an exchange finds one
+    /// (`crate::midi_exchange::forward_routes`). Empty until the first match.
     pub fn routes(&self) -> &BTreeMap<String, Vec<String>> {
         &self.routes
+    }
+
+    /// Install a routing picture directly, for tests of the consumers that
+    /// read it (the DJ forward, the exchange forward). Production writes go
+    /// through `reconcile_presence` and nowhere else — this is a test seam,
+    /// not a second writer.
+    #[cfg(test)]
+    pub fn set_routes_for_test(&mut self, routes: BTreeMap<String, Vec<String>>) {
+        self.routes = routes;
     }
 }
 

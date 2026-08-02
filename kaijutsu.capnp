@@ -437,6 +437,37 @@ interface BlockEvents {
   # attached client. `contextId` is the track's score context (the same key
   # onRenderCue uses), so a sink can associate a beat with its track.
   onBeatSync @14 (contextId :Data, beatRef :BeatRef);
+
+  # A bounded MIDI request/reply at one sink (docs/midi-next.md "SysEx: the
+  # exchange pattern"). The FIRST round-trip member of this otherwise
+  # fire-and-forget set: onRenderCue/onBeatSync push, this one *calls*. Cap'n
+  # Proto is bidirectional and promise-returning, so the kernel asks a
+  # specific sink a question and awaits its answer over the connection that
+  # sink already holds.
+  #
+  # Unlike every method above, this is NOT a fan-out: the kernel picks the ONE
+  # connection whose sink reported the device present (the presence store's
+  # SinkAttribution) and calls it there. Sending a device dialogue to every
+  # attached client would mean several ears answering for gear only one of
+  # them has.
+  #
+  # - `portOrDevice` — a device profile name (`keystep-pro`, resolved through
+  #   the sink's own routing table, exactly as a device-addressed control cue
+  #   is) or a backend port address (`"24:0"`) when the caller already knows
+  #   the port. The kernel sends the device name; it never learns ALSA
+  #   numbers.
+  # - `payload` — complete MIDI bytes to send (a whole F0…F7 SysEx today).
+  # - `replyMatch` — leading bytes the reply must start with (`F0 7E` for a
+  #   universal Identity Reply); traffic that doesn't match is ignored, so a
+  #   chatty device can't answer the wrong question.
+  # - `timeoutMs` — the sink's own bound on the wait. The kernel enforces a
+  #   slightly larger overall deadline so a wedged sink can't hang the caller.
+  #
+  # Errors are LOUD: unplugged, unroutable, no reply before the timeout, or a
+  # sink with no exchange client all come back as a failed call, never as an
+  # empty reply and never as a hang.
+  exchange @15 (portOrDevice :Text, payload :Data, replyMatch :Data, timeoutMs :UInt32)
+      -> (reply :Data);
 }
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).

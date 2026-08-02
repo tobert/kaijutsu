@@ -133,7 +133,10 @@ test-mock = []
 rustix = { version = "0.38", features = ["fs", "process"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# "test-util" gives `#[tokio::test(start_paused = true)]` — how the MIDI
+# exchange's deadline tests assert a multi-second timeout instantly instead of
+# actually sleeping through it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Enable the cross-crate test-only helpers (e.g. push_committed_for_test) for the

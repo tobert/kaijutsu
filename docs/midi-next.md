@@ -482,10 +482,35 @@ Three moves change that:
       place: role-aware port choice (slice 1 takes the device's *first*
       matched port), `/run/midi` sent-provenance (slice 3), CoreMIDI address
       forms (`parse_alsa_addr` refuses them rather than guessing).
-   5. The **`exchange()` sink method** + `kj midi identify`
-      (Identity-Request fingerprint). Step 3 already spent the slice's first
-      capnp change (`MidiPortFact` + `reportMidiPresence`), so this is the
-      second and last.
+   5. ~~The **`exchange()` sink method** + `kj midi identify`~~ — **done
+      2026-08-02**, and it closes slice 1. The wire is one appended method on
+      the existing subscriber callback (`BlockEvents.exchange @15
+      {portOrDevice, payload, replyMatch, timeoutMs} -> reply`) — the second
+      and last capnp change of the slice, as planned. The shape that made it
+      work: an exchange is **addressed, not fanned out**, so the kernel needs
+      a way to call ONE connection. Presence already knew which
+      (`SinkAttribution::connection`), so the kernel gained a matching
+      registry (`midi_exchange::MidiExchangeRegistry`, connection → channel,
+      registered by the server at `subscribe_blocks*` and reaped on
+      disconnect exactly like presence) and the server owns the task that
+      turns a channel request into the capnp call — the kernel still holds no
+      capnp capability and no hardware. App side: a **third** ALSA client
+      (`kaijutsu-exchange`, alongside render and the ear) on its own thread,
+      one dialogue at a time, request sent DIRECT to the matched port and the
+      reply heard through a subscription taken and dropped inside the
+      exchange, so the ear never sees request/reply traffic. Timeouts are a
+      ladder (app 2 s, then +0.5/+0.75/+1 s outward) so the layer that
+      actually wedged is the layer whose error a player reads; every failure
+      — unknown device, absent device, sink not serving exchanges, silent
+      device, unparseable reply — is a named error, never a hang and never an
+      empty reply. `kj midi identify` files the parsed reply at
+      `/run/midi/<device>` as the doc's **third provenance, `pulled`** — the
+      first fact in that store the *device itself* asserted. It survives
+      re-reports that keep the device live, and dies on any unplug or reap
+      (what returns to a port may be a different unit; re-plug ⇒
+      re-identify). Deferred with seams in place: per-port (rather than
+      per-sink) serialization, role-aware port choice, a CoreMIDI worker, and
+      the four-crate timeout ladder living in four files (`docs/issues.md`).
 2. **Routing consumes profiles.** The render sink resolves "track →
    *device.role*" through the profile to port + channel — paying for the
    per-track channel-routing open item (`midi.md` open questions,

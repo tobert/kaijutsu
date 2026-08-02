@@ -49,5 +49,8 @@ libc = "0.2"
 capnpc.workspace = true
 
 [dev-dependencies]
+# "test-util" gives `#[tokio::test(start_paused = true)]` — how the MIDI
+# exchange's wedged-worker test asserts a multi-second bound instantly.
+tokio = { workspace = true, features = ["fs", "test-util"] }
 env_logger.workspace = true
 tempfile.workspace = true

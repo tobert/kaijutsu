@@ -9,10 +9,22 @@
 //!
 //! `list` enumerates the devices tree, `show` prints one profile document,
 //! `send`/`panic` emit raw control cues at a named device (slice 1 step 4,
-//! below). Profile-resolved control *names* (`kj midi cc subh vco1-level
-//! -25%`), `identify`, and `pull` are later slices in `docs/midi-next.md` —
-//! this noun exists so building them doesn't fragment `kj` discovery later
-//! (the `kj audio`/`kj transport` precedent this file follows).
+//! below), and `identify` asks a device what it is over the exchange
+//! round-trip (slice 1 step 5 — see [`Self::midi_identify`]).
+//! Profile-resolved control *names* (`kj midi cc subh vco1-level -25%`) and
+//! `pull` (settings dumps over the same exchange) are later slices in
+//! `docs/midi-next.md` — this noun exists so building them doesn't fragment
+//! `kj` discovery later (the `kj audio`/`kj transport` precedent this file
+//! follows).
+//!
+//! ## Exchange (slice 1 step 5): `identify`
+//!
+//! Everything above pushes cues at every attached sink and lets the one
+//! holding the gear play them. `identify` is the first **call**: it resolves
+//! the device to the ONE connection whose sink reported it present and asks
+//! that sink alone (`crate::midi_exchange`). Presence is therefore a *gate*
+//! here — the one verb where it is — because there is no honest way to pick a
+//! sink for a device nobody has reported.
 //!
 //! ## Emit (slice 1 step 4): `send` and `panic`
 //!
@@ -65,6 +77,8 @@ use kaijutsu_audio::{CuePayload, MIDI_CONTROL_MIME, MidiControl, MidiControlEven
 use kaijutsu_types::ContentType;
 use kaijutsu_types::paths::{MIDI_ROOT, midi_device_path};
 
+use crate::midi_exchange::DEFAULT_EXCHANGE_TIMEOUT_MS;
+
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::flows::BlockFlow;
@@ -112,6 +126,18 @@ enum MidiCommand {
         /// `kj play`: every attached sink receives the cue regardless.
         #[arg(long, short = 'c', global = true)]
         context: Option<String>,
+    },
+    /// Ask a device what it is (universal MIDI Identity Request) and record
+    /// the answer as a pulled fact in /run/midi/<device>.
+    Identify {
+        /// Device name — a profile key under /etc/midi/devices
+        device: String,
+        /// How long the sink waits for the device's reply, in milliseconds
+        #[arg(long, default_value_t = DEFAULT_EXCHANGE_TIMEOUT_MS)]
+        timeout_ms: u32,
+        /// Emit a JSON object instead of a labelled view
+        #[arg(long)]
+        json: bool,
     },
     /// All-notes-off + all-sound-off on all 16 channels of <device>, or of
     /// every device the rig currently reports live when omitted.
@@ -458,6 +484,9 @@ impl KjDispatcher {
             MidiCommand::Send { device, message, context } => {
                 self.midi_send(&device, &message, context.as_deref(), caller).await
             }
+            MidiCommand::Identify { device, timeout_ms, json } => {
+                self.midi_identify(&device, timeout_ms, json).await
+            }
             MidiCommand::Panic { device, context } => {
                 self.midi_panic(device.as_deref(), context.as_deref(), caller).await
             }
@@ -623,6 +652,146 @@ impl KjDispatcher {
             receivers,
             warnings,
         )
+    }
+
+    /// `kj midi identify <device>` — the universal Identity Request
+    /// (`F0 7E 7F 06 01 F7`) over the [`exchange`](crate::midi_exchange)
+    /// round-trip, and the first **pulled** fact this store has ever held
+    /// (`docs/midi-next.md` "SysEx: the exchange pattern", slice 1 step 5).
+    ///
+    /// Resolution, in order, each step refusing rather than guessing:
+    ///
+    /// 1. **The profile is the gate**, exactly as `send`/`panic`: an unknown
+    ///    `<device>` has nothing to resolve anywhere.
+    /// 2. **Presence chooses the sink.** Unlike `send` — which publishes a cue
+    ///    every sink hears and lets the one holding the gear play it —
+    ///    an exchange must be *addressed*, so here presence IS a gate. The
+    ///    record's [`SinkAttribution::connection`](crate::midi_presence::SinkAttribution)
+    ///    names the one connection to ask. `unknown` and `absent` are
+    ///    different errors on purpose: "nobody has told this kernel anything"
+    ///    and "a sink watched it leave" send a player to different places.
+    /// 3. **The registry must have that connection.** A device reported by a
+    ///    connection that has since gone (or by a peer too old to serve
+    ///    exchanges) is a named error, never a wait.
+    ///
+    /// The reply is parsed strictly — a half-understood identity would be
+    /// stored under the most-trusted provenance in the store — and only then
+    /// written to `/run/midi/<device>`.
+    async fn midi_identify(&self, device: &str, timeout_ms: u32, json: bool) -> KjResult {
+        use crate::midi_identity::{IDENTITY_REPLY_PREFIX, IDENTITY_REQUEST, hex};
+
+        let canonical = match self.midi_device_must_exist("identify", device).await {
+            Ok(c) => c,
+            Err(e) => return KjResult::Err(e),
+        };
+        let bare = canonical
+            .rsplit('/')
+            .next()
+            .unwrap_or(&canonical)
+            .to_string();
+
+        // Presence is a GATE here (the one verb where it is): an exchange goes
+        // to exactly one connection, and there is no honest way to pick one
+        // for a device nobody has reported.
+        let record = match self.kernel().midi_presence().get(&bare) {
+            Some(r) if r.present => r,
+            Some(r) => {
+                return KjResult::Err(format!(
+                    "kj midi identify: '{bare}' was last reported ABSENT{} — an exchange \
+                     needs a sink that can actually reach the device. Plug it in, or \
+                     check `kj midi list`.",
+                    if r.sink.host.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" by {}", r.sink.host)
+                    }
+                ));
+            }
+            None => {
+                return KjResult::Err(format!(
+                    "kj midi identify: presence of '{bare}' is UNKNOWN to this kernel \
+                     (no sink has reported it) — that is not the same as absent: this \
+                     kernel simply has not been told. Connect a sink (or check \
+                     `kj midi list`) and try again."
+                ));
+            }
+        };
+
+        let reply = match self
+            .kernel()
+            .midi_exchange()
+            .exchange(
+                record.sink.connection,
+                &bare,
+                IDENTITY_REQUEST.to_vec(),
+                IDENTITY_REPLY_PREFIX.to_vec(),
+                timeout_ms,
+            )
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let where_ = if record.sink.host.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (sink on {})", record.sink.host)
+                };
+                return KjResult::Err(format!(
+                    "kj midi identify: '{bare}'{where_}: {e}"
+                ));
+            }
+        };
+
+        let identity = match crate::midi_identity::parse_identity_reply(&reply) {
+            Ok(id) => id,
+            Err(e) => {
+                // The bytes ride along in the error: an off-spec reply is a
+                // thing to look at, not a thing to shrug about.
+                return KjResult::Err(format!(
+                    "kj midi identify: '{bare}' answered, but the reply is not a usable \
+                     Identity Reply: {e} (raw: {})",
+                    hex(&reply)
+                ));
+            }
+        };
+
+        let at_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // The device answered; the record it answers about may have been
+        // reaped in the meantime (its sink disconnected mid-exchange). Loud,
+        // not fatal: the identity is still true and worth showing, we just
+        // couldn't file it.
+        let mut warnings: Vec<String> = Vec::new();
+        if let Err(e) = self
+            .kernel()
+            .midi_presence()
+            .record_identity(&bare, identity.clone(), at_ns)
+        {
+            warnings.push(format!(
+                "the reply could not be filed at /run/midi/{bare}: {e}"
+            ));
+        }
+
+        let data = serde_json::json!({
+            "device": bare,
+            "host": record.sink.host,
+            "identity": identity.to_json(),
+            "at": at_ns,
+            "source": crate::midi_presence::SOURCE_PULLED,
+            "warnings": warnings,
+        });
+        if json {
+            return KjResult::ok_with_data(data.to_string(), data);
+        }
+        let mut message = format!("{bare}: {}\n", identity.summary());
+        message.push_str(&format!("raw:      {}\n", hex(&identity.raw)));
+        message.push_str(&format!("recorded: /run/midi/{bare} (source: pulled)\n"));
+        for w in &warnings {
+            message.push_str(&format!("warning:  {w}\n"));
+        }
+        KjResult::ok_typed_with_data(message, ContentType::Plain, data)
     }
 
     async fn midi_list(&self, json: bool) -> KjResult {
@@ -1908,6 +2077,243 @@ mod tests {
                 assert_eq!(v.as_array().map(|a| a.len()), Some(0));
             }
             other => panic!("expected Ok with an empty array, got {other:?}"),
+        }
+    }
+
+    // ── identify: the exchange round-trip (slice 1 step 5) ────────────────
+
+    use crate::midi_exchange::ExchangeRequest;
+
+    /// An Arturia-shaped Identity Reply, the answer a live KeyStep Pro gives.
+    fn identity_reply() -> Vec<u8> {
+        vec![
+            0xF0, 0x7E, 0x00, 0x06, 0x02, 0x00, 0x20, 0x6B, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00,
+            0x03, 0x04, 0xF7,
+        ]
+    }
+
+    /// Register a stand-in sink on `connection` and answer the first exchange
+    /// with `answer`. Returns the join handle so a test can inspect exactly
+    /// what the kernel asked for.
+    fn spawn_fake_sink(
+        d: &KjDispatcher,
+        connection: kaijutsu_types::SessionId,
+        answer: Result<Vec<u8>, String>,
+    ) -> tokio::task::JoinHandle<Option<(String, Vec<u8>, Vec<u8>, u32)>> {
+        let mut rx = d.kernel().midi_exchange().register(connection).receiver;
+        tokio::spawn(async move {
+            let ExchangeRequest {
+                port_or_device,
+                payload,
+                reply_match,
+                timeout_ms,
+                reply,
+            } = rx.recv().await?;
+            let _ = reply.send(answer);
+            Some((port_or_device, payload, reply_match, timeout_ms))
+        })
+    }
+
+    /// The anchor: a live device, a registered sink, a real Identity Reply —
+    /// the request goes to THAT connection, and the answer lands in
+    /// `/run/midi/<device>` as a **pulled** fact.
+    #[tokio::test]
+    async fn identify_asks_the_sink_that_reported_the_device_and_files_the_answer() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let report = sink_report("keystep-pro", true, 100);
+        let connection = report.sink.connection;
+        d.kernel().midi_presence().record(report).unwrap();
+        let sink = spawn_fake_sink(&d, connection, Ok(identity_reply()));
+
+        let result = d
+            .dispatch(&[s("midi"), s("identify"), s("keystep-pro"), s("--json")], &c)
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["device"], "keystep-pro");
+                assert_eq!(v["identity"]["manufacturerName"], "Arturia");
+                assert_eq!(v["identity"]["family"], 1);
+                assert_eq!(v["identity"]["model"], 2);
+                assert_eq!(v["source"], "pulled");
+                assert_eq!(
+                    v["warnings"].as_array().map(|a| a.len()),
+                    Some(0),
+                    "a clean identify warns about nothing: {v}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        // What the sink was actually asked: the DEVICE name (never an ALSA
+        // address), the universal request, and the F0 7E reply filter.
+        let (device, payload, reply_match, timeout_ms) =
+            sink.await.unwrap().expect("the sink saw the exchange");
+        assert_eq!(device, "keystep-pro");
+        assert_eq!(payload, crate::midi_identity::IDENTITY_REQUEST.to_vec());
+        assert_eq!(reply_match, vec![0xF0, 0x7E]);
+        assert_eq!(timeout_ms, DEFAULT_EXCHANGE_TIMEOUT_MS);
+
+        // …and the pulled fact is on the record for everyone else to read.
+        let json = d
+            .kernel()
+            .midi_presence()
+            .get("keystep-pro")
+            .expect("record")
+            .to_json();
+        assert_eq!(json["identity"]["source"], "pulled");
+        assert_eq!(json["identity"]["value"]["manufacturer"], "00206b");
+        assert_eq!(json["present"]["source"], "sink", "sink facts keep their own provenance");
+    }
+
+    /// `--timeout-ms` reaches the sink verbatim: the sink owns the real wait
+    /// (it holds the wire), the kernel only bounds it from outside.
+    #[tokio::test]
+    async fn identify_passes_the_requested_timeout_to_the_sink() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let report = sink_report("keystep-pro", true, 100);
+        let connection = report.sink.connection;
+        d.kernel().midi_presence().record(report).unwrap();
+        let sink = spawn_fake_sink(&d, connection, Ok(identity_reply()));
+
+        let result = d
+            .dispatch(
+                &[s("midi"), s("identify"), s("keystep-pro"), s("--timeout-ms"), s("250")],
+                &c,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "result: {result:?}");
+        assert_eq!(sink.await.unwrap().expect("asked").3, 250);
+    }
+
+    /// Unknown presence and absent presence are DIFFERENT errors. A restarted
+    /// kernel that says "absent" would be lying about an observation nobody
+    /// made — the load-bearing distinction of the whole presence store.
+    #[tokio::test]
+    async fn identify_names_unknown_and_absent_as_different_states() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+
+        match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("UNKNOWN"), "msg: {msg}");
+                assert!(msg.contains("not the same as absent"), "msg: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("keystep-pro", false, 200))
+            .unwrap();
+        match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("ABSENT"), "msg: {msg}");
+                assert!(msg.contains("moltar"), "the error names WHERE it was seen: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// The profile is still the gate, before presence is even consulted: an
+    /// unknown device has nothing to resolve anywhere.
+    #[tokio::test]
+    async fn identify_refuses_a_device_with_no_profile() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        match d.dispatch(&[s("midi"), s("identify"), s("nonesuch")], &c).await {
+            KjResult::Err(msg) => assert!(msg.contains("unknown device"), "msg: {msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// A device reported live by a connection that serves no exchanges (it
+    /// disconnected, or it is an older peer) is a NAMED error — never a hang
+    /// and never a pretend-success.
+    #[tokio::test]
+    async fn identify_refuses_loudly_when_the_reporting_sink_serves_no_exchanges() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("keystep-pro", true, 100))
+            .unwrap();
+        match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("serving exchanges"), "msg: {msg}");
+                assert!(msg.contains("keystep-pro"), "msg: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// The sink's own refusal (device silent, port unroutable) reaches the
+    /// player verbatim — it knows why, and we would only blur it.
+    #[tokio::test]
+    async fn identify_surfaces_the_sinks_refusal_verbatim() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let report = sink_report("keystep-pro", true, 100);
+        let connection = report.sink.connection;
+        d.kernel().midi_presence().record(report).unwrap();
+        let _sink = spawn_fake_sink(
+            &d,
+            connection,
+            Err("no reply within 2000ms (device silent)".into()),
+        );
+        match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("no reply within 2000ms"), "msg: {msg}");
+                assert!(msg.contains("moltar"), "and names which sink asked: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+        // Nothing was filed for a failed exchange.
+        assert!(
+            d.kernel().midi_presence().get("keystep-pro").unwrap().identity.is_none(),
+            "a refused exchange must file nothing"
+        );
+    }
+
+    /// A device that answers with garbage (or with some other dialogue) is a
+    /// loud parse error carrying the raw bytes — never a half-filled pulled
+    /// fact, which would be the most-trusted provenance in the store holding
+    /// an invention.
+    #[tokio::test]
+    async fn identify_refuses_an_unparseable_reply_and_shows_the_bytes() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let report = sink_report("keystep-pro", true, 100);
+        let connection = report.sink.connection;
+        d.kernel().midi_presence().record(report).unwrap();
+        let _sink = spawn_fake_sink(&d, connection, Ok(vec![0xF0, 0x7E, 0x00, 0xF7]));
+        match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("not a usable"), "msg: {msg}");
+                assert!(msg.contains("raw: f07e00f7"), "the evidence rides along: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+        assert!(d.kernel().midi_presence().get("keystep-pro").unwrap().identity.is_none());
+    }
+
+    /// The human view names the device, what it said, and where it was filed.
+    #[tokio::test]
+    async fn identify_renders_a_human_line_naming_the_maker_and_the_record() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let report = sink_report("keystep-pro", true, 100);
+        let connection = report.sink.connection;
+        d.kernel().midi_presence().record(report).unwrap();
+        let _sink = spawn_fake_sink(&d, connection, Ok(identity_reply()));
+        match d.dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c).await {
+            KjResult::Ok { message, .. } => {
+                assert!(message.contains("Arturia (00206b)"), "message: {message}");
+                assert!(message.contains("/run/midi/keystep-pro"), "message: {message}");
+                assert!(message.contains("f07e00060200206b"), "message: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 }

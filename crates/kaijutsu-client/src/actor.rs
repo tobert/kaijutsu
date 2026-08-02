@@ -58,6 +58,7 @@
 //!    every `join_context` and every `subscribe_*` call. The server uses
 //!    `(principal, instance)` to dedupe subscriptions across reconnects.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kaijutsu_crdt::{ContextId, KernelId};
@@ -750,6 +751,12 @@ pub struct ActorHandle {
     /// so a caller can read "are we connected?" without racing the one-shot
     /// broadcast. See [`Self::current_status`] / [`Self::watch_status`].
     status_watch_rx: watch::Receiver<ConnectionStatus>,
+    /// The seat a MIDI-capable client installs its hardware worker into, so
+    /// the kernel's `exchange` calls have somewhere to land
+    /// (`docs/midi-next.md` "SysEx: the exchange pattern"). Shared with every
+    /// block-events forwarder this actor builds — including the ones a
+    /// reconnect rebuilds — so installing once survives reconnects.
+    midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
 }
 
 impl ActorHandle {
@@ -768,6 +775,14 @@ impl ActorHandle {
     }
 
     // ── Subscriptions ────────────────────────────────────────────────────
+
+    /// The MIDI exchange seat (`docs/midi-next.md` "SysEx: the exchange
+    /// pattern"). A client that owns MIDI hardware installs its worker's
+    /// channel here; every other client leaves it empty and the kernel is
+    /// told so, loudly, rather than waiting on a sink that was never there.
+    pub fn midi_exchange(&self) -> Arc<crate::midi_exchange::MidiExchangeSlot> {
+        self.midi_exchange.clone()
+    }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
         self.event_tx.subscribe()
@@ -1690,6 +1705,11 @@ struct RpcActor {
     /// so a second `SubscribeVfsActivity` call on a live connection is a
     /// no-op rather than stacking a duplicate bridge task server-side.
     vfs_activity_interval_ms: Option<u32>,
+    /// Shared with `ActorHandle` and handed to every block-events forwarder
+    /// this actor builds (`docs/midi-next.md` "SysEx: the exchange pattern").
+    /// Rebuilding the forwarder on reconnect therefore never loses the
+    /// installed sink.
+    midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
 
     /// Owned during `Connected`. Replaced atomically on successful handshake.
     connection: Option<ConnectionState>,
@@ -1729,6 +1749,7 @@ impl RpcActor {
         event_tx: broadcast::Sender<ServerEvent>,
         status_tx: broadcast::Sender<ConnectionStatus>,
         status_watch_tx: watch::Sender<ConnectionStatus>,
+        midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
     ) -> Self {
         let (close_tx, close_rx) = mpsc::channel(1);
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
@@ -1742,6 +1763,7 @@ impl RpcActor {
             joined_context_id: None,
             peer_registration: None,
             vfs_activity_interval_ms: None,
+            midi_exchange,
             connection: None,
             ping_task: None,
             connecting_task: None,
@@ -1813,6 +1835,7 @@ impl RpcActor {
             self.event_tx.clone(),
             self.peer_registration.clone(),
             self.vfs_activity_interval_ms,
+            self.midi_exchange.clone(),
         );
         self.connecting_task = Some(task);
         self.broadcast_state();
@@ -2186,6 +2209,7 @@ impl RpcActor {
         let kernel = conn.kernel.clone();
         let event_tx = self.event_tx.clone();
         let instance = self.instance.clone();
+        let midi_exchange = self.midi_exchange.clone();
         // Scope to the joined context only for single-context clients; a
         // kernel-wide client re-subscribes kernel-wide (None), matching its
         // handshake subscription.
@@ -2195,7 +2219,8 @@ impl RpcActor {
             None
         };
         tokio::task::spawn_local(async move {
-            let (block_client, filter) = block_events_client_and_filter(&event_tx, context_id);
+            let (block_client, filter) =
+                block_events_client_and_filter(&event_tx, context_id, midi_exchange);
             match tokio::time::timeout(
                 SUBSCRIBE_TIMEOUT,
                 kernel.subscribe_blocks_filtered(block_client, &filter, &instance),
@@ -2401,6 +2426,7 @@ impl RpcActor {
 /// Spawn the connect-handshake task. Returns a JoinHandle the actor can
 /// select on. The task runs each step with its own per-phase deadline so
 /// the failure mode names the slow phase.
+#[allow(clippy::too_many_arguments)] // the handshake's inputs, one per subscription it re-establishes
 fn spawn_handshake(
     config: SshConfig,
     context_id: Option<ContextId>,
@@ -2409,6 +2435,7 @@ fn spawn_handshake(
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
+    midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
         connect_handshake(
@@ -2419,6 +2446,7 @@ fn spawn_handshake(
             event_tx,
             peer_registration,
             vfs_activity_interval_ms,
+            midi_exchange,
         )
         .await
     })
@@ -2434,12 +2462,14 @@ fn spawn_handshake(
 fn block_events_client_and_filter(
     event_tx: &broadcast::Sender<ServerEvent>,
     context_id: Option<ContextId>,
+    midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
 ) -> (
     crate::kaijutsu_capnp::block_events::Client,
     kaijutsu_types::BlockEventFilter,
 ) {
     let block_fwd = BlockEventsForwarder {
         event_tx: event_tx.clone(),
+        midi_exchange,
     };
     let block_client: crate::kaijutsu_capnp::block_events::Client =
         capnp_rpc::new_client(block_fwd);
@@ -2452,6 +2482,7 @@ fn block_events_client_and_filter(
     (block_client, filter)
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors spawn_handshake's parameter list exactly
 async fn connect_handshake(
     config: SshConfig,
     context_id: Option<ContextId>,
@@ -2460,6 +2491,7 @@ async fn connect_handshake(
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
+    midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
 ) -> ConnectOutcome {
     // 1. SSH dial + auth + channel open (with per-phase deadline).
     let client = match tokio::time::timeout(SSH_DIAL_TIMEOUT, connect_ssh(config)).await {
@@ -2594,7 +2626,8 @@ async fn connect_handshake(
     } else {
         None
     };
-    let (block_client, filter) = block_events_client_and_filter(&event_tx, filter_context);
+    let (block_client, filter) =
+        block_events_client_and_filter(&event_tx, filter_context, midi_exchange);
 
     let resource_fwd = ResourceEventsForwarder {
         event_tx: event_tx.clone(),
@@ -3124,6 +3157,11 @@ pub fn spawn_actor(
     // `run()` issues its first `broadcast_state`.
     let (status_watch_tx, status_watch_rx) = watch::channel(ConnectionStatus::Idle);
 
+    // One slot, shared by the actor (which hands it to every block-events
+    // forwarder it builds, reconnects included) and the handle (where a
+    // MIDI-capable client installs its worker).
+    let midi_exchange = crate::midi_exchange::MidiExchangeSlot::new();
+
     let actor = RpcActor::new(
         config,
         context_id,
@@ -3133,6 +3171,7 @@ pub fn spawn_actor(
         event_tx.clone(),
         status_tx.clone(),
         status_watch_tx,
+        midi_exchange.clone(),
     );
     tokio::task::spawn_local(actor.run());
 
@@ -3141,6 +3180,7 @@ pub fn spawn_actor(
         event_tx,
         status_tx,
         status_watch_rx,
+        midi_exchange,
     }
 }
 
@@ -3210,6 +3250,7 @@ mod tests {
             event_tx,
             status_tx,
             status_watch_tx,
+            crate::midi_exchange::MidiExchangeSlot::new(),
         )
     }
 

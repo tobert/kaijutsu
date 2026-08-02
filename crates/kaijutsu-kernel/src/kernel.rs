@@ -76,6 +76,12 @@ pub struct Kernel {
     /// records); read by `kj midi list/show` and, through the read-only
     /// `MidiPresenceFs` mounted at `/run/midi`, by kaish/kai/file tools.
     midi_presence: Arc<crate::midi_presence::MidiPresenceStore>,
+    /// Connection → MIDI exchange channel (`docs/midi-next.md` "SysEx: the
+    /// exchange pattern"). The addressed counterpart to `midi_presence`'s
+    /// records: presence says WHICH connection has a device, this says how to
+    /// ask that connection a question. Ephemeral and connection-bound for the
+    /// same reason — a sink that goes away can't answer.
+    midi_exchange: Arc<crate::midi_exchange::MidiExchangeRegistry>,
     /// Image generation backend registry.
     image_backends: RwLock<crate::image::ImageBackendRegistry>,
     /// MCP-centric tool broker (Phase 1; sits alongside the old `tools`
@@ -202,6 +208,7 @@ impl Kernel {
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
             midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
+            midi_exchange: Arc::new(crate::midi_exchange::MidiExchangeRegistry::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
                 let b = Broker::new();
@@ -276,6 +283,7 @@ impl Kernel {
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
             midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
+            midi_exchange: Arc::new(crate::midi_exchange::MidiExchangeRegistry::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
                 let b = Broker::new();
@@ -802,6 +810,12 @@ impl Kernel {
     /// sink-fed") — ephemeral, in-memory, `/run/midi`'s backing state.
     pub fn midi_presence(&self) -> &Arc<crate::midi_presence::MidiPresenceStore> {
         &self.midi_presence
+    }
+
+    /// The MIDI exchange registry (`docs/midi-next.md` "SysEx: the exchange
+    /// pattern") — how the kernel asks ONE sink a bounded question.
+    pub fn midi_exchange(&self) -> &Arc<crate::midi_exchange::MidiExchangeRegistry> {
+        &self.midi_exchange
     }
 
     /// Get the `/r` client-shares registry (`docs/slash-r.md`).

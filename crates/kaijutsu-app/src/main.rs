@@ -56,6 +56,7 @@ mod constants;
 mod dj;
 mod input;
 mod kaish;
+mod midi_exchange;
 mod midi_in;
 mod midi_match;
 mod midi_presence;
@@ -228,6 +229,12 @@ fn main() {
         // (docs/midi-next.md "Presence is sink-fed"): the app matches, the
         // kernel records. Rides midi_in's existing hotplug watcher.
         .add_plugins(midi_presence::MidiPresencePlugin)
+        // The exchange client (docs/midi-next.md "SysEx: the exchange
+        // pattern"): a THIRD ALSA client, separate from render and from the
+        // ear, that runs bounded device dialogues (`kj midi identify`) the
+        // kernel calls back for. Routes through the same matcher picture the
+        // control-cue path uses.
+        .add_plugins(midi_exchange::MidiExchangePlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

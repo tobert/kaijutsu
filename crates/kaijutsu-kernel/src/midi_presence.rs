@@ -62,10 +62,15 @@ use kaijutsu_types::SessionId;
 
 use crate::vfs::{DirEntry, FileAttr, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
 
-/// Provenance tag for facts a sink reported (`docs/midi-next.md`: the other
-/// two, `observed` and `pulled`, arrive with the ear mapping and `kj midi
-/// pull`).
+/// Provenance tag for facts a sink reported (`docs/midi-next.md`: the third,
+/// `observed`, arrives with the ear mapping).
 pub const SOURCE_SINK: &str = "sink";
+
+/// Provenance tag for facts the **device itself answered** — the doc's third
+/// provenance, and it starts here with `kj midi identify` (`docs/midi-next.md`
+/// "SysEx: the exchange pattern"). A pulled fact is the strongest thing in
+/// this store: the sink didn't infer it from a port name, the device said so.
+pub const SOURCE_PULLED: &str = "pulled";
 
 /// One MIDI port as the reporting sink saw it. Backend-neutral: `name` is the
 /// display name profile match strings match on; `address` is the backend's own
@@ -105,6 +110,20 @@ impl SinkAttribution {
     }
 }
 
+/// A fact the device answered for itself: its Identity Reply, parsed, with
+/// the wallclock of the exchange that pulled it.
+///
+/// Carried on the presence record because that is where a reader already
+/// looks for "what is this device, right now" — but tagged
+/// [`SOURCE_PULLED`], never `sink`, so nobody mistakes an answer from the
+/// gear for the app's name-matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiIdentityFact {
+    pub identity: crate::midi_identity::MidiIdentity,
+    /// Kernel wallclock (ns since UNIX_EPOCH) when the exchange answered.
+    pub at_ns: u64,
+}
+
 /// One device's presence record, exactly as the reporting sink stated it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MidiPresenceRecord {
@@ -125,6 +144,10 @@ pub struct MidiPresenceRecord {
     /// Which sink said so, and over which connection. The connection half is
     /// what makes the record perishable; see [`SinkAttribution`].
     pub sink: SinkAttribution,
+    /// What the device itself answered, if anyone has asked
+    /// (`kj midi identify`). `None` = never pulled, which is the normal state
+    /// — plenty of gear (a Subharmonicon) can't answer at all.
+    pub identity: Option<MidiIdentityFact>,
 }
 
 impl MidiPresenceRecord {
@@ -146,6 +169,7 @@ impl MidiPresenceRecord {
             at_ns,
             source: SOURCE_SINK.to_string(),
             sink,
+            identity: None,
         }
     }
 
@@ -157,7 +181,7 @@ impl MidiPresenceRecord {
         let tag = |value: serde_json::Value| {
             serde_json::json!({ "value": value, "source": self.source, "at": self.at_ns })
         };
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "v": 1,
             "device": self.device,
             "present": tag(serde_json::Value::Bool(self.present)),
@@ -174,7 +198,21 @@ impl MidiPresenceRecord {
                     .map(|p| serde_json::json!({ "name": p.name, "address": p.address }))
                     .collect(),
             )),
-        })
+        });
+        // The pulled fact carries its OWN source and time — it came from a
+        // different producer at a different instant than everything above,
+        // and flattening it into the record's stamp would be the exact lie
+        // the per-fact provenance scheme exists to prevent. Absent entirely
+        // when nobody has asked: an empty identity would read as "we asked
+        // and got nothing".
+        if let Some(fact) = &self.identity {
+            json["identity"] = serde_json::json!({
+                "value": fact.identity.to_json(),
+                "source": SOURCE_PULLED,
+                "at": fact.at_ns,
+            });
+        }
+        json
     }
 
     /// The bytes `/run/midi/<device>` serves: pretty JSON with a trailing
@@ -193,6 +231,16 @@ impl MidiPresenceRecord {
 pub enum PresenceError {
     /// Empty, `.`/`..`, or slash-bearing device key.
     InvalidDevice(String),
+    /// A pulled fact arrived for a device this store holds no record of —
+    /// the device went away (or was reaped) between the exchange and its
+    /// answer. See [`MidiPresenceStore::record_identity`].
+    NoRecord(String),
+    /// A pulled fact arrived for a device that is on file as ABSENT: a sink
+    /// watched it leave while the exchange was in flight. Distinct from
+    /// [`PresenceError::NoRecord`] on purpose — "we were told it left" and
+    /// "we hold nothing at all" send a player to different places, and this
+    /// store never collapses those two.
+    NotPresent(String),
 }
 
 impl std::fmt::Display for PresenceError {
@@ -202,6 +250,16 @@ impl std::fmt::Display for PresenceError {
                 f,
                 "invalid device key '{d}': /run/midi is a flat namespace of \
                  profile names (e.g. keystep-pro)"
+            ),
+            PresenceError::NoRecord(d) => write!(
+                f,
+                "no presence record for '{d}' — nothing to attach a pulled \
+                 fact to (the device went away mid-exchange)"
+            ),
+            PresenceError::NotPresent(d) => write!(
+                f,
+                "'{d}' was reported ABSENT while the exchange was in flight — \
+                 refusing to file a pulled fact against a device that has left"
             ),
         }
     }
@@ -249,20 +307,69 @@ impl MidiPresenceStore {
 
     /// Record one sink report. Latest-timestamp-wins; an older report for a
     /// device we already hold newer news about is dropped, not merged.
-    pub fn record(&self, record: MidiPresenceRecord) -> Result<Recorded, PresenceError> {
+    pub fn record(&self, mut record: MidiPresenceRecord) -> Result<Recorded, PresenceError> {
         Self::validate_device(&record.device)?;
         let mut entries = self
             .entries
             .write()
             .expect("midi presence lock poisoned (a writer panicked)");
-        if let Some(existing) = entries.get(&record.device)
-            && existing.at_ns > record.at_ns
-        {
-            return Ok(Recorded::StaleDropped);
+        if let Some(existing) = entries.get(&record.device) {
+            if existing.at_ns > record.at_ns {
+                return Ok(Recorded::StaleDropped);
+            }
+            // Carry a pulled identity across reports that keep the device
+            // present — the sink re-states presence on every topology change,
+            // and dropping the device's own answer each time would make a
+            // fingerprint useless the moment anything else is plugged in.
+            //
+            // Any report that says ABSENT drops it, and it never comes back
+            // on the next `present=true`: what returns to that port may be a
+            // different unit, and a fingerprint that outlives the device it
+            // describes is precisely the "stale presence that lies" this
+            // store refuses. Re-plug ⇒ re-`identify`.
+            if existing.present && record.present && record.identity.is_none() {
+                record.identity = existing.identity.clone();
+            }
         }
         self.generation.fetch_add(1, Ordering::Relaxed);
         entries.insert(record.device.clone(), record);
         Ok(Recorded::Stored)
+    }
+
+    /// Attach what a device answered for itself to its presence record —
+    /// `kj midi identify`'s write, and the first **pulled** fact in the store
+    /// (`docs/midi-next.md`).
+    ///
+    /// Refuses when there is no record to attach to. That is not a
+    /// convenience check: an exchange only happens against a device some sink
+    /// reported *live*, so a missing record here means the device went away
+    /// mid-exchange (or was reaped with its connection), and minting a record
+    /// out of an identity reply would resurrect presence nobody is standing
+    /// behind.
+    pub fn record_identity(
+        &self,
+        device: &str,
+        identity: crate::midi_identity::MidiIdentity,
+        at_ns: u64,
+    ) -> Result<(), PresenceError> {
+        Self::validate_device(device)?;
+        let mut entries = self
+            .entries
+            .write()
+            .expect("midi presence lock poisoned (a writer panicked)");
+        let Some(record) = entries.get_mut(device) else {
+            return Err(PresenceError::NoRecord(device.to_string()));
+        };
+        // A record that says ABSENT is a sink's observation that the device
+        // left, and it may well have left *during* this exchange. Filing the
+        // answer against it would render `/run/midi` as "gone, and here is
+        // what it is" — a shape no reader should have to reconcile.
+        if !record.present {
+            return Err(PresenceError::NotPresent(device.to_string()));
+        }
+        record.identity = Some(MidiIdentityFact { identity, at_ns });
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Forget everything a now-dead connection told us, returning the device
@@ -761,6 +868,123 @@ mod tests {
         assert_eq!(json["backend"]["value"], "alsa");
         assert_eq!(json["ports"]["value"][0]["name"], "KeyStep Pro MIDI 1");
         assert_eq!(json["ports"]["value"][0]["address"], "24:0");
+    }
+
+    // ── pulled identity (docs/midi-next.md slice 1 step 5) ────────────────
+
+    fn identity() -> crate::midi_identity::MidiIdentity {
+        crate::midi_identity::parse_identity_reply(&[
+            0xF0, 0x7E, 0x00, 0x06, 0x02, 0x00, 0x20, 0x6B, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00,
+            0x03, 0x04, 0xF7,
+        ])
+        .expect("fixture is a valid Identity Reply")
+    }
+
+    #[test]
+    fn an_identity_lands_on_the_record_as_a_pulled_fact() {
+        let store = MidiPresenceStore::new();
+        store.record(live("keystep-pro", 100)).unwrap();
+        store.record_identity("keystep-pro", identity(), 500).unwrap();
+
+        let json = store.get("keystep-pro").unwrap().to_json();
+        assert_eq!(json["identity"]["source"], SOURCE_PULLED, "NOT 'sink'");
+        assert_eq!(json["identity"]["at"], 500, "its own stamp, not the report's");
+        assert_eq!(json["identity"]["value"]["manufacturerName"], "Arturia");
+        // The sink-reported facts keep their own provenance untouched.
+        assert_eq!(json["present"]["source"], SOURCE_SINK);
+        assert_eq!(json["present"]["at"], 100);
+    }
+
+    /// A device nobody has asked has no `identity` key at all — an empty one
+    /// would read as "we asked and got nothing".
+    #[test]
+    fn an_unasked_device_renders_no_identity_key() {
+        let store = MidiPresenceStore::new();
+        store.record(live("keystep-pro", 100)).unwrap();
+        assert!(store.get("keystep-pro").unwrap().to_json().get("identity").is_none());
+    }
+
+    /// The sink re-states presence on every topology change; a fingerprint
+    /// that evaporated each time would be useless.
+    #[test]
+    fn a_pulled_identity_survives_a_re_report_that_keeps_the_device_live() {
+        let store = MidiPresenceStore::new();
+        store.record(live("keystep-pro", 100)).unwrap();
+        store.record_identity("keystep-pro", identity(), 500).unwrap();
+        store.record(live("keystep-pro", 900)).unwrap();
+        let got = store.get("keystep-pro").unwrap();
+        assert_eq!(got.at_ns, 900, "the fresh presence report won");
+        assert_eq!(
+            got.identity.as_ref().map(|f| f.at_ns),
+            Some(500),
+            "the pulled fact rode along, still stamped with when IT was pulled"
+        );
+    }
+
+    /// Unplug drops the fingerprint, and a re-plug does NOT bring it back:
+    /// what returned to that port may be a different unit. Re-plug ⇒
+    /// re-identify.
+    #[test]
+    fn an_unplug_drops_the_identity_and_a_replug_does_not_restore_it() {
+        let store = MidiPresenceStore::new();
+        store.record(live("keystep-pro", 100)).unwrap();
+        store.record_identity("keystep-pro", identity(), 500).unwrap();
+
+        store.record(absent("keystep-pro", 600)).unwrap();
+        assert!(store.get("keystep-pro").unwrap().identity.is_none());
+
+        store.record(live("keystep-pro", 700)).unwrap();
+        assert!(
+            store.get("keystep-pro").unwrap().identity.is_none(),
+            "a replug must not inherit the previous unit's fingerprint"
+        );
+    }
+
+    /// A reap takes the identity with the record — a fingerprint for a device
+    /// no live connection stands behind is the same lie as a stale presence.
+    #[test]
+    fn reaping_takes_the_identity_with_the_record() {
+        let store = MidiPresenceStore::new();
+        let s = sink("moltar");
+        store.record(live_from("keystep-pro", 100, s.clone())).unwrap();
+        store.record_identity("keystep-pro", identity(), 500).unwrap();
+        store.reap_connection(s.connection);
+        assert!(store.get("keystep-pro").is_none());
+    }
+
+    /// A device that left while the exchange was in flight refuses the file,
+    /// and says so differently from "we hold nothing" — the same
+    /// unknown-vs-absent distinction the rest of this store lives by.
+    #[test]
+    fn an_identity_for_a_departed_device_is_refused_by_name() {
+        let store = MidiPresenceStore::new();
+        store.record(absent("keystep-pro", 100)).unwrap();
+        assert_eq!(
+            store.record_identity("keystep-pro", identity(), 500),
+            Err(PresenceError::NotPresent("keystep-pro".into()))
+        );
+        assert!(store.get("keystep-pro").unwrap().identity.is_none());
+    }
+
+    /// An identity for a device we hold no record of is refused loudly rather
+    /// than minting presence nobody reported.
+    #[test]
+    fn an_identity_for_an_unknown_device_is_refused() {
+        let store = MidiPresenceStore::new();
+        assert_eq!(
+            store.record_identity("keystep-pro", identity(), 500),
+            Err(PresenceError::NoRecord("keystep-pro".into()))
+        );
+        assert!(store.is_empty(), "and nothing was invented");
+    }
+
+    #[test]
+    fn a_pulled_identity_advances_the_view_generation() {
+        let store = MidiPresenceStore::new();
+        store.record(live("keystep-pro", 1)).unwrap();
+        let g = store.generation();
+        store.record_identity("keystep-pro", identity(), 2).unwrap();
+        assert!(store.generation() > g, "a caching reader must re-read");
     }
 
     // ── the /run/midi view ────────────────────────────────────────────────

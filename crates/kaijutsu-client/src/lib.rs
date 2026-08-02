@@ -6,6 +6,7 @@
 pub mod actor;
 pub mod constants;
 pub mod document_store;
+pub mod midi_exchange;
 pub mod rpc;
 pub mod sftp;
 pub mod share_server;
@@ -39,7 +40,11 @@ pub use share_server::{
 };
 pub use ssh::{KeySource, SshClient, SshConfig, SshError};
 pub use subscriptions::{
-    ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel, vfs_activity_events_channel,
+    ConnectionStatus, OutputEvent, ServerEvent, block_events_channel, editor_events_channel,
+    vfs_activity_events_channel,
+};
+pub use midi_exchange::{
+    MidiExchangeReceiver, MidiExchangeRequest, MidiExchangeSender, MidiExchangeSlot,
 };
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};

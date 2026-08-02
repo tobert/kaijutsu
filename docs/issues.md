@@ -691,8 +691,9 @@ job shape deferred). Slice 1 steps 1–3 have landed (seeds + `kj midi
 list/show`; sink-fed presence: in-app profile matching, `reportMidiPresence`,
 the ephemeral `/run/midi/<device>` store, presence column) — as has step 4
 (`kj midi send`/`panic`: a device-addressed control cue on the existing
-`RenderCue` wire, emitted DIRECT to the matched ALSA port). Slice order in the
-doc; next: `exchange()` + `kj midi identify`.
+`RenderCue` wire, emitted DIRECT to the matched ALSA port) and step 5 — the
+`exchange()` round-trip + `kj midi identify`, which closes slice 1. Slice
+order in the doc; next: slice 2 (routing consumes profiles).
 First real consumer: Minibrute on the laptop app, then the per-track
 channel-routing fix (this file → Hyoushigi/Musician area; `docs/chameleon.md`
 open items) built on profile vocabulary.
@@ -723,6 +724,32 @@ open items) built on profile vocabulary.
   record `{value, source: sent, at}` so relative commands ("-25%") have a
   baseline to work from. Slice 3 (device contexts) is where that pays off;
   slice 1 emits raw absolutes only, so there is nothing to be relative to yet.
+- **The exchange timeout ladder is four constants in four crates** (deferred
+  2026-08-02, slice 1 step 5). A request's bound is enforced at every hop, each
+  a little looser than the one inside it so the *innermost* layer that actually
+  wedged is the one whose error a player reads: app worker `T`
+  (`midi_exchange::ExchangeClient::exchange`), client forwarder `T + 0.5s`
+  (`MidiExchangeSlot::WORKER_SLACK`), server bridge `T + 0.75s`
+  (`rpc::EXCHANGE_CALL_SLACK`), kernel `T + 1s`
+  (`midi_exchange::KERNEL_DEADLINE_SLACK`). Nothing enforces the ordering but
+  these comments; if a fifth hop appears, the ladder wants a single home
+  (`kaijutsu-types`?) rather than a fourth doc-comment promise.
+- **Exchanges serialize per SINK, not per port** (deferred 2026-08-02, slice 1
+  step 5). The doc says "serialized per-port"; today one worker thread runs one
+  dialogue at a time for the whole app, which is strictly stronger and costs
+  nothing while exchanges are human/model-paced (identity, later a settings
+  pull). A grooming track sweeping ten devices on a cadence is the case that
+  will want per-port concurrency — and the worker is where it goes, not the
+  wire (the request already names its port).
+- **`kj midi identify` picks the device's FIRST matched port too** (deferred
+  2026-08-02, slice 1 step 5). Same positional accident as `kj midi send`, same
+  slice-2 fix: `midi_exchange::resolve_exchange_address` takes
+  `routes[device][0]`. A KeyLab answers on its MIDI port, which is right today.
+- **No CoreMIDI exchange backend** (deferred 2026-08-02, slice 1 step 5). The
+  worker is ALSA-only and says so in its answer (a mac sink refuses with "not
+  this backend" rather than timing out, so another sink on the rig can have the
+  gear). Everything above the worker — the wire method, the registry, the
+  device-name addressing — is already backend-neutral.
 - **CoreMIDI control-cue addressing** (deferred 2026-08-02, slice 1 step 4).
   `dj::midi::parse_alsa_addr` refuses anything that isn't `client:port` rather
   than guessing, so a CoreMIDI-shaped address reaching the ALSA sink is a loud

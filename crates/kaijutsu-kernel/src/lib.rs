@@ -30,6 +30,8 @@ pub mod kernel_db;
 pub mod kj;
 pub mod llm;
 pub mod mcp;
+pub mod midi_exchange;
+pub mod midi_identity;
 pub mod midi_presence;
 pub mod midi_seed;
 pub mod peers;
