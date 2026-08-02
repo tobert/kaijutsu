@@ -8340,7 +8340,6 @@ fn parse_block_filter(
         kinds,
         roles,
         statuses,
-        exclude_compacted: reader.get_exclude_compacted(),
         limit: reader.get_limit(),
         max_depth: reader.get_max_depth(),
         parent_id,

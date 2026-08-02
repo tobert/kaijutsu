@@ -45,7 +45,6 @@
 
 pub mod block;
 pub mod codec;
-pub mod compaction;
 pub mod context;
 pub mod enums;
 pub mod error_block;
@@ -98,7 +97,6 @@ pub use block::{
     format_resource_for_llm, format_tool_content_envelope, format_tool_content_for_llm,
 };
 pub use error_block::IntoErrorPayload;
-pub use compaction::CompactionBoundary;
 pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind};
 pub use ids::{ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId};

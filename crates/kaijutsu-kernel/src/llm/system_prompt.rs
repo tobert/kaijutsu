@@ -136,7 +136,7 @@ pub fn build_system_prompt(
 
 /// Pull the content of `(Role::System, BlockKind::Text)` blocks that should
 /// contribute to the system prompt. Filters mirror `hydrate_from_blocks`:
-/// skip ephemeral / excluded / compacted / empty blocks.
+/// skip ephemeral / excluded / empty blocks.
 ///
 /// The result feeds `build_system_prompt`'s `rc_sections` parameter. rc
 /// `.md` lifecycle scripts produce blocks in exactly this shape (see
@@ -150,7 +150,6 @@ pub fn extract_system_prompt_sections(blocks: &[BlockSnapshot]) -> Vec<String> {
                 && b.kind == BlockKind::Text
                 && !b.ephemeral
                 && !b.excluded
-                && !b.compacted
                 && !b.content.is_empty()
         })
         .map(|b| b.content.clone())
@@ -304,19 +303,16 @@ mod tests {
     }
 
     #[test]
-    fn extractor_skips_ephemeral_excluded_compacted_and_empty() {
+    fn extractor_skips_ephemeral_excluded_and_empty() {
         let mut ephemeral = snap(Role::System, BlockKind::Text, "ephemeral");
         ephemeral.ephemeral = true;
         let mut excluded = snap(Role::System, BlockKind::Text, "excluded");
         excluded.excluded = true;
-        let mut compacted = snap(Role::System, BlockKind::Text, "compacted");
-        compacted.compacted = true;
         let empty = snap(Role::System, BlockKind::Text, "");
 
         let blocks = vec![
             ephemeral,
             excluded,
-            compacted,
             empty,
             snap(Role::System, BlockKind::Text, "keeper"),
         ];

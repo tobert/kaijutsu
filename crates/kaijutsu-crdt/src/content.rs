@@ -594,16 +594,6 @@ impl BlockContent {
         self.header.updated_at = self.header.max_field_ts();
     }
 
-    pub fn compacted(&self) -> bool {
-        self.header.compacted
-    }
-
-    pub fn set_compacted(&mut self, val: bool, lamport_ts: u64) {
-        self.header.compacted = val;
-        self.header.compacted_at = lamport_ts;
-        self.header.updated_at = self.header.max_field_ts();
-    }
-
     /// Update `exit_code` and bump `tool_meta_at` (the tool_meta cluster's
     /// LWW timestamp covering `tool_kind`, `exit_code`, `is_error`).
     pub fn set_exit_code(&mut self, val: Option<i32>, lamport_ts: u64) {
@@ -657,7 +647,6 @@ impl BlockContent {
             kind: self.header.kind,
             content: self.text(),
             collapsed: self.collapsed,
-            compacted: self.header.compacted,
             ephemeral: self.ephemeral,
             excluded: self.excluded,
             created_at: self.header.created_at,
@@ -687,7 +676,6 @@ impl BlockContent {
             collapsed_at: self.header.collapsed_at,
             ephemeral_at: self.header.ephemeral_at,
             excluded_at: self.header.excluded_at,
-            compacted_at: self.header.compacted_at,
             tool_meta_at: self.header.tool_meta_at,
             content_type_at: self.header.content_type_at,
         }
@@ -744,17 +732,6 @@ impl BlockContent {
             self.header.excluded = remote.excluded;
             self.excluded = remote.excluded;
             self.header.excluded_at = remote.excluded_at;
-        }
-
-        // compacted
-        if field_wins(
-            remote.compacted_at,
-            self.header.compacted_at,
-            &remote.compacted,
-            &self.header.compacted,
-        ) {
-            self.header.compacted = remote.compacted;
-            self.header.compacted_at = remote.compacted_at;
         }
 
         // tool_meta (tool_kind, exit_code, is_error)

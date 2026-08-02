@@ -596,7 +596,7 @@ pub const DISTILLATION_SYSTEM_PROMPT: &str =
 /// Build a distillation prompt from a document's blocks.
 ///
 /// Formats the conversation history as a transcript suitable for LLM summarization.
-// TODO: Use query_blocks with kind/compacted filter once drift goes through RPC.
+// TODO: Use query_blocks with a kind filter once drift goes through RPC.
 // Current in-process DashMap reads are fast; optimize when drift becomes remote-capable.
 pub fn build_distillation_prompt(
     blocks: &[BlockSnapshot],

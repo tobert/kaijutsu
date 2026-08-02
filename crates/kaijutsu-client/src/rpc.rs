@@ -2412,7 +2412,6 @@ fn set_block_filter_builder(
         }
     }
 
-    builder.set_exclude_compacted(filter.exclude_compacted);
     builder.set_limit(filter.limit);
     builder.set_max_depth(filter.max_depth);
 

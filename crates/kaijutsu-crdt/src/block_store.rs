@@ -21,8 +21,6 @@ use crate::{
 /// An empty filter (all defaults) includes everything.
 #[derive(Debug, Clone, Default)]
 pub struct ForkBlockFilter {
-    /// Skip blocks marked as compacted.
-    pub exclude_compacted: bool,
     /// Skip blocks with these BlockKind names (e.g., "Thinking", "ToolCall").
     pub exclude_kinds: HashSet<String>,
     /// Skip blocks with these Role names (e.g., "Tool", "Model").
@@ -42,9 +40,6 @@ pub struct ForkBlockFilter {
 impl ForkBlockFilter {
     /// Check if a block snapshot passes this filter (should be included).
     pub fn matches(&self, snap: &BlockSnapshot) -> bool {
-        if self.exclude_compacted && snap.compacted {
-            return false;
-        }
         if !self.exclude_kinds.is_empty() {
             let kind_name = format!("{:?}", snap.kind);
             if self.exclude_kinds.contains(&kind_name) {
@@ -556,7 +551,6 @@ impl BlockStore {
             role,
             kind,
             status,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -569,7 +563,6 @@ impl BlockStore {
             collapsed_at: ts,
             ephemeral_at: ts,
             excluded_at: ts,
-            compacted_at: ts,
             tool_meta_at: ts,
             content_type,
             content_type_at: ts,
@@ -617,7 +610,6 @@ impl BlockStore {
             role: role.unwrap_or(Role::Model),
             kind: BlockKind::ToolCall,
             status: Status::Running,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -630,7 +622,6 @@ impl BlockStore {
             collapsed_at: ts,
             ephemeral_at: ts,
             excluded_at: ts,
-            compacted_at: ts,
             tool_meta_at: ts,
             content_type: ContentType::Plain,
             content_type_at: ts,
@@ -681,7 +672,6 @@ impl BlockStore {
             } else {
                 Status::Done
             },
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -694,7 +684,6 @@ impl BlockStore {
             collapsed_at: ts,
             ephemeral_at: ts,
             excluded_at: ts,
-            compacted_at: ts,
             tool_meta_at: ts,
             content_type: ContentType::Plain,
             content_type_at: ts,
@@ -1153,21 +1142,6 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the compacted flag on a block — marks it superseded (e.g. by a
-    /// Drift summary) so the hydrator skips it when reconstructing LLM
-    /// history. Kernel-level primitive; see `kaijutsu_kernel::block_store`'s
-    /// `set_compacted` for the CRDT-op-journaling wrapper callers use.
-    pub fn set_compacted(&mut self, id: &BlockId, compacted: bool) -> Result<()> {
-        let ts = self.tick();
-        let block = self
-            .blocks
-            .get_mut(id)
-            .ok_or(CrdtError::BlockNotFound(*id))?;
-        block.set_compacted(compacted, ts);
-        self.version += 1;
-        Ok(())
-    }
-
     /// Move a block to a new position.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {
@@ -1495,7 +1469,7 @@ impl BlockStore {
 
         // Survivors, kept in document order: drop positions outside the resolved
         // selection (if any), then drop blocks the predicate excludes
-        // (kind/role/compacted/id). Both are subtractions and compose.
+        // (kind/role/id). Both are subtractions and compose.
         let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
         for (pos, (_id, block)) in universe.iter().enumerate() {
             if let Some(sel) = &filter.selection
@@ -1711,7 +1685,7 @@ pub struct SyncPayload {
     /// against a fresh DTE Document (which would fail with DataMissing).
     pub new_blocks: Vec<BlockSnapshot>,
     /// Updated headers for known blocks (LWW merge via `merge_header()`).
-    /// Propagates metadata changes like status, collapsed, compacted.
+    /// Propagates metadata changes like status, collapsed, excluded.
     pub updated_headers: Vec<BlockHeader>,
     /// Block IDs that have been deleted (tombstoned) on the sender.
     /// Receiver should apply tombstones for these.
@@ -1962,29 +1936,6 @@ mod tests {
 
         store.set_status(&id, Status::Error).unwrap();
         assert_eq!(store.get_block_snapshot(&id).unwrap().status, Status::Error);
-    }
-
-    #[test]
-    fn test_set_compacted_toggles_flag() {
-        let mut store = test_store();
-        let id = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "old turn",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        assert!(!store.get_block_snapshot(&id).unwrap().compacted);
-
-        store.set_compacted(&id, true).unwrap();
-        assert!(store.get_block_snapshot(&id).unwrap().compacted);
-
-        store.set_compacted(&id, false).unwrap();
-        assert!(!store.get_block_snapshot(&id).unwrap().compacted);
     }
 
     #[test]
@@ -2679,7 +2630,6 @@ mod tests {
         assert_eq!(snap2.status, snap1.status);
         assert_eq!(snap2.parent_id, snap1.parent_id);
         assert_eq!(snap2.content, snap1.content);
-        assert_eq!(snap2.compacted, snap1.compacted);
         assert_eq!(snap2.collapsed, snap1.collapsed);
         assert_eq!(snap2.ephemeral, snap1.ephemeral);
     }
@@ -3128,7 +3078,6 @@ mod tests {
                 role: Role::User,
                 kind: BlockKind::Text,
                 status: Status::Done,
-                compacted: false,
                 collapsed: false,
                 ephemeral: false,
                 excluded: false,
@@ -3141,7 +3090,6 @@ mod tests {
                 collapsed_at: 0,
                 ephemeral_at: 0,
                 excluded_at: 0,
-                compacted_at: 0,
                 tool_meta_at: 0,
                 content_type: ContentType::Plain,
                 content_type_at: 0,
@@ -3480,67 +3428,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fork_filtered_exclude_compacted() {
-        let mut store = test_store();
-
-        let b1 = store
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "old message",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let _b2 = store
-            .insert_block(
-                Some(&b1),
-                Some(&b1),
-                Role::Model,
-                BlockKind::Text,
-                "summary",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Mark b1 as compacted via SyncPayload with updated header
-        let mut header = BlockHeader::from_snapshot(&store.get_block_snapshot(&b1).unwrap());
-        header.compacted = true;
-        header.updated_at = 1000; // Ensure LWW wins
-        let payload = SyncPayload {
-            block_ops: vec![],
-            new_blocks: vec![],
-            updated_headers: vec![header],
-            deleted_blocks: vec![],
-        };
-        store.merge_ops(payload).unwrap();
-
-        // Verify compacted flag took effect
-        assert!(
-            store.get_block_snapshot(&b1).unwrap().compacted,
-            "Block should be compacted"
-        );
-
-        let filter = ForkBlockFilter {
-            exclude_compacted: true,
-            ..Default::default()
-        };
-
-        let new_ctx = ContextId::new();
-        let new_agent = PrincipalId::new();
-        let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
-
-        assert_eq!(
-            forked.block_count(),
-            1,
-            "Compacted block should be excluded"
-        );
-    }
-
-    #[test]
     fn test_fork_filtered_selection_keeps_tail() {
         let mut store = test_store();
 
@@ -3855,7 +3742,6 @@ mod tests {
             role: Role::User,
             kind: BlockKind::Text,
             status: Status::Done,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -3868,7 +3754,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
@@ -3884,7 +3769,6 @@ mod tests {
             role: Role::Model,
             kind: BlockKind::Text,
             status: Status::Done,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -3897,7 +3781,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
@@ -3913,7 +3796,6 @@ mod tests {
             role: Role::User,
             kind: BlockKind::Text,
             status: Status::Done,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -3926,7 +3808,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
@@ -3980,7 +3861,6 @@ mod tests {
             role: Role::User,
             kind: BlockKind::Text,
             status: Status::Done,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -3993,7 +3873,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
@@ -4011,7 +3890,6 @@ mod tests {
             role: Role::Model,
             kind: BlockKind::Text,
             status: Status::Done,
-            compacted: false,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -4024,7 +3902,6 @@ mod tests {
             collapsed_at: 0,
             ephemeral_at: 0,
             excluded_at: 0,
-            compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,

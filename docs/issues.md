@@ -68,10 +68,13 @@ these are the ones that block *using* the thing.
     additive, not a replacement. Also: `claude-sonnet-4-20250514` (used by the
     `balanced`/`default` aliases) is deliberately unset — an honest gap the
     live lookup would close.
-- **Compaction triggers on block count, not tokens** (`kj/compact.rs:18`,
-  threshold 200). Wrong signal for coding: 20 blocks of build output blow the
-  window while 200 tiny blocks trigger a pointless summarize. `hydrate.rs` has
-  no budget either — it ships every non-compacted block.
+- **Hydration has no token budget.** `hydrate.rs` ships every live block into
+  the LLM context unconditionally — no cap, no summarization trigger. (The
+  automatic block-count-threshold compaction that used to catch this was
+  removed 2026-08-02 — Amy: "I don't ever use it in claude code, I won't use
+  it in kaijutsu, so we can just remove the feature." The only compaction left
+  is explicit, via `kj fork --compact`.) 20 blocks of build output can blow
+  the window with nothing to catch it.
 
 **Tier 1 — needed daily**
 
@@ -244,28 +247,6 @@ consumer branches, `vello_rasterizer.rs`, and the dependency — and rename the
 `VelloTextStyle`/`VelloFont*` shaping types whose prefix stops meaning anything
 (already flagged in the cleanup survey). Big win: a whole GPU dependency off
 the build. Do it as its own slice with a visual pass on ABC + SVG blocks.
-
-## Compaction leftovers — inert infrastructure after the autocompaction delete (2026-07-30, deepseek review)
-
-Autocompaction was deleted with its call site; `summarize` correctly survives
-(`fork --compact`, `drift merge`/`pull` — all four call sites verified live).
-What's left behind is *inert*, not broken, so none of this is urgent — but it's
-dead weight that will confuse the next reader:
-
-- **`CompactionBoundary`** (`kaijutsu-types/src/compaction.rs:16`) is referenced
-  by nothing but its own re-export (`lib.rs:101`) and its own round-trip tests.
-  Delete it, or say in a comment what future reserves it.
-- **The `compacted` block flag is now never set in production.**
-  `BlockSnapshot.compacted` (`types/src/block.rs:140`),
-  `BlockFilter::exclude_compacted` (`block.rs:2353`), `set_compacted`
-  (`kernel/src/block_store.rs:1665`), and the skips in `llm/hydrate.rs:76`,
-  `llm/system_prompt.rs:153`, `index/src/content.rs:17` all still work — but
-  every caller that sets it is a test. Decide whether the flag earns its keep
-  as a manual/future primitive or comes out with the rest.
-- **`SyncReset`'s doc comment still says "compacted"** (`kernel/src/flows.rs:327`).
-  That event is about *CRDT oplog* compaction — unrelated to the deleted LLM
-  autocompaction — so the wording now implies a feature that no longer exists.
-  One-line fix.
 
 ## MCP subsystem — audit 2026-07-29 (sonnet, read-only, verified against source + git history)
 
@@ -2652,6 +2633,15 @@ the *remaining* findings, triaged.
 ## Testing & Tooling
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
+- **`vfs::backends::local::tests::test_normal_paths_succeed` is flaky under
+  full-workspace parallelism** (found 2026-08-02 verifying the compaction
+  removal). It failed once in a `cargo test --workspace` run, then passed in
+  isolation and in two full `-p kaijutsu-kernel --lib` runs (worktree and
+  main). So it's order- or parallelism-dependent, not a real regression —
+  most likely shared temp-dir or process-CWD state between tests. Worth
+  chasing: a test that fails only sometimes trains us to ignore red, which
+  is the expensive failure mode. Note also that `cargo test … | tail` hides
+  this — the pipe's exit status is `tail`'s, so the run reads as passing.
 - **`kj` help-doc siblings: no consumer, unaudited.** `kj.md`'s command table
   was regenerated from the real clap tree 2026-07-17 (cleanup batch); the six
   siblings (`kj-cache/context/drift/fork/preset/workspace.md`) still have
