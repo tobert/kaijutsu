@@ -50,7 +50,10 @@
 #                     property of the model id the way a cloud API's is.
 
 # Which provider to use by default (must be enabled below)
-default_provider = "anthropic"
+# deepseek is the affordable lane we experiment in; anthropic and the rest
+# stay one alias away (`smart`, `best`, `opus`, `fable`) for when we need
+# their power.
+default_provider = "deepseek"
 
 # ============================================================================
 # Provider Configurations
@@ -59,27 +62,47 @@ default_provider = "anthropic"
 [providers.anthropic]
 enabled = true
 api_key_env = "ANTHROPIC_API_KEY"
-default_model = "claude-haiku-4-5-20251001"
+default_model = "claude-haiku-4-5"
 max_output_tokens = 8192
 
 [providers.anthropic.default_tools]
 type = "all"
 
-# Context windows, confirmed against platform.claude.com/docs (2026-07-29).
-[providers.anthropic.models.claude-haiku-4-5-20251001]
+# Context windows read live from GET /v1/models/{id} (`max_input_tokens`)
+# on 2026-08-02 — measured, not extrapolated.
+#
+# UNDATED ids on purpose. Dated ids get retired out from under us: both
+# claude-sonnet-4-20250514 and claude-opus-4-20250514 return a hard 404 today,
+# and the first of those was this file's own `default` alias. Undated aliases
+# roll forward instead. Model ids track kaibo's config (~/.config/kaibo).
+[providers.anthropic.models.claude-haiku-4-5]
 context_window = 200000
 
-[providers.anthropic.models.claude-opus-4-5-20251101]
+[providers.anthropic.models.claude-opus-4-5]
 context_window = 200000
-
-[providers.anthropic.models.claude-opus-4-8]
-context_window = 1000000
 
 [providers.anthropic.models.claude-opus-4-7]
 context_window = 1000000
 
+[providers.anthropic.models.claude-opus-4-8]
+context_window = 1000000
+
+[providers.anthropic.models.claude-opus-5]
+context_window = 1000000
+
 [providers.anthropic.models.claude-sonnet-4-6]
 context_window = 1000000
+
+[providers.anthropic.models.claude-sonnet-5]
+context_window = 1000000
+
+[providers.anthropic.models.claude-fable-5]
+context_window = 1000000
+
+# Latest Haiku is still 4.5 (2025-10-15) — there is no Haiku 5. Verified
+# against the full model list, not assumed. Note it is also the one model here
+# that supports NO effort levels, while opus-5 / sonnet-5 / fable-5 support
+# low→max; worth remembering before routing effort-sensitive work at `fast`.
 
 # claude-sonnet-4-20250514 ("Sonnet 4") is gone, not merely unlisted:
 # `GET /v1/models/claude-sonnet-4-20250514` returns a real 404 (confirmed
@@ -88,6 +111,12 @@ context_window = 1000000
 # model Anthropic no longer serves. Those aliases now point at deepseek.
 # Left here as a marker: don't reintroduce either id.
 
+# Gemini support in kaijutsu is INCOMPLETE — `gemini` is not a `Provider`
+# variant (llm/mod.rs: Claude / DeepSeek / OpenAi), so this block can only ever
+# be inert. It stays as a shape-of-things-to-come template and MUST keep
+# `enabled = false`: the load path skips disabled providers before resolving
+# their type, which is the only reason an unsupported type is legal here.
+# We reach Gemini through kaibo (cast="gemini"/"gemini-batch") instead.
 [providers.gemini]
 enabled = false
 api_key_env = "GEMINI_API_KEY"
@@ -125,18 +154,21 @@ context_window = 1000000
 # llama.cpp, a proxy) all share one provider implementation — they speak the
 # same `/chat/completions` dialect. Set `base_url` for a local/proxy server;
 # the API key is optional (a local server needs none).
+# Aligned with kaibo's [backends.gpt] — same endpoint, same key file.
 [providers.openai]
-enabled = false
+enabled = true
 api_key_env = "OPENAI_API_KEY"
-default_model = "gpt-4o"
+api_key_file = "~/.openai-key.txt"
+base_url = "https://api.openai.com/v1"
+default_model = "gpt-5.6-terra"
 max_output_tokens = 16384
 
 [providers.openai.default_tools]
 type = "all"
 
-# Confirmed via developers.openai.com/api/docs/models (2026-07-29).
-[providers.openai.models.gpt-4o]
-context_window = 128000
+# No [providers.openai.models.*] entries: we have no verified window for the
+# gpt-5.6 family, and a fabricated denominator is worse than an honest
+# "unknown" (the never-invent-a-denominator rule). Add one when confirmed.
 
 # ollama and lemonade serve locally-hosted GGUF models. Their effective
 # context window is a runtime setting (Ollama's `num_ctx`, a Modelfile
@@ -171,12 +203,14 @@ type = "all"
 # Short names for commonly used model configurations
 
 [model_aliases]
-fast     = { provider = "anthropic", model = "claude-haiku-4-5-20251001" }
-cheap    = { provider = "anthropic", model = "claude-haiku-4-5-20251001" }
+fast     = { provider = "anthropic", model = "claude-haiku-4-5" }
+cheap    = { provider = "anthropic", model = "claude-haiku-4-5" }
 balanced = { provider = "deepseek",  model = "deepseek-v4-flash" }
 default  = { provider = "deepseek",  model = "deepseek-v4-pro" }
-smart    = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
-best     = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
+smart    = { provider = "anthropic", model = "claude-opus-4-8" }
+best     = { provider = "anthropic", model = "claude-opus-4-8" }
+fable    = { provider = "anthropic", model = "claude-fable-5" }
+opus     = { provider = "anthropic", model = "claude-opus-5" }
 deepseek    = { provider = "deepseek", model = "deepseek-v4-flash" }
 ds-flash    = { provider = "deepseek", model = "deepseek-v4-flash" }
 ds-pro      = { provider = "deepseek", model = "deepseek-v4-pro" }

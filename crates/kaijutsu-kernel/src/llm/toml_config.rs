@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn test_default_models_toml_parses() {
         let config = load_models_config_toml(DEFAULT_TOML).unwrap();
-        assert_eq!(config.llm.default_provider, "anthropic");
+        assert_eq!(config.llm.default_provider, "deepseek");
         assert!(!config.llm.providers.is_empty());
         assert!(!config.llm.model_aliases.is_empty());
 
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(anthropic.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(
             anthropic.default_model.as_deref(),
-            Some("claude-haiku-4-5-20251001")
+            Some("claude-haiku-4-5")
         );
         assert_eq!(anthropic.max_output_tokens, Some(8192));
 
@@ -467,11 +467,11 @@ enabled = true
 
     #[test]
     fn test_default_models_toml_has_context_windows_for_known_models() {
-        // Regression guard for the deliberate choices made when populating
-        // assets/defaults/models.toml: models we're confident about carry a
-        // window; models.toml's own default alias target
-        // (claude-sonnet-4-20250514) is deliberately left unset because we
-        // couldn't confirm its context window from authoritative docs.
+        // Regression guard for assets/defaults/models.toml. Windows here were
+        // read live from GET /v1/models/{id} (`max_input_tokens`) on
+        // 2026-08-02, and the ids are UNDATED on purpose: dated ids get
+        // retired out from under us (claude-sonnet-4-20250514, once this
+        // file's own `default` alias, is a hard 404 today).
         let config = load_models_config_toml(DEFAULT_TOML).unwrap();
         let anthropic = config
             .llm
@@ -480,19 +480,19 @@ enabled = true
             .find(|p| p.provider_type == "anthropic")
             .unwrap();
         assert_eq!(
-            anthropic.context_window("claude-haiku-4-5-20251001"),
+            anthropic.context_window("claude-haiku-4-5"),
             Some(200_000),
-            "haiku 4.5 is confirmed 200K"
+            "haiku 4.5 is 200K, and is still the latest Haiku"
         );
         assert_eq!(
-            anthropic.context_window("claude-opus-4-5-20251101"),
-            Some(200_000),
-            "opus 4.5 is confirmed 200K"
+            anthropic.context_window("claude-opus-5"),
+            Some(1_000_000),
+            "opus 5 is 1M"
         );
         assert_eq!(
             anthropic.context_window("claude-sonnet-4-20250514"),
             None,
-            "the original Sonnet 4 snapshot's window is deliberately left unset (unconfirmed)"
+            "a retired id must stay absent — never reintroduce it"
         );
 
         let deepseek = config
@@ -516,7 +516,13 @@ enabled = true
         let config = load_models_config_toml(DEFAULT_TOML).unwrap();
         let fast = &config.llm.model_aliases["fast"];
         assert_eq!(fast.provider, "anthropic");
-        assert_eq!(fast.model, "claude-haiku-4-5-20251001");
+        assert_eq!(fast.model, "claude-haiku-4-5");
+
+        // The affordable lane: `default` must point at deepseek, not at a
+        // retired Anthropic snapshot (2026-08-02).
+        let default = &config.llm.model_aliases["default"];
+        assert_eq!(default.provider, "deepseek");
+        assert_eq!(default.model, "deepseek-v4-pro");
 
         let local = &config.llm.model_aliases["local"];
         assert_eq!(local.provider, "ollama");
