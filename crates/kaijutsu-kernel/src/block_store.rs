@@ -2651,6 +2651,14 @@ impl BlockStore {
             None => (CrdtBlockStore::new(context_id, principal_id), 0),
         };
 
+        // Replay must be gapless from the snapshot to the requested point.
+        // `next_journal_seq` is claimed BEFORE the row commits under the db
+        // lock (`journal_op`), so a reader can pass the head bounds check
+        // while the row it needs is still in flight — and a failed
+        // `append_op` leaves the same hole permanently. Either way, folding
+        // whatever rows exist and labeling the result "seq N" would be a
+        // version that never existed. Enforce contiguity and fail loud.
+        let mut expected = base_seq + 1;
         for (entry_seq, payload_bytes) in db_guard
             .load_oplog_since(context_id, base_seq)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?
@@ -2658,9 +2666,26 @@ impl BlockStore {
             if entry_seq > seq {
                 break;
             }
+            if entry_seq != expected {
+                return Err(BlockStoreError::Validation(format!(
+                    "journal for document {} is missing seq {expected} (found {entry_seq}); \
+                     seq {seq} cannot be reconstructed — a write may be in flight \
+                     (retry), or the row was lost",
+                    context_id.short()
+                )));
+            }
+            expected += 1;
             let payload = codec::decode::<SyncPayload>(&payload_bytes)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             replay.merge_ops(payload)?;
+        }
+        if expected <= seq {
+            return Err(BlockStoreError::Validation(format!(
+                "journal for document {} ends at seq {} but seq {seq} was requested — \
+                 a write may be in flight (retry), or the row was lost",
+                context_id.short(),
+                expected - 1
+            )));
         }
 
         replay
@@ -4869,6 +4894,106 @@ mod tests {
         assert!(
             matches!(err, BlockStoreError::NoDatabaseConfigured),
             "expected NoDatabaseConfigured, got {err:?}",
+        );
+    }
+
+    /// `block_content_at_seq` promises to fail loud rather than reconstruct a
+    /// version that never existed. A gapped oplog is exactly that case, and it
+    /// has two real producers: the TOCTOU window in `journal_op` (seq claimed
+    /// from `next_journal_seq` before the row commits under the db lock) and a
+    /// row lost to a failed `append_op`. Both leave the counter pointing past
+    /// rows the db doesn't hold; replay must refuse, not silently return the
+    /// state minus the missing op.
+    #[test]
+    fn content_at_seq_refuses_a_gapped_oplog() {
+        use crate::kernel_db::KernelDb;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let first = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "one", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        for content in ["two", "three"] {
+            store
+                .insert_block(
+                    ctx, None, None, Role::User, BlockKind::Text,
+                    content, Status::Done, ContentType::Plain,
+                )
+                .unwrap();
+        }
+
+        // Sanity: with an intact journal, every seq reconstructs.
+        assert_eq!(store.block_content_at_seq(ctx, &first, 1).unwrap(), "one");
+        assert_eq!(store.block_content_at_seq(ctx, &first, 3).unwrap(), "one");
+
+        // A mid-journal hole: seqs at or past it are unreconstructable...
+        db.lock().delete_oplog_row_for_test(ctx, 2).unwrap();
+        let err = store.block_content_at_seq(ctx, &first, 3).unwrap_err();
+        assert!(
+            matches!(err, BlockStoreError::Validation(_)),
+            "a gapped replay must be a loud Validation error, got {err:?}",
+        );
+        let err = store.block_content_at_seq(ctx, &first, 2).unwrap_err();
+        assert!(
+            matches!(err, BlockStoreError::Validation(_)),
+            "the missing seq itself must be a loud Validation error, got {err:?}",
+        );
+
+        // ...but history before the hole is still honestly answerable.
+        assert_eq!(store.block_content_at_seq(ctx, &first, 1).unwrap(), "one");
+    }
+
+    /// The head-row variant of the gap: `next_journal_seq` says N exists but
+    /// the row hasn't committed (or was lost). This is the observable state of
+    /// the `journal_op` race from a reader's chair — the bounds check passes,
+    /// the row is absent — and it must be a loud error, not the state at N−1
+    /// wearing N's label.
+    #[test]
+    fn content_at_seq_refuses_an_uncommitted_head_row() {
+        use crate::kernel_db::KernelDb;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let block = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "committed", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "in flight", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        db.lock().delete_oplog_row_for_test(ctx, 2).unwrap();
+        let err = store.block_content_at_seq(ctx, &block, 2).unwrap_err();
+        assert!(
+            matches!(err, BlockStoreError::Validation(_)),
+            "an absent head row must be a loud Validation error, got {err:?}",
+        );
+        // The last fully-journalled point still answers.
+        assert_eq!(
+            store.block_content_at_seq(ctx, &block, 1).unwrap(),
+            "committed",
         );
     }
 

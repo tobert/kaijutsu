@@ -54,6 +54,7 @@ use kaijutsu_diff::{DiffOptions, FileSpec};
 use kaijutsu_types::ContentType;
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
+use crate::block_store::BlockStoreError;
 use crate::vfs::VfsOps;
 
 #[derive(Parser, Debug)]
@@ -286,9 +287,23 @@ impl KjDispatcher {
     /// reported in `.data` so the historical source is discoverable without a
     /// separate history command. `None` when the kernel keeps no journal.
     async fn history_hint(&self, source: &DiffSource) -> Option<serde_json::Value> {
+        // A path that doesn't resolve to a document is an expected miss — the
+        // hint just doesn't apply. But past that point, only "this kernel
+        // keeps no journal" legitimately means None; a real DB failure must
+        // not be silently flattened into "no hint" or storage degradation
+        // becomes invisible.
         let target = self.editor_target(source.path()).await.ok()?;
-        let (oldest, head) = self.block_store().oplog_seq_range(target.context_id).ok()?;
-        Some(serde_json::json!({ "oldest_seq": oldest, "head_seq": head }))
+        match self.block_store().oplog_seq_range(target.context_id) {
+            Ok((oldest, head)) => {
+                Some(serde_json::json!({ "oldest_seq": oldest, "head_seq": head }))
+            }
+            Err(BlockStoreError::NoDatabaseConfigured) => None,
+            Err(e) => {
+                tracing::warn!(path = %source.path(), error = %e,
+                    "history hint lookup failed; omitting from kj diff data");
+                None
+            }
+        }
     }
 }
 

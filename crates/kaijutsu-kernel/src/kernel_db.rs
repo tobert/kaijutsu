@@ -3314,6 +3314,24 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Delete one oplog row, simulating the two states `block_content_at_seq`
+    /// must refuse to paper over: a journal write that has claimed its seq but
+    /// not yet committed (the TOCTOU window in `journal_op`), and a row lost
+    /// to a failed `append_op`. There is no public API that produces a gapped
+    /// oplog on purpose — that's the point. Never compiled outside test builds.
+    #[cfg(test)]
+    pub(crate) fn delete_oplog_row_for_test(
+        &self,
+        document_id: ContextId,
+        seq: i64,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "DELETE FROM oplog WHERE document_id = ?1 AND seq = ?2",
+            params![blob_param(document_id.as_bytes()), seq],
+        )?;
+        Ok(())
+    }
+
     /// Delete the full binding for a context (cascades to instances + names).
     /// Returns true if a parent row existed.
     pub fn delete_context_binding(&self, context_id: ContextId) -> KernelDbResult<bool> {
