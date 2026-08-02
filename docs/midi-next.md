@@ -1,8 +1,12 @@
 # MIDI Next — device profiles, bindings, device contexts, `kj midi`
 
 > **Status:** living document, seeded 2026-07-15 (Amy + Claude design
-> conversation). This is where the *device knowledge + device I/O* half of
-> the MIDI story accumulates as we build; expect it to change shape.
+> conversation); updated 2026-08-02 (moltar bench session, rack live): two
+> constraints became doctrine — **presence is sink-fed** (kernel never
+> shells) and **native MIDI backends per platform** (macOS is coming) —
+> and the roster now carries observed hardware facts. This is where the
+> *device knowledge + device I/O* half of the MIDI story accumulates as we
+> build; expect it to change shape.
 > Companions: `docs/midi.md` (transport/clock/realtime doctrine — settled
 > direction), `docs/tracks.md` (the substrate), `docs/chameleon.md` (the
 > music application; its "per-track MIDI channel" open item is what slice 2
@@ -81,15 +85,22 @@ host-current facts (which box, which client) that don't carry to the next
 machine TiMidity runs on. So `/etc/midi/devices/<name>/` is a bucket of
 `SXX-*.{md,kai}` exactly like rc: **static knowledge is `.md`** (capabilities,
 skill prose — document ground truth), **the current picture is `.kai`
-output** (locate the device now, synthesize settings from live sources —
-read `/run/midi`, `aconnect -l`, even snoop a local `timidity.cfg` /
-`/proc/<pid>/cmdline`). The ground-truth split maps onto file types. This is
-what makes a profile *portable*: it stops naming zorak — wherever TiMidity
-runs, `S10-locate.kai` finds it. TiMidity is the reference case for
-kai-synthesized profiles ("we'll always have it around somewhere in the
-rig"). Kai runs kernel-side (EmbeddedKaish) — fine while the kernel shares a
-box with the device; cross-node probing rides the sink-fed `/run` store, so
-profiles stay machine-independent either way.
+output** (locate the device now, synthesize settings from live state). The
+ground-truth split maps onto file types. This is what makes a profile
+*portable*: it stops naming zorak — wherever TiMidity runs, its locate step
+finds it. TiMidity is the reference case for kai-synthesized profiles
+("we'll always have it around somewhere in the rig").
+
+**Amended 2026-08-02 — kai reads kernel state, never host commands.** The
+original sketch had `.kai` shelling `aconnect -l` or snooping a local
+`timidity.cfg`. That's doubly wrong now: (1) the kernel routinely runs on a
+different box than the gear (zorak kernel, moltar rack) — kernel-side host
+probing reads the *wrong machine's* ALSA graph; (2) "mostly just works
+without shelling out" is a design constraint (Amy, 2026-08-02). Doctrine:
+kai synthesizes profile sections **only from kernel-visible state** — the
+sink-fed `/run/midi` presence store (next section) and the VFS — and the
+sinks are the only processes that touch platform MIDI APIs. No subprocess
+anywhere in the path.
 
 ## Device contexts: profile + model + toolbox (the skills angle)
 
@@ -169,10 +180,67 @@ tweaks. Side channel now, promotable later.
   ship knowledge of.
 - **Identity**: the universal **MIDI Identity Request** (`F0 7E 7F 06 01 F7`)
   fingerprints nearly any device (manufacturer/model/firmware) — build first;
-  tiny and vendor-neutral. Profiles carry the fingerprint plus ALSA
-  client-name match strings, so a hotplugged port resolves to a profile and
-  the ear's `played_by` gets a real name ("KeyStep Pro track 3", not "USB
-  MIDI 2x2 port 1").
+  tiny and vendor-neutral. Profiles carry the fingerprint plus
+  **backend-neutral match strings** (amended 2026-08-02): port display-name
+  substrings and USB `vendor:product` IDs — never ALSA client numbers or any
+  backend-specific handle, so the same profile matches under CoreMIDI (see
+  "Platform backends"). A hotplugged port then resolves to a profile and the
+  ear's `played_by` gets a real name ("KeyStep Pro track 3", not "USB MIDI
+  2x2 port 1").
+- **DIN-attached gear is invisible to enumeration** (observed 2026-08-02:
+  the foot pedal on the moltar rack). A DIN device rides behind its host
+  interface's port — no USB ID, no client name, no announce event. Only
+  profile knowledge can name it: the host interface's profile declares what
+  hangs off its DIN jacks (a `din_children` fact, authored), and identity
+  exchanges over that port are the one way to *verify* it. Presence for DIN
+  children is therefore inferred (host port present + authored claim), never
+  observed — and the profile should say so.
+
+## Presence is sink-fed (decided 2026-08-02)
+
+What makes "plug it in and kaijutsu just works" true, and the concrete form
+of Amendment A above:
+
+- **The app already watches hotplug.** The ear subscribes to the ALSA System
+  Announce port (shipped, `midi_in.rs`); verified live 2026-08-02 — rack
+  power-on auto-subscribed KeyLab MIDI/DAW and KeyStep Pro ports with zero
+  code changes. Announce is the trigger; nothing polls.
+- **Matching happens in the app**, against profile match strings (the
+  backend-neutral set above). The app holds the platform truth (port names,
+  USB IDs); the kernel holds the profiles. Profiles reach the app the same
+  way any config does; match results flow back.
+- **Presence flows app→kernel as a wire event** — the reverse direction
+  `commitCapture` already practices. On match (and on unplug), the app
+  reports `{device, port_facts, present, at}`; the kernel writes it into
+  **`/run/midi/<device>`** as provenance-tagged facts (`source: sink`).
+  `kj midi list` on any node then shows what's live *where* — across the
+  whole rig, because every sink reports into the same store.
+- **The kernel never shells, ever.** No `aconnect`, no exec. The sink-fed
+  store is the only source of "current picture" facts; kai synthesis reads
+  it (bucket section above).
+
+Plug → Announce → match → report → addressable. No polling, no exec, no
+host-naming in profiles.
+
+## Platform backends (decided 2026-08-02)
+
+macOS support is planned (the MacBook is a first-class client machine), and
+it constrains the sink now:
+
+- **The `MidiDispatch` trait is the seam.** The app's sink already lives
+  behind it with the `alsa` dep cfg-gated to Linux. Cross-platform = **two
+  native backends behind one trait**: `alsa` (Linux, scheduled seq queues)
+  and `coremidi` (macOS, native `MIDITimeStamp` scheduled sends).
+- **midir is rejected**, despite being the obvious cross-platform crate: it
+  is send-now only. The timing doctrine (`docs/midi.md`: schedule into the
+  sink's local queue, back-date on arrival) requires timestamped scheduled
+  output, which both native APIs provide and the lowest common denominator
+  does not. We pay for two backends to keep the one thing doctrine can't
+  give up.
+- Corollaries: match strings stay backend-neutral (identity section), and
+  the ear/exchange clients need the same per-platform split when the mac
+  sink lands — same trait-seam pattern, stated now so nobody reaches for a
+  shortcut later.
 
 ## `kj midi` — one emit surface for scripts, contexts, humans
 
@@ -342,23 +410,36 @@ Three moves change that:
 | Device | Role | Profile notes |
 |---|---|---|
 | **Minibrute** (original) | first consumer — hanging off the laptop running kaijutsu-app | Tiny profile: one receive channel, notes+bend+mod, **mono**, analog panel not CC-controllable. A handful of Brute Connection globals are SysEx-settable (sparsely documented; [Hackabrute](http://hackabrute.yusynth.net/MINIBRUTE/standard2SE_en.html) for architecture). Hand/model-draft it — needs no pull machinery. |
-| **KeyStep Pro** | usual clock master (`midi.md` topology); first *pull* target | 4 sequencer tracks on configurable channels, drum mode, CC config — big enough to make SysEx pull worth building. Doesn't *pass through* large SysEx (thru-routing limitation) but answers its own config protocol (MCC does exactly this). |
+| **KeyStep Pro** | usual clock master (`midi.md` topology); first *pull* target | 4 sequencer tracks on configurable channels, drum mode, CC config — big enough to make SysEx pull worth building. Doesn't *pass through* large SysEx (thru-routing limitation) but answers its own config protocol (MCC does exactly this). **Live on moltar 2026-08-02**: USB `1c75:0218`, client "KeyStep Pro", one MIDI port. |
 | **1010music Bitbox** | **center of the system — the deep-dive device** | `midi.md` topology said "deliberately not on MIDI for now (recording path)"; direction updated — Bitbox MIDI IO is coming and we go deep: per-pad note/channel trigger maps, CC parameter control, clock. Likely bonus: 1010music stores presets as **XML on the microSD card** — a config-ingestion path that skips SysEx entirely (verify against Amy's unit's model/firmware). |
 | **Polyend Poly 2** | Eurorack MIDI→CV bridge (loft) | Profile *must* carry its mode (first-fit poly / channel-per-voice / MPE) because the mode changes what a "channel" means. Config is on-device; profile is authored, not pulled. |
 | **Moog Subharmonicon** | MIDI-out target; likely first *device context* | Semi-modular, 2 VCOs + 4 subs, polyrhythmic sequencers. Note→VCO routing and globals per its MIDI implementation chart (verify from manual when it lands on the bench). |
-| **KeyLab 88 mkII** | lower priority | Controller: DAW maps, pads, faders/knobs, CV outs. Same Arturia SysEx family — KSP pull machinery should mostly transfer. |
+| **KeyLab 88 mkII** | promoted — live on the moltar rack | Controller: DAW maps, pads, faders/knobs, CV outs. Same Arturia SysEx family — KSP pull machinery should mostly transfer. **Live on moltar 2026-08-02**: USB `1c75:02cb`, client "KeyLab mkII 88", two ports (MIDI + DAW) — the profile must name both roles. |
+| **1010music Bluebox** | rack mixer — on the bench now | **Observed 2026-08-02**: USB `368e:0007` enumerates as *audio interface only* — no MIDI endpoint, no seq client. Its MIDI is TRS DIN (or disabled in settings; verify on the unit). First concrete case of gear that's *USB-present but MIDI-invisible* — presence via USB ID, MIDI via a DIN path or not at all. |
+| **Foot pedal** (unidentified) | on the rack, DIN-only | Invisible to USB enumeration (2026-08-02) — the motivating case for the `din_children` doctrine (identity section). Identify on the bench: what is it, whose DIN jack does it hang off, what does it send. |
 | **DrumBrute** (original) | lower priority | Analog drum machine; pads send fixed-ish notes (MCC-configurable) — profile is mostly a **drum-note map**, the same shape TiMidity's GM drum profile needs. |
 | **TiMidity (zorak)** | software device, already in use | GM soundfont synth, **drums on ch 10** — currently folk knowledge in a memory file; belongs in a profile. Cheap proof profiles aren't hardware-only. |
 
 ## Slices
 
-1. **Identity + namespace + raw emit.** `/etc/midi/devices/` profile
-   documents; `kj midi` list/show/edit; **`kj midi send`/`panic`** (raw
-   control cues incl. fire-and-forget sysex bytes, kaish-scriptable day one);
-   the **`exchange()` sink method** + `kj midi identify` (Identity-Request
-   fingerprint); ALSA-name matching. Hand-author **Minibrute** and
-   **TiMidity** profiles — **drafted 2026-07-15** as the embedded seeds:
-   `assets/defaults/midi/devices/{minibrute,timidity}.md`.
+1. **Devices become available** (reordered 2026-08-02; sub-steps in build
+   order):
+   1. ~~Verify the shipped hotplug/ear path against live gear~~ — **done
+      2026-08-02** on moltar: rack power-on auto-subscribed KeyLab + KSP,
+      zero changes.
+   2. Embed the `assets/defaults/midi/devices/` seeds; `/etc/midi/devices/`
+      namespace; `kj midi list|show`. Draft **KeyStep Pro** and **KeyLab**
+      profiles alongside the existing minibrute/timidity seeds — live bench
+      gear beats the roster order.
+   3. **In-app match + presence wire event** (the "Presence is sink-fed"
+      section) — promoted into slice 1 because *this* is what "available"
+      means; `kj midi list` shows live presence.
+   4. **`kj midi send`/`panic`** — raw control cues incl. fire-and-forget
+      sysex bytes, kaish-scriptable.
+   5. The **`exchange()` sink method** + `kj midi identify`
+      (Identity-Request fingerprint) — the slice's only capnp change; batch
+      the presence event's schema addition with it if step 3 hasn't already
+      landed it.
 2. **Routing consumes profiles.** The render sink resolves "track →
    *device.role*" through the profile to port + channel — paying for the
    per-track channel-routing open item (`midi.md` open questions,
@@ -383,7 +464,11 @@ Three moves change that:
 
 - **Bitbox specifics** — model/firmware on Amy's unit, XML preset format,
   whether MIDI config is per-preset or global. Blocks the deep dive, not
-  slices 1–4.
+  slices 1–4. **2026-08-02**: the rack unit on USB is a *Bluebox* (mixer);
+  is a Bitbox also in the rig, and is the Bluebox now the deep-dive target?
+  Also verify whether Bluebox USB-MIDI exists behind a setting.
+- **The foot pedal** — identify the unit and its DIN host; first real
+  `din_children` entry.
 - **Role vocabulary** — how rich is a profile "role"? (`notes` / `kick` /
   `voice[3]` / KSP `track2`?) Grow from the routing consumer; resist
   generality (the Cubase lesson).
