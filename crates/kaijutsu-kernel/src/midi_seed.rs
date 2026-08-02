@@ -74,7 +74,7 @@ fn collect_seeds(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static str
                 let body = file
                     .contents_utf8()
                     .expect("embedded midi device seed must be valid UTF-8");
-                out.push((format!("{MIDI_VFS_ROOT}/devices/{name}"), body));
+                out.push((kaijutsu_types::paths::midi_device_path(name), body));
             }
         }
     }
@@ -105,17 +105,25 @@ pub fn seed_body(canonical_path: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// The four devices `assets/defaults/midi/devices/` ships today. Named
+    /// once here so the test message is "these named seeds must exist," not a
+    /// pile of individual `assert!`s that silently stop growing when a fifth
+    /// device is added and forgotten in this test.
+    const SHIPPED_DEVICES: &[&str] = &["minibrute", "timidity", "keystep-pro", "keylab-88-mkii"];
+
     #[test]
     fn seed_files_covers_the_shipped_devices() {
+        let expected: Vec<String> = SHIPPED_DEVICES
+            .iter()
+            .map(|name| format!("{MIDI_VFS_ROOT}/devices/{name}"))
+            .collect();
         let paths: Vec<String> = seed_files().into_iter().map(|(p, _)| p).collect();
-        assert!(
-            paths.contains(&"/etc/midi/devices/minibrute".to_string()),
-            "paths: {paths:?}"
-        );
-        assert!(
-            paths.contains(&"/etc/midi/devices/timidity".to_string()),
-            "paths: {paths:?}"
-        );
+        for want in &expected {
+            assert!(
+                paths.contains(want),
+                "named seed must exist: {want}; paths: {paths:?}"
+            );
+        }
         // The .md extension is dropped from the canonical path.
         assert!(
             paths.iter().all(|p| !p.ends_with(".md")),
@@ -139,5 +147,45 @@ mod tests {
         assert!(seed_body("minibrute").is_none());
         // Neither is the devices directory itself.
         assert!(seed_body("/etc/midi/devices").is_none());
+    }
+
+    /// Extract every ` ```json ` fenced block from a markdown body, in order.
+    /// Deliberately dumb (line-oriented, no nesting) — every shipped seed
+    /// today is a flat prose+JSON document, and this only needs to find the
+    /// same fences a human reading the `.md` would.
+    fn json_fences(body: &str) -> Vec<&str> {
+        const OPEN: &str = "```json\n";
+        let mut fences = Vec::new();
+        let mut offset = 0usize;
+        while let Some(start_rel) = body[offset..].find(OPEN) {
+            let content_start = offset + start_rel + OPEN.len();
+            let Some(end_rel) = body[content_start..].find("\n```") else {
+                panic!("unterminated ```json fence starting at byte {content_start} in body");
+            };
+            let content_end = content_start + end_rel;
+            fences.push(&body[content_start..content_end]);
+            offset = content_end + "\n```".len();
+        }
+        fences
+    }
+
+    /// Every ` ```json ` fenced block in every shipped seed must be valid
+    /// JSON. A profile with a syntax error in its JSON must fail the build's
+    /// test run, not surface at runtime when `kj midi show`/the app matcher
+    /// tries to parse it.
+    #[test]
+    fn every_json_fence_in_every_seed_parses() {
+        for (path, body) in seed_files() {
+            let fences = json_fences(body);
+            assert!(
+                !fences.is_empty(),
+                "seed {path} has no ```json fenced block — every shipped profile is expected to carry at least one"
+            );
+            for (i, fence) in fences.iter().enumerate() {
+                serde_json::from_str::<serde_json::Value>(fence).unwrap_or_else(|e| {
+                    panic!("seed {path}: ```json fence #{i} failed to parse: {e}\n---\n{fence}\n---")
+                });
+            }
+        }
     }
 }

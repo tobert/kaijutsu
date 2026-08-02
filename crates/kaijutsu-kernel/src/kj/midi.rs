@@ -34,7 +34,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
-use kaijutsu_types::paths::MIDI_ROOT;
+use kaijutsu_types::paths::{MIDI_ROOT, midi_device_path};
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 
@@ -99,7 +99,7 @@ fn midi_device_canonical(name: &str) -> Result<String, String> {
             "invalid device name '{name}': {dir} is a flat namespace (one document per device)"
         ));
     }
-    Ok(format!("{dir}/{bare}"))
+    Ok(midi_device_path(bare))
 }
 
 /// The three presence states, rendered. `unknown` is never softened into
@@ -112,6 +112,14 @@ fn presence_label(record: Option<&crate::midi_presence::MidiPresenceRecord>) -> 
         None => "unknown",
     }
 }
+
+/// Placeholder title rendered for a directory entry under
+/// `/etc/midi/devices` — the shape a future rc-style bucket device will take
+/// (`docs/midi-next.md` "The core split"). Today's reader only understands a
+/// single-file leaf profile; a bucket directory must render a visible row
+/// instead of silently vanishing from an `is_file()` filter, so a future
+/// bucket device is a "not built yet" row, never an invisible one.
+const BUCKET_PLACEHOLDER_TITLE: &str = "(bucket device — kj midi bucket support not built yet)";
 
 /// The device's display title: its first non-empty line, with a leading
 /// markdown `#`/`##`/etc. stripped (every shipped profile opens with a `# …
@@ -166,32 +174,46 @@ impl KjDispatcher {
         };
 
         let presence = self.kernel().midi_presence();
-        // (name, title, presence label, record) — presence is a *separate*
-        // lookup per device, never derived from the document: the profile is
-        // durable knowledge, presence is a live report about it.
-        let mut rows: Vec<(String, String, &'static str, Option<_>)> = Vec::new();
-        for entry in entries.into_iter().filter(|e| e.kind.is_file()) {
-            let path = format!("{dir}/{}", entry.name);
-            let title = match vfs.read_all(std::path::Path::new(&path)).await {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => doc_title(&s),
-                    Err(e) => {
-                        return KjResult::Err(format!(
-                            "kj midi list: '{path}' is not valid UTF-8: {e}"
-                        ));
-                    }
-                },
-                Err(e) => return KjResult::Err(format!("kj midi list: read {path}: {e}")),
+        // (name, title, presence label, record, kind) — presence is a
+        // *separate* lookup per device, never derived from the document: the
+        // profile is durable knowledge, presence is a live report about it.
+        // `kind` distinguishes a real single-file profile ("profile") from a
+        // directory entry this reader can't parse yet ("bucket") — a future
+        // rc-style bucket device must show up as a visible, labelled row, not
+        // vanish behind a file-only filter.
+        let mut rows: Vec<(String, String, &'static str, Option<_>, &'static str)> = Vec::new();
+        for entry in entries {
+            use crate::vfs::FileType;
+            let (title, kind) = match entry.kind {
+                FileType::File => {
+                    let path = midi_device_path(&entry.name);
+                    let title = match vfs.read_all(std::path::Path::new(&path)).await {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(s) => doc_title(&s),
+                            Err(e) => {
+                                return KjResult::Err(format!(
+                                    "kj midi list: '{path}' is not valid UTF-8: {e}"
+                                ));
+                            }
+                        },
+                        Err(e) => return KjResult::Err(format!("kj midi list: read {path}: {e}")),
+                    };
+                    (title, "profile")
+                }
+                FileType::Directory => (BUCKET_PLACEHOLDER_TITLE.to_string(), "bucket"),
+                // Not a shape any current or planned seed uses under this
+                // tree; skip rather than guess at a title.
+                FileType::Symlink => continue,
             };
             let record = presence.get(&entry.name);
             let label = presence_label(record.as_ref());
-            rows.push((entry.name, title, label, record));
+            rows.push((entry.name, title, label, record, kind));
         }
         rows.sort_by(|a, b| a.0.cmp(&b.0));
 
         let data = serde_json::Value::Array(
             rows.iter()
-                .map(|(name, title, label, record)| {
+                .map(|(name, title, label, record, kind)| {
                     serde_json::json!({
                         "name": name,
                         "title": title,
@@ -201,6 +223,7 @@ impl KjDispatcher {
                         // "observed at the epoch".
                         "at": record.as_ref().map(|r| r.at_ns),
                         "backend": record.as_ref().map(|r| r.backend.clone()),
+                        "kind": kind,
                     })
                 })
                 .collect(),
@@ -212,10 +235,10 @@ impl KjDispatcher {
             return KjResult::ok_with_data("(no device profiles)".to_string(), data);
         }
         let width = rows.iter().map(|(n, ..)| n.len()).max().unwrap_or(0);
-        let pwidth = rows.iter().map(|(_, _, p, _)| p.len()).max().unwrap_or(0);
+        let pwidth = rows.iter().map(|(_, _, p, ..)| p.len()).max().unwrap_or(0);
         let lines: Vec<String> = rows
             .iter()
-            .map(|(name, title, label, _)| {
+            .map(|(name, title, label, ..)| {
                 format!("  {name:<width$}  {label:<pwidth$}  {title}")
             })
             .collect();
@@ -345,36 +368,36 @@ mod tests {
             .collect();
         assert!(names.contains(&"minibrute".to_string()), "names: {names:?}");
         assert!(names.contains(&"timidity".to_string()), "names: {names:?}");
+        assert!(names.contains(&"keystep-pro".to_string()), "names: {names:?}");
+        assert!(
+            names.contains(&"keylab-88-mkii".to_string()),
+            "names: {names:?}"
+        );
     }
 
     #[tokio::test]
-    async fn list_shows_minibrute_and_timidity_with_titles() {
+    async fn list_shows_all_four_shipped_devices_with_titles() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 let arr = v.as_array().expect("array");
-                let minibrute = arr
-                    .iter()
-                    .find(|row| row["name"] == "minibrute")
-                    .expect("minibrute row present");
-                assert!(
-                    minibrute["title"]
-                        .as_str()
-                        .is_some_and(|t| t.contains("MiniBrute")),
-                    "minibrute title: {minibrute:?}"
-                );
-                let timidity = arr
-                    .iter()
-                    .find(|row| row["name"] == "timidity")
-                    .expect("timidity row present");
-                assert!(
-                    timidity["title"]
-                        .as_str()
-                        .is_some_and(|t| t.contains("TiMidity")),
-                    "timidity title: {timidity:?}"
-                );
+                let title_contains = |name: &str, needle: &str| {
+                    let row = arr
+                        .iter()
+                        .find(|row| row["name"] == name)
+                        .unwrap_or_else(|| panic!("{name} row present"));
+                    assert!(
+                        row["title"].as_str().is_some_and(|t| t.contains(needle)),
+                        "{name} title: {row:?}"
+                    );
+                    assert_eq!(row["kind"], "profile", "{name} kind: {row:?}");
+                };
+                title_contains("minibrute", "MiniBrute");
+                title_contains("timidity", "TiMidity");
+                title_contains("keystep-pro", "KeyStep Pro");
+                title_contains("keylab-88-mkii", "KeyLab mkII 88");
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
@@ -389,6 +412,8 @@ mod tests {
             KjResult::Ok { message, .. } => {
                 assert!(message.contains("minibrute"), "message: {message}");
                 assert!(message.contains("timidity"), "message: {message}");
+                assert!(message.contains("keystep-pro"), "message: {message}");
+                assert!(message.contains("keylab-88-mkii"), "message: {message}");
             }
             other => panic!("expected Ok, got {other:?}"),
         }
@@ -459,6 +484,87 @@ mod tests {
         match result {
             KjResult::Err(msg) => assert!(msg.contains("flat namespace"), "msg: {msg}"),
             other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// A directory under `/etc/midi/devices` (the shape a future rc-style
+    /// bucket device will take, `docs/midi-next.md` "The core split") must
+    /// render as a visible, clearly-labelled row — not silently vanish behind
+    /// the old `is_file()` filter. Built through the real CRDT-native
+    /// `/etc/midi` mount (same fixture `fresh_kernel_seeds_midi_devices_into_the_vfs`
+    /// uses): `ConfigCrdtFs` synthesizes directories from descendant paths
+    /// (see `readdir_synthesizes_virtual_directories` in
+    /// `runtime::config_crdt_fs`), so writing a leaf file under
+    /// `/etc/midi/devices/<bucket>/...` is enough to make `<bucket>` itself
+    /// appear as a real `FileType::Directory` readdir entry — no fixture
+    /// workaround needed.
+    #[tokio::test]
+    async fn list_renders_a_placeholder_row_for_a_bucket_directory() {
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher_crdt_rc().await;
+        d.kernel()
+            .vfs()
+            .write_all(
+                std::path::Path::new("/etc/midi/devices/future-bucket/S00-notes.md"),
+                b"stub rc-style bucket file, not a seed",
+            )
+            .await
+            .expect("write nested bucket file");
+
+        let c = test_caller();
+        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let arr = v.as_array().expect("array");
+                let bucket = arr
+                    .iter()
+                    .find(|row| row["name"] == "future-bucket")
+                    .expect("future-bucket row present");
+                assert_eq!(bucket["kind"], "bucket", "row: {bucket:?}");
+                assert_eq!(
+                    bucket["title"],
+                    BUCKET_PLACEHOLDER_TITLE,
+                    "row: {bucket:?}"
+                );
+                // The real profiles are still there alongside it.
+                assert!(
+                    arr.iter().any(|row| row["name"] == "minibrute"),
+                    "arr: {arr:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The human (non-JSON) view carries the same placeholder — a bucket
+    /// device is visible there too, not just in `--json`.
+    #[tokio::test]
+    async fn list_non_json_renders_the_bucket_placeholder_too() {
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher_crdt_rc().await;
+        d.kernel()
+            .vfs()
+            .write_all(
+                std::path::Path::new("/etc/midi/devices/future-bucket/S00-notes.md"),
+                b"stub rc-style bucket file, not a seed",
+            )
+            .await
+            .expect("write nested bucket file");
+
+        let c = test_caller();
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { message, .. } => {
+                let line = message
+                    .lines()
+                    .find(|l| l.contains("future-bucket"))
+                    .expect("future-bucket row");
+                assert!(
+                    line.contains("bucket device — kj midi bucket support not built yet"),
+                    "line: {line}"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
