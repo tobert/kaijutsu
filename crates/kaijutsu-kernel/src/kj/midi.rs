@@ -12,6 +12,25 @@
 //! later slices in `docs/midi-next.md` — this noun exists so building it now
 //! doesn't fragment `kj` discovery later (the `kj audio`/`kj transport`
 //! precedent this file follows).
+//!
+//! ## Presence (slice 1 step 3)
+//!
+//! Both verbs carry the sink-fed presence column
+//! (`docs/midi-next.md` "Presence is sink-fed"). Three states, and the third
+//! is load-bearing:
+//!
+//! - **live** — some sink reported this profile matched a plugged-in device.
+//! - **absent** — some sink reported it *gone* (an unplug is a first-class
+//!   report, not an omission).
+//! - **unknown** — nobody has told this kernel anything. A fresh kernel says
+//!   this about everything, because presence is ephemeral: a restart with no
+//!   sinks connected genuinely knows nothing. Stale presence that lies is
+//!   worse than no presence, so we never soften unknown into absent.
+//!
+//! The column reads [`crate::midi_presence::MidiPresenceStore`] — the same
+//! state the read-only `/run/midi/<device>` view renders for kai and kaish.
+//! Devices with no profile are never invented: an unmatched port simply has
+//! no presence entry (the ear still captures from it regardless).
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
@@ -83,6 +102,17 @@ fn midi_device_canonical(name: &str) -> Result<String, String> {
     Ok(format!("{dir}/{bare}"))
 }
 
+/// The three presence states, rendered. `unknown` is never softened into
+/// `absent`: "nobody told us" and "a sink watched it leave" are different
+/// facts, and collapsing them would make a restarted kernel lie.
+fn presence_label(record: Option<&crate::midi_presence::MidiPresenceRecord>) -> &'static str {
+    match record {
+        Some(r) if r.present => "live",
+        Some(_) => "absent",
+        None => "unknown",
+    }
+}
+
 /// The device's display title: its first non-empty line, with a leading
 /// markdown `#`/`##`/etc. stripped (every shipped profile opens with a `# …
 /// device profile` heading — `docs/midi-next.md`'s prose+JSON hybrid). Falls
@@ -135,7 +165,11 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj midi list: readdir {dir}: {e}")),
         };
 
-        let mut rows: Vec<(String, String)> = Vec::new();
+        let presence = self.kernel().midi_presence();
+        // (name, title, presence label, record) — presence is a *separate*
+        // lookup per device, never derived from the document: the profile is
+        // durable knowledge, presence is a live report about it.
+        let mut rows: Vec<(String, String, &'static str, Option<_>)> = Vec::new();
         for entry in entries.into_iter().filter(|e| e.kind.is_file()) {
             let path = format!("{dir}/{}", entry.name);
             let title = match vfs.read_all(std::path::Path::new(&path)).await {
@@ -149,13 +183,26 @@ impl KjDispatcher {
                 },
                 Err(e) => return KjResult::Err(format!("kj midi list: read {path}: {e}")),
             };
-            rows.push((entry.name, title));
+            let record = presence.get(&entry.name);
+            let label = presence_label(record.as_ref());
+            rows.push((entry.name, title, label, record));
         }
-        rows.sort();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
 
         let data = serde_json::Value::Array(
             rows.iter()
-                .map(|(name, title)| serde_json::json!({ "name": name, "title": title }))
+                .map(|(name, title, label, record)| {
+                    serde_json::json!({
+                        "name": name,
+                        "title": title,
+                        "presence": label,
+                        // Null rather than 0 for unknown: a missing observation
+                        // has no timestamp, and an invented one would read as
+                        // "observed at the epoch".
+                        "at": record.as_ref().map(|r| r.at_ns),
+                        "backend": record.as_ref().map(|r| r.backend.clone()),
+                    })
+                })
                 .collect(),
         );
         if json {
@@ -164,10 +211,13 @@ impl KjDispatcher {
         if rows.is_empty() {
             return KjResult::ok_with_data("(no device profiles)".to_string(), data);
         }
-        let width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        let width = rows.iter().map(|(n, ..)| n.len()).max().unwrap_or(0);
+        let pwidth = rows.iter().map(|(_, _, p, _)| p.len()).max().unwrap_or(0);
         let lines: Vec<String> = rows
             .iter()
-            .map(|(name, title)| format!("  {name:<width$}  {title}"))
+            .map(|(name, title, label, _)| {
+                format!("  {name:<width$}  {label:<pwidth$}  {title}")
+            })
             .collect();
         KjResult::ok_with_data(lines.join("\n"), data)
     }
@@ -204,17 +254,37 @@ impl KjDispatcher {
         }
 
         let bare = canonical.rsplit('/').next().unwrap_or(&canonical);
+        // Presence rides alongside the document, never inside it: the profile
+        // is durable knowledge, the presence record is an ephemeral live
+        // report keyed by the same device name (`/run/midi/<device>`).
+        let presence = self.kernel().midi_presence().get(bare);
+        let label = presence_label(presence.as_ref());
         let record = serde_json::json!({
             "path": canonical,
             "name": bare,
             "content_length": content.len(),
             "content": content,
+            "presence": label,
+            "presence_record": presence.as_ref().map(|r| r.to_json()),
         });
         if json {
             return KjResult::ok_with_data(record.to_string(), record);
         }
+        let ports = presence
+            .as_ref()
+            .filter(|r| r.present)
+            .map(|r| {
+                r.ports
+                    .iter()
+                    .map(|p| format!("{} ({})", p.name, p.address))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("ports:   {s}\n"))
+            .unwrap_or_default();
         let out = format!(
-            "path:    {canonical}\nlength:  {} bytes\n\n{content}\n",
+            "path:    {canonical}\nlength:  {} bytes\npresent: {label}\n{ports}\n{content}\n",
             content.len(),
         );
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
@@ -390,6 +460,172 @@ mod tests {
             KjResult::Err(msg) => assert!(msg.contains("flat namespace"), "msg: {msg}"),
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+
+    // ── presence (docs/midi-next.md "Presence is sink-fed") ───────────────
+
+    use crate::midi_presence::{MidiPortFact, MidiPresenceRecord};
+
+    fn sink_report(device: &str, present: bool, at_ns: u64) -> MidiPresenceRecord {
+        MidiPresenceRecord::from_sink(
+            device,
+            present,
+            "alsa",
+            if present {
+                vec![MidiPortFact {
+                    name: "MiniBrute MIDI 1".into(),
+                    address: "24:0".into(),
+                }]
+            } else {
+                vec![]
+            },
+            at_ns,
+        )
+    }
+
+    /// A kernel nobody has reported to says **unknown** for every profile —
+    /// never "absent". This is the fresh-kernel/restart case: presence is
+    /// ephemeral, so silence means we don't know, not that nothing is there.
+    #[tokio::test]
+    async fn list_presence_is_unknown_until_a_sink_reports() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                for row in v.as_array().expect("array") {
+                    assert_eq!(row["presence"], "unknown", "row: {row}");
+                    assert!(row["at"].is_null(), "row: {row}");
+                }
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The whole point of step 3: a sink report turns the column live, and an
+    /// unplug turns it absent. Both are visible to `kj midi list` on any node.
+    #[tokio::test]
+    async fn list_presence_follows_sink_reports_through_plug_and_unplug() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let presence = d.kernel().midi_presence().clone();
+
+        presence.record(sink_report("minibrute", true, 1_000)).unwrap();
+        let row = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .find(|r| r["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("row {name} present"))
+        };
+
+        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let KjResult::Ok { data: Some(v), .. } = result else {
+            panic!("expected Ok with data");
+        };
+        assert_eq!(row(&v, "minibrute")["presence"], "live");
+        assert_eq!(row(&v, "minibrute")["at"], 1_000);
+        assert_eq!(row(&v, "minibrute")["backend"], "alsa");
+        // An un-reported neighbour stays unknown — presence is per device.
+        assert_eq!(row(&v, "timidity")["presence"], "unknown");
+
+        // Unplug: the report flips the column, it does not vanish.
+        presence.record(sink_report("minibrute", false, 2_000)).unwrap();
+        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let KjResult::Ok { data: Some(v), .. } = result else {
+            panic!("expected Ok with data");
+        };
+        assert_eq!(row(&v, "minibrute")["presence"], "absent");
+        assert_eq!(row(&v, "minibrute")["at"], 2_000);
+    }
+
+    /// The human view carries the column too (this is what a player reads).
+    #[tokio::test]
+    async fn list_non_json_renders_the_presence_column() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("minibrute", true, 1))
+            .unwrap();
+
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { message, .. } => {
+                let line = message
+                    .lines()
+                    .find(|l| l.contains("minibrute"))
+                    .expect("minibrute row");
+                assert!(line.contains("live"), "line: {line}");
+                let other = message
+                    .lines()
+                    .find(|l| l.contains("timidity"))
+                    .expect("timidity row");
+                assert!(other.contains("unknown"), "line: {other}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// `kj midi show` carries the live record (including the port facts the
+    /// sink reported) alongside the durable document.
+    #[tokio::test]
+    async fn show_includes_the_presence_record() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("minibrute", true, 7))
+            .unwrap();
+
+        let result = d
+            .dispatch(&[s("midi"), s("show"), s("minibrute"), s("--json")], &c)
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["presence"], "live");
+                assert_eq!(v["presence_record"]["present"]["value"], true);
+                assert_eq!(v["presence_record"]["present"]["source"], "sink");
+                assert_eq!(v["presence_record"]["ports"]["value"][0]["address"], "24:0");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// `kj midi list` reads the same state the `/run/midi/<device>` view
+    /// serves — one store, two readers (kai/kaish read the path, kj reads the
+    /// store). If these ever disagree, presence is lying somewhere.
+    #[tokio::test]
+    async fn the_run_midi_view_agrees_with_the_list_column() {
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher_crdt_rc().await;
+        d.kernel()
+            .midi_presence()
+            .record(sink_report("minibrute", true, 5))
+            .unwrap();
+
+        let names: Vec<String> = d
+            .kernel()
+            .vfs()
+            .readdir(std::path::Path::new("/run/midi"))
+            .await
+            .expect("readdir /run/midi")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["minibrute".to_string()]);
+
+        let bytes = d
+            .kernel()
+            .vfs()
+            .read_all(std::path::Path::new("/run/midi/minibrute"))
+            .await
+            .expect("read /run/midi/minibrute");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["present"]["value"], true);
+        assert_eq!(doc["present"]["source"], "sink");
+        assert_eq!(doc["present"]["at"], 5);
     }
 
     /// `kj midi list` on a kernel with no `/etc/midi` mount at all answers

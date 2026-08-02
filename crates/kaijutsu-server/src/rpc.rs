@@ -1249,6 +1249,17 @@ pub async fn create_shared_kernel(
     }
     kernel.mount(paths::MIDI_ROOT, midi_fs).await;
 
+    // The ephemeral other half of a device: sink-fed presence at
+    // /run/midi/<device> (docs/midi-next.md "Presence is sink-fed"). Read-only
+    // by construction over the kernel's in-memory presence store — the ONLY
+    // writer is a `reportMidiPresence` call from a sink, so nothing that
+    // reaches the VFS can invent a presence fact. Deliberately NOT seeded and
+    // deliberately not CRDT-owned: a restarted kernel with no sinks connected
+    // knows nothing, and saying so is the honest answer.
+    let presence_fs =
+        kaijutsu_kernel::midi_presence::MidiPresenceFs::new(kernel.midi_presence().clone());
+    kernel.mount(paths::MIDI_RUN_ROOT, presence_fs).await;
+
     // Mount the CAS object pool read-only at /v/cas (docs/slash-v.md track B).
     // A CasFs over the kernel's FileStore renders every stored object as an
     // immutable file, sharded on the hash's leading two hex chars to match the
@@ -6607,6 +6618,55 @@ impl kernel::Server for KernelImpl {
             ));
         }
         Promise::ok(())
+    }
+
+    fn report_midi_presence(
+        self: Rc<Self>,
+        params: kernel::ReportMidiPresenceParams,
+        _results: kernel::ReportMidiPresenceResults,
+    ) -> Promise<(), capnp::Error> {
+        use kaijutsu_kernel::midi_presence::{MidiPortFact, MidiPresenceRecord, Recorded};
+
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "report_midi_presence").entered();
+        let device = pry!(pry!(p.get_device()).to_str()).to_string();
+        let present = p.get_present();
+        let backend = pry!(pry!(p.get_backend()).to_str()).to_string();
+        let epoch_ns = p.get_epoch_ns();
+        let mut ports: Vec<MidiPortFact> = Vec::new();
+        for port in pry!(p.get_ports()).iter() {
+            ports.push(MidiPortFact {
+                name: pry!(pry!(port.get_name()).to_str()).to_string(),
+                address: pry!(pry!(port.get_address()).to_str()).to_string(),
+            });
+        }
+
+        // No facade gate, on purpose (the report_clock_estimate stance):
+        // presence is inert sensor data about the rig, not a context
+        // injection, and every player is inside the trust boundary.
+        let record =
+            MidiPresenceRecord::from_sink(&device, present, &backend, ports, epoch_ns);
+        match self.kernel.kernel.midi_presence().record(record) {
+            // A malformed device key would mint an unaddressable /run/midi
+            // path — refuse loudly rather than store a fiction.
+            Err(e) => Promise::err(capnp::Error::failed(format!(
+                "reportMidiPresence: {e}"
+            ))),
+            Ok(Recorded::StaleDropped) => {
+                log::debug!(
+                    "report_midi_presence: dropped stale report for {device} \
+                     (at={epoch_ns} is older than the record on file)"
+                );
+                Promise::ok(())
+            }
+            Ok(Recorded::Stored) => {
+                log::info!(
+                    "report_midi_presence: {device} {} via {backend}",
+                    if present { "live" } else { "absent" }
+                );
+                Promise::ok(())
+            }
+        }
     }
 
     fn set_block_excluded(

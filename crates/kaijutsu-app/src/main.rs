@@ -57,6 +57,8 @@ mod dj;
 mod input;
 mod kaish;
 mod midi_in;
+mod midi_match;
+mod midi_presence;
 mod patch_graph;
 mod peers;
 mod shaders;
@@ -222,6 +224,10 @@ fn main() {
         // The ear (docs/midi.md M2): device MIDI → ring → windowed batches →
         // commitCapture, landing as data-only cells on the current context's track.
         .add_plugins(midi_in::MidiInPlugin)
+        // Device-profile matching + the app→kernel presence report
+        // (docs/midi-next.md "Presence is sink-fed"): the app matches, the
+        // kernel records. Rides midi_in's existing hotplug watcher.
+        .add_plugins(midi_presence::MidiPresencePlugin)
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

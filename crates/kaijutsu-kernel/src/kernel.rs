@@ -69,6 +69,13 @@ pub struct Kernel {
     /// channel-up, unregistration on channel-down) — one `Arc`, two
     /// consumers, no other coupling between them.
     share_registry: Arc<crate::vfs::ShareRegistry>,
+    /// Sink-fed MIDI presence (`docs/midi-next.md` "Presence is sink-fed").
+    /// **Ephemeral on purpose**: in-memory only, so a restarted kernel with no
+    /// sinks connected truthfully knows nothing about what is plugged in.
+    /// Written solely by `reportMidiPresence` (the app matches, the kernel
+    /// records); read by `kj midi list/show` and, through the read-only
+    /// `MidiPresenceFs` mounted at `/run/midi`, by kaish/kai/file tools.
+    midi_presence: Arc<crate::midi_presence::MidiPresenceStore>,
     /// Image generation backend registry.
     image_backends: RwLock<crate::image::ImageBackendRegistry>,
     /// MCP-centric tool broker (Phase 1; sits alongside the old `tools`
@@ -194,6 +201,7 @@ impl Kernel {
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
+            midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
                 let b = Broker::new();
@@ -267,6 +275,7 @@ impl Kernel {
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
+            midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
                 let b = Broker::new();
@@ -787,6 +796,12 @@ impl Kernel {
     /// Get the content-addressed store.
     pub fn cas(&self) -> &Arc<FileStore> {
         &self.cas
+    }
+
+    /// The sink-fed MIDI presence store (`docs/midi-next.md` "Presence is
+    /// sink-fed") — ephemeral, in-memory, `/run/midi`'s backing state.
+    pub fn midi_presence(&self) -> &Arc<crate::midi_presence::MidiPresenceStore> {
+        &self.midi_presence
     }
 
     /// Get the `/r` client-shares registry (`docs/slash-r.md`).

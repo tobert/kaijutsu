@@ -51,6 +51,10 @@ impl Plugin for MidiInPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CaptureState>();
         app.init_resource::<ClockSense>();
+        // The ear's drain writes port topology for `crate::midi_presence`.
+        // Initialized here too (idempotent) so the ear never depends on the
+        // presence plugin having been added first.
+        app.init_resource::<crate::midi_presence::MidiPortTopology>();
         // NonSend: the receiver end of the capture thread's channel stays on
         // the main thread with its drain system (same stance as MidiSink).
         app.insert_non_send_resource(MidiEar::default());
@@ -73,6 +77,20 @@ pub(crate) enum EarEvent {
         /// slipped when this moves).
         discontinuities: u64,
     },
+    /// A port exists: seen in the initial sweep or announced by hotplug
+    /// (`docs/midi-next.md` "Presence is sink-fed" — Announce is the trigger,
+    /// nothing polls). Backend-neutral facts only; the matcher never sees an
+    /// ALSA type.
+    PortUp(crate::midi_match::PortFacts),
+    /// A port vanished. Address only — its names left with it, so the Bevy
+    /// side resolves them from the topology it already holds. **Unplug is a
+    /// first-class event**: it becomes a `present=false` report, never a
+    /// silence.
+    PortDown { address: String },
+    /// A whole client vanished (belt-and-braces for a backend that reports
+    /// the client exit without a `PortExit` per port): every port under it is
+    /// gone.
+    ClientDown { client_id: i32 },
 }
 
 /// The capture thread's Bevy-side end: a channel of stamped events. `failed`
@@ -160,6 +178,7 @@ fn drain_ear(
     ear: NonSend<MidiEar>,
     mut state: ResMut<CaptureState>,
     mut clock: ResMut<ClockSense>,
+    mut topology: ResMut<crate::midi_presence::MidiPortTopology>,
 ) {
     let Some(rx) = ear.rx.as_ref() else {
         return;
@@ -167,6 +186,12 @@ fn drain_ear(
     while let Ok(ev) = rx.try_recv() {
         match ev {
             EarEvent::Capture(ev) => state.ring.push(ev),
+            // Topology feeds presence matching (`crate::midi_presence`); the
+            // ear's own announce subscription is the one hotplug watcher, so
+            // nothing here opens a second seq client.
+            EarEvent::PortUp(facts) => topology.port_up(facts),
+            EarEvent::PortDown { address } => topology.port_down(&address),
+            EarEvent::ClientDown { client_id } => topology.client_down(client_id),
             EarEvent::Clock { source, estimate, discontinuities } => {
                 let bpm = estimate.reference.tempo_bps * 60.0;
                 match clock.sources.get_mut(&source) {
@@ -359,11 +384,21 @@ fn spawn_capture_thread() -> Result<std::sync::mpsc::Receiver<EarEvent>, String>
         warn!("MIDI ear: no System Announce subscription (hotplug disabled): {e}");
     }
 
-    // Ambient initial sweep: every external readable port.
+    // The channel exists before the sweep so the sweep's port facts ride it:
+    // presence needs the ports that were already there at startup, not only
+    // the ones that arrive later by announce.
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // Ambient initial sweep: every external readable port gets subscribed;
+    // every external port at all (readable or not — a synth's input port is
+    // still evidence the device is here) gets reported for presence matching.
     let mut subscribed = 0usize;
     for client in alsa::seq::ClientIter::new(&seq) {
         for p in alsa::seq::PortIter::new(&seq, client.get_client()) {
             let addr = p.addr();
+            if let Some(facts) = port_facts(&seq, dest.client, addr) {
+                let _ = tx.send(EarEvent::PortUp(facts));
+            }
             if subscribe_source(&seq, dest, addr) {
                 subscribed += 1;
             }
@@ -373,8 +408,6 @@ fn spawn_capture_thread() -> Result<std::sync::mpsc::Receiver<EarEvent>, String>
         "kaijutsu-app MIDI ear open on ALSA seq {}:{} ({subscribed} source(s) subscribed)",
         own, port
     );
-
-    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("kaijutsu-midi-ear".into())
         .spawn(move || capture_loop(seq, dest, tx))
@@ -385,6 +418,44 @@ fn spawn_capture_thread() -> Result<std::sync::mpsc::Receiver<EarEvent>, String>
 #[cfg(not(target_os = "linux"))]
 fn spawn_capture_thread() -> Result<std::sync::mpsc::Receiver<EarEvent>, String> {
     Err("MIDI capture is Linux/ALSA-only".into())
+}
+
+/// Backend-neutral facts about one ALSA port, or `None` when it isn't a
+/// device at all: the System client (0), our own clients (render/ear/
+/// patchview), and "Midi Through" are plumbing, not gear. This is the ONLY
+/// place ALSA types touch the presence path — everything downstream
+/// (`crate::midi_match`, the wire, the kernel) speaks display names and an
+/// opaque address, which is what lets a CoreMIDI backend reuse all of it.
+///
+/// `usb_id` is left `None`: the sysfs walk from an ALSA card to its USB
+/// `vendor:product` is deferred (`docs/midi-next.md` slice 1 step 3 allows
+/// it), and the matcher already prefers a USB ID when one appears — filling
+/// this field is the whole of that follow-up.
+#[cfg(target_os = "linux")]
+fn port_facts(
+    seq: &alsa::Seq,
+    own_client: i32,
+    addr: alsa::seq::Addr,
+) -> Option<crate::midi_match::PortFacts> {
+    if addr.client == 0 || addr.client == own_client {
+        return None;
+    }
+    let client_info = seq.get_any_client_info(addr.client).ok()?;
+    let client_name = client_info.get_name().ok()?.to_string();
+    if matches!(
+        client_name.as_str(),
+        "kaijutsu-app" | "kaijutsu-ear" | "kaijutsu-patchview" | "Midi Through"
+    ) {
+        return None;
+    }
+    let pinfo = seq.get_any_port_info(addr).ok()?;
+    let port_name = pinfo.get_name().unwrap_or("?").to_string();
+    Some(crate::midi_match::PortFacts {
+        client_name,
+        port_name,
+        address: format!("{}:{}", addr.client, addr.port),
+        usb_id: None,
+    })
 }
 
 /// Should the ear listen to this port? Readable-subscribable external sources
@@ -482,11 +553,41 @@ fn capture_loop(
                 continue;
             }
         };
-        if ev.get_type() == EventType::PortStart {
-            if let Some(addr) = ev.get_data::<alsa::seq::Addr>() {
-                subscribe_source(&seq, dest, addr);
+        // Hotplug, both directions. Arrival subscribes the ear AND feeds
+        // presence; departure feeds presence only (there is nothing left to
+        // unsubscribe). A vanished port must be *reported* gone — silence
+        // would leave the kernel holding a presence fact that has become a
+        // lie (`docs/midi-next.md`).
+        match ev.get_type() {
+            EventType::PortStart => {
+                if let Some(addr) = ev.get_data::<alsa::seq::Addr>() {
+                    if let Some(facts) = port_facts(&seq, dest.client, addr)
+                        && tx.send(EarEvent::PortUp(facts)).is_err()
+                    {
+                        return;
+                    }
+                    subscribe_source(&seq, dest, addr);
+                }
+                continue;
             }
-            continue;
+            EventType::PortExit => {
+                if let Some(addr) = ev.get_data::<alsa::seq::Addr>() {
+                    let address = format!("{}:{}", addr.client, addr.port);
+                    if tx.send(EarEvent::PortDown { address }).is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
+            EventType::ClientExit => {
+                if let Some(addr) = ev.get_data::<alsa::seq::Addr>()
+                    && tx.send(EarEvent::ClientDown { client_id: addr.client }).is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            _ => {}
         }
 
         // The clock tap, BEFORE the ring's door filter — its stamps are the
@@ -604,6 +705,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<CaptureState>()
             .init_resource::<ClockSense>()
+            .init_resource::<crate::midi_presence::MidiPortTopology>()
             .add_systems(Update, drain_ear);
         app.world_mut()
             .insert_non_send_resource(MidiEar { rx: Some(rx), failed: false });
@@ -614,6 +716,43 @@ mod tests {
         let entry = sense.sources.get("36:0").expect("clock master registered");
         assert_eq!(entry.discontinuities, 1);
         assert!((entry.estimate.reference.tempo_bps - 2.0).abs() < 1e-9);
+    }
+
+    /// Hotplug routes into the presence topology through the same one drain
+    /// (`docs/midi-next.md` "Presence is sink-fed": Announce is the trigger,
+    /// and the ear's existing subscription is the only watcher). Departure
+    /// must land too — an unplug we swallow becomes a kernel-side lie.
+    #[test]
+    fn drain_routes_port_events_into_the_presence_topology() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(EarEvent::PortUp(crate::midi_match::PortFacts {
+            client_name: "KeyStep Pro".into(),
+            port_name: "KeyStep Pro MIDI 1".into(),
+            address: "24:0".into(),
+            usb_id: None,
+        }))
+        .unwrap();
+        tx.send(EarEvent::PortUp(crate::midi_match::PortFacts {
+            client_name: "MiniBrute".into(),
+            port_name: "MiniBrute MIDI 1".into(),
+            address: "26:0".into(),
+            usb_id: None,
+        }))
+        .unwrap();
+        tx.send(EarEvent::PortDown { address: "26:0".into() }).unwrap();
+
+        let mut app = App::new();
+        app.init_resource::<CaptureState>()
+            .init_resource::<ClockSense>()
+            .init_resource::<crate::midi_presence::MidiPortTopology>()
+            .add_systems(Update, drain_ear);
+        app.world_mut()
+            .insert_non_send_resource(MidiEar { rx: Some(rx), failed: false });
+        app.update();
+
+        let topo = app.world().resource::<crate::midi_presence::MidiPortTopology>();
+        let addrs: Vec<String> = topo.ports().into_iter().map(|p| p.address).collect();
+        assert_eq!(addrs, vec!["24:0".to_string()], "the unplugged port is gone");
     }
 
     /// The cutter's loss boundary: the tracker is born WITH the ring (cursor

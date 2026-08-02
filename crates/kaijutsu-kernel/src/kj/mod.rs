@@ -761,7 +761,7 @@ pub(crate) mod test_helpers {
     use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::drift::shared_drift_router;
     use crate::kernel_db::KernelDb;
-    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, RC_ROOT};
+    use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, MIDI_RUN_ROOT, RC_ROOT};
 
     /// Create a KjDispatcher with in-memory state for testing.
     ///
@@ -878,6 +878,12 @@ pub(crate) mod test_helpers {
             .seed_entries(crate::midi_seed::seed_files())
             .expect("seed midi devices into CRDT");
         kernel.mount(MIDI_ROOT, midi_fs).await;
+        // The ephemeral, sink-fed presence view over the same kernel's store
+        // (docs/midi-next.md "Presence is sink-fed") — mounted here too so
+        // `kj midi list`'s presence column reads the real `/run/midi` path.
+        let presence_fs =
+            crate::midi_presence::MidiPresenceFs::new(kernel.midi_presence().clone());
+        kernel.mount(MIDI_RUN_ROOT, presence_fs).await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 

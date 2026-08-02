@@ -47,6 +47,22 @@ pub const CLIENT_ROOT: &str = "/etc/client";
 /// `SXX-*.{md,kai}` files later without a storage migration.
 pub const MIDI_ROOT: &str = "/etc/midi";
 
+/// Root of the kernel's **ephemeral runtime state** tree. Nothing under `/run`
+/// is CRDT-owned, nothing is a host file, and nothing survives a kernel
+/// restart: each tenant is a read-only view synthesized from in-memory state,
+/// so a kernel that just booted with no sinks connected truthfully knows
+/// nothing. The unix `/run` convention, kept deliberately (it is what
+/// `docs/midi-next.md` names) rather than folded into `/v` (kaish-shared
+/// virtual filesystems) or `/r` (live *client* roots).
+pub const RUN_ROOT: &str = "/run";
+
+/// Root of the sink-fed MIDI presence store (`docs/midi-next.md` "Presence is
+/// sink-fed"). `/run/midi/<device>` renders one profile-matched device's
+/// provenance-tagged presence facts (`{value, source, at}`) as JSON, written
+/// only by app→kernel presence reports and readable by kai/kaish/`kj midi`.
+/// Ephemeral by construction — see [`RUN_ROOT`].
+pub const MIDI_RUN_ROOT: &str = "/run/midi";
+
 /// Root of the read-only content-addressed object pool
 /// (`/v/cas/<shard>/<hash>`).
 pub const CAS_ROOT: &str = "/v/cas";
@@ -102,6 +118,14 @@ pub fn midi_device_path(name: &str) -> String {
     format!("{MIDI_ROOT}/devices/{name}")
 }
 
+/// One device's presence record path: `/run/midi/<device>`. The leaf name is
+/// the same `<device>` key as [`midi_device_path`] — presence is keyed by
+/// profile name, so `/etc/midi/devices/<name>` and `/run/midi/<name>` are the
+/// durable and ephemeral halves of one device.
+pub fn midi_presence_path(device: &str) -> String {
+    format!("{MIDI_RUN_ROOT}/{device}")
+}
+
 /// A live client's root under `/r`: `/r/<client_id>`.
 pub fn r_client_path(client_id: &str) -> String {
     format!("{R_ROOT}/{client_id}")
@@ -150,6 +174,14 @@ pub fn is_midi_path(path: &str) -> bool {
     is_or_under(path, MIDI_ROOT)
 }
 
+/// True if `path` is under the ephemeral MIDI presence store (`/run/midi` or
+/// `/run/midi/...`). Disjoint from [`is_midi_path`]: the durable profile and
+/// the ephemeral presence record for one device live in different trees on
+/// purpose (a restart drops the latter and keeps the former).
+pub fn is_midi_run_path(path: &str) -> bool {
+    is_or_under(path, MIDI_RUN_ROOT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +227,19 @@ mod tests {
     }
 
     #[test]
+    fn midi_presence_builder_joins_the_run_namespace() {
+        assert_eq!(midi_presence_path("keystep-pro"), "/run/midi/keystep-pro");
+        // The durable and ephemeral halves share the device key, not the tree.
+        assert_eq!(
+            midi_presence_path("minibrute")
+                .rsplit('/')
+                .next()
+                .unwrap(),
+            midi_device_path("minibrute").rsplit('/').next().unwrap()
+        );
+    }
+
+    #[test]
     fn predicates_match_root_and_children_only() {
         assert!(is_rc_path("/etc/rc"));
         assert!(is_rc_path("/etc/rc/coder/create/S00-stance.md"));
@@ -214,6 +259,21 @@ mod tests {
         assert!(is_midi_path("/etc/midi"));
         assert!(is_midi_path("/etc/midi/devices/minibrute"));
         assert!(!is_midi_path("/etc/midifoo"));
+
+        assert!(is_midi_run_path("/run/midi"));
+        assert!(is_midi_run_path("/run/midi/keystep-pro"));
+        assert!(!is_midi_run_path("/run/midifoo"));
+        assert!(!is_midi_run_path("/run"));
+    }
+
+    /// The durable profile tree and the ephemeral presence store never claim
+    /// each other's paths — a `/run/midi` record must not read as config.
+    #[test]
+    fn presence_store_and_profile_tree_are_disjoint() {
+        assert!(!is_midi_path(MIDI_RUN_ROOT));
+        assert!(!is_midi_run_path(MIDI_ROOT));
+        assert!(!is_config_path(MIDI_RUN_ROOT));
+        assert!(!is_rc_path(MIDI_RUN_ROOT));
     }
 
     /// The rc/config/client/midi trees never falsely overlap each other, even

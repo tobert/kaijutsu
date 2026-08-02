@@ -16,6 +16,11 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::kaijutsu_capnp::world;
 
+/// Chunk size for [`RpcClient::vfs_read_all`]. Matches the SFTP READ window
+/// and `VfsOps::STREAM_CHUNK_SIZE` so a wire-backed backend sees the same
+/// cadence its own streaming path would drive.
+const VFS_READ_CHUNK: u32 = 256 * 1024;
+
 /// Aborts the Cap'n Proto RPC system task when the last reference is dropped.
 ///
 /// Without this, `spawn_local(rpc_system)` runs forever — the task owns the
@@ -1984,6 +1989,43 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Report one profile-matched device's presence to the kernel
+    /// (`docs/midi-next.md` "Presence is sink-fed" — the app matches, the
+    /// kernel records). Not context-scoped: presence is a fact about the rig.
+    /// `present = false` is a first-class report (unplug), never an omission.
+    #[tracing::instrument(skip(self, ports), name = "rpc_client.report_midi_presence")]
+    pub async fn report_midi_presence(
+        &self,
+        device: &str,
+        present: bool,
+        backend: &str,
+        ports: &[(String, String)],
+        epoch_ns: u64,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.report_midi_presence_request();
+        {
+            let mut p = request.get();
+            p.set_device(device);
+            p.set_present(present);
+            p.set_backend(backend);
+            p.set_epoch_ns(epoch_ns);
+            let mut list = p.init_ports(ports.len() as u32);
+            for (i, (name, address)) in ports.iter().enumerate() {
+                let mut entry = list.reborrow().get(i as u32);
+                entry.set_name(name);
+                entry.set_address(address);
+            }
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
     /// Clear the input document for a context (discard draft).
     ///
     /// The server clears the CRDT input doc and emits `InputCleared` to all
@@ -2038,6 +2080,43 @@ impl KernelHandle {
             generation: reader.get_generation(),
             truncated: reader.get_truncated(),
         })
+    }
+
+    /// Read a whole VFS file over the existing `Vfs` capability — no new wire
+    /// method. Chunked at [`VFS_READ_CHUNK`] and stopping on the documented
+    /// zero-length-read EOF signal, so it works against every backend
+    /// (`ConfigCrdtFs`, `MemoryBackend`, `MidiPresenceFs`, a share) without
+    /// asking any of them for a size first.
+    ///
+    /// The app's device-profile fetch rides this: a sink reads
+    /// `/etc/midi/devices/<name>` for its match strings the same way any
+    /// other config reaches a client (`docs/midi-next.md` "Presence is
+    /// sink-fed": *profiles reach the app the same way any config does*).
+    #[tracing::instrument(skip(self), name = "rpc_client.vfs_read_all")]
+    pub async fn vfs_read_all(&self, path: &str) -> Result<Vec<u8>, RpcError> {
+        let vfs_response = self.kernel.vfs_request().send().promise.await?;
+        let vfs = vfs_response.get()?.get_vfs()?;
+
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let mut request = vfs.read_request();
+            {
+                let mut p = request.get();
+                p.set_path(path);
+                p.set_offset(out.len() as u64);
+                p.set_size(VFS_READ_CHUNK);
+            }
+            let response = request.send().promise.await?;
+            let chunk = response.get()?.get_data()?;
+            if chunk.is_empty() {
+                // Zero-length read is EOF (the VfsOps read contract). A SHORT
+                // read is not: the next request just resumes at the advanced
+                // offset.
+                break;
+            }
+            out.extend_from_slice(chunk);
+        }
+        Ok(out)
     }
 
     /// Thin wrapper over `Vfs.create` — needed by the vfs-activity e2e test

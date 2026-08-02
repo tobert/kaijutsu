@@ -485,6 +485,18 @@ enum RpcCommand {
         source: String,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    ReportMidiPresence {
+        device: String,
+        present: bool,
+        backend: String,
+        ports: Vec<(String, String)>,
+        epoch_ns: u64,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    VfsReadAll {
+        path: String,
+        reply: oneshot::Sender<Result<Vec<u8>, CallError>>,
+    },
 
     // ── Editor (vi) ──────────────────────────────────────────────────────
     EditorKeys {
@@ -674,6 +686,8 @@ impl RpcCommand {
             Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CommitCapture { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ReportClockEstimate { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ReportMidiPresence { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::VfsReadAll { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1230,6 +1244,40 @@ impl ActorHandle {
             reply,
         })
         .await
+    }
+
+    /// Report one profile-matched MIDI device's presence (`docs/midi-next.md`
+    /// "Presence is sink-fed"). Kernel-global, not context-scoped: presence is
+    /// a fact about the rig. `present = false` (unplug) is a report we owe the
+    /// kernel, not a silence — stale presence that lies is worse than none.
+    #[tracing::instrument(skip(self, ports))]
+    pub async fn report_midi_presence(
+        &self,
+        device: impl Into<String> + std::fmt::Debug,
+        present: bool,
+        backend: impl Into<String> + std::fmt::Debug,
+        ports: Vec<(String, String)>,
+        epoch_ns: u64,
+    ) -> Result<(), CallError> {
+        let device = device.into();
+        let backend = backend.into();
+        self.send(|reply| RpcCommand::ReportMidiPresence {
+            device,
+            present,
+            backend,
+            ports,
+            epoch_ns,
+            reply,
+        })
+        .await
+    }
+
+    /// Read a whole VFS file through the kernel's existing `Vfs` capability.
+    /// The sink's device-profile fetch rides this (`/etc/midi/devices/<name>`).
+    #[tracing::instrument(skip(self))]
+    pub async fn vfs_read_all(&self, path: impl Into<String> + std::fmt::Debug) -> Result<Vec<u8>, CallError> {
+        let path = path.into();
+        self.send(|reply| RpcCommand::VfsReadAll { path, reply }).await
     }
 
     /// Ship one observer clock reference (`docs/midi.md` M3, ~2 Hz stream).
@@ -2841,6 +2889,15 @@ async fn dispatch_kernel_command(
                 kernel, reply, close_tx, k,
                 k.report_clock_estimate(context_id, beat, tempo_bps, epoch_ns, &source)
             );
+        }
+        RpcCommand::ReportMidiPresence { device, present, backend, ports, epoch_ns, reply } => {
+            dispatch!(
+                kernel, reply, close_tx, k,
+                k.report_midi_presence(&device, present, &backend, &ports, epoch_ns)
+            );
+        }
+        RpcCommand::VfsReadAll { path, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.vfs_read_all(&path));
         }
 
         // ── Editor (vi) ──

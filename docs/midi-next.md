@@ -431,15 +431,24 @@ Three moves change that:
       namespace; `kj midi list|show`. Draft **KeyStep Pro** and **KeyLab**
       profiles alongside the existing minibrute/timidity seeds — live bench
       gear beats the roster order.
-   3. **In-app match + presence wire event** (the "Presence is sink-fed"
-      section) — promoted into slice 1 because *this* is what "available"
-      means; `kj midi list` shows live presence.
+   3. ~~**In-app match + presence wire event**~~ — **done 2026-08-02**. The
+      matcher is a pure, backend-neutral function
+      (`kaijutsu-app/src/midi_match.rs`: names + USB IDs in, device + role
+      out; ambiguity refuses rather than guesses) fed by the ear's existing
+      announce watcher; `reportMidiPresence` carries `{device, present,
+      backend, ports, at}` to the kernel, which records it in an **ephemeral**
+      in-memory store rendered read-only at `/run/midi/<device>`
+      (`kaijutsu-kernel/src/midi_presence.rs`). `kj midi list` gained a
+      live/absent/**unknown** column — unknown is load-bearing: a restarted
+      kernel with no sinks connected knows nothing and says so. Deferred with
+      a seam in place: USB `vendor:product` enrichment (`PortFacts::usb_id` is
+      never filled on Linux yet — matching runs on name substrings).
    4. **`kj midi send`/`panic`** — raw control cues incl. fire-and-forget
       sysex bytes, kaish-scriptable.
    5. The **`exchange()` sink method** + `kj midi identify`
-      (Identity-Request fingerprint) — the slice's only capnp change; batch
-      the presence event's schema addition with it if step 3 hasn't already
-      landed it.
+      (Identity-Request fingerprint). Step 3 already spent the slice's first
+      capnp change (`MidiPortFact` + `reportMidiPresence`), so this is the
+      second and last.
 2. **Routing consumes profiles.** The render sink resolves "track →
    *device.role*" through the profile to port + channel — paying for the
    per-track channel-routing open item (`midi.md` open questions,

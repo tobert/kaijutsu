@@ -688,10 +688,24 @@ split), track bindings as *device.role* not raw
 channel ints, rc-injected device contexts as side channels (profile as skill
 body + narrow loadout + cheap model), `kj midi` emit verbs + provenance-tagged
 `/run/midi/<device>` state, SysEx via a sink `exchange()` method (transfer
-job shape deferred). Nothing in code yet. Slice order in the doc; first
-consumer: Minibrute on the laptop app, then the per-track channel-routing fix
-(this file → Hyoushigi/Musician area; `docs/chameleon.md` open items) built
-on profile vocabulary.
+job shape deferred). Slice 1 steps 1–3 have landed (seeds + `kj midi
+list/show`; sink-fed presence: in-app profile matching, `reportMidiPresence`,
+the ephemeral `/run/midi/<device>` store, presence column). Slice order in the
+doc; next: `kj midi send`/`panic`, then `exchange()` + `kj midi identify`.
+First real consumer: Minibrute on the laptop app, then the per-track
+channel-routing fix (this file → Hyoushigi/Musician area; `docs/chameleon.md`
+open items) built on profile vocabulary.
+
+- **USB `vendor:product` enrichment for presence matching** (deferred
+  2026-08-02, slice 1 step 3). `midi_match::PortFacts::usb_id` exists and the
+  matcher already ranks a USB hit above any name match, but nothing fills the
+  field: on Linux it needs an ALSA-card → sysfs walk
+  (`/sys/class/sound/cardN/device/{idVendor,idProduct}`), on macOS the
+  CoreMIDI device properties. Until then matching is name-substring only,
+  which the shipped profiles all support. Two same-model units on one rig
+  (identical names, distinct USB paths) is the case that will force it — and
+  will also need something finer than `vendor:product`, which is per-model,
+  not per-unit.
 
 ## App (and headless sink) as MCP clients offered back to the kernel (seeded 2026-07-15)
 

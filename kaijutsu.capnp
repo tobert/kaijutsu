@@ -380,6 +380,17 @@ struct BeatRef {
   epochNs @2 :UInt64;     # sender wallclock (ns since UNIX_EPOCH) at emission; 0 = unstamped
 }
 
+# One MIDI port as a reporting sink sees it (docs/midi-next.md "Presence is
+# sink-fed"). Backend-neutral by construction: `name` is the port's display
+# name — what profile match strings match on — and `address` is the backend's
+# own handle for it ("client:port" under ALSA, a unique id under CoreMIDI),
+# opaque to the kernel and carried for logs/disambiguation only. No ALSA
+# client numbers ever reach a profile.
+struct MidiPortFact {
+  name @0 :Text;
+  address @1 :Text;
+}
+
 # Callback for receiving block updates from server
 interface BlockEvents {
   onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
@@ -1506,6 +1517,23 @@ interface Kernel {
   # same lifecycle as subscribeEditor — no cross-connection dedupe, the
   # bridge simply dies with the connection.
   subscribeVfsActivity @99 (callback :VfsActivityEvents, intervalMs :UInt32);
+
+  # ==========================================================================
+  # Sink-fed MIDI presence (docs/midi-next.md "Presence is sink-fed")
+  # ==========================================================================
+  # The app matches, the kernel records. A sink watches platform hotplug,
+  # matches port facts against the backend-neutral match strings in
+  # /etc/midi/devices/<name>, and reports here; the kernel writes the report
+  # into its EPHEMERAL /run/midi/<device> store as provenance-tagged facts
+  # (source: "sink"). Not context-scoped: presence is a fact about the rig,
+  # not about a conversation. `present` false is a first-class report (unplug)
+  # — stale presence that lies is worse than none, so the sink says so rather
+  # than going quiet. `backend` is the reporting sink's platform backend
+  # ("alsa", "coremidi"); `epochNs` is its wallclock at observation, and a
+  # report older than the one on file is dropped (latest timestamp wins).
+  # No facade gate, on purpose (the reportClockEstimate stance): presence is
+  # inert sensor data, and every player is inside the trust boundary.
+  reportMidiPresence @100 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext) -> ();
 }
 
 # ============================================================================
