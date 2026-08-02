@@ -223,6 +223,14 @@ impl KjDispatcher {
                         // "observed at the epoch".
                         "at": record.as_ref().map(|r| r.at_ns),
                         "backend": record.as_ref().map(|r| r.backend.clone()),
+                        // WHERE the report came from — the whole point of a
+                        // rig-wide store. Null for unknown (nobody reported)
+                        // and for a sink too old to say; never a placeholder
+                        // hostname, which would read as a real machine.
+                        "host": record
+                            .as_ref()
+                            .map(|r| r.sink.host.clone())
+                            .filter(|h| !h.is_empty()),
                         "kind": kind,
                     })
                 })
@@ -236,10 +244,30 @@ impl KjDispatcher {
         }
         let width = rows.iter().map(|(n, ..)| n.len()).max().unwrap_or(0);
         let pwidth = rows.iter().map(|(_, _, p, ..)| p.len()).max().unwrap_or(0);
+        // The "where" column, and only when somebody actually answered it: on
+        // a rig nobody has reported into (or one whose sinks are too old to
+        // name themselves) the column is pure blank padding, so it isn't
+        // drawn at all.
+        let host_of = |record: &Option<crate::midi_presence::MidiPresenceRecord>| -> String {
+            record
+                .as_ref()
+                .map(|r| r.sink.host.clone())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_default()
+        };
+        let hwidth = rows
+            .iter()
+            .map(|(_, _, _, record, _)| host_of(record).len())
+            .max()
+            .unwrap_or(0);
         let lines: Vec<String> = rows
             .iter()
-            .map(|(name, title, label, ..)| {
-                format!("  {name:<width$}  {label:<pwidth$}  {title}")
+            .map(|(name, title, label, record, _)| {
+                if hwidth == 0 {
+                    return format!("  {name:<width$}  {label:<pwidth$}  {title}");
+                }
+                let host = host_of(record);
+                format!("  {name:<width$}  {label:<pwidth$}  {host:<hwidth$}  {title}")
             })
             .collect();
         KjResult::ok_with_data(lines.join("\n"), data)
@@ -306,8 +334,16 @@ impl KjDispatcher {
             .filter(|s| !s.is_empty())
             .map(|s| format!("ports:   {s}\n"))
             .unwrap_or_default();
+        // Which sink saw it — the answer to "live, but WHERE?" for a rig
+        // spread across machines. Omitted rather than faked when unknown.
+        let host = presence
+            .as_ref()
+            .map(|r| r.sink.host.clone())
+            .filter(|h| !h.is_empty())
+            .map(|h| format!("host:    {h}\n"))
+            .unwrap_or_default();
         let out = format!(
-            "path:    {canonical}\nlength:  {} bytes\npresent: {label}\n{ports}\n{content}\n",
+            "path:    {canonical}\nlength:  {} bytes\npresent: {label}\n{host}{ports}\n{content}\n",
             content.len(),
         );
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
@@ -570,9 +606,18 @@ mod tests {
 
     // ── presence (docs/midi-next.md "Presence is sink-fed") ───────────────
 
-    use crate::midi_presence::{MidiPortFact, MidiPresenceRecord};
+    use crate::midi_presence::{MidiPortFact, MidiPresenceRecord, SinkAttribution};
 
     fn sink_report(device: &str, present: bool, at_ns: u64) -> MidiPresenceRecord {
+        sink_report_from(device, present, at_ns, "moltar")
+    }
+
+    fn sink_report_from(
+        device: &str,
+        present: bool,
+        at_ns: u64,
+        host: &str,
+    ) -> MidiPresenceRecord {
         MidiPresenceRecord::from_sink(
             device,
             present,
@@ -586,6 +631,7 @@ mod tests {
                 vec![]
             },
             at_ns,
+            SinkAttribution::new(kaijutsu_types::SessionId::new(), host),
         )
     }
 
@@ -674,6 +720,77 @@ mod tests {
         }
     }
 
+    /// "Live" is only half an answer on a rig spread across machines — the
+    /// other half is WHERE, and it rides the same row.
+    #[tokio::test]
+    async fn list_says_which_host_a_device_is_live_on() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report_from("minibrute", true, 1, "moltar"))
+            .unwrap();
+
+        let KjResult::Ok { data: Some(v), .. } =
+            d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await
+        else {
+            panic!("expected Ok with data");
+        };
+        let row = |name: &str| -> serde_json::Value {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .find(|r| r["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("row {name} present"))
+        };
+        assert_eq!(row("minibrute")["host"], "moltar");
+        // Unknown presence has no host to report — null, never a guess at
+        // "this machine" (the reporting sink need not be local at all).
+        assert!(row("timidity")["host"].is_null());
+    }
+
+    /// The human table grows a where-column once somebody has answered it.
+    #[tokio::test]
+    async fn list_non_json_renders_the_host_column() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report_from("minibrute", true, 1, "moltar"))
+            .unwrap();
+
+        let KjResult::Ok { message, .. } = d.dispatch(&[s("midi"), s("list")], &c).await else {
+            panic!("expected Ok");
+        };
+        let line = message
+            .lines()
+            .find(|l| l.contains("minibrute"))
+            .expect("minibrute row");
+        assert!(line.contains("live"), "line: {line}");
+        assert!(line.contains("moltar"), "line: {line}");
+    }
+
+    /// With nothing reported the column is pure padding — don't draw it.
+    #[tokio::test]
+    async fn list_non_json_omits_the_host_column_when_nobody_reported() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let KjResult::Ok { message, .. } = d.dispatch(&[s("midi"), s("list")], &c).await else {
+            panic!("expected Ok");
+        };
+        let line = message
+            .lines()
+            .find(|l| l.contains("minibrute"))
+            .expect("minibrute row");
+        let after = line.split("unknown").nth(1).expect("presence label");
+        assert!(
+            after.starts_with("  ") && !after.starts_with("   "),
+            "the title must follow the label directly, with no blank \
+             where-column between them: {line:?}"
+        );
+    }
+
     /// `kj midi show` carries the live record (including the port facts the
     /// sink reported) alongside the durable document.
     #[tokio::test]
@@ -694,9 +811,71 @@ mod tests {
                 assert_eq!(v["presence_record"]["present"]["value"], true);
                 assert_eq!(v["presence_record"]["present"]["source"], "sink");
                 assert_eq!(v["presence_record"]["ports"]["value"][0]["address"], "24:0");
+                assert_eq!(v["presence_record"]["host"]["value"], "moltar");
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// The human view of `show` answers "where" too.
+    #[tokio::test]
+    async fn show_non_json_names_the_reporting_host() {
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        d.kernel()
+            .midi_presence()
+            .record(sink_report_from("minibrute", true, 7, "zorak"))
+            .unwrap();
+
+        let KjResult::Ok { message, .. } = d
+            .dispatch(&[s("midi"), s("show"), s("minibrute")], &c)
+            .await
+        else {
+            panic!("expected Ok");
+        };
+        assert!(message.contains("host:    zorak"), "message: {message}");
+    }
+
+    /// A sink's disconnect un-knows what it told us, everywhere it shows: the
+    /// row goes back to `unknown` and `/run/midi/<device>` stops existing.
+    /// This is the crashed-sink case — no unplug report is ever coming.
+    #[tokio::test]
+    async fn a_reaped_connection_takes_its_rows_and_run_files_with_it() {
+        use crate::vfs::{VfsError, VfsOps};
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let record = sink_report_from("minibrute", true, 1, "moltar");
+        let connection = record.sink.connection;
+        d.kernel().midi_presence().record(record).unwrap();
+
+        d.kernel().midi_presence().reap_connection(connection);
+
+        let KjResult::Ok { data: Some(v), .. } =
+            d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await
+        else {
+            panic!("expected Ok with data");
+        };
+        let row = v
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|r| r["name"] == "minibrute")
+            .cloned()
+            .expect("row minibrute present");
+        assert_eq!(row["presence"], "unknown", "reaped reads as unknown");
+        assert!(row["host"].is_null());
+        assert!(row["at"].is_null());
+
+        assert!(
+            matches!(
+                d.kernel()
+                    .vfs()
+                    .read_all(std::path::Path::new("/run/midi/minibrute"))
+                    .await,
+                Err(VfsError::NotFound(_))
+            ),
+            "the /run entry must be gone, not a lingering present=true file"
+        );
     }
 
     /// `kj midi list` reads the same state the `/run/midi/<device>` view

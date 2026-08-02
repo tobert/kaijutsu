@@ -1533,7 +1533,14 @@ interface Kernel {
   # report older than the one on file is dropped (latest timestamp wins).
   # No facade gate, on purpose (the reportClockEstimate stance): presence is
   # inert sensor data, and every player is inside the trust boundary.
-  reportMidiPresence @100 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext) -> ();
+  # `sinkHost` is the reporting sink's own name for its machine — display and
+  # provenance only, so `kj midi list` can answer "live, but WHERE?" across a
+  # rig. It is NEVER the key anything is reaped by: presence is bound to the
+  # *connection* the report arrived on (the kernel attaches its own
+  # per-connection id and drops every record attributed to a connection when
+  # it dies), because a sink that crashes cannot send an unplug and cannot be
+  # trusted to identify itself honestly either. Empty from an older peer.
+  reportMidiPresence @100 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
 }
 
 # ============================================================================

@@ -553,6 +553,13 @@ pub struct ConnectionState {
     /// spawn_local tasks (FlowBus bridge, etc.) tokio::select! on this so
     /// they shut down promptly instead of leaking onto the LocalSet.
     conn_cancel: CancellationToken,
+    /// The kernel's MIDI presence store, attached the first time this
+    /// connection reports presence (`docs/midi-next.md` "Presence is
+    /// sink-fed"). Held so `Drop` can reap what this connection claimed —
+    /// a sink that crashes never sends its unplug, so presence must die with
+    /// the connection rather than outlive it as a lie. `None` on a connection
+    /// that never reported presence, which is most of them.
+    midi_presence: Option<Arc<kaijutsu_kernel::midi_presence::MidiPresenceStore>>,
 }
 
 impl ConnectionState {
@@ -570,6 +577,22 @@ impl ConnectionState {
             output_subscribers: Vec::new(),
             elicitation_subscribers: Vec::new(),
             conn_cancel: CancellationToken::new(),
+            midi_presence: None,
+        }
+    }
+
+    /// Remember the presence store this connection is writing into, so
+    /// `Drop` can reap its records. Called from `report_midi_presence` on
+    /// every report (idempotent) rather than at connect time: only a
+    /// connection that actually reported presence has anything to reap, and
+    /// the store handle then arrives from the same path that created the
+    /// obligation.
+    fn attach_midi_presence(
+        &mut self,
+        store: Arc<kaijutsu_kernel::midi_presence::MidiPresenceStore>,
+    ) {
+        if self.midi_presence.is_none() {
+            self.midi_presence = Some(store);
         }
     }
 
@@ -656,6 +679,26 @@ impl Drop for ConnectionState {
         // release their references. Without this, a wedged capnp callback
         // can pin those tasks indefinitely on the LocalSet.
         self.conn_cancel.cancel();
+        // Un-know whatever this connection told us about the rig
+        // (`docs/midi-next.md` "Presence is sink-fed"). Presence is
+        // connection-bound for the case the sink cannot cover: a crash, a
+        // yanked network, a `kill -9` — no `present=false` report is coming,
+        // so a record that outlives its reporter is a lie the kernel would
+        // keep telling forever. Records go back to *unknown* (removed), never
+        // to a fabricated `present=false`: nobody observed an absence. Same
+        // lifecycle the subscriptions above die on — this Drop is the one
+        // teardown that runs even when `run_rpc`'s tail never does.
+        if let Some(store) = &self.midi_presence {
+            let reaped = store.reap_connection(self.session_id);
+            if !reaped.is_empty() {
+                log::info!(
+                    "midi presence: connection {} closed — {} device(s) back to unknown: {}",
+                    self.session_id.short(),
+                    reaped.len(),
+                    reaped.join(", ")
+                );
+            }
+        }
         // Clean up per-session context tracking. Mirrors the explicit
         // remove that used to live at the tail of `run_rpc`; the Drop
         // guard runs even when the RPC system future is dropped mid-flight
@@ -6625,7 +6668,9 @@ impl kernel::Server for KernelImpl {
         params: kernel::ReportMidiPresenceParams,
         _results: kernel::ReportMidiPresenceResults,
     ) -> Promise<(), capnp::Error> {
-        use kaijutsu_kernel::midi_presence::{MidiPortFact, MidiPresenceRecord, Recorded};
+        use kaijutsu_kernel::midi_presence::{
+            MidiPortFact, MidiPresenceRecord, Recorded, SinkAttribution,
+        };
 
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "report_midi_presence").entered();
@@ -6633,6 +6678,10 @@ impl kernel::Server for KernelImpl {
         let present = p.get_present();
         let backend = pry!(pry!(p.get_backend()).to_str()).to_string();
         let epoch_ns = p.get_epoch_ns();
+        // Display/provenance only — whatever the sink calls its machine (empty
+        // from a peer too old to say). The reaping key is the connection
+        // below, which the sink neither chooses nor can take with it.
+        let sink_host = pry!(pry!(p.get_sink_host()).to_str()).to_string();
         let mut ports: Vec<MidiPortFact> = Vec::new();
         for port in pry!(p.get_ports()).iter() {
             ports.push(MidiPortFact {
@@ -6644,9 +6693,26 @@ impl kernel::Server for KernelImpl {
         // No facade gate, on purpose (the report_clock_estimate stance):
         // presence is inert sensor data about the rig, not a context
         // injection, and every player is inside the trust boundary.
-        let record =
-            MidiPresenceRecord::from_sink(&device, present, &backend, ports, epoch_ns);
-        match self.kernel.kernel.midi_presence().record(record) {
+        //
+        // Attribution is stamped HERE, from the connection, never from
+        // anything the sink says about itself: this is what makes the record
+        // perishable when the sink dies without an unplug report
+        // (`ConnectionState::drop` → `reap_connection`).
+        let store = self.kernel.kernel.midi_presence().clone();
+        let connection = {
+            let mut conn = self.connection.borrow_mut();
+            conn.attach_midi_presence(store.clone());
+            conn.session_id
+        };
+        let record = MidiPresenceRecord::from_sink(
+            &device,
+            present,
+            &backend,
+            ports,
+            epoch_ns,
+            SinkAttribution::new(connection, sink_host),
+        );
+        match store.record(record) {
             // A malformed device key would mint an unaddressable /run/midi
             // path — refuse loudly rather than store a fiction.
             Err(e) => Promise::err(capnp::Error::failed(format!(
@@ -6661,8 +6727,10 @@ impl kernel::Server for KernelImpl {
             }
             Ok(Recorded::Stored) => {
                 log::info!(
-                    "report_midi_presence: {device} {} via {backend}",
-                    if present { "live" } else { "absent" }
+                    "report_midi_presence: {device} {} via {backend} on \
+                     connection {}",
+                    if present { "live" } else { "absent" },
+                    connection.short()
                 );
                 Promise::ok(())
             }
@@ -9465,6 +9533,90 @@ mod connection_state_tests {
             "ConnectionState::Drop must remove its session_id from \
              session_contexts so wedged threads don't leak entries",
         );
+    }
+
+    /// The crashed-sink hole, closed at the seam that actually fires: a sink
+    /// that dies never sends `present=false`, so `ConnectionState::Drop` must
+    /// take its presence records with it. Same lifecycle as the subscription
+    /// and `session_contexts` cleanup above — no separate teardown to forget.
+    #[test]
+    fn drop_reaps_this_connections_midi_presence() {
+        use kaijutsu_kernel::midi_presence::{
+            MidiPresenceRecord, MidiPresenceStore, SinkAttribution,
+        };
+
+        let store = Arc::new(MidiPresenceStore::new());
+        let mut state = ConnectionState::new(test_principal(), session_context_map());
+        // What the report handler does on every report, before it records.
+        state.attach_midi_presence(store.clone());
+        let session_id = state.session_id;
+
+        // What this connection's sink reported…
+        store
+            .record(MidiPresenceRecord::from_sink(
+                "keystep-pro",
+                true,
+                "alsa",
+                vec![],
+                100,
+                SinkAttribution::new(session_id, "moltar"),
+            ))
+            .unwrap();
+        // …and what a *different* sink reported, which must survive.
+        let other = kaijutsu_types::SessionId::new();
+        store
+            .record(MidiPresenceRecord::from_sink(
+                "minibrute",
+                true,
+                "alsa",
+                vec![],
+                100,
+                SinkAttribution::new(other, "zorak"),
+            ))
+            .unwrap();
+
+        drop(state);
+
+        assert!(
+            store.get("keystep-pro").is_none(),
+            "ConnectionState::Drop must un-know what a now-dead sink claimed \
+             (removed → unknown, never a fabricated present=false)",
+        );
+        assert!(
+            store.get("minibrute").is_some(),
+            "another sink's connection is still up; its records stand",
+        );
+    }
+
+    /// A connection that never reported presence carries no store handle, so
+    /// its Drop reaps nothing at all — the reap is driven by the handle the
+    /// report path attached, not by a session id fished out of somewhere
+    /// global. (In production the two are inseparable: the handler attaches
+    /// before it records, so a record bearing this session id can only exist
+    /// on an attached connection.)
+    #[test]
+    fn drop_without_a_presence_report_touches_nothing() {
+        use kaijutsu_kernel::midi_presence::{
+            MidiPresenceRecord, MidiPresenceStore, SinkAttribution,
+        };
+
+        let store = Arc::new(MidiPresenceStore::new());
+        let state = ConnectionState::new(test_principal(), session_context_map());
+        let session_id = state.session_id;
+        // A record keyed to this very session, but never attached: an
+        // unattached connection is not a reaper.
+        store
+            .record(MidiPresenceRecord::from_sink(
+                "keystep-pro",
+                true,
+                "alsa",
+                vec![],
+                100,
+                SinkAttribution::new(session_id, "moltar"),
+            ))
+            .unwrap();
+        drop(state);
+        assert!(store.get("keystep-pro").is_some());
     }
 
     #[test]

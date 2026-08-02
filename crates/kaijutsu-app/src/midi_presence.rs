@@ -56,6 +56,21 @@ const BACKEND: &str = "none";
 /// handful of documents; a runaway listing is a bug, not a big rig.
 const MAX_PROFILES: u32 = 512;
 
+/// What we call the machine this sink runs on, for `kj midi list`'s "live,
+/// but WHERE?" column. Same source `main.rs` already uses to nickname a share
+/// offering (the `hostname` crate), so a player sees one name for one box.
+///
+/// Display and provenance only — the kernel binds presence to the connection,
+/// so a wrong or duplicated hostname can never erase another sink's records.
+/// An unnameable host reports empty rather than a placeholder: "we don't know
+/// where" is a fact, "localhost" would be a fiction.
+fn sink_host() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_default()
+}
+
 /// The live port picture, maintained by `midi_in`'s ear drain from ALSA
 /// announce events. Keyed by backend address (`"client:port"` under ALSA) —
 /// the one thing a departure event carries, since a vanished port's names go
@@ -318,6 +333,7 @@ fn reconcile_presence(
 
     let handle = actor.expect("checked above").handle.clone();
     let at_ns = epoch_ns_now();
+    let host = sink_host();
     IoTaskPool::get()
         .spawn(async move {
             for r in reports {
@@ -328,6 +344,7 @@ fn reconcile_presence(
                         BACKEND,
                         r.ports.clone(),
                         at_ns,
+                        host.clone(),
                     )
                     .await
                 {
@@ -533,6 +550,19 @@ mod tests {
         assert!(!out[0].present);
         assert_eq!(out[1].device, "minibrute");
         assert!(out[1].present);
+    }
+
+    /// The "where" we report is the machine's real name or nothing at all —
+    /// never a fabricated stand-in, which would put a machine that doesn't
+    /// exist in front of every player reading `kj midi list`.
+    #[test]
+    fn the_sink_host_is_the_machines_name_or_nothing() {
+        let host = sink_host();
+        match hostname::get().ok().and_then(|h| h.into_string().ok()) {
+            Some(real) => assert_eq!(host, real),
+            None => assert!(host.is_empty(), "unknowable host must report empty"),
+        }
+        assert!(!host.contains('\0'));
     }
 
     // ── the plugin's wiring ───────────────────────────────────────────────

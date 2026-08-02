@@ -218,6 +218,25 @@ of Amendment A above:
 - **The kernel never shells, ever.** No `aconnect`, no exec. The sink-fed
   store is the only source of "current picture" facts; kai synthesis reads
   it (bucket section above).
+- **Presence is connection-bound** (amended 2026-08-02, after review). A sink
+  that crashes, loses its network, or is `kill -9`'d never sends its unplug —
+  so a record must not be able to outlive the connection that made it. The
+  kernel stamps each record with **its own** per-connection id (never anything
+  the sink says about itself) and, when the connection dies, *removes* every
+  record attributed to it: back to **unknown**, the honest state. Not
+  `present=false` — that would claim an observation nobody made. Accepted
+  trade-off: removal also drops the latest-timestamp guard for that device, so
+  a stale report queued by a reconnecting sink can briefly land; the sink's
+  next fresh report (it re-states its whole picture on reconnect) corrects it.
+  A self-healing wrong answer beats a permanent one. Implementation joins the
+  existing per-connection teardown: `ConnectionState::drop` in
+  `kaijutsu-server`, the same Drop that kills subscriptions and the session's
+  context entry.
+- **The report carries the sink's `sinkHost`** — display and provenance only,
+  so `kj midi list` can answer "live, but *where*" across a multi-machine rig
+  (a `host` column, and a tagged `host` fact in `/run/midi/<device>`). It is
+  never a key: hostnames collide, go stale, and can be wrong, and reaping by
+  one would let a sink erase another's records.
 
 Plug → Announce → match → report → addressable. No polling, no exec, no
 host-naming in profiles.

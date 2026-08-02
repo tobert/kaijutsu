@@ -491,6 +491,10 @@ enum RpcCommand {
         backend: String,
         ports: Vec<(String, String)>,
         epoch_ns: u64,
+        /// This sink's name for the machine it runs on — display/provenance
+        /// only (`kj midi list` answering *where*). The kernel reaps presence
+        /// by the connection, never by this.
+        sink_host: String,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
     VfsReadAll {
@@ -1258,15 +1262,18 @@ impl ActorHandle {
         backend: impl Into<String> + std::fmt::Debug,
         ports: Vec<(String, String)>,
         epoch_ns: u64,
+        sink_host: impl Into<String> + std::fmt::Debug,
     ) -> Result<(), CallError> {
         let device = device.into();
         let backend = backend.into();
+        let sink_host = sink_host.into();
         self.send(|reply| RpcCommand::ReportMidiPresence {
             device,
             present,
             backend,
             ports,
             epoch_ns,
+            sink_host,
             reply,
         })
         .await
@@ -2890,10 +2897,12 @@ async fn dispatch_kernel_command(
                 k.report_clock_estimate(context_id, beat, tempo_bps, epoch_ns, &source)
             );
         }
-        RpcCommand::ReportMidiPresence { device, present, backend, ports, epoch_ns, reply } => {
+        RpcCommand::ReportMidiPresence {
+            device, present, backend, ports, epoch_ns, sink_host, reply
+        } => {
             dispatch!(
                 kernel, reply, close_tx, k,
-                k.report_midi_presence(&device, present, &backend, &ports, epoch_ns)
+                k.report_midi_presence(&device, present, &backend, &ports, epoch_ns, &sink_host)
             );
         }
         RpcCommand::VfsReadAll { path, reply } => {

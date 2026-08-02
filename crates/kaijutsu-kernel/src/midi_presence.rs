@@ -19,6 +19,19 @@
 //! presence, so the absence of an entry reads as **unknown** — never as
 //! "absent" and never as a remembered "live".
 //!
+//! ## Presence is connection-bound
+//!
+//! A sink that crashes, loses its network, or is `kill -9`'d never gets to
+//! send its `present=false` report — so presence may not be trusted to any
+//! statement the sink makes about itself. Every record therefore carries the
+//! **connection** it arrived on ([`SinkAttribution::connection`], the server's
+//! per-connection `SessionId`), and when that connection dies the server calls
+//! [`MidiPresenceStore::reap_connection`]: every record attributed to it is
+//! *removed*, back to **unknown**. Removal, not `present=false` — claiming an
+//! absence nobody observed would be the same class of lie in the other
+//! direction. The sink's self-reported `host` is display/provenance data and
+//! is never a reaping key.
+//!
 //! ## Provenance, not resolution
 //!
 //! Every fact renders as `{value, source, at}` with `source: "sink"` — the
@@ -45,6 +58,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use kaijutsu_types::SessionId;
 
 use crate::vfs::{DirEntry, FileAttr, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
 
@@ -61,6 +75,34 @@ pub const SOURCE_SINK: &str = "sink";
 pub struct MidiPortFact {
     pub name: String,
     pub address: String,
+}
+
+/// Who reported a record, and over which wire.
+///
+/// The two halves are deliberately different in kind:
+///
+/// - `connection` is **ours** — the kernel-internal, connection-scoped id the
+///   server minted for the sink's session. It is the only reaping key, because
+///   it is the only identity a crashed sink cannot lie about or take with it.
+/// - `host` is **theirs** — whatever the sink calls itself, for display and
+///   provenance (`kj midi list` answering *where* a device is live). Never used
+///   to key, group, or reap anything: two sinks on one box, a stale hostname,
+///   or an outright fib must not be able to erase each other's records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkAttribution {
+    /// The reporting sink's connection (the server's per-connection
+    /// `SessionId`). Dies with the connection; see
+    /// [`MidiPresenceStore::reap_connection`].
+    pub connection: SessionId,
+    /// The reporting sink's own name for the machine it runs on. Display only;
+    /// empty when a sink didn't say (an older peer).
+    pub host: String,
+}
+
+impl SinkAttribution {
+    pub fn new(connection: SessionId, host: impl Into<String>) -> Self {
+        Self { connection, host: host.into() }
+    }
 }
 
 /// One device's presence record, exactly as the reporting sink stated it.
@@ -80,16 +122,21 @@ pub struct MidiPresenceRecord {
     pub at_ns: u64,
     /// Provenance of every fact in this record ([`SOURCE_SINK`] today).
     pub source: String,
+    /// Which sink said so, and over which connection. The connection half is
+    /// what makes the record perishable; see [`SinkAttribution`].
+    pub sink: SinkAttribution,
 }
 
 impl MidiPresenceRecord {
-    /// A sink report, stamped with [`SOURCE_SINK`] provenance.
+    /// A sink report, stamped with [`SOURCE_SINK`] provenance and the
+    /// attribution that makes it reapable when the reporter goes away.
     pub fn from_sink(
         device: impl Into<String>,
         present: bool,
         backend: impl Into<String>,
         ports: Vec<MidiPortFact>,
         at_ns: u64,
+        sink: SinkAttribution,
     ) -> Self {
         Self {
             device: device.into(),
@@ -98,6 +145,7 @@ impl MidiPresenceRecord {
             ports,
             at_ns,
             source: SOURCE_SINK.to_string(),
+            sink,
         }
     }
 
@@ -114,6 +162,12 @@ impl MidiPresenceRecord {
             "device": self.device,
             "present": tag(serde_json::Value::Bool(self.present)),
             "backend": tag(serde_json::Value::String(self.backend.clone())),
+            // WHERE the device is live. Provenance data like every other fact
+            // here — the sink's own claim about its machine, tagged so a
+            // reader judges it rather than trusting it. The connection id
+            // behind the record stays kernel-internal: it is a reaping key,
+            // not something a reader can act on.
+            "host": tag(serde_json::Value::String(self.sink.host.clone())),
             "ports": tag(serde_json::Value::Array(
                 self.ports
                     .iter()
@@ -209,6 +263,43 @@ impl MidiPresenceStore {
         self.generation.fetch_add(1, Ordering::Relaxed);
         entries.insert(record.device.clone(), record);
         Ok(Recorded::Stored)
+    }
+
+    /// Forget everything a now-dead connection told us, returning the device
+    /// keys that were dropped (ascending, for the caller's log).
+    ///
+    /// This is the honesty valve for the case a sink cannot cover itself: a
+    /// crash, a yanked network, a `kill -9`. No unplug report is coming, so a
+    /// `present=true` record attributed to that connection would be a lie the
+    /// kernel keeps telling forever. We **remove** rather than flip to
+    /// `present=false`: nobody observed an absence, and `/run/midi` treats a
+    /// missing entry as *unknown*, which is exactly the truth here — a kernel
+    /// with no sinks connected knows nothing.
+    ///
+    /// Accepted trade-off: removal also drops the latest-timestamp guard for
+    /// that device. A stale report still in flight from a reconnecting sink
+    /// can therefore land on the empty slot and be believed for a moment.
+    /// That is a *brief* wrong answer that the sink's next fresh report
+    /// corrects (the app re-states its whole picture on every reconnect),
+    /// where keeping the record would be a permanent one. We take the
+    /// self-healing error over the sticky one.
+    pub fn reap_connection(&self, connection: SessionId) -> Vec<String> {
+        let mut entries = self
+            .entries
+            .write()
+            .expect("midi presence lock poisoned (a writer panicked)");
+        let doomed: Vec<String> = entries
+            .iter()
+            .filter(|(_, r)| r.sink.connection == connection)
+            .map(|(device, _)| device.clone())
+            .collect();
+        for device in &doomed {
+            entries.remove(device);
+        }
+        if !doomed.is_empty() {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+        doomed
     }
 
     /// One device's latest record, or `None` for **unknown** — no sink has
@@ -425,14 +516,28 @@ mod tests {
         MidiPortFact { name: name.into(), address: addr.into() }
     }
 
+    /// A stand-in for one sink's wire connection.
+    fn sink(host: &str) -> SinkAttribution {
+        SinkAttribution::new(SessionId::new(), host)
+    }
+
     fn live(device: &str, at_ns: u64) -> MidiPresenceRecord {
+        live_from(device, at_ns, sink("moltar"))
+    }
+
+    fn live_from(device: &str, at_ns: u64, sink: SinkAttribution) -> MidiPresenceRecord {
         MidiPresenceRecord::from_sink(
             device,
             true,
             "alsa",
             vec![port("KeyStep Pro MIDI 1", "24:0")],
             at_ns,
+            sink,
         )
+    }
+
+    fn absent(device: &str, at_ns: u64) -> MidiPresenceRecord {
+        MidiPresenceRecord::from_sink(device, false, "alsa", vec![], at_ns, sink("moltar"))
     }
 
     #[test]
@@ -462,15 +567,7 @@ mod tests {
     fn unplug_overwrites_live_with_absent() {
         let store = MidiPresenceStore::new();
         store.record(live("keystep-pro", 100)).unwrap();
-        store
-            .record(MidiPresenceRecord::from_sink(
-                "keystep-pro",
-                false,
-                "alsa",
-                vec![],
-                200,
-            ))
-            .unwrap();
+        store.record(absent("keystep-pro", 200)).unwrap();
 
         let got = store.get("keystep-pro").unwrap();
         assert!(!got.present, "the unplug report wins");
@@ -483,15 +580,7 @@ mod tests {
     #[test]
     fn an_older_report_is_dropped_not_merged() {
         let store = MidiPresenceStore::new();
-        store
-            .record(MidiPresenceRecord::from_sink(
-                "keystep-pro",
-                false,
-                "alsa",
-                vec![],
-                200,
-            ))
-            .unwrap();
+        store.record(absent("keystep-pro", 200)).unwrap();
         assert_eq!(
             store.record(live("keystep-pro", 100)),
             Ok(Recorded::StaleDropped)
@@ -521,6 +610,144 @@ mod tests {
             );
         }
         assert!(store.is_empty());
+    }
+
+    // ── connection-bound presence (the crashed-sink hole) ─────────────────
+
+    /// The headline rule: when a sink's connection dies, ONLY that sink's
+    /// records go. A second sink on the same rig keeps reporting for its own
+    /// gear and must not lose a thing.
+    #[test]
+    fn reaping_a_connection_drops_only_its_own_records() {
+        let store = MidiPresenceStore::new();
+        let moltar = sink("moltar");
+        let laptop = sink("laptop");
+        store.record(live_from("keystep-pro", 100, moltar.clone())).unwrap();
+        store.record(live_from("minibrute", 100, moltar.clone())).unwrap();
+        store.record(live_from("keylab", 100, laptop.clone())).unwrap();
+
+        let reaped = store.reap_connection(moltar.connection);
+        assert_eq!(reaped, vec!["keystep-pro".to_string(), "minibrute".into()]);
+        assert!(store.get("keystep-pro").is_none(), "reaped → unknown");
+        assert!(store.get("minibrute").is_none(), "reaped → unknown");
+        assert!(
+            store.get("keylab").is_some(),
+            "the other sink's connection is still up; its record stands"
+        );
+    }
+
+    /// Reaping means **unknown**, never a fabricated absence: `present=false`
+    /// is an observation, and a dead connection observed nothing.
+    #[test]
+    fn a_reaped_device_is_unknown_not_absent() {
+        let store = MidiPresenceStore::new();
+        let s = sink("moltar");
+        store.record(live_from("keystep-pro", 100, s.clone())).unwrap();
+        store.reap_connection(s.connection);
+        assert_eq!(
+            store.get("keystep-pro"),
+            None,
+            "a reaped record must vanish, not linger as present=false"
+        );
+        assert!(store.is_empty());
+    }
+
+    /// Two sinks can hold the same device (a shared USB hub, a re-plug across
+    /// machines). Latest-timestamp still decides who is on file, and reaping
+    /// the *loser's* connection leaves the winner's record alone.
+    #[test]
+    fn reaping_a_connection_that_lost_the_timestamp_race_changes_nothing() {
+        let store = MidiPresenceStore::new();
+        let old = sink("laptop");
+        let new = sink("moltar");
+        store.record(live_from("keystep-pro", 100, old.clone())).unwrap();
+        store.record(live_from("keystep-pro", 200, new.clone())).unwrap();
+        assert!(store.reap_connection(old.connection).is_empty());
+        assert_eq!(
+            store.get("keystep-pro").unwrap().sink.connection,
+            new.connection,
+            "the winning sink's record survives its rival's disconnect"
+        );
+    }
+
+    /// The documented trade-off, pinned as behavior so nobody "fixes" it by
+    /// accident: removal drops the latest-timestamp guard, so a stale report
+    /// queued by a reconnecting sink CAN land on the emptied slot. It is a
+    /// self-healing wrong answer (the next fresh report corrects it), chosen
+    /// over the permanent lie of a record no living connection stands behind.
+    #[test]
+    fn a_stale_report_can_land_after_a_reap_and_is_corrected_by_the_next_one() {
+        let store = MidiPresenceStore::new();
+        let old = sink("moltar");
+        store.record(live_from("keystep-pro", 500, old.clone())).unwrap();
+        store.reap_connection(old.connection);
+
+        // A report older than the reaped one, arriving late on a new
+        // connection: accepted, because there is nothing left to compare to.
+        let reconnected = sink("moltar");
+        assert_eq!(
+            store.record(live_from("keystep-pro", 100, reconnected.clone())),
+            Ok(Recorded::Stored)
+        );
+        // …and the sink's fresh re-statement wins immediately after.
+        store.record(live_from("keystep-pro", 900, reconnected.clone())).unwrap();
+        assert_eq!(store.get("keystep-pro").unwrap().at_ns, 900);
+    }
+
+    /// Equal timestamps carry no ordering, so an idempotent re-report from a
+    /// *different* connection still lands — and re-attributes the record, so
+    /// the new owner's disconnect is what reaps it.
+    #[test]
+    fn an_equal_timestamp_report_from_a_new_connection_takes_ownership() {
+        let store = MidiPresenceStore::new();
+        let first = sink("moltar");
+        let second = sink("moltar");
+        store.record(live_from("keystep-pro", 100, first.clone())).unwrap();
+        assert_eq!(
+            store.record(live_from("keystep-pro", 100, second.clone())),
+            Ok(Recorded::Stored)
+        );
+        assert!(
+            store.reap_connection(first.connection).is_empty(),
+            "the stale connection no longer owns the record"
+        );
+        assert!(store.get("keystep-pro").is_some());
+        assert_eq!(store.reap_connection(second.connection).len(), 1);
+    }
+
+    /// Reaping nothing is not a change — a connection that never reported
+    /// presence must not churn the view's generation.
+    #[test]
+    fn reaping_a_connection_that_reported_nothing_is_a_no_op() {
+        let store = MidiPresenceStore::new();
+        store.record(live("keystep-pro", 100)).unwrap();
+        let g = store.generation();
+        assert!(store.reap_connection(SessionId::new()).is_empty());
+        assert_eq!(store.generation(), g, "a no-op reap must not bump generation");
+    }
+
+    /// A reap IS a change to the picture: the /run/midi view's generation must
+    /// advance so a caching reader re-reads.
+    #[test]
+    fn a_reap_advances_the_view_generation() {
+        let store = MidiPresenceStore::new();
+        let s = sink("moltar");
+        store.record(live_from("keystep-pro", 1, s.clone())).unwrap();
+        let g = store.generation();
+        store.reap_connection(s.connection);
+        assert!(store.generation() > g);
+    }
+
+    #[test]
+    fn json_carries_the_sinks_host_as_a_tagged_fact() {
+        let json = live_from("keystep-pro", 42, sink("moltar")).to_json();
+        assert_eq!(json["host"]["value"], "moltar");
+        assert_eq!(json["host"]["source"], "sink");
+        assert_eq!(json["host"]["at"], 42);
+        assert!(
+            json.get("connection").is_none(),
+            "the reaping key is kernel-internal and must not leak into the view"
+        );
     }
 
     #[test]

@@ -2001,6 +2001,7 @@ impl KernelHandle {
         backend: &str,
         ports: &[(String, String)],
         epoch_ns: u64,
+        sink_host: &str,
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.report_midi_presence_request();
         {
@@ -2009,6 +2010,9 @@ impl KernelHandle {
             p.set_present(present);
             p.set_backend(backend);
             p.set_epoch_ns(epoch_ns);
+            // Provenance for display ("live on moltar"), not identity: the
+            // kernel keys reaping on the connection this call rides.
+            p.set_sink_host(sink_host);
             let mut list = p.init_ports(ports.len() as u32);
             for (i, (name, address)) in ports.iter().enumerate() {
                 let mut entry = list.reborrow().get(i as u32);
