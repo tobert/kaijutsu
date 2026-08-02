@@ -199,6 +199,7 @@ all, discovered wiring the Claude Code MCP config. Two pieces:
 
 ## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
 
+
 From the slice-4 post-ship review (gemini deliberate, low severity): the
 kernel attaches `DiffError::line()` spans to the ErrorPayload on `Done`
 (`block_store.rs` `validate_diff`), but the app's diff error preview is a
@@ -434,6 +435,15 @@ armed-footer legend): needs a selection UX first. The overlay's
 `selection_anchor` has no live producer (mouse drag-select and vi visual
 mode are both unwired); when one lands, copy-on-selection to PRIMARY rides
 it — `InputOverlay::selection_range` is the read point.
+
+**Update 2026-08-02 (diff slice 5):** the *write* half now exists —
+`input::ClipboardWriter`, a dedicated thread owning an `arboard::Clipboard`
+for the process lifetime (a clipboard write means becoming the selection
+owner, so it cannot be a call from a Bevy system). The diff viewer's yank is
+its first user. What is still missing is PRIMARY specifically: `set_text`
+writes CLIPBOARD, and `arboard::SetExtLinux` is the Linux-only path to
+PRIMARY. Route the selection producer through `ClipboardWriter` when it
+lands, and give it a PRIMARY variant then.
 
 ## Input: block-step scroll lane — Shift+wheel jumps block-to-block (seeded 2026-07-18, scroll-feel work)
 
@@ -836,6 +846,13 @@ struct literals that default rustfmt explodes — a `rustfmt.toml` raising
 in kaijutsu-types, 5 in kaijutsu-cas, etc.). Note: the new `kaijutsu-diff`
 crate WAS formatted with stock rustfmt, so it's formatter-clean and slightly
 unlike its neighbors; whichever config lands should keep it clean too.
+
+**2026-08-02 (diff slice 5, re-bitten):** an agent's `cargo fmt` buried a
+20-line change under ~6000 lines of unrelated reformatting; unwound by hand.
+The standing rule until this ships: *format only what you touched*. The fix
+is one command plus a judgement call Amy owns (`git blame` clean line vs
+`git log -L` history rewrite); if the whole-repo fmt happens, it must be its
+own commit with **nothing else in it**.
 
 ---
 

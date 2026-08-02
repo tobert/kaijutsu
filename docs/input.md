@@ -67,7 +67,11 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
 2. **Keyboard grabs are explicit.** The vi editor is the one sanctioned raw
    consumer — a declared exclusive grab, not a suppression side effect. The
    compose VimMachine becomes the second grab, which retires the
-   `vim_owns_keyboard` skip-dance inside `dispatch_input`.
+   `vim_owns_keyboard` skip-dance inside `dispatch_input`. The diff viewer
+   (`KeyboardGrab::DiffView`, 2026-08-02) is the third and follows the same
+   rule: an app-local modalkit machine behind the grab, derived from the
+   *screen* rather than from focus, so `q` and Esc are the surface's calls and
+   not the dispatcher's.
 3. **The Ctrl+A prefix machine** (`input/prefix.rs`) sits in front of
    everything, tmux-style: prefix wins even over vi; `Ctrl+A a` is the
    literal-passthrough escape hatch (kernel vim's own Ctrl+A increment
@@ -115,6 +119,7 @@ exactly one action.
 | Surface | Esc does |
 |---|---|
 | Vi editor (`Screen::Editor`) | Forwarded to kernel vi, never stolen |
+| Diff viewer (`Screen::Diff`) | To the app-local `DiffCore` (visual → normal). **Never closes the screen** — that is `q`/`ZQ`/`:q` (`docs/diff.md` slice 5) |
 | Compose overlay | To the VimMachine (mode switch); double-Esc in Normal mode dismisses (kept — works in practice) |
 | Everywhere else | `PopLevel`, one resolver walking the level ladder: well focus → overview → room; patch bay → room; fsn → room; room → conversation; dialog → cancel |
 
@@ -127,6 +132,12 @@ exactly one action.
 | PatchBayZoomed | `←/→/Tab` wires · `r` rescan · `↑/Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
 | FsnFly | arrows + WASD fly (WASD kept until the keys are needed elsewhere) · `PgUp/PgDn` altitude · `Esc` pop |
+
+`Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,
+so its keys never reach the binding table. `v` in Navigation opens it; inside,
+`DiffCore` owns everything (`j/k` `gg/G` counts · `]c`/`[c` hunks · `zo/zc/za`
+folds · `V` visual-line · `y` yank to clipboard · `R` reload a stale view ·
+`q`/`ZQ`/`:q` close).
 
 ## Ctrl chords and clipboard (xterm-style)
 

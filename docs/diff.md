@@ -11,10 +11,11 @@ block type.
 **Designed 2026-08-01 (research + survey session). Slices 0–4 SHIPPED
 2026-08-01** — the `kaijutsu-diff` crate, `ContentType::Diff`, the whole
 kernel surface (`kj diff`, `diff_block`, hydration-as-projection, `Done`
-validation), and the inline app preview. Slices 5–6 (`Screen::Diff` +
-`DiffCore`, then minimap/folds/word highlight) are next, in order.
-This doc is the plan of record; the per-slice "Build notes" sections below
-correct it where the build disagreed.
+validation), and the inline app preview. **Slice 5 SHIPPED 2026-08-02** —
+`DiffCore`, `Screen::Diff`, the keyboard grab, and yank→clipboard. Slice 6
+(minimap, fold rendering, word-level highlight, the multi-rect selection
+material) is next. This doc is the plan of record; the per-slice "Build
+notes" sections below correct it where the build disagreed.
 
 ## Decisions (Amy, 2026-08-01)
 
@@ -175,7 +176,7 @@ correct it where the build disagreed.
    producers — `kj diff` output and `diff_block` may enter different
    role/kind hydration branches.
 4. **SHIPPED.** App preview: rich-content arm + render arm + fence sniff + theme.
-5. `Screen::Diff` + `DiffCore` + grab/bindings + yank→clipboard.
+5. **SHIPPED.** `Screen::Diff` + `DiffCore` + grab/bindings + yank→clipboard.
    **Freeze-on-open**: the viewer binds to `(block_id, content
    version/hash)`; if the block changes underneath, show a stale banner with
    explicit refresh — never silently rebind, and yank always reads the frozen
@@ -362,6 +363,85 @@ Findings deferred to their slices:
   ErrorPayload, but the preview's error state doesn't point at the offending
   line. Inline line annotation is high-value polish once slice 5's error
   surface exists.
+
+## Build notes — slice 5 SHIPPED 2026-08-02 (`Screen::Diff` + `DiffCore`)
+
+The viewer is built: `DiffCore` in `kaijutsu-diff` behind a `viewer` feature,
+`Screen::Diff` + `KeyboardGrab::DiffView` in the app, `v` on a focused diff
+block to open, yank to the system clipboard. Corrections and discoveries only:
+
+- **The key-notation question is answered by deleting it.** `TerminalKey` IS
+  the client-neutral seam: `DiffCore::apply_keys` takes modalkit keys exactly
+  like `EditorCore`, the Bevy side already converts through
+  `input/vim/keyconv.rs`, and a `modalkit-ratatui` client gets them from
+  crossterm natively. A third notation crate would be a translation nobody
+  needs plus a version to keep in sync with modalkit's. `apply_notation`
+  parses `"Vjy"`-style strings for tests. **Slice 5's plan item is resolved,
+  not deferred.**
+- **The feature gate protects the *dependency edge*, not the kernel binary.**
+  `cargo tree -p kaijutsu-kernel -e features -i kaijutsu-diff` shows `default`
+  alone — but modalkit still reaches the kernel through `kaijutsu-editor`,
+  which owns the vi *editor* session. That predates this work. Also note cargo
+  unifies features across a workspace build, so a build that includes the app
+  compiles `kaijutsu-diff/viewer` for everyone; `cargo build -p
+  kaijutsu-kernel` alone is the meaningful check.
+- **Viewer verbs ride modalkit's application-action channel**
+  (`Action::Application`), added with `machine.add_mapping` + hand-built
+  `EdgePath`s — modalkit's own key-string `parse` is private, but
+  `EdgeEvent`/`EdgeRepeat`/`CommonKeyClass` are public, so a plain-char path
+  is four lines. This is what makes `]c` take counts and keeps a `q` typed
+  into the `:`-line from closing the viewer. `q` overrides vim's
+  macro-record binding; `v` is mapped to an explicit no-op (character-wise
+  visual stays absent, as decided).
+- **Yank reads modalkit's unnamed register** after letting the buffer run the
+  `Yank`, instead of re-deriving the range. Counts, motions and the visual
+  selection are then vim's own semantics, and the text is *literally* a slice
+  of `format(&model)` — `yanking_the_whole_diff_round_trips_through_parse`
+  pins it. Read-only is an allow-list on `EditAction` (`Motion`/`Yank` only),
+  asserted by a 28-key editing battery.
+- **Rows are built from `format_file`'s own output**, assigned by structure
+  (how many lines each hunk contributes), so a future canonical header line
+  is absorbed instead of shifting every classification after it.
+- **`DiffIntent::Refresh` was added to the plan's intent list.** Freeze-on-open
+  promises "a stale banner with explicit refresh", and the grab means no app
+  binding can reach the screen — the refresh has to be a viewer verb (`R`,
+  `:e`).
+- **Parse-at-open is synchronous** (deferral recorded, as instructed). It is
+  bounded: `truncate_to_bytes(MAX_RENDER_BYTES)` runs before the core exists,
+  so the canonical text — and every yank — is the 1 MiB projection with its
+  `#!kaijutsu-diff truncated:` marker. Move it to `AsyncComputeTaskPool` if a
+  megabyte-scale open ever shows up in a frame graph.
+- **The full view needed a row *window*, not just a byte budget.** A megabyte
+  of text shaped to draw forty lines stalls the frame regardless. The surface
+  lays out a band around the cursor (`window_for`, pure + tested) and slides
+  it only when the cursor leaves. `text::diff::view_rows` projects a row range
+  into the same `DiffPreview` shape the inline arm produces, so
+  `build_diff_span_brushes` / `build_diff_band_geometry` are reused verbatim;
+  `preview.lines[i] == core.rows()[first + i]`, and that index — never a byte
+  offset — is what the cursor and selection use.
+- **`MAX_VIEW_LINE_CHARS` = 2000** (vs the preview's 500): the full screen is
+  where you go to read a line, but one minified bundle line still must not
+  reach Parley whole. Elision is display-only; yank never sees it.
+- **Clipboard writes needed their own thread.** A *read* returns; a *write*
+  means becoming the selection owner and serving requests for as long as you
+  hold it, so the `arboard::Clipboard` has to outlive the call — `input::
+  ClipboardWriter` owns one for the process lifetime behind a channel. The app
+  had no clipboard-write path at all before this (docs/input.md's
+  "selection auto-copies to PRIMARY" describes intent, not code).
+- **`ActiveDiffView` needs `unsafe impl Send/Sync`**, mirroring
+  `input::vim::VimMachineResource`: modalkit's `ModalMachine` holds a
+  `Box<dyn Dialog>` for TUI dialogs that nothing here can reach.
+- **This repo is not rustfmt-clean.** `cargo fmt --all` rewrites hundreds of
+  unrelated files; format only what you touched.
+- **Folds are tracked, not projected.** `zo`/`zc`/`za` drive `FoldState` and
+  `format` ignores it, so rows always describe every line. Hiding folded lines
+  is slice 6's rendering call, and slice 6 also owns: word-level coloring
+  (with the run-boundary problem from slice 4's notes), the minimap, and the
+  multi-rect material that unlocks character-wise `v`.
+- **Not yet verified in the running app** (headless tests only): glyph/band
+  compositing on the diff surface, the cursor's position on screen, the status
+  strip's placement against the dock, and the stale banner firing on a live
+  block edit.
 
 ## Seam guidance (deepseek review, 2026-08-01)
 
