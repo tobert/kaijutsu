@@ -427,13 +427,22 @@ contexts, driven over BRP. Screenshots in the session scratchpad
 
 ## Things found on the way that aren't mine to fix
 
-- **The shared app camera's far plane is Bevy's default `1000.0`,** and
-  `Projection::compute_frustum` uses it for real frustum culling. The FSN
-  landscape flies to ~1400+ units and the room's octagon has a 1200 apothem —
-  **both may already be silently culling geometry at distance.** The dive
-  claims a 30000 far plane on entry and restores the original on exit, so it
-  doesn't paper over the issue for anyone else. Worth a look with fresh eyes;
-  belongs in `docs/issues.md` if confirmed.
+- ~~**The shared app camera's far plane is Bevy's default `1000.0`**, and
+  `Projection::compute_frustum` uses it for real frustum culling.~~
+  **Checked live over BRP, 2026-08-03: false alarm — `far` is not culling
+  anything.** The default really is `far: 1000.0` (confirmed at runtime on
+  both cameras), but setting the FSN world camera's `far` to **`1.0`** left
+  the entire landscape rendering, geometry thousands of units out included.
+  Control: mutating `fov` on the same component through the same path zoomed
+  the view dramatically, so `Projection` edits do propagate and the frustum
+  does recompute — the `far=1.0` result is real, not a stale-component
+  artifact. Bevy 0.18's infinite reverse-Z perspective leaves `far` as
+  metadata; it does not become a culling plane.
+
+  **For v1: drop the far-plane workaround.** The dive currently claims a
+  30000 far plane on entry and restores the original `Projection` on exit.
+  That machinery is unnecessary — delete it rather than carry it forward.
+  (The corresponding `docs/issues.md` entry has been removed as disproven.)
 - `view::editor::keys` went from `mod` to `pub(crate) mod` (and `pressed_char`
   to `pub`) so the dive's query line reuses the layout-aware key→char law
   rather than keeping a second copy of it. Two tokens; the alternative was

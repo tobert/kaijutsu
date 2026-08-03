@@ -390,10 +390,23 @@ and the conversation status bar's own left cluster self-overlaps ("40
 fail3d.8k/1M Enter: submit"). Likely ONE bug, not three: overlay/footer text
 placed with a stale or mixed logical/physical height after a scale change —
 the exact `ComputedNode`-is-physical trap CLAUDE.md warns about
-(`view::ui_rtt::logical_size`). Retest after a clean window resize before
-digging; if it reproduces at steady scale it's a real layout math bug in the
-viewer's visible-row count (footer not subtracted) plus status-bar segment
-widths.
+(`view::ui_rtt::logical_size`).
+
+**Retested live 2026-08-03 after a clean reboot: the scale-change theory is
+WRONG, and the bug is narrower than it looked.** At steady scale, on a fresh
+boot, the status bar renders cleanly in `Conversation` and in `Room`
+(`2 running, 40 failed  [db01a563]` … `31.8k/1M ↔: station | Enter/↓: zoom |
+Esc: conversation` — well separated). It self-overlaps in the **time well**,
+whose hint cluster is much longer: `40 fa1led/[db01a563]→↑↓: seat ⊙ ring |
+Enter: focus/commit |c/p/d/z/a: act | Esc: room`. So this is not stale
+HiDPI math after a resize — it is **status-bar segment layout overflowing
+when the per-screen hint cluster is long**, with the left cluster and the
+right cluster written into the same pixels instead of being measured against
+the available width. Look at how the bar allocates width between the mode/
+model/context cluster and the screen-hint cluster, not at `ui_rtt`.
+
+The diffstat-footer-over-content half of this entry is still unretested — it
+needs a diff open in `Screen::Diff`, which this session did not reach.
 
 Everything else in the slice-5 checklist verified live today: `v` open (after
 the DiffSurface resize-filter crash fix in `block_render.rs`), `]c`, `V`+`jj`
@@ -2765,29 +2778,6 @@ Open: where the summary lives (a field on the context handle vs. a block in the
 context itself), which local model, and whether concluding/demoting should get
 the same treatment or only full archival. Not needed for the dive's v1 — that
 slice ranks on `label` + `keywords`, which exist today.
-
-## Shared app camera keeps Bevy's default far plane (found 2026-08-01, horizon-dive spike)
-
-`main::setup_camera` spawns `Camera3d::default()` with no explicit
-`Projection`, so the camera carries `PerspectiveProjection::default()` —
-`far: 1000.0`. Bevy's perspective *render* matrix is infinite-reverse-Z, so
-`far` doesn't clip; but `CameraProjection::compute_frustum` passes it to
-`ViewFrustum::from_clip_from_world_custom_far`, so it **is** the real
-frustum-culling distance.
-
-Both existing 3D scenes routinely sit further out than that: `fsn::scene`
-starts its camera at `(0, 1400, 1400)` looking at the origin (≈1980 units),
-and `room`'s octagon has a 1200 apothem with a 1300 floor radius. If culling
-is really biting, distant fields/walls are being dropped and nobody has
-noticed — or something else is keeping their `Aabb`s in frustum and the
-default is harmlessly generous. **Needs one live check** (fly the FSN camera
-out and watch for districts popping), not a speculative fix.
-
-The horizon dive (`view::horizon_dive`, `docs/horizon-dive.md`) works around
-it locally: it claims a 30 000 far plane on entry and restores the camera's
-original `Projection` on exit, so its stream (which runs to ~7000 units)
-renders without changing the default for any other screen. If the check
-confirms the problem, the fix belongs in `setup_camera`, not in each scene.
 
 ## kaijutsu-mcp — June 2026 SyncedDocument migration review
 
