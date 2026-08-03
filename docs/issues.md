@@ -1226,6 +1226,15 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Persistence & Sync
 
+- **Bootstrap warns on restart with live clients** (observed 2026-08-03, first
+  restart after the subscription-instance fix): three `Failed to bootstrap
+  context <id> into KernelDb: UNIQUE constraint failed: contexts.context_id`
+  warns as reconnecting clients re-attached. Looks like a client re-attach
+  path doing a bare INSERT for contexts that already have rows — wants an
+  upsert/existence check, or a decision that the second registration is a
+  real error worth more than a warn. The 2026-08-02 "completely silent start"
+  was real but likely a start without clients racing to re-attach.
+
 - **Backup shipped 2026-08-03; export/import round-trip still open.**
   `kj db backup <path>` (`KernelDb::vacuum_into`, `VACUUM INTO ?1` bound
   param) and `kj db checkpoint` (wraps `KernelDb::checkpoint()`) landed —
