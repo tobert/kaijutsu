@@ -6798,6 +6798,7 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             })
             .unwrap();
             // A real row in context_bindings (so the parent-row lookup

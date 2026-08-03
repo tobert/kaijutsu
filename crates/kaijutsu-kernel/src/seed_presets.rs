@@ -94,8 +94,7 @@ fn insert_factory_preset(
         preset_id,
         label: fp.label.to_string(),
         description: Some(fp.description.to_string()),
-        provider: None,
-        model: None,
+        cast_id: None,
         system_prompt: None,
         consent_mode: ConsentMode::Collaborative,
         created_at: kaijutsu_types::now_millis() as i64,
@@ -139,7 +138,7 @@ mod tests {
         assert_eq!(base_of(&db, "spawn"), "spawn");
         // Factory presets move no model knobs.
         let full = db.get_preset_by_label("full").unwrap().unwrap();
-        assert!(full.model.is_none() && full.provider.is_none());
+        assert!(full.cast_id.is_none());
     }
 
     #[test]

@@ -1021,6 +1021,7 @@ pub(crate) mod test_helpers {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             };
             db.insert_context(&row).unwrap();
 

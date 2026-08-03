@@ -113,6 +113,12 @@ pub struct ContextRow {
     /// attachment wakeup fire) and rejects turn-starts loudly (seam: kernel
     /// turn-start).
     pub paused_at: Option<i64>,
+    /// The cast this context plays under, or `None` for "no ensemble
+    /// assigned" — resolution falls through to the registry default in that
+    /// case (see `crate::model_resolution::resolve_context_model`). Distinct
+    /// from `provider`/`model` above: those are an explicit PER-CONTEXT
+    /// override that always wins over a cast slot when set.
+    pub cast_id: Option<CastId>,
 }
 
 impl ContextRow {
@@ -222,8 +228,12 @@ pub struct PresetRow {
     pub preset_id: PresetId,
     pub label: String,
     pub description: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
+    /// The cast this preset assigns at fork/apply time, or `None` for "move
+    /// no model knobs" (the three factory presets' shape). Narrowed from the
+    /// old `provider`/`model` columns (Track D, 2026-08-03): a preset now
+    /// references a cast rather than pinning a provider/model pair directly
+    /// — "cast = who plays; preset = patch recall over verb args."
+    pub cast_id: Option<CastId>,
     pub system_prompt: Option<String>,
     pub consent_mode: ConsentMode,
     pub created_at: i64,
@@ -420,12 +430,15 @@ CREATE TABLE IF NOT EXISTS workspace_paths (
 );
 
 -- ── Presets ─────────────────────────────────────────────────────
+-- `cast_id` replaces the old `provider`/`model` columns (Track D,
+-- 2026-08-03): a preset NARROWS to a cast reference rather than pinning a
+-- provider/model pair itself. NULL means "move no model knobs" — the three
+-- factory presets' shape.
 CREATE TABLE IF NOT EXISTS presets (
     preset_id    BLOB NOT NULL PRIMARY KEY,
     label        TEXT NOT NULL UNIQUE,
     description  TEXT,
-    provider     TEXT,
-    model        TEXT,
+    cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     system_prompt TEXT,
     consent_mode TEXT NOT NULL DEFAULT 'collaborative',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
@@ -487,7 +500,11 @@ CREATE TABLE IF NOT EXISTS contexts (
     last_activity_at INTEGER,
     promoted_at  INTEGER,
     demoted_at   INTEGER,
-    paused_at    INTEGER
+    paused_at    INTEGER,
+    -- The cast this context plays under (NULL = no ensemble assigned, falls
+    -- through to the registry default). Distinct from `provider`/`model`
+    -- above, which are an explicit per-context override that always wins.
+    cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL;
@@ -1132,6 +1149,20 @@ fn read_opt_preset_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Optio
     }
 }
 
+fn read_opt_cast_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<CastId>> {
+    let bytes: Option<Vec<u8>> = row.get(idx)?;
+    match bytes {
+        Some(b) => CastId::try_from_slice(&b).map(Some).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "invalid CastId bytes".into(),
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 fn read_workspace_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<WorkspaceId> {
     let bytes: Vec<u8> = row.get(idx)?;
     WorkspaceId::try_from_slice(&bytes).ok_or_else(|| {
@@ -1354,6 +1385,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN demoted_at INTEGER",
             "ALTER TABLE contexts ADD COLUMN paused_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
+            "ALTER TABLE contexts ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -1362,6 +1394,147 @@ impl KernelDb {
                 }
                 return Err(e.into());
             }
+        }
+        Self::migrate_context_model_rollover(conn)?;
+        Self::migrate_preset_cast_narrowing(conn)?;
+        Ok(())
+    }
+
+    /// One-shot rollover for the Track A → Track D backend rename (2026-08-03,
+    /// design round with Amy — see `docs/devlog.md`). Track A replaced the old
+    /// free-form provider strings with honest backend NAMES sourced from
+    /// `seed_backends.rs` (`anthropic`/`deepseek`/`gpt`/`ollama`); this walks
+    /// every existing context row's `provider`/`model` columns and rewrites
+    /// them so no context is left pointing at a name no backend answers to:
+    ///
+    /// - `anthropic`/`deepseek`/`ollama`/`gpt` (case-insensitive) survive
+    ///   as-is — same name, new factory floor. `gpt` is in the KEEP set (not
+    ///   just the openai-rename target) so a row already rolled over on a
+    ///   prior boot is left alone on this one — the whole migration is a
+    ///   no-op re-run.
+    /// - `openai` renames to `gpt` (same endpoint, renamed) — the model id is
+    ///   untouched.
+    /// - anything else that has a `provider` or `model` set (`lemonade`,
+    ///   `local`, a typo, garbage, or a model with no provider at all) is not
+    ///   a name we can resolve any more, so it is reassigned to the kernel's
+    ///   affordable default: `deepseek` / `deepseek-v4-flash` (Amy: "mostly we
+    ///   can toss them to deepseek v4 flash for now").
+    /// - a row with BOTH columns NULL is left untouched — that already means
+    ///   "fall through to the registry default", and remapping it would turn
+    ///   an implicit default into an explicit pin nobody asked for.
+    ///
+    /// Every changed row logs at `info` (old → new), plus a one-line summary
+    /// count. A row whose id fails to parse is a corrupt DB, not a skip —
+    /// this fails loud rather than silently leaving a context's model
+    /// unrolled (no-silent-fallbacks).
+    fn migrate_context_model_rollover(conn: &Connection) -> KernelDbResult<()> {
+        const KEEP: [&str; 4] = ["anthropic", "deepseek", "ollama", "gpt"];
+        const FALLBACK_PROVIDER: &str = "deepseek";
+        const FALLBACK_MODEL: &str = "deepseek-v4-flash";
+
+        let rows: Vec<(Vec<u8>, Option<String>, Option<String>)> = {
+            let mut stmt = conn.prepare("SELECT context_id, provider, model FROM contexts")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<SqliteResult<_>>()?
+        };
+
+        let mut changed = 0usize;
+        for (id_bytes, provider, model) in rows {
+            if provider.is_none() && model.is_none() {
+                continue;
+            }
+            let (new_provider, new_model): (Option<String>, Option<String>) =
+                match provider.as_deref() {
+                    Some(p) if KEEP.iter().any(|k| p.eq_ignore_ascii_case(k)) => continue,
+                    Some(p) if p.eq_ignore_ascii_case("openai") => {
+                        (Some("gpt".to_string()), model.clone())
+                    }
+                    _ => (Some(FALLBACK_PROVIDER.to_string()), Some(FALLBACK_MODEL.to_string())),
+                };
+
+            let id = ContextId::try_from_slice(&id_bytes).ok_or_else(|| {
+                KernelDbError::Validation(
+                    "context model rollover: corrupt context_id blob".to_string(),
+                )
+            })?;
+            info!(
+                "context model rollover: {} {:?}/{:?} -> {:?}/{:?}",
+                id.short(),
+                provider,
+                model,
+                new_provider,
+                new_model
+            );
+            conn.execute(
+                "UPDATE contexts SET provider = ?1, model = ?2 WHERE context_id = ?3",
+                params![new_provider, new_model, id_bytes],
+            )?;
+            changed += 1;
+        }
+        info!("context model rollover: {changed} context row(s) updated");
+        Ok(())
+    }
+
+    /// One-shot preset narrowing for Track D (2026-08-03): a preset's old
+    /// `provider`/`model` columns are dropped and replaced with a nullable
+    /// `cast_id` reference (a preset now assigns a cast rather than pinning a
+    /// provider/model pair itself). No attempt is made to guess a cast from
+    /// the old provider/model — Amy: "a preset whose provider/model can't map
+    /// just loses them (cast_id stays NULL)" — but every preset that's about
+    /// to lose a non-null value logs it at `info` first, so the drop is
+    /// never silent.
+    ///
+    /// Column presence is checked via `PRAGMA table_info` rather than the
+    /// duplicate-column-error idiom `apply_additive_migrations` uses for
+    /// ADD-only alters: this function does three independent operations
+    /// (drop, drop, add) and needs to resume correctly even if a prior run
+    /// crashed between them, which a single try-and-ignore-the-error pass
+    /// over all three wouldn't detect per-column.
+    fn migrate_preset_cast_narrowing(conn: &Connection) -> KernelDbResult<()> {
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(presets)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<SqliteResult<_>>()?
+        };
+        let has_provider = columns.iter().any(|c| c == "provider");
+        let has_model = columns.iter().any(|c| c == "model");
+        let has_cast = columns.iter().any(|c| c == "cast_id");
+
+        if has_provider || has_model {
+            let provider_expr = if has_provider { "provider" } else { "NULL" };
+            let model_expr = if has_model { "model" } else { "NULL" };
+            let sql = format!(
+                "SELECT label, {provider_expr}, {model_expr} FROM presets \
+                 WHERE {provider_expr} IS NOT NULL OR {model_expr} IS NOT NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (label, provider, model) = row?;
+                info!(
+                    "preset '{label}': dropping provider={provider:?} model={model:?} \
+                     (cast_id left NULL — no automatic mapping)"
+                );
+            }
+        }
+
+        if has_provider {
+            conn.execute("ALTER TABLE presets DROP COLUMN provider", [])?;
+        }
+        if has_model {
+            conn.execute("ALTER TABLE presets DROP COLUMN model", [])?;
+        }
+        if !has_cast {
+            conn.execute(
+                "ALTER TABLE presets ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -1980,13 +2153,13 @@ impl KernelDb {
                 system_prompt, consent_mode, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
-                last_activity_at, promoted_at, demoted_at, paused_at
+                last_activity_at, promoted_at, demoted_at, paused_at, cast_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20
+                ?17, ?18, ?19, ?20, ?21
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -2009,6 +2182,7 @@ impl KernelDb {
                     row.promoted_at,
                     row.demoted_at,
                     row.paused_at,
+                    row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -2028,7 +2202,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -2076,6 +2250,28 @@ impl KernelDb {
         let updated = self.conn.execute(
             "UPDATE contexts SET provider = ?1, model = ?2 WHERE context_id = ?3",
             params![provider, model, blob_param(id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
+        }
+        Ok(())
+    }
+
+    /// Set or clear the cast a context plays under. `None` clears it (the
+    /// context falls back to the registry default at resolution time — see
+    /// `crate::model_resolution::resolve_context_model`). Does NOT validate
+    /// that `cast_id` refers to an existing cast — the FK does that at the
+    /// SQL layer (`ON DELETE SET NULL`, so a removed cast quietly clears
+    /// every context that pointed at it rather than orphaning a dangling
+    /// reference); callers resolving a `--cast <label>` flag validate the
+    /// label against `list_casts`/`get_cast_by_label` BEFORE calling this.
+    pub fn update_cast(&self, id: ContextId, cast_id: Option<CastId>) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET cast_id = ?1 WHERE context_id = ?2",
+            params![
+                cast_id.as_ref().map(|c| c.as_bytes().to_vec()),
+                blob_param(id.as_bytes())
+            ],
         )?;
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("context {}", id.short())));
@@ -2358,7 +2554,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -2375,7 +2571,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -2426,7 +2622,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -2445,7 +2641,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -2483,7 +2679,8 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, dag.depth
+                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
+                   c.cast_id, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -2491,7 +2688,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(20)?;
+            let depth: i64 = row.get(21)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -2513,7 +2710,8 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, lineage.depth
+                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
+                   c.cast_id, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -2521,7 +2719,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(20)?;
+            let depth: i64 = row.get(21)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -2542,7 +2740,8 @@ impl KernelDb {
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, subtree.depth
+                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
+                   c.cast_id, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -2550,7 +2749,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(20)?;
+            let depth: i64 = row.get(21)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -2717,15 +2916,14 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO presets (
-                preset_id, label, description, provider, model,
+                preset_id, label, description, cast_id,
                 system_prompt, consent_mode, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     blob_param(row.preset_id.as_bytes()),
                     row.label,
                     row.description,
-                    row.provider,
-                    row.model,
+                    row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.system_prompt,
                     row.consent_mode.as_str(),
                     row.created_at,
@@ -2741,7 +2939,7 @@ impl KernelDb {
     /// Get a preset by ID.
     pub fn get_preset(&self, id: PresetId) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, label, description, provider, model,
+            "SELECT preset_id, label, description, cast_id,
                     system_prompt, consent_mode, created_at, created_by
              FROM presets WHERE preset_id = ?1",
         )?;
@@ -2757,7 +2955,7 @@ impl KernelDb {
     /// Get a preset by label.
     pub fn get_preset_by_label(&self, label: &str) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, label, description, provider, model,
+            "SELECT preset_id, label, description, cast_id,
                     system_prompt, consent_mode, created_at, created_by
              FROM presets WHERE label = ?1",
         )?;
@@ -2773,7 +2971,7 @@ impl KernelDb {
     /// List all presets.
     pub fn list_presets(&self) -> KernelDbResult<Vec<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, label, description, provider, model,
+            "SELECT preset_id, label, description, cast_id,
                     system_prompt, consent_mode, created_at, created_by
              FROM presets
              ORDER BY label",
@@ -2791,14 +2989,13 @@ impl KernelDb {
             .conn
             .execute(
                 "UPDATE presets SET
-                label = ?1, description = ?2, provider = ?3, model = ?4,
-                system_prompt = ?5, consent_mode = ?6
-             WHERE preset_id = ?7",
+                label = ?1, description = ?2, cast_id = ?3,
+                system_prompt = ?4, consent_mode = ?5
+             WHERE preset_id = ?6",
                 params![
                     row.label,
                     row.description,
-                    row.provider,
-                    row.model,
+                    row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.system_prompt,
                     row.consent_mode.as_str(),
                     blob_param(row.preset_id.as_bytes()),
@@ -4607,7 +4804,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id
              FROM contexts WHERE label = ?1",
         )?;
 
@@ -5088,6 +5285,27 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Fetch a cast by id — the counterpart to `get_cast_by_label` for
+    /// callers that only have a context row's `cast_id` (e.g. resolving the
+    /// label to display in `kj context info`/`list`).
+    pub fn get_cast(&self, cast_id: CastId) -> KernelDbResult<Option<CastRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cast_id, label, description, created_at, created_by
+             FROM casts WHERE cast_id = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![blob_param(cast_id.as_bytes())], |row| {
+                Ok(CastRow {
+                    cast_id: read_cast_id(row, 0)?,
+                    label: row.get(1)?,
+                    description: row.get(2)?,
+                    created_at: row.get(3)?,
+                    created_by: read_principal_id(row, 4)?,
+                })
+            })
+            .optional()?)
+    }
+
     /// Fetch a cast by label (case-insensitive, matching the UNIQUE collation).
     pub fn get_cast_by_label(&self, label: &str) -> KernelDbResult<Option<CastRow>> {
         let mut stmt = self.conn.prepare(
@@ -5390,6 +5608,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         promoted_at: row.get(17)?,
         demoted_at: row.get(18)?,
         paused_at: row.get(19)?,
+        cast_id: read_opt_cast_id(row, 20)?,
     })
 }
 
@@ -5406,18 +5625,17 @@ fn row_to_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextEdgeRow> {
 }
 
 fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
-    let consent_str: String = row.get(6)?;
+    let consent_str: String = row.get(5)?;
 
     Ok(PresetRow {
         preset_id: read_preset_id(row, 0)?,
         label: row.get(1)?,
         description: row.get(2)?,
-        provider: row.get(3)?,
-        model: row.get(4)?,
-        system_prompt: row.get(5)?,
+        cast_id: read_opt_cast_id(row, 3)?,
+        system_prompt: row.get(4)?,
         consent_mode: consent_mode_from_sql(&consent_str),
-        created_at: row.get(7)?,
-        created_by: read_principal_id(row, 8)?,
+        created_at: row.get(6)?,
+        created_by: read_principal_id(row, 7)?,
     })
 }
 
@@ -5470,6 +5688,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
+        cast_id: None,
     }
 }
 
@@ -5537,8 +5756,7 @@ mod tests {
             preset_id: pid,
             label: label.into(),
             description: None,
-            provider: None,
-            model: None,
+            cast_id: None,
             system_prompt: None,
             consent_mode: ConsentMode::Collaborative,
             created_at: now_millis() as i64,
@@ -5681,6 +5899,243 @@ mod tests {
             !is_duplicate_column_error(&other),
             "a no-such-table failure must not be misclassified as duplicate-column: {other}"
         );
+    }
+
+    // ── Track D: context model rollover + preset cast narrowing ─────────
+
+    /// Surviving backend names (`anthropic`/`deepseek`/`ollama`/`gpt`,
+    /// case-insensitive) are untouched by the rollover — they're the SAME
+    /// name in the new factory floor, not a rename target.
+    #[test]
+    fn context_model_rollover_keeps_surviving_backend_names_untouched() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let mut anthropic = make_context_row(Some("keep-anthropic"));
+        anthropic.provider = Some("anthropic".to_string());
+        anthropic.model = Some("claude-opus-4-6".to_string());
+        insert_context_with_doc(&db, &anthropic, ws_id);
+
+        let mut deepseek = make_context_row(Some("keep-deepseek"));
+        deepseek.provider = Some("DeepSeek".to_string()); // case-insensitive
+        deepseek.model = Some("deepseek-r1".to_string());
+        insert_context_with_doc(&db, &deepseek, ws_id);
+
+        let mut ollama = make_context_row(Some("keep-ollama"));
+        ollama.provider = Some("ollama".to_string());
+        ollama.model = Some("gemma4:31b".to_string());
+        insert_context_with_doc(&db, &ollama, ws_id);
+
+        let mut gpt = make_context_row(Some("keep-gpt"));
+        gpt.provider = Some("gpt".to_string());
+        gpt.model = Some("gpt-5.6-terra".to_string());
+        insert_context_with_doc(&db, &gpt, ws_id);
+
+        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
+
+        for (id, expected_provider, expected_model) in [
+            (anthropic.context_id, "anthropic", "claude-opus-4-6"),
+            (deepseek.context_id, "DeepSeek", "deepseek-r1"),
+            (ollama.context_id, "ollama", "gemma4:31b"),
+            (gpt.context_id, "gpt", "gpt-5.6-terra"),
+        ] {
+            let row = db.get_context(id).unwrap().unwrap();
+            assert_eq!(row.provider.as_deref(), Some(expected_provider));
+            assert_eq!(row.model.as_deref(), Some(expected_model));
+        }
+    }
+
+    /// `openai` renames to `gpt` (same endpoint, renamed) — the model id
+    /// travels unchanged.
+    #[test]
+    fn context_model_rollover_renames_openai_to_gpt() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let mut row = make_context_row(Some("was-openai"));
+        row.provider = Some("openai".to_string());
+        row.model = Some("gpt-4-turbo".to_string());
+        insert_context_with_doc(&db, &row, ws_id);
+
+        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
+
+        let updated = db.get_context(row.context_id).unwrap().unwrap();
+        assert_eq!(updated.provider.as_deref(), Some("gpt"));
+        assert_eq!(updated.model.as_deref(), Some("gpt-4-turbo"), "model id is untouched");
+    }
+
+    /// Everything else with a provider or model set — a retired local-server
+    /// name, a typo, or a model with no provider at all — is reassigned to
+    /// the kernel's affordable default (Amy: "mostly we can toss them to
+    /// deepseek v4 flash for now").
+    #[test]
+    fn context_model_rollover_falls_back_everything_else_to_deepseek_flash() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let mut lemonade = make_context_row(Some("was-lemonade"));
+        lemonade.provider = Some("lemonade".to_string());
+        lemonade.model = Some("some-local-model".to_string());
+        insert_context_with_doc(&db, &lemonade, ws_id);
+
+        let mut local = make_context_row(Some("was-local"));
+        local.provider = Some("local".to_string());
+        local.model = Some("whatever".to_string());
+        insert_context_with_doc(&db, &local, ws_id);
+
+        let mut typo = make_context_row(Some("was-typo"));
+        typo.provider = Some("anthorpic".to_string()); // misspelled
+        typo.model = Some("claude-opus-4-6".to_string());
+        insert_context_with_doc(&db, &typo, ws_id);
+
+        // provider absent but a model string survives — "empty-with-garbage".
+        let mut garbage = make_context_row(Some("was-garbage"));
+        garbage.provider = None;
+        garbage.model = Some("???".to_string());
+        insert_context_with_doc(&db, &garbage, ws_id);
+
+        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
+
+        for id in [
+            lemonade.context_id,
+            local.context_id,
+            typo.context_id,
+            garbage.context_id,
+        ] {
+            let row = db.get_context(id).unwrap().unwrap();
+            assert_eq!(row.provider.as_deref(), Some("deepseek"));
+            assert_eq!(row.model.as_deref(), Some("deepseek-v4-flash"));
+        }
+    }
+
+    /// A row with BOTH `provider` and `model` NULL already means "fall
+    /// through to the registry default" — the rollover must leave it alone,
+    /// not turn an implicit default into an explicit pin nobody asked for.
+    #[test]
+    fn context_model_rollover_leaves_fully_unset_rows_untouched() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let row = make_context_row(Some("never-configured"));
+        assert!(row.provider.is_none() && row.model.is_none());
+        insert_context_with_doc(&db, &row, ws_id);
+
+        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
+
+        let after = db.get_context(row.context_id).unwrap().unwrap();
+        assert!(after.provider.is_none());
+        assert!(after.model.is_none());
+    }
+
+    /// The whole migration re-runs on every kernel `open()`/`in_memory()` —
+    /// it must be a no-op the second time, including for rows it JUST
+    /// rewrote (a re-mapped `gpt`/`deepseek` row must not be re-mapped
+    /// again on the next pass).
+    #[test]
+    fn context_model_rollover_is_idempotent() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let mut openai = make_context_row(Some("was-openai-2"));
+        openai.provider = Some("openai".to_string());
+        openai.model = Some("gpt-4-turbo".to_string());
+        insert_context_with_doc(&db, &openai, ws_id);
+
+        let mut garbage = make_context_row(Some("was-garbage-2"));
+        garbage.provider = Some("lemonade".to_string());
+        garbage.model = Some("whatever".to_string());
+        insert_context_with_doc(&db, &garbage, ws_id);
+
+        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
+        let after_first = (
+            db.get_context(openai.context_id).unwrap().unwrap(),
+            db.get_context(garbage.context_id).unwrap().unwrap(),
+        );
+
+        KernelDb::migrate_context_model_rollover(&db.conn).unwrap();
+        let after_second = (
+            db.get_context(openai.context_id).unwrap().unwrap(),
+            db.get_context(garbage.context_id).unwrap().unwrap(),
+        );
+
+        assert_eq!(after_first.0.provider, after_second.0.provider);
+        assert_eq!(after_first.0.model, after_second.0.model);
+        assert_eq!(after_first.1.provider, after_second.1.provider);
+        assert_eq!(after_first.1.model, after_second.1.model);
+        assert_eq!(after_second.0.provider.as_deref(), Some("gpt"));
+        assert_eq!(after_second.1.provider.as_deref(), Some("deepseek"));
+    }
+
+    /// `migrate_preset_cast_narrowing` against a pre-Track-D `presets` table
+    /// (still carrying `provider`/`model`): the legacy columns are dropped,
+    /// `cast_id` is added, and a preset that had a provider/model loses it —
+    /// no automatic cast mapping is attempted, `cast_id` stays NULL.
+    #[test]
+    fn preset_cast_narrowing_drops_legacy_columns_and_leaves_cast_id_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE casts (
+                cast_id BLOB NOT NULL PRIMARY KEY,
+                label TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE presets (
+                preset_id BLOB NOT NULL PRIMARY KEY,
+                label TEXT NOT NULL UNIQUE,
+                description TEXT,
+                provider TEXT,
+                model TEXT,
+                system_prompt TEXT,
+                consent_mode TEXT NOT NULL DEFAULT 'collaborative',
+                created_at INTEGER NOT NULL,
+                created_by BLOB NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO presets
+                (preset_id, label, description, provider, model, system_prompt,
+                 consent_mode, created_at, created_by)
+             VALUES (?1, 'legacy-research', NULL, 'anthropic', 'claude-opus-4-6', NULL,
+                     'autonomous', 0, ?2)",
+            params![vec![1u8; 16], vec![2u8; 16]],
+        )
+        .unwrap();
+
+        KernelDb::migrate_preset_cast_narrowing(&conn).unwrap();
+
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(presets)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<SqliteResult<_>>()
+                .unwrap()
+        };
+        assert!(!columns.contains(&"provider".to_string()), "provider column dropped");
+        assert!(!columns.contains(&"model".to_string()), "model column dropped");
+        assert!(columns.contains(&"cast_id".to_string()), "cast_id column added");
+
+        let cast_id: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT cast_id FROM presets WHERE label = 'legacy-research'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(cast_id.is_none(), "no automatic provider/model -> cast mapping");
+
+        // Idempotent re-run: already-migrated columns, no-op.
+        KernelDb::migrate_preset_cast_narrowing(&conn).unwrap();
+    }
+
+    /// A brand-new DB (current `SCHEMA`, no legacy columns ever existed) is
+    /// a clean no-op — the guard must not error just because there was
+    /// nothing to narrow.
+    #[test]
+    fn preset_cast_narrowing_is_a_no_op_on_a_fresh_db() {
+        let db = KernelDb::in_memory().unwrap();
+        // in_memory() already ran it once as part of open; running again
+        // directly must still be a clean no-op.
+        KernelDb::migrate_preset_cast_narrowing(&db.conn).unwrap();
     }
 
     /// `touch_context_activity` stamps `last_activity_at`, and pre-touch rows
@@ -6159,12 +6614,32 @@ mod tests {
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
+        // Two casts so the "update" step below can move the reference, not
+        // just leave it at None.
+        let research_cast = CastId::new();
+        db.insert_cast(&CastRow {
+            cast_id: research_cast,
+            label: "research".to_string(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+        })
+        .unwrap();
+        let fast_cast = CastId::new();
+        db.insert_cast(&CastRow {
+            cast_id: fast_cast,
+            label: "fast".to_string(),
+            description: None,
+            created_at: now,
+            created_by: creator,
+        })
+        .unwrap();
+
         let mut preset = PresetRow {
             preset_id: PresetId::new(),
                         label: "opus-research".into(),
             description: Some("Deep research preset".into()),
-            provider: Some("anthropic".into()),
-            model: Some("claude-opus-4-6".into()),
+            cast_id: Some(research_cast),
             system_prompt: None,
             consent_mode: ConsentMode::Autonomous,
             created_at: now,
@@ -6178,13 +6653,19 @@ mod tests {
             .get_preset_by_label("opus-research")
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.model, Some("claude-opus-4-6".into()));
+        assert_eq!(loaded.cast_id, Some(research_cast));
 
-        // Update
-        preset.model = Some("claude-sonnet-4-6".into());
+        // Update — narrow to a different cast
+        preset.cast_id = Some(fast_cast);
         db.update_preset(&preset).unwrap();
         let loaded = db.get_preset(preset.preset_id).unwrap().unwrap();
-        assert_eq!(loaded.model, Some("claude-sonnet-4-6".into()));
+        assert_eq!(loaded.cast_id, Some(fast_cast));
+
+        // A cast removed out from under a preset clears the reference
+        // (ON DELETE SET NULL) rather than leaving a dangling id.
+        db.delete_cast(fast_cast).unwrap();
+        let after_cast_removed = db.get_preset(preset.preset_id).unwrap().unwrap();
+        assert_eq!(after_cast_removed.cast_id, None);
 
         // Delete
         assert!(db.delete_preset(preset.preset_id).unwrap());
@@ -6524,6 +7005,7 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: None,
         };
 
         let ctx = row.to_context();
@@ -6542,6 +7024,17 @@ mod tests {
         let ws_id = setup_test_db(&db);
         let creator = PrincipalId::new();
         let parent_id = ContextId::new();
+
+        // A cast to exercise the cast_id round-trip below.
+        let cast_id = CastId::new();
+        db.insert_cast(&CastRow {
+            cast_id,
+            label: "house".to_string(),
+            description: None,
+            created_at: 500,
+            created_by: creator,
+        })
+        .unwrap();
 
         // Insert parent first (forked_from FK requires it to exist)
         let parent = ContextRow {
@@ -6565,10 +7058,11 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
-        // Insert child forked from parent
+        // Insert child forked from parent, playing under `cast_id`.
         let child_id = ContextId::new();
         let child = ContextRow {
             context_id: child_id,
@@ -6591,10 +7085,11 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: Some(cast_id),
         };
         insert_context_with_doc(&db, &child, ws_id);
 
-        // Read back and verify all 15 fields
+        // Read back and verify all 16 fields
         let recovered = db.get_context(child_id).unwrap().expect("child not found");
         assert_eq!(recovered.context_id, child_id);
         assert_eq!(recovered.label, Some("child-fork".into()));
@@ -6609,6 +7104,7 @@ mod tests {
         assert!(recovered.archived_at.is_none());
         assert!(recovered.workspace_id.is_none());
         assert!(recovered.preset_id.is_none());
+        assert_eq!(recovered.cast_id, Some(cast_id));
 
         // Verify list_active_contexts returns both
         let active = db.list_active_contexts().unwrap();
@@ -6625,6 +7121,14 @@ mod tests {
         let updated = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(updated.provider, Some("deepseek".into()));
         assert_eq!(updated.model, Some("deepseek-r1".into()));
+
+        // Verify update_cast roundtrip, including clearing it back to None.
+        db.update_cast(child_id, None).unwrap();
+        let cleared = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(cleared.cast_id, None);
+        db.update_cast(child_id, Some(cast_id)).unwrap();
+        let recast = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(recast.cast_id, Some(cast_id));
     }
 
     // ── 22. FK violation produces Validation, not LabelConflict ──────────
@@ -6669,6 +7173,7 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(

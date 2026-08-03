@@ -34,6 +34,7 @@ pub mod midi_exchange;
 pub mod midi_identity;
 pub mod midi_presence;
 pub mod midi_seed;
+pub mod model_resolution;
 pub mod peers;
 pub mod runtime;
 pub mod seed_backends;
@@ -108,6 +109,7 @@ pub use llm::{
     build_llm_registry,
     load_embedding_config,
 };
+pub use model_resolution::{ModelSource, ResolvedContextModel, resolve_context_model};
 pub use execution::{ExecContext, ExecResult};
 pub use state::KernelState;
 pub use vfs::{

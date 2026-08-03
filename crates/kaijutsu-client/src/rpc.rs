@@ -285,6 +285,12 @@ pub struct ContextInfo {
     /// when nothing has finished (-1 sentinel on the wire — real exit
     /// codes, including the `128 + signal` convention, are never negative).
     pub background_last_exit_code: Option<i32>,
+    /// The named model ensemble this context plays under (Track D,
+    /// 2026-08-03), resolved kernel-side from `ContextRow::cast_id` — the
+    /// wire ships the label, never a bare id. `None` when uncast (empty on
+    /// the wire), same falls-through-to-registry-default semantics as an
+    /// absent `provider`/`model` override.
+    pub cast_label: Option<String>,
 }
 
 /// Live state of one track (wire `TrackInfo`; docs/tracks.md) — read from the
@@ -333,13 +339,22 @@ pub struct ContextCluster {
 }
 
 /// Preset template info from the server.
+///
+/// `provider`/`model` are RETIRED (Track D, 2026-08-03): a preset narrows to
+/// a cast reference instead of pinning a provider/model pair itself. The
+/// wire's `@3`/`@4` ordinals stay declared-but-unused (capnp ordinals are
+/// dense and never renumbered) — this mirror type simply drops the two
+/// dead fields and adds `cast_label`.
 #[derive(Debug, Clone)]
 pub struct PresetInfo {
     pub id: Vec<u8>,
     pub label: String,
     pub description: String,
-    pub provider: String,
-    pub model: String,
+    /// The cast this preset assigns at fork/apply time, resolved
+    /// kernel-side from `PresetRow::cast_id` — the wire ships the label,
+    /// never a bare id. Empty = the preset moves no model knobs (the three
+    /// factory presets' shape).
+    pub cast_label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1680,8 +1695,7 @@ impl KernelHandle {
                 id: p.get_id()?.to_vec(),
                 label: p.get_label()?.to_string()?,
                 description: p.get_description()?.to_string()?,
-                provider: p.get_provider()?.to_string()?,
-                model: p.get_model()?.to_string()?,
+                cast_label: p.get_cast_label()?.to_string()?,
             });
         }
         Ok(result)
@@ -2828,6 +2842,15 @@ fn parse_context_info(
         code => Some(code),
     };
 
+    // Empty = uncast (Track D) — same "absence is the wire sentinel"
+    // convention as `context_type`/`track_id` above.
+    let cast_label_str = reader.get_cast_label()?.to_str().unwrap_or("");
+    let cast_label = if cast_label_str.is_empty() {
+        None
+    } else {
+        Some(cast_label_str.to_string())
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2856,6 +2879,7 @@ fn parse_context_info(
         background_last_finished_at,
         background_last_finished_status,
         background_last_exit_code,
+        cast_label,
     })
 }
 

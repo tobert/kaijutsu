@@ -18,7 +18,8 @@ use tokio::sync::RwLock as TokioRwLock;
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::kernel_db::KernelDb;
-use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent};
+use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent, apply_slot_tunables};
+use kaijutsu_kernel::llm::SlotTunables;
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
 use kaijutsu_kernel::mcp::{McpError, PolicyError};
 use kaijutsu_kernel::{Kernel, LlmMessage, Provider, SharedBlockStore};
@@ -349,39 +350,90 @@ pub(crate) async fn spawn_llm_for_prompt(
         }
     };
 
-    // Resolve provider + model from LLM registry
-    // Priority: explicit param > per-context (DriftRouter) > kernel default
-    let provider_resolution: Result<(Arc<Provider>, String, u64), &'static str> = {
+    // Resolve provider + model through `resolve_context_model` (the one
+    // function that answers "what model does this context play?").
+    // Priority: explicit param > per-context (DriftRouter) > cast slot on
+    // this context's context_type > registry default. The context_type and
+    // cast label are read once per turn here; the pure resolution itself
+    // lives in `kaijutsu_kernel::model_resolution` where it's unit-tested.
+    let (context_type, cast_label) = {
+        let db = kernel_db.lock();
+        match db.get_context(context_id) {
+            Ok(Some(row)) => {
+                let label = row.cast_id.and_then(|id| match db.get_cast(id) {
+                    Ok(Some(cast)) => Some(cast.label),
+                    // A dangling cast_id (cast removed; FK is SET NULL so
+                    // this is a race at worst) falls through to the
+                    // default — resolution handles None; log it so the
+                    // fallthrough is observable.
+                    Ok(None) => {
+                        log::warn!(
+                            "context {context_id} carries cast_id {id} with no cast row; \
+                             falling through to default resolution"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("cast lookup for context {context_id} failed: {e}");
+                        None
+                    }
+                });
+                (row.context_type, label)
+            }
+            // No row / read failure: resolution still works (no cast, no
+            // type-matched slot). "coder" is not assumed — an empty type
+            // matches no slot role, which is the honest answer.
+            Ok(None) => (String::new(), None),
+            Err(e) => {
+                log::warn!("context row lookup for {context_id} failed: {e}");
+                (String::new(), None)
+            }
+        }
+    };
+    let provider_resolution: Result<(Arc<Provider>, String, u64, Option<SlotTunables>), String> = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
-        let effective_model = model.map(|m| m.to_string()).or(ctx_model);
+        // Explicit RPC param outranks the per-context override; both are
+        // "the context row's own model" as far as resolution is concerned.
+        let effective_model = model.or(ctx_model.as_deref());
 
-        match effective_model {
-            Some(name) => ctx_provider_name
-                .as_deref()
-                .and_then(|pn| registry.get(pn))
-                .or_else(|| registry.default_provider())
-                .map(|p| (p, name, max_tokens))
-                .ok_or("No LLM backend configured (see `kj backend list`)"),
-            None => match registry.default_provider() {
+        match kaijutsu_kernel::resolve_context_model(
+            &context_type,
+            ctx_provider_name.as_deref(),
+            effective_model,
+            cast_label.as_deref(),
+            &registry,
+        ) {
+            Some(resolved) => match registry.get(&resolved.backend) {
                 Some(p) => {
-                    let m = registry
-                        .default_model()
-                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                        .to_string();
-                    Ok((p, m, max_tokens))
+                    log::debug!(
+                        "model resolution for {context_id}: {}/{} via {:?}",
+                        resolved.backend,
+                        resolved.model,
+                        resolved.source
+                    );
+                    Ok((p, resolved.model, max_tokens, resolved.tunables))
                 }
-                None => Err("No LLM backend configured (see `kj backend list`)"),
+                // The backend name resolved but nothing registered under it
+                // (missing key, failed init). The old code silently fell
+                // back to the default provider while keeping the pinned
+                // model — a wrong-model-to-wrong-provider shape. Loud now.
+                None => Err(format!(
+                    "backend '{}' for this context is not registered (missing key? \
+                     see `kj backend list` / `kj backend show {}`)",
+                    resolved.backend, resolved.backend
+                )),
             },
+            None => Err("No LLM backend configured (see `kj backend list`)".to_string()),
         }
     };
-    let (provider, model_name, max_output_tokens) = match provider_resolution {
+    let (provider, model_name, max_output_tokens, slot_tunables) = match provider_resolution {
         Ok(v) => v,
         Err(detail) => {
-            log::error!("No LLM provider configured");
-            insert_pre_stream_error_block(&documents, context_id, after_block_id, detail);
-            return Err(capnp::Error::failed(detail.into()));
+            log::error!("LLM resolution failed for context {context_id}: {detail}");
+            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
+            return Err(capnp::Error::failed(detail));
         }
     };
 
@@ -446,6 +498,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         after_block_id,
         system_prompt,
         max_output_tokens,
+        slot_tunables,
         conversation_cache,
         user_principal_id,
         tool_ctx,
@@ -965,6 +1018,10 @@ async fn process_llm_stream(
     after_block_id: kaijutsu_crdt::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
+    // The context's resolved cast-seat tunables (`resolve_context_model`),
+    // already cascaded onto `llm_defaults`; `None` when no cast seat answered
+    // (the floor then applies at the `apply_slot_tunables` seam below).
+    slot_tunables: Option<SlotTunables>,
     conversation_cache: Arc<ConversationCache>,
     // The turn's principal — authors the TurnFlow outcome event (and reserved
     // for future per-user attribution on model-generated blocks).
@@ -1203,11 +1260,26 @@ async fn process_llm_stream(
             }
         };
 
-        let build_opts = BuildOpts::new(&model_name)
-            .with_system(&system_prompt)
-            .with_max_tokens(max_output_tokens)
-            .with_tools(tools.clone())
-            .with_cache_breakpoints(cache_breakpoints);
+        // Overlay the LLM tunables cascade (max_tokens/temperature/top_p/
+        // effort/thinking_budget/thinking_style) onto the request:
+        // `slot_tunables` is the context's resolved cast seat (already
+        // cascaded onto `llm_defaults` by `resolve_context_model`); when no
+        // seat answered, `floor` (the bare `llm_defaults` row) applies, so a
+        // kernel with no casts configured still gets its defaults on every
+        // request.
+        let default_tunables = {
+            let registry = kernel.llm().read().await;
+            registry.default_tunables().clone()
+        };
+        let build_opts = apply_slot_tunables(
+            BuildOpts::new(&model_name)
+                .with_system(&system_prompt)
+                .with_max_tokens(max_output_tokens)
+                .with_tools(tools.clone())
+                .with_cache_breakpoints(cache_breakpoints),
+            slot_tunables.as_ref(),
+            &default_tunables,
+        );
 
         // Start streaming with exponential backoff retry for transient failures.
         // Retries cover network blips and rate limits before any content is emitted;
@@ -2062,6 +2134,7 @@ mod publish_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             conversation_cache,
             player,
             tool_ctx,
@@ -2185,6 +2258,7 @@ mod publish_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             conversation_cache,
             player,
             tool_ctx,
@@ -2670,6 +2744,7 @@ mod usage_tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             })
             .unwrap();
         }
@@ -2695,6 +2770,7 @@ mod usage_tests {
             after,
             "system".to_string(),
             1024,
+            None,
             conversation_cache,
             player,
             tool_ctx,

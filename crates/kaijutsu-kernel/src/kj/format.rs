@@ -1,14 +1,32 @@
 //! Text table/tree formatting helpers for kj command output.
 
-use kaijutsu_types::ContextId;
+use std::collections::HashMap;
+
+use kaijutsu_types::{CastId, ContextId};
 
 use crate::kernel_db::ContextRow;
+
+/// Look up a context row's cast label in the `cast_id -> label` map a caller
+/// builds once (e.g. from `KernelDb::list_casts`) — never a per-row DB call.
+/// Empty string when the context has no cast, or its `cast_id` is dangling
+/// (the cast was removed since the map was built).
+fn cast_tag(cast_id: Option<CastId>, casts: &HashMap<CastId, String>) -> String {
+    cast_id
+        .and_then(|id| casts.get(&id))
+        .map(|label| format!(" [cast:{label}]"))
+        .unwrap_or_default()
+}
 
 /// Format a context list as a flat table.
 ///
 /// Marks the current context with `*` and ring-0 (promoted) contexts with a
-/// trailing `[ring0]` tag.
-pub fn format_context_table(contexts: &[ContextRow], current: Option<ContextId>) -> String {
+/// trailing `[ring0]` tag; `casts` resolves each row's `cast_id` to its label
+/// for an additional `[cast:<label>]` tag (omitted when uncast).
+pub fn format_context_table(
+    contexts: &[ContextRow],
+    current: Option<ContextId>,
+    casts: &HashMap<CastId, String>,
+) -> String {
     if contexts.is_empty() {
         return "(no contexts)".to_string();
     }
@@ -29,7 +47,8 @@ pub fn format_context_table(contexts: &[ContextRow], current: Option<ContextId>)
         } else {
             ""
         };
-        lines.push(format!("{marker} {id_short}  {label:<16} {model}{ring0}"));
+        let cast = cast_tag(ctx.cast_id, casts);
+        lines.push(format!("{marker} {id_short}  {label:<16} {model}{ring0}{cast}"));
     }
 
     lines.join("\n")
@@ -37,8 +56,14 @@ pub fn format_context_table(contexts: &[ContextRow], current: Option<ContextId>)
 
 /// Format context DAG results as an indented tree.
 ///
-/// `dag` is a list of (ContextRow, depth) from the recursive CTE.
-pub fn format_context_tree(dag: &[(ContextRow, i64)], current: Option<ContextId>) -> String {
+/// `dag` is a list of (ContextRow, depth) from the recursive CTE. `casts`
+/// resolves each row's `cast_id` to its label, same convention as
+/// `format_context_table`.
+pub fn format_context_tree(
+    dag: &[(ContextRow, i64)],
+    current: Option<ContextId>,
+    casts: &HashMap<CastId, String>,
+) -> String {
     if dag.is_empty() {
         return "(no contexts)".to_string();
     }
@@ -55,10 +80,11 @@ pub fn format_context_tree(dag: &[(ContextRow, i64)], current: Option<ContextId>
         let label = ctx.label.as_deref().unwrap_or("-");
         let model = format_model(&ctx.provider, &ctx.model);
         let id_short = ctx.context_id.short();
+        let cast = cast_tag(ctx.cast_id, casts);
 
         let prefix = if *depth > 0 { "└─ " } else { "" };
         lines.push(format!(
-            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}"
+            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}{cast}"
         ));
     }
 
@@ -390,6 +416,7 @@ mod tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: None,
         }
     }
 
@@ -402,7 +429,7 @@ mod tests {
             make_row(Some("alt"), other),
         ];
 
-        let output = format_context_table(&rows, Some(current));
+        let output = format_context_table(&rows, Some(current), &HashMap::new());
         assert!(output.contains("* "));
         assert!(output.contains("default"));
         assert!(output.contains("alt"));
@@ -410,8 +437,35 @@ mod tests {
 
     #[test]
     fn table_empty() {
-        let output = format_context_table(&[], Some(ContextId::new()));
+        let output = format_context_table(&[], Some(ContextId::new()), &HashMap::new());
         assert_eq!(output, "(no contexts)");
+    }
+
+    #[test]
+    fn table_tags_cast_label_when_resolvable() {
+        let cast_id = CastId::new();
+        let mut cast = make_row(Some("cast-ctx"), ContextId::new());
+        cast.cast_id = Some(cast_id);
+        let uncast = make_row(Some("uncast-ctx"), ContextId::new());
+        let mut casts = HashMap::new();
+        casts.insert(cast_id, "house".to_string());
+
+        let output = format_context_table(&[cast, uncast], None, &casts);
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].contains("[cast:house]"), "output: {output}");
+        assert!(!lines[1].contains("[cast:"), "output: {output}");
+    }
+
+    #[test]
+    fn table_omits_cast_tag_for_a_dangling_cast_id() {
+        // The cast was removed after the row was written but before this
+        // listing's `casts` map was built — must not panic or fabricate a
+        // label.
+        let mut row = make_row(Some("orphaned"), ContextId::new());
+        row.cast_id = Some(CastId::new());
+
+        let output = format_context_table(&[row], None, &HashMap::new());
+        assert!(!output.contains("[cast:"), "output: {output}");
     }
 
     #[test]
@@ -454,7 +508,7 @@ mod tests {
         seated.promoted_at = Some(1_000);
         let plain = make_row(Some("plain"), ContextId::new());
 
-        let output = format_context_table(&[seated, plain], None);
+        let output = format_context_table(&[seated, plain], None, &HashMap::new());
         let lines: Vec<&str> = output.lines().collect();
         assert!(lines[0].contains("[ring0]"), "output: {output}");
         assert!(!lines[1].contains("[ring0]"), "output: {output}");

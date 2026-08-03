@@ -1244,6 +1244,7 @@ fn bootstrap_discovered_context(
         promoted_at: None,
         demoted_at: None,
         paused_at: None,
+        cast_id: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -1307,6 +1308,7 @@ mod context_bootstrap_tests {
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -2133,6 +2135,7 @@ async fn create_context_inner(
             promoted_at: None,
             demoted_at: None,
             paused_at: None,
+            cast_id: None,
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error
@@ -3626,6 +3629,18 @@ impl kernel::Server for KernelImpl {
                     }
                 };
 
+                // Cast id → label (Track D, 2026-08-03). Resolved ONCE for the
+                // whole listing — never per-row — same convention as
+                // `track_of`/`db_map` above. The wire ships the label, never a
+                // bare CastId, so the app never needs its own cast lookup.
+                let cast_labels: HashMap<kaijutsu_types::CastId, String> = {
+                    let db = kernel_db_arc.lock();
+                    match db.list_casts() {
+                        Ok(casts) => casts.into_iter().map(|c| (c.cast_id, c.label)).collect(),
+                        Err(_) => HashMap::new(),
+                    }
+                };
+
                 // Context → last-call usage snapshot (one query for the whole
                 // kernel, same shape as db_map/track_of above). Absent for a
                 // context that has never completed an LLM call — honest
@@ -3717,6 +3732,14 @@ impl kernel::Server for KernelImpl {
                         c.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
+                        // Empty when uncast, or the cast_id is dangling (removed
+                        // between the two reads above) — never an error.
+                        c.set_cast_label(
+                            row.cast_id
+                                .and_then(|id| cast_labels.get(&id))
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                        );
                     }
 
                     // Context-window usage — the bottom-dock gauge's wire spine
@@ -6525,9 +6548,16 @@ impl kernel::Server for KernelImpl {
         let _span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_presets");
         let _kernel_id = self.kernel.id;
 
-        let presets = {
+        let (presets, cast_labels) = {
             let db = self.kernel.kernel_db.lock();
-            db.list_presets().unwrap_or_default()
+            let presets = db.list_presets().unwrap_or_default();
+            // Resolved once for the whole listing (Track D) — `provider`/
+            // `model` (@3/@4) are demolished; `castLabel` (@5) replaces them.
+            let cast_labels: HashMap<kaijutsu_types::CastId, String> = db
+                .list_casts()
+                .map(|casts| casts.into_iter().map(|c| (c.cast_id, c.label)).collect())
+                .unwrap_or_default();
+            (presets, cast_labels)
         };
 
         let mut list = results.get().init_presets(presets.len() as u32);
@@ -6536,8 +6566,15 @@ impl kernel::Server for KernelImpl {
             p.set_id(preset.preset_id.as_bytes());
             p.set_label(&preset.label);
             p.set_description(preset.description.as_deref().unwrap_or(""));
-            p.set_provider(preset.provider.as_deref().unwrap_or(""));
-            p.set_model(preset.model.as_deref().unwrap_or(""));
+            // @3/@4 (provider/model) are UNUSED since Track D — left at their
+            // wire default (empty), never populated.
+            p.set_cast_label(
+                preset
+                    .cast_id
+                    .and_then(|id| cast_labels.get(&id))
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            );
         }
 
         Promise::ok(())

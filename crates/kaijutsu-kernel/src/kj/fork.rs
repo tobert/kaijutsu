@@ -533,12 +533,13 @@ impl KjDispatcher {
         {
             let mut db = self.kernel_db().lock();
 
-            // Inherit workspace from source
-            let source_ws = db
-                .get_context(source_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.workspace_id);
+            // Inherit workspace + cast from source — a fork is the same
+            // ensemble's continuation by default; `apply_preset` (below, if
+            // `--preset` was given) or a later `kj context set --cast` can
+            // still change it.
+            let source_row = db.get_context(source_id).ok().flatten();
+            let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
+            let source_cast = source_row.as_ref().and_then(|r| r.cast_id);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -565,6 +566,7 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: source_cast,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -845,11 +847,9 @@ impl KjDispatcher {
         {
             let mut db = self.kernel_db().lock();
 
-            let source_ws = db
-                .get_context(source_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.workspace_id);
+            let source_row = db.get_context(source_id).ok().flatten();
+            let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
+            let source_cast = source_row.as_ref().and_then(|r| r.cast_id);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -872,6 +872,7 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: source_cast,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1110,6 +1111,7 @@ impl KjDispatcher {
                     promoted_at: None,
                     demoted_at: None,
                     paused_at: None,
+                    cast_id: row.cast_id,
                 };
                 let default_ws =
                     match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1266,6 +1268,16 @@ impl KjDispatcher {
     }
 
     /// Apply a preset's settings to a context (post-fork).
+    /// Apply a preset's settings to a newly forked context (post-fork).
+    ///
+    /// A preset's `cast_id` (when set) assigns that cast to the context —
+    /// this is orthogonal to the context's `provider`/`model` override
+    /// column, so an explicit `--model` given at fork time (applied just
+    /// before this runs — see the caller) is never clobbered: cast
+    /// assignment and the per-context model override are resolved in
+    /// priority order at turn time (explicit override wins, then cast slot,
+    /// then registry default — `crate::model_resolution::resolve_context_model`),
+    /// never by one overwriting the other's column.
     async fn apply_preset(&self, context_id: ContextId, preset_label: &str) -> Result<(), String> {
         let preset = {
             let db = self.kernel_db().lock();
@@ -1274,32 +1286,17 @@ impl KjDispatcher {
                 .ok_or_else(|| format!("preset '{}' not found", preset_label))?
         };
 
-        // Update DB
-        {
-            let db = self.kernel_db().lock();
-            if preset.provider.is_some() || preset.model.is_some() {
-                db.update_model(
-                    context_id,
-                    preset.provider.as_deref(),
-                    preset.model.as_deref(),
-                )
+        let db = self.kernel_db().lock();
+        if let Some(cast_id) = preset.cast_id {
+            db.update_cast(context_id, Some(cast_id))
                 .map_err(|e| e.to_string())?;
-            }
-            db.update_settings(
-                context_id,
-                preset.system_prompt.as_deref(),
-                preset.consent_mode,
-            )
-            .map_err(|e| e.to_string())?;
         }
-
-        // Update DriftRouter
-        {
-            let mut drift = self.drift_router().write();
-            if let (Some(p), Some(m)) = (&preset.provider, &preset.model) {
-                let _ = drift.configure_llm(context_id, p, m);
-            }
-        }
+        db.update_settings(
+            context_id,
+            preset.system_prompt.as_deref(),
+            preset.consent_mode,
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -2835,6 +2832,168 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(child.workspace_id, Some(ws_id));
+    }
+
+    // ── Track D: cast inherits/assigns across fork ───────────────────────
+
+    /// A plain fork is the same ensemble's continuation by default — the
+    /// child inherits the source's assigned cast, same convention as
+    /// `fork_inherits_workspace`.
+    #[tokio::test]
+    async fn fork_inherits_cast_from_source() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+
+        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+        d.dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
+            .await;
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("child").unwrap().unwrap();
+        let cast = db.get_cast(child.cast_id.expect("cast inherited")).unwrap().unwrap();
+        assert_eq!(cast.label, "house");
+    }
+
+    /// A source with no cast forks a child with no cast — inheritance copies
+    /// the actual value, it doesn't invent one.
+    #[tokio::test]
+    async fn fork_of_uncast_source_leaves_child_uncast() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("child").unwrap().unwrap();
+        assert!(child.cast_id.is_none());
+    }
+
+    /// `--as` subtree fork copies the template's `cast_id` through with the
+    /// rest of the row (verifies the "fork inherits cast_id naturally with
+    /// the row copy" requirement for the subtree path too).
+    #[tokio::test]
+    async fn fork_as_subtree_copies_cast_id_from_template() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let template = register_context(&d, Some("template"), None, principal);
+        d.block_store()
+            .create_document(template, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(template);
+
+        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+        d.dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
+            .await;
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--as"), s("template"), s("--name"), s("clone")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "subtree fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("clone").unwrap().unwrap();
+        let cast = db.get_cast(child.cast_id.expect("cast copied from template")).unwrap().unwrap();
+        assert_eq!(cast.label, "house");
+    }
+
+    /// A preset carrying a `cast_id` assigns it to the newly forked context
+    /// — the narrowed preset apply path (Track D replaces the old
+    /// provider/model preset columns with a cast reference).
+    #[tokio::test]
+    async fn fork_preset_with_cast_assigns_it_to_the_child() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+
+        d.dispatch(&[s("cast"), s("create"), s("fast-cast")], &c).await;
+        d.dispatch(
+            &[s("preset"), s("save"), s("fastify"), s("--cast"), s("fast-cast")],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--name"), s("child"), s("--preset"), s("fastify")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork with preset failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("child").unwrap().unwrap();
+        let cast = db.get_cast(child.cast_id.expect("cast set by preset")).unwrap().unwrap();
+        assert_eq!(cast.label, "fast-cast");
+    }
+
+    /// "Explicit CLI flags still win": an explicit `--model` at fork time is
+    /// never clobbered by a preset's cast assignment — they are orthogonal
+    /// columns (`apply_preset`'s doc comment), resolved in priority order at
+    /// turn time, not by one overwriting the other's column.
+    #[tokio::test]
+    async fn fork_explicit_model_override_survives_preset_cast_assignment() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+
+        d.dispatch(&[s("cast"), s("create"), s("fast-cast")], &c).await;
+        d.dispatch(
+            &[s("preset"), s("save"), s("fastify"), s("--cast"), s("fast-cast")],
+            &c,
+        )
+        .await;
+        // Registered AFTER the cast/preset writes above: both mutate via
+        // `reload_llm_registry`, which rebuilds the registry live from the
+        // DB and would otherwise wipe this ad-hoc (non-persisted) provider.
+        register_mock_provider(&d).await;
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("child"),
+                    s("--preset"),
+                    s("fastify"),
+                    s("--model"),
+                    s("mock/explicit-model"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("child").unwrap().unwrap();
+        assert_eq!(child.provider.as_deref(), Some("mock"), "explicit --model provider wins");
+        assert_eq!(child.model.as_deref(), Some("explicit-model"), "explicit --model wins");
+        let cast = db.get_cast(child.cast_id.expect("cast still assigned by preset")).unwrap().unwrap();
+        assert_eq!(cast.label, "fast-cast", "preset's cast assignment is untouched");
     }
 
     // ====================================================================

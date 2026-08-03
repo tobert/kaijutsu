@@ -553,6 +553,7 @@ impl KjDispatcher {
                             promoted_at: None,
                             demoted_at: None,
                             paused_at: None,
+                            cast_id: None,
                         };
                         if let Err(e) = db.insert_context_with_document(&row, ws) {
                             tracing::error!("failed to persist lost+found context row: {e}");

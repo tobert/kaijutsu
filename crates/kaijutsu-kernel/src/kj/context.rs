@@ -47,6 +47,11 @@ pub(crate) struct ContextConfigArgs {
     /// rc-dispatch context_type (selects which /etc/rc scripts run)
     #[arg(long = "type")]
     type_: Option<String>,
+    /// Cast label — the named model ensemble this context plays under
+    /// (`kj cast show <label>`). Must already exist; to clear an assigned
+    /// cast use `kj context unset --cast`.
+    #[arg(long)]
+    cast: Option<String>,
 }
 
 impl From<ContextConfigArgs> for ContextConfig {
@@ -58,6 +63,7 @@ impl From<ContextConfigArgs> for ContextConfig {
             cwd_spec: a.cwd,
             env_spec: a.env,
             type_spec: a.type_,
+            cast_spec: a.cast,
         }
     }
 }
@@ -102,12 +108,16 @@ enum ContextCommand {
         #[command(flatten)]
         config: ContextConfigArgs,
     },
-    /// Remove an env var from a context.
+    /// Remove an env var from a context, or clear its assigned cast.
     Unset {
         context: Option<String>,
         /// Env var key to remove
         #[arg(long)]
         env: Option<String>,
+        /// Clear the context's assigned cast (falls back to the registry
+        /// default at resolution time)
+        #[arg(long)]
+        cast: bool,
     },
     /// Show fork lineage from a context up to root (default: current).
     Log { context: Option<String> },
@@ -182,6 +192,9 @@ struct ContextConfig {
     cwd_spec: Option<String>,
     env_spec: Option<String>,
     type_spec: Option<String>,
+    /// `--cast <label>` — resolved + validated against `list_casts` in
+    /// [`KjDispatcher::resolve_context_config`] before any mutation.
+    cast_spec: Option<String>,
 }
 
 /// A `--model` spec resolved against the LLM registry: a bare model name has
@@ -192,19 +205,23 @@ struct ResolvedModel {
 }
 
 impl KjDispatcher {
-    /// Validate user-supplied config and resolve `--model` BEFORE any mutation.
+    /// Validate user-supplied config and resolve `--model`/`--cast` BEFORE
+    /// any mutation.
     ///
     /// Checks provider existence, consent-mode spelling, and `--env KEY=VALUE`
     /// shape, and resolves a bare model name (no `provider/` prefix) to the
     /// registry's default provider — erroring if none is configured, exactly
-    /// like `kj fork`. Pure checks plus an async registry read, no DB writes,
-    /// so callers can bail out cleanly without leaving a half-configured (or
-    /// orphan) context behind. Returns the resolved model when `--model` was
-    /// given, else `None`.
+    /// like `kj fork`. A `--cast <label>` is resolved against `list_casts`
+    /// the same way: an unknown label fails loud, listing the known casts,
+    /// rather than silently leaving the context uncast. Pure checks plus a
+    /// registry read and a `kernel_db` read, no writes, so callers can bail
+    /// out cleanly without leaving a half-configured (or orphan) context
+    /// behind. Returns the resolved model / cast when the corresponding flag
+    /// was given, else `None`.
     async fn resolve_context_config(
         &self,
         cfg: &ContextConfig,
-    ) -> Result<Option<ResolvedModel>, String> {
+    ) -> Result<(Option<ResolvedModel>, Option<kaijutsu_types::CastId>), String> {
         let resolved_model = match cfg.model_spec {
             Some(ref spec) if !spec.is_empty() => {
                 let registry = self.kernel().llm().read().await;
@@ -226,7 +243,32 @@ impl KjDispatcher {
         {
             return Err("--env requires KEY=VALUE format".to_string());
         }
-        Ok(resolved_model)
+
+        let resolved_cast = match cfg.cast_spec {
+            Some(ref label) if !label.is_empty() => {
+                let db = self.kernel_db().lock();
+                match db.get_cast_by_label(label) {
+                    Ok(Some(cast)) => Some(cast.cast_id),
+                    Ok(None) => {
+                        let known: Vec<String> = db
+                            .list_casts()
+                            .map(|casts| casts.iter().map(|c| c.label.clone()).collect())
+                            .unwrap_or_default();
+                        let known = if known.is_empty() {
+                            "(no casts configured — `kj cast create <label>` starts one)"
+                                .to_string()
+                        } else {
+                            known.join(", ")
+                        };
+                        return Err(format!("unknown cast '{label}' — known casts: {known}"));
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            _ => None,
+        };
+
+        Ok((resolved_model, resolved_cast))
     }
 
     /// Apply already-validated config to an existing context row and return
@@ -240,6 +282,7 @@ impl KjDispatcher {
         target_id: ContextId,
         cfg: &ContextConfig,
         resolved_model: Option<&ResolvedModel>,
+        resolved_cast: Option<kaijutsu_types::CastId>,
     ) -> Result<Vec<String>, String> {
         let (changes, model_for_drift) = {
             let db = self.kernel_db().lock();
@@ -256,6 +299,15 @@ impl KjDispatcher {
                 if let (Some(p), Some(m)) = (&rm.provider, &rm.model) {
                     model_for_drift = Some((p.clone(), m.clone()));
                 }
+            }
+
+            if let Some(cast_id) = resolved_cast {
+                db.update_cast(target_id, Some(cast_id))
+                    .map_err(|e| e.to_string())?;
+                // `cast_spec` is the original argv label — guaranteed present
+                // here since `resolved_cast` is Some only when it was given.
+                let label = cfg.cast_spec.as_deref().unwrap_or("?");
+                changes.push(format!("cast={label}"));
             }
 
             // consent_spec is validated upstream; treat a parse miss as absent.
@@ -388,8 +440,8 @@ impl KjDispatcher {
             ContextCommand::Set { context, config } => {
                 self.context_set(context.as_deref(), config.into(), caller).await
             }
-            ContextCommand::Unset { context, env } => {
-                self.context_unset(context.as_deref(), env.as_deref(), caller)
+            ContextCommand::Unset { context, env, cast } => {
+                self.context_unset(context.as_deref(), env.as_deref(), cast, caller)
             }
             ContextCommand::Log { context } => self.context_log(context.as_deref(), caller),
             ContextCommand::Move {
@@ -420,10 +472,17 @@ impl KjDispatcher {
 
     async fn context_list(&self, tree: bool, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
+        // Resolved once per listing, never per-row — the operator-scale
+        // `casts` table is small and this keeps the list a single DB round
+        // trip beyond the context query itself.
+        let casts: std::collections::HashMap<kaijutsu_types::CastId, String> = db
+            .list_casts()
+            .map(|cs| cs.into_iter().map(|c| (c.cast_id, c.label)).collect())
+            .unwrap_or_default();
         if tree {
             match db.context_dag() {
                 Ok(dag) => {
-                    let text = format_context_tree(&dag, caller.context_id);
+                    let text = format_context_tree(&dag, caller.context_id, &casts);
                     let ids = context_handles(dag.iter().map(|(row, _)| row));
                     KjResult::ok_with_data(text, ids)
                 }
@@ -432,7 +491,7 @@ impl KjDispatcher {
         } else {
             match db.list_active_contexts() {
                 Ok(contexts) => {
-                    let text = format_context_table(&contexts, caller.context_id);
+                    let text = format_context_table(&contexts, caller.context_id, &casts);
                     let ids = context_handles(contexts.iter());
                     KjResult::ok_with_data(text, ids)
                 }
@@ -458,6 +517,7 @@ impl KjDispatcher {
             usage,
             workspace_paths,
             workspace_label,
+            cast_label,
         ) = {
             let db = self.kernel_db().lock();
 
@@ -513,6 +573,15 @@ impl KjDispatcher {
                 .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
                 .map(|ws| ws.label);
 
+            // Cast label — the row only carries the id; resolve it here for
+            // display the same way `workspace_label` above resolves a
+            // `workspace_id`. A dangling id (cast removed between reads)
+            // shows as absent, not an error.
+            let cast_label = row
+                .cast_id
+                .and_then(|cid| db.get_cast(cid).ok().flatten())
+                .map(|c| c.label);
+
             (
                 row,
                 children_count,
@@ -525,6 +594,7 @@ impl KjDispatcher {
                 usage,
                 workspace_paths,
                 workspace_label,
+                cast_label,
             )
         };
 
@@ -601,6 +671,10 @@ impl KjDispatcher {
             }
         }
 
+        if let Some(ref label) = cast_label {
+            info.push_str(&format!("\nCast:    {label}"));
+        }
+
         // Structured record: full ids and the same fields the text view
         // surfaces, so `kaish-last` round-trips and per-field jq queries work.
         let record = serde_json::json!({
@@ -620,6 +694,8 @@ impl KjDispatcher {
             "workspace_id": row.workspace_id.map(|id| id.to_hex()),
             "workspace_label": workspace_label,
             "preset_id": row.preset_id.map(|id| id.to_hex()),
+            "cast_id": row.cast_id.map(|id| id.to_hex()),
+            "cast_label": cast_label,
             "cwd": shell.as_ref().and_then(|s| s.cwd.clone()),
             "env": env_vars.iter()
                 .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
@@ -740,8 +816,8 @@ impl KjDispatcher {
         // "context_type is an rc bundle of features".
 
         // Validate + resolve the rest before any mutation so a typo'd
-        // --model/--consent/--env can't leave an orphan context behind.
-        let resolved_model = match self.resolve_context_config(&cfg).await {
+        // --model/--cast/--consent/--env can't leave an orphan context behind.
+        let (resolved_model, resolved_cast) = match self.resolve_context_config(&cfg).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         };
@@ -776,6 +852,7 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -805,11 +882,11 @@ impl KjDispatcher {
             }
         }
 
-        // Apply settable config (model, system-prompt, consent, cwd, env) now
-        // that the row and drift handle exist. Validated above; only DB I/O
-        // errors surface here.
+        // Apply settable config (model, cast, system-prompt, consent, cwd,
+        // env) now that the row and drift handle exist. Validated above;
+        // only DB I/O errors surface here.
         let config_changes = match self
-            .apply_context_config(new_id, &cfg, resolved_model.as_ref())
+            .apply_context_config(new_id, &cfg, resolved_model.as_ref(), resolved_cast)
             .await
         {
             Ok(changes) => changes,
@@ -882,6 +959,7 @@ impl KjDispatcher {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
@@ -900,15 +978,15 @@ impl KjDispatcher {
         ))
     }
 
-    /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
+    /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
     async fn context_set(
         &self,
         target_arg: Option<&str>,
         cfg: ContextConfig,
         caller: &KjCaller,
     ) -> KjResult {
-        // Validate + resolve the model before touching the DB.
-        let resolved_model = match self.resolve_context_config(&cfg).await {
+        // Validate + resolve the model/cast before touching the DB.
+        let (resolved_model, resolved_cast) = match self.resolve_context_config(&cfg).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj context set: {e}")),
         };
@@ -923,7 +1001,7 @@ impl KjDispatcher {
         };
 
         match self
-            .apply_context_config(target_id, &cfg, resolved_model.as_ref())
+            .apply_context_config(target_id, &cfg, resolved_model.as_ref(), resolved_cast)
             .await
         {
             Ok(changes) if changes.is_empty() => {
@@ -939,6 +1017,7 @@ impl KjDispatcher {
         &self,
         target_arg: Option<&str>,
         env_key: Option<&str>,
+        clear_cast: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let db = self.kernel_db().lock();
@@ -953,8 +1032,13 @@ impl KjDispatcher {
                 Ok(false) => KjResult::Err(format!("kj context unset: env var '{}' not set", key)),
                 Err(e) => KjResult::Err(format!("kj context unset: {e}")),
             }
+        } else if clear_cast {
+            match db.update_cast(target_id, None) {
+                Ok(()) => KjResult::ok("cleared cast".to_string()),
+                Err(e) => KjResult::Err(format!("kj context unset: {e}")),
+            }
         } else {
-            KjResult::Err("kj context unset: requires --env KEY".to_string())
+            KjResult::Err("kj context unset: requires --env KEY or --cast".to_string())
         }
     }
 
@@ -3193,6 +3277,108 @@ mod tests {
         let row = db.get_context(target).unwrap().expect("target row");
         assert_eq!(row.provider.as_deref(), Some("lemonade"));
         assert_eq!(row.model.as_deref(), Some("Gemma-4-E4B-it-GGUF"));
+    }
+
+    // ── Track D: cast-on-context ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn context_create_with_cast_assigns_it() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let c = caller_with_context(parent);
+
+        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+
+        let result = d
+            .dispatch(
+                &[s("context"), s("create"), s("kid"), s("--cast"), s("house")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let id = db.resolve_context("kid").expect("kid should exist");
+        let row = db.get_context(id).unwrap().expect("kid row");
+        let cast = db.get_cast(row.cast_id.expect("cast_id set")).unwrap().unwrap();
+        assert_eq!(cast.label, "house");
+    }
+
+    #[tokio::test]
+    async fn context_create_with_unknown_cast_fails_loud_listing_known_casts() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let c = caller_with_context(parent);
+
+        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+
+        let result = d
+            .dispatch(
+                &[s("context"), s("create"), s("kid"), s("--cast"), s("nonesuch")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "unknown cast must be rejected");
+        assert!(
+            result.message().contains("unknown cast") && result.message().contains("house"),
+            "error should list known casts: {}",
+            result.message()
+        );
+
+        // The context must not have been created (orphan-context guard).
+        let db = d.kernel_db().lock();
+        assert!(db.resolve_context("kid").is_err(), "kid must not exist");
+    }
+
+    #[tokio::test]
+    async fn context_set_assigns_and_unset_clears_cast() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("target"), None, principal);
+        let c = caller_with_context(target);
+
+        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
+            .await;
+        assert!(result.is_ok(), "set --cast failed: {}", result.message());
+        {
+            let db = d.kernel_db().lock();
+            let row = db.get_context(target).unwrap().unwrap();
+            let cast = db.get_cast(row.cast_id.expect("cast_id set")).unwrap().unwrap();
+            assert_eq!(cast.label, "house");
+        }
+
+        let result = d
+            .dispatch(&[s("context"), s("unset"), s("--cast")], &c)
+            .await;
+        assert!(result.is_ok(), "unset --cast failed: {}", result.message());
+        let db = d.kernel_db().lock();
+        let row = db.get_context(target).unwrap().unwrap();
+        assert!(row.cast_id.is_none(), "cast cleared");
+    }
+
+    #[tokio::test]
+    async fn context_info_and_list_surface_the_cast_label() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("staffed"), None, principal);
+        let c = caller_with_context(target);
+
+        d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+        d.dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
+            .await;
+
+        let info = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(info.is_ok());
+        assert!(info.message().contains("Cast:    house"), "info: {}", info.message());
+
+        let list = d.dispatch(&[s("context"), s("list")], &c).await;
+        assert!(list.is_ok());
+        assert!(list.message().contains("[cast:house]"), "list: {}", list.message());
     }
 
     #[tokio::test]

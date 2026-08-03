@@ -970,6 +970,7 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             },
             ws_id,
         )
@@ -1071,6 +1072,7 @@ mod tests {
                 promoted_at: None,
                 demoted_at: None,
                 paused_at: None,
+                cast_id: None,
             },
             ws_id,
         )

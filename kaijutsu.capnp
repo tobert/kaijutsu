@@ -613,14 +613,32 @@ struct ContextHandleInfo {
   backgroundLastExitCode @27 :Int32 = -1;       # exit code for an "exited" finish; -1 sentinel = "killed" or none
                                                  # (real exit codes, incl. 128+signal, are never negative — see
                                                  # background_exec.rs's exit_code_from_status)
+
+  # Track D (cast-on-context, 2026-08-03): the named model ensemble this
+  # context plays under (`ContextRow::cast_id`, resolved to its label
+  # kernel-side — the wire never ships a bare CastId for the app to look up
+  # itself). Empty = no cast assigned (falls through to the registry default
+  # at resolution time; see `kaijutsu-kernel`'s `model_resolution` module).
+  castLabel @28 :Text;
 }
 
 struct PresetInfo {
   id @0 :Data;                    # 16-byte PresetId (UUIDv7)
   label @1 :Text;
   description @2 :Text;
-  provider @3 :Text;
-  model @4 :Text;
+
+  # Track D (2026-08-03): the `presets` table's `provider`/`model` columns
+  # are demolished — a preset now narrows to a cast reference instead of
+  # pinning a provider/model pair itself ("cast = who plays; preset = patch
+  # recall over verb args"). capnp ordinals are dense and never renumbered,
+  # so @3/@4 stay DECLARED but UNUSED (the server never sets them; always
+  # empty on the wire) rather than removed — `castLabel` (resolved
+  # kernel-side, same convention as `ContextHandleInfo.castLabel`) is the
+  # additive replacement at @5. Empty = the preset moves no model knobs (the
+  # three factory presets' shape).
+  provider @3 :Text; # UNUSED since Track D — always empty; do not repurpose
+  model @4 :Text;    # UNUSED since Track D — always empty; do not repurpose
+  castLabel @5 :Text;
 }
 
 struct SimilarContext {
