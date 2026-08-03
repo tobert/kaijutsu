@@ -256,8 +256,22 @@ can wait.**
    matches the rten in-process precedent. Caveat named: candle's AMD/
    Vulkan GPU story is weak and zorak is Strix Halo — but the encoder
    lane runs fine on CPU (bge-small already proves the shape; a 350M
-   classify is tens of ms). Community proof candle runs lfm2: MioTTS
-   drives LFM2-2.6B on candle, no Python.
+   classify is tens of ms).
+
+   **Searched 2026-08-03 — the crate does NOT exist; scoped as a new
+   ~/src-level project** (Amy: "might be a fun new ~/src level project").
+   Upstream candle-transformers already ships `lfm2.rs` +
+   `quantized_lfm2.rs` — the CAUSAL branch, i.e. the hard hybrid blocks
+   (gated short conv + GQA) are done. Nobody has the encoder branch:
+   crates.io LFM2 hits are internals of other projects (candle-miotts TTS,
+   bebelm 8B CPU, two VL runners), none reusable, none bidirectional.
+   Project shape: adapt upstream blocks → drop causal mask
+   (`Lfm2BidirectionalModel`) → map 2.5-encoder checkpoint weights →
+   three heads in increments: sequence-classification (Router),
+   token-classification (PII/Policy-Linter), pooled embedding
+   (Embedding-350M; ColBERT later). Upstream-PR-shaped if it comes out
+   clean — candle takes model contributions. Amy reads AI policies before
+   we interact with any outside repo, per standing practice.
 2. **Generation models: llama.cpp servers stay EXTERNAL** — kaijutsu
    already speaks to them as openai-kind backends; Vulkan works there.
    `llama-cpp-2` in-process is the fallback only if candle CPU perf
