@@ -248,22 +248,37 @@ our seams. Surveyed 2026-08-03 (HF API, live):
 stays pure-Rust/light-build; "candle might be cool there though." Kaibo
 can wait.**
 
-1. **kaijutsu: llama.cpp / GGUF** — official artifacts, lfm2 arch
-   upstreamed by LiquidAI, Vulkan on zorak. In-process via `llama-cpp-2`
-   for classifiers (router eval), or the existing openai-kind backend
-   route for generation/embedding servers.
-2. **kaibo (later): candle** — pure-Rust; proven runnable (community
-   MioTTS runs LFM2-2.6B on candle, no Python). Classifier-head plumbing
-   is ours to write; keeps kaibo's toolchain C++-free and its stdio-only
-   invariant untouched (in-process, no socket).
-3. **rten/ONNX** — only if we want index-pipeline symmetry; `lfm2` hybrid
+1. **Small encoders (router/guards/embedding): candle in-process, BOTH
+   projects** (Amy 2026-08-03: "maybe candle here too"). Write the `lfm2`
+   bidirectional-encoder + classifier-head implementation ONCE as its own
+   small crate; kaijutsu consumes first, kaibo later. Keeps workspace
+   builds pure-Rust (no cmake/C++ bolt-on next to Bevy), Mac-clean, and
+   matches the rten in-process precedent. Caveat named: candle's AMD/
+   Vulkan GPU story is weak and zorak is Strix Halo — but the encoder
+   lane runs fine on CPU (bge-small already proves the shape; a 350M
+   classify is tens of ms). Community proof candle runs lfm2: MioTTS
+   drives LFM2-2.6B on candle, no Python.
+2. **Generation models: llama.cpp servers stay EXTERNAL** — kaijutsu
+   already speaks to them as openai-kind backends; Vulkan works there.
+   `llama-cpp-2` in-process is the fallback only if candle CPU perf
+   disappoints or the arch port stalls.
+3. **rten/ONNX** — only for index-pipeline symmetry; `lfm2` hybrid
    conv+attention arch is a real conversion risk; verify via embed_check.
 4. LEAP (Liquid's edge SDK) — phones/edge, not our shape.
 
-Deep-dive order when Amy picks this up: Router eval offline (kaijutsu,
-llama-cpp-2 or a scratch llama.cpp server) → Embedding-350M swap eval
-against bge-small on the real index corpus → kaibo guard embed via candle
-(PII+injection on explorer reads) when kaibo's turn comes.
+**Side quest (Amy 2026-08-03): fine-tuning LFM encoders for other things,
+"like some music things."** The 230M/350M bases LoRA cheaply (moltar's
+GPU ample; LiquidAI ships TRL-compatible fine-tune recipes). Music angle
+stays symbolic per doctrine — the score is text (ABC, patterns), so
+encoder fine-tunes can tag phrase style, classify patterns, or judge
+groove-fit without audio ever riding the wire. Also the substrate for
+our own boundary classifiers.
+
+Deep-dive order when Amy picks this up: lfm2-encoder-in-candle crate +
+Router eval offline (a scratch llama.cpp server is fine for the eval
+itself) → Embedding-350M swap eval against bge-small on the real index
+corpus → kaibo guard embed dropping in the shared crate → fine-tune
+side quest.
 
 ## Cast follow-ups (seeded 2026-08-03, casts shipped same day — devlog "Contexts join a band")
 
