@@ -336,11 +336,11 @@ pub struct ModelAlias {
 /// provider's `build()` interprets the per-wire mapping from there (Claude:
 /// `thinking_style`/`thinking_budget`/`effort` → `thinking`, with
 /// temperature/top_p dropped whenever thinking ends up on; DeepSeek/OpenAI:
-/// `effort` → `reasoning_effort` or a structural disable). Nothing wires a
-/// context's *own* cast slot through yet — `apply_slot_tunables` is called
-/// with `slot: None` from `kaijutsu-server/src/llm_stream.rs` today, so only
-/// the bare `llm_defaults` floor applies; a follow-up supplies the context's
-/// resolved cast seat through that same seam.
+/// `effort` → `reasoning_effort` or a structural disable). **Track D's
+/// stitch** closed the loop: `kaijutsu-server/src/llm_stream.rs` resolves the
+/// context's cast seat via `model_resolution::resolve_context_model` and
+/// passes its tunables through `apply_slot_tunables`; a context with no cast
+/// seat gets the bare `llm_defaults` floor.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlotTunables {
     /// Maximum RESPONSE tokens. Not the context window — a different number.

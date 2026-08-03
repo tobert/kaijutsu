@@ -195,15 +195,21 @@ impl KjDispatcher {
         };
         let ctx_ref = parsed.context;
 
-        // Read the context row (its explicit provider/model columns, if any).
-        let (ctx_id, row_provider, row_model) = {
+        // Read the context row: explicit provider/model columns, plus the
+        // context_type + cast label the turn path resolves through.
+        let (ctx_id, row_provider, row_model, context_type, cast_label) = {
             let db = self.kernel_db().lock();
             let ctx_id = match refs::resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj model: {e}")),
             };
             match db.get_context(ctx_id) {
-                Ok(Some(row)) => (ctx_id, row.provider, row.model),
+                Ok(Some(row)) => {
+                    let cast_label = row.cast_id.and_then(|id| {
+                        db.get_cast(id).ok().flatten().map(|c| c.label)
+                    });
+                    (ctx_id, row.provider, row.model, row.context_type, cast_label)
+                }
                 Ok(None) => {
                     return KjResult::Err(format!(
                         "kj model: context {} not found",
@@ -214,18 +220,31 @@ impl KjDispatcher {
             }
         };
 
-        // Effective model: the row's column when set, else the registry default
-        // the context falls through to at turn time. Acquire the registry
-        // lock unconditionally (not just on the fallback branch) — the
-        // context-window lookup below needs it regardless of `source`.
+        // Effective model via `resolve_context_model` — the SAME ladder the
+        // turn path walks (explicit override → cast slot on context_type →
+        // registry default), so this verb can never disagree with what a
+        // turn actually runs. Acquire the registry lock unconditionally —
+        // the context-window lookup below needs it regardless of `source`.
         let registry = self.kernel().llm().read().await;
-        let (provider, model, source) = match row_model {
-            Some(m) => (row_provider, Some(m), "context"),
-            None => (
-                registry.default_provider_name().map(str::to_string),
-                registry.default_model().map(str::to_string),
-                "default",
-            ),
+        let resolved = crate::model_resolution::resolve_context_model(
+            &context_type,
+            row_provider.as_deref(),
+            row_model.as_deref(),
+            cast_label.as_deref(),
+            &registry,
+        );
+        let (provider, model, source) = match resolved {
+            Some(r) => {
+                let source = match &r.source {
+                    crate::model_resolution::ModelSource::ContextOverride => "context".to_string(),
+                    crate::model_resolution::ModelSource::CastSlot { cast } => {
+                        format!("cast {cast}")
+                    }
+                    crate::model_resolution::ModelSource::RegistryDefault => "default".to_string(),
+                };
+                (Some(r.backend), Some(r.model), source)
+            }
+            None => (None, None, "default".to_string()),
         };
 
         // Context window for the effective model, via the SAME
@@ -252,13 +271,16 @@ impl KjDispatcher {
             None => "unknown".to_string(),
         };
 
-        let message = if source == "context" {
-            format!("{}: {display} [context: {window_display}]", ctx_id.short())
-        } else {
-            format!(
+        let message = match source.as_str() {
+            "context" => format!("{}: {display} [context: {window_display}]", ctx_id.short()),
+            "default" => format!(
                 "{}: {display} (registry default) [context: {window_display}]",
                 ctx_id.short()
-            )
+            ),
+            cast => format!(
+                "{}: {display} (via {cast}) [context: {window_display}]",
+                ctx_id.short()
+            ),
         };
 
         KjResult::ok_ephemeral_with_data(
@@ -636,5 +658,81 @@ mod tests {
         let mut c = test_caller();
         c.context_id = None;
         c
+    }
+
+    /// The 2026-08-03 deepseek-review P0: `kj model` answered from its own
+    /// two-rung ladder (row column → registry default) while the turn path
+    /// resolved through the cast slot — a cast-seated context showed the
+    /// default model here but RAN the cast's model. Both surfaces now walk
+    /// `resolve_context_model`, so this pins the cast rung end-to-end
+    /// through the kj verbs and the DB-reloaded registry.
+    #[tokio::test]
+    async fn model_reports_the_cast_slot_the_turn_path_would_run() {
+        let d = test_dispatcher().await;
+        {
+            let mut db = d.kernel_db().lock();
+            crate::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
+                .unwrap();
+        }
+        d.reload_llm_registry().await.unwrap();
+        // `context create` forks the structural edge from the caller's
+        // context, so the caller needs a real registered one (FK).
+        let principal = PrincipalId::new();
+        let parent =
+            crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
+        let c = crate::kj::test_helpers::caller_with_context(parent);
+
+        d.dispatch(&[s("cast"), s("create"), s("band")], &c).await;
+        let r = d
+            .dispatch(
+                &[
+                    s("cast"),
+                    s("slot"),
+                    s("set"),
+                    s("band"),
+                    s("coder"),
+                    s("--backend"),
+                    s("deepseek"),
+                    s("--model"),
+                    s("deepseek-v4-pro"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(r.is_ok(), "slot set failed: {}", r.message());
+        let r = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("create"),
+                    s("probe"),
+                    s("--type"),
+                    s("coder"),
+                    s("--cast"),
+                    s("band"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(r.is_ok(), "context create failed: {}", r.message());
+
+        let result = d.dispatch(&[s("model"), s("--context"), s("probe")], &c).await;
+        assert!(result.is_ok(), "model failed: {}", result.message());
+        let msg = result.message();
+        assert!(
+            msg.contains("deepseek/deepseek-v4-pro"),
+            "reports the cast slot's model, not the registry default: {msg}"
+        );
+        assert!(msg.contains("via cast band"), "names the cast as the source: {msg}");
+        let data = match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => v,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(data["source"], "cast band");
+        assert_eq!(data["provider"], "deepseek");
+        assert_eq!(data["model"], "deepseek-v4-pro");
+        // The floor pins deepseek-v4-pro's window, so the gauge input rides
+        // along instead of "unknown".
+        assert_eq!(data["context_window"], 1_000_000);
     }
 }
