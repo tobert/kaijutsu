@@ -162,7 +162,7 @@ offline.
 
 **What ort does for us:** [ort](https://ort.pyke.io/) embeds ONNX Runtime
 so the kernel runs the embedding model (bge-small-en-v1.5, configured in
-`models.toml` `[embedding]`) in-process. It powers semantic search across
+the `embedding_config` table) in-process. It powers semantic search across
 contexts, constellation clustering, and the keyword/gist synthesis shown
 on well cards — all without a network call. The `download-binaries`
 feature fetches the ONNX Runtime shared library at build time.

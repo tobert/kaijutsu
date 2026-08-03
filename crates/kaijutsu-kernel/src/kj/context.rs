@@ -601,10 +601,10 @@ impl KjDispatcher {
         // Context-window denominator: resolved kernel-side (never shipped to
         // the client as raw inputs to derive) via the same
         // `LlmRegistry::context_window_for_live(provider, model)` `kj model`
-        // already uses — config (models.toml) wins as an override; absent
+        // already uses — the configured backend model metadata wins as an override; absent
         // that, a live Anthropic `GET /v1/models/{id}` lookup (cached) fills
         // the honest gaps config never had (e.g. `claude-sonnet-4-20250514`,
-        // deliberately unset in models.toml). `None` when neither source
+        // deliberately unset in the backend model metadata). `None` when neither source
         // knows the window — the two fields below MUST both be `null` in
         // that case, never a guessed denominator standing in for one. The
         // percentage itself comes from
@@ -2979,7 +2979,7 @@ mod tests {
     }
 
     /// The flip side: once `LlmRegistry::context_window_for` resolves a real
-    /// window (mirroring how it's populated from `models.toml` in
+    /// window (mirroring how it's populated from the backend model metadata in
     /// production), `kj context info --json` must compute the percentage
     /// kernel-side from the LAST call's fill — not fabricate it, not leave it
     /// null, and not clamp a result over 100% (this project's standing
@@ -3182,7 +3182,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_create_resolves_model_alias() {
-        // `--model local` must expand the `models.toml` alias to its concrete
+        // `--model local` must expand the registry alias to its concrete
         // provider/model BEFORE storage — otherwise "local" ships to the default
         // provider at turn time and 404s (`not_found_error: model: local`).
         let d = test_dispatcher().await;

@@ -21,9 +21,8 @@ doctrine (CLAUDE.md):
 
 - **Whole-file** parse failure (bad TOML syntax, or a field shape `serde`
   can't coerce at all) is the caller's problem: `Err`, and callers fall back
-  to the embedded default, loudly logged — same shape as
-  `kaijutsu-server::rpc::initialize_kernel_models`'s handling of
-  `models.toml`.
+  to the embedded default, loudly logged — the same embedded-default fallback
+  shape the kernel's other config files use.
 - **Per-entry** semantic failure (stdio transport with no `command`,
   `streamable_http` with no `url`, an unrecognized `transport` string) does
   **not** fail the whole file — the entry is dropped and a human-readable

@@ -57,7 +57,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Default model to use when none specified.
-pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Mock LLM client for testing — returns a canned response.
 #[cfg(any(test, feature = "test-mock"))]
@@ -828,7 +827,7 @@ impl LlmRegistry {
 
     /// Live-lookup variant of [`Self::context_window_for`].
     ///
-    /// Precedence: the config-declared `context_window` (`models.toml`) is
+    /// Precedence: the config-declared `context_window` (backend_models) is
     /// checked FIRST and, when present, returned immediately — config is
     /// always the override, and no network is attempted if it hits. Only
     /// when config has no entry AND the resolved provider is Anthropic does

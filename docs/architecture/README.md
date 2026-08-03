@@ -261,7 +261,7 @@ retroactively).
 | `KernelDb` | SQLite (WAL) | Contexts, edges, presets, workspaces, document registry, CRDT **oplog + snapshots**, input-doc oplog, per-context shell cwd/env, tool bindings, hooks, cache breakpoints, hydration markers. |
 | CRDT documents | in-memory + oplog | Live block stores; cold start = latest snapshot + oplog replay. |
 | CAS (`FileStore`) | sharded files | Content-addressed blobs (BLAKE3-truncated 128-bit hash), images, large bodies. |
-| Config | CRDT doc → TOML | `theme.toml`, `models.toml`, `mcp.toml`, `system.md`; CRDT is source of truth, disk is a debounced flush + reload-on-change. |
+| Config | CRDT doc → TOML | `theme.toml`, `mcp.toml`, `system.md`; CRDT is source of truth, disk is a debounced flush + reload-on-change. Model config is NOT here — it lives in kernel-db tables (`kj backend/cast/alias`, 2026-08-03). |
 | rc scripts | real files | `~/.config/kaijutsu/rc/...` lifecycle scripts; seeded once from embedded defaults. |
 | `auth.db` | SQLite | Principals + SSH credentials. |
 

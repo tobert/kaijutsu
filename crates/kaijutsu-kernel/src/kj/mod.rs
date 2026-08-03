@@ -625,7 +625,7 @@ impl KjDispatcher {
         // Distillation model resolution:
         //   1. explicit `--distill-model` → the SAME grammar as `--model`
         //      (`resolve_model_choice`): `provider/model` slash form with a
-        //      validated provider, `models.toml` aliases, the loud
+        //      validated provider, registry aliases, the loud
         //      `provider:model` colon footgun, bare name → default provider.
         //      Before this, the override went through `resolve_model`, which
         //      doesn't parse the slash — so the very `provider/model` form the

@@ -71,7 +71,6 @@ pub use kaijutsu_types::DocKind;
 pub use kernel::Kernel;
 pub use llm::{
     // Default model
-    DEFAULT_MODEL,
     // Configuration (SQL-native: kernel_db is the source of truth)
     BackendConfig,
     BackendKind,

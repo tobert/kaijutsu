@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(data["model"], "deepseek-r1");
         assert_eq!(data["provider"], "deepseek");
         assert_eq!(data["source"], "context", "column-set → source=context");
-        // "deepseek" has no ProviderConfig at all in seed_registry — the
+        // "deepseek" has no configured models at all in seed_registry — the
         // window must be an explicit null, never a fabricated number.
         assert!(
             data["context_window"].is_null(),
@@ -517,7 +517,7 @@ mod tests {
     /// `llm/mod.rs` and `llm/claude/mod.rs`): a model config leaves
     /// unconfigured resolves through `kj model`'s live fallback when the
     /// (faked) Anthropic API knows about it — closing the exact gap
-    /// `claude-sonnet-4-20250514` has in production models.toml.
+    /// `claude-sonnet-4-20250514` has in the backend model metadata.
     #[tokio::test]
     async fn model_resolves_context_window_via_live_fallback_when_config_absent() {
         let d = test_dispatcher().await;

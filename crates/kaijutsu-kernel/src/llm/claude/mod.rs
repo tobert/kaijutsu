@@ -46,7 +46,7 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 ///
 /// `model_window_cache` + `capability_source` back the live
 /// `GET /v1/models/{id}` context-window lookup (see [`Self::context_window`])
-/// — models.toml's hand-maintained `context_window` is checked first by the
+/// — the configured `context_window` (backend_models) is checked first by the
 /// caller (`LlmRegistry::context_window_for_live`); this is the fallback
 /// when that's absent. `capability_source` is the test seam: production
 /// code gets `HttpModelCapabilitySource` (a real network call), tests inject
@@ -155,7 +155,7 @@ impl Client {
 
     /// Live context-window lookup for `model`, cached for the life of this
     /// `Client`. Checked by [`crate::llm::LlmRegistry::context_window_for_live`]
-    /// only after the config path (`models.toml`'s `context_window`) came up
+    /// only after the config path (the backend's configured `context_window`) came up
     /// empty — config is always the override, this is the fallback.
     ///
     /// A cache hit never touches the network. On a miss, awaits

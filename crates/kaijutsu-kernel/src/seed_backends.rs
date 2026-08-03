@@ -1,5 +1,5 @@
-//! Factory LLM configuration — the backends, their known context windows, and
-//! the defaults a fresh kernel is born with.
+//! Factory LLM configuration — the backends, their known context windows, the
+//! defaults, and the embedding config a fresh kernel is born with.
 //!
 //! The backend analogue of [`crate::seed_presets`]: an idempotent floor
 //! ([`ensure_factory_backends`], insert-only-if-absent, so an operator's edits
