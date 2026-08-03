@@ -242,6 +242,86 @@ impl ConversationCache {
     }
 }
 
+/// One live FlowBus block-event subscription in the per-(principal, instance)
+/// dedupe registry — see [`SharedKernelState::subscription_registry`].
+pub struct SubscriptionEntry {
+    abort: tokio::task::AbortHandle,
+    /// Which connection (SSH session) registered this subscription. Lets a
+    /// replacement distinguish "this connection re-issuing the RPC" (quiet)
+    /// from "a different connection claimed the same (principal, instance)
+    /// slot" (logged) — see [`register_subscription`].
+    session_id: SessionId,
+    /// When this entry was registered. Reported as the replaced
+    /// subscription's age on a cross-connection replacement: a young age
+    /// (both connections live at once) smells like two clients trampling one
+    /// hardcoded instance literal; an old age smells like an ordinary
+    /// reconnect after a dead socket.
+    registered_at: std::time::Instant,
+}
+
+/// Outcome of [`register_subscription`] inserting a new entry.
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionRegistration {
+    /// No prior subscription existed for this (principal, instance).
+    Fresh,
+    /// A prior subscription existed but its task had already finished
+    /// naturally (its connection dropped, or `SubscriberHealth` reaped it) —
+    /// nothing live was displaced.
+    ReplacedFinished,
+    /// A prior LIVE subscription from the SAME connection was displaced —
+    /// this connection re-issuing `subscribeBlocksFiltered` (e.g. a changed
+    /// filter). Ordinary; the caller should stay quiet or log at debug.
+    ReplacedSameConnection,
+    /// A prior LIVE subscription from a DIFFERENT connection was displaced.
+    /// Could be a legitimate reconnect (same logical client, new SSH
+    /// session) or two live clients sharing one hardcoded `instance` literal
+    /// (docs/issues.md, "MCP shell delay" — the bug this registry exists to
+    /// catch). The caller should warn, including `prior_session_id` and
+    /// `age` so an operator can tell the two apart.
+    ReplacedDifferentConnection {
+        prior_session_id: SessionId,
+        age: std::time::Duration,
+    },
+}
+
+/// Insert `entry` for `key` in the dedupe registry, aborting whatever live
+/// task was there before. Pure registry mutation with no tracing calls, so
+/// the replace-vs-coexist decision is unit-testable independent of the RPC
+/// plumbing; the caller logs based on the returned [`SubscriptionRegistration`].
+fn register_subscription(
+    registry: &parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>>,
+    key: (PrincipalId, String),
+    session_id: SessionId,
+    abort: tokio::task::AbortHandle,
+) -> SubscriptionRegistration {
+    let new_entry = SubscriptionEntry {
+        abort,
+        session_id,
+        registered_at: std::time::Instant::now(),
+    };
+    let prior = {
+        let mut reg = registry.lock();
+        reg.insert(key, new_entry)
+    };
+    match prior {
+        None => SubscriptionRegistration::Fresh,
+        Some(prior) if prior.abort.is_finished() => SubscriptionRegistration::ReplacedFinished,
+        Some(prior) if prior.session_id == session_id => {
+            prior.abort.abort();
+            SubscriptionRegistration::ReplacedSameConnection
+        }
+        Some(prior) => {
+            let age = prior.registered_at.elapsed();
+            let prior_session_id = prior.session_id;
+            prior.abort.abort();
+            SubscriptionRegistration::ReplacedDifferentConnection {
+                prior_session_id,
+                age,
+            }
+        }
+    }
+}
+
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
 pub struct SharedKernelState {
@@ -278,7 +358,7 @@ pub struct SharedKernelState {
     ///
     /// `parking_lot::Mutex` because all ops are insert/remove/replace and
     /// complete in microseconds.
-    pub subscription_registry: Arc<parking_lot::Mutex<HashMap<(PrincipalId, String), tokio::task::AbortHandle>>>,
+    pub subscription_registry: Arc<parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>>>,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -5576,6 +5656,7 @@ impl kernel::Server for KernelImpl {
             let kernel_id = self.kernel.id;
             let conn_cancel = self.connection.borrow().cancel_token();
             let principal_id = self.connection.borrow().principal.id;
+            let session_id = self.connection.borrow().session_id;
             let registry = self.kernel.subscription_registry.clone();
             let dedupe_key = (principal_id, instance.clone());
 
@@ -6102,19 +6183,46 @@ impl kernel::Server for KernelImpl {
             // (principal, instance) ever seen; correctness wins over a tiny
             // bounded leak.
             let new_handle = task.abort_handle();
-            let prior = {
-                let mut reg = registry.lock();
-                reg.insert(dedupe_key.clone(), new_handle)
-            };
-            if let Some(prior) = prior
-                && !prior.is_finished()
-            {
-                log::info!(
-                    "Replacing live FlowBus subscription for kernel {} \
-                     instance={} principal={:?}",
-                    kernel_id, dedupe_key.1, dedupe_key.0,
-                );
-                prior.abort();
+            match register_subscription(&registry, dedupe_key.clone(), session_id, new_handle) {
+                SubscriptionRegistration::Fresh | SubscriptionRegistration::ReplacedFinished => {}
+                // Same connection re-issuing the RPC (e.g. a changed filter)
+                // — ordinary, not worth an operator's attention.
+                SubscriptionRegistration::ReplacedSameConnection => {
+                    log::debug!(
+                        "Replacing this connection's own FlowBus subscription for \
+                         kernel {} instance={} principal={:?} session={}",
+                        kernel_id,
+                        dedupe_key.1,
+                        dedupe_key.0,
+                        session_id.short(),
+                    );
+                }
+                // A different connection claimed this (principal, instance)
+                // slot. Could be a legitimate reconnect (same logical client,
+                // new SSH session) or two live clients sharing one hardcoded
+                // `instance` literal silently stealing the block-event bridge
+                // from each other (docs/issues.md, "MCP shell delay") — we
+                // can't fully tell those apart from here, so surface both the
+                // replaced session and its age: a young age with both
+                // connections still live reads as theft, a multi-second/
+                // minute age reads as an ordinary reconnect.
+                SubscriptionRegistration::ReplacedDifferentConnection {
+                    prior_session_id,
+                    age,
+                } => {
+                    tracing::warn!(
+                        kernel = %kernel_id.to_hex(),
+                        principal = ?dedupe_key.0,
+                        instance = %dedupe_key.1,
+                        prior_session = %prior_session_id.short(),
+                        new_session = %session_id.short(),
+                        prior_age_secs = age.as_secs_f64(),
+                        "Replacing live FlowBus subscription registered by a \
+                         different connection — reconnect if this instance id \
+                         is genuinely one client, or two live clients \
+                         trampling a shared instance id if not",
+                    );
+                }
             }
         }
         Promise::ok(())
@@ -9808,4 +9916,198 @@ mod connection_state_tests {
         drop(state);
         assert!(a.is_cancelled() && b.is_cancelled());
     }
+}
+
+/// Pins the `subscribe_blocks_filtered` dedupe contract described at
+/// `SharedKernelState::subscription_registry`:
+/// * a reconnect from the SAME (principal, instance) replaces the prior live
+///   subscription rather than stacking a second one — the design the
+///   registry exists to implement;
+/// * TWO DIFFERENT instances for the same principal must coexist — this is
+///   the regression this file exists to catch. `kaijutsu-mcp`
+///   (`crates/kaijutsu-mcp/src/lib.rs:459`) and `kaijutsu-app`
+///   (`crates/kaijutsu-app/src/connection/actor_plugin.rs:239,633`) used to
+///   pass a hardcoded literal instance ("mcp-server" / "bevy-client"), so
+///   every process of that client claimed the same registry slot and
+///   silently evicted each other's block-event bridge (docs/issues.md, "MCP
+///   shell delay" — measured 5.4s tax on MCP shell calls). A test built
+///   directly against `register_subscription` — the exact map mutation the
+///   live RPC path calls — reproduces that failure mode without a live SSH
+///   session: construct it with the *old* buggy call shape (same literal
+///   instance for two "processes") and the coexistence assertion below
+///   fails, because the second insert evicts the first regardless of which
+///   session registered it. That is the theft bug, caught in-process.
+///
+/// Also pins the observability behavior added alongside the fix: a
+/// same-connection replacement is quiet (`ReplacedSameConnection`), a
+/// cross-connection replacement is flagged (`ReplacedDifferentConnection`,
+/// carrying the prior session and the replaced subscription's age) so an
+/// operator can tell a reconnect from a theft.
+#[cfg(test)]
+mod subscription_registry_tests {
+    use super::*;
+
+    /// A no-op task standing in for a live FlowBus bridge task: never
+    /// resolves, so `AbortHandle::is_finished()` reads false until aborted —
+    /// matching a subscription bridge that's actually still running.
+    fn live_abort_handle() -> tokio::task::AbortHandle {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            // Never resolves on its own (sender is dropped only when the
+            // whole runtime tears down at test end) — stands in for a live
+            // bridge task blocked in `tokio::select!`.
+            let _ = rx.await;
+        });
+        handle.abort_handle()
+    }
+
+    fn principal() -> PrincipalId {
+        PrincipalId::new()
+    }
+
+    #[tokio::test]
+    async fn same_instance_reconnect_replaces_not_stacks() {
+        let registry: parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let p = principal();
+        let key = (p, "stable-instance".to_string());
+
+        let first_session = SessionId::new();
+        let outcome = register_subscription(&registry, key.clone(), first_session, live_abort_handle());
+        assert_eq!(outcome, SubscriptionRegistration::Fresh);
+        assert_eq!(registry.lock().len(), 1, "first subscribe registers one entry");
+
+        // Reconnect: same (principal, instance), new SSH session (a fresh
+        // TCP connection always mints a new SessionId) — this is the
+        // intended "replace my own prior subscription" path.
+        let second_session = SessionId::new();
+        let outcome = register_subscription(&registry, key.clone(), second_session, live_abort_handle());
+        match outcome {
+            SubscriptionRegistration::ReplacedDifferentConnection {
+                prior_session_id,
+                age,
+            } => {
+                assert_eq!(
+                    prior_session_id, first_session,
+                    "must report the session that owned the replaced entry",
+                );
+                assert!(
+                    age < std::time::Duration::from_secs(5),
+                    "age of a subscription registered microseconds ago must \
+                     be small, got {age:?}",
+                );
+            }
+            other => panic!(
+                "a reconnect (new session, same instance) must replace, not \
+                 stack — and is reported as cross-connection since \
+                 reconnects always mint a fresh SessionId; got {other:?}"
+            ),
+        }
+        assert_eq!(
+            registry.lock().len(),
+            1,
+            "replacing the (principal, instance) slot must not leave two \
+             entries behind",
+        );
+    }
+
+    #[tokio::test]
+    async fn different_instances_for_same_principal_coexist() {
+        let registry: parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let p = principal();
+
+        // Two DIFFERENT processes of the same principal, each minting its
+        // own per-process instance (the fixed shape) — NOT the pre-fix
+        // hardcoded-literal shape, which would collapse both keys into one
+        // and trigger the eviction this test forbids.
+        let instance_a = format!("kaijutsu-mcp-{}", uuid::Uuid::new_v4());
+        let instance_b = format!("kaijutsu-mcp-{}", uuid::Uuid::new_v4());
+        assert_ne!(instance_a, instance_b);
+
+        let outcome_a = register_subscription(
+            &registry,
+            (p, instance_a.clone()),
+            SessionId::new(),
+            live_abort_handle(),
+        );
+        let outcome_b = register_subscription(
+            &registry,
+            (p, instance_b.clone()),
+            SessionId::new(),
+            live_abort_handle(),
+        );
+
+        assert_eq!(outcome_a, SubscriptionRegistration::Fresh);
+        assert_eq!(outcome_b, SubscriptionRegistration::Fresh);
+        assert_eq!(
+            registry.lock().len(),
+            2,
+            "two distinct instances for the same principal must coexist as \
+             two live entries — this is the exact case the pre-fix hardcoded \
+             instance literal collapsed into one, causing the silent \
+             block-event-bridge theft in docs/issues.md",
+        );
+
+        let a_alive = registry
+            .lock()
+            .get(&(p, instance_a))
+            .map(|e| !e.abort.is_finished());
+        let b_alive = registry
+            .lock()
+            .get(&(p, instance_b))
+            .map(|e| !e.abort.is_finished());
+        assert_eq!(
+            a_alive,
+            Some(true),
+            "registering instance B must not abort instance A's subscription",
+        );
+        assert_eq!(b_alive, Some(true));
+    }
+
+    #[tokio::test]
+    async fn same_connection_replacing_its_own_subscription_is_quiet() {
+        let registry: parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let p = principal();
+        let key = (p, "stable-instance".to_string());
+        let session = SessionId::new();
+
+        register_subscription(&registry, key.clone(), session, live_abort_handle());
+        // The SAME connection re-issues subscribeBlocksFiltered (e.g. the
+        // client changed its filter) — same SessionId both times.
+        let outcome = register_subscription(&registry, key, session, live_abort_handle());
+
+        assert_eq!(
+            outcome,
+            SubscriptionRegistration::ReplacedSameConnection,
+            "a same-session replacement must be classified as ordinary \
+             (not the cross-connection variant that warns)",
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_already_finished_subscription_is_not_a_live_theft() {
+        let registry: parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let p = principal();
+        let key = (p, "stable-instance".to_string());
+
+        let finished = tokio::spawn(async {}).abort_handle();
+        // Give the trivial task a chance to actually complete.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(finished.is_finished(), "test setup: task must have finished");
+
+        register_subscription(&registry, key.clone(), SessionId::new(), finished);
+        let outcome = register_subscription(&registry, key, SessionId::new(), live_abort_handle());
+
+        assert_eq!(
+            outcome,
+            SubscriptionRegistration::ReplacedFinished,
+            "a prior entry whose task already finished naturally (dropped \
+             connection, or SubscriberHealth reap) is not a live steal",
+        );
+    }
+
 }

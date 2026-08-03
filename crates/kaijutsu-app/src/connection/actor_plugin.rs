@@ -236,7 +236,7 @@ impl Plugin for ActorPlugin {
             config: ssh_config.clone(),
             kernel_id: None,
             context_id: None,
-            instance: "bevy-client".to_string(),
+            instance: app_peer_instance().to_string(),
         });
 
         // Register resources
@@ -630,7 +630,7 @@ fn poll_bootstrap_results(
                                 context_id: ctx_id,
                                 kernel_id,
                                 nick,
-                                instance: "bevy-client".to_string(),
+                                instance: app_peer_instance().to_string(),
                             };
 
                             let _ = tx.send(RpcResultMessage::ContextJoined {

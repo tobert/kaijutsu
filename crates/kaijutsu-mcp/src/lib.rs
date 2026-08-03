@@ -89,6 +89,18 @@ use helpers::*;
 pub use models::*;
 use tree::format_dag_tree;
 
+/// This process's peer `instance` — minted once, stable for the process's
+/// life, distinct from every other `kaijutsu-mcp` process. The server dedupes
+/// FlowBus block-event subscriptions by `(principal, instance)`: a literal
+/// constant here would make every MCP process for one principal claim the
+/// same slot, so whichever subscribed last silently steals the block-event
+/// bridge from the others (docs/issues.md, "MCP shell delay"). Mirrors
+/// `app_peer_instance()` in `kaijutsu-app/src/connection/actor_plugin.rs`.
+fn mcp_peer_instance() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| format!("kaijutsu-mcp-{}", uuid::Uuid::new_v4()))
+}
+
 // ============================================================================
 // Prompt Argument Types
 // ============================================================================
@@ -456,7 +468,7 @@ impl KaijutsuMcp {
         // single-threaded RPC LocalSet is starved by kernel-wide foreign-context
         // event volume (the 2026-06-17 shell-timeout stall). Scoping the block
         // subscription to the joined context cuts that volume to zero.
-        let actor = spawn_actor(config, None, "mcp-server".to_string(), true);
+        let actor = spawn_actor(config, None, mcp_peer_instance().to_string(), true);
 
         tracing::info!("RPC actor spawned, persistent connection ready");
 

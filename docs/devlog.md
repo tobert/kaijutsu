@@ -896,3 +896,40 @@ persisted rows after manual detach), and the jam demonstrated that any
 track played continuously for a few hours drowns every musician that
 sits down at it — the windowed-band-view problem now filed as the next
 real design arc.
+
+## The stolen bridge (August 2–3)
+
+For weeks the MCP shell carried an intermittent ~5-second tax that read
+like a haunting: the kernel finished every command in milliseconds, the
+reply just didn't arrive until a stall-fallback resubscribe went and
+fetched it. The 2026-07-17 `SubscriberHealth` rewrite had already fixed
+the *long* hangs, but this residue survived reboots and defied the usual
+staleness stories. The diagnosis, when it landed, was one line reading
+another: the server dedupes block-event subscriptions by (principal,
+instance) — correct, so a reconnect replaces its own dead bridge — but
+`kaijutsu-mcp` passed the literal `"mcp-server"` as its instance, so
+every concurrent MCP process for one principal was *the same client*.
+Whoever subscribed last silently evicted the rest, and an evicted client
+was never told; its channel just went quiet until its own next call
+stole the slot back. Five live processes, measured: 5419 ms for a
+146 ms echo. The app had the identical bug spelled `"bevy-client"` —
+two windows trampling each other — while the correct shape,
+`app_peer_instance()`, sat one layer above it minting per-process UUIDs
+for the peer registry. The fix was to let both clients use that shape
+for the subscription too, and the lasting lesson rode along as
+observability: the registry now remembers *which connection* registered
+each bridge and warns when a different one displaces a live entry,
+carrying the evicted subscription's age — the signal that turns this
+class of theft from an afternoon of forensics into one journal line.
+Truncation honesty shipped the same day: a kaish result that spilled its
+output (exit remapped to 3) no longer reads as failure on the MCP path —
+error-ness is judged by the command's real exit, with `[output
+truncated]` and a structural `did_spill` keeping the cap unmissable, so
+a model neither retries a command that succeeded nor reasons over a
+head+tail excerpt as if it were whole. And kernel.db — 287 MB of every
+conversation we've ever had, one WAL-mode file with no backup story —
+got its first: `kj db backup` (SQLite's `VACUUM INTO`, consistent
+against a live writer), `kj db checkpoint` for the snapshot-your-own
+crowd, and restore deliberately left a documented procedure instead of a
+verb, because a live file swap under a kernel full of in-memory state is
+a lie waiting to be discovered.

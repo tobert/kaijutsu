@@ -42,6 +42,9 @@ tracing-subscriber = { workspace = true }
 # Search
 regex = { workspace = true }
 
+# Per-process subscription instance (mcp_peer_instance)
+uuid = { workspace = true }
+
 [dev-dependencies]
 # e2e tests stand up a real ephemeral SSH server and drive the full MCP
 # store-replica + poll path against it (see tests/e2e_shell.rs).
