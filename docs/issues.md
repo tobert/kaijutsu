@@ -2746,6 +2746,29 @@ Neither gap blocks Lane C (the Bevy world renderer): the snapshot tree itself
 is always structurally correct (real listings, real attrs); only the
 generation staleness signal and the ignored-styling hint have known slop.
 
+## Shared app camera keeps Bevy's default far plane (found 2026-08-01, horizon-dive spike)
+
+`main::setup_camera` spawns `Camera3d::default()` with no explicit
+`Projection`, so the camera carries `PerspectiveProjection::default()` —
+`far: 1000.0`. Bevy's perspective *render* matrix is infinite-reverse-Z, so
+`far` doesn't clip; but `CameraProjection::compute_frustum` passes it to
+`ViewFrustum::from_clip_from_world_custom_far`, so it **is** the real
+frustum-culling distance.
+
+Both existing 3D scenes routinely sit further out than that: `fsn::scene`
+starts its camera at `(0, 1400, 1400)` looking at the origin (≈1980 units),
+and `room`'s octagon has a 1200 apothem with a 1300 floor radius. If culling
+is really biting, distant fields/walls are being dropped and nobody has
+noticed — or something else is keeping their `Aabb`s in frustum and the
+default is harmlessly generous. **Needs one live check** (fly the FSN camera
+out and watch for districts popping), not a speculative fix.
+
+The horizon dive (`view::horizon_dive`, `docs/horizon-dive.md`) works around
+it locally: it claims a 30 000 far plane on entry and restores the camera's
+original `Projection` on exit, so its stream (which runs to ~7000 units)
+renders without changing the default for any other screen. If the check
+confirms the problem, the fix belongs in `setup_camera`, not in each scene.
+
 ## kaijutsu-mcp — June 2026 SyncedDocument migration review
 
 Surfaced by a DeepSeek (concurrency) + Gemini (architecture) review of commit
