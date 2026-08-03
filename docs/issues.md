@@ -243,21 +243,27 @@ our seams. Surveyed 2026-08-03 (HF API, live):
 - **`Encoder-230M/350M` base** (fill-mask) — fine-tune substrate for our
   own future boundary classifiers.
 
-**Runtimes (not stuck on ONNX — Amy):** best-first:
-1. **llama.cpp / GGUF** — official artifacts, lfm2 arch upstreamed by
-   LiquidAI, Vulkan on zorak, `--embedding` server mode. For embedding IN
-   kaibo: in-process via the `llama-cpp-2` Rust bindings — no socket, no
-   sidecar, preserves kaibo's stdio-only invariant outright.
-2. **candle** — pure-Rust; proven runnable (community MioTTS runs LFM2-2.6B
-   on candle, no Python). Classifier-head plumbing is ours to write; keeps
-   the toolchain C++-free.
+**Runtimes (not stuck on ONNX — Amy), with a per-project split (Amy
+2026-08-03): `llama-cpp-2` is fine in KAIJUTSU but NOT in kaibo — kaibo
+stays pure-Rust/light-build; "candle might be cool there though." Kaibo
+can wait.**
+
+1. **kaijutsu: llama.cpp / GGUF** — official artifacts, lfm2 arch
+   upstreamed by LiquidAI, Vulkan on zorak. In-process via `llama-cpp-2`
+   for classifiers (router eval), or the existing openai-kind backend
+   route for generation/embedding servers.
+2. **kaibo (later): candle** — pure-Rust; proven runnable (community
+   MioTTS runs LFM2-2.6B on candle, no Python). Classifier-head plumbing
+   is ours to write; keeps kaibo's toolchain C++-free and its stdio-only
+   invariant untouched (in-process, no socket).
 3. **rten/ONNX** — only if we want index-pipeline symmetry; `lfm2` hybrid
    conv+attention arch is a real conversion risk; verify via embed_check.
 4. LEAP (Liquid's edge SDK) — phones/edge, not our shape.
 
-Deep-dive order when Amy picks this up: Router eval offline → kaibo guard
-embed (llama-cpp-2, PII+injection on explorer reads) → Embedding-350M swap
-eval against bge-small on the real index corpus.
+Deep-dive order when Amy picks this up: Router eval offline (kaijutsu,
+llama-cpp-2 or a scratch llama.cpp server) → Embedding-350M swap eval
+against bge-small on the real index corpus → kaibo guard embed via candle
+(PII+injection on explorer reads) when kaibo's turn comes.
 
 ## Cast follow-ups (seeded 2026-08-03, casts shipped same day — devlog "Contexts join a band")
 
