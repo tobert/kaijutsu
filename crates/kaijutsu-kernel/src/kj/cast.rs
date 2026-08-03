@@ -57,6 +57,17 @@ enum CastCommand {
         /// Cast label
         label: String,
     },
+    /// Update a cast's mutable fields (today: description only — future
+    /// mutable fields join this verb rather than growing their own).
+    Set {
+        /// Cast label
+        label: String,
+        /// New description; "" clears it to NULL. The flag is required —
+        /// `cast set <label>` with no `--desc` at all is an error, not a
+        /// silent no-op.
+        #[arg(long, alias = "description")]
+        desc: Option<String>,
+    },
     /// Manage a cast's per-role slots.
     #[command(subcommand)]
     Slot(CastSlotCommand),
@@ -142,6 +153,7 @@ impl KjDispatcher {
             CastCommand::Show { label } => self.cast_show(&label),
             CastCommand::Create { label, desc } => self.cast_create(&label, desc, caller),
             CastCommand::Remove { label } => self.cast_remove(&label),
+            CastCommand::Set { label, desc } => self.cast_set(&label, desc),
             CastCommand::Slot(cmd) => self.cast_slot(cmd),
         };
 
@@ -294,6 +306,45 @@ impl KjDispatcher {
         match db.delete_cast(cast.cast_id) {
             Ok(()) => KjResult::ok(format!("removed cast '{label}' (slots cascaded)")),
             Err(e) => KjResult::Err(format!("kj cast remove: {e}")),
+        }
+    }
+
+    fn cast_set(&self, label: &str, desc: Option<String>) -> KjResult {
+        // No --desc at all is an error, not a silent no-op: `set` will grow
+        // more mutable fields later, and a bare `set` that quietly does
+        // nothing would hide a typo'd flag name forever.
+        let Some(desc) = desc else {
+            return KjResult::Err(
+                "kj cast set: nothing to set — pass --desc (\"\" clears it to NULL)".to_string(),
+            );
+        };
+        let db = self.kernel_db().lock();
+        let cast = match db.get_cast_by_label(label) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                let known: Vec<String> = db
+                    .list_casts()
+                    .map(|casts| casts.iter().map(|c| c.label.clone()).collect())
+                    .unwrap_or_default();
+                let known = if known.is_empty() {
+                    "(no casts configured — `kj cast create <label>` starts one)".to_string()
+                } else {
+                    known.join(", ")
+                };
+                return KjResult::Err(format!(
+                    "kj cast set: unknown cast '{label}' — known casts: {known}"
+                ));
+            }
+            Err(e) => return KjResult::Err(format!("kj cast set: {e}")),
+        };
+        let desc_opt = if desc.is_empty() { None } else { Some(desc.as_str()) };
+        match db.update_cast_description(cast.cast_id, desc_opt) {
+            Ok(()) => KjResult::ok(if desc_opt.is_some() {
+                format!("updated cast '{label}'")
+            } else {
+                format!("cleared description on cast '{label}'")
+            }),
+            Err(e) => KjResult::Err(format!("kj cast set: {e}")),
         }
     }
 
@@ -535,6 +586,65 @@ mod tests {
         match d.dispatch(&argv(&["cast", "create", "HOUSE"]), &c).await {
             KjResult::Err(msg) => assert!(msg.to_lowercase().contains("already in use"), "{msg}"),
             other => panic!("labels are case-insensitively unique: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cast_set_desc_changes_what_show_reports() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house", "--desc", "Opus spine"]), &c).await;
+        let r = d
+            .dispatch(&argv(&["cast", "set", "house", "--desc", "deepseek-first"]), &c)
+            .await;
+        assert!(r.is_ok(), "{}", r.message());
+
+        match d.dispatch(&argv(&["cast", "show", "house"]), &c).await {
+            KjResult::Ok { message, data: Some(v), .. } => {
+                assert!(message.contains("deepseek-first"), "{message}");
+                assert!(!message.contains("Opus spine"), "{message}");
+                assert_eq!(v["description"], "deepseek-first");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cast_set_refuses_an_unknown_label_and_lists_known_casts() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        match d.dispatch(&argv(&["cast", "set", "ghost", "--desc", "x"]), &c).await {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("unknown cast 'ghost'"), "{msg}");
+                assert!(msg.contains("house"), "error should list known casts: {msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cast_set_empty_desc_clears_it_to_null() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house", "--desc", "Opus spine"]), &c).await;
+        let r = d.dispatch(&argv(&["cast", "set", "house", "--desc", ""]), &c).await;
+        assert!(r.is_ok(), "{}", r.message());
+
+        match d.dispatch(&argv(&["cast", "show", "house"]), &c).await {
+            KjResult::Ok { data: Some(v), .. } => assert!(v["description"].is_null(), "{v:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cast_set_with_no_desc_flag_is_an_error_not_a_silent_no_op() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house", "--desc", "Opus spine"]), &c).await;
+        match d.dispatch(&argv(&["cast", "set", "house"]), &c).await {
+            KjResult::Err(msg) => assert!(msg.contains("nothing to set"), "{msg}"),
+            other => panic!("bare `set` with no flags must error: {other:?}"),
         }
     }
 }

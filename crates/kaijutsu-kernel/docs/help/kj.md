@@ -59,8 +59,10 @@ block           list, inspect, count, read, cat, append, history, diff, status, 
                 edit (insert|delete|replace)
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
-cast            list, show, create, remove, slot set|remove — named model ensembles
-                (role → backend/model + tunables); role is a context_type
+cast            list, show, create, remove, set, slot set|remove — named model
+                ensembles (role → backend/model + tunables); role is a
+                context_type; `set --desc` edits the description after create
+                ("" clears it to NULL)
 config          list, show, set, edit, reset — CRDT-owned config at /etc/config
                 (system.md, theme.toml, mcp.toml) + per-client at /etc/client
 context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,

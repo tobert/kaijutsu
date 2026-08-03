@@ -5351,6 +5351,24 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Update a cast's description; `None` clears it to NULL. The empty-vs-
+    /// clear decision (an empty `--desc ""` means clear) is the `kj cast set`
+    /// caller's contract, not this method's — this just writes what it's given.
+    pub fn update_cast_description(
+        &self,
+        cast_id: CastId,
+        description: Option<&str>,
+    ) -> KernelDbResult<()> {
+        let n = self.conn.execute(
+            "UPDATE casts SET description = ?1 WHERE cast_id = ?2",
+            params![description, blob_param(cast_id.as_bytes())],
+        )?;
+        if n == 0 {
+            return Err(KernelDbError::NotFound(format!("cast {}", cast_id.short())));
+        }
+        Ok(())
+    }
+
     /// Insert or replace one slot of a cast.
     pub fn set_cast_slot(&self, row: &CastSlotRow) -> KernelDbResult<()> {
         if row.role.trim().is_empty() {

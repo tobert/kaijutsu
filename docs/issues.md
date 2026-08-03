@@ -236,9 +236,6 @@ Deferred from the renovation, in rough priority order:
   is that forever context_type's job?
 - **App UI for casts** — kj-only today; the app compiles against the new wire
   fields but renders nothing cast-shaped yet.
-- **`kj cast set --desc`** — no verb edits a cast's description after create
-  (`create` correctly refuses an existing label; found retitling `house` for
-  the deepseek-first move, its desc still says "Opus spine").
 - **`kj backend set` clear-on-omit sharp edge** (deepseek review P2): the
   documented declare-the-whole-row upsert means a partial update silently
   clears key sources; the command succeeds while the backend then warn-skips
@@ -252,6 +249,16 @@ Deferred from the renovation, in rough priority order:
   fallback arm tosses provider=NULL+model=set rows to deepseek-v4-flash —
   that was Amy's instruction, and the live migration touched 0 rows anyway.
   Not a bug; recorded so nobody re-litigates it.
+- **Write-time inverted-budget check on `kj cast slot set`** (gemini review,
+  the one genuine find of its four): a slot `thinking_budget` that exceeds
+  the EFFECTIVE max_tokens after the llm_defaults cascade only errors at
+  request-build time (loudly, with a good message — correctness is fine).
+  Kinder to also warn at write time when the resolved pair is inverted.
+  The review's other three findings were disproven or re-litigated policy:
+  DeepSeek `thinking:{"type":"disabled"}` claimed Anthropic-only → live
+  probe 2026-08-03 shows DeepSeek accepts it (kaibo had measured the same);
+  rollover + preset narrowing are Amy's explicit policy; the "keys now in
+  SQL" leak concern is structurally impossible (no key column exists).
 
 ## kaijutsu-mcp: workspace autoshare (seeded 2026-08-01, MCP-config session)
 
