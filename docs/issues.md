@@ -258,8 +258,14 @@ can wait.**
    lane runs fine on CPU (bge-small already proves the shape; a 350M
    classify is tens of ms).
 
-   **Searched 2026-08-03 — the crate does NOT exist; scoped as a new
-   ~/src-level project** (Amy: "might be a fun new ~/src level project").
+   **STARTED 2026-08-03: `~/src/candle-lfm2-encoder`** (own git repo, day-0
+   commit `1f871e6`) — milestone 1 (config, fixture-verified, 7 tests) done;
+   candle reference clone at `~/src/research/candle` (dual MIT/Apache, no
+   CONTRIBUTING.md, no AI policy — upstreaming deferred until Amy reads at
+   PR time). Fixture discoveries recorded in that repo's CLAUDE.md, headline:
+   the PII detector's taxonomy includes credential.api_key/jwt/private_key —
+   it's a SECRETS detector too.
+   Searched first — the crate did NOT exist anywhere; scoping notes:
    Upstream candle-transformers already ships `lfm2.rs` +
    `quantized_lfm2.rs` — the CAUSAL branch, i.e. the hard hybrid blocks
    (gated short conv + GQA) are done. Nobody has the encoder branch:
