@@ -213,6 +213,35 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## Casts: adopt kaibo's named model-team concept (seeded 2026-08-03, Amy, hydration-budget design round)
+
+Amy, choosing where model-window config should live: *"I wonder if we should
+consider adopting kaibo's config and cast concept? it came out really nice…
+That but we put it in /etc/config crdt file… part of what we do is make it so
+easy to ask for a config update that the user can say 'hey I hit this limit,
+configure it in' and it's easy for the agent to do."*
+
+Read against kaibo's live config (`kaibo://config`), the mapping:
+
+- kaibo **backends** ≈ our `[providers.*]` (keys, base_url, timeouts) — have it.
+- kaibo **per-model params** ≈ our `[providers.X.models.Y] context_window` —
+  have it, including the "hit a limit → agent runs one `kj config set`" flow
+  and the live-lookup ladder that makes Anthropic windows self-updating.
+- kaibo **casts** — named role→model bundles with per-role params
+  (`[casts.fable.synth] model/vision/lane=batch/effort`) — the genuinely new
+  piece. Kaijutsu analog: named teams over *our* roles (context_types /
+  chameleon seats), e.g. `[casts.house.coder]`, `[casts.house.musician]`,
+  so `kj context create --cast house` replaces raw provider/model strings.
+  Dovetails with the underused `preset_id` on ContextRow (`kj preset` exists —
+  reconcile or absorb it), the model-routing doctrine (Opus spine / cheap
+  cloud token-burn / local churn), and rc `context_type` dispatch.
+- Aliases (`cast_aliases`) are cheap and worth copying as-is.
+
+Design questions for the real conversation: cast vs preset (two names for one
+thing?); does a cast pin per-role params we don't model yet (effort, vision,
+batch lane); where does per-cast rc/stance fit. Lives in `/etc/config` CRDT
+like models.toml. Two-voices rule applies when this gets designed.
+
 ## kaijutsu-mcp: workspace autoshare (seeded 2026-08-01, MCP-config session)
 
 `--share` is app-only today (`kaijutsu-app --share`, `share_dial.rs` /
