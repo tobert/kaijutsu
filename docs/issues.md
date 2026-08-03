@@ -2746,6 +2746,26 @@ Neither gap blocks Lane C (the Bevy world renderer): the snapshot tree itself
 is always structurally correct (real listings, real attrs); only the
 generation staleness signal and the ignored-styling hint have known slop.
 
+## Archive-time summaries, written by a local model (Amy, 2026-08-03)
+
+When a context is archived it stops changing. That makes archiving the natural
+moment to generate a small summary once and keep it forever — no invalidation
+problem, because the thing it summarises is frozen by definition. Good work for
+a local model: it is not latency-sensitive, it happens on an explicit event
+rather than a hot path, and it never needs to be redone.
+
+Two payoffs. Browsing archived contexts stops being a list of labels you have
+to remember the meaning of — a card can say what the context *was about*. And
+any search over the archive gets real prose to match on instead of a title plus
+keywords; the horizon dive's ranker (`docs/horizon-dive.md`, "Where a real
+search plugs in") would benefit directly, as would `SemanticIndex` when it
+lands behind it.
+
+Open: where the summary lives (a field on the context handle vs. a block in the
+context itself), which local model, and whether concluding/demoting should get
+the same treatment or only full archival. Not needed for the dive's v1 — that
+slice ranks on `label` + `keywords`, which exist today.
+
 ## Shared app camera keeps Bevy's default far plane (found 2026-08-01, horizon-dive spike)
 
 `main::setup_camera` spawns `Camera3d::default()` with no explicit

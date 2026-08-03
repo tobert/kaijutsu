@@ -1,9 +1,15 @@
 # The Horizon Dive — searching what fell past the event horizon
 
-2026-08-01. The time well seats forty contexts on four rings and renders
+2026-08-01. The time well seats its most recent contexts on rings and renders
 everything else as a "+N" chip at its throat (`docs/timewell.md`, "Ring
 membership becomes explicit"). That chip is currently a dead end: a count with
-nothing behind it. This doc designs what happens when you **activate** it —
+nothing behind it.
+
+*(This opened "forty contexts on four rings". Thirteen minutes after it was
+written, `5a3dfb6b` collapsed the well to two rings of ten with everyone else
+past the horizon — `kaijutsu-viz/src/layout.rs`. The design below is
+unaffected; it only requires that a horizon set exist, and the collapse made
+that set bigger and more worth searching.)* This doc designs what happens when you **activate** it —
 a dive into an abstract space that is, first and foremost, a **search
 interface** over the demoted, concluded, archived and overflowed contexts
 behind that number.
@@ -11,7 +17,9 @@ behind that number.
 *Status: the spike this doc describes lives on branch `feat/horizon-dive`,
 deliberately not on `main` — it runs against ~300 synthetic contexts behind a
 debug `F2` binding, not live kernel data. "Slices" below is what a real v1
-still needs.*
+still needs. The branch is kept rebased on `main` and building (one commit,
+full app suite green) so the work can be picked up incrementally; sections
+marked "Decided 2026-08-03" record Amy's answers to what were open questions.*
 
 The well's own charter already called this shot. Requirement 3 of "What the
 time well is for" reads: *"An event horizon — past some depth, contexts stop
@@ -109,11 +117,23 @@ navigate by — never moves at all. **Open question for Amy** below.
 
 ### Entering
 
-The real entry is activating the well's "+N" horizon chip: `Enter` on the
-horizon label at the throat, which is currently inert. The dive is a screen
-transition, not a station zoom — like the FSN landscape, it's an unbounded
-world, too big to stand as room furniture (`docs/scenes/shell.md`, "N stays a
-dive-THROUGH door").
+**Decided 2026-08-03 (open question 5): two doors.** `Ctrl+A /` from anywhere —
+"search everything, from wherever I am" — *and* `Enter` on the well's "+N"
+horizon chip at the throat. Same destination. The chord is what gets used once
+it's muscle memory; the chip is what teaches that the space exists at all, and
+it is the thing that finally makes the count lead somewhere. Paying a slot in
+the one-screenful prefix table is accepted, deliberately, for the first door.
+
+Main has since built half of it: `Action::ActivateHorizon` is already bound to
+`h` in `WellZoomed` (commit `b3473014`), described in its own message as "a
+front door with nothing behind it", with a handler arm that logs and returns at
+`view/time_well/scene.rs:1247`. So v1's first task is not designing a binding —
+it is making that arm call `handle_dive_entry`, adding the `Ctrl+A /` chord
+beside it, and retiring the `F2` debug entry.
+
+The dive is a screen transition, not a station zoom — like the FSN landscape,
+it's an unbounded world, too big to stand as room furniture
+(`docs/scenes/shell.md`, "N stays a dive-THROUGH door").
 
 *The spike does not wire that entry.* It ships `F2` from anywhere and `h` in
 the zoomed well, both through the central action table, so the prototype
@@ -190,18 +210,38 @@ wobbling selection.
 
 ### Verbs on the selection
 
+**Decided 2026-08-03 (open questions 3 and 4): the dive is a place you read
+from, not a place you open from.** This section originally asked whether `Enter`
+should open-and-leave or open-and-stay. Amy rejected the premise: down here you
+*inspect*, and when you want a context back in play you **promote it out to an
+active ring** — the opening happens there, in the well, where opening always
+happens. The dive never becomes a second way to switch context.
+
+That settles open question 4 in the same stroke, and inverts its worry. The
+question was whether a search interface should be allowed to mutate ring
+membership. It should — that *is* the errand. Promotion is the dive's primary
+verb, not a convenience bolted onto a browser.
+
 | Key | Verb | What it means |
 |---|---|---|
-| `Enter` | **Open** | Switch to this context and leave the dive. You came here to find something; finding it should end the trip. |
-| `p` | **Surface** | Promote it back onto a ring — it stops being past the horizon. The card leaves the dive; the selection steps to its nearest link so you're never parked on something invisible. |
+| `p` | **Promote** | Put it back on an active ring — it stops being past the horizon, and becomes openable the ordinary way. The dive's whole point. The card leaves the dive; the selection steps to its nearest link so you're never parked on something invisible. |
+| `n` / `N` | **Next / previous result** | Jump to the brightest result, then the next. Decided 2026-08-03 (open question 2): a query still may never move you — the invariant holds absolutely — but an *explicit* key for "take me to the best match" is a real thing to want, and asking for it is not the same as having the space move under you. |
 | `Esc` | **Leave** | Back to the screen you dived from. One `PopLevel`, per the Esc doctrine. |
 
-`p` reuses `Action::Promote` and `Enter` reuses `Action::Activate` — the same
-actions the well binds — rather than minting dive-specific verbs. Likewise
+`Enter` is deliberately unassigned. Inspection beyond what the card face
+already shows — a fuller read of a context without leaving the archive — is
+wanted but undesigned; `Enter` is the obvious seat for it when it is. Until
+then it does nothing, which is honest, and better than training a reflex we
+intend to take away.
+
+`p` reuses `Action::Promote` — the same action the well binds — rather than
+minting a dive-specific verb. Likewise
 `StepPrev`/`StepNext` are "move within the level" and `LevelUp`/`LevelDown` are
 "shallower/deeper", which in a stream is literally what up and down mean. The
-dive adds exactly two new actions: `DiveHorizon` and `EditQuery`. Gamepad
-support, `bindings.toml` rebinding, and the `?` legend then come free.
+spike added two new actions — `DiveHorizon` and `EditQuery` — and the `n`/`N`
+decision adds a result-stepping pair on top of them; `ActivateHorizon` already
+exists on main. Gamepad support, `bindings.toml` rebinding, and the `?` legend
+then come free.
 
 ## Where a real search plugs in
 
@@ -240,6 +280,24 @@ one and a half:
 | **Drift / crosstalk partners** | ❌ `StagedDriftInfo` covers the *staged* queue only. Historical drift between two long-cold contexts isn't queryable. |
 | **The horizon list itself** | ❌ `assign_ring_seats` returns `horizon: Vec<Id>` app-side from a full context list. Fine at 300; a paging RPC at 10k. |
 
+**Re-checked 2026-08-03: v1 needs no kernel work at all.** The cost table below
+budgeted ~1 day for a `horizonContexts` RPC. That line is crossed off, not
+shrunk. `listContexts` already returns the *entire* corpus including archived
+contexts — archive/conclude/demote only `set_state` on a handle that stays in
+the map, and nothing but `kj context remove` ever unregisters one. The app
+already polls that into `DriftState.contexts` for the well, and
+`assign_ring_seats` already computes the horizon set app-side. `family` and
+`state` need no new wire fields either: both are pure client-side derivations
+over `ContextInfo`, and the lineage walk already exists as
+`time_well::card::ancestors`. What remains genuinely absent is exactly the two
+things this doc already defers — a true fall stamp (v1 uses `last_activity_at`,
+documented as a stand-in, per the paragraph below) and historical drift edges
+(v2). If a real fall stamp is wanted later it should be an *additive field* on
+`ContextHandleInfo`, not a new capability.
+
+This matters beyond effort: kernel development runs in its own sessions, so a
+v1 that touches no kernel code can proceed in parallel without coordination.
+
 None of these are hard, and none belong in a spike. The depth axis is the one
 that actually bites: without a "fell past the horizon at" stamp, an overflowed
 context's depth has to fall back to `last_activity_at`, which is a different
@@ -267,12 +325,38 @@ so a rebind shows up for free.
 well's `live.rs` lanes already exist). Cluster tinting from
 `kaijutsu_index::compute_clusters` — clusters are a *colour*, never a position,
 or principle 2 falls. A "you were here" trail. Query history on `Ctrl+A '`-style
-prefill.
+prefill. **Archive-time summaries** (Amy, 2026-08-03): when a context is
+archived it stops changing, so that is the moment to have a local model write a
+small summary and keep it — a card face down here could then say what the
+context *was about*, not just what it was called, and the ranker would have real
+prose to match on. Kernel-side and out of scope for v1; tracked in
+`docs/issues.md`.
 
 **Not planned.** Free-flight. Zoom levels. A minimap. Multi-select. Each is a
 vehicle, and the whole design is an argument that you don't need one.
 
 ## Open questions for Amy
+
+**Answered 2026-08-03.** Questions 2, 3, 4 and 5 are decided and have been
+folded into the sections above — they are kept here with their reasoning
+intact, because the argument is worth more than the verdict.
+
+- **Q2 — may a query move you?** *Decided: no, and `n`/`N` anyway.* The
+  invariant stands: a query changes light, never position or selection. But an
+  explicit key for "take me to the brightest result" is a different act from
+  the space moving under you. See "Verbs on the selection".
+- **Q3 — is `Enter` open-and-leave or open-and-stay?** *Decided: neither — the
+  premise was wrong.* The dive is inspect-only; you promote a context out to an
+  active ring and open it there. `Enter` is left unassigned for a future
+  inspect-in-place. See "Verbs on the selection".
+- **Q4 — should surfacing be reachable from down here?** *Decided: yes, and it
+  is the point.* Given Q3, promotion is not a convenience in a browser — it is
+  the dive's primary verb. A search interface mutating ring membership is the
+  errand, not a hazard.
+- **Q5 — the right entry gesture?** *Decided: both doors.* `Ctrl+A /` from
+  anywhere, and `Enter` on the "+N" chip. See "Entering".
+
+**Still open — both need eyes on it in motion, not an answer in the abstract:**
 
 1. **Does depth drifting over days bother you?** Depth is age, so cards sink
    slowly. The alternative is depth-from-a-fixed-epoch (absolutely stable, but
@@ -281,29 +365,7 @@ vehicle, and the whole design is an argument that you don't need one.
    angular lane — the axis you actually navigate by — is rock stable, and
    because "older is deeper" stays true under drift. Worth a look in motion.
 
-2. **Should the query be able to move you, on an explicit key?** I've argued
-   hard that a query must not evict the selection. But "jump to the brightest
-   result" is a real thing to want. A separate key (`n`/`N`, next/previous
-   result by light) would give it without breaking the invariant. I left it
-   out of the spike to see whether snap navigation alone is enough.
-
-3. **Is `Enter` = open-and-leave right, or should it be open-and-stay?**
-   Leaving matches "you came here to find something." Staying supports "open
-   three things in a row." The prototype logs instead of opening, so this is
-   still fully open.
-
-4. **Should surfacing (`p`) be reachable at all from down here**, or is the
-   horizon a place you only *read* from? Making a placement verb reachable in
-   the archive is convenient; it also means a search interface can mutate
-   ring membership, which is a different kind of surface than a browser.
-
-5. **The right entry gesture.** `Enter` on the "+N" chip is the obvious one.
-   But the chip is only reachable by navigating to the deepest ring first. A
-   `Ctrl+A /`-style prefix chord ("search everything, from anywhere") might be
-   the shortcut that actually gets used — at the cost of a slot in a table the
-   docs say is deliberately kept to one screenful.
-
-6. **`FOCUS_RADIUS` / the attention falloff.** Cards fade with distance from
+2. **`FOCUS_RADIUS` / the attention falloff.** Cards fade with distance from
    the selection (see the notes below for why). That is a *second* dimming
    axis on top of the query, and two dimming axes can fight. It reads well at
    the current numbers; it may want to be brightness-only, with scale left to
@@ -388,16 +450,21 @@ contexts, driven over BRP. Screenshots in the session scratchpad
 Assuming the spike's pure modules survive largely intact (they should — they
 have no Bevy in them and 50-odd tests):
 
+*Revised 2026-08-03 after re-checking the wire and after Amy's decisions.*
+
 | Work | Estimate |
 |---|---|
-| Kernel: `horizonContexts` RPC (list + the fall stamp) | ~1 day, mostly deciding what the stamp *is* |
+| ~~Kernel: `horizonContexts` RPC~~ | **Not needed.** `listContexts` already carries it — see "What the kernel still owes us" |
 | App: corpus adapter, `ContextInfo` → `HorizonContext`, keyed-join reconcile like `time_well::sync` | ~half a day |
-| Wire the well's "+N" chip as the entry; retire the debug bindings | ~2 hours |
+| Both entry doors: make main's `ActivateHorizon` arm dive, add the `Ctrl+A /` chord, retire `F2` | ~2 hours |
+| `p` promote as the primary verb (real ring placement, selection steps to nearest link) | ~2 hours |
+| `n` / `N` result stepping | ~1 hour |
 | Camera framing pass (aim at the stream axis; the composition problem above) | ~half a day, mostly live-tuning over BRP |
-| Real `Enter` (switch context and leave) | ~2 hours |
+| ~~Real `Enter` (switch context and leave)~~ | **Dropped** — the dive is inspect-only; promotion replaces it |
 | Legend from `InputMap`; visual polish pass with Amy in front of it | ~half a day |
 
-**~3 days of focused work to a shippable v1**, plus however long the tuning
+**~2 days of focused work to a shippable v1** — down from ~3 now that the
+kernel line is gone and `Enter` is not an open. Plus however long the tuning
 conversation takes — and that conversation is the part that decides whether
 this is good, so it shouldn't be squeezed. v2 (semantic index + drift edges)
 is gated on kernel work more than app work.
