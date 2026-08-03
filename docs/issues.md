@@ -379,6 +379,29 @@ correctness problem, both erode the value of WARN.
   and work, so this is config debt from the SQL-config seeding: either create
   the file, clear `api_key_file` on those rows, or teach the fall-through to
   log once at debug when the env key is present.
+## Diff viewer footer + status bar overlap content rows (2026-08-03, slice-5 live verify)
+
+Seen during the first live run of `Screen::Diff` on moltar, in a ~1080p-scale
+window (the app had just survived a zorak hibernation + relaunch, so a window
+scale change is in the mix): the viewer's diffstat footer strip ("diff, 1
+file, +10 −6, 1/22") draws OVER the last visible content rows instead of
+reserving a row for itself, the global status bar bleeds through beneath it,
+and the conversation status bar's own left cluster self-overlaps ("40
+fail3d.8k/1M Enter: submit"). Likely ONE bug, not three: overlay/footer text
+placed with a stale or mixed logical/physical height after a scale change —
+the exact `ComputedNode`-is-physical trap CLAUDE.md warns about
+(`view::ui_rtt::logical_size`). Retest after a clean window resize before
+digging; if it reproduces at steady scale it's a real layout math bug in the
+viewer's visible-row count (footer not subtracted) plus status-bar segment
+widths.
+
+Everything else in the slice-5 checklist verified live today: `v` open (after
+the DiffSurface resize-filter crash fix in `block_render.rs`), `]c`, `V`+`jj`
+selection bands, `y` → Wayland clipboard (`wl-paste` exact), compose
+`Ctrl+V` paste, `R` re-parse, `q` close. Still unverified: stale banner +
+`R`-after-change, declared `ContentType::Diff` open path, parse-error banner
+(all need kernel block edits — kaijutsu-mcp was stuck in local mode this
+session; global `~/.claude.json` entry now carries `--connect`).
 
 ## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
 

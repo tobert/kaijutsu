@@ -1405,6 +1405,7 @@ pub fn resize_block_textures(
             With<crate::view::components::MsdfOverlayText>,
             With<crate::view::shell_dock::MsdfShellDockText>,
             With<crate::view::editor::render::EditorSurface>,
+            With<crate::view::diff_view::render::DiffSurface>,
             With<RoleGroupBorder>,
         )>,
     >,
@@ -1862,6 +1863,74 @@ fn should_extract_msdf_block(version: u64, _glyphs_empty: bool, last_rendered: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- resize_block_textures marker filter --------------------------------
+
+    /// Every MSDF surface must be in `resize_block_textures`' marker filter,
+    /// or it keeps its `ImageNode::default()` placeholder — which lacks
+    /// RENDER_ATTACHMENT, so the first render pass into it is a fatal wgpu
+    /// validation error (how `Screen::Diff` crashed the app on open,
+    /// 2026-08-03). Spawns the surface exactly as its screen does and
+    /// asserts the swap to a renderable texture happens.
+    fn assert_surface_gets_renderable_texture(marker: impl Bundle) {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(TextMetrics::default());
+        world.insert_resource(GpuTextureLimits {
+            max_texture_dim: FALLBACK_MAX_TEXTURE_DIM,
+        });
+        world.insert_resource(Assets::<Image>::default());
+        let mut materials = Assets::<BlockFxMaterial>::default();
+        let material = materials.add(BlockFxMaterial::default());
+        world.insert_resource(materials);
+
+        let surface = world
+            .spawn((
+                marker,
+                crate::view::ui_rtt::UiRttTexture {
+                    built_width: 640.0,
+                    built_height: 480.0,
+                    ..default()
+                },
+                MaterialNode(material),
+                ImageNode::default(),
+            ))
+            .id();
+
+        world
+            .run_system_once(resize_block_textures)
+            .expect("system runs");
+
+        let rtt = world.get::<crate::view::ui_rtt::UiRttTexture>(surface).unwrap();
+        assert!(
+            rtt.width > 0 && rtt.height > 0,
+            "surface not matched by resize_block_textures' marker filter"
+        );
+        let image_node = world.get::<ImageNode>(surface).unwrap();
+        let images = world.resource::<Assets<Image>>();
+        let image = images
+            .get(&image_node.image)
+            .expect("ImageNode still points at the un-allocated placeholder");
+        assert!(
+            image
+                .texture_descriptor
+                .usage
+                .contains(TextureUsages::RENDER_ATTACHMENT),
+            "allocated texture is not renderable: {:?}",
+            image.texture_descriptor.usage
+        );
+    }
+
+    #[test]
+    fn diff_surface_gets_renderable_texture() {
+        assert_surface_gets_renderable_texture(crate::view::diff_view::render::DiffSurface);
+    }
+
+    #[test]
+    fn editor_surface_gets_renderable_texture() {
+        assert_surface_gets_renderable_texture(crate::view::editor::render::EditorSurface);
+    }
 
     // -- round_to_physical_px (Fix 2: built_width physical-pixel rounding) -
     //
