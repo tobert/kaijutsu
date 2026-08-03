@@ -679,14 +679,11 @@ landed 2026-07-15 in `claude::Client::stream()`. The client is young; we own
 it precisely so we can tailor to the provider — gaps observed while wiring
 thinking, roughly by priority:
 
-- **No config path into provider clients.** The documented seam
-  (`llm_stream.rs` "provider-specific knobs applied inside `Client::stream()`
-  from configuration and context state") works, but "configuration" is
-  currently a hardcoded default — there is no per-context or models.toml
-  route to say "thinking off for this context" or "effort: low here".
-  Natural homes: a per-model options table in models.toml, or context config
-  (`/etc/client`-style cascade). Decide once, then the same pipe carries
-  future knobs (effort, `output_config`, fast mode).
+- ~~No config path into provider clients~~ **SHIPPED 2026-08-03** by the
+  cast renovation: per-slot `effort`/`thinking_style`/`thinking_budget`/
+  sampling on `cast_slots`, cascading to `llm_defaults`, reaching the wire
+  through `apply_slot_tunables` — "effort: low here" is now
+  `kj cast slot set <cast> <role> --effort low`.
 - **Model capability knowledge is string-parsing.** `Thinking::default_for_model`
   parses `claude-<family>-<major>-<minor>` and gates on `>= 4.6`. Fine for
   one knob; a second capability (effort levels, sampling-param rejection on
@@ -716,15 +713,16 @@ landed 2026-07-15. Deliberately left out, in rough priority order:
   should cross the wire instead).
 - **Model registry / `kj models` verb**: two model dirs now follow the
   `~/.local/share/kaijutsu/models/<name>/` convention (bge-small-en-v1.5,
-  beat-this) with install instructions living in models.toml comments and a
+  beat-this) with install instructions living beside the embedding recipe in seed_backends.rs and a
   README. A registry (name → expected files → checksum → fetch) would make
   `kj models list/fetch/verify` possible and close the manual-download gap.
   This is also where a `kaijutsu-inference`-style shared crate becomes
   justified — explicitly deferred (Amy, 2026-07-15) until there's real
   sharing; the Embedder trait + per-crate rten deps are the seam until then.
-- **models.toml `[audio]`/beat-this section**: the verb hardcodes the model
-  dir convention; a config section needs toml_config plumbing + the
-  seeded-once CRDT caveat handled.
+- **audio/beat-this model config**: the verb hardcodes the model dir
+  convention; a config home now means a kj-managed kernel-db table (the
+  2026-08-03 SQL model-config shape — models.toml is gone, and the
+  seeded-once CRDT caveat died with it).
 - **Vendor risk note**: beat-this is v1.0.0, single maintainer (danigb), MIT —
   small enough to vendor/fork if it stalls. rten GPU support (Metal-first) is
   on its author's 2026 roadmap; CPU is fine for our workloads.
@@ -1237,7 +1235,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   one (or delete the dead one) as part of moving the cache; moving the whole
   `DocumentCache` into the client is the bigger refactor.
 - **LLM providers:**
-  - Move per-model knobs out of the config layer (`models.toml`), into the app.
+  - Per-model knobs in the app (server-side config is now cast_slots/backend_models, 2026-08-03; the app renders none of it yet).
   - Push subscriber for `ConversationMailbox`.
   - **`Registry::resolve_model` pins a bare model name on the *default*
     provider** (`llm/mod.rs:721`) — the sharp edge behind the 2026-07-04
@@ -1853,7 +1851,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   spec. Consider letting reserved words bind as plain args after a flag.
   (kaish-lexer change in `~/src/kaish`, not kaijutsu-side.) NOTE: alias
   *resolution* is now fixed — `kj context create/set --model "local"` expands
-  the `models.toml [model_aliases]` entry to its concrete `provider/model`
+  the registry alias entry (then models.toml [model_aliases]) to its concrete `provider/model`
   before storage (`resolve_context_config`, 2026-06-14), so the quoted form
   works end-to-end; only the bare-`local` lexer footgun remains.
 - **Turn-loop timeout gaps (residual of the local-model stall, re-triaged
@@ -1903,9 +1901,10 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   config predates whatever earlier fix corrected this would still be
   serving the stale value, since a context's model is baked in at creation
   time from the live registry (`rpc.rs` `create_context_inner`) and restarts
-  never re-seed an already-present file. If `not_found_error` on mcp/default
-  contexts recurs, run `kj config reset models.toml` against the live kernel
-  rather than assuming a source fix will reach it.
+  never re-seed an already-present file. **2026-08-03: this whole failure
+  class is structurally dead** — models.toml no longer exists; defaults live
+  in the `llm_defaults` table. If a stale default ever recurs, the remedy is
+  `kj backend default show` / `set` (or `kj backend reseed`), all live-reload.
 - **`builtin.file` hardening — remaining (small; the byte→char corruption fix +
   hashline addressing shipped 2026-06-17, story in devlog +
   `project_file_tools_hashline`):** the in-context recovery affordance
@@ -1949,7 +1948,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   `outputs[0]` (`kaijutsu-index/src/embedder.rs`). E5/jina-style models (no
   token_type_ids, CLS pooling, or a ready pooled output) won't load. Growth
   path: introspect `session.inputs` for the input set + a small per-model
-  manifest (pooling strategy) in models.toml. The `Embedder` trait is the seam;
+  manifest (pooling strategy) beside embedding_config in the kernel db. The `Embedder` trait is the seam;
   nothing structural blocks this.
 - **Embedder: serialized CPU-only inference** (2026-07-12): one ONNX session
   behind a `Mutex` with `intra_threads(1)`; no execution-provider plumbing

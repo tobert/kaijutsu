@@ -5000,20 +5000,60 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let provider_name = pry!(pry!(pry!(params.get()).get_provider()).to_str()).to_owned();
         let kernel_arc = self.kernel.kernel.clone();
+        let kernel_db = self.kernel.kernel_db.clone();
 
         let span = tracing::info_span!("rpc", method = "set_default_provider");
         Promise::from_future(
             async move {
-                let mut registry = kernel_arc.llm().write().await;
-                if registry.set_default(&provider_name) {
-                    results.get().set_success(true);
-                    results.get().set_error("");
-                    log::info!("Default LLM provider set to: {}", provider_name);
-                } else {
-                    results.get().set_success(false);
-                    results
-                        .get()
-                        .set_error(format!("provider '{}' not found", provider_name));
+                // DB-first, then rebuild — the same write-then-reload shape
+                // every `kj backend/cast/alias` mutation uses. The old body
+                // mutated the in-memory registry only, so the change silently
+                // reverted on the next config write's reload (or restart):
+                // registry drifting from DB truth, the dual-ownership disease
+                // this config system exists to prevent. `set_llm_defaults`
+                // refuses a dangling backend name, so validation rides the
+                // write.
+                let rebuilt = {
+                    let db = kernel_db.lock();
+                    let row = match db.get_llm_defaults() {
+                        Ok(Some(mut d)) => {
+                            d.default_backend = provider_name.clone();
+                            d
+                        }
+                        Ok(None) => {
+                            results.get().set_success(false);
+                            results.get().set_error(
+                                "no llm_defaults row — run `kj backend reseed` \
+                                 or `kj backend default set`",
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            results.get().set_success(false);
+                            results.get().set_error(format!("reading llm_defaults: {e}"));
+                            return Ok(());
+                        }
+                    };
+                    if let Err(e) = db.set_llm_defaults(&row) {
+                        results.get().set_success(false);
+                        results.get().set_error(format!("{e}"));
+                        return Ok(());
+                    }
+                    kaijutsu_kernel::build_llm_registry(&db)
+                };
+                match rebuilt {
+                    Ok(reg) => {
+                        *kernel_arc.llm().write().await = reg;
+                        results.get().set_success(true);
+                        results.get().set_error("");
+                        log::info!("Default LLM backend set to: {}", provider_name);
+                    }
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(format!(
+                            "write landed but the LLM registry failed to reload: {e}"
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -5030,27 +5070,61 @@ impl kernel::Server for KernelImpl {
         let provider_name = pry!(pry!(params_reader.get_provider()).to_str()).to_owned();
         let model = pry!(pry!(params_reader.get_model()).to_str()).to_owned();
         let kernel_arc = self.kernel.kernel.clone();
+        let kernel_db = self.kernel.kernel_db.clone();
 
         let span = tracing::info_span!("rpc", method = "set_default_model");
         Promise::from_future(
             async move {
-                let mut registry = kernel_arc.llm().write().await;
-                // Verify the provider exists
-                if registry.get(&provider_name).is_none() {
-                    results.get().set_success(false);
-                    results
-                        .get()
-                        .set_error(format!("provider '{}' not found", provider_name));
-                    return Ok(());
+                // DB-first + rebuild, same shape as set_default_provider
+                // above (and the kj mutations). Takes both halves of the
+                // identity, so it sets backend AND model together.
+                let rebuilt = {
+                    let db = kernel_db.lock();
+                    let row = match db.get_llm_defaults() {
+                        Ok(Some(mut d)) => {
+                            d.default_backend = provider_name.clone();
+                            d.default_model = model.clone();
+                            d
+                        }
+                        Ok(None) => {
+                            results.get().set_success(false);
+                            results.get().set_error(
+                                "no llm_defaults row — run `kj backend reseed` \
+                                 or `kj backend default set`",
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            results.get().set_success(false);
+                            results.get().set_error(format!("reading llm_defaults: {e}"));
+                            return Ok(());
+                        }
+                    };
+                    if let Err(e) = db.set_llm_defaults(&row) {
+                        results.get().set_success(false);
+                        results.get().set_error(format!("{e}"));
+                        return Ok(());
+                    }
+                    kaijutsu_kernel::build_llm_registry(&db)
+                };
+                match rebuilt {
+                    Ok(reg) => {
+                        *kernel_arc.llm().write().await = reg;
+                        results.get().set_success(true);
+                        results.get().set_error("");
+                        log::info!(
+                            "Default model set to: {} (backend: {})",
+                            model,
+                            provider_name
+                        );
+                    }
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(format!(
+                            "write landed but the LLM registry failed to reload: {e}"
+                        ));
+                    }
                 }
-                registry.set_default_model(&model);
-                results.get().set_success(true);
-                results.get().set_error("");
-                log::info!(
-                    "Default model set to: {} (provider: {})",
-                    model,
-                    provider_name
-                );
                 Ok(())
             }
             .instrument(span),

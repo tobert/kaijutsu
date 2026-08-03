@@ -120,9 +120,27 @@ const FACTORY_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 /// budget (max 64K), so leave headroom above a plain-answer ceiling.
 const FACTORY_MAX_TOKENS: i64 = 16384;
 
-/// The local ONNX embedding model for semantic indexing. Directory should hold
-/// `model.onnx` + `tokenizer.json`; the model's identity is its directory
-/// basename, so renaming the dir invalidates the on-disk index.
+/// The local ONNX embedding model for semantic indexing (constellation
+/// clustering, drift discovery, semantic search). Inference is pure-Rust
+/// (rten) — no ONNX Runtime library involved.
+///
+/// Install recipe (rescued from the demolished models.toml's comments —
+/// this is its durable home now):
+///
+/// - Directory must hold `model.onnx` + `tokenizer.json`.
+/// - fp32 export (works as-is, 133 MB): `onnx/model.onnx` + `tokenizer.json`
+///   from <https://huggingface.co/Xenova/bge-small-en-v1.5>
+/// - int8 (34 MB, faster load, what we ship): quantize the fp32 export with
+///   rten's own tool (needs a Python venv with onnxruntime, onnx, onnx_ir):
+///   `python ort-quantize.py dynamic fp32.onnx model.onnx` —
+///   <https://github.com/robertknight/rten/blob/main/tools/ort-quantize.py>
+/// - Verify a candidate: `cargo run -p kaijutsu-index --example embed_check`
+/// - Quantized exports from OTHER pipelines may not load — rten rejects e.g.
+///   fp16 initializers (the old Qdrant bge-small-en-v1.5-onnx-Q fails so).
+///
+/// The model's identity is its directory basename: renaming the dir — or
+/// changing `dimensions` — invalidates the on-disk semantic index (wiped at
+/// next kernel start, re-populated lazily from the watcher / `kj synth all`).
 const FACTORY_EMBEDDING_DIR: &str = "~/.local/share/kaijutsu/models/bge-small-en-v1.5";
 const FACTORY_EMBEDDING_DIMS: i64 = 384;
 const FACTORY_EMBEDDING_MAX_TOKENS: i64 = 512;
