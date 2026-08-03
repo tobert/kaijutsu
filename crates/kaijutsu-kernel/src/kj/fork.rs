@@ -140,7 +140,7 @@ impl KjDispatcher {
 
         match model_spec {
             Some(spec) => {
-                // Same resolver as `kj context set` — resolves `models.toml`
+                // Same resolver as `kj context set` — resolves configured
                 // aliases (`deepseek-lite`), validates an explicit provider, and
                 // fails loud on the `provider:model` colon footgun. Before this,
                 // fork skipped alias resolution and silently pinned a bare alias
@@ -1617,7 +1617,7 @@ mod tests {
             aliases.insert(
                 s("deepseek-lite"),
                 ModelAlias {
-                    provider: s("deepseek"),
+                    backend: s("deepseek"),
                     model: s("deepseek-v4-flash"),
                 },
             );
@@ -3192,7 +3192,7 @@ mod tests {
             aliases.insert(
                 s("cheap"),
                 ModelAlias {
-                    provider: s("deepseek"),
+                    backend: s("deepseek"),
                     model: s("deepseek-flash"),
                 },
             );

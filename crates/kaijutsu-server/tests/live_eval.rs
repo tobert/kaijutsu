@@ -2,7 +2,7 @@
 //!
 //! Skeleton + one fork. Spins up an isolated kernel rooted at
 //! `target/live_eval/<ts>/`, points it at Claude Haiku via a generated
-//! `models.toml`, runs one model turn, then hands off to a kaish harness
+//! the kernel DB's model config, runs one model turn, then hands off to a kaish harness
 //! (`tests/live_eval/harness/*.kai`) that forks the conversation and asserts
 //! on the resulting block topology with `kj block` JSON output.
 //!
@@ -40,7 +40,7 @@ fn live_eval_wc_clone_skeleton() {
     }
 
     // Persistent per-run dir under target/live_eval/<ts>/. Survives on
-    // failure for inspection (kernel db, models.toml, workdir/).
+    // failure for inspection (kernel db, workdir/).
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -62,20 +62,10 @@ fn live_eval_wc_clone_skeleton() {
     fs::create_dir_all(&workdir).expect("create workdir");
     eprintln!("[live_eval] run dir: {}", run_root.display());
 
-    // Write models.toml so the kernel registers an anthropic provider with
-    // Haiku as the default. API key resolves from ANTHROPIC_API_KEY env var.
-    let models_toml = format!(
-        r#"default_provider = "{ANTHROPIC_PROVIDER}"
-
-[providers.{ANTHROPIC_PROVIDER}]
-enabled = true
-default_model = "{HAIKU_MODEL}"
-api_key_env = "ANTHROPIC_API_KEY"
-
-[model_aliases]
-"#
-    );
-    fs::write(state_dir.join("models.toml"), models_toml).expect("write models.toml");
+    // Point the kernel's SQL model config at Anthropic/Haiku. The factory
+    // floor already ships an `anthropic` backend reading ANTHROPIC_API_KEY;
+    // this only moves the DEFAULT onto it (the shipped default is deepseek).
+    write_haiku_defaults(&state_dir);
 
     // Concatenate the kaish harness sources into one program. No `source`
     // builtin in kaish today, so we splice them at submission time.
@@ -355,20 +345,25 @@ fn setup_run_dirs(suffix: &str) -> (PathBuf, PathBuf) {
     (run_root, state_dir)
 }
 
-/// Write a `models.toml` that registers Anthropic with Haiku as default.
-fn write_haiku_models_toml(state_dir: &std::path::Path) {
-    let models_toml = format!(
-        r#"default_provider = "{ANTHROPIC_PROVIDER}"
+/// Point the kernel's `llm_defaults` at Anthropic with Haiku as the default
+/// model. Model config is SQL-native, so this writes the DB directly rather
+/// than a `models.toml` the kernel would have read once at seed time.
+///
+/// `ensure_factory_backends` runs at server boot and is absent-only, so the
+/// `anthropic` backend it creates (reading `ANTHROPIC_API_KEY`) is exactly the
+/// one these defaults name — we seed both here so the ordering does not matter.
+fn write_haiku_defaults(state_dir: &std::path::Path) {
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_types::PrincipalId;
 
-[providers.{ANTHROPIC_PROVIDER}]
-enabled = true
-default_model = "{HAIKU_MODEL}"
-api_key_env = "ANTHROPIC_API_KEY"
-
-[model_aliases]
-"#
-    );
-    fs::write(state_dir.join("models.toml"), models_toml).expect("write models.toml");
+    fs::create_dir_all(state_dir).expect("create state dir");
+    let mut db = KernelDb::open(state_dir.join("kernel.db")).expect("open kernel db");
+    kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
+        .expect("seed factory backends");
+    let mut defaults = db.get_llm_defaults().unwrap().expect("floor seeds defaults");
+    defaults.default_backend = ANTHROPIC_PROVIDER.to_string();
+    defaults.default_model = HAIKU_MODEL.to_string();
+    db.set_llm_defaults(&defaults).expect("point defaults at anthropic/haiku");
 }
 
 /// Local copy of the e2e_kj_workflow `shell_exec_wait_timeout` helper.
@@ -447,7 +442,7 @@ fn live_eval_conversation_session_slice_a() {
     }
 
     let (run_root, state_dir) = setup_run_dirs("slice_a");
-    write_haiku_models_toml(&state_dir);
+    write_haiku_defaults(&state_dir);
 
     let tap = std::sync::Arc::new(std::sync::Mutex::new(TapCounter::default()));
     let tap_for_async = tap.clone();

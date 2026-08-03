@@ -8,12 +8,15 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+pub mod alias;
 pub mod attach;
 pub mod audio;
+pub mod backend;
 pub mod binding;
 pub mod block;
 pub mod cache;
 pub mod cas;
+pub mod cast;
 pub mod cp;
 pub mod config;
 pub mod context;
@@ -356,6 +359,19 @@ impl KjDispatcher {
         }
         if cmd == "preset" {
             return self.dispatch_preset(&argv[1..], caller);
+        }
+        // Model configuration is SQL-native and kernel-global — `kj backend`,
+        // `kj cast`, and `kj alias` address rows by name, never a context, so
+        // they're exempt from the active-context gate below (same rationale as
+        // `kj config`, which they replaced for this surface).
+        if cmd == "backend" {
+            return self.dispatch_backend(&argv[1..], caller).await;
+        }
+        if cmd == "cast" {
+            return self.dispatch_cast(&argv[1..], caller).await;
+        }
+        if cmd == "alias" {
+            return self.dispatch_alias(&argv[1..], caller).await;
         }
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
@@ -734,6 +750,9 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(context::ContextArgs::command())
         .subcommand(workspace::WorkspaceArgs::command())
         .subcommand(preset::PresetArgs::command())
+        .subcommand(backend::BackendArgs::command())
+        .subcommand(cast::CastArgs::command())
+        .subcommand(alias::AliasArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())

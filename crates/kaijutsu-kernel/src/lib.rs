@@ -36,6 +36,7 @@ pub mod midi_presence;
 pub mod midi_seed;
 pub mod peers;
 pub mod runtime;
+pub mod seed_backends;
 pub mod seed_presets;
 pub mod seed_scripts;
 pub mod state;
@@ -70,18 +71,20 @@ pub use kernel::Kernel;
 pub use llm::{
     // Default model
     DEFAULT_MODEL,
+    // Configuration (SQL-native: kernel_db is the source of truth)
+    BackendConfig,
+    BackendKind,
     EmbeddingModelConfig,
-    LlmConfig,
     // Core types
     LlmError,
     LlmRegistry,
     LlmResult,
     Message as LlmMessage,
     ModelAlias,
-    ModelsConfig,
-    // Configuration
-    ProviderConfig,
+    ModelInfo,
+    ResolvedSlot,
     ResponseBlock,
+    SlotTunables,
     // Provider dispatch (replaces rig-shaped RigProvider/RigStreamAdapter)
     Provider,
     ProviderStream,
@@ -102,9 +105,8 @@ pub use llm::{
     SituationalContext,
     build_system_prompt,
     extract_system_prompt_sections,
-    initialize_llm_registry,
-    load_llm_config_toml,
-    load_models_config_toml,
+    build_llm_registry,
+    load_embedding_config,
 };
 pub use execution::{ExecContext, ExecResult};
 pub use state::KernelState;

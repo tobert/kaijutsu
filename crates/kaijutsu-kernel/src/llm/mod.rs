@@ -29,6 +29,7 @@
 
 pub mod claude;
 pub mod config;
+pub mod db_config;
 pub mod deepseek;
 mod hydrate;
 pub mod image_cache;
@@ -37,20 +38,19 @@ pub mod openai;
 mod splice;
 pub mod stream;
 pub mod system_prompt;
-pub mod toml_config;
 
 // Re-export key types
-pub use config::ProviderConfig;
+pub use config::{
+    BackendConfig, BackendKind, EmbeddingModelConfig, ModelAlias, ModelInfo, ResolvedSlot,
+    SUPPORTED_BACKEND_KINDS, SlotTunables, unknown_backend_kind_message,
+};
+pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
     StreamError, StreamEvent, UsageExtra,
 };
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
-pub use toml_config::{
-    EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
-    load_llm_config_toml, load_models_config_toml,
-};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -398,57 +398,30 @@ pub enum Provider {
     Mock(MockClient),
 }
 
-/// Provider type names `Provider::from_config` accepts — the `[providers.
-/// <name>]` TOML table name in `models.toml` IS the type. Shared with `kj
-/// config set`'s write-time validation of `models.toml` (`kj/config.rs`) so
-/// both surfaces agree on the supported list and its wording (2026-06-30
-/// config papercuts: a typo'd provider type should fail loud at write time,
-/// not silently drop at boot and hang a turn later).
-pub const SUPPORTED_PROVIDER_TYPES: &[&str] = &[
-    "anthropic",
-    "deepseek",
-    "openai",
-    "ollama",
-    "lemonade",
-    "local",
-];
-
-/// Build the standard "unknown provider type" message — used by both
-/// `Provider::from_config` (boot-time init) and `kj config set`'s
-/// `models.toml` validation (write-time rejection), so an operator sees the
-/// same wording regardless of which surface caught the typo.
-pub fn unknown_provider_type_message(name: &str) -> String {
-    format!(
-        "unknown provider type '{name}' (supported: {})",
-        SUPPORTED_PROVIDER_TYPES.join(", ")
-    )
-}
-
-/// Resolve a provider's API key, falling back to a placeholder when
+/// Resolve a backend's API key, falling back to a placeholder when
 /// `key_optional` is set (for a gateway where auth is network identity, not
 /// the bearer token — the header still has to be present and non-empty,
 /// but nothing downstream reads its value).
-fn resolve_key_or_placeholder(config: &ProviderConfig, provider_label: &str) -> LlmResult<String> {
+fn resolve_key_or_placeholder(config: &BackendConfig, label: &str) -> LlmResult<String> {
     match config.resolve_api_key() {
         Some(key) => Ok(key),
         None if config.key_optional => Ok("key-optional-placeholder".to_string()),
-        None => Err(LlmError::AuthError(format!(
-            "No API key for {provider_label}"
-        ))),
+        None => Err(LlmError::AuthError(format!("No API key for {label}"))),
     }
 }
 
 impl Provider {
-    /// Create a provider from configuration.
+    /// Build a client from a resolved `backends` row.
     ///
-    /// The `provider_type` string maps to the enum variant: `anthropic`/
-    /// `claude`, `deepseek`, and the OpenAI-compatible family
-    /// (`openai`, `ollama`, `lemonade`, `local`). Unknown types return
-    /// [`LlmError::Unavailable`] rather than silently falling back —
-    /// surfacing the mismatch is the point.
-    pub fn from_config(config: &ProviderConfig) -> LlmResult<Self> {
-        match config.provider_type.as_str() {
-            "anthropic" | "claude" => {
+    /// The [`BackendKind`] — not the name — picks the variant, which is the
+    /// whole point of the name/kind split: a backend called `zorak` or
+    /// `gateway-2` with `kind = openai` works, and two Anthropic endpoints can
+    /// coexist. The backend NAME rides along on the OpenAI-compatible client
+    /// (it labels the provider in wire logs), so a local server is finally
+    /// nameable as itself.
+    pub fn from_backend(config: &BackendConfig) -> LlmResult<Self> {
+        match config.kind {
+            BackendKind::Anthropic => {
                 let api_key = resolve_key_or_placeholder(config, "Anthropic")?;
                 let mut client = claude::Client::new(api_key);
                 if let Some(ref url) = config.base_url {
@@ -456,20 +429,22 @@ impl Provider {
                 }
                 Ok(Self::Claude(client))
             }
-            "deepseek" => {
+            BackendKind::DeepSeek => {
                 let api_key = resolve_key_or_placeholder(config, "DeepSeek")?;
                 let mut client = deepseek::Client::new(api_key);
+                // DeepSeek's endpoint is fixed; a base_url on this kind is
+                // accepted and honored rather than silently discarded, but the
+                // `kj backend set` help says not to bother.
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
                 }
                 Ok(Self::DeepSeek(client))
             }
-            // Generic OpenAI-compatible servers. `openai` is OpenAI itself;
-            // `ollama`, `lemonade`, and `local` are common local-server
-            // aliases pointed at a `base_url`. Auth is optional — a local
-            // server needs no key — so a missing key is not an error here.
-            "openai" | "ollama" | "lemonade" | "local" => {
-                let mut client = openai::Client::new(config.provider_type.clone());
+            // Any OpenAI-compatible `/chat/completions` server. Auth is
+            // optional — a local server needs no key — so a missing key is
+            // not an error here.
+            BackendKind::OpenAi => {
+                let mut client = openai::Client::new(config.name.clone());
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
                 }
@@ -479,37 +454,33 @@ impl Provider {
                 Ok(Self::OpenAi(client))
             }
             #[cfg(any(test, feature = "test-mock"))]
-            "mock" => {
-                let model = config
-                    .default_model
-                    .clone()
-                    .unwrap_or_else(|| "mock-model".into());
-                Ok(Self::Mock(MockClient::new(format!(
-                    "Mock summary for testing (model: {model})."
-                ))))
-            }
-            other => Err(LlmError::Unavailable(unknown_provider_type_message(other))),
+            BackendKind::Mock => Ok(Self::Mock(MockClient::new(format!(
+                "Mock summary for testing (backend: {}).",
+                config.name
+            )))),
         }
     }
 
     /// Create a Claude provider from `ANTHROPIC_API_KEY`.
     pub fn anthropic_from_env() -> LlmResult<Self> {
-        let config = ProviderConfig::new("anthropic").with_api_key_env("ANTHROPIC_API_KEY");
-        Self::from_config(&config)
+        let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
+            .with_api_key_env("ANTHROPIC_API_KEY");
+        Self::from_backend(&config)
     }
 
     /// Create a DeepSeek provider from `DEEPSEEK_API_KEY`.
     pub fn deepseek_from_env() -> LlmResult<Self> {
-        let config = ProviderConfig::new("deepseek").with_api_key_env("DEEPSEEK_API_KEY");
-        Self::from_config(&config)
+        let config = BackendConfig::new("deepseek", BackendKind::DeepSeek)
+            .with_api_key_env("DEEPSEEK_API_KEY");
+        Self::from_backend(&config)
     }
 
-    /// Stable provider identifier (matches the `provider_type` field used
-    /// in models.toml and the DriftRouter).
+    /// Stable identifier for the *kind* of wire this client speaks.
     ///
-    /// Most variants map to a static string; `OpenAi` borrows its
-    /// config-supplied name (e.g. "lemonade", "ollama", "openai"), so this
-    /// returns `&str` rather than `&'static str`.
+    /// NOT the backend name — an `OpenAi` client borrows its config-supplied
+    /// name (which for the OpenAI-compatible kind IS the backend name), while
+    /// Claude/DeepSeek report their kind. Registry keys are backend names;
+    /// use those when you need the handle.
     pub fn name(&self) -> &str {
         match self {
             Self::Claude(_) => "anthropic",
@@ -658,14 +629,27 @@ impl ProviderStream {
     }
 }
 
-/// Registry of LLM providers.
+/// Registry of live LLM backends, keyed by backend NAME.
+///
+/// A **snapshot** of the DB config, not a view onto it: the whole thing is
+/// rebuilt from `kernel_db` and swapped in behind the kernel's
+/// `RwLock<LlmRegistry>` whenever a `kj backend`/`kj cast`/`kj alias` write
+/// lands (see `db_config::build_llm_registry` and
+/// `KjDispatcher::reload_llm_registry`). Reads stay lock-cheap on the hot turn
+/// path, and config changes take effect without a kernel restart.
 #[derive(Default)]
 pub struct LlmRegistry {
     providers: HashMap<String, Arc<Provider>>,
     default_provider: Option<String>,
     default_model: Option<String>,
-    model_aliases: HashMap<String, toml_config::ModelAlias>,
-    provider_configs: Option<Vec<ProviderConfig>>,
+    model_aliases: HashMap<String, config::ModelAlias>,
+    backends: HashMap<String, BackendConfig>,
+    /// The `llm_defaults` tunable floor a cast slot cascades onto.
+    default_tunables: SlotTunables,
+    /// Resolved cast slots keyed by `(cast_label_lowercase, role)`. Stored so
+    /// Track B can ask "what does cast X say for role Y" without a DB hop on
+    /// the turn path.
+    cast_slots: HashMap<(String, String), ResolvedSlot>,
 }
 
 impl std::fmt::Debug for LlmRegistry {
@@ -678,6 +662,7 @@ impl std::fmt::Debug for LlmRegistry {
                 "model_aliases",
                 &self.model_aliases.keys().collect::<Vec<_>>(),
             )
+            .field("casts", &self.cast_labels())
             .finish()
     }
 }
@@ -730,25 +715,71 @@ impl LlmRegistry {
         self.default_model.as_deref()
     }
 
-    /// Get max_output_tokens for the default provider, falling back to 64000.
+    /// Maximum RESPONSE tokens, from `llm_defaults.max_tokens`, falling back
+    /// to 64000 when unset.
     ///
-    /// Set generously — the API enforces per-model ceilings.
+    /// Set generously — the API enforces per-model ceilings. This is the
+    /// global floor; a cast slot's own `max_tokens` overrides it, which Track
+    /// B consumes via [`Self::resolved_slot`].
     pub fn max_output_tokens(&self) -> u64 {
-        self.provider_configs
-            .as_ref()
-            .and_then(|configs| {
-                let default = self.default_provider.as_deref()?;
-                configs.iter().find(|c| c.provider_type == default)
-            })
-            .and_then(|c| c.max_output_tokens)
-            .unwrap_or(64000)
+        self.default_tunables.max_tokens.unwrap_or(64000)
     }
 
-    /// Get a provider's config by name.
-    pub fn provider_config(&self, name: &str) -> Option<&ProviderConfig> {
-        self.provider_configs
-            .as_ref()
-            .and_then(|configs| configs.iter().find(|c| c.provider_type == name))
+    /// The `llm_defaults` tunable floor.
+    pub fn default_tunables(&self) -> &SlotTunables {
+        &self.default_tunables
+    }
+
+    /// Get a backend's config by name.
+    pub fn backend_config(&self, name: &str) -> Option<&BackendConfig> {
+        self.backends.get(name)
+    }
+
+    /// Every configured backend, ordered by name.
+    pub fn backend_configs(&self) -> Vec<&BackendConfig> {
+        let mut v: Vec<&BackendConfig> = self.backends.values().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Install the backend configs (registry construction; see `db_config`).
+    pub fn set_backends(&mut self, backends: Vec<BackendConfig>) {
+        self.backends = backends.into_iter().map(|b| (b.name.clone(), b)).collect();
+    }
+
+    /// Install the `llm_defaults` tunable floor.
+    pub fn set_default_tunables(&mut self, tunables: SlotTunables) {
+        self.default_tunables = tunables;
+    }
+
+    /// Install the resolved cast slots (registry construction).
+    pub fn set_cast_slots(&mut self, slots: Vec<(String, ResolvedSlot)>) {
+        self.cast_slots = slots
+            .into_iter()
+            .map(|(cast, slot)| ((cast.to_lowercase(), slot.role.clone()), slot))
+            .collect();
+    }
+
+    /// One cast's seat for a role, with the `llm_defaults` cascade already
+    /// applied. Cast labels are case-insensitive (matching the UNIQUE
+    /// collation); roles are exact.
+    ///
+    /// Nothing on the turn path reads this yet — **Track B** wires cast
+    /// selection into context creation and the request builder.
+    pub fn resolved_slot(&self, cast: &str, role: &str) -> Option<&ResolvedSlot> {
+        self.cast_slots.get(&(cast.to_lowercase(), role.to_string()))
+    }
+
+    /// Every configured cast label, sorted.
+    pub fn cast_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .cast_slots
+            .keys()
+            .map(|(cast, _)| cast.clone())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     /// Configured context window for a resolved `(provider, model)` pair,
@@ -764,7 +795,7 @@ impl LlmRegistry {
     /// rendered as an explicit "unknown" by every caller — never a
     /// fabricated default.
     pub fn context_window_for(&self, provider_name: &str, model: &str) -> Option<u64> {
-        self.provider_config(provider_name)?.context_window(model)
+        self.backend_config(provider_name)?.context_window(model)
     }
 
     /// Live-lookup variant of [`Self::context_window_for`].
@@ -793,32 +824,37 @@ impl LlmRegistry {
         }
     }
 
-    /// Store provider configs for runtime queries (e.g. max_output_tokens).
-    pub fn set_provider_configs(&mut self, configs: Vec<ProviderConfig>) {
-        self.provider_configs = Some(configs);
+    /// Set model aliases. Keys are normalized to lowercase so lookups match
+    /// the `COLLATE NOCASE` semantics the `model_aliases` table enforces.
+    pub fn set_model_aliases(&mut self, aliases: HashMap<String, config::ModelAlias>) {
+        self.model_aliases = aliases
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect();
     }
 
-    /// Set model aliases.
-    pub fn set_model_aliases(&mut self, aliases: HashMap<String, toml_config::ModelAlias>) {
-        self.model_aliases = aliases;
-    }
-
-    /// All configured model aliases (friendly name → provider/model).
+    /// All configured model aliases (friendly name → backend/model).
     ///
     /// Exposed for discovery surfaces (`kj models`) that enumerate the
     /// `--model` specs a caller can name. Read-only borrow of the map.
-    pub fn model_aliases(&self) -> &HashMap<String, toml_config::ModelAlias> {
+    pub fn model_aliases(&self) -> &HashMap<String, config::ModelAlias> {
         &self.model_aliases
     }
 
     /// Resolve a model name through aliases.
     ///
-    /// If the name matches an alias, returns the (provider, model) tuple.
+    /// If the name matches an alias, returns the (backend, model) tuple.
     /// Otherwise returns None, meaning the name should be used as-is.
+    ///
+    /// Alias lookup is case-insensitive, matching the `model_aliases.alias`
+    /// `COLLATE NOCASE` PRIMARY KEY — the DB will not let two aliases differ
+    /// only by case, so a case-sensitive resolver here could only ever fail to
+    /// find a row that exists.
     pub fn resolve_alias(&self, name: &str) -> Option<(&str, &str)> {
+        let key = name.to_lowercase();
         self.model_aliases
-            .get(name)
-            .map(|a| (a.provider.as_str(), a.model.as_str()))
+            .get(&key)
+            .map(|a| (a.backend.as_str(), a.model.as_str()))
     }
 
     /// Resolve a model name, returning the provider and model to use.
@@ -838,24 +874,21 @@ impl LlmRegistry {
         self.providers.keys().map(|s| s.as_str()).collect()
     }
 
-    /// List all available model IDs for a provider (from aliases + default).
+    /// List all known model IDs for a backend: every model with a
+    /// `backend_models` row, plus every model any alias points at.
+    ///
+    /// This is a discovery listing, not a claim about what the endpoint
+    /// serves — an OpenAI-compatible server will happily accept a model id
+    /// nobody wrote down.
     pub fn models_for_provider(&self, provider_name: &str) -> Vec<String> {
         let mut models: Vec<String> = self
             .model_aliases
             .values()
-            .filter(|a| a.provider == provider_name)
+            .filter(|a| a.backend == provider_name)
             .map(|a| a.model.clone())
             .collect();
-        // Include provider's default model if not already listed
-        if let Some(configs) = &self.provider_configs {
-            for config in configs {
-                if config.provider_type == provider_name
-                    && let Some(ref default) = config.default_model
-                    && !models.contains(default)
-                {
-                    models.push(default.clone());
-                }
-            }
+        if let Some(backend) = self.backends.get(provider_name) {
+            models.extend(backend.models.keys().cloned());
         }
         models.sort();
         models.dedup();
@@ -1100,29 +1133,24 @@ mod tests {
         );
     }
 
-    /// An unknown `[providers.<name>]` type must name the type precisely and
-    /// list the supported set — and must NOT guess about API keys (that
-    /// guess belongs to the actual `AuthError` case below). Regression for
-    /// the 2026-06-30 config papercut: `local-e4b` was reported as "Unknown
-    /// or unsupported provider type" with no indication that the fix is to
-    /// rename the table, not hunt for a missing key.
+    /// An unknown backend KIND must name it precisely and list the closed
+    /// set — and must NOT guess about API keys (that guess belongs to the
+    /// actual `AuthError` case below). Regression for the 2026-06-30 config
+    /// papercut: `local-e4b` was reported as "Unknown or unsupported provider
+    /// type" with no indication that the fix is to name a real kind.
+    ///
+    /// Note the shape change: under models.toml the *table name* was the
+    /// type, so `local-e4b` was an unknown TYPE. Now a backend named
+    /// `local-e4b` is perfectly legal — what must be a known token is its
+    /// `kind`, and `BackendKind::parse` is where that is enforced.
     #[test]
-    fn from_config_unknown_type_names_it_precisely_no_key_guess() {
-        let config = ProviderConfig::new("local-e4b");
-        let err = Provider::from_config(&config).unwrap_err();
-        assert!(matches!(err, LlmError::Unavailable(_)), "got {err:?}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unknown provider type 'local-e4b'"),
-            "msg: {msg}"
-        );
-        assert!(
-            msg.contains("supported: anthropic, deepseek, openai, ollama, lemonade, local"),
-            "msg: {msg}"
-        );
+    fn unknown_backend_kind_names_it_precisely_no_key_guess() {
+        let msg = BackendKind::parse("local-e4b").unwrap_err();
+        assert!(msg.contains("unknown backend kind 'local-e4b'"), "msg: {msg}");
+        assert!(msg.contains("supported: anthropic, deepseek, openai"), "msg: {msg}");
         assert!(
             !msg.to_lowercase().contains("key"),
-            "unknown-type error must not guess about API keys: {msg}"
+            "unknown-kind error must not guess about API keys: {msg}"
         );
     }
 
@@ -1132,15 +1160,40 @@ mod tests {
     /// `ANTHROPIC_API_KEY` being unset) so the test is deterministic
     /// regardless of the host's real environment.
     #[test]
-    fn from_config_missing_key_is_an_auth_error_mentioning_key() {
-        let config =
-            ProviderConfig::new("anthropic").with_api_key_env("KAIJUTSU_TEST_DEFINITELY_UNSET_XYZ");
-        let err = Provider::from_config(&config).unwrap_err();
+    fn from_backend_missing_key_is_an_auth_error_mentioning_key() {
+        let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
+            .with_api_key_env("KAIJUTSU_TEST_DEFINITELY_UNSET_XYZ");
+        let err = Provider::from_backend(&config).unwrap_err();
         assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
         assert!(
             err.to_string().to_lowercase().contains("key"),
             "auth error should mention key: {err}"
         );
+    }
+
+    /// A `key_optional` backend registers with a placeholder rather than
+    /// failing — the local-gateway path, unchanged by the renovation.
+    #[test]
+    fn key_optional_backend_registers_without_a_key() {
+        let config = BackendConfig::new("ollama", BackendKind::OpenAi)
+            .with_base_url("http://localhost:11434/v1")
+            .with_key_optional(true);
+        assert!(Provider::from_backend(&config).is_ok());
+    }
+
+    /// The name/kind split in one assertion: two differently-NAMED backends
+    /// of the same KIND both build, and the OpenAI-compatible client carries
+    /// the backend's own name. `models.toml` could not express this.
+    #[test]
+    fn two_openai_kind_backends_keep_their_own_names() {
+        let gpt = BackendConfig::new("gpt", BackendKind::OpenAi)
+            .with_base_url("https://api.openai.com/v1")
+            .with_key_optional(true);
+        let zorak = BackendConfig::new("zorak", BackendKind::OpenAi)
+            .with_base_url("http://zorak:8080/v1")
+            .with_key_optional(true);
+        assert_eq!(Provider::from_backend(&gpt).unwrap().name(), "gpt");
+        assert_eq!(Provider::from_backend(&zorak).unwrap().name(), "zorak");
     }
 
     #[test]
@@ -1164,8 +1217,8 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "fast".to_string(),
-            toml_config::ModelAlias {
-                provider: "anthropic".to_string(),
+            ModelAlias {
+                backend: "anthropic".to_string(),
                 model: "claude-haiku-4-5-20251001".to_string(),
             },
         );
@@ -1179,16 +1232,17 @@ mod tests {
     }
 
     #[test]
-    fn context_window_for_resolves_via_provider_config() {
+    fn context_window_for_resolves_via_backend_config() {
         let mut registry = LlmRegistry::new();
-        let mut anthropic = ProviderConfig::new("anthropic");
+        let mut anthropic = BackendConfig::new("anthropic", BackendKind::Anthropic);
         anthropic.models.insert(
             "claude-opus-4-8".to_string(),
             config::ModelInfo {
                 context_window: Some(1_000_000),
+                extra: None,
             },
         );
-        registry.set_provider_configs(vec![anthropic]);
+        registry.set_backends(vec![anthropic]);
 
         assert_eq!(
             registry.context_window_for("anthropic", "claude-opus-4-8"),
@@ -1199,8 +1253,8 @@ mod tests {
     #[test]
     fn context_window_for_unconfigured_model_is_none_not_a_default() {
         let mut registry = LlmRegistry::new();
-        let anthropic = ProviderConfig::new("anthropic"); // no models configured
-        registry.set_provider_configs(vec![anthropic]);
+        let anthropic = BackendConfig::new("anthropic", BackendKind::Anthropic); // no models configured
+        registry.set_backends(vec![anthropic]);
 
         assert_eq!(
             registry.context_window_for("anthropic", "claude-haiku-4-5-20251001"),
@@ -1211,7 +1265,7 @@ mod tests {
 
     #[test]
     fn context_window_for_unknown_provider_is_none() {
-        let registry = LlmRegistry::new(); // no provider_configs set at all
+        let registry = LlmRegistry::new(); // no backends set at all
         assert_eq!(registry.context_window_for("anthropic", "anything"), None);
     }
 
@@ -1223,9 +1277,8 @@ mod tests {
 
         /// Build a registry with a `Provider::Claude` registered under
         /// "anthropic", backed by `fake` instead of the real HTTP source —
-        /// the test seam. `provider_configs` starts empty; tests add config
-        /// entries via `set_provider_configs` when they need to exercise
-        /// the override-wins path.
+        /// the test seam. The backend map starts empty; tests add entries via
+        /// `set_backends` when they need to exercise the override-wins path.
         fn registry_with_fake_claude(fake: FakeModelCapabilitySource) -> LlmRegistry {
             let mut registry = LlmRegistry::new();
             let client = claude::Client::new("fake-key").with_capability_source(Arc::new(fake));
@@ -1242,14 +1295,15 @@ mod tests {
             let fake = FakeModelCapabilitySource::always_none()
                 .with_response("claude-opus-4-8", Ok(Some(999)));
             let mut registry = registry_with_fake_claude(fake);
-            let mut cfg = ProviderConfig::new("anthropic");
+            let mut cfg = BackendConfig::new("anthropic", BackendKind::Anthropic);
             cfg.models.insert(
                 "claude-opus-4-8".to_string(),
                 config::ModelInfo {
                     context_window: Some(1_000_000),
+                    extra: None,
                 },
             );
-            registry.set_provider_configs(vec![cfg]);
+            registry.set_backends(vec![cfg]);
 
             let window = registry.context_window_for_live("anthropic", "claude-opus-4-8").await;
             assert_eq!(

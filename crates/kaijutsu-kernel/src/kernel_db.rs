@@ -24,8 +24,8 @@ use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    BlockId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind, KernelId, PresetId,
-    PrincipalId, WorkspaceId,
+    BackendId, BlockId, CastId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
+    KernelId, PresetId, PrincipalId, WorkspaceId,
 };
 
 use crate::llm::stream::{CacheTarget, CacheTtl};
@@ -837,6 +837,125 @@ CREATE TABLE IF NOT EXISTS client_views (
     client_id   TEXT    NOT NULL PRIMARY KEY,
     context_id  BLOB    NOT NULL,
     updated_at  INTEGER NOT NULL
+);
+
+-- ── LLM backends (SQL-native model config) ─────────────────────
+-- Replaces the demolished `models.toml`. SQL is the source of truth: there
+-- is no TOML anywhere in the model-config path. The shape is kaibo's
+-- "backends + casts".
+--
+-- `name` is free-form and unique (the handle you type: `anthropic`, `gpt`,
+-- `ollama`, `zorak`); `kind` is a CLOSED enum owned by code, mapping onto
+-- the `Provider` variants (Claude / DeepSeek / OpenAi). The old TOML
+-- conflated the two — the `[providers.<name>]` table name WAS the type, so
+-- you could not run two Anthropic gateways or name a local server anything
+-- but `ollama`/`lemonade`/`local`. `mock` is a test-only kind: the CHECK
+-- admits it so the test harness can seed one, but `BackendKind::parse`
+-- rejects it unless the `test-mock` feature is on.
+--
+-- NO api key column, ever: only an env-var NAME or a file PATH. NO `enabled`
+-- flag either — a backend you don't want is a row you delete (soft-disable
+-- was a second way to say "absent" and it silently ate typo'd kinds at boot).
+CREATE TABLE IF NOT EXISTS backends (
+    backend_id           BLOB NOT NULL PRIMARY KEY,
+    name                 TEXT NOT NULL UNIQUE,
+    kind                 TEXT NOT NULL
+        CHECK (kind IN ('anthropic', 'deepseek', 'openai', 'mock')),
+    base_url             TEXT,
+    api_key_env          TEXT,
+    api_key_file         TEXT,
+    key_optional         INTEGER NOT NULL DEFAULT 0,
+    request_timeout_secs INTEGER CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
+    created_at           INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by           BLOB NOT NULL
+);
+
+-- Per-model metadata for one backend. `context_window` is an OVERRIDE that
+-- is checked first; a model absent here (or present with a NULL window) is
+-- an honest "unknown" — for Anthropic it falls through to the live
+-- `GET /v1/models/{id}` lookup, everywhere else it stays unknown. Never a
+-- guess: a fabricated denominator makes a "% of context used" gauge
+-- confidently wrong. `extra` is JSON for sparse provider-specific fields
+-- (vision pins, effort-ladder notes) that don't deserve a column yet.
+CREATE TABLE IF NOT EXISTS backend_models (
+    backend_id     BLOB NOT NULL REFERENCES backends(backend_id) ON DELETE CASCADE,
+    model_id       TEXT NOT NULL,
+    context_window INTEGER CHECK (context_window IS NULL OR context_window > 0),
+    extra          TEXT,
+    PRIMARY KEY (backend_id, model_id)
+);
+
+-- Global LLM defaults (singleton, id=1 — same pin as the `kernel` table).
+-- The kernel-wide default backend/model plus the tunable floor a cast slot
+-- falls back to when its own column is NULL. A NULL tunable means "provider
+-- default" and that is a real answer, not a missing one.
+CREATE TABLE IF NOT EXISTS llm_defaults (
+    id               INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    default_backend  TEXT    NOT NULL,
+    default_model    TEXT    NOT NULL CHECK (default_model != ''),
+    max_tokens       INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+    temperature      REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+    top_p            REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+    effort           TEXT,
+    thinking_budget  INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+    thinking_style   TEXT
+);
+
+-- ── Casts (named ensembles) ────────────────────────────────────
+-- A cast is a model *team*: one slot per role, where a role is a
+-- `context_type` (coder, musician, mcp, …). Free-form TEXT with no FK —
+-- context types are an open set defined by the rc tree, and a cast that
+-- names a role nobody has created yet is a legitimate forward declaration.
+CREATE TABLE IF NOT EXISTS casts (
+    cast_id     BLOB NOT NULL PRIMARY KEY,
+    label       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    description TEXT,
+    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by  BLOB NOT NULL
+);
+
+-- One role's seat in a cast. A NULL tunable falls back to `llm_defaults` at
+-- resolution time (see `ResolvedSlot`). `loadout` is a stub for a future
+-- capability/loadout reference — stored, no consumer yet.
+CREATE TABLE IF NOT EXISTS cast_slots (
+    cast_id         BLOB NOT NULL REFERENCES casts(cast_id) ON DELETE CASCADE,
+    role            TEXT NOT NULL,
+    backend_id      BLOB NOT NULL REFERENCES backends(backend_id),
+    model           TEXT NOT NULL CHECK (model != ''),
+    max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+    temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+    top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+    effort          TEXT,
+    thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+    thinking_style  TEXT,
+    loadout         TEXT,
+    extra           TEXT,
+    PRIMARY KEY (cast_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
+
+-- ── Model aliases ──────────────────────────────────────────────
+-- The short `--model` handles (fast/smart/opus/ds-pro/local/…). Replaces
+-- the TOML `[model_aliases]` table; same semantics, now with a real FK so a
+-- backend can't be deleted out from under an alias.
+CREATE TABLE IF NOT EXISTS model_aliases (
+    alias      TEXT NOT NULL PRIMARY KEY COLLATE NOCASE,
+    backend_id BLOB NOT NULL REFERENCES backends(backend_id),
+    model      TEXT NOT NULL CHECK (model != '')
+);
+CREATE INDEX IF NOT EXISTS idx_model_aliases_backend ON model_aliases(backend_id);
+
+-- ── Embedding model (semantic indexing) ────────────────────────
+-- The former `[embedding]` section of models.toml. Singleton, same id=1 pin.
+-- Changing `model_dir` (the model's identity is its directory basename) or
+-- `dimensions` invalidates the on-disk semantic index — it is wiped at the
+-- next kernel start and re-populates lazily.
+CREATE TABLE IF NOT EXISTS embedding_config (
+    id         INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    model_dir  TEXT    NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    max_tokens INTEGER NOT NULL CHECK (max_tokens > 0)
 );
 "#;
 
@@ -4533,6 +4652,699 @@ impl KernelDb {
             None => Ok(None),
         }
     }
+}
+
+// ============================================================================
+// LLM configuration (backends / models / casts / aliases / defaults)
+// ============================================================================
+//
+// SQL is the source of truth for model configuration — there is no TOML in
+// this path. Every write validates loudly and every failure bubbles: a
+// swallowed config write means the kernel talks to the wrong model, which is
+// exactly the silent-wrong-answer this project refuses.
+
+/// One configured LLM endpoint. `name` is the free-form handle; `kind` is the
+/// closed code-owned enum. See the `backends` table comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRow {
+    pub backend_id: BackendId,
+    pub name: String,
+    pub kind: String,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub api_key_file: Option<String>,
+    pub key_optional: bool,
+    pub request_timeout_secs: Option<i64>,
+    pub created_at: i64,
+    pub created_by: PrincipalId,
+}
+
+/// Per-model metadata for one backend (a `backend_models` row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendModelRow {
+    pub backend_id: BackendId,
+    pub model_id: String,
+    /// Total context window (input + output) in tokens. `None` = unknown,
+    /// never a guess.
+    pub context_window: Option<i64>,
+    /// Sparse provider-specific JSON.
+    pub extra: Option<String>,
+}
+
+/// The singleton `llm_defaults` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmDefaultsRow {
+    pub default_backend: String,
+    pub default_model: String,
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub effort: Option<String>,
+    pub thinking_budget: Option<i64>,
+    pub thinking_style: Option<String>,
+}
+
+/// A named ensemble.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastRow {
+    pub cast_id: CastId,
+    pub label: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub created_by: PrincipalId,
+}
+
+/// One role's seat in a cast. NULL tunables cascade to `llm_defaults`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastSlotRow {
+    pub cast_id: CastId,
+    pub role: String,
+    pub backend_id: BackendId,
+    pub model: String,
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub effort: Option<String>,
+    pub thinking_budget: Option<i64>,
+    pub thinking_style: Option<String>,
+    /// Stub for a future capability/loadout reference. Stored, no consumer.
+    pub loadout: Option<String>,
+    pub extra: Option<String>,
+}
+
+/// A `--model` shorthand: alias → (backend, model).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasRow {
+    pub alias: String,
+    pub backend_id: BackendId,
+    pub model: String,
+}
+
+/// The singleton `embedding_config` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingConfigRow {
+    pub enabled: bool,
+    pub model_dir: String,
+    pub dimensions: i64,
+    pub max_tokens: i64,
+}
+
+fn read_backend_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<BackendId> {
+    let bytes: Vec<u8> = row.get(idx)?;
+    BackendId::try_from_slice(&bytes).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "backend_id blob is not 16 bytes",
+            )),
+        )
+    })
+}
+
+fn read_cast_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<CastId> {
+    let bytes: Vec<u8> = row.get(idx)?;
+    CastId::try_from_slice(&bytes).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cast_id blob is not 16 bytes",
+            )),
+        )
+    })
+}
+
+const BACKEND_COLS: &str = "backend_id, name, kind, base_url, api_key_env, api_key_file, \
+                            key_optional, request_timeout_secs, created_at, created_by";
+
+fn row_to_backend(row: &rusqlite::Row<'_>) -> SqliteResult<BackendRow> {
+    Ok(BackendRow {
+        backend_id: read_backend_id(row, 0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        base_url: row.get(3)?,
+        api_key_env: row.get(4)?,
+        api_key_file: row.get(5)?,
+        key_optional: row.get::<_, i64>(6)? != 0,
+        request_timeout_secs: row.get(7)?,
+        created_at: row.get(8)?,
+        created_by: read_principal_id(row, 9)?,
+    })
+}
+
+const CAST_SLOT_COLS: &str = "cast_id, role, backend_id, model, max_tokens, temperature, \
+                              top_p, effort, thinking_budget, thinking_style, loadout, extra";
+
+fn row_to_cast_slot(row: &rusqlite::Row<'_>) -> SqliteResult<CastSlotRow> {
+    Ok(CastSlotRow {
+        cast_id: read_cast_id(row, 0)?,
+        role: row.get(1)?,
+        backend_id: read_backend_id(row, 2)?,
+        model: row.get(3)?,
+        max_tokens: row.get(4)?,
+        temperature: row.get(5)?,
+        top_p: row.get(6)?,
+        effort: row.get(7)?,
+        thinking_budget: row.get(8)?,
+        thinking_style: row.get(9)?,
+        loadout: row.get(10)?,
+        extra: row.get(11)?,
+    })
+}
+
+impl KernelDb {
+    // ── backends ────────────────────────────────────────────────────────
+
+    /// Insert or update a backend, keyed on its unique `name`. Returns the
+    /// row as stored (with the id that was kept or minted).
+    ///
+    /// Upsert semantics: an existing row with the same name keeps its
+    /// `backend_id` — so cast slots and aliases pointing at it survive a
+    /// re-`set` — and every other column is replaced by what the caller
+    /// passed. There is no partial merge: `kj backend set` is a declaration
+    /// of the whole row, and a half-applied config is worse than a loud
+    /// re-type.
+    pub fn upsert_backend(&self, row: &BackendRow) -> KernelDbResult<BackendRow> {
+        validate_label(&row.name)?;
+        let existing = self.get_backend_by_name(&row.name)?;
+        let backend_id = existing.as_ref().map(|b| b.backend_id).unwrap_or(row.backend_id);
+        let created_at = existing.as_ref().map(|b| b.created_at).unwrap_or(row.created_at);
+        self.conn.execute(
+            "INSERT INTO backends (backend_id, name, kind, base_url, api_key_env, api_key_file,
+                                   key_optional, request_timeout_secs, created_at, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(backend_id) DO UPDATE SET
+                 name = excluded.name,
+                 kind = excluded.kind,
+                 base_url = excluded.base_url,
+                 api_key_env = excluded.api_key_env,
+                 api_key_file = excluded.api_key_file,
+                 key_optional = excluded.key_optional,
+                 request_timeout_secs = excluded.request_timeout_secs",
+            params![
+                blob_param(backend_id.as_bytes()),
+                row.name,
+                row.kind,
+                row.base_url,
+                row.api_key_env,
+                row.api_key_file,
+                row.key_optional as i64,
+                row.request_timeout_secs,
+                created_at,
+                blob_param(row.created_by.as_bytes()),
+            ],
+        )?;
+        Ok(BackendRow {
+            backend_id,
+            created_at,
+            ..row.clone()
+        })
+    }
+
+    /// Fetch a backend by its unique name.
+    pub fn get_backend_by_name(&self, name: &str) -> KernelDbResult<Option<BackendRow>> {
+        let sql = format!("SELECT {BACKEND_COLS} FROM backends WHERE name = ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt.query_row(params![name], row_to_backend).optional()?)
+    }
+
+    /// Every backend, ordered by name.
+    pub fn list_backends(&self) -> KernelDbResult<Vec<BackendRow>> {
+        let sql = format!("SELECT {BACKEND_COLS} FROM backends ORDER BY name");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_backend)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Delete a backend by name.
+    ///
+    /// Refuses loudly when a cast slot or a model alias still points at it —
+    /// the FK would reject the DELETE anyway, but a named list of the
+    /// referents is the difference between "fix this" and "SQLITE_CONSTRAINT".
+    pub fn delete_backend(&self, name: &str) -> KernelDbResult<()> {
+        let Some(backend) = self.get_backend_by_name(name)? else {
+            return Err(KernelDbError::NotFound(format!("backend '{name}'")));
+        };
+        let id = blob_param(backend.backend_id.as_bytes());
+        let slots: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT c.label || '/' || s.role FROM cast_slots s
+                 JOIN casts c ON c.cast_id = s.cast_id
+                 WHERE s.backend_id = ?1 ORDER BY 1",
+            )?;
+            stmt.query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
+        let aliases: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT alias FROM model_aliases WHERE backend_id = ?1 ORDER BY alias")?;
+            stmt.query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
+        if !slots.is_empty() || !aliases.is_empty() {
+            let mut parts = Vec::new();
+            if !slots.is_empty() {
+                parts.push(format!("cast slots [{}]", slots.join(", ")));
+            }
+            if !aliases.is_empty() {
+                parts.push(format!("aliases [{}]", aliases.join(", ")));
+            }
+            return Err(KernelDbError::Validation(format!(
+                "backend '{name}' is still referenced by {} — remove those first",
+                parts.join(" and ")
+            )));
+        }
+        self.conn
+            .execute("DELETE FROM backends WHERE backend_id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ── backend_models ──────────────────────────────────────────────────
+
+    /// Insert or replace one backend's per-model metadata row.
+    pub fn set_backend_model(&self, row: &BackendModelRow) -> KernelDbResult<()> {
+        if row.model_id.trim().is_empty() {
+            return Err(KernelDbError::Validation(
+                "model id must not be empty".to_string(),
+            ));
+        }
+        if let Some(w) = row.context_window
+            && w <= 0
+        {
+            return Err(KernelDbError::Validation(format!(
+                "context_window must be a positive integer (got {w}) — 0 is a typo, \
+                 and a zero denominator makes every usage gauge garbage"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO backend_models (backend_id, model_id, context_window, extra)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(backend_id, model_id) DO UPDATE SET
+                 context_window = excluded.context_window,
+                 extra = excluded.extra",
+            params![
+                blob_param(row.backend_id.as_bytes()),
+                row.model_id,
+                row.context_window,
+                row.extra,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one backend's per-model metadata row. Returns whether a row went.
+    pub fn delete_backend_model(
+        &self,
+        backend_id: BackendId,
+        model_id: &str,
+    ) -> KernelDbResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM backend_models WHERE backend_id = ?1 AND model_id = ?2",
+            params![blob_param(backend_id.as_bytes()), model_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// One backend's per-model metadata rows, ordered by model id.
+    pub fn list_backend_models(
+        &self,
+        backend_id: BackendId,
+    ) -> KernelDbResult<Vec<BackendModelRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_id, context_window, extra FROM backend_models
+             WHERE backend_id = ?1 ORDER BY model_id",
+        )?;
+        let rows = stmt.query_map(params![blob_param(backend_id.as_bytes())], |row| {
+            Ok(BackendModelRow {
+                backend_id,
+                model_id: row.get(0)?,
+                context_window: row.get(1)?,
+                extra: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    // ── llm_defaults ────────────────────────────────────────────────────
+
+    /// The singleton defaults row, or `None` on a kernel that has never been
+    /// seeded. `None` is a real state (a bare DB in a unit test), not an
+    /// error — the registry builder reports it as "no default backend".
+    pub fn get_llm_defaults(&self) -> KernelDbResult<Option<LlmDefaultsRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT default_backend, default_model, max_tokens, temperature, top_p,
+                    effort, thinking_budget, thinking_style
+             FROM llm_defaults WHERE id = 1",
+        )?;
+        Ok(stmt
+            .query_row([], |row| {
+                Ok(LlmDefaultsRow {
+                    default_backend: row.get(0)?,
+                    default_model: row.get(1)?,
+                    max_tokens: row.get(2)?,
+                    temperature: row.get(3)?,
+                    top_p: row.get(4)?,
+                    effort: row.get(5)?,
+                    thinking_budget: row.get(6)?,
+                    thinking_style: row.get(7)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Replace the singleton defaults row. Range checks run here — loud
+    /// rejection, never a clamp: a silently clamped temperature is a turn
+    /// that answers differently than the operator asked for.
+    pub fn set_llm_defaults(&self, row: &LlmDefaultsRow) -> KernelDbResult<()> {
+        validate_tunables(
+            row.max_tokens,
+            row.temperature,
+            row.top_p,
+            row.thinking_budget,
+        )?;
+        if row.default_model.trim().is_empty() {
+            return Err(KernelDbError::Validation(
+                "default_model must not be empty".to_string(),
+            ));
+        }
+        if self.get_backend_by_name(&row.default_backend)?.is_none() {
+            return Err(KernelDbError::Validation(format!(
+                "default backend '{}' does not exist — create it first \
+                 (`kj backend set {} --kind …`)",
+                row.default_backend, row.default_backend
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO llm_defaults (id, default_backend, default_model, max_tokens,
+                                       temperature, top_p, effort, thinking_budget, thinking_style)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 default_backend = excluded.default_backend,
+                 default_model = excluded.default_model,
+                 max_tokens = excluded.max_tokens,
+                 temperature = excluded.temperature,
+                 top_p = excluded.top_p,
+                 effort = excluded.effort,
+                 thinking_budget = excluded.thinking_budget,
+                 thinking_style = excluded.thinking_style",
+            params![
+                row.default_backend,
+                row.default_model,
+                row.max_tokens,
+                row.temperature,
+                row.top_p,
+                row.effort,
+                row.thinking_budget,
+                row.thinking_style,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ── casts ───────────────────────────────────────────────────────────
+
+    /// Create a cast. Fails loudly on a duplicate label (case-insensitive).
+    pub fn insert_cast(&self, row: &CastRow) -> KernelDbResult<()> {
+        validate_label(&row.label)?;
+        self.conn
+            .execute(
+                "INSERT INTO casts (cast_id, label, description, created_at, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    blob_param(row.cast_id.as_bytes()),
+                    row.label,
+                    row.description,
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                ],
+            )
+            .map_err(|e| {
+                map_unique_violation(e, format!("cast label '{}' already in use", row.label))
+            })?;
+        Ok(())
+    }
+
+    /// Fetch a cast by label (case-insensitive, matching the UNIQUE collation).
+    pub fn get_cast_by_label(&self, label: &str) -> KernelDbResult<Option<CastRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cast_id, label, description, created_at, created_by
+             FROM casts WHERE label = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![label], |row| {
+                Ok(CastRow {
+                    cast_id: read_cast_id(row, 0)?,
+                    label: row.get(1)?,
+                    description: row.get(2)?,
+                    created_at: row.get(3)?,
+                    created_by: read_principal_id(row, 4)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Every cast, ordered by label.
+    pub fn list_casts(&self) -> KernelDbResult<Vec<CastRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cast_id, label, description, created_at, created_by FROM casts ORDER BY label",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CastRow {
+                cast_id: read_cast_id(row, 0)?,
+                label: row.get(1)?,
+                description: row.get(2)?,
+                created_at: row.get(3)?,
+                created_by: read_principal_id(row, 4)?,
+            })
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Delete a cast; its slots cascade.
+    pub fn delete_cast(&self, cast_id: CastId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "DELETE FROM casts WHERE cast_id = ?1",
+            params![blob_param(cast_id.as_bytes())],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or replace one slot of a cast.
+    pub fn set_cast_slot(&self, row: &CastSlotRow) -> KernelDbResult<()> {
+        if row.role.trim().is_empty() {
+            return Err(KernelDbError::Validation("role must not be empty".into()));
+        }
+        if row.model.trim().is_empty() {
+            return Err(KernelDbError::Validation("model must not be empty".into()));
+        }
+        validate_tunables(
+            row.max_tokens,
+            row.temperature,
+            row.top_p,
+            row.thinking_budget,
+        )?;
+        self.conn.execute(
+            &format!(
+                "INSERT INTO cast_slots ({CAST_SLOT_COLS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(cast_id, role) DO UPDATE SET
+                     backend_id = excluded.backend_id,
+                     model = excluded.model,
+                     max_tokens = excluded.max_tokens,
+                     temperature = excluded.temperature,
+                     top_p = excluded.top_p,
+                     effort = excluded.effort,
+                     thinking_budget = excluded.thinking_budget,
+                     thinking_style = excluded.thinking_style,
+                     loadout = excluded.loadout,
+                     extra = excluded.extra"
+            ),
+            params![
+                blob_param(row.cast_id.as_bytes()),
+                row.role,
+                blob_param(row.backend_id.as_bytes()),
+                row.model,
+                row.max_tokens,
+                row.temperature,
+                row.top_p,
+                row.effort,
+                row.thinking_budget,
+                row.thinking_style,
+                row.loadout,
+                row.extra,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one slot. Returns whether a row went.
+    pub fn delete_cast_slot(&self, cast_id: CastId, role: &str) -> KernelDbResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM cast_slots WHERE cast_id = ?1 AND role = ?2",
+            params![blob_param(cast_id.as_bytes()), role],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// One cast's slots, ordered by role.
+    pub fn list_cast_slots(&self, cast_id: CastId) -> KernelDbResult<Vec<CastSlotRow>> {
+        let sql =
+            format!("SELECT {CAST_SLOT_COLS} FROM cast_slots WHERE cast_id = ?1 ORDER BY role");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![blob_param(cast_id.as_bytes())], row_to_cast_slot)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// One cast's slot for `role`, if it has one.
+    pub fn get_cast_slot(&self, cast_id: CastId, role: &str) -> KernelDbResult<Option<CastSlotRow>> {
+        let sql = format!("SELECT {CAST_SLOT_COLS} FROM cast_slots WHERE cast_id = ?1 AND role = ?2");
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_row(params![blob_param(cast_id.as_bytes()), role], row_to_cast_slot)
+            .optional()?)
+    }
+
+    // ── model_aliases ───────────────────────────────────────────────────
+
+    /// Insert or replace a `--model` alias.
+    pub fn set_model_alias(&self, row: &ModelAliasRow) -> KernelDbResult<()> {
+        if row.alias.trim().is_empty() {
+            return Err(KernelDbError::Validation("alias must not be empty".into()));
+        }
+        if row.model.trim().is_empty() {
+            return Err(KernelDbError::Validation("model must not be empty".into()));
+        }
+        self.conn.execute(
+            "INSERT INTO model_aliases (alias, backend_id, model) VALUES (?1, ?2, ?3)
+             ON CONFLICT(alias) DO UPDATE SET
+                 backend_id = excluded.backend_id,
+                 model = excluded.model",
+            params![
+                row.alias,
+                blob_param(row.backend_id.as_bytes()),
+                row.model
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an alias. Returns whether a row went.
+    pub fn delete_model_alias(&self, alias: &str) -> KernelDbResult<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM model_aliases WHERE alias = ?1", params![alias])?;
+        Ok(n > 0)
+    }
+
+    /// Every alias, ordered by name.
+    pub fn list_model_aliases(&self) -> KernelDbResult<Vec<ModelAliasRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT alias, backend_id, model FROM model_aliases ORDER BY alias")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModelAliasRow {
+                alias: row.get(0)?,
+                backend_id: read_backend_id(row, 1)?,
+                model: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    // ── embedding_config ────────────────────────────────────────────────
+
+    /// The singleton embedding row, or `None` when never seeded.
+    pub fn get_embedding_config(&self) -> KernelDbResult<Option<EmbeddingConfigRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT enabled, model_dir, dimensions, max_tokens FROM embedding_config WHERE id = 1",
+        )?;
+        Ok(stmt
+            .query_row([], |row| {
+                Ok(EmbeddingConfigRow {
+                    enabled: row.get::<_, i64>(0)? != 0,
+                    model_dir: row.get(1)?,
+                    dimensions: row.get(2)?,
+                    max_tokens: row.get(3)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Replace the singleton embedding row.
+    pub fn set_embedding_config(&self, row: &EmbeddingConfigRow) -> KernelDbResult<()> {
+        if row.dimensions <= 0 || row.max_tokens <= 0 {
+            return Err(KernelDbError::Validation(format!(
+                "embedding dimensions/max_tokens must be positive \
+                 (got dimensions={}, max_tokens={})",
+                row.dimensions, row.max_tokens
+            )));
+        }
+        if row.model_dir.trim().is_empty() {
+            return Err(KernelDbError::Validation(
+                "embedding model_dir must not be empty".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO embedding_config (id, enabled, model_dir, dimensions, max_tokens)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 enabled = excluded.enabled,
+                 model_dir = excluded.model_dir,
+                 dimensions = excluded.dimensions,
+                 max_tokens = excluded.max_tokens",
+            params![
+                row.enabled as i64,
+                row.model_dir,
+                row.dimensions,
+                row.max_tokens
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// Range-check the shared tunable knobs. Loud rejection, never a clamp — the
+/// SQL CHECKs say the same thing, but a Rust-side error names the knob and
+/// the legal range instead of surfacing `SQLITE_CONSTRAINT`.
+fn validate_tunables(
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    thinking_budget: Option<i64>,
+) -> KernelDbResult<()> {
+    if let Some(v) = max_tokens
+        && v <= 0
+    {
+        return Err(KernelDbError::Validation(format!(
+            "max_tokens must be a positive integer (got {v})"
+        )));
+    }
+    if let Some(v) = temperature
+        && !(0.0..=2.0).contains(&v)
+    {
+        return Err(KernelDbError::Validation(format!(
+            "temperature must be in 0.0..=2.0 (got {v})"
+        )));
+    }
+    if let Some(v) = top_p
+        && !(v > 0.0 && v <= 1.0)
+    {
+        return Err(KernelDbError::Validation(format!(
+            "top_p must be in (0.0, 1.0] (got {v})"
+        )));
+    }
+    if let Some(v) = thinking_budget
+        && v <= 0
+    {
+        return Err(KernelDbError::Validation(format!(
+            "thinking_budget must be a positive integer (got {v})"
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================

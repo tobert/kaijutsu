@@ -938,62 +938,48 @@ async fn reset_config_to_embedded(kernel: &Arc<Kernel>, path: &str) -> (bool, St
     }
 }
 
-/// Initialize a kernel's LLM registry from the CRDT-owned `models.toml`.
+/// Initialize a kernel's LLM registry from the kernel database.
 ///
-/// Reads `/etc/config/models.toml` through the VFS (the CRDT is the sole owner,
-/// seeded from the embedded default on a fresh kernel), parses it, and populates
-/// the kernel's `LlmRegistry`. Returns the embedding config if present.
+/// Model configuration is SQL-native (`backends` / `backend_models` /
+/// `llm_defaults` / `casts` / `cast_slots` / `model_aliases` /
+/// `embedding_config`). There is no `models.toml`, no CRDT config doc, and no
+/// host file in this path — the embedded floor lives in
+/// `kaijutsu_kernel::seed_backends` and is applied at kernel construction.
 ///
-/// There is no host disk to fall back to. A read/parse failure falls back to the
-/// **embedded default** — loudly, and without overwriting the user's content
-/// (they repair it with `kj config reset /etc/config/models.toml`) — because a
-/// kernel with no LLM registry is useless.
+/// Returns the embedding config if one is set and enabled.
+///
+/// A build failure here is loud and leaves the registry empty rather than
+/// falling back to some other backend: quietly running a different model than
+/// the operator configured is the exact silent-wrong-answer this project
+/// refuses. Repair with `kj backend reseed`.
 async fn initialize_kernel_models(
     kernel: &Arc<Kernel>,
+    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
-    use kaijutsu_kernel::vfs::VfsOps;
-
-    let models_path = paths::config_path("models.toml");
-    let raw = match kernel.vfs().read_all(std::path::Path::new(&models_path)).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => {
-            log::error!(
-                "read {models_path} from CRDT failed: {e}; booting on embedded default models"
-            );
-            kaijutsu_kernel::config_seed::DEFAULT_MODELS_CONFIG.to_string()
-        }
-    };
-
-    let models_config = match kaijutsu_kernel::load_models_config_toml(&raw) {
-        Ok(c) => c,
-        Err(parse_err) => {
-            log::error!(
-                "{models_path} in the CRDT is unparseable ({parse_err}); booting on embedded \
-                 default models — repair with `kj config reset {models_path}`"
-            );
-            match kaijutsu_kernel::load_models_config_toml(
-                kaijutsu_kernel::config_seed::DEFAULT_MODELS_CONFIG,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("embedded default models.toml failed to parse: {e}");
-                    return None;
-                }
+    let (registry, embedding) = {
+        let db = kernel_db.lock();
+        let registry = match kaijutsu_kernel::build_llm_registry(&db) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!(
+                    "Failed to build the LLM registry from the kernel DB: {e} \
+                     — repair with `kj backend reseed`"
+                );
+                return None;
             }
-        }
+        };
+        let embedding = match kaijutsu_kernel::load_embedding_config(&db) {
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("Failed to read embedding config: {e}");
+                None
+            }
+        };
+        (registry, embedding)
     };
-
-    match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
-        Ok(registry) => {
-            *kernel.llm().write().await = registry;
-            log::info!("Initialized kernel LLM registry from {models_path}");
-            models_config.embedding
-        }
-        Err(e) => {
-            log::error!("Failed to initialize LLM registry: {e}");
-            None
-        }
-    }
+    *kernel.llm().write().await = registry;
+    log::info!("Initialized kernel LLM registry from the kernel DB");
+    embedding
 }
 
 
@@ -1448,7 +1434,7 @@ pub async fn create_shared_kernel(
     // One-time CRDT config seed source on a fresh kernel (see the /etc/config
     // mount below). NOT ongoing ownership: production passes None (embedded
     // defaults; the kernel never reads the user's host config). Tests point it
-    // at a tempdir to inject a mock models.toml.
+    // at a tempdir to inject config seeds.
     config_dir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
@@ -1539,6 +1525,14 @@ pub async fn create_shared_kernel(
         // ship a kernel where `kj fork --preset` has nothing to recall.
         kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        // Seed the LLM configuration floor — backends, their known context
+        // windows, the `--model` aliases, the defaults, and the embedding
+        // model. Same absent-only floor pattern as the presets above, and the
+        // successor to seeding `models.toml` into the CRDT. Fail loud: a
+        // kernel with no backends hangs its first turn on "no provider
+        // configured", which is a far worse diagnostic than this error.
+        kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
         ws
     };
 
@@ -1578,7 +1572,7 @@ pub async fn create_shared_kernel(
     // type as rc, one rule, no host file. Seed the embedded defaults only when
     // the config namespace is still empty (a genuinely fresh kernel); after that
     // the CRDT owns the content. Per-file recovery is `kj config reset`. Seeding
-    // failure is fatal — a kernel without a parseable models.toml is useless.
+    // failure is fatal — a kernel without a system prompt is useless.
     let config_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
         documents.clone(),
         paths::CONFIG_ROOT,
@@ -1589,7 +1583,7 @@ pub async fn create_shared_kernel(
         // config file, a host file under that dir supplies the body if present,
         // else the embedded default. Production passes None → embedded only (the
         // hard-reset cutover: the kernel never reads the user's host config).
-        // Tests point config_dir at a tempdir to inject a mock models.toml.
+        // Model config is NOT here — it is SQL-native (`kj backend`).
         // After this, the CRDT is the sole owner — no host read/flush/reload.
         let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::config_seed_files()
             .into_iter()
@@ -1803,8 +1797,8 @@ pub async fn create_shared_kernel(
         }
     }
 
-    // Initialize LLM registry + embedding config from models.toml
-    let embedding_config = initialize_kernel_models(&kernel_arc).await;
+    // Initialize LLM registry + embedding config from the kernel DB.
+    let embedding_config = initialize_kernel_models(&kernel_arc, &kernel_db_arc).await;
 
     // External MCP servers (mcp.toml — kaibo, bevy_brp, …) are deliberately
     // NOT started here. Spawning real subprocesses is a property of
@@ -4815,11 +4809,16 @@ impl kernel::Server for KernelImpl {
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
         Promise::from_future(
             async move {
-                // Validate provider before persisting — never write bad data
-                let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
-                    .with_default_model(&model);
-                match kaijutsu_kernel::llm::Provider::from_config(&config) {
-                    Ok(new_provider) => {
+                // Validate the backend before persisting — never write bad
+                // data. A backend must already EXIST (`kj backend set`): the
+                // name alone no longer implies a kind, so there is nothing
+                // sensible to construct from a bare string, and inventing one
+                // here would let a typo persist onto a context row.
+                let known = kaijutsu_kernel::build_llm_registry(&shared_kernel.kernel_db.lock())
+                    .map(|r| r.backend_config(&provider_name).is_some())
+                    .unwrap_or(false);
+                match known {
+                    true => {
                         // Provider is valid — now persist
                         {
                             let db = shared_kernel.kernel_db.lock();
@@ -4837,12 +4836,9 @@ impl kernel::Server for KernelImpl {
                             let mut drift = kernel_arc.drift().write();
                             let _ = drift.configure_llm(ctx_id, &provider_name, &model);
                         }
-                        // Ensure provider is registered in LLM registry (for API client),
-                        // but do NOT change kernel-wide defaults — model is per-context
-                        let mut registry = kernel_arc.llm().write().await;
-                        if registry.get(&provider_name).is_none() {
-                            registry.register(&provider_name, Arc::new(new_provider));
-                        }
+                        // The backend is already registered (that is what
+                        // `known` established); kernel-wide defaults are NOT
+                        // touched — the model is per-context.
                         results.get().set_success(true);
                         results.get().set_error("");
                         log::info!(
@@ -4852,15 +4848,16 @@ impl kernel::Server for KernelImpl {
                             model
                         );
                     }
-                    Err(e) => {
+                    false => {
+                        let msg = format!(
+                            "unknown backend '{provider_name}' \
+                             (configure it with `kj backend set {provider_name} --kind …`)"
+                        );
                         results.get().set_success(false);
-                        results.get().set_error(format!("{}", e));
+                        results.get().set_error(&msg);
                         log::warn!(
-                            "Failed to configure LLM for context {}: provider={}, model={}, err={}",
+                            "Failed to configure LLM for context {}: {msg}",
                             ctx_id.short(),
-                            provider_name,
-                            model,
-                            e
                         );
                     }
                 }

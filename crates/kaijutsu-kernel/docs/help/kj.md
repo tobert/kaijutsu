@@ -44,9 +44,14 @@ kj drift merge
 ## Commands
 
 ```
+alias           list, set, remove — short --model handles → backend/model
+                (the kernel ships none; they're yours to define)
 attach          Attach to an existing context and run its rc attach lifecycle
                 (distinct from `transport attach`, which attaches to a beat track)
 audio           beats — offline audio analysis (beat/downbeat tracking via beat-this)
+backend         list, show, set, remove, model set|remove, default show|set, reseed —
+                SQL-native LLM endpoints (name + kind), their context windows,
+                and the kernel-wide defaults. Replaces models.toml entirely.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
                 (cap tokens incl. rc-write, config-write, drive, fork, drift, transport,
                 operator, exec, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
@@ -54,8 +59,10 @@ block           list, inspect, count, read, cat, append, history, diff, status, 
                 edit (insert|delete|replace)
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
+cast            list, show, create, remove, slot set|remove — named model ensembles
+                (role → backend/model + tunables); role is a context_type
 config          list, show, set, edit, reset — CRDT-owned config at /etc/config
-                (models.toml, system.md, theme.toml, mcp.toml) + per-client at /etc/client
+                (system.md, theme.toml, mcp.toml) + per-client at /etc/client
 context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,
                 rename, archive, conclude, promote, demote, pause, resume, remove,
                 retag, hydrate

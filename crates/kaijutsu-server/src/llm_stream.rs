@@ -122,8 +122,8 @@ fn warn_if_near_context_window(
         "conversation is an estimated ~{estimate} tokens against {model_name}'s {window}-token \
          window (~{pct:.0}%). The turn was sent anyway; the provider is the hard limit. \
          Remedies: exclude large blocks then fork; `kj fork --compact`; if this model's window \
-         is wrong, set [providers.{provider_name}.models.{model_name}].context_window via \
-         `kj config set models.toml`."
+         is wrong, re-pin it with \
+         `kj backend model set {provider_name} {model_name} --context-window <N>`."
     );
     log::warn!("{detail}");
 
@@ -363,7 +363,7 @@ pub(crate) async fn spawn_llm_for_prompt(
                 .and_then(|pn| registry.get(pn))
                 .or_else(|| registry.default_provider())
                 .map(|p| (p, name, max_tokens))
-                .ok_or("No LLM provider configured (check models.toml)"),
+                .ok_or("No LLM backend configured (see `kj backend list`)"),
             None => match registry.default_provider() {
                 Some(p) => {
                     let m = registry
@@ -372,7 +372,7 @@ pub(crate) async fn spawn_llm_for_prompt(
                         .to_string();
                     Ok((p, m, max_tokens))
                 }
-                None => Err("No LLM provider configured (check models.toml)"),
+                None => Err("No LLM backend configured (see `kj backend list`)"),
             },
         }
     };

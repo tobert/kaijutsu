@@ -1040,11 +1040,12 @@ mod tests {
 
         assert!(fs.is_empty(), "fresh config mount owns nothing");
         let n = fs.seed_entries(crate::config_seed::config_seed_files()).unwrap();
-        assert_eq!(n, 4, "the four config files seed on a fresh mount");
+        assert_eq!(n, 3, "the three config files seed on a fresh mount");
 
-        // models.toml round-trips through the VFS (read mount-relative).
-        let models = fs.read_all(p("models.toml")).await.unwrap();
-        assert_eq!(models, crate::config_seed::DEFAULT_MODELS_CONFIG.as_bytes());
+        // theme.toml round-trips through the VFS (read mount-relative).
+        // models.toml is deliberately absent: model config is SQL-native now.
+        let theme = fs.read_all(p("theme.toml")).await.unwrap();
+        assert_eq!(theme, crate::config_seed::DEFAULT_THEME.as_bytes());
 
         // readdir lists the flat config set.
         let entries: Vec<_> = fs

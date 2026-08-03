@@ -2911,17 +2911,19 @@ mod tests {
         // fill fractions below (25%, 200%) are exactly representable in
         // binary floating point, ruling out an epsilon-fudged assertion.
         {
-            use crate::llm::config::ModelInfo;
-            use crate::llm::ProviderConfig;
-            let mut cfg = ProviderConfig::new("mock");
+            use crate::llm::{BackendConfig, BackendKind, ModelInfo};
+            // Named "mock" to match the context rows below; the KIND is what
+            // picks a client, and nothing here builds one.
+            let mut cfg = BackendConfig::new("mock", BackendKind::Mock);
             cfg.models.insert(
                 "big-model".to_string(),
                 ModelInfo {
                     context_window: Some(100_000),
+                    extra: None,
                 },
             );
             let mut registry = d.kernel().llm().write().await;
-            registry.set_provider_configs(vec![cfg]);
+            registry.set_backends(vec![cfg]);
         }
 
         // Comfortably under the window: 20_000 + 5_000 = 25_000 / 100_000 = 25%.
@@ -3105,7 +3107,7 @@ mod tests {
 
         // Register a provider + a `local` alias pointing at it.
         {
-            use crate::llm::toml_config::ModelAlias;
+            use crate::llm::ModelAlias;
             use crate::llm::{MockClient, Provider};
             use std::collections::HashMap;
             use std::sync::Arc;
@@ -3116,7 +3118,7 @@ mod tests {
             aliases.insert(
                 "local".to_string(),
                 ModelAlias {
-                    provider: "lemonade".to_string(),
+                    backend: "lemonade".to_string(),
                     model: "Gemma-4-E4B-it-GGUF".to_string(),
                 },
             );
@@ -3163,7 +3165,7 @@ mod tests {
         let target = register_context(&d, Some("target"), None, principal);
 
         {
-            use crate::llm::toml_config::ModelAlias;
+            use crate::llm::ModelAlias;
             use crate::llm::{MockClient, Provider};
             use std::collections::HashMap;
             use std::sync::Arc;
@@ -3174,7 +3176,7 @@ mod tests {
             aliases.insert(
                 "local".to_string(),
                 ModelAlias {
-                    provider: "lemonade".to_string(),
+                    backend: "lemonade".to_string(),
                     model: "Gemma-4-E4B-it-GGUF".to_string(),
                 },
             );

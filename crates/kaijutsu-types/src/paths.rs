@@ -30,7 +30,7 @@
 pub const RC_ROOT: &str = "/etc/rc";
 
 /// Root of the CRDT-owned kernel-global config tree. A flat namespace:
-/// `/etc/config/<name>` (e.g. `models.toml`, `theme.toml`).
+/// `/etc/config/<name>` (e.g. `theme.toml`, `mcp.toml`).
 pub const CONFIG_ROOT: &str = "/etc/config";
 
 /// Root of the CRDT-owned per-client config tree. Hierarchical:
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn config_builder_joins_the_flat_namespace() {
-        assert_eq!(config_path("models.toml"), "/etc/config/models.toml");
+        assert_eq!(config_path("theme.toml"), "/etc/config/theme.toml");
     }
 
     #[test]
@@ -248,7 +248,7 @@ mod tests {
         assert!(!is_rc_path("/etc/passwd"));
 
         assert!(is_config_path("/etc/config"));
-        assert!(is_config_path("/etc/config/models.toml"));
+        assert!(is_config_path("/etc/config/theme.toml"));
         assert!(!is_config_path("/etc/configuration"));
 
         assert!(is_client_path("/etc/client"));

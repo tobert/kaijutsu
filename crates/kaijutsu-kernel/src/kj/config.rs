@@ -1,6 +1,6 @@
 //! `kj config` — read and edit the CRDT-owned config files.
 //!
-//! Config files (`models.toml`, `system.md`, `theme.toml`, `mcp.toml`) live at
+//! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at
 //! `/etc/config` on the same CRDT-native backend as `/etc/rc` (slice 2,
 //! `docs/config-crdt-ownership.md`): the kernel is the sole owner — no host
 //! file, no write-through. `show`/`list` read the live CRDT; `set` writes it
@@ -12,12 +12,11 @@
 //! surface, bypassing the gated `builtin.file:write` tool), so the `config-write`
 //! capability is enforced here — the only place it gates the `kj` surface.
 //!
-//! `models.toml` gets one extra write-time check (2026-06-30 config
-//! papercuts, Fix 2): a `[providers.<name>]` table whose name isn't a
-//! provider type `Provider::from_config` understands is rejected outright,
-//! rather than silently dropped at boot (`initialize_llm_registry`) and
-//! discovered only when a turn later hangs on the missing provider. See
-//! [`validate_config_write`].
+//! Model configuration is **not** here. It is SQL-native — `kj backend`,
+//! `kj cast`, `kj alias` over `kernel_db` tables — and `models.toml` was
+//! demolished along with its CRDT doc. The write-time provider-type check
+//! this module used to carry moved with it: the closed set now lives in
+//! `BackendKind`, enforced by `kj backend set` and a SQL CHECK.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
@@ -28,7 +27,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "CRDT-owned config: kernel-global at /etc/config (models.toml, system.md, theme.toml, mcp.toml) + per-client at /etc/client (metronome.toml)",
+    about = "CRDT-owned config: kernel-global at /etc/config (system.md, theme.toml, mcp.toml) + per-client at /etc/client (metronome.toml). Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -49,7 +48,7 @@ enum ConfigCommand {
     /// Print one config file's content.
     #[command(alias = "cat")]
     Show {
-        /// Config file name (e.g. models.toml) or full /etc/config path
+        /// Config file name (e.g. theme.toml) or full /etc/config path
         path: String,
         /// Emit a JSON object instead of a labelled view
         #[arg(long)]
@@ -63,7 +62,7 @@ enum ConfigCommand {
     /// (`--content` or piped stdin) — use `edit` with no body to open an
     /// interactive session instead.
     Set {
-        /// Config file name (e.g. models.toml) or full /etc/config path
+        /// Config file name (e.g. theme.toml) or full /etc/config path
         path: String,
         /// Replacement body (stdin is piped here when omitted). Free text —
         /// TOML/markdown bodies legitimately start with `-`, so this must
@@ -78,7 +77,7 @@ enum ConfigCommand {
     /// lacked.
     #[command(alias = "update")]
     Edit {
-        /// Config file name (e.g. models.toml) or full /etc/config path
+        /// Config file name (e.g. theme.toml) or full /etc/config path
         path: String,
         /// Replacement body (omit to open the editor instead). Same
         /// hyphen-tolerant shape as `set`'s `--content`.
@@ -88,13 +87,13 @@ enum ConfigCommand {
     /// Restore a config file to its embedded default. Errors if the path ships
     /// no built-in seed — there is nothing to reset it to.
     Reset {
-        /// Config file name (e.g. models.toml) or full /etc/config path
+        /// Config file name (e.g. theme.toml) or full /etc/config path
         path: String,
     },
 }
 
 /// Canonicalize a user-supplied config arg to its `/etc/config/<name>` path.
-/// Accepts a bare name (`models.toml`) or an already-full path. Rejects nested
+/// Accepts a bare name (`theme.toml`) or an already-full path. Rejects nested
 /// paths and parent escapes — config is a flat namespace.
 fn config_canonical(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
@@ -126,7 +125,7 @@ fn config_canonical(path: &str) -> Result<String, String> {
         .unwrap_or(trimmed)
         .trim_start_matches('/');
     if name.is_empty() {
-        return Err("missing config file name (e.g. models.toml)".to_string());
+        return Err("missing config file name (e.g. theme.toml)".to_string());
     }
     if name.contains('/') || name == ".." || name == "." {
         return Err(format!(
@@ -134,47 +133,6 @@ fn config_canonical(path: &str) -> Result<String, String> {
         ));
     }
     Ok(format!("{CONFIG_ROOT}/{name}"))
-}
-
-/// Validate a config file's content before it's written to the CRDT.
-///
-/// Only `models.toml` gets structural validation today: the TOML must parse,
-/// and every `[providers.<name>]` table name must be a provider type
-/// `Provider::from_config` understands (`crate::llm::SUPPORTED_PROVIDER_TYPES`).
-/// This is deliberately narrow — not a general schema validator, just the one
-/// closed-set invariant that turns a silent boot-time drop
-/// (`initialize_llm_registry`) into a loud write-time rejection, per the
-/// house fail-loud posture (2026-06-30 config papercuts, Fix 2).
-fn validate_config_write(canonical: &str, content: &str) -> Result<(), String> {
-    if canonical != kaijutsu_types::paths::config_path("models.toml") {
-        return Ok(());
-    }
-    let value: toml::Value = toml::from_str(content).map_err(|e| format!("invalid TOML: {e}"))?;
-    let Some(providers) = value.get("providers").and_then(toml::Value::as_table) else {
-        return Ok(());
-    };
-    for (name, table) in providers {
-        // Mirror the LOAD path: `initialize_llm_registry` skips a disabled
-        // provider (`toml_config.rs:69`) BEFORE resolving its type, so an
-        // `enabled = false` block never has to name a type the kernel knows.
-        // Validation must agree, or an inert template makes the whole file
-        // unwritable — which is exactly what the shipped default's disabled
-        // `[providers.gemini]` did: `models.toml` loaded fine and then
-        // rejected every `kj config set`, including a byte-identical
-        // round-trip (found 2026-08-02 repointing the model aliases).
-        // `enabled` defaults to true, matching `ProviderToml`'s serde default.
-        let enabled = table
-            .get("enabled")
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(true);
-        if !enabled {
-            continue;
-        }
-        if !crate::llm::SUPPORTED_PROVIDER_TYPES.contains(&name.as_str()) {
-            return Err(crate::llm::unknown_provider_type_message(name));
-        }
-    }
-    Ok(())
 }
 
 impl KjDispatcher {
@@ -391,9 +349,6 @@ impl KjDispatcher {
                 );
             }
         };
-        if let Err(e) = validate_config_write(&canonical, content) {
-            return KjResult::Err(format!("kj config set: {canonical}: {e}"));
-        }
         if let Err(e) = self.write_config_content(&canonical, content).await {
             return KjResult::Err(format!("kj config set: {e}"));
         }
@@ -404,7 +359,7 @@ impl KjDispatcher {
     }
 
     /// `kj config edit`: with a body (`--content` or piped stdin) it's the same
-    /// validate-then-write `set` does; with none it opens an interactive vi
+    /// write `set` does; with none it opens an interactive vi
     /// editor session on the owning CRDT block — the same
     /// `Kernel::editor_open_signaled` primitive `kj rc edit` uses (docs/vi.md
     /// step 4). Config has no symlink-composition concept (`config_canonical`
@@ -441,9 +396,6 @@ impl KjDispatcher {
             };
         };
 
-        if let Err(e) = validate_config_write(&canonical, content) {
-            return KjResult::Err(format!("kj config edit: {canonical}: {e}"));
-        }
         if let Err(e) = self.write_config_content(&canonical, content).await {
             return KjResult::Err(format!("kj config edit: {e}"));
         }
@@ -485,8 +437,8 @@ mod tests {
     #[test]
     fn canonical_accepts_bare_and_full_rejects_nesting() {
         assert_eq!(
-            config_canonical("models.toml").unwrap(),
-            "/etc/config/models.toml"
+            config_canonical("theme.toml").unwrap(),
+            "/etc/config/theme.toml"
         );
         assert_eq!(
             config_canonical("/etc/config/system.md").unwrap(),
@@ -516,18 +468,18 @@ mod tests {
         assert!(config_canonical("/etc/client/").is_err());
     }
 
-    /// `kj config show models.toml` round-trips the seeded default.
+    /// `kj config show theme.toml` round-trips the seeded default.
     #[tokio::test]
-    async fn show_round_trips_seeded_models() {
+    async fn show_round_trips_seeded_theme() {
         let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let result = d
-            .dispatch(&[s("config"), s("show"), s("models.toml")], &c)
+            .dispatch(&[s("config"), s("show"), s("theme.toml")], &c)
             .await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 let obj = v.as_object().expect("show emits an object");
-                assert_eq!(obj["path"].as_str(), Some("/etc/config/models.toml"));
+                assert_eq!(obj["path"].as_str(), Some("/etc/config/theme.toml"));
                 assert!(
                     obj["content"].as_str().is_some_and(|s| !s.is_empty()),
                     "seeded content present"
@@ -551,7 +503,7 @@ mod tests {
                     .iter()
                     .filter_map(|x| x.as_str())
                     .collect();
-                assert!(names.contains(&"models.toml"), "names: {names:?}");
+                assert!(names.contains(&"theme.toml"), "names: {names:?}");
                 assert!(names.contains(&"theme.toml"), "names: {names:?}");
                 assert!(names.contains(&"system.md"), "names: {names:?}");
             }
@@ -592,7 +544,7 @@ mod tests {
                     .filter_map(|x| x.as_str())
                     .collect();
                 // /etc/config entries are still there, as bare names.
-                assert!(names.contains(&"models.toml"), "names: {names:?}");
+                assert!(names.contains(&"theme.toml"), "names: {names:?}");
                 // The shared client default, seeded at the mount root.
                 assert!(
                     names.contains(&"/etc/client/metronome.toml"),
@@ -707,15 +659,15 @@ mod tests {
             &[
                 s("config"),
                 s("set"),
-                s("models.toml"),
+                s("theme.toml"),
                 s("--content"),
-                s("# broken"),
+                s("# clobbered"),
             ],
             &c,
         )
         .await;
         let reset = d
-            .dispatch(&[s("config"), s("reset"), s("models.toml")], &c)
+            .dispatch(&[s("config"), s("reset"), s("theme.toml")], &c)
             .await;
         assert!(
             matches!(reset, KjResult::Ok { .. }),
@@ -723,13 +675,13 @@ mod tests {
         );
 
         let show = d
-            .dispatch(&[s("config"), s("show"), s("models.toml"), s("--json")], &c)
+            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
             .await;
         match show {
             KjResult::Ok { data: Some(v), .. } => {
                 assert_eq!(
                     v["content"].as_str(),
-                    Some(crate::config_seed::DEFAULT_MODELS_CONFIG),
+                    Some(crate::config_seed::DEFAULT_THEME),
                     "reset should restore the embedded default"
                 );
             }
@@ -780,170 +732,6 @@ mod tests {
     }
 
     // ── Fix 2 (2026-06-30 config papercuts): `kj config set` validates
-    // ── `models.toml` before writing — invalid TOML or an unsupported
-    // ── `[providers.<name>]` type is rejected loudly, not silently dropped
-    // ── at the next boot.
-
-    /// Invalid TOML syntax is rejected outright — never written to the CRDT.
-    #[tokio::test]
-    async fn set_models_toml_rejects_invalid_toml() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = test_caller();
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("models.toml"),
-                    s("--content"),
-                    s("[providers"),
-                ],
-                &c,
-            )
-            .await;
-        match result {
-            KjResult::Err(msg) => assert!(msg.contains("invalid TOML"), "msg: {msg}"),
-            other => panic!("expected Err, got {other:?}"),
-        }
-    }
-
-    /// A `[providers.<name>]` table whose name isn't a provider type
-    /// `Provider::from_config` understands is rejected at write time with the
-    /// same wording `Provider::from_config` uses at boot — the whole point of
-    /// Fix 2: catch the typo before it's saved, not after a turn hangs.
-    #[tokio::test]
-    async fn set_models_toml_rejects_unknown_provider_type() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = test_caller();
-        let toml = "[providers.local-e4b]\nenabled = true\n";
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("models.toml"),
-                    s("--content"),
-                    s(toml),
-                ],
-                &c,
-            )
-            .await;
-        match result {
-            KjResult::Err(msg) => {
-                assert!(
-                    msg.contains("unknown provider type 'local-e4b'"),
-                    "msg: {msg}"
-                );
-                assert!(
-                    msg.contains("supported: anthropic, deepseek, openai, ollama, lemonade, local"),
-                    "msg: {msg}"
-                );
-            }
-            other => panic!("expected Err, got {other:?}"),
-        }
-
-        // The rejected write must not have landed — `show` still sees the
-        // seeded default, not the bad content.
-        let show = d
-            .dispatch(&[s("config"), s("show"), s("models.toml"), s("--json")], &c)
-            .await;
-        match show {
-            KjResult::Ok { data: Some(v), .. } => {
-                assert_ne!(
-                    v["content"].as_str(),
-                    Some(toml),
-                    "rejected content must not have been written"
-                );
-            }
-            other => panic!("expected Ok, got {other:?}"),
-        }
-    }
-
-    /// A DISABLED provider of an unknown type must validate, because the load
-    /// path skips disabled providers before it ever resolves their type. Found
-    /// live 2026-08-02: the shipped default's `enabled = false`
-    /// `[providers.gemini]` template loaded fine and then made `models.toml`
-    /// unwritable — every `kj config set` was rejected, including a
-    /// byte-identical round-trip of the file the kernel was already running.
-    #[tokio::test]
-    async fn set_models_toml_accepts_disabled_unknown_provider_type() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = test_caller();
-        // `gemini` is not a Provider variant; `enabled = false` makes it inert.
-        let toml = "[providers.gemini]\nenabled = false\ndefault_model = \"gemini-2.0-flash\"\n";
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("models.toml"),
-                    s("--content"),
-                    s(toml),
-                ],
-                &c,
-            )
-            .await;
-        assert!(
-            matches!(result, KjResult::Ok { .. }),
-            "a disabled provider of an unknown type must not block the write: {result:?}"
-        );
-    }
-
-    /// The flip side: a real supported type still writes fine — validation
-    /// isn't accidentally rejecting everything.
-    #[tokio::test]
-    async fn set_models_toml_accepts_known_provider_type() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = test_caller();
-        let toml = "[providers.ollama]\nenabled = true\nbase_url = \"http://localhost:11434\"\n";
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("models.toml"),
-                    s("--content"),
-                    s(toml),
-                ],
-                &c,
-            )
-            .await;
-        assert!(
-            matches!(result, KjResult::Ok { .. }),
-            "set failed: {result:?}"
-        );
-    }
-
-    /// Validation is narrow-scoped to `models.toml` — other config files
-    /// aren't TOML at all (system.md) or just don't get the providers-table
-    /// check, so `set` must not choke on content that wouldn't parse as this
-    /// validator's shape.
-    #[tokio::test]
-    async fn set_non_models_toml_skips_provider_validation() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = test_caller();
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("set"),
-                    s("system.md"),
-                    s("--content"),
-                    s("# not a providers table, not even TOML {{{"),
-                ],
-                &c,
-            )
-            .await;
-        assert!(
-            matches!(result, KjResult::Ok { .. }),
-            "set failed: {result:?}"
-        );
-    }
-
-    // ── Stretch: `kj config edit` mirrors `kj rc edit` — optional content
-    // ── replaces (validated like `set`); no content opens an interactive vi
-    // ── session on the owning CRDT block.
-
     /// `kj config edit <path>` with no `--content` opens an interactive editor
     /// session on the owning block (mirrors
     /// `rc_edit_without_content_opens_an_editor_session` in `kj/rc.rs`).
@@ -967,37 +755,6 @@ mod tests {
                 );
             }
             other => panic!("expected ok-with-data session, got {other:?}"),
-        }
-    }
-
-    /// `kj config edit <path> --content <body>` behaves exactly like `set`,
-    /// including validation — `models.toml` with an unknown provider type is
-    /// still rejected, not just when using `set`.
-    #[tokio::test]
-    async fn config_edit_with_content_validates_like_set() {
-        let d = test_dispatcher_crdt_rc().await;
-        let c = test_caller();
-        let toml = "[providers.local-e4b]\nenabled = true\n";
-        let result = d
-            .dispatch(
-                &[
-                    s("config"),
-                    s("edit"),
-                    s("models.toml"),
-                    s("--content"),
-                    s(toml),
-                ],
-                &c,
-            )
-            .await;
-        match result {
-            KjResult::Err(msg) => {
-                assert!(
-                    msg.contains("unknown provider type 'local-e4b'"),
-                    "msg: {msg}"
-                )
-            }
-            other => panic!("expected Err, got {other:?}"),
         }
     }
 

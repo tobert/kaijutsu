@@ -187,7 +187,7 @@ pub enum DocKind {
     /// Static markdown/text.
     #[strum(serialize = "text", serialize = "markdown")]
     Text,
-    /// Configuration file (theme.toml, models.toml).
+    /// Configuration file (theme.toml, mcp.toml).
     #[strum(serialize = "config")]
     Config,
     // `Kv` retired 2026-07-04 (KV store deleted). Do not reuse the `"kv"`

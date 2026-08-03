@@ -171,7 +171,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding model in models.toml)".to_string(),
+                "semantic index not configured (no embedding model — see the `embedding_config` row)".to_string(),
             );
         };
 
@@ -278,7 +278,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding model in models.toml)".to_string(),
+                "semantic index not configured (no embedding model — see the `embedding_config` row)".to_string(),
             );
         };
 
@@ -300,7 +300,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding model in models.toml)".to_string(),
+                "semantic index not configured (no embedding model — see the `embedding_config` row)".to_string(),
             );
         };
 
@@ -374,7 +374,7 @@ impl KjBuiltin {
     fn synth_status(&self) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::success(
-                "semantic index: not configured\n(set embedding model in models.toml)".to_string(),
+                "semantic index: not configured\n(no embedding model configured)".to_string(),
             );
         };
 
@@ -600,7 +600,7 @@ impl Tool for KjBuiltin {
         // Lets shell pipelines author multi-line .md / .kai scripts and load a
         // staged TOML file without the `--content "$(cat …)"` dance:
         //   cat prompt.md | kj rc add /etc/rc/coder/create/S00-stance.md
-        //   cat new.toml | kj config set /etc/config/models.toml
+        //   cat theme.toml | kj config set /etc/config/theme.toml
         // Only kicks in when --content was not given explicitly. `kj config
         // set`/`edit` joined `rc add`/`edit` here 2026-06-30 (config
         // papercuts, Fix 3) — the help text already promised piped stdin;
@@ -788,7 +788,7 @@ fn rc_depth_from_scope(scope: &kaish_kernel::interpreter::Scope) -> Result<u8, S
 /// (`--confirm`/`--json` already stripped). Two write surfaces want this:
 /// `kj rc add`/`edit` (scripts) and, since 2026-06-30 (config papercuts,
 /// Fix 3), `kj config set`/`edit` (`cat new.toml | kj config set
-/// /etc/config/models.toml`).
+/// /etc/config/theme.toml`).
 fn wants_stdin_content(argv: &[String]) -> bool {
     matches!(
         (
@@ -1818,7 +1818,7 @@ mod tests {
     /// Piped stdin populates `--content` for `kj config set` when the flag is
     /// omitted — Fix 3 (2026-06-30 config papercuts): `--help` already
     /// promised "stdin is piped here when omitted", but before this,
-    /// `cat new.toml | kj config set /etc/config/models.toml` failed with
+    /// `cat new.toml | kj config set /etc/config/theme.toml` failed with
     /// "missing content" despite the promise. This is the same injection
     /// `rc add`/`edit` already had (`pipe_stdin_provides_rc_add_content`
     /// above), widened to `config set`/`edit` in `wants_stdin_content`.
@@ -1832,8 +1832,8 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
         let script = r#"
-            echo '[providers.ollama]' | kj config set models.toml
-            kj config show models.toml
+            echo 'marker-101010' | kj config set theme.toml
+            kj config show theme.toml
         "#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
@@ -1843,7 +1843,7 @@ mod tests {
 
         let stdout = res.text_out();
         assert!(
-            stdout.contains("providers.ollama"),
+            stdout.contains("marker-101010"),
             "stdin content didn't reach config set: {stdout}"
         );
         assert!(
@@ -1866,8 +1866,8 @@ mod tests {
         let kaish = embedded_with_kj(dispatcher, ctx).await;
 
         let script = r#"
-            echo '[providers.lemonade]' | kj config edit models.toml
-            kj config show models.toml
+            echo 'marker-202020' | kj config edit theme.toml
+            kj config show theme.toml
         "#;
         let res = kaish
             .execute_with_options(script, ExecuteOptions::default())
@@ -1877,7 +1877,7 @@ mod tests {
 
         let stdout = res.text_out();
         assert!(
-            stdout.contains("providers.lemonade"),
+            stdout.contains("marker-202020"),
             "stdin content didn't reach config edit: {stdout}"
         );
     }

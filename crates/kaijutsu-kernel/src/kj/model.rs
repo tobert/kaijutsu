@@ -83,26 +83,33 @@ impl KjDispatcher {
         }
 
         for name in &provider_names {
-            let cfg_default = registry
-                .provider_config(name)
-                .and_then(|c| c.default_model.clone());
+            // Everything the DB knows this backend can serve (its
+            // `backend_models` rows plus every model an alias points at),
+            // unioned with whatever the client advertises. A backend row has
+            // no `default_model` of its own any more — the kernel-wide
+            // default lives in `llm_defaults`.
             let mut models: Vec<String> = registry
                 .get(name)
-                .map(|p| p.available_models().iter().map(|m| m.to_string()).collect())
+                .map(|p| {
+                    p.available_models()
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<String>>()
+                })
                 .unwrap_or_default();
-            if let Some(d) = &cfg_default
-                && !models.contains(d)
-            {
-                models.push(d.clone());
-            }
+            models.extend(registry.models_for_provider(name));
             models.sort();
             models.dedup();
 
             let is_default_provider = default_provider.as_deref() == Some(name.as_str());
+            let kind = registry
+                .backend_config(name)
+                .map(|b| b.kind.as_str())
+                .unwrap_or("?");
             let header = if is_default_provider {
-                format!("### {name} _(default provider)_")
+                format!("### {name} _({kind}, default backend)_")
             } else {
-                format!("### {name}")
+                format!("### {name} _({kind})_")
             };
             lines.push(header);
             if models.is_empty() {
@@ -110,19 +117,17 @@ impl KjDispatcher {
             }
             for m in &models {
                 let mut marks: Vec<String> = Vec::new();
-                if cfg_default.as_deref() == Some(m.as_str()) {
-                    marks.push("provider default".to_string());
-                }
                 if is_default_provider && default_model.as_deref() == Some(m.as_str()) {
                     marks.push("registry default".to_string());
                 }
                 // Context window, when configured — the same resolution
-                // `kj model` uses (`ProviderConfig::context_window`), so
-                // this listing can never disagree with the single-context
-                // verb. Unconfigured models get no annotation here (silence
-                // is the "unknown" signal in this listing; `kj model`'s
-                // JSON is the surface that must say so explicitly).
-                if let Some(w) = registry.provider_config(name).and_then(|c| c.context_window(m)) {
+                // `kj model` uses (`BackendConfig::context_window`, read from
+                // the `backend_models` table), so this listing can never
+                // disagree with the single-context verb. Unconfigured models
+                // get no annotation here (silence is the "unknown" signal in
+                // this listing; `kj model`'s JSON is the surface that must
+                // say so explicitly).
+                if let Some(w) = registry.backend_config(name).and_then(|c| c.context_window(m)) {
                     marks.push(format!("{w} ctx"));
                 }
                 let suffix = if marks.is_empty() {
@@ -144,7 +149,7 @@ impl KjDispatcher {
             lines.push("### aliases".to_string());
             for alias in alias_names {
                 let a = &aliases[alias];
-                lines.push(format!("- `{alias}` → `{}/{}`", a.provider, a.model));
+                lines.push(format!("- `{alias}` → `{}/{}`", a.backend, a.model));
                 specs.push(alias.clone());
             }
             lines.push(String::new());
@@ -277,8 +282,8 @@ mod tests {
 
     use crate::kj::test_helpers::*;
     use crate::llm::claude::models_api::test_support::FakeModelCapabilitySource;
-    use crate::llm::toml_config::ModelAlias;
-    use crate::llm::{Provider, ProviderConfig, claude, deepseek};
+    use crate::llm::ModelAlias;
+    use crate::llm::{BackendConfig, BackendKind, Provider, claude, deepseek};
     use kaijutsu_types::PrincipalId;
 
     fn s(v: &str) -> String {
@@ -309,29 +314,27 @@ mod tests {
         reg.register("deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))));
         reg.set_default("anthropic");
         reg.set_default_model("claude-opus-4-8");
-        reg.set_provider_configs(vec![
-            {
-                let mut c = ProviderConfig::new("anthropic");
-                c.default_model = Some("claude-opus-4-8".to_string());
-                // Only "claude-opus-4-8" carries a configured window — the
-                // "fast" alias below points at "claude-haiku-4-5-20251001",
-                // which is deliberately left unconfigured so tests can
-                // exercise the "no fabricated default" path through alias
-                // resolution too.
-                c.models.insert(
-                    "claude-opus-4-8".to_string(),
-                    crate::llm::config::ModelInfo {
-                        context_window: Some(1_000_000),
-                    },
-                );
-                c
-            },
-        ]);
+        reg.set_backends(vec![{
+            let mut c = BackendConfig::new("anthropic", BackendKind::Anthropic);
+            // Only "claude-opus-4-8" carries a configured window — the
+            // "fast" alias below points at "claude-haiku-4-5-20251001",
+            // which is deliberately left unconfigured so tests can
+            // exercise the "no fabricated default" path through alias
+            // resolution too.
+            c.models.insert(
+                "claude-opus-4-8".to_string(),
+                crate::llm::ModelInfo {
+                    context_window: Some(1_000_000),
+                    extra: None,
+                },
+            );
+            c
+        }]);
         let mut aliases = HashMap::new();
         aliases.insert(
             "fast".to_string(),
             ModelAlias {
-                provider: "anthropic".to_string(),
+                backend: "anthropic".to_string(),
                 model: "claude-haiku-4-5-20251001".to_string(),
             },
         );
@@ -347,12 +350,12 @@ mod tests {
         let result = d.dispatch(&[s("models")], &c).await;
         assert!(result.is_ok(), "models failed: {}", result.message());
         let msg = result.message();
-        assert!(msg.contains("anthropic"), "lists anthropic provider: {msg}");
-        assert!(msg.contains("deepseek"), "lists deepseek provider: {msg}");
+        assert!(msg.contains("anthropic"), "lists the anthropic backend: {msg}");
+        assert!(msg.contains("deepseek"), "lists the deepseek backend: {msg}");
         assert!(msg.contains("fast"), "lists the alias: {msg}");
         assert!(
-            msg.contains("default provider"),
-            "marks the default provider: {msg}"
+            msg.contains("default backend"),
+            "marks the default backend: {msg}"
         );
     }
 
@@ -505,7 +508,7 @@ mod tests {
             reg.register("anthropic", Arc::new(Provider::Claude(client)));
             // Deliberately NO provider_configs entry for this model — the
             // honest-gap scenario the live fallback exists to close.
-            reg.set_provider_configs(vec![ProviderConfig::new("anthropic")]);
+            reg.set_backends(vec![BackendConfig::new("anthropic", BackendKind::Anthropic)]);
         }
         let ctx = register_context(&d, Some("c"), None, principal);
         {

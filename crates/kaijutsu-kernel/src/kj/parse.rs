@@ -109,7 +109,7 @@ pub fn parse_model_spec(spec: &str) -> (Option<String>, Option<String>) {
 /// the two surfaces can't drift apart again.
 ///
 /// - `provider/model` (slash): explicit provider — it must exist.
-/// - bare name: a `models.toml` alias first (e.g. `deepseek-lite`), else a
+/// - bare name: a `model_aliases` row first (e.g. `deepseek-lite`), else a
 ///   model on the default provider.
 /// - `provider:model` (colon): rejected with a slash hint when the prefix names
 ///   a real provider. The separator is `/`, never `:` — `:` collides with
@@ -277,7 +277,7 @@ mod tests {
         aliases.insert(
             s("deepseek-lite"),
             crate::llm::ModelAlias {
-                provider: s("deepseek"),
+                backend: s("deepseek"),
                 model: s("deepseek-v4-flash"),
             },
         );

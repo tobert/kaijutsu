@@ -1,7 +1,7 @@
 //! Embedded default config-file bodies + the config seed manifest.
 //!
-//! The config TOMLs (`theme.toml`, `models.toml`, `mcp.toml`) and the system
-//! prompt (`system.md`) are **CRDT-owned**, exactly like `/etc/rc`: a fresh
+//! The config TOMLs (`theme.toml`, `mcp.toml`) and the system prompt
+//! (`system.md`) are **CRDT-owned**, exactly like `/etc/rc`: a fresh
 //! kernel seeds them from these compiled-in defaults into a [`ConfigCrdtFs`]
 //! mounted at [`CONFIG_VFS_ROOT`], and the CRDT is the sole owner thereafter
 //! (no host file, no write-through). See `docs/config-crdt-ownership.md`.
@@ -15,11 +15,12 @@
 /// Embedded default theme content (TOML).
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.toml");
 
-/// Embedded default models configuration (LLM providers + embedding, TOML).
-pub const DEFAULT_MODELS_CONFIG: &str = include_str!("../../../assets/defaults/models.toml");
-
-/// Alias for backwards compatibility.
-pub const DEFAULT_LLM_CONFIG: &str = DEFAULT_MODELS_CONFIG;
+// NOTE: there is deliberately no `models.toml` here. Model configuration is
+// SQL-native — `backends` / `backend_models` / `casts` / `cast_slots` /
+// `model_aliases` / `llm_defaults` / `embedding_config` in `kernel_db.rs` —
+// and the embedded floor lives in `crate::seed_backends`, not in an asset.
+// The `/etc/config/models.toml` CRDT doc and its loader were demolished; do
+// not reintroduce a TOML in this path.
 
 /// Embedded default MCP server configuration (TOML).
 pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.toml");
@@ -61,7 +62,6 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
     use kaijutsu_types::paths::config_path;
     vec![
         (config_path("theme.toml"), DEFAULT_THEME),
-        (config_path("models.toml"), DEFAULT_MODELS_CONFIG),
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("system.md"), DEFAULT_SYSTEM_PROMPT),
     ]
@@ -106,14 +106,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_manifest_covers_the_four_config_files() {
+    fn seed_manifest_covers_the_three_config_files() {
         let files = config_seed_files();
         let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         assert!(names.contains(&"/etc/config/theme.toml"));
-        assert!(names.contains(&"/etc/config/models.toml"));
         assert!(names.contains(&"/etc/config/mcp.toml"));
         assert!(names.contains(&"/etc/config/system.md"));
-        assert_eq!(files.len(), 4, "exactly the four known config files");
+        assert_eq!(files.len(), 3, "exactly the three known config files");
+    }
+
+    #[test]
+    fn models_toml_is_gone_from_the_config_surface() {
+        // Model config is SQL-native (see crate::seed_backends). A seed entry
+        // here would resurrect a second, silently-diverging source of truth.
+        let files = config_seed_files();
+        assert!(
+            files.iter().all(|(p, _)| !p.ends_with("models.toml")),
+            "models.toml must not be a CRDT config doc: {files:?}"
+        );
+        assert!(config_seed_body("/etc/config/models.toml").is_none());
     }
 
     #[test]
@@ -125,10 +136,10 @@ mod tests {
 
     #[test]
     fn seed_body_round_trips_and_rejects_unknown() {
-        assert_eq!(config_seed_body("/etc/config/models.toml"), Some(DEFAULT_MODELS_CONFIG));
+        assert_eq!(config_seed_body("/etc/config/theme.toml"), Some(DEFAULT_THEME));
         assert!(config_seed_body("/etc/config/nonesuch.toml").is_none());
         // Bare names are not canonical keys — must be the full /etc/config path.
-        assert!(config_seed_body("models.toml").is_none());
+        assert!(config_seed_body("theme.toml").is_none());
     }
 
     #[test]

@@ -99,7 +99,9 @@ pub use block::{
 pub use error_block::IntoErrorPayload;
 pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind};
-pub use ids::{ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId};
+pub use ids::{
+    BackendId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId,
+};
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
 pub use kernel::Kernel;
 pub use principal::{Credential, CredentialKind, Principal};

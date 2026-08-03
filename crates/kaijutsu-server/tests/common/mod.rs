@@ -41,9 +41,51 @@ pub async fn start_server() -> SocketAddr {
     addr
 }
 
-/// Start a server whose ephemeral config dir contains a `models.toml` with a mock provider.
+/// Seed a `mock`-kind backend into the kernel DB at `data_dir` and make it the
+/// default, so `initialize_kernel_models()` brings up a registry a test can
+/// drive without a live provider.
 ///
-/// This makes `initialize_kernel_models()` register a "mock" provider so that
+/// Model configuration is SQL-native now (`models.toml` is demolished), so the
+/// injection point is the DB itself rather than a host file the kernel reads
+/// once at seed time. The server opens the same `kernel.db` a moment later and
+/// `ensure_factory_backends` — an absent-only floor — leaves the `llm_defaults`
+/// row we write here alone.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn seed_mock_backend(data_dir: &std::path::Path) {
+    use kaijutsu_kernel::kernel_db::{BackendRow, KernelDb, LlmDefaultsRow};
+    use kaijutsu_types::{BackendId, PrincipalId};
+
+    std::fs::create_dir_all(data_dir).expect("create data dir");
+    let db = KernelDb::open(data_dir.join("kernel.db")).expect("open kernel db for mock seed");
+    db.upsert_backend(&BackendRow {
+        backend_id: BackendId::new(),
+        name: "mock".to_string(),
+        kind: "mock".to_string(),
+        base_url: None,
+        api_key_env: None,
+        api_key_file: None,
+        key_optional: true,
+        request_timeout_secs: None,
+        created_at: 0,
+        created_by: PrincipalId::system(),
+    })
+    .expect("seed mock backend");
+    db.set_llm_defaults(&LlmDefaultsRow {
+        default_backend: "mock".to_string(),
+        default_model: "mock-model".to_string(),
+        max_tokens: Some(16384),
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+    })
+    .expect("point defaults at the mock backend");
+}
+
+/// Start a server whose ephemeral kernel DB carries a mock LLM backend.
+///
+/// This makes `initialize_kernel_models()` register a "mock" backend so that
 /// `KjDispatcher.summarize()` and other LLM-dependent paths work in tests.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn start_server_with_mock_llm() -> SocketAddr {
@@ -51,20 +93,8 @@ pub async fn start_server_with_mock_llm() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     let config = SshServerConfig::ephemeral(addr.port());
-
-    // Write a models.toml that uses the mock provider into the ephemeral config dir
-    if let Some(ref config_dir) = config.config_dir {
-        let models_toml = r#"
-default_provider = "mock"
-
-[providers.mock]
-enabled = true
-default_model = "mock-model"
-
-[model_aliases]
-"#;
-        std::fs::write(config_dir.join("models.toml"), models_toml)
-            .expect("failed to write models.toml to ephemeral config dir");
+    if let Some(ref data_dir) = config.data_dir {
+        seed_mock_backend(data_dir);
     }
 
     tokio::task::spawn_local(async move {
@@ -79,7 +109,7 @@ default_model = "mock-model"
 }
 
 /// Start a server with caller-supplied config + data dir, so the test can
-/// pre-populate `models.toml` and inspect kernel state on the filesystem.
+/// pre-populate the kernel DB and inspect kernel state on the filesystem.
 ///
 /// Like `start_server_with_mock_llm`, but the directory is provided
 /// rather than created in `/tmp`. Use for live-eval runs where the

@@ -44,6 +44,19 @@ pub struct WorkspaceId(uuid::Uuid);
 #[serde(transparent)]
 pub struct PresetId(uuid::Uuid);
 
+/// An LLM backend identifier (UUIDv7). A *backend* is one configured endpoint
+/// — a free-form unique `name` plus a closed `kind` (anthropic/deepseek/
+/// openai). The name/kind split is the thing the old TOML conflated.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BackendId(uuid::Uuid);
+
+/// A cast identifier (UUIDv7). A *cast* is a named ensemble: role → backend +
+/// model + tunables, one slot per `context_type`.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CastId(uuid::Uuid);
+
 // ── Shared behavior ─────────────────────────────────────────────────────────
 
 macro_rules! impl_typed_id {
@@ -186,6 +199,8 @@ impl_typed_id!(ContextId, "ContextId");
 impl_typed_id!(SessionId, "SessionId");
 impl_typed_id!(WorkspaceId, "WorkspaceId");
 impl_typed_id!(PresetId, "PresetId");
+impl_typed_id!(BackendId, "BackendId");
+impl_typed_id!(CastId, "CastId");
 
 // ── PrefixResolvable ────────────────────────────────────────────────────────
 

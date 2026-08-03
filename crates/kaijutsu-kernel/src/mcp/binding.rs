@@ -138,7 +138,8 @@ pub enum Capability {
     /// distinct from `Admin` (which is narrowly loadout-write).
     Operator,
     /// `kj config set/reset` — may write the CRDT-owned config files at
-    /// `/etc/config` (models.toml, system.md, theme.toml, mcp.toml). The config
+    /// `/etc/config` (system.md, theme.toml, mcp.toml) AND the SQL-native model
+    /// config surfaces (`kj backend`/`kj cast`/`kj alias`). The config
     /// analogue of [`RcWrite`]: dedicated so a broad loadout (e.g. `coder` with
     /// "*") can't silently rewrite which model runs or the base system prompt.
     /// `kj config` writes go straight through the VFS (not the gated file tool),
