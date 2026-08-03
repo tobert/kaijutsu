@@ -11,6 +11,12 @@ tmp/
 proptest-regressions/
 node_modules/
 .hrlauncher.toml
+.ssh-agent
+
+# Claude Code local state: settings.local.json (per-machine permissions) and
+# worktrees/ (harness-managed agent checkouts). Shared project config that
+# SHOULD be committed lives in AGENTS.md and .mcp.json, not here.
+.claude/
 
 # signoff.md — ephemeral, personal cross-session handoff; never commit.
 # Shared working notes live in docs/issues.md and docs/devlog.md.
