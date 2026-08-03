@@ -217,6 +217,48 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
+
+LiquidAI's LFM2.5 encoder branch is a small-model toolbox aimed at exactly
+our seams. Surveyed 2026-08-03 (HF API, live):
+
+- **`Encoder-350M-Prompt-Router`** — prompt→tier classifier. Our fit: the
+  *dynamic* half of the routing doctrine — per-turn "flash or pro, effort
+  high or none" feeding cast-lane choice, decided locally for free. Eval
+  first: run a pile of real prompts from the block log through it and score
+  its lane picks against Amy's.
+- **`Encoder-350M-PII-Detector` / `-Policy-Linter`** — token-level boundary
+  screening. Amy's framing: guards are for **mistake-protection and foreign
+  content crossing the membrane** (new OSS repos, prose/code from elsewhere)
+  — NOT inter-player policing, which stays off-doctrine. Strongest first
+  home is **kaibo** (its whole job is reading untrusted repos): screen
+  explorer file reads for injection, screen batch payloads for PII.
+  Amy: *"an embedded LFM in Kaibo would kick so much butt for the safety
+  elements."* (Kaibo-side work; tracked here as the cross-project seed.)
+- **`Embedding-350M`** (1024-dim, safetensors + official GGUF) +
+  **`ColBERT-350M`** — bge-small successor candidates. Embedder swap =
+  full semantic-index rebuild (dims change; by design). ColBERT needs
+  per-token vector storage — bigger lift; `bge-reranker-v2-m3` remains the
+  cheap second-stage quality win meanwhile.
+- **`Encoder-230M/350M` base** (fill-mask) — fine-tune substrate for our
+  own future boundary classifiers.
+
+**Runtimes (not stuck on ONNX — Amy):** best-first:
+1. **llama.cpp / GGUF** — official artifacts, lfm2 arch upstreamed by
+   LiquidAI, Vulkan on zorak, `--embedding` server mode. For embedding IN
+   kaibo: in-process via the `llama-cpp-2` Rust bindings — no socket, no
+   sidecar, preserves kaibo's stdio-only invariant outright.
+2. **candle** — pure-Rust; proven runnable (community MioTTS runs LFM2-2.6B
+   on candle, no Python). Classifier-head plumbing is ours to write; keeps
+   the toolchain C++-free.
+3. **rten/ONNX** — only if we want index-pipeline symmetry; `lfm2` hybrid
+   conv+attention arch is a real conversion risk; verify via embed_check.
+4. LEAP (Liquid's edge SDK) — phones/edge, not our shape.
+
+Deep-dive order when Amy picks this up: Router eval offline → kaibo guard
+embed (llama-cpp-2, PII+injection on explorer reads) → Embedding-350M swap
+eval against bge-small on the real index corpus.
+
 ## Cast follow-ups (seeded 2026-08-03, casts shipped same day — devlog "Contexts join a band")
 
 Deferred from the renovation, in rough priority order:
