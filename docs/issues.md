@@ -46,13 +46,6 @@ these are the ones that block *using* the thing.
   shipped in `4ed99bd3`), but rank it below token accounting, not beside it.
   The genuinely unbounded surface is `block_read` on a large block and external
   MCP results — and external MCP doesn't load at all today.
-- **Pre-existing exit-code asymmetry, found during A1.** kaish remaps a spilled
-  (truncated) result to exit code 3. `rpc.rs:7450` classifies exit 2/3 as
-  `Status::Done`; `ShellServer::call_tool` (`mcp/servers/shell.rs`) treats exit
-  3 as `is_error = true`. So the same spilled-output outcome reads as success on
-  one path and failure on the other. Untouched by `4ed99bd3`. Decide which is
-  right — "ran fine, output spilled" is arguably `Done` with a pointer to the
-  spill file, and a model told `is_error` may retry a command that succeeded.
 - **No token accounting anywhere in the kernel.** `Usage { input_tokens,
   output_tokens, cache_read.. }` (`llm/stream.rs:242`) is parsed off every
   provider stream and consumed by *nothing*. The numbers already arrive; nobody

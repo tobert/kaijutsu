@@ -374,10 +374,20 @@ impl McpServerLike for ShellServer {
 /// structured envelope carries the exit code + raw streams for programmatic
 /// consumers, plus any confirmation-latch request so a caller can fulfill it
 /// structurally rather than parsing the prose.
+///
+/// A capped result (kaish `did_spill`: exit remapped to 3, real exit stashed
+/// in `original_code`) is judged by the command's REAL exit — truncation is
+/// not failure, and an `is_error` here tempts a model into re-running a
+/// command that already succeeded. The truncation itself stays unmissable:
+/// `[output truncated]` in the body, `did_spill` in the envelope.
 fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> KernelToolResult {
     let stdout = result.text_out().into_owned();
     let stderr = result.err.clone();
-    let exit_code = result.code;
+    let exit_code = if result.did_spill {
+        result.original_code.unwrap_or(result.code)
+    } else {
+        result.code
+    };
     let is_error = exit_code != 0;
     // kj verbs (and any builtin that opts in) attach a structured `.data`
     // payload — context-id arrays for list commands, records for inspect. Carry
@@ -405,6 +415,9 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
     if !stderr.is_empty() {
         push_line(&stderr);
     }
+    if result.did_spill {
+        push_line("[output truncated]");
+    }
     if is_error {
         push_line(&format!("[exit {exit_code}]"));
     }
@@ -416,6 +429,7 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code,
+            "did_spill": result.did_spill,
             "data": data,
             "latch": latch,
         })),
@@ -692,6 +706,75 @@ mod tests {
             kr.structured.unwrap()["exit_code"],
             serde_json::json!(3),
             "structured envelope carries the exit code"
+        );
+    }
+
+    #[test]
+    fn conversion_spilled_success_is_not_error_but_signals_truncation() {
+        // kaish remaps a capped/spilled result to exit 3, stashing the real
+        // exit in `original_code`. Truncation is not failure: flagging it
+        // `is_error` tempts a model into re-running a command that succeeded.
+        // The truncation must still be unmissable — a model reasoning over a
+        // head+tail excerpt as if it were complete output hallucinates.
+        let mut r = kaish_kernel::interpreter::ExecResult::success(
+            "head…\n[output truncated: spilled to /v/spill/abc]",
+        );
+        r.did_spill = true;
+        r.original_code = Some(r.code);
+        r.code = 3;
+        let kr = shell_result_to_kernel(r);
+        assert!(!kr.is_error, "a spilled successful command is not an error");
+        match kr.content.first().unwrap() {
+            ToolContent::Text(s) => {
+                assert!(
+                    s.contains("[output truncated]"),
+                    "truncation must be labelled in the body: {s:?}"
+                );
+                assert!(
+                    !s.contains("[exit"),
+                    "a successful spill must not carry an exit label: {s:?}"
+                );
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        let structured = kr.structured.unwrap();
+        assert_eq!(
+            structured["exit_code"],
+            serde_json::json!(0),
+            "envelope carries the command's real exit, not kaish's spill marker"
+        );
+        assert_eq!(structured["did_spill"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn conversion_spilled_failure_stays_error_with_original_code() {
+        let mut r = kaish_kernel::interpreter::ExecResult::failure(3, "tail of a real failure");
+        r.did_spill = true;
+        r.original_code = Some(1);
+        let kr = shell_result_to_kernel(r);
+        assert!(kr.is_error, "a spilled FAILING command is still an error");
+        match kr.content.first().unwrap() {
+            ToolContent::Text(s) => {
+                assert!(s.contains("[output truncated]"), "truncation labelled: {s:?}");
+                assert!(
+                    s.contains("[exit 1]"),
+                    "exit label shows the real code, not the spill marker: {s:?}"
+                );
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        let structured = kr.structured.unwrap();
+        assert_eq!(structured["exit_code"], serde_json::json!(1));
+        assert_eq!(structured["did_spill"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn conversion_unspilled_results_report_did_spill_false() {
+        let plain = shell_result_to_kernel(kaish_kernel::interpreter::ExecResult::success("ok"));
+        assert_eq!(
+            plain.structured.unwrap()["did_spill"],
+            serde_json::json!(false),
+            "did_spill is always present so consumers can test it directly"
         );
     }
 
