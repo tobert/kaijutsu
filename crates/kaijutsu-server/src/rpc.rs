@@ -1199,6 +1199,246 @@ pub async fn start_external_mcp_servers(kernel: &Arc<kaijutsu_kernel::Kernel>) {
     }
 }
 
+/// What happened when a BlockStore-discovered conversation was offered to
+/// KernelDb at cold start (see [`bootstrap_discovered_context`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextBootstrapOutcome {
+    /// KernelDb had no row for this conversation; a minimal placeholder row
+    /// was created so the discovered blocks are reachable.
+    Inserted,
+    /// KernelDb already knew this context. The persisted row is authoritative
+    /// and is left exactly as-is — a placeholder must never overwrite it.
+    AlreadyKnown { archived: bool },
+}
+
+/// Offer one BlockStore-discovered Conversation document to KernelDb.
+///
+/// Cold start walks every `DocKind::Conversation` document in the BlockStore
+/// and makes sure KernelDb has a context row for it, so blocks that outlived
+/// their row are still reachable. "Already known" is decided against the WHOLE
+/// `contexts` table, archived rows included: an archived context still owns its
+/// conversation document, so it is *known*, not missing. Re-inserting it would
+/// be a resurrection — a placeholder row (state Live, `created_at` = now,
+/// `created_by` = system) overwriting a real archived one. Today the PK
+/// constraint is what stops that; this function stops it a step earlier, and
+/// the constraint stays as the backstop.
+///
+/// A UNIQUE violation from the INSERT is therefore never expected. If one
+/// happens anyway (another writer won a race), it is re-classified by reading
+/// the row back: the caller asked for something that is already true, which is
+/// not a failed write. Any other error IS a failed write and bubbles.
+fn bootstrap_discovered_context(
+    db: &KernelDb,
+    context_id: ContextId,
+) -> Result<ContextBootstrapOutcome, KernelDbError> {
+    if let Some(existing) = db.get_context(context_id)? {
+        return Ok(ContextBootstrapOutcome::AlreadyKnown {
+            archived: existing.archived_at.is_some(),
+        });
+    }
+
+    let row = ContextRow {
+        context_id,
+        label: None,
+        provider: None,
+        model: None,
+        system_prompt: None,
+        consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
+        context_state: kaijutsu_types::ContextState::Live,
+        context_type: "default".to_string(),
+        created_at: kaijutsu_types::now_millis() as i64,
+        created_by: PrincipalId::system(),
+        forked_from: None,
+        fork_kind: None,
+        archived_at: None,
+        workspace_id: None,
+        preset_id: None,
+        concluded_at: None,
+        last_activity_at: None,
+        promoted_at: None,
+        demoted_at: None,
+        paused_at: None,
+    };
+    // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
+    // in `workspaces`, so the fallback only converts a legible workspace error
+    // into an illegible FK violation on the next statement.
+    let default_ws = db.get_or_create_default_workspace(row.created_by)?;
+    match db.insert_context_with_document(&row, default_ws) {
+        Ok(()) => Ok(ContextBootstrapOutcome::Inserted),
+        Err(e) => match db.get_context(context_id)? {
+            // Someone inserted between our read and our write. The row we
+            // wanted exists, so the request is satisfied — not a failed write.
+            // Unexpected at cold start (the KernelDb lock is held across the
+            // whole walk), so say so rather than hiding it.
+            Some(existing) => {
+                log::warn!(
+                    "context {} appeared in KernelDb during cold-start bootstrap \
+                     (concurrent writer); keeping the persisted row",
+                    context_id.short(),
+                );
+                Ok(ContextBootstrapOutcome::AlreadyKnown {
+                    archived: existing.archived_at.is_some(),
+                })
+            }
+            // Nothing to show for the write: a real persistence failure.
+            None => Err(e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod context_bootstrap_tests {
+    use super::*;
+
+    fn db() -> KernelDb {
+        KernelDb::in_memory().expect("in-memory KernelDb")
+    }
+
+    /// A context the way a real one looks on disk: a human label, a real
+    /// principal, a non-default context_type, a birth timestamp in the past.
+    /// Nothing a cold-start placeholder would ever reproduce — which is the
+    /// point: if bootstrap ever overwrites this row, the difference shows.
+    fn persist_real_context(db: &KernelDb, label: &str) -> (ContextId, ContextRow) {
+        let context_id = ContextId::new();
+        let row = ContextRow {
+            context_id,
+            label: Some(label.to_string()),
+            provider: Some("anthropic".into()),
+            model: Some("claude-opus-4-8".into()),
+            system_prompt: None,
+            consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
+            context_state: kaijutsu_types::ContextState::Live,
+            context_type: "coder".to_string(),
+            created_at: 1_700_000_000_000,
+            created_by: PrincipalId::new(),
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+            concluded_at: None,
+            last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+        };
+        let ws = db
+            .get_or_create_default_workspace(row.created_by)
+            .expect("default workspace");
+        db.insert_context_with_document(&row, ws)
+            .expect("persist context");
+        (context_id, row)
+    }
+
+    #[test]
+    fn unknown_conversation_is_bootstrapped() {
+        let db = db();
+        let discovered = ContextId::new();
+
+        assert_eq!(
+            bootstrap_discovered_context(&db, discovered).expect("bootstrap must not fail"),
+            ContextBootstrapOutcome::Inserted,
+            "a conversation document with no KernelDb row is exactly what \
+             bootstrap exists for",
+        );
+
+        let row = db
+            .get_context(discovered)
+            .expect("read back")
+            .expect("row must exist after Inserted");
+        assert_eq!(row.context_state, kaijutsu_types::ContextState::Live);
+        assert_eq!(row.created_by, PrincipalId::system());
+
+        // The workspace rides on the `documents` row (contexts.workspace_id
+        // stays NULL for every path that passes `workspace_id: None`). It must
+        // be the real default workspace, never a fabricated id that names no
+        // row in `workspaces`.
+        let doc = db
+            .get_document(discovered)
+            .expect("read back")
+            .expect("bootstrap creates the documents row too");
+        assert_eq!(
+            doc.workspace_id,
+            db.get_or_create_default_workspace(PrincipalId::system())
+                .expect("default workspace"),
+        );
+    }
+
+    #[test]
+    fn live_context_is_already_known() {
+        let db = db();
+        let (id, _) = persist_real_context(&db, "live-one");
+
+        assert_eq!(
+            bootstrap_discovered_context(&db, id).expect("bootstrap must not fail"),
+            ContextBootstrapOutcome::AlreadyKnown { archived: false },
+        );
+    }
+
+    /// The live-caught bug: every restart re-offered the same archived
+    /// contexts and logged `UNIQUE constraint failed: contexts.context_id`.
+    /// An archived context still owns its conversation document, so the
+    /// document walk finds it — but it is *known*, not missing.
+    #[test]
+    fn archived_context_is_known_not_missing() {
+        let db = db();
+        let (id, _) = persist_real_context(&db, "archived-one");
+        assert!(db.archive_context(id).expect("archive"), "row archived");
+
+        assert_eq!(
+            bootstrap_discovered_context(&db, id).expect(
+                "re-offering an archived context is not a failed write — the \
+                 row it asks for already exists",
+            ),
+            ContextBootstrapOutcome::AlreadyKnown { archived: true },
+        );
+    }
+
+    /// Guards the fix that must NOT be made: idempotent insert-or-replace.
+    /// The placeholder row is strictly poorer than the persisted one, so
+    /// "make the insert idempotent" would silently resurrect an archived
+    /// context as Live and erase its label, owner, type, and birth time.
+    #[test]
+    fn bootstrap_never_overwrites_the_persisted_row() {
+        let db = db();
+        let (id, original) = persist_real_context(&db, "precious");
+        db.archive_context(id).expect("archive");
+
+        let _ = bootstrap_discovered_context(&db, id);
+
+        let after = db.get_context(id).expect("read back").expect("row");
+        assert!(
+            after.archived_at.is_some(),
+            "bootstrap must never resurrect an archived context",
+        );
+        assert_eq!(after.label, original.label, "label must survive bootstrap");
+        assert_eq!(after.created_by, original.created_by);
+        assert_eq!(after.created_at, original.created_at);
+        assert_eq!(after.context_type, original.context_type);
+        assert_eq!(after.model, original.model);
+    }
+
+    /// Cold start runs on every restart; the second restart must be as quiet
+    /// as the first was loud.
+    #[test]
+    fn second_bootstrap_of_the_same_conversation_is_benign() {
+        let db = db();
+        let discovered = ContextId::new();
+
+        assert_eq!(
+            bootstrap_discovered_context(&db, discovered).unwrap(),
+            ContextBootstrapOutcome::Inserted,
+        );
+        assert_eq!(
+            bootstrap_discovered_context(&db, discovered).expect(
+                "a restart re-walking the same conversation document is the \
+                 normal case, not an error",
+            ),
+            ContextBootstrapOutcome::AlreadyKnown { archived: false },
+        );
+    }
+}
+
 /// Create the shared kernel at server startup.
 ///
 /// This performs all kernel initialization: VFS mounts, block store with DB
@@ -1482,66 +1722,49 @@ pub async fn create_shared_kernel(
     kernel_arc.broker().set_kernel(&kernel_arc).await;
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
-    // A failure to read the DB here means we cannot know which contexts should be recovered —
-    // refuse to start rather than silently coming up with zero contexts.
     let all_contexts: Vec<ContextRow> = {
         let db = kernel_db_arc.lock();
-        // Step 1: Load active contexts from KernelDb
-        let db_contexts = db.list_active_contexts().map_err(|e| {
-            capnp::Error::failed(format!("Failed to load contexts from KernelDb: {}", e))
-        })?;
-        let db_ids: std::collections::HashSet<ContextId> =
-            db_contexts.iter().map(|r| r.context_id).collect();
 
-        // Step 2: Discover Conversation documents not in KernelDb → bootstrap minimal rows.
-        // Only conversations are contexts — code/config/text docs are internal.
+        // Step 1: Discover Conversation documents and make sure KernelDb has a
+        // row for each. Only conversations are contexts — code/config/text docs
+        // are internal. `bootstrap_discovered_context` decides "already known"
+        // against the WHOLE contexts table, archived rows included: an archived
+        // context still owns its conversation document, and re-offering it is
+        // not a missing row (that check used to run against the ACTIVE set,
+        // which re-offered every archived context on every single restart).
         let block_store_ids: Vec<ContextId> =
             documents.list_ids_by_kind(kaijutsu_types::DocKind::Conversation);
         for &bs_ctx_id in &block_store_ids {
-            if !db_ids.contains(&bs_ctx_id) {
-                let row = ContextRow {
-                    context_id: bs_ctx_id,
-                                        label: None,
-                    provider: None,
-                    model: None,
-                    system_prompt: None,
-                    consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
-                    context_state: kaijutsu_types::ContextState::Live,
-                    context_type: "default".to_string(),
-                    created_at: kaijutsu_types::now_millis() as i64,
-                    created_by: PrincipalId::system(),
-                    forked_from: None,
-                    fork_kind: None,
-                    archived_at: None,
-                    workspace_id: None,
-                    preset_id: None,
-                    concluded_at: None,
-                    last_activity_at: None,
-                    promoted_at: None,
-                    demoted_at: None,
-                    paused_at: None,
-                };
-                let default_ws = db
-                    .get_or_create_default_workspace(row.created_by)
-                    .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
-                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    log::warn!(
+            match bootstrap_discovered_context(&db, bs_ctx_id) {
+                Ok(ContextBootstrapOutcome::Inserted) => log::info!(
+                    "Bootstrapped context {} into KernelDb from BlockStore",
+                    bs_ctx_id.short()
+                ),
+                Ok(ContextBootstrapOutcome::AlreadyKnown { archived }) => log::debug!(
+                    "Context {} already in KernelDb ({}) — nothing to bootstrap",
+                    bs_ctx_id.short(),
+                    if archived { "archived" } else { "live" },
+                ),
+                // A discovered conversation we could not persist would come up
+                // invisible to every context surface while its blocks stay live
+                // in the BlockStore — two stores disagreeing about what exists.
+                // Same stance as the context read below: refuse to start rather
+                // than warn and carry on with a store we know is divergent.
+                Err(e) => {
+                    return Err(capnp::Error::failed(format!(
                         "Failed to bootstrap context {} into KernelDb: {}",
                         bs_ctx_id.short(),
                         e
-                    );
-                } else {
-                    log::info!(
-                        "Bootstrapped context {} into KernelDb from BlockStore",
-                        bs_ctx_id.short()
-                    );
+                    )));
                 }
             }
         }
 
-        // Step 3: Re-read all active contexts (lock dropped after this block)
+        // Step 2: Read the active contexts to recover (lock dropped after this
+        // block). A failure here means we cannot know which contexts should be
+        // recovered — refuse to start rather than silently coming up with zero.
         db.list_active_contexts().map_err(|e| {
-            capnp::Error::failed(format!("Failed to re-read contexts from KernelDb: {}", e))
+            capnp::Error::failed(format!("Failed to read contexts from KernelDb: {}", e))
         })?
     }; // db lock dropped here — safe to await below
 
@@ -1917,9 +2140,21 @@ async fn create_context_inner(
             demoted_at: None,
             paused_at: None,
         };
-        let default_ws = db
-            .get_or_create_default_workspace(row.created_by)
-            .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+        // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
+        // no row in `workspaces`, so it only turns a legible workspace error
+        // into an FK violation reported as an insert failure one line later.
+        let default_ws = match db.get_or_create_default_workspace(row.created_by) {
+            Ok(ws) => ws,
+            Err(e) => {
+                drop(db);
+                let _ = state.documents.delete_document(context_id);
+                return Err(capnp::Error::failed(format!(
+                    "Failed to resolve default workspace for context {}: {}",
+                    context_id.short(),
+                    e
+                )));
+            }
+        };
         if let Err(e) = db.insert_context_with_document(&row, default_ws) {
             drop(db);
             let _ = state.documents.delete_document(context_id);

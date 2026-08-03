@@ -46,10 +46,14 @@ these are the ones that block *using* the thing.
   shipped in `4ed99bd3`), but rank it below token accounting, not beside it.
   The genuinely unbounded surface is `block_read` on a large block and external
   MCP results — and external MCP doesn't load at all today.
-- **No token accounting anywhere in the kernel.** `Usage { input_tokens,
-  output_tokens, cache_read.. }` (`llm/stream.rs:242`) is parsed off every
-  provider stream and consumed by *nothing*. The numbers already arrive; nobody
-  reads them.
+- **Token accounting — gauge SHIPPED, pre-flight budget still missing.**
+  (Headline corrected 2026-08-03; it originally read "consumed by nothing",
+  which `95e6664a` made stale.) The full gauge exists: per-turn usage
+  SNAPSHOT persisted to `context_usage` (`llm_stream.rs:1347`, provider
+  cache-token normalization + never-overwrite-with-absent guard),
+  displayed by `kj context info` and `contextUsedPct` on the wire. What's
+  still missing is anything that *acts* on it BEFORE a turn — see the
+  hydration-budget bullet below.
   - Denominator SHIPPED 2026-07-29 (`36f57547`) as hand-maintained per-model
     `context_window` in models.toml, resolving to `Option<u64>` — never a
     fabricated default.
@@ -223,6 +227,37 @@ all, discovered wiring the Claude Code MCP config. Two pieces:
   automatically offer the workspace (cwd or repo root) as a share, so the
   kernel side sees `/r/<client>/workspace` with zero flags. Needs the usual
   `/r` decisions: share name, ro vs `:rw` default, and an opt-out.
+
+## `create_document` classifies duplicate-document by error *string* (2026-08-03, from the cold-start bootstrap fix)
+
+Found while fixing the cold-start `UNIQUE constraint failed: contexts.context_id`
+warn (that one is fixed — cold start now decides "already known" against the
+whole `contexts` table, archived rows included, so archived contexts stop being
+re-offered on every restart).
+
+The sibling still open: `BlockStore::create_document` and
+`create_document_with_path` (`block_store.rs:424`, `:475`) classify an
+`insert_document` failure as benign by matching `e.to_string()` for
+`"UNIQUE constraint"` or `"already exists"`, then warn "Document already in DB
+but not in memory, recovering" and continue. Two problems:
+
+- It only works by luck of the message text. `insert_document` routes through
+  `map_unique_violation`, which turns *any* constraint violation into
+  `KernelDbError::LabelConflict("document already exists or path conflict")` —
+  it happens to contain "already exists". Reword that string and every
+  duplicate-document recovery silently becomes a hard `BlockStoreError`.
+- The same message covers the **PK** conflict (same document, benign) and the
+  **`idx_documents_path`** conflict (a *different* document claiming a path
+  that's taken — divergent, not benign). Both are swallowed as "recovering".
+
+Wants a typed classifier on `KernelDbError` (`is_unique_violation`, or better,
+distinct variants for PK vs path conflict) and a read-back-and-compare on the
+benign arm, the same shape `bootstrap_discovered_context` (`rpc.rs`) now uses.
+
+Second sibling, lower stakes: the lost+found row in `kj/drift.rs:557` logs
+`tracing::error!("failed to persist lost+found context row")` and carries on —
+which breaks the "registered handle implies a KernelDb row" invariant the
+comment three lines above it is there to defend.
 
 ## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
 
