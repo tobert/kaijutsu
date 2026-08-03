@@ -11,6 +11,14 @@ Status: **SHIPPED** — slice 1 (rc) landed 2026-06-16, slice 2 (config TOMLs)
 build order. It supersedes the earlier `FileDocumentCache`-era design
 (`docs/rc-crdt-vfs-bridge.md`, deleted 2026-07-04 — git history has it).
 
+> **2026-08-03 update — `models.toml` left the CRDT for SQL.** Model config
+> (backends, casts, aliases, tunables, embedding) now lives in normalized
+> kernel-db tables, edited via `kj backend`/`kj cast`/`kj alias` with live
+> registry reload — no TOML in that path at all (devlog: "Contexts join a
+> band"). Mentions of `models.toml` below are accurate history for slice 2 as
+> built. The doctrine itself is unchanged and `theme.toml`, `mcp.toml`,
+> `system.md`, and all of `/etc/rc` remain CRDT-owned exactly as described.
+
 ---
 
 ## Why — dual ownership is the disease

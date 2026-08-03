@@ -933,3 +933,40 @@ against a live writer), `kj db checkpoint` for the snapshot-your-own
 crowd, and restore deliberately left a documented procedure instead of a
 verb, because a live file swap under a kernel full of in-memory state is
 a lie waiting to be discovered.
+
+## Contexts join a band — SQL-native model config and casts (August 3)
+
+The afternoon's seed ("consider adopting kaibo's config and cast concept?")
+became the evening's renovation. Reading kaibo's resolved config against our
+`llm/` layer made the gaps obvious: the provider table's NAME was its TYPE, so
+a second openai-compatible endpoint needed a blessed name; tunables (effort,
+thinking budgets, sampling) existed nowhere; and the hosted-OpenAI path had
+been quietly broken since GPT-5.x started rejecting `max_tokens` — a live
+probe confirmed it in one curl.
+
+The design conversation took two turns that mattered. First, Amy pushed past
+"adopt kaibo's TOML": *"I'd like to see the cast data modeled in SQL directly
+and that's the source."* models.toml — the CRDT doc, the embedded asset, the
+whole TOML parse layer — was demolished, replaced by normalized tables
+(backends with a name/kind split, casts, cast_slots, aliases, llm_defaults)
+edited through `kj backend`/`kj cast`/`kj alias`, with the registry rebuilt
+live on every write. No restart to change which model runs. Bootstrap is
+agent-driven: read a colleague's config, run the verbs. Second, presets
+survived on purpose. The near-miss was absorbing them into casts; reading the
+actual code showed presets are patch recall over verb args (fork bases,
+consent), of which model-pinning was only the underused corner. So the
+concepts split cleanly — **cast = who plays, preset = the patch** — and a
+preset now references a cast instead of pinning provider/model itself.
+
+Roles are context_types, the same word rc dispatch already keys on, so `kj
+context create --cast house --type coder` seats a context in the band and the
+turn path resolves explicit override → cast slot → default through one pure
+function. Existing contexts rolled over idempotently (keep the surviving
+backend names, rename openai→gpt, toss the rest to deepseek-v4-flash). Three
+lanes ran it: Opus built the schema/registry/verbs, two Sonnets in one tree
+with file fences did tunables-to-the-wire and cast-on-context, and the lead
+stitched the seam where they met. The first live proof was a `budget`-cast
+probe context resolving `deepseek/deepseek-v4-pro via CastSlot` in the
+journal on its first turn. Old aliases didn't make the trip — Amy: "they were
+guesses" — the floor ships four backends, zero aliases, zero casts, and every
+row above it is something someone chose.

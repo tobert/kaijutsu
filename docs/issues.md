@@ -217,25 +217,25 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
-## Casts: adopt kaibo's named model-team concept (seeded 2026-08-03; design round DONE same day — IN FLIGHT)
+## Cast follow-ups (seeded 2026-08-03, casts shipped same day — devlog "Contexts join a band")
 
-The design conversation happened 2026-08-03 (evening round, see signoff.md for
-the full decision list and Amy quotes). Resolved: **SQL is the source of truth**
-— backends/casts/slots/aliases/defaults as normalized kernel-db tables, no TOML
-anywhere in the path (models.toml demolished; JSON `extra` column for sparse
-per-model fields); backend name/kind split (closed kind enum anthropic/deepseek/
-openai); **roles = context_types**; NULL slot tunables cascade to llm_defaults;
-**preset narrowed, not absorbed** (its provider/model columns → nullable cast_id
-FK; preset stays the patch-recall system); casts get a stubbed
-loadout/capability reference for later; bootstrap is agent-driven (read
-`kaibo://config`, run kj verbs — a setup tool can wait); registry rebuilds live
-from DB, no restart. Tracks: A = schema/registry/kj verbs (Opus), B = tunables
-→ wire incl. the hosted-OpenAI max_completion_tokens fix (live-probed broken
-today), D = ContextRow.cast_id + preset narrowing. Delete this entry when the
-tracks ship; melt the story into the devlog.
+Deferred from the renovation, in rough priority order:
 
-Deferred beyond this round: per-cast rc/stance placement; Responses wire for
-OpenAI reasoning summaries; capability-loadout consumer for cast slots.
+- **Anthropic `output_config.effort` wire shape unverified live** — the house
+  probe hit a billing wall (credit balance) before shape validation. Unit
+  tests assert the documented shape; run one `kj drive` on a house/coder
+  context after credits top up and confirm no 400.
+- **capability-loadout consumer** for `cast_slots.loadout` (stored stub; the
+  "cast can have domain capabilities" half of Amy's design).
+- **`kj fork --cast`** — explicit fork-time cast override (inheritance +
+  `--preset` cover today's need).
+- **Responses wire for OpenAI** — only needed for streamed reasoning
+  summaries; the chat wire with `max_completion_tokens` + `reasoning_effort`
+  is live and sufficient.
+- **Per-cast rc/stance placement** — does a cast ever carry stance text, or
+  is that forever context_type's job?
+- **App UI for casts** — kj-only today; the app compiles against the new wire
+  fields but renders nothing cast-shaped yet.
 
 ## kaijutsu-mcp: workspace autoshare (seeded 2026-08-01, MCP-config session)
 
