@@ -974,6 +974,16 @@ pub async fn resolve_image_blocks_from_cas(
     }
 }
 
+/// Crate-external entry point for [`hydrate::estimate_tokens`] — the
+/// pre-flight token-size estimate walked over an already-hydrated message
+/// sequence. `hydrate` is a private submodule (`mod hydrate;` above), so this
+/// thin `pub fn` is the seam that lets `kaijutsu-server`'s pre-send
+/// context-window warning (`llm_stream.rs`) reach it without widening the
+/// submodule's own visibility.
+pub fn estimate_tokens(messages: &[Message]) -> u64 {
+    hydrate::estimate_tokens(messages)
+}
+
 /// Reconstruct LLM conversation history from stored blocks.
 ///
 /// Walks blocks in order and produces the `Message` sequence expected by the

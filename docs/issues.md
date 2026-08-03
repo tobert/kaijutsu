@@ -96,13 +96,17 @@ these are the ones that block *using* the thing.
     `list_models` — the right tool for this question — confirms Haiku 4.5 is
     still the newest Haiku and turned up `claude-sonnet-5` /
     `claude-opus-4-6`, which we were missing.
-- **Hydration has no token budget.** `hydrate.rs` ships every live block into
-  the LLM context unconditionally — no cap, no summarization trigger. (The
-  automatic block-count-threshold compaction that used to catch this was
-  removed 2026-08-02 — Amy: "I don't ever use it in claude code, I won't use
-  it in kaijutsu, so we can just remove the feature." The only compaction left
-  is explicit, via `kj fork --compact`.) 20 blocks of build output can blow
-  the window with nothing to catch it.
+- **Hydration size warning SHIPPED 2026-08-03 as warn-but-send; a hard cap
+  is rejected by design.** Amy chose warn-and-send over refusal: a
+  `BlockKind::Trace` block + `log::warn!` when the pre-flight estimate
+  (`estimate_tokens`, bytes/4 + flat 1600/image) hits ≥90% of the resolved
+  window (`warn_if_near_context_window`, `llm_stream.rs`); unknown window =
+  no check (never fabricate a denominator); the provider's own rejection
+  stays the hard backstop, and the kernel never trims or refuses a turn
+  (auto-compaction stays deliberately removed). Known simplifications, fine
+  until they annoy: warns every over-threshold turn (no latch), estimate
+  runs once per turn (pre-agentic-loop, so mid-turn tool-result growth is
+  seen next turn).
 
 **Tier 1 — needed daily**
 

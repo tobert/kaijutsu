@@ -64,6 +64,90 @@ fn insert_pre_stream_error_block(
     }
 }
 
+/// Fraction of a model's context window at which the pre-flight size
+/// estimate (`kaijutsu_kernel::estimate_tokens`) triggers a visible warning.
+/// 0.9, not 1.0: the estimator's bytes/4 conversion undercounts code-heavy
+/// text (real BPE tokenizers run denser on structured content than plain
+/// prose), and a non-blocking warning is most useful *before* the provider's
+/// own hard rejection fires — so this fires with headroom, not at the edge.
+const CONTEXT_WARNING_THRESHOLD: f64 = 0.9;
+
+/// Pre-flight, non-blocking size check: warn — never refuse or trim — when a
+/// turn's *estimated* size is at or above `CONTEXT_WARNING_THRESHOLD` of the
+/// resolved model's context window.
+///
+/// This is a WARN-AND-SEND path, not a correctness gate. Auto-compaction was
+/// deliberately removed from kaijutsu and the kernel never silently refuses
+/// or trims a turn on this model's behalf; the provider's own overflow
+/// rejection remains the hard backstop. `window` is `None` when the model's
+/// context window is unconfigured/unresolvable (`LlmRegistry::context_window_
+/// for_live`) — in that case there is nothing honest to compare against, so
+/// no check runs at all. Never fabricate a denominator (same house rule as
+/// `context_used_pct`, kernel_db.rs:360).
+///
+/// Emits **unconditionally** per over-threshold turn — a growing
+/// conversation will warn again on every subsequent turn, with no
+/// once-per-context latch. That's a deliberate, noted simplification: a
+/// latch would need to track "have we warned since the last exclude/fork",
+/// state this advisory path doesn't otherwise carry. `kj context info`
+/// remains the quiet, on-demand gauge for anyone who wants a single check
+/// instead of a running warning.
+fn warn_if_near_context_window(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    after_block_id: &kaijutsu_crdt::BlockId,
+    messages: &[LlmMessage],
+    provider_name: &str,
+    model_name: &str,
+    window: Option<u64>,
+) {
+    let Some(window) = window else {
+        // Unknown window: nothing to compare against. Never invent a
+        // fabricated denominator just to produce a number.
+        return;
+    };
+    let estimate = kaijutsu_kernel::estimate_tokens(messages);
+    let threshold = (window as f64 * CONTEXT_WARNING_THRESHOLD) as u64;
+    if estimate < threshold {
+        return;
+    }
+    let pct = if window == 0 {
+        // A configured window of 0 is a config error, not a real model —
+        // still never panic this advisory path over a division by zero.
+        100.0
+    } else {
+        (estimate as f64 / window as f64) * 100.0
+    };
+    let detail = format!(
+        "conversation is an estimated ~{estimate} tokens against {model_name}'s {window}-token \
+         window (~{pct:.0}%). The turn was sent anyway; the provider is the hard limit. \
+         Remedies: exclude large blocks then fork; `kj fork --compact`; if this model's window \
+         is wrong, set [providers.{provider_name}.models.{model_name}].context_window via \
+         `kj config set models.toml`."
+    );
+    log::warn!("{detail}");
+
+    // Telemetry-only insert: unlike the loud-failure paths elsewhere in this
+    // file, a failed Trace insert here must never fail or stall the turn —
+    // the `log::warn!` above already surfaced the warning operator-side, and
+    // this is a WARN-AND-SEND path by design, exempt from the fail-loudly-
+    // and-stop pattern that governs the hydration/provider-resolution/tool
+    // failures above. The in-conversation copy is best-effort.
+    if let Err(e) = documents.insert_block_as(
+        context_id,
+        None,
+        Some(after_block_id),
+        kaijutsu_crdt::Role::System,
+        kaijutsu_crdt::BlockKind::Trace,
+        detail,
+        kaijutsu_crdt::Status::Done,
+        kaijutsu_crdt::ContentType::Plain,
+        Some(PrincipalId::system()),
+    ) {
+        log::warn!("Failed to insert context-size warning Trace block: {e}");
+    }
+}
+
 /// Hydrate the live conversation session for one turn.
 ///
 /// Catches the `mailbox` up against the current block log and returns the
@@ -560,6 +644,186 @@ mod hydration_tests {
     }
 }
 
+#[cfg(test)]
+mod context_window_warning_tests {
+    use super::*;
+    use kaijutsu_kernel::{DocumentKind, shared_block_store};
+
+    /// When the estimated turn size is at/above `CONTEXT_WARNING_THRESHOLD`
+    /// of a *known* model window, a visible `BlockKind::Trace` block lands in
+    /// the conversation and the turn is never blocked — `warn_if_near_
+    /// context_window` returns `()` unconditionally and the already-hydrated
+    /// `messages` the caller holds are untouched, so the stream proceeds to
+    /// send them regardless of the warning.
+    #[test]
+    fn over_threshold_with_known_window_inserts_trace_and_does_not_block_turn() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let user_block_id = documents
+            .insert_block_as(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert user block");
+
+        // ~400 bytes of content -> ~100 estimated tokens (400/4), comfortably
+        // over 90% of a 100-token window.
+        let messages = vec![LlmMessage::user("x".repeat(400))];
+        let window = Some(100u64);
+
+        // The turn's message list is what actually gets sent; prove the
+        // warning path doesn't consume or replace it.
+        let messages_len_before = messages.len();
+
+        warn_if_near_context_window(
+            &documents,
+            context_id,
+            &user_block_id,
+            &messages,
+            "anthropic",
+            "claude-opus-4-8",
+            window,
+        );
+
+        assert_eq!(
+            messages.len(),
+            messages_len_before,
+            "the warning path must never mutate the outgoing message list"
+        );
+
+        let blocks = documents
+            .block_snapshots(context_id)
+            .expect("read blocks after warning check");
+        let trace = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Trace)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a BlockKind::Trace warning block, got kinds: {:?}",
+                    blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            trace.content.contains("claude-opus-4-8"),
+            "trace content should name the model: {}",
+            trace.content
+        );
+        assert!(
+            trace.content.contains("100-token"),
+            "trace content should name the window size: {}",
+            trace.content
+        );
+        assert!(
+            trace.content.contains("sent anyway"),
+            "trace content should say the turn was sent anyway: {}",
+            trace.content
+        );
+    }
+
+    /// Small conversation, well under the threshold of a known window: no
+    /// Trace block appears.
+    #[test]
+    fn under_threshold_with_known_window_inserts_no_trace() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let user_block_id = documents
+            .insert_block_as(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert user block");
+
+        let messages = vec![LlmMessage::user("hello")];
+        let window = Some(100_000u64);
+
+        warn_if_near_context_window(
+            &documents,
+            context_id,
+            &user_block_id,
+            &messages,
+            "anthropic",
+            "claude-opus-4-8",
+            window,
+        );
+
+        let blocks = documents
+            .block_snapshots(context_id)
+            .expect("read blocks after warning check");
+        assert!(
+            !blocks.iter().any(|b| b.kind == BlockKind::Trace),
+            "no warning should fire under threshold; got kinds: {:?}",
+            blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// An unknown/unconfigured window (`None`) must never be treated as a
+    /// fabricated denominator — no check runs at all, even for a huge
+    /// conversation that would clearly be "close to the edge" under any real
+    /// window.
+    #[test]
+    fn unknown_window_inserts_no_trace_even_for_huge_input() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let user_block_id = documents
+            .insert_block_as(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert user block");
+
+        let messages = vec![LlmMessage::user("x".repeat(1_000_000))];
+
+        warn_if_near_context_window(
+            &documents,
+            context_id,
+            &user_block_id,
+            &messages,
+            "anthropic",
+            "claude-opus-4-8",
+            None,
+        );
+
+        let blocks = documents
+            .block_snapshots(context_id)
+            .expect("read blocks after warning check");
+        assert!(
+            !blocks.iter().any(|b| b.kind == BlockKind::Trace),
+            "an unknown window must never fabricate a denominator; got kinds: {:?}",
+            blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Map a tool-dispatch outcome into the `(content, is_error, error_payload)`
 /// triple used both for the model-visible `ToolResult` and the block-store
 /// write. Pure/sync so it's unit-testable without spinning up a kernel.
@@ -803,6 +1067,28 @@ async fn process_llm_stream(
             Some(conversation_cache.image_cache()),
         )
         .await;
+    }
+
+    // Pre-flight context-size warning (WARN AND SEND — never block the
+    // turn). Runs against the FINAL message list about to be sent, after CAS
+    // image resolution — the same `messages` the provider receives below.
+    // See `warn_if_near_context_window` for the design rationale.
+    {
+        let context_window = {
+            let registry = kernel.llm().read().await;
+            registry
+                .context_window_for_live(provider.name(), &model_name)
+                .await
+        };
+        warn_if_near_context_window(
+            &documents,
+            context_id,
+            &after_block_id,
+            &messages,
+            provider.name(),
+            &model_name,
+            context_window,
+        );
     }
 
     log::info!(

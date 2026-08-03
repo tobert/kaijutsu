@@ -670,3 +670,178 @@ impl HydrationState {
             .push(Message::user(format!("[{archived} blocks archived]")));
     }
 }
+
+/// Flat per-image token cost used by [`estimate_tokens`]. Hydration leaves
+/// `data_base64` unresolved (`None`) on every `ContentBlock::Image` — the
+/// bytes live in CAS and aren't reachable from a pure `&[Message]` walk — so
+/// counting an image as 0 tokens would just lie about its real cost. ~1600
+/// tokens is a defensible flat estimate for a typical image attachment
+/// (comparable to a standard-resolution screenshot under most vision
+/// tokenizers), not a measurement of the actual bytes.
+pub(crate) const ESTIMATED_TOKENS_PER_IMAGE: u64 = 1600;
+
+/// Rough bytes-per-token ratio for the character-count → token-count
+/// conversion in [`estimate_tokens`]. English prose runs close to 4
+/// bytes/token; code and dense structured text (JSON tool input, diffs) run
+/// denser, so this estimator undercounts on code-heavy turns. That's why the
+/// caller (`llm_stream.rs`'s `CONTEXT_WARNING_THRESHOLD`) warns at 90% of the
+/// window rather than 100% — headroom for exactly this undercount.
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// Small fixed overhead added per message (role marker, envelope framing)
+/// that a raw content-length walk alone would miss.
+const PER_MESSAGE_TOKEN_OVERHEAD: u64 = 4;
+
+fn bytes_to_tokens(bytes: usize) -> u64 {
+    (bytes as u64) / BYTES_PER_TOKEN
+}
+
+fn estimate_block(block: &ContentBlock) -> u64 {
+    match block {
+        ContentBlock::Text { text } => bytes_to_tokens(text.len()),
+        ContentBlock::Reasoning { text, .. } => bytes_to_tokens(text.len()),
+        ContentBlock::ToolUse { name, input, .. } => {
+            // Serialized JSON length + the tool name — a failed serialization
+            // (shouldn't happen for a `serde_json::Value` we built ourselves)
+            // degrades to 0 extra bytes rather than panicking; this is an
+            // estimate, not a correctness-critical path.
+            let input_len = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
+            bytes_to_tokens(name.len() + input_len)
+        }
+        ContentBlock::ToolResult { content, .. } => bytes_to_tokens(content.len()),
+        ContentBlock::Image { .. } => ESTIMATED_TOKENS_PER_IMAGE,
+    }
+}
+
+fn estimate_message_content(content: &MessageContent) -> u64 {
+    match content {
+        MessageContent::Text(text) => bytes_to_tokens(text.len()),
+        MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block).sum(),
+    }
+}
+
+/// Estimate the token cost of a hydrated message sequence *before* it goes
+/// out to the provider — a cheap pre-flight sizing check
+/// (`llm_stream.rs`'s pre-send context-window warning), not a real
+/// tokenizer. Deliberately simple and provider-agnostic: each provider's
+/// actual BPE tokenizer differs and a real count would mean a network round
+/// trip per turn, whereas a rough byte-derived number is free and fast
+/// enough to run unconditionally.
+///
+/// Never trims, refuses, or mutates anything — purely informational.
+pub(crate) fn estimate_tokens(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .map(|m| PER_MESSAGE_TOKEN_OVERHEAD + estimate_message_content(&m.content))
+        .sum()
+}
+
+#[cfg(test)]
+mod estimate_tokens_tests {
+    use super::*;
+
+    #[test]
+    fn empty_messages_is_zero() {
+        assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn text_message_counts_overhead_plus_bytes_over_four() {
+        // "hello" = 5 bytes -> 5/4 = 1 token (integer division), plus the
+        // fixed per-message overhead.
+        let messages = vec![Message::user("hello")];
+        assert_eq!(
+            estimate_tokens(&messages),
+            PER_MESSAGE_TOKEN_OVERHEAD + 1,
+            "5-byte text should contribute 5/4=1 token plus per-message overhead"
+        );
+    }
+
+    #[test]
+    fn longer_text_scales_with_byte_count() {
+        let text: String = "x".repeat(400); // 400 bytes -> 100 tokens
+        let messages = vec![Message::user(text)];
+        assert_eq!(estimate_tokens(&messages), PER_MESSAGE_TOKEN_OVERHEAD + 100);
+    }
+
+    #[test]
+    fn image_block_uses_flat_constant_regardless_of_resolution() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::Image {
+                hash: "deadbeef".to_string(),
+                media_type: "image/png".to_string(),
+                data_base64: None, // unresolved, as it always is at hydration time
+            }]),
+        }];
+        assert_eq!(
+            estimate_tokens(&messages),
+            PER_MESSAGE_TOKEN_OVERHEAD + ESTIMATED_TOKENS_PER_IMAGE
+        );
+    }
+
+    #[test]
+    fn blocks_mix_sums_text_tool_use_tool_result_and_image() {
+        let tool_input = serde_json::json!({"path": "/tmp/foo.txt"});
+        let input_str = serde_json::to_string(&tool_input).unwrap();
+        let expected_tool_use = bytes_to_tokens("read_file".len() + input_str.len());
+        let expected_text = bytes_to_tokens("some assistant text".len());
+        let expected_tool_result = bytes_to_tokens("file contents here".len());
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "some assistant text".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: tool_input,
+                },
+                ContentBlock::Image {
+                    hash: "abc123".to_string(),
+                    media_type: "image/jpeg".to_string(),
+                    data_base64: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "tool_1".to_string(),
+                    content: "file contents here".to_string(),
+                    is_error: false,
+                },
+            ]),
+        }];
+
+        let expected = PER_MESSAGE_TOKEN_OVERHEAD
+            + expected_text
+            + expected_tool_use
+            + ESTIMATED_TOKENS_PER_IMAGE
+            + expected_tool_result;
+        assert_eq!(estimate_tokens(&messages), expected);
+    }
+
+    #[test]
+    fn reasoning_block_counts_text_bytes() {
+        let text = "x".repeat(40); // 40 bytes -> 10 tokens
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::Reasoning {
+                text,
+                signature: Some("sig".to_string()),
+            }]),
+        }];
+        assert_eq!(estimate_tokens(&messages), PER_MESSAGE_TOKEN_OVERHEAD + 10);
+    }
+
+    #[test]
+    fn multiple_messages_sum_independently() {
+        let messages = vec![
+            Message::user("x".repeat(40)), // 10 tokens + overhead
+            Message::assistant("y".repeat(80)), // 20 tokens + overhead
+        ];
+        assert_eq!(
+            estimate_tokens(&messages),
+            2 * PER_MESSAGE_TOKEN_OVERHEAD + 10 + 20
+        );
+    }
+}

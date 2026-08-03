@@ -95,6 +95,7 @@ pub use llm::{
     // Conversation session
     ConversationMailbox,
     // Hydration
+    estimate_tokens,
     hydrate_from_blocks,
     resolve_image_blocks_from_cas,
     // System prompt assembly
