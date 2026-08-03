@@ -48,7 +48,7 @@ pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
-    StreamError, StreamEvent, UsageExtra,
+    StreamError, StreamEvent, UsageExtra, apply_slot_tunables,
 };
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 
@@ -410,6 +410,31 @@ fn resolve_key_or_placeholder(config: &BackendConfig, label: &str) -> LlmResult<
     }
 }
 
+/// Default per-request HTTP timeout applied when a backend's
+/// `request_timeout_secs` is `NULL`. Generous enough that it almost never
+/// fires before kaijutsu-server's own total-deadline
+/// (`Timeouts::llm_request_timeout`, 300s / 5 minutes as of this writing —
+/// `kaijutsu_types::timeout`) does, so the higher layer's cancel-and-warn
+/// path is what normally governs a long-running generation. This is the
+/// lower-level HTTP-client backstop for a connection that never gets a
+/// response at all (a dead TCP peer, a proxy that swallows the request) —
+/// 10 minutes comfortably outlasts the 5-minute default above it while
+/// still bounding an indefinite hang, which is what an unset `reqwest`
+/// timeout would otherwise allow.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+
+/// Resolve the per-request HTTP timeout for a backend: the configured
+/// `request_timeout_secs` when set, else [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+/// `0` is refused at write time (`BackendConfig::validate`), so `Some(0)`
+/// cannot reach here.
+fn resolve_request_timeout(config: &BackendConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        config
+            .request_timeout_secs
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+    )
+}
+
 impl Provider {
     /// Build a client from a resolved `backends` row.
     ///
@@ -423,7 +448,8 @@ impl Provider {
         match config.kind {
             BackendKind::Anthropic => {
                 let api_key = resolve_key_or_placeholder(config, "Anthropic")?;
-                let mut client = claude::Client::new(api_key);
+                let mut client = claude::Client::new(api_key)
+                    .with_request_timeout(resolve_request_timeout(config));
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
                 }
@@ -431,7 +457,8 @@ impl Provider {
             }
             BackendKind::DeepSeek => {
                 let api_key = resolve_key_or_placeholder(config, "DeepSeek")?;
-                let mut client = deepseek::Client::new(api_key);
+                let mut client = deepseek::Client::new(api_key)
+                    .with_request_timeout(resolve_request_timeout(config));
                 // DeepSeek's endpoint is fixed; a base_url on this kind is
                 // accepted and honored rather than silently discarded, but the
                 // `kj backend set` help says not to bother.
@@ -444,7 +471,8 @@ impl Provider {
             // optional — a local server needs no key — so a missing key is
             // not an error here.
             BackendKind::OpenAi => {
-                let mut client = openai::Client::new(config.name.clone());
+                let mut client = openai::Client::new(config.name.clone())
+                    .with_request_timeout(resolve_request_timeout(config));
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
                 }
@@ -1168,6 +1196,27 @@ mod tests {
         assert!(
             err.to_string().to_lowercase().contains("key"),
             "auth error should mention key: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_request_timeout_uses_configured_value_when_set() {
+        let mut config =
+            BackendConfig::new("anthropic", BackendKind::Anthropic).with_api_key_env("X");
+        config.request_timeout_secs = Some(45);
+        assert_eq!(
+            resolve_request_timeout(&config),
+            std::time::Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn resolve_request_timeout_falls_back_to_default_when_null() {
+        let config = BackendConfig::new("anthropic", BackendKind::Anthropic);
+        assert_eq!(config.request_timeout_secs, None);
+        assert_eq!(
+            resolve_request_timeout(&config),
+            std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
         );
     }
 

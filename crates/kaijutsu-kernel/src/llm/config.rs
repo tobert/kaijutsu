@@ -330,9 +330,17 @@ pub struct ModelAlias {
 /// `None` at every level means "provider default", which is a real answer, not
 /// a missing one — we do not invent numbers we have not decided on.
 ///
-/// Track A stores and resolves these; **Track B** plumbs them into provider
-/// requests (`llm/stream.rs` `BuildOpts`, the per-client `build()`), which is
-/// why nothing here is read by the request path yet.
+/// Track A stored and resolved these; **Track B** plumbed them into provider
+/// requests — `stream::apply_slot_tunables` is the one seam that copies a
+/// resolved `SlotTunables` onto a `BuildOpts` in progress, and each
+/// provider's `build()` interprets the per-wire mapping from there (Claude:
+/// `thinking_style`/`thinking_budget`/`effort` → `thinking`, with
+/// temperature/top_p dropped whenever thinking ends up on; DeepSeek/OpenAI:
+/// `effort` → `reasoning_effort` or a structural disable). Nothing wires a
+/// context's *own* cast slot through yet — `apply_slot_tunables` is called
+/// with `slot: None` from `kaijutsu-server/src/llm_stream.rs` today, so only
+/// the bare `llm_defaults` floor applies; a follow-up supplies the context's
+/// resolved cast seat through that same seam.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlotTunables {
     /// Maximum RESPONSE tokens. Not the context window — a different number.

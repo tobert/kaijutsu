@@ -41,6 +41,11 @@ impl Client {
         Self(self.0.with_base_url(base_url))
     }
 
+    /// Set the per-request HTTP timeout (see `openai::Client::with_request_timeout`).
+    pub fn with_request_timeout(self, timeout: std::time::Duration) -> Self {
+        Self(self.0.with_request_timeout(timeout))
+    }
+
     /// Tool-capable models surfaced by this provider.
     pub fn available_models(&self) -> Vec<&'static str> {
         vec!["deepseek-v4-flash", "deepseek-v4-pro"]

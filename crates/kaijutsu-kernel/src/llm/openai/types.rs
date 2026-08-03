@@ -39,7 +39,20 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<RequestMessage>,
 
-    pub max_tokens: u64,
+    /// The plain `/chat/completions` response-token cap. Every dialect
+    /// EXCEPT hosted `api.openai.com` uses this field — see
+    /// [`Self::max_completion_tokens`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+
+    /// `api.openai.com`-only response-token cap (live-probed 2026-08-03
+    /// against gpt-5.6-terra: the hosted API REJECTS `max_tokens` outright
+    /// with "Unsupported parameter... use max_completion_tokens"). Exactly
+    /// one of `max_tokens` / `max_completion_tokens` is set per request —
+    /// `super::build::build_request` picks based on the caller's
+    /// `hosted_openai` flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u64>,
 
     /// `true` enables SSE streaming terminated by `data: [DONE]`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,6 +74,24 @@ pub struct ChatRequest {
     /// doesn't error on it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+
+    /// Effort-ladder passthrough. DeepSeek and hosted `api.openai.com` both
+    /// honor this field; every other OpenAI-compatible endpoint (local
+    /// servers, gateways) has no reasoning-effort concept, so
+    /// `super::build::build_request` leaves it unset there and warns if the
+    /// caller had it configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
+    /// DeepSeek's structural thinking-disable knob (`{"type": "disabled"}`).
+    /// Emitted INSTEAD of `reasoning_effort` when `effort == "none"` —
+    /// asking DeepSeek for zero effort with thinking left structurally
+    /// enabled still bills reasoning tokens; this is the real off-switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingMode>,
 }
 
 impl ChatRequest {
@@ -75,6 +106,15 @@ impl ChatRequest {
             requested
         }
     }
+}
+
+/// DeepSeek's structural thinking mode override. Only the `Disabled` variant
+/// exists today — the `effort == "none"` special case
+/// (`super::build::build_request`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingMode {
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -391,20 +431,28 @@ mod tests {
         let req = ChatRequest {
             model: "deepseek-v4-flash".into(),
             messages: vec![RequestMessage::user_text("hi")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
+            max_completion_tokens: None,
             stream: None,
             stream_options: None,
             tools: vec![],
             tool_choice: None,
             temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            thinking: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["model"], "deepseek-v4-flash");
         assert_eq!(v["max_tokens"], 1024);
+        assert!(v.get("max_completion_tokens").is_none());
         assert!(v.get("stream").is_none(), "stream must skip when None");
         assert!(v.get("tools").is_none(), "empty tools must skip");
         assert!(v.get("tool_choice").is_none());
         assert!(v.get("temperature").is_none());
+        assert!(v.get("top_p").is_none());
+        assert!(v.get("reasoning_effort").is_none());
+        assert!(v.get("thinking").is_none());
         // messages[0] is a bare user text message
         assert_eq!(v["messages"][0]["role"], "user");
         assert_eq!(v["messages"][0]["content"], "hi");
@@ -419,12 +467,16 @@ mod tests {
         let req = ChatRequest {
             model: "deepseek-v4-pro".into(),
             messages: vec![RequestMessage::user_text("hi")],
-            max_tokens: 256,
+            max_tokens: Some(256),
+            max_completion_tokens: None,
             stream: Some(true),
             stream_options: Some(StreamOptions { include_usage: true }),
             tools: vec![],
             tool_choice: None,
             temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            thinking: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["stream"], true);
@@ -576,6 +628,54 @@ mod tests {
         let err: ApiError = serde_json::from_str(json).unwrap();
         assert_eq!(err.error.message, "Insufficient Balance");
         assert_eq!(err.error.kind.as_deref(), Some("insufficient_balance"));
+    }
+
+    #[test]
+    fn thinking_mode_disabled_serializes_as_typed_object() {
+        let v = serde_json::to_value(ThinkingMode::Disabled).unwrap();
+        assert_eq!(v["type"], "disabled");
+    }
+
+    #[test]
+    fn reasoning_effort_field_serializes_when_set() {
+        let req = ChatRequest {
+            model: "deepseek-v4-pro".into(),
+            messages: vec![RequestMessage::user_text("hi")],
+            max_tokens: Some(256),
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            tools: vec![],
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: Some("high".into()),
+            thinking: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
+        assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn max_completion_tokens_field_serializes_when_max_tokens_is_none() {
+        let req = ChatRequest {
+            model: "gpt-5.6-terra".into(),
+            messages: vec![RequestMessage::user_text("hi")],
+            max_tokens: None,
+            max_completion_tokens: Some(4096),
+            stream: None,
+            stream_options: None,
+            tools: vec![],
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            thinking: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("max_tokens").is_none(), "hosted dialect must omit max_tokens entirely");
+        assert_eq!(v["max_completion_tokens"], 4096);
     }
 
     #[test]

@@ -54,6 +54,33 @@ pub struct Client {
     api_key: Option<String>,
     provider_name: String,
     reasoning_required: bool,
+    /// Per-request HTTP timeout (`BackendConfig.request_timeout_secs`,
+    /// resolved by `Provider::from_backend`). See the field doc on
+    /// `claude::Client::request_timeout` for the same rationale — applied
+    /// via `RequestBuilder::timeout` at each `.send()`, layered below
+    /// kaijutsu-server's own total-deadline + idle-timeout.
+    request_timeout: Option<std::time::Duration>,
+}
+
+/// Whether `base_url` points at OpenAI's own hosted API — the ONE
+/// `/chat/completions` server (live-probed 2026-08-03 against
+/// gpt-5.6-terra) that REJECTS `max_tokens` outright in favor of
+/// `max_completion_tokens`, and that actually honors `reasoning_effort`.
+/// Every other OpenAI-compatible endpoint (ollama, llama.cpp, a gateway) —
+/// and DeepSeek, whose own preset takes over before this check would ever
+/// matter — keeps the plain `max_tokens` dialect.
+///
+/// Deliberately NOT a full URL-parse dependency: a plain host-segment
+/// compare after stripping the scheme is enough for this one closed
+/// comparison, and it's pure/cheap to unit test with adversarial inputs
+/// (a lookalike host, a path containing the string, mixed case).
+pub(crate) fn is_hosted_openai(base_url: &str) -> bool {
+    let without_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let host = without_scheme.split(['/', ':']).next().unwrap_or("");
+    host.eq_ignore_ascii_case("api.openai.com")
 }
 
 impl Client {
@@ -70,7 +97,16 @@ impl Client {
             api_key: None,
             provider_name: provider_name.into(),
             reasoning_required: false,
+            request_timeout: None,
         }
+    }
+
+    /// Set the per-request HTTP timeout (`Provider::from_backend` calls this
+    /// with `BackendConfig.request_timeout_secs`, resolved against a default
+    /// when unset — see `resolve_request_timeout` in `llm/mod.rs`).
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     /// Attach a bearer API key. Validity is checked at send time (an
@@ -129,15 +165,23 @@ impl Client {
         if let Some(sys) = system {
             opts = opts.with_system(sys);
         }
-        let body = build::build_request(&opts, &messages, false, self.reasoning_required);
+        let body = build::build_request(
+            &opts,
+            &messages,
+            false,
+            self.reasoning_required,
+            is_hosted_openai(&self.base_url),
+            &self.provider_name,
+        );
 
-        let response = self
+        let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
+            .json(&body);
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(http_error)?;
 
         let response = self.error_for_status(response).await?;
 
@@ -158,16 +202,24 @@ impl Client {
     /// Start a streaming completion. POSTs `stream: true` and wraps the
     /// `text/event-stream` response in a [`Stream`].
     pub async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<Stream> {
-        let body = build::build_request(&opts, &messages, true, self.reasoning_required);
+        let body = build::build_request(
+            &opts,
+            &messages,
+            true,
+            self.reasoning_required,
+            is_hosted_openai(&self.base_url),
+            &self.provider_name,
+        );
 
-        let response = self
+        let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
+            .json(&body);
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(http_error)?;
 
         let response = self.error_for_status(response).await?;
 
@@ -350,6 +402,52 @@ impl Stream {
 mod tests {
     use super::*;
     use crate::llm::stream::{OpenAiCompatUsageExtra, UsageExtra};
+
+    mod is_hosted_openai_tests {
+        use super::*;
+
+        #[test]
+        fn matches_the_plain_hosted_url() {
+            assert!(is_hosted_openai("https://api.openai.com/v1"));
+        }
+
+        #[test]
+        fn matches_without_a_path_suffix() {
+            assert!(is_hosted_openai("https://api.openai.com"));
+        }
+
+        #[test]
+        fn is_case_insensitive() {
+            assert!(is_hosted_openai("https://API.OpenAI.COM/v1"));
+        }
+
+        #[test]
+        fn local_server_is_not_hosted() {
+            assert!(!is_hosted_openai("http://localhost:11434/v1"));
+        }
+
+        #[test]
+        fn deepseek_endpoint_is_not_hosted() {
+            assert!(!is_hosted_openai("https://api.deepseek.com"));
+        }
+
+        #[test]
+        fn lookalike_subdomain_suffix_is_not_hosted() {
+            // A host that merely CONTAINS the string must not match — only
+            // an exact host-segment equality counts.
+            assert!(!is_hosted_openai("https://api.openai.com.evil.example/v1"));
+        }
+
+        #[test]
+        fn lookalike_path_segment_is_not_hosted() {
+            assert!(!is_hosted_openai("https://evil.example/api.openai.com"));
+        }
+
+        #[test]
+        fn scheme_with_port_is_still_matched_on_host_only() {
+            assert!(is_hosted_openai("https://api.openai.com:443/v1"));
+        }
+    }
 
     const SIMPLE: &str = "\
 data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}

@@ -31,7 +31,7 @@ use crate::llm::{LlmError, LlmResult, Message};
 use self::models_api::{HttpModelCapabilitySource, ModelCapabilitySource};
 use self::sse::{ClaudeSseEvent, decode_event};
 use self::stream::StateMachine;
-use self::types::{MessagesResponse, ResponseContent, Thinking};
+use self::types::{MessagesResponse, ResponseContent};
 
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -67,6 +67,16 @@ pub struct Client {
     /// itself on the next call instead of pinning "unknown" until restart.
     model_window_cache: Arc<AsyncRwLock<HashMap<String, Option<u64>>>>,
     capability_source: Arc<dyn ModelCapabilitySource>,
+    /// Per-request HTTP timeout (`BackendConfig.request_timeout_secs`,
+    /// resolved by `Provider::from_backend`). Applied via
+    /// `RequestBuilder::timeout` at each `.send()` call — covers the whole
+    /// request/response including a streamed body read, so it's a backstop
+    /// for a connection that never responds at all, layered *below*
+    /// kaijutsu-server's own total-deadline + idle-timeout
+    /// (`llm_stream.rs`), which govern a stream that opened but stalled or
+    /// ran long. `None` only in tests that construct a bare `Client::new`
+    /// directly instead of going through `Provider::from_backend`.
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl Client {
@@ -105,7 +115,16 @@ impl Client {
             base_url,
             model_window_cache: Arc::new(AsyncRwLock::new(HashMap::new())),
             capability_source,
+            request_timeout: None,
         }
+    }
+
+    /// Set the per-request HTTP timeout (`Provider::from_backend` calls this
+    /// with `BackendConfig.request_timeout_secs`, resolved against a default
+    /// when unset — see `resolve_request_timeout` in `llm/mod.rs`).
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     /// Override the API base URL (for proxies or local mocks).
@@ -208,14 +227,15 @@ impl Client {
         }
         let body = build::build_request(&opts, &messages, false);
 
-        let response = self
+        let mut request = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
+            .json(&body);
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(http_error)?;
 
         let response = error_for_status(response).await?;
 
@@ -258,20 +278,22 @@ impl Client {
     ) -> LlmResult<Stream> {
         let mut body = build::build_request(&opts, &messages, true);
         // Provider-tailored knob (the reason this client is bespoke):
-        // adaptive thinking with visible summaries wherever the model
-        // supports it. Omitted on older models — sending `adaptive`
-        // there is a 400. See `Thinking::default_for_model`.
-        body.thinking = Thinking::default_for_model(&opts.model);
+        // resolves opts's thinking_style/thinking_budget/effort cascade
+        // (model-gated adaptive default when unset) and strips
+        // temperature/top_p when thinking ends up on — see
+        // `build::apply_thinking`.
+        build::apply_thinking(&mut body, &opts)?;
 
-        let response = self
+        let mut request = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(http_error)?;
+            .json(&body);
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(http_error)?;
 
         let response = error_for_status(response).await?;
 

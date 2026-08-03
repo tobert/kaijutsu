@@ -19,10 +19,10 @@ use std::collections::HashSet;
 
 use super::types::{
     CacheControl, ImageSource, MessageContent, MessageRole, MessagesRequest, RequestContent,
-    RequestMessage, RequestTool, SystemBlock, SystemPrompt,
+    RequestMessage, RequestTool, SystemBlock, SystemPrompt, Thinking,
 };
 use crate::llm::stream::{BuildOpts, CacheTarget, CacheTtl};
-use crate::llm::{ContentBlock, Message, MessageContent as KaiContent, Role};
+use crate::llm::{ContentBlock, LlmError, Message, MessageContent as KaiContent, Role};
 
 /// Anthropic's hard cap on `cache_control` breakpoints per request.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
@@ -109,12 +109,15 @@ fn plan_cache(breakpoints: &[CacheTarget]) -> CachePlan {
 /// Construct an Anthropic [`MessagesRequest`] from kaijutsu inputs.
 ///
 /// `streaming` selects between the SSE form (`stream: Some(true)`) and
-/// the non-streaming form (omitted). All other knobs come from `opts`.
+/// the non-streaming form (omitted). `temperature`/`top_p` flow straight
+/// from `opts` here; all other knobs come from `opts` too.
 ///
-/// Thinking is *not* decided here — `build_request` leaves it `None`
-/// and [`super::Client::stream`] applies [`Thinking::default_for_model`]
-/// (adaptive + summarized on models that support it). `prompt()` leaves
-/// it off deliberately: distillation drops thinking blocks anyway.
+/// Thinking is *not* decided here — `build_request` leaves it `None` and
+/// [`apply_thinking`] (called by [`super::Client::stream`]) resolves
+/// `opts`'s `thinking_style`/`thinking_budget`/`effort` cascade, then strips
+/// `temperature`/`top_p` from the body when thinking ends up on. `prompt()`
+/// never calls `apply_thinking`, so thinking stays off and sampling params
+/// flow unconditionally there — distillation drops thinking blocks anyway.
 pub fn build_request(
     opts: &BuildOpts,
     messages: &[Message],
@@ -140,10 +143,124 @@ pub fn build_request(
         tools,
         tool_choice: None,
         temperature: opts.temperature,
+        top_p: opts.top_p,
         stream: streaming.then_some(true),
-        thinking: None, // stream() applies the model-gated default
+        thinking: None, // apply_thinking() fills this in after build_request
         stop_sequences: vec![],
     }
+}
+
+/// Resolve `opts`'s thinking tunables (`thinking_style` / `thinking_budget` /
+/// `effort`) into the `thinking` config for a stream request.
+///
+/// - `None` / `"auto"`: the model-gated default
+///   ([`Thinking::default_for_model`]) — unchanged prior behavior. `effort`
+///   rides along on `output_config` when the default resolves to the
+///   adaptive tier; it has nowhere to land when the model doesn't support
+///   thinking at all (pre-4.6 / haiku), so it's dropped with a warning.
+/// - `"adaptive"`: force the adaptive tier regardless of the model-gated
+///   default, with `effort` on `output_config` when set.
+/// - `"budget"`: force the legacy `Enabled { budget_tokens }` shape.
+///   `thinking_budget` MUST be set and `max_tokens` MUST exceed it —
+///   Anthropic 400s on a missing/inverted pair, and we refuse earlier here
+///   with a message naming the model, rather than let the round-trip fail
+///   downstream. `effort` has no field on this tier — it's INERT
+///   (warned, never silently dropped).
+/// - Anything else: refused — the closed set is `auto`/`adaptive`/`budget`.
+///
+/// Every branch that can't apply an explicitly-set `effort` or
+/// `thinking_budget` emits a `tracing::warn!` naming the model and the
+/// dropped knob. Unset knobs never warn — only an explicit, dropped
+/// configuration is loud.
+pub fn resolve_thinking(opts: &BuildOpts) -> Result<Option<Thinking>, LlmError> {
+    let thinking = match opts.thinking_style.as_deref() {
+        None | Some("auto") => Thinking::default_for_model(&opts.model)
+            .map(|_| Thinking::adaptive_summarized_with_effort(opts.effort.as_deref())),
+        Some("adaptive") => Some(Thinking::adaptive_summarized_with_effort(
+            opts.effort.as_deref(),
+        )),
+        Some("budget") => {
+            let budget = opts.thinking_budget.ok_or_else(|| {
+                LlmError::InvalidRequest(format!(
+                    "thinking_style=budget requires thinking_budget to be set (model {}); \
+                     Anthropic 400s on a missing budget — refusing earlier with this message",
+                    opts.model
+                ))
+            })?;
+            if opts.max_tokens <= budget {
+                return Err(LlmError::InvalidRequest(format!(
+                    "thinking_budget ({budget}) must be less than max_tokens ({}) for model {} \
+                     — Anthropic 400s on an inverted budget/max_tokens pair",
+                    opts.max_tokens, opts.model
+                )));
+            }
+            Some(Thinking::Enabled {
+                budget_tokens: budget,
+            })
+        }
+        Some(other) => {
+            return Err(LlmError::InvalidRequest(format!(
+                "unknown thinking_style '{other}' for model {} (expected auto, adaptive, or budget)",
+                opts.model
+            )));
+        }
+    };
+
+    if let Some(effort) = &opts.effort
+        && !matches!(thinking, Some(Thinking::Adaptive { .. }))
+    {
+        tracing::warn!(
+            backend = "anthropic",
+            model = %opts.model,
+            knob = "effort",
+            value = %effort,
+            "effort has no field to land on for this thinking configuration \
+             (only the adaptive tier's output_config.effort accepts it); dropped"
+        );
+    }
+    if opts.thinking_budget.is_some() && !matches!(thinking, Some(Thinking::Enabled { .. })) {
+        tracing::warn!(
+            backend = "anthropic",
+            model = %opts.model,
+            knob = "thinking_budget",
+            "thinking_budget has no sink outside thinking_style=budget; dropped"
+        );
+    }
+
+    Ok(thinking)
+}
+
+/// Resolve `opts`'s thinking config onto `body.thinking`, then enforce
+/// Anthropic's hard incompatibility: `temperature`/`top_p` may ride ONLY
+/// when thinking ends up off — the Messages API 400s if either is present
+/// alongside any thinking tier. Kept a free function (not inlined in
+/// `Client::stream`) so it's unit-testable without a live HTTP round-trip.
+///
+/// Dropping an explicitly-set `temperature`/`top_p` here is exactly the
+/// silent-failure shape this project refuses, so each drop is a
+/// `tracing::warn!` naming the model and the knob — same discipline as
+/// [`resolve_thinking`]'s effort/thinking_budget warnings.
+pub fn apply_thinking(body: &mut MessagesRequest, opts: &BuildOpts) -> Result<(), LlmError> {
+    body.thinking = resolve_thinking(opts)?;
+    if body.thinking.is_some() {
+        if body.temperature.take().is_some() {
+            tracing::warn!(
+                backend = "anthropic",
+                model = %opts.model,
+                knob = "temperature",
+                "dropped: Anthropic rejects temperature alongside extended thinking"
+            );
+        }
+        if body.top_p.take().is_some() {
+            tracing::warn!(
+                backend = "anthropic",
+                model = %opts.model,
+                knob = "top_p",
+                "dropped: Anthropic rejects top_p alongside extended thinking"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Apply `cache_control` to messages at each `(index, ttl)` in the plan.
@@ -961,5 +1078,157 @@ mod tests {
         o.cache_breakpoints = vec![CacheTarget::Tools(CacheTtl::Ephemeral)];
         let req = build_request(&o, &[Message::user("hi")], false);
         assert!(req.tools.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_thinking / apply_thinking (Track B tunables plumbing)
+    // ------------------------------------------------------------------
+
+    mod thinking_tunables {
+        use super::*;
+        use crate::llm::LlmError;
+
+        #[test]
+        fn auto_style_unset_matches_prior_default_for_model_behavior() {
+            let o = opts("claude-opus-4-8"); // thinking_style unset -> "auto"
+            let t = resolve_thinking(&o).expect("auto must not error");
+            assert!(matches!(t, Some(Thinking::Adaptive { .. })), "opus 4.8 defaults to adaptive");
+
+            let o2 = opts("claude-haiku-4-5"); // pre-adaptive-generation model
+            let t2 = resolve_thinking(&o2).expect("auto must not error");
+            assert!(t2.is_none(), "haiku has no adaptive support, same as before this change");
+        }
+
+        #[test]
+        fn auto_style_with_effort_lands_on_output_config_when_adaptive_applies() {
+            let mut o = opts("claude-opus-4-8");
+            o.effort = Some("high".into());
+            let t = resolve_thinking(&o).unwrap().expect("opus defaults to adaptive");
+            match t {
+                Thinking::Adaptive { output_config, .. } => {
+                    assert_eq!(output_config.unwrap().effort.as_deref(), Some("high"));
+                }
+                other => panic!("expected Adaptive, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn explicit_adaptive_style_forces_adaptive_with_effort() {
+            let mut o = opts("claude-opus-4-8");
+            o.thinking_style = Some("adaptive".into());
+            o.effort = Some("max".into());
+            let t = resolve_thinking(&o).unwrap().expect("adaptive forced on");
+            match t {
+                Thinking::Adaptive { output_config, .. } => {
+                    assert_eq!(output_config.unwrap().effort.as_deref(), Some("max"));
+                }
+                other => panic!("expected Adaptive, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn budget_style_without_thinking_budget_is_a_loud_error() {
+            let mut o = opts("claude-opus-4-8");
+            o.thinking_style = Some("budget".into());
+            let err = resolve_thinking(&o).unwrap_err();
+            assert!(matches!(err, LlmError::InvalidRequest(_)));
+            assert!(err.to_string().contains("thinking_budget"), "{err}");
+            assert!(err.to_string().contains("claude-opus-4-8"), "{err}");
+        }
+
+        #[test]
+        fn budget_style_with_budget_gte_max_tokens_is_a_loud_error() {
+            let mut o = opts("claude-opus-4-8");
+            o.max_tokens = 1000;
+            o.thinking_style = Some("budget".into());
+            o.thinking_budget = Some(1000); // inverted: budget == max_tokens
+            let err = resolve_thinking(&o).unwrap_err();
+            assert!(err.to_string().contains("must be less than max_tokens"), "{err}");
+        }
+
+        #[test]
+        fn budget_style_with_valid_budget_produces_enabled() {
+            let mut o = opts("claude-opus-4-8");
+            o.max_tokens = 8192;
+            o.thinking_style = Some("budget".into());
+            o.thinking_budget = Some(4096);
+            let t = resolve_thinking(&o).unwrap();
+            match t {
+                Some(Thinking::Enabled { budget_tokens }) => assert_eq!(budget_tokens, 4096),
+                other => panic!("expected Enabled, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn effort_on_budget_tier_is_inert_but_does_not_error() {
+            // effort has no field on the Enabled shape — it's dropped (and
+            // warned at the tracing layer), never an error.
+            let mut o = opts("claude-opus-4-8");
+            o.max_tokens = 8192;
+            o.thinking_style = Some("budget".into());
+            o.thinking_budget = Some(4096);
+            o.effort = Some("high".into());
+            let t = resolve_thinking(&o).unwrap();
+            assert!(matches!(t, Some(Thinking::Enabled { .. })));
+            // No panic, no field to inspect — Enabled has no effort slot.
+        }
+
+        #[test]
+        fn thinking_budget_on_adaptive_style_is_inert_but_does_not_error() {
+            let mut o = opts("claude-opus-4-8");
+            o.thinking_style = Some("adaptive".into());
+            o.thinking_budget = Some(4096); // no sink on the adaptive tier
+            let t = resolve_thinking(&o).unwrap();
+            assert!(matches!(t, Some(Thinking::Adaptive { .. })));
+        }
+
+        #[test]
+        fn unknown_thinking_style_is_a_loud_error() {
+            let mut o = opts("claude-opus-4-8");
+            o.thinking_style = Some("bogus".into());
+            let err = resolve_thinking(&o).unwrap_err();
+            assert!(err.to_string().contains("bogus"), "{err}");
+            assert!(err.to_string().contains("auto"), "{err}");
+        }
+
+        #[test]
+        fn apply_thinking_strips_temperature_and_top_p_when_thinking_on() {
+            let mut o = opts("claude-opus-4-8"); // defaults to adaptive
+            o.temperature = Some(0.7);
+            o.top_p = Some(0.9);
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o).expect("adaptive default must not error");
+            assert!(req.thinking.is_some());
+            assert!(
+                req.temperature.is_none(),
+                "temperature must be dropped when thinking is enabled"
+            );
+            assert!(
+                req.top_p.is_none(),
+                "top_p must be dropped when thinking is enabled"
+            );
+        }
+
+        #[test]
+        fn apply_thinking_keeps_temperature_and_top_p_when_thinking_off() {
+            let mut o = opts("claude-haiku-4-5"); // no adaptive support -> thinking off
+            o.temperature = Some(0.7);
+            o.top_p = Some(0.9);
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o).expect("no thinking on this model must not error");
+            assert!(req.thinking.is_none());
+            assert_eq!(req.temperature, Some(0.7), "sampling params flow when thinking is off");
+            assert_eq!(req.top_p, Some(0.9), "sampling params flow when thinking is off");
+        }
+
+        #[test]
+        fn apply_thinking_propagates_the_budget_validation_error() {
+            let mut o = opts("claude-opus-4-8");
+            o.thinking_style = Some("budget".into());
+            // thinking_budget left unset -> error
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            let err = apply_thinking(&mut req, &o).unwrap_err();
+            assert!(matches!(err, LlmError::InvalidRequest(_)));
+        }
     }
 }

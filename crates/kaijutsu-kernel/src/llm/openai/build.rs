@@ -24,7 +24,7 @@ use crate::llm::{ContentBlock, Message, MessageContent, Role};
 
 use super::types::{
     ChatRequest, ContentPart, ImageUrl, MessageContent as WireContent, RequestFunctionCall,
-    RequestMessage, RequestTool, RequestToolCall, StreamOptions, ToolFunction,
+    RequestMessage, RequestTool, RequestToolCall, StreamOptions, ThinkingMode, ToolFunction,
 };
 
 /// Build a `/chat/completions` request body.
@@ -36,12 +36,42 @@ use super::types::{
 /// assistant message carries `reasoning_content` (real, synthesized, or
 /// `""`) so tool-call turns survive the API's presence check. Plain
 /// OpenAI-compatible servers pass `false` — the field is then emitted only
-/// when genuine reasoning exists, and omitted otherwise.
+/// when genuine reasoning exists, and omitted otherwise. `reasoning_required`
+/// doubles as the DeepSeek marker for `opts.effort`'s wire mapping below —
+/// today it is the only preset that sets it `true`.
+///
+/// `hosted_openai` is the caller-computed result of
+/// [`super::is_hosted_openai`] against the client's configured `base_url` —
+/// never guessed in here. `backend_label` is the configured backend NAME
+/// (not the wire dialect), used only to name the backend in inert-tunable
+/// `tracing::warn!`s.
+///
+/// Wire mapping for the tunables `BuildOpts` carries beyond `temperature`
+/// (Track B):
+///
+/// - **`max_tokens` field choice**: `hosted_openai` sends
+///   `max_completion_tokens` instead of `max_tokens` — live-probed
+///   2026-08-03 against `api.openai.com`'s gpt-5.6-terra, which REJECTS
+///   `max_tokens` outright. Every other endpoint (DeepSeek, local servers,
+///   gateways) keeps `max_tokens`.
+/// - **`effort`**: DeepSeek maps it to `reasoning_effort`, with `"none"`
+///   special-cased to the structural `thinking: {"type": "disabled"}`
+///   (asking for zero effort with thinking left enabled still bills
+///   reasoning tokens). Hosted OpenAI maps it to `reasoning_effort`
+///   directly. Every other endpoint has no reasoning-effort concept —
+///   `effort` is INERT there, warned (not silently dropped) when explicitly
+///   set.
+/// - **`thinking_budget`**: no OpenAI-compatible dialect has a budget sink —
+///   always INERT here, warned when explicitly set.
+/// - **`top_p`**: flows top-level unconditionally; every dialect this build
+///   targets accepts it.
 pub fn build_request(
     opts: &BuildOpts,
     messages: &[Message],
     streaming: bool,
     reasoning_required: bool,
+    hosted_openai: bool,
+    backend_label: &str,
 ) -> ChatRequest {
     let mut wire: Vec<RequestMessage> = Vec::with_capacity(messages.len() + 1);
 
@@ -69,16 +99,77 @@ pub fn build_request(
         })
         .collect();
 
+    let clamped_max_tokens = ChatRequest::clamp_max_tokens(opts.max_tokens);
+    let (max_tokens, max_completion_tokens) = if hosted_openai {
+        (None, Some(clamped_max_tokens))
+    } else {
+        (Some(clamped_max_tokens), None)
+    };
+
+    let (reasoning_effort, thinking) = resolve_effort(
+        opts.effort.as_deref(),
+        reasoning_required,
+        hosted_openai,
+        backend_label,
+        &opts.model,
+    );
+
+    if opts.thinking_budget.is_some() {
+        tracing::warn!(
+            backend = backend_label,
+            model = %opts.model,
+            knob = "thinking_budget",
+            "thinking_budget has no sink on this OpenAI-compatible dialect; dropped"
+        );
+    }
+
     ChatRequest {
         model: opts.model.clone(),
         messages: wire,
-        max_tokens: ChatRequest::clamp_max_tokens(opts.max_tokens),
+        max_tokens,
+        max_completion_tokens,
         stream: streaming.then_some(true),
         stream_options: streaming.then_some(StreamOptions { include_usage: true }),
         tools,
         tool_choice: None, // server-side default `auto`
         temperature: opts.temperature,
+        top_p: opts.top_p,
+        reasoning_effort,
+        thinking,
     }
+}
+
+/// Resolve `effort` into the `(reasoning_effort, thinking)` wire pair for
+/// one of the three dialects `build_request` distinguishes. Free function so
+/// each branch — and its inert-tunable warning — is directly unit-testable.
+fn resolve_effort(
+    effort: Option<&str>,
+    is_deepseek: bool,
+    hosted_openai: bool,
+    backend_label: &str,
+    model: &str,
+) -> (Option<String>, Option<ThinkingMode>) {
+    if is_deepseek {
+        return match effort {
+            Some("none") => (None, Some(ThinkingMode::Disabled)),
+            Some(e) => (Some(e.to_string()), None),
+            None => (None, None),
+        };
+    }
+    if hosted_openai {
+        return (effort.map(str::to_string), None);
+    }
+    if let Some(e) = effort {
+        tracing::warn!(
+            backend = backend_label,
+            model = %model,
+            knob = "effort",
+            value = %e,
+            "effort has no sink on a non-hosted, non-DeepSeek OpenAI-compatible \
+             endpoint; dropped"
+        );
+    }
+    (None, None)
 }
 
 /// User turn → one user message (text and/or images) plus a separate
@@ -275,6 +366,21 @@ mod tests {
 
     fn opts() -> BuildOpts {
         BuildOpts::new("deepseek-v4-flash")
+    }
+
+    /// Shadows `super::build_request` for the bulk of this module's
+    /// pre-existing tests: they only ever varied `reasoning_required` and
+    /// don't care about the Track B hosted/backend-label dialect params, so
+    /// this keeps every 4-arg call site unchanged. New tests exercising the
+    /// dialect mapping itself call `super::build_request` directly with all
+    /// six arguments.
+    fn build_request(
+        opts: &BuildOpts,
+        messages: &[Message],
+        streaming: bool,
+        reasoning_required: bool,
+    ) -> ChatRequest {
+        super::build_request(opts, messages, streaming, reasoning_required, false, "test")
     }
 
     #[test]
@@ -497,7 +603,10 @@ mod tests {
         let mut o = opts();
         o.max_tokens = 0;
         let req = build_request(&o, &[Message::user("hi")], false, true);
-        assert!(req.max_tokens > 0, "zero must become a sane default");
+        assert!(
+            req.max_tokens.unwrap() > 0,
+            "zero must become a sane default"
+        );
     }
 
     // ── Generic OpenAI-compatible mode (reasoning_required = false) ──────
@@ -555,5 +664,142 @@ mod tests {
             v["messages"][0]["reasoning_content"], "real thoughts",
             "genuine reasoning must survive even in generic mode"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Track B: max_tokens/max_completion_tokens + effort dialect mapping
+    // ------------------------------------------------------------------
+
+    mod dialect_mapping {
+        use super::*;
+
+        #[test]
+        fn generic_non_hosted_uses_max_tokens_not_max_completion_tokens() {
+            let req = super::super::build_request(
+                &opts(),
+                &[Message::user("hi")],
+                false,
+                false,
+                false,
+                "ollama",
+            );
+            assert!(req.max_tokens.is_some());
+            assert!(req.max_completion_tokens.is_none());
+        }
+
+        #[test]
+        fn hosted_openai_uses_max_completion_tokens_not_max_tokens() {
+            let mut o = BuildOpts::new("gpt-5.6-terra");
+            o.max_tokens = 4096;
+            let req = super::super::build_request(
+                &o,
+                &[Message::user("hi")],
+                false,
+                false,
+                true,
+                "gpt",
+            );
+            assert_eq!(req.max_completion_tokens, Some(4096));
+            assert!(
+                req.max_tokens.is_none(),
+                "hosted api.openai.com rejects max_tokens outright (live-probed 2026-08-03)"
+            );
+        }
+
+        #[test]
+        fn deepseek_effort_passes_through_as_reasoning_effort() {
+            let mut o = opts();
+            o.effort = Some("high".into());
+            let req = super::super::build_request(
+                &o,
+                &[Message::user("hi")],
+                false,
+                true, // reasoning_required = DeepSeek
+                false,
+                "deepseek",
+            );
+            assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+            assert!(req.thinking.is_none());
+        }
+
+        #[test]
+        fn deepseek_effort_none_emits_structural_thinking_disabled_not_reasoning_effort() {
+            let mut o = opts();
+            o.effort = Some("none".into());
+            let req = super::super::build_request(
+                &o,
+                &[Message::user("hi")],
+                false,
+                true,
+                false,
+                "deepseek",
+            );
+            assert!(
+                req.reasoning_effort.is_none(),
+                "effort=none must NOT become reasoning_effort=\"none\" — that still \
+                 bills reasoning tokens on DeepSeek"
+            );
+            let v = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["thinking"]["type"], "disabled");
+        }
+
+        #[test]
+        fn hosted_openai_effort_passes_through_as_reasoning_effort() {
+            let mut o = BuildOpts::new("gpt-5.6-terra");
+            o.effort = Some("medium".into());
+            let req = super::super::build_request(
+                &o,
+                &[Message::user("hi")],
+                false,
+                false,
+                true,
+                "gpt",
+            );
+            assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
+        }
+
+        #[test]
+        fn generic_non_hosted_effort_is_inert_no_reasoning_effort_no_thinking() {
+            // Local servers / unrecognized gateways: effort has nowhere to
+            // land. Dropped (warned at the tracing layer), never sent.
+            let mut o = opts();
+            o.effort = Some("high".into());
+            let req = super::super::build_request(
+                &o,
+                &[Message::user("hi")],
+                false,
+                false, // not the DeepSeek preset
+                false, // not hosted openai
+                "lemonade",
+            );
+            assert!(req.reasoning_effort.is_none());
+            assert!(req.thinking.is_none());
+        }
+
+        #[test]
+        fn thinking_budget_never_reaches_the_wire_on_any_dialect() {
+            // No OpenAI-compatible dialect has a budget sink — the field
+            // simply doesn't exist on ChatRequest. This test pins that no
+            // panic/misrouting occurs when it's set; there is nothing to
+            // assert about the JSON since the type has no such field.
+            let mut o = opts();
+            o.thinking_budget = Some(4096);
+            let _req = super::super::build_request(
+                &o,
+                &[Message::user("hi")],
+                false,
+                true,
+                false,
+                "deepseek",
+            );
+        }
+
+        #[test]
+        fn top_p_flows_top_level_on_every_dialect() {
+            let mut o = opts();
+            o.top_p = Some(0.85);
+            let req = build_request(&o, &[Message::user("hi")], false, true);
+            assert_eq!(req.top_p, Some(0.85));
+        }
     }
 }

@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ToolDefinition;
+use super::config::SlotTunables;
 
 /// Provider-agnostic streaming events from an LLM completion.
 ///
@@ -142,6 +143,31 @@ pub struct BuildOpts {
     pub system: Option<String>,
     pub max_tokens: u64,
     pub temperature: Option<f64>,
+    /// Nucleus-sampling cutoff. `None` = provider default. Dropped alongside
+    /// `temperature` on Anthropic requests where thinking is enabled (see
+    /// `claude::build::apply_thinking`) — the Messages API 400s if either
+    /// rides with thinking on.
+    pub top_p: Option<f64>,
+    /// Provider effort-ladder token, passthrough with NO allowlist (each
+    /// provider's `build()` interprets or ignores it; unrecognized strings
+    /// ride straight to the wire — the provider's own 400, not ours, is the
+    /// validation). Anthropic: adaptive tier's `output_config.effort`.
+    /// DeepSeek: `reasoning_effort`, with `"none"` special-cased to the
+    /// structural `thinking: {"type": "disabled"}`. Hosted OpenAI
+    /// (`api.openai.com`): `reasoning_effort`. Everywhere else: inert
+    /// (warned if explicitly set — see each provider's `build`).
+    pub effort: Option<String>,
+    /// Anthropic budget-tier thinking token budget. Only meaningful when
+    /// `thinking_style == Some("budget")` on Claude; inert (warned) on every
+    /// other backend/style combination — there is no budget sink outside
+    /// that one tier.
+    pub thinking_budget: Option<u64>,
+    /// `"auto"` (default/unset — current model-gated behavior) | `"adaptive"`
+    /// (force the adaptive tier) | `"budget"` (force `Enabled { budget_tokens
+    /// }`, which requires `thinking_budget` to be set — see
+    /// `claude::build::resolve_thinking`). Validated on Claude; ignored
+    /// elsewhere (no other provider has a thinking-style knob yet).
+    pub thinking_style: Option<String>,
     pub tools: Vec<ToolDefinition>,
     /// Cache breakpoint policy for Claude prompt caching. Empty = no
     /// `cache_control` applied. See [`CacheTarget`].
@@ -155,6 +181,10 @@ impl BuildOpts {
             system: None,
             max_tokens: 64_000,
             temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
         }
@@ -175,6 +205,26 @@ impl BuildOpts {
         self
     }
 
+    pub fn with_top_p(mut self, top_p: f64) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
+        self
+    }
+
+    pub fn with_thinking_budget(mut self, thinking_budget: u64) -> Self {
+        self.thinking_budget = Some(thinking_budget);
+        self
+    }
+
+    pub fn with_thinking_style(mut self, thinking_style: impl Into<String>) -> Self {
+        self.thinking_style = Some(thinking_style.into());
+        self
+    }
+
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = tools;
         self
@@ -184,6 +234,47 @@ impl BuildOpts {
         self.cache_breakpoints = breakpoints;
         self
     }
+}
+
+/// Apply a cast's resolved tunables onto a `BuildOpts` in progress — the ONE
+/// seam through which [`SlotTunables`] reach a provider request. `slot` is
+/// the tunables of the caller's resolved cast seat for this context's role
+/// (`resolve_context_model`'s `tunables`, ultimately
+/// [`crate::llm::LlmRegistry::resolved_slot`] — already cascaded onto
+/// `llm_defaults`); `None` when the context has no cast seat (no cast
+/// assigned, or its cast has no slot for this context_type). When `slot` is
+/// `None`, `floor` (the bare `llm_defaults` row,
+/// [`crate::llm::LlmRegistry::default_tunables`]) supplies the tunables
+/// directly, so a kernel with no casts configured at all still gets its
+/// `llm_defaults`.
+///
+/// `max_tokens` carries different precedence than the other knobs: a
+/// tunable-supplied value overrides whatever `opts.max_tokens` already held,
+/// but when neither `slot` nor `floor` sets it, `opts.max_tokens` is left
+/// exactly as the caller built it — never reset to a hardcoded number — so a
+/// provider's own clamp-on-zero fallback (`ChatRequest::clamp_max_tokens` for
+/// DeepSeek/generic OpenAI) still applies when nothing upstream configured
+/// anything. Every other field is set unconditionally from the resolved
+/// tunables (including back to `None` — a slot/floor `None` is the honest
+/// "provider default" answer, not "leave whatever was there").
+///
+/// Grep `apply_slot_tunables` to find every call site — this is Track D's
+/// seam for wiring a context's cast slot through.
+pub fn apply_slot_tunables(
+    mut opts: BuildOpts,
+    slot: Option<&SlotTunables>,
+    floor: &SlotTunables,
+) -> BuildOpts {
+    let tunables = slot.unwrap_or(floor);
+    if let Some(max_tokens) = tunables.max_tokens {
+        opts.max_tokens = max_tokens;
+    }
+    opts.temperature = tunables.temperature;
+    opts.top_p = tunables.top_p;
+    opts.effort = tunables.effort.clone();
+    opts.thinking_budget = tunables.thinking_budget;
+    opts.thinking_style = tunables.thinking_style.clone();
+    opts
 }
 
 /// Where to place a Claude `cache_control` breakpoint within a request.
@@ -395,5 +486,101 @@ mod tests {
             extra: None,
         };
         assert_eq!(usage.total(), 150);
+    }
+
+    #[test]
+    fn build_opts_new_defaults_new_tunables_to_none() {
+        let opts = BuildOpts::new("m");
+        assert_eq!(opts.top_p, None);
+        assert_eq!(opts.effort, None);
+        assert_eq!(opts.thinking_budget, None);
+        assert_eq!(opts.thinking_style, None);
+    }
+
+    #[test]
+    fn build_opts_tunable_builders_set_fields() {
+        let opts = BuildOpts::new("m")
+            .with_top_p(0.9)
+            .with_effort("high")
+            .with_thinking_budget(4096)
+            .with_thinking_style("budget");
+        assert_eq!(opts.top_p, Some(0.9));
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        assert_eq!(opts.thinking_budget, Some(4096));
+        assert_eq!(opts.thinking_style.as_deref(), Some("budget"));
+    }
+
+    mod apply_slot_tunables_tests {
+        use super::*;
+        use crate::llm::config::{ResolvedSlot, SlotTunables};
+
+        fn floor(max_tokens: Option<u64>) -> SlotTunables {
+            SlotTunables {
+                max_tokens,
+                temperature: Some(0.5),
+                top_p: Some(0.8),
+                effort: Some("low".into()),
+                thinking_budget: Some(1000),
+                thinking_style: Some("auto".into()),
+            }
+        }
+
+        #[test]
+        fn no_slot_uses_floor_directly() {
+            let floor = floor(Some(8000));
+            let opts = apply_slot_tunables(BuildOpts::new("m"), None, &floor);
+            assert_eq!(opts.max_tokens, 8000);
+            assert_eq!(opts.temperature, Some(0.5));
+            assert_eq!(opts.top_p, Some(0.8));
+            assert_eq!(opts.effort.as_deref(), Some("low"));
+            assert_eq!(opts.thinking_budget, Some(1000));
+            assert_eq!(opts.thinking_style.as_deref(), Some("auto"));
+        }
+
+        #[test]
+        fn slot_tunables_win_over_floor() {
+            let floor = floor(Some(8000));
+            let slot = ResolvedSlot {
+                role: "coder".into(),
+                backend: "anthropic".into(),
+                model: "claude-x".into(),
+                tunables: SlotTunables {
+                    max_tokens: Some(4000),
+                    temperature: Some(0.9),
+                    top_p: None,
+                    effort: None,
+                    thinking_budget: None,
+                    thinking_style: None,
+                },
+                loadout: None,
+                extra: None,
+            };
+            let opts = apply_slot_tunables(BuildOpts::new("m"), Some(&slot.tunables), &floor);
+            assert_eq!(opts.max_tokens, 4000, "slot's own max_tokens wins over floor");
+            assert_eq!(opts.temperature, Some(0.9), "slot's own temperature wins over floor");
+            assert_eq!(
+                opts.top_p, None,
+                "slot leaves top_p None, which is the honest resolved answer \
+                 (the ResolvedSlot cascade already merged floor values in — \
+                 this helper does not re-cascade)"
+            );
+        }
+
+        #[test]
+        fn unset_max_tokens_leaves_opts_value_untouched() {
+            let floor = floor(None); // no configured max_tokens anywhere
+            let opts = apply_slot_tunables(BuildOpts::new("m").with_max_tokens(12345), None, &floor);
+            assert_eq!(
+                opts.max_tokens, 12345,
+                "no configured max_tokens anywhere must not reset an already-set value"
+            );
+        }
+
+        #[test]
+        fn set_max_tokens_overrides_existing_opts_value() {
+            let floor = floor(Some(999));
+            let opts = apply_slot_tunables(BuildOpts::new("m").with_max_tokens(12345), None, &floor);
+            assert_eq!(opts.max_tokens, 999, "an explicitly configured max_tokens wins");
+        }
     }
 }
