@@ -111,6 +111,10 @@ recoverable from each file's own git history.
 - Working on main (early development); parallel work on the same repo is common
 - Add files by name, avoid wildcards; ephemeral markdown is usually not committed
 - Set Co-Authored-By in commit messages, crediting the model that did the work.
+- **Never run `cargo fmt`.** `rustfmt.toml` disables it repo-wide so the command
+  is a no-op — don't work around that, and don't reformat by hand either. Match
+  the surrounding style. Rationale + the condition that would reverse it:
+  README.md "Code Style".
 
 Commit and pull request bodies should usually summarize the decisions behind the
 change, **drawn from the conversation with the user**. Commit messages briefly explain

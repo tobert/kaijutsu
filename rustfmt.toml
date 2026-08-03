@@ -1,0 +1,11 @@
+# Formatting is OFF for this repo, on purpose — see README.md "Code Style".
+#
+# This is not a convention anyone has to remember: with this set, `cargo fmt`
+# and `cargo fmt --check` are both genuine no-ops, so an agent or contributor
+# who runs fmt out of habit cannot reformat 317 files as a drive-by.
+#
+# Revisit when we hit a formatting-only merge conflict between parallel
+# sessions. That is the one cost that is real and that grows with the number
+# of hands on the repo. Until then, adopting fmt buys ~3500 hunks of churn
+# and nothing we have actually wanted.
+disable_all_formatting = true

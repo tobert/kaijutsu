@@ -78,6 +78,22 @@ cargo run -p kaijutsu-server
 cargo run -p kaijutsu-app
 ```
 
+## Code Style
+
+**Do not run `cargo fmt`.** `rustfmt.toml` sets `disable_all_formatting`, so
+fmt and `fmt --check` are both no-ops. Match the code around you and move on.
+
+Most of this codebase is written by models, which emit stock-rustfmt-shaped
+Rust already — measured, line lengths are p99=93 against rustfmt's default
+100, and every config we tried drifted *further* from the existing code than
+plain defaults. So formatting buys ~3500 hunks of churn, some of it worse to
+read, to fix a coordination problem a single-maintainer repo doesn't have.
+
+The one real argument is merge determinism: enforced formatting makes a
+file's text a function of its AST, so parallel sessions can't conflict unless
+they actually disagree. **Revisit when we hit a formatting-only merge
+conflict** — then format per-crate with a `.git-blame-ignore-revs`.
+
 ## Crates
 
 ### kaijutsu-types
