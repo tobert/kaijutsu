@@ -18,6 +18,7 @@ pub mod cp;
 pub mod config;
 pub mod context;
 pub mod context_shell;
+pub mod db;
 pub mod diff;
 pub mod doc;
 pub mod drift;
@@ -358,6 +359,11 @@ impl KjDispatcher {
         }
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
+        }
+        // `kj db` operates on the whole kernel database (backup/checkpoint),
+        // not a context — same exemption rationale as `kj cas`.
+        if cmd == "db" {
+            return self.dispatch_db(&argv[1..], caller);
         }
         // `kj audio` operates on a host filesystem path (like `kj play`/
         // `kj cas put`), not a context — same exemption rationale.
@@ -729,6 +735,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(workspace::WorkspaceArgs::command())
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
+        .subcommand(db::DbArgs::command())
         .subcommand(audio::AudioArgs::command())
         .subcommand(midi::MidiArgs::command())
         .subcommand(cp::CpArgs::command())

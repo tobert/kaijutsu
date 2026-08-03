@@ -60,6 +60,9 @@ context (ctx)   list, info, current, switch, create, scratch, set, unset, log, m
                 rename, archive, conclude, promote, demote, pause, resume, remove,
                 retag, hydrate
 cp              Copy a file between VFS paths via the streaming pump (-r not implemented)
+db              backup <path>, checkpoint — hot SQLite backup (VACUUM INTO, absolute
+                path required) and WAL checkpoint/quiesce; restore is deliberately NOT
+                a verb (see `kj db backup help`)
 diff            <a> [<b>] — unified diff as a typed block: one path diffs disk
                 against the CRDT document that owns it, two paths diff both
                 documents, --from/--to address a document's journalled history

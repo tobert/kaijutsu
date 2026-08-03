@@ -51,6 +51,31 @@ two additive `ALTER TABLE` guards (`:868`). ~20 tables:
 | `cache_breakpoints` | per-context Claude cache targets (set by rc) |
 | `context_hydration` | windowed hydration marker + window size |
 
+#### Backup & restore
+
+`kernel.db` is WAL-mode SQLite, so a bare `cp` is quietly unsafe: committed
+history can live in `kernel.db-wal` while the main file lags, producing a
+torn or stale copy that *looks* fine. Two `kj db` verbs address this
+(`src/kj/db.rs`):
+
+- **`kj db backup <path>`** — `KernelDb::vacuum_into` (`kernel_db.rs`, next to
+  `checkpoint()`) runs SQLite-native `VACUUM INTO ?1`: one consistent,
+  already-compacted snapshot file, safe against a live writer, no quiesce
+  needed first. `<path>` must be absolute (the kernel process's cwd isn't
+  the caller's shell cwd, so a relative path can't be resolved
+  predictably) and must not already exist — SQLite refuses to overwrite,
+  and the verb will not pre-delete a same-named file to make room.
+- **`kj db checkpoint`** — wraps the existing `KernelDb::checkpoint()`
+  (`PRAGMA wal_checkpoint(TRUNCATE)`), reporting the busy case honestly.
+  This is the quiesce step for people doing their own btrfs/ZFS snapshot or
+  file copy: after a clean (non-busy) checkpoint, `kernel.db` alone
+  reflects all committed history and `kernel.db-wal` is empty.
+
+**Restore is deliberately not a `kj` verb.** The kernel holds in-memory
+state (`BlockStore` documents, registries) that a live file swap would
+desynchronize. To restore a backup: stop the kernel, replace `kernel.db`
+(removing any `-wal`/`-shm` siblings alongside it), then start the kernel.
+
 ### CRDT documents — `BlockStore` (`src/block_store.rs:180`)
 
 Kernel-level wrapper around `kaijutsu_crdt`: a `DashMap<ContextId,

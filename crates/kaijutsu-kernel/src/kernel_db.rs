@@ -1627,6 +1627,33 @@ impl KernelDb {
         Ok(row)
     }
 
+    /// Hot-backup this database into a fresh file at `path` via SQLite's
+    /// native `VACUUM INTO` — a single consistent, already-compacted
+    /// snapshot that's safe to run against a live writer (unlike a bare `cp`
+    /// of `kernel.db`, which can race the `-wal` file and produce a torn or
+    /// stale copy; see docs/issues.md "Persistence & Sync"). No prior
+    /// `checkpoint()` call is required — `VACUUM INTO` reads a consistent
+    /// snapshot regardless of WAL state.
+    ///
+    /// The path is bound as a query parameter (`VACUUM INTO ?1`), not
+    /// string-interpolated, so a path containing `'` or other SQL
+    /// metacharacters can't break out of the statement.
+    ///
+    /// SQLite refuses to overwrite an existing target file — that error
+    /// surfaces as-is (`KernelDbError::Db`) rather than being papered over by
+    /// pre-deleting the target, so a caller can never silently clobber an
+    /// existing backup by name collision.
+    pub fn vacuum_into<P: AsRef<Path>>(&self, path: P) -> KernelDbResult<()> {
+        let path_str = path.as_ref().to_str().ok_or_else(|| {
+            KernelDbError::Validation(format!(
+                "backup path is not valid UTF-8: {}",
+                path.as_ref().display()
+            ))
+        })?;
+        self.conn.execute("VACUUM INTO ?1", params![path_str])?;
+        Ok(())
+    }
+
     // ========================================================================
     // Input Document Op-Log
     // ========================================================================
@@ -4927,6 +4954,123 @@ mod tests {
         assert_eq!(
             wal_after, 0,
             "TRUNCATE checkpoint should zero the -wal file, got {wal_after} bytes",
+        );
+    }
+
+    // ── VACUUM INTO backup ──────────────────────────────────────────────
+
+    /// `vacuum_into` must produce a real, non-empty file — the behavioral
+    /// guard against a silent no-op (e.g. a typo'd pragma or a swallowed
+    /// error that still returns `Ok`). A bug that made `vacuum_into` write
+    /// nothing would still pass a test that only checked `is_ok()`; this one
+    /// also asserts the file exists and has SQLite's magic header size.
+    #[test]
+    fn vacuum_into_produces_nonempty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("backup.db");
+
+        let db = KernelDb::open(&db_path).unwrap();
+        db.get_or_create_default_workspace(PrincipalId::system())
+            .unwrap();
+
+        assert!(!backup_path.exists(), "precondition: backup must not exist yet");
+        db.vacuum_into(&backup_path).unwrap();
+
+        let meta = std::fs::metadata(&backup_path)
+            .expect("vacuum_into must create the backup file");
+        assert!(
+            meta.len() >= 100,
+            "backup file too small to be a real SQLite db ({} bytes) — vacuum_into may have \
+             written nothing",
+            meta.len()
+        );
+    }
+
+    /// The backup must be a fully valid, queryable SQLite database containing
+    /// the same rows as the source — not just a non-empty file. Opens the
+    /// backup as an independent `KernelDb` and checks it has the same
+    /// singleton kernel id and the workspace/document rows written before
+    /// the backup was taken.
+    #[test]
+    fn vacuum_into_backup_is_valid_and_contains_expected_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("backup.db");
+
+        let db = KernelDb::open(&db_path).unwrap();
+        let ws_id = db
+            .get_or_create_default_workspace(PrincipalId::system())
+            .unwrap();
+        let doc = ContextId::new();
+        db.insert_document(&DocumentRow {
+            document_id: doc,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+        let source_kernel_id = db.kernel_id().unwrap();
+
+        db.vacuum_into(&backup_path).unwrap();
+
+        // Open the backup as an independent connection — proves it's a
+        // structurally valid SQLite file with the full schema, not a
+        // truncated or corrupt copy.
+        let backup = KernelDb::open(&backup_path).unwrap();
+        assert_eq!(
+            backup.kernel_id().unwrap(),
+            source_kernel_id,
+            "backup must carry the same singleton kernel identity"
+        );
+        let restored_doc = backup
+            .get_document(doc)
+            .expect("query backup db")
+            .expect("document present in backup");
+        assert_eq!(restored_doc.doc_kind, DocKind::Conversation);
+    }
+
+    /// SQLite refuses to `VACUUM INTO` an existing file. The error must
+    /// surface cleanly (not panic, not silently succeed by overwriting) —
+    /// `kj db backup` relies on this to avoid clobbering a same-named backup.
+    #[test]
+    fn vacuum_into_target_exists_errors_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("backup.db");
+        std::fs::write(&backup_path, b"not a database, just occupying the name").unwrap();
+
+        let db = KernelDb::open(&db_path).unwrap();
+        let result = db.vacuum_into(&backup_path);
+
+        assert!(
+            result.is_err(),
+            "vacuum_into must error when the target file already exists"
+        );
+        // The pre-existing (bogus) file content must be left untouched —
+        // vacuum_into must not have deleted-then-recreated it.
+        let contents = std::fs::read(&backup_path).unwrap();
+        assert_eq!(contents, b"not a database, just occupying the name");
+    }
+
+    /// A path with a `'` — the SQL string-literal delimiter — must not be
+    /// able to break out of the `VACUUM INTO` statement. Guards the bound-
+    /// parameter choice (`?1`) over string interpolation.
+    #[test]
+    fn vacuum_into_path_with_quote_is_bound_not_interpolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("back'up.db");
+
+        let db = KernelDb::open(&db_path).unwrap();
+        db.vacuum_into(&backup_path).unwrap();
+
+        assert!(
+            backup_path.exists(),
+            "a bound parameter should handle a quote in the filename literally"
         );
     }
 
