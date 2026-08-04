@@ -629,7 +629,7 @@ impl DiffCore {
         }
         // Motions may move a column; a *yank* may not take one. See
         // [`is_line_wise_yank`].
-        if is_yank(&ea, ctx) && !is_line_wise_yank(&ea) {
+        if is_yank(&ea, ctx) && !is_line_wise_yank(&ea, ctx) {
             return;
         }
         let ictx = (self.group, &self.viewport, ctx);
@@ -796,8 +796,16 @@ fn is_read_only(ea: &EditorAction, ctx: &EditContext) -> bool {
 ///
 /// Text-object targets are held to the same rule: `yiw` would yank a word out
 /// of the middle of a line, quietly breaking the same contract.
-fn is_line_wise_yank(ea: &EditorAction) -> bool {
-    use editor_types::prelude::{EditTarget, MoveType, RangeType, SearchType};
+fn is_line_wise_yank(ea: &EditorAction, ctx: &EditContext) -> bool {
+    use editor_types::prelude::{EditTarget, MoveType, RangeType, SearchType, TargetShape};
+
+    // A *forced* shape settles it before the target is even looked at: `y^`
+    // carries an explicit `CharWise` (modalkit's own binding does), and so do
+    // vim's shape overrides `yvj` / `y<C-v>j`. Only an explicitly line-wise
+    // force, or no force at all, can go on to the target check.
+    if !matches!(ctx.get_target_shape(), None | Some(TargetShape::LineWise)) {
+        return false;
+    }
 
     let EditorAction::Edit(_, target) = ea else {
         return true; // not a motion/operator at all
@@ -830,10 +838,14 @@ fn is_line_wise_yank(ea: &EditorAction) -> bool {
                 | MoveType::ParagraphBegin(_)
                 | MoveType::SectionBegin(_)
                 | MoveType::SectionEnd(_)
-                // `+` / `-` / `_` / `^` — line steps that then seek a column
-                // the snap discards. (`^` carries count 0, so it stays put.)
+                // `+` / `-` / `_` — line steps that then seek a column,
+                // which a line-wise yank discards. Their same-line cousins
+                // `^` and `g^` do NOT belong here: `^` is caught by the
+                // forced-`CharWise` shape above, and `g^` (which carries no
+                // shape) is why `ScreenFirstWord` is absent from this list —
+                // `yg^` would otherwise yank from the cursor back to the
+                // first non-blank.
                 | MoveType::FirstWord(_)
-                | MoveType::ScreenFirstWord(_)
         ),
         // `EditTarget` is `#[non_exhaustive]`. A target we have never seen is
         // exactly the case this function exists to refuse.
@@ -1369,18 +1381,36 @@ mod tests {
     fn no_yank_can_take_less_than_a_whole_line() {
         let mut c = core();
         c.apply_notation("5G");
-        for keys in ["yiw", "yaw", "yw", "y$", "ye", "yb", "y0", "yf@"] {
+        for keys in [
+            "yiw", "yaw", "yw", "y$", "ye", "yb", "y0", "yf@",
+            // Same-line column seekers, and vim's explicit shape overrides.
+            // These reach the guard by a *different* road than the target
+            // list — a forced `CharWise`/`BlockWise` shape — and `y^` at a
+            // non-zero column is the one that actually got through.
+            "y^", "yg^", "yvj", "y<C-v>j",
+        ] {
+            let mut c = core();
+            c.apply_notation("5G$");
+            assert!(c.cursor_col() > 0, "test premise: the cursor is mid-line");
             assert!(
                 c.apply_notation(keys).is_empty(),
                 "keys {keys:?} yanked a fragment",
             );
         }
 
-        // ...while the line and buffer objects still work.
-        let line = c.apply_notation("yy");
-        assert!(matches!(line.first(), Some(DiffIntent::Yank { .. })));
-        let all = c.apply_notation("yG");
-        assert!(matches!(all.first(), Some(DiffIntent::Yank { .. })));
+        // ...while the whole-line motions still yank, mid-line cursor or not.
+        for keys in ["yy", "yG", "y_", "y+", "yVj", "3yy"] {
+            let mut c = core();
+            c.apply_notation("5G$");
+            let yanked = c.apply_notation(keys);
+            let Some(DiffIntent::Yank { text }) = yanked.first() else {
+                panic!("keys {keys:?} yanked nothing: {yanked:?}");
+            };
+            assert!(
+                text.ends_with('\n') && text.starts_with([' ', '+', '-', '@', 'd', '\\']),
+                "keys {keys:?} yanked something that is not whole lines: {text:?}",
+            );
+        }
     }
 
     /// **Yank stays line-wise even though the cursor no longer is.** `$` then
