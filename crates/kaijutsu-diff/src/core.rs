@@ -280,6 +280,7 @@ pub struct DiffCore {
     /// borrow of the viewer. Refreshed after every action, so it is never
     /// behind by more than the keystroke currently being processed.
     cursor_row: usize,
+    cursor_col: usize,
     selection: Option<(usize, usize)>,
 }
 
@@ -317,6 +318,7 @@ impl DiffCore {
             cmdline,
             cmdline_group,
             cursor_row: 0,
+            cursor_col: 0,
             selection: None,
         }
     }
@@ -378,6 +380,16 @@ impl DiffCore {
         self.cursor_row
     }
 
+    /// The cursor's column on its row, counted in **chars** (modalkit's own
+    /// unit — its buffer is a char-indexed rope).
+    ///
+    /// Real again as of slice 6: word-level rendering is what makes a column
+    /// visible, and a cursor drawn where it actually is can be trusted. Slice
+    /// 5 pinned it to 0 precisely because it could not be drawn.
+    pub fn cursor_col(&self) -> usize {
+        self.cursor_col
+    }
+
     /// The cursor's position in [`visible_rows`](Self::visible_rows) — what a
     /// renderer laying out only the visible rows needs.
     ///
@@ -427,32 +439,6 @@ impl DiffCore {
         self.selection
     }
 
-    /// Force the cursor back to column 0, making every column-only motion a
-    /// no-op.
-    ///
-    /// **The viewer is line-wise by doctrine this slice**, and it renders the
-    /// cursor at the start of its row. Without this, `w`/`b`/`e`/`f`/`0`/`$`
-    /// would move modalkit's real column while the drawn cursor stayed put —
-    /// invisible state that a later yank would silently read from. A cursor
-    /// that never lies beats a motion that cannot be seen.
-    ///
-    /// Snapping rather than enumerating "column-only" `MoveType`s is
-    /// deliberate: the invariant then holds *by construction* for motions we
-    /// have not thought of and for whatever modalkit adds in a future version,
-    /// instead of resting on a list that rots silently. A motion that also
-    /// changes the *line* (`w` wrapping past the end of one) still moves —
-    /// that movement is real and visible, so it is honest.
-    ///
-    /// Column motions come back with slice 6's word-level rendering, which is
-    /// what would make them visible.
-    fn snap_to_line_start(&mut self) {
-        let cursor = self.buffer.get_leader(self.group);
-        if cursor.get_x() != 0 {
-            self.buffer
-                .set_leader(self.group, Cursor::new(cursor.get_y(), 0));
-        }
-    }
-
     /// Move the cursor off a folded-away row, in the direction it was going.
     ///
     /// Vim's own fold behavior, and for the reason the whole viewer is built
@@ -493,6 +479,15 @@ impl DiffCore {
         }
     }
 
+    /// How many chars a row holds, newline excluded — the bound on a column
+    /// the renderer can draw.
+    fn row_char_len(&self, row: usize) -> usize {
+        self.rows
+            .get(row)
+            .map(|r| self.text[r.start..r.end].trim_end_matches('\n').chars().count())
+            .unwrap_or(0)
+    }
+
     /// Rebuild the visible-row projection after a fold changed.
     fn rebuild_visible(&mut self) {
         self.visible = visible_row_indices(&self.model, &self.rows);
@@ -501,10 +496,19 @@ impl DiffCore {
 
     /// Re-read the cursor and selection out of modalkit into the cache.
     fn sync_cursor(&mut self) {
-        self.snap_to_line_start();
         self.snap_out_of_folds(self.cursor_row);
         let last = self.rows.len().saturating_sub(1);
-        self.cursor_row = self.buffer.get_leader(self.group).get_y().min(last);
+        let leader = self.buffer.get_leader(self.group);
+        self.cursor_row = leader.get_y().min(last);
+        // Report a column the row actually has. modalkit keeps a *goal*
+        // column (vim's `$`-sticky behavior) that can sit past a short line,
+        // and a renderer handed that would draw the cursor off the end of the
+        // text. Clamping the reported value leaves the goal column alone.
+        self.cursor_col = if leader.get_y() > last {
+            0
+        } else {
+            leader.get_x().min(self.row_char_len(self.cursor_row))
+        };
         self.selection =
             self.buffer
                 .get_leader_selection(self.group)
@@ -601,7 +605,12 @@ impl DiffCore {
 
     /// Run an editor action against the document buffer — if it is read-only.
     fn editor_action(&mut self, ea: EditorAction, ctx: &EditContext, out: &mut Vec<DiffIntent>) {
-        if !is_read_only(&ea, ctx) || !is_line_wise(&ea) {
+        if !is_read_only(&ea, ctx) {
+            return;
+        }
+        // Motions may move a column; a *yank* may not take one. See
+        // [`is_line_wise_yank`].
+        if is_yank(&ea, ctx) && !is_line_wise_yank(&ea) {
             return;
         }
         let ictx = (self.group, &self.viewport, ctx);
@@ -744,24 +753,31 @@ fn is_read_only(ea: &EditorAction, ctx: &EditContext) -> bool {
     }
 }
 
-/// Is this action's target line-wise — the only granularity the viewer has?
+/// Is this **yank's** target line-wise — the only granularity the viewer
+/// yanks?
 ///
-/// **The viewer draws its cursor at the start of a row and yanks whole lines.**
-/// A column motion (`w`, `b`, `e`, `0`, `$`, `|`, `f`/`t`) would move
-/// modalkit's real column with nothing on screen to show for it, and a later
-/// yank would read from that invisible position — state that lies. So they are
-/// dropped here, and [`DiffCore::snap_to_line_start`] keeps the invariant true
-/// by construction for anything this list misses.
+/// Slice 5 applied this to every editor action, because the cursor was drawn
+/// at column 0 and a column motion would have moved modalkit's real column
+/// with nothing on screen to show for it. Slice 6 draws the cursor at its real
+/// column, so the motions are honest again and the rule narrows to what it was
+/// always really about: **what comes out of a yank**.
+///
+/// Yank stays line-wise (`docs/diff.md` slice 5, unchanged): a yank is "the
+/// exact canonical unified text of the selected lines, prefixes included", and
+/// that is the property that makes `VGy` re-parse as the same model and makes
+/// a hunk pasteable into feedback. A `yw` or `y$` would produce a fragment
+/// with a `+` prefix and no line — text that looks like a patch and is not
+/// one. Partial-line yank is not blocked by rendering; it is blocked by
+/// meaning, so it stays out until something asks for it with a semantics
+/// attached.
 ///
 /// The list is **positive**: a `MoveType` we have not classified is rejected,
-/// because "silently moves somewhere the reader cannot see" is the failure
-/// worth defaulting against. Column motions return with slice 6's word-level
-/// rendering, which is what would make them visible.
+/// because "yanks something that isn't whole lines" is the failure worth
+/// defaulting against.
 ///
-/// Text-object targets are held to the same rule: with the cursor pinned to
-/// column 0, a `yiw` would yank the first *word* of a line, quietly breaking
-/// the "exact canonical unified text of the selected lines" contract.
-fn is_line_wise(ea: &EditorAction) -> bool {
+/// Text-object targets are held to the same rule: `yiw` would yank a word out
+/// of the middle of a line, quietly breaking the same contract.
+fn is_line_wise_yank(ea: &EditorAction) -> bool {
     use editor_types::prelude::{EditTarget, MoveType, RangeType, SearchType};
 
     let EditorAction::Edit(_, target) = ea else {
@@ -1225,38 +1241,91 @@ mod tests {
         assert_eq!(c.cursor_row(), headers[0]);
     }
 
-    /// Column-only motions must not move the *effective* cursor: the viewer
-    /// draws at line start, and a motion you cannot see is state that lies.
+    /// Column motions are real again (slice 6): word-level rendering draws the
+    /// cursor at its actual column, so a motion that moves it is visible.
     #[test]
-    fn column_motions_do_not_move_the_effective_cursor() {
+    fn column_motions_move_the_cursor_along_its_row() {
+        let wide = {
+            let c = core();
+            c.rows()
+                .iter()
+                .position(|r| matches!(r.kind, RowKind::HunkHeader))
+                .expect("a hunk header — the longest line in the fixture")
+        };
+        let at = |keys: &str| -> usize {
+            let mut c = core();
+            c.apply_notation(&format!("{}G", wide + 1));
+            assert_eq!(c.cursor_col(), 0, "G lands at column 0");
+            c.apply_notation(keys);
+            assert_eq!(c.cursor_row(), wide, "keys {keys:?} left the row");
+            c.cursor_col()
+        };
+
+        assert!(at("l") > 0, "l must move a column");
+        assert!(at("5l") > at("l"));
+        assert!(at("w") > 0, "w must move a column");
+        assert!(at("3w") > at("w"));
+        assert!(at("$") > at("w"), "$ goes to the end of the line");
+        assert_eq!(at("$0"), 0, "0 comes back");
+        assert_eq!(at("$b0"), 0);
+    }
+
+    /// `f`/`t` are the column motions with the most exact contract, so they
+    /// get a line whose characters are unambiguous: a context row reads
+    /// `" line 4"`, where `n` is at column 3.
+    #[test]
+    fn find_and_till_land_where_vim_puts_them() {
         let mut c = core();
-        // Park on a line with several words to move within.
+        let row = c
+            .rows()
+            .iter()
+            .position(|r| r.kind == RowKind::Body(LineKind::Context))
+            .expect("a context row");
+        c.apply_notation(&format!("{}G", row + 1));
+        let text: String = c.text()[c.rows()[row].start..c.rows()[row].end]
+            .trim_end_matches('\n')
+            .to_string();
+        assert_eq!(&text[..6], " line ", "fixture text changed: {text:?}");
+
+        c.apply_notation("fn");
+        assert_eq!(c.cursor_col(), 3, "f lands ON the match");
+        c.apply_notation("0tn");
+        assert_eq!(c.cursor_col(), 2, "t lands one short of it");
+        assert_eq!(c.cursor_row(), row, "neither leaves the row");
+    }
+
+    /// A row change resets nothing the reader can see: the column travels, as
+    /// it does in vim, and stays inside the row it lands on.
+    #[test]
+    fn the_column_is_clamped_to_the_row_the_cursor_lands_on() {
+        let mut c = core();
         let wide = c
             .rows()
             .iter()
             .position(|r| matches!(r.kind, RowKind::HunkHeader))
-            .expect("a hunk header — the longest line in the fixture");
-        c.apply_notation(&format!("{}G", wide + 1));
-        assert_eq!(c.cursor_row(), wide);
+            .expect("a hunk header");
+        c.apply_notation(&format!("{}G$", wide + 1));
+        assert!(c.cursor_col() > 0, "test premise: the column is off zero");
 
-        for keys in [
-            "w", "3w", "b", "e", "l", "5l", "h", "$", "0", "^", "fc", "tc", "F@", "|",
-        ] {
-            let mut c = DiffCore::new(sample());
-            c.apply_notation(&format!("{}G", wide + 1));
-            let before = c.cursor_row();
-            c.apply_notation(keys);
-            assert_eq!(
-                c.cursor_row(),
-                before,
-                "keys {keys:?} moved the effective cursor",
+        // Every row the cursor visits must report a column inside its text —
+        // including after a fold snap, which carries the column with it.
+        c.apply_notation("]czc");
+        for _ in 0..c.rows().len() {
+            c.apply_notation("j");
+            let row = c.rows()[c.cursor_row()];
+            let text = c.text()[row.start..row.end].trim_end_matches('\n');
+            assert!(
+                c.cursor_col() <= text.chars().count(),
+                "column {} past the end of row {:?}",
+                c.cursor_col(),
+                text,
             );
         }
     }
 
-    /// The snap must not cost the line motions the viewer is built on.
+    /// The line motions the viewer is built on still land at column 0.
     #[test]
-    fn line_motions_still_work_under_the_snap() {
+    fn line_motions_still_work() {
         let mut c = core();
         c.apply_notation("3j");
         assert_eq!(c.cursor_row(), 3);
@@ -1274,30 +1343,38 @@ mod tests {
         assert_eq!(c.cursor_row(), 0);
     }
 
-    /// A word text object would yank a fragment of a line, breaking the
-    /// "exact canonical unified text of the selected lines" contract. Only
-    /// whole-line and whole-buffer objects survive the filter.
+    /// A partial-line yank would produce a fragment carrying a `+` prefix and
+    /// no line — text that looks like a patch and is not one. The cursor may
+    /// sit at a column; the yank still takes whole lines.
     #[test]
-    fn a_word_text_object_cannot_yank_a_fragment() {
+    fn no_yank_can_take_less_than_a_whole_line() {
         let mut c = core();
         c.apply_notation("5G");
-        assert!(c.apply_notation("yiw").is_empty(), "yiw must yank nothing");
-        assert!(c.apply_notation("yaw").is_empty(), "yaw must yank nothing");
+        for keys in ["yiw", "yaw", "yw", "y$", "ye", "yb", "y0", "yf@"] {
+            assert!(
+                c.apply_notation(keys).is_empty(),
+                "keys {keys:?} yanked a fragment",
+            );
+        }
 
         // ...while the line and buffer objects still work.
         let line = c.apply_notation("yy");
         assert!(matches!(line.first(), Some(DiffIntent::Yank { .. })));
+        let all = c.apply_notation("yG");
+        assert!(matches!(all.first(), Some(DiffIntent::Yank { .. })));
     }
 
-    /// A column motion must not leave a hidden column behind for a later
-    /// yank to read: `$` then `yy` is still the whole line.
+    /// **Yank stays line-wise even though the cursor no longer is.** `$` then
+    /// `yy` is the whole line, prefix included — the contract that makes a
+    /// yanked hunk a real patch.
     #[test]
     fn a_yank_after_a_column_motion_is_still_the_whole_line() {
         let mut c = core();
         c.apply_notation("5G");
         let plain = c.apply_notation("yy");
         let mut c2 = core();
-        c2.apply_notation("5G$w");
+        c2.apply_notation("5G$");
+        assert!(c2.cursor_col() > 0, "test premise: the column moved");
         let after_column_motion = c2.apply_notation("yy");
         assert_eq!(plain, after_column_motion);
         assert!(matches!(plain[0], DiffIntent::Yank { .. }));

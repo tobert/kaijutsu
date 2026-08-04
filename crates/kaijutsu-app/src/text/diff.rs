@@ -617,6 +617,29 @@ pub fn error_view(text: &str, reason: &str) -> DiffPreview {
     error_preview_with(text, reason, 500)
 }
 
+/// The byte offset in [`DiffPreview::plain_text`] of `column` on preview line
+/// `line`, for placing the cursor.
+///
+/// `column` is counted in **chars** — modalkit's unit, since its buffer is a
+/// char-indexed rope (`DiffCore::cursor_col`) — and everything downstream of
+/// here is bytes, so this is the one conversion on the path. It clamps to the
+/// end of the line's text rather than running into the newline: a column past
+/// the end can only come from a row shorter than the goal column, and drawing
+/// the cursor on the next line would be worse than drawing it at the end of
+/// this one.
+///
+/// `None` only for a line index the preview does not have.
+pub fn cursor_byte(preview: &DiffPreview, line: usize, column: usize) -> Option<usize> {
+    let l = preview.lines.get(line)?;
+    let text = preview.plain_text[l.start..l.end].trim_end_matches('\n');
+    let offset = text
+        .char_indices()
+        .nth(column)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    Some(l.start + offset)
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Background bands
 // ════════════════════════════════════════════════════════════════════════════
@@ -1326,6 +1349,42 @@ mod tests {
             "shows more than a preview would"
         );
         assert_contiguous(&v);
+    }
+
+    // ── the cursor's column ─────────────────────────────────────────────────
+
+    /// The column is counted in chars and the answer is a byte offset — the
+    /// one conversion on the cursor path, and the one a multibyte line would
+    /// silently corrupt.
+    #[test]
+    fn cursor_byte_converts_a_char_column_to_a_byte_offset() {
+        let raw = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-日本語\n+にほんご\n";
+        let c = kaijutsu_diff::DiffCore::new(kaijutsu_diff::parse(raw).expect("parses"));
+        let v = whole(&c);
+        let insert = v
+            .lines
+            .iter()
+            .position(|l| l.class == DiffLineClass::Insert)
+            .expect("an insertion");
+        let start = v.lines[insert].start;
+
+        assert_eq!(cursor_byte(&v, insert, 0), Some(start), "column 0 is the +");
+        // One char in is one ASCII byte; the next three chars are 3 bytes each.
+        assert_eq!(cursor_byte(&v, insert, 1), Some(start + 1));
+        assert_eq!(cursor_byte(&v, insert, 3), Some(start + 1 + 6));
+    }
+
+    /// A column past the end of a short row clamps to the end of *that* row.
+    /// modalkit keeps a goal column that can sit past a short line; the cursor
+    /// must not be drawn on the next line because of it.
+    #[test]
+    fn cursor_byte_clamps_to_the_end_of_its_own_line() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let line = v.lines[1];
+        let end = line.end - 1; // the line's newline is not part of its text
+        assert_eq!(cursor_byte(&v, 1, 9_999), Some(end));
+        assert!(cursor_byte(&v, 9_999, 0).is_none(), "no such line");
     }
 
     // ── bands ───────────────────────────────────────────────────────────────

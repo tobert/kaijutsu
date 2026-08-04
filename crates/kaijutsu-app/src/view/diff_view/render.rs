@@ -53,9 +53,9 @@ const STATUS_BOTTOM_MARGIN: f32 = 72.0;
 /// no scroll offset, so `visible_rows` is the real bound. Motion *inside* the
 /// band is free (see `DiffSurfaceWindow`); walking off the bottom edge still
 /// re-shapes one band per row, which is what a viewport without a scroll
-/// offset costs. Cheap to improve later — cache the parley `Layout` and move
-/// the glyph offset instead — but not worth the complexity until a profile
-/// says so.
+/// offset costs. Cheap to improve later — the `Layout` is cached now (the
+/// cursor needs it), so this wants moving the glyph offset instead of
+/// re-collecting — but not worth the complexity until a profile says so.
 const WINDOW_SLACK_ROWS: usize = 24;
 
 /// Full-window root painting the dark page behind the text child.
@@ -87,9 +87,16 @@ pub struct DiffSurfaceWindow {
     /// pass can address lines without re-projecting.
     preview: Option<crate::text::diff::DiffPreview>,
     /// The cached layout's wrapped visual rows, block-local logical px. The
-    /// cursor and the selection bands are both derived from these, which is
-    /// why neither needs Parley again.
+    /// selection bands are derived from these, which is why they need no
+    /// Parley of their own.
     rows: Vec<crate::text::diff::PreviewRow>,
+    /// The cached parley layout itself, kept for the **cursor**: with column
+    /// motions back (slice 6) the cursor is a point inside a line, not a row
+    /// box, and only the layout knows where a column sits — especially on a
+    /// wrapped line, where a late column belongs to a later visual row.
+    /// Querying it is a search over the cached lines, not a re-shape, so the
+    /// cheap pass stays cheap.
+    layout: Option<parley::Layout<peniko::Brush>>,
     /// How many entries at the FRONT of `MsdfBlockGlyphs::glyphs` are the
     /// body. The status strip is appended after them and remade every pass.
     body_glyphs: usize,
@@ -117,6 +124,7 @@ struct LayoutKey {
 #[derive(PartialEq, Eq, Clone, Debug)]
 struct CursorKey {
     cursor_row: usize,
+    cursor_col: usize,
     selection: Option<(usize, usize)>,
     stale: bool,
     status: String,
@@ -251,7 +259,7 @@ pub fn build_diff_surface(
     // publishes the cursor and the selection in the same coordinates, and
     // `view_rows` projects the same range, so the whole surface agrees;
     // yank and the canonical model never see a fold at all.
-    let (first_row, end_row, cursor_row, selection, kind) = match &session.content {
+    let (first_row, end_row, cursor_row, cursor_col, selection, kind) = match &session.content {
         DiffViewContent::Ready(core) => {
             let cursor = core.cursor_visible_row();
             let (first, end) = window_for(
@@ -264,6 +272,7 @@ pub fn build_diff_surface(
                 first,
                 end,
                 cursor,
+                core.cursor_col(),
                 core.selection_visible_rows(),
                 // The viewer is never in insert mode, so the beam shape would
                 // be a lie. Normal → block; visual → hidden, because the
@@ -273,7 +282,7 @@ pub fn build_diff_surface(
         }
         // The error state has nothing to navigate: one fixed "window", no
         // cursor at all.
-        DiffViewContent::Failed { .. } => (0, 0, 0, None, CursorKind::Hidden),
+        DiffViewContent::Failed { .. } => (0, 0, 0, 0, None, CursorKind::Hidden),
     };
 
     let layout_key = LayoutKey {
@@ -292,6 +301,7 @@ pub fn build_diff_surface(
     };
     let cursor_key = CursorKey {
         cursor_row,
+        cursor_col,
         selection,
         stale: session.stale,
         status: status_line(session, cursor_row),
@@ -383,6 +393,7 @@ pub fn build_diff_surface(
         window.end_row = end_row;
         window.rows = rows;
         window.preview = Some(preview);
+        window.layout = Some(layout);
         window.laid_out = Some(layout_key);
     }
 
@@ -454,21 +465,27 @@ pub fn build_diff_surface(
     // version gate (`MsdfBlockGeometry`'s contract: fill both, bump once).
     glyphs.version = glyphs.version.wrapping_add(1);
 
-    // The cursor is a row box: a line-wise viewer has no column to preserve,
-    // so the cached visual rows answer this and Parley is not involved.
+    // The cursor is a point inside a line again (slice 6): column motions are
+    // back, so it is drawn where it actually is. The cached layout answers
+    // where that is — a lookup over lines already shaped, not a re-shape —
+    // and it is the only thing that gets a *wrapped* line right, where a late
+    // column belongs to a later visual row.
     let local = cursor_row.saturating_sub(window.first_row);
-    let row_box = preview
-        .lines
-        .get(local)
-        .and_then(|line| window.rows.iter().find(|r| r.text_offset == line.start));
-    match row_box {
-        Some(r) => {
-            cursor_geom.x = text_offset.0;
-            cursor_geom.y = text_offset.1 + r.top as f64;
-            cursor_geom.height = (r.bottom - r.top) as f64;
-            cursor_geom.last_cursor_offset = preview.lines[local].start;
+    let byte = crate::text::diff::cursor_byte(preview, local, cursor_col);
+    match (byte, window.layout.as_ref()) {
+        (Some(byte), Some(layout)) => {
+            let geom = parley::editing::Cursor::from_byte_index(
+                layout,
+                byte,
+                parley::layout::Affinity::Downstream,
+            )
+            .geometry(layout, 2.0);
+            cursor_geom.x = text_offset.0 + geom.x0;
+            cursor_geom.y = text_offset.1 + geom.y0;
+            cursor_geom.height = geom.y1 - geom.y0;
+            cursor_geom.last_cursor_offset = byte;
         }
-        None => {
+        _ => {
             cursor_geom.height = 0.0;
             cursor_geom.last_cursor_offset = 0;
         }
@@ -633,6 +650,7 @@ mod tests {
     fn a_cursor_move_does_change_the_cheap_pass_key() {
         let key = |cursor_row| CursorKey {
             cursor_row,
+            cursor_col: 0,
             selection: None,
             stale: false,
             status: format!("diff  {}/100", cursor_row + 1),
