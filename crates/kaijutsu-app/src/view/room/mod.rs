@@ -1901,8 +1901,31 @@ fn floor_mesh(radius: f32, rings: usize, segments: usize) -> Mesh {
 
 // ── Shared plate-text helper (also used by the patch bay's plates) ────────────
 
-fn plate_brush() -> Brush {
+pub(crate) fn plate_brush() -> Brush {
     bevy_color_to_brush(Color::srgba(0.82, 0.88, 0.97, 0.9))
+}
+
+/// The tail every plate-text layout function runs once it has a finished
+/// `parley::Layout` and has decided on a font size: register each glyph
+/// run's font (so the MSDF atlas can rasterize it) and collect positioned
+/// MSDF glyphs at the shared plate padding ([`PLATE_PAD`]). Shared by
+/// [`layout_plate_text`] (fixed size) and the patch bay's
+/// `layout_info_text` (shrink-to-fit) — the two differ only in how they
+/// pick a font size before calling this.
+pub(crate) fn collect_plate_glyphs(
+    layout: &parley::Layout<Brush>,
+    brush: &Brush,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+) -> Vec<PositionedGlyph> {
+    for line in layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                font_data_map.register(gr.run().font());
+            }
+        }
+    }
+    collect_msdf_glyphs(layout, &[], brush, (PLATE_PAD as f64, PLATE_PAD as f64), atlas)
 }
 
 /// Single-line MSDF layout for a nameplate-style panel sized
@@ -1925,14 +1948,7 @@ pub(crate) fn layout_plate_text(
         VelloTextAlign::Middle,
         Some(PLATE_TEX_W - 2.0 * PLATE_PAD),
     );
-    for line in layout.lines() {
-        for item in line.items() {
-            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                font_data_map.register(gr.run().font());
-            }
-        }
-    }
-    collect_msdf_glyphs(&layout, &[], &brush, (PLATE_PAD as f64, PLATE_PAD as f64), atlas)
+    collect_plate_glyphs(&layout, &brush, atlas, font_data_map)
 }
 
 /// `WellCardMaterial.shape` for a nameplate: texture aspect, soft corner, thin

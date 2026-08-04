@@ -30,14 +30,14 @@ use crate::dj::RenderPortTraffic;
 use crate::patch_graph::{EndpointInfo, PatchGraphReader, PatchGraphSnapshot, diff, without_plumbing};
 use crate::shaders::{ChordMaterial, WellCardMaterial};
 use crate::text::ShapingFonts;
-use crate::text::components::bevy_color_to_brush;
-use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
+use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::Screen;
 use crate::view::palette;
 use crate::view::room::nav::Station;
 use crate::view::room::{
-    PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text,
+    PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, collect_plate_glyphs,
+    layout_plate_text, plate_brush,
 };
 use crate::view::scene_palette::{ScenePalette, lin, lin_scaled};
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
@@ -1338,10 +1338,10 @@ fn choose_info_plate_size(
 /// Shrink-to-fit MSDF layout for the inspection plate (`PLATE_TEX_W`×`PLATE_TEX_H`):
 /// steps the font size down via [`choose_info_plate_size`] until the shaped
 /// `client:port -> client:port` fits the plate's usable box, then collects
-/// glyphs at that size. Same machinery as `room::layout_plate_text` (brush,
-/// atlas, MSDF collect) — it only adds the fit loop the fixed-size helper
-/// can't do, so a long wire name no longer overflows the frame
-/// (`docs/issues.md`).
+/// glyphs at that size via [`collect_plate_glyphs`] — the same brush and
+/// glyph-collection tail `room::layout_plate_text` uses; this only adds the
+/// fit loop the fixed-size helper can't do, so a long wire name no longer
+/// overflows the frame (`docs/issues.md`).
 fn layout_info_text(
     text: &str,
     font: &VelloFont,
@@ -1351,7 +1351,7 @@ fn layout_info_text(
     if text.is_empty() {
         return Vec::new();
     }
-    let brush = bevy_color_to_brush(Color::srgba(0.82, 0.88, 0.97, 0.9));
+    let brush = plate_brush();
     let max_w = PLATE_TEX_W - 2.0 * PLATE_PAD;
     let max_h = PLATE_TEX_H - 2.0 * PLATE_PAD;
     let style = |size: f32| VelloTextStyle { font_size: size, line_height: 1.1, ..default() };
@@ -1370,14 +1370,7 @@ fn layout_info_text(
     );
 
     let layout = font.layout(text, &style(chosen), VelloTextAlign::Middle, Some(max_w));
-    for line in layout.lines() {
-        for item in line.items() {
-            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                font_data_map.register(gr.run().font());
-            }
-        }
-    }
-    collect_msdf_glyphs(&layout, &[], &brush, (PLATE_PAD as f64, PLATE_PAD as f64), atlas)
+    collect_plate_glyphs(&layout, &brush, atlas, font_data_map)
 }
 
 // ── Plate + ribbon helpers ──────────────────────────────────────────────────
