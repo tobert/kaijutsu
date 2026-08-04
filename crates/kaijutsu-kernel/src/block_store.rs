@@ -27,7 +27,7 @@ use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
 
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
 use crate::input_doc::InputDocEntry;
-use crate::kernel_db::{DocumentRow, KernelDb};
+use crate::kernel_db::{DocumentRow, KernelDb, KernelDbError};
 
 /// Backward-compatible alias during migration.
 pub type DocumentKind = DocKind;
@@ -65,6 +65,19 @@ pub enum BlockStoreError {
 
     #[error("{0}")]
     Validation(String),
+
+    /// A DB row already exists at this `document_id`, but it does NOT match
+    /// the row `create_document`/`create_document_with_path` intended to
+    /// write (`doc_kind`, `workspace_id`, or `path` differ) — divergence
+    /// must never be silently "recovered" the way a genuine duplicate is.
+    /// See `insert_or_reconcile_document`.
+    #[error("document {id} diverged from its persisted row: {detail}")]
+    DocumentDiverged { id: ContextId, detail: String },
+
+    /// A *different* document already claims this `(workspace, path)` — a
+    /// hard error, never recovered.
+    #[error("path '{path}' is already claimed by document {existing}")]
+    DocumentPathConflict { path: String, existing: ContextId },
 }
 
 /// Result type alias for BlockStore operations.
@@ -392,6 +405,82 @@ impl BlockStore {
         *self.principal_id.write() = principal_id;
     }
 
+    /// Insert `row` via `db.insert_document`, reconciling the typed
+    /// conflict variants `create_document`/`create_document_with_path` can
+    /// see (docs/issues.md:361). Shared by both so the classification logic
+    /// exists exactly once.
+    ///
+    /// - `Ok(())` — inserted cleanly.
+    /// - `DuplicateDocument` — a row already exists at this `document_id`.
+    ///   Read it back and compare against `row`: if `doc_kind`,
+    ///   `workspace_id`, and `path` all match, this is the benign
+    ///   already-in-DB-not-in-memory recovery (a differing `language` is
+    ///   logged but not divergence). Any of those three differing — or the
+    ///   row vanishing between the insert and the read-back — is
+    ///   `DocumentDiverged`, which must NOT be silently recovered.
+    /// - `DocumentPathConflict` — a *different* document already claims this
+    ///   path. Always a hard error.
+    /// - anything else — wrapped as `BlockStoreError::Db`, as before.
+    fn insert_or_reconcile_document(db: &KernelDb, row: &DocumentRow) -> BlockStoreResult<()> {
+        match db.insert_document(row) {
+            Ok(()) => Ok(()),
+            Err(KernelDbError::DuplicateDocument(id)) => {
+                let persisted = db
+                    .get_document(id)
+                    .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+                let Some(persisted) = persisted else {
+                    return Err(BlockStoreError::DocumentDiverged {
+                        id,
+                        detail: "persisted row vanished between insert and read-back"
+                            .to_string(),
+                    });
+                };
+
+                let mut diffs = Vec::new();
+                if persisted.doc_kind != row.doc_kind {
+                    diffs.push(format!(
+                        "doc_kind: persisted={:?} intended={:?}",
+                        persisted.doc_kind, row.doc_kind
+                    ));
+                }
+                if persisted.workspace_id != row.workspace_id {
+                    diffs.push(format!(
+                        "workspace_id: persisted={} intended={}",
+                        persisted.workspace_id, row.workspace_id
+                    ));
+                }
+                if persisted.path != row.path {
+                    diffs.push(format!(
+                        "path: persisted={:?} intended={:?}",
+                        persisted.path, row.path
+                    ));
+                }
+                if !diffs.is_empty() {
+                    return Err(BlockStoreError::DocumentDiverged {
+                        id,
+                        detail: diffs.join("; "),
+                    });
+                }
+
+                // `language` differing is not divergence — log and continue.
+                if persisted.language != row.language {
+                    tracing::warn!(
+                        context_id = %id.to_hex(),
+                        persisted_language = ?persisted.language,
+                        intended_language = ?row.language,
+                        "Document language differs from persisted row; not treated as divergence"
+                    );
+                }
+                tracing::warn!(context_id = %id.to_hex(), "Document already in DB but not in memory, recovering");
+                Ok(())
+            }
+            Err(KernelDbError::DocumentPathConflict { path, existing }) => {
+                Err(BlockStoreError::DocumentPathConflict { path, existing })
+            }
+            Err(e) => Err(BlockStoreError::Db(e.to_string())),
+        }
+    }
+
     /// Create a new document.
     ///
     /// Uses DashMap `entry()` for atomicity — the DB INSERT only runs in the
@@ -421,16 +510,7 @@ impl BlockStore {
                         created_at: kaijutsu_types::now_millis() as i64,
                         created_by: principal_id,
                     };
-                    match db_guard.insert_document(&row) {
-                        Ok(()) => {}
-                        Err(e)
-                            if e.to_string().contains("UNIQUE constraint")
-                                || e.to_string().contains("already exists") =>
-                        {
-                            tracing::warn!(context_id = %context_id.to_hex(), "Document already in DB but not in memory, recovering");
-                        }
-                        Err(e) => return Err(BlockStoreError::Db(e.to_string())),
-                    }
+                    Self::insert_or_reconcile_document(&db_guard, &row)?;
                 }
 
                 let entry = DocumentEntry::new(context_id, kind, language, principal_id);
@@ -472,16 +552,7 @@ impl BlockStore {
                         created_at: kaijutsu_types::now_millis() as i64,
                         created_by: principal_id,
                     };
-                    match db_guard.insert_document(&row) {
-                        Ok(()) => {}
-                        Err(e)
-                            if e.to_string().contains("UNIQUE constraint")
-                                || e.to_string().contains("already exists") =>
-                        {
-                            tracing::warn!(context_id = %context_id.to_hex(), "Document already in DB but not in memory, recovering");
-                        }
-                        Err(e) => return Err(BlockStoreError::Db(e.to_string())),
-                    }
+                    Self::insert_or_reconcile_document(&db_guard, &row)?;
                 }
 
                 let entry = DocumentEntry::new(context_id, kind, language, principal_id);
@@ -6023,5 +6094,152 @@ mod tests {
             .filter(|b| b.kind == BlockKind::Error && b.parent_id == Some(block))
             .collect();
         assert_eq!(errors.len(), 1, "validation must be idempotent");
+    }
+
+    // ========================================================================
+    // docs/issues.md:361 — create_document / create_document_with_path must
+    // classify an insert_document failure via the typed KernelDbError
+    // variants (DuplicateDocument / DocumentPathConflict), not by matching
+    // error message text, and must tell a genuine benign duplicate apart
+    // from a divergent row claiming the same id or path.
+    // ========================================================================
+
+    /// 5. A matching row already in the DB (same id, kind, path=None) is the
+    /// genuine benign-recovery case: `create_document` must still return
+    /// `Ok` and the in-memory entry must exist. `test_merge_ops_persists_to_db`
+    /// already depends on this staying `Ok` — this test pins it directly.
+    #[test]
+    fn create_document_recovers_when_db_row_matches() {
+        use crate::kernel_db::{DocumentRow, KernelDb};
+        use kaijutsu_types::now_millis;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard.get_or_create_default_workspace(creator).unwrap()
+        };
+
+        let ctx = ContextId::new();
+        {
+            let db_guard = db.lock();
+            db_guard
+                .insert_document(&DocumentRow {
+                    document_id: ctx,
+                    workspace_id: ws_id,
+                    doc_kind: DocumentKind::Conversation,
+                    language: None,
+                    path: None,
+                    created_at: now_millis() as i64,
+                    created_by: creator,
+                })
+                .unwrap();
+        }
+
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .expect("matching DB row must recover, not error");
+        assert!(store.get(ctx).is_some(), "recovered document must be resident in memory");
+    }
+
+    /// 6. A DB row with the SAME id but a DIFFERENT `doc_kind` is divergence,
+    /// not benign duplication — `create_document` must return
+    /// `DocumentDiverged` and must NOT insert the in-memory entry.
+    #[test]
+    fn create_document_errors_on_diverged_kind() {
+        use crate::kernel_db::{DocumentRow, KernelDb};
+        use kaijutsu_types::now_millis;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard.get_or_create_default_workspace(creator).unwrap()
+        };
+
+        let ctx = ContextId::new();
+        {
+            let db_guard = db.lock();
+            db_guard
+                .insert_document(&DocumentRow {
+                    document_id: ctx,
+                    workspace_id: ws_id,
+                    doc_kind: DocumentKind::Code, // diverges from Conversation below
+                    language: None,
+                    path: None,
+                    created_at: now_millis() as i64,
+                    created_by: creator,
+                })
+                .unwrap();
+        }
+
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        let err = store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, BlockStoreError::DocumentDiverged { id, .. } if id == ctx),
+            "expected DocumentDiverged({ctx}), got: {err}"
+        );
+        assert!(
+            store.get(ctx).is_none(),
+            "a diverged document must not be inserted into memory"
+        );
+    }
+
+    /// 7. `create_document_with_path` where a DIFFERENT document already
+    /// owns that `(workspace, path)` must return `DocumentPathConflict` —
+    /// always a hard error, never recovered — and must NOT insert the
+    /// in-memory entry.
+    #[test]
+    fn create_document_with_path_errors_on_path_conflict() {
+        use crate::kernel_db::{DocumentRow, KernelDb};
+        use kaijutsu_types::now_millis;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard.get_or_create_default_workspace(creator).unwrap()
+        };
+
+        let existing_id = ContextId::new();
+        {
+            let db_guard = db.lock();
+            db_guard
+                .insert_document(&DocumentRow {
+                    document_id: existing_id,
+                    workspace_id: ws_id,
+                    doc_kind: DocumentKind::Conversation,
+                    language: None,
+                    path: Some("/etc/rc/shared.kai".into()),
+                    created_at: now_millis() as i64,
+                    created_by: creator,
+                })
+                .unwrap();
+        }
+
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        let new_id = ContextId::new();
+        let err = store
+            .create_document_with_path(
+                new_id,
+                DocumentKind::Conversation,
+                None,
+                "/etc/rc/shared.kai".to_string(),
+            )
+            .unwrap_err();
+        match &err {
+            BlockStoreError::DocumentPathConflict { path, existing } => {
+                assert_eq!(path, "/etc/rc/shared.kai");
+                assert_eq!(*existing, existing_id);
+            }
+            other => panic!("expected DocumentPathConflict, got: {other}"),
+        }
+        assert!(
+            store.get(new_id).is_none(),
+            "a path-conflicting document must not be inserted into memory"
+        );
     }
 }

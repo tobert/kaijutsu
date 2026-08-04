@@ -62,6 +62,18 @@ pub enum KernelDbError {
     /// General validation failure.
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// A document with this `document_id` already exists (PRIMARY KEY
+    /// conflict on `documents.document_id`) — read back from the DB, never
+    /// inferred from message text. See `classify_document_insert_error`.
+    #[error("document already exists: {0}")]
+    DuplicateDocument(ContextId),
+
+    /// A *different* document already claims this `(workspace_id, path)`
+    /// (the `idx_documents_path` partial-unique conflict) — read back from
+    /// the DB, never inferred from message text.
+    #[error("path '{path}' is already claimed by document {existing}")]
+    DocumentPathConflict { path: String, existing: ContextId },
 }
 
 pub type KernelDbResult<T> = Result<T, KernelDbError>;
@@ -1709,8 +1721,75 @@ impl KernelDb {
                     blob_param(row.created_by.as_bytes()),
                 ],
             )
-            .map_err(|e| map_unique_violation(e, "document already exists or path conflict"))?;
+            .map_err(|e| self.classify_document_insert_error(e, row))?;
         Ok(())
+    }
+
+    /// Classify an `insert_document` constraint-violation failure by READING
+    /// THE DB BACK, never by inspecting the SQLite/kaijutsu error message
+    /// text — `map_unique_violation` flattens every UNIQUE conflict into the
+    /// same `LabelConflict` string, which happened to make "document already
+    /// exists" and "path already claimed" indistinguishable except by luck of
+    /// wording (docs/issues.md:361).
+    ///
+    /// FK violations (extended code 787) and anything that isn't a
+    /// constraint violation delegate straight to `map_unique_violation`,
+    /// preserving today's `Validation` mapping exactly.
+    fn classify_document_insert_error(
+        &self,
+        e: rusqlite::Error,
+        row: &DocumentRow,
+    ) -> KernelDbError {
+        let is_constraint_violation = matches!(
+            &e,
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && err.extended_code != 787
+        );
+        if !is_constraint_violation {
+            return map_unique_violation(e, "document already exists or path conflict");
+        }
+
+        // Which constraint fired? Read back, don't guess from the message.
+        match self.get_document(row.document_id) {
+            Ok(Some(_)) => return KernelDbError::DuplicateDocument(row.document_id),
+            Ok(None) => {}
+            Err(read_err) => return read_err,
+        }
+        if let Some(path) = row.path.as_deref() {
+            match self.document_id_at_path(row.workspace_id, path) {
+                Ok(Some(existing)) => {
+                    return KernelDbError::DocumentPathConflict {
+                        path: path.to_string(),
+                        existing,
+                    };
+                }
+                Ok(None) => {}
+                Err(read_err) => return read_err,
+            }
+        }
+        // Neither read-back explains the failure — don't fabricate a
+        // classification, fall through to the existing generic mapping.
+        map_unique_violation(e, "document already exists or path conflict")
+    }
+
+    /// The `document_id` occupying `(workspace_id, path)`, if any. Backs
+    /// `classify_document_insert_error`'s read-back classification of the
+    /// `idx_documents_path` partial-unique conflict.
+    pub fn document_id_at_path(
+        &self,
+        workspace_id: WorkspaceId,
+        path: &str,
+    ) -> KernelDbResult<Option<ContextId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT document_id FROM documents WHERE workspace_id = ?1 AND path = ?2")?;
+        let mut rows = stmt.query(params![blob_param(workspace_id.as_bytes()), path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(read_context_id(row, 0)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Insert a document, ignoring if it already exists (idempotent).
@@ -10010,4 +10089,105 @@ mod tests {
              old (touched 3000) — last_activity_at must beat created_at"
         );
     }
+
+    // ── 30. insert_document constraint classification, by read-back ─────
+    //
+    // docs/issues.md:361 — `insert_document` failures used to be classified
+    // by matching `e.to_string()` against "UNIQUE constraint" / "already
+    // exists", which conflated the PRIMARY KEY conflict (same document,
+    // benign) with the `idx_documents_path` conflict (a different document
+    // claiming a taken path, divergent) and was only correct by luck of the
+    // message text. These prove the typed, read-back-based classification.
+
+    /// 1. Re-inserting a `DocumentRow` with an already-used `document_id`
+    /// must classify as `DuplicateDocument`, carrying the right id.
+    #[test]
+    fn insert_document_duplicate_id_is_typed_duplicate_document() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let doc_id = ContextId::new();
+        let row = DocumentRow {
+            document_id: doc_id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::system(),
+        };
+        db.insert_document(&row).unwrap();
+
+        // Same document_id again — same benign PRIMARY KEY conflict that
+        // `BlockStore::create_document` recovers from.
+        let err = db.insert_document(&row).unwrap_err();
+        match err {
+            KernelDbError::DuplicateDocument(id) => assert_eq!(id, doc_id),
+            other => panic!("expected DuplicateDocument({doc_id}), got: {other}"),
+        }
+    }
+
+    /// 2. Inserting a *different* document whose `(workspace_id, path)` is
+    /// already claimed must classify as `DocumentPathConflict`, carrying the
+    /// path and the id of the document that actually holds it.
+    #[test]
+    fn insert_document_path_conflict_is_typed_document_path_conflict() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let first_id = ContextId::new();
+        db.insert_document(&DocumentRow {
+            document_id: first_id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: Some("/etc/rc/shared.kai".into()),
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+
+        let second_id = ContextId::new();
+        let err = db
+            .insert_document(&DocumentRow {
+                document_id: second_id,
+                workspace_id: ws_id,
+                doc_kind: DocKind::Conversation,
+                language: None,
+                path: Some("/etc/rc/shared.kai".into()),
+                created_at: now_millis() as i64,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap_err();
+        match err {
+            KernelDbError::DocumentPathConflict { path, existing } => {
+                assert_eq!(path, "/etc/rc/shared.kai");
+                assert_eq!(existing, first_id);
+            }
+            other => panic!("expected DocumentPathConflict, got: {other}"),
+        }
+    }
+
+    /// 3. Guard: `idx_documents_path` is a *partial* unique index
+    /// (`WHERE path IS NOT NULL`) — two documents with `path: None` in the
+    /// same workspace must both insert cleanly. If someone "fixes" the index
+    /// into a full unique index, this must fail loudly.
+    #[test]
+    fn insert_document_two_null_paths_in_same_workspace_both_succeed() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        for _ in 0..2 {
+            db.insert_document(&DocumentRow {
+                document_id: ContextId::new(),
+                workspace_id: ws_id,
+                doc_kind: DocKind::Conversation,
+                language: None,
+                path: None,
+                created_at: now_millis() as i64,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap();
+        }
+    }
+
+    // 4. The existing FK-violation test (test 22, `fk_violation_is_validation_error`)
+    // stays green — see that test above; not duplicated here.
 }
