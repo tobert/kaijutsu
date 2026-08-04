@@ -151,6 +151,49 @@ pub fn create_ui_rtt_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Hand
     images.add(image)
 }
 
+/// Reallocate `texture`'s backing image (and repoint `image_node`) to match
+/// `logical_width`×`logical_height` scaled/clamped to physical px, if that
+/// target differs from what's currently allocated. Returns `true` when it
+/// actually resized (so `texture.image` now points at a fresh handle);
+/// `false` when the current allocation already matches, or the requested
+/// logical size is degenerate (`<= 0` on either axis) — in both cases
+/// nothing is touched.
+///
+/// Shared by `block_render::resize_block_textures` (sizes from each
+/// surface's own `built_width`/`built_height`, set by that surface's own
+/// build pass) and `dock::resize_dock_textures` (sizes from the dock's
+/// `ComputedNode` directly, every frame — the dock has no separate "build"
+/// pass gating when its layout size is trustworthy, so it reads live layout
+/// instead of a cached built size). That's a real difference in *what* each
+/// caller feeds this, not a stylistic one; this function owns only the
+/// "compute target dims, compare, reallocate, swap handles" plumbing that
+/// was identical either way.
+pub fn resize_rtt_texture(
+    texture: &mut UiRttTexture,
+    image_node: &mut ImageNode,
+    logical_width: f32,
+    logical_height: f32,
+    scale: f32,
+    max_dim: u32,
+    images: &mut Assets<Image>,
+) -> bool {
+    if logical_width <= 0.0 || logical_height <= 0.0 {
+        return false;
+    }
+
+    let (target_w, target_h) = ui_rtt_texture_dims(logical_width, logical_height, scale, max_dim);
+    if texture.width == target_w && texture.height == target_h {
+        return false;
+    }
+
+    let new_handle = create_ui_rtt_texture(images, target_w, target_h);
+    image_node.image = new_handle.clone();
+    texture.image = new_handle;
+    texture.width = target_w;
+    texture.height = target_h;
+    true
+}
+
 // ============================================================================
 // RENDER WORLD
 // ============================================================================

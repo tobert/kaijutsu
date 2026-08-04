@@ -13,9 +13,7 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::view::block_render::GpuTextureLimits;
-use crate::view::ui_rtt::{
-    UiVectorScene, UiRttTexture, create_ui_rtt_texture, logical_size, ui_rtt_texture_dims,
-};
+use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, logical_size};
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
@@ -743,20 +741,17 @@ pub fn resize_dock_textures(
     let max_dim = gpu_limits.max_texture_dim;
 
     for (computed, mut texture, mut image_node) in query.iter_mut() {
-        // ComputedNode is physical px; ui_rtt_texture_dims expects logical.
+        // ComputedNode is physical px; resize_rtt_texture expects logical.
         let size = logical_size(computed);
-        if size.x <= 0.0 || size.y <= 0.0 {
-            continue;
-        }
-
-        let (target_w, target_h) = ui_rtt_texture_dims(size.x, size.y, scale, max_dim);
-        if texture.width != target_w || texture.height != target_h {
-            let new_handle = create_ui_rtt_texture(&mut images, target_w, target_h);
-            image_node.image = new_handle.clone();
-            texture.image = new_handle;
-            texture.width = target_w;
-            texture.height = target_h;
-        }
+        crate::view::ui_rtt::resize_rtt_texture(
+            &mut texture,
+            &mut image_node,
+            size.x,
+            size.y,
+            scale,
+            max_dim,
+            &mut images,
+        );
     }
 }
 

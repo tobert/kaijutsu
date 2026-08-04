@@ -1458,27 +1458,18 @@ pub fn resize_block_textures(
     // must tolerate that one-frame gap.
     // MaterialNode's shader reads from the same texture for post-processing.
     for (mut texture, mat_node, mut image_node) in block_query.iter_mut() {
-        if texture.built_width <= 0.0 || texture.built_height <= 0.0 {
-            continue;
-        }
-
-        let (target_w, target_h) = crate::view::ui_rtt::ui_rtt_texture_dims(
-            texture.built_width,
-            texture.built_height,
+        let (built_width, built_height) = (texture.built_width, texture.built_height);
+        let resized = crate::view::ui_rtt::resize_rtt_texture(
+            &mut texture,
+            &mut image_node,
+            built_width,
+            built_height,
             scale,
             max_dim,
+            &mut images,
         );
-
-        if texture.width != target_w || texture.height != target_h {
-            let new_handle =
-                crate::view::ui_rtt::create_ui_rtt_texture(&mut images, target_w, target_h);
-            if let Some(mat) = fx_materials.get_mut(&mat_node.0) {
-                mat.texture = new_handle.clone();
-            }
-            image_node.image = new_handle.clone();
-            texture.image = new_handle;
-            texture.width = target_w;
-            texture.height = target_h;
+        if resized && let Some(mat) = fx_materials.get_mut(&mat_node.0) {
+            mat.texture = texture.image.clone();
         }
     }
 }
