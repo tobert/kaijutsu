@@ -77,7 +77,7 @@ use crate::interrupt::ContextInterruptState;
 use crate::kaijutsu_capnp::*;
 use crate::llm_stream::spawn_llm_for_prompt;
 
-use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+use kaijutsu_crdt::{BlockKind, ContentType, Role, Status, TaskStatus};
 // `derive_context_live_status` moved to kaijutsu-kernel (single source of
 // truth shared with `BlockStore::live_status`'s incremental cache); only
 // `live_status_tests` below still exercises it directly, so the import is
@@ -8067,6 +8067,7 @@ fn build_block_metadata(
         builder.set_has_stderr(true);
         builder.set_stderr(stderr);
     }
+    builder.set_task_status(meta.task_status.as_str());
 }
 
 /// Fill a Cap'n Proto `RenderCue` builder from the typed cue (docs/pcm.md "The
@@ -8782,6 +8783,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
         kaijutsu_crdt::BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
         kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+        kaijutsu_crdt::BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
     });
 
     // Set basic fields (no author — derived from id.principal_id)
@@ -8838,6 +8840,12 @@ fn set_block_snapshot(
     // Set content_type hint (MIME type)
     if block.content_type != ContentType::Plain {
         builder.set_content_type(block.content_type.as_mime());
+    }
+
+    // Set task lifecycle status (meaningful only on BlockKind::Task; "" on
+    // the wire falls back to Open, same convention as content_type/Plain)
+    if block.task_status != TaskStatus::default() {
+        builder.set_task_status(block.task_status.as_str());
     }
 
     // Set ephemeral flag
@@ -8906,6 +8914,7 @@ fn set_block_snapshot(
                     crate::kaijutsu_capnp::BlockKind::Resource
                 }
                 kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+                kaijutsu_crdt::BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
             });
         }
     }
@@ -9076,6 +9085,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                 crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
                 crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
+                crate::kaijutsu_capnp::BlockKind::Task => BlockKind::Task,
             });
         }
         if kinds.is_empty() {
@@ -9236,6 +9246,7 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                             crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
                             crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
+                            crate::kaijutsu_capnp::BlockKind::Task => BlockKind::Task,
                         })
                     })
                     .collect()

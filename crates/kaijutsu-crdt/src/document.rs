@@ -500,6 +500,7 @@ impl BlockDocument {
             error,
             notification: None, // Legacy document predates notification blocks
             resource: None,     // Legacy document predates resource blocks
+            task_status: kaijutsu_types::TaskStatus::default(), // Legacy document predates task blocks
             content_type: ContentType::Plain, // Legacy document predates content_type
             content_type_at: 0,               // Legacy document predates content_type
             order_key: None,                  // Legacy document uses DTE-backed ordering
@@ -511,6 +512,7 @@ impl BlockDocument {
             ephemeral_at: 0,
             excluded_at: 0,
             tool_meta_at: 0,
+            task_status_at: 0, // Legacy document predates task blocks
         })
     }
 

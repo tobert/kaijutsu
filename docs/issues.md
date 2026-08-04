@@ -276,12 +276,26 @@ clones at `~/src/research/hermes-agent` + `~/src/research/QwenPaw` — and wrote
 the comparison to `~/src/meadow-lab/docs/kaijutsu-gap-analysis.md`. kj already
 wins model switching, semantic memory, OTel, and CRDT-native state; the gaps:
 
-- **Task BlockKind + tool — spin up soon** (Amy: *"Task BlockKind and tool is
-  a great idea"*). Neither harness beats a todo tool writing JSON to disk; a
-  `BlockKind::Task` gets multi-frontend task sync from the CRDT for free.
+- **Task BlockKind + tool — SHIPPED 2026-08-04** (Amy: *"Task BlockKind and
+  tool is a great idea"*). `BlockKind::Task` + a dedicated CRDT-synced
+  `task_status`/`task_status_at` field (mirrors `content_type`'s exact
+  mechanism — its own `TaskStatus` enum, not a reuse of the tool-execution-
+  shaped `Status`) get multi-frontend task sync from the CRDT for free.
   Closes the "no task/plan state — compare TodoWrite" gap noted in the
-  day-job entry above. Needs: kind + status/parent metadata conventions, a
-  tool verb set (create/complete/groom); app/kj rendering can trail.
+  day-job entry above. `builtin.tasks` (`mcp/servers/tasks.rs`) exposes
+  create/update/complete/cancel/list (open/done buckets); subtasks reuse
+  the ordinary `parent_id` DAG edge. Hydration mirrors `BlockKind::Notification`
+  (D-34): a task's creation/current-state is appended once per
+  `ConversationMailbox`'s `seen`-keyed translate-once rule, so a later status
+  edit never rewrites an already-cached message. Design note: `docs/tasks.md`.
+  **Deferred** (kept narrow on purpose): app/kj-CLI rendering (a placeholder
+  `[status] content` line covers `kaijutsu-app` for now), a `task_reparent`
+  verb (no cheap "move to new parent" primitive exists yet — `move_block`
+  only reorders siblings), and — the one real design gap — a companion
+  `Notification` block auto-emitted when a task changes from OUTSIDE the
+  model's own tool call (another principal grooming via the app), so an
+  out-of-band change actually reaches a live conversation instead of only
+  showing up at the next boundary re-hydrate.
 - **EvictionIndex as an oplog view** (QwenPaw `scroll/eviction_index.py`, the
   best idea in either codebase): compressed-out history collapses into a
   tiered in-context "odometer" (capped blocks per tier, older tiers carry
@@ -308,8 +322,7 @@ wins model switching, semantic memory, OTel, and CRDT-native state; the gaps:
 - Always-on hardening already tracked elsewhere in this file (MCP audit,
   `register_session` reconnect, hook self-lockout, WorkspaceGuard fail-open)
   graduates from papercut to blocker once the kernel runs unattended.
-- Scheduling steals folded into **"Grooming tracks"** below — that entry is
-  this arc's cron half.
+- Scheduling steals folded into **"Grooming tracks"** below — that entry is this arc's cron half.
 - **ACP adapter (`kaijutsu-acp`) — the mobile shortcut** (researched
   2026-08-04). ACP v1 went stable 2026-06-24 (schema 1.20.0), governance
   moved off Zed to a neutral `agentclientprotocol` org, LSP-style. Mobile
@@ -689,8 +702,6 @@ than left to rot.
   `Task`, which blocks or wakes the caller. Seam documented at
   `request_child_turn` (`kj/fork.rs`). *(Relates to "Headless one-shot with
   JSONL streaming" below.)*
-- **No task/plan state.** No `BlockKind` variant, no tool. A model can only
-  `block_create` freeform text and re-read it. Compare TodoWrite.
 - **No LSP / diagnostics** — no go-to-definition, no type errors without paying
   for a full compile.
 

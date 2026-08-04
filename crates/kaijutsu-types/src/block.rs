@@ -167,6 +167,12 @@ pub struct BlockHeader {
     pub is_error: bool,
     /// Content type for rendering (LWW via `content_type_at`).
     pub content_type: ContentType,
+    /// Lifecycle status for `BlockKind::Task` blocks (LWW via
+    /// `task_status_at`). Meaningful only when `kind == BlockKind::Task`;
+    /// defaults to `TaskStatus::Open` on every other kind (unused, never
+    /// read). See [`TaskStatus`] for why this is a dedicated field rather
+    /// than a reuse of `status`.
+    pub task_status: TaskStatus,
 
     // ── Per-field LWW timestamps ────────────────────────────────────────
     // Each mutable field group has its own Lamport timestamp for independent
@@ -183,6 +189,8 @@ pub struct BlockHeader {
     pub tool_meta_at: u64,
     /// Lamport timestamp for `content_type` field.
     pub content_type_at: u64,
+    /// Lamport timestamp for `task_status` field.
+    pub task_status_at: u64,
 }
 
 impl BlockHeader {
@@ -203,12 +211,14 @@ impl BlockHeader {
             exit_code: snap.exit_code,
             is_error: snap.is_error,
             content_type: snap.content_type,
+            task_status: snap.task_status,
             status_at: snap.status_at,
             collapsed_at: snap.collapsed_at,
             ephemeral_at: snap.ephemeral_at,
             excluded_at: snap.excluded_at,
             tool_meta_at: snap.tool_meta_at,
             content_type_at: snap.content_type_at,
+            task_status_at: snap.task_status_at,
         }
     }
 
@@ -220,6 +230,7 @@ impl BlockHeader {
             .max(self.excluded_at)
             .max(self.tool_meta_at)
             .max(self.content_type_at)
+            .max(self.task_status_at)
     }
 
     /// Check if this is a root block (no parent).
@@ -933,6 +944,44 @@ pub fn format_resource_for_llm(block: &BlockSnapshot) -> String {
     format!("<resource {}>\n{}\n</resource>", attrs, body)
 }
 
+/// Format a Task block for inclusion in LLM context.
+///
+/// Produces an XML-ish envelope carrying the block's CURRENT `task_status`
+/// and content at the moment of hydration:
+/// ```text
+/// <task id="..." status="open" parent="...">
+/// Buy groceries
+/// </task>
+/// ```
+/// `parent` is present only for subtasks (`parent_id` is `Some`).
+///
+/// See `docs/tasks.md` "Hydration" for why this is a one-time appended
+/// message, never mutated in place: `HydrationState`/`ConversationMailbox`
+/// translate a given `BlockId` at most once (mirrors `BlockKind::Notification`
+/// — D-34), so a later status/text edit on the SAME task block does not
+/// retroactively rewrite an already-hydrated message. That's what keeps a
+/// task update from invalidating the LLM prompt cache prefix: the edit never
+/// touches bytes that were already sent. A boundary re-hydrate (fork, new
+/// context, cold start, attach) re-derives this envelope from the block's
+/// then-current LWW-merged fields, so the *next* full hydration always shows
+/// the truth — only the *live, already-cached* conversation is stale until
+/// that next boundary (or a fresh companion event, e.g. a `Notification`
+/// block announcing the change — not implemented by this slice; see
+/// `docs/tasks.md`).
+pub fn format_task_for_llm(block: &BlockSnapshot) -> String {
+    let parent_attr = block
+        .parent_id
+        .map(|p| format!(" parent=\"{}\"", p.to_key()))
+        .unwrap_or_default();
+    format!(
+        "<task id=\"{}\" status=\"{}\"{}>\n{}\n</task>",
+        block.id.to_key(),
+        block.task_status.as_str(),
+        parent_attr,
+        block.content,
+    )
+}
+
 /// Execution status for blocks (CRDT-synced).
 ///
 /// Discriminant order matters for LWW tiebreaking: when two peers write at the
@@ -1058,6 +1107,18 @@ pub enum BlockKind {
     #[serde(rename = "trace")]
     #[strum(serialize = "trace")]
     Trace,
+    /// A groomable task/plan item — household-agent grooming (create,
+    /// update, complete, cancel, list). `content` carries the title/
+    /// description; `task_status` (a dedicated CRDT-synced field, see
+    /// [`TaskStatus`]) carries the lifecycle state. Subtasks reuse the
+    /// ordinary DAG `parent_id` edge — no bespoke hierarchy. Unlike
+    /// `Notification`/`Resource`/`Error`, a Task's `role` follows normal
+    /// content-authorship (whoever/whatever created it), not a forced
+    /// `System` — see `BlockSnapshotBuilder::task`. See `docs/tasks.md`
+    /// for the full design, hydration reasoning especially.
+    #[serde(rename = "task")]
+    #[strum(serialize = "task")]
+    Task,
 }
 
 impl BlockKind {
@@ -1080,6 +1141,7 @@ impl BlockKind {
             BlockKind::Notification => "notification",
             BlockKind::Resource => "resource",
             BlockKind::Trace => "trace",
+            BlockKind::Task => "task",
         }
     }
 
@@ -1111,6 +1173,11 @@ impl BlockKind {
     /// Check if this is a resource block.
     pub fn is_resource(&self) -> bool {
         matches!(self, BlockKind::Resource)
+    }
+
+    /// Check if this is a task block.
+    pub fn is_task(&self) -> bool {
+        matches!(self, BlockKind::Task)
     }
 }
 
@@ -1206,6 +1273,78 @@ impl DriftKind {
 }
 
 impl std::fmt::Display for DriftKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Lifecycle status for `BlockKind::Task` blocks.
+///
+/// A dedicated enum, not a reuse of [`Status`]. `Status` (Pending/Running/
+/// Done/Error) is tool-execution shaped: `Error` means "the tool crashed,"
+/// and its LWW tie-break order (`Error > Done > Running > Pending`) exists
+/// so a concurrent completion report can never mask a real failure. Neither
+/// half of that fits a task: a task doesn't "error," and there's no honest
+/// way to fold `Cancelled` — an intentional groom decision, not a failure —
+/// into `Status` without mislabeling it. `TaskStatus` says what actually
+/// happened; see `BlockHeader::task_status`/`task_status_at` for the CRDT
+/// plumbing (mirrors `content_type`/`content_type_at` exactly, giving task
+/// status the same multi-frontend LWW sync for free).
+///
+/// LWW tie-break order is the derived (declaration-order) `Ord`:
+/// `Open < InProgress < Done < Cancelled`. Both terminal states dominate
+/// `Open`/`InProgress` (a concurrent groom action should never be masked by
+/// a stale in-progress write), and between the two terminals `Cancelled`
+/// wins a same-timestamp race — treated as the more deliberate of two
+/// concurrent terminal writes on one task. True concurrent done/cancel
+/// races on a single task are rare; this only needs to be *a* deterministic
+/// answer both peers compute independently (same precedent as `Status` and
+/// `ContentType::richness`).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(ascii_case_insensitive)]
+pub enum TaskStatus {
+    /// Not started yet (the default for a freshly created task).
+    #[default]
+    Open,
+    /// Actively being worked.
+    #[strum(serialize = "in_progress", serialize = "inprogress", serialize = "active")]
+    InProgress,
+    /// Completed.
+    #[strum(serialize = "done", serialize = "complete", serialize = "completed")]
+    Done,
+    /// Deliberately abandoned — distinct from `Done`, never conflated with
+    /// `Status::Error`.
+    #[strum(serialize = "cancelled", serialize = "canceled")]
+    Cancelled,
+}
+
+impl TaskStatus {
+    /// Parse from string (case-insensitive).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        <Self as FromStr>::from_str(s).ok()
+    }
+
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Open => "open",
+            TaskStatus::InProgress => "in_progress",
+            TaskStatus::Done => "done",
+            TaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    /// Check if this status indicates the task is finished (Done or Cancelled).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TaskStatus::Done | TaskStatus::Cancelled)
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -1350,6 +1489,14 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub resource: Option<ResourcePayload>,
 
+    // Task-specific fields (Task)
+    /// Lifecycle status. Meaningful only when `kind == BlockKind::Task`
+    /// (defaults to `TaskStatus::Open` and is unused on every other kind —
+    /// same convention as `content_type`/`ContentType::Plain`). CRDT-synced
+    /// via `task_status_at` (LWW), independent of `status`/`status_at`.
+    #[serde(default)]
+    pub task_status: TaskStatus,
+
     // Content type hint
     /// Content type for rendering. When not `Plain`, consumers skip heuristic
     /// detection and use the declared type directly.
@@ -1415,6 +1562,9 @@ pub struct BlockSnapshot {
     /// Lamport timestamp for `content_type` field.
     #[serde(default)]
     pub content_type_at: u64,
+    /// Lamport timestamp for `task_status` field.
+    #[serde(default)]
+    pub task_status_at: u64,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1433,6 +1583,11 @@ pub struct BlockMetadata {
     pub ephemeral: bool,
     pub tool_use_id: Option<String>,
     pub stderr: Option<String>,
+    /// Task lifecycle status (`BlockKind::Task` only). Rides this generic
+    /// scalar-metadata event rather than a dedicated flow kind — same
+    /// treatment as `content_type`, which is also "scalar, not DTE-tracked,
+    /// applies across kinds."
+    pub task_status: TaskStatus,
 }
 
 impl BlockSnapshot {
@@ -1450,6 +1605,7 @@ impl BlockSnapshot {
             ephemeral: self.ephemeral,
             tool_use_id: self.tool_use_id.clone(),
             stderr: self.stderr.clone(),
+            task_status: self.task_status,
         }
     }
 
@@ -1492,6 +1648,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1503,6 +1660,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1540,6 +1698,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1551,6 +1710,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1600,6 +1760,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1611,6 +1772,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1660,6 +1822,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1671,6 +1834,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1727,6 +1891,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1738,6 +1903,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1782,6 +1948,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1793,6 +1960,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1835,6 +2003,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1846,6 +2015,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1888,6 +2058,7 @@ impl BlockSnapshot {
             error: Some(payload),
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1899,6 +2070,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1937,6 +2109,7 @@ impl BlockSnapshot {
             error: Some(payload),
             notification: None,
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -1948,6 +2121,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -1997,6 +2171,7 @@ impl BlockSnapshot {
             error: None,
             notification: None,
             resource: Some(payload),
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -2008,6 +2183,68 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
+        }
+    }
+
+    /// Create a task block (household-agent grooming — create/update/
+    /// complete/cancel/list). `role` follows normal content-authorship
+    /// (whoever/whatever created it) — unlike `resource_block`/
+    /// `notification_block`, this does NOT force `Role::System`; see
+    /// `BlockKind::Task`. `parent_id` doubles as the subtask edge (reuse
+    /// of the ordinary DAG parent, not a bespoke hierarchy).
+    pub fn task_block(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        role: Role,
+        status: TaskStatus,
+        content: impl Into<String>,
+    ) -> Self {
+        assert!(
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
+            "parent_id must be in same context as task block"
+        );
+        Self {
+            id,
+            parent_id,
+            role,
+            status: Status::Done,
+            kind: BlockKind::Task,
+            content: content.into(),
+            collapsed: false,
+            ephemeral: false,
+            excluded: false,
+            created_at: crate::now_millis(),
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            stderr: None,
+            signature: None,
+            output: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+            file_path: None,
+            error: None,
+            notification: None,
+            resource: None,
+            task_status: status,
+            content_type: ContentType::Plain,
+            order_key: None,
+            tick: None,
+            track: None,
+            updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            excluded_at: 0,
+            tool_meta_at: 0,
+            content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -2055,6 +2292,7 @@ impl BlockSnapshot {
             error: None,
             notification: Some(payload),
             resource: None,
+            task_status: TaskStatus::default(),
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
@@ -2066,6 +2304,7 @@ impl BlockSnapshot {
             excluded_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
+            task_status_at: 0,
         }
     }
 
@@ -2119,6 +2358,7 @@ impl BlockSnapshot {
             && self.notification == other.notification
             && self.resource == other.resource
             && self.content_type == other.content_type
+            && self.task_status == other.task_status
             && self.order_key == other.order_key
             && self.track == other.track
     }
@@ -2180,6 +2420,7 @@ impl BlockSnapshotBuilder {
                 error: None,
                 notification: None,
                 resource: None,
+                task_status: TaskStatus::default(),
                 content_type: ContentType::Plain,
                 order_key: None,
                 tick: None,
@@ -2191,6 +2432,7 @@ impl BlockSnapshotBuilder {
                 excluded_at: 0,
                 tool_meta_at: 0,
                 content_type_at: 0,
+                task_status_at: 0,
             },
         }
     }
@@ -2347,6 +2589,26 @@ impl BlockSnapshotBuilder {
         self.snap.resource = Some(payload);
         self.snap.kind = BlockKind::Resource;
         self.snap.role = Role::System;
+        self
+    }
+
+    /// Set `kind = Task` with the given lifecycle status. Deliberately does
+    /// NOT force `role = System` the way `notification_payload`/
+    /// `resource_payload`/`error_payload` do: those are broker-emitted
+    /// events, but a task is ordinary authored content (a user, a model, or
+    /// a tool creates it) — `role` follows whatever `.role(...)` set (or the
+    /// builder's `Role::User` default). See `BlockKind::Task`.
+    pub fn task(mut self, status: TaskStatus) -> Self {
+        self.snap.task_status = status;
+        self.snap.kind = BlockKind::Task;
+        self
+    }
+
+    /// Set the task lifecycle status without changing `kind` (for building a
+    /// snapshot that's already `Task`-kind via `.task(..)` or the `new(id,
+    /// BlockKind::Task)` constructor).
+    pub fn task_status(mut self, status: TaskStatus) -> Self {
+        self.snap.task_status = status;
         self
     }
 
@@ -4771,5 +5033,226 @@ mod tests {
             "fallback content",
         );
         assert_eq!(format_resource_for_llm(&snap), "fallback content");
+    }
+
+    // ── TaskStatus / BlockKind::Task ───────────────────────────────────────
+
+    #[test]
+    fn test_task_status_parsing() {
+        assert_eq!(TaskStatus::from_str("open"), Some(TaskStatus::Open));
+        assert_eq!(TaskStatus::from_str("OPEN"), Some(TaskStatus::Open));
+        assert_eq!(
+            TaskStatus::from_str("in_progress"),
+            Some(TaskStatus::InProgress)
+        );
+        assert_eq!(
+            TaskStatus::from_str("active"),
+            Some(TaskStatus::InProgress)
+        );
+        assert_eq!(TaskStatus::from_str("done"), Some(TaskStatus::Done));
+        assert_eq!(TaskStatus::from_str("completed"), Some(TaskStatus::Done));
+        assert_eq!(
+            TaskStatus::from_str("cancelled"),
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(
+            TaskStatus::from_str("canceled"),
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(TaskStatus::from_str("bogus"), None);
+        assert_eq!(TaskStatus::default(), TaskStatus::Open);
+    }
+
+    #[test]
+    fn test_task_status_is_terminal() {
+        assert!(!TaskStatus::Open.is_terminal());
+        assert!(!TaskStatus::InProgress.is_terminal());
+        assert!(TaskStatus::Done.is_terminal());
+        assert!(TaskStatus::Cancelled.is_terminal());
+    }
+
+    /// Pins the LWW tie-break order documented on `TaskStatus`: both
+    /// terminal states dominate the non-terminal states, and `Cancelled`
+    /// dominates `Done`. If someone reorders the enum's declaration later,
+    /// this test breaks loudly instead of silently flipping merge outcomes.
+    #[test]
+    fn test_task_status_lww_tiebreak_order() {
+        assert!(TaskStatus::Open < TaskStatus::InProgress);
+        assert!(TaskStatus::InProgress < TaskStatus::Done);
+        assert!(TaskStatus::Done < TaskStatus::Cancelled);
+        assert!(TaskStatus::Cancelled > TaskStatus::Open);
+    }
+
+    #[test]
+    fn test_task_status_serde_roundtrip() {
+        for status in [
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            TaskStatus::Done,
+            TaskStatus::Cancelled,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, parsed);
+        }
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::InProgress).unwrap(),
+            "\"in_progress\""
+        );
+    }
+
+    #[test]
+    fn test_block_kind_task_parses() {
+        assert_eq!(BlockKind::from_str("task"), Some(BlockKind::Task));
+        assert_eq!(BlockKind::from_str("TASK"), Some(BlockKind::Task));
+        assert_eq!(BlockKind::Task.as_str(), "task");
+        assert!(BlockKind::Task.is_task());
+        assert!(!BlockKind::Text.is_task());
+    }
+
+    #[test]
+    fn test_block_kind_task_serde_roundtrip() {
+        let json = serde_json::to_string(&BlockKind::Task).unwrap();
+        assert_eq!(json, "\"task\"");
+        let parsed: BlockKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, BlockKind::Task);
+    }
+
+    #[test]
+    fn test_task_block_constructor_sets_fields() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let snap = BlockSnapshot::task_block(id, None, Role::User, TaskStatus::Open, "Buy milk");
+
+        assert_eq!(snap.kind, BlockKind::Task);
+        // Task role follows ordinary authorship — NOT forced to System, unlike
+        // notification_block/resource_block (broker-emitted events).
+        assert_eq!(snap.role, Role::User);
+        assert_eq!(snap.task_status, TaskStatus::Open);
+        assert_eq!(snap.content, "Buy milk");
+        assert!(snap.parent_id.is_none());
+    }
+
+    #[test]
+    fn test_task_block_subtask_reuses_parent_id() {
+        let ctx = test_context();
+        let parent_id = BlockId::new(ctx, test_agent(), 1);
+        let child_id = BlockId::new(ctx, test_agent(), 2);
+        let snap = BlockSnapshot::task_block(
+            child_id,
+            Some(parent_id),
+            Role::Model,
+            TaskStatus::Open,
+            "Buy oat milk specifically",
+        );
+        // Subtask nesting rides the ordinary DAG parent_id edge — no
+        // dedicated hierarchy field.
+        assert_eq!(snap.parent_id, Some(parent_id));
+    }
+
+    #[test]
+    fn test_text_constructor_has_default_task_status() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::User,
+            "hello",
+        );
+        assert_eq!(snap.kind, BlockKind::Text);
+        assert_eq!(snap.task_status, TaskStatus::Open); // unused default, not meaningful
+    }
+
+    #[test]
+    fn test_task_block_content_eq_includes_task_status() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let snap_a = BlockSnapshot::task_block(id, None, Role::User, TaskStatus::Open, "a");
+        let snap_b = BlockSnapshot::task_block(id, None, Role::User, TaskStatus::Done, "a");
+        assert!(!snap_a.content_eq(&snap_b));
+    }
+
+    #[test]
+    fn test_task_block_snapshot_json_roundtrip() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let snap = BlockSnapshot::task_block(
+            id,
+            None,
+            Role::User,
+            TaskStatus::InProgress,
+            "Buy milk",
+        );
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.content_eq(&snap));
+        assert_eq!(parsed.task_status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn test_builder_task() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::Model)
+            .content("Buy milk")
+            .task(TaskStatus::InProgress)
+            .build();
+        assert_eq!(snap.kind, BlockKind::Task);
+        // Builder's `.task()` does NOT force role — stays whatever `.role()` set.
+        assert_eq!(snap.role, Role::Model);
+        assert_eq!(snap.task_status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn format_task_for_llm_envelope_shape() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let snap =
+            BlockSnapshot::task_block(id, None, Role::User, TaskStatus::Open, "Buy milk");
+        let formatted = format_task_for_llm(&snap);
+        assert!(formatted.starts_with("<task "));
+        assert!(formatted.ends_with("</task>"));
+        assert!(formatted.contains(&format!("id=\"{}\"", id.to_key())));
+        assert!(formatted.contains("status=\"open\""));
+        assert!(formatted.contains("Buy milk"));
+        assert!(!formatted.contains("parent="));
+    }
+
+    #[test]
+    fn format_task_for_llm_includes_parent_for_subtasks() {
+        let ctx = test_context();
+        let parent_id = BlockId::new(ctx, test_agent(), 1);
+        let child_id = BlockId::new(ctx, test_agent(), 2);
+        let snap = BlockSnapshot::task_block(
+            child_id,
+            Some(parent_id),
+            Role::User,
+            TaskStatus::Done,
+            "Buy oat milk",
+        );
+        let formatted = format_task_for_llm(&snap);
+        assert!(formatted.contains("status=\"done\""));
+        assert!(formatted.contains(&format!("parent=\"{}\"", parent_id.to_key())));
+    }
+
+    /// Current-state-at-hydration-time: `format_task_for_llm` always reflects
+    /// whatever `task_status`/`content` the snapshot carries *right now* — it
+    /// has no memory of a prior render. Mutating the snapshot's fields (what
+    /// a CRDT merge does before a boundary re-hydrate) changes the next
+    /// envelope produced from it. The "don't retroactively rewrite an
+    /// already-hydrated message" half of the contract lives in
+    /// `ConversationMailbox`'s translate-once-per-BlockId behavior (kernel
+    /// crate); this test pins the piece that lives in this crate.
+    #[test]
+    fn format_task_for_llm_reflects_current_snapshot_fields() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let mut snap =
+            BlockSnapshot::task_block(id, None, Role::User, TaskStatus::Open, "Buy milk");
+        assert!(format_task_for_llm(&snap).contains("status=\"open\""));
+
+        snap.task_status = TaskStatus::Done;
+        assert!(format_task_for_llm(&snap).contains("status=\"done\""));
     }
 }

@@ -2433,6 +2433,7 @@ fn set_block_filter_builder(
                     BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
                     BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
                     BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+                    BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
                 },
             );
         }
@@ -2569,6 +2570,7 @@ fn set_block_event_filter_builder(
                     BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
                     BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
                     BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+                    BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
                 },
             );
         }
@@ -2650,6 +2652,12 @@ pub(crate) fn parse_block_metadata(
     } else {
         None
     };
+    let task_status = reader
+        .get_task_status()
+        .ok()
+        .and_then(|t| t.to_str().ok())
+        .and_then(kaijutsu_types::TaskStatus::from_str)
+        .unwrap_or_default();
     kaijutsu_types::BlockMetadata {
         exit_code: reader.get_has_exit_code().then(|| reader.get_exit_code()),
         is_error: reader.get_is_error(),
@@ -2657,6 +2665,7 @@ pub(crate) fn parse_block_metadata(
         ephemeral: reader.get_ephemeral(),
         tool_use_id,
         stderr,
+        task_status,
     }
 }
 
@@ -3008,6 +3017,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
         crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
         crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
+        crate::kaijutsu_capnp::BlockKind::Task => BlockKind::Task,
     };
 
     let mut builder = BlockSnapshotBuilder::new(id, kind);
@@ -3162,6 +3172,16 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.content_type(ContentType::from_mime(s));
     }
 
+    // Task lifecycle status (BlockKind::Task; "" falls back to the builder's
+    // default Open, same "empty = default" convention as content_type)
+    if reader.has_task_status()
+        && let Ok(ts) = reader.get_task_status()
+        && let Ok(s) = ts.to_str()
+        && let Some(status) = kaijutsu_types::TaskStatus::from_str(s)
+    {
+        builder = builder.task_status(status);
+    }
+
     // Ephemeral flag (human-only, excluded from LLM hydration)
     if reader.get_ephemeral() {
         builder = builder.ephemeral(true);
@@ -3233,6 +3253,7 @@ pub(crate) fn parse_block_snapshot(
                 crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                 crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
                 crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
+                crate::kaijutsu_capnp::BlockKind::Task => BlockKind::Task,
             })
         } else {
             None
@@ -3774,6 +3795,18 @@ mod tests {
             id.set_seq(snap.id.seq);
         }
 
+        // Set parent_id if present (DAG edge — also the subtask edge for
+        // BlockKind::Task; no dedicated wire field needed).
+        if let Some(ref parent) = snap.parent_id {
+            builder.set_has_parent_id(true);
+            let mut pid = builder.reborrow().init_parent_id();
+            pid.set_context_id(parent.context_id.as_bytes());
+            pid.set_principal_id(parent.principal_id.as_bytes());
+            pid.set_seq(parent.seq);
+        } else {
+            builder.set_has_parent_id(false);
+        }
+
         // Set kind
         builder.set_kind(match snap.kind {
             BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
@@ -3786,6 +3819,7 @@ mod tests {
             BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
             BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
             BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
+            BlockKind::Task => crate::kaijutsu_capnp::BlockKind::Task,
         });
 
         // Set role
@@ -3918,6 +3952,13 @@ mod tests {
             builder.set_signature(signature);
         }
 
+        // Task lifecycle status ("" on the wire means Open/default, same
+        // convention as content_type/Plain — see kaijutsu-server's
+        // set_block_snapshot).
+        if snap.task_status != kaijutsu_types::TaskStatus::default() {
+            builder.set_task_status(snap.task_status.as_str());
+        }
+
         // Parse back
         let reader = message
             .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
@@ -4036,6 +4077,66 @@ mod tests {
         // A block with no signature roundtrips as None (hasSignature=false).
         let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
         assert_eq!(roundtrip_snapshot(&plain).signature, None);
+    }
+
+    /// Task block round-trip (household-agent arc, docs/tasks.md): create →
+    /// capnp serialize → deserialize → same `kind`/`task_status`/`content`/
+    /// `parent_id`. Covers every non-default `TaskStatus` (the default,
+    /// Open, is covered by the "plain block" empty-string-fallback case
+    /// below — the wire convention `"" == Open` needs its own assertion,
+    /// not just "whatever the enum's Default happens to be").
+    #[test]
+    fn test_task_block_capnp_roundtrip() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let id = BlockId {
+            context_id: ctx,
+            principal_id: principal,
+            seq: 1,
+        };
+
+        for status in [
+            kaijutsu_types::TaskStatus::Open,
+            kaijutsu_types::TaskStatus::InProgress,
+            kaijutsu_types::TaskStatus::Done,
+            kaijutsu_types::TaskStatus::Cancelled,
+        ] {
+            let snap = kaijutsu_types::BlockSnapshotBuilder::new(id, BlockKind::Task)
+                .role(Role::Tool)
+                .content("Buy milk")
+                .task_status(status)
+                .build();
+            let round_tripped = roundtrip_snapshot(&snap);
+            assert_eq!(round_tripped.kind, BlockKind::Task, "status={status:?}");
+            assert_eq!(round_tripped.task_status, status, "status={status:?}");
+            assert_eq!(round_tripped.content, "Buy milk", "status={status:?}");
+        }
+
+        // Subtask: parent_id round-trips too (the ordinary DAG edge, no
+        // task-specific wire field needed).
+        let parent_id = id;
+        let child_id = BlockId {
+            context_id: ctx,
+            principal_id: principal,
+            seq: 2,
+        };
+        let subtask = kaijutsu_types::BlockSnapshotBuilder::new(child_id, BlockKind::Task)
+            .role(Role::Tool)
+            .content("Buy oat milk")
+            .task_status(kaijutsu_types::TaskStatus::Open)
+            .parent_id(parent_id)
+            .build();
+        let round_tripped = roundtrip_snapshot(&subtask);
+        assert_eq!(round_tripped.parent_id, Some(parent_id));
+
+        // "" on the wire falls back to Open — an ordinary (non-task) block
+        // never wrote task_status, so it must decode as the default, not an
+        // error or garbage value.
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        assert_eq!(
+            roundtrip_snapshot(&plain).task_status,
+            kaijutsu_types::TaskStatus::Open
+        );
     }
 
     #[test]

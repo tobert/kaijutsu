@@ -75,6 +75,10 @@ enum BlockKind {
   # Operator/UI telemetry — rc stdout, hook output, kernel diagnostics.
   # Hydrator skips unconditionally so the LLM never sees them.
   trace @9;
+  # Groomable task/plan item (household-agent grooming). Lifecycle rides
+  # `taskStatus` (a Text field below, same convention as `contentType` —
+  # no dedicated capnp enum). Subtasks reuse `parentId`.
+  task @10;
 }
 
 # Which execution engine handled a tool call/result.
@@ -267,6 +271,10 @@ struct BlockSnapshot {
   # nonce. Absent on non-reasoning and legacy/older-wire blocks.
   signature @39 :Text;
   hasSignature @40 :Bool;        # True if signature is set (distinguishes "" from unset)
+
+  # Task lifecycle status (task blocks). "" falls back to "open" — same
+  # "empty = default" convention as contentType (no dedicated capnp enum).
+  taskStatus @41 :Text;
 }
 
 # Full context state — blocks + CRDT oplog for sync
@@ -331,6 +339,9 @@ struct BlockMetadata {
   toolUseId @5 :Text;         # LLM-assigned tool invocation id ("" if unset)
   stderr @6 :Text;            # Standard error stream
   hasStderr @7 :Bool;         # True if stderr is set (distinguishes "" from unset)
+  # Task lifecycle status (BlockKind::Task only); "" falls back to "open",
+  # same "empty = default" convention as contentType.
+  taskStatus @8 :Text;
 }
 
 # A render directive crossing the seam to an off-box sink (docs/midi.md

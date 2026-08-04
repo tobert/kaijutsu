@@ -7,7 +7,7 @@
 
 use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uuid};
 
-use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status};
+use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus};
 use kaijutsu_types::Tick;
 
 /// Value-based tiebreaker for per-field LWW merge.
@@ -572,6 +572,22 @@ impl BlockContent {
         self.header.updated_at = self.header.max_field_ts();
     }
 
+    /// Get the task lifecycle status (`BlockKind::Task` only — meaningless
+    /// on other kinds).
+    pub fn task_status(&self) -> TaskStatus {
+        self.header.task_status
+    }
+
+    /// Set the task lifecycle status, bumping per-field and aggregate
+    /// timestamps. Mirrors `set_content_type` exactly — same "Copy field on
+    /// `BlockHeader` with its own LWW clock" mechanism, giving task status
+    /// the same multi-frontend CRDT sync for free.
+    pub fn set_task_status(&mut self, status: TaskStatus, lamport_ts: u64) {
+        self.header.task_status = status;
+        self.header.task_status_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
+    }
+
     pub fn ephemeral(&self) -> bool {
         self.ephemeral
     }
@@ -667,6 +683,7 @@ impl BlockContent {
             error: self.error.clone(),
             notification: self.notification.clone(),
             resource: self.resource.clone(),
+            task_status: self.header.task_status,
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
             tick: self.tick,
@@ -678,6 +695,7 @@ impl BlockContent {
             excluded_at: self.header.excluded_at,
             tool_meta_at: self.header.tool_meta_at,
             content_type_at: self.header.content_type_at,
+            task_status_at: self.header.task_status_at,
         }
     }
 
@@ -756,6 +774,17 @@ impl BlockContent {
         ) {
             self.header.content_type = remote.content_type;
             self.header.content_type_at = remote.content_type_at;
+        }
+
+        // task_status
+        if field_wins(
+            remote.task_status_at,
+            self.header.task_status_at,
+            &remote.task_status,
+            &self.header.task_status,
+        ) {
+            self.header.task_status = remote.task_status;
+            self.header.task_status_at = remote.task_status_at;
         }
 
         // Recompute aggregate timestamp

@@ -650,6 +650,7 @@ pub fn build_distillation_prompt(
             BlockKind::Notification => " (notification)",
             BlockKind::Resource => " (resource)",
             BlockKind::Trace => " (trace)",
+            BlockKind::Task => " (task)",
             BlockKind::Text => "",
         };
 

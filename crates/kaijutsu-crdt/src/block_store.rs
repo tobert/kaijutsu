@@ -12,7 +12,7 @@ use crate::content::{BlockContent, base62_encode_padded, order_key_successor, or
 use crate::selection::IntervalSet;
 use crate::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, DriftKind,
-    MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, Tick, ToolKind,
+    MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, TaskStatus, Tick, ToolKind,
 };
 
 /// Filter criteria for selective block inclusion during fork.
@@ -566,6 +566,8 @@ impl BlockStore {
             tool_meta_at: ts,
             content_type,
             content_type_at: ts,
+            task_status: TaskStatus::default(),
+            task_status_at: ts,
         };
 
         let block =
@@ -625,6 +627,8 @@ impl BlockStore {
             tool_meta_at: ts,
             content_type: ContentType::Plain,
             content_type_at: ts,
+            task_status: TaskStatus::default(),
+            task_status_at: ts,
         };
 
         let mut block =
@@ -687,6 +691,8 @@ impl BlockStore {
             tool_meta_at: ts,
             content_type: ContentType::Plain,
             content_type_at: ts,
+            task_status: TaskStatus::default(),
+            task_status_at: ts,
         };
 
         let mut block =
@@ -1099,6 +1105,21 @@ impl BlockStore {
             .get_mut(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
         block.set_content_type(content_type, ts);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Set the task lifecycle status on a block using LWW semantics.
+    /// Meaningful only on `BlockKind::Task` blocks — mirrors
+    /// `set_content_type` exactly (same per-field-clock mechanism).
+    pub fn set_task_status(&mut self, id: &BlockId, status: TaskStatus) -> Result<()> {
+        let ts = self.tick();
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_task_status(status, ts);
         self.version += 1;
         Ok(())
     }
@@ -3093,6 +3114,8 @@ mod tests {
                 tool_meta_at: 0,
                 content_type: ContentType::Plain,
                 content_type_at: 0,
+                task_status: TaskStatus::default(),
+                task_status_at: 0,
             };
             // tick = None — legacy.
             let block = BlockContent::with_content(header, text, store.principal_id, key.to_string(), None);
@@ -3757,6 +3780,8 @@ mod tests {
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
+            task_status: TaskStatus::default(),
+            task_status_at: 0,
         };
         let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string(), None);
         store.blocks.insert(id1, b1);
@@ -3784,6 +3809,8 @@ mod tests {
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
+            task_status: TaskStatus::default(),
+            task_status_at: 0,
         };
         let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string(), None);
         store.blocks.insert(id2, b2);
@@ -3811,6 +3838,8 @@ mod tests {
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
+            task_status: TaskStatus::default(),
+            task_status_at: 0,
         };
         let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string(), None);
         store.blocks.insert(id3, b3);
@@ -3876,6 +3905,8 @@ mod tests {
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
+            task_status: TaskStatus::default(),
+            task_status_at: 0,
         };
         store.blocks.insert(
             id1,
@@ -3905,6 +3936,8 @@ mod tests {
             tool_meta_at: 0,
             content_type: ContentType::Plain,
             content_type_at: 0,
+            task_status: TaskStatus::default(),
+            task_status_at: 0,
         };
         store.blocks.insert(
             id2,
@@ -4187,6 +4220,125 @@ mod tests {
             "Svg.richness() > Markdown.richness() on tiebreak"
         );
         assert_eq!(ha.content_type, hb.content_type, "stores must converge");
+    }
+
+    /// `set_task_status` updates the field and bumps its own LWW clock
+    /// (`task_status_at`), independent of `status`/`status_at` — proves the
+    /// two are genuinely separate registers, not the same field under a
+    /// different name.
+    #[test]
+    fn test_set_task_status_updates_field_and_clock() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, agent);
+        let block_id = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Task,
+                "Buy milk",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let snap_before = store.get_block_snapshot(&block_id).unwrap();
+        assert_eq!(snap_before.task_status, TaskStatus::Open);
+        assert_eq!(snap_before.status, Status::Done);
+
+        store
+            .set_task_status(&block_id, TaskStatus::InProgress)
+            .unwrap();
+
+        let snap_after = store.get_block_snapshot(&block_id).unwrap();
+        assert_eq!(snap_after.task_status, TaskStatus::InProgress);
+        assert!(
+            snap_after.task_status_at > snap_before.task_status_at,
+            "task_status_at must advance on update"
+        );
+        // status (the tool-execution-shaped field) is untouched by a task
+        // status change — confirms task_status is a genuinely separate
+        // register, not a repaint of `status`.
+        assert_eq!(snap_after.status, Status::Done);
+        assert_eq!(snap_after.status_at, snap_before.status_at);
+    }
+
+    /// Per-field LWW tiebreaker for `task_status`: equal Lamport timestamp,
+    /// the declared-order-greater status wins (`Cancelled` beats `Done`),
+    /// and both peers converge. CRDT-level companion to
+    /// `test_task_status_lww_tiebreak_order` in kaijutsu-types (which pins
+    /// the `Ord` — this proves the merge path actually consults it).
+    #[test]
+    fn test_per_field_lww_tiebreaker_task_status() {
+        let ctx = ContextId::new();
+        let agent_a = PrincipalId::new();
+        let agent_b = PrincipalId::new();
+
+        let mut store_a = BlockStore::new(ctx, agent_a);
+        let block_id = store_a
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Task,
+                "Buy milk",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let mut store_b = BlockStore::new(ctx, agent_b);
+        let payload = store_a.ops_since(&HashMap::new());
+        store_b.merge_ops(payload).unwrap();
+
+        // `merge_clock` (block_store.rs) sets the receiver's Lamport clock to
+        // `max(local, remote) + 1` — strictly past whatever it just learned.
+        // After the one-way sync above, store_b's clock (2) is already one
+        // ahead of store_a's (1); a `set_task_status` on each side right now
+        // would NOT tie (B's write would simply have a later timestamp and
+        // win outright, exercising nothing about the value-based tiebreak).
+        // A no-op round trip equalizes them: A learns store_b's
+        // already-known header (unchanged, but still bumps A's clock past
+        // it), landing both stores on the same Lamport value before the
+        // real racing writes below.
+        let equalize = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(equalize).unwrap();
+
+        // Both peers groom the task at the SAME Lamport tick now.
+        // A cancels it, B marks it done. Cancelled > Done, so Cancelled wins.
+        store_a
+            .set_task_status(&block_id, TaskStatus::Cancelled)
+            .unwrap();
+        store_b
+            .set_task_status(&block_id, TaskStatus::Done)
+            .unwrap();
+
+        // Guard the setup itself: if this ever stops being a genuine tie
+        // (e.g. a future change to `merge_clock`), the test must fail LOUD
+        // here rather than silently start passing for the wrong reason
+        // (later timestamp winning outright, not the value-based tiebreak).
+        assert_eq!(
+            store_a.blocks.get(&block_id).unwrap().header().task_status_at,
+            store_b.blocks.get(&block_id).unwrap().header().task_status_at,
+            "test setup must produce a genuine Lamport tie, not a later-write win"
+        );
+
+        // Merge A→B then B→A
+        let payload_a = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload_a).unwrap();
+        let payload_b = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(payload_b).unwrap();
+
+        let ha = store_a.blocks.get(&block_id).unwrap().header();
+        let hb = store_b.blocks.get(&block_id).unwrap().header();
+
+        assert_eq!(
+            ha.task_status,
+            TaskStatus::Cancelled,
+            "Cancelled > Done on tiebreak"
+        );
+        assert_eq!(ha.task_status, hb.task_status, "stores must converge");
     }
 
     // ── Order/tick decoupling + seq lanes (design §2, §3) ─────────────────
