@@ -25,6 +25,12 @@ pub use font::VelloFont;
 pub use loader::VelloFontLoader;
 pub use types::{VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
+/// The loader's registration half, without Bevy's asset machinery — a test
+/// that needs to shape real text registers a shipped `.ttf` through this and
+/// then calls [`VelloFont::layout`] exactly as the app does.
+#[cfg(test)]
+pub(crate) use loader::load_into_font_context;
+
 use bevy::prelude::*;
 
 /// Registers the `VelloFont` asset and its `.ttf` loader.
