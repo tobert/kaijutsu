@@ -39,12 +39,16 @@
 //! a yank of rows `a..=b` is *exactly* the canonical unified text of those
 //! lines, prefixes included — no re-derivation, no header scraping.
 //!
-//! # What this crate does not do
+//! # Folds are a projection, never a rewrite
 //!
-//! Folding is tracked ([`FoldState`] on the model, driven by `zo`/`zc`/`za`)
-//! but **not projected**: [`DiffCore::rows`] always describes every line,
-//! because [`crate::format`] ignores folds. Hiding folded lines is a rendering
-//! decision and lands with the viewer's fold polish (`docs/diff.md` slice 6).
+//! [`DiffCore::rows`] always describes **every** line and [`DiffCore::text`] is
+//! always the whole canonical patch — folding must never move the ground a
+//! yank stands on. What folding produces is a second, derived list:
+//! [`DiffCore::visible_rows`], the row indices a renderer should draw, with a
+//! folded hunk's body absent and its header kept as the indicator. The cursor
+//! is kept out of hidden rows ([`DiffCore::snap_out_of_folds`]) for the same
+//! reason column motions were dropped in slice 5: a cursor somewhere the
+//! reader cannot see is state that lies.
 
 use editor_types::application::{ApplicationAction, ApplicationInfo};
 use editor_types::context::{EditContext, Resolve};
@@ -233,6 +237,15 @@ impl InputBindings<TerminalKey, InputStep<DiffInfo>> for ViewerBindings {
     }
 }
 
+/// What a folded hunk hides, for the indicator its header carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldSummary {
+    /// How many rows of the canonical text the fold is hiding — body lines
+    /// plus any `\ No newline` markers among them. Never zero: an empty hunk
+    /// cannot exist in the dialect.
+    pub hidden_rows: usize,
+}
+
 /// A read-only vi surface over one frozen [`DiffModel`].
 pub struct DiffCore {
     /// The frozen model. Only [`FoldState`] — view state — ever changes.
@@ -241,6 +254,15 @@ pub struct DiffCore {
     text: String,
     /// One entry per line of `text`, contiguous.
     rows: Vec<DiffRow>,
+    /// Indices into `rows` a renderer should draw: everything, minus the body
+    /// of every folded hunk. Rebuilt whenever a fold verb runs — never on the
+    /// render path, which asks the same question every frame.
+    visible: Vec<usize>,
+    /// Bumped on every fold change. A renderer caching a laid-out window keys
+    /// on it: the *content* hash cannot see a fold, and two folds of equal
+    /// size between frames would leave the visible row count unchanged while
+    /// the visible rows themselves differ.
+    fold_seq: u64,
     machine: VimMachine<TerminalKey, DiffInfo>,
     buffer: EditBuffer<DiffInfo>,
     store: Store<DiffInfo>,
@@ -277,10 +299,14 @@ impl DiffCore {
         let mut cmdline = EditBuffer::<DiffInfo>::from_str(String::from("cmdline"), "");
         let cmdline_group = cmdline.create_group();
 
+        let visible = visible_row_indices(&model, &rows);
+
         Self {
             model,
             text,
             rows,
+            visible,
+            fold_seq: 0,
             machine,
             buffer,
             store: Store::default(),
@@ -312,9 +338,85 @@ impl DiffCore {
         &self.rows
     }
 
+    /// The rows a renderer should draw, as indices into [`rows`](Self::rows),
+    /// ascending.
+    ///
+    /// Identical to `0..rows().len()` while nothing is folded. A folded hunk
+    /// contributes its header row and nothing else — the header *is* the
+    /// indicator, carrying [`fold_summary`](Self::fold_summary) — so the
+    /// projection never invents a row that has no counterpart in the canonical
+    /// text. Everything the viewer addresses by index (cursor, selection,
+    /// window) can therefore be mapped in both directions.
+    pub fn visible_rows(&self) -> &[usize] {
+        &self.visible
+    }
+
+    /// What the hunk owning `row` is hiding, or `None` if it is not folded.
+    ///
+    /// Only ever `Some` for a [`RowKind::HunkHeader`] row, because that is the
+    /// only row of a folded hunk that is still drawn.
+    pub fn fold_summary(&self, row: usize) -> Option<FoldSummary> {
+        let r = self.rows.get(row)?;
+        if r.kind != RowKind::HunkHeader {
+            return None;
+        }
+        let hunk = self
+            .model
+            .files
+            .get(r.file?)
+            .and_then(|f| f.hunks.get(r.hunk?))?;
+        if hunk.fold != FoldState::Folded {
+            return None;
+        }
+        Some(FoldSummary {
+            hidden_rows: hunk.lines.len() + hunk.lines.iter().filter(|l| l.no_newline).count(),
+        })
+    }
+
     /// The cursor's row index (0-based), clamped into `rows`.
     pub fn cursor_row(&self) -> usize {
         self.cursor_row
+    }
+
+    /// The cursor's position in [`visible_rows`](Self::visible_rows) — what a
+    /// renderer laying out only the visible rows needs.
+    ///
+    /// The cursor is never on a hidden row (see
+    /// [`snap_out_of_folds`](Self::snap_out_of_folds)), so this is an exact
+    /// lookup rather than a nearest-match.
+    pub fn cursor_visible_row(&self) -> usize {
+        self.visible_index_of(self.cursor_row).unwrap_or(0)
+    }
+
+    /// The visual-line selection as an inclusive range of
+    /// [`visible_rows`](Self::visible_rows) indices.
+    ///
+    /// A selection *spanning* a folded hunk keeps every hidden row selected —
+    /// the yank is unaffected by folding — and draws as the rows that remain,
+    /// which is why the ends are clamped inward to visible rows rather than
+    /// mapped exactly.
+    pub fn selection_visible_rows(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selection?;
+        let first = self.visible.partition_point(|&r| r < a);
+        let last = self.visible.partition_point(|&r| r <= b);
+        if first >= last {
+            // Every selected row is hidden inside one fold.
+            return None;
+        }
+        Some((first, last - 1))
+    }
+
+    /// How many times a fold has changed. A renderer caching a laid-out
+    /// window includes it in the cache key — see the field's own comment.
+    pub fn fold_seq(&self) -> u64 {
+        self.fold_seq
+    }
+
+    /// Where `row` sits in [`visible_rows`](Self::visible_rows), if it is
+    /// drawn at all.
+    pub fn visible_index_of(&self, row: usize) -> Option<usize> {
+        let i = self.visible.partition_point(|&r| r < row);
+        (self.visible.get(i) == Some(&row)).then_some(i)
     }
 
     /// The inclusive row range covered by the visual-line selection, if any.
@@ -351,9 +453,56 @@ impl DiffCore {
         }
     }
 
+    /// Move the cursor off a folded-away row, in the direction it was going.
+    ///
+    /// Vim's own fold behavior, and for the reason the whole viewer is built
+    /// on: the cursor must be where the reader can see it. Coming *down* into
+    /// a fold, the cursor lands past it — the fold behaves as one line, so `j`
+    /// steps over it. Any other way in (moving up, jumping, or folding the
+    /// hunk the cursor is already inside) parks it on the header, which is the
+    /// one row of the fold still drawn.
+    ///
+    /// `previous` is where the cursor was before this action, which is the
+    /// only thing that distinguishes "walking down into it" from the rest.
+    fn snap_out_of_folds(&mut self, previous: usize) {
+        if self.visible.is_empty() {
+            return;
+        }
+        let row = self.buffer.get_leader(self.group).get_y();
+        if self.visible_index_of(row).is_some() {
+            return;
+        }
+        let at = self.visible.partition_point(|&r| r < row);
+        let target = if row > previous {
+            // The next visible row after the fold; the end of the document
+            // has none, so fall back to the header behind us.
+            self.visible
+                .get(at)
+                .copied()
+                .or_else(|| self.visible.get(at.saturating_sub(1)).copied())
+        } else {
+            self.visible
+                .get(at.saturating_sub(1))
+                .copied()
+                .or_else(|| self.visible.first().copied())
+        };
+        if let Some(target) = target {
+            let col = self.buffer.get_leader(self.group).get_x();
+            self.buffer
+                .set_leader(self.group, Cursor::new(target, col));
+        }
+    }
+
+    /// Rebuild the visible-row projection after a fold changed.
+    fn rebuild_visible(&mut self) {
+        self.visible = visible_row_indices(&self.model, &self.rows);
+        self.fold_seq = self.fold_seq.wrapping_add(1);
+    }
+
     /// Re-read the cursor and selection out of modalkit into the cache.
     fn sync_cursor(&mut self) {
         self.snap_to_line_start();
+        self.snap_out_of_folds(self.cursor_row);
         let last = self.rows.len().saturating_sub(1);
         self.cursor_row = self.buffer.get_leader(self.group).get_y().min(last);
         self.selection =
@@ -544,7 +693,34 @@ impl DiffCore {
             FoldState::Expanded => FoldState::Folded,
             FoldState::Folded => FoldState::Expanded,
         });
+        self.rebuild_visible();
     }
+}
+
+/// The rows a renderer should draw: everything except the body of a folded
+/// hunk.
+///
+/// Pure, and deliberately so — the projection is the whole of what folding
+/// *means* to a viewer, and it is testable without a keystroke. The header row
+/// of a folded hunk stays: it is the indicator, and keeping it means the
+/// projection is always a subsequence of the real rows, never a rewrite with
+/// synthetic entries the cursor could not address.
+pub fn visible_row_indices(model: &DiffModel, rows: &[DiffRow]) -> Vec<usize> {
+    let folded = |row: &DiffRow| -> bool {
+        let (Some(fi), Some(hi)) = (row.file, row.hunk) else {
+            return false;
+        };
+        model
+            .files
+            .get(fi)
+            .and_then(|f| f.hunks.get(hi))
+            .is_some_and(|h| h.fold == FoldState::Folded)
+    };
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.kind == RowKind::HunkHeader || !folded(row))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Is this editor action safe on a read-only surface?
@@ -1287,6 +1463,160 @@ mod tests {
         c.apply_notation("]czc");
         assert_eq!(c.text(), before_text);
         assert_eq!(c.rows(), before_rows.as_slice());
+    }
+
+    /// Folding is a *projection*: the canonical rows stay, and the visible
+    /// list loses exactly the folded hunk's body — header included, because
+    /// the header is the indicator.
+    #[test]
+    fn a_folded_hunk_hides_its_body_and_keeps_its_header() {
+        let mut c = core();
+        assert_eq!(
+            c.visible_rows().len(),
+            c.rows().len(),
+            "nothing folded: every row is visible",
+        );
+
+        c.apply_notation("]c");
+        let header = c.cursor_row();
+        let (fi, hi) = (c.rows()[header].file.unwrap(), c.rows()[header].hunk.unwrap());
+        let body = c.model().files[fi].hunks[hi].lines.len();
+        c.apply_notation("zc");
+
+        assert_eq!(c.visible_rows().len(), c.rows().len() - body);
+        assert!(
+            c.visible_rows().contains(&header),
+            "the header must survive as the indicator",
+        );
+        assert_eq!(
+            c.fold_summary(header),
+            Some(FoldSummary { hidden_rows: body }),
+        );
+        // ...and every hidden row belongs to that hunk.
+        for (i, row) in c.rows().iter().enumerate() {
+            if c.visible_index_of(i).is_none() {
+                assert_eq!((row.file, row.hunk), (Some(fi), Some(hi)));
+                assert_ne!(row.kind, RowKind::HunkHeader);
+            }
+        }
+
+        c.apply_notation("zo");
+        assert_eq!(c.visible_rows().len(), c.rows().len(), "unfold restores");
+        assert_eq!(c.fold_summary(header), None);
+    }
+
+    /// The visible list is a subsequence of the real rows — ascending, in
+    /// order, no invented entries. Everything the viewer addresses by index
+    /// depends on that.
+    #[test]
+    fn the_visible_projection_is_an_ascending_subsequence() {
+        let mut c = core();
+        c.apply_notation("]czc]czc");
+        let v = c.visible_rows();
+        assert!(v.windows(2).all(|w| w[0] < w[1]), "not ascending: {v:?}");
+        assert!(v.iter().all(|&i| i < c.rows().len()));
+        for (i, &row) in v.iter().enumerate() {
+            assert_eq!(c.visible_index_of(row), Some(i));
+        }
+    }
+
+    /// `j` steps *over* a closed fold: the fold behaves as one line, so
+    /// walking down lands past it, never inside it.
+    #[test]
+    fn j_steps_over_a_closed_fold() {
+        let mut c = core();
+        c.apply_notation("]czc");
+        let header = c.cursor_row();
+        let after = c
+            .visible_rows()
+            .iter()
+            .copied()
+            .find(|&r| r > header)
+            .expect("a row after the fold");
+
+        c.apply_notation("j");
+        assert_eq!(c.cursor_row(), after, "j must clear the whole fold");
+        c.apply_notation("k");
+        assert_eq!(c.cursor_row(), header, "k comes back to the header");
+    }
+
+    /// Folding the hunk the cursor is standing *inside* parks it on the
+    /// header — the alternative is a cursor on a row that is no longer drawn.
+    #[test]
+    fn folding_from_inside_parks_the_cursor_on_the_header() {
+        let mut c = core();
+        c.apply_notation("]cjj");
+        let inside = c.cursor_row();
+        let header = c.rows()[..inside]
+            .iter()
+            .rposition(|r| r.kind == RowKind::HunkHeader)
+            .expect("a header above");
+        assert_ne!(inside, header, "test premise: the cursor is in the body");
+
+        c.apply_notation("zc");
+        assert_eq!(c.cursor_row(), header);
+        assert!(c.visible_index_of(c.cursor_row()).is_some());
+    }
+
+    /// The cursor is never on a hidden row, whatever the motion — the
+    /// invariant the whole projection rests on.
+    #[test]
+    fn no_motion_leaves_the_cursor_inside_a_fold() {
+        let mut c = core();
+        // Fold every hunk, then walk the document with everything we have.
+        c.apply_notation("]czc]czc]czc");
+        for keys in ["j", "k", "G", "gg", "5j", "3k", "}", "{", "]c", "[c", "L", "H"] {
+            c.apply_notation(keys);
+            assert!(
+                c.visible_index_of(c.cursor_row()).is_some(),
+                "keys {keys:?} left the cursor on hidden row {}",
+                c.cursor_row(),
+            );
+        }
+    }
+
+    /// A selection across a folded hunk still yanks every line of it — the
+    /// canonical text is what a yank slices, and folding never touches it.
+    /// The *drawn* range is the visible rows it covers.
+    #[test]
+    fn a_selection_over_a_fold_yanks_the_hidden_lines_too() {
+        let mut c = core();
+        c.apply_notation("]czc");
+        let header = c.cursor_row();
+        let intents = c.apply_notation("Vjy");
+        let DiffIntent::Yank { text } = &intents[0] else {
+            panic!("expected a yank, got {intents:?}");
+        };
+        // `j` cleared the fold, so the selection spans the whole hunk.
+        let end = c
+            .visible_rows()
+            .iter()
+            .copied()
+            .find(|&r| r > header)
+            .unwrap();
+        let expected: String = (header..=end)
+            .map(|i| format!("{}\n", row_text(&c, i)))
+            .collect();
+        assert_eq!(text, &expected);
+        assert!(
+            text.lines().count() > 2,
+            "a folded hunk's hidden lines must still be yanked: {text:?}",
+        );
+    }
+
+    /// The drawn selection is in *visible* coordinates, clamped inward — a
+    /// renderer that laid it out in canonical row indices would band the
+    /// wrong lines the moment anything above it folded.
+    #[test]
+    fn the_drawn_selection_is_in_visible_coordinates() {
+        let mut c = core();
+        assert_eq!(c.selection_visible_rows(), None, "no selection, no range");
+        c.apply_notation("]czc");
+        let header = c.cursor_row();
+        c.apply_notation("Vj");
+        let (a, b) = c.selection_visible_rows().expect("a selection");
+        assert_eq!(a, c.visible_index_of(header).unwrap());
+        assert_eq!(b, a + 1, "the fold's body is not drawn between them");
     }
 
     #[test]

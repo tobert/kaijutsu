@@ -524,12 +524,15 @@ pub fn class_for_row(kind: kaijutsu_diff::RowKind) -> DiffLineClass {
 ///   elided ([`MAX_VIEW_LINE_CHARS`]). The byte budget was already spent when
 ///   the core was built.
 ///
-/// **`preview.lines[i]` is `core.rows()[rows.start + i]`**, one for one — the
-/// projection never adds, drops, or reorders a line. Everything the viewer
-/// needs (cursor row → laid-out line, selection rows → bands) is that index,
-/// so an elided line changes what is *drawn* and nothing about what is
-/// addressed. Yank is unaffected either way: it reads the core's canonical
-/// text, never this.
+/// **`rows` indexes `DiffCore::visible_rows`, not the canonical rows**, and
+/// `preview.lines[i]` is the row `visible_rows()[rows.start + i]` names — one
+/// for one, in order. Folding is a projection (`docs/diff.md` slice 6): a
+/// folded hunk's body is simply not in that list, its header stays and picks
+/// up a `⋯ N lines folded` indicator here. The cursor and the selection are
+/// published in the same visible coordinates (`cursor_visible_row`,
+/// `selection_visible_rows`), so everything the viewer addresses agrees.
+/// Yank is unaffected either way: it reads the core's canonical text, which
+/// folding never touches.
 ///
 /// It takes a **window** rather than the whole diff because a diff bounded
 /// only by `MAX_RENDER_BYTES` is up to a megabyte of text, and Parley-shaping
@@ -539,13 +542,26 @@ pub fn class_for_row(kind: kaijutsu_diff::RowKind) -> DiffLineClass {
 pub fn view_rows(core: &kaijutsu_diff::DiffCore, rows: std::ops::Range<usize>) -> DiffPreview {
     let mut b = PreviewBuilder::new();
     let text = core.text();
-    let end = rows.end.min(core.rows().len());
+    let visible = core.visible_rows();
+    let end = rows.end.min(visible.len());
     let start = rows.start.min(end);
 
-    for row in &core.rows()[start..end] {
+    for &index in &visible[start..end] {
+        let row = &core.rows()[index];
         let raw = text[row.start..row.end].trim_end_matches('\n');
         let cut = elision_cut(raw, MAX_VIEW_LINE_CHARS);
-        let shown = crate::text::truncate_chars(raw, MAX_VIEW_LINE_CHARS);
+        let mut shown = crate::text::truncate_chars(raw, MAX_VIEW_LINE_CHARS);
+        // A folded hunk draws as its header alone, so the header has to say
+        // what is missing — a fold with no indicator is a diff that quietly
+        // lies about its own size. Appended after elision, so the indicator
+        // survives an absurd header line.
+        if let Some(fold) = core.fold_summary(index) {
+            shown.push_str(&format!(
+                "  \u{22ef} {} line{} folded",
+                fold.hidden_rows,
+                if fold.hidden_rows == 1 { "" } else { "s" },
+            ));
+        }
         // The prefix byte only exists if it survived elision (it always does —
         // the budget is thousands of chars — but derive it rather than assume).
         let prefix_bytes = (row.text_start - row.start).min(shown.len());
@@ -1166,6 +1182,61 @@ mod tests {
         assert_eq!(v.lines[0].class, DiffLineClass::FileHeader);
         assert!(v.plain_text.starts_with("diff --git"), "{}", v.plain_text);
         assert!(v.lines.iter().all(|l| l.class != DiffLineClass::Stat));
+    }
+
+    // ── folds ───────────────────────────────────────────────────────────────
+
+    /// A folded hunk draws as its header alone, carrying an indicator that
+    /// says how much is hidden. The rows are gone from the *projection* only —
+    /// `core.rows()` and the canonical text are untouched, which is what keeps
+    /// yank honest.
+    #[test]
+    fn a_folded_hunk_projects_as_one_annotated_header_row() {
+        let mut c = core("canonical/single_file_modify.diff");
+        c.apply_notation("]czc");
+        let header = c.cursor_row();
+        let hidden = c.fold_summary(header).expect("the hunk is folded");
+
+        let v = whole(&c);
+        assert_eq!(v.lines.len(), c.visible_rows().len());
+        assert_eq!(
+            v.lines.len(),
+            c.rows().len() - hidden.hidden_rows,
+            "the fold's body must not be laid out",
+        );
+        assert!(
+            v.plain_text
+                .contains(&format!("\u{22ef} {} lines folded", hidden.hidden_rows)),
+            "the header must say what it is hiding: {}",
+            v.plain_text,
+        );
+        assert_contiguous(&v);
+    }
+
+    /// Unfolding restores the projection exactly — a fold is view state, so a
+    /// round trip through it must leave nothing behind.
+    #[test]
+    fn folding_and_unfolding_round_trips_the_projection() {
+        let mut c = core("canonical/single_file_modify.diff");
+        let before = whole(&c);
+        c.apply_notation("]czc");
+        assert_ne!(whole(&c).plain_text, before.plain_text);
+        c.apply_notation("zo");
+        assert_eq!(whole(&c), before);
+    }
+
+    /// The window is in visible coordinates too: a range past a fold projects
+    /// the rows that survived it, not the ones the canonical indices name.
+    #[test]
+    fn a_window_over_a_folded_document_follows_the_visible_rows() {
+        let mut c = core("canonical/multi_file.diff");
+        c.apply_notation("]czc");
+        let v = view_rows(&c, 1..4);
+        assert_eq!(v.lines.len(), 3);
+        for (i, line) in v.lines.iter().enumerate() {
+            let row = c.rows()[c.visible_rows()[1 + i]];
+            assert_eq!(line.class, class_for_row(row.kind), "line {i}");
+        }
     }
 
     /// The full view highlights words too, and reaches them the only way it

@@ -105,6 +105,7 @@ pub struct DiffSurfaceWindow {
 #[derive(PartialEq, Eq, Clone, Debug)]
 struct LayoutKey {
     content_hash: u64,
+    fold_seq: u64,
     first_row: usize,
     end_row: usize,
     width_px: i32,
@@ -245,20 +246,25 @@ pub fn build_diff_surface(
         .max(1) as usize;
 
     // ── where we are ────────────────────────────────────────────────────────
+    // Everything below is in VISIBLE row coordinates — indices into
+    // `DiffCore::visible_rows`, which drops a folded hunk's body. The core
+    // publishes the cursor and the selection in the same coordinates, and
+    // `view_rows` projects the same range, so the whole surface agrees;
+    // yank and the canonical model never see a fold at all.
     let (first_row, end_row, cursor_row, selection, kind) = match &session.content {
         DiffViewContent::Ready(core) => {
-            let cursor = core.cursor_row();
+            let cursor = core.cursor_visible_row();
             let (first, end) = window_for(
                 cursor,
                 visible_rows,
-                core.rows().len(),
+                core.visible_rows().len(),
                 (window.first_row, window.end_row),
             );
             (
                 first,
                 end,
                 cursor,
-                core.selection_rows(),
+                core.selection_visible_rows(),
                 // The viewer is never in insert mode, so the beam shape would
                 // be a lie. Normal → block; visual → hidden, because the
                 // selection bands are the visible thing there.
@@ -272,6 +278,13 @@ pub fn build_diff_surface(
 
     let layout_key = LayoutKey {
         content_hash: session.content_hash,
+        // Folding changes what the window projects without changing a byte of
+        // content, and two folds of equal size between frames would leave even
+        // the row count unchanged. The core's own counter is the honest key.
+        fold_seq: match &session.content {
+            DiffViewContent::Ready(core) => core.fold_seq(),
+            DiffViewContent::Failed { .. } => 0,
+        },
         first_row,
         end_row,
         width_px: width as i32,
@@ -491,8 +504,10 @@ fn status_line(session: &super::DiffViewSession, cursor_row: usize) -> String {
                 s.push_str("  (truncated for display)");
             }
             // An empty diff has no line 1 to be on; `1/1` would be a claim
-            // about content that isn't there.
-            let total = core.rows().len();
+            // about content that isn't there. The count is of *drawn* rows —
+            // it has to agree with the position beside it, and that position
+            // is where the cursor is on screen.
+            let total = core.visible_rows().len();
             if total > 0 {
                 s.push_str(&format!("  {}/{total}", cursor_row + 1));
             }
@@ -559,6 +574,7 @@ mod tests {
         let (first_row, end_row) = window_for(cursor, visible, total, current);
         LayoutKey {
             content_hash: 7,
+            fold_seq: 0,
             first_row,
             end_row,
             width_px: 1920,
