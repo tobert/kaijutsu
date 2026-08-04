@@ -997,6 +997,104 @@ impl HasSubject for InputDocFlow {
 // Turn Flow Events
 // ============================================================================
 
+/// Why a turn stopped — the structured half of the turn outcome.
+///
+/// A turn that ran out of tokens, one a player cancelled, and one that simply
+/// finished are three different endings, and a consumer has to tell them apart
+/// to react correctly. Before this existed, a cancel arrived as
+/// `Failed { error: "turn interrupted before completion" }` — a string an
+/// observer had to pattern-match to learn anything, which is exactly the silent
+/// ambiguity the house style rejects. `Failed` now means *only* "the turn broke";
+/// every ending the turn driver reached on purpose is a `Completed` carrying its
+/// reason.
+///
+/// This is the substrate for the ACP adapter's `stopReason` (`end_turn`,
+/// `max_tokens`, `max_turn_requests`, `cancelled`) — the mapping is 1:1 by
+/// construction, and the wire form is capnp `TurnStopReason`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnStopReason {
+    /// The model finished its phrase and asked for nothing more — ACP `end_turn`.
+    #[default]
+    EndTurn,
+    /// A player interrupted the turn (`interruptContext`).
+    ///
+    /// `immediate` is the RPC's soft/hard distinction, kept because the two
+    /// endings differ in kind, not just in urgency: a **soft** cancel
+    /// (`immediate: false`) lets the in-flight model call finish and stops the
+    /// agentic loop before the next one, so the output block is a *complete*
+    /// phrase; a **hard** cancel (`immediate: true`) aborts the HTTP stream
+    /// mid-token, so whatever text landed is a fragment. Both map to ACP
+    /// `cancelled`; only the consumer that cares about phrase integrity (the
+    /// beat scheduler's OODA Act) reads the bool.
+    Cancelled {
+        /// `true` for a hard interrupt (stream aborted mid-flight).
+        immediate: bool,
+    },
+    /// The provider hit the output-token ceiling — ACP `max_tokens`. Detected
+    /// from the provider's own terminal stop reason (`max_tokens` on Anthropic,
+    /// `length` on the OpenAI-compatible providers).
+    MaxTokens,
+    /// The agentic loop hit its per-turn tool-iteration cap — ACP
+    /// `max_turn_requests`.
+    MaxIterations,
+}
+
+impl TurnStopReason {
+    /// Whether the turn's `output_block_id` names a *finished* phrase.
+    ///
+    /// False only for a hard cancel, which severs the stream mid-token. Every
+    /// other ending — including a soft cancel, a token-ceiling truncation, and
+    /// an iteration-cap halt — leaves the last model block syntactically whole,
+    /// because the provider closed the message before the driver stopped.
+    /// The beat scheduler gates the OODA **Act** on this: crystallizing a
+    /// half-written phrase would schedule notation that was never played.
+    pub fn output_is_complete(self) -> bool {
+        !matches!(self, Self::Cancelled { immediate: true })
+    }
+
+    /// Stable wire/log name, matching the ACP `stopReason` vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::Cancelled { immediate: false } => "cancelled_soft",
+            Self::Cancelled { immediate: true } => "cancelled_immediate",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxIterations => "max_iterations",
+        }
+    }
+}
+
+/// Who asked for the turn — a human at a prompt, or the kernel driving itself.
+///
+/// The turn driver used to encode this as an `announce_completion: bool`
+/// *producer-side gate*: interactive turns published nothing at all, because
+/// the one consumer (the beat scheduler's OODA Act) must never crystallize a
+/// human-prompted turn. That gate is now here, on the event, where it belongs —
+/// every turn announces, and the consumer that cares filters. Without the move,
+/// no wire subscriber could ever see an interactive turn complete, which is the
+/// case ACP frontends care about most.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnOrigin {
+    /// A player submitted a prompt (`prompt` / `submitInput`). The default,
+    /// because it is the conservative answer for a decoded-without-the-field
+    /// payload: an interactive turn feeds no autonomous machinery.
+    #[default]
+    Interactive,
+    /// The kernel drove the turn itself (`TurnFlow::Requested` — `kj fork
+    /// --prompt`, drift delivery, the cruise director).
+    Autonomous,
+}
+
+impl TurnOrigin {
+    /// Stable wire/log name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Autonomous => "autonomous",
+        }
+    }
+}
+
 /// Turn-driving flow events.
 ///
 /// The keystone of headless autonomy: kernel-side code (which can't reach the
@@ -1010,6 +1108,22 @@ impl HasSubject for InputDocFlow {
 /// The seed itself already lives in the context's block log (e.g. the fork
 /// note), so this carries only what the driver needs to anchor and attribute
 /// the turn — it does NOT re-insert the seed.
+///
+/// # On the wire, but never journaled
+///
+/// `Requested` stays in-process — it is a request *to* the server's turn
+/// driver, and nothing outside the kernel process can serve it. The two
+/// outcome variants are different: `Completed`/`Failed` cross the capnp
+/// boundary through the `TurnEvents` callback interface (`subscribeTurnEvents`,
+/// bridged in `kaijutsu-server::rpc`), because completion is the one turn fact
+/// every client needs and none can compute. Before that bridge existed, clients
+/// inferred completion by polling block status — a heuristic that cannot
+/// distinguish "finished" from "cancelled" from "still thinking".
+///
+/// Still **never journaled**, and that is deliberate: blocks are the durable
+/// record of what a turn produced. These events are a live signal about a live
+/// turn; replaying them after a restart would announce completions for turns
+/// nobody is waiting on. A subscriber that missed the push reads the block log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TurnFlow {
     /// Drive one autonomous turn for `context_id`.
@@ -1029,8 +1143,13 @@ pub enum TurnFlow {
         model: Option<String>,
     },
 
-    /// An autonomous turn finished successfully. The join-side substrate for
-    /// `kj wait`: a blocking caller can wait for this to know the child acted.
+    /// A turn reached an ending the driver arrived at on purpose — it finished,
+    /// ran out of tokens or iterations, or a player cancelled it. `reason` says
+    /// which; only a genuine breakage publishes [`TurnFlow::Failed`].
+    ///
+    /// Every turn publishes this, interactive and autonomous alike. It is the
+    /// join-side substrate for a blocking waiter (`kj wait`, the delegation
+    /// join) and the payload the `TurnEvents` wire bridge forwards to clients.
     Completed {
         /// The context whose turn completed.
         context_id: ContextId,
@@ -1040,16 +1159,30 @@ pub enum TurnFlow {
         /// — the last `Role::Model` / `BlockKind::Text` block this stream
         /// inserted, or `None` when the turn produced no text. Carried so the
         /// beat scheduler schedules *that* block's ABC instead of a blind
-        /// last-block read that races the model (F2 §7). `#[serde(default)]`:
-        /// the field is purely additive and rides the in-process FlowBus only —
-        /// `TurnFlow` is never sent over capnp nor journaled, so this is a
-        /// wire-inert in-process extension, not a wire change (F2 §13).
+        /// last-block read that races the model (F2 §7).
         #[serde(default)]
         output_block_id: Option<BlockId>,
+        /// Why the turn stopped. `#[serde(default)]` → [`TurnStopReason::EndTurn`]
+        /// for a payload that predates the field, which is the only honest
+        /// default: before this field existed, every `Completed` *was* a clean
+        /// end-of-turn (cancels went out as `Failed`).
+        #[serde(default)]
+        reason: TurnStopReason,
+        /// Who asked for the turn. `#[serde(default)]` →
+        /// [`TurnOrigin::Interactive`], the answer that feeds no autonomous
+        /// machinery if the field is ever missing.
+        #[serde(default)]
+        origin: TurnOrigin,
     },
 
-    /// An autonomous turn failed. Carries the error so `kj wait` (and any
-    /// observer) can surface it rather than hanging or silently succeeding.
+    /// A turn **broke** — it never reached an ending the driver chose. Carries
+    /// the error so a waiter (`kj wait`, an ACP frontend) can surface it rather
+    /// than hanging or silently succeeding.
+    ///
+    /// A cancelled turn is NOT a failure: it publishes
+    /// `Completed { reason: Cancelled { .. } }`. Reserve this for hydration
+    /// failures, provider/stream errors, and unreadable policy — the cases
+    /// where there is a real error to report and no turn happened.
     Failed {
         /// The context whose turn failed.
         context_id: ContextId,
@@ -1057,6 +1190,9 @@ pub enum TurnFlow {
         principal_id: PrincipalId,
         /// Human-readable failure description.
         error: String,
+        /// Who asked for the turn. See [`TurnFlow::Completed::origin`].
+        #[serde(default)]
+        origin: TurnOrigin,
     },
 }
 
@@ -1665,6 +1801,8 @@ mod tests {
             context_id: ctx,
             principal_id: principal,
             output_block_id: None,
+            reason: TurnStopReason::EndTurn,
+            origin: TurnOrigin::Autonomous,
         });
         assert_eq!(delivered, 1, "exactly one subscriber on turn.completed");
 
@@ -1672,6 +1810,7 @@ mod tests {
             context_id: ctx,
             principal_id: principal,
             error: "boom".into(),
+            origin: TurnOrigin::Autonomous,
         });
         assert_eq!(delivered, 1, "exactly one subscriber on turn.failed");
 
@@ -1697,10 +1836,12 @@ mod tests {
                 context_id,
                 principal_id,
                 error,
+                origin,
             } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(principal_id, principal);
                 assert_eq!(error, "boom");
+                assert_eq!(origin, TurnOrigin::Autonomous);
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -1730,6 +1871,8 @@ mod tests {
             context_id: ctx,
             principal_id: principal,
             output_block_id: Some(output),
+            reason: TurnStopReason::EndTurn,
+            origin: TurnOrigin::Autonomous,
         });
         let msg = sub.try_recv().expect("should receive completion");
         match msg.payload {
@@ -1744,6 +1887,8 @@ mod tests {
             context_id: ctx,
             principal_id: principal,
             output_block_id: None,
+            reason: TurnStopReason::EndTurn,
+            origin: TurnOrigin::Autonomous,
         });
         let msg = sub.try_recv().expect("should receive the second completion");
         match msg.payload {
@@ -1776,6 +1921,104 @@ mod tests {
                 output_block_id, ..
             } => assert_eq!(output_block_id, None),
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// `reason` and `origin` are additive the same way `output_block_id` was: a
+    /// payload that predates them decodes to the conservative defaults rather
+    /// than failing. `EndTurn` is honest for an old `Completed` (cancels used to
+    /// ride `Failed`); `Interactive` is the origin that feeds no autonomous
+    /// machinery, so a missing field can never spuriously fire the OODA Act.
+    #[test]
+    fn completed_reason_and_origin_default_when_absent() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let json = serde_json::json!({
+            "Completed": { "context_id": ctx, "principal_id": principal }
+        });
+        let decoded: TurnFlow =
+            serde_json::from_value(json).expect("Completed decodes without reason/origin");
+        match decoded {
+            TurnFlow::Completed { reason, origin, .. } => {
+                assert_eq!(reason, TurnStopReason::EndTurn);
+                assert_eq!(origin, TurnOrigin::Interactive);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        let json = serde_json::json!({
+            "Failed": { "context_id": ctx, "principal_id": principal, "error": "boom" }
+        });
+        let decoded: TurnFlow =
+            serde_json::from_value(json).expect("Failed decodes without origin");
+        match decoded {
+            TurnFlow::Failed { origin, .. } => assert_eq!(origin, TurnOrigin::Interactive),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A cancelled turn is a `Completed` with a reason, never a bare error
+    /// string — the whole point of the structured stop reason. Soft and hard
+    /// cancels stay distinguishable, because only the hard one severs the phrase.
+    #[test]
+    fn cancel_is_a_completed_reason_not_a_failure() {
+        let soft = TurnStopReason::Cancelled { immediate: false };
+        let hard = TurnStopReason::Cancelled { immediate: true };
+        assert_ne!(soft, hard, "soft and hard cancels are distinguishable");
+
+        // Only a hard cancel leaves a half-written phrase behind.
+        assert!(
+            soft.output_is_complete(),
+            "a soft cancel lets the in-flight model call finish"
+        );
+        assert!(
+            !hard.output_is_complete(),
+            "a hard cancel aborts mid-token — the output is a fragment"
+        );
+
+        // Every non-cancel ending leaves a whole phrase.
+        for reason in [
+            TurnStopReason::EndTurn,
+            TurnStopReason::MaxTokens,
+            TurnStopReason::MaxIterations,
+        ] {
+            assert!(reason.output_is_complete(), "{reason:?} closes the message");
+        }
+    }
+
+    /// The stop-reason names are the ACP `stopReason` vocabulary and the capnp
+    /// enumerant names. They are wire-visible, so pin them.
+    #[test]
+    fn stop_reason_names_are_stable() {
+        assert_eq!(TurnStopReason::EndTurn.as_str(), "end_turn");
+        assert_eq!(
+            TurnStopReason::Cancelled { immediate: false }.as_str(),
+            "cancelled_soft"
+        );
+        assert_eq!(
+            TurnStopReason::Cancelled { immediate: true }.as_str(),
+            "cancelled_immediate"
+        );
+        assert_eq!(TurnStopReason::MaxTokens.as_str(), "max_tokens");
+        assert_eq!(TurnStopReason::MaxIterations.as_str(), "max_iterations");
+        assert_eq!(TurnOrigin::Interactive.as_str(), "interactive");
+        assert_eq!(TurnOrigin::Autonomous.as_str(), "autonomous");
+    }
+
+    /// Round-trip every stop reason through serde so a future journaling or
+    /// cross-process hop can't silently collapse two endings into one.
+    #[test]
+    fn stop_reason_round_trips_through_serde() {
+        for reason in [
+            TurnStopReason::EndTurn,
+            TurnStopReason::Cancelled { immediate: false },
+            TurnStopReason::Cancelled { immediate: true },
+            TurnStopReason::MaxTokens,
+            TurnStopReason::MaxIterations,
+        ] {
+            let json = serde_json::to_string(&reason).expect("serialize");
+            let back: TurnStopReason = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, reason, "{json} must round-trip");
         }
     }
 
@@ -1965,11 +2208,14 @@ mod tests {
                 context_id: ctx,
                 principal_id: principal,
                 output_block_id: None,
+                reason: TurnStopReason::EndTurn,
+                origin: TurnOrigin::Autonomous,
             },
             TurnFlow::Failed {
                 context_id: ctx,
                 principal_id: principal,
                 error: "boom".into(),
+                origin: TurnOrigin::Autonomous,
             },
         ];
 

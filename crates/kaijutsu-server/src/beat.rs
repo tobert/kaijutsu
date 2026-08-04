@@ -36,7 +36,7 @@ use tokio::time::Instant;
 
 use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::flows::{BlockFlow, TurnFlow};
+use kaijutsu_kernel::flows::{BlockFlow, TurnFlow, TurnOrigin};
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ClockKind,
     ContentRef, DeriverRegistry, MaterializeCursor, Span, TrackSnapshot, materialize_committed,
@@ -2389,7 +2389,29 @@ impl BeatScheduler {
                 },
                 msg = completed.recv(), if turn_bus_open => match msg {
                     Some(m) => {
-                        if let TurnFlow::Completed { context_id, output_block_id, .. } = m.payload {
+                        // Every turn announces now — interactive prompts too — so
+                        // the "is this the musician's own turn?" question the
+                        // producer used to answer by staying silent is answered
+                        // HERE, where it belongs (design §7):
+                        //   * `origin` — a human-prompted turn must never
+                        //     crystallize into the Act; the player is driving.
+                        //   * `reason.output_is_complete()` — a hard interrupt
+                        //     severed the stream mid-token, so the output block
+                        //     is a fragment, not a phrase. Scheduling it would
+                        //     play notation the model never finished writing.
+                        //     (This is the ending that used to arrive as a bare
+                        //     `Failed`, which the scheduler skipped by accident
+                        //     of the variant rather than on purpose.)
+                        if let TurnFlow::Completed {
+                            context_id,
+                            output_block_id,
+                            reason,
+                            origin,
+                            ..
+                        } = m.payload
+                            && origin == TurnOrigin::Autonomous
+                            && reason.output_is_complete()
+                        {
                             self.on_turn_completed(context_id, output_block_id);
                         }
                     }
