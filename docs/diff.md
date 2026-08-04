@@ -14,10 +14,11 @@ kernel surface (`kj diff`, `diff_block`, hydration-as-projection, `Done`
 validation), and the inline app preview. **Slice 5 SHIPPED 2026-08-02** —
 `DiffCore`, `Screen::Diff`, the keyboard grab, and yank→clipboard. **Slice 6
 phase A SHIPPED 2026-08-04** — word-level highlight, fold rendering, and the
-return of column motions. Phase B (minimap, the multi-rect `BlockFxMaterial`
-extension, and the character-wise visual mode it unlocks) is what remains.
-This doc is the plan of record; the per-slice "Build notes" sections below
-correct it where the build disagreed.
+return of column motions. **Phase B SHIPPED 2026-08-04** — the multi-rect
+`BlockFxMaterial` extension, character-wise `v` with a plain-text yank
+semantics, the minimap, and word-level background washes. The viewer is
+feature-complete against this plan. This doc is the plan of record; the
+per-slice "Build notes" sections below correct it where the build disagreed.
 
 ## Decisions (Amy, 2026-08-01)
 
@@ -197,7 +198,8 @@ correct it where the build disagreed.
    do NOT share the intent-drain types — Editor intents carry write semantics,
    Diff intents don't, and a shared trait would couple their evolution.
 6. **Phase A SHIPPED.** Word-level highlight, fold rendering, column motions.
-   **Phase B:** minimap, multi-rect material, character-wise visual mode.
+   **Phase B SHIPPED.** Multi-rect material, character-wise visual mode,
+   minimap, word-level background washes.
 
 ## Build notes — slices 0+1 SHIPPED 2026-08-01 (corrections to the plan above)
 
@@ -589,6 +591,107 @@ audit it triggered found three more of the same shape:
   HiDPI scale makes fractional, so a resize inside one integer could still
   move a wrap point.
 
+## Build notes — slice 6 phase B SHIPPED 2026-08-04 (rects, `v`, minimap)
+
+The three things that needed the multi-rect material, plus the word-level
+background the material's rect math made cheap. What the build settled:
+
+- **Character-wise `v` is IN, and yank grew a second semantics.** Slice 5 said
+  `v` was absent because the selection could not be *drawn*; phase A then said
+  yank stays line-wise because a fragment carrying a `+` and no line is
+  "blocked by meaning, not rendering". With the drawing problem solved, the
+  two had to be reconciled, and the answer is that **the shape decides the
+  semantics**: whole lines yank canonical unified text (a patch fragment,
+  prefixes included, `VGy` still re-parses); characters under `v` yank the
+  selected text with **every line's prefix column removed** — plain source,
+  explicitly not a patch, and unable to masquerade as one because no `+`
+  survives. That is what `v` is *for*: grabbing an identifier or an expression
+  out of a diff you are reading. `DiffIntent::Yank` carries a `YankKind` so the
+  distinction is in the type, not in a comment.
+  **Enabling `v` did not loosen phase A's operator guard by one inch.** `yw`,
+  `y$`, `yiw`, `` y`a ``, `y^`, `yvj` all still yank nothing. The line: a
+  visual selection is a decision the reader *saw highlighted* before acting on
+  it; an operator-motion fragment is an accident of a motion. `<C-v>` block
+  visual stays Nop'd — a rectangle cuts *through* the prefix column, so it is
+  neither a patch nor a coherent run of source. It is the shape with no
+  semantics attached, and it stays out until something asks for it with one.
+- **The selection branch had to read modalkit's own rule, not the context.**
+  `EditTarget::Selection` resolves its shape as
+  `ctx.get_target_shape().unwrap_or(cursor_state.shape())`. Asking the context
+  alone — the obvious thing — would have missed a plain `v`, which forces no
+  shape, and silently routed it to the patch path with prefixes intact.
+- **The material takes many rects, and interior rows draw full width.** A
+  fixed uniform array of 16 (portable everywhere wgpu runs; the shader loops to
+  `count`, never to the capacity). `coalesce_selection_rects` replaces the
+  interior rows of a multi-row selection with **one** full-width band: it is
+  what every editor draws (the band to the right edge is how you see the
+  newline is included) *and* it bounds a contiguous selection at three rects,
+  so the fixed capacity can never truncate one. The capacity is headroom for
+  shapes that do not coalesce (bidi rows, future search matches); overflow
+  warns rather than silently dropping what the reader can see.
+- **Two compositors, one producer.** The rects come from parley's own
+  `Selection::geometry` (the off-the-shelf answer `docs/vi.md` names). The
+  editor panel will push them through the *material*, which composites over
+  the text; the diff viewer draws them as `MsdfBlockGeometry` quads, because a
+  diff selection has to sit on top of the `+`/`-` bands and under the glyphs.
+  Neither surface could use the other's compositor, and both use the same
+  rects. `shaders::selection` is the shared middle.
+- **A count is not a column** (deepseek post-ship review, phase A — a real
+  bug found and fixed here). `cursor_col` clamped to `row_char_len`, which is
+  one *past* the last character; `cursor_byte` then returned the line's
+  newline byte, and parley's `Cursor::from_byte_index(.., Downstream)`
+  resolves that onto the **next** visual row. `$` then `j` onto a shorter line
+  drew the cursor a line low. Fixed in both halves — `DiffCore::last_col`
+  clamps the reported column, and `cursor_byte` clamps to a real character —
+  which split the old function in two: `column_byte` stops at the end of the
+  text (the exclusive end a *selection* wants), `cursor_byte` stops *on* the
+  last character (where a cursor is *drawn*). Using either for the other's job
+  is a visible bug: a selection missing its last glyph, or a cursor a line low.
+- **The minimap keys on its own tier, coarser than the cursor's.** Buckets are
+  O(drawn rows) to build and O(buckets) to draw, so they are computed against
+  `(content, fold_seq, bucket count, strip box)` and *memcpy'd* into the
+  geometry buffer on every cheap pass; only the viewport band and the cursor
+  line are rebuilt per keystroke. It never joins `LayoutKey`, so a minimap
+  redraw never re-shapes a glyph.
+- **A bucket keeps counts, not a dominant class.** One deleted line inside a
+  screenful of context is what a reader scans a minimap *for*; a slot that
+  reported only its majority would erase it. Insertions and deletions draw as
+  a diverging bar from the strip's centre, each with a two-pixel floor, so
+  presence survives compression even where proportion cannot.
+- **The minimap is built from `visible_rows`, not from the model**, which is
+  the one place this deviates from the seam guidance's "extents live on
+  `DiffModel`". A minimap must agree with what is on screen, and that is the
+  fold projection — a viewer concept. Folds are reflected for free as a
+  result. The row↔bucket mapping is invertible and tested, so click-to-jump
+  (Decision 6's reason for wanting `viz::scales`) is a wiring job, not a
+  design one.
+- **Word-level background washes came free** with the rect math: the same
+  `Selection::geometry` query over a `WordHighlight`'s byte range, no cluster
+  walk in our code at all. They ride the *layout* tier beside the `+`/`-`
+  bands (word spans change only when the content does) and draw over them,
+  under the glyphs.
+- **Not verified in the running app** (headless only): the WGSL compiles only
+  on a real device, so the multi-rect shader loop is unproven until the
+  runner draws a selection; the character selection's rects against a wrapped
+  line; the minimap's readability and its width against the status strip; and
+  the word washes stacked on the line bands.
+
+### Post-ship review — slice 6 phase B (deepseek, 2026-08-04)
+
+Holistic read of the shipped files, no diff. **No correctness defects.** It
+verified the three things most likely to be quietly wrong and found them
+right: the encase↔WGSL layout of the new uniform matches byte for byte
+(`[Vec4; 16]` at offset 0, `count` at 256, struct padded to 272); a dynamic
+loop over a uniform array bounded by `min(count, MAX)` is valid on every wgpu
+backend; and no consumer still assumes the single-rect uniform. It also traced
+that no key sequence can get a `+`/`-` prefix into a `PlainText` yank, and
+that the `CharSpan` is always captured *before* the buffer action collapses
+the selection it came from. Two robustness notes applied: `coalesce_selection
+_rects` now filters both paths through `is_visible` (the multi-row path was
+correct only because coalescing happened to give a zero-width rect width), and
+the render-side local span no longer carries an `end_col` measured on a row
+outside the laid-out window — dead today, a magnet for a future refactor.
+
 ## Seam guidance (deepseek review, 2026-08-01)
 
 Consulted deepseek specifically on how the seams should evolve so this work
@@ -673,12 +776,6 @@ line-wise `V` only until multi-rect). Still open:
   changed-bar wash is a background quad per bar extent. Bar-aligned text hunks
   map 1:1 onto engraved measures, so the text diff *is* the index into the
   visual one.
-- **Word-level *background* emphasis** — slice 6A colors changed words with a
-  brighter foreground brush only. jj's `color-words` and git's `--word-diff`
-  also wash the word's background, which reads better on a busy line. The
-  band geometry can already draw arbitrary quads; what it lacks is the word's
-  **x extent**, which means walking clusters in the cached parley layout (or
-  the multi-rect material phase B brings). Cheap once either exists.
 - **Syntax highlighting under diff colors** — the biggest visual lever per the
   research; kaijutsu has span infra but no grammars (kaish tokenizer stubs are
   marked "Phase 4: syntax highlighting via Parley spans"). Design the diff

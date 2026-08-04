@@ -133,11 +133,15 @@ pub fn coalesce_selection_rects(
     left: f32,
     right: f32,
 ) -> Vec<SelectionRect> {
-    let visible: Vec<SelectionRect> = rects.iter().copied().filter(|r| r.height > 0.0).collect();
+    // One filter, `is_visible`, for both paths. Filtering the multi-row path
+    // on height alone would let a zero-width rect into the head/tail slots,
+    // where the coalescing happens to give it width — correct by accident is
+    // not a property worth keeping.
+    let visible: Vec<SelectionRect> = rects.iter().copied().filter(|r| r.is_visible()).collect();
     match visible.len() {
         0 => Vec::new(),
         // A selection inside one row is exactly what Parley measured.
-        1 => visible.into_iter().filter(|r| r.is_visible()).collect(),
+        1 => visible,
         n => {
             let mut out = Vec::with_capacity(3);
             let head = visible[0];

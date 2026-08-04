@@ -577,7 +577,18 @@ pub fn build_diff_surface(
                     0
                 },
                 end_row: span.end_row.saturating_sub(window.first_row),
-                end_col: span.end_col,
+                // A column only means something on the row it was measured
+                // on. If the selection ends below the laid-out window, the
+                // end row is not this one, so the column travelling with it
+                // would be a measurement of a different line —
+                // `char_selection_bytes` clamps that case to "the last row,
+                // whole", and this says so rather than leaving a live-looking
+                // value for a future refactor to start reading.
+                end_col: if span.end_row.saturating_sub(window.first_row) < preview.lines.len() {
+                    span.end_col
+                } else {
+                    usize::MAX
+                },
             };
             if span.end_row >= window.first_row
                 && let Some(bytes) = crate::text::diff::char_selection_bytes(preview, local)

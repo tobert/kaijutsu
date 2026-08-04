@@ -25,11 +25,23 @@ issues are fixed.
   more than render wiring. It needs, in order: (1) a selection range on the
   kernel's `EditorState` (`kaijutsu-kernel/src/editor.rs`) *and* the capnp
   `EditorState` struct (`kaijutsu.capnp`) — the wire carries only a cursor
-  today, no selection anchor; (2) a `BlockFxMaterial`/shader extension — the
-  material has one `selection_params` rect today, and multi-line selection
-  needs multi-rect support; (3) only then the parley
-  `Selection::geometry(layout)` render wiring, which *is* off-the-shelf in
-  parley 0.7.
+  today, no selection anchor; ~~(2) a `BlockFxMaterial`/shader extension~~
+  **DONE 2026-08-04** (diff slice 6 phase B): the material takes up to 16
+  UV-space rects with a live count, and `shaders::selection` carries the
+  pixel-space rect type, the coalescing rule, and the packer; (3) only then the
+  parley `Selection::geometry(layout)` render wiring, which *is* off-the-shelf
+  in parley 0.7 — and is now *already used*, by the diff viewer, through
+  `text::diff::layout_rects`.
+
+  So step (1) is the whole remaining cost. When it lands, the editor's path is:
+  `Selection::geometry` → `layout_rects` (one rect per visual row, bidi rows
+  unioned) → `coalesce_selection_rects` (interior rows become one full-width
+  band, which bounds a contiguous selection at three rects) →
+  `pack_selection_rects` → `mat.selection_rects`. The diff viewer draws the
+  *same* rects as `MsdfBlockGeometry` quads instead, because a diff selection
+  has to sit on top of the `+`/`-` bands; the editor has no bands and wants the
+  shader's over-the-text composite. Neither could use the other's compositor —
+  which is exactly why the rect *producer* is shared and the drawing is not.
 - **`/`·`?` search and `.` dot-repeat** — safe no-ops today (the command-bar
   suppression guard makes them inert, not corrupting). Real search needs the
   bar submit wired to a search action; real `.` needs modalkit's
