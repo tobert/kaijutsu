@@ -6,6 +6,43 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Conversation block-focus indicator is invisible (2026-08-04, live BRP debug)
+
+The "j/k navigation stuck" mystery from the 08-03 signoff is SOLVED and it
+was never navigation: an instrumented live session showed 8/8 `j`/`k`
+presses moving `FocusTarget` correctly (log-verified, both directions)
+while two screenshots at adjacent focus indexes differed by 4 pixels at
+max channel delta 0.28/255. **Focus moves; nothing visible shows it.**
+Mechanism, three contributing factors, all render-side:
+
+- The only focus visual is a 1.15× brighten of the block's plain-text
+  color (`view/render.rs:787` `highlight_focused_block`, multiply at
+  `:813`); `FocusedBlockCell` has exactly one consumer.
+- Markdown/rich blocks ignore that color entirely (per-span theme brushes,
+  `block_render.rs:677`), and most conversation content is markdown — so
+  for typical blocks the brighten changes zero pixels.
+- The borders you CAN see are kind/status styling
+  (`cell/block_border.rs:143` takes no focus input); the fork block's
+  purple border reads as a focus ring and anchored the misdiagnosis. The
+  first `j` "works" visually only because the cold-start `None → 0` focus
+  jump scrolls the viewport to document top.
+
+Also: nothing un-highlights (one-way write until `doc_version` advances),
+and `highlight_focused_block:806` clones a whole-document snapshot
+(`editor.blocks()`, 187 blocks) every frame a block is focused, against
+the discipline stated at `render.rs:83` — should be
+`editor.block_snapshot(&block_cell.block_id)`.
+
+Fix sketch (from the debug session, not yet implemented): move focus
+feedback to the border — pass focus into `determine_block_border_style`
+and emit a distinct focus border; note its `layout_gen` early-return at
+`block_border.rs:158` must gain a `focus.is_changed()` escape or the new
+style never applies. Then delete `highlight_focused_block` or give it a
+revert path. Regression tests: extract `next_focus_index` math
+(`input/systems.rs:484-497`) for the ends; an app-level test asserting
+focus-visual moves AND reverts between two blocks (fails on both counts
+today). Also fold in the snapshot-clone fix above.
+
 ## Shell dock never draws a visual-selection highlight (noticed 2026-08-04, tier-2 app cleanup)
 
 While unifying `build_overlay_glyphs`/`build_shell_dock_glyphs`
@@ -433,8 +470,14 @@ right cluster written into the same pixels instead of being measured against
 the available width. Look at how the bar allocates width between the mode/
 model/context cluster and the screen-hint cluster, not at `ui_rtt`.
 
-The diffstat-footer-over-content half of this entry is still unretested — it
-needs a diff open in `Screen::Diff`, which this session did not reach.
+The diffstat-footer-over-content half **CONFIRMED live 2026-08-04** (BRP
+session, steady scale, fresh boot — so also not a scale artifact): with a
+22-row diff open in `Screen::Diff`, the footer strip draws over the last
+two content rows, and the conversation status bar renders THROUGH the
+viewer's footer (both bars visible in the same pixels). Same
+width-allocation family as the time-well overlap above: the footer does
+not reserve a content row, and the underlying screen's bar is not
+suppressed while the viewer owns the screen.
 
 Everything else in the slice-5 checklist verified live today: `v` open (after
 the DiffSurface resize-filter crash fix in `block_render.rs`), `]c`, `V`+`jj`
