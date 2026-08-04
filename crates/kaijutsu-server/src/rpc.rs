@@ -10628,3 +10628,73 @@ mod subscription_registry_tests {
     }
 
 }
+
+#[cfg(test)]
+mod turn_event_wire_mapping_tests {
+    //! The kernel→wire half of the turn-outcome encoding.
+    //!
+    //! The client crate pins the wire→client half (`turn_events_tests` in
+    //! `kaijutsu-client`), so between them the whole chain — kernel
+    //! `TurnStopReason` → capnp enumerant → client `TurnCompletedStopReason` —
+    //! is pinned without needing a live turn to hit every ending. That matters
+    //! because the endings hardest to reach in an e2e test (a cancel winning a
+    //! race against a mock provider, a real token-ceiling truncation) are the
+    //! ones a collapsed mapping would hide.
+
+    use super::*;
+
+    /// Each kernel reason gets its own enumerant. A collapsed mapping would
+    /// report a cancelled turn to every client as a clean end of turn.
+    #[test]
+    fn every_stop_reason_has_its_own_enumerant() {
+        use crate::kaijutsu_capnp::TurnStopReason as W;
+        let pairs = [
+            (TurnStopReason::EndTurn, W::EndTurn),
+            (TurnStopReason::Cancelled { immediate: false }, W::CancelledSoft),
+            (
+                TurnStopReason::Cancelled { immediate: true },
+                W::CancelledImmediate,
+            ),
+            (TurnStopReason::MaxTokens, W::MaxTokens),
+            (TurnStopReason::MaxIterations, W::MaxIterations),
+        ];
+        for (kernel_reason, wire) in pairs {
+            assert_eq!(
+                stop_reason_to_capnp(kernel_reason),
+                wire,
+                "{kernel_reason:?} must encode as {wire:?}"
+            );
+        }
+
+        // Distinctness, stated directly: five reasons, five enumerants.
+        let encoded: Vec<_> = pairs.iter().map(|(r, _)| stop_reason_to_capnp(*r)).collect();
+        for (i, a) in encoded.iter().enumerate() {
+            for b in encoded.iter().skip(i + 1) {
+                assert_ne!(a, b, "two stop reasons collapsed onto one enumerant");
+            }
+        }
+    }
+
+    /// The soft/hard cancel split survives encoding — the flag that tells the
+    /// beat scheduler (and an ACP frontend) whether the output is a whole
+    /// phrase or a fragment.
+    #[test]
+    fn soft_and_hard_cancels_stay_distinct_on_the_wire() {
+        assert_ne!(
+            stop_reason_to_capnp(TurnStopReason::Cancelled { immediate: false }),
+            stop_reason_to_capnp(TurnStopReason::Cancelled { immediate: true }),
+        );
+    }
+
+    #[test]
+    fn origin_maps_both_ways() {
+        assert_eq!(
+            turn_origin_to_capnp(TurnOrigin::Interactive),
+            crate::kaijutsu_capnp::TurnOrigin::Interactive
+        );
+        assert_eq!(
+            turn_origin_to_capnp(TurnOrigin::Autonomous),
+            crate::kaijutsu_capnp::TurnOrigin::Autonomous
+        );
+    }
+}

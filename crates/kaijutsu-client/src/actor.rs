@@ -79,7 +79,7 @@ use crate::rpc::{
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, ResourceEventsForwarder,
-    ServerEvent, VfsActivityEventsForwarder,
+    ServerEvent, TurnEventsForwarder, VfsActivityEventsForwarder,
 };
 use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 
@@ -2645,17 +2645,35 @@ async fn connect_handshake(
     let editor_client: crate::kaijutsu_capnp::editor_events::Client =
         capnp_rpc::new_client(editor_fwd);
 
+    // Turn outcomes ride the same shared `event_tx`, alongside the editor and
+    // block streams. Kernel-wide for the same reason the editor channel is: the
+    // event names its own context. Part of the MANDATORY subscription set, not
+    // an opt-in like the VFS digest — knowing a turn ended is not decorative,
+    // and a client that entered Connected without it would be back to guessing
+    // completion from block-status polling.
+    let turn_fwd = TurnEventsForwarder {
+        event_tx: event_tx.clone(),
+    };
+    let turn_client: crate::kaijutsu_capnp::turn_events::Client =
+        capnp_rpc::new_client(turn_fwd);
+
     let subscribe_block = kernel.subscribe_blocks_filtered(block_client, &filter, &instance);
     let subscribe_resource = kernel.subscribe_mcp_resources(resource_client, &instance);
     let subscribe_editor = kernel.subscribe_editor(editor_client);
+    let subscribe_turns = kernel.subscribe_turn_events(turn_client);
 
     // `try_join!` short-circuits: if any subscription fails, the others are
     // cancelled and we return immediately. `futures::future::join` would wait
     // for all, eating budget for nothing.
     let subscribe_both = async {
-        tokio::try_join!(subscribe_block, subscribe_resource, subscribe_editor)
-            .map(|_| ())
-            .map_err(|e| format!("subscribe: {e}"))
+        tokio::try_join!(
+            subscribe_block,
+            subscribe_resource,
+            subscribe_editor,
+            subscribe_turns
+        )
+        .map(|_| ())
+        .map_err(|e| format!("subscribe: {e}"))
     };
 
     match tokio::time::timeout(SUBSCRIBE_TIMEOUT, subscribe_both).await {
