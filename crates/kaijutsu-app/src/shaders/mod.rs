@@ -5,6 +5,7 @@
 
 pub mod block_fx_material;
 pub mod chord_material;
+pub mod selection;
 pub mod terrace_ring_material;
 pub mod trace_glow_material;
 pub mod track_ray_material;
@@ -15,6 +16,7 @@ use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
 pub use chord_material::ChordMaterial;
+pub use selection::{SelectionRect, SelectionRects, pack_selection_rects};
 pub use terrace_ring_material::TerraceRingMaterial;
 pub use trace_glow_material::TraceGlowMaterial;
 pub use track_ray_material::TrackRayMaterial;
@@ -167,32 +169,39 @@ fn sync_block_fx(
             (true, Some(geom)) => {
                 cursor_selection_uniforms(geom, rtt.built_width, rtt.built_height, &theme)
             }
-            _ => (Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO),
+            _ => (Vec4::ZERO, Vec4::ZERO, SelectionRects::none(), Vec4::ZERO),
         };
         mat.cursor_params = cp;
         mat.cursor_color = cc;
-        mat.selection_params = sp;
+        mat.selection_rects = sp;
         mat.selection_color = sc;
     }
 }
 
 /// Compute the cursor + selection material uniforms from cursor geometry, in UV
-/// space: `(cursor_params, cursor_color, selection_params, selection_color)`.
+/// space: `(cursor_params, cursor_color, selection_rects, selection_color)`.
 ///
 /// Shared by the compose overlay ([`sync_block_fx`]) and the editor surface
 /// (`view::editor::render::sync_editor_cursor`) so the cursor beam/block/underline
 /// shapes and the selection highlight render identically. `rtt_w`/`rtt_h` are the
 /// surface's logical build dimensions (pixel rects → UV). Returns all-zero (no
 /// composite) when there is no cursor to draw.
+///
+/// [`OverlayCursorGeometry`] carries **one** selection rect, which is all the
+/// compose overlay's single-line selection needs. The material now takes many
+/// ([`selection`]); a surface with a real multi-row selection — the editor
+/// panel, once its wire carries a selection anchor — builds its rects from
+/// `parley::Selection::geometry`, coalesces them, and calls
+/// [`pack_selection_rects`] itself rather than coming through here.
 pub fn cursor_selection_uniforms(
     geom: &OverlayCursorGeometry,
     rtt_w: f32,
     rtt_h: f32,
     theme: &Theme,
-) -> (Vec4, Vec4, Vec4, Vec4) {
+) -> (Vec4, Vec4, SelectionRects, Vec4) {
     use crate::input::vim::CursorKind;
     if geom.height <= 0.0 || rtt_w <= 0.0 || rtt_h <= 0.0 {
-        return (Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO);
+        return (Vec4::ZERO, Vec4::ZERO, SelectionRects::none(), Vec4::ZERO);
     }
 
     // Block-cursor width: a fraction of line height. Mono fonts cluster around
@@ -223,21 +232,25 @@ pub fn cursor_selection_uniforms(
         (Vec4::ZERO, Vec4::ZERO)
     };
 
-    let (selection_params, selection_color) =
+    let (selection_rects, selection_color) =
         if geom.selection_width > 0.0 && geom.selection_height > 0.0 {
             let s = theme.selection_bg.to_srgba();
             (
-                Vec4::new(
-                    geom.selection_x as f32 / rtt_w,
-                    geom.selection_y as f32 / rtt_h,
-                    geom.selection_width as f32 / rtt_w,
-                    geom.selection_height as f32 / rtt_h,
+                pack_selection_rects(
+                    &[SelectionRect::new(
+                        geom.selection_x as f32,
+                        geom.selection_y as f32,
+                        geom.selection_width as f32,
+                        geom.selection_height as f32,
+                    )],
+                    rtt_w,
+                    rtt_h,
                 ),
                 Vec4::new(s.red, s.green, s.blue, s.alpha),
             )
         } else {
-            (Vec4::ZERO, Vec4::ZERO)
+            (SelectionRects::none(), Vec4::ZERO)
         };
 
-    (cursor_params, cursor_color, selection_params, selection_color)
+    (cursor_params, cursor_color, selection_rects, selection_color)
 }

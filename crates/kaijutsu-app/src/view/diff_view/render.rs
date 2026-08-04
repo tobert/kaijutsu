@@ -585,7 +585,7 @@ pub fn sync_diff_cursor(
         );
         mat.cursor_params = cp;
         mat.cursor_color = cc;
-        mat.selection_params = sp;
+        mat.selection_rects = sp;
         mat.selection_color = sc;
     }
 }

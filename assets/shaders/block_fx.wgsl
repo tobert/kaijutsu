@@ -19,6 +19,9 @@
 //     label_inset_top/bottom: >0 moves border inward for fieldset/legend labels; 0=default (1px)
 //   border_insets    - [pad_top, pad_bottom, pad_left, pad_right] in pixels
 //   border_color     - RGBA color for border stroke (linear)
+//   selection_rects  - up to 16 UV-space [x, y, w, h] rects + a live count
+//     One selection is many rects — see `shaders::selection` for why, and for
+//     the coalescing that keeps a contiguous selection down to three.
 
 #import bevy_ui::ui_vertex_output::UiVertexOutput
 #import bevy_render::globals::Globals
@@ -37,7 +40,17 @@
 @group(1) @binding(9) var<uniform> border_insets: vec4<f32>;
 @group(1) @binding(10) var<uniform> border_color: vec4<f32>;
 @group(1) @binding(11) var<uniform> label_gaps: vec4<f32>;
-@group(1) @binding(12) var<uniform> selection_params: vec4<f32>;
+
+// A selection is MANY rects: crossing a line break gives a ragged first row,
+// whole middle rows, and a ragged last row. `count` is how many of `rects` are
+// live — the loop is bounded by it, not by the capacity, so the ordinary
+// one-to-three-rect selection costs three iterations.
+const MAX_SELECTION_RECTS: u32 = 16u;
+struct SelectionRects {
+    rects: array<vec4<f32>, 16>,
+    count: u32,
+}
+@group(1) @binding(12) var<uniform> selection_rects: SelectionRects;
 @group(1) @binding(13) var<uniform> selection_color: vec4<f32>;
 
 // Border kind constants
@@ -348,20 +361,27 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // --- Visual-mode selection rect (composited UNDER cursor, OVER text) ---
+    // --- Visual-mode selection rects (composited UNDER cursor, OVER text) ---
     // Translucent background — text shows through, cursor still draws on top.
-    if selection_params.z > 0.0 && selection_params.w > 0.0 {
-        let sx = selection_params.x;
-        let sy = selection_params.y;
-        let sw = selection_params.z;
-        let sh = selection_params.w;
-        if in.uv.x >= sx && in.uv.x <= sx + sw && in.uv.y >= sy && in.uv.y <= sy + sh {
-            let sa = selection_color.a;
-            result = vec4<f32>(
-                result.rgb * (1.0 - sa) + selection_color.rgb * sa,
-                result.a * (1.0 - sa) + sa,
-            );
+    // Rects may overlap; the composite is applied ONCE per fragment (a doubled
+    // wash at a seam would draw the coalescing seams as visible bands).
+    var in_selection = false;
+    let sel_count = min(selection_rects.count, MAX_SELECTION_RECTS);
+    for (var i = 0u; i < sel_count; i = i + 1u) {
+        let r = selection_rects.rects[i];
+        if r.z > 0.0 && r.w > 0.0
+            && in.uv.x >= r.x && in.uv.x <= r.x + r.z
+            && in.uv.y >= r.y && in.uv.y <= r.y + r.w {
+            in_selection = true;
+            break;
         }
+    }
+    if in_selection {
+        let sa = selection_color.a;
+        result = vec4<f32>(
+            result.rgb * (1.0 - sa) + selection_color.rgb * sa,
+            result.a * (1.0 - sa) + sa,
+        );
     }
 
     // --- Cursor beam (sharp rect in UV space, composited over text) ---

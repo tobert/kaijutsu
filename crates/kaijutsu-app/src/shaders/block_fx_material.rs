@@ -8,6 +8,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
+use super::selection::SelectionRects;
+
 /// Post-processing material for conversation block textures.
 ///
 /// # Uniforms
@@ -26,6 +28,10 @@ use bevy::shader::ShaderRef;
 ///   6=center_line (role-group divider — one full-width rule, no box)
 /// - `border_insets`: `[pad_top, pad_bottom, pad_left, pad_right]` in pixels.
 /// - `border_color`: RGBA color for the border stroke (linear).
+/// - `selection_rects`: up to
+///   [`MAX_SELECTION_RECTS`](super::selection::MAX_SELECTION_RECTS) UV-space
+///   rects plus a live count — a selection is many rectangles, one per visual
+///   row it crosses (`super::selection`).
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct BlockFxMaterial {
     #[texture(0)]
@@ -76,10 +82,14 @@ pub struct BlockFxMaterial {
     #[uniform(11)]
     pub label_gaps: Vec4,
 
-    /// Selection rect in UV space: [x, y, width, height]. All zero (or w=0)
-    /// disables the selection composite. Used for vim Visual mode highlight.
+    /// The selection highlight: **many** rects in UV space, not one.
+    ///
+    /// A vim Visual selection that crosses a line break covers a ragged first
+    /// row, whole middle rows, and a ragged last row — three rects minimum, and
+    /// one per row before `super::selection::coalesce_selection_rects` folds
+    /// the interior into a single band. `count == 0` skips the composite.
     #[uniform(12)]
-    pub selection_params: Vec4,
+    pub selection_rects: SelectionRects,
 
     /// Selection background color (RGBA, linear color space).
     #[uniform(13)]
@@ -100,7 +110,7 @@ impl Default for BlockFxMaterial {
             border_insets: Vec4::ZERO,
             border_color: Vec4::ZERO,
             label_gaps: Vec4::ZERO,
-            selection_params: Vec4::ZERO,
+            selection_rects: SelectionRects::none(),
             selection_color: Vec4::ZERO,
         }
     }
