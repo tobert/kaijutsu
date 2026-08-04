@@ -491,6 +491,54 @@ interface EditorEvents {
 }
 
 # ============================================================================
+# Turn lifecycle push channel
+# ============================================================================
+# Turn completion is the one fact about a turn that every client needs and no
+# client can compute. Before this channel, clients inferred it by polling block
+# status — a heuristic that cannot tell "finished" from "cancelled" from "still
+# thinking", and that gets slower and less certain as a turn gets longer.
+#
+# Mirrors kernel `TurnFlow::Completed`/`Failed` (kaijutsu-kernel/src/flows.rs);
+# `TurnFlow::Requested` deliberately stays in-process (it is a request TO the
+# server's turn driver, which nothing outside the process can serve).
+
+# Why a turn stopped. 1:1 with kernel `TurnStopReason` and with the ACP v1
+# `stopReason` vocabulary — end_turn / cancelled / max_tokens /
+# max_turn_requests. The soft/hard cancel split matches `interruptContext`'s
+# `immediate` flag: a soft cancel lets the in-flight model call finish (whole
+# phrase), a hard one aborts mid-token (fragment).
+enum TurnStopReason {
+  endTurn @0;             # model finished; ACP end_turn
+  cancelledSoft @1;       # interruptContext(immediate = false); ACP cancelled
+  cancelledImmediate @2;  # interruptContext(immediate = true);  ACP cancelled
+  maxTokens @3;           # provider hit the output ceiling; ACP max_tokens
+  maxIterations @4;       # agentic tool-iteration cap; ACP max_turn_requests
+}
+
+# Who asked for the turn. Interactive turns announce like every other turn;
+# consumers that must ignore them (the kernel's own OODA Act) filter here.
+enum TurnOrigin {
+  interactive @0;   # a player submitted a prompt (prompt / submitInput)
+  autonomous @1;    # the kernel drove itself (kj fork --prompt, drift, cruise)
+}
+
+# Callback for receiving turn-outcome pushes. Kernel-wide, exactly like
+# `subscribeEditor` — the event names its context rather than the subscription
+# filtering to one, so a client watching several contexts needs one channel.
+interface TurnEvents {
+  # A turn reached an ending the driver arrived at on purpose. `outputBlockId`
+  # is the model's last text block; `hasOutputBlock` is false (and the id
+  # meaningless) when the turn produced no text at all.
+  onTurnCompleted @0 (contextId :Data, principalId :Data,
+                      outputBlockId :BlockId, hasOutputBlock :Bool,
+                      stopReason :TurnStopReason, origin :TurnOrigin);
+  # A turn BROKE — hydration failure, provider/stream error. Not a cancel:
+  # a cancelled turn arrives as onTurnCompleted with a cancelled stopReason.
+  onTurnFailed @1 (contextId :Data, principalId :Data, error :Text,
+                   origin :TurnOrigin);
+}
+
+# ============================================================================
 # Block Queries & Timeline
 # ============================================================================
 
@@ -1593,6 +1641,21 @@ interface Kernel {
   # it dies), because a sink that crashes cannot send an unplug and cannot be
   # trusted to identify itself honestly either. Empty from an older peer.
   reportMidiPresence @100 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
+
+  # ==========================================================================
+  # Turn lifecycle stream
+  # ==========================================================================
+  # Push channel: the server bridges the kernel's `TurnFlow` outcome bus onto
+  # `TurnEvents` callbacks. Every turn announces — interactive prompts and
+  # kernel-driven autonomous turns alike — carrying the structured stop reason
+  # (`end_turn` / cancelled / `max_tokens` / `max_iterations`) that a client
+  # cannot infer from block status at all.
+  #
+  # Kernel-wide, following `subscribeEditor`: no per-context filter parameter,
+  # because the event names its own `contextId` and a client watching several
+  # contexts should not need several subscriptions. Connection-scoped — the
+  # bridge dies with the connection, no cross-connection dedupe.
+  subscribeTurnEvents @101 (callback :TurnEvents);
 }
 
 # ============================================================================

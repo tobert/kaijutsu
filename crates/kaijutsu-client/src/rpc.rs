@@ -1062,6 +1062,26 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Subscribe to turn-outcome pushes — the server streams every turn's
+    /// terminal event (completed, with its structured stop reason, or failed)
+    /// to `callback` until the connection drops.
+    ///
+    /// Kernel-wide, following `subscribe_editor`: the event names its own
+    /// context, so one subscription covers every context this client watches.
+    /// See [`crate::subscriptions::turn_events_channel`] for building the
+    /// callback client. This is what replaces inferring turn completion from
+    /// block-status polling.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_turn_events")]
+    pub async fn subscribe_turn_events(
+        &self,
+        callback: crate::kaijutsu_capnp::turn_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_turn_events_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
+
     // =========================================================================
     // MCP Tool operations
     // =========================================================================

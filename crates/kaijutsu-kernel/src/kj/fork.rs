@@ -1363,6 +1363,22 @@ impl KjDispatcher {
     /// the child's block log as the fork note, so this only publishes the
     /// request — it does not re-insert the seed. Must run after all fork-time
     /// block injections so `after_block_id` anchors at the true tail.
+    ///
+    /// # The join seam
+    ///
+    /// Fire-and-forget by design: `fork()` returns on the parent immediately.
+    /// The **join** half now exists as a signal — the child's turn publishes
+    /// `TurnFlow::Completed`/`Failed` naming its context, in-process on the bus
+    /// and over capnp via `subscribeTurnEvents`. Anything that wants to block
+    /// on the child (the unimplemented `kj wait`, an ACP frontend's delegation
+    /// view) subscribes and matches on the child's `context_id`; nothing needs
+    /// to poll the child's block log any more.
+    ///
+    /// What is still missing is the *command* — `kj wait` itself (docs/issues.md,
+    /// "Delegation has no join"). Deliberately not half-built here: a waiter also
+    /// needs a timeout policy, a story for the turn that ends before the waiter
+    /// subscribes, and a decision about waiting on several children at once. The
+    /// substrate is ready; the semantics are a separate conversation.
     fn request_child_turn(
         &self,
         new_id: ContextId,

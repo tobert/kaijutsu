@@ -40,7 +40,8 @@ pub use share_server::{
 };
 pub use ssh::{KeySource, SshClient, SshConfig, SshError};
 pub use subscriptions::{
-    ConnectionStatus, OutputEvent, ServerEvent, block_events_channel, editor_events_channel,
+    ConnectionStatus, OutputEvent, ServerEvent, TurnCompletedStopReason, TurnOrigin,
+    block_events_channel, editor_events_channel, turn_events_channel,
     vfs_activity_events_channel,
 };
 pub use midi_exchange::{
