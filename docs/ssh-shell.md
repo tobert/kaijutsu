@@ -77,10 +77,13 @@ like any context (`insert_context_with_document`), and survives restart. There i
 exactly *one* scratch context for the whole kernel, so every SSH login would share it.
 
 There is no genesis/root context constant. The only well-known system context today is
-**`lost+found`**, lazily minted by `ensure_lost_found()` with `PrincipalId::system()`
-(`drift.rs:548`) and re-adopted at cold-start (`rpc.rs:1289`,
-`drift.adopt_lost_found`). That `ensure_*` / `adopt_*` pair is the pattern to copy for
-a lobby anchor.
+**`lost+found`**, created on demand by `KjDispatcher::ensure_lost_found_context()`
+(`kj/drift.rs`) with `PrincipalId::system()` and re-adopted at cold-start (`rpc.rs:1289`,
+`drift.adopt_lost_found`). That pair is the pattern to copy for a lobby anchor —
+including its ordering: the caller writes the document + `contexts` row **first** and
+only then calls `DriftRouter::claim_lost_found()`, because a registered handle must
+always imply a KernelDb row. The router deliberately cannot mint the context itself
+(it holds no DB handle, so minting there could only produce a rowless handle).
 
 Lineage for reference: `forked_from` column (root = `None`) traversed by
 `fork_lineage()`, plus a structural DAG in the `context_edges` table
@@ -242,4 +245,4 @@ Playing the shell out, smallest surprises first:
 | VFS mounts scoped to context | `runtime/embedded_kaish.rs:282` (`/v/docs`, `/v/input`) |
 | `kj` no-context dispatch gate | `kj/mod.rs:425` |
 | Scratch context (global singleton) | `kj/context.rs:755` (`context_scratch`) |
-| `lost+found` anchor pattern to copy | `drift.rs:548` (`ensure_lost_found`), `rpc.rs:1289` (adopt) |
+| `lost+found` anchor pattern to copy | `kj/drift.rs` (`ensure_lost_found_context`, row before claim), `drift.rs` (`claim_lost_found`), `rpc.rs:1289` (adopt) |

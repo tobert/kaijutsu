@@ -545,21 +545,47 @@ impl DriftRouter {
         Some(item)
     }
 
-    /// Get or create the ContextId for the "lost+found" context.
+    /// Put drained dead letters back on the dead-letter queue.
     ///
-    /// Lazily creates and registers the context on first call. The caller is
-    /// responsible for creating the corresponding block store document.
-    pub fn ensure_lost_found(&mut self) -> (ContextId, bool) {
-        if let Some(id) = self.lost_found_id {
-            return (id, false);
+    /// [`drain_dead_letter`](Self::drain_dead_letter) takes the whole queue,
+    /// so an item whose write into lost+found fails afterwards is gone —
+    /// dropped by the one path whose entire job is *not* losing failed drifts.
+    /// The flush engine hands those items back here instead, and they get
+    /// another attempt on the next flush.
+    pub fn restore_dead_letters(&mut self, items: Vec<StagedDrift>) {
+        self.dead_letter.extend(items);
+    }
+
+    /// Claim `id` — a context whose `KernelDb` row the caller has **already
+    /// persisted** — as the lost+found sink, registering it as a handle.
+    ///
+    /// The router deliberately cannot mint a lost+found of its own: it holds no
+    /// DB handle, so minting here would register a drift handle with no
+    /// `contexts` row behind it, breaking the "a registered handle implies a
+    /// KernelDb row" invariant at the one call site nobody watches (and losing
+    /// the dead letters again on the next restart). Row first, then claim.
+    ///
+    /// Returns the claimed id, or the id already claimed if someone else won
+    /// the race — the loser's persisted row is then unused, so it is logged
+    /// loudly enough to be traceable.
+    pub fn claim_lost_found(&mut self, id: ContextId) -> Result<ContextId, DriftError> {
+        if let Some(existing) = self.lost_found_id {
+            if existing != id {
+                tracing::warn!(
+                    existing = %existing.short(),
+                    candidate = %id.short(),
+                    "claim_lost_found lost a race: the candidate's persisted row is now unused"
+                );
+            }
+            return Ok(existing);
         }
-        let id = ContextId::new();
+        // Register before claiming: a failed register (reserved label taken by
+        // some other context) must not leave a claim pointing at a handle that
+        // does not exist.
+        self.register(id, Some("lost+found"), None, PrincipalId::system())?;
         self.lost_found_id = Some(id);
-        // lost+found label is system-reserved; conflict is a programming error
-        self.register(id, Some("lost+found"), None, PrincipalId::system())
-            .expect("lost+found label should never conflict");
         tracing::info!(context = %id.short(), "created lost+found context");
-        (id, true)
+        Ok(id)
     }
 }
 
@@ -1235,21 +1261,72 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_lost_found_idempotent() {
+    fn test_claim_lost_found_idempotent() {
         let mut router = DriftRouter::new();
-        let (id1, is_new1) = router.ensure_lost_found();
-        assert!(is_new1);
-        let (id2, is_new2) = router.ensure_lost_found();
-        assert!(!is_new2);
+        let id1 = router.claim_lost_found(ContextId::new()).unwrap();
+        // A second claim with a *different* candidate keeps the first — the
+        // router never ends up with two lost+found handles.
+        let id2 = router.claim_lost_found(ContextId::new()).unwrap();
         assert_eq!(id1, id2);
+        assert_eq!(router.lost_found_id(), Some(id1));
         // Should be registered with label "lost+found"
         assert!(router.resolve_context("lost+found").is_ok());
     }
 
     #[test]
+    fn test_claim_lost_found_registers_a_handle() {
+        // The invariant this API exists to protect runs the other way too: a
+        // claimed lost+found must be a real, resolvable handle, not just an id
+        // sitting in a field.
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        assert!(router.get(id).is_none());
+        assert_eq!(router.claim_lost_found(id).unwrap(), id);
+        assert!(router.get(id).is_some(), "claim must register the handle");
+    }
+
+    #[test]
+    fn test_claim_lost_found_label_conflict_leaves_no_claim() {
+        // Some other context already holds the reserved label: the claim must
+        // fail and leave `lost_found_id` unset, so the caller can't proceed
+        // believing it has a sink.
+        let mut router = DriftRouter::new();
+        router
+            .register(ContextId::new(), Some("lost+found"), None, PrincipalId::system())
+            .unwrap();
+
+        let candidate = ContextId::new();
+        assert!(router.claim_lost_found(candidate).is_err());
+        assert_eq!(router.lost_found_id(), None);
+        assert!(router.get(candidate).is_none());
+    }
+
+    #[test]
+    fn test_restore_dead_letters_requeues_unwritten() {
+        // A dead letter whose write into lost+found fails goes back on the
+        // queue — the drain must not be able to lose it.
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let dst = ContextId::new();
+        router.register(src, None, None, PrincipalId::system()).unwrap();
+        router.register(dst, None, None, PrincipalId::system()).unwrap();
+        router
+            .stage(src, dst, "undeliverable".to_string(), None, DriftKind::Push)
+            .unwrap();
+        let staged = router.drain(None);
+
+        router.restore_dead_letters(staged);
+        assert_eq!(router.dead_letters().len(), 1);
+        assert_eq!(router.dead_letters()[0].content, "undeliverable");
+        // And it drains like any other dead letter on the next flush.
+        assert_eq!(router.drain_dead_letter().len(), 1);
+        assert!(router.dead_letters().is_empty());
+    }
+
+    #[test]
     fn test_adopt_lost_found_claims_recovered_context() {
         // Simulates cold-start: the persisted lost+found is registered through
-        // the normal path, then adopted so a later ensure_lost_found reuses it.
+        // the normal path, then adopted so a later claim reuses it.
         let mut router = DriftRouter::new();
         let id = ContextId::new();
         router
@@ -1260,16 +1337,15 @@ mod tests {
         router.adopt_lost_found(id);
         assert_eq!(router.lost_found_id(), Some(id));
 
-        // ensure_lost_found must reuse the adopted id, not mint a duplicate.
-        let (got, is_new) = router.ensure_lost_found();
+        // A later claim must reuse the adopted id, not mint a duplicate.
+        let got = router.claim_lost_found(ContextId::new()).unwrap();
         assert_eq!(got, id);
-        assert!(!is_new);
     }
 
     #[test]
     fn test_adopt_lost_found_keeps_first_claim() {
         let mut router = DriftRouter::new();
-        let (first, _) = router.ensure_lost_found();
+        let first = router.claim_lost_found(ContextId::new()).unwrap();
         // A stray second adopt with a different id is ignored.
         router.adopt_lost_found(ContextId::new());
         assert_eq!(router.lost_found_id(), Some(first));

@@ -89,9 +89,13 @@ DocumentEntry>`, threaded with the `DbHandle` for journaling.
 
 The **single source of truth for live contexts**: `contexts` map, `label_to_id`
 index, a `staging` queue, a `dead_letter` list (after `MAX_DRIFT_RETRIES` = 5),
-and a lazily-created `lost+found` sink. `register`/`register_fork`/`unregister`,
+and a `lost+found` sink. `register`/`register_fork`/`unregister`,
 `stage`/`drain`/`requeue`, `resolve_context` (label / label-prefix / hex-prefix),
-`adopt_lost_found` for cold-start recovery. The distillation-prompt builder lives
+`adopt_lost_found` for cold-start recovery. The router never *creates* the
+lost+found context — `claim_lost_found` only claims an id whose DB row the caller
+(`KjDispatcher::ensure_lost_found_context`) has already written, so a registered
+handle always implies a KernelDb row; `restore_dead_letters` puts drained items
+back when a write into the sink fails, so the flush cannot lose them. The distillation-prompt builder lives
 here too (`:602`).
 
 ### Events — `FlowBus<T>` (`src/flows.rs:514`)

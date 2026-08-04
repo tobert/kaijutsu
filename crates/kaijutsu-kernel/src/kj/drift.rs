@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_crdt::DriftKind;
-use kaijutsu_types::{ContentType, EdgeKind};
+use kaijutsu_types::{ContentType, ContextId, EdgeKind};
 
 use super::format::format_drift_queue;
 use super::refs;
@@ -511,64 +511,31 @@ impl KjDispatcher {
             router.requeue(failed);
         }
 
-        // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES) into lost+found
-        let dead = {
-            let mut router = self.drift_router().write();
-            router.drain_dead_letter()
-        };
-        if !dead.is_empty() {
-            let (lf_id, is_new) = {
-                let mut router = self.drift_router().write();
-                router.ensure_lost_found()
-            };
-            // Persist lost+found as a real context the first time it's created,
-            // so the "registered handle implies a DB row" invariant holds and
-            // dead letters survive a kernel restart (cold-start rehydrates it
-            // from this row and re-adopts it). The router itself has no DB
-            // handle; this caller does.
-            if is_new {
-                let db = self.kernel_db().lock();
-                let system = kaijutsu_types::PrincipalId::system();
-                match db.get_or_create_default_workspace(system) {
-                    Ok(ws) => {
-                        let now = kaijutsu_types::now_millis() as i64;
-                        let row = crate::kernel_db::ContextRow {
-                            context_id: lf_id,
-                            label: Some("lost+found".to_string()),
-                            provider: None,
-                            model: None,
-                            system_prompt: None,
-                            consent_mode: kaijutsu_types::ConsentMode::Collaborative,
-                            context_state: kaijutsu_types::ContextState::Live,
-                            context_type: "default".to_string(),
-                            created_at: now,
-                            created_by: system,
-                            forked_from: None,
-                            fork_kind: None,
-                            archived_at: None,
-                            workspace_id: None,
-                            preset_id: None,
-                            concluded_at: None,
-                            last_activity_at: None,
-                            promoted_at: None,
-                            demoted_at: None,
-                            paused_at: None,
-                            cast_id: None,
-                        };
-                        if let Err(e) = db.insert_context_with_document(&row, ws) {
-                            tracing::error!("failed to persist lost+found context row: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("failed to resolve workspace for lost+found: {e}")
-                    }
+        // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES) into
+        // lost+found. Secure the sink BEFORE draining: if lost+found can't be
+        // created, the queue must keep its items rather than have them drained
+        // into a context that does not exist.
+        let has_dead = !self.drift_router().read().dead_letters().is_empty();
+        let mut dead_retained = 0usize;
+        if has_dead {
+            let lf_id = match self.ensure_lost_found_context() {
+                Ok(id) => id,
+                Err(e) => {
+                    let retained = self.drift_router().read().dead_letters().len();
+                    tracing::error!("lost+found unavailable, {retained} dead letters retained: {e}");
+                    return KjResult::Err(format!(
+                        "kj drift flush: flushed {injected}/{count} drifts, but {retained} dead \
+                         letter(s) could not be written — lost+found unavailable: {e} \
+                         (they stay queued; run flush again)"
+                    ));
                 }
-            }
-            // create_document is idempotent (DashMap entry-based)
-            let _ =
-                self.block_store()
-                    .create_document(lf_id, crate::DocumentKind::Conversation, None);
+            };
+            let dead = {
+                let mut router = self.drift_router().write();
+                router.drain_dead_letter()
+            };
             let dead_count = dead.len();
+            let mut unwritten = Vec::new();
             for item in dead {
                 let after = self.block_store().last_block_id(lf_id);
                 let content = format!(
@@ -585,26 +552,112 @@ impl KjDispatcher {
                     after.as_ref(),
                     content,
                     item.source_ctx,
-                    item.source_model,
+                    item.source_model.clone(),
                     item.drift_kind,
                 ) {
-                    tracing::error!("failed to write dead letter to lost+found: {e}");
+                    tracing::error!("failed to write dead letter to lost+found, retaining: {e}");
+                    unwritten.push(item);
                 }
             }
+            dead_retained = unwritten.len();
+            if !unwritten.is_empty() {
+                self.drift_router().write().restore_dead_letters(unwritten);
+            }
             tracing::warn!(
-                count = dead_count,
+                count = dead_count - dead_retained,
+                retained = dead_retained,
                 context = %lf_id.short(),
                 "wrote dead letter drifts to lost+found"
             );
         }
 
+        let retained_note = if dead_retained > 0 {
+            format!("; {dead_retained} dead letter(s) retained for the next flush")
+        } else {
+            String::new()
+        };
         if fail_count > 0 {
             KjResult::ok(format!(
-                "flushed {injected}/{count} drifts ({fail_count} requeued)"
+                "flushed {injected}/{count} drifts ({fail_count} requeued){retained_note}"
             ))
         } else {
-            KjResult::ok(format!("flushed {injected} drift(s)"))
+            KjResult::ok(format!("flushed {injected} drift(s){retained_note}"))
         }
+    }
+
+    /// The lost+found context id, creating the context if this kernel has none.
+    ///
+    /// Order matters and is the point of this helper: the `documents` row (via
+    /// the block store) and the `contexts` row land BEFORE the router claims
+    /// the handle, so the "a registered handle implies a KernelDb row"
+    /// invariant holds even when the DB write fails. A failure rolls the
+    /// document back and returns `Err` — the caller keeps its dead letters
+    /// queued rather than writing them into a context that isn't there.
+    fn ensure_lost_found_context(&self) -> Result<ContextId, String> {
+        if let Some(id) = self.drift_router().read().lost_found_id() {
+            return Ok(id);
+        }
+
+        let id = ContextId::new();
+        let system = kaijutsu_types::PrincipalId::system();
+
+        // 1. The document — this is what writes the `documents` row.
+        self.block_store()
+            .create_document(id, crate::DocumentKind::Conversation, None)
+            .map_err(|e| format!("failed to create lost+found document: {e}"))?;
+
+        // 2. The context row, so cold start rehydrates and re-adopts it and the
+        //    dead letters survive a restart.
+        let persist = {
+            let db = self.kernel_db().lock();
+            let now = kaijutsu_types::now_millis() as i64;
+            db.get_or_create_default_workspace(system)
+                .map_err(|e| format!("failed to resolve workspace for lost+found: {e}"))
+                .and_then(|ws| {
+                    let row = crate::kernel_db::ContextRow {
+                        context_id: id,
+                        label: Some("lost+found".to_string()),
+                        provider: None,
+                        model: None,
+                        system_prompt: None,
+                        consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                        context_state: kaijutsu_types::ContextState::Live,
+                        context_type: "default".to_string(),
+                        created_at: now,
+                        created_by: system,
+                        forked_from: None,
+                        fork_kind: None,
+                        archived_at: None,
+                        workspace_id: Some(ws),
+                        preset_id: None,
+                        concluded_at: None,
+                        last_activity_at: None,
+                        promoted_at: None,
+                        demoted_at: None,
+                        paused_at: None,
+                        cast_id: None,
+                    };
+                    db.insert_context_with_document(&row, ws)
+                        .map_err(|e| format!("failed to persist lost+found context row: {e}"))
+                })
+        };
+        if let Err(e) = persist {
+            // Roll the document back so a retry starts clean instead of
+            // leaving an orphan `documents` row behind per attempt.
+            if let Err(cleanup) = self.block_store().delete_document(id) {
+                tracing::error!(
+                    context = %id.short(),
+                    "lost+found rollback failed, orphan document row left behind: {cleanup}"
+                );
+            }
+            return Err(e);
+        }
+
+        // 3. Only now is a handle legitimate.
+        self.drift_router()
+            .write()
+            .claim_lost_found(id)
+            .map_err(|e| format!("failed to claim lost+found: {e}"))
     }
 
     async fn drift_queue(&self) -> KjResult {
