@@ -1278,6 +1278,7 @@ fn parse_kind(s: &str) -> Option<BlockKind> {
         "notification" => Some(BlockKind::Notification),
         "resource" => Some(BlockKind::Resource),
         "trace" => Some(BlockKind::Trace),
+        "task" => Some(BlockKind::Task),
         _ => None,
     }
 }

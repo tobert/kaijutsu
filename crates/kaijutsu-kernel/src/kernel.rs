@@ -623,7 +623,7 @@ impl Kernel {
     ) -> crate::mcp::McpResult<()> {
         use crate::mcp::servers::{
             BlockToolsServer, BuiltinBindingsServer, BuiltinHooksServer, BuiltinResourcesServer,
-            FileToolsServer, KernelInfoServer,
+            BuiltinTasksServer, FileToolsServer, KernelInfoServer,
         };
         use crate::mcp::servers::bindings_builtin::KERNEL_TOOLS_URI;
         use crate::mcp::{InstancePolicy, KernelNotification};
@@ -642,7 +642,18 @@ impl Kernel {
 
         self.broker
             .register_silently(
-                Arc::new(BlockToolsServer::new(documents, self.cas.clone())),
+                Arc::new(BlockToolsServer::new(documents.clone(), self.cas.clone())),
+                InstancePolicy::for_kernel(self),
+            )
+            .await?;
+
+        // builtin.tasks — task/plan grooming (household-agent arc,
+        // docs/tasks.md): task_create/update/complete/cancel/list. A
+        // sibling of builtin.block, not an extension — see tasks.rs's
+        // module doc for why it's a separate curated instance.
+        self.broker
+            .register_silently(
+                Arc::new(BuiltinTasksServer::new(documents)),
                 InstancePolicy::for_kernel(self),
             )
             .await?;

@@ -20,7 +20,9 @@ use parking_lot::RwLock;
 use kaijutsu_crdt::block_store::{
     BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload,
 };
-use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, ToolKind};
+use kaijutsu_crdt::{
+    BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, TaskStatus, ToolKind,
+};
 use kaijutsu_types::BlockFilter;
 use kaijutsu_types::codec;
 use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
@@ -1742,6 +1744,46 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_content_type(block_id, content_type)?;
+            entry.touch(self.principal_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            metadata,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
+    /// Set the task lifecycle status on a `BlockKind::Task` block (household-
+    /// agent grooming — docs/tasks.md). Mirrors `set_content_type` exactly:
+    /// same per-field LWW clock mechanism, same `MetadataChanged` flow event
+    /// (rather than a dedicated flow kind) — a task's status change reaches
+    /// every subscribed frontend (app, sibling contexts) the same cheap way
+    /// content-type changes already do. Does NOT by itself make the change
+    /// visible to the LLM mid-conversation — see `docs/tasks.md`
+    /// "Hydration".
+    pub fn set_task_status(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        status: TaskStatus,
+    ) -> BlockStoreResult<()> {
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_task_status(block_id, status)?;
             entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };

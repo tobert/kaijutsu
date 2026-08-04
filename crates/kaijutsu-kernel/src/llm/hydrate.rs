@@ -130,12 +130,19 @@ impl HydrationState {
         if matches!(block.kind, BlockKind::File | BlockKind::Trace) {
             return;
         }
-        // Skip System blocks unless they're Drift, Error, Notification, or Resource (D-34)
+        // Skip System blocks unless they're Drift, Error, Notification,
+        // Resource, or Task (D-34; Task added for household-agent grooming —
+        // docs/tasks.md). Task's builder/constructor don't force `role =
+        // System` the way Notification/Resource/Error do (a task follows
+        // ordinary content-authorship), but this stays in the allow-list
+        // defensively in case a future producer (e.g. an rc-seeded default
+        // task list) creates one as System.
         if block.role == BlockRole::System
             && block.kind != BlockKind::Drift
             && block.kind != BlockKind::Error
             && block.kind != BlockKind::Notification
             && block.kind != BlockKind::Resource
+            && block.kind != BlockKind::Task
         {
             return;
         }
@@ -145,6 +152,7 @@ impl HydrationState {
             && block.kind != BlockKind::Error
             && block.kind != BlockKind::Notification
             && block.kind != BlockKind::Resource
+            && block.kind != BlockKind::Task
         {
             return;
         }
@@ -407,6 +415,27 @@ impl HydrationState {
                 // the read-through body (truncated per
                 // RESOURCE_CONTENT_HYDRATION_BUDGET).
                 let envelope = kaijutsu_types::format_resource_for_llm(block);
+                self.flush_all();
+                self.messages.push(Message::user(envelope));
+            }
+            (_, BlockKind::Task) => {
+                // Task blocks (household-agent grooming — docs/tasks.md):
+                // surface current status/content to the model as a one-time
+                // appended user message. Deliberately mirrors Notification's
+                // hydration precedent (D-34) rather than inventing a new
+                // mechanism: `translate_block` runs at most once per BlockId
+                // (see `ConversationMailbox::feed`/`catch_up`'s `seen` set),
+                // so a LATER status/text edit on this SAME task block never
+                // rewrites this message — the already-hydrated (and
+                // possibly already-cached) prefix stays byte-identical. A
+                // status change reaches the model instead through whichever
+                // path caused it: the model's own tool_call/tool_result
+                // (ordinary hydration, no special-casing needed) if it made
+                // the change itself, or — not implemented by this slice — a
+                // fresh companion Notification block for an out-of-band
+                // groom from another principal. See docs/tasks.md
+                // "Hydration" for the full reasoning and what's deferred.
+                let envelope = kaijutsu_types::format_task_for_llm(block);
                 self.flush_all();
                 self.messages.push(Message::user(envelope));
             }

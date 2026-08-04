@@ -23,6 +23,7 @@ pub mod kernel_info;
 pub mod policy_admin;
 pub mod resources_builtin;
 pub mod shell;
+pub mod tasks;
 pub mod tool_search;
 
 pub use background::BackgroundServer;
@@ -35,4 +36,5 @@ pub use kernel_info::KernelInfoServer;
 pub use policy_admin::BuiltinPolicyServer;
 pub use resources_builtin::BuiltinResourcesServer;
 pub use shell::ShellServer;
+pub use tasks::BuiltinTasksServer;
 pub use tool_search::BuiltinToolSearchServer;

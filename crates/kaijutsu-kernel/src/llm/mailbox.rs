@@ -821,4 +821,119 @@ mod tests {
              this is exactly what the ephemeral stamp suppresses"
         );
     }
+
+    // ── BlockKind::Task hydration (household-agent arc, docs/tasks.md) ────
+
+    fn task_block(status: kaijutsu_types::TaskStatus, content: &str) -> BlockSnapshot {
+        let c = TEST_CTX.with(|v| *v);
+        let p = TEST_PRINCIPAL.with(|v| *v);
+        BlockSnapshotBuilder::new(BlockId::new(c, p, next_seq()), BlockKind::Text)
+            .role(BlockRole::Tool)
+            .content(content)
+            .task(status)
+            .build()
+    }
+
+    /// A Task block hydrates as a single appended user-role message carrying
+    /// the `<task ...>` envelope — same shape as Notification/Resource (D-34).
+    #[test]
+    fn task_block_hydrates_as_user_message_envelope() {
+        let block = task_block(kaijutsu_types::TaskStatus::Open, "Buy milk");
+        let msgs = hydrate_from_blocks(&[block]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
+        let text = match &msgs[0].content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Blocks(bs) => bs
+                .iter()
+                .find_map(|b| {
+                    if let ContentBlock::Text { text } = b {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+        };
+        assert!(text.starts_with("<task "));
+        assert!(text.contains("status=\"open\""));
+        assert!(text.contains("Buy milk"));
+    }
+
+    /// THE hydration contract this design promises (docs/tasks.md
+    /// "Hydration"): once a task block has been folded into a live
+    /// `ConversationMailbox` (mirrors what happens mid-conversation, one
+    /// turn at a time via `catch_up`), a LATER mutation of that SAME
+    /// block's `task_status`/`content` — exactly what `set_task_status`/
+    /// `replace_content` do in the CRDT store — must NOT change the
+    /// already-produced snapshot. `catch_up` is keyed by `BlockId` in its
+    /// `seen` set and only ever translates a given id once; re-feeding the
+    /// same id (now mutated) is a no-op. That's what keeps a task update
+    /// from invalidating an LLM prompt-cache prefix the message already
+    /// landed in: the bytes of an already-hydrated message never change
+    /// underneath a cache breakpoint.
+    #[test]
+    fn task_status_mutation_after_hydration_does_not_alter_cached_prefix() {
+        let mut block = task_block(kaijutsu_types::TaskStatus::Open, "Buy milk");
+
+        let mut mb = ConversationMailbox::new();
+        mb.catch_up(std::slice::from_ref(&block));
+        let before = mb.snapshot();
+        assert_eq!(before.len(), 1);
+
+        // Mutate the SAME BlockId's fields — exactly what a CRDT merge does
+        // after `set_task_status`/content edit lands (LWW-resolved in place,
+        // same id). This is the "task edited mid-conversation" scenario.
+        block.task_status = kaijutsu_types::TaskStatus::Done;
+        block.content = "Buy oat milk".to_string();
+
+        // Re-present the (now-mutated) block log, as the LLM-stream path
+        // does every turn via `catch_up(&block_log)`.
+        let new_count = mb.catch_up(std::slice::from_ref(&block));
+        let after = mb.snapshot();
+
+        assert_eq!(
+            new_count, 0,
+            "the same BlockId must be treated as already-seen, not re-translated"
+        );
+        // `Message` has no `PartialEq` (Debug/Clone/Serialize only) —
+        // compare by serialized value instead.
+        let before_json = serde_json::to_string(&before).unwrap();
+        let after_json = serde_json::to_string(&after).unwrap();
+        assert_eq!(
+            before_json, after_json,
+            "an already-hydrated task message must be byte-identical after the \
+             underlying block mutates — this is what keeps a live task edit from \
+             invalidating an already-cached prompt prefix"
+        );
+
+        // Non-vacuity guard: a boundary re-hydrate (fresh mailbox, e.g. after
+        // a fork) DOES pick up the new status — proving the assertion above
+        // pins "stays stable within a live conversation," not "task edits
+        // are invisible forever."
+        let mut fresh = ConversationMailbox::new();
+        fresh.catch_up(std::slice::from_ref(&block));
+        let rehydrated = fresh.snapshot();
+        let rehydrated_json = serde_json::to_string(&rehydrated).unwrap();
+        assert_ne!(
+            rehydrated_json, after_json,
+            "a fresh boundary hydration must reflect the block's current \
+             (mutated) state — otherwise this test would vacuously pass"
+        );
+        let rehydrated_text = match &rehydrated[0].content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Blocks(bs) => bs
+                .iter()
+                .find_map(|b| {
+                    if let ContentBlock::Text { text } = b {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+        };
+        assert!(rehydrated_text.contains("status=\"done\""));
+        assert!(rehydrated_text.contains("Buy oat milk"));
+    }
 }
