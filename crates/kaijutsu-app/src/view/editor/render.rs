@@ -13,12 +13,11 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy::ui::widget::ImageNode;
 
 use super::ActiveEditor;
 use crate::input::vim::mode_kind;
 use crate::shaders::BlockFxMaterial;
-use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfAtlas, MsdfBlockGlyphs, collect_msdf_glyphs};
+use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
@@ -82,11 +81,7 @@ pub fn spawn_editor_panel(
             parent.spawn((
                 EditorSurface,
                 BlockScene::default(),
-                UiRttTexture::default(),
-                MsdfBlockGlyphs::default(),
-                BlockRenderMethod::Msdf,
-                ImageNode::default(),
-                MaterialNode(material),
+                crate::view::block_render::msdf_surface_bundle(material),
                 OverlayCursorGeometry::default(),
                 Node {
                     width: Val::Percent(100.0),

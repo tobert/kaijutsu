@@ -113,6 +113,39 @@ impl Default for BlockScene {
     }
 }
 
+/// Marker for every entity `resize_block_textures` must service.
+///
+/// The system used to match surfaces by an `Or<With<Marker1>, With<Marker2>,
+/// ...>` filter, hand-extended one arm per surface type. `Screen::Diff`
+/// missed its arm, so `DiffSurface` kept an `ImageNode::default()` placeholder
+/// with no `RENDER_ATTACHMENT` usage — a fatal wgpu validation error on first
+/// render (2026-08-03, `a4229714`). Attach this marker (via
+/// [`msdf_surface_bundle`], never by hand) instead of adding a filter arm: a
+/// new surface is then visible to the resize system simply by using the
+/// bundle, and the bug class cannot recur by omission.
+#[derive(Component, Default)]
+pub struct MsdfSurface;
+
+/// The RTT/glyph/material plumbing every hand-rolled MSDF render-texture
+/// surface needs, bundled so a new surface cannot forget a piece of it —
+/// most importantly [`MsdfSurface`], the marker `resize_block_textures`
+/// matches on. Callers add their own extras (`BlockScene`, cursor geometry,
+/// border style, `Node`, `Name`, ...); this covers only the part every
+/// surface shares: an unbuilt [`UiRttTexture`], empty glyphs, the `Msdf`
+/// render method, an `ImageNode` pointing at the un-allocated placeholder,
+/// and the `MaterialNode` binding the resize system repoints once it
+/// allocates a real texture.
+pub fn msdf_surface_bundle(material: Handle<BlockFxMaterial>) -> impl Bundle {
+    (
+        MsdfSurface,
+        UiRttTexture::default(),
+        MsdfBlockGlyphs::default(),
+        BlockRenderMethod::Msdf,
+        ImageNode::default(),
+        MaterialNode(material),
+    )
+}
+
 /// Child entities a block's content-drawing arm spawned (sparkline polyline,
 /// image placeholder background, or the rasterized `Svg` bitmap) that must be
 /// despawned before the arm rebuilds them for new content. Sparkline/image
@@ -1398,21 +1431,15 @@ pub fn sync_role_group_headers(
 /// Resize block textures to match physical pixel dimensions.
 ///
 /// Runs after build_block_scenes / sync_role_group_headers so
-/// built_width/built_height are up to date. Block cells, the MSDF
-/// overlay/shell-dock text surfaces, and role-group divider headers all
-/// carry `MaterialNode<BlockFxMaterial>` now, so one system covers all of
-/// them — update its texture binding alongside the `ImageNode`.
+/// built_width/built_height are up to date. Every consumer — block cells,
+/// the MSDF overlay/shell-dock/editor/diff text surfaces, and role-group
+/// divider headers — carries [`MsdfSurface`] (via [`msdf_surface_bundle`]),
+/// so one filter covers all of them by construction; see that marker's docs
+/// for why this is no longer a hand-maintained `Or<With<...>>` list.
 pub fn resize_block_textures(
     mut block_query: Query<
         (&mut UiRttTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
-        Or<(
-            With<BlockCell>,
-            With<crate::view::components::MsdfOverlayText>,
-            With<crate::view::shell_dock::MsdfShellDockText>,
-            With<crate::view::editor::render::EditorSurface>,
-            With<crate::view::diff_view::render::DiffSurface>,
-            With<RoleGroupBorder>,
-        )>,
+        With<MsdfSurface>,
     >,
     text_metrics: Res<TextMetrics>,
     gpu_limits: Res<GpuTextureLimits>,
@@ -1871,12 +1898,18 @@ mod tests {
 
     // -- resize_block_textures marker filter --------------------------------
 
-    /// Every MSDF surface must be in `resize_block_textures`' marker filter,
-    /// or it keeps its `ImageNode::default()` placeholder — which lacks
-    /// RENDER_ATTACHMENT, so the first render pass into it is a fatal wgpu
-    /// validation error (how `Screen::Diff` crashed the app on open,
-    /// 2026-08-03). Spawns the surface exactly as its screen does and
-    /// asserts the swap to a renderable texture happens.
+    /// Every MSDF surface must carry [`MsdfSurface`] (via
+    /// [`msdf_surface_bundle`]) or it keeps its `ImageNode::default()`
+    /// placeholder — which lacks RENDER_ATTACHMENT, so the first render pass
+    /// into it is a fatal wgpu validation error (how `Screen::Diff` crashed
+    /// the app on open, 2026-08-03, before the marker filter grew a
+    /// `DiffSurface` arm). Spawns `marker` through the real
+    /// `msdf_surface_bundle` — the same call every screen's panel-spawn
+    /// function makes — so this exercises production code, not a
+    /// hand-reimplemented copy of it, and generalizes for free: a future
+    /// surface that uses the bundle passes without a new `Or<>` arm
+    /// anywhere; one that hand-rolls its components instead is exactly the
+    /// mistake this test exists to catch.
     fn assert_surface_gets_renderable_texture(marker: impl Bundle) {
         use bevy::ecs::system::RunSystemOnce;
 
@@ -1890,18 +1923,12 @@ mod tests {
         let material = materials.add(BlockFxMaterial::default());
         world.insert_resource(materials);
 
-        let surface = world
-            .spawn((
-                marker,
-                crate::view::ui_rtt::UiRttTexture {
-                    built_width: 640.0,
-                    built_height: 480.0,
-                    ..default()
-                },
-                MaterialNode(material),
-                ImageNode::default(),
-            ))
-            .id();
+        let surface = world.spawn((marker, msdf_surface_bundle(material))).id();
+        // Simulate the post-layout state: a real build pass (build_block_scenes,
+        // sync_editor_text, ...) stamps a nonzero built size onto the surface
+        // spawned above before resize ever runs.
+        world.get_mut::<crate::view::ui_rtt::UiRttTexture>(surface).unwrap().built_width = 640.0;
+        world.get_mut::<crate::view::ui_rtt::UiRttTexture>(surface).unwrap().built_height = 480.0;
 
         world
             .run_system_once(resize_block_textures)
@@ -1910,7 +1937,7 @@ mod tests {
         let rtt = world.get::<crate::view::ui_rtt::UiRttTexture>(surface).unwrap();
         assert!(
             rtt.width > 0 && rtt.height > 0,
-            "surface not matched by resize_block_textures' marker filter"
+            "surface not matched by resize_block_textures' MsdfSurface filter"
         );
         let image_node = world.get::<ImageNode>(surface).unwrap();
         let images = world.resource::<Assets<Image>>();
@@ -1935,6 +1962,34 @@ mod tests {
     #[test]
     fn editor_surface_gets_renderable_texture() {
         assert_surface_gets_renderable_texture(crate::view::editor::render::EditorSurface);
+    }
+
+    #[test]
+    fn overlay_surface_gets_renderable_texture() {
+        assert_surface_gets_renderable_texture(crate::view::components::MsdfOverlayText);
+    }
+
+    #[test]
+    fn shell_dock_surface_gets_renderable_texture() {
+        assert_surface_gets_renderable_texture(crate::view::shell_dock::MsdfShellDockText);
+    }
+
+    /// Test-only `BlockId` — the value is never inspected, only carried.
+    fn test_block_id() -> kaijutsu_crdt::BlockId {
+        kaijutsu_crdt::BlockId::new(kaijutsu_crdt::ContextId::new(), kaijutsu_crdt::PrincipalId::new(), 0)
+    }
+
+    #[test]
+    fn role_group_border_surface_gets_renderable_texture() {
+        assert_surface_gets_renderable_texture(RoleGroupBorder {
+            role: kaijutsu_crdt::Role::User,
+            block_id: test_block_id(),
+        });
+    }
+
+    #[test]
+    fn block_cell_surface_gets_renderable_texture() {
+        assert_surface_gets_renderable_texture(BlockCell::new(test_block_id()));
     }
 
     // -- round_to_physical_px (Fix 2: built_width physical-pixel rounding) -

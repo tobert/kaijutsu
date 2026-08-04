@@ -21,13 +21,12 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy::ui::widget::ImageNode;
 
 use super::{ActiveDiffView, DiffViewContent};
 use crate::input::vim::{CursorKind, mode_kind};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
-    BlockRenderMethod, FontDataMap, MsdfAtlas, MsdfBlockGeometry, MsdfBlockGlyphs,
+    FontDataMap, MsdfAtlas, MsdfBlockGeometry, MsdfBlockGlyphs,
     collect_msdf_glyphs, collect_msdf_glyphs_styled,
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
@@ -168,12 +167,8 @@ pub fn spawn_diff_panel(mut commands: Commands, mut fx_materials: ResMut<Assets<
                 DiffSurface,
                 DiffSurfaceWindow::default(),
                 BlockScene::default(),
-                UiRttTexture::default(),
-                MsdfBlockGlyphs::default(),
                 MsdfBlockGeometry::default(),
-                BlockRenderMethod::Msdf,
-                ImageNode::default(),
-                MaterialNode(material),
+                crate::view::block_render::msdf_surface_bundle(material),
                 OverlayCursorGeometry::default(),
                 Node {
                     width: Val::Percent(100.0),

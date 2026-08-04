@@ -15,7 +15,7 @@ use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, B
 use crate::cell::{InputOverlay, InputOverlayMarker, MsdfOverlayText};
 use crate::input::FocusArea;
 use crate::shaders::BlockFxMaterial;
-use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
+use crate::text::msdf::{FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::view::block_render::{BlockScene, round_to_physical_px};
@@ -104,11 +104,7 @@ pub fn spawn_input_overlay(
             parent.spawn((
                 MsdfOverlayText,
                 BlockScene::default(),
-                UiRttTexture::default(),
-                MsdfBlockGlyphs::default(),
-                BlockRenderMethod::Msdf,
-                ImageNode::default(),
-                MaterialNode(material_handle),
+                crate::view::block_render::msdf_surface_bundle(material_handle),
                 BlockBorderStyle {
                     kind: BorderKind::Full,
                     color: theme.compose_palette_border,

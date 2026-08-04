@@ -451,12 +451,8 @@ pub fn spawn_block_cells(
                     layout_seed,
                     crate::view::block_render::BlockScene::default(),
                     crate::view::ui_rtt::UiVectorScene::default(),
-                    crate::view::ui_rtt::UiRttTexture::default(),
-                    crate::text::msdf::MsdfBlockGlyphs::default(),
                     crate::text::msdf::MsdfBlockGeometry::default(),
-                    crate::text::msdf::BlockRenderMethod::default(),
-                    ImageNode::default(),
-                    MaterialNode(material_handle),
+                    crate::view::block_render::msdf_surface_bundle(material_handle),
                     block_cell_node(),
                     TimelineVisibility {
                         // Persisted in the geometry row so a despawned block
@@ -596,11 +592,7 @@ pub fn sync_role_headers(
             .spawn((
                 RoleGroupBorder { role, block_id },
                 RoleGroupBorderLayout::default(),
-                crate::view::ui_rtt::UiRttTexture::default(),
-                crate::text::msdf::MsdfBlockGlyphs::default(),
-                crate::text::msdf::BlockRenderMethod::default(),
-                ImageNode::default(),
-                MaterialNode(material_handle),
+                crate::view::block_render::msdf_surface_bundle(material_handle),
                 Node {
                     width: Val::Percent(100.0),
                     min_height: Val::Px(ROLE_HEADER_HEIGHT),

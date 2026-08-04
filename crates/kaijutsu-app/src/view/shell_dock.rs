@@ -13,7 +13,7 @@ use crate::cell::InputOverlay;
 use crate::input::focus::ActiveSurface;
 use crate::input::FocusArea;
 use crate::shaders::BlockFxMaterial;
-use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
+use crate::text::msdf::{FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::view::block_render::{BlockScene, round_to_physical_px};
@@ -97,11 +97,7 @@ pub fn spawn_shell_dock(
             parent.spawn((
                 MsdfShellDockText,
                 BlockScene::default(),
-                UiRttTexture::default(),
-                MsdfBlockGlyphs::default(),
-                BlockRenderMethod::Msdf,
-                ImageNode::default(),
-                MaterialNode(material_handle),
+                crate::view::block_render::msdf_surface_bundle(material_handle),
                 BlockBorderStyle {
                     kind: BorderKind::TopAccent,
                     color: theme.compose_palette_border,
