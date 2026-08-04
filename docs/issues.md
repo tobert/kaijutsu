@@ -358,6 +358,28 @@ all, discovered wiring the Claude Code MCP config. Two pieces:
   kernel side sees `/r/<client>/workspace` with zero flags. Needs the usual
   `/r` decisions: share name, ro vs `:rw` default, and an opt-out.
 
+## Two live-log papercuts seen during the 2026-08-04 durability verification
+
+Both pre-existing, both noticed while watching a live kernel; neither is a
+correctness problem, both erode the value of WARN.
+
+- **"Document already in DB but not in memory, recovering" fires on EVERY
+  `kj context create`.** `insert_context_with_document` writes the `documents`
+  row, then the create rc lifecycle calls `BlockStore::create_document`, which
+  finds it — the benign duplicate arm, by construction, every single time.
+  Since 2026-08-04 that arm *proves* benignity (kind/workspace/path all
+  compared; anything else is now a `DocumentDiverged` error), so the surviving
+  case is provably routine and probably wants `debug!`. Counter-argument for
+  keeping it loud: it is also the signal that memory and DB disagreed, which
+  matters on other paths (cache coherence). Amy's call — the noise is real
+  either way.
+- **Four backends warn `api_key_file configured but unreadable` at every
+  start** (`gemma-26b`, `gemma-e4b`, `openai-local`, `sd`), all pointing at
+  `/home/atobey/.openai-key`, which does not exist. They fall through to env
+  and work, so this is config debt from the SQL-config seeding: either create
+  the file, clear `api_key_file` on those rows, or teach the fall-through to
+  log once at debug when the env key is present.
+
 ## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
 
 

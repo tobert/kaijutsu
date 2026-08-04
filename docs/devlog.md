@@ -1015,3 +1015,16 @@ rebuilt. The flush secures the sink before draining, returns an error
 naming what it flushed instead of a log line nobody reads, and hands a
 failed dead-letter write back to the queue — the one code path whose whole
 purpose is not losing failed drifts had been dropping them on the floor.
+
+Then the live run found the joke in it. Restart the kernel, orphan a staged
+drift, ask for a flush: *nothing to flush*. The staged queue drains
+per-caller; the dead-letter queue is kernel-global; and the early return for
+an empty caller queue sat above the global half, so dead letters were only
+ever written when the same caller happened to have something else staged —
+never in the case the sink exists for, which is everything having failed. The
+existing test had met this behavior and *accommodated* it, in a comment that
+reads, now, like a confession: "the flush early-returns when the caller's
+staging is empty, so we need both a deliverable item AND a dead letter
+present at flush time." All three fixes were unit-green before that flush
+ever ran, and none of them would have found it. What did was typing the
+command on a live kernel and reading the answer.
