@@ -6,6 +6,31 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Shell dock never draws a visual-selection highlight (noticed 2026-08-04, tier-2 app cleanup)
+
+While unifying `build_overlay_glyphs`/`build_shell_dock_glyphs`
+(`view/overlay.rs`, `view/shell_dock.rs`) into a shared
+`sync_compose_text_glyphs`, found the two had already drifted: the overlay
+palette tracks vim-mode `kind` and a selection anchor on its
+`OverlayCursorGeometry` and draws a highlight rect for single-line visual
+selection; the shell dock's `build_shell_dock_glyphs` never sets either
+field, so `v`/visual-mode selection in the shell dock has no visual
+feedback at all — only the cursor moves. Left as-is (behavior preservation,
+not this cleanup's job to decide), but worth Amy confirming whether that's
+deliberate (shell dock = one command line, selection matters less) or a
+gap worth closing.
+
+## chore/app-cleanup-tier2 branch based on a now-stale `main` (2026-08-04)
+
+The tier-2 app cleanup branch (`~/src/wt/tier2-cleanup`, worktree) was cut
+from `main` at `7a34e2f6`; a parallel agent landed diff-viewer slice 6
+directly on `main` (through `cb209481`) while this branch was in progress.
+The two touch almost disjoint files — this branch's one diff-adjacent
+commit (`refactor(app): MsdfSurfaceBundle...`) only mechanically repackages
+`diff_view/render.rs`'s spawn tuple, no diff-viewer behavior — but `main`
+should be merged/rebased onto this branch (or vice versa) and re-verified
+before either lands, rather than assumed conflict-free.
+
 ## Day-job coding readiness (2026-07-29, live-kernel probe + deepseek review)
 
 Amy: *"I want to get kaijutsu's coding functionality up to a level I can use for
