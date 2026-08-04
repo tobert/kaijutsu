@@ -423,7 +423,14 @@ impl KjDispatcher {
             router.drain(caller.context_id)
         };
 
-        if staged.is_empty() {
+        // The staged queue is drained per-CALLER; the dead-letter queue below is
+        // kernel-global. Returning early on an empty caller queue made the
+        // global half unreachable in exactly the case that matters — every
+        // drift dead-lettered and nothing left staged — so dead letters sat
+        // forever and lost+found was never written. Only stop when BOTH are
+        // empty. (Found live, 2026-08-04.)
+        let has_dead = !self.drift_router().read().dead_letters().is_empty();
+        if staged.is_empty() && !has_dead {
             return KjResult::ok("nothing to flush".to_string());
         }
 
@@ -511,11 +518,13 @@ impl KjDispatcher {
             router.requeue(failed);
         }
 
-        // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES) into
-        // lost+found. Secure the sink BEFORE draining: if lost+found can't be
-        // created, the queue must keep its items rather than have them drained
-        // into a context that does not exist.
+        // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES, plus any
+        // staged drift orphaned by `unregister`) into lost+found. Secure the
+        // sink BEFORE draining: if lost+found can't be created, the queue must
+        // keep its items rather than have them drained into a context that does
+        // not exist. Re-read the flag — the loop above can dead-letter more.
         let has_dead = !self.drift_router().read().dead_letters().is_empty();
+        let mut dead_written = 0usize;
         let mut dead_retained = 0usize;
         if has_dead {
             let lf_id = match self.ensure_lost_found_context() {
@@ -560,28 +569,37 @@ impl KjDispatcher {
                 }
             }
             dead_retained = unwritten.len();
+            dead_written = dead_count - dead_retained;
             if !unwritten.is_empty() {
                 self.drift_router().write().restore_dead_letters(unwritten);
             }
             tracing::warn!(
-                count = dead_count - dead_retained,
+                count = dead_written,
                 retained = dead_retained,
                 context = %lf_id.short(),
                 "wrote dead letter drifts to lost+found"
             );
         }
 
-        let retained_note = if dead_retained > 0 {
-            format!("; {dead_retained} dead letter(s) retained for the next flush")
-        } else {
-            String::new()
-        };
+        // Dead letters used to be reported only to the log. Say it in the
+        // result too — the whole point of the sink is that a human finds them.
+        let mut dead_note = String::new();
+        if dead_written > 0 {
+            dead_note.push_str(&format!(
+                "; wrote {dead_written} dead letter(s) to lost+found"
+            ));
+        }
+        if dead_retained > 0 {
+            dead_note.push_str(&format!(
+                "; {dead_retained} dead letter(s) retained for the next flush"
+            ));
+        }
         if fail_count > 0 {
             KjResult::ok(format!(
-                "flushed {injected}/{count} drifts ({fail_count} requeued){retained_note}"
+                "flushed {injected}/{count} drifts ({fail_count} requeued){dead_note}"
             ))
         } else {
-            KjResult::ok(format!("flushed {injected} drift(s){retained_note}"))
+            KjResult::ok(format!("flushed {injected} drift(s){dead_note}"))
         }
     }
 
@@ -834,9 +852,9 @@ mod tests {
     async fn drift_flush_persists_lost_found_context_row() {
         // A dead letter drained into lost+found must persist a real context
         // row, so the "registered handle implies a DB row" invariant holds and
-        // the sink survives restart. The flush early-returns when the caller's
-        // staging is empty, so we need both a deliverable item AND a dead
-        // letter present at flush time.
+        // the sink survives restart. This is the mixed case: one deliverable
+        // item AND one dead letter in the same flush. (The dead-letters-only
+        // case is `drift_flush_drains_dead_letters_with_nothing_staged`.)
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -879,6 +897,64 @@ mod tests {
             .unwrap()
             .expect("lost+found has a persisted context row");
         assert_eq!(row.label.as_deref(), Some("lost+found"));
+    }
+
+    #[tokio::test]
+    async fn drift_flush_drains_dead_letters_with_nothing_staged() {
+        // FOUND LIVE 2026-08-04. The staged queue drains per-CALLER; the
+        // dead-letter queue is kernel-global. The empty-staging early return
+        // skipped the global half entirely, so in the case that matters most
+        // — every drift dead-lettered, nothing left staged — `kj drift flush`
+        // answered "nothing to flush" and the dead letters sat there forever,
+        // with lost+found never written.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        {
+            let mut router = d.drift_router().write();
+            router
+                .stage(src, dst, "victim".into(), None, kaijutsu_crdt::DriftKind::Push)
+                .unwrap();
+            for _ in 0..8 {
+                let drained = router.drain(None);
+                router.requeue(drained);
+            }
+            assert_eq!(router.dead_letters().len(), 1, "victim should be dead-lettered");
+            assert!(router.queue().is_empty(), "nothing may remain staged");
+        }
+
+        let c = caller_with_context(src);
+        let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(result.is_ok(), "flush: {}", result.message());
+        assert!(
+            result.message().contains("dead letter"),
+            "the result must report the dead letters, not just the log: {}",
+            result.message()
+        );
+        assert!(
+            d.drift_router().read().dead_letters().is_empty(),
+            "dead letters must be drained even with an empty staging queue"
+        );
+
+        // …into a lost+found that exists in both the router and the DB.
+        let lf_id = d
+            .drift_router()
+            .read()
+            .lost_found_id()
+            .expect("lost+found created during flush");
+        assert!(
+            d.kernel_db().lock().get_context(lf_id).unwrap().is_some(),
+            "lost+found handle implies a KernelDb row"
+        );
+        assert!(
+            d.block_store().last_block_id(lf_id).is_some(),
+            "the dead letter must actually be written into lost+found"
+        );
     }
 
     #[tokio::test]
