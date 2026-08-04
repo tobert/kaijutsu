@@ -579,6 +579,33 @@ impl KernelHandle {
         parse_context_id(response.get()?.get_id()?)
     }
 
+    /// Resolve a label straight against `KernelDb` — bypassing the
+    /// DriftRouter that `list_contexts` reads. `None` means no context
+    /// currently holds this label. See the capnp doc comment on
+    /// `resolveContextLabel` for why this exists as a separate call rather
+    /// than reusing `list_contexts`: an indexed single-row lookup instead of
+    /// a kernel-wide scan, and it also reaches the one real registry gap
+    /// (an archived context whose restart-time registration recovery skips
+    /// it) that `list_contexts` can miss.
+    #[tracing::instrument(skip(self), name = "rpc_client.resolve_context_label")]
+    pub async fn resolve_context_label(&self, label: &str) -> Result<Option<ContextInfo>, RpcError> {
+        let mut request = self.kernel.resolve_context_label_request();
+        request.get().set_label(label);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if !reader.get_found() {
+            return Ok(None);
+        }
+        let info = reader.get_info()?;
+        Ok(Some(parse_context_info(&info)?))
+    }
+
     /// Join a context by ID.
     ///
     /// Returns the document_id for the joined context. The `instance` param

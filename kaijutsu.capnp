@@ -1593,6 +1593,28 @@ interface Kernel {
   # it dies), because a sink that crashes cannot send an unplug and cannot be
   # trusted to identify itself honestly either. Empty from an older peer.
   reportMidiPresence @100 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
+
+  # ==========================================================================
+  # Label resolution (DB-driven — deliberately NOT `listContexts`)
+  # ==========================================================================
+  # Resolve a label straight against KernelDb::find_context_by_label, bypassing
+  # the in-memory DriftRouter entirely. `listContexts` reads the DriftRouter,
+  # which `create_shared_kernel`'s boot-time recovery already re-registers
+  # every NON-ARCHIVED context into on every restart (KernelDb is the
+  # recovery source) — so for the common live/concluded case, `listContexts`
+  # and this call agree. The gap is narrower than "never rehydrated": an
+  # ARCHIVED context's DriftRouter entry does NOT survive a restart (recovery
+  # filters `archived_at IS NULL`), so it stays durable (KernelDb row +
+  # BlockStore document both survive) but invisible to listContexts until
+  # something re-registers it (see joinContext's registry-heal). More to the
+  # point for registerSession's upsert/attach decision: even WITHOUT any
+  # restart, a label a live context already holds needs resolving here rather
+  # than through listContexts, because the decision (attach vs. suffix vs.
+  # create) has to be made before creating anything — reusing listContexts
+  # would mean scanning + label-matching every context in the kernel on every
+  # register_session call instead of one indexed lookup. `found = false`
+  # means no context currently holds this label.
+  resolveContextLabel @101 (label :Text, trace :TraceContext) -> (found :Bool, info :ContextHandleInfo);
 }
 
 # ============================================================================
