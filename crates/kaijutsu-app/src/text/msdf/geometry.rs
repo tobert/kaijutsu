@@ -80,6 +80,20 @@ pub fn stroke_line_quad(x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: [
     ]
 }
 
+/// A filled axis-aligned rectangle (2 triangles, 6 vertices) from its top-left
+/// corner and size.
+///
+/// A rectangle *is* a butt-capped horizontal stroke whose width is the
+/// rectangle's height — the trick the diff bands already use — so this is a
+/// named wrapper over [`stroke_line_quad`] rather than a second primitive. The
+/// name earns its place: every caller that open-codes it repeats the same
+/// center-line arithmetic, and getting that wrong shifts a quad by half its
+/// height.
+pub fn rect_quad(x: f64, y: f64, width: f64, height: f64, color: [u8; 4]) -> [GeometryVertex; 6] {
+    let cy = y + height * 0.5;
+    stroke_line_quad(x, cy, x + width, cy, height, color)
+}
+
 /// Signed area (shoelace formula, doubled) of a polygon given in order. Sign
 /// indicates winding: positive is one direction, negative the other — which
 /// is which doesn't matter here, only that it's consistent so `is_convex`

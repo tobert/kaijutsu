@@ -618,18 +618,20 @@ pub fn error_view(text: &str, reason: &str) -> DiffPreview {
 }
 
 /// The byte offset in [`DiffPreview::plain_text`] of `column` on preview line
-/// `line`, for placing the cursor.
+/// `line`, clamped to the **end** of that line's text.
 ///
 /// `column` is counted in **chars** — modalkit's unit, since its buffer is a
 /// char-indexed rope (`DiffCore::cursor_col`) — and everything downstream of
-/// here is bytes, so this is the one conversion on the path. It clamps to the
-/// end of the line's text rather than running into the newline: a column past
-/// the end can only come from a row shorter than the goal column, and drawing
-/// the cursor on the next line would be worse than drawing it at the end of
-/// this one.
+/// here is bytes, so this is the one conversion on the path. The clamp stops
+/// at the line's text, never past its newline, so a range built from two of
+/// these can never leak into the next line.
+///
+/// This is the **exclusive-end-friendly** form: use it for the end of a
+/// selection, where "one past the last selected char" is exactly what is
+/// wanted. For placing a cursor *on* a character, use [`cursor_byte`].
 ///
 /// `None` only for a line index the preview does not have.
-pub fn cursor_byte(preview: &DiffPreview, line: usize, column: usize) -> Option<usize> {
+pub fn column_byte(preview: &DiffPreview, line: usize, column: usize) -> Option<usize> {
     let l = preview.lines.get(line)?;
     let text = preview.plain_text[l.start..l.end].trim_end_matches('\n');
     let offset = text
@@ -637,6 +639,31 @@ pub fn cursor_byte(preview: &DiffPreview, line: usize, column: usize) -> Option<
         .nth(column)
         .map(|(i, _)| i)
         .unwrap_or(text.len());
+    Some(l.start + offset)
+}
+
+/// Where to *draw* the cursor for `column` on preview line `line`: the byte
+/// offset of a real character, never of the line's newline.
+///
+/// The distinction is not pedantry. `text.len()` is the offset of the
+/// terminating `\n`, and Parley's `Cursor::from_byte_index(.., Downstream)`
+/// resolves that onto the **following** visual row — so a goal column past the
+/// end of a short line (vim's `$` then `j`) drew the cursor one line below
+/// where the viewer thought it was. The core clamps the column too
+/// (`DiffCore::cursor_col`); this is the other half, and it holds even if a
+/// future caller hands over an unclamped column.
+///
+/// A line with no characters at all has no byte that is not its newline; it
+/// returns the line start, and the caller draws a zero-width cursor there.
+/// (The diff viewer has no such line — every row carries at least a prefix or
+/// a header — but the error view's source lines can be empty.)
+pub fn cursor_byte(preview: &DiffPreview, line: usize, column: usize) -> Option<usize> {
+    let l = preview.lines.get(line)?;
+    let text = preview.plain_text[l.start..l.end].trim_end_matches('\n');
+    let offset = match text.char_indices().nth(column) {
+        Some((i, _)) => i,
+        None => text.char_indices().next_back().map_or(0, |(i, _)| i),
+    };
     Some(l.start + offset)
 }
 
@@ -771,6 +798,72 @@ pub fn build_selection_band_geometry(
             (offset.0 + width) as f64,
             cy as f64,
             height as f64,
+            color,
+        ));
+    }
+    out
+}
+
+/// The byte range of [`DiffPreview::plain_text`] a **character-wise**
+/// selection covers, given its extent in window-local line indices.
+///
+/// The one translation between `DiffCore`'s coordinates (row + char column)
+/// and the byte range Parley's `Selection` wants. Two clamps, both deliberate:
+///
+/// - Rows outside the laid-out window are clipped to it. A selection can start
+///   above the window or end below it; the part on screen is still the part
+///   that gets drawn.
+/// - `end_col` is **inclusive** ([`kaijutsu_diff::CharSpan`]), so the range
+///   runs one column past it — and [`column_byte`] clamps that to the end of
+///   the line's text rather than running into the newline. (Not
+///   [`cursor_byte`]: that one clamps *onto* the last character, which as an
+///   exclusive end would drop the last selected glyph.)
+///
+/// `None` when the span covers nothing the window laid out, or when it is
+/// degenerate — a caller must not turn either into a rectangle.
+pub fn char_selection_bytes(
+    preview: &DiffPreview,
+    span: kaijutsu_diff::CharSpan,
+) -> Option<std::ops::Range<usize>> {
+    if preview.lines.is_empty() || span.start_row >= preview.lines.len() {
+        return None;
+    }
+    let last = preview.lines.len() - 1;
+    let (end_row, end_col) = if span.end_row > last {
+        // The selection runs off the bottom of the window: take the last row
+        // whole rather than dropping it.
+        (last, usize::MAX)
+    } else {
+        (span.end_row, span.end_col)
+    };
+    if end_row < span.start_row {
+        return None;
+    }
+    let start = column_byte(preview, span.start_row, span.start_col)?;
+    let end = column_byte(preview, end_row, end_col.saturating_add(1))?;
+    (end > start).then_some(start..end)
+}
+
+/// Turn selection rectangles into flat-colored quads for `MsdfBlockGeometry`.
+///
+/// The diff viewer draws its selection **behind** the glyphs and on top of the
+/// `+`/`-` bands, which is why it goes through geometry rather than the
+/// material's shader composite (`shaders::selection` explains the split). The
+/// rects arrive in Parley's layout-local space; `offset` moves them to
+/// block-local logical pixels, the space every other geometry producer works
+/// in.
+pub fn selection_rect_geometry(
+    rects: &[crate::shaders::SelectionRect],
+    offset: (f32, f32),
+    color: [u8; 4],
+) -> Vec<GeometryVertex> {
+    let mut out = Vec::with_capacity(rects.len() * 6);
+    for rect in rects.iter().filter(|r| r.is_visible()) {
+        out.extend_from_slice(&crate::text::msdf::geometry::rect_quad(
+            (rect.x + offset.0) as f64,
+            (rect.y + offset.1) as f64,
+            rect.width as f64,
+            rect.height as f64,
             color,
         ));
     }
@@ -1374,17 +1467,106 @@ mod tests {
         assert_eq!(cursor_byte(&v, insert, 3), Some(start + 1 + 6));
     }
 
-    /// A column past the end of a short row clamps to the end of *that* row.
-    /// modalkit keeps a goal column that can sit past a short line; the cursor
-    /// must not be drawn on the next line because of it.
+    /// A column past the end of a short row clamps to *that* row. The two
+    /// clamps differ on purpose, and the difference is a real bug either way
+    /// round: `column_byte` stops at the end of the text (the exclusive end a
+    /// selection wants), `cursor_byte` stops **on the last character**.
+    ///
+    /// `text.len()` is the offset of the line's `\n`, and Parley resolves that
+    /// downstream — onto the NEXT visual row. `$` then `j` onto a shorter line
+    /// drew the cursor a line low until this clamp existed.
     #[test]
-    fn cursor_byte_clamps_to_the_end_of_its_own_line() {
+    fn the_two_column_clamps_stop_in_different_places() {
         let c = core("canonical/single_file_modify.diff");
         let v = whole(&c);
         let line = v.lines[1];
-        let end = line.end - 1; // the line's newline is not part of its text
-        assert_eq!(cursor_byte(&v, 1, 9_999), Some(end));
+        let text = &v.plain_text[line.start..line.end];
+        let newline = line.end - 1; // the line's own text ends here
+        assert_eq!(&text[text.len() - 1..], "\n", "premise: it has a newline");
+
+        assert_eq!(
+            column_byte(&v, 1, 9_999),
+            Some(newline),
+            "an exclusive end stops at the end of the text",
+        );
+        assert_eq!(
+            cursor_byte(&v, 1, 9_999),
+            Some(newline - 1),
+            "a drawn cursor stops ON the last character, never on the newline",
+        );
         assert!(cursor_byte(&v, 9_999, 0).is_none(), "no such line");
+        assert!(column_byte(&v, 9_999, 0).is_none());
+    }
+
+    /// An empty line has no character to sit on. Both clamps land on the line
+    /// start (which *is* its newline) rather than panicking or walking
+    /// backwards into the line above.
+    #[test]
+    fn an_empty_line_clamps_to_its_own_start() {
+        // The error view is the one path that lays out arbitrary source text,
+        // blank lines included.
+        let v = error_view("not a diff\n\nstill not\n", "no file header");
+        let blank = v
+            .lines
+            .iter()
+            .position(|l| v.plain_text[l.start..l.end].trim_end_matches('\n').is_empty())
+            .expect("a blank source line");
+        let start = v.lines[blank].start;
+        assert_eq!(cursor_byte(&v, blank, 0), Some(start));
+        assert_eq!(cursor_byte(&v, blank, 40), Some(start));
+        assert_eq!(column_byte(&v, blank, 40), Some(start));
+    }
+
+    /// The elision cut is a **byte** offset derived from a **char** count.
+    /// Both of its uses (the clip in `push_words`, the slice the renderer
+    /// takes) assume it is a char boundary, and a multibyte character sitting
+    /// exactly at the cut is where that assumption would break.
+    #[test]
+    fn the_elision_cut_always_lands_on_a_char_boundary() {
+        let text = "aaa\u{65e5}bbb";
+        for max in 0..=text.chars().count() + 2 {
+            let cut = elision_cut(text, max);
+            assert!(
+                text.is_char_boundary(cut),
+                "cut {cut} for max {max} split a character",
+            );
+        }
+        // The interesting one, spelled out: the 4th char IS the multibyte one.
+        assert_eq!(elision_cut(text, 4), 3);
+        assert_eq!(elision_cut(text, 5), 6, "past it, not into it");
+    }
+
+    /// ...and the same, end to end: a word span straddling a cut that falls
+    /// inside a run of multibyte characters must come out sliceable.
+    #[test]
+    fn word_spans_survive_a_cut_that_lands_mid_multibyte_run() {
+        use kaijutsu_diff::{DiffModel, DiffOptions, FileSpec, diff_file};
+        // The changed run starts a couple of chars before the cut and ends
+        // well past it, and every character in it is three bytes wide.
+        let head = "\u{65e5}".repeat(MAX_PREVIEW_LINE_CHARS - 3);
+        let before = format!("{head}\u{3042}\u{3044}\u{3046}\u{3048}\u{304a}\n");
+        let after = format!("{head}\u{304b}\u{304d}\u{304f}\u{3051}\u{3053}\n");
+        let file = diff_file(
+            &FileSpec::modified("wide.txt", &before, &after),
+            &DiffOptions::default(),
+        )
+        .expect("diffs");
+        let text = kaijutsu_diff::format(&DiffModel::new(vec![file]));
+
+        let p = build_diff_preview(&text, ContentType::Diff);
+        assert!(!p.words.is_empty(), "premise: the refinement found words");
+        for w in &p.words {
+            assert!(w.end > w.start, "an empty span survived the clip");
+            assert!(
+                p.plain_text.is_char_boundary(w.start) && p.plain_text.is_char_boundary(w.end),
+                "span {}..{} splits a character",
+                w.start,
+                w.end,
+            );
+            // What the renderer actually does with it.
+            let _ = &p.plain_text[w.start..w.end];
+        }
+        assert_contiguous(&p);
     }
 
     // ── bands ───────────────────────────────────────────────────────────────

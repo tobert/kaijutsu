@@ -557,7 +557,7 @@ impl DiffCore {
             end_col: if last_row == span.end_row {
                 span.end_col
             } else {
-                self.row_char_len(last_row).saturating_sub(1)
+                self.last_col(last_row)
             },
         })
     }
@@ -602,13 +602,26 @@ impl DiffCore {
         }
     }
 
-    /// How many chars a row holds, newline excluded — the bound on a column
-    /// the renderer can draw.
+    /// How many chars a row holds, newline excluded.
     fn row_char_len(&self, row: usize) -> usize {
         self.rows
             .get(row)
             .map(|r| self.text[r.start..r.end].trim_end_matches('\n').chars().count())
             .unwrap_or(0)
+    }
+
+    /// The last column a cursor may occupy on `row` — the bound a renderer
+    /// can actually draw on.
+    ///
+    /// **A count is not a column.** `row_char_len` is a count, so the last
+    /// valid index is one less: vim's normal mode puts the cursor *on* the
+    /// last character, never past it (that is an insert-mode position, and
+    /// this surface has no insert mode). Reporting the count let `$` then `j`
+    /// onto a shorter line hand the renderer a column whose byte offset is the
+    /// line's newline — which Parley resolves onto the following visual row,
+    /// drawing the cursor one line low.
+    fn last_col(&self, row: usize) -> usize {
+        self.row_char_len(row).saturating_sub(1)
     }
 
     /// Rebuild the visible-row projection after a fold changed.
@@ -618,6 +631,14 @@ impl DiffCore {
     }
 
     /// Re-read the cursor and selection out of modalkit into the cache.
+    ///
+    /// `self.cursor_row` is deliberately read here **before** it is written:
+    /// the fold snap needs where the cursor *was* to tell "walking down into a
+    /// fold" from every other way in, and this runs once per popped action
+    /// inside [`apply_keys`](Self::apply_keys)'s loop, so the stale value is
+    /// exactly one action old — the previous position. Reordering the two
+    /// statements, or hoisting this out of the pop loop to run once per batch,
+    /// silently breaks the direction test.
     fn sync_cursor(&mut self) {
         self.snap_out_of_folds(self.cursor_row);
         let last = self.rows.len().saturating_sub(1);
@@ -630,7 +651,7 @@ impl DiffCore {
         self.cursor_col = if leader.get_y() > last {
             0
         } else {
-            leader.get_x().min(self.row_char_len(self.cursor_row))
+            leader.get_x().min(self.last_col(self.cursor_row))
         };
         let selection = self.buffer.get_leader_selection(self.group);
         self.selection = selection.as_ref().map(|(start, end, _shape)| {
@@ -647,9 +668,9 @@ impl DiffCore {
                 let (sr, er) = (start.get_y().min(last), end.get_y().min(last));
                 CharSpan {
                     start_row: sr,
-                    start_col: start.get_x().min(self.row_char_len(sr)),
+                    start_col: start.get_x().min(self.last_col(sr)),
                     end_row: er,
-                    end_col: end.get_x().min(self.row_char_len(er)),
+                    end_col: end.get_x().min(self.last_col(er)),
                 }
             })
         });
@@ -904,6 +925,14 @@ impl DiffCore {
     /// Move the cursor `n` hunk headers forward (negative: backward), clamping
     /// at the first and last hunk rather than wrapping — a diff is a bounded
     /// document and wrapping past the end loses the reader's place.
+    ///
+    /// ⚠ **This walks canonical rows, not [`visible_rows`](Self::visible_rows).**
+    /// It is correct only because a folded hunk *keeps its header row* — every
+    /// jump target is drawn. If a future fold level ever hides a hunk or file
+    /// header (file-level collapse is the obvious one), `]c` would land the
+    /// cursor on a row nobody draws: the exact invisible-state failure
+    /// `snap_out_of_folds` exists to prevent. Move it to visible space at the
+    /// same time, not afterwards.
     fn jump_hunk(&mut self, n: isize) {
         if n == 0 {
             return;
@@ -1605,6 +1634,31 @@ mod tests {
                 c.cursor_col(),
                 text,
             );
+        }
+    }
+
+    /// **A count is not a column.** `$` on a long line then `j` onto a short
+    /// one must report a column that row actually *has a character at* —
+    /// reporting the char count instead pointed the renderer at the line's
+    /// newline byte, which Parley resolves onto the next visual row: the
+    /// cursor drew a line low. (deepseek post-ship review, phase A.)
+    #[test]
+    fn a_goal_column_never_reports_past_the_last_character() {
+        let mut c = core();
+        // Walk the whole document with a sticky `$` goal column and check
+        // every row, long or short.
+        c.apply_notation("gg$");
+        for _ in 0..c.rows().len() {
+            let row = c.cursor_row();
+            let len = c.rows()[row];
+            let text = c.text()[len.start..len.end].trim_end_matches('\n');
+            let chars = text.chars().count();
+            assert!(
+                c.cursor_col() < chars.max(1),
+                "column {} is not a character of row {row} ({chars} chars): {text:?}",
+                c.cursor_col(),
+            );
+            c.apply_notation("j");
         }
     }
 

@@ -135,6 +135,9 @@ struct CursorKey {
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<(usize, usize)>,
+    /// The character-wise extent, when there is one. Rows alone cannot key it:
+    /// `vll` never leaves its row and must still redraw.
+    char_selection: Option<kaijutsu_diff::CharSpan>,
     stale: bool,
     status: String,
     kind: CursorKind,
@@ -267,7 +270,9 @@ pub fn build_diff_surface(
     // publishes the cursor and the selection in the same coordinates, and
     // `view_rows` projects the same range, so the whole surface agrees;
     // yank and the canonical model never see a fold at all.
-    let (first_row, end_row, cursor_row, cursor_col, selection, kind) = match &session.content {
+    let (first_row, end_row, cursor_row, cursor_col, selection, char_selection, kind) = match
+        &session.content
+    {
         DiffViewContent::Ready(core) => {
             let cursor = core.cursor_visible_row();
             let (first, end) = window_for(
@@ -282,6 +287,7 @@ pub fn build_diff_surface(
                 cursor,
                 core.cursor_col(),
                 core.selection_visible_rows(),
+                core.char_selection_visible(),
                 // The viewer is never in insert mode, so the beam shape would
                 // be a lie. Normal → block; visual → hidden, because the
                 // selection bands are the visible thing there.
@@ -290,7 +296,7 @@ pub fn build_diff_surface(
         }
         // The error state has nothing to navigate: one fixed "window", no
         // cursor at all.
-        DiffViewContent::Failed { .. } => (0, 0, 0, 0, None, CursorKind::Hidden),
+        DiffViewContent::Failed { .. } => (0, 0, 0, 0, None, None, CursorKind::Hidden),
     };
 
     let layout_key = LayoutKey {
@@ -312,6 +318,7 @@ pub fn build_diff_surface(
         cursor_row,
         cursor_col,
         selection,
+        char_selection,
         stale: session.stale,
         status: status_line(session, cursor_row),
         kind,
@@ -456,23 +463,64 @@ pub fn build_diff_surface(
 
     // Selection rides ON TOP of the +/- bands: a selected insertion should
     // read as both. Row indices are window-relative.
-    if let Some((a, b)) = selection
-        && b >= window.first_row
-    {
-        let local = (
-            a.saturating_sub(window.first_row),
-            b.saturating_sub(window.first_row),
-        );
-        geometry
-            .vertices
-            .extend(crate::text::diff::build_selection_band_geometry(
-                preview,
-                &window.rows,
-                local,
-                content_width,
-                offset,
-                rgba8(theme.selection_bg),
-            ));
+    //
+    // Two shapes, two paths. Line-wise (`V`) is full-width bands and needs no
+    // Parley at all — a whole row is a whole row. Character-wise (`v`) is the
+    // ragged shape the multi-rect work exists for: Parley measures where the
+    // columns actually are, `coalesce_selection_rects` folds the interior rows
+    // into one full-width band (`shaders::selection`), and the result is the
+    // same three-rect shape the editor panel will push into the material.
+    match (char_selection, selection) {
+        (Some(span), _) => {
+            let local = kaijutsu_diff::CharSpan {
+                // A selection reaching above the window starts at the window's
+                // first row, from its first column — the columns of a row that
+                // was never laid out mean nothing here.
+                start_row: span.start_row.saturating_sub(window.first_row),
+                start_col: if span.start_row >= window.first_row {
+                    span.start_col
+                } else {
+                    0
+                },
+                end_row: span.end_row.saturating_sub(window.first_row),
+                end_col: span.end_col,
+            };
+            if span.end_row >= window.first_row
+                && let Some(bytes) = crate::text::diff::char_selection_bytes(preview, local)
+                && let Some(layout) = window.layout.as_ref()
+            {
+                let rects = selection_rects(layout, bytes);
+                let coalesced = crate::shaders::selection::coalesce_selection_rects(
+                    &rects,
+                    0.0,
+                    content_width,
+                );
+                geometry
+                    .vertices
+                    .extend(crate::text::diff::selection_rect_geometry(
+                        &coalesced,
+                        offset,
+                        rgba8(theme.selection_bg),
+                    ));
+            }
+        }
+        (None, Some((a, b))) if b >= window.first_row => {
+            let local = (
+                a.saturating_sub(window.first_row),
+                b.saturating_sub(window.first_row),
+            );
+            geometry
+                .vertices
+                .extend(crate::text::diff::build_selection_band_geometry(
+                    preview,
+                    &window.rows,
+                    local,
+                    content_width,
+                    offset,
+                    rgba8(theme.selection_bg),
+                ));
+        }
+        _ => {}
     }
 
     // Geometry and glyphs are published together under the single shared
@@ -507,6 +555,48 @@ pub fn build_diff_surface(
     cursor_geom.kind = kind;
 
     window.drawn = Some(cursor_key);
+}
+
+/// Where a byte range of the laid-out text actually sits on screen: one rect
+/// per visual row it crosses.
+///
+/// Parley's `Selection::geometry` is the off-the-shelf answer `docs/vi.md`
+/// names — it walks clusters, so it is right on a wrapped line and on a line
+/// whose glyphs are not uniform width, which cell arithmetic is not. It can
+/// report several boxes for one visual row (bidi); they are unioned per row so
+/// the coalescing rule downstream sees the one-rect-per-row shape it expects.
+fn selection_rects(
+    layout: &parley::Layout<peniko::Brush>,
+    bytes: std::ops::Range<usize>,
+) -> Vec<crate::shaders::SelectionRect> {
+    use parley::editing::{Cursor, Selection};
+    use parley::layout::Affinity;
+
+    let selection = Selection::new(
+        Cursor::from_byte_index(layout, bytes.start, Affinity::Downstream),
+        Cursor::from_byte_index(layout, bytes.end, Affinity::Upstream),
+    );
+    let mut out: Vec<(crate::shaders::SelectionRect, usize)> = Vec::new();
+    selection.geometry_with(layout, |rect, line| {
+        let next = crate::shaders::SelectionRect::from_edges(
+            rect.x0 as f32,
+            rect.y0 as f32,
+            rect.x1 as f32,
+            rect.y1 as f32,
+        );
+        match out.last_mut() {
+            Some((prev, prev_line)) if *prev_line == line => {
+                *prev = crate::shaders::SelectionRect::from_edges(
+                    prev.x.min(next.x),
+                    prev.y.min(next.y),
+                    prev.right().max(next.right()),
+                    prev.bottom().max(next.bottom()),
+                );
+            }
+            _ => out.push((next, line)),
+        }
+    });
+    out.into_iter().map(|(rect, _)| rect).collect()
 }
 
 /// RGBA8 for the geometry vertex format.
@@ -678,11 +768,34 @@ mod tests {
             cursor_row,
             cursor_col: 0,
             selection: None,
+            char_selection: None,
             stale: false,
             status: format!("diff  {}/100", cursor_row + 1),
             kind: CursorKind::Block,
         };
         assert_ne!(key(0), key(1));
+        assert_eq!(key(3), key(3));
+    }
+
+    /// A character-wise selection that never leaves its row still has to
+    /// redraw — `vll` changes nothing the row range can see.
+    #[test]
+    fn widening_a_character_selection_changes_the_cheap_pass_key() {
+        let key = |end_col| CursorKey {
+            cursor_row: 4,
+            cursor_col: end_col,
+            selection: Some((4, 4)),
+            char_selection: Some(kaijutsu_diff::CharSpan {
+                start_row: 4,
+                start_col: 1,
+                end_row: 4,
+                end_col,
+            }),
+            stale: false,
+            status: "diff  5/100".into(),
+            kind: CursorKind::Hidden,
+        };
+        assert_ne!(key(3), key(6));
         assert_eq!(key(3), key(3));
     }
 
