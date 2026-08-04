@@ -1856,8 +1856,9 @@ mod tests {
 
     /// F2 §7/§13 — `TurnFlow::Completed` carries the turn's output block id so
     /// the beat scheduler schedules *that* block's ABC, not a blind last-block
-    /// read. The field rides the in-process FlowBus only (additive, wire-inert);
-    /// it round-trips a real id and tolerates `None` (a turn with no text).
+    /// read. It round-trips a real id and tolerates `None` (a turn with no
+    /// text); the wire half of the same field is covered by the capnp
+    /// round-trip tests in `kaijutsu-client`.
     #[tokio::test]
     async fn completed_carries_output_block_id() {
         let bus: FlowBus<TurnFlow> = FlowBus::new(16);
