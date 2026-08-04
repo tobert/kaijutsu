@@ -138,7 +138,9 @@ mod tokenize;
 mod truncate;
 
 #[cfg(feature = "viewer")]
-pub use core::{DiffCore, DiffIntent, DiffRow, FoldSummary, RowKind, visible_row_indices};
+pub use core::{
+    CharSpan, DiffCore, DiffIntent, DiffRow, FoldSummary, RowKind, YankKind, visible_row_indices,
+};
 pub use engine::{DiffAlgorithm, DiffOptions, FileSpec, diff, diff_file};
 pub use error::DiffError;
 pub use format::{TRUNCATION_MARKER_PREFIX, format, format_file, format_hunk, truncation_marker};

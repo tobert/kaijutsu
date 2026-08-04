@@ -39,6 +39,22 @@
 //! a yank of rows `a..=b` is *exactly* the canonical unified text of those
 //! lines, prefixes included — no re-derivation, no header scraping.
 //!
+//! # Two yank semantics, chosen by shape
+//!
+//! A diff viewer is read for two different reasons, and [`YankKind`] is the
+//! answer to both without either one lying:
+//!
+//! - **Whole lines are a patch.** `V`/`yy`/`VGy` yank canonical unified text,
+//!   prefixes included, and re-parse as the same model.
+//! - **Characters are plain text.** `v` selects characters and its yank drops
+//!   every line's prefix column — you are grabbing an identifier, not a
+//!   change to one.
+//!
+//! What stays banned is the middle: an operator-motion yank (`yw`, `y$`,
+//! `yiw`) hands back a ragged fragment that still carries a `+` — text that
+//! *looks* like a patch and is not one, and that the reader never saw
+//! highlighted before it hit the clipboard.
+//!
 //! # Folds are a projection, never a rewrite
 //!
 //! [`DiffCore::rows`] always describes **every** line and [`DiffCore::text`] is
@@ -52,7 +68,7 @@
 
 use editor_types::application::{ApplicationAction, ApplicationInfo};
 use editor_types::context::{EditContext, Resolve};
-use editor_types::prelude::{CommandType, Count, ViewportContext};
+use editor_types::prelude::{CommandType, Count, TargetShape, ViewportContext};
 use editor_types::{
     Action, CommandBarAction, EditAction, EditorAction, PromptAction, WindowAction,
 };
@@ -116,6 +132,45 @@ pub struct DiffRow {
     pub line: Option<usize>,
 }
 
+/// What a yank *means*, and therefore what its text is.
+///
+/// **The shape decides the semantics** (`docs/diff.md` slice 6 phase B). There
+/// is no third option and no ambiguity: a yank of whole lines is a patch
+/// fragment, a yank of characters is plain text with no diff prefixes
+/// anywhere in it. The one thing the viewer must never produce is the middle
+/// case — a ragged fragment that still carries a `+` and therefore *looks*
+/// like a patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YankKind {
+    /// The exact canonical unified text of whole lines, prefixes included —
+    /// a patch fragment, which is what makes `VGy` re-parse as the same
+    /// model. Every line-wise yank.
+    Patch,
+    /// The selected characters with every line's ` `/`+`/`-` prefix column
+    /// removed: plain source text, explicitly **not** a patch. Only a
+    /// character-wise visual selection produces this — the reader asked for
+    /// characters, in a mode that draws exactly what they will get.
+    PlainText,
+}
+
+/// A character-wise range over rows, in the same coordinates as the row index
+/// it names.
+///
+/// `end_col` is **inclusive** — vim's `v` selects the character under the
+/// cursor, and a renderer drawing an exclusive end would leave the last
+/// selected glyph unhighlighted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharSpan {
+    /// First row of the selection.
+    pub start_row: usize,
+    /// First selected column on `start_row`, counted in **chars**.
+    pub start_col: usize,
+    /// Last row of the selection.
+    pub end_row: usize,
+    /// Last selected column on `end_row`, inclusive, counted in **chars**.
+    pub end_col: usize,
+}
+
 /// Something the viewer must act on that [`DiffCore`] cannot do itself.
 ///
 /// Deliberately **not** shared with `EditorCore`'s intents: those carry write
@@ -123,11 +178,14 @@ pub struct DiffRow {
 /// two surfaces whose whole point is that one of them cannot write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffIntent {
-    /// `y` — copy `text` (the exact canonical unified text of the selected
-    /// rows, prefixes included) to the system clipboard. Never emitted empty.
+    /// `y` — copy `text` to the system clipboard. Never emitted empty.
     Yank {
-        /// The canonical text to copy, newline-terminated for a linewise yank.
+        /// The text to copy. What it *is* depends on `kind`: canonical
+        /// unified text (newline-terminated) for [`YankKind::Patch`], prefix
+        /// -stripped plain text for [`YankKind::PlainText`].
         text: String,
+        /// Which of the viewer's two yank semantics produced `text`.
+        kind: YankKind,
     },
     /// `q` / `ZQ` / `ZZ` / `:q` — leave the viewer.
     Close,
@@ -157,12 +215,12 @@ pub enum ViewerAction {
     Close,
     /// `R` — re-read the block (see [`DiffIntent::Refresh`]).
     Refresh,
-    /// `v` and `<C-v>`/`<C-q>` — deliberately nothing. Character-wise and
-    /// block-wise visual selections cannot be *drawn* until the multi-rect
-    /// selection material lands, and an invisible selection that still yanks
-    /// is worse than no binding at all (`docs/diff.md` slice 5). Block visual
-    /// is worse still: its yank is a *rectangle*, so the text would not be a
-    /// patch at all. `V` is the line-wise mode the viewer has.
+    /// `<C-v>`/`<C-q>` — deliberately nothing. Visual **block**'s yank is a
+    /// *rectangle*: it cuts through the prefix column, so the text is neither
+    /// a patch nor a coherent run of source. Character-wise `v` has a
+    /// semantics ([`YankKind::PlainText`]); a rectangle of a diff does not,
+    /// and it stays out until something asks for it with one attached
+    /// (`docs/diff.md` slice 6 phase B).
     Nop,
 }
 
@@ -233,7 +291,6 @@ impl InputBindings<TerminalKey, InputStep<DiffInfo>> for ViewerBindings {
             ("za", ViewerAction::FoldToggle),
             ("q", ViewerAction::Close),
             ("R", ViewerAction::Refresh),
-            ("v", ViewerAction::Nop),
         ];
         for (keys, verb) in verbs {
             let step = InputStep::<DiffInfo>::new().actions(vec![Action::Application(verb)]);
@@ -243,9 +300,10 @@ impl InputBindings<TerminalKey, InputStep<DiffInfo>> for ViewerBindings {
             }
         }
         // `<C-v>` (and vim's `<C-q>` alias) enter visual BLOCK, whose yank is
-        // a rectangle — not the whole lines the viewer promises. Same reason
-        // as `v`, one step further out: the selection cannot be drawn and the
-        // yank would not be a patch. Nop'd until the multi-rect material.
+        // a rectangle: it cuts *through* the prefix column, so the result is
+        // neither a patch nor a coherent run of source text. Character-wise
+        // `v` is allowed because it has a meaning (plain text, prefixes
+        // stripped per line); a rectangle has none, so it stays Nop'd.
         let nop = InputStep::<DiffInfo>::new().actions(vec![Action::Application(ViewerAction::Nop)]);
         for c in ['v', 'q'] {
             let path = ctrl_path(c);
@@ -301,6 +359,13 @@ pub struct DiffCore {
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<(usize, usize)>,
+    /// The selection's shape, straight from modalkit's cursor state. It is
+    /// what decides which of the two yank semantics runs — see
+    /// [`DiffCore::yank_semantics`].
+    selection_shape: Option<TargetShape>,
+    /// The selection's exact character extent, cached only while it is
+    /// character-wise. `None` in normal mode and under `V`.
+    char_selection: Option<CharSpan>,
 }
 
 impl DiffCore {
@@ -339,6 +404,8 @@ impl DiffCore {
             cursor_row: 0,
             cursor_col: 0,
             selection: None,
+            selection_shape: None,
+            char_selection: None,
         }
     }
 
@@ -450,12 +517,49 @@ impl DiffCore {
         (self.visible.get(i) == Some(&row)).then_some(i)
     }
 
-    /// The inclusive row range covered by the visual-line selection, if any.
-    ///
-    /// Line-wise (`V`) is the only visual mode the viewer offers, so a
-    /// selection is always whole rows.
+    /// The inclusive **row** range covered by the visual selection, whatever
+    /// its shape. A character-wise selection covers whole rows here too — the
+    /// rows it touches — which is what a coarse consumer (the window, the
+    /// status counter) wants.
     pub fn selection_rows(&self) -> Option<(usize, usize)> {
         self.selection
+    }
+
+    /// The selection's exact character extent, in canonical row coordinates —
+    /// `None` unless it is character-wise.
+    ///
+    /// This is the half of a `v` selection a line-band renderer cannot draw,
+    /// and the reason character-wise visual waited for the multi-rect
+    /// material.
+    pub fn char_selection(&self) -> Option<CharSpan> {
+        self.char_selection
+    }
+
+    /// [`char_selection`](Self::char_selection) in **visible** row
+    /// coordinates, clamped to drawn rows the way
+    /// [`selection_visible_rows`](Self::selection_visible_rows) is.
+    ///
+    /// A clamped end loses its column with its row: an end row that is folded
+    /// away becomes "to the end of the last drawn row", because the alternative
+    /// is drawing a column that belongs to a line nobody can see.
+    pub fn char_selection_visible(&self) -> Option<CharSpan> {
+        let span = self.char_selection?;
+        let (first, last) = self.selection_visible_rows()?;
+        let (first_row, last_row) = (self.visible[first], self.visible[last]);
+        Some(CharSpan {
+            start_row: first,
+            start_col: if first_row == span.start_row {
+                span.start_col
+            } else {
+                0
+            },
+            end_row: last,
+            end_col: if last_row == span.end_row {
+                span.end_col
+            } else {
+                self.row_char_len(last_row).saturating_sub(1)
+            },
+        })
     }
 
     /// Move the cursor off a folded-away row, in the direction it was going.
@@ -528,13 +632,27 @@ impl DiffCore {
         } else {
             leader.get_x().min(self.row_char_len(self.cursor_row))
         };
-        self.selection =
-            self.buffer
-                .get_leader_selection(self.group)
-                .map(|(start, end, _shape)| {
-                    let (a, b) = (start.get_y().min(last), end.get_y().min(last));
-                    (a.min(b), a.max(b))
-                });
+        let selection = self.buffer.get_leader_selection(self.group);
+        self.selection = selection.as_ref().map(|(start, end, _shape)| {
+            let (a, b) = (start.get_y().min(last), end.get_y().min(last));
+            (a.min(b), a.max(b))
+        });
+        self.selection_shape = selection.as_ref().map(|(_, _, shape)| *shape);
+        // modalkit sorts the pair by (row, column), so the ends are already in
+        // reading order. Columns are clamped the same way the cursor's is: a
+        // goal column past the end of a short row would draw a selection off
+        // the end of the text.
+        self.char_selection = selection.and_then(|(start, end, shape)| {
+            (shape == TargetShape::CharWise).then(|| {
+                let (sr, er) = (start.get_y().min(last), end.get_y().min(last));
+                CharSpan {
+                    start_row: sr,
+                    start_col: start.get_x().min(self.row_char_len(sr)),
+                    end_row: er,
+                    end_col: end.get_x().min(self.row_char_len(er)),
+                }
+            })
+        });
     }
 
     /// The vim mode banner (`None` in normal mode, `Some("-- VISUAL LINE --")`
@@ -627,26 +745,145 @@ impl DiffCore {
         if !is_read_only(&ea, ctx) {
             return;
         }
-        // Motions may move a column; a *yank* may not take one. See
-        // [`is_line_wise_yank`].
-        if is_yank(&ea, ctx) && !is_line_wise_yank(&ea, ctx) {
-            return;
-        }
+        // A yank with no semantics attached does not run at all. See
+        // [`DiffCore::yank_semantics`].
+        let yank = match is_yank(&ea, ctx) {
+            true => match self.yank_semantics(&ea, ctx) {
+                Some(kind) => Some(kind),
+                None => return,
+            },
+            false => None,
+        };
+        // Read the span *before* executing: the yank collapses the selection
+        // it was taken from.
+        let span = self.char_selection;
+
         let ictx = (self.group, &self.viewport, ctx);
         let ran = self.buffer.editor_command(&ea, &ictx, &mut self.store);
-        // A yank lands in the unnamed register with modalkit's own semantics —
-        // counts, motions, and the visual selection all already resolved. Read
-        // it back rather than re-deriving the range here, which is how the
-        // yanked text stays *exactly* the canonical text of those rows.
-        if ran.is_ok()
-            && is_yank(&ea, ctx)
-            && let Ok(cell) = self.store.registers.get(&Register::Unnamed)
-        {
-            let text = cell.value.to_string();
-            if !text.is_empty() {
-                out.push(DiffIntent::Yank { text });
-            }
+        if ran.is_err() {
+            return;
         }
+        let text = match yank {
+            // A line-wise yank lands in the unnamed register with modalkit's
+            // own semantics — counts, motions and the visual selection all
+            // already resolved. Read it back rather than re-deriving the
+            // range, which is how the yanked text stays *exactly* the
+            // canonical text of those rows.
+            Some(YankKind::Patch) => self
+                .store
+                .registers
+                .get(&Register::Unnamed)
+                .map(|cell| cell.value.to_string())
+                .unwrap_or_default(),
+            // The register is no use here: it holds the raw slice of the
+            // canonical text, prefixes and all, which is the one thing a
+            // character-wise yank must not hand back.
+            Some(YankKind::PlainText) => match span {
+                Some(span) => self.charwise_plain_text(span),
+                None => return,
+            },
+            None => return,
+        };
+        if !text.is_empty() {
+            out.push(DiffIntent::Yank {
+                text,
+                kind: yank.expect("a yank with text"),
+            });
+        }
+    }
+
+    /// What this yank *means* — or `None` if it means nothing the viewer is
+    /// willing to put on the clipboard.
+    ///
+    /// **The shape decides** (`docs/diff.md` slice 6 phase B). Three answers:
+    ///
+    /// - Whole lines → [`YankKind::Patch`]. Canonical unified text, prefixes
+    ///   included, so a yanked hunk really is a patch.
+    /// - A character-wise **visual selection** → [`YankKind::PlainText`]. The
+    ///   reader is looking at exactly the characters they asked for, and what
+    ///   they want is the *code* — an identifier, an expression — not a diff
+    ///   of it. Stripping the prefix column makes that explicitly-not-a-patch,
+    ///   so it can never be mistaken for one.
+    /// - Anything else → `None`, unchanged from phase A. `yw`, `y$`, `yiw`,
+    ///   `` y`a ``, `y^` and vim's `yvj` shape override all resolve to a
+    ///   ragged fragment that the reader never *saw* as a selection. A
+    ///   fragment nobody looked at is an accident of a motion; the same
+    ///   characters under `v` are a decision. That is the whole difference,
+    ///   and it is why enabling `v` does not loosen the operator guard by one
+    ///   inch.
+    ///
+    /// The selection branch reproduces modalkit's own rule for
+    /// `EditTarget::Selection` — `ctx.get_target_shape()` if the keybinding
+    /// forced one, else the cursor state's shape (`editing/buffer/mod.rs`).
+    /// Asking the *context* alone would miss a plain `v` selection, which
+    /// carries no forced shape at all.
+    fn yank_semantics(&self, ea: &EditorAction, ctx: &EditContext) -> Option<YankKind> {
+        use editor_types::prelude::EditTarget;
+        if let EditorAction::Edit(_, EditTarget::Selection) = ea {
+            return match ctx.get_target_shape().or(self.selection_shape) {
+                Some(TargetShape::LineWise) => Some(YankKind::Patch),
+                Some(TargetShape::CharWise) => {
+                    // No cached span means no selection to take characters
+                    // from; refusing beats yanking the register's raw text.
+                    self.char_selection.map(|_| YankKind::PlainText)
+                }
+                // `<C-v>` is Nop'd, so this is unreachable today — and a
+                // rectangle is exactly the shape with no semantics attached.
+                Some(TargetShape::BlockWise) | None => None,
+            };
+        }
+        is_line_wise_yank(ea, ctx).then_some(YankKind::Patch)
+    }
+
+    /// The plain text of a character-wise selection: the selected characters
+    /// of each row, **without** the diff prefix column.
+    ///
+    /// Pure given the frozen text and rows, and the whole of what
+    /// [`YankKind::PlainText`] means. Three rules, each with a reason:
+    ///
+    /// - **A body row's prefix is never included**, even when the selection
+    ///   starts at column 0. The prefix is not part of the line's text — it is
+    ///   the diff's annotation of it — and letting it through is precisely how
+    ///   a fragment starts looking like a patch.
+    /// - **A header row contributes its whole text** (clipped to the
+    ///   selection). `@@ -1,3 +1,4 @@` has no prefix column to strip, and it
+    ///   cannot be confused for a patch on its own.
+    /// - **Row structure survives**: one output line per selected row,
+    ///   including empty ones. Vim's character-wise register has no trailing
+    ///   newline and neither does this.
+    fn charwise_plain_text(&self, span: CharSpan) -> String {
+        let mut out = String::new();
+        for r in span.start_row..=span.end_row.min(self.rows.len().saturating_sub(1)) {
+            let Some(row) = self.rows.get(r) else {
+                break;
+            };
+            if r > span.start_row {
+                out.push('\n');
+            }
+            let raw = self.text[row.start..row.end].trim_end_matches('\n');
+            // The prefix is one ASCII byte, so byte and char agree on its
+            // width — `text_start` is the model's own answer for where the
+            // line's text begins.
+            let prefix = row.text_start - row.start;
+            let len = raw.chars().count();
+            let lo = if r == span.start_row {
+                span.start_col.max(prefix)
+            } else {
+                prefix
+            };
+            let hi = if r == span.end_row {
+                (span.end_col + 1).min(len)
+            } else {
+                len
+            };
+            if hi <= lo {
+                continue;
+            }
+            let from = char_byte(raw, lo);
+            let to = char_byte(raw, hi);
+            out.push_str(&raw[from..to]);
+        }
+        out
     }
 
     /// Run one viewer verb.
@@ -811,8 +1048,10 @@ fn is_line_wise_yank(ea: &EditorAction, ctx: &EditContext) -> bool {
         return true; // not a motion/operator at all
     };
     match target {
-        // No movement, or movement the viewer itself decides.
-        EditTarget::CurrentPosition | EditTarget::Selection => true,
+        // No movement at all. (`EditTarget::Selection` never reaches here —
+        // a visual selection is settled by its own shape in
+        // [`DiffCore::yank_semantics`], one level up.)
+        EditTarget::CurrentPosition => true,
         // `'a` is a LINE address, `` `a `` is a character one — vim yanks
         // them line-wise and character-wise respectively, and a mark is
         // settable here (`ma` is bookkeeping, so it passes `is_read_only`).
@@ -882,6 +1121,14 @@ fn parse_ex_command(body: &str) -> Option<DiffIntent> {
         "e" | "edit" | "refresh" => Some(DiffIntent::Refresh),
         _ => None,
     }
+}
+
+/// Byte offset of char index `n` in `s`, clamped to `s.len()`.
+///
+/// modalkit counts columns in chars (its buffer is a char-indexed rope) and
+/// every slice below is bytes; this is the one conversion between them.
+fn char_byte(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 /// Remove at most one trailing `\n` (modalkit's guaranteed line terminator).
@@ -1413,7 +1660,7 @@ mod tests {
             let mut c = core();
             c.apply_notation("5G$");
             let yanked = c.apply_notation(keys);
-            let Some(DiffIntent::Yank { text }) = yanked.first() else {
+            let Some(DiffIntent::Yank { text, .. }) = yanked.first() else {
                 panic!("keys {keys:?} yanked nothing: {yanked:?}");
             };
             assert!(
@@ -1454,23 +1701,50 @@ mod tests {
         assert_eq!(c.selection_rows(), None);
     }
 
-    /// `docs/diff.md` slice 5: character-wise visual is deliberately absent
-    /// until the multi-rect selection material lands, because a line-band
-    /// renderer cannot draw it. `v` must therefore do *nothing* — not enter an
-    /// invisible visual mode that still yanks.
+    /// Character-wise `v` is real as of slice 6 phase B: the multi-rect
+    /// material can draw the selection, and its yank has a semantics of its
+    /// own ([`YankKind::PlainText`]).
     #[test]
-    fn lowercase_v_does_nothing() {
+    fn lowercase_v_selects_character_wise() {
         let mut c = core();
-        let intents = c.apply_notation("v");
-        assert!(intents.is_empty());
-        assert_eq!(c.mode(), None, "v must not enter visual mode");
-        assert_eq!(c.selection_rows(), None);
-        assert_eq!(c.cursor_row(), 0);
+        c.apply_notation("5G0v");
+        assert_eq!(c.mode().as_deref(), Some("-- VISUAL --"));
+        let span = c.char_selection().expect("a character-wise selection");
+        assert_eq!(
+            span,
+            CharSpan {
+                start_row: 4,
+                start_col: 0,
+                end_row: 4,
+                end_col: 0,
+            },
+            "a fresh `v` selects the character under the cursor",
+        );
+
+        c.apply_notation("ll");
+        assert_eq!(c.char_selection().map(|s| s.end_col), Some(2));
+        c.apply_notation("j");
+        let span = c.char_selection().expect("a selection");
+        assert_eq!((span.start_row, span.end_row), (4, 5));
+
+        c.apply_notation("<Esc>");
+        assert_eq!(c.mode(), None, "Esc returns to normal");
+        assert_eq!(c.char_selection(), None);
     }
 
-    /// Visual BLOCK is worse than character-wise: its yank is a *rectangle*,
-    /// so the text would not be a patch at all — `<C-v>jly` used to hand back
-    /// `"di\n--"`. It must not be reachable.
+    /// `V` is line-wise and stays that way: no character span, so a renderer
+    /// cannot accidentally draw a ragged band for it.
+    #[test]
+    fn a_line_wise_selection_has_no_character_span() {
+        let mut c = core();
+        c.apply_notation("5G$Vj");
+        assert_eq!(c.selection_rows(), Some((4, 5)));
+        assert_eq!(c.char_selection(), None);
+    }
+
+    /// Visual BLOCK is the shape with no semantics: its yank is a
+    /// *rectangle*, cutting through the prefix column — `<C-v>jly` used to
+    /// hand back `"di\n--"`. It must not be reachable.
     #[test]
     fn block_visual_does_nothing() {
         for keys in ["<C-v>", "<C-q>"] {
@@ -1501,7 +1775,13 @@ mod tests {
         let expected: String = (first..=first + 2)
             .map(|i| format!("{}\n", row_text(&c, i)))
             .collect();
-        assert_eq!(intents, vec![DiffIntent::Yank { text: expected }]);
+        assert_eq!(
+            intents,
+            vec![DiffIntent::Yank {
+                text: expected,
+                kind: YankKind::Patch,
+            }],
+        );
         assert_eq!(c.mode(), None, "yank leaves visual mode");
     }
 
@@ -1518,7 +1798,13 @@ mod tests {
         let intents = c.apply_notation("yy");
         let text = format!("{}\n", row_text(&c, insert));
         assert!(text.starts_with('+'), "prefix must survive: {text:?}");
-        assert_eq!(intents, vec![DiffIntent::Yank { text }]);
+        assert_eq!(
+            intents,
+            vec![DiffIntent::Yank {
+                text,
+                kind: YankKind::Patch,
+            }],
+        );
     }
 
     #[test]
@@ -1526,7 +1812,13 @@ mod tests {
         let mut c = core();
         let intents = c.apply_notation("3yy");
         let expected: String = (0..3).map(|i| format!("{}\n", row_text(&c, i))).collect();
-        assert_eq!(intents, vec![DiffIntent::Yank { text: expected }]);
+        assert_eq!(
+            intents,
+            vec![DiffIntent::Yank {
+                text: expected,
+                kind: YankKind::Patch,
+            }],
+        );
     }
 
     /// A whole-document yank must re-parse as the same model — proof that the
@@ -1535,11 +1827,191 @@ mod tests {
     fn yanking_the_whole_diff_round_trips_through_parse() {
         let mut c = core();
         let intents = c.apply_notation("VGy");
-        let DiffIntent::Yank { text } = &intents[0] else {
+        let DiffIntent::Yank { text, .. } = &intents[0] else {
             panic!("expected a yank, got {intents:?}");
         };
         assert_eq!(text, c.text());
         assert_eq!(&parse(text).expect("the yank must parse"), c.model());
+    }
+
+    // ── character-wise yank: plain text, never a patch ──────────────────────
+
+    /// The row index of the first insertion row in the fixture, and its text.
+    fn insert_row(c: &DiffCore) -> usize {
+        c.rows()
+            .iter()
+            .position(|r| r.kind == RowKind::Body(LineKind::Insert))
+            .expect("an insertion row")
+    }
+
+    /// **The headline contract of phase B**: a character-wise yank hands back
+    /// the *code*, never the diff's annotation of it. `v$y` on `+THREE` is
+    /// `THREE`, with no `+` anywhere.
+    #[test]
+    fn a_character_wise_yank_drops_the_diff_prefix() {
+        let mut c = core();
+        let row = insert_row(&c);
+        c.apply_notation(&format!("{}G0", row + 1));
+        let line = row_text(&c, row).to_string();
+        assert!(line.starts_with('+'), "fixture changed: {line:?}");
+
+        let yanked = c.apply_notation("v$y");
+        assert_eq!(
+            yanked,
+            vec![DiffIntent::Yank {
+                text: line[1..].to_string(),
+                kind: YankKind::PlainText,
+            }],
+            "the prefix column is not part of the line's text",
+        );
+        assert_eq!(c.mode(), None, "the yank leaves visual mode");
+    }
+
+    /// Starting the selection *past* the prefix is the common case — grabbing
+    /// an identifier out of the middle of a line.
+    #[test]
+    fn a_character_wise_yank_takes_exactly_the_selected_characters() {
+        let mut c = core();
+        let row = insert_row(&c);
+        let line = row_text(&c, row).to_string();
+        // `+THREE` → skip the prefix and the `T`, then select three chars.
+        let yanked = c.apply_notation(&format!("{}G0llvlly", row + 1));
+        let chars: Vec<char> = line.chars().collect();
+        let expected: String = chars[2..5].iter().collect();
+        assert_eq!(
+            yanked,
+            vec![DiffIntent::Yank {
+                text: expected,
+                kind: YankKind::PlainText,
+            }],
+        );
+    }
+
+    /// Every row of a multi-row character selection loses its prefix, so the
+    /// result is plain source: no line of it can start a patch.
+    #[test]
+    fn a_multi_row_character_yank_is_plain_text_on_every_line() {
+        let mut c = core();
+        let row = insert_row(&c);
+        c.apply_notation(&format!("{}G0", row + 1));
+        let yanked = c.apply_notation("v3j$y");
+        let DiffIntent::Yank { text, kind } = &yanked[0] else {
+            panic!("expected a yank, got {yanked:?}");
+        };
+        assert_eq!(*kind, YankKind::PlainText);
+        assert_eq!(text.lines().count(), 4, "one line per selected row");
+        for line in text.lines() {
+            assert!(
+                !line.starts_with(['+', '-']),
+                "a prefix survived into plain text: {text:?}",
+            );
+        }
+        // And the rows it came from really did carry prefixes.
+        assert!(
+            (row..row + 4).any(|r| row_text(&c, r).starts_with(['+', '-'])),
+            "premise: the selection covered prefixed rows",
+        );
+    }
+
+    /// A character-wise yank is vim's: no trailing newline, and the rows
+    /// between the ends are taken whole.
+    #[test]
+    fn a_character_wise_yank_has_no_trailing_newline() {
+        let mut c = core();
+        let row = insert_row(&c);
+        c.apply_notation(&format!("{}G0", row + 1));
+        let yanked = c.apply_notation("vj$y");
+        let DiffIntent::Yank { text, .. } = &yanked[0] else {
+            panic!("expected a yank");
+        };
+        assert!(!text.ends_with('\n'), "char-wise never terminates: {text:?}");
+    }
+
+    /// A header row has no prefix column to strip — the `@@` line comes
+    /// through whole, and still cannot be mistaken for a patch on its own.
+    #[test]
+    fn a_header_row_keeps_its_whole_text() {
+        let mut c = core();
+        let header = c
+            .rows()
+            .iter()
+            .position(|r| r.kind == RowKind::HunkHeader)
+            .expect("a hunk header");
+        let line = row_text(&c, header).to_string();
+        c.apply_notation(&format!("{}G0", header + 1));
+        let yanked = c.apply_notation("v$y");
+        assert_eq!(
+            yanked,
+            vec![DiffIntent::Yank {
+                text: line,
+                kind: YankKind::PlainText,
+            }],
+        );
+    }
+
+    /// Selecting only the prefix column yanks nothing at all — an empty
+    /// clipboard write is not an intent the viewer emits.
+    #[test]
+    fn selecting_only_the_prefix_yanks_nothing() {
+        let mut c = core();
+        let row = insert_row(&c);
+        c.apply_notation(&format!("{}G0", row + 1));
+        assert!(
+            c.apply_notation("vy").is_empty(),
+            "the prefix alone is not text",
+        );
+    }
+
+    /// **Enabling `v` must not loosen the operator guard by one inch.** The
+    /// phase-A battery of fragment yanks is still refused: a fragment nobody
+    /// saw highlighted is an accident of a motion, not a decision.
+    #[test]
+    fn enabling_v_did_not_reopen_the_operator_fragment_yanks() {
+        for keys in [
+            "yiw", "yaw", "yw", "y$", "ye", "yb", "y0", "yf@", "y^", "yg^", "yvj", "y<C-v>j",
+            "may`a",
+        ] {
+            let mut c = core();
+            c.apply_notation("5G$");
+            assert!(
+                c.apply_notation(keys).is_empty(),
+                "keys {keys:?} yanked a fragment",
+            );
+        }
+    }
+
+    /// The two semantics never blur: whatever the cursor column, `V` yanks a
+    /// patch and `v` yanks plain text.
+    #[test]
+    fn the_shape_decides_the_semantics() {
+        let row = insert_row(&core());
+        let kind = |keys: &str| {
+            let mut c = core();
+            c.apply_notation(&format!("{}G0", row + 1));
+            match c.apply_notation(keys).first() {
+                Some(DiffIntent::Yank { kind, .. }) => Some(*kind),
+                other => panic!("keys {keys:?} yanked nothing: {other:?}"),
+            }
+        };
+        assert_eq!(kind("Vy"), Some(YankKind::Patch));
+        assert_eq!(kind("Vjy"), Some(YankKind::Patch));
+        assert_eq!(kind("yy"), Some(YankKind::Patch));
+        assert_eq!(kind("v$y"), Some(YankKind::PlainText));
+        assert_eq!(kind("vj$y"), Some(YankKind::PlainText));
+    }
+
+    /// A character selection clamped by a fold reports visible coordinates,
+    /// with a clamped end losing its column along with its row.
+    #[test]
+    fn the_drawn_character_selection_is_in_visible_coordinates() {
+        let mut c = core();
+        assert_eq!(c.char_selection_visible(), None);
+        c.apply_notation("]czc");
+        let header = c.cursor_row();
+        c.apply_notation("vj");
+        let span = c.char_selection_visible().expect("a selection");
+        assert_eq!(span.start_row, c.visible_index_of(header).unwrap());
+        assert_eq!(span.end_row, span.start_row + 1, "the fold is not drawn");
     }
 
     // ── read-only ───────────────────────────────────────────────────────────
@@ -1739,7 +2211,7 @@ mod tests {
         c.apply_notation("]czc");
         let header = c.cursor_row();
         let intents = c.apply_notation("Vjy");
-        let DiffIntent::Yank { text } = &intents[0] else {
+        let DiffIntent::Yank { text, .. } = &intents[0] else {
             panic!("expected a yank, got {intents:?}");
         };
         // `j` cleared the fold, so the selection spans the whole hunk.

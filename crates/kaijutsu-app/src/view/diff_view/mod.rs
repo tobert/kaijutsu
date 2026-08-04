@@ -333,12 +333,14 @@ fn diff_view_dispatch_keys(
     let mut refresh = false;
     for intent in core.apply_keys(terminal_keys) {
         match intent {
-            DiffIntent::Yank { text } => match clipboard.as_ref() {
+            DiffIntent::Yank { text, kind } => match clipboard.as_ref() {
                 // Reads the FROZEN core, never the block's current content —
                 // copying a hunk that has since changed is a correctness bug
-                // you cannot see.
+                // you cannot see. `kind` says which of the two semantics the
+                // core applied (patch text vs prefix-stripped plain text); the
+                // clipboard takes either verbatim.
                 Some(writer) => {
-                    debug!("diff viewer: yanked {} bytes", text.len());
+                    debug!("diff viewer: yanked {} bytes as {kind:?}", text.len());
                     writer.write(text);
                 }
                 None => warn!("diff viewer: yank discarded — no clipboard available"),
