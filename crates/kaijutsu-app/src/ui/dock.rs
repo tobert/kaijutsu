@@ -50,7 +50,7 @@ impl DockSparkline {
     }
 }
 use crate::text::{ShapingFonts, bevy_color_to_brush};
-use crate::ui::drift::DriftState;
+use crate::connection::drift::DriftState;
 use crate::ui::theme::Theme;
 
 // ============================================================================

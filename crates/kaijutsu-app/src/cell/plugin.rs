@@ -73,7 +73,7 @@ impl Plugin for CellPlugin {
             .register_type::<OverlayStyle>();
 
         // Register custom BRP methods for context navigation
-        use crate::view::brp_methods;
+        use crate::kaish::brp_methods;
         let switch_id = app.register_system(brp_methods::handle_switch_context);
         let active_id = app.register_system(brp_methods::handle_active_context);
         app.world_mut()

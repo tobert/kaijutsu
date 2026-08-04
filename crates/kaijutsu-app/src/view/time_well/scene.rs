@@ -981,7 +981,7 @@ pub fn well_keyboard(
     mut switch: MessageWriter<crate::view::components::ContextSwitchRequested>,
     mut next: ResMut<NextState<Screen>>,
     actor: Option<Res<crate::connection::RpcActor>>,
-    drift: Res<crate::ui::drift::DriftState>,
+    drift: Res<crate::connection::drift::DriftState>,
     mut room: ResMut<crate::view::room::RoomState>,
 ) {
     use crate::input::Action;
@@ -1698,7 +1698,7 @@ pub fn highlight_lineage(
 /// info, not stale frozen state, and it clears naturally the moment the next
 /// poll lands — nothing here can freeze.
 pub fn highlight_drift(
-    drift: Res<crate::ui::drift::DriftState>,
+    drift: Res<crate::connection::drift::DriftState>,
     mut cards: Query<(&Card, &mut CardParams)>,
 ) {
     let drifting = super::card::drift_endpoints(&drift.staged);

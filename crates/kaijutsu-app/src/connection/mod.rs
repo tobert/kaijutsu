@@ -7,6 +7,7 @@
 pub mod actor_plugin;
 pub mod bootstrap;
 pub mod client_id;
+pub mod drift;
 pub mod share_dial;
 
 pub use actor_plugin::{

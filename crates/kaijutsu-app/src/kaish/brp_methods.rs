@@ -8,9 +8,9 @@ use bevy_remote::{error_codes, BrpError, BrpResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::components::ContextSwitchRequested;
-use super::document::DocumentCache;
-use crate::ui::drift::DriftState;
+use crate::connection::drift::DriftState;
+use crate::view::components::ContextSwitchRequested;
+use crate::view::document::DocumentCache;
 use kaijutsu_types::ContextId;
 
 /// Method name for switching to a context by ID.

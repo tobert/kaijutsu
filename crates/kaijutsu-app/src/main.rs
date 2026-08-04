@@ -246,7 +246,7 @@ fn main() {
         .add_plugins(ui::tiling_reconciler::TilingReconcilerPlugin)
         .add_plugins(ui::dock::DockPlugin)
         // Drift state - context list + staged queue polling
-        .add_plugins(ui::drift::DriftPlugin)
+        .add_plugins(connection::drift::DriftPlugin)
         // Room level + patch bay station + time well (docs/scenes/): dive into
         // a zoomed station via `RoomState::zoomed`, Ctrl+W to jump straight
         // into the well. RoomPlugin MUST be added before any zoomable

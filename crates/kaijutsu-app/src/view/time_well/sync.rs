@@ -39,7 +39,7 @@ use super::panel::create_msdf_panel;
 pub fn sync_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
-    drift: Res<crate::ui::drift::DriftState>,
+    drift: Res<crate::connection::drift::DriftState>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut cards: Query<(&mut Card, &mut CardTarget, &mut RingSeat, &mut CardParams)>,
@@ -309,7 +309,7 @@ const MIN_CLUSTER_SIZE: u32 = 2;
 /// Poll semantic clusters (the band-2 angle + label source) while the well is
 /// open.
 ///
-/// Mirrors `ui::drift::poll_drift_state`: clone the handle, spawn an IO task,
+/// Mirrors `connection::drift::poll_drift_state`: clone the handle, spawn an IO task,
 /// ship the result back over `RpcResultChannel`. Throttled and well-only (the
 /// haystack is the only consumer). An empty result — e.g. the kernel has no
 /// semantic index — is fine: band-2 then falls back to creation-id order.

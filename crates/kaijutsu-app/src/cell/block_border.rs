@@ -12,7 +12,7 @@ use kaijutsu_types::ToolKind;
 
 use crate::connection::RpcConnectionState;
 use crate::text::TextMetrics;
-use crate::ui::drift::DriftState;
+use crate::connection::drift::DriftState;
 use crate::ui::theme::Theme;
 use crate::view::document::DocumentCache;
 use crate::view::{

@@ -3,7 +3,7 @@
 use super::plugin::PeerInvocationChannel;
 use bevy::prelude::*;
 
-use crate::ui::drift::DriftState;
+use crate::connection::drift::DriftState;
 use crate::view::components::ContextSwitchRequested;
 use crate::view::document::DocumentCache;
 use crate::view::editor::EditorOpenRequested;

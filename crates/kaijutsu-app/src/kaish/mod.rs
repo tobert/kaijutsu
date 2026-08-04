@@ -9,6 +9,13 @@
 //!
 //! Integrated into the InputOverlay: shell mode input is validated on each
 //! keystroke, tinting text red for syntax errors.
+//!
+//! [`brp_methods`] is BRP (Bevy Remote Protocol) glue, not kaish parsing —
+//! it lives here because it's the same "agent drives the app" surface kaish
+//! itself serves, registering custom methods (context switch/query) agents
+//! call over the same protocol used for scene inspection.
+
+pub mod brp_methods;
 
 use kaish_kernel::lexer::{Token, TokenCategory};
 use kaish_kernel::parser;

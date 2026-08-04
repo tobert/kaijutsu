@@ -15,11 +15,12 @@
 //!   `time_well`, `patch_bay`, `fsn`, `tracker`.
 //! - Styling: `palette`, `scene_palette`.
 //! - Render plumbing: `vello_rasterizer`, `ui_rtt` (render-to-texture
-//!   sizing), `brp_methods` (Bevy Remote Protocol inspector glue).
+//!   sizing). Bevy Remote Protocol inspector glue lives in
+//!   `kaish::brp_methods` (kaish-adjacent: agents drive both over the same
+//!   protocol).
 //! - `components` — the component/resource types shared across the above.
 
 pub mod block_render;
-pub mod brp_methods;
 pub mod components;
 pub mod document;
 pub mod diff_view;

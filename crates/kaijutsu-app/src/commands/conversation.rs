@@ -22,7 +22,7 @@ use crate::input::{Action, ActionFired};
 use crate::view::time_well::card::assign_placement;
 
 /// Ring-0 seat ids in seat order, from the same drift poll the well reads.
-fn active_ring(drift: &crate::ui::drift::DriftState) -> Vec<kaijutsu_crdt::ContextId> {
+fn active_ring(drift: &crate::connection::drift::DriftState) -> Vec<kaijutsu_crdt::ContextId> {
     // The well filters archived contexts before placement (sync.rs does the
     // same) — archived ids never hold a seat.
     let live: Vec<_> = drift
@@ -37,7 +37,7 @@ fn active_ring(drift: &crate::ui::drift::DriftState) -> Vec<kaijutsu_crdt::Conte
 /// Consume the prefix context verbs.
 pub fn handle_prefix_context_verbs(
     mut actions: MessageReader<ActionFired>,
-    drift: Res<crate::ui::drift::DriftState>,
+    drift: Res<crate::connection::drift::DriftState>,
     doc_cache: Res<DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
