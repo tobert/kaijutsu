@@ -379,6 +379,20 @@ correctness problem, both erode the value of WARN.
   and work, so this is config debt from the SQL-config seeding: either create
   the file, clear `api_key_file` on those rows, or teach the fall-through to
   log once at debug when the env key is present.
+## Diff cursor stops at the ellipsis on an elided line (2026-08-04, slice 6A)
+
+With column motions back, the drawn cursor and modalkit's column agree
+everywhere except on a line long enough to be elided for display
+(`MAX_VIEW_LINE_CHARS` = 2000 in the viewer, 500 inline). `text::diff::
+cursor_byte` clamps to the end of the *shown* text, so `$` on a 5000-char
+line parks the drawn cursor on the `…` while modalkit's real column is far
+to its right. Bounded and rare (a minified bundle line), and the safe
+direction — the alternative is a cursor drawn past the end of the text — but
+it is the one place the viewer's "the cursor never lies" rule is approximate.
+Fixes worth considering when someone hits it: elide in the *middle* of the
+line so the tail stays addressable, or clamp modalkit's column to the shown
+length on such rows (a real behavior change, so not done blind).
+
 ## Diff viewer footer + status bar overlap content rows (2026-08-03, slice-5 live verify)
 
 Seen during the first live run of `Screen::Diff` on moltar, in a ~1080p-scale

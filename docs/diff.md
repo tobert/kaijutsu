@@ -12,10 +12,12 @@ block type.
 2026-08-01** — the `kaijutsu-diff` crate, `ContentType::Diff`, the whole
 kernel surface (`kj diff`, `diff_block`, hydration-as-projection, `Done`
 validation), and the inline app preview. **Slice 5 SHIPPED 2026-08-02** —
-`DiffCore`, `Screen::Diff`, the keyboard grab, and yank→clipboard. Slice 6
-(minimap, fold rendering, word-level highlight, the multi-rect selection
-material) is next. This doc is the plan of record; the per-slice "Build
-notes" sections below correct it where the build disagreed.
+`DiffCore`, `Screen::Diff`, the keyboard grab, and yank→clipboard. **Slice 6
+phase A SHIPPED 2026-08-04** — word-level highlight, fold rendering, and the
+return of column motions. Phase B (minimap, the multi-rect `BlockFxMaterial`
+extension, and the character-wise visual mode it unlocks) is what remains.
+This doc is the plan of record; the per-slice "Build notes" sections below
+correct it where the build disagreed.
 
 ## Decisions (Amy, 2026-08-01)
 
@@ -194,7 +196,8 @@ notes" sections below correct it where the build disagreed.
    the same notation data — decide the exact crate when this slice lands);
    do NOT share the intent-drain types — Editor intents carry write semantics,
    Diff intents don't, and a shared trait would couple their evolution.
-6. Minimap, folds, word-level highlight polish; multi-rect material slice.
+6. **Phase A SHIPPED.** Word-level highlight, fold rendering, column motions.
+   **Phase B:** minimap, multi-rect material, character-wise visual mode.
 
 ## Build notes — slices 0+1 SHIPPED 2026-08-01 (corrections to the plan above)
 
@@ -486,6 +489,74 @@ order (yank before close, refresh deferred to the end of the batch), and
 clipboard ownership ending at process exit (platform reality, tracked with the
 PRIMARY entry in `docs/issues.md`).
 
+## Build notes — slice 6 phase A SHIPPED 2026-08-04 (words, folds, columns)
+
+The three items that did not need the multi-rect material are built. What
+the build settled:
+
+- **Run splitting: parley's ranged brushes won, not per-cluster tracking in
+  the bridge.** `VelloFont::layout_spanned` pushes the span list as real
+  `StyleProperty::Brush` ranges; parley then subdivides its glyph runs by
+  style index and `GlyphRun::style().brush` hands the color back per run.
+  `collect_msdf_glyphs_styled` reads it. The bridge got *simpler*, not
+  smarter — the alternative would have re-implemented in our code a split
+  parley already performs. Pinned by real shaping in a headless test (the
+  loader's registration half is `#[cfg(test)] pub(crate)`, so a test loads a
+  shipped `.ttf` into the same font collection the app uses): a mid-run span
+  colors exactly its glyphs, the old run-start lookup demonstrably does not,
+  and — the one that would have bitten silently — **brush is not a shaping
+  property**: spanned and plain layouts position every glyph identically.
+- **`build_diff_span_brushes` emits DISJOINT spans**, cutting each line
+  around its words rather than stacking word spans over line spans. Parley
+  resolves overlap by push order, `brush_at_offset` resolves it by first
+  match; disjoint spans mean the two mechanisms cannot disagree.
+- **`DiffPreview::words` is a flat list, not a field on `PreviewLine`** —
+  the line stays `Copy` (the class and band lookups index it per visual row,
+  per frame). Truncation filtering landed as `elision_cut`: the byte offset
+  where display elision cut a line, with spans dropped past it and clipped
+  across it (never drawn over the `…`). Both budgets go through it.
+- **The full view reaches word spans through row provenance**, since spans
+  are derived and never serialized. A `\ No newline` row shares its body
+  line's `file/hunk/line` and none of its text, so it is excluded *by kind* —
+  the one place that indirection can bite.
+- **Folds project in `DiffCore`, not in the app.** `visible_rows()` is a
+  second derived list — row indices to draw — while `rows()`/`text()` still
+  describe the whole patch, so yank and the canonical model never see a fold.
+  Projecting in `view_rows` alone would have left modalkit's cursor free to
+  sit on a row nobody draws, the same invisible-state failure that cost
+  slice 5 its column motions. A folded hunk **keeps its header row** (the app
+  appends `⋯ N lines folded`); no synthetic row, so the projection stays a
+  subsequence and every drawn line maps back to a canonical one.
+- **The cursor is snapped out of folds, direction-aware** (vim's behavior):
+  walking down lands past the fold, every other way in parks on the header.
+  Cursor and selection publish visible coordinates (`cursor_visible_row`,
+  `selection_visible_rows`) so window, bands, status counter and projection
+  index one space. A selection spanning a fold still yanks the hidden lines.
+- **`fold_seq` had to join the layout cache key.** Folding changes the
+  projection without changing a byte of content, and two folds of equal size
+  between frames leave even the visible row count unchanged.
+- **Column motions returned by narrowing the rule, not deleting it.**
+  `snap_to_line_start` is gone and `is_line_wise` became `is_line_wise_yank`,
+  applied only when the resolved op is a `Yank`. **Yank stays line-wise** —
+  `yw`/`y$`/`yiw` would produce a fragment carrying a `+` and no line, text
+  that looks like a patch and is not one. Partial-line yank is blocked by
+  *meaning*, not by rendering; it stays out until something asks for it with
+  a semantics attached.
+- **`cursor_col()` is clamped for reporting only.** modalkit keeps a goal
+  column (vim's `$`-sticky) that can sit past a short line; clamping the
+  reported value keeps the renderer honest without breaking the goal column.
+- **The surface now caches the parley `Layout`** and places the cursor with
+  `Cursor::from_byte_index` — the editor's own path. A row box cannot answer
+  where a column is, and on a *wrapped* line a late column belongs to a later
+  visual row, which cell-width arithmetic would put off the right edge. The
+  query searches already-shaped lines, so the cheap pass stays cheap.
+  `text::diff::cursor_byte` is the single char-column → byte-offset step.
+- **Not verified in the running app** (headless only): word emphasis colors
+  against the theme on screen, the fold indicator's readability, the cursor's
+  drawn position at a column (especially on a wrapped line), and that folding
+  visibly re-lays-out. The `docs/issues.md` diffstat-footer overlap entry is
+  still unretested and is the natural thing to check in the same sitting.
+
 ## Seam guidance (deepseek review, 2026-08-01)
 
 Consulted deepseek specifically on how the seams should evolve so this work
@@ -570,6 +641,12 @@ line-wise `V` only until multi-rect). Still open:
   changed-bar wash is a background quad per bar extent. Bar-aligned text hunks
   map 1:1 onto engraved measures, so the text diff *is* the index into the
   visual one.
+- **Word-level *background* emphasis** — slice 6A colors changed words with a
+  brighter foreground brush only. jj's `color-words` and git's `--word-diff`
+  also wash the word's background, which reads better on a busy line. The
+  band geometry can already draw arbitrary quads; what it lacks is the word's
+  **x extent**, which means walking clusters in the cached parley layout (or
+  the multi-rect material phase B brings). Cheap once either exists.
 - **Syntax highlighting under diff colors** — the biggest visual lever per the
   research; kaijutsu has span infra but no grammars (kaish tokenizer stubs are
   marked "Phase 4: syntax highlighting via Parley spans"). Design the diff
