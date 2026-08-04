@@ -268,6 +268,54 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## TurnEvents + register upsert — deepseek review findings (2026-08-04, post-merge)
+
+DeepSeek V4 pass (dpal, whole files, no diff) over the merged foundations at
+`29529ded`. Eight keepers explicitly endorsed (single-terminal-publish,
+origin-on-the-event, beat's three Act guards, resolveContextLabel honesty,
+loud attach warning, subject⊆TOPICS gates, unknown-enumerant hard error,
+hasOutputBlock zeroing). The queue, P2 first:
+
+- **`⛔ Interrupted` marker leaks into model context** (`llm_stream.rs:
+  1747-1757` + `hydrate.rs:190-200`): inserted as `(Role::Model,
+  BlockKind::Text)` so hydration folds it into assistant_text — next turn
+  the model sees a hallucinated `assistant: ⛔ Interrupted`. Fix: ephemeral
+  flag, or `Role::System`/`BlockKind::Notification` (both hydration-skipped).
+- **Hard cancel + hung provider publishes `Failed`** (`llm_stream.rs:
+  1393-1448 → 1781`): post-cancel drain's idle timeout constructs
+  `StreamEvent::Error`, violating the cancel-is-not-failure contract
+  (flows.rs:1182-1185). Fix: break the loop with `stream_cancelled` set
+  instead of erroring — a hung stream won't deliver the flush anyway.
+- **`refusal`/`stop_sequence` collapse to `EndTurn`** (`llm_stream.rs:
+  1769-1772`): an Anthropic refusal renders as a clean completion. Minimal:
+  log distinctly; right: a `Refusal` stop reason (wire addition).
+- **beat.rs "exactly preserves prior behavior" is FALSE for soft cancel**
+  (`beat.rs:2390-2416`): old code skipped soft-cancelled autonomous turns
+  (they arrived as Failed); now `output_is_complete()==true` → the phrase
+  crystallizes into the Act. Defensible — the phrase IS whole — but it's a
+  behavior CHANGE; fix the comment, decide the semantics on purpose.
+- **register_session suffix TOCTOU** (`kaijutsu-mcp/src/lib.rs:1127-1155`):
+  two concurrent registers on one concluded label race resolve→create; the
+  loser gets a raw DB constraint error, not a clean retry. No corruption
+  (uniqueness index arbitrates). Fix: retry-on-constraint-violation loop.
+- **flows.rs:1123-1126 recovery claim overstates**: "a subscriber that
+  missed the push reads the block log" — true for text ops, false for
+  stop_reason (EndTurn/MaxTokens/soft-cancel are indistinguishable from
+  block status). Fix the doc; the real catch-up story is already tracked.
+- **Test gaps before unattended always-on** (P2 tier): post-cancel-idle
+  path, wire e2e for onTurnFailed, concurrent register race, soft-cancel
+  crystallization + hard-cancel skip in the Act.
+
+P3 tier, recorded not urgent: subscribe-happens-in-spawned-task window
+(`rpc.rs:3522-3633` — subscribe synchronously or document ordering);
+stream-start retry backoff ignores a pending hard cancel (`llm_stream.rs:
+1300-1320`); no turnId/endedAt on onTurnCompleted (correlation by ordering
+only — matters for a stateless ACP frontend, revisit with the adapter);
+suffix-orphan residue on crash between create and join;
+`publish_with_sender` drops silently where `publish` warns (`flows.rs:
+664-680`); archived-context re-listing via joinContext heal is documented
+but surprising (heal re-registers without clearing `archived_at`).
+
 ## Household-agent arc — task blocks + harness steals (seeded 2026-08-04, gap-analysis session)
 
 Amy is pointing kaijutsu at always-on household duty (daily task grooming,
