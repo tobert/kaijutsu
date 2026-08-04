@@ -109,14 +109,24 @@ pub struct DiffSurfaceWindow {
 
 /// The inputs the **text shaping** depends on. Deliberately free of cursor
 /// state: that is what keeps a line move off the Parley path.
+///
+/// Sizes ride as raw f32 bits rather than truncated integers: the surface is
+/// laid out in *logical* px, which a fractional HiDPI scale factor makes
+/// fractional, and a resize that stays inside one integer can still move a
+/// wrap point. Exact bits cannot be too sensitive here — a size that did not
+/// change produces identical bits.
 #[derive(PartialEq, Eq, Clone, Debug)]
 struct LayoutKey {
     content_hash: u64,
     fold_seq: u64,
     first_row: usize,
     end_row: usize,
-    width_px: i32,
-    height_px: i32,
+    width_bits: u32,
+    height_bits: u32,
+    /// Font size shapes every glyph and sets the row height the window is
+    /// measured in. It is fixed today, which is exactly why leaving it out
+    /// would be a trap for whoever makes it adjustable.
+    font_bits: u32,
 }
 
 /// The inputs the **cheap pass** depends on — everything that can change
@@ -299,8 +309,9 @@ pub fn build_diff_surface(
         },
         first_row,
         end_row,
-        width_px: width as i32,
-        height_px: height as i32,
+        width_bits: width.to_bits(),
+        height_bits: height.to_bits(),
+        font_bits: text_metrics.cell_font_size.to_bits(),
     };
     let cursor_key = CursorKey {
         cursor_row,
@@ -310,7 +321,12 @@ pub fn build_diff_surface(
         status: status_line(session, cursor_row),
         kind,
     };
-    let relayout = window.laid_out.as_ref() != Some(&layout_key);
+    // Theme colors are baked into the cached layout (as ranged brushes) and
+    // into the cached band geometry, and the kernel can replace the whole
+    // `Theme` resource over RPC at any moment (`apply_theme_from_rpc`). No
+    // key can see that — Bevy's own change detection can, so it joins the
+    // relayout condition rather than being hashed into one.
+    let relayout = window.laid_out.as_ref() != Some(&layout_key) || theme.is_changed();
     if !relayout && window.drawn.as_ref() == Some(&cursor_key) {
         return;
     }
@@ -597,8 +613,9 @@ mod tests {
             fold_seq: 0,
             first_row,
             end_row,
-            width_px: 1920,
-            height_px: 1080,
+            width_bits: 1920.0f32.to_bits(),
+            height_bits: 1080.0f32.to_bits(),
+            font_bits: 20.0f32.to_bits(),
         }
     }
 
@@ -643,8 +660,19 @@ mod tests {
         let band = (0, 64);
         let a = layout_key_at(0, 40, 100_000, band);
         let mut b = a.clone();
-        b.width_px = 1280;
+        b.width_bits = 1280.0f32.to_bits();
         assert_ne!(a, b);
+
+        // ...including a resize too small to change a truncated integer,
+        // which can still move a wrap point.
+        let mut c = a.clone();
+        c.width_bits = 1920.4f32.to_bits();
+        assert_ne!(a, c, "a fractional logical resize must re-shape");
+
+        // ...and a font-size change with the window untouched.
+        let mut d = a.clone();
+        d.font_bits = 22.0f32.to_bits();
+        assert_ne!(a, d);
     }
 
     /// The cheap pass still has to run on a cursor move — the status counter,
