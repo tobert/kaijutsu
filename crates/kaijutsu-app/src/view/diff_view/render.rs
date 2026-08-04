@@ -28,7 +28,7 @@ use crate::input::vim::{CursorKind, mode_kind};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
     BlockRenderMethod, FontDataMap, MsdfAtlas, MsdfBlockGeometry, MsdfBlockGlyphs,
-    collect_msdf_glyphs,
+    collect_msdf_glyphs, collect_msdf_glyphs_styled,
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
@@ -310,11 +310,15 @@ pub fn build_diff_surface(
             }
         };
 
-        let layout = font.layout(
+        let span_brushes = crate::text::rich::build_diff_span_brushes(&preview, &theme);
+        // Spanned, not plain: word-level highlights start *inside* a line, and
+        // only parley's own ranged brushes split a shaping run there.
+        let layout = font.layout_spanned(
             &preview.plain_text,
             &style,
             VelloTextAlign::Left,
             Some(content_width),
+            &span_brushes,
         );
         for line in layout.lines() {
             for item in line.items() {
@@ -324,8 +328,7 @@ pub fn build_diff_surface(
             }
         }
 
-        let span_brushes = crate::text::rich::build_diff_span_brushes(&preview, &theme);
-        let body = collect_msdf_glyphs(&layout, &span_brushes, &fallback, text_offset, atlas);
+        let body = collect_msdf_glyphs_styled(&layout, text_offset, atlas);
 
         // One entry per WRAPPED visual row, addressed by its start byte — a
         // long `+` line must be tinted across every row it occupies. Kept so

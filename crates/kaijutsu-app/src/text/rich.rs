@@ -209,7 +209,45 @@ pub fn build_output_span_brushes(
     result
 }
 
-/// Build `SpanBrush` vec for a diff preview — one span per preview line.
+/// The theme color for a diff line class.
+fn diff_line_color(
+    class: super::diff::DiffLineClass,
+    theme: &crate::ui::theme::Theme,
+) -> Color {
+    use super::diff::DiffLineClass;
+    match class {
+        DiffLineClass::Stat => theme.diff_stat,
+        DiffLineClass::FileHeader => theme.diff_file_header,
+        DiffLineClass::HunkHeader => theme.diff_hunk_header,
+        DiffLineClass::Insert => theme.diff_insert_fg,
+        DiffLineClass::Delete => theme.diff_delete_fg,
+        DiffLineClass::Context => theme.diff_context_fg,
+        DiffLineClass::Meta => theme.diff_meta,
+        DiffLineClass::Error => theme.diff_error_fg,
+    }
+}
+
+/// The emphasis color for a *word* the refinement marked changed inside a
+/// line of that class.
+///
+/// Only the two changed classes have one. A word span on any other class would
+/// be a claim the model never makes (`DiffLine::words` is empty on context
+/// lines and on anything with no counterpart), so it draws in the line color
+/// rather than inventing an emphasis for it.
+fn diff_word_color(
+    class: super::diff::DiffLineClass,
+    theme: &crate::ui::theme::Theme,
+) -> Option<Color> {
+    use super::diff::DiffLineClass;
+    match class {
+        DiffLineClass::Insert => Some(theme.diff_insert_word_fg),
+        DiffLineClass::Delete => Some(theme.diff_delete_word_fg),
+        _ => None,
+    }
+}
+
+/// Build `SpanBrush` vec for a diff preview — one span per preview line, split
+/// around the intra-line word highlights.
 ///
 /// Diff color is **semantic** (`docs/diff.md` Decision 8): the block's content
 /// is plain unified text with no escape codes, and every color below comes
@@ -217,33 +255,50 @@ pub fn build_output_span_brushes(
 /// `text::diff::PreviewLine`), which matters because `collect_msdf_glyphs`
 /// resolves a brush from each shaping *run's start byte* — a gap would fall
 /// through to the fallback brush mid-line.
+///
+/// **The output is non-overlapping**: a line carrying word highlights is cut
+/// into line-colored and word-colored pieces rather than having the word spans
+/// stacked on top. Parley's ranged styles would resolve the overlap by push
+/// order and the byte-offset lookup would resolve it by *first match* — two
+/// mechanisms with opposite answers. Emitting disjoint spans means both agree,
+/// whichever the caller uses.
+///
+/// Word coloring only reaches the screen through
+/// `VelloFont::layout_spanned` + `collect_msdf_glyphs_styled`: the plain
+/// `collect_msdf_glyphs` looks a brush up per shaping run and cannot see a
+/// span that starts mid-run.
 pub fn build_diff_span_brushes(
     preview: &super::diff::DiffPreview,
     theme: &crate::ui::theme::Theme,
 ) -> Vec<SpanBrush> {
-    use super::diff::DiffLineClass;
+    let mut out = Vec::with_capacity(preview.lines.len() + 2 * preview.words.len());
+    let mut words = preview.words.iter().peekable();
 
-    preview
-        .lines
-        .iter()
-        .map(|line| {
-            let color = match line.class {
-                DiffLineClass::Stat => theme.diff_stat,
-                DiffLineClass::FileHeader => theme.diff_file_header,
-                DiffLineClass::HunkHeader => theme.diff_hunk_header,
-                DiffLineClass::Insert => theme.diff_insert_fg,
-                DiffLineClass::Delete => theme.diff_delete_fg,
-                DiffLineClass::Context => theme.diff_context_fg,
-                DiffLineClass::Meta => theme.diff_meta,
-                DiffLineClass::Error => theme.diff_error_fg,
+    for line in &preview.lines {
+        let line_brush = || bevy_color_to_brush(diff_line_color(line.class, theme));
+        let mut at = line.start;
+        while let Some(word) = words.peek().filter(|w| w.start < line.end) {
+            let (start, end) = (word.start.max(at), word.end.min(line.end));
+            let brush = diff_word_color(word.class, theme).map(bevy_color_to_brush);
+            words.next();
+            let Some(brush) = brush else {
+                continue;
             };
-            SpanBrush {
-                start: line.start,
-                end: line.end,
-                brush: bevy_color_to_brush(color),
+            if start >= end {
+                continue;
             }
-        })
-        .collect()
+            if start > at {
+                out.push(SpanBrush { start: at, end: start, brush: line_brush() });
+            }
+            out.push(SpanBrush { start, end, brush });
+            at = end;
+        }
+        if at < line.end {
+            out.push(SpanBrush { start: at, end: line.end, brush: line_brush() });
+        }
+    }
+
+    out
 }
 
 /// Resolve the diff band colors from the theme, as RGBA8 for the geometry
@@ -756,6 +811,67 @@ mod tests {
             diff_preview(rich).is_none(),
             "a non-diff ```diff fence must not become a diff preview"
         );
+    }
+
+    // ── diff span brushes ───────────────────────────────────────────────────
+
+    fn word_diff_preview() -> crate::text::diff::DiffPreview {
+        crate::text::diff::build_diff_preview(
+            "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-the quick brown fox\n+the quick red fox\n",
+            ContentType::Diff,
+        )
+    }
+
+    /// The invariant both color lookups depend on: spans tile the text with no
+    /// gap and no overlap. A gap falls through to the default brush mid-line;
+    /// an overlap means parley (push order) and the byte-offset lookup (first
+    /// match) would disagree about the color of the same byte.
+    #[test]
+    fn diff_span_brushes_tile_the_text_without_overlapping() {
+        let theme = crate::ui::theme::Theme::default();
+        let p = word_diff_preview();
+        let spans = build_diff_span_brushes(&p, &theme);
+        assert!(!p.words.is_empty(), "test premise: the fixture refines");
+
+        let mut at = 0usize;
+        for span in &spans {
+            assert_eq!(span.start, at, "gap or overlap at {}", span.start);
+            assert!(span.end > span.start);
+            at = span.end;
+        }
+        assert_eq!(at, p.plain_text.len(), "spans must cover the whole text");
+    }
+
+    /// A changed word gets the emphasis color and the rest of its line keeps
+    /// the line color — the whole point of the intra-line refinement.
+    #[test]
+    fn a_changed_word_is_brushed_apart_from_its_line() {
+        let theme = crate::ui::theme::Theme::default();
+        let p = word_diff_preview();
+        let spans = build_diff_span_brushes(&p, &theme);
+
+        let colored = |needle: &str| -> Brush {
+            let at = p.plain_text.find(needle).expect("needle in the preview");
+            let span = spans
+                .iter()
+                .find(|s| at >= s.start && at < s.end)
+                .expect("every byte is covered");
+            span.brush.clone()
+        };
+
+        assert_eq!(colored("brown"), bevy_color_to_brush(theme.diff_delete_word_fg));
+        assert_eq!(colored("red fox"), bevy_color_to_brush(theme.diff_insert_word_fg));
+        // The unchanged head of the inserted line stays the line color.
+        let insert_line = p
+            .lines
+            .iter()
+            .find(|l| l.class == crate::text::diff::DiffLineClass::Insert)
+            .unwrap();
+        let head = spans
+            .iter()
+            .find(|s| s.start == insert_line.start)
+            .expect("the line starts a span");
+        assert_eq!(head.brush, bevy_color_to_brush(theme.diff_insert_fg));
     }
 }
 

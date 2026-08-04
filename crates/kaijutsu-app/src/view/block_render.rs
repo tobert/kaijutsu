@@ -893,18 +893,24 @@ pub fn build_block_scenes(
                 // `text::diff` already spent the render byte budget and the
                 // preview line budget before this point; what reaches Parley
                 // here is bounded by construction.
-                let layout = font.layout(
+                // Context is the quietest class, so it is the right default
+                // for any byte a span somehow misses.
+                let fallback_brush = bevy_color_to_brush(theme.diff_context_fg);
+                let span_brushes = crate::text::rich::build_diff_span_brushes(preview, &theme);
+                // Spanned, not plain: word-level highlights start *inside* a
+                // line, and only parley's own ranged brushes split a shaping
+                // run there (`layout_spanned`'s doc comment has the why).
+                let layout = font.layout_spanned(
                     &preview.plain_text,
-                    &style,
+                    &VelloTextStyle {
+                        brush: fallback_brush.clone(),
+                        ..style.clone()
+                    },
                     VelloTextAlign::Left,
                     max_advance,
+                    &span_brushes,
                 );
                 content_height = layout.height();
-
-                let span_brushes = crate::text::rich::build_diff_span_brushes(preview, &theme);
-                // Context is the quietest class, so it is the right fallback
-                // for any run a span somehow misses.
-                let fallback_brush = bevy_color_to_brush(theme.diff_context_fg);
 
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
@@ -939,9 +945,8 @@ pub fn build_block_scenes(
                         &crate::text::rich::diff_band_colors(&theme),
                     );
 
-                    let glyphs = collect_msdf_glyphs(
-                        &layout, &span_brushes, &fallback_brush, text_offset, atlas,
-                    );
+                    let glyphs =
+                        crate::text::msdf::collect_msdf_glyphs_styled(&layout, text_offset, atlas);
                     msdf_glyphs.glyphs = glyphs;
                     // Bump from the field's OWN previous value (ABC's
                     // pattern), never from `scene_version` — see

@@ -114,7 +114,7 @@ fn collect_with(
 }
 
 /// Convert a Brush to RGBA8.
-pub(crate) fn brush_to_rgba8(brush: &Brush) -> [u8; 4] {
+fn brush_to_rgba8(brush: &Brush) -> [u8; 4] {
     match brush {
         Brush::Solid(color) => {
             let [r, g, b, a] = color.components;

@@ -93,6 +93,30 @@ pub struct PreviewLine {
     pub class: DiffLineClass,
 }
 
+/// A byte range of [`DiffPreview::plain_text`] that the word-level refinement
+/// marked as *changed within its line* — the intra-line half of the diff.
+///
+/// Separate from [`PreviewLine`] rather than a field on it, for two reasons:
+/// `PreviewLine` stays `Copy` (the band and class lookups index it per visual
+/// row, per frame), and the renderer wants one flat, sorted, non-overlapping
+/// list to turn into brush spans anyway.
+///
+/// Ranges are absolute in `plain_text`: [`kaijutsu_diff::WordSpan`] indexes
+/// bytes of `DiffLine::text`, and the translation is `+ text_start`
+/// ([`PreviewLine::text_start`]) — plus the elision clip, see
+/// [`elision_cut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordHighlight {
+    /// Inclusive start byte offset in `plain_text`.
+    pub start: usize,
+    /// Exclusive end byte offset in `plain_text`.
+    pub end: usize,
+    /// The class of the line the span belongs to — [`DiffLineClass::Insert`]
+    /// or [`DiffLineClass::Delete`]. The renderer picks the emphasis color
+    /// from it.
+    pub class: DiffLineClass,
+}
+
 /// A parsed, budgeted, class-annotated inline preview of a diff block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffPreview {
@@ -102,6 +126,9 @@ pub struct DiffPreview {
     pub plain_text: String,
     /// One entry per line of `plain_text`, in order, contiguous.
     pub lines: Vec<PreviewLine>,
+    /// Intra-line changed ranges, ascending and non-overlapping. Empty for an
+    /// error preview and for any line the refinement had no counterpart for.
+    pub words: Vec<WordHighlight>,
     /// The stat of the **whole** diff, not of the previewed slice — the stat
     /// describes the change, the body is what fits.
     pub stat: DiffStat,
@@ -184,10 +211,33 @@ pub fn try_build_diff_preview(text: &str, content_type: ContentType) -> Option<D
     Some(preview_from_model(&model))
 }
 
-/// Accumulates lines and their byte ranges as the preview is written.
+/// Where display elision cut `text`, as a byte offset into it.
+///
+/// [`crate::text::truncate_chars`] keeps `max - 1` chars and appends `…`, so
+/// this is the byte length of the part that *survived unchanged* — the point
+/// past which a [`kaijutsu_diff::WordSpan`] no longer describes anything on
+/// screen. A span past it would index into the ellipsis or off the end of the
+/// line entirely (the failure the slice-4 post-ship review flagged), and one
+/// straddling it is clipped here rather than drawn over the `…`.
+fn elision_cut(text: &str, max_chars: usize) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+    if text.chars().count() <= max_chars {
+        return text.len();
+    }
+    text.char_indices()
+        .nth(max_chars - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
+}
+
+/// Accumulates lines, their byte ranges, and their word spans as the preview
+/// is written.
 struct PreviewBuilder {
     text: String,
     lines: Vec<PreviewLine>,
+    words: Vec<WordHighlight>,
 }
 
 impl PreviewBuilder {
@@ -195,6 +245,7 @@ impl PreviewBuilder {
         Self {
             text: String::new(),
             lines: Vec::new(),
+            words: Vec::new(),
         }
     }
 
@@ -213,6 +264,38 @@ impl PreviewBuilder {
         });
     }
 
+    /// Append a body line together with its word-level spans.
+    ///
+    /// `words` index bytes of the line's **own** text (`DiffLine::text`), and
+    /// `cut` is how many of those bytes survived display elision — see
+    /// [`elision_cut`]. Spans are sorted ascending, so the first one that
+    /// starts past the cut ends the walk.
+    fn push_words(
+        &mut self,
+        class: DiffLineClass,
+        prefix_bytes: usize,
+        content: &str,
+        words: &[kaijutsu_diff::WordSpan],
+        cut: usize,
+    ) {
+        self.push(class, prefix_bytes, content);
+        let text_start = self.lines.last().expect("just pushed").text_start;
+        for span in words {
+            if span.start >= cut {
+                break;
+            }
+            let end = span.end.min(cut);
+            if end <= span.start {
+                continue;
+            }
+            self.words.push(WordHighlight {
+                start: text_start + span.start,
+                end: text_start + end,
+                class,
+            });
+        }
+    }
+
     fn finish(mut self, stat: DiffStat, is_error: bool) -> DiffPreview {
         // Drop the trailing newline and shrink the last line's range with it,
         // so `end` stays exactly `plain_text.len()` and the contiguity
@@ -226,6 +309,7 @@ impl PreviewBuilder {
         DiffPreview {
             plain_text: self.text,
             lines: self.lines,
+            words: self.words,
             stat,
             is_error,
         }
@@ -272,8 +356,15 @@ fn preview_from_model(model: &DiffModel) -> DiffPreview {
                     LineKind::Delete => DiffLineClass::Delete,
                     LineKind::Context => DiffLineClass::Context,
                 };
+                let cut = elision_cut(&line.text, MAX_PREVIEW_LINE_CHARS);
                 let text = crate::text::truncate_chars(&line.text, MAX_PREVIEW_LINE_CHARS);
-                b.push(class, 1, &format!("{}{}", line.prefix(), text));
+                b.push_words(
+                    class,
+                    1,
+                    &format!("{}{}", line.prefix(), text),
+                    &line.words,
+                    cut,
+                );
             }
         }
     }
@@ -453,14 +544,52 @@ pub fn view_rows(core: &kaijutsu_diff::DiffCore, rows: std::ops::Range<usize>) -
 
     for row in &core.rows()[start..end] {
         let raw = text[row.start..row.end].trim_end_matches('\n');
+        let cut = elision_cut(raw, MAX_VIEW_LINE_CHARS);
         let shown = crate::text::truncate_chars(raw, MAX_VIEW_LINE_CHARS);
         // The prefix byte only exists if it survived elision (it always does —
         // the budget is thousands of chars — but derive it rather than assume).
         let prefix_bytes = (row.text_start - row.start).min(shown.len());
-        b.push(class_for_row(row.kind), prefix_bytes, &shown);
+        // `cut` is measured on the row (prefix included); word spans index the
+        // line's own text, so the cut moves with them.
+        b.push_words(
+            class_for_row(row.kind),
+            prefix_bytes,
+            &shown,
+            row_words(core.model(), row),
+            cut.saturating_sub(prefix_bytes),
+        );
     }
 
     b.finish(core.model().stat(), false)
+}
+
+/// The word-level spans of the model line a row came from, or nothing.
+///
+/// A row's provenance (`file`/`hunk`/`line`) is the only link back to the
+/// model: the canonical text carries no word information, because word spans
+/// are *derived* — recomputed by `parse`, never serialized — which is what
+/// keeps the format/parse roundtrip an identity.
+fn row_words<'a>(
+    model: &'a kaijutsu_diff::DiffModel,
+    row: &kaijutsu_diff::DiffRow,
+) -> &'a [kaijutsu_diff::WordSpan] {
+    const NONE: &[kaijutsu_diff::WordSpan] = &[];
+    // A `\ No newline` row points at the body line above it, so it has the
+    // same provenance and none of the same text — asking the kind is what
+    // keeps its marker text from being highlighted with that line's spans.
+    if !matches!(row.kind, kaijutsu_diff::RowKind::Body(_)) {
+        return NONE;
+    }
+    let (Some(fi), Some(hi), Some(li)) = (row.file, row.hunk, row.line) else {
+        return NONE;
+    };
+    model
+        .files
+        .get(fi)
+        .and_then(|f| f.hunks.get(hi))
+        .and_then(|h| h.lines.get(li))
+        .map(|l| l.words.as_slice())
+        .unwrap_or(NONE)
 }
 
 /// The full viewer's error state: a block that declares itself a diff and
@@ -707,6 +836,129 @@ mod tests {
         assert_contiguous(&p);
     }
 
+    // ── word-level highlight ────────────────────────────────────────────────
+
+    /// The text each word highlight covers, with the class it belongs to.
+    fn highlighted(p: &DiffPreview) -> Vec<(DiffLineClass, &str)> {
+        p.words
+            .iter()
+            .map(|w| (w.class, &p.plain_text[w.start..w.end]))
+            .collect()
+    }
+
+    /// Word spans must land on the *changed words* of a changed line, not on
+    /// the line and not on the diff prefix. `text_start` is the whole
+    /// translation: a `WordSpan` indexes bytes of `DiffLine::text`.
+    #[test]
+    fn word_spans_cover_the_changed_words_inside_a_changed_line() {
+        let p = build_diff_preview(
+            "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-the quick brown fox\n+the quick red fox\n",
+            ContentType::Diff,
+        );
+        assert_eq!(
+            highlighted(&p),
+            vec![
+                (DiffLineClass::Delete, "brown"),
+                (DiffLineClass::Insert, "red"),
+            ],
+        );
+        // ...and never over the `+`/`-` prefix byte.
+        for w in &p.words {
+            let line = p
+                .lines
+                .iter()
+                .find(|l| w.start >= l.start && w.end <= l.end)
+                .expect("every word span lives inside one line");
+            assert!(w.start >= line.text_start, "a span covered the diff prefix");
+        }
+    }
+
+    /// A line with no counterpart (a pure insertion) has nothing to refine
+    /// against — highlighting all of it would be a lie dressed as detail.
+    #[test]
+    fn a_pure_insertion_has_no_word_spans() {
+        let p = build_diff_preview(
+            "--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+brand new line\n",
+            ContentType::Diff,
+        );
+        assert!(highlighted(&p).is_empty(), "{:?}", highlighted(&p));
+    }
+
+    /// Byte-indexed, all the way through: the spans must slice multibyte text
+    /// on char boundaries (a panic here is what a char/byte confusion looks
+    /// like) and land on the changed word.
+    #[test]
+    fn word_spans_are_byte_exact_on_multibyte_text() {
+        let raw = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-日本語 は たのしい\n+日本語 は むずかしい\n";
+        let p = build_diff_preview(raw, ContentType::Diff);
+        assert_eq!(
+            highlighted(&p),
+            vec![
+                (DiffLineClass::Delete, "たのしい"),
+                (DiffLineClass::Insert, "むずかしい"),
+            ],
+        );
+    }
+
+    /// **The slice-4 post-ship finding**: per-line elision cuts the text after
+    /// `text_start` is fixed, so a span past the cut would index the ellipsis
+    /// or run off the end of the line. Spans are filtered against the cut.
+    #[test]
+    fn word_spans_past_the_line_elision_are_dropped() {
+        let head = "x".repeat(MAX_PREVIEW_LINE_CHARS + 100);
+        let raw = format!(
+            "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-{head} alpha\n+{head} omega\n",
+        );
+        let p = build_diff_preview(&raw, ContentType::Diff);
+        for w in &p.words {
+            assert!(w.end <= p.plain_text.len(), "span ran off the end");
+            // Every span must still slice on a char boundary of the *shown*
+            // text — the check that fails loudly if the cut is ignored.
+            assert!(p.plain_text.is_char_boundary(w.start));
+            assert!(p.plain_text.is_char_boundary(w.end));
+            let line = p
+                .lines
+                .iter()
+                .find(|l| w.start >= l.start && w.start < l.end)
+                .expect("a span outside every line");
+            assert!(w.end <= line.end, "a span crossed into the next line");
+        }
+        // The changed words live past the cut, so nothing survives to draw.
+        assert!(
+            highlighted(&p).is_empty(),
+            "changes past the elision cut must not be highlighted: {:?}",
+            highlighted(&p),
+        );
+    }
+
+    /// A span that *straddles* the cut is clipped to it rather than dropped —
+    /// the visible half of the change is still the change.
+    #[test]
+    fn a_word_span_straddling_the_elision_cut_is_clipped() {
+        // `cut` lands inside the long token, so the span starts before it and
+        // ends after it.
+        let before = format!("head {}", "a".repeat(MAX_PREVIEW_LINE_CHARS));
+        let after = format!("head {}", "b".repeat(MAX_PREVIEW_LINE_CHARS));
+        let raw = format!("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-{before}\n+{after}\n");
+        let p = build_diff_preview(&raw, ContentType::Diff);
+        for w in &p.words {
+            let line = p
+                .lines
+                .iter()
+                .find(|l| w.start >= l.start && w.start < l.end)
+                .expect("a span outside every line");
+            assert!(w.end <= line.end, "clip failed: {w:?} vs line {line:?}");
+            assert!(
+                !p.plain_text[w.start..w.end].contains('\u{2026}'),
+                "a span was drawn over the ellipsis",
+            );
+        }
+        assert!(
+            !p.words.is_empty(),
+            "the visible half of a straddling change must survive",
+        );
+    }
+
     #[test]
     fn file_headers_name_what_happened_to_the_file() {
         let p = preview("canonical/multi_file.diff");
@@ -914,6 +1166,51 @@ mod tests {
         assert_eq!(v.lines[0].class, DiffLineClass::FileHeader);
         assert!(v.plain_text.starts_with("diff --git"), "{}", v.plain_text);
         assert!(v.lines.iter().all(|l| l.class != DiffLineClass::Stat));
+    }
+
+    /// The full view highlights words too, and reaches them the only way it
+    /// can: through each row's provenance back into the model. Word spans are
+    /// derived, never serialized, so they are not in the canonical text.
+    #[test]
+    fn the_full_view_carries_word_spans_from_the_model() {
+        let raw = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-the quick brown fox\n+the quick red fox\n";
+        let model = kaijutsu_diff::parse(raw).expect("parses");
+        let c = kaijutsu_diff::DiffCore::new(model);
+        let v = whole(&c);
+        assert_eq!(
+            highlighted(&v),
+            vec![
+                (DiffLineClass::Delete, "brown"),
+                (DiffLineClass::Insert, "red"),
+            ],
+        );
+    }
+
+    /// A `\ No newline at end of file` row carries the provenance of the body
+    /// line above it and none of its text — highlighting it with that line's
+    /// spans would paint the marker.
+    #[test]
+    fn a_no_newline_marker_row_gets_no_word_spans() {
+        let file = kaijutsu_diff::diff_file(
+            &kaijutsu_diff::FileSpec::modified("a", "alpha beta\n", "alpha gamma"),
+            &kaijutsu_diff::DiffOptions::default(),
+        )
+        .unwrap();
+        let c = kaijutsu_diff::DiffCore::new(DiffModel::new(vec![file]));
+        let v = whole(&c);
+        let marker = v
+            .lines
+            .iter()
+            .zip(c.rows())
+            .find(|(_, r)| r.kind == kaijutsu_diff::RowKind::NoNewline)
+            .map(|(l, _)| *l)
+            .expect("a no-newline row");
+        assert!(
+            !v.words
+                .iter()
+                .any(|w| w.start >= marker.start && w.start < marker.end),
+            "the no-newline marker must carry no word spans",
+        );
     }
 
     /// A truncated model's marker leads the canonical text, so it leads the

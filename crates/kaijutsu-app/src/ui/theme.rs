@@ -288,6 +288,13 @@ pub struct Theme {
     pub diff_delete_fg: Color,
     /// Unchanged context line text.
     pub diff_context_fg: Color,
+    /// The *changed words* inside an added line — the intra-line refinement.
+    /// Brighter than `diff_insert_fg`, which stays the color of the rest of
+    /// the line, so a one-word edit reads as one word rather than a whole
+    /// changed line.
+    pub diff_insert_word_fg: Color,
+    /// The changed words inside a removed line.
+    pub diff_delete_word_fg: Color,
     /// Truncation/omission notes ("… 12 more lines").
     pub diff_meta: Color,
     /// Background band behind an added line. Alpha, by design.
@@ -603,6 +610,8 @@ impl Default for Theme {
             diff_insert_fg: Color::srgb(0.275, 0.788, 0.541), // #46c98a green
             diff_delete_fg: Color::srgb(0.957, 0.404, 0.498), // #f4677f rose
             diff_context_fg: Color::srgb(0.561, 0.533, 0.659), // #8f88a8 muted
+            diff_insert_word_fg: Color::srgb(0.722, 1.000, 0.855), // #b8ffda bright green
+            diff_delete_word_fg: Color::srgb(1.000, 0.757, 0.812), // #ffc1cf bright rose
             diff_meta: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
             diff_insert_bg: Color::srgba(0.275, 0.788, 0.541, 0.12),
             diff_delete_bg: Color::srgba(0.957, 0.404, 0.498, 0.12),
