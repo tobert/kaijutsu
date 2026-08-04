@@ -170,7 +170,7 @@ impl ScenePalette {
 
 impl Default for ScenePalette {
     /// Compiled defaults — the exact linear values the scene modules shipped
-    /// with (palette.rs / room / time_well / patch_bay constants as of the
+    /// with (scene_geometry.rs / room / time_well / patch_bay constants as of the
     /// color pass). A test pins these ≈ `SceneData::default()`'s hex.
     fn default() -> Self {
         let lin = |r: f32, g: f32, b: f32| LinearRgba::rgb(r, g, b);

@@ -9,7 +9,7 @@
 //! per-frame material churn (the same event-driven material-lane trick the well's
 //! track rays use for the beat packet). Unlit: the ribbon *is* light, so it needs
 //! no scene lamp (the brass table + pegs went all-unlit too, 2026-07-10 — no
-//! lit `StandardMaterial` remains in the scene family, `view::palette`'s
+//! lit `StandardMaterial` remains in the scene family, `view::scene_geometry`'s
 //! material discipline).
 
 use bevy::prelude::*;

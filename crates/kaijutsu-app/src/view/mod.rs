@@ -7,13 +7,16 @@
 //! - Conversation block pipeline: `lifecycle` (spawn/despawn block cell
 //!   entities), `render`/`block_render` (buffer sync, MSDF/SVG/scene
 //!   content build), `format` (pure formatting helpers), `geometry` (row
-//!   layout readback), `sync`/`submit`/`document`/`editor`/`fieldset`
-//!   (server sync, prompt submission, the CellEditor buffer, block fields).
+//!   layout readback), `sync`/`submit`/`document`/`editor`/`role_divider`
+//!   (server sync, prompt submission, the CellEditor buffer, role-divider
+//!   layout math).
 //! - Chat-adjacent surfaces: `overlay` (the input overlay), `shell_dock`,
 //!   `scroll`.
 //! - Room-level scenes reached from the shell: `room` (station carousel),
-//!   `time_well`, `patch_bay`, `fsn`, `tracker`.
-//! - Styling: `palette`, `scene_palette`.
+//!   `time_well`, `patch_bay`, `fsn`, `tracker` — sharing the
+//!   `scene_geometry` datums (octagon shell, W-wall patch-wheel mount) they
+//!   have to agree on without eyeballing each other.
+//! - Styling: `scene_palette`.
 //! - Render plumbing: `vello_rasterizer`, `ui_rtt` (render-to-texture
 //!   sizing). Bevy Remote Protocol inspector glue lives in
 //!   `kaish::brp_methods` (kaish-adjacent: agents drive both over the same
@@ -25,16 +28,16 @@ pub mod components;
 pub mod document;
 pub mod diff_view;
 pub mod editor;
-pub mod fieldset;
 pub mod format;
 pub mod fsn;
 pub mod geometry;
 pub mod lifecycle;
 pub mod overlay;
-pub mod palette;
 pub mod patch_bay;
 pub mod render;
+pub mod role_divider;
 pub mod room;
+pub mod scene_geometry;
 pub mod scene_palette;
 pub mod shell_dock;
 pub mod scroll;

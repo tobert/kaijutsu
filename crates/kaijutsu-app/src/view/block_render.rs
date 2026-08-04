@@ -60,7 +60,7 @@ use crate::text::markdown::MarkdownColors;
 use crate::text::sparkline::{SparklineColors, SparklineSegment, build_sparkline_geometry};
 use crate::text::svg_raster::{fit_svg_to_box, rasterize_svg};
 use crate::ui::theme::Theme;
-use crate::view::fieldset;
+use crate::view::role_divider;
 use crate::view::ui_rtt::{UiVectorScene, UiRttTexture, ui_rtt_texture_dims};
 use bevy::math::Rot2;
 use bevy::ui::UiTransform;
@@ -1360,20 +1360,20 @@ pub fn sync_role_group_headers(
         let brush = bevy_color_to_brush(color);
         let label_style = VelloTextStyle {
             brush: brush.clone(),
-            font_size: fieldset::ROLE_LABEL_FONT_SIZE,
+            font_size: role_divider::ROLE_LABEL_FONT_SIZE,
             ..default()
         };
         let label_layout = font.layout(label, &label_style, VelloTextAlign::Left, None);
         let label_w = label_layout.width() as f64;
         let label_h = label_layout.height();
 
-        let div_layout = fieldset::compute_role_divider_layout(
+        let div_layout = role_divider::compute_role_divider_layout(
             label_w,
             theme.label_inset as f64,
             theme.label_pad as f64,
         );
         // Vertically centered on the line, matching the pre-shader Vello
-        // fieldset's `text_y = y - line_height / 2`.
+        // role_divider's `text_y = y - line_height / 2`.
         let label_y = ((height as f64 - label_h as f64) * 0.5).max(0.0);
 
         if let Some(ref mut atlas) = atlas {
@@ -1399,7 +1399,7 @@ pub fn sync_role_group_headers(
         let new_style = BlockBorderStyle {
             kind: BorderKind::CenterLine,
             color,
-            thickness: fieldset::ROLE_DIVIDER_THICKNESS,
+            thickness: role_divider::ROLE_DIVIDER_THICKNESS,
             corner_radius: 0.0,
             padding: BorderPadding {
                 top: 0.0,

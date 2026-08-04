@@ -292,7 +292,7 @@ fn spawn_portal_quad(
     mats: &mut Assets<StandardMaterial>,
     image: &Handle<Image>,
 ) {
-    let wall_apothem = crate::view::palette::WALL_APOTHEM;
+    let wall_apothem = crate::view::scene_geometry::WALL_APOTHEM;
     let panels = bearing::octagon_panels(wall_apothem);
     let north = panels
         .iter()

@@ -25,7 +25,7 @@
 //! at exactly [`crate::view::scene_palette::ScenePalette::crest`]
 //! (`room::crest_color`), and picks a `trough` low enough that
 //! `trough * crest < 1.0` — the element's resting state (and its
-//! time-average) stays LDR even though the crest blooms (`view::palette`'s
+//! time-average) stays LDR even though the crest blooms (`view::scene_geometry`'s
 //! amended material discipline).
 
 use bevy::prelude::*;

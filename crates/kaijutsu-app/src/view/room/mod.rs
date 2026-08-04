@@ -40,7 +40,7 @@
 //! showing the patch bay's own LOD, not by being a different world.
 //!
 //! **Slice B, retuned (2026-07-10): the octagon shell + the wheel-as-station**
-//! (`docs/scenes/palette.rs`'s station-W contract). The room is now enclosed by
+//! (`docs/scenes/scene_geometry.rs`'s station-W contract). The room is now enclosed by
 //! eight single-sided wall panels ([`bearing::octagon_panels`]) standing on the
 //! floor — the camera orbits OUTSIDE them for the overview pose, and the near
 //! panel(s) cull away (default back-face culling on an inward-facing quad),
@@ -55,7 +55,7 @@
 //! ("the surface gets taken over by its content" — studio patch bays are
 //! wall panels, not tables). The dais and its furniture builder are gone;
 //! the patch bay's own placement (untouched here beyond reading
-//! `palette::WALL_APOTHEM`) re-orients the wheel face-out with a pitch+yaw
+//! `scene_geometry::WALL_APOTHEM`) re-orients the wheel face-out with a pitch+yaw
 //! composition and seats it flush against the panel `spawn_walls` already
 //! builds — no new room-side furniture at all.
 //!
@@ -112,7 +112,7 @@ use crate::text::msdf::{
 };
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::Screen;
-use crate::view::palette;
+use crate::view::scene_geometry;
 use crate::view::patch_bay;
 use crate::view::scene_palette::{ScenePalette, lin_scaled};
 use crate::view::time_well::live::WellBeats;
@@ -121,14 +121,14 @@ use vello::peniko::Brush;
 
 // ── Room geometry (Amy-tunable) ─────────────────────────────────────────────
 // Color/brightness constants moved onto `Res<ScenePalette>`
-// (feat/scene-palette-migration) — see `palette.rs`'s header. What's left
+// (feat/scene-palette-migration) — see `scene_geometry.rs`'s header. What's left
 // here is geometry only.
 
 /// Floor disc radius (world units); comfortably past the wall stations so the
 /// room reads as a chamber, not a platform. Bumped 1100 → 1300 alongside
-/// `palette::WALL_APOTHEM`'s 800 → 1200 (2026-07-10 evening, the
+/// `scene_geometry::WALL_APOTHEM`'s 800 → 1200 (2026-07-10 evening, the
 /// fullscreen-panel pivot): must clear the octagon's own circumradius
-/// (`bearing::octagon_circumradius(palette::WALL_APOTHEM)` ≈ 1299) so the
+/// (`bearing::octagon_circumradius(scene_geometry::WALL_APOTHEM)` ≈ 1299) so the
 /// walls stand ON the floor disc rather than past its edge —
 /// `floor_radius_clears_the_octagon_circumradius_so_the_walls_stand_on_the_floor`
 /// locks the margin.
@@ -204,7 +204,7 @@ const PLATE_HEIGHT: f32 = 200.0;
 /// `pub(crate)` since Slice C (time-well/room integration plan): the well's
 /// own `STATION_CENTER_PLACEMENT` (`time_well/scene.rs`) reads this to seat
 /// its ring stack above the same table face, the same cross-module contract
-/// `palette::STATION_W_MOUNT_Y`/`WALL_APOTHEM` already establish for the
+/// `scene_geometry::STATION_W_MOUNT_Y`/`WALL_APOTHEM` already establish for the
 /// patch bay's wall placement.
 pub(crate) const TABLE_TOP_Y: f32 = 70.0;
 const TABLE_RADIUS: f32 = 120.0;
@@ -228,15 +228,15 @@ const TABLE_PLINTH_HEIGHT: f32 = 16.0;
 // centerpiece) ──────────────────────────────────────────────────────────────
 // Eight flat single-sided panels forming a wall around the room — faces on
 // the four cardinals plus the four `bearing::RADIATOR_DIRS` diagonals,
-// `palette::WALL_APOTHEM` out from center ([`bearing::octagon_panels`]).
+// `scene_geometry::WALL_APOTHEM` out from center ([`bearing::octagon_panels`]).
 // Every panel/mullion/trim/thread quad MUST stay single-sided (default
 // `cull_mode`, no `Cuboid`, no `cull_mode: None`): a camera outside the
 // octagon sees a near panel's back face — culled — and the chamber shows
 // through (the dollhouse cutaway; see `bearing`'s own module comment for the
 // exact mechanics). No W-bearing dais stands here any more (the 2026-07-10
-// wall-mount retune, `palette.rs`'s "Station W contract"): the wheel mounts
+// wall-mount retune, `scene_geometry.rs`'s "Station W contract"): the wheel mounts
 // directly on the W panel below via `patch_bay::STATION_W_PLACEMENT`, which
-// is why `WALL_APOTHEM` itself now lives in `palette.rs` — both files read
+// is why `WALL_APOTHEM` itself now lives in `scene_geometry.rs` — both files read
 // the same number, this one just for the panel geometry.
 
 /// Panel height, standing on the floor (`y = 0` to `WALL_HEIGHT`).
@@ -826,7 +826,7 @@ pub(crate) fn teardown_room(
 /// foot, then for the wall-mount retune (the dais is gone, and the wiring
 /// flows all the way to the wall the wheel hangs on, terminating at the
 /// panel's base instead of the old floor-furniture foot), then again that
-/// evening when the octagon itself grew (`palette::WALL_APOTHEM` 800 → 1200,
+/// evening when the octagon itself grew (`scene_geometry::WALL_APOTHEM` 800 → 1200,
 /// the fullscreen-panel pivot) — expressed as `WALL_APOTHEM` minus a fixed
 /// gap (160/30) rather than a re-guessed literal, so the pads stay the SAME
 /// distance short of the wall regardless of how far out the wall itself
@@ -857,9 +857,9 @@ fn route_bundles(palette: &ScenePalette) -> [bearing::RouteBundle; 9] {
             arc_range: (0.25, 0.9),
             // Terminates at the wall base under the mounted wheel — clustered
             // a fixed 160/30 units short of the panel itself
-            // (`palette::WALL_APOTHEM`), so the gap from the wall stays the
+            // (`scene_geometry::WALL_APOTHEM`), so the gap from the wall stays the
             // same size the 2026-07-10 evening apothem bump moved the wall.
-            pad_range: (palette::WALL_APOTHEM - 160.0, palette::WALL_APOTHEM - 30.0),
+            pad_range: (scene_geometry::WALL_APOTHEM - 160.0, scene_geometry::WALL_APOTHEM - 30.0),
             hue: trace_crimson,
             brightness_range: (0.7, 1.15),
         },
@@ -1192,7 +1192,7 @@ fn spawn_walls(
     mats: &mut Assets<StandardMaterial>,
     glow_mats: &mut Assets<TraceGlowMaterial>,
 ) {
-    let wall_apothem = crate::view::palette::WALL_APOTHEM;
+    let wall_apothem = crate::view::scene_geometry::WALL_APOTHEM;
     let panel_width = bearing::octagon_panel_width(wall_apothem) - WALL_PANEL_GAP;
 
     let base_mesh = meshes.add(Rectangle::new(panel_width, WALL_HEIGHT));
@@ -2140,7 +2140,7 @@ mod tests {
             w_bundle.pad_range
         );
         assert!(
-            w_bundle.pad_range.1 < palette::WALL_APOTHEM,
+            w_bundle.pad_range.1 < scene_geometry::WALL_APOTHEM,
             "W pads stop just short of the wall panel itself: {:?}",
             w_bundle.pad_range
         );
@@ -2296,17 +2296,17 @@ mod tests {
 
     #[test]
     fn wall_apothem_clears_the_old_radiator_radius_and_the_marker_radius() {
-        // WALL_APOTHEM moved to `palette.rs` (2026-07-10, the wall-mount
+        // WALL_APOTHEM moved to `scene_geometry.rs` (2026-07-10, the wall-mount
         // slice) — a cross-file datum now that `patch_bay`'s placement reads
         // it too, but `room::spawn_walls` still builds the panel geometry at
         // this same radius.
         assert!(
-            palette::WALL_APOTHEM > ROOM_RADIUS,
+            scene_geometry::WALL_APOTHEM > ROOM_RADIUS,
             "the shell must enclose the wall stations: {}",
-            palette::WALL_APOTHEM
+            scene_geometry::WALL_APOTHEM
         );
-        assert!(palette::WALL_APOTHEM > 660.0, "the shell must enclose the old radiator radius (660)");
-        assert!(palette::WALL_APOTHEM < FLOOR_RADIUS, "the shell must stand on the floor disc");
+        assert!(scene_geometry::WALL_APOTHEM > 660.0, "the shell must enclose the old radiator radius (660)");
+        assert!(scene_geometry::WALL_APOTHEM < FLOOR_RADIUS, "the shell must stand on the floor disc");
     }
 
     #[test]
@@ -2317,7 +2317,7 @@ mod tests {
         // the weaker `WALL_APOTHEM < FLOOR_RADIUS` check above isn't enough —
         // the floor has to reach past every corner, or the walls stand past
         // the disc's edge instead of on it.
-        let circumradius = bearing::octagon_circumradius(palette::WALL_APOTHEM);
+        let circumradius = bearing::octagon_circumradius(scene_geometry::WALL_APOTHEM);
         assert!(
             FLOOR_RADIUS > circumradius,
             "the floor disc must reach past every octagon vertex ({circumradius}) so the walls stand ON it: {FLOOR_RADIUS}"
@@ -2326,7 +2326,7 @@ mod tests {
 
     #[test]
     fn wall_panel_width_stays_positive_after_the_mullion_gap() {
-        let width = bearing::octagon_panel_width(palette::WALL_APOTHEM) - WALL_PANEL_GAP;
+        let width = bearing::octagon_panel_width(scene_geometry::WALL_APOTHEM) - WALL_PANEL_GAP;
         assert!(width > 0.0, "the mullion gap must not eat the whole panel: {width}");
     }
 

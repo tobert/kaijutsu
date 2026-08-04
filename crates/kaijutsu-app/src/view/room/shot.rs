@@ -28,7 +28,7 @@ use bevy::prelude::Vec3;
 
 use super::bearing;
 use super::nav::Station;
-use crate::view::palette;
+use crate::view::scene_geometry;
 use crate::view::time_well::card;
 use crate::view::time_well::scene::{FOCUS_CARD_POS, STATION_CENTER_PLACEMENT, placement_to_room};
 
@@ -59,7 +59,7 @@ const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 90.0, 0.0);
 const APPROACH_PANEL_STANDOFF: f32 = 850.0;
 
 /// Approach-pose eye height AND look height: the panel's own vertical
-/// center (the same number [`palette::STATION_W_MOUNT_Y`] names for the
+/// center (the same number [`scene_geometry::STATION_W_MOUNT_Y`] names for the
 /// wheel's mount). Eye and look sharing a height is the point: the camera
 /// flies LEVEL between panels, no down-tilt (the pre-2026-07-13 pose looked
 /// from 260 down to 130). Derived from `WALL_HEIGHT`, so it follows any
@@ -202,7 +202,7 @@ pub fn resolve(shot: RoomShot) -> (Vec3, Vec3) {
             // — no border, just the world and the HUD). Every other panel
             // fills the frame with its own full height; they all share the
             // same vertical center (`super::WALL_HEIGHT * 0.5` —
-            // `palette::STATION_W_MOUNT_Y` is this same number, named for
+            // `scene_geometry::STATION_W_MOUNT_Y` is this same number, named for
             // the wheel's own placement contract).
             if station == Station::Vfs {
                 portal_fullscreen_pose(Vec3::from_array(dir))
@@ -280,7 +280,7 @@ fn well_ring_overview_eye(ring: usize) -> Vec3 {
 ///
 /// The old per-station look-point exceptions (marker radius vs wall
 /// apothem, furniture height vs mount height) dissolve: the wall PANEL is
-/// the subject now, and every panel stands at [`palette::WALL_APOTHEM`]
+/// the subject now, and every panel stands at [`scene_geometry::WALL_APOTHEM`]
 /// with its center at the same height. Panics if `station` has no wall
 /// bearing — only [`RoomShot::focused`]/[`RoomShot::Approach`] should ever
 /// reach this, and `focused` never picks `Approach` for a bearing-less
@@ -288,10 +288,10 @@ fn well_ring_overview_eye(ring: usize) -> Vec3 {
 fn approach_pose(station: Station) -> (Vec3, Vec3) {
     let d = bearing::focus_dir(station)
         .expect("RoomShot::Approach is only constructed for a station with a wall bearing");
-    let eye_r = palette::WALL_APOTHEM - APPROACH_PANEL_STANDOFF;
+    let eye_r = scene_geometry::WALL_APOTHEM - APPROACH_PANEL_STANDOFF;
     (
         Vec3::from_array(bearing::approach_camera(d, eye_r, APPROACH_EYE_HEIGHT)),
-        Vec3::from_array(bearing::approach_look(d, palette::WALL_APOTHEM, APPROACH_EYE_HEIGHT)),
+        Vec3::from_array(bearing::approach_look(d, scene_geometry::WALL_APOTHEM, APPROACH_EYE_HEIGHT)),
     )
 }
 
@@ -311,9 +311,9 @@ fn approach_pose(station: Station) -> (Vec3, Vec3) {
 fn fullscreen_pose(bearing_dir: Vec3, mount_y: f32) -> (Vec3, Vec3) {
     let d = (super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
     let panel = Vec3::new(
-        bearing_dir.x * palette::WALL_APOTHEM,
+        bearing_dir.x * scene_geometry::WALL_APOTHEM,
         mount_y,
-        bearing_dir.z * palette::WALL_APOTHEM,
+        bearing_dir.z * scene_geometry::WALL_APOTHEM,
     );
     let eye = panel - bearing_dir * d;
     (eye, panel)
@@ -331,9 +331,9 @@ fn portal_fullscreen_pose(bearing_dir: Vec3) -> (Vec3, Vec3) {
     use crate::view::fsn::backdrop::{WINDOW_H, WINDOW_Y};
     let d = (WINDOW_H * PORTAL_OVERSCAN * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
     let glass = Vec3::new(
-        bearing_dir.x * palette::WALL_APOTHEM,
+        bearing_dir.x * scene_geometry::WALL_APOTHEM,
         WINDOW_Y,
-        bearing_dir.z * palette::WALL_APOTHEM,
+        bearing_dir.z * scene_geometry::WALL_APOTHEM,
     );
     let eye = glass - bearing_dir * d;
     (eye, glass)
@@ -348,23 +348,23 @@ mod tests {
     #[test]
     fn fullscreen_pose_stands_the_pinhole_distance_back_from_the_panel() {
         let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (eye, look) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
+        let (eye, look) = fullscreen_pose(dir, scene_geometry::STATION_W_MOUNT_Y);
         let d = (super::super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
         assert!(
             ((look - eye).length() - d).abs() < 1e-3,
             "eye should stand exactly d={d} back from the panel, got {}",
             (look - eye).length()
         );
-        assert!((look.y - palette::STATION_W_MOUNT_Y).abs() < 1e-5, "looks at the given mount height");
+        assert!((look.y - scene_geometry::STATION_W_MOUNT_Y).abs() < 1e-5, "looks at the given mount height");
     }
 
     #[test]
     fn fullscreen_pose_looks_squarely_at_the_panel_center() {
         let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (_, look) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
+        let (_, look) = fullscreen_pose(dir, scene_geometry::STATION_W_MOUNT_Y);
         let look_r = look.x * dir.x + look.z * dir.z;
         assert!(
-            (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
+            (look_r - scene_geometry::WALL_APOTHEM).abs() < 1e-3,
             "look point should sit exactly on the wall apothem: {look_r}"
         );
     }
@@ -372,10 +372,10 @@ mod tests {
     #[test]
     fn fullscreen_pose_stands_inside_the_octagon_not_through_the_wall() {
         let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (eye, _) = fullscreen_pose(dir, palette::STATION_W_MOUNT_Y);
+        let (eye, _) = fullscreen_pose(dir, scene_geometry::STATION_W_MOUNT_Y);
         let eye_r = eye.x * dir.x + eye.z * dir.z;
         assert!(eye_r > 0.0, "eye stands on the room side of center: {eye_r}");
-        assert!(eye_r < palette::WALL_APOTHEM, "eye stands short of the wall, inside the octagon: {eye_r}");
+        assert!(eye_r < scene_geometry::WALL_APOTHEM, "eye stands short of the wall, inside the octagon: {eye_r}");
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
         let via_shot = resolve(RoomShot::Fullscreen(Station::PatchBay));
         let via_primitive = fullscreen_pose(
             Vec3::from_array(bearing::Bearing::West.dir()),
-            palette::STATION_W_MOUNT_Y,
+            scene_geometry::STATION_W_MOUNT_Y,
         );
         assert_eq!(via_shot, via_primitive);
     }
@@ -491,7 +491,7 @@ mod tests {
             let d = bearing::focus_dir(s).unwrap();
             let look_r = look.x * d[0] + look.z * d[2];
             assert!(
-                (look_r - palette::WALL_APOTHEM).abs() < 1e-3,
+                (look_r - scene_geometry::WALL_APOTHEM).abs() < 1e-3,
                 "{s:?} should look at the wall apothem: {look_r}"
             );
             assert!(

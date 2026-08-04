@@ -46,7 +46,7 @@ use crate::text::ShapingFonts;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs};
 use crate::text::shaping::VelloFont;
 use crate::ui::screen::Screen;
-use crate::view::palette;
+use crate::view::scene_geometry;
 use crate::view::room::nav::Station;
 use crate::view::room::{PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text};
 use crate::view::scene_palette::{ScenePalette, lin, lin_scaled};
@@ -102,7 +102,7 @@ fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
 
 /// The tracker face's placement at E — mounted ON the wall panel, the same
 /// "the surface gets taken over by its content" call the W wheel made
-/// (`palette.rs`'s "Station E contract" banner has the shared numbers).
+/// (`scene_geometry.rs`'s "Station E contract" banner has the shared numbers).
 ///
 /// **The rotation.** The face is authored with local +Z as its outward
 /// normal (a plain vertical billboard: local XY is the drawing plane, no
@@ -121,18 +121,18 @@ fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
 /// tests below.
 ///
 /// **The placement.** `translation.x` sets the face plane
-/// [`palette::STATION_E_PROUD`] world-units proud of the E panel (inward,
-/// toward world −X, off `palette::WALL_APOTHEM`); `translation.y` centers
-/// it on the panel ([`palette::STATION_E_MOUNT_Y`], the panel's own
+/// [`scene_geometry::STATION_E_PROUD`] world-units proud of the E panel (inward,
+/// toward world −X, off `scene_geometry::WALL_APOTHEM`); `translation.y` centers
+/// it on the panel ([`scene_geometry::STATION_E_MOUNT_Y`], the panel's own
 /// vertical center — the same number [`patch_bay`](super::patch_bay) uses
 /// at W, since both walls share `room::WALL_HEIGHT`).
 const STATION_E_PLACEMENT: StationPlacement = StationPlacement {
     translation: Vec3::new(
-        palette::WALL_APOTHEM - palette::STATION_E_PROUD,
-        palette::STATION_E_MOUNT_Y,
+        scene_geometry::WALL_APOTHEM - scene_geometry::STATION_E_PROUD,
+        scene_geometry::STATION_E_MOUNT_Y,
         0.0,
     ),
-    scale: palette::STATION_E_SCALE,
+    scale: scene_geometry::STATION_E_SCALE,
     pitch: 0.0,
     yaw: -std::f32::consts::FRAC_PI_2,
 };
@@ -140,9 +140,9 @@ const STATION_E_PLACEMENT: StationPlacement = StationPlacement {
 // ── Face geometry (Amy-tunable) ─────────────────────────────────────────────
 
 /// The face's authored size — near the E panel's own full width/height
-/// (`bearing::octagon_panel_width(palette::WALL_APOTHEM)` ≈ 994,
-/// `room::WALL_HEIGHT` = 560), so [`palette::STATION_E_SCALE`] starts at
-/// `1.0` (`palette.rs`'s "Station E contract" doc has the reasoning).
+/// (`bearing::octagon_panel_width(scene_geometry::WALL_APOTHEM)` ≈ 994,
+/// `room::WALL_HEIGHT` = 560), so [`scene_geometry::STATION_E_SCALE`] starts at
+/// `1.0` (`scene_geometry.rs`'s "Station E contract" doc has the reasoning).
 const FACE_W: f32 = 994.0;
 const FACE_H: f32 = 560.0;
 
@@ -1007,7 +1007,7 @@ mod tests {
         assert_eq!(at, STATION_E_PLACEMENT.translation);
         assert!(at.x > 0.0, "E wall is at world +X: {at:?}");
         assert!(
-            (palette::WALL_APOTHEM - at.x - palette::STATION_E_PROUD).abs() < 1e-3,
+            (scene_geometry::WALL_APOTHEM - at.x - scene_geometry::STATION_E_PROUD).abs() < 1e-3,
             "proud of the wall by STATION_E_PROUD, not deep inside it: {at:?}"
         );
     }

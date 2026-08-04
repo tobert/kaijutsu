@@ -33,7 +33,7 @@ use crate::text::ShapingFonts;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::Screen;
-use crate::view::palette;
+use crate::view::scene_geometry;
 use crate::view::room::nav::Station;
 use crate::view::room::{
     PLATE_FONT_SIZE, PLATE_PAD, PLATE_TEX_H, PLATE_TEX_W, RoomState, collect_plate_glyphs,
@@ -55,13 +55,13 @@ use geometry::{chord_points, layout_sockets};
 // positioning/scaling/orienting happens HERE and the patch bay's internal
 // coordinates never change. `room::spawn_walls` builds the W panel itself
 // (the chamber's architecture, not this station's furniture); this placement
-// reads the SAME `palette::STATION_W_*`/`WALL_APOTHEM` numbers to seat the
-// wheel flush against it (`palette.rs`'s "Station W contract" — room and
+// reads the SAME `scene_geometry::STATION_W_*`/`WALL_APOTHEM` numbers to seat the
+// wheel flush against it (`scene_geometry.rs`'s "Station W contract" — room and
 // patch bay agree there, never by eyeballing each other).
 //
 // The dive camera is NO LONGER derived from this placement (2026-07-10
 // evening, the fullscreen-panel pivot): `room::fullscreen_pose` computes the
-// zoomed pose straight from `palette::WALL_APOTHEM`/`room::WALL_HEIGHT` and
+// zoomed pose straight from `scene_geometry::WALL_APOTHEM`/`room::WALL_HEIGHT` and
 // the station's own bearing direction, independent of this transform. Editing
 // `STATION_W_PLACEMENT` moves the wheel itself but no longer moves the
 // camera — the two were deliberately decoupled once the camera pose stopped
@@ -101,7 +101,7 @@ fn placement_rotation(p: &StationPlacement) -> Quat {
 /// The patch bay's placement at W — mounted ON the wall panel (Amy,
 /// 2026-07-10: the wheel is the west station's wall instrument now, not a
 /// tabletop on a dais; supersedes the 2026-07-09/-10 dais placement —
-/// `STATION_W_X`/`_DAIS_TOP_Y`/`_DAIS_R`, all deleted from `palette.rs`).
+/// `STATION_W_X`/`_DAIS_TOP_Y`/`_DAIS_R`, all deleted from `scene_geometry.rs`).
 ///
 /// **The rotation.** The standalone scene is a horizontal table: local +Y is
 /// the table's upward normal (everything the wheel draws — sockets, chords,
@@ -125,22 +125,22 @@ fn placement_rotation(p: &StationPlacement) -> Quat {
 /// Locked ±1e-5 by the `placement_*` tests below.
 ///
 /// **The placement.** `translation.x` sets the tabletop plane (the
-/// placement's local origin) [`palette::STATION_W_PROUD`] world-units proud
-/// of the panel ([`palette::WALL_APOTHEM`] out); `translation.y` centers it
-/// on the panel ([`palette::STATION_W_MOUNT_Y`], the panel's own vertical
+/// placement's local origin) [`scene_geometry::STATION_W_PROUD`] world-units proud
+/// of the panel ([`scene_geometry::WALL_APOTHEM`] out); `translation.y` centers it
+/// on the panel ([`scene_geometry::STATION_W_MOUNT_Y`], the panel's own vertical
 /// center). No thickness lift (the old dais needed one —
-/// `palette::STATION_W_PROUD`'s doc has why the wall-mount doesn't): the
+/// `scene_geometry::STATION_W_PROUD`'s doc has why the wall-mount doesn't): the
 /// table's solid backing extrudes local −Y (`TABLE_DEPTH`), which now maps
 /// to world −X — toward and through the invisible, single-sided far side of
 /// the panel, not onto a load-bearing surface whose top face the table's
 /// underside had to land on exactly.
 const STATION_W_PLACEMENT: StationPlacement = StationPlacement {
     translation: Vec3::new(
-        -(palette::WALL_APOTHEM - palette::STATION_W_PROUD),
-        palette::STATION_W_MOUNT_Y,
+        -(scene_geometry::WALL_APOTHEM - scene_geometry::STATION_W_PROUD),
+        scene_geometry::STATION_W_MOUNT_Y,
         0.0,
     ),
-    scale: palette::STATION_W_SCALE,
+    scale: scene_geometry::STATION_W_SCALE,
     pitch: -std::f32::consts::FRAC_PI_2,
     yaw: -std::f32::consts::FRAC_PI_2,
 };
