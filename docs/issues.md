@@ -20,17 +20,6 @@ not this cleanup's job to decide), but worth Amy confirming whether that's
 deliberate (shell dock = one command line, selection matters less) or a
 gap worth closing.
 
-## chore/app-cleanup-tier2 branch based on a now-stale `main` (2026-08-04)
-
-The tier-2 app cleanup branch (`~/src/wt/tier2-cleanup`, worktree) was cut
-from `main` at `7a34e2f6`; a parallel agent landed diff-viewer slice 6
-directly on `main` (through `cb209481`) while this branch was in progress.
-The two touch almost disjoint files — this branch's one diff-adjacent
-commit (`refactor(app): MsdfSurfaceBundle...`) only mechanically repackages
-`diff_view/render.rs`'s spawn tuple, no diff-viewer behavior — but `main`
-should be merged/rebased onto this branch (or vice versa) and re-verified
-before either lands, rather than assumed conflict-free.
-
 ## Day-job coding readiness (2026-07-29, live-kernel probe + deepseek review)
 
 Amy: *"I want to get kaijutsu's coding functionality up to a level I can use for
