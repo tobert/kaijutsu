@@ -2060,6 +2060,141 @@ impl KernelImpl {
     }
 }
 
+/// Fill a `ContextHandleInfo` builder directly from a durable `ContextRow` —
+/// the DB-driven counterpart to `list_contexts`' per-row wire-writing above,
+/// which instead starts from a live `ContextHandle` (registry) and only
+/// *supplements* with `ContextRow` fields. Used by `resolve_context_label`,
+/// where there is no registry entry to start from (that's the whole point —
+/// see the capnp doc comment on `resolveContextLabel`). Deliberately leaves
+/// registry/runtime-only fields (`traceId`, `liveStatus`, `trackId`,
+/// synthesis keywords/preview, usage/background-process summaries) at their
+/// wire defaults: honest absence, not fabricated from data this path never
+/// had.
+fn write_context_row_to_handle_info(
+    mut info: context_handle_info::Builder<'_>,
+    row: &ContextRow,
+) {
+    info.set_id(row.context_id.as_bytes());
+    info.set_label(row.label.as_deref().unwrap_or(""));
+    info.set_parent_id(
+        row.forked_from
+            .map(|p| *p.as_bytes())
+            .unwrap_or([0u8; 16])
+            .as_slice(),
+    );
+    info.set_provider(row.provider.as_deref().unwrap_or(""));
+    info.set_model(row.model.as_deref().unwrap_or(""));
+    info.set_created_at(row.created_at as u64);
+    info.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
+    info.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_context_state(row.context_state.as_str());
+    info.set_context_type(&row.context_type);
+    info.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_last_activity_at(row.last_activity_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
+}
+
+/// Verify a context can be joined, healing the DriftRouter registration from
+/// the durable KernelDb row if the in-memory registry has lost it. Returns
+/// the context's trace id (zeroed if truly unknown) on success.
+///
+/// The registry is populated by `createContext`/`registerFork`, AND
+/// `create_shared_kernel`'s boot-time recovery step already re-registers
+/// every context `KernelDb::list_active_contexts` returns (`WHERE
+/// archived_at IS NULL`) on every kernel start — so a live or concluded
+/// context surviving a restart is normally already registered by the time
+/// anyone calls `joinContext` (verified directly:
+/// `list_contexts_recovers_live_context_after_restart`,
+/// `crates/kaijutsu-server/tests/context_label_resolve.rs`). The gap
+/// recovery does NOT cover is an ARCHIVED context: excluded from
+/// `list_active_contexts`, its registry entry does not survive a restart,
+/// even though its KernelDb row and BlockStore document both do. Before this
+/// fix, joining it after a restart was a hard failure here ("use
+/// createContext first") despite the context plainly existing — this is the
+/// narrow, real remainder of the divergence docs/issues.md originally
+/// described more broadly ("MCP-created context invisible to `kj context
+/// list` after kernel restart" — the live/concluded case in that report does
+/// not reproduce against current code; see the docs update alongside this
+/// change). Healing here — the one place every attach/reconnect funnels
+/// through (the `joinContext` RPC handler, and via that RPC,
+/// `register_session`'s attach path) — fixes it generally: the join succeeds
+/// AND the now-re-registered context reappears in `listContexts` for
+/// everyone else.
+///
+/// Pulled out of the `joinContext` RPC handler so it's exercisable directly
+/// against a `SharedKernelState` in tests, without a capnp/SSH round trip —
+/// see `join_context_heals_registry_for_an_archived_context_after_restart`,
+/// same test file.
+async fn ensure_context_joinable(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+) -> Result<[u8; 16], capnp::Error> {
+    // Context must already exist — no auto-creation.
+    if !kernel.documents.contains(context_id) {
+        return Err(capnp::Error::failed(format!(
+            "context {} does not exist — use createContext first",
+            context_id
+        )));
+    }
+
+    log::debug!("Re-joining existing context {}", context_id);
+
+    // Ensure input doc exists (idempotent)
+    if let Err(e) = kernel.documents.create_input_doc(context_id) {
+        log::warn!(
+            "Failed to create input doc for context {}: {}",
+            context_id,
+            e
+        );
+    }
+
+    let needs_heal = { kernel.kernel.drift().read().get(context_id).is_none() };
+    if needs_heal {
+        let row = {
+            let db = kernel.kernel_db.lock();
+            db.get_context(context_id).map_err(|e| {
+                capnp::Error::failed(format!(
+                    "join_context: KernelDb lookup for {context_id} failed: {e}"
+                ))
+            })?
+        };
+        let row = row.ok_or_else(|| {
+            capnp::Error::failed(format!(
+                "context {context_id} not registered in drift router and has \
+                 no KernelDb row — use createContext first",
+            ))
+        })?;
+        log::warn!(
+            "join_context: {} missing from the in-memory registry (likely a \
+             kernel restart) — healing from its KernelDb row: label={:?} \
+             created_at={} last_activity_at={:?}",
+            context_id,
+            row.label,
+            row.created_at,
+            row.last_activity_at,
+        );
+        let mut drift = kernel.kernel.drift().write();
+        drift
+            .register(context_id, row.label.as_deref(), row.forked_from, row.created_by)
+            .map_err(|e| {
+                capnp::Error::failed(format!(
+                    "join_context: failed to heal registry for {context_id}: {e}"
+                ))
+            })?;
+        if let (Some(p), Some(m)) = (&row.provider, &row.model) {
+            let _ = drift.configure_llm(context_id, p, m);
+        }
+    }
+
+    let trace_id = {
+        let drift = kernel.kernel.drift().read();
+        drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16])
+    };
+    Ok(trace_id)
+}
+
 /// The shared context-creation recipe, called by both the `createContext` RPC
 /// and the cold-start genesis bootstrap (`create_shared_kernel`).
 ///
@@ -3966,6 +4101,47 @@ impl kernel::Server for KernelImpl {
         )
     }
 
+    /// Resolve a label straight against `KernelDb` — deliberately bypassing
+    /// the DriftRouter that `listContexts` reads. See the capnp doc comment
+    /// on `resolveContextLabel` for the full rationale (an indexed lookup
+    /// vs. a registry scan, and the one real registry gap — archived
+    /// contexts — this also happens to sidestep). `registerSession`'s
+    /// upsert/attach decision (docs/issues.md, "register_session hard-fails
+    /// on label conflict") needs this durable truth before it decides
+    /// whether to attach, suffix, or create.
+    fn resolve_context_label(
+        self: Rc<Self>,
+        params: kernel::ResolveContextLabelParams,
+        mut results: kernel::ResolveContextLabelResults,
+    ) -> Promise<(), capnp::Error> {
+        let label = pry!(pry!(pry!(params.get()).get_label()).to_str()).to_owned();
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "resolve_context_label");
+        let kernel_db_arc = self.kernel.kernel_db.clone();
+        Promise::from_future(
+            async move {
+                let row = {
+                    let db = kernel_db_arc.lock();
+                    db.find_context_by_label(&label).map_err(|e| {
+                        capnp::Error::failed(format!(
+                            "resolve_context_label: KernelDb lookup for '{label}' failed: {e}"
+                        ))
+                    })?
+                };
+                let mut res = results.get();
+                match row {
+                    Some(row) => {
+                        res.set_found(true);
+                        let info = res.init_info();
+                        write_context_row_to_handle_info(info, &row);
+                    }
+                    None => res.set_found(false),
+                }
+                Ok(())
+            }
+            .instrument(span),
+        )
+    }
+
     /// Create a new context with the given label.
     ///
     /// Generates a fresh ContextId (UUIDv7), creates the document in the
@@ -4056,41 +4232,9 @@ impl kernel::Server for KernelImpl {
         let span = extract_rpc_trace(params.get_trace(), "join_context");
         Promise::from_future(
             async move {
-                // Context must already exist — no auto-creation
-                if !kernel.documents.contains(context_id) {
-                    return Err(capnp::Error::failed(format!(
-                        "context {} does not exist — use createContext first",
-                        context_id
-                    )));
-                }
-
-                log::debug!("Re-joining existing context {}", context_id);
-
-                // Ensure input doc exists (idempotent)
-                if let Err(e) = kernel.documents.create_input_doc(context_id) {
-                    log::warn!(
-                        "Failed to create input doc for context {}: {}",
-                        context_id,
-                        e
-                    );
-                }
-
-                // Verify context is registered in drift router
-                {
-                    let drift = kernel.kernel.drift().read();
-                    if drift.get(context_id).is_none() {
-                        return Err(capnp::Error::failed(format!(
-                            "context {} not registered in drift router — use createContext first",
-                            context_id
-                        )));
-                    }
-                    let trace_id = drift
-                        .get(context_id)
-                        .map(|h| h.trace_id)
-                        .unwrap_or([0u8; 16]);
-                    let _ctx_span =
-                        kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
-                }
+                let trace_id = ensure_context_joinable(&kernel, context_id).await?;
+                let _ctx_span =
+                    kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
 
                 // Update connection's active context in the global map
                 let session_id = connection.borrow().session_id;

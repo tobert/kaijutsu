@@ -369,6 +369,13 @@ enum RpcCommand {
         context_type: String,
         reply: oneshot::Sender<Result<ContextId, CallError>>,
     },
+    /// DB-driven label lookup — bypasses the DriftRouter `ListContexts`
+    /// reads. `None` reply payload means no context currently holds the
+    /// label. See `KernelHandle::resolve_context_label`.
+    ResolveContextLabel {
+        label: String,
+        reply: oneshot::Sender<Result<Option<crate::rpc::ContextInfo>, CallError>>,
+    },
 
     // ── CRDT Sync ────────────────────────────────────────────────────────
     PushOps {
@@ -669,6 +676,7 @@ impl RpcCommand {
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetClusters { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ResolveContextLabel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextSync { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -978,6 +986,20 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::CreateContext {
             label: label.into(),
             context_type: context_type.into(),
+            reply,
+        })
+        .await
+    }
+
+    /// DB-driven label lookup — see `KernelHandle::resolve_context_label`.
+    /// `Ok(None)` means no context currently holds this label.
+    #[tracing::instrument(skip(self))]
+    pub async fn resolve_context_label(
+        &self,
+        label: &str,
+    ) -> Result<Option<crate::rpc::ContextInfo>, CallError> {
+        self.send(|reply| RpcCommand::ResolveContextLabel {
+            label: label.into(),
             reply,
         })
         .await
@@ -2817,6 +2839,9 @@ async fn dispatch_kernel_command(
                 k,
                 k.create_context_typed(&label, &context_type)
             );
+        }
+        RpcCommand::ResolveContextLabel { label, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.resolve_context_label(&label));
         }
 
         // ── CRDT Sync ──
