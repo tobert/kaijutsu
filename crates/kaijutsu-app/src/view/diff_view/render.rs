@@ -50,7 +50,7 @@ const STATUS_BOTTOM_MARGIN: f32 = 72.0;
 ///
 /// It does **not** widen the range the cursor may roam before the band slides:
 /// the cursor has to stay on screen, and the surface draws from the top with
-/// no scroll offset, so `visible_rows` is the real bound. Motion *inside* the
+/// no scroll offset, so `viewport_rows` is the real bound. Motion *inside* the
 /// band is free (see `DiffSurfaceWindow`); walking off the bottom edge still
 /// re-shapes one band per row, which is what a viewport without a scroll
 /// offset costs. Cheap to improve later — the `Layout` is cached now (the
@@ -250,7 +250,10 @@ pub fn build_diff_surface(
 
     let content_width = (width - 2.0 * PAD).max(0.0);
     let line_height = text_metrics.cell_font_size.max(1.0) * 1.3;
-    let visible_rows = (((height - TOP_MARGIN - STATUS_BOTTOM_MARGIN) / line_height).floor() as i64)
+    // How many rows FIT on screen — not to be confused with
+    // `DiffCore::visible_rows`, which is how many rows folding leaves to draw.
+    let viewport_rows = (((height - TOP_MARGIN - STATUS_BOTTOM_MARGIN) / line_height).floor()
+        as i64)
         .max(1) as usize;
 
     // ── where we are ────────────────────────────────────────────────────────
@@ -264,7 +267,7 @@ pub fn build_diff_surface(
             let cursor = core.cursor_visible_row();
             let (first, end) = window_for(
                 cursor,
-                visible_rows,
+                viewport_rows,
                 core.visible_rows().len(),
                 (window.first_row, window.end_row),
             );

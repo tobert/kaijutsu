@@ -157,10 +157,12 @@ pub enum ViewerAction {
     Close,
     /// `R` — re-read the block (see [`DiffIntent::Refresh`]).
     Refresh,
-    /// `v` — deliberately nothing. Character-wise visual selection cannot be
-    /// *drawn* until the multi-rect selection material lands, and an invisible
-    /// selection that still yanks is worse than no binding at all
-    /// (`docs/diff.md` slice 5). `V` is the line-wise mode the viewer has.
+    /// `v` and `<C-v>`/`<C-q>` — deliberately nothing. Character-wise and
+    /// block-wise visual selections cannot be *drawn* until the multi-rect
+    /// selection material lands, and an invisible selection that still yanks
+    /// is worse than no binding at all (`docs/diff.md` slice 5). Block visual
+    /// is worse still: its yank is a *rectangle*, so the text would not be a
+    /// patch at all. `V` is the line-wise mode the viewer has.
     Nop,
 }
 
@@ -215,6 +217,12 @@ fn key_path(keys: &str) -> Vec<EdgePathPart<TerminalKey, CommonKeyClass>> {
         .collect()
 }
 
+/// One `Ctrl`-chorded character as an edge path part.
+fn ctrl_path(c: char) -> Vec<EdgePathPart<TerminalKey, CommonKeyClass>> {
+    let key = TerminalKey::from(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    vec![(EdgeRepeat::Once, EdgeEvent::Key(key))]
+}
+
 impl InputBindings<TerminalKey, InputStep<DiffInfo>> for ViewerBindings {
     fn setup(&self, machine: &mut VimMachine<TerminalKey, DiffInfo>) {
         let verbs = [
@@ -232,6 +240,17 @@ impl InputBindings<TerminalKey, InputStep<DiffInfo>> for ViewerBindings {
             let path = key_path(keys);
             for mode in [VimMode::Normal, VimMode::Visual] {
                 machine.add_mapping(mode, &path, &step);
+            }
+        }
+        // `<C-v>` (and vim's `<C-q>` alias) enter visual BLOCK, whose yank is
+        // a rectangle — not the whole lines the viewer promises. Same reason
+        // as `v`, one step further out: the selection cannot be drawn and the
+        // yank would not be a patch. Nop'd until the multi-rect material.
+        let nop = InputStep::<DiffInfo>::new().actions(vec![Action::Application(ViewerAction::Nop)]);
+        for c in ['v', 'q'] {
+            let path = ctrl_path(c);
+            for mode in [VimMode::Normal, VimMode::Visual] {
+                machine.add_mapping(mode, &path, &nop);
             }
         }
     }
@@ -1407,6 +1426,25 @@ mod tests {
         assert_eq!(c.mode(), None, "v must not enter visual mode");
         assert_eq!(c.selection_rows(), None);
         assert_eq!(c.cursor_row(), 0);
+    }
+
+    /// Visual BLOCK is worse than character-wise: its yank is a *rectangle*,
+    /// so the text would not be a patch at all — `<C-v>jly` used to hand back
+    /// `"di\n--"`. It must not be reachable.
+    #[test]
+    fn block_visual_does_nothing() {
+        for keys in ["<C-v>", "<C-q>"] {
+            let mut c = core();
+            assert!(c.apply_notation(keys).is_empty(), "keys {keys:?}");
+            assert_eq!(c.mode(), None, "{keys:?} must not enter visual mode");
+            assert_eq!(c.selection_rows(), None);
+
+            let yanked = c.apply_notation("jly");
+            assert!(
+                yanked.is_empty(),
+                "{keys:?} left a yankable selection: {yanked:?}",
+            );
+        }
     }
 
     // ── yank ────────────────────────────────────────────────────────────────
