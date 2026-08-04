@@ -195,6 +195,116 @@ pub fn sync_overlay_visibility(
 // MSDF GLYPH BUILDING (PostUpdate, after Layout)
 // ============================================================================
 
+/// The MSDF layout/glyph/geometry build shared by every compose-style text
+/// surface — the overlay palette and the shell dock, previously two
+/// copy-pasted ~100-line systems (`build_overlay_glyphs` /
+/// `build_shell_dock_glyphs`) that had already drifted: the shell dock
+/// tracks neither vim-mode `kind` nor a selection anchor, so unlike the
+/// overlay it never draws a visual-selection highlight (see the caller in
+/// `shell_dock.rs`, which is why it has no equivalent of the block below
+/// this function's return). What differs per surface — the display text and
+/// its cursor byte offset (the shell dock prepends `$ `; the overlay does
+/// not), the text color rule, and whether anything besides text/width/cursor
+/// forces a rebuild — stays with the caller; this runs only the part that
+/// was byte-for-byte identical: layout, glyph rasterization (when
+/// `rebuild`), RTT/scene sizing, node height, and the cursor's base geometry
+/// (position, height, last-offset).
+///
+/// Returns the built layout and its content origin (`text_offset`, logical
+/// px) so a caller that needs more from it — the overlay's visual-selection
+/// highlight — can keep going without re-shaping.
+pub(crate) fn sync_compose_text_glyphs(
+    display: &str,
+    cursor_byte_offset: usize,
+    text_color: Color,
+    rebuild: bool,
+    block_scene: &mut BlockScene,
+    rtt: &mut UiRttTexture,
+    msdf_glyphs: &mut MsdfBlockGlyphs,
+    border_style: &BlockBorderStyle,
+    width: f32,
+    node: &mut Node,
+    cursor_geom: &mut OverlayCursorGeometry,
+    font: &VelloFont,
+    text_metrics: &TextMetrics,
+    atlas: Option<&mut crate::text::msdf::MsdfAtlas>,
+    font_data_map: &mut FontDataMap,
+) -> (parley::Layout<peniko::Brush>, (f64, f64)) {
+    let text_brush = bevy_color_to_brush(text_color);
+
+    // Compute content area (inside border padding)
+    let pad = &border_style.padding;
+    let content_width = (width - pad.left - pad.right).max(0.0);
+    let max_advance = if content_width > 0.0 {
+        Some(content_width)
+    } else {
+        None
+    };
+
+    // Build text style
+    let style = VelloTextStyle {
+        brush: text_brush,
+        font_size: text_metrics.cell_font_size,
+        font_axes: VelloFontAxes {
+            weight: Some(200.0),
+            ..default()
+        },
+        ..default()
+    };
+
+    // Run Parley layout
+    let layout = font.layout(display, &style, VelloTextAlign::Left, max_advance);
+    let content_height = layout.height();
+
+    let text_offset = (pad.left as f64, pad.top as f64);
+
+    // Only rebuild glyphs when text or width changed (not cursor-only)
+    if rebuild {
+        if let Some(atlas) = atlas {
+            for line in layout.lines() {
+                for item in line.items() {
+                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                        font_data_map.register(gr.run().font());
+                    }
+                }
+            }
+            let glyphs = collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
+            msdf_glyphs.glyphs = glyphs;
+            msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
+            msdf_glyphs.rainbow = false;
+        }
+
+        // Set scene dimensions (content + padding).
+        // Round to physical pixel boundary — see block_render.rs comment.
+        let scale = text_metrics.scale_factor;
+        let total_height = round_to_physical_px(content_height + pad.top + pad.bottom, scale);
+        rtt.built_width = width;
+        rtt.built_height = total_height;
+        block_scene.text = display.to_string();
+        block_scene.color = text_color;
+        block_scene.content_version = block_scene.content_version.wrapping_add(1);
+        block_scene.last_built_version = block_scene.content_version;
+        block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
+
+        // Set explicit height on the node
+        node.height = Val::Px(total_height);
+    }
+
+    // Always recompute cursor geometry when anything changed
+    let cursor = parley::editing::Cursor::from_byte_index(
+        &layout,
+        cursor_byte_offset,
+        parley::layout::Affinity::Upstream,
+    );
+    let geom = cursor.geometry(&layout, 2.0);
+    cursor_geom.x = text_offset.0 + geom.x0;
+    cursor_geom.y = text_offset.1 + geom.y0;
+    cursor_geom.height = geom.y1 - geom.y0;
+    cursor_geom.last_cursor_offset = cursor_byte_offset;
+
+    (layout, text_offset)
+}
+
 /// Build MSDF glyphs for the overlay text surface.
 ///
 /// Runs in PostUpdate after UiSystems::Layout so ComputedNode is available.
@@ -280,80 +390,33 @@ pub fn build_overlay_glyphs(
                 theme.block_user
             };
 
-            let text_brush = bevy_color_to_brush(text_color);
-
-            // Compute content area (inside border padding)
-            let pad = &border_style.padding;
-            let content_width = (width - pad.left - pad.right).max(0.0);
-            let max_advance = if content_width > 0.0 {
-                Some(content_width)
-            } else {
-                None
-            };
-
-            // Build text style
-            let style = VelloTextStyle {
-                brush: text_brush,
-                font_size: text_metrics.cell_font_size,
-                font_axes: VelloFontAxes {
-                    weight: Some(200.0),
-                    ..default()
-                },
-                ..default()
-            };
-
-            // Run Parley layout
-            let layout = font.layout(display, &style, VelloTextAlign::Left, max_advance);
-            let content_height = layout.height();
-
-            let text_offset = (pad.left as f64, pad.top as f64);
-
-            // Only rebuild glyphs when text or width changed (not cursor-only)
-            if text_changed || width_changed {
-                if let Some(ref mut atlas) = atlas {
-                    for line in layout.lines() {
-                        for item in line.items() {
-                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                                font_data_map.register(gr.run().font());
-                            }
-                        }
-                    }
-                    let glyphs =
-                        collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
-                    msdf_glyphs.glyphs = glyphs;
-                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                    msdf_glyphs.rainbow = false;
-                }
-
-                // Set scene dimensions (content + padding).
-                // Round to physical pixel boundary — see block_render.rs comment.
-                let scale = text_metrics.scale_factor;
-                let total_height = round_to_physical_px(content_height + pad.top + pad.bottom, scale);
-                rtt.built_width = width;
-                rtt.built_height = total_height;
-                block_scene.text = display.to_string();
-                block_scene.color = text_color;
-                block_scene.content_version = block_scene.content_version.wrapping_add(1);
-                block_scene.last_built_version = block_scene.content_version;
-                block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
-
-                // Set explicit height on the node
-                node.height = Val::Px(total_height);
-            }
-
-            // Always recompute cursor geometry when anything changed
-            let cursor = parley::editing::Cursor::from_byte_index(
-                &layout,
+            let (layout, text_offset) = sync_compose_text_glyphs(
+                display,
                 cursor_byte_offset,
-                parley::layout::Affinity::Upstream,
+                text_color,
+                text_changed || width_changed,
+                &mut block_scene,
+                &mut rtt,
+                &mut msdf_glyphs,
+                border_style,
+                width,
+                &mut node,
+                &mut cursor_geom,
+                font,
+                &text_metrics,
+                atlas.as_deref_mut(),
+                &mut font_data_map,
             );
-            let geom = cursor.geometry(&layout, 2.0);
-            cursor_geom.x = text_offset.0 + geom.x0;
-            cursor_geom.y = text_offset.1 + geom.y0;
-            cursor_geom.height = geom.y1 - geom.y0;
-            cursor_geom.last_cursor_offset = cursor_byte_offset;
             cursor_geom.kind = new_kind;
             cursor_geom.last_selection_anchor = new_anchor;
+            // The cursor's own geometry, reconstructed from what
+            // `sync_compose_text_glyphs` just derived it from — same
+            // `text_offset` + `cursor_byte_offset`, so this is exactly the
+            // `geom` it computed internally, not a fresh (possibly
+            // divergent) recomputation.
+            let geom_x0 = cursor_geom.x - text_offset.0;
+            let geom_y0 = cursor_geom.y - text_offset.1;
+            let geom_y1 = geom_y0 + cursor_geom.height;
 
             // Selection geometry — only when in Visual mode with a selection.
             // Single-line scope only: multi-line selections fall back to no
@@ -373,14 +436,14 @@ pub fn build_overlay_glyphs(
                 let anchor_geom = anchor_cursor.geometry(&layout, 2.0);
 
                 // Same line if y-extents align (within 0.5 px).
-                let same_line = (anchor_geom.y0 - geom.y0).abs() < 0.5;
+                let same_line = (anchor_geom.y0 - geom_y0).abs() < 0.5;
                 if same_line {
-                    let x_left = anchor_geom.x0.min(geom.x0);
-                    let x_right = anchor_geom.x0.max(geom.x0);
+                    let x_left = anchor_geom.x0.min(geom_x0);
+                    let x_right = anchor_geom.x0.max(geom_x0);
                     cursor_geom.selection_x = text_offset.0 + x_left;
-                    cursor_geom.selection_y = text_offset.1 + geom.y0;
+                    cursor_geom.selection_y = text_offset.1 + geom_y0;
                     cursor_geom.selection_width = (x_right - x_left).max(0.0);
-                    cursor_geom.selection_height = geom.y1 - geom.y0;
+                    cursor_geom.selection_height = geom_y1 - geom_y0;
                 } else {
                     log::trace!(
                         "vim: visual selection spans lines; multi-line highlight not yet rendered"
