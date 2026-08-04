@@ -970,3 +970,48 @@ probe context resolving `deepseek/deepseek-v4-pro via CastSlot` in the
 journal on its first turn. Old aliases didn't make the trip — Amy: "they were
 guesses" — the floor ships four backends, zero aliases, zero casts, and every
 row above it is something someone chose.
+
+## Errors that were only strings (August 3–4)
+
+Amy's rule arrived as a one-liner — *DB errors are P1, we fix them now* —
+and the kernel spent two days proving why. It started with a warn that had
+been scrolling past every restart since mid-July: `UNIQUE constraint failed:
+contexts.context_id`, once per archived context. Not a race, as everyone
+assumed, but two different definitions of "KernelDb already knows this
+context" sitting a few lines apart: the presence check asked the *active*
+set while the primary key covered the whole table, so every archived
+context looked missing forever and got re-offered on every cold start. The
+PK had been quietly doing the real work — and quietly preventing an
+archived context from being *resurrected* by a placeholder row, which is
+why the obvious idempotent-insert "fix" would have been the dangerous one.
+
+Pulling that thread surfaced the sibling one file over. `create_document`
+decided whether a failed insert was benign by asking `e.to_string()`
+whether it contained "UNIQUE constraint" or "already exists" — and the
+string it was matching came from `map_unique_violation`, which flattens
+*every* constraint violation into one message. Two failures wore that one
+disguise: a primary-key conflict (the same document, genuinely benign) and
+a partial-unique conflict on `(workspace_id, path)` — a *different*
+document claiming a taken path, which is divergence. Both got the same
+cheerful "recovering" warn. And the whole recovery hung on wording: reword
+the message and every duplicate-document recovery becomes a hard error, no
+test the wiser. The fix refuses to read messages at all. On a constraint
+violation the DB layer *reads itself back* — is there a row at this id? is
+there a row at this path? — and returns a typed answer, so classification
+depends on the database's state rather than its prose. Above it, the benign
+arm now compares the persisted row against the one it meant to write; kind,
+workspace, or path differing is `DocumentDiverged`, never a recovery.
+
+The same day's third strand was the drift router's lost+found. Its dead
+letters — drifts that failed every retry — were written into a context the
+router minted and registered itself, then persisted by a caller that logged
+`tracing::error!` and carried on when the row wouldn't write. Three lines
+above sat the comment explaining the invariant being broken: a registered
+handle implies a KernelDb row. The router turned out to be the wrong place
+to hold the pen, since it has no DB handle and can only ever produce a
+rowless handle; it now *claims* an id whose row someone else has already
+written, and `ensure_lost_found` is gone so the old shape can't be
+rebuilt. The flush secures the sink before draining, returns an error
+naming what it flushed instead of a log line nobody reads, and hands a
+failed dead-letter write back to the queue — the one code path whose whole
+purpose is not losing failed drifts had been dropping them on the floor.

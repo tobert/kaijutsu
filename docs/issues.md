@@ -358,37 +358,6 @@ all, discovered wiring the Claude Code MCP config. Two pieces:
   kernel side sees `/r/<client>/workspace` with zero flags. Needs the usual
   `/r` decisions: share name, ro vs `:rw` default, and an opt-out.
 
-## `create_document` classifies duplicate-document by error *string* (2026-08-03, from the cold-start bootstrap fix)
-
-Found while fixing the cold-start `UNIQUE constraint failed: contexts.context_id`
-warn (that one is fixed — cold start now decides "already known" against the
-whole `contexts` table, archived rows included, so archived contexts stop being
-re-offered on every restart).
-
-The sibling still open: `BlockStore::create_document` and
-`create_document_with_path` (`block_store.rs:424`, `:475`) classify an
-`insert_document` failure as benign by matching `e.to_string()` for
-`"UNIQUE constraint"` or `"already exists"`, then warn "Document already in DB
-but not in memory, recovering" and continue. Two problems:
-
-- It only works by luck of the message text. `insert_document` routes through
-  `map_unique_violation`, which turns *any* constraint violation into
-  `KernelDbError::LabelConflict("document already exists or path conflict")` —
-  it happens to contain "already exists". Reword that string and every
-  duplicate-document recovery silently becomes a hard `BlockStoreError`.
-- The same message covers the **PK** conflict (same document, benign) and the
-  **`idx_documents_path`** conflict (a *different* document claiming a path
-  that's taken — divergent, not benign). Both are swallowed as "recovering".
-
-Wants a typed classifier on `KernelDbError` (`is_unique_violation`, or better,
-distinct variants for PK vs path conflict) and a read-back-and-compare on the
-benign arm, the same shape `bootstrap_discovered_context` (`rpc.rs`) now uses.
-
-Second sibling, lower stakes: the lost+found row in `kj/drift.rs:557` logs
-`tracing::error!("failed to persist lost+found context row")` and carries on —
-which breaks the "registered handle implies a KernelDb row" invariant the
-comment three lines above it is there to defend.
-
 ## Diff parse errors render as a generic banner, not line-anchored (2026-08-02)
 
 
@@ -1388,15 +1357,6 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   view; consider a cached AST keyed on block content version.
 
 ## Persistence & Sync
-
-- **Bootstrap warns on restart with live clients** (observed 2026-08-03, first
-  restart after the subscription-instance fix): three `Failed to bootstrap
-  context <id> into KernelDb: UNIQUE constraint failed: contexts.context_id`
-  warns as reconnecting clients re-attached. Looks like a client re-attach
-  path doing a bare INSERT for contexts that already have rows — wants an
-  upsert/existence check, or a decision that the second registration is a
-  real error worth more than a warn. The 2026-08-02 "completely silent start"
-  was real but likely a start without clients racing to re-attach.
 
 - **Backup shipped 2026-08-03; export/import round-trip still open.**
   `kj db backup <path>` (`KernelDb::vacuum_into`, `VACUUM INTO ?1` bound
