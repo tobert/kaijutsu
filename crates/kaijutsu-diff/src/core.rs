@@ -813,12 +813,19 @@ fn is_line_wise_yank(ea: &EditorAction, ctx: &EditContext) -> bool {
     match target {
         // No movement, or movement the viewer itself decides.
         EditTarget::CurrentPosition | EditTarget::Selection => true,
-        // Marks are line addresses here; the snap flattens the column.
-        EditTarget::CharJump(_) | EditTarget::LineJump(_) => true,
-        // `f`/`t`/`;`/`,` are pure column motions. Regex search moves lines
-        // (and is not wired yet), so it stays.
+        // `'a` is a LINE address, `` `a `` is a character one — vim yanks
+        // them line-wise and character-wise respectively, and a mark is
+        // settable here (`ma` is bookkeeping, so it passes `is_read_only`).
+        // `` y`a `` from a column really did hand back a fragment with a
+        // ragged end.
+        EditTarget::LineJump(_) => true,
+        EditTarget::CharJump(_) => false,
+        // `f`/`t`/`;`/`,` are pure column motions, and a regex search is
+        // exclusive/character-wise in vim too. Search is not wired here yet
+        // (the `/`-bar submits nothing), so refusing it now costs nothing and
+        // means wiring it later cannot silently produce a fragment yank.
         EditTarget::Search(SearchType::Char(_), _, _) => false,
-        EditTarget::Search(_, _, _) => true,
+        EditTarget::Search(_, _, _) => false,
         // Text objects: only the whole-line and whole-buffer ones.
         EditTarget::Range(range, _, _) | EditTarget::Boundary(range, _, _, _) => {
             matches!(range, RangeType::Line | RangeType::Buffer)
@@ -1388,6 +1395,9 @@ mod tests {
             // list — a forced `CharWise`/`BlockWise` shape — and `y^` at a
             // non-zero column is the one that actually got through.
             "y^", "yg^", "yvj", "y<C-v>j",
+            // A character mark address. `` y`a `` really did hand back
+            // `"line 1\n line 2\n-line 3\n+THRE"` — ragged at both ends.
+            "may`a", "maj$y`a",
         ] {
             let mut c = core();
             c.apply_notation("5G$");
@@ -1399,7 +1409,7 @@ mod tests {
         }
 
         // ...while the whole-line motions still yank, mid-line cursor or not.
-        for keys in ["yy", "yG", "y_", "y+", "yVj", "3yy"] {
+        for keys in ["yy", "yG", "y_", "y+", "yVj", "3yy", "majy'a"] {
             let mut c = core();
             c.apply_notation("5G$");
             let yanked = c.apply_notation(keys);
