@@ -316,6 +316,7 @@ fn sampling_rate(name: &str) -> f64 {
         || name.starts_with("tool.")
         || name.starts_with("drift.")
         || name.starts_with("sftp.")
+        || name.starts_with("turn.")
     {
         1.0 // 100% — high-value, low-volume namespaces (sftp control/metadata ops)
     } else if name.starts_with("rpc") {
@@ -352,6 +353,9 @@ mod tests {
         assert_eq!(sampling_rate("tool.dispatch"), 1.0);
         assert_eq!(sampling_rate("gen_ai.chat"), 1.0);
         assert_eq!(sampling_rate("llm.prompt"), 1.0);
+        // Turn-outcome pushes are as rare as the turns themselves and are the
+        // whole story of a turn's ending — sample them like the LLM spans.
+        assert_eq!(sampling_rate("turn.events_push"), 1.0);
     }
 
     /// The rpc family — bare `rpc`, `rpc.request`, `rpc_client.*` — and other

@@ -621,11 +621,16 @@ than left to rot.
 
 **Tier 2 — velocity**
 
-- **Delegation has no join.** `kj fork --prompt` → `request_child_turn`
-  (`kj/fork.rs:1369`) publishes `TurnFlow::Requested` and returns; nothing waits
-  or notifies, and there is no `kj wait`. The parent must poll or manually
-  `kj drift pull`. Compare Claude Code's `Task`, which blocks or wakes the
-  caller. *(Relates to "Headless one-shot with JSONL streaming" below.)*
+- **Delegation has no join — the SIGNAL shipped, the command didn't.** The
+  child's turn now publishes `TurnFlow::Completed`/`Failed` naming its context,
+  in-process and over capnp (`subscribeTurnEvents`), so a waiter no longer has
+  to poll the child's block log. What's missing is `kj wait` itself: it needs a
+  timeout policy, an answer for the turn that ends before the waiter subscribes
+  (the bus is lossy and un-journaled — see the TurnFlow durability item), and a
+  decision about waiting on several children at once. Compare Claude Code's
+  `Task`, which blocks or wakes the caller. Seam documented at
+  `request_child_turn` (`kj/fork.rs`). *(Relates to "Headless one-shot with
+  JSONL streaming" below.)*
 - **No task/plan state.** No `BlockKind` variant, no tool. A model can only
   `block_create` freeform text and re-read it. Compare TodoWrite.
 - **No LSP / diagnostics** — no go-to-definition, no type errors without paying
@@ -1974,7 +1979,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **POSIX context quartet:** Implement `kj wait` and `kj stop` to complete the fork/drive/wait/merge paradigm.
 - **`kj drive` follow-up:** Add verb-level refusal for driving Staging contexts.
 - **Autonomous turn runaway guard:** Add a `drive_depth` cap to prevent unbounded fan-out from `--prompt` forks.
-- **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up.
+- **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up — and now matters more, since `turn.completed`/`turn.failed` reach wire clients over `subscribeTurnEvents`: a client that subscribes late, or reconnects mid-turn, misses the outcome entirely and must fall back to reading the block log. Deliberately un-journaled (blocks are the durable record; replaying completions after a restart would announce turns nobody is waiting on), so the fix is a *catch-up* story, not a journal.
 - **Headless turn cwd is `/`:** Decide whether to thread the context's stored shell cwd into the headless `ExecContext`.
 - **`--switch --prompt` double-drives:** Clarify semantics when both human and autonomous turn try to drive a child.
 - **Context-type ↔ fork asymmetry (discovery 2026-06-17, fork code is fresh —
@@ -3242,6 +3247,9 @@ deleted — folded into the hook-lockout entry below, which is the real issue.)*
   consume-until-done path. CI/eval harnesses need a blocking subprocess. Add
   `kj run --prompt … --output-format jsonl` that streams turn events
   (turn.requested/tool_call/tool_result/turn.completed) and exits with a machine code.
+  The completion half is now available to a client: `subscribeTurnEvents` pushes
+  a structured stop reason (end_turn / cancelled / max_tokens / max_iterations),
+  which is exactly the machine exit code this wants.
   *(relates to the existing "headless turn cwd is `/`" item.)*
 - **Python/TS thin SDK.** `kaijutsu-client` is full-featured but requires Rust
   compilation; eval/CI tooling lives in Python/TS. Wrap `kj run --json` JSONL (or the

@@ -59,6 +59,7 @@ the server extracts it via `extract_rpc_trace()`.
 | Drift engines | `drift.{op}` | `drift.push` | 100% |
 | MCP tools | `mcp.{tool}` | `mcp.block_read` | 10% (default) |
 | LLM | Auto-named with `llm.*` fields | `prompt{llm.model, llm.provider}` | 100% |
+| Turn outcome | `turn.{op}`, `turn.*` fields | `turn.events_push{turn.stop_reason}` | 100% |
 | CRDT sync | `sync.{op}` | `sync.push_ops` | 1% |
 
 ### Server RPC (59 methods)
@@ -83,7 +84,7 @@ Sync methods use `span.entered()` guards.
 | Blobs | `read_blob`, `write_blob`, `delete_blob`, `list_blobs` |
 | Peers | `attach_peer`, `detach_peer`, `list_peers`, `invoke_peer` |
 | Config | `get_config`, `list_configs`, `reload_config`, `reset_config` |
-| Subscriptions | `subscribe_blocks`, `subscribe_mcp_resources`, `subscribe_mcp_elicitations` |
+| Subscriptions | `subscribe_blocks`, `subscribe_mcp_resources`, `subscribe_mcp_elicitations`, `subscribe_editor`, `subscribe_turn_events` |
 | Other | `set_attribution`, `get_command_history` |
 
 **Not instrumented:** VFS filesystem methods (~15 in `impl vfs::Server`) — high volume, low debugging value. Trivial stubs (`whoami`, `get_info`, `interrupt`, `complete`, `detach`).
@@ -194,6 +195,7 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 | `gen_ai.*`, `llm.*` | 100% | Expensive, rare, highest value |
 | `engine.*`, `tool.*` | 100% | Critical for debugging |
 | `drift.*` | 100% | Cross-context operations |
+| `turn.*` | 100% | One span per turn ending — as rare as turns, and the whole story of how one ended |
 | `rpc.*` | 10% | High volume |
 | `sync.*` | 1% | Very high volume CRDT ops |
 | Errors | 100% | Always captured |
@@ -202,7 +204,7 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 Parent-sampled spans always inherit (trace continuity).
 
 **Prefix collision caveat:** the 100% namespaces are **dot-qualified**
-(`drift.`, `engine.`, `tool.`, `gen_ai.`, `llm.`). Auto-named actor/method spans
+(`drift.`, `engine.`, `tool.`, `gen_ai.`, `llm.`, `turn.`). Auto-named actor/method spans
 like `drift_queue` must NOT match `drift.` — before the dot they were swept to
 100% and the app's 5s idle drift poll dominated trace volume. See
 `sampling_rate()` and its regression test in `kaijutsu-telemetry`.

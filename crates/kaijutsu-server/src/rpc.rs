@@ -474,8 +474,11 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     model,
                 } = msg.payload
                 else {
-                    // The driver only subscribes to turn.requested; completion
-                    // and failure events are observed elsewhere (e.g. kj wait).
+                    // The driver only subscribes to turn.requested. Completion
+                    // and failure are observed on their own topics — in-process
+                    // by the beat scheduler, and over the wire by
+                    // `subscribeTurnEvents` subscribers (a future `kj wait`
+                    // joins there, not here).
                     continue;
                 };
                 // Headless turn: no interactive session, so synthesize the
@@ -3404,7 +3407,7 @@ impl kernel::Server for KernelImpl {
                                     origin,
                                 } => {
                                     let span = tracing::info_span!(
-                                        "turn_events.push",
+                                        "turn.events_push",
                                         turn.stop_reason = reason.as_str(),
                                         turn.origin = origin.as_str(),
                                     );
@@ -3451,7 +3454,7 @@ impl kernel::Server for KernelImpl {
                                     origin,
                                 } => {
                                     let span = tracing::info_span!(
-                                        "turn_events.push",
+                                        "turn.events_push",
                                         turn.stop_reason = "failed",
                                         turn.origin = origin.as_str(),
                                     );
