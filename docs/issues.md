@@ -630,12 +630,6 @@ than left to rot.
   `block_create` freeform text and re-read it. Compare TodoWrite.
 - **No LSP / diagnostics** — no go-to-definition, no type errors without paying
   for a full compile.
-- **`register_session` hard-fails on label conflict** instead of reusing the
-  existing context: `KernelDb insert_context failed for <id>: label conflict:
-  label '<uuid>' already in use`. It stamps the caller's agent-session id as the
-  context label, so a reconnect after a dropped session is fatal until the label
-  is freed. Hit live 2026-07-29. Related to the known
-  "startup agent detection can report a previous session's id" gotcha.
 
 ## rmcp 1.7 → 3.0.1 bump left SEP-2577 deprecations papered over (2026-07-30)
 
@@ -3526,18 +3520,35 @@ kernel process env into exec-granted shells.
   unknown-command investigation.)
 - **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
   host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
-- **MCP-created context invisible to `kj context list` after kernel restart
-  (found 2026-07-03 during the exec live-verify).** A `register_session` context
-  (`investigate-d1d3257e`) kept working across a kernel restart — shell executes,
-  blocks write, `kj context switch <full id>` resolves it with its label — but
-  `kj context list` no longer shows it, and prefix/label resolution
-  (`kj binding allow exec 019f29bb`) fails "no context matches". The row is
-  durable; the *listing* filter loses it. Smells like the peer/registry
-  re-attach gap (auto-memory `tech_debt_peer_reattach_on_reconnect`) extended to
-  MCP sessions: list is registry-driven, resolution-by-full-id is DB-driven.
-  Symptom cost: an operator can't see or target a live working context by
-  prefix. Find where `list_all_contexts` vs the session/registry filter diverge
-  post-restart.
+- **`kj context list` registry/DB divergence — narrowed and partly shipped
+  (2026-08-04, `register_session` upsert work).** Re-investigated while
+  building `register_session`'s upsert/attach fix (was going to "heal the
+  registry on attach"). Findings against current code:
+  - `create_shared_kernel`'s boot-time recovery step (`rpc.rs`, "Recover
+    contexts") already re-registers every context `KernelDb::list_active_contexts`
+    returns into the DriftRouter on EVERY kernel start — confirmed with a
+    same-process double-boot test
+    (`list_contexts_recovers_live_context_after_restart`,
+    `crates/kaijutsu-server/tests/context_label_resolve.rs`). So the
+    original symptom described here (a live/concluded MCP context surviving
+    a restart but vanishing from `kj context list`) does NOT reproduce
+    against current code — it looks stale, possibly already fixed
+    incidentally by unrelated work landed since 2026-07-03, or the original
+    live observation involved something the synthetic restart here doesn't
+    capture (e.g. a torn/non-graceful shutdown, or two server processes
+    briefly both live). Flagging rather than silently deleting, per 改善 —
+    if the symptom recurs, treat it as a genuinely different bug, not this
+    one.
+  - The one real, provable registry gap: `list_active_contexts` filters
+    `WHERE archived_at IS NULL`, so an ARCHIVED context's DriftRouter entry
+    does NOT survive a restart even though its KernelDb row and BlockStore
+    document do. **Shipped**: `joinContext` (`rpc.rs`'s `ensure_context_joinable`)
+    now heals this — re-registers from the durable KernelDb row instead of
+    hard-failing with "use createContext first" — and a passing regression
+    test covers it end-to-end over the wire
+    (`join_context_heals_registry_for_an_archived_context_after_restart`,
+    same test file): archived-context join fails before the fix, succeeds
+    and reappears in `listContexts` after.
 
 ---
 
