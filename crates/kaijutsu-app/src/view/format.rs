@@ -18,7 +18,10 @@ use kaijutsu_types::{ContextId, OutputData, OutputEntryType, OutputNode};
 /// - Shell: cyan for commands, gray for output
 pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color {
     match block.kind {
-        BlockKind::Text | BlockKind::File => match block.role {
+        // Task rendering deliberately trails this slice (docs/tasks.md) —
+        // role-based coloring is the same honest placeholder Text/File get,
+        // not a dedicated task palette.
+        BlockKind::Text | BlockKind::File | BlockKind::Task => match block.role {
             Role::User => theme.block_user,
             Role::Model => theme.block_assistant,
             Role::System => theme.fg_dim,
@@ -709,6 +712,10 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             }
         }
         BlockKind::Trace => block.content.clone(),
+        // Placeholder — a real task view (status glyph, subtask indent,
+        // groom actions) is deferred (docs/tasks.md); this just shows the
+        // status and title so a Task block isn't invisible in the meantime.
+        BlockKind::Task => format!("[{}] {}", block.task_status.as_str(), block.content),
     }
 }
 
