@@ -557,6 +557,38 @@ the build settled:
   visibly re-lays-out. The `docs/issues.md` diffstat-footer overlap entry is
   still unretested and is the natural thing to check in the same sitting.
 
+### Post-ship review — slice 6 phase A (deepseek + gpt-5.6-sol, 2026-08-04)
+
+Two independent casts, holistic reads (no diff). Both cleared the word-span
+translation, the elision clipping, the canonical-vs-visible coordinate
+discipline, and `snap_out_of_folds`. Both found the **same** defect, and the
+audit it triggered found three more of the same shape:
+
+- **Un-pinning the column re-opened every yank whose justification was "the
+  snap discards it."** The positive list was written when the cursor could
+  not leave column 0; four entries were only safe *because* of that.
+  `y^`/`yg^` (`FirstWord`/`ScreenFirstWord` at a non-zero column),
+  `` y`a `` (`CharJump` — a *character* mark address, and `ma` is settable
+  because it is bookkeeping), `yvj`/`y<C-v>j` (vim's explicit shape
+  overrides), and `<C-v>` block visual (pre-existing since slice 5: `v` was
+  Nop'd and `<C-v>` was not) each handed back a fragment carrying a `+` and
+  no line. Fixes: a **forced-shape guard** ahead of the target list (only
+  `None`/`LineWise` may proceed — this is what catches the overrides, which
+  no target-type list could), `CharJump` split from `LineJump`, regex search
+  flipped to refused before it is ever wired, and `<C-v>`/`<C-q>` Nop'd.
+  **The lesson worth keeping: when an invariant stops being enforced by
+  construction, re-derive every rule that leaned on it — a positive list is
+  only as honest as the reason each entry is on it.**
+- **The layout cache could not see a theme change.** Colors are baked into
+  the cached parley layout (as ranged brushes) and into the cached band
+  geometry, and the kernel replaces the whole `Theme` resource over RPC. Now
+  `theme.is_changed()` joins the relayout condition — change detection, not
+  a hash. Font size joined `LayoutKey` (fixed today, a trap for whoever
+  makes it adjustable), and sizes ride as f32 bits instead of truncated
+  integers: the surface is laid out in *logical* px, which a fractional
+  HiDPI scale makes fractional, so a resize inside one integer could still
+  move a wrap point.
+
 ## Seam guidance (deepseek review, 2026-08-01)
 
 Consulted deepseek specifically on how the seams should evolve so this work
