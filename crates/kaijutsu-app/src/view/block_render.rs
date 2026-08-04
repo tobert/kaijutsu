@@ -977,6 +977,18 @@ pub fn build_block_scenes(
                         (pad_left, pad_top),
                         &crate::text::rich::diff_band_colors(&theme),
                     );
+                    // ...then the word washes on top of them, from the same
+                    // layout. The inline preview and the full viewer draw the
+                    // same shapes through the same builders, which is the only
+                    // way the two stay agreed on what a diff looks like.
+                    msdf_geometry.vertices.extend(
+                        crate::text::diff::build_word_wash_geometry(
+                            preview,
+                            &layout,
+                            (pad_left, pad_top),
+                            &crate::text::rich::diff_word_colors(&theme),
+                        ),
+                    );
 
                     let glyphs =
                         crate::text::msdf::collect_msdf_glyphs_styled(&layout, text_offset, atlas);

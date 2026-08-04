@@ -56,6 +56,18 @@ const STATUS_BOTTOM_MARGIN: f32 = 72.0;
 /// cursor needs it), so this wants moving the glyph offset instead of
 /// re-collecting — but not worth the complexity until a profile says so.
 const WINDOW_SLACK_ROWS: usize = 24;
+/// Width of the minimap strip down the right edge, logical px.
+const MINIMAP_WIDTH: f32 = 12.0;
+/// Gap between the text column and the strip, logical px.
+const MINIMAP_GAP: f32 = 12.0;
+/// Height of one minimap slot, logical px.
+///
+/// Not one slot per pixel: a taller slot is a shorter bucket list to build and
+/// to memcpy, and at three pixels a hunk boundary is still a legible tick. The
+/// strip's resolution is a compression choice, not a fidelity one — the
+/// counts inside a bucket are what keep a lone change visible
+/// (`kaijutsu_diff::minimap`).
+const MINIMAP_SLOT_PX: f32 = 3.0;
 
 /// Full-window root painting the dark page behind the text child.
 #[derive(Component)]
@@ -99,9 +111,25 @@ pub struct DiffSurfaceWindow {
     /// How many entries at the FRONT of `MsdfBlockGlyphs::glyphs` are the
     /// body. The status strip is appended after them and remade every pass.
     body_glyphs: usize,
-    /// Same, for `MsdfBlockGeometry::vertices`: the `+`/`-` bands are the
-    /// prefix, selection bands are appended after them.
+    /// Same, for `MsdfBlockGeometry::vertices`: the `+`/`-` bands and the
+    /// word washes are the prefix, selection and minimap are appended after
+    /// them.
     body_bands: usize,
+    /// The minimap's document layer, cached against [`MinimapKey`].
+    ///
+    /// **Its own tier, coarser than the cursor's.** Building buckets is
+    /// O(drawn rows) — a hundred thousand of them on a big diff — and it can
+    /// only change when the diff or its folds do, which is far less often
+    /// than the cursor moves. So it is built against a key of its own and
+    /// *memcpy'd* into the geometry buffer on each cheap pass; only the
+    /// viewport band and the cursor line are rebuilt per keystroke. It never
+    /// joins [`LayoutKey`]: a minimap redraw must never re-shape a glyph.
+    minimap_quads: Vec<crate::text::msdf::geometry::GeometryVertex>,
+    /// How many slots `minimap_quads` was built for — the position layer has
+    /// to bucket into the same space.
+    minimap_slots: usize,
+    /// What `minimap_quads` was built for.
+    minimap: Option<MinimapKey>,
     /// What the last cheap pass drew.
     drawn: Option<CursorKey>,
 }
@@ -126,6 +154,21 @@ struct LayoutKey {
     /// measured in. It is fixed today, which is exactly why leaving it out
     /// would be a trap for whoever makes it adjustable.
     font_bits: u32,
+}
+
+/// The inputs the **minimap's document layer** depends on: the whole drawn
+/// document and the box it is compressed into. Deliberately coarser than
+/// [`CursorKey`] — a cursor move slides the viewport band, it does not
+/// re-bucket a hundred thousand rows — and deliberately not part of
+/// [`LayoutKey`], because a strip rebuild must never re-shape text.
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct MinimapKey {
+    content_hash: u64,
+    fold_seq: u64,
+    rows: usize,
+    slots: usize,
+    /// The strip's box. A resize moves and re-scales every bar.
+    strip_bits: [u32; 4],
 }
 
 /// The inputs the **cheap pass** depends on — everything that can change
@@ -256,7 +299,17 @@ pub fn build_diff_surface(
         return;
     }
 
-    let content_width = (width - 2.0 * PAD).max(0.0);
+    // The strip eats into the text column: the minimap is beside the text, not
+    // over it. `width_bits` in `LayoutKey` already keys the surface width, so
+    // the narrower column re-wraps correctly on a resize.
+    let content_width = (width - 2.0 * PAD - MINIMAP_WIDTH - MINIMAP_GAP).max(0.0);
+    let strip = crate::shaders::SelectionRect::new(
+        width - PAD - MINIMAP_WIDTH,
+        TOP_MARGIN,
+        MINIMAP_WIDTH,
+        (height - TOP_MARGIN - STATUS_BOTTOM_MARGIN).max(0.0),
+    );
+    let minimap_slots = ((strip.height / MINIMAP_SLOT_PX).floor() as i64).max(1) as usize;
     let line_height = text_metrics.cell_font_size.max(1.0) * 1.3;
     // How many rows FIT on screen — not to be confused with
     // `DiffCore::visible_rows`, which is how many rows folding leaves to draw.
@@ -390,13 +443,22 @@ pub fn build_diff_surface(
             })
             .collect();
 
-        let bands = crate::text::diff::build_diff_band_geometry(
+        let mut bands = crate::text::diff::build_diff_band_geometry(
             &preview,
             &rows,
             content_width,
             offset,
             &crate::text::rich::diff_band_colors(&theme),
         );
+        // Word washes ride the LAYOUT tier beside the line bands — word spans
+        // change only when the content does — and are appended *after* them,
+        // so a changed word draws as a brighter patch inside its line's band.
+        bands.extend(crate::text::diff::build_word_wash_geometry(
+            &preview,
+            &layout,
+            offset,
+            &crate::text::rich::diff_word_colors(&theme),
+        ));
 
         window.body_glyphs = body.len();
         window.body_bands = bands.len();
@@ -418,13 +480,45 @@ pub fn build_diff_surface(
         window.laid_out = Some(layout_key);
     }
 
-    // ── the cheap half: status strip, selection, cursor ─────────────────────
-    // Everything below rides the cached layout: the body glyphs and `+`/`-`
-    // bands are the untouched prefix of each buffer, and these are appended
-    // after them.
-    let Some(preview) = window.preview.as_ref() else {
+    // ── the cheap half: status strip, selection, minimap, cursor ────────────
+    // Everything below rides the cached layout: the body glyphs, `+`/`-` bands
+    // and word washes are the untouched prefix of each buffer, and these are
+    // appended after them.
+    if window.preview.is_none() {
         return;
-    };
+    }
+
+    // The minimap's document layer is refreshed FIRST, while nothing else
+    // holds a borrow of the window — building it is O(drawn rows) and it can
+    // only change when the diff or its folds do, so it has a key of its own
+    // (`MinimapKey`), coarser than the cursor's and outside `LayoutKey`
+    // entirely. Drawing it below is then a memcpy.
+    let minimap_colors = crate::text::rich::diff_minimap_colors(&theme);
+    if let DiffViewContent::Ready(core) = &session.content {
+        let minimap_key = MinimapKey {
+            content_hash: session.content_hash,
+            fold_seq: core.fold_seq(),
+            rows: core.visible_rows().len(),
+            slots: minimap_slots,
+            strip_bits: [
+                strip.x.to_bits(),
+                strip.y.to_bits(),
+                strip.width.to_bits(),
+                strip.height.to_bits(),
+            ],
+        };
+        if window.minimap.as_ref() != Some(&minimap_key) || theme.is_changed() {
+            window.minimap_quads = crate::text::diff::build_minimap_geometry(
+                &core.minimap(minimap_slots),
+                strip,
+                &minimap_colors,
+            );
+            window.minimap_slots = minimap_slots;
+            window.minimap = Some(minimap_key);
+        }
+    }
+
+    let preview = window.preview.as_ref().expect("checked just above");
     glyphs.glyphs.truncate(window.body_glyphs);
     geometry.vertices.truncate(window.body_bands);
 
@@ -489,7 +583,7 @@ pub fn build_diff_surface(
                 && let Some(bytes) = crate::text::diff::char_selection_bytes(preview, local)
                 && let Some(layout) = window.layout.as_ref()
             {
-                let rects = selection_rects(layout, bytes);
+                let rects = crate::text::diff::layout_rects(layout, bytes);
                 let coalesced = crate::shaders::selection::coalesce_selection_rects(
                     &rects,
                     0.0,
@@ -521,6 +615,26 @@ pub fn build_diff_surface(
                 ));
         }
         _ => {}
+    }
+
+    // The minimap: the cached document layer, then the two marks that follow
+    // the reader — the band of rows on screen and the cursor's own line.
+    if let DiffViewContent::Ready(core) = &session.content {
+        geometry.vertices.extend_from_slice(&window.minimap_quads);
+        geometry
+            .vertices
+            .extend(crate::text::diff::build_minimap_position_geometry(
+                core.visible_rows().len(),
+                window.minimap_slots,
+                // What is actually on SCREEN, not what was laid out: the
+                // window lays out slack rows past the bottom edge that the
+                // reader cannot see, and a band claiming them would overstate
+                // where they are.
+                first_row..end_row.min(first_row + viewport_rows),
+                cursor_row,
+                strip,
+                &minimap_colors,
+            ));
     }
 
     // Geometry and glyphs are published together under the single shared
@@ -555,48 +669,6 @@ pub fn build_diff_surface(
     cursor_geom.kind = kind;
 
     window.drawn = Some(cursor_key);
-}
-
-/// Where a byte range of the laid-out text actually sits on screen: one rect
-/// per visual row it crosses.
-///
-/// Parley's `Selection::geometry` is the off-the-shelf answer `docs/vi.md`
-/// names — it walks clusters, so it is right on a wrapped line and on a line
-/// whose glyphs are not uniform width, which cell arithmetic is not. It can
-/// report several boxes for one visual row (bidi); they are unioned per row so
-/// the coalescing rule downstream sees the one-rect-per-row shape it expects.
-fn selection_rects(
-    layout: &parley::Layout<peniko::Brush>,
-    bytes: std::ops::Range<usize>,
-) -> Vec<crate::shaders::SelectionRect> {
-    use parley::editing::{Cursor, Selection};
-    use parley::layout::Affinity;
-
-    let selection = Selection::new(
-        Cursor::from_byte_index(layout, bytes.start, Affinity::Downstream),
-        Cursor::from_byte_index(layout, bytes.end, Affinity::Upstream),
-    );
-    let mut out: Vec<(crate::shaders::SelectionRect, usize)> = Vec::new();
-    selection.geometry_with(layout, |rect, line| {
-        let next = crate::shaders::SelectionRect::from_edges(
-            rect.x0 as f32,
-            rect.y0 as f32,
-            rect.x1 as f32,
-            rect.y1 as f32,
-        );
-        match out.last_mut() {
-            Some((prev, prev_line)) if *prev_line == line => {
-                *prev = crate::shaders::SelectionRect::from_edges(
-                    prev.x.min(next.x),
-                    prev.y.min(next.y),
-                    prev.right().max(next.right()),
-                    prev.bottom().max(next.bottom()),
-                );
-            }
-            _ => out.push((next, line)),
-        }
-    });
-    out.into_iter().map(|(rect, _)| rect).collect()
 }
 
 /// RGBA8 for the geometry vertex format.

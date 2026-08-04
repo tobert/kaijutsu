@@ -2,12 +2,16 @@
 //!
 //! `docs/diff.md` Decision 5: a diff block reads in the conversation as a
 //! **diffstat header plus the first N lines**, collapsed by default; expanding
-//! it into a full vi-motion surface is `Screen::Diff` (slice 5). Everything
-//! here is the collapsed half, and it is deliberately pure: text in, a
-//! [`DiffPreview`] out, no Bevy, no Parley, no theme. `view::block_render`
-//! lays the preview's text out and `text::rich` maps its classes to theme
-//! colors — this module only decides *what the preview says and what each of
-//! its lines means*.
+//! it into a full vi-motion surface is `Screen::Diff` (slice 5).
+//!
+//! Two halves, and the line between them matters. The **projection** half
+//! (everything down to `cursor_byte`) is deliberately pure: text in, a
+//! [`DiffPreview`] out, no Bevy, no Parley, no theme — it only decides what
+//! the preview says and what each of its lines means. The **geometry** half
+//! below it turns a laid-out preview into quads, so it works in layout space
+//! and does touch Parley; it is here rather than in the renderer because both
+//! the inline preview and the full viewer draw the same shapes, and two
+//! copies of "what a diff looks like" would drift.
 //!
 //! Three contracts from the crate rustdoc (`kaijutsu-diff`) live here:
 //!
@@ -870,6 +874,253 @@ pub fn selection_rect_geometry(
     out
 }
 
+/// Where a byte range of laid-out text actually sits: one rect per visual row
+/// it crosses.
+///
+/// Parley's `Selection::geometry` is the off-the-shelf answer `docs/vi.md`
+/// names, and it is the *only* honest one — it walks clusters, so it is right
+/// on a wrapped line and on a run whose glyphs are not uniform width, which
+/// cell-width arithmetic is not. It can report several boxes for one visual
+/// row (bidi); they are unioned per row so every consumer downstream sees the
+/// one-rect-per-row shape it expects.
+///
+/// This is the single parley query behind both the character-wise selection
+/// and the word-level background washes — the "walk clusters in the cached
+/// layout" step `docs/diff.md` recorded as the cost of word backgrounds turns
+/// out to be a library call we already had.
+pub fn layout_rects(
+    layout: &parley::Layout<peniko::Brush>,
+    bytes: std::ops::Range<usize>,
+) -> Vec<crate::shaders::SelectionRect> {
+    use crate::shaders::SelectionRect;
+    use parley::editing::{Cursor, Selection};
+    use parley::layout::Affinity;
+
+    if bytes.end <= bytes.start {
+        return Vec::new();
+    }
+    let selection = Selection::new(
+        Cursor::from_byte_index(layout, bytes.start, Affinity::Downstream),
+        Cursor::from_byte_index(layout, bytes.end, Affinity::Upstream),
+    );
+    let mut out: Vec<(SelectionRect, usize)> = Vec::new();
+    selection.geometry_with(layout, |rect, line| {
+        let next =
+            SelectionRect::from_edges(rect.x0 as f32, rect.y0 as f32, rect.x1 as f32, rect.y1 as f32);
+        match out.last_mut() {
+            Some((prev, prev_line)) if *prev_line == line => {
+                *prev = SelectionRect::from_edges(
+                    prev.x.min(next.x),
+                    prev.y.min(next.y),
+                    prev.right().max(next.right()),
+                    prev.bottom().max(next.bottom()),
+                );
+            }
+            _ => out.push((next, line)),
+        }
+    });
+    out.into_iter().map(|(rect, _)| rect).collect()
+}
+
+/// Background washes behind the words the refinement marked changed.
+///
+/// `docs/diff.md` "Future / adjacent" wanted these and priced them at a
+/// cluster walk; [`layout_rects`] is that walk, already written by parley.
+/// They ride the **layout** tier beside the `+`/`-` bands — word spans change
+/// only when the content does — and draw over them, under the glyphs, so a
+/// changed word reads as a brighter patch inside its line's band.
+///
+/// Only the two changed classes wash. A span on any other class would be a
+/// claim the model never makes (`DiffLine::words` is empty on context lines),
+/// exactly as with the foreground emphasis.
+pub fn build_word_wash_geometry(
+    preview: &DiffPreview,
+    layout: &parley::Layout<peniko::Brush>,
+    offset: (f32, f32),
+    colors: &DiffWordColors,
+) -> Vec<GeometryVertex> {
+    let mut out = Vec::new();
+    for word in &preview.words {
+        let color = match word.class {
+            DiffLineClass::Insert => colors.insert,
+            DiffLineClass::Delete => colors.delete,
+            _ => continue,
+        };
+        // Deliberately NOT coalesced: coalescing squares a multi-row shape off
+        // to full width, which is right for a selection and wrong for a word —
+        // a word that wraps must stay two word-shaped rects.
+        let rects = layout_rects(layout, word.start..word.end);
+        out.extend(selection_rect_geometry(&rects, offset, color));
+    }
+    out
+}
+
+/// RGBA8 word-wash colors, resolved from the theme by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffWordColors {
+    /// Behind a changed word in an added line.
+    pub insert: [u8; 4],
+    /// Behind a changed word in a removed line.
+    pub delete: [u8; 4],
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The minimap strip
+// ════════════════════════════════════════════════════════════════════════════
+
+/// RGBA8 colors for the minimap strip, resolved from the theme by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinimapColors {
+    /// The rail behind everything — how long the document is.
+    pub rail: [u8; 4],
+    /// Insertion density, drawn right of centre.
+    pub insert: [u8; 4],
+    /// Deletion density, drawn left of centre.
+    pub delete: [u8; 4],
+    /// Hunk/file header ticks.
+    pub structure: [u8; 4],
+    /// The band showing what part of the document is on screen.
+    pub viewport: [u8; 4],
+    /// The line showing where the cursor is.
+    pub cursor: [u8; 4],
+}
+
+/// The smallest bar a non-zero count may draw, in logical px.
+///
+/// **Presence survives compression.** One deleted line inside a thousand-row
+/// diff is a fraction of a pixel wide; rounding it to nothing would erase
+/// exactly what a reader scans a minimap for. Proportion is lost below this
+/// width — deliberately, and only below it.
+const MIN_MINIMAP_BAR: f32 = 2.0;
+
+/// The document layer of the strip: rail, per-bucket density bars, hunk ticks.
+///
+/// `rect` is the strip's box in block-local logical px. Insertions grow right
+/// from the centre line and deletions grow left — a diverging bar chart, so
+/// "this region is mostly additions" is a *shape*, not a color the reader has
+/// to decode.
+///
+/// O(buckets), not O(rows), which is what lets it be cached against a coarse
+/// key and memcpy'd into the geometry buffer on every cheap pass.
+pub fn build_minimap_geometry(
+    buckets: &[kaijutsu_diff::MinimapBucket],
+    rect: crate::shaders::SelectionRect,
+    colors: &MinimapColors,
+) -> Vec<GeometryVertex> {
+    use crate::text::msdf::geometry::rect_quad;
+    if buckets.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(buckets.len() * 18 + 6);
+    out.extend_from_slice(&rect_quad(
+        rect.x as f64,
+        rect.y as f64,
+        rect.width as f64,
+        rect.height as f64,
+        colors.rail,
+    ));
+
+    let n = buckets.len() as f32;
+    let slot_h = (rect.height / n).max(1.0);
+    let half = rect.width * 0.5;
+    let centre = rect.x + half;
+    for (i, bucket) in buckets.iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        let top = rect.y + rect.height * i as f32 / n;
+        let rows = bucket.rows() as f32;
+        let bar = |count: u32| -> f32 {
+            if count == 0 {
+                0.0
+            } else {
+                (half * count as f32 / rows).clamp(MIN_MINIMAP_BAR.min(half), half)
+            }
+        };
+
+        let del = bar(bucket.deletes);
+        if del > 0.0 {
+            out.extend_from_slice(&rect_quad(
+                (centre - del) as f64,
+                top as f64,
+                del as f64,
+                slot_h as f64,
+                colors.delete,
+            ));
+        }
+        let ins = bar(bucket.inserts);
+        if ins > 0.0 {
+            out.extend_from_slice(&rect_quad(
+                centre as f64,
+                top as f64,
+                ins as f64,
+                slot_h as f64,
+                colors.insert,
+            ));
+        }
+        // Structure is a full-width tick at the slot's top edge: where the
+        // hunks are, readable even where the density bars are empty.
+        if bucket.structure > 0 {
+            out.extend_from_slice(&rect_quad(
+                rect.x as f64,
+                top as f64,
+                rect.width as f64,
+                slot_h.min(2.0) as f64,
+                colors.structure,
+            ));
+        }
+    }
+    out
+}
+
+/// The position layer: the band of document currently on screen, and the
+/// cursor's line within it.
+///
+/// Separate from [`build_minimap_geometry`] because it changes on every
+/// keystroke while the document layer changes only when the diff or its folds
+/// do — the same two-tier split as the surface's `LayoutKey`/`CursorKey`, one
+/// level finer.
+pub fn build_minimap_position_geometry(
+    rows: usize,
+    buckets: usize,
+    window: std::ops::Range<usize>,
+    cursor: usize,
+    rect: crate::shaders::SelectionRect,
+    colors: &MinimapColors,
+) -> Vec<GeometryVertex> {
+    use crate::text::msdf::geometry::rect_quad;
+    use kaijutsu_diff::minimap::bucket_of;
+    if rows == 0 || buckets == 0 || rect.width <= 0.0 || rect.height <= 0.0 {
+        return Vec::new();
+    }
+    let slot_h = rect.height / buckets as f32;
+    let y_of = |bucket: usize| rect.y + rect.height * bucket as f32 / buckets as f32;
+
+    let mut out = Vec::with_capacity(12);
+    // The viewport band. `window.end` is exclusive; the band has to cover the
+    // last visible row, so it is measured from `end - 1`.
+    if window.end > window.start {
+        let top = y_of(bucket_of(window.start, rows, buckets));
+        let bottom = y_of(bucket_of(window.end - 1, rows, buckets)) + slot_h;
+        out.extend_from_slice(&rect_quad(
+            rect.x as f64,
+            top as f64,
+            rect.width as f64,
+            (bottom - top).max(slot_h) as f64,
+            colors.viewport,
+        ));
+    }
+    let cursor_top = y_of(bucket_of(cursor, rows, buckets));
+    out.extend_from_slice(&rect_quad(
+        rect.x as f64,
+        cursor_top as f64,
+        rect.width as f64,
+        slot_h.max(2.0) as f64,
+        colors.cursor,
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,6 +1818,293 @@ mod tests {
             let _ = &p.plain_text[w.start..w.end];
         }
         assert_contiguous(&p);
+    }
+
+    // ── character-wise selection extents ────────────────────────────────────
+
+    fn span(
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> kaijutsu_diff::CharSpan {
+        kaijutsu_diff::CharSpan {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        }
+    }
+
+    /// The inclusive end really is inclusive: a one-character selection covers
+    /// one character, not zero.
+    #[test]
+    fn a_one_character_selection_covers_one_character() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let bytes = char_selection_bytes(&v, span(1, 0, 1, 0)).expect("a range");
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes.start, v.lines[1].start);
+    }
+
+    /// A selection running off the bottom of the laid-out window takes the
+    /// last row whole rather than disappearing.
+    #[test]
+    fn a_selection_past_the_window_clamps_to_its_last_row() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let last = v.lines.len() - 1;
+        let bytes = char_selection_bytes(&v, span(0, 0, 9_999, 9_999)).expect("a range");
+        assert_eq!(bytes.start, 0);
+        assert_eq!(
+            bytes.end,
+            v.lines[last].end,
+            "the last row must be taken whole",
+        );
+        // ...and it never runs past the text Parley was given.
+        assert!(bytes.end <= v.plain_text.len());
+    }
+
+    /// Degenerate spans produce no range at all — a caller must not turn one
+    /// into a zero-area rectangle.
+    #[test]
+    fn a_degenerate_character_span_has_no_range() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        assert!(char_selection_bytes(&v, span(9_999, 0, 9_999, 4)).is_none());
+        let empty = DiffPreview {
+            plain_text: String::new(),
+            lines: Vec::new(),
+            words: Vec::new(),
+            stat: DiffStat::default(),
+            is_error: false,
+        };
+        assert!(char_selection_bytes(&empty, span(0, 0, 0, 0)).is_none());
+    }
+
+    /// A multi-row span covers every byte between its ends, so the rects built
+    /// from it cannot skip a row.
+    #[test]
+    fn a_multi_row_span_is_contiguous() {
+        let c = core("canonical/single_file_modify.diff");
+        let v = whole(&c);
+        let bytes = char_selection_bytes(&v, span(1, 2, 3, 1)).expect("a range");
+        assert_eq!(bytes.start, v.lines[1].start + 2);
+        assert!(bytes.end > v.lines[3].start);
+        assert!(bytes.end <= v.lines[3].end);
+    }
+
+    // ── rects from a real layout ────────────────────────────────────────────
+
+    /// The shipped mono font, registered exactly as the asset loader does —
+    /// the rect math is *parley's*, so shaping for real is the point.
+    fn mono() -> crate::text::shaping::VelloFont {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/fonts/NotoMono-Regular.ttf"
+        ))
+        .expect("shipped test font must be present");
+        crate::text::shaping::load_into_font_context(bytes)
+    }
+
+    fn laid_out(text: &str, width: Option<f32>) -> parley::Layout<peniko::Brush> {
+        use crate::text::shaping::{VelloTextAlign, VelloTextStyle};
+        mono().layout(
+            text,
+            &VelloTextStyle {
+                font_size: 16.0,
+                ..Default::default()
+            },
+            VelloTextAlign::Left,
+            width,
+        )
+    }
+
+    /// One rect per visual row, and a range inside one row is one rect that
+    /// starts where the text does — not at the left margin.
+    #[test]
+    fn layout_rects_are_one_per_visual_row() {
+        let layout = laid_out("aaaa\nbbbb\ncccc", None);
+        let inside = layout_rects(&layout, 1..3);
+        assert_eq!(inside.len(), 1, "a range inside one row is one rect");
+        assert!(inside[0].x > 0.0, "it starts at the second character");
+        assert!(inside[0].is_visible());
+
+        let across = layout_rects(&layout, 1..12);
+        assert_eq!(across.len(), 3, "one rect per row it crosses");
+        // Rows descend the page in order.
+        assert!(across[0].y < across[1].y && across[1].y < across[2].y);
+    }
+
+    /// A range that wraps produces a rect per *visual* row, which is the whole
+    /// reason this goes through Parley instead of cell arithmetic.
+    #[test]
+    fn layout_rects_follow_a_wrap() {
+        // Narrow enough that one logical line must wrap.
+        let layout = laid_out("aaaa bbbb cccc dddd eeee ffff", Some(60.0));
+        assert!(layout.lines().count() > 1, "premise: it wrapped");
+        let rects = layout_rects(&layout, 0..29);
+        assert_eq!(rects.len(), layout.lines().count());
+    }
+
+    #[test]
+    fn an_empty_range_has_no_rects() {
+        let layout = laid_out("aaaa", None);
+        assert!(layout_rects(&layout, 2..2).is_empty());
+        assert!(layout_rects(&layout, 3..1).is_empty());
+    }
+
+    /// Word washes draw one quad per rect, for the changed classes only —
+    /// a context line has no word spans to wash and no claim to make.
+    #[test]
+    fn word_washes_draw_only_the_changed_classes() {
+        let colors = DiffWordColors {
+            insert: [1, 2, 3, 4],
+            delete: [5, 6, 7, 8],
+        };
+        let mut p = preview("canonical/single_file_modify.diff");
+        let layout = laid_out(&p.plain_text, None);
+
+        let with_words = build_word_wash_geometry(&p, &layout, (0.0, 0.0), &colors);
+        for v in &with_words {
+            assert!(
+                v.color == colors.insert || v.color == colors.delete,
+                "a wash used a color no class asks for: {:?}",
+                v.color,
+            );
+        }
+        assert_eq!(with_words.len() % 6, 0, "quads are six vertices");
+
+        // Strip the word spans and the washes go with them.
+        p.words.clear();
+        assert!(build_word_wash_geometry(&p, &layout, (0.0, 0.0), &colors).is_empty());
+    }
+
+    // ── minimap ─────────────────────────────────────────────────────────────
+
+    fn minimap_colors() -> MinimapColors {
+        MinimapColors {
+            rail: [1, 1, 1, 1],
+            insert: [2, 2, 2, 2],
+            delete: [3, 3, 3, 3],
+            structure: [4, 4, 4, 4],
+            viewport: [5, 5, 5, 5],
+            cursor: [6, 6, 6, 6],
+        }
+    }
+
+    fn strip() -> crate::shaders::SelectionRect {
+        crate::shaders::SelectionRect::new(900.0, 50.0, 12.0, 600.0)
+    }
+
+    /// **Presence survives compression**: a bucket holding one deletion among
+    /// a hundred context rows still draws a bar, even though its proportion
+    /// rounds to a fraction of a pixel.
+    #[test]
+    fn a_lone_change_still_draws_a_bar() {
+        let mut bucket = kaijutsu_diff::MinimapBucket {
+            context: 100,
+            ..Default::default()
+        };
+        let colors = minimap_colors();
+        let rail_only = build_minimap_geometry(&[bucket], strip(), &colors);
+
+        bucket.deletes = 1;
+        let with_change = build_minimap_geometry(&[bucket], strip(), &colors);
+        assert!(
+            with_change.len() > rail_only.len(),
+            "one deletion in a hundred rows drew nothing",
+        );
+        assert!(
+            with_change.iter().any(|v| v.color == colors.delete),
+            "the bar is not in the deletion color",
+        );
+    }
+
+    /// Deletions grow left of centre and insertions right — the diverging
+    /// shape is what makes "mostly additions here" readable without decoding
+    /// a color.
+    #[test]
+    fn insertions_and_deletions_diverge_from_the_centre() {
+        let colors = minimap_colors();
+        let rect = strip();
+        let centre = rect.x + rect.width * 0.5;
+        let quads = build_minimap_geometry(
+            &[kaijutsu_diff::MinimapBucket {
+                inserts: 1,
+                deletes: 1,
+                ..Default::default()
+            }],
+            rect,
+            &colors,
+        );
+        for v in quads.iter().filter(|v| v.color == colors.delete) {
+            assert!(v.x <= centre + 0.01, "a deletion drew right of centre");
+        }
+        for v in quads.iter().filter(|v| v.color == colors.insert) {
+            assert!(v.x >= centre - 0.01, "an insertion drew left of centre");
+        }
+    }
+
+    /// An empty slot draws nothing but the rail: a short diff should look
+    /// short, not smeared down the strip.
+    #[test]
+    fn empty_buckets_draw_only_the_rail() {
+        let colors = minimap_colors();
+        let quads =
+            build_minimap_geometry(&[kaijutsu_diff::MinimapBucket::default(); 40], strip(), &colors);
+        assert_eq!(quads.len(), 6, "the rail is one quad");
+        assert!(quads.iter().all(|v| v.color == colors.rail));
+    }
+
+    #[test]
+    fn a_degenerate_strip_draws_nothing() {
+        let colors = minimap_colors();
+        let flat = crate::shaders::SelectionRect::new(900.0, 50.0, 0.0, 600.0);
+        assert!(build_minimap_geometry(&[kaijutsu_diff::MinimapBucket::default()], flat, &colors).is_empty());
+        assert!(build_minimap_geometry(&[], strip(), &colors).is_empty());
+        assert!(build_minimap_position_geometry(0, 8, 0..1, 0, strip(), &colors).is_empty());
+        assert!(build_minimap_position_geometry(10, 0, 0..1, 0, strip(), &colors).is_empty());
+    }
+
+    /// The position layer tracks the reader: the viewport band moves down as
+    /// the window does, and the cursor line lands inside it.
+    #[test]
+    fn the_position_layer_follows_the_window_and_the_cursor() {
+        let colors = minimap_colors();
+        let rect = strip();
+        let y_of = |first: usize| {
+            let quads =
+                build_minimap_position_geometry(1000, 200, first..first + 40, first, rect, &colors);
+            let band: Vec<f32> = quads
+                .iter()
+                .filter(|v| v.color == colors.viewport)
+                .map(|v| v.y)
+                .collect();
+            let cursor: Vec<f32> = quads
+                .iter()
+                .filter(|v| v.color == colors.cursor)
+                .map(|v| v.y)
+                .collect();
+            assert!(!band.is_empty() && !cursor.is_empty());
+            (
+                band.iter().cloned().fold(f32::MAX, f32::min),
+                band.iter().cloned().fold(f32::MIN, f32::max),
+                cursor.iter().cloned().fold(f32::MAX, f32::min),
+            )
+        };
+        let (top_a, _, cur_a) = y_of(0);
+        let (top_b, bottom_b, cur_b) = y_of(500);
+        assert!(top_b > top_a, "the band must follow the window down");
+        assert!(cur_b > cur_a, "and so must the cursor line");
+        assert!(
+            cur_b >= top_b - 0.01 && cur_b <= bottom_b + 0.01,
+            "the cursor line must sit inside the band it is in",
+        );
+        assert!(
+            top_a >= rect.y && bottom_b <= rect.y + rect.height + 2.0,
+            "the strip must stay inside its own box",
+        );
     }
 
     // ── bands ───────────────────────────────────────────────────────────────

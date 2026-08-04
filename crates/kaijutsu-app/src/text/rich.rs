@@ -304,19 +304,57 @@ pub fn build_diff_span_brushes(
 /// Resolve the diff band colors from the theme, as RGBA8 for the geometry
 /// vertex format.
 pub fn diff_band_colors(theme: &crate::ui::theme::Theme) -> super::diff::DiffBandColors {
-    fn rgba8(color: Color) -> [u8; 4] {
-        let c = color.to_srgba();
-        [
-            (c.red.clamp(0.0, 1.0) * 255.0) as u8,
-            (c.green.clamp(0.0, 1.0) * 255.0) as u8,
-            (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
-            (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
-        ]
-    }
     super::diff::DiffBandColors {
         insert: rgba8(theme.diff_insert_bg),
         delete: rgba8(theme.diff_delete_bg),
         error: rgba8(theme.diff_error_bg),
+    }
+}
+
+/// RGBA8 for the geometry vertex format.
+fn rgba8(color: Color) -> [u8; 4] {
+    let c = color.to_srgba();
+    [
+        (c.red.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.green.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.blue.clamp(0.0, 1.0) * 255.0) as u8,
+        (c.alpha.clamp(0.0, 1.0) * 255.0) as u8,
+    ]
+}
+
+/// The background washes behind *changed words*, resolved from the theme.
+///
+/// The background half of what `diff_word_color` does for the foreground, and
+/// it draws on top of the line band — the two alphas add, which is why the
+/// theme's word washes are kept low.
+pub fn diff_word_colors(theme: &crate::ui::theme::Theme) -> super::diff::DiffWordColors {
+    super::diff::DiffWordColors {
+        insert: rgba8(theme.diff_insert_word_bg),
+        delete: rgba8(theme.diff_delete_word_bg),
+    }
+}
+
+/// The minimap's palette, resolved from the theme.
+///
+/// The density bars reuse the *line band* colors at full strength rather than
+/// inventing a second green and a second rose: the strip is a compression of
+/// the page, so it should be the same diff in miniature.
+pub fn diff_minimap_colors(theme: &crate::ui::theme::Theme) -> super::diff::MinimapColors {
+    super::diff::MinimapColors {
+        rail: rgba8(theme.diff_minimap_rail),
+        insert: rgba8(theme.diff_insert_fg),
+        delete: rgba8(theme.diff_delete_fg),
+        structure: rgba8(theme.diff_hunk_header),
+        viewport: rgba8(theme.diff_minimap_viewport),
+        // The same violet the block cursor draws in, so the strip's marker and
+        // the cursor on the page are visibly the same thing. `cursor_normal`
+        // is already linear RGBA for the shader, so it converts directly.
+        cursor: [
+            (theme.cursor_normal.x.clamp(0.0, 1.0) * 255.0) as u8,
+            (theme.cursor_normal.y.clamp(0.0, 1.0) * 255.0) as u8,
+            (theme.cursor_normal.z.clamp(0.0, 1.0) * 255.0) as u8,
+            (theme.cursor_normal.w.clamp(0.0, 1.0) * 255.0) as u8,
+        ],
     }
 }
 

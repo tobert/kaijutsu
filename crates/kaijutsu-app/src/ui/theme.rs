@@ -301,6 +301,18 @@ pub struct Theme {
     pub diff_insert_bg: Color,
     /// Background band behind a removed line. Alpha, by design.
     pub diff_delete_bg: Color,
+    /// Background wash behind the *changed words* of an added line — jj's
+    /// `color-words` and git's `--word-diff` both draw one, and it reads far
+    /// better than color alone on a busy line. Drawn ON TOP of
+    /// `diff_insert_bg`, so the two alphas add: keep this one low.
+    pub diff_insert_word_bg: Color,
+    /// The same, behind the changed words of a removed line.
+    pub diff_delete_word_bg: Color,
+    /// The minimap's rail — the document's own extent, behind the density
+    /// bars. Alpha, by design.
+    pub diff_minimap_rail: Color,
+    /// The minimap band marking what part of the document is on screen.
+    pub diff_minimap_viewport: Color,
     /// Banner text for a block declared `Diff` whose content does not parse.
     pub diff_error_fg: Color,
     /// Background band behind that banner. Alpha, by design.
@@ -615,6 +627,10 @@ impl Default for Theme {
             diff_meta: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
             diff_insert_bg: Color::srgba(0.275, 0.788, 0.541, 0.12),
             diff_delete_bg: Color::srgba(0.957, 0.404, 0.498, 0.12),
+            diff_insert_word_bg: Color::srgba(0.275, 0.788, 0.541, 0.20),
+            diff_delete_word_bg: Color::srgba(0.957, 0.404, 0.498, 0.20),
+            diff_minimap_rail: Color::srgba(0.435, 0.396, 0.573, 0.22),
+            diff_minimap_viewport: Color::srgba(0.725, 0.549, 0.961, 0.20),
             diff_error_fg: Color::srgb(1.000, 0.361, 0.541), // #ff5c8a red
             diff_error_bg: Color::srgba(1.000, 0.176, 0.431, 0.20),
 

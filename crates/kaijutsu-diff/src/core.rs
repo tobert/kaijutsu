@@ -87,6 +87,7 @@ use modalkit::keybindings::{BindingMachine, EdgeEvent, EdgePathPart, EdgeRepeat,
 use modalkit::prelude::Register;
 
 use crate::format::{format_file, truncation_marker};
+use crate::minimap::{MinimapBucket, MinimapClass, minimap_buckets};
 use crate::model::{DiffModel, FoldState, LineKind};
 
 /// What one line of the canonical text *is*.
@@ -508,6 +509,28 @@ impl DiffCore {
     /// window includes it in the cache key — see the field's own comment.
     pub fn fold_seq(&self) -> u64 {
         self.fold_seq
+    }
+
+    /// The whole diff compressed into `buckets` slots — the minimap.
+    ///
+    /// Built from [`visible_rows`](Self::visible_rows), **not** from the
+    /// model. The seam guidance put minimap extents on `DiffModel`, and this
+    /// is the one place the build deviates from it, for a reason: a minimap
+    /// that disagreed with what is on screen would be worse than none, and
+    /// what is on screen is the fold projection. Folds are therefore reflected
+    /// for free — a folded hunk contributes its one header row to the strip
+    /// exactly as it contributes one row to the page.
+    ///
+    /// O(drawn rows), so a caller caches it against something coarse
+    /// (content + [`fold_seq`](Self::fold_seq) + bucket count) rather than
+    /// rebuilding it per keystroke.
+    pub fn minimap(&self, buckets: usize) -> Vec<MinimapBucket> {
+        minimap_buckets(
+            self.visible
+                .iter()
+                .map(|&i| minimap_class(self.rows[i].kind)),
+            buckets,
+        )
     }
 
     /// Where `row` sits in [`visible_rows`](Self::visible_rows), if it is
@@ -1015,6 +1038,24 @@ pub fn visible_row_indices(model: &DiffModel, rows: &[DiffRow]) -> Vec<usize> {
         .filter(|(_, row)| row.kind == RowKind::HunkHeader || !folded(row))
         .map(|(i, _)| i)
         .collect()
+}
+
+/// What a row contributes to the minimap.
+///
+/// Exhaustive on purpose: a new [`RowKind`] must be a compile error here
+/// rather than silently painting itself as document structure.
+fn minimap_class(kind: RowKind) -> MinimapClass {
+    match kind {
+        RowKind::Body(LineKind::Insert) => MinimapClass::Insert,
+        RowKind::Body(LineKind::Delete) => MinimapClass::Delete,
+        RowKind::Body(LineKind::Context) => MinimapClass::Context,
+        // A `\ No newline` marker is an annotation of the line above, not a
+        // line of its own — it belongs with the structure, not with content
+        // the reader is scanning for changes.
+        RowKind::Marker | RowKind::FileHeader | RowKind::HunkHeader | RowKind::NoNewline => {
+            MinimapClass::Structure
+        }
+    }
 }
 
 /// Is this editor action safe on a read-only surface?
@@ -2313,6 +2354,57 @@ mod tests {
                 .all(|h| h.fold == FoldState::Expanded),
             "a fold on a header row must not fold some other hunk"
         );
+    }
+
+    // ── minimap ─────────────────────────────────────────────────────────────
+
+    /// The strip describes the *drawn* document, so folding a hunk must
+    /// shorten it — and the rows it hides must leave the strip with it.
+    #[test]
+    fn the_minimap_follows_the_folds() {
+        let mut c = core();
+        let open = c.minimap(16);
+        let changed: u32 = open.iter().map(|b| b.inserts + b.deletes).sum();
+        assert!(changed > 0, "premise: the fixture has changes");
+        assert_eq!(
+            open.iter().map(MinimapBucket::rows).sum::<u32>(),
+            c.visible_rows().len() as u32,
+        );
+
+        c.apply_notation("]czc");
+        let folded = c.minimap(16);
+        assert_eq!(
+            folded.iter().map(MinimapBucket::rows).sum::<u32>(),
+            c.visible_rows().len() as u32,
+            "the strip must describe what is drawn, not what exists",
+        );
+        assert!(
+            folded.iter().map(MinimapBucket::rows).sum::<u32>()
+                < open.iter().map(MinimapBucket::rows).sum::<u32>(),
+            "folding hid rows the strip still shows",
+        );
+    }
+
+    /// Headers are structure, body lines are content — the classification the
+    /// strip's ticks and bars rest on.
+    #[test]
+    fn the_minimap_classes_headers_as_structure() {
+        let c = core();
+        let one = c.minimap(c.visible_rows().len());
+        let structure: u32 = one.iter().map(|b| b.structure).sum();
+        let headers = c
+            .rows()
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::FileHeader | RowKind::HunkHeader))
+            .count() as u32;
+        assert_eq!(structure, headers);
+    }
+
+    #[test]
+    fn an_empty_viewer_has_an_empty_minimap() {
+        let c = DiffCore::new(DiffModel::default());
+        assert!(c.minimap(8).iter().all(MinimapBucket::is_empty));
+        assert!(c.minimap(0).is_empty());
     }
 
     // ── close / refresh ─────────────────────────────────────────────────────

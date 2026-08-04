@@ -125,6 +125,7 @@ pub mod core;
 pub mod error;
 pub mod fixtures;
 pub mod limits;
+pub mod minimap;
 pub mod model;
 pub mod paths;
 pub mod profile;
@@ -143,6 +144,7 @@ pub use core::{
 };
 pub use engine::{DiffAlgorithm, DiffOptions, FileSpec, diff, diff_file};
 pub use error::DiffError;
+pub use minimap::{MinimapBucket, MinimapClass, minimap_buckets};
 pub use format::{TRUNCATION_MARKER_PREFIX, format, format_file, format_hunk, truncation_marker};
 pub use model::{
     DiffLine, DiffModel, FileChange, FileDiff, FoldState, Hunk, LineKind, Truncation, WordSpan,
