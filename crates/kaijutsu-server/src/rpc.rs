@@ -110,7 +110,7 @@ use kaijutsu_kernel::{
     ActivityCursor,
     block_store::BlockStore,
     flows::EditorFlow,
-    flows::TurnFlow,
+    flows::{TurnFlow, TurnOrigin, TurnStopReason},
     shared_block_flow_bus,
     shared_input_doc_flow_bus,
 };
@@ -474,8 +474,11 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     model,
                 } = msg.payload
                 else {
-                    // The driver only subscribes to turn.requested; completion
-                    // and failure events are observed elsewhere (e.g. kj wait).
+                    // The driver only subscribes to turn.requested. Completion
+                    // and failure are observed on their own topics — in-process
+                    // by the beat scheduler, and over the wire by
+                    // `subscribeTurnEvents` subscribers (a future `kj wait`
+                    // joins there, not here).
                     continue;
                 };
                 // Headless turn: no interactive session, so synthesize the
@@ -495,13 +498,15 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     &after_block_id,
                     tool_ctx,
                     principal_id,
-                    // Announce: this is the autonomous turn-driver path (the
-                    // musician's OODA loop). `process_llm_stream` now publishes
-                    // Completed/Failed at ACTUAL stream end with the real output
-                    // block id (design §7). The old publish-at-spawn here is gone —
-                    // it fired before the model wrote anything and raced the stream,
-                    // so the beat scheduler read the seed prompt instead of the Act.
-                    true,
+                    // The autonomous turn-driver path (the musician's OODA loop).
+                    // `process_llm_stream` publishes the terminal `TurnFlow` at
+                    // ACTUAL stream end with the real output block id (design §7);
+                    // the old publish-at-spawn here is gone — it fired before the
+                    // model wrote anything and raced the stream, so the beat
+                    // scheduler read the seed prompt instead of the Act. The
+                    // origin rides onto that event so the scheduler can tell an
+                    // autonomous turn (which feeds the Act) from a human one.
+                    TurnOrigin::Autonomous,
                 )
                 .await
                 {
@@ -545,6 +550,7 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                             context_id,
                             principal_id,
                             error: err,
+                            origin: TurnOrigin::Autonomous,
                         });
                     }
                 }
@@ -2054,6 +2060,141 @@ impl KernelImpl {
     }
 }
 
+/// Fill a `ContextHandleInfo` builder directly from a durable `ContextRow` —
+/// the DB-driven counterpart to `list_contexts`' per-row wire-writing above,
+/// which instead starts from a live `ContextHandle` (registry) and only
+/// *supplements* with `ContextRow` fields. Used by `resolve_context_label`,
+/// where there is no registry entry to start from (that's the whole point —
+/// see the capnp doc comment on `resolveContextLabel`). Deliberately leaves
+/// registry/runtime-only fields (`traceId`, `liveStatus`, `trackId`,
+/// synthesis keywords/preview, usage/background-process summaries) at their
+/// wire defaults: honest absence, not fabricated from data this path never
+/// had.
+fn write_context_row_to_handle_info(
+    mut info: context_handle_info::Builder<'_>,
+    row: &ContextRow,
+) {
+    info.set_id(row.context_id.as_bytes());
+    info.set_label(row.label.as_deref().unwrap_or(""));
+    info.set_parent_id(
+        row.forked_from
+            .map(|p| *p.as_bytes())
+            .unwrap_or([0u8; 16])
+            .as_slice(),
+    );
+    info.set_provider(row.provider.as_deref().unwrap_or(""));
+    info.set_model(row.model.as_deref().unwrap_or(""));
+    info.set_created_at(row.created_at as u64);
+    info.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
+    info.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_context_state(row.context_state.as_str());
+    info.set_context_type(&row.context_type);
+    info.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_last_activity_at(row.last_activity_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_promoted_at(row.promoted_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_demoted_at(row.demoted_at.map(|ts| ts as u64).unwrap_or(0));
+    info.set_paused_at(row.paused_at.map(|ts| ts as u64).unwrap_or(0));
+}
+
+/// Verify a context can be joined, healing the DriftRouter registration from
+/// the durable KernelDb row if the in-memory registry has lost it. Returns
+/// the context's trace id (zeroed if truly unknown) on success.
+///
+/// The registry is populated by `createContext`/`registerFork`, AND
+/// `create_shared_kernel`'s boot-time recovery step already re-registers
+/// every context `KernelDb::list_active_contexts` returns (`WHERE
+/// archived_at IS NULL`) on every kernel start — so a live or concluded
+/// context surviving a restart is normally already registered by the time
+/// anyone calls `joinContext` (verified directly:
+/// `list_contexts_recovers_live_context_after_restart`,
+/// `crates/kaijutsu-server/tests/context_label_resolve.rs`). The gap
+/// recovery does NOT cover is an ARCHIVED context: excluded from
+/// `list_active_contexts`, its registry entry does not survive a restart,
+/// even though its KernelDb row and BlockStore document both do. Before this
+/// fix, joining it after a restart was a hard failure here ("use
+/// createContext first") despite the context plainly existing — this is the
+/// narrow, real remainder of the divergence docs/issues.md originally
+/// described more broadly ("MCP-created context invisible to `kj context
+/// list` after kernel restart" — the live/concluded case in that report does
+/// not reproduce against current code; see the docs update alongside this
+/// change). Healing here — the one place every attach/reconnect funnels
+/// through (the `joinContext` RPC handler, and via that RPC,
+/// `register_session`'s attach path) — fixes it generally: the join succeeds
+/// AND the now-re-registered context reappears in `listContexts` for
+/// everyone else.
+///
+/// Pulled out of the `joinContext` RPC handler so it's exercisable directly
+/// against a `SharedKernelState` in tests, without a capnp/SSH round trip —
+/// see `join_context_heals_registry_for_an_archived_context_after_restart`,
+/// same test file.
+async fn ensure_context_joinable(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+) -> Result<[u8; 16], capnp::Error> {
+    // Context must already exist — no auto-creation.
+    if !kernel.documents.contains(context_id) {
+        return Err(capnp::Error::failed(format!(
+            "context {} does not exist — use createContext first",
+            context_id
+        )));
+    }
+
+    log::debug!("Re-joining existing context {}", context_id);
+
+    // Ensure input doc exists (idempotent)
+    if let Err(e) = kernel.documents.create_input_doc(context_id) {
+        log::warn!(
+            "Failed to create input doc for context {}: {}",
+            context_id,
+            e
+        );
+    }
+
+    let needs_heal = { kernel.kernel.drift().read().get(context_id).is_none() };
+    if needs_heal {
+        let row = {
+            let db = kernel.kernel_db.lock();
+            db.get_context(context_id).map_err(|e| {
+                capnp::Error::failed(format!(
+                    "join_context: KernelDb lookup for {context_id} failed: {e}"
+                ))
+            })?
+        };
+        let row = row.ok_or_else(|| {
+            capnp::Error::failed(format!(
+                "context {context_id} not registered in drift router and has \
+                 no KernelDb row — use createContext first",
+            ))
+        })?;
+        log::warn!(
+            "join_context: {} missing from the in-memory registry (likely a \
+             kernel restart) — healing from its KernelDb row: label={:?} \
+             created_at={} last_activity_at={:?}",
+            context_id,
+            row.label,
+            row.created_at,
+            row.last_activity_at,
+        );
+        let mut drift = kernel.kernel.drift().write();
+        drift
+            .register(context_id, row.label.as_deref(), row.forked_from, row.created_by)
+            .map_err(|e| {
+                capnp::Error::failed(format!(
+                    "join_context: failed to heal registry for {context_id}: {e}"
+                ))
+            })?;
+        if let (Some(p), Some(m)) = (&row.provider, &row.model) {
+            let _ = drift.configure_llm(context_id, p, m);
+        }
+    }
+
+    let trace_id = {
+        let drift = kernel.kernel.drift().read();
+        drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16])
+    };
+    Ok(trace_id)
+}
+
 /// The shared context-creation recipe, called by both the `createContext` RPC
 /// and the cold-start genesis bootstrap (`create_shared_kernel`).
 ///
@@ -3351,6 +3492,147 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
+    /// Push channel: bridges the kernel's `TurnFlow` outcome bus onto the
+    /// client's `TurnEvents` callback — the wire half of turn completion.
+    ///
+    /// Same shape as `subscribe_editor` (FlowBus subscribe → spawn_local bridge
+    /// → per-callback timeout → health reaping → dies with the connection), and
+    /// kernel-wide for the same reason: the event names its own context, so one
+    /// subscription serves a client watching many.
+    ///
+    /// It subscribes to `turn.completed`/`turn.failed` and NOT `turn.*` on
+    /// purpose. `turn.requested` is a request *to* this server's turn driver;
+    /// forwarding it would tell a client about work it cannot do and cannot
+    /// observe the result of any other way.
+    fn subscribe_turn_events(
+        self: Rc<Self>,
+        params: kernel::SubscribeTurnEventsParams,
+        _results: kernel::SubscribeTurnEventsResults,
+    ) -> Promise<(), capnp::Error> {
+        // Turn/LLM-adjacent spans are 100%-sampled (docs/telemetry.md), unlike
+        // the 10% default for `rpc`: a turn is rare, expensive, and the thing we
+        // most need a complete trace of.
+        let _span = tracing::info_span!("rpc", method = "subscribe_turn_events").entered();
+        let callback = pry!(pry!(params.get()).get_callback());
+        {
+            let turn_flows = self.kernel.kernel.turn_flows().clone();
+            let kernel_id = self.kernel.id;
+            let conn_cancel = self.connection.borrow().cancel_token();
+
+            tokio::task::spawn_local(async move {
+                let mut completed = turn_flows.subscribe("turn.completed");
+                let mut failed = turn_flows.subscribe("turn.failed");
+                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
+                const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+                log::debug!("Started turn-events subscription for kernel {}", kernel_id);
+
+                loop {
+                    let success = tokio::select! {
+                        _ = conn_cancel.cancelled() => {
+                            log::debug!("turn-events bridge cancelled with connection");
+                            break;
+                        }
+                        Some(msg) = completed.recv() => {
+                            match msg.payload {
+                                TurnFlow::Completed {
+                                    context_id,
+                                    principal_id,
+                                    output_block_id,
+                                    reason,
+                                    origin,
+                                } => {
+                                    let span = tracing::info_span!(
+                                        "turn.events_push",
+                                        turn.stop_reason = reason.as_str(),
+                                        turn.origin = origin.as_str(),
+                                    );
+                                    let _enter = span.enter();
+                                    let mut req = callback.on_turn_completed_request();
+                                    {
+                                        let mut p = req.get();
+                                        p.set_context_id(context_id.as_bytes());
+                                        p.set_principal_id(principal_id.as_bytes());
+                                        p.set_stop_reason(stop_reason_to_capnp(reason));
+                                        p.set_origin(turn_origin_to_capnp(origin));
+                                        // `hasOutputBlock` is the honest signal
+                                        // for "the turn wrote no text" — the id
+                                        // slot stays zeroed and the client is
+                                        // told not to read it, rather than
+                                        // shipping a plausible-looking nil id.
+                                        p.set_has_output_block(output_block_id.is_some());
+                                        if let Some(id) = output_block_id {
+                                            let mut b = p.init_output_block_id();
+                                            set_block_id_builder(&mut b, &id);
+                                        }
+                                    }
+                                    drop(_enter);
+                                    await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
+                                }
+                                // A wildcard-free bus subscription still delivers
+                                // only its own topic; anything else here is a bug
+                                // in the bus, not something to paper over.
+                                other => {
+                                    log::error!(
+                                        "turn.completed subscription delivered {}: bus routing bug",
+                                        other.subject()
+                                    );
+                                    true
+                                }
+                            }
+                        }
+                        Some(msg) = failed.recv() => {
+                            match msg.payload {
+                                TurnFlow::Failed {
+                                    context_id,
+                                    principal_id,
+                                    ref error,
+                                    origin,
+                                } => {
+                                    let span = tracing::info_span!(
+                                        "turn.events_push",
+                                        turn.stop_reason = "failed",
+                                        turn.origin = origin.as_str(),
+                                    );
+                                    let _enter = span.enter();
+                                    let mut req = callback.on_turn_failed_request();
+                                    {
+                                        let mut p = req.get();
+                                        p.set_context_id(context_id.as_bytes());
+                                        p.set_principal_id(principal_id.as_bytes());
+                                        p.set_error(error.as_str());
+                                        p.set_origin(turn_origin_to_capnp(origin));
+                                    }
+                                    drop(_enter);
+                                    await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
+                                }
+                                ref other => {
+                                    log::error!(
+                                        "turn.failed subscription delivered {}: bus routing bug",
+                                        other.subject()
+                                    );
+                                    true
+                                }
+                            }
+                        }
+                        else => break,
+                    };
+
+                    if !health.record(success) {
+                        log::warn!(
+                            "turn-events bridge for kernel {} stopping: callback \
+                             failures continuous for over {:?} — reaping subscriber",
+                            kernel_id,
+                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
+                        );
+                        break;
+                    }
+                }
+                log::debug!("turn-events bridge task for kernel {} ended", kernel_id);
+            });
+        }
+        Promise::ok(())
+    }
+
     /// Push channel: server-ticked timer streams `VfsActivityEvents` digests
     /// to the subscriber (Lane K, FSN slice-1, `docs/scenes/vfs.md`). Unlike
     /// `subscribe_editor`/`subscribe_blocks` this is NOT a FlowBus bridge —
@@ -3562,9 +3844,12 @@ impl kernel::Server for KernelImpl {
                     model
                 );
 
-                // Spawn LLM streaming in background. Interactive human prompt:
-                // announce_completion=false so the musician's OODA Act never
-                // crystallizes a human-prompted turn (design §7).
+                // Spawn LLM streaming in background. An interactive human
+                // prompt: it announces like every other turn, and the
+                // `Interactive` origin is what keeps the musician's OODA Act
+                // from crystallizing it (design §7) — the filter lives on the
+                // consumer now, so a `subscribeTurnEvents` client still hears
+                // this turn finish.
                 spawn_llm_for_prompt(
                     &kernel,
                     context_id,
@@ -3572,7 +3857,7 @@ impl kernel::Server for KernelImpl {
                     &user_block_id,
                     tool_ctx,
                     user_principal_id,
-                    false,
+                    TurnOrigin::Interactive,
                 )
                 .await?;
 
@@ -3816,6 +4101,47 @@ impl kernel::Server for KernelImpl {
         )
     }
 
+    /// Resolve a label straight against `KernelDb` — deliberately bypassing
+    /// the DriftRouter that `listContexts` reads. See the capnp doc comment
+    /// on `resolveContextLabel` for the full rationale (an indexed lookup
+    /// vs. a registry scan, and the one real registry gap — archived
+    /// contexts — this also happens to sidestep). `registerSession`'s
+    /// upsert/attach decision (docs/issues.md, "register_session hard-fails
+    /// on label conflict") needs this durable truth before it decides
+    /// whether to attach, suffix, or create.
+    fn resolve_context_label(
+        self: Rc<Self>,
+        params: kernel::ResolveContextLabelParams,
+        mut results: kernel::ResolveContextLabelResults,
+    ) -> Promise<(), capnp::Error> {
+        let label = pry!(pry!(pry!(params.get()).get_label()).to_str()).to_owned();
+        let span = extract_rpc_trace(pry!(params.get()).get_trace(), "resolve_context_label");
+        let kernel_db_arc = self.kernel.kernel_db.clone();
+        Promise::from_future(
+            async move {
+                let row = {
+                    let db = kernel_db_arc.lock();
+                    db.find_context_by_label(&label).map_err(|e| {
+                        capnp::Error::failed(format!(
+                            "resolve_context_label: KernelDb lookup for '{label}' failed: {e}"
+                        ))
+                    })?
+                };
+                let mut res = results.get();
+                match row {
+                    Some(row) => {
+                        res.set_found(true);
+                        let info = res.init_info();
+                        write_context_row_to_handle_info(info, &row);
+                    }
+                    None => res.set_found(false),
+                }
+                Ok(())
+            }
+            .instrument(span),
+        )
+    }
+
     /// Create a new context with the given label.
     ///
     /// Generates a fresh ContextId (UUIDv7), creates the document in the
@@ -3906,41 +4232,9 @@ impl kernel::Server for KernelImpl {
         let span = extract_rpc_trace(params.get_trace(), "join_context");
         Promise::from_future(
             async move {
-                // Context must already exist — no auto-creation
-                if !kernel.documents.contains(context_id) {
-                    return Err(capnp::Error::failed(format!(
-                        "context {} does not exist — use createContext first",
-                        context_id
-                    )));
-                }
-
-                log::debug!("Re-joining existing context {}", context_id);
-
-                // Ensure input doc exists (idempotent)
-                if let Err(e) = kernel.documents.create_input_doc(context_id) {
-                    log::warn!(
-                        "Failed to create input doc for context {}: {}",
-                        context_id,
-                        e
-                    );
-                }
-
-                // Verify context is registered in drift router
-                {
-                    let drift = kernel.kernel.drift().read();
-                    if drift.get(context_id).is_none() {
-                        return Err(capnp::Error::failed(format!(
-                            "context {} not registered in drift router — use createContext first",
-                            context_id
-                        )));
-                    }
-                    let trace_id = drift
-                        .get(context_id)
-                        .map(|h| h.trace_id)
-                        .unwrap_or([0u8; 16]);
-                    let _ctx_span =
-                        kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
-                }
+                let trace_id = ensure_context_joinable(&kernel, context_id).await?;
+                let _ctx_span =
+                    kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
 
                 // Update connection's active context in the global map
                 let session_id = connection.borrow().session_id;
@@ -5666,9 +5960,12 @@ impl kernel::Server for KernelImpl {
                             capnp::Error::failed(format!("failed to insert user block: {}", e))
                         })?;
 
-                    // Spawn LLM streaming in background. Interactive chat prompt
-                    // via submit_input: announce_completion=false (design §7) —
-                    // a human-prompted turn never feeds the musician's OODA Act.
+                    // Spawn LLM streaming in background. An interactive chat
+                    // prompt via submit_input: it announces like every other
+                    // turn; the `Interactive` origin keeps it out of the
+                    // musician's OODA Act (design §7) while still reaching every
+                    // `subscribeTurnEvents` client — this is the turn an ACP
+                    // frontend is waiting on.
                     spawn_llm_for_prompt(
                         &kernel,
                         context_id,
@@ -5676,7 +5973,7 @@ impl kernel::Server for KernelImpl {
                         &user_block_id,
                         tool_ctx,
                         user_principal_id,
-                        false,
+                        TurnOrigin::Interactive,
                     )
                     .await?;
 
@@ -8412,6 +8709,30 @@ fn set_block_id_builder(
     builder.set_seq(block_id.seq);
 }
 
+/// Kernel [`TurnStopReason`] → its wire enumerant.
+///
+/// Total by construction — an exhaustive match, so adding a kernel-side ending
+/// without giving it a wire name is a compile error rather than a stop reason
+/// that silently arrives at every client as `endTurn`.
+fn stop_reason_to_capnp(reason: TurnStopReason) -> crate::kaijutsu_capnp::TurnStopReason {
+    use crate::kaijutsu_capnp::TurnStopReason as W;
+    match reason {
+        TurnStopReason::EndTurn => W::EndTurn,
+        TurnStopReason::Cancelled { immediate: false } => W::CancelledSoft,
+        TurnStopReason::Cancelled { immediate: true } => W::CancelledImmediate,
+        TurnStopReason::MaxTokens => W::MaxTokens,
+        TurnStopReason::MaxIterations => W::MaxIterations,
+    }
+}
+
+/// Kernel [`TurnOrigin`] → its wire enumerant.
+fn turn_origin_to_capnp(origin: TurnOrigin) -> crate::kaijutsu_capnp::TurnOrigin {
+    match origin {
+        TurnOrigin::Interactive => crate::kaijutsu_capnp::TurnOrigin::Interactive,
+        TurnOrigin::Autonomous => crate::kaijutsu_capnp::TurnOrigin::Autonomous,
+    }
+}
+
 /// Set BlockSnapshot fields on a Cap'n Proto builder.
 fn set_block_snapshot(
     builder: &mut crate::kaijutsu_capnp::block_snapshot::Builder,
@@ -10453,4 +10774,74 @@ mod subscription_registry_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod turn_event_wire_mapping_tests {
+    //! The kernel→wire half of the turn-outcome encoding.
+    //!
+    //! The client crate pins the wire→client half (`turn_events_tests` in
+    //! `kaijutsu-client`), so between them the whole chain — kernel
+    //! `TurnStopReason` → capnp enumerant → client `TurnCompletedStopReason` —
+    //! is pinned without needing a live turn to hit every ending. That matters
+    //! because the endings hardest to reach in an e2e test (a cancel winning a
+    //! race against a mock provider, a real token-ceiling truncation) are the
+    //! ones a collapsed mapping would hide.
+
+    use super::*;
+
+    /// Each kernel reason gets its own enumerant. A collapsed mapping would
+    /// report a cancelled turn to every client as a clean end of turn.
+    #[test]
+    fn every_stop_reason_has_its_own_enumerant() {
+        use crate::kaijutsu_capnp::TurnStopReason as W;
+        let pairs = [
+            (TurnStopReason::EndTurn, W::EndTurn),
+            (TurnStopReason::Cancelled { immediate: false }, W::CancelledSoft),
+            (
+                TurnStopReason::Cancelled { immediate: true },
+                W::CancelledImmediate,
+            ),
+            (TurnStopReason::MaxTokens, W::MaxTokens),
+            (TurnStopReason::MaxIterations, W::MaxIterations),
+        ];
+        for (kernel_reason, wire) in pairs {
+            assert_eq!(
+                stop_reason_to_capnp(kernel_reason),
+                wire,
+                "{kernel_reason:?} must encode as {wire:?}"
+            );
+        }
+
+        // Distinctness, stated directly: five reasons, five enumerants.
+        let encoded: Vec<_> = pairs.iter().map(|(r, _)| stop_reason_to_capnp(*r)).collect();
+        for (i, a) in encoded.iter().enumerate() {
+            for b in encoded.iter().skip(i + 1) {
+                assert_ne!(a, b, "two stop reasons collapsed onto one enumerant");
+            }
+        }
+    }
+
+    /// The soft/hard cancel split survives encoding — the flag that tells the
+    /// beat scheduler (and an ACP frontend) whether the output is a whole
+    /// phrase or a fragment.
+    #[test]
+    fn soft_and_hard_cancels_stay_distinct_on_the_wire() {
+        assert_ne!(
+            stop_reason_to_capnp(TurnStopReason::Cancelled { immediate: false }),
+            stop_reason_to_capnp(TurnStopReason::Cancelled { immediate: true }),
+        );
+    }
+
+    #[test]
+    fn origin_maps_both_ways() {
+        assert_eq!(
+            turn_origin_to_capnp(TurnOrigin::Interactive),
+            crate::kaijutsu_capnp::TurnOrigin::Interactive
+        );
+        assert_eq!(
+            turn_origin_to_capnp(TurnOrigin::Autonomous),
+            crate::kaijutsu_capnp::TurnOrigin::Autonomous
+        );
+    }
 }

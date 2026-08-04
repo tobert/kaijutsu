@@ -679,21 +679,20 @@ than left to rot.
 
 **Tier 2 — velocity**
 
-- **Delegation has no join.** `kj fork --prompt` → `request_child_turn`
-  (`kj/fork.rs:1369`) publishes `TurnFlow::Requested` and returns; nothing waits
-  or notifies, and there is no `kj wait`. The parent must poll or manually
-  `kj drift pull`. Compare Claude Code's `Task`, which blocks or wakes the
-  caller. *(Relates to "Headless one-shot with JSONL streaming" below.)*
+- **Delegation has no join — the SIGNAL shipped, the command didn't.** The
+  child's turn now publishes `TurnFlow::Completed`/`Failed` naming its context,
+  in-process and over capnp (`subscribeTurnEvents`), so a waiter no longer has
+  to poll the child's block log. What's missing is `kj wait` itself: it needs a
+  timeout policy, an answer for the turn that ends before the waiter subscribes
+  (the bus is lossy and un-journaled — see the TurnFlow durability item), and a
+  decision about waiting on several children at once. Compare Claude Code's
+  `Task`, which blocks or wakes the caller. Seam documented at
+  `request_child_turn` (`kj/fork.rs`). *(Relates to "Headless one-shot with
+  JSONL streaming" below.)*
 - **No task/plan state.** No `BlockKind` variant, no tool. A model can only
   `block_create` freeform text and re-read it. Compare TodoWrite.
 - **No LSP / diagnostics** — no go-to-definition, no type errors without paying
   for a full compile.
-- **`register_session` hard-fails on label conflict** instead of reusing the
-  existing context: `KernelDb insert_context failed for <id>: label conflict:
-  label '<uuid>' already in use`. It stamps the caller's agent-session id as the
-  context label, so a reconnect after a dropped session is fatal until the label
-  is freed. Hit live 2026-07-29. Related to the known
-  "startup agent detection can report a previous session's id" gotcha.
 
 ## rmcp 1.7 → 3.0.1 bump left SEP-2577 deprecations papered over (2026-07-30)
 
@@ -2043,7 +2042,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **POSIX context quartet:** Implement `kj wait` and `kj stop` to complete the fork/drive/wait/merge paradigm.
 - **`kj drive` follow-up:** Add verb-level refusal for driving Staging contexts.
 - **Autonomous turn runaway guard:** Add a `drive_depth` cap to prevent unbounded fan-out from `--prompt` forks.
-- **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up.
+- **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up — and now matters more, since `turn.completed`/`turn.failed` reach wire clients over `subscribeTurnEvents`: a client that subscribes late, or reconnects mid-turn, misses the outcome entirely and must fall back to reading the block log. Deliberately un-journaled (blocks are the durable record; replaying completions after a restart would announce turns nobody is waiting on), so the fix is a *catch-up* story, not a journal.
 - **Headless turn cwd is `/`:** Decide whether to thread the context's stored shell cwd into the headless `ExecContext`.
 - **`--switch --prompt` double-drives:** Clarify semantics when both human and autonomous turn try to drive a child.
 - **Context-type ↔ fork asymmetry (discovery 2026-06-17, fork code is fresh —
@@ -3311,6 +3310,9 @@ deleted — folded into the hook-lockout entry below, which is the real issue.)*
   consume-until-done path. CI/eval harnesses need a blocking subprocess. Add
   `kj run --prompt … --output-format jsonl` that streams turn events
   (turn.requested/tool_call/tool_result/turn.completed) and exits with a machine code.
+  The completion half is now available to a client: `subscribeTurnEvents` pushes
+  a structured stop reason (end_turn / cancelled / max_tokens / max_iterations),
+  which is exactly the machine exit code this wants.
   *(relates to the existing "headless turn cwd is `/`" item.)*
 - **Python/TS thin SDK.** `kaijutsu-client` is full-featured but requires Rust
   compilation; eval/CI tooling lives in Python/TS. Wrap `kj run --json` JSONL (or the
@@ -3595,18 +3597,35 @@ kernel process env into exec-granted shells.
   unknown-command investigation.)
 - **Later slices** (bin-mount catalog, VFS-mediated resolution, dropping the
   host-root mount): `docs/mounts.md`, coordinated with the kaish mounts release.
-- **MCP-created context invisible to `kj context list` after kernel restart
-  (found 2026-07-03 during the exec live-verify).** A `register_session` context
-  (`investigate-d1d3257e`) kept working across a kernel restart — shell executes,
-  blocks write, `kj context switch <full id>` resolves it with its label — but
-  `kj context list` no longer shows it, and prefix/label resolution
-  (`kj binding allow exec 019f29bb`) fails "no context matches". The row is
-  durable; the *listing* filter loses it. Smells like the peer/registry
-  re-attach gap (auto-memory `tech_debt_peer_reattach_on_reconnect`) extended to
-  MCP sessions: list is registry-driven, resolution-by-full-id is DB-driven.
-  Symptom cost: an operator can't see or target a live working context by
-  prefix. Find where `list_all_contexts` vs the session/registry filter diverge
-  post-restart.
+- **`kj context list` registry/DB divergence — narrowed and partly shipped
+  (2026-08-04, `register_session` upsert work).** Re-investigated while
+  building `register_session`'s upsert/attach fix (was going to "heal the
+  registry on attach"). Findings against current code:
+  - `create_shared_kernel`'s boot-time recovery step (`rpc.rs`, "Recover
+    contexts") already re-registers every context `KernelDb::list_active_contexts`
+    returns into the DriftRouter on EVERY kernel start — confirmed with a
+    same-process double-boot test
+    (`list_contexts_recovers_live_context_after_restart`,
+    `crates/kaijutsu-server/tests/context_label_resolve.rs`). So the
+    original symptom described here (a live/concluded MCP context surviving
+    a restart but vanishing from `kj context list`) does NOT reproduce
+    against current code — it looks stale, possibly already fixed
+    incidentally by unrelated work landed since 2026-07-03, or the original
+    live observation involved something the synthetic restart here doesn't
+    capture (e.g. a torn/non-graceful shutdown, or two server processes
+    briefly both live). Flagging rather than silently deleting, per 改善 —
+    if the symptom recurs, treat it as a genuinely different bug, not this
+    one.
+  - The one real, provable registry gap: `list_active_contexts` filters
+    `WHERE archived_at IS NULL`, so an ARCHIVED context's DriftRouter entry
+    does NOT survive a restart even though its KernelDb row and BlockStore
+    document do. **Shipped**: `joinContext` (`rpc.rs`'s `ensure_context_joinable`)
+    now heals this — re-registers from the durable KernelDb row instead of
+    hard-failing with "use createContext first" — and a passing regression
+    test covers it end-to-end over the wire
+    (`join_context_heals_registry_for_an_archived_context_after_restart`,
+    same test file): archived-context join fails before the fix, succeeds
+    and reappears in `listContexts` after.
 
 ---
 

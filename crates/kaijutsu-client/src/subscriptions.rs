@@ -16,7 +16,8 @@ use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
 use crate::kaijutsu_capnp::{
-    block_events, editor_events, kernel_output, resource_events, vfs_activity_events,
+    block_events, editor_events, kernel_output, resource_events, turn_events,
+    vfs_activity_events,
 };
 use crate::rpc::{
     EditorState, SyncState, VfsActivityEntry, parse_block_id, parse_block_snapshot,
@@ -166,6 +167,79 @@ pub enum ServerEvent {
         entries: Vec<VfsActivityEntry>,
         global_total: u64,
     },
+    /// A turn reached an ending the server's turn driver arrived at on purpose:
+    /// the model finished, a player cancelled, or a ceiling was hit.
+    /// [`stop_reason`](TurnCompletedStopReason) says which.
+    ///
+    /// This is the push that replaces inferring completion from block status —
+    /// polling can tell you a block stopped changing, but never *why*, and never
+    /// the difference between a finished turn and a cancelled one.
+    TurnCompleted {
+        /// The context whose turn ended.
+        context_id: ContextId,
+        /// The principal the turn ran as.
+        principal_id: kaijutsu_types::PrincipalId,
+        /// The model's last text block, or `None` when the turn produced no
+        /// text (a tool-only turn, or an interrupt before the first token).
+        output_block_id: Option<BlockId>,
+        /// Why the turn stopped.
+        stop_reason: TurnCompletedStopReason,
+        /// Who asked for the turn.
+        origin: TurnOrigin,
+    },
+    /// A turn **broke** — hydration failure, provider or stream error. Carries
+    /// the server's description. A *cancelled* turn is not a failure: it arrives
+    /// as [`ServerEvent::TurnCompleted`] with a cancelled stop reason.
+    TurnFailed {
+        /// The context whose turn broke.
+        context_id: ContextId,
+        /// The principal the turn ran as.
+        principal_id: kaijutsu_types::PrincipalId,
+        /// Human-readable failure description from the server.
+        error: String,
+        /// Who asked for the turn.
+        origin: TurnOrigin,
+    },
+}
+
+/// Why a turn stopped — client-owned mirror of the wire `TurnStopReason` enum
+/// (kaijutsu-client deliberately doesn't depend on kaijutsu-kernel, the same
+/// reason [`crate::rpc::FileType`] is mirrored rather than re-exported).
+///
+/// Maps 1:1 onto ACP v1's `stopReason`, which is what this event exists to feed:
+/// `EndTurn` → `end_turn`, both cancels → `cancelled`, `MaxTokens` →
+/// `max_tokens`, `MaxIterations` → `max_turn_requests`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnCompletedStopReason {
+    /// The model finished its phrase and asked for nothing more.
+    EndTurn,
+    /// A player interrupted with `interrupt_context(immediate = false)`. The
+    /// in-flight model call was allowed to finish, so the output block is a
+    /// complete phrase; only the agentic loop was stopped.
+    CancelledSoft,
+    /// A player interrupted with `interrupt_context(immediate = true)`. The
+    /// stream was aborted mid-token, so the output block is a fragment.
+    CancelledImmediate,
+    /// The provider hit its output-token ceiling — the response is truncated.
+    MaxTokens,
+    /// The agentic loop hit its per-turn tool-iteration cap.
+    MaxIterations,
+}
+
+impl TurnCompletedStopReason {
+    /// Whether a player cancelled this turn (either interrupt flavour).
+    pub fn is_cancelled(self) -> bool {
+        matches!(self, Self::CancelledSoft | Self::CancelledImmediate)
+    }
+}
+
+/// Who asked for a turn — client-owned mirror of the wire `TurnOrigin` enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnOrigin {
+    /// A player submitted a prompt (`prompt` / `submit_input`).
+    Interactive,
+    /// The kernel drove the turn itself (`kj fork --prompt`, drift, cruise).
+    Autonomous,
 }
 
 /// Connection lifecycle status broadcast by the reconnect FSM.
@@ -416,6 +490,204 @@ impl vfs_activity_events::Server for VfsActivityEventsForwarder {
             .is_err()
         {
             tracing::warn!("Event channel closed, dropping VfsActivity event");
+        }
+        Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Turn Events Forwarder
+// ============================================================================
+
+/// Implements the Cap'n Proto `TurnEvents::Server` trait, forwarding each
+/// turn-outcome push into the shared `broadcast::Sender<ServerEvent>`.
+pub(crate) struct TurnEventsForwarder {
+    pub event_tx: broadcast::Sender<ServerEvent>,
+}
+
+/// Build a `TurnEvents` callback client plus the receiver its pushes land on.
+///
+/// Pass the returned client to [`KernelHandle::subscribe_turn_events`](crate::rpc::KernelHandle::subscribe_turn_events);
+/// drain the receiver for [`ServerEvent::TurnCompleted`] /
+/// [`ServerEvent::TurnFailed`]. Shaped exactly like [`editor_events_channel`] —
+/// one place builds the push callback, and the headless e2e tests, the app, and
+/// a future ACP adapter all share that wiring.
+///
+/// The subscription is kernel-wide, not per-context: each event names its own
+/// `context_id`, so a client watching several contexts needs one channel.
+pub fn turn_events_channel(
+    capacity: usize,
+) -> (
+    crate::kaijutsu_capnp::turn_events::Client,
+    broadcast::Receiver<ServerEvent>,
+) {
+    let (tx, rx) = broadcast::channel(capacity);
+    let client: crate::kaijutsu_capnp::turn_events::Client =
+        capnp_rpc::new_client(TurnEventsForwarder { event_tx: tx });
+    (client, rx)
+}
+
+/// Decode the wire stop reason. A `NotInSchema` (an enumerant a newer server
+/// added) is a hard error rather than a silent coercion to `EndTurn`: reporting
+/// an unknown ending as a clean end-of-turn is precisely the lie this event
+/// exists to prevent.
+fn parse_stop_reason(
+    wire: crate::kaijutsu_capnp::TurnStopReason,
+) -> TurnCompletedStopReason {
+    use crate::kaijutsu_capnp::TurnStopReason as W;
+    match wire {
+        W::EndTurn => TurnCompletedStopReason::EndTurn,
+        W::CancelledSoft => TurnCompletedStopReason::CancelledSoft,
+        W::CancelledImmediate => TurnCompletedStopReason::CancelledImmediate,
+        W::MaxTokens => TurnCompletedStopReason::MaxTokens,
+        W::MaxIterations => TurnCompletedStopReason::MaxIterations,
+    }
+}
+
+/// Decode the wire turn origin.
+fn parse_turn_origin(wire: crate::kaijutsu_capnp::TurnOrigin) -> TurnOrigin {
+    match wire {
+        crate::kaijutsu_capnp::TurnOrigin::Interactive => TurnOrigin::Interactive,
+        crate::kaijutsu_capnp::TurnOrigin::Autonomous => TurnOrigin::Autonomous,
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl turn_events::Server for TurnEventsForwarder {
+    fn on_turn_completed(
+        self: Rc<Self>,
+        params: turn_events::OnTurnCompletedParams,
+        _results: turn_events::OnTurnCompletedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let context_id = match params.get_context_id() {
+            Ok(bytes) => match ContextId::try_from_slice(bytes) {
+                Some(id) => id,
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "invalid context_id on TurnCompleted".into(),
+                    ));
+                }
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let principal_id = match params.get_principal_id() {
+            Ok(bytes) => match kaijutsu_types::PrincipalId::try_from_slice(bytes) {
+                Some(id) => id,
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "invalid principal_id on TurnCompleted".into(),
+                    ));
+                }
+            },
+            Err(e) => return Promise::err(e),
+        };
+        // A turn that produced no text sends `hasOutputBlock = false`; the id
+        // slot is then meaningless and must NOT be decoded into a plausible
+        // -looking block id.
+        let output_block_id = if params.get_has_output_block() {
+            match params.get_output_block_id() {
+                Ok(r) => match parse_block_id(&r) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Promise::err(rpc_to_capnp(e)),
+                },
+                Err(e) => return Promise::err(e),
+            }
+        } else {
+            None
+        };
+        let stop_reason = match params.get_stop_reason() {
+            Ok(w) => parse_stop_reason(w),
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "unknown TurnStopReason on the wire (newer server?): {e}"
+                )));
+            }
+        };
+        let origin = match params.get_origin() {
+            Ok(w) => parse_turn_origin(w),
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "unknown TurnOrigin on the wire (newer server?): {e}"
+                )));
+            }
+        };
+        if self
+            .event_tx
+            .send(ServerEvent::TurnCompleted {
+                context_id,
+                principal_id,
+                output_block_id,
+                stop_reason,
+                origin,
+            })
+            .is_err()
+        {
+            tracing::warn!("Event channel closed, dropping TurnCompleted event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_turn_failed(
+        self: Rc<Self>,
+        params: turn_events::OnTurnFailedParams,
+        _results: turn_events::OnTurnFailedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let context_id = match params.get_context_id() {
+            Ok(bytes) => match ContextId::try_from_slice(bytes) {
+                Some(id) => id,
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "invalid context_id on TurnFailed".into(),
+                    ));
+                }
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let principal_id = match params.get_principal_id() {
+            Ok(bytes) => match kaijutsu_types::PrincipalId::try_from_slice(bytes) {
+                Some(id) => id,
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "invalid principal_id on TurnFailed".into(),
+                    ));
+                }
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let error = match params.get_error() {
+            Ok(t) => match t.to_str() {
+                Ok(s) => s.to_string(),
+                Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let origin = match params.get_origin() {
+            Ok(w) => parse_turn_origin(w),
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!(
+                    "unknown TurnOrigin on the wire (newer server?): {e}"
+                )));
+            }
+        };
+        if self
+            .event_tx
+            .send(ServerEvent::TurnFailed {
+                context_id,
+                principal_id,
+                error,
+                origin,
+            })
+            .is_err()
+        {
+            tracing::warn!("Event channel closed, dropping TurnFailed event");
         }
         Promise::ok(())
     }
@@ -1210,5 +1482,232 @@ impl kernel_output::Server for KernelOutputForwarder {
             tracing::warn!("Output channel closed, dropping output event");
         }
         Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod turn_events_tests {
+    //! Cap'n Proto round-trip for the turn-outcome payloads.
+    //!
+    //! These drive the real generated client/server pair built by
+    //! [`turn_events_channel`] — set the wire fields, send, and assert on the
+    //! [`ServerEvent`] that falls out the other side. The decode is where a
+    //! wire change goes quietly wrong (an enumerant mapped to the wrong
+    //! variant, an unset optional read as if it were set), so it is worth
+    //! exercising through the generated code rather than against a hand-built
+    //! reader.
+
+    use super::*;
+    use kaijutsu_types::PrincipalId;
+
+    /// Run `f` on a LocalSet — capnp-rpc clients are `Rc`-based and must not
+    /// cross threads.
+    fn run_local<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, f);
+    }
+
+    /// A completed turn carrying an output block: every field survives the
+    /// round-trip, and the block id is reassembled whole (context + principal +
+    /// seq), not just its seq.
+    #[test]
+    fn completed_with_output_block_round_trips() {
+        run_local(async {
+            let (client, mut rx) = turn_events_channel(16);
+            let ctx = ContextId::new();
+            let principal = PrincipalId::new();
+            let output = BlockId::new(ctx, principal, 42);
+
+            let mut req = client.on_turn_completed_request();
+            {
+                let mut p = req.get();
+                p.set_context_id(ctx.as_bytes());
+                p.set_principal_id(principal.as_bytes());
+                p.set_stop_reason(crate::kaijutsu_capnp::TurnStopReason::MaxTokens);
+                p.set_origin(crate::kaijutsu_capnp::TurnOrigin::Interactive);
+                p.set_has_output_block(true);
+                let mut b = p.init_output_block_id();
+                b.set_context_id(output.context_id.as_bytes());
+                b.set_principal_id(output.principal_id.as_bytes());
+                b.set_seq(output.seq);
+            }
+            req.send().promise.await.expect("callback delivered");
+
+            match rx.try_recv().expect("a TurnCompleted event arrived") {
+                ServerEvent::TurnCompleted {
+                    context_id,
+                    principal_id,
+                    output_block_id,
+                    stop_reason,
+                    origin,
+                } => {
+                    assert_eq!(context_id, ctx);
+                    assert_eq!(principal_id, principal);
+                    assert_eq!(output_block_id, Some(output));
+                    assert_eq!(stop_reason, TurnCompletedStopReason::MaxTokens);
+                    assert_eq!(origin, TurnOrigin::Interactive);
+                }
+                other => panic!("expected TurnCompleted, got {other:?}"),
+            }
+        });
+    }
+
+    /// `hasOutputBlock = false` decodes to `None`. The id slot is zeroed on the
+    /// wire, and reading it anyway would hand the consumer a nil-context block
+    /// id that looks real — the exact silent fallback the flag exists to avoid.
+    #[test]
+    fn completed_without_output_block_decodes_to_none() {
+        run_local(async {
+            let (client, mut rx) = turn_events_channel(16);
+            let ctx = ContextId::new();
+            let principal = PrincipalId::new();
+
+            let mut req = client.on_turn_completed_request();
+            {
+                let mut p = req.get();
+                p.set_context_id(ctx.as_bytes());
+                p.set_principal_id(principal.as_bytes());
+                p.set_stop_reason(crate::kaijutsu_capnp::TurnStopReason::EndTurn);
+                p.set_origin(crate::kaijutsu_capnp::TurnOrigin::Autonomous);
+                p.set_has_output_block(false);
+            }
+            req.send().promise.await.expect("callback delivered");
+
+            match rx.try_recv().expect("a TurnCompleted event arrived") {
+                ServerEvent::TurnCompleted {
+                    output_block_id,
+                    origin,
+                    ..
+                } => {
+                    assert_eq!(output_block_id, None, "no text → None, never a nil id");
+                    assert_eq!(origin, TurnOrigin::Autonomous);
+                }
+                other => panic!("expected TurnCompleted, got {other:?}"),
+            }
+        });
+    }
+
+    /// Every stop reason maps to its own client variant. A collapsed mapping
+    /// (two endings decoding to one) is the failure this pins down: it would
+    /// make a cancelled turn read as a finished one at the frontend.
+    #[test]
+    fn every_stop_reason_maps_distinctly() {
+        run_local(async {
+            use crate::kaijutsu_capnp::TurnStopReason as W;
+            let cases = [
+                (W::EndTurn, TurnCompletedStopReason::EndTurn),
+                (W::CancelledSoft, TurnCompletedStopReason::CancelledSoft),
+                (
+                    W::CancelledImmediate,
+                    TurnCompletedStopReason::CancelledImmediate,
+                ),
+                (W::MaxTokens, TurnCompletedStopReason::MaxTokens),
+                (W::MaxIterations, TurnCompletedStopReason::MaxIterations),
+            ];
+            let (client, mut rx) = turn_events_channel(16);
+            let ctx = ContextId::new();
+            let principal = PrincipalId::new();
+
+            for (wire, expected) in cases {
+                let mut req = client.on_turn_completed_request();
+                {
+                    let mut p = req.get();
+                    p.set_context_id(ctx.as_bytes());
+                    p.set_principal_id(principal.as_bytes());
+                    p.set_stop_reason(wire);
+                    p.set_origin(crate::kaijutsu_capnp::TurnOrigin::Autonomous);
+                    p.set_has_output_block(false);
+                }
+                req.send().promise.await.expect("callback delivered");
+
+                match rx.try_recv().expect("a TurnCompleted event arrived") {
+                    ServerEvent::TurnCompleted { stop_reason, .. } => {
+                        assert_eq!(stop_reason, expected, "{wire:?} must decode distinctly");
+                    }
+                    other => panic!("expected TurnCompleted, got {other:?}"),
+                }
+            }
+
+            // Both cancels report as cancelled; nothing else does.
+            assert!(TurnCompletedStopReason::CancelledSoft.is_cancelled());
+            assert!(TurnCompletedStopReason::CancelledImmediate.is_cancelled());
+            assert!(!TurnCompletedStopReason::EndTurn.is_cancelled());
+            assert!(!TurnCompletedStopReason::MaxTokens.is_cancelled());
+            assert!(!TurnCompletedStopReason::MaxIterations.is_cancelled());
+        });
+    }
+
+    /// A failed turn round-trips its error text and origin.
+    #[test]
+    fn failed_round_trips() {
+        run_local(async {
+            let (client, mut rx) = turn_events_channel(16);
+            let ctx = ContextId::new();
+            let principal = PrincipalId::new();
+
+            let mut req = client.on_turn_failed_request();
+            {
+                let mut p = req.get();
+                p.set_context_id(ctx.as_bytes());
+                p.set_principal_id(principal.as_bytes());
+                p.set_error("hydration failed: could not read conversation history");
+                p.set_origin(crate::kaijutsu_capnp::TurnOrigin::Interactive);
+            }
+            req.send().promise.await.expect("callback delivered");
+
+            match rx.try_recv().expect("a TurnFailed event arrived") {
+                ServerEvent::TurnFailed {
+                    context_id,
+                    principal_id,
+                    error,
+                    origin,
+                } => {
+                    assert_eq!(context_id, ctx);
+                    assert_eq!(principal_id, principal);
+                    assert_eq!(error, "hydration failed: could not read conversation history");
+                    assert_eq!(origin, TurnOrigin::Interactive);
+                }
+                other => panic!("expected TurnFailed, got {other:?}"),
+            }
+        });
+    }
+
+    /// A malformed context id fails the callback loudly rather than inventing
+    /// an id. Crashing the push beats handing a consumer a turn outcome
+    /// attributed to a context that does not exist.
+    #[test]
+    fn malformed_context_id_is_an_error_not_a_guess() {
+        run_local(async {
+            let (client, mut rx) = turn_events_channel(16);
+            let mut req = client.on_turn_completed_request();
+            {
+                let mut p = req.get();
+                p.set_context_id(&[0u8; 3]); // not 16 bytes
+                p.set_principal_id(PrincipalId::new().as_bytes());
+                p.set_stop_reason(crate::kaijutsu_capnp::TurnStopReason::EndTurn);
+                p.set_origin(crate::kaijutsu_capnp::TurnOrigin::Autonomous);
+                p.set_has_output_block(false);
+            }
+            let err = match req.send().promise.await {
+                Ok(_) => panic!("a 3-byte context id must not decode"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("context_id"),
+                "the error should name the bad field, got: {err}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be published from a malformed push"
+            );
+        });
     }
 }

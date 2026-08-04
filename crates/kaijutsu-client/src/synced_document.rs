@@ -107,7 +107,13 @@ impl SyncedDocument {
             | ServerEvent::InputCleared { context_id, .. }
             | ServerEvent::ContextSwitched { context_id, .. }
             | ServerEvent::RenderCue { context_id, .. }
-            | ServerEvent::BeatSync { context_id, .. } => Some(*context_id),
+            | ServerEvent::BeatSync { context_id, .. }
+            // Turn outcomes name the context whose turn ended. They change no
+            // document state (the blocks the turn wrote already arrived on the
+            // block stream), but they are context-scoped facts, so report the
+            // context honestly and let `apply_event_inner` ignore them.
+            | ServerEvent::TurnCompleted { context_id, .. }
+            | ServerEvent::TurnFailed { context_id, .. } => Some(*context_id),
             // Editor events are session-scoped, not context-scoped — the
             // editor renders off its own subscription, not the doc cache.
             // A post-reconnect resync delivery names its target context inline.
@@ -454,7 +460,13 @@ impl SyncedDocument {
             | ServerEvent::RenderCue { .. }
             | ServerEvent::BeatSync { .. }
             // VFS activity is decorative world-rendering heat, not doc state.
-            | ServerEvent::VfsActivity { .. } => SyncEffect::Ignored,
+            | ServerEvent::VfsActivity { .. }
+            // Turn outcomes are lifecycle signals, not doc state: everything a
+            // turn wrote already reached the doc through the block stream.
+            // Consumers (the ACP adapter, a `kj wait`) read them off the raw
+            // event stream.
+            | ServerEvent::TurnCompleted { .. }
+            | ServerEvent::TurnFailed { .. } => SyncEffect::Ignored,
         }
     }
 

@@ -984,7 +984,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and create a context. Must be called before using context-dependent tools (shell, context_shell, read_input/write_input/submit_input). Returns the new context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell, context_shell, read_input/write_input/submit_input). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
@@ -1002,8 +1002,9 @@ impl KaijutsuMcp {
     /// Core of `register_session`, callable without the MCP tool call
     /// machinery — `run_serve` uses this to auto-register a session at
     /// startup so hook events land somewhere without requiring a model to
-    /// call the tool first. Same idempotency (`already_registered`) and
-    /// wire shape as the tool.
+    /// call the tool first. Same idempotency (`already_registered`), upsert/
+    /// attach behavior (`resumed`/`previous_context`), and wire shape as the
+    /// tool.
     pub async fn register_session_auto(
         &self,
         label: Option<String>,
@@ -1011,6 +1012,31 @@ impl KaijutsuMcp {
     ) -> String {
         let req = RegisterSessionRequest { label, context_type };
         self.register_session_impl(req).await
+    }
+
+    /// Find a free label derived from `base` by trying `base-2`, `base-3`, …
+    /// against the durable KernelDb (via `resolve_context_label`, not the
+    /// registry). Used when `base` itself names a concluded/archived context
+    /// — we must not resurrect it, and KernelDb's label-uniqueness index
+    /// keeps the label attached to that row even after conclude/archive, so
+    /// `base` itself is never a candidate. Bounded: fails loudly rather than
+    /// looping forever if 1000 suffixes are somehow all taken.
+    async fn find_available_suffixed_label(
+        actor: &ActorHandle,
+        base: &str,
+    ) -> Result<String, String> {
+        const MAX_SUFFIX: u32 = 1000;
+        for n in 2..=MAX_SUFFIX {
+            let candidate = format!("{base}-{n}");
+            match actor.resolve_context_label(&candidate).await {
+                Ok(None) => return Ok(candidate),
+                Ok(Some(_)) => continue,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(format!(
+            "exhausted {MAX_SUFFIX} suffixed candidates derived from '{base}' — all taken"
+        ))
     }
 
     async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
@@ -1035,29 +1061,126 @@ impl KaijutsuMcp {
         }
 
         // Generate label
-        let label = req.label.unwrap_or_else(|| {
+        let requested_label = req.label.unwrap_or_else(|| {
             let session = self.session_id.lock().ok().and_then(|g| g.clone());
             session.unwrap_or_else(|| format!("mcp-{}", &ContextId::new().short()))
         });
 
-        // 1. Create context on the server. MCP-attached contexts default to
-        // the "mcp" mode bundle so their rc lifecycle + tool policy runs.
+        // MCP-attached contexts default to the "mcp" mode bundle so their rc
+        // lifecycle + tool policy runs.
         let context_type = req.context_type.unwrap_or_else(|| "mcp".to_string());
-        let context_id = match remote
-            .actor
-            .create_context_typed(&label, &context_type)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => return format!("Error creating context: {e}"),
+
+        // 0. Resolve the label against the durable KernelDb — NOT the
+        // in-memory DriftRouter `list_contexts` reads (see
+        // `resolveContextLabel`'s capnp doc comment). The label defaults to
+        // the harness's agent-session id, so a reconnect after a dropped MCP
+        // session (or a kernel restart) would otherwise reuse the exact same
+        // label and hit KernelDb's label-uniqueness constraint as a fatal
+        // "insert_context failed ... label conflict" (docs/issues.md,
+        // "register_session hard-fails on label conflict"). Upsert instead:
+        // attach to a still-live context, or create fresh under a suffixed
+        // label if the prior one concluded/archived.
+        let existing = match remote.actor.resolve_context_label(&requested_label).await {
+            Ok(v) => v,
+            Err(e) => return format!("Error resolving label '{requested_label}': {e}"),
         };
 
-        // 2. Join it via the actor (updates actor's internal state for reconnects).
-        // The actor's `instance` was set at spawn_actor time; the join_context
-        // RPC now only takes the context id.
-        if let Err(e) = remote.actor.join_context(context_id).await {
-            return format!("Error joining context: {e}");
-        }
+        let mut resumed = false;
+        let mut previous_context: Option<serde_json::Value> = None;
+        let (context_id, label) = match existing {
+            Some(ctx) if ctx.concluded_at.is_none() && !ctx.archived => {
+                // Attach: the label already names a live context. Loud on
+                // purpose — docs/issues.md notes "startup agent detection can
+                // report a previous session's id"; a stale id here would
+                // silently attach to the wrong prior conversation, so this
+                // stays visible in the server log AND in the reply's
+                // `resumed`/`last_activity_at` fields for the caller to
+                // sanity-check rather than trust blindly.
+                tracing::warn!(
+                    context_id = %ctx.id,
+                    label = %requested_label,
+                    created_at = ctx.created_at,
+                    last_activity_at = ?ctx.last_activity_at,
+                    "register_session: label already names a live context — \
+                     attaching instead of creating (reconnect/restart upsert); \
+                     verify this is the expected prior session, not a stale \
+                     agent-session id",
+                );
+                // Ordinarily a same-process reconnect (the label just
+                // survived because nothing ever unregisters a context from
+                // the server's in-memory registry), so join_context finds it
+                // registered already. If the kernel itself also restarted in
+                // between, boot recovery re-registers every non-archived
+                // context anyway — join_context's registry-heal (see its doc
+                // comment server-side) exists for defense-in-depth, not
+                // because this call path is expected to need it.
+                if let Err(e) = remote.actor.join_context(ctx.id).await {
+                    return format!("Error joining existing context {}: {e}", ctx.id.short());
+                }
+                resumed = true;
+                (ctx.id, requested_label.clone())
+            }
+            Some(ctx) => {
+                // Concluded or archived — never silently resurrect. Create a
+                // fresh context under a deterministic suffixed label and tell
+                // the caller what happened to the old one.
+                let fresh_label =
+                    match Self::find_available_suffixed_label(&remote.actor, &requested_label)
+                        .await
+                    {
+                        Ok(l) => l,
+                        Err(e) => {
+                            return format!(
+                                "Error finding an available label derived from \
+                                 '{requested_label}': {e}"
+                            );
+                        }
+                    };
+                tracing::info!(
+                    previous_context_id = %ctx.id,
+                    previous_label = %requested_label,
+                    fresh_label = %fresh_label,
+                    concluded_at = ?ctx.concluded_at,
+                    archived = ctx.archived,
+                    "register_session: label names a concluded/archived context — \
+                     creating a fresh context under a suffixed label",
+                );
+                let new_id = match remote
+                    .actor
+                    .create_context_typed(&fresh_label, &context_type)
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => return format!("Error creating context: {e}"),
+                };
+                if let Err(e) = remote.actor.join_context(new_id).await {
+                    return format!("Error joining context: {e}");
+                }
+                previous_context = Some(serde_json::json!({
+                    "context_id": ctx.id.to_hex(),
+                    "context_short": ctx.id.short(),
+                    "label": requested_label,
+                    "concluded_at": ctx.concluded_at,
+                    "archived": ctx.archived,
+                }));
+                (new_id, fresh_label)
+            }
+            None => {
+                // No conflict — create as today.
+                let new_id = match remote
+                    .actor
+                    .create_context_typed(&requested_label, &context_type)
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => return format!("Error creating context: {e}"),
+                };
+                if let Err(e) = remote.actor.join_context(new_id).await {
+                    return format!("Error joining context: {e}");
+                }
+                (new_id, requested_label.clone())
+            }
+        };
 
         // 3. Sync initial state from server
         let sync_state = match remote.actor.get_context_sync(context_id).await {
@@ -1167,7 +1290,8 @@ impl KaijutsuMcp {
         tracing::info!(
             context_id = %context_id,
             label = %label,
-            "Session registered with new context"
+            resumed,
+            "Session registered"
         );
 
         serde_json::json!({
@@ -1175,6 +1299,8 @@ impl KaijutsuMcp {
             "context_id": context_id.to_hex(),
             "context_short": context_id.short(),
             "label": label,
+            "resumed": resumed,
+            "previous_context": previous_context,
         })
         .to_string()
     }

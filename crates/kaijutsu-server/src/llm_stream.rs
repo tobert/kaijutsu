@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
-use kaijutsu_kernel::flows::TurnFlow;
+use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent, apply_slot_tunables};
 use kaijutsu_kernel::llm::SlotTunables;
@@ -274,13 +274,13 @@ pub(crate) async fn spawn_llm_for_prompt(
     after_block_id: &kaijutsu_crdt::BlockId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     user_principal_id: PrincipalId,
-    // `true` only on the autonomous turn-driver path (the musician's OODA loop):
-    // the stream publishes `TurnFlow::Completed`/`Failed` at its end. Interactive
-    // human-prompt callers pass `false` — a human turn must never feed the
-    // musician's OODA Act, so it announces nothing (design §7). This gate is what
-    // keeps the publish-at-stream-end from silently extending Completed to every
-    // interactive prompt.
-    announce_completion: bool,
+    // Who asked for this turn. Rides onto the `TurnFlow` outcome the stream
+    // publishes at its end, so the one consumer that must ignore human turns
+    // (the beat scheduler's OODA Act) can filter on the event instead of the
+    // producer staying silent. EVERY turn announces — an interactive turn's
+    // completion is precisely what a wire subscriber (`subscribeTurnEvents`,
+    // the ACP adapter) is waiting for.
+    origin: TurnOrigin,
 ) -> Result<(), capnp::Error> {
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
@@ -505,7 +505,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         interrupt,
         interrupt_generation,
         context_interrupts,
-        announce_completion,
+        origin,
     ));
 
     Ok(())
@@ -989,6 +989,12 @@ async fn dispatch_and_map_tool_result(
 /// metrics live under `gen_ai.*`). Usage fields are declared empty and
 /// recorded from the terminal `Done` event so token/cache/reasoning
 /// accounting lands on the trace, not just the metrics meter.
+///
+/// `turn.*` is the outcome namespace, recorded at the publish site: how the turn
+/// ended (`turn.stop_reason`) and who asked for it (`turn.origin`) — the same two
+/// facts the `TurnEvents` wire push carries, so a trace and a subscriber tell the
+/// same story. Turn/LLM spans are 100%-sampled (`docs/telemetry.md`), so these
+/// land on every turn.
 #[tracing::instrument(
     name = "llm.turn",
     skip_all,
@@ -1001,6 +1007,8 @@ async fn dispatch_and_map_tool_result(
         llm.usage.cache_write_tokens = tracing::field::Empty,
         llm.usage.reasoning_tokens = tracing::field::Empty,
         llm.response.stop_reason = tracing::field::Empty,
+        turn.stop_reason = tracing::field::Empty,
+        turn.origin = tracing::field::Empty,
     )
 )]
 // The full turn context (provider, target block, interrupt/cache/kernel
@@ -1030,12 +1038,11 @@ async fn process_llm_stream(
     interrupt: Arc<ContextInterruptState>,
     interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
-    // Only autonomous (turn-driver) turns announce their completion on the
-    // TurnFlow bus; interactive human prompts pass `false` so the musician's
-    // OODA Act never crystallizes a human-prompted turn (design §7). The publish
-    // moved here from the spawn site (rpc.rs:391) so it fires at actual stream
-    // end with the real output block id, not at spawn racing the model.
-    announce_completion: bool,
+    // Who asked for the turn (see `spawn_llm_for_prompt`). Rides onto every
+    // terminal `TurnFlow` this stream publishes; the publish itself is
+    // unconditional. It fires at actual stream end with the real output block
+    // id, not at spawn racing the model.
+    origin: TurnOrigin,
 ) {
     // Get per-context mailbox lock — held for the entire stream,
     // serializing concurrent prompts to the same context (Fix D+E).
@@ -1064,13 +1071,12 @@ async fn process_llm_stream(
             log::error!(
                 "Hydration policy read failed for context {context_id}: {e}; failing the turn"
             );
-            if announce_completion {
-                kernel.turn_flows().publish(TurnFlow::Failed {
-                    context_id,
-                    principal_id: user_principal_id,
-                    error: format!("hydration policy unreadable: {e}"),
-                });
-            }
+            kernel.turn_flows().publish(TurnFlow::Failed {
+                context_id,
+                principal_id: user_principal_id,
+                error: format!("hydration policy unreadable: {e}"),
+                origin,
+            });
             return;
         }
     };
@@ -1089,13 +1095,12 @@ async fn process_llm_stream(
         // Act handoff gets no signal and the turn silently falls off the bus while
         // every other terminal path announces.
         Err(()) => {
-            if announce_completion {
-                kernel.turn_flows().publish(TurnFlow::Failed {
-                    context_id,
-                    principal_id: user_principal_id,
-                    error: "hydration failed: could not read conversation history".to_string(),
-                });
-            }
+            kernel.turn_flows().publish(TurnFlow::Failed {
+                context_id,
+                principal_id: user_principal_id,
+                error: "hydration failed: could not read conversation history".to_string(),
+                origin,
+            });
             return;
         }
     };
@@ -1174,13 +1179,15 @@ async fn process_llm_stream(
     // text (a tool-only turn, an interrupt before any text, or a hard error all
     // leave it `None`); a `None` Completed schedules nothing downstream.
     let mut output_block_id: Option<kaijutsu_crdt::BlockId> = None;
-    // Terminal failure reason for an announced turn. `Some` on any path that
-    // ends the turn without a clean Act (a hard cancel/interrupt); the two
-    // hard-error early returns publish `Failed` inline and never reach the tail.
-    // The scheduler must hear exactly one terminal event per announced turn so
-    // it never waits forever — so the tail publishes Completed-or-Failed, gated
-    // on `announce_completion` (design §7).
-    let mut turn_error: Option<String> = None;
+    // How this turn ends, as the structured reason the tail publishes on
+    // `TurnFlow::Completed`. Every `break` out of the agentic loop sets it
+    // first — a cancel, an iteration cap, and a token-ceiling truncation are
+    // three different endings, and reporting them as one (or as a bare error
+    // string, which is what a cancel used to be) is exactly the ambiguity the
+    // `TurnEvents` subscribers exist to escape. Genuine breakage still returns
+    // early with `TurnFlow::Failed` and never reaches the tail, so a turn
+    // publishes exactly one terminal event either way.
+    let mut stop_reason_out = TurnStopReason::EndTurn;
 
     // Agentic loop - continue until model is done or max iterations
     loop {
@@ -1214,10 +1221,13 @@ async fn process_llm_stream(
                 ContentType::Plain,
                 Some(PrincipalId::system()),
             );
+            stop_reason_out = TurnStopReason::MaxIterations;
             break;
         }
 
-        // Soft interrupt: stop before the next LLM call.
+        // Soft interrupt: stop before the next LLM call. The in-flight model
+        // call already finished, so the output block is a whole phrase — that
+        // is the difference `immediate: false` records.
         if interrupt
             .stop_after_turn
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1226,6 +1236,7 @@ async fn process_llm_stream(
                 "Soft interrupt requested for {}, stopping agentic loop",
                 context_id
             );
+            stop_reason_out = TurnStopReason::Cancelled { immediate: false };
             break;
         }
 
@@ -1332,15 +1343,15 @@ async fn process_llm_stream(
                             payload.summary_line(),
                             Some(PrincipalId::system()),
                         );
-                        // Terminal error for an announced turn — publish Failed so
-                        // the scheduler isn't left waiting on this turn forever.
-                        if announce_completion {
-                            kernel.turn_flows().publish(TurnFlow::Failed {
-                                context_id,
-                                principal_id: user_principal_id,
-                                error: format!("LLM stream failed to start: {e}"),
-                            });
-                        }
+                        // Terminal error — publish Failed so no waiter (the beat
+                        // scheduler, a `TurnEvents` subscriber) is left hanging
+                        // on a turn that will never end.
+                        kernel.turn_flows().publish(TurnFlow::Failed {
+                            context_id,
+                            principal_id: user_principal_id,
+                            error: format!("LLM stream failed to start: {e}"),
+                            origin,
+                        });
                         return;
                     }
                 }
@@ -1747,6 +1758,18 @@ async fn process_llm_stream(
                         // Exit the agentic loop; cleanup runs below.
                         break;
                     }
+                    // Carry the provider's terminal stop reason into the turn
+                    // outcome. Anthropic says `max_tokens`, the OpenAI-compatible
+                    // providers say `length`; both mean the model was cut off at
+                    // the output ceiling, which ACP reports as `max_tokens` and a
+                    // frontend renders very differently from a clean end of turn.
+                    // Reassigned (not or-ed) on every Done so a truncated *middle*
+                    // iteration doesn't mislabel a turn that later ends cleanly;
+                    // the cancel/cap breaks below overwrite it in turn.
+                    stop_reason_out = match stop_reason.as_deref() {
+                        Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
+                        _ => TurnStopReason::EndTurn,
+                    };
                     log::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
                         stop_reason,
@@ -1774,24 +1797,25 @@ async fn process_llm_stream(
                     );
                     // Terminal mid-stream error — Failed (not Completed) so an
                     // announced turn never leaves the scheduler waiting.
-                    if announce_completion {
-                        kernel.turn_flows().publish(TurnFlow::Failed {
-                            context_id,
-                            principal_id: user_principal_id,
-                            error: format!("LLM stream error: {err}"),
-                        });
-                    }
+                    kernel.turn_flows().publish(TurnFlow::Failed {
+                        context_id,
+                        principal_id: user_principal_id,
+                        error: format!("LLM stream error: {err}"),
+                        origin,
+                    });
                     return;
                 }
             }
         }
 
-        // After a hard interrupt, break the agentic loop immediately. A cancelled
-        // turn is terminal-without-Act → Failed for an announced turn (design §7):
-        // the scheduler hears it and moves on rather than waiting on a turn that
-        // will never produce an Act.
+        // After a hard interrupt, break the agentic loop immediately. This is a
+        // *cancellation*, not a failure: the turn ended exactly where a player
+        // told it to, so it publishes `Completed { reason: Cancelled {
+        // immediate: true } }` rather than the old bare-string `Failed`. The
+        // `immediate` flag is what tells the beat scheduler the output block is
+        // a fragment (severed mid-token) and must not crystallize into an Act.
         if stream_cancelled {
-            turn_error = Some("turn interrupted before completion".to_string());
+            stop_reason_out = TurnStopReason::Cancelled { immediate: true };
             break;
         }
 
@@ -2032,41 +2056,52 @@ async fn process_llm_stream(
     log::info!("LLM stream processing complete for cell {}", context_id);
 
     // Announce the turn outcome at ACTUAL stream end (design §7) — the publish
-    // moved here from the spawn site so it carries the real `output_block_id`
+    // sits here, not at the spawn site, so it carries the real `output_block_id`
     // (the model's last text block) rather than firing at spawn and racing the
-    // model. Only announced (autonomous turn-driver) turns publish; interactive
-    // human prompts stay silent so the musician's OODA Act never crystallizes a
-    // human-prompted turn. Exactly one terminal event per announced turn — the
-    // two hard-error early returns already published Failed and never reach here.
-    if announce_completion {
-        match turn_error {
-            None => kernel.turn_flows().publish(TurnFlow::Completed {
-                context_id,
-                principal_id: user_principal_id,
-                output_block_id,
-            }),
-            Some(error) => kernel.turn_flows().publish(TurnFlow::Failed {
-                context_id,
-                principal_id: user_principal_id,
-                error,
-            }),
-        };
-    }
+    // model.
+    //
+    // EVERY turn announces, interactive and autonomous alike. The old
+    // `announce_completion` gate silenced interactive turns because the one
+    // consumer (the beat scheduler's OODA Act) must never crystallize a
+    // human-prompted turn — but that put a consumer's filter in the producer,
+    // and it made the completion of the turns a UI cares about most invisible to
+    // every wire subscriber. The filter now rides on `origin`, where the
+    // scheduler applies it (`beat.rs`) and a `TurnEvents` subscriber can ignore it.
+    //
+    // Exactly one terminal event per turn: the early-return paths above publish
+    // `Failed` and never reach here, so this is the sole `Completed`.
+    let turn_span = tracing::Span::current();
+    turn_span.record("turn.stop_reason", stop_reason_out.as_str());
+    turn_span.record("turn.origin", origin.as_str());
+    kernel.turn_flows().publish(TurnFlow::Completed {
+        context_id,
+        principal_id: user_principal_id,
+        output_block_id,
+        reason: stop_reason_out,
+        origin,
+    });
 }
 
 #[cfg(test)]
 mod publish_tests {
-    //! T15 (design-chameleon-batch1-f2-notation §7/§16) — the turn-completion
-    //! publish moves from stream *spawn* (the rpc.rs:391 race) to stream *end*,
-    //! carrying the model's output block id, and only for *announced* turns.
+    //! The turn-outcome publish site: at stream *end* (not spawn — that raced
+    //! the model, T15 / design-chameleon-batch1-f2-notation §7/§16), carrying
+    //! the model's output block id, the structured stop reason, and the turn's
+    //! origin.
+    //!
+    //! EVERY turn publishes now, interactive included. The old producer-side
+    //! gate silenced interactive turns because the beat scheduler must not
+    //! crystallize them; that filter moved onto the event (`origin`) so wire
+    //! subscribers can see the turns a UI cares about most. These tests pin
+    //! both halves: everyone announces, and the announcement says enough to be
+    //! filtered correctly.
     //!
     //! This is the smallest honest test of the publish site (the design allows
     //! it over the heavy mock-provider SSH e2e harness, which the project's
     //! test discipline steers away from for --lib runs — russh teardown noise).
     //! It drives `process_llm_stream` directly with a Mock provider against a
-    //! real ephemeral kernel + block store, so the moved publish and the
-    //! `announce_completion` gate are exercised end-to-end through the actual
-    //! stream loop, not a stub.
+    //! real ephemeral kernel + block store, so the publish is exercised end to
+    //! end through the actual stream loop, not a stub.
     use super::*;
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
     use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
@@ -2081,8 +2116,27 @@ mod publish_tests {
     /// Returns the documents store and the principal so the caller can inspect
     /// the inserted blocks.
     async fn drive_one_turn(
-        announce_completion: bool,
+        origin: TurnOrigin,
         kernel: Arc<Kernel>,
+    ) -> (SharedBlockStore, ContextId, PrincipalId) {
+        drive_turn_with(
+            origin,
+            kernel,
+            Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n")),
+            |_| {},
+        )
+        .await
+    }
+
+    /// The general form: pick the provider, and get a chance to arm the
+    /// interrupt state *before* the stream starts (how the cancel paths are
+    /// driven — a cancel already pending when the loop first looks is the
+    /// deterministic stand-in for one that lands mid-turn).
+    async fn drive_turn_with(
+        origin: TurnOrigin,
+        kernel: Arc<Kernel>,
+        provider: Provider,
+        arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
     ) -> (SharedBlockStore, ContextId, PrincipalId) {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore =
@@ -2108,12 +2162,11 @@ mod publish_tests {
             )
             .unwrap();
 
-        let provider = Arc::new(Provider::Mock(MockClient::new(
-            "X:1\nK:C\nCDEF|\n",
-        )));
+        let provider = Arc::new(provider);
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
+        arm_interrupt(&interrupt);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
         let tool_ctx = kaijutsu_kernel::ExecContext::new(
             player,
@@ -2141,7 +2194,7 @@ mod publish_tests {
             interrupt,
             1,
             context_interrupts,
-            announce_completion,
+            origin,
         )
         .await;
 
@@ -2162,7 +2215,8 @@ mod publish_tests {
                 // Nothing published before the turn runs.
                 assert!(sub.try_recv().is_none(), "no Completed before the turn");
 
-                let (documents, ctx, _player) = drive_one_turn(true, kernel.clone()).await;
+                let (documents, ctx, _player) =
+                    drive_one_turn(TurnOrigin::Autonomous, kernel.clone()).await;
 
                 // The stream has fully ended; exactly one Completed is queued.
                 let msg = sub
@@ -2172,9 +2226,13 @@ mod publish_tests {
                     TurnFlow::Completed {
                         context_id,
                         output_block_id,
+                        reason,
+                        origin,
                         ..
                     } => {
                         assert_eq!(context_id, ctx);
+                        assert_eq!(reason, TurnStopReason::EndTurn, "the mock ends its turn");
+                        assert_eq!(origin, TurnOrigin::Autonomous);
                         output_block_id.expect("the mock turn produced text → Some(id)")
                     }
                     other => panic!("expected Completed, got {other:?}"),
@@ -2197,22 +2255,222 @@ mod publish_tests {
             .await;
     }
 
-    /// An interactive (un-announced) turn publishes NOTHING — the human-prompt
-    /// paths must never feed the musician's OODA Act (design §7).
+    /// An INTERACTIVE turn announces too — this is the whole point of the
+    /// change. A human-prompted turn ending is the event an app or an ACP
+    /// frontend most needs; it used to be invisible on the bus (and therefore
+    /// on the wire), leaving clients to infer completion from block-status
+    /// polling. It carries `origin: Interactive` so the one consumer that must
+    /// ignore it (the beat scheduler's OODA Act) still can.
     #[tokio::test]
-    async fn interactive_turn_publishes_nothing() {
+    async fn interactive_turn_announces_with_interactive_origin() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let kernel = Arc::new(Kernel::new_ephemeral("publish-test").await);
                 let mut sub = kernel.turn_flows().subscribe("turn.completed");
 
-                let (_documents, _ctx, _player) = drive_one_turn(false, kernel.clone()).await;
+                let (_documents, ctx, _player) =
+                    drive_one_turn(TurnOrigin::Interactive, kernel.clone()).await;
 
+                let msg = sub
+                    .try_recv()
+                    .expect("an interactive turn publishes Completed like any other");
+                match msg.payload {
+                    TurnFlow::Completed {
+                        context_id,
+                        origin,
+                        reason,
+                        output_block_id,
+                        ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(
+                            origin,
+                            TurnOrigin::Interactive,
+                            "the origin is what keeps this out of the OODA Act"
+                        );
+                        assert_eq!(reason, TurnStopReason::EndTurn);
+                        assert!(
+                            output_block_id.is_some(),
+                            "the model wrote text, so the id is carried"
+                        );
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+                assert!(sub.try_recv().is_none(), "exactly one Completed per turn");
+            })
+            .await;
+    }
+
+    /// A SOFT interrupt is a cancellation, not a failure: `Completed` with
+    /// `Cancelled { immediate: false }`. It used to be indistinguishable from a
+    /// clean end of turn (it simply broke the loop and published a bare
+    /// `Completed`), so no observer could tell a player had stopped the turn.
+    ///
+    /// `immediate: false` also records that the in-flight model call was allowed
+    /// to finish — the output block is a whole phrase, which is why this ending
+    /// still feeds the Act while a hard cancel does not.
+    #[tokio::test]
+    async fn soft_interrupt_completes_as_a_soft_cancel() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("soft-cancel").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+
+                // Arm the soft interrupt before the loop's first look at it:
+                // deterministic, and semantically the same check the RPC trips.
+                let (_documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Autonomous,
+                    kernel.clone(),
+                    Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n")),
+                    |interrupt| interrupt.soft(),
+                )
+                .await;
+
+                let msg = completed
+                    .try_recv()
+                    .expect("a cancelled turn is a Completed, not a Failed");
+                match msg.payload {
+                    TurnFlow::Completed {
+                        context_id, reason, ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(
+                            reason,
+                            TurnStopReason::Cancelled { immediate: false },
+                            "a soft interrupt reports itself as a soft cancel"
+                        );
+                        assert!(
+                            reason.output_is_complete(),
+                            "a soft cancel let the model finish its phrase"
+                        );
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
                 assert!(
-                    sub.try_recv().is_none(),
-                    "an un-announced (interactive) turn must not publish Completed"
+                    failed.try_recv().is_none(),
+                    "a cancel must never arrive as a bare-error Failed"
                 );
+            })
+            .await;
+    }
+
+    /// A HARD interrupt reports `Cancelled { immediate: true }` — the ending
+    /// that used to arrive as `Failed { error: "turn interrupted before
+    /// completion" }`, a string an observer had to pattern-match to learn it
+    /// was a cancel and not a crash.
+    ///
+    /// The cancel token is armed before the stream starts, so the loop's
+    /// `select!` sees a ready cancellation branch on every poll. `select!`
+    /// chooses randomly among ready branches, so the scripted stream is long
+    /// (64 deltas): the chance of never picking the cancel branch is 2^-64,
+    /// which is far below the flake floor of the machine running it.
+    #[tokio::test]
+    async fn hard_interrupt_completes_as_an_immediate_cancel() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("hard-cancel").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+
+                let mut events = vec![kaijutsu_kernel::llm::StreamEvent::TextStart];
+                events.extend(
+                    (0..64).map(|_| kaijutsu_kernel::llm::StreamEvent::TextDelta("C".into())),
+                );
+                events.push(kaijutsu_kernel::llm::StreamEvent::TextEnd);
+                events.push(kaijutsu_kernel::llm::StreamEvent::Done {
+                    stop_reason: Some("end_turn".into()),
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    extra: None,
+                });
+
+                let (_documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Autonomous,
+                    kernel.clone(),
+                    Provider::Mock(
+                        MockClient::new("unused").with_scripted_stream(vec![events]),
+                    ),
+                    |interrupt| interrupt.hard(),
+                )
+                .await;
+
+                let msg = completed
+                    .try_recv()
+                    .expect("a hard-cancelled turn publishes Completed with a cancel reason");
+                match msg.payload {
+                    TurnFlow::Completed {
+                        context_id, reason, ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(
+                            reason,
+                            TurnStopReason::Cancelled { immediate: true },
+                            "a hard interrupt reports itself as an immediate cancel"
+                        );
+                        assert!(
+                            !reason.output_is_complete(),
+                            "the stream was severed mid-token — the output is a fragment, \
+                             so the beat scheduler must not crystallize it"
+                        );
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+                assert!(
+                    failed.try_recv().is_none(),
+                    "a cancel is not a failure"
+                );
+            })
+            .await;
+    }
+
+    /// A truncated response carries `MaxTokens`, taken from the provider's own
+    /// terminal stop reason. Without it, a turn cut off at the output ceiling is
+    /// indistinguishable from one the model chose to end — the frontend renders
+    /// a half-sentence as a finished answer.
+    #[tokio::test]
+    async fn token_ceiling_truncation_reports_max_tokens() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("max-tokens").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+                let events = vec![
+                    kaijutsu_kernel::llm::StreamEvent::TextStart,
+                    kaijutsu_kernel::llm::StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
+                    kaijutsu_kernel::llm::StreamEvent::TextEnd,
+                    kaijutsu_kernel::llm::StreamEvent::Done {
+                        stop_reason: Some("max_tokens".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    },
+                ];
+
+                let (_documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Interactive,
+                    kernel.clone(),
+                    Provider::Mock(
+                        MockClient::new("unused").with_scripted_stream(vec![events]),
+                    ),
+                    |_| {},
+                )
+                .await;
+
+                let msg = completed.try_recv().expect("a truncated turn still completes");
+                match msg.payload {
+                    TurnFlow::Completed {
+                        context_id, reason, ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(reason, TurnStopReason::MaxTokens);
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
             })
             .await;
     }
@@ -2223,7 +2481,7 @@ mod publish_tests {
     /// design's "exactly one terminal event per announced turn" contract (§7),
     /// while the two stream-error paths and the clean tail all announce. An
     /// un-announced (interactive) turn stays silent even when hydration fails.
-    async fn drive_failed_hydration(announce_completion: bool, kernel: Arc<Kernel>) -> ContextId {
+    async fn drive_failed_hydration(origin: TurnOrigin, kernel: Arc<Kernel>) -> ContextId {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore =
             Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
@@ -2265,7 +2523,7 @@ mod publish_tests {
             interrupt,
             1,
             context_interrupts,
-            announce_completion,
+            origin,
         )
         .await;
         ctx
@@ -2280,7 +2538,7 @@ mod publish_tests {
                 let mut failed = kernel.turn_flows().subscribe("turn.failed");
                 let mut completed = kernel.turn_flows().subscribe("turn.completed");
 
-                let ctx = drive_failed_hydration(true, kernel.clone()).await;
+                let ctx = drive_failed_hydration(TurnOrigin::Autonomous, kernel.clone()).await;
 
                 let msg = failed
                     .try_recv()
@@ -2298,20 +2556,33 @@ mod publish_tests {
             .await;
     }
 
+    /// An interactive turn whose hydration fails publishes `Failed` too, tagged
+    /// `Interactive`. It used to stay silent — which meant a client that had
+    /// just submitted a prompt got no signal at all that its turn had died, and
+    /// would wait on block status that was never going to change.
     #[tokio::test]
-    async fn failed_hydration_stays_silent_when_interactive() {
+    async fn failed_hydration_announces_when_interactive() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let kernel = Arc::new(Kernel::new_ephemeral("hydrate-fail").await);
                 let mut failed = kernel.turn_flows().subscribe("turn.failed");
 
-                let _ctx = drive_failed_hydration(false, kernel.clone()).await;
+                let ctx = drive_failed_hydration(TurnOrigin::Interactive, kernel.clone()).await;
 
-                assert!(
-                    failed.try_recv().is_none(),
-                    "an interactive turn announces nothing, even on hydration failure"
-                );
+                let msg = failed
+                    .try_recv()
+                    .expect("a broken interactive turn must tell its client");
+                match msg.payload {
+                    TurnFlow::Failed {
+                        context_id, origin, ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(origin, TurnOrigin::Interactive);
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                assert!(failed.try_recv().is_none(), "exactly one terminal event");
             })
             .await;
     }
@@ -2777,7 +3048,7 @@ mod usage_tests {
             interrupt,
             1,
             context_interrupts,
-            true,
+            TurnOrigin::Autonomous,
         )
         .await;
 
