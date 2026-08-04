@@ -268,6 +268,78 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
+## Household-agent arc — task blocks + harness steals (seeded 2026-08-04, gap-analysis session)
+
+Amy is pointing kaijutsu at always-on household duty (daily task grooming,
+proactive check-ins, chat access). We read the two flagship harnesses —
+clones at `~/src/research/hermes-agent` + `~/src/research/QwenPaw` — and wrote
+the comparison to `~/src/meadow-lab/docs/kaijutsu-gap-analysis.md`. kj already
+wins model switching, semantic memory, OTel, and CRDT-native state; the gaps:
+
+- **Task BlockKind + tool — SHIPPED 2026-08-04** (Amy: *"Task BlockKind and
+  tool is a great idea"*). `BlockKind::Task` + a dedicated CRDT-synced
+  `task_status`/`task_status_at` field (mirrors `content_type`'s exact
+  mechanism — its own `TaskStatus` enum, not a reuse of the tool-execution-
+  shaped `Status`) get multi-frontend task sync from the CRDT for free.
+  Closes the "no task/plan state — compare TodoWrite" gap noted in the
+  day-job entry above. `builtin.tasks` (`mcp/servers/tasks.rs`) exposes
+  create/update/complete/cancel/list (open/done buckets); subtasks reuse
+  the ordinary `parent_id` DAG edge. Hydration mirrors `BlockKind::Notification`
+  (D-34): a task's creation/current-state is appended once per
+  `ConversationMailbox`'s `seen`-keyed translate-once rule, so a later status
+  edit never rewrites an already-cached message. Design note: `docs/tasks.md`.
+  **Deferred** (kept narrow on purpose): app/kj-CLI rendering (a placeholder
+  `[status] content` line covers `kaijutsu-app` for now), a `task_reparent`
+  verb (no cheap "move to new parent" primitive exists yet — `move_block`
+  only reorders siblings), and — the one real design gap — a companion
+  `Notification` block auto-emitted when a task changes from OUTSIDE the
+  model's own tool call (another principal grooming via the app), so an
+  out-of-band change actually reaches a live conversation instead of only
+  showing up at the next boundary re-hydrate.
+- **EvictionIndex as an oplog view** (QwenPaw `scroll/eviction_index.py`, the
+  best idea in either codebase): compressed-out history collapses into a
+  tiered in-context "odometer" (capped blocks per tier, older tiers carry
+  upward) so the model *knows what it forgot*, paired with one bounded
+  read-only recall tool. Amy's shape for kj: *"should be simple in kaijutsu,
+  we could have an RC script inject the generation counter, kaijutsu keeps
+  the graph intact if we use fork to manage the contexts as they roll"* —
+  rolling fork chain as the generations, RC-injected counter, index as a view
+  over `context_edges` + oplog. No second store.
+- **One channel, exactly one** — a new `invoke_peer` peer kind for an
+  external chat channel (today only `app`/`mcp` exist). Field lesson: QwenPaw
+  ships 17 channels, Hermes is mid-migration between two competing adapter
+  systems; protocol quirks (Telegram UTF-16 chunking, Signal rate limiting)
+  dominate the cost. Hermes' 4-method adapter ABC
+  (connect/disconnect/send/get_chat_info) is the right size. Pick the
+  channel the household actually uses; stop there.
+- **Graduated trust, when access grows**: QwenPaw `governance/policy.py` is
+  the reference — two-tier rules (immutable builtin + approval-generated),
+  verdicts ALLOW/DENY/ASK/SANDBOX, ASK→approve→generalize to fight allowlist
+  fatigue. Hermes is the cautionary tale (honest SECURITY.md: "the OS is the
+  only boundary"; shipped the denylist default anyway). kj's shared-trust
+  stance is right for Amy-only operation; channels + household input change
+  the threat model — decide the posture explicitly at that point.
+- Always-on hardening already tracked elsewhere in this file (MCP audit,
+  `register_session` reconnect, hook self-lockout, WorkspaceGuard fail-open)
+  graduates from papercut to blocker once the kernel runs unattended.
+- Scheduling steals folded into **"Grooming tracks"** (not yet seeded in this
+  file) — that entry is this arc's cron half.
+- **ACP adapter (`kaijutsu-acp`) — the mobile shortcut** (researched
+  2026-08-04). ACP v1 went stable 2026-06-24 (schema 1.20.0), governance
+  moved off Zed to a neutral `agentclientprotocol` org, LSP-style. Mobile
+  clients already exist (Happy iOS/Android/Web, Agmente, Ferngeist, Mobvibe)
+  plus messaging bridges — an ACP server adapter shaped exactly like
+  `kaijutsu-mcp --connect` (thin bridge: ACP session ↔ kj context, JSON-RPC
+  stdio outside, Cap'n Proto inside) could put kj on Amy's phone before any
+  custom app exists. Rust SDK is real: `agent-client-protocol` 2.0.0 on
+  crates.io (SemVer, NOT protocol v2 — v2 is behind `unstable_protocol_v2`).
+  **Build against v1; ACP2 is draft** (announced 2026-07-20, alpha schemas,
+  explicit "gate behind feature flags", no GA date). v2 heads-up that suits
+  us: `fs/*`+`terminal/*` methods are removed in favor of client-provided
+  MCP servers — kj's MCP-first tool story is already on the right side of
+  that migration. Remote transport (HTTP/WS) is still an Active RFD; our SSH
+  `--connect` pattern sidesteps the wait.
+
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 
 LiquidAI's LFM2.5 encoder branch is a small-model toolbox aimed at exactly
@@ -626,8 +698,6 @@ than left to rot.
   or notifies, and there is no `kj wait`. The parent must poll or manually
   `kj drift pull`. Compare Claude Code's `Task`, which blocks or wakes the
   caller. *(Relates to "Headless one-shot with JSONL streaming" below.)*
-- **No task/plan state.** No `BlockKind` variant, no tool. A model can only
-  `block_create` freeform text and re-read it. Compare TodoWrite.
 - **No LSP / diagnostics** — no go-to-definition, no type errors without paying
   for a full compile.
 - **`register_session` hard-fails on label conflict** instead of reusing the

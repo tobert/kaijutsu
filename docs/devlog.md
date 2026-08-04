@@ -1028,3 +1028,65 @@ staging is empty, so we need both a deliverable item AND a dead letter
 present at flush time." All three fixes were unit-green before that flush
 ever ran, and none of them would have found it. What did was typing the
 command on a live kernel and reading the answer.
+
+## Tasks join the block model — the household-agent arc opens (August 4)
+
+A gap-analysis session against two flagship agent harnesses — hermes-agent
+and QwenPaw, both cloned and read cover to cover — turned up one gap kj
+actually had to fix: no task state. Both harnesses lean on a todo tool
+writing JSON to disk; Amy's read was immediate — *"Task BlockKind and tool
+is a great idea"* — and the reason why fell out of the block model itself.
+A task that's a block gets the CRDT for free: create it here, watch it
+converge everywhere, no second store to keep honest.
+
+The design took less debate than expected once the precedent was found.
+`content_type` had already solved "one more mutable field on every block,
+independently LWW-clocked, cheap to add" — a `Copy` field on `BlockHeader`
+plus its own Lamport timestamp, merged by the same `field_wins` tiebreak
+every other per-field register uses. `task_status` is that mechanism
+again, verbatim, which meant the CRDT plumbing — `content.rs`'s
+`set_task_status`, `block_store.rs`'s wrapper, the wire fields on
+`BlockSnapshot` and the `MetadataChanged` bundle — was less a design
+problem than a typing exercise. The one real decision was what status
+even means: reusing the existing `Status` enum (Pending/Running/Done/
+Error) was tempting and wrong, because `Error` means "the tool crashed"
+and a cancelled task isn't a crash, it's a choice. `TaskStatus` got its
+own four values and its own tie-break order — Cancelled outranks Done on
+a timestamp tie, the same way Error outranks Done in the original —
+documented rather than left to accident.
+
+The nuance the task brief flagged in advance turned out to be the real
+one: tasks get edited constantly, mid-conversation, and kaijutsu already
+has a hard rule against exactly that shape of block — the daily
+system-prompt-cache invalidation `BlockKind::Notification` was built to
+dodge in July. The Notification precedent transferred clean once its
+actual mechanism was understood, not just its name: it isn't that
+Notification blocks are special, it's that `ConversationMailbox` only
+ever translates a given `BlockId` once, so a block whose fields mutate in
+place after that translation simply never gets re-rendered into the live
+conversation — the already-sent bytes stay the already-sent bytes,
+cache-safe by construction, no special hydration path required. Task
+inherited that for free. What it does *not* get for free — and what got
+written down rather than built — is the case of Amy completing a task
+from the app while the model isn't looking; that one wants a companion
+Notification block on the same pattern that already exists, deferred
+because nothing forces it yet.
+
+The MCP surface turned into a smaller decision than the doc comments
+suggest it should have been: a fifth builtin server, `builtin.tasks`,
+sitting next to `block.rs` rather than inside it, for the same reason
+`builtin.shell`/`builtin.shell_readonly` already split — a household
+agent should be grantable "groom tasks" without also getting arbitrary
+block surgery. Reaching Claude Code needed nothing at all: the MCP
+slim-down from a few weeks back had already turned the external server
+into a generic `kaish_exec` dispatcher gated by broker capability, so a
+new builtin instance is visible to every `*`-loadout role the moment it
+registers. The tests found two real bugs on the way in — a Lamport-tie
+test that wasn't actually testing a tie (the second peer's clock starts
+one tick ahead after a one-way sync; the fix was an equalizing round trip
+before the race, now called out by name in the test comment so nobody
+"fixes" it back into a false pass), and a `task_list` filter that
+validated the filter string per-candidate instead of up front, so an
+invalid filter silently passed on an empty task list. Both are exactly
+the shape of bug a fresh feature is supposed to shake out before anyone
+depends on it.
