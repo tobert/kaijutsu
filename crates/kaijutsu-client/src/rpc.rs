@@ -994,6 +994,31 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Declare what this client's push subscriptions can handle.
+    ///
+    /// Call BEFORE subscribing — a server-side bridge reads the flags once,
+    /// when it starts. Opt-in by design: a kernel that never hears from us
+    /// sends the conservative event shapes, which is exactly what keeps an
+    /// older binary working against a newer kernel and vice versa.
+    ///
+    /// This build implements both `onBlockTextOpsBatch` (coalesced text ops)
+    /// and `onSubscriptionTerminated` (the lag kick), so it declares both.
+    #[tracing::instrument(skip(self), name = "rpc_client.declare_event_capabilities")]
+    pub async fn declare_event_capabilities(
+        &self,
+        text_ops_batch: bool,
+        subscription_terminated: bool,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.declare_event_capabilities_request();
+        {
+            let mut params = request.get();
+            params.set_text_ops_batch(text_ops_batch);
+            params.set_subscription_terminated(subscription_terminated);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
     // =========================================================================
     // In-app editor sessions (the vi/edit builtin; see docs/vi.md)
     // =========================================================================

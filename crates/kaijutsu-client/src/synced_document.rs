@@ -119,7 +119,10 @@ impl SyncedDocument {
             // A post-reconnect resync delivery names its target context inline.
             ServerEvent::ContextResynced { sync } => Some(sync.context_id),
             // Connection- and session-scoped events carry no context.
-            ServerEvent::ResourceUpdated { .. }
+            // A subscription termination is connection-wide: it cuts every
+            // context this client was watching, not one of them.
+            ServerEvent::SubscriptionTerminated { .. }
+            | ServerEvent::ResourceUpdated { .. }
             | ServerEvent::ResourceListChanged { .. }
             | ServerEvent::EditorStateChanged { .. }
             | ServerEvent::EditorClosed { .. }
@@ -435,7 +438,11 @@ impl SyncedDocument {
             // Resource, input document, and editor events don't affect
             // conversation document state. The editor renders off its own
             // session subscription, never the conversation doc cache (Design A).
-            ServerEvent::ResourceUpdated { .. }
+            // The kernel cut us off for falling behind. Recovery is the
+            // actor's reconnect + full resync, not a doc-level patch — there is
+            // nothing here to apply and nothing to salvage.
+            ServerEvent::SubscriptionTerminated { .. }
+            | ServerEvent::ResourceUpdated { .. }
             | ServerEvent::ResourceListChanged { .. }
             | ServerEvent::InputTextOps { .. }
             | ServerEvent::InputCleared { .. }
