@@ -1,0 +1,41 @@
+[package]
+name = "kaijutsu-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent Client Protocol (ACP v1) bridge exposing a kaijutsu kernel to ACP clients (toad, Zed, Happy, …)"
+
+[[bin]]
+name = "kaijutsu-acp"
+path = "src/main.rs"
+
+[dependencies]
+kaijutsu-client.workspace = true
+kaijutsu-crdt.workspace = true
+kaijutsu-types.workspace = true
+kaijutsu-viz.workspace = true
+kaijutsu-telemetry.workspace = true
+
+# ACP v1. The `2.0.0` is CRATE SemVer, not protocol v2 — protocol v2 lives
+# behind `unstable_protocol_v2`, which we deliberately leave OFF (docs/acp.md,
+# "Version stance"). Default features only: every `unstable_*` schema type is
+# off-limits here.
+agent-client-protocol = "2.0.0"
+
+# `time` on top of the workspace set: the connect wait is bounded by a
+# timeout, and relying on another crate's feature unification for that would
+# be a build that breaks the day this crate is compiled alone.
+tokio = { workspace = true, features = ["time"] }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+whoami = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+# RFC3339 stamps for ACP `SessionInfo::updated_at`. Already in the lock via
+# schemars' chrono04 feature; taken as a direct dep here rather than
+# hand-rolling a date formatter.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
