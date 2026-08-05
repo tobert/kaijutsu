@@ -751,6 +751,11 @@ struct SlotState<T> {
     /// Set when the ordered queue overflowed. The consumer is told once, then
     /// the subscription is finished.
     terminated: Option<FlowTermination>,
+    /// The termination has been logged. Guards against re-logging it on every
+    /// subsequent publish to a subscriber that has not noticed yet — that is
+    /// exactly the "one warning per text delta" noise this rework set out to
+    /// kill, and it would come straight back without this flag.
+    logged: bool,
     /// The termination has been reported; further receives return `None`.
     reported: bool,
 }
@@ -971,6 +976,7 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
                 delivered: 0,
                 timing_dropped: 0,
                 terminated: None,
+                logged: false,
                 reported: false,
             }),
             notify: Notify::new(),
@@ -1045,13 +1051,16 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
                     delivered += 1;
                     return true;
                 }
-                // Refused: either already terminated (stays until the consumer
-                // notices and drops it) or terminated by THIS message.
-                if !slot.finished()
-                    && let Ok(st) = slot.state.lock()
+                // Refused: either terminated by THIS message, or already
+                // terminated and waiting for the consumer to notice. Log the
+                // first case exactly once — a terminated slot lingers until its
+                // handle drops, and every publish in between would otherwise
+                // re-log it.
+                if let Ok(mut st) = slot.state.lock()
+                    && !st.logged
                     && let Some(info) = st.terminated.clone()
-                    && info.delivered == st.delivered
                 {
+                    st.logged = true;
                     kicked.push((slot.pattern.clone(), info));
                 }
                 true
@@ -2818,6 +2827,42 @@ mod tests {
             late_seqs,
             vec![1],
             "a late subscriber starts its own count at 1 — seq is per-subscription"
+        );
+    }
+
+    /// A terminated subscription that nobody has drained yet must be logged
+    /// EXACTLY ONCE, however many publishes keep arriving. The bug this rework
+    /// replaced announced itself once per text delta; reintroducing that noise
+    /// on the termination path would be the same mistake wearing a new hat.
+    #[tokio::test]
+    async fn termination_is_announced_once_not_once_per_publish() {
+        let bus: FlowBus<BlockFlow> = FlowBus::with_capacities(4, 4);
+        let sub = bus.subscribe("block.text_ops");
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+
+        // Overflow, then keep publishing at the dead subscriber.
+        for i in 0..200 {
+            bus.publish(text_op(ctx, id, i as u8));
+        }
+        assert!(sub.is_terminated());
+
+        // The `logged` latch is what bounds the log volume; assert it directly
+        // (the tracing output itself is not capturable here).
+        let slot = sub.slot.as_ref().expect("a live slot");
+        assert!(
+            slot.state.lock().unwrap().logged,
+            "the termination was announced"
+        );
+
+        // And the publisher still refuses to slow down or block on it.
+        let started = std::time::Instant::now();
+        for i in 0..1_000 {
+            bus.publish(text_op(ctx, id, i as u8));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "publishing past a dead subscriber must stay cheap"
         );
     }
 
