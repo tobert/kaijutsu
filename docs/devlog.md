@@ -1090,3 +1090,81 @@ validated the filter string per-candidate instead of up front, so an
 invalid filter silently passed on an empty task list. Both are exactly
 the shape of bug a fresh feature is supposed to shake out before anyone
 depends on it.
+
+## The day toad played kaijutsu (August 5)
+
+The household-agent foundations were one night old when Amy opened the day
+with a verdict and a wish: *"Using toad with kaibo was a delight. I'd like
+to have some subagents work on the ACP adapter."* Four lanes launched
+before lunch — the deferred cast toil, the deepseek review queue (where
+soft-cancel crystallization got decided on purpose rather than left as an
+accident of the variant), the Ask pathway for permissions, and the
+headline: `kaijutsu-acp`, a thin ACP v1 bridge in the exact image of
+kaijutsu-mcp. The adapter lane had prior art nobody had planned for — the
+kaibo ACP worktree was sitting in ~/src/wt, the very adapter toad had been
+talking to the day before — and it returned the day's most satisfying
+finding: the session picker could serve the app's ring-0 rank with zero
+schema changes, because the ring stamps already rode the wire and the
+seating function was pure. One seating engine, two frontends; seat 2 on
+the desk is seat 2 anywhere.
+
+Then Amy bounced the kernel and the first toad flight died on its first
+prompt — and pulling that thread found the day's real monster. The
+task-blockkind merge had added a field to a struct that rides the at-rest
+oplog CBOR, without a serde default. Nobody had restarted the kernel
+across that merge, so the breakage sat latent until the bounce, then
+detonated all at once: every pre-task document undecodable, rc scripts
+unreadable, therefore no create-time capability bindings, therefore
+deny-by-default locking every facade including the operator's own kj. A
+missing attribute became a total lockout through four links of chain. The
+skip-not-truncate durability design held — nothing lost, everything
+replayed once decode was fixed — and the lessons went straight into the
+backlog: new at-rest fields decode old bytes or they don't merge; forty
+quiet per-document errors should be one loud aggregate; and an unbound
+context that denies its own operator is mistake-prevention behaving like
+an auth wall, which the instrument stance explicitly forbids.
+
+The afternoon became the best shakedown this project has had. Toad flew;
+things broke; every break was real. Four incidents traced to one kernel
+defect — the FlowBus was a shared broadcast ring, so one slow subscriber's
+overflow silently evicted events for everyone — and the adapter grew
+defensive layers (a quiet-poll on the turn wait, catch-up resync, a
+trailing-edge sweep) that each taught the true shape of the problem before
+the real fix landed. Amy set the doctrine in one sentence: *"no lossy
+solutions. I'd rather be disconnected."* The Opus rework built exactly
+that: per-subscription bounded queues, lossless-or-terminated for ordered
+topics, an explicit kick that drops the connection so even a version-blind
+old client recovers through ordinary reconnect-resync. Musical time kept
+its own law — timing topics stay latency-first and drop-oldest, missed
+beats stay missed — and the token firehose got coalesced at the forwarder,
+batching calls but never concatenating buffers. The quiet contract
+underneath is the part worth keeping: sequence numbers mean a gap can now
+only be "terminated or resubscribed," so a gap without a termination is by
+definition a kernel bug, and the client logs it as one. Silent loss
+stopped being a representable state.
+
+Losslessness had one more lesson to teach: per-lane guarantees say nothing
+about ordering *across* lanes, and the turn-completion event started
+beating the final text chunks to the bridge — truncating exactly the
+report the user was waiting for. The bridge learned to settle delivery
+before answering the prompt. Then the arcs converged: Task blocks, one day
+old, wired into ACP's plan updates — cancelled tasks omitted because a
+plan is what the agent intends to do, subtasks flattened, identical
+rebuilds silent — and Amy's flight report closed the loop: *"that task
+tracker worked perfectly though."* Grooming a CRDT task block anywhere now
+moves a checklist in every connected frontend.
+
+What toad taught that wasn't ours to fix: it doesn't consume ACP's session
+list (its picker is its own database), and its thought widget accumulates
+upward where nobody is looking. What it taught that is ours: a fresh coder
+context with a full toolbelt answers a simple question with a 63k-token
+expedition, rediscovering kaish's parse rules the hard way every session —
+the coder stance owes the model both proportionality and a primer, and
+connecting clients want identity-keyed presets (ACP's initialize already
+says who's calling). Review earned its keep all day — a hydration-skip
+suggestion from an external reviewer that would have made the leak worse,
+a chained-lock self-deadlock in a merged lane, a settled behavior change
+pinned by test instead of comment. And the crosstalk stance stopped being
+theory: while the model toured the repo in Amy's toad session, the lead
+watched the same blocks from the kj side and Amy watched from the app —
+three players reading one score, which is what the instrument was for.
