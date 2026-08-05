@@ -176,8 +176,15 @@ impl std::fmt::Debug for Kernel {
     }
 }
 
-/// Default capacity for the block flow bus.
-const DEFAULT_FLOW_CAPACITY: usize = 1024;
+/// Per-subscription lossless queue depth for the kernel's flow buses.
+///
+/// Resolved once per kernel from [`crate::flows::FLOW_QUEUE_DEPTH_ENV`], falling
+/// back to [`crate::flows::DEFAULT_ORDERED_QUEUE_DEPTH`]. It is the one knob on
+/// the backpressure story: how much memory a stalled subscriber may hold before
+/// it is cut off (see `flows.rs` for the sizing rationale).
+fn default_flow_capacity() -> usize {
+    crate::flows::configured_queue_depth()
+}
 
 impl Kernel {
     /// Resolve the CAS base path from a data_dir.
@@ -202,8 +209,8 @@ impl Kernel {
             llm: RwLock::new(LlmRegistry::new()),
             peers: RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
-            block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
-            turn_flows: shared_turn_flow_bus(DEFAULT_FLOW_CAPACITY),
+            block_flows: shared_block_flow_bus(default_flow_capacity()),
+            turn_flows: shared_turn_flow_bus(default_flow_capacity()),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
@@ -225,7 +232,7 @@ impl Kernel {
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
                 crate::editor::EditorSessions::new(),
             )),
-            editor_flows: shared_editor_flow_bus(DEFAULT_FLOW_CAPACITY),
+            editor_flows: shared_editor_flow_bus(default_flow_capacity()),
             // spawn_reaper: a lightweight periodic sweep so terminal
             // background-process entries are reaped even if nothing ever
             // polls the registry again (e.g. a context is removed —
@@ -278,7 +285,7 @@ impl Kernel {
             peers: RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
-            turn_flows: shared_turn_flow_bus(DEFAULT_FLOW_CAPACITY),
+            turn_flows: shared_turn_flow_bus(default_flow_capacity()),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
@@ -300,7 +307,7 @@ impl Kernel {
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
                 crate::editor::EditorSessions::new(),
             )),
-            editor_flows: shared_editor_flow_bus(DEFAULT_FLOW_CAPACITY),
+            editor_flows: shared_editor_flow_bus(default_flow_capacity()),
             // spawn_reaper: a lightweight periodic sweep so terminal
             // background-process entries are reaped even if nothing ever
             // polls the registry again (e.g. a context is removed —

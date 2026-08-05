@@ -1546,8 +1546,12 @@ pub async fn create_shared_kernel(
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
-    let block_flows = shared_block_flow_bus(1024);
-    let input_flows = shared_input_doc_flow_bus(256);
+    // Per-subscription lossless queue depth (KAIJUTSU_FLOW_QUEUE_DEPTH). The
+    // real server's buses must match the kernel's own sizing, not a smaller
+    // literal that would kick clients sooner here than anywhere else.
+    let flow_depth = kaijutsu_kernel::flows::configured_queue_depth();
+    let block_flows = shared_block_flow_bus(flow_depth);
+    let input_flows = shared_input_doc_flow_bus(flow_depth);
 
     // Resolve stable data directory (used for block store DB, kernel DB, semantic index)
     let resolved_data_dir = match data_dir {
