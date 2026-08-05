@@ -395,6 +395,51 @@ wins model switching, semantic memory, OTel, and CRDT-native state; the gaps:
   MCP servers — kj's MCP-first tool story is already on the right side of
   that migration. Remote transport (HTTP/WS) is still an Active RFD; our SSH
   `--connect` pattern sidesteps the wait.
+  **Prototype landed 2026-08-05** on branch `acp-adapter` —
+  `crates/kaijutsu-acp`, ACP v1 over stdio, `--connect` inward, ring 0 served
+  as the session picker. Living record + the full mapping table + the manual
+  smoke test: `docs/acp.md`. What it left open is below.
+
+## ACP adapter follow-ups (2026-08-05, from building `kaijutsu-acp`)
+
+Ordered roughly by how much they hurt. Full context in `docs/acp.md`, "The
+adapter, as built".
+
+- **`session/request_permission` is stubbed to auto-allow** —
+  `kaijutsu-acp/src/permission.rs`, marked in capitals. Blocked on
+  `HookAction::Ask` + a `PermissionEvents` server→client callback (acp.md
+  gap #2). The bridge-side half — option shaping, outcome interpretation,
+  deny-on-anything-unrecognised — is written and unit-tested; only the
+  kernel→bridge transport is missing. **Do not point an untrusted client at
+  the bridge until this lands.**
+- **No catch-up after a resync.** On `SyncReset`/broadcast-lag/reconnect the
+  session pump rebuilds its CRDT mirror and re-pegs the mapper *silently*
+  (`session.rs::resync`); changes during the gap never reach that ACP client.
+  Replaying instead would duplicate the whole transcript. Logged at `warn`.
+  Same family as the deferred TurnFlow catch-up story — one fix serves both.
+- **`onTurnCompleted` carries no turn id.** The adapter's prompt wait matches
+  on `context_id` + `TurnOrigin::Interactive`; two interactive turns racing in
+  one context would cross wires. This is the P3 "no turnId/endedAt … revisit
+  with the adapter" item above, now with a caller asking for it.
+- **`kaijutsu-mcp`'s `write_input` deletes by BYTE length** (`lib.rs:1434`,
+  `state.content.len()` fed to `edit_input`'s char-addressed `delete`). Any
+  non-ASCII in the input doc truncates or over-deletes. `kaijutsu-acp` uses
+  `chars().count()`; mcp should too. Same byte→char class as the file-tools
+  bug already fixed.
+- **`BlockKind::Task` has no ACP shape.** ACP v1's `plan`/`PlanEntry` is
+  stable (not the unstable plan-operations feature) and is the obvious target
+  once the `builtin.tasks` grooming surface settles.
+- **Stable v1 methods left unimplemented**: `session/delete` (→
+  `conclude`/`archive`), `session/set_mode` (→ `context_type` / cast roles),
+  `session/set_config_option`. None are advertised in capabilities, so no
+  client will call them.
+- **Kernel-wide block subscription.** The bridge uses
+  `scope_blocks_to_context: false` so several ACP sessions can stream at once,
+  and filters per pump. That is the firehose kaijutsu-mcp deliberately scopes
+  away from (the 2026-06-17 executor-starvation stall). If it bites, the fix
+  is one actor per session, not a narrower filter.
+- **Client-declared `mcpServers` are ignored** (warned once per
+  `session/new`). Needs the unplumbed `external.rs` caller — acp.md gap #4.
 
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 
