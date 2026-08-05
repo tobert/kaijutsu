@@ -403,51 +403,77 @@ struct MidiPortFact {
 }
 
 # Callback for receiving block updates from server
+#
+# # Delivery contract (2026-08-05 backpressure rework)
+#
+# Every method carries `subSeq`: a per-SUBSCRIPTION monotonic counter starting
+# at 1, incremented once per callback the server issues on this subscription
+# (a coalesced `onBlockTextOpsBatch` counts as one). The kernel's FlowBus is
+# lossless per subscriber — a subscriber that cannot keep up is terminated, not
+# silently truncated — so a gap in `subSeq` can only mean one of:
+#
+#   * you were terminated for falling behind (`onSubscriptionTerminated`
+#     arrives, and the connection is dropped right after), or
+#   * you resubscribed / reconnected and the counter restarted at 1.
+#
+# It can NEVER mean "the server quietly lost an event". A client that sees a
+# gap without a termination has found a kernel bug and should say so loudly.
+#
+# `subSeq` is 0 on a peer that predates the rework; treat 0 as "not reporting".
+# Methods on the musical-time lane (`onRenderCue`, `onBeatSync`) count on their
+# OWN sequence, because a missed beat is missed on purpose (docs/midi.md) and
+# must not look like a hole in the block stream.
 interface BlockEvents {
-  onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
-  onBlockDeleted @1 (contextId :Data, blockId :BlockId);
-  onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool);
-  onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status);
-  # `seqNum` is a per-context monotonic counter (M2-B2). Clients use it
-  # to detect dropped events when the broadcast channel overflows; on a
-  # gap, re-fetch via `getContextSync` / `getInputState`.
-  onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data, seqNum :UInt64);
-  onSyncReset @6 (contextId :Data, generation :UInt64);
+  onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data, subSeq :UInt64);
+  onBlockDeleted @1 (contextId :Data, blockId :BlockId, subSeq :UInt64);
+  onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool, subSeq :UInt64);
+  onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool, subSeq :UInt64);
+  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, subSeq :UInt64);
+  # `seqNum` is a per-context monotonic counter (M2-B2) over the CRDT op
+  # stream — distinct from `subSeq`, which counts callbacks on THIS
+  # subscription. Both are useful: `seqNum` says "which op", `subSeq` says
+  # "which delivery".
+  onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data, seqNum :UInt64, subSeq :UInt64);
+  onSyncReset @6 (contextId :Data, generation :UInt64, subSeq :UInt64);
 
   # Input document events (compose scratchpad)
-  onInputTextOps @7 (contextId :Data, ops :Data, seqNum :UInt64);
-  onInputCleared @8 (contextId :Data);
+  onInputTextOps @7 (contextId :Data, ops :Data, seqNum :UInt64, subSeq :UInt64);
+  onInputCleared @8 (contextId :Data, subSeq :UInt64);
 
   # Session control events (server → client)
-  onContextSwitched @9 (contextId :Data);
+  onContextSwitched @9 (contextId :Data, subSeq :UInt64);
 
   # Block excluded flag changed (staging curation)
-  onBlockExcludedChanged @10 (contextId :Data, blockId :BlockId, excluded :Bool);
+  onBlockExcludedChanged @10 (contextId :Data, blockId :BlockId, excluded :Bool, subSeq :UInt64);
 
   # Scalar metadata changed (exit code, stderr, content type, …). Applied
   # directly to the client store — frontier-independent, so it survives a
   # reconnect even when text ops are gated behind a full resync.
-  onBlockMetadataChanged @11 (contextId :Data, blockId :BlockId, metadata :BlockMetadata);
+  onBlockMetadataChanged @11 (contextId :Data, blockId :BlockId, metadata :BlockMetadata, subSeq :UInt64);
 
   # Structured output data changed (output is not DTE-tracked, so it rides
   # its own event rather than the block text op stream).
-  onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData);
+  onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData, subSeq :UInt64);
 
   # Render a cue (docs/pcm.md, docs/midi.md "Render is a wire cue"). A kernel
   # directive (from `kj play`, later the track render seam), not a block change
   # — carried on this channel because it already fans out to every attached
   # client. `contextId` is the originating context (reserved for future
   # per-listener routing); the standalone slice forwards unconditionally.
-  onRenderCue @13 (contextId :Data, cue :RenderCue);
+  #
+  # Musical-time lane: `subSeq` counts separately from the block stream and a
+  # gap is legitimate — a stalled sink misses cues rather than replaying stale
+  # ones.
+  onRenderCue @13 (contextId :Data, cue :RenderCue, subSeq :UInt64);
 
   # A beat reference for the sink's continuous timebase (docs/midi.md "The
   # relative-lead timebase, analyzed"). Emitted at a low rate while a track's
   # clock rolls; the sink's phasor extrapolates the beats between and slews
   # toward each reference. Like onRenderCue, a directive that fans out to every
-  # attached client. `contextId` is the track's score context (the same key
-  # onRenderCue uses), so a sink can associate a beat with its track.
-  onBeatSync @14 (contextId :Data, beatRef :BeatRef);
+  # attached client, on the musical-time lane. `contextId` is the track's score
+  # context (the same key onRenderCue uses), so a sink can associate a beat
+  # with its track.
+  onBeatSync @14 (contextId :Data, beatRef :BeatRef, subSeq :UInt64);
 
   # A bounded MIDI request/reply at one sink (docs/midi-next.md "SysEx: the
   # exchange pattern"). The FIRST round-trip member of this otherwise
@@ -479,7 +505,59 @@ interface BlockEvents {
   # empty reply and never as a hang.
   exchange @15 (portOrDevice :Text, payload :Data, replyMatch :Data, timeoutMs :UInt32)
       -> (reply :Data);
+
+  # THE LAG KICK. This subscription is over: the client could not drain its
+  # per-subscriber queue fast enough, so the kernel terminated it rather than
+  # let it keep a hole-punched view of the log (Amy, 2026-08-05: "I'd rather be
+  # disconnected"). Sent best-effort with a short deadline, immediately before
+  # the server tears the RPC connection down — so a client that never
+  # implements this method still recovers, via the ordinary reconnect path,
+  # just without knowing why.
+  #
+  # The contract for the client: this is NOT a resumable gap. Reconnect and
+  # resync from scratch (`getContextSync` / a fresh subscription); do not try
+  # to patch forward from the last `subSeq`, because the events between are
+  # gone by construction.
+  #
+  # - `reason` — why the subscription ended.
+  # - `topic` — the FlowBus topic whose event could not be enqueued.
+  # - `delivered` — how many events this subscription successfully received;
+  #   equals the last `subSeq` the client should have seen.
+  # - `capacity` — the queue depth that was exceeded, for the operator.
+  onSubscriptionTerminated @16 (reason :SubscriptionEndReason, topic :Text,
+                                delivered :UInt64, capacity :UInt64);
+
+  # Coalesced text ops for ONE block, in order. The firehose fix: during heavy
+  # streaming the server merges consecutive per-token `block.text_ops` events
+  # for the same block over a short flush window and ships them as one call,
+  # cutting client-visible events per second by an order of magnitude while
+  # preserving content exactly — applying `ops` in order is byte-for-byte what
+  # the individual `onBlockTextOps` calls would have produced. (The blobs are
+  # separate because each is an independently-encoded DTE op set; concatenating
+  # the BYTES would be corruption, so we batch the calls, not the buffers.)
+  #
+  # Only sent to a client that opted in via `Kernel.declareEventCapabilities`.
+  # An older binary never declares, never receives this, and keeps getting
+  # per-op `onBlockTextOps` — no probing, no unimplemented-error fallback.
+  #
+  # `firstSeqNum` is the per-context CRDT `seqNum` of the FIRST op in the
+  # batch; the rest follow consecutively. `subSeq` counts the batch as one
+  # delivery.
+  onBlockTextOpsBatch @17 (contextId :Data, blockId :BlockId, ops :List(Data),
+                           firstSeqNum :UInt64, subSeq :UInt64);
 }
+
+# Why a push subscription ended. Additive: an unknown enumerant decodes as the
+# default, which is the honest "we don't know" answer.
+enum SubscriptionEndReason {
+  # The subscriber's bounded queue filled — it could not keep up.
+  slowSubscriber @0;
+  # The server is going away (shutdown, kernel restart).
+  serverShutdown @1;
+  # Replaced by a newer subscription from the same client instance.
+  superseded @2;
+}
+
 
 # Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).
 # Carries everything a renderer draws; see docs/vi.md.
@@ -1749,6 +1827,23 @@ interface Kernel {
   # `kaijutsu-kernel`'s `mcp::permission` module for the no-subscriber/
   # timeout fail-closed policy this bridges to.
   subscribePermissionEvents @103 (callback :PermissionEvents);
+
+  # Tell the server what this connection's push subscriptions can handle.
+  # Purely additive and purely opt-in: a client that never calls this gets the
+  # conservative shape (per-op text events, no batching), which is exactly what
+  # an older binary needs — no probe, no unimplemented-error fallback, no
+  # silent capability guessing.
+  #
+  # Call it BEFORE subscribing; the flags are read when a bridge starts.
+  #
+  # - `textOpsBatch` — the client implements `BlockEvents.onBlockTextOpsBatch`,
+  #   so the server may coalesce consecutive per-token text ops for one block
+  #   into a single call (docs: the 2026-08-05 backpressure rework).
+  # - `subscriptionTerminated` — the client implements
+  #   `BlockEvents.onSubscriptionTerminated` and will resync on it. The server
+  #   drops the connection either way; this only decides whether it bothers to
+  #   explain itself first.
+  declareEventCapabilities @104 (textOpsBatch :Bool, subscriptionTerminated :Bool);
 }
 
 # ============================================================================

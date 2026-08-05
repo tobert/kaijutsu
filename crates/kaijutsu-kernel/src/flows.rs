@@ -128,15 +128,16 @@ pub struct FlowMessage<T> {
     pub timestamp: Instant,
     /// Optional sender identifier (principal_id or user_id).
     pub sender: Option<String>,
-    /// **Per-subscription** monotonic sequence number, stamped when the message
-    /// is enqueued for one particular subscriber. Two subscribers of the same
-    /// publish see different `seq` values; within one subscription it counts
-    /// 1, 2, 3, … with no holes.
+    /// **Per-subscription, per-lane** monotonic sequence number, stamped when
+    /// the message is enqueued for one particular subscriber. Two subscribers
+    /// of the same publish see different `seq` values; within one
+    /// subscription's ordered lane it counts 1, 2, 3, … with no holes.
     ///
-    /// The contract (see the module docs on [`TopicClass::Ordered`]): a gap in
-    /// `seq` on an ordered topic can only mean the subscription was terminated
-    /// or replaced, never that an event was silently lost. `0` on a message
-    /// that never went through a subscription queue.
+    /// The contract (see [`TopicClass`]): a gap on an **ordered** topic can
+    /// only mean the subscription was terminated or replaced — never that an
+    /// event was silently lost. The **timing** lane counts separately and a gap
+    /// there is honest and expected: it says beats were missed, which is what
+    /// that lane promises. `0` on a message that never went through a queue.
     pub seq: u64,
 }
 
@@ -734,9 +735,14 @@ struct SlotState<T> {
     ordered: VecDeque<FlowMessage<T>>,
     /// Latency-first ring; oldest is dropped when full.
     timing: VecDeque<FlowMessage<T>>,
-    /// Next per-subscription sequence number to stamp (starts at 1; 0 means
-    /// "never went through a queue").
+    /// Next ordered-lane sequence number to stamp (starts at 1; 0 means
+    /// "never went through a queue"). Counted separately from the timing lane
+    /// so that a legitimately-dropped beat cannot punch a hole in the ordered
+    /// stream's continuity — a gap there must mean exactly one thing.
     next_seq: u64,
+    /// Next timing-lane sequence number. Gaps here are expected and honest:
+    /// they say "beats were missed", which is the whole contract of that lane.
+    next_timing_seq: u64,
     /// Messages handed to the consumer so far.
     delivered: u64,
     /// Timing-lane events dropped because the consumer was behind. Never a
@@ -788,8 +794,8 @@ impl<T: Clone> SubscriberSlot<T> {
                     st.timing.pop_front();
                     st.timing_dropped += 1;
                 }
-                msg.seq = st.next_seq;
-                st.next_seq += 1;
+                msg.seq = st.next_timing_seq;
+                st.next_timing_seq += 1;
                 st.timing.push_back(msg);
             }
             TopicClass::Ordered => {
@@ -961,6 +967,7 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
                 ordered: VecDeque::new(),
                 timing: VecDeque::new(),
                 next_seq: 1,
+                next_timing_seq: 1,
                 delivered: 0,
                 timing_dropped: 0,
                 terminated: None,
