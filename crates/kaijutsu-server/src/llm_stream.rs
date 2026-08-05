@@ -1792,6 +1792,35 @@ async fn process_llm_stream(
                     // Reassigned (not or-ed) on every Done so a truncated *middle*
                     // iteration doesn't mislabel a turn that later ends cleanly;
                     // the cancel/cap breaks below overwrite it in turn.
+                    //
+                    // `refusal` and `stop_sequence` both fall through to the
+                    // `_` arm below and render as a clean `EndTurn` — the wire
+                    // has no dedicated stop reason for either yet (deepseek
+                    // post-merge review, docs/issues.md: adding one is a
+                    // capnp change and capnp is owned by a parallel lane right
+                    // now, so it stays open there). The minimal fix here is to
+                    // at least log each distinctly rather than let them
+                    // silently blend into "the model finished normally" —
+                    // `refusal` in particular means the model declined to
+                    // answer, which is operationally worth a `warn`, not a
+                    // `debug`.
+                    match stop_reason.as_deref() {
+                        Some("refusal") => {
+                            log::warn!(
+                                "LLM stream ended with stop_reason=refusal for {context_id} \
+                                 — the model declined to answer; reported to the turn \
+                                 outcome as EndTurn until the wire has a dedicated \
+                                 Refusal stop reason (docs/issues.md)"
+                            );
+                        }
+                        Some("stop_sequence") => {
+                            log::info!(
+                                "LLM stream ended with stop_reason=stop_sequence for \
+                                 {context_id}; reported to the turn outcome as EndTurn"
+                            );
+                        }
+                        _ => {}
+                    }
                     stop_reason_out = match stop_reason.as_deref() {
                         Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
                         _ => TurnStopReason::EndTurn,
