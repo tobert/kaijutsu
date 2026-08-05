@@ -463,9 +463,36 @@ adapter, as built".
   on `context_id` + `TurnOrigin::Interactive`; two interactive turns racing in
   one context would cross wires. This is the P3 "no turnId/endedAt … revisit
   with the adapter" item above, now with a caller asking for it.
-- **`BlockKind::Task` has no ACP shape.** ACP v1's `plan`/`PlanEntry` is
-  stable (not the unstable plan-operations feature) and is the obvious target
-  once the `builtin.tasks` grooming surface settles.
+- ~~**`BlockKind::Task` has no ACP shape.**~~ **SHIPPED 2026-08-05** on
+  branch `acp-plan`. `BlockKind::Task` blocks rebuild into ACP v1's `plan`
+  session update, whole-context, one non-cancelled task per `PlanEntry`.
+  `UpdateMapper::note_task`/`build_plan` (`kaijutsu-acp/src/update.rs`) is
+  the one rebuild-and-emit path, threaded through the live pump, `session/
+  load` replay (exactly one plan at the end), `session/new` bootstrap
+  (silent baseline), and the resync sweep. Decisions: cancelled tasks are
+  omitted (not mapped to any `PlanEntryStatus` — a plan is "what the agent
+  intends to do," and cancelling isn't intent); subtasks (`parent_id` DAG)
+  flatten via pre-order DFS with a `"↳ "` nesting prefix on `content`;
+  priority defaults to `Medium` (no kernel-side priority field exists, none
+  invented). Full writeup: `docs/acp.md` "Task → plan". Found while
+  building: `session::run_pump`'s `BlockDeleted` arm calls `mapper.forget`
+  and `continue`s WITHOUT ever calling `doc.apply_event(&event)` — the live
+  `SyncedDocument` mirror never drops a deleted block, only a resync
+  rebuilds it away. Pre-existing, affects every block kind (not
+  Task-specific), not fixed here — noted as a follow-up below.
+- **`session::run_pump`'s `BlockDeleted` arm never updates the `SyncedDocument`
+  mirror.** Found 2026-08-05 while wiring Task → `plan`. The early-return
+  branch (`kaijutsu-acp/src/session.rs`, the `if let ServerEvent::BlockDeleted
+  ... continue` a few lines into the event-loop arm) calls `mapper.forget`
+  and `continue`s before `doc.apply_event(&event)` runs, even though
+  `SyncedDocument::apply_event_inner` has a real `BlockDeleted` handler
+  (`synced_document.rs` — `sync.apply_delete`). A block deleted mid-session
+  lingers in the live mirror (and so in `doc.blocks()`, and so in a rebuilt
+  Task plan) until the next resync/reconnect throws the mirror away and
+  rebuilds it fresh. Affects every block kind's live rendering, not just
+  Task's plan — worth a one-line fix (call `doc.apply_event` for
+  `BlockDeleted` too, same as every other per-block event) plus a
+  regression test once someone's in that file for another reason.
 - **Client-identity presets on connect** (Amy, 2026-08-05 evening, first
   toad day): ACP `initialize` carries `clientInfo` (Implementation
   name+version) and capabilities — enough to recognize *which* frontend
