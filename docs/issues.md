@@ -452,8 +452,13 @@ adapter, as built".
   the mapper's high-water marks and re-observes the rebuilt doc — the sweep
   emits exactly the gap (unseen tails + unannounced tool patches), never a
   duplicate. The *TurnFlow* half (dropped completion events) got adapter-side
-  lag recovery the same day (idle-poll → best-effort `end_turn`); the exact
-  stop reason across a gap still needs the kernel catch-up story.
+  lag recovery the same day (idle-poll → best-effort `end_turn`).
+  **The kernel-side cause is now fixed** (below), so **the adapter's defensive
+  sweeps — quiet-poll turn wait, trailing-edge pump resync — are dormant
+  defence-in-depth and are candidates for removal** once a few real flights
+  confirm the kernel never drops on them again. Leave them in place until
+  then; delete them together, and only after checking the ACP logs show the
+  sweeps firing zero times.
 - **`onTurnCompleted` carries no turn id.** The adapter's prompt wait matches
   on `context_id` + `TurnOrigin::Interactive`; two interactive turns racing in
   one context would cross wires. This is the P3 "no turnId/endedAt … revisit
@@ -469,9 +474,37 @@ adapter, as built".
   `scope_blocks_to_context: false` so several ACP sessions can stream at once,
   and filters per pump. That is the firehose kaijutsu-mcp deliberately scopes
   away from (the 2026-06-17 executor-starvation stall). If it bites, the fix
-  is one actor per session, not a narrower filter.
+  is one actor per session, not a narrower filter. Less likely to bite now:
+  the 2026-08-05 rework coalesces the text-op firehose at the forwarder, so
+  the bridge sees roughly an order of magnitude fewer callbacks under
+  streaming — and if it *does* fall behind, it is disconnected with a reason
+  instead of quietly losing events.
 - **Client-declared `mcpServers` are ignored** (warned once per
   `session/new`). Needs the unplumbed `external.rs` caller — acp.md gap #4.
+
+## FlowBus backpressure — what the 2026-08-05 rework left open
+
+The rework itself shipped (per-subscription bounded queues, lossless-or-
+terminated, forwarder-side text-op coalescing, `subSeq` + the lag kick on the
+wire). What it deliberately did NOT do:
+
+- **The ACP adapter's defensive sweeps are still in.** Quiet-poll turn wait
+  and trailing-edge pump resync (commits b8b9fe22, 35c4b5b9, 3960fad3,
+  e31d6ddd) are now dormant defence-in-depth. Remove them together, after a
+  few real flights show them firing zero times — not before.
+- **No catch-up for a subscriber that wasn't there.** Losslessness is a
+  promise to *live* subscribers only. See the TurnFlow catch-up item below.
+- **Queue depth is one number for every subscription** (8192, via
+  `KAIJUTSU_FLOW_QUEUE_DEPTH`). A GUI client and a headless MCP session get
+  the same allowance. Per-class or per-principal depths are easy to add if a
+  real workload ever wants them; nothing does yet.
+- **The timing lane is untunable from config.** `block.render_cue` /
+  `block.beat_sync` ride a fixed 64-deep drop-oldest ring. Deliberate — the
+  doctrine is that a stale beat is worse than a missed one — but if a sink
+  ever wants a different depth it needs a knob.
+- **Only `slowSubscriber` is ever sent.** The wire enum also has
+  `serverShutdown` and `superseded`; nothing emits them yet. A clean shutdown
+  still looks to a client like an ordinary disconnect.
 
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 
@@ -2175,7 +2208,7 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **POSIX context quartet:** Implement `kj wait` and `kj stop` to complete the fork/drive/wait/merge paradigm.
 - **`kj drive` follow-up:** Add verb-level refusal for driving Staging contexts.
 - **Autonomous turn runaway guard:** Add a `drive_depth` cap to prevent unbounded fan-out from `--prompt` forks.
-- **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up — and now matters more, since `turn.completed`/`turn.failed` reach wire clients over `subscribeTurnEvents`: a client that subscribes late, or reconnects mid-turn, misses the outcome entirely and must fall back to reading the block log. Deliberately un-journaled (blocks are the durable record; replaying completions after a restart would announce turns nobody is waiting on), so the fix is a *catch-up* story, not a journal.
+- **TurnFlow catch-up for late/reconnecting subscribers:** the *lossy* half is FIXED (2026-08-05, the FlowBus backpressure rework — a live subscriber can no longer miss an event; it is terminated with an explicit signal instead). What remains is the **catch-up** story: a client that subscribes *late*, or reconnects mid-turn, was never a subscriber when the outcome was published, so it still misses `turn.completed`/`turn.failed` and must fall back to reading the block log — which recovers *what* the turn wrote but never *why it stopped* (`TurnStopReason` has no block-log shadow; `EndTurn`, `MaxTokens`, and a soft cancel all leave the same `Done` block behind). Deliberately un-journaled (blocks are the durable record; replaying completions after a restart would announce turns nobody is waiting on), so the fix is a bounded per-context "last outcome" the subscriber reads on attach, not a journal.
 - **Headless turn cwd is `/`:** Decide whether to thread the context's stored shell cwd into the headless `ExecContext`.
 - **`--switch --prompt` double-drives:** Clarify semantics when both human and autonomous turn try to drive a child.
 - **Context-type ↔ fork asymmetry (discovery 2026-06-17, fork code is fresh —

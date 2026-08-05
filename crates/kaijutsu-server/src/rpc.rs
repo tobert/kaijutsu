@@ -110,6 +110,7 @@ use kaijutsu_kernel::{
     ActivityCursor,
     block_store::BlockStore,
     flows::EditorFlow,
+    flows::FlowMessage,
     flows::{TurnFlow, TurnOrigin, TurnStopReason},
     shared_block_flow_bus,
     shared_input_doc_flow_bus,
@@ -738,6 +739,20 @@ pub struct ConnectionState {
     /// spawn_local tasks (FlowBus bridge, etc.) tokio::select! on this so
     /// they shut down promptly instead of leaking onto the LocalSet.
     conn_cancel: CancellationToken,
+    /// The other direction: fired BY a background task to take this whole
+    /// connection down. `run_rpc` selects on it alongside the RpcSystem.
+    ///
+    /// The one caller today is the block bridge, when its per-subscriber queue
+    /// overflows: the client is cut off rather than handed a stream with a hole
+    /// in it (Amy, 2026-08-05: "I'd rather be disconnected"). Dropping the
+    /// connection — not just the subscription — is what makes recovery work for
+    /// EVERY client, including binaries that predate `onSubscriptionTerminated`:
+    /// the actor's existing reconnect-with-full-resync path is already the
+    /// tested route back to a consistent view.
+    disconnect: CancellationToken,
+    /// What this connection's push subscriptions can handle, as declared via
+    /// `declareEventCapabilities`. Conservative until the client says otherwise.
+    event_caps: EventCapabilities,
     /// The kernel's MIDI presence store, attached the first time this
     /// connection reports presence (`docs/midi-next.md` "Presence is
     /// sink-fed"). Held so `Drop` can reap what this connection claimed —
@@ -769,6 +784,8 @@ impl ConnectionState {
             output_subscribers: Vec::new(),
             elicitation_subscribers: Vec::new(),
             conn_cancel: CancellationToken::new(),
+            disconnect: CancellationToken::new(),
+            event_caps: EventCapabilities::default(),
             midi_presence: None,
             midi_exchange: None,
         }
@@ -808,6 +825,23 @@ impl ConnectionState {
     /// should observe this in a `tokio::select!` so they can exit promptly.
     pub fn cancel_token(&self) -> CancellationToken {
         self.conn_cancel.clone()
+    }
+
+    /// Token a background task fires to bring this connection down (see
+    /// [`ConnectionState::disconnect`]). `run_rpc` awaits it.
+    pub fn disconnect_token(&self) -> CancellationToken {
+        self.disconnect.clone()
+    }
+
+    /// What this connection's push subscriptions can handle.
+    pub fn event_capabilities(&self) -> EventCapabilities {
+        self.event_caps
+    }
+
+    /// Record the client's declared push capabilities. Read when a bridge
+    /// starts, so a client must declare before it subscribes.
+    pub fn set_event_capabilities(&mut self, caps: EventCapabilities) {
+        self.event_caps = caps;
     }
 
     /// Get the connection's active context, or error if none joined.
@@ -1546,8 +1580,12 @@ pub async fn create_shared_kernel(
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
-    let block_flows = shared_block_flow_bus(1024);
-    let input_flows = shared_input_doc_flow_bus(256);
+    // Per-subscription lossless queue depth (KAIJUTSU_FLOW_QUEUE_DEPTH). The
+    // real server's buses must match the kernel's own sizing, not a smaller
+    // literal that would kick clients sooner here than anywhere else.
+    let flow_depth = kaijutsu_kernel::flows::configured_queue_depth();
+    let block_flows = shared_block_flow_bus(flow_depth);
+    let input_flows = shared_input_doc_flow_bus(flow_depth);
 
     // Resolve stable data directory (used for block store DB, kernel DB, semantic index)
     let resolved_data_dir = match data_dir {
@@ -2921,519 +2959,41 @@ impl kernel::Server for KernelImpl {
         }
 
         {
-            // Get the FlowBus instances from the kernel
             let block_flows = self.kernel.kernel.block_flows().clone();
             let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
             // Connection-lifetime cancellation. Cleared on ConnectionState
-            // Drop, so the bridge unwinds when the RPC system tears down
-            // (even mid-callback). Per-send `timeout` below bounds the
-            // window during which a stalled peer can pin this task.
-            let conn_cancel = self.connection.borrow().cancel_token();
+            // Drop, so the bridge unwinds when the RPC system tears down (even
+            // mid-callback). `disconnect` is the other direction: the bridge
+            // fires it to take the whole connection down when this subscriber
+            // falls behind, which is what makes the client reconnect and
+            // resync.
+            let (conn_cancel, disconnect, caps) = {
+                let conn = self.connection.borrow();
+                (
+                    conn.cancel_token(),
+                    conn.disconnect_token(),
+                    conn.event_capabilities(),
+                )
+            };
 
-            // Spawn a bridge task that forwards FlowBus events to the callback
-            // Use spawn_local because Cap'n Proto callbacks are not Send
-            // Uses tokio::select! to multiplex block + input doc events on one callback
+            // Cap'n Proto callbacks are not Send, so spawn_local.
             tokio::task::spawn_local(async move {
-                let mut block_sub = block_flows.subscribe("block.*");
+                let block_sub = block_flows.subscribe("block.*");
                 // Input flows are optional at this subscription site.
-                let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
-                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
-                log::debug!(
-                    "Started FlowBus subscription for kernel {} (input_flows={})",
-                    kernel_id.to_hex(),
-                    input_sub.is_some()
-                );
-
-                // Per-callback wall-clock bound. Capnp callbacks share the
-                // SSH socket with all RPC traffic; if the client's read
-                // side has stalled, the server's write buffer fills and
-                // `promise.await` blocks indefinitely. That blocks the
-                // capnp RpcSystem from polling reads, which is the exact
-                // wedge we observed (CLOSE_WAIT, unread bytes). 5s is
-                // generous for a healthy peer and short enough that one
-                // stuck callback can't pin the LocalSet.
-                const CALLBACK_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(5);
-
-                loop {
-                    let success = tokio::select! {
-                        // Connection torn down — exit immediately rather than
-                        // wait for the next event or a callback round-trip.
-                        _ = conn_cancel.cancelled() => {
-                            log::debug!("FlowBus bridge cancelled with connection");
-                            break;
-                        }
-                        Some(msg) = block_sub.recv() => {
-                            match msg.payload {
-                                BlockFlow::Inserted { context_id, ref block, ref after_id, ref ops, .. } => {
-                                    let mut req = callback.on_block_inserted_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        params.set_has_after_id(after_id.is_some());
-                                        if let Some(after) = after_id {
-                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
-                                        }
-                                        // Include CRDT ops for proper sync
-                                        params.set_ops(ops);
-                                        let mut block_state = params.init_block();
-                                        set_block_snapshot(&mut block_state, block);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::Deleted { context_id, ref block_id, .. } => {
-                                    let mut req = callback.on_block_deleted_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
-                                    let mut req = callback.on_block_status_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_status(status_to_capnp(status));
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::CollapsedChanged { context_id, ref block_id, collapsed, .. } => {
-                                    let mut req = callback.on_block_collapsed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_collapsed(collapsed);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::ExcludedChanged { context_id, ref block_id, excluded, .. } => {
-                                    let mut req = callback.on_block_excluded_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_excluded(excluded);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
-                                    let mut req = callback.on_block_moved_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_has_after_id(after_id.is_some());
-                                        if let Some(after) = after_id {
-                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
-                                        }
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::TextOps { context_id, ref block_id, ref ops, seq_num, .. } => {
-                                    let mut req = callback.on_block_text_ops_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_ops(ops);
-                                        params.set_seq_num(seq_num);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::SyncReset { context_id, generation } => {
-                                    let mut req = callback.on_sync_reset_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        params.set_generation(generation);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::ContextSwitched { context_id } => {
-                                    let mut req = callback.on_context_switched_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::OutputChanged { context_id, ref block_id, ref output, .. } => {
-                                    let mut req = callback.on_block_output_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        if let Some(output_data) = output {
-                                            build_output_data(params.reborrow().init_output(), output_data);
-                                        }
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::MetadataChanged { context_id, ref block_id, ref metadata, .. } => {
-                                    let mut req = callback.on_block_metadata_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        build_block_metadata(params.reborrow().init_metadata(), metadata);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::RenderCue { context_id, ref cue } => {
-                                    let mut req = callback.on_render_cue_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_render_cue(params.reborrow().init_cue(), cue);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::BeatSync { context_id, ref beat_ref } => {
-                                    let mut req = callback.on_beat_sync_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_beat_ref(params.reborrow().init_beat_ref(), beat_ref);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Some(msg) = async {
-                            match &mut input_sub {
-                                Some(sub) => sub.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        } => {
-                            match msg.payload {
-                                InputDocFlow::TextOps { context_id, ref ops, seq_num, .. } => {
-                                    let mut req = callback.on_input_text_ops_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        params.set_ops(ops);
-                                        params.set_seq_num(seq_num);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                InputDocFlow::Cleared { context_id } => {
-                                    let mut req = callback.on_input_cleared_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        else => break,
-                    };
-
-                    // Tolerate a transient client-executor stall; reap only on
-                    // sustained failure (see SubscriberHealth). Breaking on the
-                    // first failure permanently severed delivery silently.
-                    if !health.record(success) {
-                        log::warn!(
-                            "FlowBus bridge task for kernel {} stopping: callback \
-                             failures continuous for over {:?} — reaping subscriber",
-                            kernel_id,
-                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
-                        );
-                        break;
-                    }
-                }
-
-                log::debug!("FlowBus bridge task for kernel {} ended", kernel_id);
+                let input_sub = input_flows.map(|f| f.subscribe("input.*"));
+                run_block_bridge(
+                    callback,
+                    block_sub,
+                    input_sub,
+                    None,
+                    caps,
+                    kernel_id,
+                    conn_cancel,
+                    disconnect,
+                    "FlowBus",
+                )
+                .await;
             });
         }
         Promise::ok(())
@@ -3557,7 +3117,10 @@ impl kernel::Server for KernelImpl {
         {
             let editor_flows = self.kernel.kernel.editor_flows().clone();
             let kernel_id = self.kernel.id;
-            let conn_cancel = self.connection.borrow().cancel_token();
+            let (conn_cancel, disconnect) = {
+                let conn = self.connection.borrow();
+                (conn.cancel_token(), conn.disconnect_token())
+            };
 
             tokio::task::spawn_local(async move {
                 let mut sub = editor_flows.subscribe("editor.*");
@@ -3571,7 +3134,27 @@ impl kernel::Server for KernelImpl {
                             log::debug!("editor bridge cancelled with connection");
                             break;
                         }
-                        Some(msg) = sub.recv() => {
+                        Some(ev) = sub.recv_event() => {
+                            let msg = match ev {
+                                kaijutsu_kernel::flows::FlowRecv::Message(m) => m,
+                                // Same doctrine as the block bridge: a
+                                // subscriber that cannot keep up is cut off, not
+                                // handed a stream with a hole in it. Editor state
+                                // is a full snapshot per event, so a gap here
+                                // means a renderer silently showing a stale
+                                // buffer — exactly what we refuse to ship.
+                                kaijutsu_kernel::flows::FlowRecv::Terminated(info) => {
+                                    tracing::error!(
+                                        kernel = %kernel_id,
+                                        topic = info.topic,
+                                        delivered = info.delivered,
+                                        "editor subscriber fell behind — dropping the \
+                                         connection so it resyncs"
+                                    );
+                                    disconnect.cancel();
+                                    break;
+                                }
+                            };
                             match msg.payload {
                                 EditorFlow::StateChanged { session_id, ref state } => {
                                     let mut req = callback.on_editor_state_request();
@@ -3629,9 +3212,18 @@ impl kernel::Server for KernelImpl {
         {
             let turn_flows = self.kernel.kernel.turn_flows().clone();
             let kernel_id = self.kernel.id;
-            let conn_cancel = self.connection.borrow().cancel_token();
+            let (conn_cancel, disconnect) = {
+                let conn = self.connection.borrow();
+                (conn.cancel_token(), conn.disconnect_token())
+            };
 
             tokio::task::spawn_local(async move {
+                // Two subscriptions, two independent queues. Turn outcomes are
+                // rare and CRITICAL — a dropped `Completed` is what left an ACP
+                // prompt promise unresolved forever on 2026-08-05 — and the
+                // per-subscription queues mean bulk block/text pressure cannot
+                // evict, delay, or terminate them: those ride a different bus
+                // entirely.
                 let mut completed = turn_flows.subscribe("turn.completed");
                 let mut failed = turn_flows.subscribe("turn.failed");
                 let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
@@ -3644,7 +3236,22 @@ impl kernel::Server for KernelImpl {
                             log::debug!("turn-events bridge cancelled with connection");
                             break;
                         }
-                        Some(msg) = completed.recv() => {
+                        Some(ev) = completed.recv_event() => {
+                            let msg = match ev {
+                                kaijutsu_kernel::flows::FlowRecv::Message(m) => m,
+                                kaijutsu_kernel::flows::FlowRecv::Terminated(info) => {
+                                    tracing::error!(
+                                        kernel = %kernel_id,
+                                        topic = info.topic,
+                                        delivered = info.delivered,
+                                        "turn-events subscriber fell behind — dropping \
+                                         the connection so it resyncs rather than \
+                                         missing a turn outcome"
+                                    );
+                                    disconnect.cancel();
+                                    break;
+                                }
+                            };
                             match msg.payload {
                                 TurnFlow::Completed {
                                     context_id,
@@ -3692,7 +3299,22 @@ impl kernel::Server for KernelImpl {
                                 }
                             }
                         }
-                        Some(msg) = failed.recv() => {
+                        Some(ev) = failed.recv_event() => {
+                            let msg = match ev {
+                                kaijutsu_kernel::flows::FlowRecv::Message(m) => m,
+                                kaijutsu_kernel::flows::FlowRecv::Terminated(info) => {
+                                    tracing::error!(
+                                        kernel = %kernel_id,
+                                        topic = info.topic,
+                                        delivered = info.delivered,
+                                        "turn-events subscriber fell behind — dropping \
+                                         the connection so it resyncs rather than \
+                                         missing a turn outcome"
+                                    );
+                                    disconnect.cancel();
+                                    break;
+                                }
+                            };
                             match msg.payload {
                                 TurnFlow::Failed {
                                     context_id,
@@ -4719,6 +4341,32 @@ impl kernel::Server for KernelImpl {
     /// RPC. A dead entry (channel closed) is pruned reactively by the
     /// bridge on its next failed send — see `PermissionAskBridge`'s doc
     /// comment.
+    /// Record what this connection's push subscriptions can handle.
+    ///
+    /// Explicit opt-in rather than probing: a client that never calls this
+    /// keeps receiving exactly the event shapes it already understands, so the
+    /// app binary on moltar works unchanged against a kernel that gained
+    /// coalescing. Call it before subscribing — a bridge reads the flags once,
+    /// when it starts.
+    fn declare_event_capabilities(
+        self: Rc<Self>,
+        params: kernel::DeclareEventCapabilitiesParams,
+        _results: kernel::DeclareEventCapabilitiesResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let caps = EventCapabilities {
+            text_ops_batch: p.get_text_ops_batch(),
+            subscription_terminated: p.get_subscription_terminated(),
+        };
+        log::debug!(
+            "client declared event capabilities: batch={} kick={}",
+            caps.text_ops_batch,
+            caps.subscription_terminated,
+        );
+        self.connection.borrow_mut().set_event_capabilities(caps);
+        Promise::ok(())
+    }
+
     fn subscribe_permission_events(
         self: Rc<Self>,
         params: kernel::SubscribePermissionEventsParams,
@@ -6525,519 +6173,44 @@ impl kernel::Server for KernelImpl {
             let block_flows = self.kernel.kernel.block_flows().clone();
             let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
-            let conn_cancel = self.connection.borrow().cancel_token();
-            let principal_id = self.connection.borrow().principal.id;
-            let session_id = self.connection.borrow().session_id;
+            let (conn_cancel, disconnect, caps, principal_id, session_id) = {
+                let conn = self.connection.borrow();
+                (
+                    conn.cancel_token(),
+                    conn.disconnect_token(),
+                    conn.event_capabilities(),
+                    conn.principal.id,
+                    conn.session_id,
+                )
+            };
             let registry = self.kernel.subscription_registry.clone();
             let dedupe_key = (principal_id, instance.clone());
+            let wire_filter = if has_filter { Some(filter) } else { None };
 
             let task = tokio::task::spawn_local(async move {
-                let mut block_sub = block_flows.subscribe(subscribe_pattern);
-                let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
-                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
+                let block_sub = block_flows.subscribe(subscribe_pattern);
+                let input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 log::debug!(
-                    "Started filtered FlowBus subscription for kernel {} (filter_active={}, pattern={})",
+                    "Started filtered FlowBus subscription for kernel {} (filter_active={}, \
+                     pattern={}, batch={}, kick={})",
                     kernel_id.to_hex(),
                     has_filter,
-                    subscribe_pattern
+                    subscribe_pattern,
+                    caps.text_ops_batch,
+                    caps.subscription_terminated,
                 );
-
-                // See subscribe_blocks for rationale.
-                const CALLBACK_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(5);
-
-                loop {
-                    let success = tokio::select! {
-                        _ = conn_cancel.cancelled() => {
-                            log::debug!("Filtered FlowBus bridge cancelled with connection");
-                            break;
-                        }
-                        Some(msg) = block_sub.recv() => {
-                            // Apply server-side filter before serializing to wire
-                            if has_filter && !msg.payload.matches_filter(&filter) {
-                                continue;
-                            }
-
-                            // Same dispatch as subscribe_blocks — forward to callback
-                            match msg.payload {
-                                BlockFlow::Inserted { context_id, ref block, ref after_id, ref ops, .. } => {
-                                    let mut req = callback.on_block_inserted_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        params.set_has_after_id(after_id.is_some());
-                                        if let Some(after) = after_id {
-                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
-                                        }
-                                        params.set_ops(ops);
-                                        let mut block_state = params.init_block();
-                                        set_block_snapshot(&mut block_state, block);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::Deleted { context_id, ref block_id, .. } => {
-                                    let mut req = callback.on_block_deleted_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
-                                    let mut req = callback.on_block_status_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_status(status_to_capnp(status));
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::CollapsedChanged { context_id, ref block_id, collapsed, .. } => {
-                                    let mut req = callback.on_block_collapsed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_collapsed(collapsed);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::ExcludedChanged { context_id, ref block_id, excluded, .. } => {
-                                    let mut req = callback.on_block_excluded_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_excluded(excluded);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
-                                    let mut req = callback.on_block_moved_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_has_after_id(after_id.is_some());
-                                        if let Some(after) = after_id {
-                                            set_block_id_builder(&mut params.reborrow().init_after_id(), after);
-                                        }
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::TextOps { context_id, ref block_id, ref ops, seq_num, .. } => {
-                                    let mut req = callback.on_block_text_ops_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        params.set_ops(ops);
-                                        params.set_seq_num(seq_num);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::SyncReset { context_id, generation } => {
-                                    let mut req = callback.on_sync_reset_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        params.set_generation(generation);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::ContextSwitched { context_id } => {
-                                    let mut req = callback.on_context_switched_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::OutputChanged { context_id, ref block_id, ref output, .. } => {
-                                    let mut req = callback.on_block_output_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        if let Some(output_data) = output {
-                                            build_output_data(params.reborrow().init_output(), output_data);
-                                        }
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::MetadataChanged { context_id, ref block_id, ref metadata, .. } => {
-                                    let mut req = callback.on_block_metadata_changed_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
-                                        build_block_metadata(params.reborrow().init_metadata(), metadata);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::RenderCue { context_id, ref cue } => {
-                                    let mut req = callback.on_render_cue_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_render_cue(params.reborrow().init_cue(), cue);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                BlockFlow::BeatSync { context_id, ref beat_ref } => {
-                                    let mut req = callback.on_beat_sync_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        set_beat_ref(params.reborrow().init_beat_ref(), beat_ref);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Some(msg) = async {
-                            match &mut input_sub {
-                                Some(sub) => sub.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        } => {
-                            match msg.payload {
-                                InputDocFlow::TextOps { context_id, ref ops, seq_num, .. } => {
-                                    let mut req = callback.on_input_text_ops_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                        params.set_ops(ops);
-                                        params.set_seq_num(seq_num);
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                                InputDocFlow::Cleared { context_id } => {
-                                    let mut req = callback.on_input_cleared_request();
-                                    {
-                                        let mut params = req.get();
-                                        params.set_context_id(context_id.as_bytes());
-                                    }
-                                    match tokio::time::timeout(
-                                        CALLBACK_TIMEOUT, req.send().promise,
-                                    ).await {
-                                        Ok(Ok(_)) => true,
-                                        Ok(Err(e)) => {
-                                            log::debug!(
-                                                "FlowBus callback failed for {kernel_id}: {e}",
-                                            );
-                                            false
-                                        }
-                                        Err(_) => {
-                                            log::warn!(
-                                                "FlowBus callback timed out after {:?} \
-                                                 for kernel {kernel_id} — peer is not \
-                                                 reading; dropping subscriber",
-                                                CALLBACK_TIMEOUT,
-                                            );
-                                            false
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        else => break,
-                    };
-
-                    // A single failed/timed-out callback is treated as a
-                    // transient client-executor stall, not a dead peer: drop
-                    // this event and keep the subscription. Reap only once
-                    // failures have been landing continuously for
-                    // SUBSCRIBER_FAILURE_STREAK_TIMEOUT (a success resets the
-                    // streak). Breaking on the first failure was the
-                    // 2026-06-17 "every shell call times out after restart"
-                    // bug — it silently and permanently severed delivery.
-                    if !health.record(success) {
-                        log::warn!(
-                            "Filtered FlowBus bridge task for kernel {} stopping: \
-                             callback failures continuous for over {:?} — \
-                             reaping subscriber instance={} principal={:?}",
-                            kernel_id,
-                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
-                            instance,
-                            principal_id,
-                        );
-                        break;
-                    }
-                }
-
-                log::debug!(
-                    "Filtered FlowBus bridge task for kernel {} ended",
-                    kernel_id
-                );
+                run_block_bridge(
+                    callback,
+                    block_sub,
+                    input_sub,
+                    wire_filter,
+                    caps,
+                    kernel_id,
+                    conn_cancel,
+                    disconnect,
+                    "Filtered FlowBus",
+                )
+                .await;
             });
 
             // Register the AbortHandle. If a prior subscription exists for
@@ -9523,6 +8696,692 @@ fn set_editor_state(
     b.set_dirty(state.dirty);
     b.set_command_line(state.command_line.as_deref().unwrap_or(""));
     b.set_message(state.message.as_deref().unwrap_or(""));
+}
+
+// ============================================================================
+// Block-event bridge — FlowBus → BlockEvents callback
+// ============================================================================
+//
+// One implementation, shared by `subscribe_blocks` and
+// `subscribe_blocks_filtered`, which used to carry two ~250-line copies of the
+// same per-variant dispatch.
+//
+// Three properties it owes the client (2026-08-05 backpressure rework):
+//
+//  1. **Lossless or loud.** The kernel bus hands this task a terminated
+//     subscription rather than a hole; the bridge relays that as
+//     `onSubscriptionTerminated` and then drops the connection, so the client
+//     reconnects and resyncs instead of rendering a stale turn forever.
+//  2. **Coalesced firehose.** Consecutive per-token text ops for one block are
+//     merged over a ~15 ms window into a single `onBlockTextOpsBatch` — the
+//     round-trip per token was the reason the queue backed up at all. Content
+//     is preserved exactly: the ops ride as a list, applied in order, because
+//     each blob is an independently-encoded DTE op set and concatenating the
+//     bytes would be corruption.
+//  3. **Musical time is never delayed.** The coalescing window closes the
+//     instant anything that is not a text op arrives, and the bus already
+//     drains the timing lane ahead of the ordered one.
+
+/// Per-callback wall-clock bound for a block bridge.
+///
+/// Capnp callbacks share the SSH socket with all RPC traffic; if the client's
+/// read side has stalled, the server's write buffer fills and `promise.await`
+/// blocks indefinitely, which blocks the capnp RpcSystem from polling reads —
+/// the exact wedge we observed (CLOSE_WAIT, unread bytes). 5s is generous for a
+/// healthy peer and short enough that one stuck callback can't pin the LocalSet.
+const BLOCK_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the bridge lingers collecting more text ops for the same block
+/// before flushing them as one batch.
+///
+/// 15 ms is below the threshold where a human reads streaming text as anything
+/// but continuous, and at typical token rates it merges tens of ops into one
+/// call. It is a *ceiling*, not a fixed delay: anything that is not a text op
+/// closes the window immediately, and a batch that fills flushes at once.
+const TEXT_OPS_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(15);
+
+/// Most ops merged into one `onBlockTextOpsBatch` call. Bounds the size of a
+/// single capnp message so a long stall can't produce one enormous frame.
+const TEXT_OPS_COALESCE_MAX: usize = 512;
+
+/// Most events pulled off the bus in one drain pass before we start sending.
+const BRIDGE_DRAIN_MAX: usize = 1024;
+
+/// What a connection's push subscriptions can handle, as the client declared it
+/// via `declareEventCapabilities`.
+///
+/// Defaults are the conservative shape on purpose: a binary that predates the
+/// rework never declares anything, so it keeps receiving exactly the events it
+/// already understands. No probing, no unimplemented-error fallback, no
+/// guessing from a version string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventCapabilities {
+    /// Client implements `BlockEvents.onBlockTextOpsBatch`.
+    pub text_ops_batch: bool,
+    /// Client implements `BlockEvents.onSubscriptionTerminated`.
+    pub subscription_terminated: bool,
+}
+
+/// Per-subscription delivery counters handed to the client as `subSeq`.
+///
+/// Two lanes, counted separately, because they promise different things: a gap
+/// in `ordered` can only mean "terminated or resubscribed", while a gap in
+/// `timing` is the honest report that beats were missed (docs/midi.md).
+#[derive(Default)]
+struct BridgeSeq {
+    ordered: u64,
+    timing: u64,
+}
+
+impl BridgeSeq {
+    fn next(&mut self, topic: &str) -> u64 {
+        match <BlockFlow as kaijutsu_kernel::flows::FlowTopics>::topic_class(topic) {
+            kaijutsu_kernel::flows::TopicClass::Timing => {
+                self.timing += 1;
+                self.timing
+            }
+            kaijutsu_kernel::flows::TopicClass::Ordered => {
+                self.ordered += 1;
+                self.ordered
+            }
+        }
+    }
+
+    /// Input-doc events ride the ordered lane too — they are content, not time.
+    fn next_ordered(&mut self) -> u64 {
+        self.ordered += 1;
+        self.ordered
+    }
+}
+
+/// One item the bridge has pulled off a bus and still owes the client.
+enum BridgeItem {
+    Block(FlowMessage<BlockFlow>),
+    Input(FlowMessage<InputDocFlow>),
+}
+
+/// Forward ONE block event. Returns whether the peer accepted it.
+async fn send_block_event(
+    callback: &block_events::Client,
+    payload: &BlockFlow,
+    sub_seq: u64,
+    kernel_id: impl std::fmt::Display + Copy,
+) -> bool {
+    match payload {
+        BlockFlow::Inserted {
+            context_id,
+            block,
+            after_id,
+            ops,
+            ..
+        } => {
+            let mut req = callback.on_block_inserted_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_has_after_id(after_id.is_some());
+                if let Some(after) = after_id {
+                    set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                }
+                params.set_ops(ops);
+                params.set_sub_seq(sub_seq);
+                let mut block_state = params.init_block();
+                set_block_snapshot(&mut block_state, block);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::Deleted {
+            context_id,
+            block_id,
+            ..
+        } => {
+            let mut req = callback.on_block_deleted_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::StatusChanged {
+            context_id,
+            block_id,
+            status,
+            ..
+        } => {
+            let mut req = callback.on_block_status_changed_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_status(status_to_capnp(*status));
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::CollapsedChanged {
+            context_id,
+            block_id,
+            collapsed,
+            ..
+        } => {
+            let mut req = callback.on_block_collapsed_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_collapsed(*collapsed);
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::ExcludedChanged {
+            context_id,
+            block_id,
+            excluded,
+            ..
+        } => {
+            let mut req = callback.on_block_excluded_changed_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_excluded(*excluded);
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::Moved {
+            context_id,
+            block_id,
+            after_id,
+            ..
+        } => {
+            let mut req = callback.on_block_moved_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_has_after_id(after_id.is_some());
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                if let Some(after) = after_id {
+                    set_block_id_builder(&mut params.reborrow().init_after_id(), after);
+                }
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::TextOps {
+            context_id,
+            block_id,
+            ops,
+            seq_num,
+            ..
+        } => {
+            let mut req = callback.on_block_text_ops_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_ops(ops);
+                params.set_seq_num(*seq_num);
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::SyncReset {
+            context_id,
+            generation,
+        } => {
+            let mut req = callback.on_sync_reset_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_generation(*generation);
+                params.set_sub_seq(sub_seq);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::OutputChanged {
+            context_id,
+            block_id,
+            output,
+            ..
+        } => {
+            let mut req = callback.on_block_output_changed_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                if let Some(output_data) = output {
+                    build_output_data(params.reborrow().init_output(), output_data);
+                }
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::MetadataChanged {
+            context_id,
+            block_id,
+            metadata,
+            ..
+        } => {
+            let mut req = callback.on_block_metadata_changed_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+                set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                build_block_metadata(params.reborrow().init_metadata(), metadata);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::ContextSwitched { context_id } => {
+            let mut req = callback.on_context_switched_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::RenderCue { context_id, cue } => {
+            let mut req = callback.on_render_cue_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+                set_render_cue(params.reborrow().init_cue(), cue);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        BlockFlow::BeatSync {
+            context_id,
+            beat_ref,
+        } => {
+            let mut req = callback.on_beat_sync_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+                set_beat_ref(params.reborrow().init_beat_ref(), beat_ref);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+    }
+}
+
+/// Forward a run of consecutive text ops for ONE block as a single call.
+///
+/// Applying `ops` in order is byte-for-byte identical to the individual
+/// `onBlockTextOps` calls it replaces — this trades N round trips for one, it
+/// does not merge, reorder, or rewrite content.
+async fn send_text_ops_batch(
+    callback: &block_events::Client,
+    context_id: ContextId,
+    block_id: &kaijutsu_crdt::BlockId,
+    ops: &[std::sync::Arc<[u8]>],
+    first_seq_num: u64,
+    sub_seq: u64,
+    kernel_id: impl std::fmt::Display + Copy,
+) -> bool {
+    let mut req = callback.on_block_text_ops_batch_request();
+    {
+        let mut params = req.get();
+        params.set_context_id(context_id.as_bytes());
+        params.set_first_seq_num(first_seq_num);
+        params.set_sub_seq(sub_seq);
+        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+        let mut list = params.init_ops(ops.len() as u32);
+        for (i, blob) in ops.iter().enumerate() {
+            list.set(i as u32, blob);
+        }
+    }
+    await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+}
+
+/// Forward one input-doc (compose scratchpad) event.
+async fn send_input_event(
+    callback: &block_events::Client,
+    payload: &InputDocFlow,
+    sub_seq: u64,
+    kernel_id: impl std::fmt::Display + Copy,
+) -> bool {
+    match payload {
+        InputDocFlow::TextOps {
+            context_id,
+            ops,
+            seq_num,
+            ..
+        } => {
+            let mut req = callback.on_input_text_ops_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_ops(ops);
+                params.set_seq_num(*seq_num);
+                params.set_sub_seq(sub_seq);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+        InputDocFlow::Cleared { context_id } => {
+            let mut req = callback.on_input_cleared_request();
+            {
+                let mut params = req.get();
+                params.set_context_id(context_id.as_bytes());
+                params.set_sub_seq(sub_seq);
+            }
+            await_editor_callback(req.send().promise, BLOCK_CALLBACK_TIMEOUT, kernel_id).await
+        }
+    }
+}
+
+/// Tell the client its subscription was terminated, then take the connection
+/// down so it reconnects and resyncs.
+///
+/// Best-effort and short-deadline on purpose: the client we are talking to is
+/// by definition not draining well, so we must not spend the full callback
+/// budget explaining ourselves. Dropping the connection is what actually makes
+/// the client recover — the courtesy call only tells it *why*, and an older
+/// binary that never declared the capability recovers just the same, via the
+/// ordinary reconnect path.
+async fn kick_slow_subscriber(
+    callback: &block_events::Client,
+    info: &kaijutsu_kernel::flows::FlowTermination,
+    caps: EventCapabilities,
+    kernel_id: impl std::fmt::Display + Copy,
+    label: &str,
+) {
+    tracing::error!(
+        bridge = label,
+        kernel = %kernel_id,
+        topic = info.topic,
+        delivered = info.delivered,
+        capacity = info.capacity,
+        "client fell behind its event queue — terminating the subscription and \
+         dropping the connection so it resyncs (no lossy delivery)"
+    );
+    if caps.subscription_terminated {
+        const KICK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let mut req = callback.on_subscription_terminated_request();
+        {
+            let mut p = req.get();
+            p.set_reason(crate::kaijutsu_capnp::SubscriptionEndReason::SlowSubscriber);
+            p.set_topic(info.topic);
+            p.set_delivered(info.delivered);
+            p.set_capacity(info.capacity as u64);
+        }
+        if tokio::time::timeout(KICK_TIMEOUT, req.send().promise)
+            .await
+            .is_err()
+        {
+            log::debug!("slow subscriber did not even accept its termination notice");
+        }
+    }
+}
+
+/// Is this message a text-op event (the coalescable one)?
+fn text_ops_parts(msg: &FlowMessage<BlockFlow>) -> Option<(ContextId, kaijutsu_crdt::BlockId)> {
+    match &msg.payload {
+        BlockFlow::TextOps {
+            context_id,
+            block_id,
+            ..
+        } => Some((*context_id, *block_id)),
+        _ => None,
+    }
+}
+
+/// The shared FlowBus→BlockEvents bridge loop.
+///
+/// `filter` is `None` for `subscribe_blocks` (everything) and `Some` for
+/// `subscribe_blocks_filtered`; the two RPCs differ in nothing else.
+#[allow(clippy::too_many_arguments)]
+async fn run_block_bridge(
+    callback: block_events::Client,
+    mut block_sub: kaijutsu_kernel::flows::Subscription<BlockFlow>,
+    mut input_sub: Option<kaijutsu_kernel::flows::Subscription<InputDocFlow>>,
+    filter: Option<kaijutsu_types::BlockEventFilter>,
+    caps: EventCapabilities,
+    kernel_id: kaijutsu_types::KernelId,
+    conn_cancel: CancellationToken,
+    disconnect: CancellationToken,
+    label: &'static str,
+) {
+    use kaijutsu_kernel::flows::FlowRecv;
+
+    let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
+    let mut seq = BridgeSeq::default();
+    let mut pending: Vec<BridgeItem> = Vec::new();
+
+    // Drain everything already queued, without waiting. Returns Err(term) if
+    // the bus terminated us, Ok(false) if a stream closed.
+    macro_rules! drain_ready {
+        () => {{
+            let mut outcome: Result<bool, kaijutsu_kernel::flows::FlowTermination> = Ok(true);
+            while pending.len() < BRIDGE_DRAIN_MAX {
+                match block_sub.try_recv_event() {
+                    Some(FlowRecv::Message(m)) => pending.push(BridgeItem::Block(m)),
+                    Some(FlowRecv::Terminated(info)) => {
+                        outcome = Err(info);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            if outcome.is_ok()
+                && let Some(sub) = input_sub.as_mut()
+            {
+                while pending.len() < BRIDGE_DRAIN_MAX {
+                    match sub.try_recv_event() {
+                        Some(FlowRecv::Message(m)) => pending.push(BridgeItem::Input(m)),
+                        Some(FlowRecv::Terminated(info)) => {
+                            outcome = Err(info);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            outcome
+        }};
+    }
+
+    log::debug!("{label} bridge online for kernel {}", kernel_id.to_hex());
+
+    'outer: loop {
+        // 1. Take everything that is already sitting in our queues. Draining
+        //    before awaiting is what makes the `select!` below safe to cancel:
+        //    we never park while our own mailbox has work in it.
+        match drain_ready!() {
+            Ok(_) => {}
+            Err(info) => {
+                kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                disconnect.cancel();
+                break;
+            }
+        }
+
+        // 2. Nothing ready — wait for the next event (or the connection dying).
+        if pending.is_empty() {
+            // Which bus woke us. Both arms are cancel-safe because we always
+            // drain before parking: a lost `Notify` permit can only ever
+            // correspond to an event we have already taken.
+            enum Woke {
+                Block(FlowRecv<BlockFlow>),
+                Input(FlowRecv<InputDocFlow>),
+                Closed,
+            }
+            let woke = tokio::select! {
+                _ = conn_cancel.cancelled() => {
+                    log::debug!("{label} bridge cancelled with connection");
+                    break;
+                }
+                ev = block_sub.recv_event() => ev.map(Woke::Block).unwrap_or(Woke::Closed),
+                ev = async {
+                    match input_sub.as_mut() {
+                        Some(sub) => sub.recv_event().await,
+                        None => std::future::pending().await,
+                    }
+                } => ev.map(Woke::Input).unwrap_or(Woke::Closed),
+            };
+            match woke {
+                Woke::Closed => break,
+                Woke::Block(FlowRecv::Message(m)) => pending.push(BridgeItem::Block(m)),
+                Woke::Input(FlowRecv::Message(m)) => pending.push(BridgeItem::Input(m)),
+                Woke::Block(FlowRecv::Terminated(info))
+                | Woke::Input(FlowRecv::Terminated(info)) => {
+                    kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                    disconnect.cancel();
+                    break;
+                }
+            }
+            match drain_ready!() {
+                Ok(_) => {}
+                Err(info) => {
+                    kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                    disconnect.cancel();
+                    break;
+                }
+            }
+        }
+
+        // 3. Coalescing window. Only when the batch currently ENDS in a text op
+        //    and the client can accept a batch — otherwise there is nothing to
+        //    merge and no reason to wait. Anything that is not a text op closes
+        //    the window at once, so a beat, a status patch, or a render cue is
+        //    never held back (docs/midi.md: musical time is latency-first).
+        if caps.text_ops_batch
+            && pending.len() < TEXT_OPS_COALESCE_MAX
+            && matches!(pending.last(), Some(BridgeItem::Block(m)) if text_ops_parts(m).is_some())
+        {
+            let deadline = tokio::time::Instant::now() + TEXT_OPS_COALESCE_WINDOW;
+            while pending.len() < TEXT_OPS_COALESCE_MAX {
+                let next = tokio::select! {
+                    _ = conn_cancel.cancelled() => break,
+                    ev = tokio::time::timeout_at(deadline, block_sub.recv_event()) => ev,
+                };
+                match next {
+                    // Window expired — flush what we have.
+                    Err(_) => break,
+                    Ok(None) => break,
+                    Ok(Some(FlowRecv::Terminated(info))) => {
+                        kick_slow_subscriber(&callback, &info, caps, kernel_id, label).await;
+                        disconnect.cancel();
+                        break 'outer;
+                    }
+                    Ok(Some(FlowRecv::Message(m))) => {
+                        let still_ops = text_ops_parts(&m).is_some();
+                        pending.push(BridgeItem::Block(m));
+                        if !still_ops {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Ship the batch, preserving publish order exactly.
+        let mut i = 0;
+        while i < pending.len() {
+            let success = match &pending[i] {
+                BridgeItem::Input(msg) => {
+                    let s = seq.next_ordered();
+                    let ok = send_input_event(&callback, &msg.payload, s, kernel_id).await;
+                    i += 1;
+                    ok
+                }
+                BridgeItem::Block(msg) => {
+                    // Server-side filter before serializing to the wire.
+                    if let Some(f) = &filter
+                        && !msg.payload.matches_filter(f)
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    match text_ops_parts(msg) {
+                        // A run of consecutive ops for the SAME block collapses
+                        // into one call. `caps.text_ops_batch` gates it, so an
+                        // older client still gets one call per op.
+                        Some((ctx, block_id)) if caps.text_ops_batch => {
+                            let mut ops: Vec<std::sync::Arc<[u8]>> = Vec::new();
+                            let mut first_seq_num = 0u64;
+                            let mut j = i;
+                            while j < pending.len() {
+                                let BridgeItem::Block(m) = &pending[j] else {
+                                    break;
+                                };
+                                let Some((c, b)) = text_ops_parts(m) else {
+                                    break;
+                                };
+                                if c != ctx || b != block_id {
+                                    break;
+                                }
+                                if let BlockFlow::TextOps { ops: o, seq_num, .. } = &m.payload {
+                                    if ops.is_empty() {
+                                        first_seq_num = *seq_num;
+                                    }
+                                    ops.push(o.clone());
+                                }
+                                j += 1;
+                            }
+                            let s = seq.next("block.text_ops");
+                            let ok = if ops.len() == 1 {
+                                send_block_event(&callback, &pending[i].block_payload(), s, kernel_id)
+                                    .await
+                            } else {
+                                send_text_ops_batch(
+                                    &callback,
+                                    ctx,
+                                    &block_id,
+                                    &ops,
+                                    first_seq_num,
+                                    s,
+                                    kernel_id,
+                                )
+                                .await
+                            };
+                            i = j;
+                            ok
+                        }
+                        _ => {
+                            let s = seq.next(msg.topic);
+                            let ok = send_block_event(&callback, &msg.payload, s, kernel_id).await;
+                            i += 1;
+                            ok
+                        }
+                    }
+                }
+            };
+
+            // Tolerate a transient client-executor stall; reap only on
+            // sustained failure (see SubscriberHealth). Breaking on the first
+            // failure was the 2026-06-17 "every shell call times out after
+            // restart" bug — it silently and permanently severed delivery.
+            if !health.record(success) {
+                log::warn!(
+                    "{label} bridge for kernel {} stopping: callback failures \
+                     continuous for over {:?} — reaping subscriber",
+                    kernel_id,
+                    SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
+                );
+                break 'outer;
+            }
+        }
+        pending.clear();
+    }
+
+    log::debug!("{label} bridge task for kernel {} ended", kernel_id.to_hex());
+}
+
+impl BridgeItem {
+    /// The block payload, for the single-op fast path inside the batcher.
+    fn block_payload(&self) -> BlockFlow {
+        match self {
+            BridgeItem::Block(m) => m.payload.clone(),
+            BridgeItem::Input(_) => unreachable!("block_payload on an input item"),
+        }
+    }
 }
 
 /// Await an editor-callback round-trip with the shared callback timeout,

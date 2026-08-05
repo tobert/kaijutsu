@@ -520,6 +520,13 @@ async fn run_rpc(
         session_contexts.clone(),
     )));
     let session_id = connection.borrow().session_id;
+    // Fired by a background task that decides this connection must go — today
+    // only the block bridge, when the client's per-subscriber event queue
+    // overflows. Taking the whole RPC session down (rather than quietly ending
+    // one subscription) is what makes the client's existing
+    // reconnect-with-full-resync path engage, and it works for every client
+    // version, including binaries that predate `onSubscriptionTerminated`.
+    let disconnect = connection.borrow().disconnect_token();
     let world = WorldImpl::new(registry, connection);
     let client: kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
 
@@ -557,7 +564,19 @@ async fn run_rpc(
         .await
     });
 
-    let rpc_result = rpc_system.await;
+    let rpc_result = tokio::select! {
+        r = rpc_system => r,
+        _ = disconnect.cancelled() => {
+            log::warn!(
+                "Dropping RPC session for {} session={}: a push subscription \
+                 fell too far behind (see the FlowBus termination above). The \
+                 client reconnects and resyncs — we do not serve a partial view.",
+                principal.username,
+                session_id.short(),
+            );
+            Ok(())
+        }
+    };
     watchdog_cancel.cancel();
     let _ = watchdog.await;
 

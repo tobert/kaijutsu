@@ -28,6 +28,19 @@ use crate::rpc::{
 // Event Types
 // ============================================================================
 
+/// Why a push subscription ended. Mirrors capnp `SubscriptionEndReason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionEndReason {
+    /// The client's bounded queue in the kernel filled — it could not keep up.
+    SlowSubscriber,
+    /// The server is going away.
+    ServerShutdown,
+    /// Replaced by a newer subscription from the same client instance.
+    Superseded,
+    /// An enumerant this build does not know. Honest rather than guessed.
+    Unknown,
+}
+
 /// Events pushed from server to app via broadcast.
 ///
 /// These are the typed, deserialized forms of Cap'n Proto callback invocations.
@@ -111,6 +124,24 @@ pub enum ServerEvent {
     },
     /// A context's input document was cleared (after submit).
     InputCleared { context_id: ContextId },
+    /// The kernel TERMINATED this client's block subscription because the
+    /// client could not drain it fast enough (the 2026-08-05 backpressure
+    /// rework). The view is incomplete as of `delivered`; the connection drops
+    /// immediately after, and the actor reconnects with a full resync.
+    ///
+    /// This is not a resumable gap — do not try to patch forward. It exists so
+    /// a UI can say "you were disconnected for falling behind" instead of
+    /// silently showing a stale turn forever.
+    SubscriptionTerminated {
+        /// Why the subscription ended.
+        reason: SubscriptionEndReason,
+        /// The kernel topic whose event could not be enqueued.
+        topic: String,
+        /// How many events this subscription delivered before the cut.
+        delivered: u64,
+        /// The queue depth that was exceeded.
+        capacity: u64,
+    },
     /// An MCP resource's content was updated.
     ResourceUpdated { server: String, uri: String },
     /// An MCP server's resource list changed.
@@ -290,6 +321,17 @@ pub enum ConnectionStatus {
 /// callback into a `broadcast::Sender<ServerEvent>`.
 pub(crate) struct BlockEventsForwarder {
     pub event_tx: broadcast::Sender<ServerEvent>,
+    /// Last `subSeq` seen on the ordered (content) lane, and on the musical-time
+    /// lane. The kernel's bus is lossless per subscriber, so a gap on the
+    /// ordered lane can only mean "this subscription was terminated or
+    /// restarted" — never silent loss. If we ever see one WITHOUT a
+    /// termination, that is a kernel bug and we say so rather than papering
+    /// over it with a resync (docs: the 2026-08-05 backpressure rework).
+    ///
+    /// A gap on the timing lane is legitimate and expected: a missed beat is
+    /// missed on purpose (docs/midi.md "The one timebase").
+    pub last_ordered_seq: std::sync::atomic::AtomicU64,
+    pub last_timing_seq: std::sync::atomic::AtomicU64,
     /// Where an `exchange` call is run (`docs/midi-next.md` "SysEx: the
     /// exchange pattern"). Late-bindable and shared: a MIDI-capable client
     /// installs its hardware worker whenever that worker is ready, with no
@@ -317,7 +359,12 @@ pub fn block_events_channel(
 ) {
     let (tx, rx) = broadcast::channel(capacity);
     let client: crate::kaijutsu_capnp::block_events::Client = capnp_rpc::new_client(
-        BlockEventsForwarder { event_tx: tx, midi_exchange },
+        BlockEventsForwarder {
+            event_tx: tx,
+            midi_exchange,
+            last_ordered_seq: std::sync::atomic::AtomicU64::new(0),
+            last_timing_seq: std::sync::atomic::AtomicU64::new(0),
+        },
     );
     (client, rx)
 }
@@ -837,6 +884,49 @@ impl permission_events::Server for PermissionAskForwarder {
     }
 }
 
+impl BlockEventsForwarder {
+    /// Assert continuity on the ordered lane.
+    ///
+    /// `0` means the peer predates the rework and is not reporting; a restart
+    /// back to 1 is a fresh subscription. Anything else that skips is a kernel
+    /// bug — the bus terminates a subscriber it cannot serve rather than
+    /// dropping an event, so there is no legitimate hole here.
+    fn note_ordered_seq(&self, sub_seq: u64) {
+        use std::sync::atomic::Ordering;
+        if sub_seq == 0 {
+            return;
+        }
+        let prev = self.last_ordered_seq.swap(sub_seq, Ordering::Relaxed);
+        if sub_seq == 1 || prev == 0 || sub_seq == prev + 1 {
+            return;
+        }
+        tracing::error!(
+            expected = prev + 1,
+            got = sub_seq,
+            missing = sub_seq.saturating_sub(prev + 1),
+            "block-event subscription seq GAP without a termination — the kernel \
+             bus promises lossless-or-terminated, so this is a bug, not backpressure"
+        );
+    }
+
+    /// Note a musical-time lane delivery. A gap here is the honest report that
+    /// beats were missed, which that lane promises; log it at debug so a sink
+    /// can be diagnosed without treating it as an error.
+    fn note_timing_seq(&self, sub_seq: u64) {
+        use std::sync::atomic::Ordering;
+        if sub_seq == 0 {
+            return;
+        }
+        let prev = self.last_timing_seq.swap(sub_seq, Ordering::Relaxed);
+        if prev != 0 && sub_seq > prev + 1 {
+            tracing::debug!(
+                missed = sub_seq - prev - 1,
+                "missed beats/cues while behind — by design, never replayed"
+            );
+        }
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl block_events::Server for BlockEventsForwarder {
     fn on_block_inserted(
@@ -848,6 +938,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -887,6 +978,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -923,6 +1015,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -960,6 +1053,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -997,6 +1091,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1039,6 +1134,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1088,6 +1184,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1130,6 +1227,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1173,6 +1271,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1217,6 +1316,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1247,6 +1347,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1282,6 +1383,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1307,6 +1409,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_ordered_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1343,6 +1446,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_timing_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1377,6 +1481,7 @@ impl block_events::Server for BlockEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        self.note_timing_seq(params.get_sub_seq());
 
         let context_id = match params.get_context_id() {
             Ok(s) => match parse_context_id_data(s) {
@@ -1453,6 +1558,124 @@ impl block_events::Server for BlockEventsForwarder {
                 Err(e) => Err(capnp::Error::failed(e)),
             }
         })
+    }
+
+    /// Coalesced text ops for one block (the firehose fix). Applying them in
+    /// order is byte-for-byte what the individual `onBlockTextOps` calls would
+    /// have produced — the server batched the CALLS, not the buffers, because
+    /// each blob is an independently-encoded DTE op set.
+    fn on_block_text_ops_batch(
+        self: Rc<Self>,
+        params: block_events::OnBlockTextOpsBatchParams,
+        _results: block_events::OnBlockTextOpsBatchResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        self.note_ordered_seq(params.get_sub_seq());
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(rpc_to_capnp(e)),
+            },
+            Err(e) => return Promise::err(e),
+        };
+        let ops_list = match params.get_ops() {
+            Ok(l) => l,
+            Err(e) => return Promise::err(e),
+        };
+        let first_seq_num = params.get_first_seq_num();
+
+        for i in 0..ops_list.len() {
+            let ops = match ops_list.get(i) {
+                Ok(d) => d.to_vec(),
+                Err(e) => return Promise::err(e),
+            };
+            let event = ServerEvent::BlockTextOps {
+                context_id,
+                block_id,
+                ops,
+                seq_num: first_seq_num.saturating_add(i as u64),
+            };
+            if self.event_tx.send(event).is_err() {
+                tracing::warn!("Event channel closed, dropping batched BlockTextOps event");
+                break;
+            }
+        }
+        Promise::ok(())
+    }
+
+    /// THE LAG KICK. The kernel cut this subscription because we could not
+    /// drain it — our view of the log is incomplete as of `delivered`.
+    ///
+    /// There is nothing to patch forward from: the events between are gone by
+    /// construction. The server drops the connection immediately after this
+    /// call, and the actor's reconnect path does a full resync; all this
+    /// handler owes anyone is a loud, accurate account of what happened.
+    fn on_subscription_terminated(
+        self: Rc<Self>,
+        params: block_events::OnSubscriptionTerminatedParams,
+        _results: block_events::OnSubscriptionTerminatedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let reason = match params.get_reason() {
+            Ok(crate::kaijutsu_capnp::SubscriptionEndReason::SlowSubscriber) => {
+                SubscriptionEndReason::SlowSubscriber
+            }
+            Ok(crate::kaijutsu_capnp::SubscriptionEndReason::ServerShutdown) => {
+                SubscriptionEndReason::ServerShutdown
+            }
+            Ok(crate::kaijutsu_capnp::SubscriptionEndReason::Superseded) => {
+                SubscriptionEndReason::Superseded
+            }
+            Err(_) => SubscriptionEndReason::Unknown,
+        };
+        let topic = params
+            .get_topic()
+            .ok()
+            .and_then(|t| t.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let delivered = params.get_delivered();
+        let capacity = params.get_capacity();
+
+        tracing::error!(
+            ?reason,
+            topic = %topic,
+            delivered,
+            capacity,
+            "kernel terminated our block subscription — we fell behind. The \
+             connection is about to drop; reconnect does a full resync."
+        );
+
+        // Reset continuity: the next subscription counts from 1.
+        self.last_ordered_seq
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.last_timing_seq
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let event = ServerEvent::SubscriptionTerminated {
+            reason,
+            topic,
+            delivered,
+            capacity,
+        };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping SubscriptionTerminated event");
+        }
+        Promise::ok(())
     }
 }
 

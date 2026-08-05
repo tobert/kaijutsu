@@ -2492,6 +2492,8 @@ fn block_events_client_and_filter(
     let block_fwd = BlockEventsForwarder {
         event_tx: event_tx.clone(),
         midi_exchange,
+        last_ordered_seq: std::sync::atomic::AtomicU64::new(0),
+        last_timing_seq: std::sync::atomic::AtomicU64::new(0),
     };
     let block_client: crate::kaijutsu_capnp::block_events::Client =
         capnp_rpc::new_client(block_fwd);
@@ -2678,6 +2680,15 @@ async fn connect_handshake(
     };
     let turn_client: crate::kaijutsu_capnp::turn_events::Client =
         capnp_rpc::new_client(turn_fwd);
+
+    // Declare our push capabilities BEFORE subscribing: a bridge reads the
+    // flags when it starts, so a late declaration would leave this connection's
+    // stream in the conservative shape for its whole life. Non-fatal on
+    // failure — an older kernel simply doesn't have the method, and everything
+    // still works, just without coalescing.
+    if let Err(e) = kernel.declare_event_capabilities(true, true).await {
+        log::debug!("declare_event_capabilities unavailable (older kernel?): {e}");
+    }
 
     let subscribe_block = kernel.subscribe_blocks_filtered(block_client, &filter, &instance);
     let subscribe_resource = kernel.subscribe_mcp_resources(resource_client, &instance);
