@@ -172,6 +172,14 @@ pub struct BlockHeader {
     /// defaults to `TaskStatus::Open` on every other kind (unused, never
     /// read). See [`TaskStatus`] for why this is a dedicated field rather
     /// than a reuse of `status`.
+    ///
+    /// `#[serde(default)]` is LOAD-BEARING, not style: `BlockHeader` rides
+    /// the at-rest oplog CBOR (inside `BlockContent`), so a new field
+    /// without a default makes every pre-existing document undecodable —
+    /// exactly the 2026-08-05 boot flood of "missing field `task_status`"
+    /// that skipped rc scripts and locked out every capability binding.
+    /// Any field added to this struct must carry it.
+    #[serde(default)]
     pub task_status: TaskStatus,
 
     // ── Per-field LWW timestamps ────────────────────────────────────────
@@ -190,6 +198,7 @@ pub struct BlockHeader {
     /// Lamport timestamp for `content_type` field.
     pub content_type_at: u64,
     /// Lamport timestamp for `task_status` field.
+    #[serde(default)]
     pub task_status_at: u64,
 }
 
@@ -1586,7 +1595,9 @@ pub struct BlockMetadata {
     /// Task lifecycle status (`BlockKind::Task` only). Rides this generic
     /// scalar-metadata event rather than a dedicated flow kind — same
     /// treatment as `content_type`, which is also "scalar, not DTE-tracked,
-    /// applies across kinds."
+    /// applies across kinds." `#[serde(default)]` for the same at-rest
+    /// reason as `BlockHeader::task_status` — see that field's doc.
+    #[serde(default)]
     pub task_status: TaskStatus,
 }
 
@@ -2772,6 +2783,72 @@ mod tests {
 
     fn test_agent() -> PrincipalId {
         PrincipalId::new()
+    }
+
+    // ── At-rest schema evolution ────────────────────────────────────────
+
+    /// Strip `fields` from a CBOR-serialized struct, simulating bytes
+    /// written by a build that predates those fields.
+    fn cbor_without_fields<T: serde::Serialize>(value: &T, fields: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf).unwrap();
+        let mut val: ciborium::Value = ciborium::from_reader(buf.as_slice()).unwrap();
+        match &mut val {
+            ciborium::Value::Map(entries) => {
+                let before = entries.len();
+                entries.retain(|(k, _)| {
+                    k.as_text().is_none_or(|name| !fields.contains(&name))
+                });
+                assert_eq!(
+                    before - entries.len(),
+                    fields.len(),
+                    "premise: every named field must actually be present to strip"
+                );
+            }
+            other => panic!("expected CBOR map serialization, got {other:?}"),
+        }
+        let mut stripped = Vec::new();
+        ciborium::into_writer(&val, &mut stripped).unwrap();
+        stripped
+    }
+
+    /// THE 2026-08-05 boot-flood regression: `task_status`/`task_status_at`
+    /// were added to `BlockHeader` — which rides the at-rest oplog CBOR —
+    /// without `#[serde(default)]`. Every document persisted before the
+    /// fields existed failed decode ("missing field `task_status`") and was
+    /// skipped at kernel boot: rc scripts unreadable, capability bindings
+    /// never granted, every facade denied. New at-rest fields MUST decode
+    /// from old bytes; this pins that for the exact fields that broke.
+    #[test]
+    fn block_header_decodes_pre_task_status_cbor() {
+        let snap = BlockSnapshotBuilder::new(
+            BlockId::new(test_context(), test_agent(), 1),
+            BlockKind::Text,
+        )
+        .role(Role::Model)
+        .content("old bytes")
+        .build();
+        let header = BlockHeader::from_snapshot(&snap);
+
+        let old_bytes = cbor_without_fields(&header, &["task_status", "task_status_at"]);
+        let back: BlockHeader = ciborium::from_reader(old_bytes.as_slice())
+            .expect("pre-task-era CBOR must decode with defaults, not fail the whole document");
+        assert_eq!(back.task_status, TaskStatus::default());
+        assert_eq!(back.task_status_at, 0);
+        assert_eq!(back.id, header.id);
+        assert_eq!(back.kind, header.kind);
+    }
+
+    /// Same guarantee for `BlockMetadata` (the `MetadataChanged` payload):
+    /// not on the at-rest path today, but it is Serialize/Deserialize and
+    /// one persistence consumer away from the same trap.
+    #[test]
+    fn block_metadata_decodes_pre_task_status_cbor() {
+        let meta = BlockMetadata::default();
+        let old_bytes = cbor_without_fields(&meta, &["task_status"]);
+        let back: BlockMetadata = ciborium::from_reader(old_bytes.as_slice())
+            .expect("pre-task-era metadata CBOR must decode with defaults");
+        assert_eq!(back.task_status, TaskStatus::default());
     }
 
     // ── BlockId ─────────────────────────────────────────────────────────
