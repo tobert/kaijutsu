@@ -283,8 +283,14 @@ cargo build -p kaijutsu-acp
 Driving it from toad (the desk-side client this was built for):
 
 ```bash
-# toad launches the agent as a subprocess and speaks ACP on its stdio
-toad --agent '/path/to/target/debug/kaijutsu-acp --connect --host zorak --port 2222'
+# toad's custom-agent entry point is the `acp` SUBCOMMAND (there is no
+# --agent flag — bare `toad` opens the agent-store picker, which only lists
+# registered agents). `toad acp "COMMAND" [PATH]` wraps the command in an
+# ad-hoc agent definition and launches straight into it; -t titles the
+# status bar. Quote the whole command; use an absolute path — toad runs it
+# from the project dir.
+toad acp '/home/atobey/src/kaijutsu/target/debug/kaijutsu-acp --connect --host zorak --port 2222' \
+  ~/src/kaijutsu -t kaijutsu
 ```
 
 What to check, in order:
