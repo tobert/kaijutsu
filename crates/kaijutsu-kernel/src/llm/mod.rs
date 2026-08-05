@@ -74,6 +74,14 @@ pub struct MockClient {
     /// the default single-shot text+Done reply below. Each `Provider::stream`
     /// call pops the next `Vec<StreamEvent>`; see `with_scripted_stream`.
     scripted: Option<Arc<parking_lot::Mutex<std::collections::VecDeque<Vec<stream::StreamEvent>>>>>,
+    /// When true, a stream's `next_event()` never resolves once its scripted
+    /// events run out — instead of returning `None` (a clean close). Models
+    /// an HTTP connection that hangs rather than closing: the provider-side
+    /// stand-in for "hard-cancelled, and the confirming flush never arrives"
+    /// (deepseek review, `docs/issues.md`: hard-cancel-plus-hung-provider).
+    /// Combine with `tokio::test(start_paused = true)` so a caller's idle
+    /// timeout fires on virtual-clock auto-advance instead of real wall time.
+    hangs_when_exhausted: bool,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -83,6 +91,7 @@ impl MockClient {
             canned_response: response.into(),
             delay: std::time::Duration::ZERO,
             scripted: None,
+            hangs_when_exhausted: false,
         }
     }
 
@@ -104,6 +113,13 @@ impl MockClient {
         self.scripted = Some(Arc::new(parking_lot::Mutex::new(
             std::collections::VecDeque::from(calls),
         )));
+        self
+    }
+
+    /// Builder: make the stream hang instead of closing once its scripted
+    /// events are exhausted — see the `hangs_when_exhausted` field doc.
+    pub fn hangs_when_exhausted(mut self) -> Self {
+        self.hangs_when_exhausted = true;
         self
     }
 }
@@ -600,7 +616,10 @@ impl Provider {
                         },
                     ]
                 };
-                Ok(ProviderStream::Mock(std::collections::VecDeque::from(events)))
+                Ok(ProviderStream::Mock(MockStream {
+                    events: std::collections::VecDeque::from(events),
+                    hangs_when_exhausted: mock.hangs_when_exhausted,
+                }))
             }
         }
     }
@@ -630,7 +649,16 @@ pub enum ProviderStream {
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
-    Mock(std::collections::VecDeque<StreamEvent>),
+    Mock(MockStream),
+}
+
+/// Backing state for `ProviderStream::Mock` — see
+/// `MockClient::hangs_when_exhausted` for why this is more than a bare
+/// `VecDeque`.
+#[cfg(any(test, feature = "test-mock"))]
+pub struct MockStream {
+    events: std::collections::VecDeque<StreamEvent>,
+    hangs_when_exhausted: bool,
 }
 
 impl ProviderStream {
@@ -641,7 +669,11 @@ impl ProviderStream {
             Self::Claude(s) => s.next_event().await,
             Self::OpenAi(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(events) => events.pop_front(),
+            Self::Mock(state) => match state.events.pop_front() {
+                Some(ev) => Some(ev),
+                None if state.hangs_when_exhausted => std::future::pending().await,
+                None => None,
+            },
         }
     }
 
@@ -3547,6 +3579,79 @@ mod tests {
                 text.contains("[truncated]"),
                 "long body must show truncation marker"
             );
+        }
+
+        /// Regression for the deepseek post-merge review (docs/issues.md,
+        /// "⛔ Interrupted marker leaks into model context"): the hard-cancel
+        /// marker used to land as `(Role::Model, BlockKind::Text)`, which
+        /// hydration folds straight into `assistant_text` — the model's next
+        /// turn would read its own prior turn as having said "⛔ Interrupted"
+        /// verbatim. `llm_stream.rs` now inserts it as `(Role::System,
+        /// BlockKind::Text)` *and* ephemeral; either alone is enough to be
+        /// hydration-skipped, but both apply in practice, so this test pins
+        /// each independently plus the real shape together.
+        #[test]
+        fn interrupted_marker_shapes_never_reach_hydrated_messages() {
+            let c = ctx();
+            let m = model();
+            let s = system();
+
+            let role_system_and_ephemeral = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, s, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::System)
+            .content("⛔ Interrupted")
+            .ephemeral(true)
+            .build();
+
+            let role_system_only = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, s, 1),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::System)
+            .content("⛔ Interrupted")
+            .build();
+
+            let ephemeral_only = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 1),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Model)
+            .content("⛔ Interrupted")
+            .ephemeral(true)
+            .build();
+
+            for (name, block) in [
+                ("role=System + ephemeral (the real shape)", role_system_and_ephemeral),
+                ("role=System alone", role_system_only),
+                ("ephemeral alone", ephemeral_only),
+            ] {
+                let msgs = hydrate_from_blocks(&[block]);
+                assert!(
+                    msgs.is_empty(),
+                    "{name}: marker must not reach hydrated messages, got {msgs:?}"
+                );
+            }
+
+            // Sanity check the regression is real: the OLD shape — plain
+            // (Role::Model, BlockKind::Text) with no ephemeral flag — DOES
+            // fold into assistant_text. If this assertion ever fails, the
+            // three cases above stopped testing anything meaningful.
+            let old_shape = BlockSnapshot::text(
+                BlockId::new(c, m, 2),
+                None,
+                BlockRole::Model,
+                "⛔ Interrupted",
+            );
+            let msgs = hydrate_from_blocks(&[old_shape]);
+            assert_eq!(
+                msgs.len(),
+                1,
+                "the OLD leaking shape must still fold into assistant_text \
+                 (proves the fixed shapes above are actually being exercised)"
+            );
+            assert_eq!(msgs[0].as_text(), Some("⛔ Interrupted"));
         }
     }
 }
