@@ -489,10 +489,6 @@ Deferred from the renovation, in rough priority order:
   is that forever context_type's job?
 - **App UI for casts** — kj-only today; the app compiles against the new wire
   fields but renders nothing cast-shaped yet.
-- **`kj context info` JSON lacks the resolved effective model** (deepseek
-  review P4): it carries raw row provider/model + cast label, so a consumer
-  must re-derive the resolution ladder. Add resolved backend/model/source
-  fields from `resolve_context_model`.
 - Deepseek-review P1, reviewed and ACCEPTED as policy: the rollover's
   fallback arm tosses provider=NULL+model=set rows to deepseek-v4-flash —
   that was Amy's instruction, and the live migration touched 0 rows anyway.

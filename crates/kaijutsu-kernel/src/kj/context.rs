@@ -612,9 +612,42 @@ impl KjDispatcher {
         // wire's `contextUsedPct` (`ContextHandleInfo` /
         // `kaijutsu-server/src/rpc.rs::list_contexts`) so the two surfaces
         // can never disagree.
+        // Resolved effective model: the SAME ladder the turn path walks
+        // (explicit context override → cast slot on context_type → registry
+        // default) via `resolve_context_model` — so a consumer of this JSON
+        // never has to re-derive the resolution ladder from the raw
+        // `provider`/`model` columns above (deepseek review P4). `kj model`
+        // already resolves the identical way; kept in lockstep so the two
+        // surfaces can never disagree. The registry read lock is acquired
+        // unconditionally — the context-window lookup below needs it too.
+        let registry = self.kernel().llm().read().await;
+        let resolved = crate::model_resolution::resolve_context_model(
+            &row.context_type,
+            row.provider.as_deref(),
+            row.model.as_deref(),
+            cast_label.as_deref(),
+            &registry,
+        );
+        let (resolved_backend, resolved_model, resolved_source) = match &resolved {
+            Some(r) => {
+                let source = match &r.source {
+                    crate::model_resolution::ModelSource::ContextOverride => {
+                        "context".to_string()
+                    }
+                    crate::model_resolution::ModelSource::CastSlot { cast } => {
+                        format!("cast {cast}")
+                    }
+                    crate::model_resolution::ModelSource::RegistryDefault => {
+                        "default".to_string()
+                    }
+                };
+                (Some(r.backend.clone()), Some(r.model.clone()), source)
+            }
+            None => (None, None, "default".to_string()),
+        };
+
         let (context_window, context_used_pct) = match &usage {
             Some(u) => {
-                let registry = self.kernel().llm().read().await;
                 let window = registry.context_window_for_live(&u.provider, &u.model).await;
                 let pct = crate::kernel_db::context_used_pct(u, window);
                 (window, pct)
@@ -629,6 +662,14 @@ impl KjDispatcher {
             is_current,
             trace_id,
         );
+
+        {
+            let display = match (&resolved_backend, &resolved_model) {
+                (Some(b), Some(m)) => format!("{b}/{m}"),
+                _ => "(none configured)".to_string(),
+            };
+            info.push_str(&format!("\nResolved: {display} ({resolved_source})"));
+        }
 
         if let Some(ref s) = shell
             && let Some(cwd) = &s.cwd
@@ -696,6 +737,17 @@ impl KjDispatcher {
             "preset_id": row.preset_id.map(|id| id.to_hex()),
             "cast_id": row.cast_id.map(|id| id.to_hex()),
             "cast_label": cast_label,
+            // Resolved effective model — same ladder as `kj model` and the
+            // turn path (`resolve_context_model`): explicit context
+            // override → cast slot on context_type → registry default.
+            // `resolved_source` is one of "context" | "cast <label>" |
+            // "default". Both `resolved_backend`/`resolved_model` are
+            // `null` together only when nothing is configured anywhere
+            // (no registry default either) — an honest absence, never a
+            // fabricated fallback.
+            "resolved_backend": resolved_backend,
+            "resolved_model": resolved_model,
+            "resolved_source": resolved_source,
             "cwd": shell.as_ref().and_then(|s| s.cwd.clone()),
             "env": env_vars.iter()
                 .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
@@ -2975,6 +3027,80 @@ mod tests {
                 );
             }
             other => panic!("expected Ok with usage data, got {other:?}"),
+        }
+    }
+
+    /// `kj context info`'s JSON carries the raw `provider`/`model` row
+    /// columns, but a consumer that wants to know what will ACTUALLY run
+    /// has to walk the resolution ladder itself (deepseek review P4). This
+    /// asserts the structured record and the human text both surface the
+    /// SAME resolved backend/model/source `resolve_context_model` (and `kj
+    /// model`) would produce — for an explicit context override, so
+    /// `resolved_source` must read "context".
+    #[tokio::test]
+    async fn context_info_data_carries_the_resolved_effective_model() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("resolved-ctx"), None, principal);
+
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+        }
+
+        let c = caller_with_context(ctx);
+        let set = d
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--model"), s("mock/test-model")],
+                &c,
+            )
+            .await;
+        assert!(set.is_ok(), "set failed: {}", set.message());
+
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+        assert!(
+            result.message().contains("Resolved: mock/test-model (context)"),
+            "human text must show the resolved model: {}",
+            result.message()
+        );
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["resolved_backend"], "mock");
+                assert_eq!(v["resolved_model"], "test-model");
+                assert_eq!(v["resolved_source"], "context");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// The other end of the ladder: a fresh context with no override, no
+    /// cast, and a registry with no default at all must resolve to
+    /// `null`/`null`/"default" — an honest absence, never a fabricated
+    /// fallback pair.
+    #[tokio::test]
+    async fn context_info_data_resolved_model_is_null_when_nothing_configured() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("unresolved-ctx"), None, principal);
+
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("context"), s("info")], &c).await;
+        assert!(result.is_ok(), "info failed: {}", result.message());
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert!(v["resolved_backend"].is_null(), "got {v}");
+                assert!(v["resolved_model"].is_null(), "got {v}");
+                assert_eq!(v["resolved_source"], "default");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
         }
     }
 
