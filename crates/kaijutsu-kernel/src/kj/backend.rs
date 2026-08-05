@@ -188,7 +188,11 @@ impl KjDispatcher {
             return denied;
         }
 
-        let result = match parsed.command {
+        // Set aside so the post-reload registration check below (the
+        // clear-on-omit sharp edge fix) knows which backend name to look up
+        // — the upsert can succeed while the registry still warn-skips it.
+        let mut newly_set_backend: Option<String> = None;
+        let mut result = match parsed.command {
             BackendCommand::List => self.backend_list(),
             BackendCommand::Show { name } => self.backend_show(&name),
             BackendCommand::Set {
@@ -199,16 +203,19 @@ impl KjDispatcher {
                 api_key_file,
                 key_optional,
                 request_timeout,
-            } => self.backend_set(
-                &name,
-                &kind,
-                base_url,
-                api_key_env,
-                api_key_file,
-                key_optional,
-                request_timeout,
-                caller,
-            ),
+            } => {
+                newly_set_backend = Some(name.clone());
+                self.backend_set(
+                    &name,
+                    &kind,
+                    base_url,
+                    api_key_env,
+                    api_key_file,
+                    key_optional,
+                    request_timeout,
+                    caller,
+                )
+            }
             BackendCommand::Remove { name } => self.backend_remove(&name),
             BackendCommand::Model(cmd) => self.backend_model(cmd),
             BackendCommand::Default(BackendDefaultCommand::Show) => self.backend_default_show(),
@@ -243,6 +250,28 @@ impl KjDispatcher {
                 return KjResult::Err(format!(
                     "kj backend: write landed but the LLM registry failed to reload: {e}"
                 ));
+            }
+            // `backend set` is a declare-the-whole-row upsert (documented
+            // policy — a partial update silently clears an omitted key
+            // source). The write can therefore succeed while the registry
+            // warn-skips the backend at build time (missing/invalid key,
+            // say) — the row lands but nothing serves requests until fixed.
+            // Say so here rather than leaving the operator to grep server
+            // logs for a warning they don't know to look for.
+            if let Some(name) = &newly_set_backend {
+                let registered = self.kernel().llm().read().await.get(name).is_some();
+                if let KjResult::Ok { message, .. } = &mut result {
+                    if registered {
+                        message.push_str(" — registered and live");
+                    } else {
+                        message.push_str(
+                            " — WARNING: not registered (check server logs); the row \
+                             was written but the registry skipped it, most likely a \
+                             missing or unresolvable API key. It will not serve \
+                             requests until `kj backend set` is retried with a fix.",
+                        );
+                    }
+                }
             }
         }
         result
@@ -710,6 +739,65 @@ mod tests {
         assert!(
             d.kernel().llm().read().await.get("vllm").is_some(),
             "the registry must see a new backend immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_confirms_registration_in_its_own_output() {
+        // The success message must say the backend actually went live, not
+        // just that the row was written.
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d
+            .dispatch(
+                &argv(&[
+                    "backend", "set", "vllm", "--kind", "openai", "--base-url",
+                    "http://localhost:8000/v1", "--key-optional",
+                ]),
+                &c,
+            )
+            .await;
+        match r {
+            KjResult::Ok { message, .. } => {
+                assert!(
+                    message.contains("registered and live"),
+                    "success message should confirm registration: {message}"
+                );
+            }
+            other => panic!("expected Ok: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_warns_in_its_own_output_when_the_registry_skips_it() {
+        // The `backend set` clear-on-omit sharp edge: the upsert can
+        // succeed (row written) while the registry warn-skips the backend
+        // at build time (unresolvable key here). Before this fix, the only
+        // sign was a `tracing::warn!` in the server log — the command's own
+        // output claimed unqualified success. It must now say so itself.
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d
+            .dispatch(
+                &argv(&[
+                    "backend", "set", "anthropic-broken", "--kind", "anthropic",
+                    "--api-key-env", "KJ_TEST_NONEXISTENT_KEY_VAR_XYZ",
+                ]),
+                &c,
+            )
+            .await;
+        match r {
+            KjResult::Ok { message, .. } => {
+                assert!(
+                    message.contains("WARNING") && message.contains("not registered"),
+                    "success message must flag the registry skip: {message}"
+                );
+            }
+            other => panic!("the upsert itself must still succeed: {other:?}"),
+        }
+        assert!(
+            d.kernel().llm().read().await.get("anthropic-broken").is_none(),
+            "a backend with no resolvable key must not be registered"
         );
     }
 

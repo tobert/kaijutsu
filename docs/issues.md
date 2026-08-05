@@ -489,11 +489,6 @@ Deferred from the renovation, in rough priority order:
   is that forever context_type's job?
 - **App UI for casts** — kj-only today; the app compiles against the new wire
   fields but renders nothing cast-shaped yet.
-- **`kj backend set` clear-on-omit sharp edge** (deepseek review P2): the
-  documented declare-the-whole-row upsert means a partial update silently
-  clears key sources; the command succeeds while the backend then warn-skips
-  at registry build. Consider: after reload, `backend set` checks the backend
-  actually registered and says so in the command output.
 - **`kj context info` JSON lacks the resolved effective model** (deepseek
   review P4): it carries raw row provider/model + cast label, so a consumer
   must re-derive the resolution ladder. Add resolved backend/model/source
