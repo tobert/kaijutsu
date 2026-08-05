@@ -26,8 +26,9 @@ use super::binding::{ContextToolBinding, ResolvedName};
 use super::coalescer::{NotificationCoalescer, ObserveOutcome};
 use super::context::CallContext;
 use super::error::{HookId, McpError, McpResult, PolicyError};
-use super::hook_table::{HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
+use super::hook_table::{AskSpec, HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
+use super::permission::{PermissionAskRequest, PermissionAsker, PermissionOutcome};
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
@@ -185,6 +186,18 @@ pub struct Broker {
     /// `kj mcp list` instead of requiring a log grep — "loud, not silent"
     /// extends to *after* the boot log has scrolled by.
     external_mcp_failures: RwLock<Option<Vec<(String, String)>>>,
+    /// Bridge to the server's `PermissionEvents` subscriber registry (D-57).
+    /// `Arc<dyn PermissionAsker>` rather than `Weak` like `kernel`/
+    /// `kj_dispatcher`: the bridge is a small registry object owned by
+    /// kernel bootstrap alongside the broker itself, not something the
+    /// broker would otherwise keep alive — there's no ownership cycle to
+    /// break. Set via `set_permission_asker`; `None` → every `Ask` fires
+    /// the no-subscriber fail-closed default (see `evaluate_phase`).
+    permission_asker: RwLock<Option<Arc<dyn PermissionAsker>>>,
+    /// Round-trip budget for a permission ask (D-57). Defaults to
+    /// [`super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`]; shrunk by
+    /// `#[cfg(test)]` callers so timeout tests don't actually wait 30s.
+    permission_ask_timeout: RwLock<std::time::Duration>,
 }
 
 impl Default for Broker {
@@ -222,6 +235,10 @@ impl Broker {
             kj_dispatcher: RwLock::new(None),
             enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
             external_mcp_failures: RwLock::new(None),
+            permission_asker: RwLock::new(None),
+            permission_ask_timeout: RwLock::new(
+                super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT,
+            ),
         }
     }
 
@@ -254,6 +271,25 @@ impl Broker {
     /// `kj` tool. Called at server bootstrap after `Arc::new(KjDispatcher::new(...))`.
     pub async fn set_kj_dispatcher(&self, dispatcher: &Arc<crate::kj::KjDispatcher>) {
         *self.kj_dispatcher.write().await = Some(Arc::downgrade(dispatcher));
+    }
+
+    /// Wire the `PermissionEvents` subscriber bridge (D-57) so
+    /// `HookAction::Ask` has somewhere to send its round trip. Called at
+    /// server bootstrap once the kernel-wide subscriber registry exists.
+    /// `None` (the default) means every `Ask` fires the no-subscriber
+    /// fail-closed default — a bare `Broker::new()` in tests is exactly
+    /// that case unless the test wires a fake asker.
+    pub async fn set_permission_asker(&self, asker: Arc<dyn PermissionAsker>) {
+        *self.permission_asker.write().await = Some(asker);
+    }
+
+    /// Override the permission-ask timeout. Test-only: production always
+    /// uses [`super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`] (30s,
+    /// "generous"); a timeout test shrinks this so it doesn't actually
+    /// block for 30 real seconds.
+    #[cfg(test)]
+    pub(crate) async fn set_permission_ask_timeout_for_test(&self, timeout: std::time::Duration) {
+        *self.permission_ask_timeout.write().await = timeout;
     }
 
     /// Upgrade the stashed `Weak<KjDispatcher>` (set via [`Self::set_kj_dispatcher`]).
@@ -1011,7 +1047,7 @@ impl Broker {
                     }
                     // Never reached in normal operation (D-56 rejects these
                     // at add time). Defensive no-op if somehow present.
-                    HookAction::ShortCircuit(_) | HookAction::Invoke(_) => {}
+                    HookAction::ShortCircuit(_) | HookAction::Invoke(_) | HookAction::Ask(_) => {}
                 }
             }
             true
@@ -1619,6 +1655,14 @@ impl Broker {
                         result,
                     });
                 }
+                HookAction::Ask(spec) => {
+                    if let Some(reason) = self.run_permission_ask(&entry.id, &spec, params, ctx).await {
+                        return Ok(PhaseOutcome::Deny {
+                            hook_id: entry.id,
+                            reason,
+                        });
+                    }
+                }
                 HookAction::Invoke(body) => match body {
                     HookBody::Builtin { name, hook } => {
                         // D-29 / D-47: guard against runaway recursion when
@@ -1652,6 +1696,136 @@ impl Broker {
             }
         }
         Ok(PhaseOutcome::Continue)
+    }
+
+    /// Run one `HookAction::Ask` round trip (D-57). Returns `None` when the
+    /// call should proceed (an attached subscriber answered "allow");
+    /// `Some(reason)` when it should be denied — either a real "no" from a
+    /// subscriber, or one of the two fail-closed defaults:
+    ///
+    /// - **No subscriber attached** (`self.permission_asker` unset, or the
+    ///   bridge itself reports `PermissionOutcome::NoSubscriber` because its
+    ///   registry is empty) — nothing to ask, so the safe default is Deny.
+    ///   An `Ask` hook with nobody to ask is a misconfiguration, not a
+    ///   quiet no-op (`CLAUDE.md`: "Silent fallbacks are often a mistake").
+    /// - **Timeout** — a subscriber was attached but didn't answer within
+    ///   `permission_ask_timeout` (default 30s, "generous" — see
+    ///   `super::permission::DEFAULT_PERMISSION_ASK_TIMEOUT`). Same Deny
+    ///   default; a turn must not hang forever on an unanswered prompt.
+    ///
+    /// Both fail-closed paths log at `warn!` (not the plain `debug!` other
+    /// hook denials use) — a stuck Ask usually means the current session
+    /// has no client subscribed to answer it, which the operator needs to
+    /// notice, not just trace.
+    async fn run_permission_ask(
+        &self,
+        hook_id: &HookId,
+        spec: &AskSpec,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+    ) -> Option<String> {
+        let description = spec
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("{}.{}", params.instance, params.tool));
+        let request = PermissionAskRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            context_id: ctx.context_id,
+            description,
+            instance: params.instance.as_str().to_string(),
+            tool: params.tool.clone(),
+            hook_id: hook_id.0.clone(),
+            options: Vec::new(),
+        };
+
+        let asker = self.permission_asker.read().await.clone();
+        let Some(asker) = asker else {
+            tracing::warn!(
+                target: "kaijutsu::hooks",
+                hook_id = %hook_id,
+                instance = %params.instance,
+                tool = %params.tool,
+                context_id = %ctx.context_id,
+                "permission ask fired with no PermissionEvents subscriber attached; denying (fail-closed)",
+            );
+            return Some(
+                "permission ask: no PermissionEvents subscriber attached (fail-closed)".into(),
+            );
+        };
+
+        let timeout = *self.permission_ask_timeout.read().await;
+        let request_id = request.request_id.clone();
+        match tokio::time::timeout(timeout, asker.ask(request)).await {
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    request_id = %request_id,
+                    timeout_secs = timeout.as_secs_f64(),
+                    "permission ask timed out waiting for a response; denying (fail-closed)",
+                );
+                Some(format!(
+                    "permission ask: timed out after {:.1}s waiting for a response (fail-closed)",
+                    timeout.as_secs_f64()
+                ))
+            }
+            Ok(PermissionOutcome::NoSubscriber) => {
+                tracing::warn!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    request_id = %request_id,
+                    "permission ask bridge reports no subscriber; denying (fail-closed)",
+                );
+                Some(
+                    "permission ask: no PermissionEvents subscriber attached (fail-closed)".into(),
+                )
+            }
+            Ok(PermissionOutcome::TimedOut) => {
+                tracing::warn!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    request_id = %request_id,
+                    "permission ask bridge reports its own timeout; denying (fail-closed)",
+                );
+                Some(
+                    "permission ask: subscriber did not answer in time (fail-closed)".into(),
+                )
+            }
+            Ok(PermissionOutcome::Answered(answer)) => {
+                tracing::debug!(
+                    target: "kaijutsu::hooks",
+                    hook_id = %hook_id,
+                    instance = %params.instance,
+                    tool = %params.tool,
+                    context_id = %ctx.context_id,
+                    request_id = %request_id,
+                    allow = answer.allow,
+                    remember = ?answer.remember,
+                    "permission ask answered",
+                );
+                if answer.allow {
+                    None
+                } else {
+                    Some(format!(
+                        "permission ask: denied by subscriber{}",
+                        answer
+                            .remember
+                            .as_deref()
+                            .map(|r| format!(" (remember={r})"))
+                            .unwrap_or_default()
+                    ))
+                }
+            }
+        }
     }
 
     /// Run a `HookBody::Kaish` body. The script's `id` field is treated
@@ -2908,6 +3082,8 @@ mod tests {
     use std::future::Future;
     use std::time::Duration;
 
+    use super::super::permission::PermissionAnswer;
+
     use async_trait::async_trait;
     use futures::future::BoxFuture;
     use serde_json::json;
@@ -3869,6 +4045,8 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
+                permission_asker: RwLock::new(None),
+                permission_ask_timeout: RwLock::new(crate::mcp::permission::DEFAULT_PERMISSION_ASK_TIMEOUT),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -4044,6 +4222,8 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
+                permission_asker: RwLock::new(None),
+                permission_ask_timeout: RwLock::new(crate::mcp::permission::DEFAULT_PERMISSION_ASK_TIMEOUT),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -5429,6 +5609,8 @@ mod tests {
                 enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
                 external_mcp_failures: RwLock::new(None),
+                permission_asker: RwLock::new(None),
+                permission_ask_timeout: RwLock::new(crate::mcp::permission::DEFAULT_PERMISSION_ASK_TIMEOUT),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -6332,6 +6514,7 @@ mod tests {
                     action_deny_reason: None,
                     action_log_target: Some("x".into()),
                     action_log_level: Some("info".into()),
+                    action_ask_description: None,
                 },
                 HookRow {
                     hook_id: "pc-low".into(),
@@ -6350,6 +6533,7 @@ mod tests {
                     action_deny_reason: None,
                     action_log_target: Some("x".into()),
                     action_log_level: Some("info".into()),
+                    action_ask_description: None,
                 },
                 HookRow {
                     hook_id: "post".into(),
@@ -6368,6 +6552,7 @@ mod tests {
                     action_deny_reason: None,
                     action_log_target: Some("x".into()),
                     action_log_level: Some("info".into()),
+                    action_ask_description: None,
                 },
             ] {
                 guard.insert_hook(&row).unwrap();
@@ -6502,6 +6687,7 @@ mod tests {
                     action_deny_reason: None,
                     action_log_target: None,
                     action_log_level: None,
+                    action_ask_description: None,
                 })
                 .unwrap();
             guard
@@ -6522,6 +6708,7 @@ mod tests {
                     action_deny_reason: None,
                     action_log_target: Some("x".into()),
                     action_log_level: Some("info".into()),
+                    action_ask_description: None,
                 })
                 .unwrap();
         }
@@ -6829,5 +7016,286 @@ mod tests {
             }
             other => panic!("expected BindingUnavailable, got {other:?}"),
         }
+    }
+
+    // ── D-57: HookAction::Ask ───────────────────────────────────────────
+
+    /// Test double for `PermissionAsker`. Records the last request it saw
+    /// (so tests can assert on the auto-generated description / hook_id /
+    /// context wiring) and answers with a scripted `PermissionOutcome`,
+    /// optionally after a delay — the delay is what exercises the timeout
+    /// path without a real client.
+    struct ScriptedAsker {
+        outcome: PermissionOutcome,
+        delay: Option<Duration>,
+        last_request: Mutex<Option<PermissionAskRequest>>,
+    }
+
+    impl ScriptedAsker {
+        fn new(outcome: PermissionOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                delay: None,
+                last_request: Mutex::new(None),
+            })
+        }
+
+        fn with_delay(outcome: PermissionOutcome, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                delay: Some(delay),
+                last_request: Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionAsker for ScriptedAsker {
+        async fn ask(&self, request: PermissionAskRequest) -> PermissionOutcome {
+            *self.last_request.lock().await = Some(request);
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.outcome.clone()
+        }
+    }
+
+    fn ask_entry(id: &str, description: Option<&str>) -> HookEntry {
+        HookEntry {
+            id: hook_id(id),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Ask(AskSpec {
+                description: description.map(|s| s.to_string()),
+            }),
+            priority: 0,
+            kaish_script_id: None,
+        }
+    }
+
+    /// A subscriber that answers "allow" lets the call through.
+    #[tokio::test]
+    async fn permission_ask_allow_lets_call_proceed() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-allow", None));
+
+        let asker = ScriptedAsker::new(PermissionOutcome::Answered(PermissionAnswer {
+            allow: true,
+            selected_option_id: None,
+            remember: None,
+        }));
+        broker.set_permission_asker(asker.clone()).await;
+
+        let ok = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!ok.is_error);
+
+        // The request the bridge saw carries the auto-generated
+        // description (no override was set on the hook) and the firing
+        // hook's own id.
+        let seen = asker.last_request.lock().await.clone().unwrap();
+        assert_eq!(seen.description, "svc.t");
+        assert_eq!(seen.hook_id, "ask-allow");
+        assert_eq!(seen.instance, "svc");
+        assert_eq!(seen.tool, "t");
+    }
+
+    /// A subscriber that answers "deny" blocks the call as
+    /// `McpError::Denied`, same channel as `HookAction::Deny`.
+    #[tokio::test]
+    async fn permission_ask_deny_blocks_call() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-deny", Some("about to do something risky")));
+
+        let asker = ScriptedAsker::new(PermissionOutcome::Answered(PermissionAnswer {
+            allow: false,
+            selected_option_id: None,
+            remember: Some("session".into()),
+        }));
+        broker.set_permission_asker(asker.clone()).await;
+
+        let err = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "ask-deny"));
+
+        let seen = asker.last_request.lock().await.clone().unwrap();
+        assert_eq!(seen.description, "about to do something risky");
+    }
+
+    /// D-57 fail-closed default #1: no `PermissionEvents` subscriber
+    /// attached at all (`set_permission_asker` never called) denies the
+    /// call rather than silently letting it through.
+    #[tokio::test]
+    async fn permission_ask_no_subscriber_denies() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-no-sub", None));
+
+        let err = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        match err {
+            McpError::Denied { by_hook } => assert_eq!(by_hook.0, "ask-no-sub"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// D-57 fail-closed default #1, variant: a bridge IS attached but its
+    /// own registry is empty, so it reports `NoSubscriber` explicitly
+    /// rather than the kernel inferring it from an absent bridge. Same
+    /// Deny outcome either way.
+    #[tokio::test]
+    async fn permission_ask_bridge_reports_no_subscriber_denies() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-empty-registry", None));
+        broker
+            .set_permission_asker(ScriptedAsker::new(PermissionOutcome::NoSubscriber))
+            .await;
+
+        let err = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "ask-empty-registry"));
+    }
+
+    /// D-57 fail-closed default #2: a subscriber is attached but doesn't
+    /// answer within the timeout — must not hang the turn forever, and
+    /// must resolve to the same Deny default as no-subscriber. The test
+    /// shrinks the timeout (`set_permission_ask_timeout_for_test`) so this
+    /// doesn't block the suite for the real 30s production default.
+    #[tokio::test]
+    async fn permission_ask_timeout_denies() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-timeout", None));
+
+        // Asker "answers allow" but only after 200ms — the 20ms test
+        // timeout must win, and the call must still be denied (a slow
+        // subscriber is not a substitute for a real one within budget).
+        let asker = ScriptedAsker::with_delay(
+            PermissionOutcome::Answered(PermissionAnswer {
+                allow: true,
+                selected_option_id: None,
+                remember: None,
+            }),
+            Duration::from_millis(200),
+        );
+        broker.set_permission_asker(asker).await;
+        broker
+            .set_permission_ask_timeout_for_test(Duration::from_millis(20))
+            .await;
+
+        let started = std::time::Instant::now();
+        let err = broker
+            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "must resolve at the 20ms timeout, not wait for the 200ms answer",
+        );
+        match err {
+            McpError::Denied { by_hook } => assert_eq!(by_hook.0, "ask-timeout"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// A `HookAction::Ask` with `match_context` set correctly threads the
+    /// firing context's id onto the wire request — needed so a future ACP
+    /// adapter can route the prompt to the right session.
+    #[tokio::test]
+    async fn permission_ask_request_carries_context_id() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(ask_entry("ask-ctx", None));
+
+        let asker = ScriptedAsker::new(PermissionOutcome::Answered(PermissionAnswer {
+            allow: true,
+            selected_option_id: None,
+            remember: None,
+        }));
+        broker.set_permission_asker(asker.clone()).await;
+
+        let mut ctx = CallContext::test();
+        let target_ctx = ContextId::new();
+        ctx.context_id = target_ctx;
+        broker
+            .call_tool(params("svc", "t"), &ctx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let seen = asker.last_request.lock().await.clone().unwrap();
+        assert_eq!(seen.context_id, target_ctx);
     }
 }

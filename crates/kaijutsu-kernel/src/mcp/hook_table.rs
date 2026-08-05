@@ -39,6 +39,13 @@
 //! `Broker::set_kernel`; without that wired, kaish hooks return Deny.
 //! `ListTools` phase still rejects kaish at `hook_add` (no coherent
 //! list-filter semantics).
+//!
+//! `HookAction::Ask(AskSpec)` (D-57, docs/acp.md gap #2) blocks the phase
+//! on a `PermissionEvents::onAsk` round trip to a subscribed client —
+//! see `super::permission` for the request/response/trait shape and
+//! `Broker::evaluate_phase` for the fail-closed no-subscriber/timeout
+//! policy. Like `Kaish`, `ListTools` rejects `Ask` at `hook_add` (D-56):
+//! a list-filter can't block-wait per tool.
 
 use std::sync::Arc;
 
@@ -108,18 +115,35 @@ impl std::fmt::Debug for HookBody {
     }
 }
 
+/// Configuration for `HookAction::Ask`. A struct (not inline enum fields)
+/// so the ask surface can grow — e.g. a configurable options list — without
+/// another `HookAction` variant shape change.
+#[derive(Clone, Debug, Default)]
+pub struct AskSpec {
+    /// Human-readable description shown to the answering client. `None`
+    /// falls back to an auto-generated `"{instance}.{tool}"` at fire time
+    /// (`Broker::evaluate_phase`), so a hook config doesn't have to spell
+    /// out the obvious case.
+    pub description: Option<String>,
+}
+
 /// Hook action: continue the chain, terminate with a result, terminate with
-/// an error, or observe and continue (§4.3).
+/// an error, block on a permission ask, or observe and continue (§4.3).
 ///
 /// `Deny` carries a `String` reason rather than `McpError`. The broker
 /// converts denials uniformly to `McpError::Denied { by_hook }` at the
 /// LLM boundary (D-28); the reason string is tracing-only.
+///
+/// `Ask` also terminates as `McpError::Denied` when the answer is "no" (or
+/// the fail-closed default fires) — same D-28 channel, different verdict
+/// source. See `super::permission` (D-57).
 #[derive(Clone, Debug)]
 pub enum HookAction {
     Invoke(HookBody),
     ShortCircuit(KernelToolResult),
     Deny(String),
     Log(LogSpec),
+    Ask(AskSpec),
 }
 
 #[derive(Clone, Debug)]

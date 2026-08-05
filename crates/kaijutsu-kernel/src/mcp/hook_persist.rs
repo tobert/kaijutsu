@@ -15,7 +15,7 @@
 
 use super::error::HookId;
 use super::hook_table::{
-    GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, LogSpec,
+    AskSpec, GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, LogSpec,
 };
 use super::hooks_builtin::BuiltinHookRegistry;
 use super::types::{KernelToolResult, ToolContent};
@@ -26,6 +26,7 @@ pub const ACTION_KAISH_INVOKE: &str = "kaish_invoke";
 pub const ACTION_SHORT_CIRCUIT: &str = "shortcircuit";
 pub const ACTION_DENY: &str = "deny";
 pub const ACTION_LOG: &str = "log";
+pub const ACTION_ASK: &str = "ask";
 
 pub fn phase_to_str(phase: McpHookPhase) -> &'static str {
     match phase {
@@ -98,6 +99,7 @@ pub fn entry_to_row(phase: McpHookPhase, entry: &HookEntry) -> HookRow {
         action_deny_reason: None,
         action_log_target: None,
         action_log_level: None,
+        action_ask_description: None,
     };
 
     match &entry.action {
@@ -143,6 +145,10 @@ pub fn entry_to_row(phase: McpHookPhase, entry: &HookEntry) -> HookRow {
             row.action_kind = ACTION_LOG.into();
             row.action_log_target = Some(spec.target.clone());
             row.action_log_level = Some(level_to_str(spec.level).to_string());
+        }
+        HookAction::Ask(spec) => {
+            row.action_kind = ACTION_ASK.into();
+            row.action_ask_description = spec.description.clone();
         }
     }
 
@@ -266,6 +272,9 @@ pub fn row_to_entry(
                 .unwrap_or_else(|| "kaijutsu::hooks".to_string());
             HookAction::Log(LogSpec { target, level })
         }
+        ACTION_ASK => HookAction::Ask(AskSpec {
+            description: row.action_ask_description.clone(),
+        }),
         other => return Err(RowParseError::UnknownActionKind(other.to_string())),
     };
 
@@ -344,11 +353,69 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         let err = row_to_entry(&row, &registry).unwrap_err();
         match err {
             RowParseError::UnknownBuiltin(name) => assert_eq!(name, "removed_hook_name"),
             other => panic!("expected UnknownBuiltin, got {other:?}"),
+        }
+    }
+
+    /// D-57: `Ask` round-trips its optional description. `None` (the
+    /// "auto-generate at fire time" case) must round-trip as `None`, not
+    /// coerce to an empty string — that distinction is what
+    /// `Broker::run_permission_ask` keys its fallback description on.
+    #[test]
+    fn ask_round_trip_with_description() {
+        let registry = BuiltinHookRegistry::new();
+        let entry = HookEntry {
+            id: HookId("ask-1".into()),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Ask(AskSpec {
+                description: Some("about to delete files".into()),
+            }),
+            priority: 3,
+            kaish_script_id: None,
+        };
+        let row = entry_to_row(McpHookPhase::PreCall, &entry);
+        assert_eq!(row.action_kind, "ask");
+        assert_eq!(row.action_ask_description.as_deref(), Some("about to delete files"));
+
+        let (phase2, entry2) = row_to_entry(&row, &registry).unwrap();
+        assert_eq!(phase2, McpHookPhase::PreCall);
+        assert_eq!(entry2.priority, 3);
+        match entry2.action {
+            HookAction::Ask(spec) => {
+                assert_eq!(spec.description.as_deref(), Some("about to delete files"));
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_round_trip_without_description_stays_none() {
+        let registry = BuiltinHookRegistry::new();
+        let entry = HookEntry {
+            id: HookId("ask-2".into()),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Ask(AskSpec { description: None }),
+            priority: 0,
+            kaish_script_id: None,
+        };
+        let row = entry_to_row(McpHookPhase::PreCall, &entry);
+        assert_eq!(row.action_ask_description, None);
+
+        let (_phase, entry2) = row_to_entry(&row, &registry).unwrap();
+        match entry2.action {
+            HookAction::Ask(spec) => assert_eq!(spec.description, None),
+            other => panic!("expected Ask, got {other:?}"),
         }
     }
 
@@ -403,6 +470,7 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         let (_phase, entry) = row_to_entry(&row, &registry).expect("kaish row reconstructs");
         match entry.action {
@@ -431,6 +499,7 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         assert!(matches!(
             row_to_entry(&row, &registry),
@@ -466,6 +535,7 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         let (_phase, entry) =
             row_to_entry(&row, &registry).expect("snapshot row reconstructs");
