@@ -44,7 +44,7 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 | `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
 | `session/request_permission` | **auto-allow stub** (`permission.rs`); `HookAction::Ask` not built | STUB |
 | `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
-| `Task` blocks → ACP `plan` | — | unmapped, see gaps |
+| `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the CRDT mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
 
 ## Session picker = the rank
@@ -256,9 +256,6 @@ bridge until gap #2 lands.
 - **`kaijutsu-mcp`'s `write_input` deletes by byte length** (`lib.rs:1434`,
   `state.content.len()`), so a non-ASCII input doc is corrupted or truncated.
   `kaijutsu-acp` uses `chars().count()`. mcp should too.
-- **No ACP shape for `BlockKind::Task`.** ACP v1 has `plan` /`PlanEntry`
-  (stable, not the unstable plan-operations feature), which is a plausible
-  target once the `builtin.tasks` grooming surface settles.
 - **`session/delete`, `session/set_mode`, `session/set_config_option`** are
   stable v1 and unimplemented. `set_mode` maps naturally onto `context_type`
   / cast roles; `delete` onto `conclude`/`archive`. Not advertised, so a
@@ -266,6 +263,98 @@ bridge until gap #2 lands.
 - **Prompt content is text-only.** Image/audio/embedded-resource blocks are
   turned into a `[… omitted]` marker rather than dropped in silence, and the
   capabilities say `image: false, audio: false, embedded_context: false`.
+
+## Task → plan
+
+`BlockKind::Task` (`docs/tasks.md`) wired to ACP v1's `plan` session update,
+2026-08-05. `crates/kaijutsu-acp/src/update.rs`.
+
+**Why it can't be `observe()` alone.** Every other block kind maps to a
+per-block update (`observe()` is deliberately pure: one `BlockSnapshot` in,
+the deltas that block hasn't shown the client yet out). A `plan` is not
+per-block — ACP v1 has no `plan_operations` feature in this build, so a plan
+update **replaces the whole list**; there is no "here's one new entry"
+shape. So the mapper splits the job:
+
+- `UpdateMapper::note_task(&BlockSnapshot) -> bool` — a cheap per-block
+  high-water mark (`content`, `task_status`), the same idempotence
+  pattern as `emitted`/`tool_status` for every other kind. `false` for
+  any non-`Task` block (harmless no-op — the pump calls it
+  unconditionally rather than gating on `block.kind` itself) and for an
+  unchanged Task.
+- `UpdateMapper::build_plan(&[BlockSnapshot]) -> Option<SessionUpdate>` —
+  the actual rebuild: walks the **whole** document's Task blocks
+  (`task_plan_entries`), and returns `None` if the result is
+  byte-for-byte the plan already emitted (`last_plan`). This is the ONE
+  rebuild-and-emit path, called from three places:
+  - **Live pump** (`session::run_pump`): after `observe()` on any block,
+    `note_task` gates whether `build_plan(&doc.blocks())` is even
+    attempted.
+  - **`session/load` replay**: `observe()` every block first (Task
+    always empty per-block, same as live), then exactly **one**
+    `build_plan` call at the end — not one per task touched during
+    replay.
+  - **`session/new` bootstrap** and **resync**: `mark_seen`/
+    `baseline_plan` silently establish `last_plan` from the current
+    doc without emitting (an rc-seeded task shouldn't be narrated at a
+    client that just opened the session — same reasoning as
+    `mark_seen` for text/tool-call marks); the resync sweep then calls
+    `build_plan` unconditionally alongside its existing `observe()`
+    sweep, so a gap with no task activity stays silent (the same
+    "second sweep must be silent" contract `resync_sweep_emits_
+    exactly_the_gap` already pins for every other kind).
+
+**Status mapping** (`TaskStatus` → `PlanEntryStatus`):
+
+| kaijutsu `TaskStatus` | ACP `PlanEntryStatus` |
+|---|---|
+| `Open` | `Pending` |
+| `InProgress` | `InProgress` |
+| `Done` | `Completed` |
+| `Cancelled` | *(omitted — see below)* |
+
+**Cancelled tasks are omitted from the plan entirely**, not mapped onto any
+of the three ACP states. ACP's `plan` is framed as "what the agent intends
+to do"; a cancelled task is a deliberate groom decision to do nothing
+further with it, and `PlanEntryStatus` has no fourth state to say that
+honestly in-line (`Pending` would be a lie — nothing is queued —  and
+`Completed` would be a different lie). Cancelling an already-shown task is
+an ordinary status write, not a delete: it round-trips through the same
+`note_task`/`build_plan` path and the entry simply drops out of the next
+rebuilt plan.
+
+**Subtasks flatten.** ACP plans are flat (`Vec<PlanEntry>`, no hierarchy
+field); kaijutsu subtasks nest via the ordinary `parent_id` DAG edge
+(`docs/tasks.md` decision 3). `task_plan_entries` does a pre-order DFS over
+that edge — a parent, then each child and its own descendants, before the
+next sibling — and renders the nesting as a `"↳ "` prefix on `content`,
+repeated once per ancestor level, since there's nowhere else to put it. A
+task whose `parent_id` doesn't resolve to another *Task* block in the
+current snapshot (`None`, or pointing at a non-Task block — nothing in
+`builtin.tasks` promises otherwise) falls back to being treated as a root,
+so it can never silently vanish from the plan.
+
+**Priority defaults to `Medium`** for every entry. `docs/tasks.md`
+"Deferred" is explicit that Task blocks carry no priority field yet
+(nothing asked for it); this is ACP's required-field filler, not a
+kernel-side signal — do not read anything into it, and do not invent a
+priority field on the kernel side just to feed this mapping.
+
+**Ordering** is document order (`SyncedDocument::blocks()` →
+`block_ids_ordered()`), not `BlockId`/`BTreeMap` iteration, which is
+principal-major and would scramble both plan order and subtask nesting
+(`gotcha_blockid_vs_document_order` — the same trap this crate's other
+block-ordered reads already avoid).
+
+**Known gap, not fixed here**: `session::run_pump`'s `BlockDeleted` arm
+calls `mapper.forget(block_id)` and `continue`s *without* calling
+`doc.apply_event(&event)` — so the live `SyncedDocument` mirror never
+actually drops a deleted block; it lingers until the next resync rebuilds
+the mirror from scratch. This predates the Task work and affects every
+block kind identically, not just tasks — a deleted Task block (`kj block
+delete` on the underlying generic block, since `builtin.tasks` itself
+has no delete verb) will not disappear from a live plan until the next
+resync/reconnect. Logged in `docs/issues.md`.
 
 ## Manual smoke test (live kernel)
 
