@@ -1479,7 +1479,7 @@ impl KaijutsuMcp {
                     Ok(text) => serde_json::json!({
                         "context_id": ctx_id.short(),
                         "content": text,
-                        "length": text.len(),
+                        "length": input_char_len(&text),
                     })
                     .to_string(),
                     Err(e) => format!("Error: {}", e),
@@ -1490,7 +1490,7 @@ impl KaijutsuMcp {
                     Ok(state) => serde_json::json!({
                         "context_id": ctx_id.short(),
                         "content": state.content,
-                        "length": state.content.len(),
+                        "length": input_char_len(&state.content),
                         "version": state.version,
                     })
                     .to_string(),
@@ -1525,14 +1525,16 @@ impl KaijutsuMcp {
                 serde_json::json!({
                     "success": true,
                     "context_id": ctx_id.short(),
-                    "length": req.text.len(),
+                    "length": input_char_len(&req.text),
                 })
                 .to_string()
             }
             Backend::Remote(remote) => {
-                // Get current state to know how much to delete
+                // Get current state to know how much to delete — in CHARS,
+                // matching edit_input's char-addressed `delete` (found by the
+                // kaijutsu-acp lane: bytes here over-deletes on non-ASCII).
                 let current_len = match remote.actor.get_input_state(ctx_id).await {
-                    Ok(state) => state.content.len() as u64,
+                    Ok(state) => input_char_len(&state.content),
                     Err(e) => return format!("Error getting current state: {}", e),
                 };
                 // Delete all, then insert new text in one operation
@@ -1544,7 +1546,7 @@ impl KaijutsuMcp {
                     Ok(version) => serde_json::json!({
                         "success": true,
                         "context_id": ctx_id.short(),
-                        "length": req.text.len(),
+                        "length": input_char_len(&req.text),
                         "version": version,
                     })
                     .to_string(),
@@ -2318,6 +2320,19 @@ impl ServerHandler for KaijutsuMcp {
 /// a JSON object or array, unwrap that one layer. A genuine scalar/string param
 /// (whose text is not JSON object/array) is passed through unchanged — we only
 /// undo the specific double-encoding, never reinterpret real string values.
+/// Length on the input-document surface, counted in CHARACTERS.
+///
+/// `edit_input`'s `pos`/`delete` are character-addressed (rpc.rs: "insert
+/// text at position, delete characters"), so every length this surface
+/// derives — and reports, since a reported length is the position math a
+/// caller's next edit starts from — must be chars. `str::len()` is bytes;
+/// feeding it to a char-addressed delete overshoots on any non-ASCII
+/// content (e.g. 日本語 is 9 bytes, 3 chars — the same byte→char class as
+/// the file-tools hashline bug).
+fn input_char_len(s: &str) -> u64 {
+    s.chars().count() as u64
+}
+
 fn normalize_peer_params(params: &serde_json::Value) -> serde_json::Value {
     if let serde_json::Value::String(s) = params
         && let Ok(inner @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
@@ -2332,6 +2347,20 @@ fn normalize_peer_params(params: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The input-document surface is character-addressed end to end
+    /// (`edit_input`'s `pos`/`delete` are chars), so its lengths must be
+    /// counted in chars — `write_input` used to feed `str::len()` BYTES as
+    /// the delete count, over-deleting on any non-ASCII content (found by
+    /// the kaijutsu-acp lane, 2026-08-05).
+    #[test]
+    fn input_lengths_are_chars_not_bytes() {
+        // 9 bytes; a byte-derived delete count would ask for 3x the doc.
+        assert_eq!("日本語".len(), 9, "premise: the byte length really differs");
+        assert_eq!(input_char_len("日本語"), 3);
+        assert_eq!(input_char_len("hello"), 5);
+        assert_eq!(input_char_len(""), 0);
+    }
 
     /// The bug: an object param arrives double-encoded as a JSON string. We must
     /// unwrap exactly one layer so the peer receives an object, not a string.

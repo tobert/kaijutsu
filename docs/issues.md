@@ -421,11 +421,6 @@ adapter, as built".
   on `context_id` + `TurnOrigin::Interactive`; two interactive turns racing in
   one context would cross wires. This is the P3 "no turnId/endedAt … revisit
   with the adapter" item above, now with a caller asking for it.
-- **`kaijutsu-mcp`'s `write_input` deletes by BYTE length** (`lib.rs:1434`,
-  `state.content.len()` fed to `edit_input`'s char-addressed `delete`). Any
-  non-ASCII in the input doc truncates or over-deletes. `kaijutsu-acp` uses
-  `chars().count()`; mcp should too. Same byte→char class as the file-tools
-  bug already fixed.
 - **`BlockKind::Task` has no ACP shape.** ACP v1's `plan`/`PlanEntry` is
   stable (not the unstable plan-operations feature) and is the obvious target
   once the `builtin.tasks` grooming surface settles.
