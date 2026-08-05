@@ -1123,7 +1123,17 @@ impl TurnOrigin {
 /// Still **never journaled**, and that is deliberate: blocks are the durable
 /// record of what a turn produced. These events are a live signal about a live
 /// turn; replaying them after a restart would announce completions for turns
-/// nobody is waiting on. A subscriber that missed the push reads the block log.
+/// nobody is waiting on.
+///
+/// A subscriber that missed the push can fall back to the block log, but
+/// only for **what the turn wrote** — the text and status ops are durable.
+/// It cannot recover **why the turn stopped**: `reason` (`TurnStopReason`)
+/// has no block-log shadow, and `EndTurn`, `MaxTokens`, and a soft cancel all
+/// leave the same thing behind (a `Done` block with ordinary text) —
+/// indistinguishable from block status alone. A missed push genuinely loses
+/// that fact, not just delays it. The real fix is a catch-up story for the
+/// bus itself (deepseek post-merge review, `docs/issues.md`: "TurnFlow bus
+/// lossy + in-memory"), not a claim that the block log already covers it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TurnFlow {
     /// Drive one autonomous turn for `context_id`.
