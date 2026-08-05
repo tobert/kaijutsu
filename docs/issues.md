@@ -446,11 +446,14 @@ adapter, as built".
   deny-on-anything-unrecognised — is written and unit-tested; only the
   kernel→bridge transport is missing. **Do not point an untrusted client at
   the bridge until this lands.**
-- **No catch-up after a resync.** On `SyncReset`/broadcast-lag/reconnect the
-  session pump rebuilds its CRDT mirror and re-pegs the mapper *silently*
-  (`session.rs::resync`); changes during the gap never reach that ACP client.
-  Replaying instead would duplicate the whole transcript. Logged at `warn`.
-  Same family as the deferred TurnFlow catch-up story — one fix serves both.
+- ~~**No catch-up after a resync.**~~ **SHIPPED 2026-08-05** after it ate a
+  live answer on toad flight two (FlowBus lag mid-turn; the client rendered
+  the tool call, then silence over a finished report). `resync` now keeps
+  the mapper's high-water marks and re-observes the rebuilt doc — the sweep
+  emits exactly the gap (unseen tails + unannounced tool patches), never a
+  duplicate. The *TurnFlow* half (dropped completion events) got adapter-side
+  lag recovery the same day (idle-poll → best-effort `end_turn`); the exact
+  stop reason across a gap still needs the kernel catch-up story.
 - **`onTurnCompleted` carries no turn id.** The adapter's prompt wait matches
   on `context_id` + `TurnOrigin::Interactive`; two interactive turns racing in
   one context would cross wires. This is the P3 "no turnId/endedAt … revisit

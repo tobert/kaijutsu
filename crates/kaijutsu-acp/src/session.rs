@@ -145,7 +145,7 @@ pub async fn run_pump(
                     }
                     let effect = doc.apply_event(&event);
                     if matches!(effect, kaijutsu_client::SyncEffect::NeedsResync) {
-                        resync(&bridge, &session, &mut doc, "sync reset").await;
+                        resync(&bridge, &session, &session_id, &cx, &mut doc, "sync reset").await;
                         continue;
                     }
                     let Some(block_id) = event_block(&event) else { continue };
@@ -160,7 +160,7 @@ pub async fn run_pump(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(session = %session_id, dropped = n, "event stream lagged");
-                    resync(&bridge, &session, &mut doc, "events lagged").await;
+                    resync(&bridge, &session, &session_id, &cx, &mut doc, "events lagged").await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!(session = %session_id, "event stream closed; pump exiting");
@@ -169,11 +169,11 @@ pub async fn run_pump(
             },
             change = status.recv() => match change {
                 Ok(ConnectionStatus::Connected { .. }) => {
-                    resync(&bridge, &session, &mut doc, "reconnected").await;
+                    resync(&bridge, &session, &session_id, &cx, &mut doc, "reconnected").await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    resync(&bridge, &session, &mut doc, "status lagged").await;
+                    resync(&bridge, &session, &session_id, &cx, &mut doc, "status lagged").await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!(session = %session_id, "status stream closed; pump exiting");
@@ -184,30 +184,47 @@ pub async fn run_pump(
     }
 }
 
-/// Rebuild the CRDT mirror and re-peg the mapper **without replaying**.
+/// Rebuild the CRDT mirror and **catch the client up on the gap**.
 ///
-/// Anything that changed while we were desynced is lost to this client — a
-/// deliberate trade against re-sending the whole transcript. Logged at `warn`
-/// so a gap is never silent; a real catch-up story is the same open question
-/// the turn-events work deferred (docs/acp.md).
+/// The mapper's high-water marks are kept (pruned only for blocks that no
+/// longer exist), and every block in the rebuilt doc is re-observed —
+/// `observe()` emits exactly each block's unseen tail plus any tool-call
+/// create/patch not yet announced, so the client receives what the gap
+/// dropped and nothing twice. First live victim of the old
+/// swallow-the-gap behavior (2026-08-05): a FlowBus lag mid-turn ate the
+/// final report text — toad rendered the tool call, then silence, over a
+/// finished answer.
 async fn resync(
     bridge: &KernelBridge,
     session: &Arc<Session>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
     doc: &mut SyncedDocument,
     reason: &str,
 ) {
     match bridge.synced(session.context_id).await {
         Ok(fresh) => {
             *doc = fresh;
-            let mut mapper = session.mapper.lock();
-            mapper.reset();
-            for block in doc.blocks() {
-                mapper.mark_seen(&block);
+            let updates: Vec<_> = {
+                let mut mapper = session.mapper.lock();
+                let blocks = doc.blocks();
+                let live: std::collections::HashSet<BlockId> =
+                    blocks.iter().map(|b| b.id).collect();
+                mapper.retain_marks(|id| live.contains(id));
+                blocks.iter().flat_map(|b| mapper.observe(b)).collect()
+            };
+            let emitted = updates.len();
+            for update in updates {
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    update,
+                ));
             }
             tracing::warn!(
                 context = %session.context_id.short(),
                 reason,
-                "resynced; updates during the gap were not delivered to this client"
+                emitted,
+                "resynced; emitted catch-up updates covering the gap"
             );
         }
         Err(e) => {

@@ -175,11 +175,10 @@ impl UpdateMapper {
     /// Bring the high-water marks up to a block's current state **without
     /// emitting anything**.
     ///
-    /// Used after a CRDT resync: the alternative — [`reset`](Self::reset) and
-    /// replay — would re-send the entire transcript to a client that already
-    /// has it. Content that changed while we were desynced is lost, which is
-    /// why the caller logs loudly. Losing a gap beats duplicating a
-    /// conversation.
+    /// Used when binding a `session/new` to a context whose existing blocks
+    /// the client should NOT have narrated at it (rc-seeded bootstrap). Not
+    /// used for resync — a resync keeps its marks and re-observes, so the
+    /// client receives exactly the gap (see `session.rs::resync`).
     pub fn mark_seen(&mut self, block: &BlockSnapshot) {
         self.emitted.insert(block.id, block.content.chars().count());
         if matches!(block.kind, BlockKind::ToolCall) {
@@ -201,13 +200,16 @@ impl UpdateMapper {
         self.tool_status.remove(&block);
     }
 
-    /// Drop every high-water mark. Used after a CRDT resync, where the
-    /// document may have been rebuilt underneath us and "what the client has
-    /// seen" is no longer a claim we can make about block contents.
-    pub fn reset(&mut self) {
-        self.emitted.clear();
-        self.announced.clear();
-        self.tool_status.clear();
+    /// Drop state for blocks not in `live` — resync hygiene, so marks for
+    /// blocks deleted during a desync gap don't accumulate. The surviving
+    /// marks are the point: they are what lets a post-resync
+    /// [`observe`](Self::observe) sweep emit only the gap instead of the
+    /// whole transcript.
+    pub fn retain_marks<F: Fn(&BlockId) -> bool>(&mut self, live: F) {
+        self.emitted.retain(|id, _| live(id));
+        self.announced.retain(|id| live(id));
+        self.tool_status.retain(|id, _| live(id));
+        self.suppressed.retain(|id| live(id));
     }
 
     /// Translate the current state of `block` into the updates not yet sent.
@@ -749,12 +751,58 @@ mod tests {
         assert!(matches!(out[0], SessionUpdate::ToolCallUpdate(_)));
     }
 
+    /// The resync catch-up contract (first live victim 2026-08-05: a FlowBus
+    /// lag mid-turn ate the final report text; the old reset+mark_seen
+    /// re-pegged silently and the answer never reached toad): marks survive
+    /// the resync, so a full observe() sweep of the rebuilt doc emits ONLY
+    /// each block's unseen tail — never a duplicate of what was already
+    /// delivered, never a re-announce of a known tool call.
     #[test]
-    fn reset_replays_everything_after_a_resync() {
+    fn resync_sweep_emits_exactly_the_gap() {
         let mut m = mapper();
-        let b = block(BlockKind::Text, Role::Model, "hello", 1);
-        assert_eq!(m.observe(&b).len(), 1);
-        m.reset();
-        assert_eq!(chunk_text(&m.observe(&b)[0]), "hello");
+        let mut b = block(BlockKind::Text, Role::Model, "seen before the lag", 1);
+        assert_eq!(m.observe(&b).len(), 1, "delivered pre-gap");
+        let mut call = block(BlockKind::ToolCall, Role::Model, "", 2);
+        call.status = Status::Running;
+        call.tool_name = Some("bash".into());
+        assert!(!m.observe(&call).is_empty(), "announced pre-gap");
+
+        // The gap: text grew, the tool call finished, a brand-new block
+        // appeared. Then the pump resyncs and sweeps.
+        b.content.push_str(" — and the part the gap swallowed");
+        call.status = Status::Done;
+        let fresh = block(BlockKind::Text, Role::Model, "the final report", 3);
+
+        let mut swept = Vec::new();
+        for blk in [&b, &call, &fresh] {
+            swept.extend(m.observe(blk));
+        }
+        assert_eq!(swept.len(), 3, "one tail + one patch + one new block: {swept:?}");
+        assert_eq!(chunk_text(&swept[0]), " — and the part the gap swallowed");
+        assert!(matches!(swept[1], SessionUpdate::ToolCallUpdate(_)));
+        assert_eq!(chunk_text(&swept[2]), "the final report");
+
+        // Idempotent: a second sweep over unchanged state emits nothing.
+        let mut again = Vec::new();
+        for blk in [&b, &call, &fresh] {
+            again.extend(m.observe(blk));
+        }
+        assert!(again.is_empty(), "second sweep must be silent: {again:?}");
+    }
+
+    #[test]
+    fn retain_marks_prunes_only_dead_blocks() {
+        let mut m = mapper();
+        let kept = block(BlockKind::Text, Role::Model, "kept", 1);
+        let dead = block(BlockKind::Text, Role::Model, "dead", 2);
+        m.observe(&kept);
+        m.observe(&dead);
+        m.retain_marks(|id| *id == kept.id);
+        assert!(m.observe(&kept).is_empty(), "kept block's mark must survive");
+        assert_eq!(
+            chunk_text(&m.observe(&dead)[0]),
+            "dead",
+            "a pruned block observed again replays from zero (it is new again)"
+        );
     }
 }
