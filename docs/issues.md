@@ -466,6 +466,16 @@ adapter, as built".
 - **`BlockKind::Task` has no ACP shape.** ACP v1's `plan`/`PlanEntry` is
   stable (not the unstable plan-operations feature) and is the obvious target
   once the `builtin.tasks` grooming surface settles.
+- **Client-identity presets on connect** (Amy, 2026-08-05 evening, first
+  toad day): ACP `initialize` carries `clientInfo` (Implementation
+  name+version) and capabilities — enough to recognize *which* frontend
+  connected. Wire that into the existing per-client config machinery: derive
+  a ClientId from the client identity, let the `/etc/client` cascade
+  (docs/config-crdt-ownership.md; metronome was the first consumer) and/or a
+  preset/cast mapping key off it — "toad connections get preset X / cast Y,
+  Happy gets Z." Today every ACP context gets the row-stamped default
+  (ds-v4-flash) regardless of who connected; this is also where the pending
+  ACP-cast decision could land generally instead of as a bridge hardcode.
 - **Stable v1 methods left unimplemented**: `session/delete` (→
   `conclude`/`archive`), `session/set_mode` (→ `context_type` / cast roles),
   `session/set_config_option`. None are advertised in capabilities, so no
