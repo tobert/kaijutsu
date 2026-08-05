@@ -231,12 +231,41 @@ pub enum TurnOutcome {
     Failed(String),
 }
 
+/// How long the event stream must stay quiet, after a lag, before the turn
+/// wait falls back to polling ground truth. Long enough that a briefly-slow
+/// consumer during active streaming never false-positives (deltas arrive
+/// every few ms when a turn is live); short enough that a dropped completion
+/// resolves in seconds, not a stuck spinner.
+const LAG_RECOVERY_QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether a context's block state says no turn is executing: nothing
+/// `Running` and nothing `Pending`. Used only for lag recovery — the live
+/// signal is [`ServerEvent::TurnCompleted`]; this is the durable fallback
+/// when that signal was dropped (first live hit 2026-08-05: a heavy recon
+/// turn overflowed the FlowBus on every text delta, the completion rode the
+/// dropped window, and toad spun forever over a finished, fully-rendered
+/// answer).
+fn turn_is_idle(blocks: &[kaijutsu_types::BlockSnapshot]) -> bool {
+    use kaijutsu_types::Status;
+    !blocks
+        .iter()
+        .any(|b| matches!(b.status, Status::Running | Status::Pending))
+}
+
 /// Submit a prompt and wait for the turn to finish.
 ///
 /// The subscription is taken **before** the write: the turn can complete
 /// before `submit_input` returns for a fast refusal, and a subscriber that
 /// arrived late would wait forever (the bus is lossy and un-journaled — there
 /// is no catch-up).
+///
+/// Lag recovery: after a `Lagged`, the completion may have been in the
+/// dropped window, so waiting forever is not an option. Once lagged, a
+/// quiet window on the stream triggers a poll of the context's block state;
+/// an idle context resolves as `EndTurn`. That stop reason is honest-best-
+/// effort, not exact — the true reason has no block-log shadow
+/// (`flows.rs`, "A subscriber that missed the push…"), which is the same
+/// gap the tracked turn-id/catch-up work will close properly.
 pub async fn run_turn(
     bridge: &KernelBridge,
     session: &Arc<Session>,
@@ -250,8 +279,39 @@ pub async fn run_turn(
     session.mapper.lock().suppress(block_id);
     tracing::debug!(context = %context_id.short(), block = %block_id, "prompt submitted");
 
+    let mut lagged = false;
     loop {
-        match events.recv().await {
+        let incoming = if lagged {
+            match tokio::time::timeout(LAG_RECOVERY_QUIET, events.recv()).await {
+                Ok(r) => r,
+                Err(_quiet) => {
+                    // Stream went quiet after a lag — poll ground truth.
+                    match bridge.synced(context_id).await {
+                        Ok(doc) if turn_is_idle(&doc.blocks()) => {
+                            tracing::warn!(
+                                context = %context_id.short(),
+                                "turn wait recovered after lag: context is idle, \
+                                 completion event was dropped; reporting end_turn \
+                                 (exact stop reason unrecoverable — lossy bus)"
+                            );
+                            return Ok(TurnOutcome::Stopped(StopReason::EndTurn));
+                        }
+                        Ok(_) => continue, // still executing; keep waiting
+                        Err(e) => {
+                            tracing::warn!(
+                                context = %context_id.short(),
+                                error = %e,
+                                "lag-recovery poll failed; continuing to wait"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else {
+            events.recv().await
+        };
+        match incoming {
             Ok(ServerEvent::TurnCompleted {
                 context_id: ctx,
                 stop_reason,
@@ -270,13 +330,13 @@ pub async fn run_turn(
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                // Our completion may have been in the dropped window. Say so
-                // rather than hanging silently forever.
                 tracing::warn!(
                     context = %context_id.short(),
                     dropped = n,
-                    "turn wait lagged; the completion event may have been dropped"
+                    "turn wait lagged; completion may have been dropped — \
+                     arming idle-poll recovery"
                 );
+                lagged = true;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 anyhow::bail!("kernel event stream closed while waiting for the turn");
@@ -355,6 +415,35 @@ mod tests {
         };
         assert_eq!(event_context(&ev), Some(c));
         assert_eq!(event_block(&ev), Some(b));
+    }
+
+    /// Lag recovery's ground-truth check: a context with any Running or
+    /// Pending block is still executing; only a fully-settled block set
+    /// (done/error) counts as idle. First live hit 2026-08-05 — FlowBus
+    /// overflow dropped the TurnCompleted and toad spun over a finished
+    /// answer.
+    #[test]
+    fn lag_recovery_idle_means_no_running_or_pending_blocks() {
+        use kaijutsu_types::Status;
+        let c = ctx();
+        let p = PrincipalId::new();
+        let block = |seq: u64, status: Status| {
+            BlockSnapshotBuilder::new(BlockId::new(c, p, seq), BlockKind::Text)
+                .role(Role::Model)
+                .status(status)
+                .build()
+        };
+
+        assert!(turn_is_idle(&[]), "an empty context is idle");
+        assert!(turn_is_idle(&[block(0, Status::Done), block(1, Status::Error)]));
+        assert!(
+            !turn_is_idle(&[block(0, Status::Done), block(1, Status::Running)]),
+            "a streaming block means the turn is live — never resolve early"
+        );
+        assert!(
+            !turn_is_idle(&[block(0, Status::Pending)]),
+            "a queued tool call means the turn is live — never resolve early"
+        );
     }
 
     #[test]
