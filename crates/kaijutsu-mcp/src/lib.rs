@@ -1021,6 +1021,11 @@ impl KaijutsuMcp {
     /// keeps the label attached to that row even after conclude/archive, so
     /// `base` itself is never a candidate. Bounded: fails loudly rather than
     /// looping forever if 1000 suffixes are somehow all taken.
+    ///
+    /// TOCTOU note: `resolve_context_label` returning `Ok(None)` here is a
+    /// snapshot, not a reservation — see
+    /// `create_context_with_fresh_label`'s doc for the race this opens and
+    /// how the caller handles it.
     async fn find_available_suffixed_label(
         actor: &ActorHandle,
         base: &str,
@@ -1036,6 +1041,78 @@ impl KaijutsuMcp {
         }
         Err(format!(
             "exhausted {MAX_SUFFIX} suffixed candidates derived from '{base}' — all taken"
+        ))
+    }
+
+    /// Whether a `create_context_typed` failure is the specific,
+    /// safe-to-retry label-uniqueness race `create_context_with_fresh_label`
+    /// exists to paper over — as opposed to any other RPC failure (auth,
+    /// connection loss, an unrelated server-side bug), which must propagate
+    /// unretried.
+    ///
+    /// There is no typed signal for this across the wire: the server folds
+    /// `KernelDbError::LabelConflict` into a plain `capnp::Error::failed`
+    /// string (`rpc.rs`), and the client folds that into `CallError::Rpc`
+    /// (`actor.rs`) — a capnp schema change would be the principled fix, but
+    /// capnp is owned by a parallel lane right now (docs/issues.md). Matching
+    /// on `CallError::Rpc` first is the load-bearing part: it already rules
+    /// out `NotReady`/`Timeout`/`Shutdown`/`PermanentlyFailed`, none of which
+    /// a retry could fix. The `"label conflict"` substring inside that
+    /// specific variant then narrows to the one `Rpc` failure retrying
+    /// actually helps with; "the string classification is only correct by
+    /// luck of the message text" is a known trap in this codebase
+    /// (`kernel_db.rs`'s `insert_document` classification history) — kept
+    /// narrow and commented rather than pretending it's a typed check.
+    fn is_retryable_label_conflict(err: &kaijutsu_client::CallError) -> bool {
+        matches!(err, kaijutsu_client::CallError::Rpc(msg) if msg.contains("label conflict"))
+    }
+
+    /// Find a free suffixed label and create a context under it, retrying on
+    /// the TOCTOU race between `find_available_suffixed_label`'s resolve and
+    /// the create call: two `register_session` calls racing the same
+    /// concluded/archived base label can both resolve the SAME candidate as
+    /// free, then both try to create it — one wins (KernelDb's
+    /// label-uniqueness index arbitrates; no corruption), and the loser used
+    /// to surface a raw DB constraint error to its caller instead of a clean
+    /// retry (deepseek post-merge review, docs/issues.md). Re-resolving after
+    /// a conflict sees the winner's just-created row and picks the next free
+    /// candidate.
+    ///
+    /// Bounded at `MAX_RETRIES` — a caller should never exhaust this in
+    /// practice; it would mean sustained heavy concurrent churn creating
+    /// contexts under the exact same base label.
+    async fn create_context_with_fresh_label(
+        actor: &ActorHandle,
+        base_label: &str,
+        context_type: &str,
+    ) -> Result<(ContextId, String), String> {
+        const MAX_RETRIES: u32 = 5;
+        let mut last_conflict: Option<String> = None;
+        for attempt in 1..=MAX_RETRIES {
+            let candidate = Self::find_available_suffixed_label(actor, base_label).await?;
+            match actor.create_context_typed(&candidate, context_type).await {
+                Ok(id) => return Ok((id, candidate)),
+                Err(e) if Self::is_retryable_label_conflict(&e) => {
+                    tracing::warn!(
+                        base_label = %base_label,
+                        candidate = %candidate,
+                        attempt,
+                        max_retries = MAX_RETRIES,
+                        "register_session: candidate label claimed by a concurrent \
+                         register between resolve and create — retrying with a \
+                         fresh candidate",
+                    );
+                    last_conflict = Some(e.to_string());
+                    continue;
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(format!(
+            "gave up after {MAX_RETRIES} attempts deriving a free label from \
+             '{base_label}' — concurrent registers kept winning the race \
+             (last conflict: {})",
+            last_conflict.unwrap_or_else(|| "<none>".to_string())
         ))
     }
 
@@ -1123,19 +1200,24 @@ impl KaijutsuMcp {
             Some(ctx) => {
                 // Concluded or archived — never silently resurrect. Create a
                 // fresh context under a deterministic suffixed label and tell
-                // the caller what happened to the old one.
-                let fresh_label =
-                    match Self::find_available_suffixed_label(&remote.actor, &requested_label)
-                        .await
-                    {
-                        Ok(l) => l,
-                        Err(e) => {
-                            return format!(
-                                "Error finding an available label derived from \
-                                 '{requested_label}': {e}"
-                            );
-                        }
-                    };
+                // the caller what happened to the old one. Retries internally
+                // on the resolve→create TOCTOU race — see
+                // `create_context_with_fresh_label`'s doc.
+                let (new_id, fresh_label) = match Self::create_context_with_fresh_label(
+                    &remote.actor,
+                    &requested_label,
+                    &context_type,
+                )
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        return format!(
+                            "Error creating a fresh context derived from \
+                             '{requested_label}': {e}"
+                        );
+                    }
+                };
                 tracing::info!(
                     previous_context_id = %ctx.id,
                     previous_label = %requested_label,
@@ -1145,14 +1227,6 @@ impl KaijutsuMcp {
                     "register_session: label names a concluded/archived context — \
                      creating a fresh context under a suffixed label",
                 );
-                let new_id = match remote
-                    .actor
-                    .create_context_typed(&fresh_label, &context_type)
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(e) => return format!("Error creating context: {e}"),
-                };
                 if let Err(e) = remote.actor.join_context(new_id).await {
                     return format!("Error joining context: {e}");
                 }
@@ -2294,6 +2368,75 @@ mod tests {
     }
 
     use kaijutsu_crdt::ContextId;
+
+    // =========================================================================
+    // register_session TOCTOU retry classification
+    // =========================================================================
+    //
+    // deepseek post-merge review (docs/issues.md): two concurrent
+    // `register_session` calls racing the same concluded/archived base label
+    // can both resolve the same suffixed candidate as free, then race
+    // `create_context_typed` — the loser used to get a raw DB constraint
+    // error surfaced straight to its caller instead of a clean retry. No
+    // end-to-end race test here: this crate's RPC path needs a real
+    // `ActorHandle` over a live SSH connection to a `kaijutsu-server`, and
+    // the project steers `--lib` runs away from that harness (russh teardown
+    // noise — see `llm_stream.rs`'s `publish_tests` doc comment for the same
+    // call elsewhere). `is_retryable_label_conflict` is the deterministic,
+    // pure piece that actually decides retry-or-propagate, so it's pinned
+    // directly instead.
+
+    use kaijutsu_client::CallError;
+    use kaijutsu_client::actor::NotReadyReason;
+
+    /// The real shape this exists for: the server wraps
+    /// `KernelDbError::LabelConflict` in `capnp::Error::failed`, and the
+    /// client folds that into `CallError::Rpc`. The "label conflict"
+    /// substring survives the wrapping (`rpc.rs`: `"KernelDb insert_context
+    /// failed for {}: {}"` around the DB error's own `"label conflict: {0}"`
+    /// Display).
+    #[test]
+    fn rpc_error_with_label_conflict_text_is_retryable() {
+        assert!(KaijutsuMcp::is_retryable_label_conflict(&CallError::Rpc(
+            "KernelDb insert_context failed for 019ec1: label conflict: mcp-42-2".to_string()
+        )));
+    }
+
+    /// An `Rpc` failure that ISN'T the label race must not be retried —
+    /// retrying a genuinely different server-side error would just loop
+    /// through suffixed candidates for no reason and eventually exhaust them
+    /// with a misleading "all taken" message.
+    #[test]
+    fn rpc_error_without_label_conflict_text_is_not_retryable() {
+        assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::Rpc(
+            "Failed to resolve default workspace for context 019ec1: some other failure"
+                .to_string()
+        )));
+    }
+
+    /// The variant match comes FIRST, deliberately: a `PermanentlyFailed`
+    /// (or any non-`Rpc` variant) must never be retried even if its message
+    /// happens to contain the string "label conflict" — otherwise this
+    /// degrades into the exact string-only classification trap the codebase
+    /// already learned to avoid once (`kernel_db.rs`'s `insert_document`
+    /// classification history, docs/issues.md:361). A retry can't fix a
+    /// connection that's already gone.
+    #[test]
+    fn non_rpc_variants_are_never_retryable_even_with_matching_text() {
+        assert!(!KaijutsuMcp::is_retryable_label_conflict(
+            &CallError::PermanentlyFailed("label conflict: definitely not retryable".to_string())
+        ));
+        assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::NotReady(
+            NotReadyReason::Cooldown {
+                until_ms: 0,
+                last_error: "label conflict: still not retryable".to_string(),
+            }
+        )));
+        assert!(!KaijutsuMcp::is_retryable_label_conflict(
+            &CallError::Timeout(std::time::Duration::from_secs(5))
+        ));
+        assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::Shutdown));
+    }
 
     // =========================================================================
     // Input Document Tools (Local mode)
