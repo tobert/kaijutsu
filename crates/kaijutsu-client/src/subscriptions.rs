@@ -13,10 +13,10 @@ use std::rc::Rc;
 use capnp::capability::Promise;
 use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{BlockId, BlockSnapshot};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::kaijutsu_capnp::{
-    block_events, editor_events, kernel_output, resource_events, turn_events,
+    block_events, editor_events, kernel_output, permission_events, resource_events, turn_events,
     vfs_activity_events,
 };
 use crate::rpc::{
@@ -690,6 +690,150 @@ impl turn_events::Server for TurnEventsForwarder {
             tracing::warn!("Event channel closed, dropping TurnFailed event");
         }
         Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Permission asks (D-57, docs/acp.md gap #2)
+// ============================================================================
+
+/// One `options` entry offered on a `PermissionAskEnvelope` — decoded, not
+/// the raw capnp reader. Free-text `kind` (not a closed enum): ACP's
+/// `request_permission` offers option *kinds* like allow-once/allow-always/
+/// reject-once/reject-always, but this wire shape isn't boxed into ACP's
+/// specific vocabulary.
+#[derive(Clone, Debug)]
+pub struct PermissionOptionInfo {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+/// An incoming permission ask (`HookAction::Ask` fired kernel-side),
+/// decoded off the wire and paired with a one-shot channel to send the
+/// answer back on. This is what an ACP adapter (or the app) drains after
+/// calling [`KernelHandle::subscribe_permission_events`](crate::rpc::KernelHandle::subscribe_permission_events)
+/// with the client half of [`permission_events_channel`].
+///
+/// Dropping `answer` without sending resolves the ask exactly like an
+/// explicit decline from the server's perspective (the awaiting capnp
+/// promise on `answer_rx.await` errors, which `on_ask` reports as a
+/// malformed/no answer) — kaijutsu-kernel's D-57 no-subscriber/timeout
+/// policy denies either way, so there is no separate "silently ignore"
+/// outcome to model on this side.
+#[derive(Debug)]
+pub struct PermissionAskEnvelope {
+    pub request_id: String,
+    pub context_id: ContextId,
+    pub description: String,
+    pub instance: String,
+    pub tool: String,
+    pub hook_id: String,
+    pub options: Vec<PermissionOptionInfo>,
+    pub answer: oneshot::Sender<PermissionAskAnswer>,
+}
+
+/// The consumer's verdict on a [`PermissionAskEnvelope`].
+#[derive(Clone, Debug)]
+pub struct PermissionAskAnswer {
+    pub allow: bool,
+    pub selected_option_id: Option<String>,
+    pub remember: Option<String>,
+}
+
+/// Implements the Cap'n Proto `PermissionEvents::Server` trait, decoding
+/// each `onAsk` call into a [`PermissionAskEnvelope`], forwarding it on
+/// `tx`, and awaiting the paired oneshot reply before answering the RPC —
+/// this is the blocking call/response half `ElicitationEvents::onRequest`
+/// only templated (D-57's "genuinely new" gap): the promise this method
+/// returns does not resolve until something drains the channel and answers.
+struct PermissionAskForwarder {
+    tx: mpsc::Sender<PermissionAskEnvelope>,
+}
+
+/// Build a `PermissionEvents` callback client plus the receiver its asks
+/// land on.
+///
+/// Pass the returned client to
+/// [`KernelHandle::subscribe_permission_events`](crate::rpc::KernelHandle::subscribe_permission_events);
+/// drain the receiver, decide allow/deny, and send a [`PermissionAskAnswer`]
+/// back through each envelope's `answer` channel. Kernel-wide, following
+/// [`turn_events_channel`]: `HookAction::Ask` can fire from any call path,
+/// so one subscription serves every context.
+pub fn permission_events_channel(
+    capacity: usize,
+) -> (
+    crate::kaijutsu_capnp::permission_events::Client,
+    mpsc::Receiver<PermissionAskEnvelope>,
+) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let client: crate::kaijutsu_capnp::permission_events::Client =
+        capnp_rpc::new_client(PermissionAskForwarder { tx });
+    (client, rx)
+}
+
+#[allow(refining_impl_trait)]
+impl permission_events::Server for PermissionAskForwarder {
+    fn on_ask(
+        self: Rc<Self>,
+        params: permission_events::OnAskParams,
+        mut results: permission_events::OnAskResults,
+    ) -> Promise<(), capnp::Error> {
+        let tx = self.tx.clone();
+        Promise::from_future(async move {
+            let request = params.get()?.get_request()?;
+
+            let request_id = request.get_request_id()?.to_str()?.to_string();
+            let context_id = parse_context_id_data(request.get_context_id()?)?;
+            let description = request.get_description()?.to_str()?.to_string();
+            let instance = request.get_instance()?.to_str()?.to_string();
+            let tool = request.get_tool()?.to_str()?.to_string();
+            let hook_id = request.get_hook_id()?.to_str()?.to_string();
+            let options_reader = request.get_options()?;
+            let mut options = Vec::with_capacity(options_reader.len() as usize);
+            for i in 0..options_reader.len() {
+                let o = options_reader.get(i);
+                options.push(PermissionOptionInfo {
+                    id: o.get_id()?.to_str()?.to_string(),
+                    label: o.get_label()?.to_str()?.to_string(),
+                    kind: o.get_kind()?.to_str()?.to_string(),
+                });
+            }
+
+            let (answer_tx, answer_rx) = oneshot::channel();
+            let envelope = PermissionAskEnvelope {
+                request_id,
+                context_id,
+                description,
+                instance,
+                tool,
+                hook_id,
+                options,
+                answer: answer_tx,
+            };
+            tx.send(envelope).await.map_err(|_| {
+                capnp::Error::failed(
+                    "permission ask receiver dropped — nobody is draining subscribe_permission_events".into(),
+                )
+            })?;
+            let answer = answer_rx.await.map_err(|_| {
+                capnp::Error::failed(
+                    "permission ask answer channel dropped without a reply".into(),
+                )
+            })?;
+
+            let mut response = results.get().init_response();
+            response.set_allow(answer.allow);
+            if let Some(id) = &answer.selected_option_id {
+                response.set_selected_option_id(id.as_str());
+                response.set_has_selected_option_id(true);
+            }
+            if let Some(remember) = &answer.remember {
+                response.set_remember(remember.as_str());
+                response.set_has_remember(true);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1707,6 +1851,249 @@ mod turn_events_tests {
             assert!(
                 rx.try_recv().is_err(),
                 "nothing may be published from a malformed push"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod permission_events_tests {
+    //! Cap'n Proto round-trip for `HookAction::Ask` (D-57, docs/acp.md gap
+    //! #2), driving the real generated client/server pair built by
+    //! [`permission_events_channel`].
+    //!
+    //! Unlike the push-only channels above, `onAsk` is a blocking
+    //! call/response: the server's `on_ask_request().send().promise` does
+    //! not resolve until something drains the envelope off the receiver and
+    //! sends an answer back through it. These tests are the proof that half
+    //! of the D-57 wire actually works end to end (decode the request,
+    //! round-trip the answer) — the other half, the server-side dispatch
+    //! from `HookAction::Ask` through the bridge to this callback, is
+    //! covered by `kaijutsu-server`'s `permission_ask_wire` e2e test.
+
+    use super::*;
+
+    fn run_local<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, f);
+    }
+
+    /// Send a request, answer "allow" from a spawned task (mimicking a
+    /// consumer draining the envelope receiver), and assert the response
+    /// that comes back over the wire.
+    #[test]
+    fn allow_round_trips() {
+        run_local(async {
+            let (client, mut rx) = permission_events_channel(16);
+            let ctx = ContextId::new();
+
+            tokio::task::spawn_local(async move {
+                let envelope = rx.recv().await.expect("envelope");
+                assert_eq!(envelope.request_id, "req-1");
+                assert_eq!(envelope.context_id, ctx);
+                assert_eq!(envelope.description, "about to rm -rf a workspace");
+                assert_eq!(envelope.instance, "builtin.shell");
+                assert_eq!(envelope.tool, "shell.exec");
+                assert_eq!(envelope.hook_id, "confirm-shell");
+                assert!(envelope.options.is_empty());
+                envelope
+                    .answer
+                    .send(PermissionAskAnswer {
+                        allow: true,
+                        selected_option_id: None,
+                        remember: Some("session".into()),
+                    })
+                    .expect("answer channel open");
+            });
+
+            let mut req = client.on_ask_request();
+            {
+                let mut r = req.get().init_request();
+                r.set_request_id("req-1");
+                r.set_context_id(ctx.as_bytes());
+                r.set_description("about to rm -rf a workspace");
+                r.set_instance("builtin.shell");
+                r.set_tool("shell.exec");
+                r.set_hook_id("confirm-shell");
+                r.init_options(0);
+            }
+            let reply = req.send().promise.await.expect("onAsk round trip");
+            let response = reply.get().unwrap().get_response().unwrap();
+            assert!(response.get_allow());
+            assert!(!response.get_has_selected_option_id());
+            assert!(response.get_has_remember());
+            assert_eq!(
+                response.get_remember().unwrap().to_str().unwrap(),
+                "session"
+            );
+        });
+    }
+
+    /// Same round trip, answering "deny" with a selected option id — the
+    /// negative-control complement to `allow_round_trips`, and proof
+    /// `selectedOptionId` survives independently of `remember`.
+    #[test]
+    fn deny_with_selected_option_round_trips() {
+        run_local(async {
+            let (client, mut rx) = permission_events_channel(16);
+            let ctx = ContextId::new();
+
+            tokio::task::spawn_local(async move {
+                let envelope = rx.recv().await.expect("envelope");
+                envelope
+                    .answer
+                    .send(PermissionAskAnswer {
+                        allow: false,
+                        selected_option_id: Some("reject_always".into()),
+                        remember: None,
+                    })
+                    .expect("answer channel open");
+            });
+
+            let mut req = client.on_ask_request();
+            {
+                let mut r = req.get().init_request();
+                r.set_request_id("req-2");
+                r.set_context_id(ctx.as_bytes());
+                r.set_description("about to rm -rf a workspace");
+                r.set_instance("builtin.shell");
+                r.set_tool("shell.exec");
+                r.set_hook_id("confirm-shell");
+                r.init_options(0);
+            }
+            let reply = req.send().promise.await.expect("onAsk round trip");
+            let response = reply.get().unwrap().get_response().unwrap();
+            assert!(!response.get_allow());
+            assert!(response.get_has_selected_option_id());
+            assert_eq!(
+                response.get_selected_option_id().unwrap().to_str().unwrap(),
+                "reject_always"
+            );
+            assert!(!response.get_has_remember());
+        });
+    }
+
+    /// The `options` list — present on the wire for a future richer prompt
+    /// (ACP-style allow-once/allow-always/...) even though `HookAction::Ask`
+    /// doesn't populate it today — decodes intact.
+    #[test]
+    fn options_list_round_trips() {
+        run_local(async {
+            let (client, mut rx) = permission_events_channel(16);
+            let ctx = ContextId::new();
+
+            tokio::task::spawn_local(async move {
+                let envelope = rx.recv().await.expect("envelope");
+                assert_eq!(envelope.options.len(), 2);
+                assert_eq!(envelope.options[0].id, "allow_once");
+                assert_eq!(envelope.options[0].label, "Allow once");
+                assert_eq!(envelope.options[0].kind, "allow_once");
+                assert_eq!(envelope.options[1].id, "reject_always");
+                envelope
+                    .answer
+                    .send(PermissionAskAnswer {
+                        allow: true,
+                        selected_option_id: Some("allow_once".into()),
+                        remember: None,
+                    })
+                    .expect("answer channel open");
+            });
+
+            let mut req = client.on_ask_request();
+            {
+                let mut r = req.get().init_request();
+                r.set_request_id("req-3");
+                r.set_context_id(ctx.as_bytes());
+                r.set_description("d");
+                r.set_instance("i");
+                r.set_tool("t");
+                r.set_hook_id("h");
+                let mut opts = r.init_options(2);
+                {
+                    let mut o = opts.reborrow().get(0);
+                    o.set_id("allow_once");
+                    o.set_label("Allow once");
+                    o.set_kind("allow_once");
+                }
+                {
+                    let mut o = opts.reborrow().get(1);
+                    o.set_id("reject_always");
+                    o.set_label("Reject always");
+                    o.set_kind("reject_always");
+                }
+            }
+            req.send().promise.await.expect("onAsk round trip");
+        });
+    }
+
+    /// A malformed context id fails the promise loudly — same discipline as
+    /// `turn_events_tests::malformed_context_id_is_an_error_not_a_guess`,
+    /// and here it also proves nothing was forwarded to the envelope
+    /// receiver on a decode failure (no half-built ask reaches a consumer).
+    #[test]
+    fn malformed_context_id_is_an_error_not_a_guess() {
+        run_local(async {
+            let (client, mut rx) = permission_events_channel(16);
+            let mut req = client.on_ask_request();
+            {
+                let mut r = req.get().init_request();
+                r.set_request_id("req-bad");
+                r.set_context_id(&[0u8; 3]); // not 16 bytes
+                r.set_description("d");
+                r.set_instance("i");
+                r.set_tool("t");
+                r.set_hook_id("h");
+                r.init_options(0);
+            }
+            let err = match req.send().promise.await {
+                Ok(_) => panic!("a 3-byte context id must not decode"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("context"),
+                "the error should name the bad field, got: {err}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be forwarded from a malformed ask"
+            );
+        });
+    }
+
+    /// If nobody is draining the envelope receiver (dropped, or the
+    /// subscriber never wired one up), `onAsk` fails loudly rather than
+    /// hanging forever — the caller-side timeout in
+    /// `Broker::run_permission_ask` is the real backstop, but the capnp
+    /// promise itself must still resolve so the bridge task's per-request
+    /// slot isn't wedged waiting on a channel with no reader.
+    #[test]
+    fn dropped_receiver_fails_the_promise_instead_of_hanging() {
+        run_local(async {
+            let (client, rx) = permission_events_channel(16);
+            drop(rx);
+
+            let mut req = client.on_ask_request();
+            {
+                let mut r = req.get().init_request();
+                r.set_request_id("req-orphan");
+                r.set_context_id(ContextId::new().as_bytes());
+                r.set_description("d");
+                r.set_instance("i");
+                r.set_tool("t");
+                r.set_hook_id("h");
+                r.init_options(0);
+            }
+            let err = match req.send().promise.await {
+                Ok(_) => panic!("onAsk must fail, not hang, when the envelope receiver is gone"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("receiver dropped"),
+                "got: {err}"
             );
         });
     }

@@ -28,7 +28,7 @@ use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{HookId, McpError, McpResult};
 use super::super::hook_table::{
-    GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, HookTable, LogSpec,
+    AskSpec, GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, HookTable, LogSpec,
 };
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{
@@ -72,6 +72,12 @@ pub enum HookActionWire {
         target: Option<String>,
         level: String,
     },
+    /// Block the phase on a `PermissionEvents::onAsk` round trip (D-57,
+    /// docs/acp.md gap #2). `description` overrides the auto-generated
+    /// `"{instance}.{tool}"` shown to the answering client. No subscriber
+    /// attached, or no answer within the timeout, both fail closed
+    /// (`McpError::Denied`) — see `Broker::run_permission_ask`.
+    Ask { description: Option<String> },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -203,7 +209,10 @@ fn validate_action_for_phase(phase: McpHookPhase, action: &HookActionWire) -> Mc
             HookActionWire::BuiltinInvoke { .. }
             | HookActionWire::ShortCircuit { .. }
             | HookActionWire::Kaish { .. }
-            | HookActionWire::KaishScript { .. } => return Err(McpError::Unsupported),
+            | HookActionWire::KaishScript { .. }
+            // D-57: a list-filter can't block-wait for a permission
+            // answer per tool any more than it can invoke a body.
+            | HookActionWire::Ask { .. } => return Err(McpError::Unsupported),
             HookActionWire::Deny { .. } | HookActionWire::Log { .. } => {}
         }
     }
@@ -296,6 +305,9 @@ async fn build_hook_action(
                 None,
             )
         }
+        HookActionWire::Ask { description } => {
+            (HookAction::Ask(AskSpec { description }), None)
+        }
     })
 }
 
@@ -334,6 +346,10 @@ fn entry_summary_json(phase: McpHookPhase, entry: &HookEntry, full: bool) -> ser
             "type": "log",
             "target": spec.target,
             "level": level_to_str(spec.level),
+        }),
+        HookAction::Ask(spec) => serde_json::json!({
+            "type": "ask",
+            "description": spec.description,
         }),
     };
     serde_json::json!({
@@ -1071,6 +1087,118 @@ mod tests {
             matches!(err, McpError::Unsupported),
             "expected Unsupported for list_tools+kaish, got {err:?}"
         );
+    }
+
+    /// D-56/D-57: `Ask` has no coherent list-filter semantics either — a
+    /// list-filter can't block-wait per tool. Same rejection shape as
+    /// `Kaish`.
+    #[tokio::test]
+    async fn hook_add_ask_rejected_for_list_tools() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let err = broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "list_tools",
+                        "action": {
+                            "type": "ask",
+                            "description": "should never install",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::Unsupported),
+            "expected Unsupported for list_tools+ask, got {err:?}"
+        );
+    }
+
+    /// D-57: `hook_add` → `hook_list` → `hook_inspect` → `hook_remove`
+    /// round-trip using an `Ask` action, mirroring
+    /// `admin_round_trip_with_builtin_log_hook`. Exercises the wire
+    /// surface an rc script / hook config uses to declare
+    /// `HookAction::Ask` — the description round-trips through the admin
+    /// JSON, not just the DB row (that's `kernel_db`'s
+    /// `hook_insert_roundtrip_preserves_all_action_variants`).
+    #[tokio::test]
+    async fn hook_add_ask_installs_and_round_trips() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let add = broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "pre_call",
+                        "match_tool": "shell.exec",
+                        "hook_id": "confirm-shell",
+                        "action": {
+                            "type": "ask",
+                            "description": "about to run a shell command",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!add.is_error);
+
+        let inspect = broker
+            .call_tool(
+                call_params(
+                    "hook_inspect",
+                    serde_json::json!({"hook_id": "confirm-shell"}),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let action = inspect
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("action"))
+            .cloned()
+            .unwrap();
+        assert_eq!(action.get("type").and_then(|v| v.as_str()), Some("ask"));
+        assert_eq!(
+            action.get("description").and_then(|v| v.as_str()),
+            Some("about to run a shell command"),
+        );
+
+        // The installed hook is a live `HookAction::Ask` in the broker's
+        // pre_call table, not just admin-surface JSON.
+        let hooks = broker.hooks().read().await;
+        let entry = hooks
+            .pre_call
+            .entries
+            .iter()
+            .find(|e| e.id.0 == "confirm-shell")
+            .unwrap();
+        match &entry.action {
+            HookAction::Ask(spec) => {
+                assert_eq!(spec.description.as_deref(), Some("about to run a shell command"));
+            }
+            other => panic!("expected HookAction::Ask, got {other:?}"),
+        }
     }
 
     /// `hook_list` with a phase filter returns only that phase.

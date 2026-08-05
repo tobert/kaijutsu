@@ -14,6 +14,7 @@ pub mod external_registry;
 pub mod hook_persist;
 pub mod hook_table;
 pub mod hooks_builtin;
+pub mod permission;
 pub mod policy;
 pub mod server_like;
 pub mod servers;
@@ -30,9 +31,14 @@ pub use toml::{McpConfigLoad, load_mcp_config_toml};
 pub use context::{CallContext, TraceContext};
 pub use error::{CoalescerError, HookId, McpError, McpResult, PolicyError};
 pub use hook_table::{
-    GlobPattern, Hook, HookAction, HookBody, HookEntry, McpHookPhase, HookTable, HookTables, LogSpec,
+    AskSpec, GlobPattern, Hook, HookAction, HookBody, HookEntry, McpHookPhase, HookTable,
+    HookTables, LogSpec,
 };
 pub use hooks_builtin::{BuiltinHookRegistry, NoOpHook, TracingAuditHook};
+pub use permission::{
+    DEFAULT_PERMISSION_ASK_TIMEOUT, PermissionAnswer, PermissionAskRequest, PermissionAsker,
+    PermissionOption, PermissionOutcome,
+};
 pub use policy::InstancePolicy;
 pub use server_like::{McpServerLike, ServerNotification};
 pub use types::{

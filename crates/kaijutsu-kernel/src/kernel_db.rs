@@ -218,6 +218,11 @@ pub struct HookRow {
     pub action_deny_reason: Option<String>,
     pub action_log_target: Option<String>,
     pub action_log_level: Option<String>,
+    /// `action_kind = "ask"` (D-57): the `AskSpec::description` override,
+    /// if the hook set one. `None` means "auto-generate `{instance}.{tool}`
+    /// at fire time" — that fallback is NOT persisted, so a rename of
+    /// either doesn't stale the description.
+    pub action_ask_description: Option<String>,
 }
 
 /// A shared kaish script body, referenced by zero or more hooks via
@@ -725,6 +730,10 @@ CREATE TABLE IF NOT EXISTS hooks (
     action_deny_reason       TEXT,
     action_log_target        TEXT,
     action_log_level         TEXT,
+    -- `action_kind = 'ask'` (D-57): optional description override for the
+    -- permission ask. NULL means "auto-generate `{instance}.{tool}` at
+    -- fire time" — see `HookAction::Ask` / `AskSpec`.
+    action_ask_description   TEXT,
     updated_at               INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     UNIQUE (phase, insertion_idx)
@@ -1398,6 +1407,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN paused_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE contexts ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
+            "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -3788,7 +3798,8 @@ impl KernelDb {
                 action_builtin_name, action_kaish_body, action_kaish_script_id,
                 action_result_text, action_is_error,
                 action_deny_reason,
-                action_log_target, action_log_level
+                action_log_target, action_log_level,
+                action_ask_description
              ) VALUES (
                 ?1, ?2, ?3,
                 (SELECT COALESCE(MAX(insertion_idx), -1) + 1 FROM hooks WHERE phase = ?2),
@@ -3797,7 +3808,8 @@ impl KernelDb {
                 ?9, ?10, ?11,
                 ?12, ?13,
                 ?14,
-                ?15, ?16
+                ?15, ?16,
+                ?17
              )",
             params![
                 row.hook_id,
@@ -3816,6 +3828,7 @@ impl KernelDb {
                 row.action_deny_reason,
                 row.action_log_target,
                 row.action_log_level,
+                row.action_ask_description,
             ],
         )?;
         Ok(())
@@ -3942,7 +3955,8 @@ impl KernelDb {
                     action_builtin_name, action_kaish_body, action_kaish_script_id,
                     action_result_text, action_is_error,
                     action_deny_reason,
-                    action_log_target, action_log_level
+                    action_log_target, action_log_level,
+                    action_ask_description
              FROM hooks
              ORDER BY phase ASC, priority ASC, insertion_idx ASC",
         )?;
@@ -3988,6 +4002,7 @@ impl KernelDb {
                 action_deny_reason: row.get(13)?,
                 action_log_target: row.get(14)?,
                 action_log_level: row.get(15)?,
+                action_ask_description: row.get(16)?,
             })
         })?;
         let mut out = Vec::new();
@@ -7862,6 +7877,7 @@ mod tests {
             action_deny_reason: None,
             action_log_target: Some("kaijutsu::hooks".into()),
             action_log_level: Some("info".into()),
+            action_ask_description: None,
         }
     }
 
@@ -7892,6 +7908,7 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         db.insert_hook(&builtin).unwrap();
 
@@ -7913,6 +7930,7 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         db.insert_hook(&sc).unwrap();
 
@@ -7934,6 +7952,7 @@ mod tests {
             action_deny_reason: Some("no writes".into()),
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         db.insert_hook(&deny).unwrap();
 
@@ -7961,11 +7980,36 @@ mod tests {
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
+            action_ask_description: None,
         };
         db.insert_hook(&kaish).unwrap();
 
+        // Ask (D-57): description round-trips; None means "auto-generate
+        // at fire time" and is exercised by `minimal_hook_row`-style
+        // callers elsewhere, not here.
+        let ask = HookRow {
+            hook_id: "h-ask".into(),
+            phase: "pre_call".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: "ask".into(),
+            action_builtin_name: None,
+            action_kaish_body: None,
+            action_kaish_script_id: None,
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+            action_ask_description: Some("about to rm -rf a workspace path".into()),
+        };
+        db.insert_hook(&ask).unwrap();
+
         let loaded = db.load_all_hooks().unwrap();
-        assert_eq!(loaded.len(), 5);
+        assert_eq!(loaded.len(), 6);
 
         let by_id: std::collections::HashMap<String, HookRow> = loaded
             .into_iter()
@@ -7999,6 +8043,13 @@ mod tests {
         let k = by_id.get("h-kaish").unwrap();
         assert_eq!(k.action_kind, "kaish_invoke");
         assert_eq!(k.action_kaish_body.as_deref(), Some("script-42"));
+
+        let a = by_id.get("h-ask").unwrap();
+        assert_eq!(a.action_kind, "ask");
+        assert_eq!(
+            a.action_ask_description.as_deref(),
+            Some("about to rm -rf a workspace path"),
+        );
     }
 
     #[test]

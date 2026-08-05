@@ -1185,6 +1185,53 @@ interface ElicitationEvents {
   onRequest @0 (request :McpElicitationRequest) -> (response :McpElicitationResponse);
 }
 
+# ============================================================================
+# Permission asks (HookAction::Ask, D-57, docs/acp.md gap #2)
+# ============================================================================
+# Modeled on ElicitationEvents above: a blocking server->client call and
+# response. Deliberately NOT MCP-scoped like elicitation (no `server`/
+# `instance` field) — a permission Ask fires from the hook engine, which can
+# be triggered by any call path (an autonomous turn, a sibling context, a
+# kaish script), not just the connection driving the call. Subscribers are
+# kernel-wide (see `subscribePermissionEvents` below), mirroring
+# `subscribeTurnEvents` rather than the per-connection elicitation model.
+#
+# No-subscriber and timeout both fail closed on the kernel side (Deny, loud
+# log) — see `kaijutsu-kernel`'s `mcp::permission` module and
+# `Broker::run_permission_ask`. This interface only carries the round trip
+# for the case a subscriber IS attached and DOES answer in time.
+
+struct PermissionOption {
+  id @0 :Text;                # Caller-defined option id (e.g. "allow_always")
+  label @1 :Text;             # Human-readable label for display
+  # Free text, not a closed enum: ACP's request_permission offers option
+  # *kinds* like "allow_once"/"allow_always"/"reject_once"/"reject_always",
+  # but this wire shape isn't boxed into ACP's specific vocabulary.
+  kind @2 :Text;
+}
+
+struct PermissionAskRequest {
+  requestId @0 :Text;         # Unique id for this ask; correlates logs
+  contextId @1 :Data;         # The context the hooked call originated from (16 bytes)
+  description @2 :Text;       # Human-readable description of the action being asked about
+  instance @3 :Text;          # MCP instance name (e.g. "builtin.shell")
+  tool @4 :Text;               # Tool name being called
+  hookId @5 :Text;             # The HookEntry id that fired this Ask
+  options @6 :List(PermissionOption);  # Optional richer choices; empty = plain allow/deny
+}
+
+struct PermissionAskResponse {
+  allow @0 :Bool;                    # True = let the call proceed
+  selectedOptionId @1 :Text;         # Which `options` entry was picked, if any
+  hasSelectedOptionId @2 :Bool;
+  remember @3 :Text;                  # Optional remembered scope ("session" | "always" | ...)
+  hasRemember @4 :Bool;
+}
+
+interface PermissionEvents {
+  onAsk @0 (request :PermissionAskRequest) -> (response :PermissionAskResponse);
+}
+
 # MCP Completion — argument value suggestions
 struct McpCompletionResult {
   values @0 :List(Text);     # Suggested completions
@@ -1689,6 +1736,19 @@ interface Kernel {
   # register_session call instead of one indexed lookup. `found = false`
   # means no context currently holds this label.
   resolveContextLabel @102 (label :Text, trace :TraceContext) -> (found :Bool, info :ContextHandleInfo);
+
+  # ==========================================================================
+  # Permission asks (HookAction::Ask, D-57, docs/acp.md gap #2)
+  # ==========================================================================
+  # Kernel-wide, following `subscribeTurnEvents` rather than the per-
+  # connection `subscribeMcpElicitations` model: `HookAction::Ask` can fire
+  # from any call path, not just the connection that triggered it, so one
+  # subscription serves every context. No per-context filter parameter for
+  # the same reason `subscribeTurnEvents` has none — the request names its
+  # own `contextId`. See `PermissionEvents` above for the wire shape and
+  # `kaijutsu-kernel`'s `mcp::permission` module for the no-subscriber/
+  # timeout fail-closed policy this bridges to.
+  subscribePermissionEvents @103 (callback :PermissionEvents);
 }
 
 # ============================================================================
