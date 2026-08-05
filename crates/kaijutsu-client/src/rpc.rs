@@ -1284,6 +1284,29 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Subscribe to permission asks (`HookAction::Ask`, D-57, docs/acp.md
+    /// gap #2).
+    ///
+    /// Kernel-wide, following `subscribe_turn_events` rather than the
+    /// per-connection `subscribe_mcp_elicitations` model: an Ask can fire
+    /// from any call path, not just the connection that triggered it, so
+    /// there's no `instance` dedupe parameter — one subscription serves
+    /// every context. The server calls `onAsk` on this callback and blocks
+    /// the hooked call on the response, bounded by its own timeout
+    /// (`kaijutsu-kernel`'s `mcp::permission` module); no subscriber
+    /// attached (or no answer in time) fails the call closed on the
+    /// server side, never hangs the client.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_permission_events")]
+    pub async fn subscribe_permission_events(
+        &self,
+        callback: crate::kaijutsu_capnp::permission_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_permission_events_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
+
     // =========================================================================
     // Timeline / Fork operations
     // =========================================================================
