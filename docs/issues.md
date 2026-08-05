@@ -325,6 +325,28 @@ suffix-orphan residue on crash between create and join;
 664-680`); archived-context re-listing via joinContext heal is documented
 but surprising (heal re-registers without clearing `archived_at`).
 
+## Coder stance tuning — proportionality + kaish primer (Amy, 2026-08-05, first toad day)
+
+Amy, watching a fresh ACP coder context: *"wow that's a lot of work for a
+simple question, we might have work to do on the coder prompt soon."* The
+exhibit: a simple repo question triggered a 63k-token, 160-block recon tour
+(12+ agentic iterations), and the model repeatedly fought kaish syntax it
+should have been told about (piping after `done`, `[` banned, quoting
+rules — several [exit 2] tool errors it then reasoned around, stretching
+the loop). Threads to pull, together or separately:
+
+- **Proportionality**: the stance should ask for answer-first behavior —
+  explore only as much as the question warrants; a fresh context need not
+  map the whole world before speaking. Consider a light tool budget nudge.
+- **kaish quirks primer in the stance** (or a `/etc/rc` .md slot): the
+  live models rediscover the same parse rules every session. The stance
+  is CRDT-seeded June-era content; kaish is at 0.13 — audit for staleness
+  while in there (`kj rc` surface, embedded defaults are only the seed).
+- **Per-surface stance**: ACP/toad sessions may want a snappier stance
+  than the desk coder seat — ties into the client-identity-preset seed
+  (ACP entry) and the pending ACP-cast decision (flash + thinking dialed
+  down vs house pro).
+
 ## At-rest schema-evolution follow-ups (2026-08-05, the task_status boot flood)
 
 The `39326e7c` postmortem seeds, recorded not yet built. Contributing
