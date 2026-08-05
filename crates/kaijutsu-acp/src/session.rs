@@ -397,6 +397,7 @@ pub async fn run_turn(
                              bus); reporting end_turn (exact stop reason \
                              unrecoverable until the kernel catch-up story)"
                         );
+                        settle_delivery(bridge, session, context_id).await;
                         return Ok(TurnOutcome::Stopped(StopReason::EndTurn));
                     }
                     Ok(_) => continue, // not started or still executing; keep waiting
@@ -418,6 +419,7 @@ pub async fn run_turn(
                 origin,
                 ..
             }) if ctx == context_id && origin == TurnOrigin::Interactive => {
+                settle_delivery(bridge, session, context_id).await;
                 return Ok(TurnOutcome::Stopped(acp_stop_reason(stop_reason)));
             }
             Ok(ServerEvent::TurnFailed {
@@ -444,6 +446,44 @@ pub async fn run_turn(
             }
         }
     }
+}
+
+/// Let the pump's delivery catch up with the kernel before the prompt
+/// responds.
+///
+/// Turn events and block events ride separate ordered lanes (FlowBus
+/// rework), so `TurnCompleted` can beat the last text chunks to the bridge.
+/// Responding at that instant makes the client finalize its message widget
+/// and drop the tail — a truncated final answer (first live hit 2026-08-05,
+/// toad). Poll the mapper's high-water marks against the kernel's snapshot;
+/// bounded, because the pump's 5s trailing-edge sweep repairs anything a
+/// grace window this size somehow misses, after the response.
+async fn settle_delivery(bridge: &KernelBridge, session: &Arc<Session>, context_id: ContextId) {
+    const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    const SETTLE_MAX_POLLS: u32 = 20; // 2s ceiling
+    for _ in 0..SETTLE_MAX_POLLS {
+        match bridge.synced(context_id).await {
+            Ok(doc) => {
+                if session.mapper.lock().caught_up_with(&doc.blocks()) {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context = %context_id.short(),
+                    error = %e,
+                    "settle-delivery poll failed; responding without settling"
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+    tracing::warn!(
+        context = %context_id.short(),
+        "prompt response sent before delivery fully settled (2s ceiling); \
+         the pump's trailing-edge sweep will deliver the remainder"
+    );
 }
 
 #[cfg(test)]

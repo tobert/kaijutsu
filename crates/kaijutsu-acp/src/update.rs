@@ -445,6 +445,29 @@ impl UpdateMapper {
             .unwrap_or_default()
     }
 
+    /// Whether every message-lane block in `blocks` has been fully emitted
+    /// to this client — the turn-end settle check.
+    ///
+    /// Turn events and block events ride separate ordered lanes since the
+    /// FlowBus rework, so `TurnCompleted` can reach the bridge while the
+    /// final text chunks are still in flight on the block lane. Answering
+    /// `session/prompt` at that instant makes the client finalize its
+    /// message widget and the tail lands after the window closed — a
+    /// truncated final report (first live hit 2026-08-05, toad). The prompt
+    /// handler polls this against the kernel's current snapshot before
+    /// responding; message-lane kinds only, since those are what a client
+    /// renders inside the prompt's lifetime.
+    pub fn caught_up_with(&self, blocks: &[BlockSnapshot]) -> bool {
+        blocks.iter().all(|b| match b.kind {
+            BlockKind::Text | BlockKind::Thinking | BlockKind::Notification | BlockKind::Drift => {
+                self.suppressed.contains(&b.id)
+                    || self.emitted.get(&b.id).copied().unwrap_or(0)
+                        >= b.content.chars().count()
+            }
+            _ => true,
+        })
+    }
+
     /// The not-yet-emitted suffix of a block's content, advancing the mark.
     /// `None` when nothing is new.
     fn take_delta(&mut self, block: &BlockSnapshot) -> Option<String> {
@@ -977,6 +1000,32 @@ mod tests {
             again.extend(m.observe(blk));
         }
         assert!(again.is_empty(), "second sweep must be silent: {again:?}");
+    }
+
+    /// The turn-end settle check: fully-emitted and suppressed message
+    /// blocks count as caught up; a block with an undelivered tail does
+    /// not; non-message kinds never gate it. This is what `run_turn` polls
+    /// before answering `session/prompt`, so `TurnCompleted` beating the
+    /// last text chunks across lanes can no longer truncate the final
+    /// answer at the client.
+    #[test]
+    fn caught_up_requires_every_message_tail_delivered() {
+        let mut m = mapper();
+        let mut b = block(BlockKind::Text, Role::Model, "the final report", 1);
+        assert!(!m.caught_up_with(std::slice::from_ref(&b)), "nothing delivered yet");
+        m.observe(&b);
+        assert!(m.caught_up_with(std::slice::from_ref(&b)), "fully delivered");
+        b.content.push_str(" — plus a tail still in flight");
+        assert!(!m.caught_up_with(std::slice::from_ref(&b)), "undelivered tail must gate");
+
+        // Suppressed (our own prompt echo) counts as caught up unseen.
+        let prompt = block(BlockKind::Text, Role::User, "prompt", 2);
+        m.suppress(prompt.id);
+        assert!(m.caught_up_with(&[prompt]));
+
+        // Non-message kinds never gate the settle.
+        let call = block(BlockKind::ToolCall, Role::Model, "unobserved", 3);
+        assert!(m.caught_up_with(&[call]));
     }
 
     #[test]
