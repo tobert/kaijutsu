@@ -29,13 +29,13 @@
 use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, SessionId, SessionUpdate, StopReason, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind as AcpToolKind,
+    ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionId,
+    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind as AcpToolKind,
 };
 use kaijutsu_client::TurnCompletedStopReason;
 use kaijutsu_types::{
-    BlockId, BlockKind, BlockSnapshot, Role, Status, ToolKind as KjToolKind,
+    BlockId, BlockKind, BlockSnapshot, Role, Status, TaskStatus, ToolKind as KjToolKind,
 };
 
 /// Map a kaijutsu turn outcome onto ACP's `stopReason`.
@@ -141,6 +141,19 @@ pub struct UpdateMapper {
     /// window in which a sibling's message could be eaten instead of ours —
     /// accepted for the prototype, and noted in docs/acp.md.
     armed: bool,
+    /// Per-Task-block high-water mark: `(content, task_status)` last seen.
+    /// This is the mapper's half of the plan story — cheap, per-block
+    /// "did this change" detection, mirroring `emitted`/`tool_status` for
+    /// every other kind. See [`Self::note_task`].
+    task_marks: HashMap<BlockId, (String, TaskStatus)>,
+    /// The plan last actually emitted to the client — or silently
+    /// established as a baseline by [`Self::baseline_plan`]. The ONE place
+    /// plan-level dedup lives: [`Self::build_plan`] diffs against this, so a
+    /// rebuild that produces byte-for-byte the same entries (a resync sweep
+    /// over unchanged tasks, a duplicate event) emits nothing — the same
+    /// "identical re-observation is silent" contract `observe()` gives every
+    /// other block kind.
+    last_plan: Option<Vec<PlanEntry>>,
 }
 
 impl UpdateMapper {
@@ -152,6 +165,8 @@ impl UpdateMapper {
             tool_status: HashMap::new(),
             suppressed: HashSet::new(),
             armed: false,
+            task_marks: HashMap::new(),
+            last_plan: None,
         }
     }
 
@@ -191,6 +206,9 @@ impl UpdateMapper {
             self.announced.insert(target);
             self.tool_status.insert(target, acp_tool_status(block.status));
         }
+        if matches!(block.kind, BlockKind::Task) {
+            self.task_marks.insert(block.id, task_mark(block));
+        }
     }
 
     /// Forget a block entirely (it was deleted).
@@ -198,6 +216,7 @@ impl UpdateMapper {
         self.emitted.remove(&block);
         self.announced.remove(&block);
         self.tool_status.remove(&block);
+        self.task_marks.remove(&block);
     }
 
     /// Drop state for blocks not in `live` — resync hygiene, so marks for
@@ -210,6 +229,56 @@ impl UpdateMapper {
         self.announced.retain(|id| live(id));
         self.tool_status.retain(|id, _| live(id));
         self.suppressed.retain(|id| live(id));
+        self.task_marks.retain(|id, _| live(id));
+    }
+
+    /// Update this Task block's high-water mark; `true` when it's new or its
+    /// `(content, task_status)` moved since the last mark, `false` for any
+    /// non-`Task` block (harmless no-op, so the pump can call this
+    /// unconditionally per event rather than gating on kind itself) or an
+    /// unchanged Task block.
+    ///
+    /// This is the mapper's half of the plan story: "did a Task block change
+    /// in a way the client hasn't seen." The pump uses a `true` result to
+    /// decide a full plan rebuild ([`task_plan_entries`] via
+    /// [`Self::build_plan`]) is worth attempting on the live per-event path.
+    /// `session/load` replay and the resync sweep skip this gate — they
+    /// already walk every block, so they rebuild unconditionally and let
+    /// [`Self::build_plan`]'s own diff against the last emitted plan be the
+    /// idempotence guarantee those paths need.
+    pub fn note_task(&mut self, block: &BlockSnapshot) -> bool {
+        if block.kind != BlockKind::Task {
+            return false;
+        }
+        let mark = task_mark(block);
+        let changed = self.task_marks.get(&block.id) != Some(&mark);
+        self.task_marks.insert(block.id, mark);
+        changed
+    }
+
+    /// Rebuild the whole-context task plan from `blocks` (must be document
+    /// order — see [`task_plan_entries`]) and return the `plan` update to
+    /// send, or `None` when it is identical to the plan already emitted (or
+    /// baselined by [`Self::baseline_plan`]).
+    ///
+    /// This is the ONE rebuild-and-emit path: the live pump (gated by
+    /// [`Self::note_task`]), `session/load` replay, and the resync sweep all
+    /// call it, so a client always receives the CURRENT full task list —
+    /// never a partial patch, never a duplicate.
+    pub fn build_plan(&mut self, blocks: &[BlockSnapshot]) -> Option<SessionUpdate> {
+        let entries = task_plan_entries(blocks);
+        if self.last_plan.as_ref() == Some(&entries) {
+            return None;
+        }
+        self.last_plan = Some(entries.clone());
+        Some(SessionUpdate::Plan(Plan::new(entries)))
+    }
+
+    /// Establish the plan baseline without emitting — `session/new`
+    /// bootstrap, mirroring [`Self::mark_seen`]: rc-seeded Task blocks
+    /// should not be narrated at a client that just opened the session.
+    pub fn baseline_plan(&mut self, blocks: &[BlockSnapshot]) {
+        self.last_plan = Some(task_plan_entries(blocks));
     }
 
     /// Translate the current state of `block` into the updates not yet sent.
@@ -228,12 +297,15 @@ impl UpdateMapper {
             BlockKind::ToolCall => self.observe_tool_call(block),
             BlockKind::ToolResult => self.observe_tool_result(block),
             BlockKind::Error => self.observe_error(block),
-            // Trace is model-hidden rc plumbing; File/Resource/Task have no
-            // honest ACP v1 shape yet (Task wants `plan`, which needs the
-            // grooming surface to settle first — docs/acp.md).
-            BlockKind::Trace | BlockKind::File | BlockKind::Resource | BlockKind::Task => {
-                Vec::new()
-            }
+            // Task DOES have an honest ACP v1 shape (`plan`) but it's
+            // whole-context, not per-block — this pure single-block method
+            // can't build it. See `note_task`/`build_plan`/
+            // `task_plan_entries` and `session::run_pump`, which rebuild and
+            // emit the full plan whenever a Task block changes.
+            BlockKind::Task => Vec::new(),
+            // Trace is model-hidden rc plumbing; File/Resource have no
+            // honest ACP v1 shape yet.
+            BlockKind::Trace | BlockKind::File | BlockKind::Resource => Vec::new(),
         }
     }
 
@@ -392,6 +464,93 @@ impl UpdateMapper {
     }
 }
 
+/// This block's plan-relevant identity: the fields whose change makes the
+/// whole-context plan worth rebuilding.
+fn task_mark(block: &BlockSnapshot) -> (String, TaskStatus) {
+    (block.content.clone(), block.task_status)
+}
+
+/// `TaskStatus` → ACP `PlanEntryStatus`. `None` for `Cancelled` — see
+/// [`task_plan_entries`]'s doc comment for why it's omitted rather than
+/// mapped onto one of the three ACP states.
+fn task_status_to_plan_status(status: TaskStatus) -> Option<PlanEntryStatus> {
+    match status {
+        TaskStatus::Open => Some(PlanEntryStatus::Pending),
+        TaskStatus::InProgress => Some(PlanEntryStatus::InProgress),
+        TaskStatus::Done => Some(PlanEntryStatus::Completed),
+        TaskStatus::Cancelled => None,
+    }
+}
+
+/// The nesting prefix for a flattened subtask, repeated once per ancestor
+/// level. ACP's `PlanEntry` has no hierarchy field, so nesting rides along
+/// on `content` instead of being dropped.
+const SUBTASK_PREFIX: &str = "↳ ";
+
+/// Build the ACP plan entries for the CURRENT state of every Task block in
+/// `blocks`. `blocks` MUST be in document order (`SyncedDocument::blocks()`/
+/// `block_ids_ordered()`) — a raw `BTreeMap` iteration is principal-major
+/// and would scramble both subtask nesting and plan order.
+///
+/// Semantics (docs/acp.md "Task → plan" has the full writeup):
+/// - **Cancelled tasks are omitted.** ACP's plan is "what the agent intends
+///   to do"; a cancelled task is a groom decision to do nothing further, so
+///   showing it as a permanently-unchecked entry would misrepresent intent
+///   rather than convey it. `PlanEntryStatus` has no fourth state to be
+///   honest about it in-line either way.
+/// - **Subtasks flatten** via a pre-order DFS over the `parent_id` DAG
+///   (parent, then each child and its own descendants, before the next
+///   sibling), nesting rendered as `SUBTASK_PREFIX` repeated once per level
+///   on `content`. A Task whose `parent_id` doesn't name another *Task*
+///   block in this set (`None`, or pointing at a non-Task block) is treated
+///   as a root — defensive, since nothing in `builtin.tasks` promises
+///   `parent_id` only ever points at another task.
+/// - **Priority defaults to `Medium`** for every entry — kaijutsu Task
+///   blocks carry no priority field (docs/tasks.md "Deferred"); this is
+///   ACP's required-field filler, not a real signal.
+fn task_plan_entries(blocks: &[BlockSnapshot]) -> Vec<PlanEntry> {
+    let task_ids: HashSet<BlockId> = blocks
+        .iter()
+        .filter(|b| b.kind == BlockKind::Task)
+        .map(|b| b.id)
+        .collect();
+
+    // children[parent] = that parent's direct Task children, document order.
+    // `None` is the root bucket (including tasks whose parent_id isn't a
+    // Task in this set).
+    let mut children: HashMap<Option<BlockId>, Vec<&BlockSnapshot>> = HashMap::new();
+    for task in blocks.iter().filter(|b| b.kind == BlockKind::Task) {
+        let parent = task.parent_id.filter(|p| task_ids.contains(p));
+        children.entry(parent).or_default().push(task);
+    }
+
+    fn walk(
+        parent: Option<BlockId>,
+        depth: usize,
+        children: &HashMap<Option<BlockId>, Vec<&BlockSnapshot>>,
+        entries: &mut Vec<PlanEntry>,
+    ) {
+        let Some(kids) = children.get(&parent) else {
+            return;
+        };
+        for task in kids {
+            if let Some(status) = task_status_to_plan_status(task.task_status) {
+                let content = if depth == 0 {
+                    task.content.clone()
+                } else {
+                    format!("{}{}", SUBTASK_PREFIX.repeat(depth), task.content)
+                };
+                entries.push(PlanEntry::new(content, PlanEntryPriority::Medium, status));
+            }
+            walk(Some(task.id), depth + 1, children, entries);
+        }
+    }
+
+    let mut entries = Vec::new();
+    walk(None, 0, &children, &mut entries);
+    entries
+}
+
 fn text_chunk(text: &str) -> ContentChunk {
     ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
 }
@@ -425,6 +584,36 @@ mod tests {
 
     fn mapper() -> UpdateMapper {
         UpdateMapper::new(SessionId::new("test-session"))
+    }
+
+    /// A `BlockKind::Task` snapshot. `ctx` is shared across a test's tasks so
+    /// `parent_id` can name a sibling by `BlockId` (subtask blocks live in
+    /// the same context as their parent).
+    fn task(
+        ctx: ContextId,
+        seq: u64,
+        content: &str,
+        status: TaskStatus,
+        parent: Option<BlockId>,
+    ) -> BlockSnapshot {
+        let mut builder = kaijutsu_types::BlockSnapshotBuilder::new(
+            BlockId::new(ctx, PrincipalId::new(), seq),
+            BlockKind::Task,
+        )
+        .role(Role::Tool)
+        .content(content)
+        .task_status(status);
+        if let Some(p) = parent {
+            builder = builder.parent_id(p);
+        }
+        builder.build()
+    }
+
+    fn plan_entries(update: &SessionUpdate) -> Vec<PlanEntry> {
+        match update {
+            SessionUpdate::Plan(plan) => plan.entries.clone(),
+            other => panic!("not a plan: {other:?}"),
+        }
     }
 
     fn chunk_text(u: &SessionUpdate) -> String {
@@ -803,6 +992,201 @@ mod tests {
             chunk_text(&m.observe(&dead)[0]),
             "dead",
             "a pruned block observed again replays from zero (it is new again)"
+        );
+    }
+
+    // ── task blocks → plan ──────────────────────────────────────────────────
+
+    #[test]
+    fn observe_never_emits_a_per_block_update_for_a_task() {
+        // Task's shape (`plan`) is whole-context, not per-block — observe()
+        // must stay silent for it no matter what changes; the pump builds
+        // the plan separately via note_task/build_plan.
+        let mut m = mapper();
+        let t = task(ContextId::new(), 1, "buy milk", TaskStatus::Open, None);
+        assert!(m.observe(&t).is_empty());
+    }
+
+    #[test]
+    fn task_create_emits_a_plan_containing_it() {
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let t = task(ctx, 1, "buy milk", TaskStatus::Open, None);
+
+        assert!(m.note_task(&t), "a brand-new task is a change");
+        let update = m.build_plan(&[t.clone()]).expect("plan emitted");
+        let entries = plan_entries(&update);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "buy milk");
+        assert_eq!(entries[0].status, PlanEntryStatus::Pending);
+        assert_eq!(entries[0].priority, PlanEntryPriority::Medium);
+    }
+
+    #[test]
+    fn status_change_re_emits_with_the_new_status() {
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let mut t = task(ctx, 1, "buy milk", TaskStatus::Open, None);
+        m.note_task(&t);
+        m.build_plan(&[t.clone()]).expect("first plan emitted");
+
+        t.task_status = TaskStatus::InProgress;
+        assert!(m.note_task(&t), "status flip is a change");
+        let update = m.build_plan(&[t.clone()]).expect("re-emitted");
+        assert_eq!(plan_entries(&update)[0].status, PlanEntryStatus::InProgress);
+
+        t.task_status = TaskStatus::Done;
+        assert!(m.note_task(&t));
+        let update = m.build_plan(&[t]).expect("re-emitted again");
+        assert_eq!(plan_entries(&update)[0].status, PlanEntryStatus::Completed);
+    }
+
+    #[test]
+    fn a_non_task_change_emits_no_plan() {
+        // note_task is the pump's gate: it must be a harmless no-op for any
+        // other block kind, so a Text/ToolCall/whatever event never triggers
+        // a plan rebuild.
+        let mut m = mapper();
+        let text = block(BlockKind::Text, Role::Model, "hello", 1);
+        assert!(!m.note_task(&text));
+        let tool_call = block(BlockKind::ToolCall, Role::Model, "", 2);
+        assert!(!m.note_task(&tool_call));
+    }
+
+    #[test]
+    fn identical_reobservation_emits_no_duplicate_plan() {
+        // The resync sweep's contract: rebuilding from unchanged task state
+        // must be silent, same as observe()'s idempotence for every other
+        // kind.
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let t = task(ctx, 1, "buy milk", TaskStatus::Open, None);
+        m.note_task(&t);
+        assert!(m.build_plan(&[t.clone()]).is_some(), "first build emits");
+        assert!(
+            m.build_plan(&[t]).is_none(),
+            "second build over unchanged state must be silent"
+        );
+    }
+
+    #[test]
+    fn load_replay_emits_exactly_one_plan_at_the_end() {
+        // Mirrors run_pump's replay loop: observe() every block first (Task
+        // never emits per-block), THEN one build_plan call over the whole
+        // set — not one per task touched during replay.
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let blocks = vec![
+            task(ctx, 1, "buy milk", TaskStatus::Open, None),
+            task(ctx, 2, "walk the dog", TaskStatus::Done, None),
+        ];
+
+        let mut replayed = Vec::new();
+        for b in &blocks {
+            replayed.extend(m.observe(b));
+        }
+        assert!(replayed.is_empty(), "no per-block updates during replay");
+
+        let plan = m.build_plan(&blocks).expect("exactly one plan at the end");
+        let entries = plan_entries(&plan);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "buy milk");
+        assert_eq!(entries[1].content, "walk the dog");
+
+        // A second identical rebuild (e.g. a resync sweep immediately after
+        // load with no task activity) must not duplicate it.
+        assert!(m.build_plan(&blocks).is_none());
+    }
+
+    #[test]
+    fn cancelled_tasks_are_omitted_from_the_plan() {
+        let ctx = ContextId::new();
+        let blocks = vec![
+            task(ctx, 1, "buy milk", TaskStatus::Open, None),
+            task(ctx, 2, "cancelled errand", TaskStatus::Cancelled, None),
+        ];
+        let entries = task_plan_entries(&blocks);
+        assert_eq!(entries.len(), 1, "the cancelled task must not appear: {entries:?}");
+        assert_eq!(entries[0].content, "buy milk");
+    }
+
+    #[test]
+    fn a_task_cancelled_after_being_shown_disappears_on_the_next_plan() {
+        // Cancelling isn't a delete — it's a status write like any other, so
+        // it must round-trip through the normal note_task/build_plan path
+        // and the entry must vanish from the rebuilt plan.
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let mut t = task(ctx, 1, "buy milk", TaskStatus::Open, None);
+        m.note_task(&t);
+        let first = m.build_plan(&[t.clone()]).unwrap();
+        assert_eq!(plan_entries(&first).len(), 1);
+
+        t.task_status = TaskStatus::Cancelled;
+        assert!(m.note_task(&t), "cancelling is a status change");
+        let second = m.build_plan(&[t]).expect("plan changed — the entry dropped");
+        assert!(plan_entries(&second).is_empty());
+    }
+
+    #[test]
+    fn subtasks_flatten_in_dag_order_with_a_nesting_prefix() {
+        let ctx = ContextId::new();
+        let parent = task(ctx, 1, "plan the trip", TaskStatus::Open, None);
+        let child_a = task(ctx, 2, "book flights", TaskStatus::Open, Some(parent.id));
+        let grandchild = task(ctx, 3, "pick seats", TaskStatus::Open, Some(child_a.id));
+        let child_b = task(ctx, 4, "book hotel", TaskStatus::Open, Some(parent.id));
+        let other_root = task(ctx, 5, "unrelated errand", TaskStatus::Open, None);
+
+        // Deliberately out of document order relative to the DAG to prove
+        // flattening follows parent_id, not insertion position.
+        let blocks = vec![
+            parent.clone(),
+            other_root,
+            child_a.clone(),
+            grandchild,
+            child_b,
+        ];
+        let entries = task_plan_entries(&blocks);
+        let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "plan the trip",
+                "↳ book flights",
+                "↳ ↳ pick seats",
+                "↳ book hotel",
+                "unrelated errand",
+            ],
+            "parent, then its subtree depth-first, then the next root"
+        );
+    }
+
+    #[test]
+    fn an_orphaned_parent_id_falls_back_to_root() {
+        // A task whose parent_id points at a non-Task block (or a Task not
+        // in this snapshot) must not be silently dropped from the plan.
+        let ctx = ContextId::new();
+        let stray_parent = BlockId::new(ctx, PrincipalId::new(), 99);
+        let t = task(ctx, 1, "orphan", TaskStatus::Open, Some(stray_parent));
+        let entries = task_plan_entries(std::slice::from_ref(&t));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "orphan", "no nesting prefix — treated as root");
+    }
+
+    #[test]
+    fn session_new_bootstrap_baselines_silently() {
+        // mark_seen + baseline_plan (the session/new path) must not treat a
+        // pre-existing rc-seeded task as new; the client should not be
+        // narrated at for state that predates its connection.
+        let ctx = ContextId::new();
+        let mut m = mapper();
+        let t = task(ctx, 1, "pre-seeded", TaskStatus::Open, None);
+        m.mark_seen(&t);
+        m.baseline_plan(&[t.clone()]);
+
+        assert!(
+            m.build_plan(&[t]).is_none(),
+            "no drift from the baseline — nothing to emit"
         );
     }
 }
