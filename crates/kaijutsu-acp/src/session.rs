@@ -132,13 +132,32 @@ pub async fn run_pump(
         }
     }
 
+    // Trailing-edge catch-up: the kernel's FlowBus drops events server-side
+    // under load (upstream of SSH — no client `Lagged` ever fires), so a
+    // gap in OUR context's stream is invisible to the arms below. After any
+    // burst of activity touching this context, one sweep re-observes the
+    // rebuilt doc; the mapper's marks make it emit exactly what was missed
+    // (usually nothing). Idle sessions never sweep. Third live victim
+    // 2026-08-05: final tool-status patches + answer text dropped → toad
+    // rendered perpetually-running tool calls over a finished turn.
+    let mut sweep = tokio::time::interval(std::time::Duration::from_secs(5));
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut dirty = false;
+
     loop {
         tokio::select! {
+            _ = sweep.tick() => {
+                if dirty {
+                    dirty = false;
+                    resync(&bridge, &session, &session_id, &cx, &mut doc, "post-burst sweep").await;
+                }
+            }
             incoming = events.recv() => match incoming {
                 Ok(event) => {
                     if event_context(&event) != Some(context_id) {
                         continue;
                     }
+                    dirty = true;
                     if let ServerEvent::BlockDeleted { block_id, .. } = &event {
                         session.mapper.lock().forget(*block_id);
                         continue;
