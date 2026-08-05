@@ -402,7 +402,41 @@ impl KjDispatcher {
                     loadout,
                     extra,
                 }) {
-                    Ok(()) => KjResult::ok(format!("set {cast}/{role} → {backend}/{model}")),
+                    Ok(()) => {
+                        let mut msg = format!("set {cast}/{role} → {backend}/{model}");
+                        // Write-time inverted-budget check (gemini review):
+                        // request-build time already refuses an inverted
+                        // thinking_budget/max_tokens pair loudly — that stays
+                        // exactly as-is. This just says so earlier, at write
+                        // time, against the SAME llm_defaults-cascade floor
+                        // (`SlotTunables::over`) the turn path resolves
+                        // through, so the operator doesn't have to wait for
+                        // a live request to fail to learn the slot is
+                        // already broken. Warn, not error — the write lands
+                        // either way (an operator raising max_tokens on
+                        // `llm_defaults` right after can make it valid, and
+                        // refusing the write would make that two-step
+                        // impossible to perform in either order).
+                        if let Some(tb) = thinking_budget {
+                            let floor_max_tokens = db
+                                .get_llm_defaults()
+                                .ok()
+                                .flatten()
+                                .and_then(|d| d.max_tokens)
+                                .and_then(|v| u64::try_from(v).ok());
+                            let effective_max_tokens =
+                                max_tokens.or(floor_max_tokens).unwrap_or(64_000);
+                            if tb >= effective_max_tokens {
+                                msg.push_str(&format!(
+                                    " — WARN: thinking_budget ({tb}) >= effective max_tokens \
+                                     ({effective_max_tokens}) after the llm_defaults cascade; \
+                                     requests on this slot will fail at build time until one is \
+                                     raised or the other lowered"
+                                ));
+                            }
+                        }
+                        KjResult::ok(msg)
+                    }
                     Err(e) => KjResult::Err(format!("kj cast slot set: {e}")),
                 }
             }
@@ -557,6 +591,116 @@ mod tests {
         {
             KjResult::Err(msg) => assert!(msg.contains("top_p"), "{msg}"),
             other => panic!("out-of-range top_p must fail, not clamp: {other:?}"),
+        }
+    }
+
+    /// The write-time inverted-budget WARN (gemini review, the one genuine
+    /// find): a `thinking_budget` that meets or exceeds the EFFECTIVE
+    /// `max_tokens` — here the `llm_defaults` floor, since the slot doesn't
+    /// override it — is only ever caught loudly (an Err) at request-build
+    /// time today (`llm/claude/build.rs::resolve_thinking`). That stays
+    /// exactly as-is; this just says so earlier, in the write's own success
+    /// message, so the operator isn't stuck waiting for a live request to
+    /// fail before learning the slot is already broken. Warn, not error —
+    /// the write must still land (`slot_set_still_lands_despite_the_warning`
+    /// below is the other half of that contract).
+    #[tokio::test]
+    async fn slot_set_warns_when_thinking_budget_meets_or_exceeds_the_effective_floor() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        let r = d
+            .dispatch(
+                &argv(&[
+                    "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
+                    "claude-opus-5", "--thinking-budget", "20000",
+                ]),
+                &c,
+            )
+            .await;
+        match r {
+            KjResult::Ok { message, .. } => {
+                assert!(
+                    message.contains("WARN") && message.contains("thinking_budget"),
+                    "success message must flag the inverted pair: {message}"
+                );
+                assert!(message.contains("20000"), "{message}");
+                assert!(
+                    message.contains("16384"),
+                    "must name the resolved floor, not just the raw knob: {message}"
+                );
+            }
+            other => panic!("the write must still land: {other:?}"),
+        }
+    }
+
+    /// Same check, but against an explicit per-slot `--max-tokens` override
+    /// rather than the `llm_defaults` floor — the resolved pair after the
+    /// cascade is what matters (`SlotTunables::over`: slot wins, else
+    /// floor), not the floor alone.
+    #[tokio::test]
+    async fn slot_set_warns_against_its_own_max_tokens_override_not_just_the_floor() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        let r = d
+            .dispatch(
+                &argv(&[
+                    "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
+                    "claude-opus-5", "--max-tokens", "1000", "--thinking-budget", "1500",
+                ]),
+                &c,
+            )
+            .await;
+        match r {
+            KjResult::Ok { message, .. } => {
+                assert!(message.contains("WARN"), "{message}");
+                assert!(message.contains("1500"), "{message}");
+                assert!(message.contains("1000"), "{message}");
+            }
+            other => panic!("the write must still land: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_set_still_lands_despite_the_warning() {
+        // Warn, not error: the resolved_slot must show the write took, even
+        // though the pair is inverted.
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        d.dispatch(
+            &argv(&[
+                "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
+                "claude-opus-5", "--thinking-budget", "20000",
+            ]),
+            &c,
+        )
+        .await;
+        let registry = d.kernel().llm().read().await;
+        let slot = registry.resolved_slot("house", "coder").expect("write must still land");
+        assert_eq!(slot.tunables.thinking_budget, Some(20000));
+    }
+
+    #[tokio::test]
+    async fn slot_set_does_not_warn_when_the_pair_is_sane() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        let r = d
+            .dispatch(
+                &argv(&[
+                    "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
+                    "claude-opus-5", "--thinking-budget", "1000",
+                ]),
+                &c,
+            )
+            .await;
+        match r {
+            KjResult::Ok { message, .. } => {
+                assert!(!message.contains("WARN"), "should not warn: {message}");
+            }
+            other => panic!("{other:?}"),
         }
     }
 
