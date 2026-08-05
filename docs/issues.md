@@ -325,6 +325,40 @@ suffix-orphan residue on crash between create and join;
 664-680`); archived-context re-listing via joinContext heal is documented
 but surprising (heal re-registers without clearing `archived_at`).
 
+## At-rest schema-evolution follow-ups (2026-08-05, the task_status boot flood)
+
+The `39326e7c` postmortem seeds, recorded not yet built. Contributing
+factors: a new field on an at-rest struct (`BlockHeader`) without
+`#[serde(default)]`; nothing in tests exercised decode-old-bytes; the
+kernel had not been restarted across the merge so the breakage sat latent
+until the next bounce; rc-read failure degraded silently into
+deny-by-default.
+
+- **Decode-from-old-bytes guard, systematically.** The new
+  `cbor_without_fields` pin covers the two fields that broke. The general
+  guard is a corpus test: serialize every at-rest struct (SyncPayload,
+  snapshots, oplog entries) at each historical shape — or strip
+  fields-newer-than-N — and assert decode. Cheap version: a checked-in
+  CBOR fixture of a real pre-task oplog entry, decoded in CI forever.
+- **Oplog decode failure at boot is quiet relative to its blast radius.**
+  Per-doc ERROR + skip is the right durability call (nothing truncated),
+  but ~40 docs skipping should surface as ONE loud aggregate (count +
+  first error) at boot end, and `kj status`-visible state — same
+  loud-not-silent treatment external MCP failures got.
+- **rc-create failure → unbound context → total facade lockout.** When
+  S10-binding.kai can't run, the context is created ANYWAY with no
+  binding, then deny-by-default locks every surface including the
+  operator's own kj — mistake-prevention became a lockout (violates the
+  "ergonomic nudge, not auth denial" stance). Options: refuse context
+  creation when the create lifecycle fails (crash-over-corruption), or a
+  documented operator escape hatch. Decide on purpose.
+- **Broken-window contexts (2026-08-05 14:27–15:05) are unbound**: at
+  least `2e1334a4` (this CC session's kaijutsu-mcp context) and
+  `1c39e6ab` (`acp-kaijutsu-1785954617`, the first toad attempt). They
+  need `kj context remove` from a bound context (app), then /mcp
+  reconnect re-creates fresh + bound. Older contexts' bindings persisted
+  in the DB and are believed fine — spot-check from the app.
+
 ## Household-agent arc — task blocks + harness steals (seeded 2026-08-04, gap-analysis session)
 
 Amy is pointing kaijutsu at always-on household duty (daily task grooming,
