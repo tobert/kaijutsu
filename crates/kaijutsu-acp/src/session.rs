@@ -194,10 +194,20 @@ pub async fn run_pump(
                     // `note_task` is a no-op (returns false) for anything
                     // that isn't a changed Task block, so this is safe to
                     // call unconditionally rather than gating on `block.kind`
-                    // here too.
-                    if session.mapper.lock().note_task(&block)
-                        && let Some(update) = session.mapper.lock().build_plan(&doc.blocks())
-                    {
+                    // here too. ONE lock scope for note_task + build_plan:
+                    // two `.lock()` calls chained in a single `if` condition
+                    // share one temporary scope, so the first guard is still
+                    // alive when the second acquires — a self-deadlock on the
+                    // first live task event (parking_lot is not reentrant).
+                    let plan = {
+                        let mut mapper = session.mapper.lock();
+                        if mapper.note_task(&block) {
+                            mapper.build_plan(&doc.blocks())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(update) = plan {
                         let _ = cx.send_notification(SessionNotification::new(
                             session_id.clone(),
                             update,
