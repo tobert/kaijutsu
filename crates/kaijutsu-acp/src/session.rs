@@ -248,25 +248,45 @@ pub enum TurnOutcome {
     Failed(String),
 }
 
-/// How long the event stream must stay quiet, after a lag, before the turn
-/// wait falls back to polling ground truth. Long enough that a briefly-slow
-/// consumer during active streaming never false-positives (deltas arrive
-/// every few ms when a turn is live); short enough that a dropped completion
-/// resolves in seconds, not a stuck spinner.
-const LAG_RECOVERY_QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long the event stream must stay quiet before the turn wait polls
+/// ground truth. Long enough that active streaming never trips it (deltas
+/// arrive every few ms when a turn is live, resetting the window); short
+/// enough that a dropped completion resolves in seconds, not a stuck
+/// spinner. Polling is unconditional-on-quiet, NOT gated on a client-side
+/// `Lagged`: the 2026-08-05 drops happened in the KERNEL's FlowBus
+/// (before SSH), so the bridge's own stream looked clean-with-a-hole and a
+/// lag-gated recovery never armed — second stuck toad same day.
+const TURN_WAIT_QUIET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether a context's block state says no turn is executing: nothing
-/// `Running` and nothing `Pending`. Used only for lag recovery — the live
-/// signal is [`ServerEvent::TurnCompleted`]; this is the durable fallback
-/// when that signal was dropped (first live hit 2026-08-05: a heavy recon
-/// turn overflowed the FlowBus on every text delta, the completion rode the
-/// dropped window, and toad spun forever over a finished, fully-rendered
-/// answer).
+/// `Running` and nothing `Pending`. Half of the quiet-poll fallback — the
+/// live signal is [`ServerEvent::TurnCompleted`]; this is the durable
+/// check when that signal was dropped.
 fn turn_is_idle(blocks: &[kaijutsu_types::BlockSnapshot]) -> bool {
     use kaijutsu_types::Status;
     !blocks
         .iter()
         .any(|b| matches!(b.status, Status::Running | Status::Pending))
+}
+
+/// The full quiet-poll verdict: the turn both RAN (a model-authored block
+/// exists at-or-after our prompt block) and SETTLED (nothing running or
+/// pending). The ran-guard is what makes unconditional quiet-polling safe:
+/// between `submit_input` and the model's first block the context is idle
+/// but the turn hasn't happened yet — resolving there would answer the
+/// prompt with `end_turn` before the model ever spoke.
+fn turn_ran_and_settled(blocks: &[kaijutsu_types::BlockSnapshot], prompt: &BlockId) -> bool {
+    use kaijutsu_types::Role;
+    if !turn_is_idle(blocks) {
+        return false;
+    }
+    let Some(prompt_at) = blocks.iter().find(|b| b.id == *prompt).map(|b| b.created_at) else {
+        // Our own prompt block isn't visible yet — nothing has settled.
+        return false;
+    };
+    blocks
+        .iter()
+        .any(|b| b.role == Role::Model && b.id != *prompt && b.created_at >= prompt_at)
 }
 
 /// Submit a prompt and wait for the turn to finish.
@@ -276,11 +296,13 @@ fn turn_is_idle(blocks: &[kaijutsu_types::BlockSnapshot]) -> bool {
 /// arrived late would wait forever (the bus is lossy and un-journaled — there
 /// is no catch-up).
 ///
-/// Lag recovery: after a `Lagged`, the completion may have been in the
-/// dropped window, so waiting forever is not an option. Once lagged, a
-/// quiet window on the stream triggers a poll of the context's block state;
-/// an idle context resolves as `EndTurn`. That stop reason is honest-best-
-/// effort, not exact — the true reason has no block-log shadow
+/// Dropped-completion recovery: the completion event can be lost anywhere
+/// on the lossy path (the kernel FlowBus overflowed live on 2026-08-05 —
+/// upstream of SSH, invisible to this side's `Lagged`), so waiting on the
+/// stream alone is not an option. Every quiet window triggers a poll of
+/// the context's block state; a turn that both ran and settled
+/// ([`turn_ran_and_settled`]) resolves as `EndTurn`. That stop reason is
+/// honest-best-effort, not exact — the true reason has no block-log shadow
 /// (`flows.rs`, "A subscriber that missed the push…"), which is the same
 /// gap the tracked turn-id/catch-up work will close properly.
 pub async fn run_turn(
@@ -296,37 +318,33 @@ pub async fn run_turn(
     session.mapper.lock().suppress(block_id);
     tracing::debug!(context = %context_id.short(), block = %block_id, "prompt submitted");
 
-    let mut lagged = false;
     loop {
-        let incoming = if lagged {
-            match tokio::time::timeout(LAG_RECOVERY_QUIET, events.recv()).await {
-                Ok(r) => r,
-                Err(_quiet) => {
-                    // Stream went quiet after a lag — poll ground truth.
-                    match bridge.synced(context_id).await {
-                        Ok(doc) if turn_is_idle(&doc.blocks()) => {
-                            tracing::warn!(
-                                context = %context_id.short(),
-                                "turn wait recovered after lag: context is idle, \
-                                 completion event was dropped; reporting end_turn \
-                                 (exact stop reason unrecoverable — lossy bus)"
-                            );
-                            return Ok(TurnOutcome::Stopped(StopReason::EndTurn));
-                        }
-                        Ok(_) => continue, // still executing; keep waiting
-                        Err(e) => {
-                            tracing::warn!(
-                                context = %context_id.short(),
-                                error = %e,
-                                "lag-recovery poll failed; continuing to wait"
-                            );
-                            continue;
-                        }
+        let incoming = match tokio::time::timeout(TURN_WAIT_QUIET, events.recv()).await {
+            Ok(r) => r,
+            Err(_quiet) => {
+                // Stream is quiet — poll ground truth.
+                match bridge.synced(context_id).await {
+                    Ok(doc) if turn_ran_and_settled(&doc.blocks(), &block_id) => {
+                        tracing::warn!(
+                            context = %context_id.short(),
+                            "turn wait resolved by quiet-poll: turn ran and settled \
+                             but no completion event arrived (dropped on the lossy \
+                             bus); reporting end_turn (exact stop reason \
+                             unrecoverable until the kernel catch-up story)"
+                        );
+                        return Ok(TurnOutcome::Stopped(StopReason::EndTurn));
+                    }
+                    Ok(_) => continue, // not started or still executing; keep waiting
+                    Err(e) => {
+                        tracing::warn!(
+                            context = %context_id.short(),
+                            error = %e,
+                            "quiet-poll failed; continuing to wait"
+                        );
+                        continue;
                     }
                 }
             }
-        } else {
-            events.recv().await
         };
         match incoming {
             Ok(ServerEvent::TurnCompleted {
@@ -347,13 +365,14 @@ pub async fn run_turn(
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                // Informational only — quiet-polling runs regardless, and a
+                // kernel-side drop never surfaces here anyway.
                 tracing::warn!(
                     context = %context_id.short(),
                     dropped = n,
-                    "turn wait lagged; completion may have been dropped — \
-                     arming idle-poll recovery"
+                    "turn wait lagged locally; quiet-poll will recover if the \
+                     completion was in the window"
                 );
-                lagged = true;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 anyhow::bail!("kernel event stream closed while waiting for the turn");
@@ -461,6 +480,43 @@ mod tests {
             !turn_is_idle(&[block(0, Status::Pending)]),
             "a queued tool call means the turn is live — never resolve early"
         );
+    }
+
+    /// The quiet-poll's full verdict. The ran-guard is what makes polling
+    /// on EVERY quiet window safe (the drop can happen kernel-side, where
+    /// no client `Lagged` ever fires — second stuck toad, 2026-08-05):
+    /// idle-before-the-model-speaks must NOT resolve, and the prompt block
+    /// alone is not evidence the turn ran.
+    #[test]
+    fn quiet_poll_requires_a_model_response_and_a_settled_context() {
+        use kaijutsu_types::Status;
+        let c = ctx();
+        let bridge_p = PrincipalId::new();
+        let model_p = PrincipalId::new();
+        let mk = |p: PrincipalId, seq: u64, role: Role, status: Status, at: u64| {
+            let mut b = BlockSnapshotBuilder::new(BlockId::new(c, p, seq), BlockKind::Text)
+                .role(role)
+                .status(status)
+                .build();
+            b.created_at = at;
+            b
+        };
+        let prompt = mk(bridge_p, 1, Role::User, Status::Done, 100);
+        let prompt_id = prompt.id;
+
+        // Submitted but the model hasn't spoken: idle, yet NOT settled.
+        assert!(!turn_ran_and_settled(&[prompt.clone()], &prompt_id));
+        // Prompt not even visible yet: not settled.
+        assert!(!turn_ran_and_settled(&[], &prompt_id));
+        // Model replied and everything is done: settled.
+        let reply = mk(model_p, 1, Role::Model, Status::Done, 200);
+        assert!(turn_ran_and_settled(&[prompt.clone(), reply.clone()], &prompt_id));
+        // Model replied but a tool call is still running: not settled.
+        let tool = mk(model_p, 2, Role::Model, Status::Running, 300);
+        assert!(!turn_ran_and_settled(&[prompt.clone(), reply.clone(), tool], &prompt_id));
+        // A model block from BEFORE our prompt (prior turn) is not evidence.
+        let stale = mk(model_p, 0, Role::Model, Status::Done, 50);
+        assert!(!turn_ran_and_settled(&[prompt, stale], &prompt_id));
     }
 
     #[test]
