@@ -36,7 +36,7 @@ use tokio::time::Instant;
 
 use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::flows::{BlockFlow, TurnFlow, TurnOrigin};
+use kaijutsu_kernel::flows::{BlockFlow, TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::hyoushigi::{
     Attachment, BeatAck, BeatCommand, BeatPolicy, BeatRequest, Body, Cadence, Cell, ClockKind,
     ContentRef, DeriverRegistry, MaterializeCursor, Span, TrackSnapshot, materialize_committed,
@@ -2090,6 +2090,40 @@ impl BeatScheduler {
         self.fire_lifecycle(ctx, "rotate");
     }
 
+    /// Whether a completed turn's output should crystallize into the OODA
+    /// **Act** — the gate the scheduler's main loop checks before ever
+    /// calling [`Self::on_turn_completed`].
+    ///
+    /// Two independent conditions, both must hold:
+    ///   * `origin == Autonomous` — a human-prompted (`Interactive`) turn must
+    ///     never crystallize; the player is driving, not the OODA loop.
+    ///   * `reason.output_is_complete()` — the output block must be a
+    ///     *finished* phrase, not a fragment.
+    ///
+    /// **The soft-cancel decision, pinned on purpose (2026-08-05):** before
+    /// structured stop reasons existed, EVERY cancelled turn — soft or hard —
+    /// arrived as a bare `Failed`, which this gate's ancestor skipped
+    /// (`Failed` never reached the `Completed` arm at all). Once cancels
+    /// became `Completed { reason: Cancelled { immediate } }`, that old
+    /// behavior split in two: a **hard** cancel severs the HTTP stream
+    /// mid-token, so its output is a genuine fragment and stays excluded
+    /// (`output_is_complete()` is `false` only for `immediate: true`). A
+    /// **soft** cancel lets the in-flight model call finish before stopping
+    /// the agentic loop, so the output block is syntactically whole — and
+    /// this gate now lets it through.
+    ///
+    /// That is a real behavior CHANGE from the old all-cancels-are-Failed
+    /// world for the soft-cancel case, not a preserved one — a deepseek
+    /// post-merge review (`docs/issues.md`) flagged that the surrounding
+    /// comment previously justified only the hard-cancel exclusion and left
+    /// the soft-cancel inclusion unstated, reading as an accidental side
+    /// effect rather than a decision. It is deliberate: the phrase the model
+    /// wrote before a soft cancel took effect IS complete, and a complete
+    /// phrase belongs in the score like any other clean ending.
+    fn turn_should_crystallize(origin: TurnOrigin, reason: TurnStopReason) -> bool {
+        origin == TurnOrigin::Autonomous && reason.output_is_complete()
+    }
+
     /// The OODA **Act** handoff: a musician's turn just completed (it wrote ABC),
     /// so crystallize **that turn's output block** onto the timeline one phrase
     /// ahead. The output block id is carried on `TurnFlow::Completed` (F2 §7) —
@@ -2112,6 +2146,10 @@ impl BeatScheduler {
     ///     A carried id that trips any guard is a BUG (the publish site should
     ///     only ever carry a real player Model block), so each is a loud
     ///     `log::error!`, refused, never silently skipped.
+    ///
+    /// Whether `on_turn_completed` is even called is gated upstream, in
+    /// [`Self::turn_should_crystallize`] — see that doc for the soft-cancel
+    /// decision this scheduler pins on purpose.
     fn on_turn_completed(&mut self, ctx: ContextId, output_block_id: Option<BlockId>) {
         // Resolve the context's track + attachment; only an OODA-armed musician we
         // manage gets its turn output crystallized. Schedule one phrase of lead ahead
@@ -2390,18 +2428,13 @@ impl BeatScheduler {
                 msg = completed.recv(), if turn_bus_open => match msg {
                     Some(m) => {
                         // Every turn announces now — interactive prompts too — so
-                        // the "is this the musician's own turn?" question the
-                        // producer used to answer by staying silent is answered
-                        // HERE, where it belongs (design §7):
-                        //   * `origin` — a human-prompted turn must never
-                        //     crystallize into the Act; the player is driving.
-                        //   * `reason.output_is_complete()` — a hard interrupt
-                        //     severed the stream mid-token, so the output block
-                        //     is a fragment, not a phrase. Scheduling it would
-                        //     play notation the model never finished writing.
-                        //     (This is the ending that used to arrive as a bare
-                        //     `Failed`, which the scheduler skipped by accident
-                        //     of the variant rather than on purpose.)
+                        // the "is this the musician's own turn, with a whole
+                        // phrase to crystallize?" question the producer used
+                        // to answer by staying silent is answered HERE, where
+                        // it belongs (design §7). See
+                        // `Self::turn_should_crystallize` for the full gate,
+                        // including the soft-cancel decision it pins on
+                        // purpose.
                         if let TurnFlow::Completed {
                             context_id,
                             output_block_id,
@@ -2409,8 +2442,7 @@ impl BeatScheduler {
                             origin,
                             ..
                         } = m.payload
-                            && origin == TurnOrigin::Autonomous
-                            && reason.output_is_complete()
+                            && Self::turn_should_crystallize(origin, reason)
                         {
                             self.on_turn_completed(context_id, output_block_id);
                         }
@@ -4153,6 +4185,109 @@ mod tests {
         assert_eq!(
             midi.id.principal_id, player,
             "the materialized block is authored by the player (played_by), not beat()"
+        );
+    }
+
+    /// Pin for the deepseek post-merge review (`docs/issues.md`): the
+    /// scheduler's `turn_should_crystallize` gate was previously stated only
+    /// in terms of what it excludes (a hard-cancel fragment), leaving the
+    /// soft-cancel case's inclusion unstated — read as an accident rather
+    /// than a decision. Amy's call (2026-08-05): keep it. This pins BOTH
+    /// halves against the real gate + the real scheduling path, not just the
+    /// boolean:
+    ///   - a **soft**-cancelled autonomous turn (`immediate: false`) has a
+    ///     whole phrase (`output_is_complete()` true) and DOES crystallize.
+    ///   - a **hard**-cancelled autonomous turn (`immediate: true`) has a
+    ///     severed fragment and is skipped, same as before.
+    #[test]
+    fn turn_should_crystallize_soft_cancel_yes_hard_cancel_no() {
+        use kaijutsu_kernel::flows::{TurnOrigin, TurnStopReason};
+
+        assert!(
+            BeatScheduler::turn_should_crystallize(
+                TurnOrigin::Autonomous,
+                TurnStopReason::Cancelled { immediate: false },
+            ),
+            "a soft-cancelled autonomous turn's whole phrase must crystallize into the Act"
+        );
+        assert!(
+            !BeatScheduler::turn_should_crystallize(
+                TurnOrigin::Autonomous,
+                TurnStopReason::Cancelled { immediate: true },
+            ),
+            "a hard-cancelled autonomous turn's fragment must never crystallize"
+        );
+        // Sanity: an ordinary clean end-of-turn still crystallizes, and origin
+        // still gates regardless of reason — the two conditions are independent.
+        assert!(BeatScheduler::turn_should_crystallize(
+            TurnOrigin::Autonomous,
+            TurnStopReason::EndTurn
+        ));
+        assert!(!BeatScheduler::turn_should_crystallize(
+            TurnOrigin::Interactive,
+            TurnStopReason::EndTurn
+        ));
+    }
+
+    /// The same soft/hard split, but through the real `on_turn_completed`
+    /// scheduling path (not just the gate) — proves a soft cancel's phrase
+    /// actually lands on the timeline and a hard cancel's does not, mirroring
+    /// `completed_turn_schedules_one_phrase_ahead` above. Each case only
+    /// calls `on_turn_completed` when `turn_should_crystallize` says to,
+    /// exactly like the scheduler's own `run()` loop.
+    #[tokio::test]
+    async fn soft_cancel_crystallizes_hard_cancel_is_skipped_in_the_act() {
+        use kaijutsu_kernel::flows::{TurnOrigin, TurnStopReason};
+
+        async fn materialized_asset_count(reason: TurnStopReason) -> usize {
+            let (kernel, documents) = fresh_kernel_and_docs().await;
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let player = PrincipalId::new();
+            let abc_block = insert_player_abc(
+                &documents,
+                ctx,
+                player,
+                "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEFGABc|\n",
+            );
+
+            let phrase = BeatPolicy {
+                period: Duration::from_secs(1),
+                beats_per_phrase: 4,
+            };
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            let base = Instant::now();
+            let track_id = TrackId::solo();
+            sched.attach(track_id.clone(), ctx, slow_attachment(), phrase).unwrap();
+            let score = sched.score_context(&track_id);
+            sched.play(&track_id, base);
+            sched.fire_due(base + Duration::from_secs(1));
+
+            // Exactly what the select-loop arm does: gate, then act.
+            if BeatScheduler::turn_should_crystallize(TurnOrigin::Autonomous, reason) {
+                sched.on_turn_completed(ctx, Some(abc_block));
+            }
+            for i in 2..=8 {
+                sched.fire_due(base + Duration::from_secs(i));
+            }
+
+            documents
+                .block_snapshots(score)
+                .unwrap()
+                .iter()
+                .filter(|b| b.role == kaijutsu_crdt::Role::Asset)
+                .count()
+        }
+
+        assert_eq!(
+            materialized_asset_count(TurnStopReason::Cancelled { immediate: false }).await,
+            1,
+            "a soft cancel's whole phrase must materialize a MIDI asset on the timeline"
+        );
+        assert_eq!(
+            materialized_asset_count(TurnStopReason::Cancelled { immediate: true }).await,
+            0,
+            "a hard cancel's severed fragment must never materialize"
         );
     }
 
