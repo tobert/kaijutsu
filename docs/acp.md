@@ -28,17 +28,24 @@ kaijutsu-acp
 kaijutsu-server / kernel
 ```
 
-Rough concept mapping (to be validated by the client-readiness assessment):
+Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
 
-| ACP v1 | kaijutsu |
-|---|---|
-| `session/new` / `session/load` | context create / attach (`register_session`) |
-| `session/prompt` turn | `write_input` + `submit_input` |
-| `session/update` notifications | turn event stream (tokens, tool calls, blocks) |
-| `session/cancel` | ⚠ needs a turn-interrupt primitive — check |
-| `session/request_permission` | ⚠ hook engine has Deny/Log/Invoke, no Ask — check |
-| `mcpServers` declared into session | external MCP wiring (issues.md — unplumbed) |
-| session list ordering | **the rank** (ring 0) — see below |
+| ACP v1 | kaijutsu | status |
+|---|---|---|
+| ACP `SessionId` | `ContextId` hex (`rank::session_id_of`) | durable; survives restarts, no side table |
+| `session/new` | `resolve_context_label` upsert → `create_context_typed(label, "coder")` → `join_context` | built |
+| `session/load` | parse session id → `join_context` + replay transcript as updates | built |
+| `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1 | built (ring stamps are on the wire — see below) |
+| `session/prompt` | `get_input_state` → `edit_input(0, text, len)` → `submit_input(ctx, false)` | built; text-only |
+| turn end → `stopReason` | `ServerEvent::TurnCompleted{stop_reason}` (1:1 by construction) | built |
+| turn broke | `ServerEvent::TurnFailed` → JSON-RPC error, **not** a stop reason | built |
+| `session/update` text/thought | `BlockKind::Text`/`Thinking` char deltas off the CRDT mirror | built |
+| `session/update` tool_call / tool_call_update | `BlockKind::ToolCall` create, then patch; `ToolResult` patches the call it links to | built |
+| `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
+| `session/request_permission` | **auto-allow stub** (`permission.rs`); `HookAction::Ask` not built | STUB |
+| `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
+| `Task` blocks → ACP `plan` | — | unmapped, see gaps |
+| `fs/*`, `terminal/*` client methods | — | not used; kj runs its own tools |
 
 ## Session picker = the rank
 
@@ -53,6 +60,24 @@ rank as its session list — a phone shows the identical ten seats, same order,
 as the app's ring 0. Muscle memory transfers: `ctrl-a 2` on the desk is seat 2
 on the phone. Still open per timewell.md: table-edge rail rendering, pinning
 (deferred until the itch is real).
+
+**Verified on the wire (2026-08-05).** No schema change was needed:
+`ContextHandleInfo.promotedAt/@17`, `.demotedAt/@18`, `.pausedAt/@19`
+(`kaijutsu.capnp:637-639`) ride `listContexts` and are decoded into
+`ContextInfo` (`kaijutsu-client/src/rpc.rs:2845`). *Seat order* is not on the
+wire and does not need to be: `kaijutsu_viz::layout::assign_ring_seats` is a
+zero-dep pure function, so the bridge computes the identical seating the app
+does from the identical inputs. `kaijutsu-acp` adds `kaijutsu-viz` as a
+dependency and calls it (`rank.rs`) — one seating engine, two frontends.
+
+Note what is *not* exposed: `kj context info --json` omits the three stamps
+(human text only, `kj/format.rs:229`), and no VFS path carries them. A
+consumer must use `list_contexts()`, not the `kj` surface.
+
+`ranked_sessions` serves ring 0 in seat order, then ring 1 by recency. Ring 0
+alone is empty on a fresh kernel and a picker showing nothing is useless;
+appending ring 1 keeps ring 0's seats stable at the front where the muscle
+memory lives.
 
 ## Foundational work before the adapter
 
@@ -116,6 +141,133 @@ Suggested order: #1 (+#5 riding along) → #3 → #2 → adapter prototype can
 start with `request_permission` stubbed to auto-allow → #4 and real
 permissions before any untrusted frontend.
 
+## The adapter, as built (2026-08-05)
+
+`crates/kaijutsu-acp` — one binary, no forked RPC code, `kaijutsu-client`
+consumed exactly as `kaijutsu-mcp` consumes it.
+
+```
+src/bridge.rs      kernel side: connect, resolve/create/join, prompt, interrupt
+src/session.rs     SessionRegistry + the per-session event pump + the turn wait
+src/update.rs      PURE: BlockSnapshot → SessionUpdate (the mapping layer)
+src/rank.rs        PURE: ContextInfo[] → the rank → SessionInfo[]
+src/permission.rs  the auto-allow STUB + the shaped Ask seam
+src/lib.rs         the six ACP handlers + version negotiation
+src/main.rs        clap, stderr tracing, LocalSet, --connect
+tests/dispatch.rs  the six-handler chain actually dispatches by type
+```
+
+**Which way agency points.** In MCP kaijutsu is a *tool* another agent calls;
+in ACP kaijutsu *is* the agent and the client is the human's seat. So new
+sessions take `context_type=coder` (the model-facing stance bundle), not
+`mcp`. `--context-type` overrides.
+
+**Decisions worth remembering:**
+
+- *Snapshots, not events.* `BlockTextOps` carries opaque CRDT ops, so decoding
+  a delta means owning a `SyncedDocument` anyway. The pump applies the event
+  and hands the resulting `BlockSnapshot` to a mapper that keeps per-block
+  high-water marks. That makes translation idempotent, which is also how
+  `session/load` replays history through the same code path.
+- *Char deltas, never byte.* A chunk boundary mid-codepoint is a corrupt frame.
+  Same for the input-doc write: `edit_input`'s delete count is characters.
+- *Kernel-wide block events* (`scope_blocks_to_context: false`). An ACP client
+  can hold several sessions — that is what `session/list` is for — and a
+  context-scoped subscription would starve every session but the last joined.
+  Each pump filters by context id. If the firehose bites, the fix is an actor
+  per session, not a narrower filter.
+- *Echo suppression is armed, not addressed.* `submit_input` only returns the
+  block id after the fact, by which time the pump may have already streamed
+  the echo. The mapper arms before the write and claims the first unseen user
+  block. A sibling's message landing in that window would be eaten instead —
+  accepted for the prototype.
+- *Crosstalk reaches the phone.* User-role blocks from other principals are
+  forwarded as `user_message_chunk`. Your neighbour typing at the desk shows
+  up in the ACP transcript. That is the stance, not a leak.
+- *A failed turn is a JSON-RPC error*, not `stopReason: end_turn`. ACP has no
+  "failed" stop and reporting a clean end for a crashed turn is the silent
+  fallback we refuse.
+- *Soft cancel by default.* `interrupt_context(immediate: false)` — the
+  in-flight model call finishes, so the transcript keeps a complete phrase.
+- *Bounded connect.* The actor's FSM retries a failed handshake forever and
+  never reaches Terminal, so an unbounded wait hangs the bridge with the ACP
+  client seeing `initialize` go unanswered. `--connect-timeout` (30s) turns
+  that into a message naming the likely cause. Found by the first live smoke
+  test, against a kernel too old to serve `subscribeTurnEvents`.
+
+**Permission stub.** `permission.rs` allows everything and never asks; the
+module header says so in capitals. The Ask-side code that *will* be needed —
+option shaping, outcome interpretation, deny-on-anything-unrecognised — is
+written and unit-tested; only the kernel→bridge transport is missing, and this
+crate does not own the wire schema. Do not point an untrusted client at this
+bridge until gap #2 lands.
+
+**Gaps found while building** (also in issues.md):
+
+- **No catch-up after a resync.** On `SyncReset`/lag/reconnect the pump
+  rebuilds the mirror and re-pegs the mapper *silently* — anything that
+  changed during the gap never reaches that client. Replaying instead would
+  duplicate the whole transcript. Logged at `warn`; the real fix is the same
+  catch-up story the turn-events work deferred.
+- **`TurnCompleted` has no turn id.** The prompt wait matches on
+  `context_id` + `TurnOrigin::Interactive`, which is correlation by ordering.
+  Two interactive turns racing in one context would confuse it. Already noted
+  P3 in issues.md ("no turnId/endedAt … revisit with the adapter") — the
+  adapter now says: yes, we want it.
+- **`kaijutsu-mcp`'s `write_input` deletes by byte length** (`lib.rs:1434`,
+  `state.content.len()`), so a non-ASCII input doc is corrupted or truncated.
+  `kaijutsu-acp` uses `chars().count()`. mcp should too.
+- **No ACP shape for `BlockKind::Task`.** ACP v1 has `plan` /`PlanEntry`
+  (stable, not the unstable plan-operations feature), which is a plausible
+  target once the `builtin.tasks` grooming surface settles.
+- **`session/delete`, `session/set_mode`, `session/set_config_option`** are
+  stable v1 and unimplemented. `set_mode` maps naturally onto `context_type`
+  / cast roles; `delete` onto `conclude`/`archive`. Not advertised, so a
+  client will not call them.
+- **Prompt content is text-only.** Image/audio/embedded-resource blocks are
+  turned into a `[… omitted]` marker rather than dropped in silence, and the
+  capabilities say `image: false, audio: false, embedded_context: false`.
+
+## Manual smoke test (live kernel)
+
+Prerequisite: the running `kaijutsu-server` must post-date the turn-events
+merge — an older one answers `subscribeTurnEvents` with "Method not
+implemented", the actor never reaches Connected, and the bridge now exits with
+a message saying exactly that. `./contrib/kj rebuild && ./contrib/kj restart`.
+
+```bash
+cargo build -p kaijutsu-acp
+# sanity: should print the rank, then exit
+./target/debug/kaijutsu-acp --connect --host localhost --port 2222
+```
+
+Driving it from toad (the desk-side client this was built for):
+
+```bash
+# toad launches the agent as a subprocess and speaks ACP on its stdio
+toad --agent '/path/to/target/debug/kaijutsu-acp --connect --host zorak --port 2222'
+```
+
+What to check, in order:
+
+1. **initialize** — toad connects and shows the agent as `kaijutsu-acp`.
+2. **session picker** — the sessions listed are ring 0 in seat order, then
+   ring 1. Compare against `kj context list` (ring-0 rows carry `[ring0]`).
+3. **session/new** — a fresh `acp-<dir>-<secs>` context appears in the app's
+   time well. It should get the `coder` rc stance.
+4. **prompt** — text streams in as it generates; thinking shows in the thought
+   lane; a tool call appears once and then updates in place rather than
+   repeating.
+5. **crosstalk** — type into the same context from `kaijutsu-app`; it should
+   appear in toad as a user message.
+6. **cancel** — interrupt a long turn; toad should get `stopReason: cancelled`
+   and the block should end on a complete phrase (soft cancel).
+7. **session/load** — reconnect toad and reopen the same session from the
+   picker; the transcript should replay.
+
+`RUST_LOG=kaijutsu_acp=debug` on stderr for the play-by-play. stdout is the
+wire — never print to it.
+
 ## Version stance
 
 **ACP v1 only.** v2 is draft (announced 2026-07-20, alpha schemas, no GA
@@ -152,7 +304,12 @@ Remote transport (HTTP/WS) is an Active RFD — irrelevant to us; SSH
 - One ACP session per kj context is the obvious mapping — but does a session
   want to *follow* a context through fork rolls (EvictionIndex generations),
   or bind to a single context id? Leaning: follow the chain, it's what a
-  phone user means by "the conversation."
+  phone user means by "the conversation." **The prototype binds a single
+  context id** and makes the session id *be* that context id, which is what
+  made `session/list` → `session/load` work with no side table. Following the
+  chain means the session id can no longer be the context id — it would have
+  to name a chain, and the picker would have to show chains. Worth doing, but
+  it is a data-model change, not an adapter change.
 - Permission UX on mobile: ACP `session/request_permission` vs. kj's
   shared-trust stance — the adapter may be where graduated trust first gets
   real teeth.
