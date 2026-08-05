@@ -489,27 +489,15 @@ Deferred from the renovation, in rough priority order:
   is that forever context_type's job?
 - **App UI for casts** — kj-only today; the app compiles against the new wire
   fields but renders nothing cast-shaped yet.
-- **`kj backend set` clear-on-omit sharp edge** (deepseek review P2): the
-  documented declare-the-whole-row upsert means a partial update silently
-  clears key sources; the command succeeds while the backend then warn-skips
-  at registry build. Consider: after reload, `backend set` checks the backend
-  actually registered and says so in the command output.
-- **`kj context info` JSON lacks the resolved effective model** (deepseek
-  review P4): it carries raw row provider/model + cast label, so a consumer
-  must re-derive the resolution ladder. Add resolved backend/model/source
-  fields from `resolve_context_model`.
 - Deepseek-review P1, reviewed and ACCEPTED as policy: the rollover's
   fallback arm tosses provider=NULL+model=set rows to deepseek-v4-flash —
   that was Amy's instruction, and the live migration touched 0 rows anyway.
   Not a bug; recorded so nobody re-litigates it.
-- **Write-time inverted-budget check on `kj cast slot set`** (gemini review,
-  the one genuine find of its four): a slot `thinking_budget` that exceeds
-  the EFFECTIVE max_tokens after the llm_defaults cascade only errors at
-  request-build time (loudly, with a good message — correctness is fine).
-  Kinder to also warn at write time when the resolved pair is inverted.
-  The review's other three findings were disproven or re-litigated policy:
-  DeepSeek `thinking:{"type":"disabled"}` claimed Anthropic-only → live
-  probe 2026-08-03 shows DeepSeek accepts it (kaibo had measured the same);
+- Gemini review, reviewed and ACCEPTED as policy on three of its four
+  findings (the fourth — a write-time inverted-budget WARN on `kj cast slot
+  set` — shipped, see devlog "Contexts join a band"): DeepSeek
+  `thinking:{"type":"disabled"}` claimed Anthropic-only → live probe
+  2026-08-03 shows DeepSeek accepts it (kaibo had measured the same);
   rollover + preset narrowing are Amy's explicit policy; the "keys now in
   SQL" leak concern is structurally impossible (no key column exists).
 
