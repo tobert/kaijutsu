@@ -1400,14 +1400,25 @@ async fn process_llm_stream(
                     Ok(Some(ev)) => ev,
                     Ok(None) => break 'stream,
                     Err(_) => {
+                        // Cancel-is-not-failure (flows.rs) applies here too: a
+                        // hung provider during the post-cancel drain is not a
+                        // stream error, just a confirmation that never
+                        // arrives. Constructing `StreamEvent::Error` here used
+                        // to route through the Error arm below and publish
+                        // `Failed`, overriding the `Cancelled` outcome the
+                        // player actually asked for. `stream_cancelled` is
+                        // already true, so breaking straight out of `'stream`
+                        // lets the `if stream_cancelled` check after the loop
+                        // set `Cancelled { immediate: true }` as it would for
+                        // any other confirmed hard cancel — the flush this
+                        // drain was waiting for was never going to arrive.
                         log::warn!(
-                            "LLM stream idle for {:?} during post-cancel drain ({})",
+                            "LLM stream idle for {:?} during post-cancel drain — hung \
+                             provider, no confirming flush; treating as a confirmed \
+                             cancel, not a failure ({})",
                             idle_timeout, context_id
                         );
-                        StreamEvent::Error(format!(
-                            "LLM stream idle for {:?} (post-cancel)",
-                            idle_timeout
-                        ))
+                        break 'stream;
                     }
                 }
             } else {
@@ -1744,17 +1755,32 @@ async fn process_llm_stream(
                             input_tokens,
                             output_tokens
                         );
-                        let _ = documents.insert_block_as(
-                            context_id,
-                            None,
-                            Some(&last_block_id),
-                            Role::Model,
-                            BlockKind::Text,
-                            "⛔ Interrupted",
-                            Status::Done,
-                            ContentType::Plain,
-                            Some(PrincipalId::system()),
-                        );
+                        // Role::System (not Model): this is a kernel-authored
+                        // marker about the turn, not something the model said.
+                        // Hydration's role filter already drops (System, Text)
+                        // outright (llm/hydrate.rs), but `set_ephemeral` is
+                        // added too — the established pattern for an
+                        // out-of-band notice elsewhere in this file (the
+                        // staging-mode warning above) — so the block also
+                        // reads as a machine record to any future UI/hydration
+                        // consumer, not just today's role check. Previously
+                        // this landed as (Role::Model, BlockKind::Text), which
+                        // hydration folds straight into assistant_text: the
+                        // next turn, the model would read its own prior turn
+                        // as having said "⛔ Interrupted" verbatim.
+                        let _ = documents
+                            .insert_block_as(
+                                context_id,
+                                None,
+                                Some(&last_block_id),
+                                Role::System,
+                                BlockKind::Text,
+                                "⛔ Interrupted",
+                                Status::Done,
+                                ContentType::Plain,
+                                Some(PrincipalId::system()),
+                            )
+                            .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
                         // Exit the agentic loop; cleanup runs below.
                         break;
                     }
@@ -1766,6 +1792,35 @@ async fn process_llm_stream(
                     // Reassigned (not or-ed) on every Done so a truncated *middle*
                     // iteration doesn't mislabel a turn that later ends cleanly;
                     // the cancel/cap breaks below overwrite it in turn.
+                    //
+                    // `refusal` and `stop_sequence` both fall through to the
+                    // `_` arm below and render as a clean `EndTurn` — the wire
+                    // has no dedicated stop reason for either yet (deepseek
+                    // post-merge review, docs/issues.md: adding one is a
+                    // capnp change and capnp is owned by a parallel lane right
+                    // now, so it stays open there). The minimal fix here is to
+                    // at least log each distinctly rather than let them
+                    // silently blend into "the model finished normally" —
+                    // `refusal` in particular means the model declined to
+                    // answer, which is operationally worth a `warn`, not a
+                    // `debug`.
+                    match stop_reason.as_deref() {
+                        Some("refusal") => {
+                            log::warn!(
+                                "LLM stream ended with stop_reason=refusal for {context_id} \
+                                 — the model declined to answer; reported to the turn \
+                                 outcome as EndTurn until the wire has a dedicated \
+                                 Refusal stop reason (docs/issues.md)"
+                            );
+                        }
+                        Some("stop_sequence") => {
+                            log::info!(
+                                "LLM stream ended with stop_reason=stop_sequence for \
+                                 {context_id}; reported to the turn outcome as EndTurn"
+                            );
+                        }
+                        _ => {}
+                    }
                     stop_reason_out = match stop_reason.as_deref() {
                         Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
                         _ => TurnStopReason::EndTurn,
@@ -2422,6 +2477,81 @@ mod publish_tests {
                 assert!(
                     failed.try_recv().is_none(),
                     "a cancel is not a failure"
+                );
+            })
+            .await;
+    }
+
+    /// Regression for the deepseek post-merge review (docs/issues.md: "Hard
+    /// cancel + hung provider publishes `Failed`"): after a hard cancel, the
+    /// drain loop polls the stream once more to let the provider flush its
+    /// pending Done event. If the provider is HUNG — the connection stays
+    /// open but never delivers that flush — the idle-timeout branch used to
+    /// construct `StreamEvent::Error`, which routed through the ordinary
+    /// error arm and published `Failed`. That overwrites the `Cancelled`
+    /// outcome the player actually asked for with an error string, violating
+    /// the cancel-is-not-failure contract this same module tests above
+    /// (`hard_interrupt_completes_as_an_immediate_cancel`).
+    ///
+    /// `MockClient::hangs_when_exhausted` models the hang: once the scripted
+    /// deltas run out, `next_event()` never resolves. `start_paused = true`
+    /// lets the idle timeout actually elapse (via virtual-clock
+    /// auto-advance) without the test burning real wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn post_cancel_idle_timeout_with_hung_provider_is_cancelled_not_failed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("hard-cancel-hang").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+
+                // No TextEnd/Done in the script — deliberately: the point is
+                // that nothing more ever arrives after these deltas. Long
+                // enough that `select!`'s random branch pick almost certainly
+                // catches the already-armed hard cancel before the script
+                // runs dry on its own (same reasoning as
+                // `hard_interrupt_completes_as_an_immediate_cancel` above).
+                let mut events = vec![kaijutsu_kernel::llm::StreamEvent::TextStart];
+                events.extend(
+                    (0..64).map(|_| kaijutsu_kernel::llm::StreamEvent::TextDelta("C".into())),
+                );
+
+                let (_documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Autonomous,
+                    kernel.clone(),
+                    Provider::Mock(
+                        MockClient::new("unused")
+                            .with_scripted_stream(vec![events])
+                            .hangs_when_exhausted(),
+                    ),
+                    |interrupt| interrupt.hard(),
+                )
+                .await;
+
+                let msg = completed.try_recv().expect(
+                    "a hard-cancelled turn with a hung post-cancel drain must still \
+                     publish Completed, not silently hang or fail",
+                );
+                match msg.payload {
+                    TurnFlow::Completed {
+                        context_id, reason, ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(
+                            reason,
+                            TurnStopReason::Cancelled { immediate: true },
+                            "the hung post-cancel drain must not downgrade the outcome \
+                             away from the cancel that was actually requested"
+                        );
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+                assert!(
+                    failed.try_recv().is_none(),
+                    "a hung post-cancel drain must never publish Failed — the \
+                     cancel-is-not-failure contract this file's other test pins for \
+                     the clean-confirmation case applies just as much here"
                 );
             })
             .await;

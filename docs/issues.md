@@ -268,43 +268,52 @@ these are the ones that block *using* the thing.
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
 
-## TurnEvents + register upsert — deepseek review findings (2026-08-04, post-merge)
+## TurnEvents + register upsert — deepseek review findings (2026-08-04/05, post-merge) — P2 tier SHIPPED
 
 DeepSeek V4 pass (dpal, whole files, no diff) over the merged foundations at
 `29529ded`. Eight keepers explicitly endorsed (single-terminal-publish,
 origin-on-the-event, beat's three Act guards, resolveContextLabel honesty,
 loud attach warning, subject⊆TOPICS gates, unknown-enumerant hard error,
-hasOutputBlock zeroing). The queue, P2 first:
+hasOutputBlock zeroing). All six P2 findings landed 2026-08-05:
 
-- **`⛔ Interrupted` marker leaks into model context** (`llm_stream.rs:
-  1747-1757` + `hydrate.rs:190-200`): inserted as `(Role::Model,
-  BlockKind::Text)` so hydration folds it into assistant_text — next turn
-  the model sees a hallucinated `assistant: ⛔ Interrupted`. Fix: ephemeral
-  flag, or `Role::System`/`BlockKind::Notification` (both hydration-skipped).
-- **Hard cancel + hung provider publishes `Failed`** (`llm_stream.rs:
-  1393-1448 → 1781`): post-cancel drain's idle timeout constructs
-  `StreamEvent::Error`, violating the cancel-is-not-failure contract
-  (flows.rs:1182-1185). Fix: break the loop with `stream_cancelled` set
-  instead of erroring — a hung stream won't deliver the flush anyway.
-- **`refusal`/`stop_sequence` collapse to `EndTurn`** (`llm_stream.rs:
-  1769-1772`): an Anthropic refusal renders as a clean completion. Minimal:
-  log distinctly; right: a `Refusal` stop reason (wire addition).
-- **beat.rs "exactly preserves prior behavior" is FALSE for soft cancel**
-  (`beat.rs:2390-2416`): old code skipped soft-cancelled autonomous turns
-  (they arrived as Failed); now `output_is_complete()==true` → the phrase
-  crystallizes into the Act. Defensible — the phrase IS whole — but it's a
-  behavior CHANGE; fix the comment, decide the semantics on purpose.
-- **register_session suffix TOCTOU** (`kaijutsu-mcp/src/lib.rs:1127-1155`):
-  two concurrent registers on one concluded label race resolve→create; the
-  loser gets a raw DB constraint error, not a clean retry. No corruption
-  (uniqueness index arbitrates). Fix: retry-on-constraint-violation loop.
-- **flows.rs:1123-1126 recovery claim overstates**: "a subscriber that
-  missed the push reads the block log" — true for text ops, false for
-  stop_reason (EndTurn/MaxTokens/soft-cancel are indistinguishable from
-  block status). Fix the doc; the real catch-up story is already tracked.
-- **Test gaps before unattended always-on** (P2 tier): post-cancel-idle
-  path, wire e2e for onTurnFailed, concurrent register race, soft-cancel
-  crystallization + hard-cancel skip in the Act.
+1. `⛔ Interrupted` marker → `(Role::System, BlockKind::Text)` + ephemeral,
+   no longer folds into assistant_text on the model's next turn
+   (`llm_stream.rs`). Checked the review's `BlockKind::Notification`
+   alternative against `hydrate.rs` before picking — Notification is NOT
+   hydration-skipped (it formats into a *user* message,
+   `format_notification_for_llm`), which would have been worse.
+2. Post-cancel drain's idle timeout no longer constructs `StreamEvent::Error`
+   on a hung provider — breaks the loop with `stream_cancelled` already set,
+   so the outcome stays `Cancelled`, not `Failed` (`llm_stream.rs`).
+3. `refusal`/`stop_sequence` now log distinctly (`warn`/`info`) before
+   falling through to `EndTurn` (`llm_stream.rs`). Still open: a dedicated
+   wire `Refusal` stop reason — a capnp change, and capnp is owned by a
+   parallel lane right now.
+4. beat.rs's OODA-Act gate is now `BeatScheduler::turn_should_crystallize`,
+   with the soft-cancel-crystallizes / hard-cancel-skips decision stated
+   explicitly and pinned by tests, replacing a comment that explained the
+   hard-cancel exclusion but left the soft-cancel inclusion unstated.
+5. `register_session`'s suffix TOCTOU (concurrent registers racing one
+   concluded label) now retries on a real label-conflict, bounded at 5
+   attempts (`kaijutsu-mcp/src/lib.rs`).
+6. `flows.rs`'s `TurnFlow` doc no longer claims the block log covers a missed
+   push — true for the text a turn wrote, false for `TurnStopReason` (no
+   block-log shadow; `EndTurn`/`MaxTokens`/soft-cancel all leave an identical
+   `Done` block). Points at the already-tracked bus catch-up story below
+   ("TurnFlow bus lossy + in-memory") instead.
+
+**Two review claims turned out wrong on inspection** (worth recording — this
+repo has now caught this reviewer wrong more than once): the
+`BlockKind::Notification` hydration-skip claim in (1) above, and the
+"wire e2e for onTurnFailed" test-gap — `subscriptions.rs`'s
+`turn_events_tests::failed_round_trips` already exercised `on_turn_failed`
+through the real generated capnp client/server pair, and predates the
+review (landed in `0564b334`, an ancestor of the reviewed `29529ded`). The
+remaining test-gap item (concurrent register race) got the review's own
+fallback: `kaijutsu-mcp`'s retry classification is unit-tested directly
+rather than raced end-to-end, since this crate's RPC path needs a live SSH
+connection to a `kaijutsu-server` and the project steers `--lib` runs away
+from that harness.
 
 P3 tier, recorded not urgent: subscribe-happens-in-spawned-task window
 (`rpc.rs:3522-3633` — subscribe synchronously or document ordering);
