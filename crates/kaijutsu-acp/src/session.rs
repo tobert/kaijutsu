@@ -118,17 +118,32 @@ pub async fn run_pump(
     // bootstrap.
     {
         let mut mapper = session.mapper.lock();
-        for block in doc.blocks() {
-            if replay_history {
-                for update in mapper.observe(&block) {
+        let blocks = doc.blocks();
+        if replay_history {
+            for block in &blocks {
+                for update in mapper.observe(block) {
                     let _ = cx.send_notification(SessionNotification::new(
                         session_id.clone(),
                         update,
                     ));
                 }
-            } else {
-                mapper.mark_seen(&block);
             }
+            // One plan, once, after the transcript — not per Task block
+            // touched during replay. `build_plan` is idempotent (diffs
+            // against `last_plan`, `None` on first call), so this is exactly
+            // the same rebuild-and-emit path the live pump and resync use,
+            // just called once at the end instead of per event.
+            if let Some(update) = mapper.build_plan(&blocks) {
+                let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+            }
+        } else {
+            for block in &blocks {
+                mapper.mark_seen(block);
+            }
+            // Silent baseline — an rc-seeded Task block should not be
+            // narrated at a client that just opened `session/new`, same
+            // reasoning as `mark_seen` for every other kind.
+            mapper.baseline_plan(&blocks);
         }
     }
 
@@ -171,6 +186,18 @@ pub async fn run_pump(
                     let Some(block) = doc.get_block(&block_id) else { continue };
                     let updates = session.mapper.lock().observe(&block);
                     for update in updates {
+                        let _ = cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            update,
+                        ));
+                    }
+                    // `note_task` is a no-op (returns false) for anything
+                    // that isn't a changed Task block, so this is safe to
+                    // call unconditionally rather than gating on `block.kind`
+                    // here too.
+                    if session.mapper.lock().note_task(&block)
+                        && let Some(update) = session.mapper.lock().build_plan(&doc.blocks())
+                    {
                         let _ = cx.send_notification(SessionNotification::new(
                             session_id.clone(),
                             update,
@@ -230,7 +257,16 @@ async fn resync(
                 let live: std::collections::HashSet<BlockId> =
                     blocks.iter().map(|b| b.id).collect();
                 mapper.retain_marks(|id| live.contains(id));
-                blocks.iter().flat_map(|b| mapper.observe(b)).collect()
+                let mut updates: Vec<_> = blocks.iter().flat_map(|b| mapper.observe(b)).collect();
+                // Same idempotence contract as `observe()`: rebuilding the
+                // plan from unchanged task state is a no-op, so a resync over
+                // a gap with no task activity stays silent, matching
+                // `resync_sweep_emits_exactly_the_gap`'s "second sweep must
+                // be silent" contract for every other block kind.
+                if let Some(plan) = mapper.build_plan(&blocks) {
+                    updates.push(plan);
+                }
+                updates
             };
             let emitted = updates.len();
             for update in updates {
