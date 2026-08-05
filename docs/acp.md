@@ -88,12 +88,47 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
    subscription set. Catch-up for late/reconnecting subscribers deliberately
    deferred (needs a catch-up story, not a journal — noted on the
    TurnFlow-durability issue).
-2. **No Ask pathway for `session/request_permission` — MEDIUM, genuinely
-   new.** `HookAction` is Invoke/Deny/Log only (`hook_table.rs:118-122`).
-   Template exists: `ElicitationEvents::onRequest` (`kaijutsu.capnp:
-   1125-1127`) already does blocking server→client call/response, just scoped
-   to MCP elicitation. Needed: `HookAction::Ask` + a `PermissionEvents`
-   callback. This is also where graduated trust gets teeth.
+2. ~~**No Ask pathway for `session/request_permission`**~~ **SHIPPED on
+   branch `hook-ask`** (2026-08-05, Sonnet agent; 1949 kaijutsu-kernel +
+   304 kaijutsu-server + 139 kaijutsu-client tests green, `cargo build
+   --workspace` clean, awaiting review/merge). `HookAction::Ask(AskSpec)`
+   joins Invoke/Deny/Log/ShortCircuit (`hook_table.rs`), with an
+   `HookActionWire::Ask { description }` admin-wire surface and DB
+   persistence (`hooks.action_ask_description`) alongside the others.
+   `PermissionEvents::onAsk` (`kaijutsu.capnp`, ordinal `@103` on `Kernel`
+   for `subscribePermissionEvents`) is modeled on `ElicitationEvents::
+   onRequest`'s blocking call/response shape but is deliberately
+   **kernel-wide, not per-connection**: `HookAction::Ask` can fire from any
+   call path (autonomous turn, sibling context, kaish script), so there's no
+   "the connection that asked" the way MCP elicitation has. That forced a
+   real correction mid-implementation — a first pass tried to hold
+   `permission_events::Client`s directly in `SharedKernelState` and hit a
+   wall: capnp `Client`s are `Rc`-based (`!Send`), but `SharedKernelState`
+   must stay `Send + Sync` (each connection can run on its own OS thread).
+   Fixed by copying the `peers::InvokeRequest` cross-thread pattern: the
+   shared registry holds only `Send`-safe `mpsc::Sender`s; the actual
+   capability stays on its owning connection's `spawn_local` bridge task,
+   which drains the channel and drives `onAsk` locally, replying via a
+   paired `oneshot`. `Broker::run_permission_ask` wraps the whole ask in
+   `tokio::time::timeout` (30s default, `DEFAULT_PERMISSION_ASK_TIMEOUT`,
+   test-overridable) — **no subscriber attached, and timeout, both fail
+   closed** (`McpError::Denied`, logged at `warn!`, not the quieter `debug!`
+   other hook denials use — a stuck Ask usually means a misconfigured
+   session, worth an operator's attention). `kaijutsu-client` gained
+   `permission_events_channel()` (mirrors `turn_events_channel`, but
+   request/response instead of push-only) and `KernelHandle::
+   subscribe_permission_events`; an ACP adapter calls the former to build a
+   callback + envelope receiver, passes the callback to the latter, then
+   drains `PermissionAskEnvelope`s and answers each via its paired
+   `oneshot::Sender<PermissionAskAnswer>` — exactly `session/
+   request_permission`'s shape. Tests: kernel-side hook parse/dispatch +
+   allow/deny/no-subscriber/timeout round trips against a fake
+   `PermissionAsker` (`broker.rs`), DB round-trip (`kernel_db.rs`),
+   admin-wire install/reject (`hooks_builtin.rs`); client-side capnp
+   encode/decode round trips including a dropped-receiver failure mode
+   (`subscriptions.rs`); a real SSH+capnp e2e proving the cross-thread
+   bridge itself — not just each side's fakes — actually joins
+   (`kaijutsu-server/tests/permission_ask_wire.rs`).
 3. ~~**`register_session` reconnect/label-conflict**~~ **SHIPPED on branch
    `register-session-upsert`** (2026-08-04, Sonnet agent; 2440 tests green,
    awaiting review/merge). Upsert semantics: DB-driven `resolveContextLabel`
@@ -114,7 +149,11 @@ Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
 
 Suggested order: #1 (+#5 riding along) → #3 → #2 → adapter prototype can
 start with `request_permission` stubbed to auto-allow → #4 and real
-permissions before any untrusted frontend.
+permissions before any untrusted frontend. #1–#3 are now all shipped
+(pending merge); #2's `HookAction::Ask` + `PermissionEvents` is real
+permission plumbing, not the stub the original order assumed — an adapter
+can wire `session/request_permission` straight to `subscribe_permission_events`
+/ `permission_events_channel` from day one instead of auto-allowing.
 
 ## Version stance
 
