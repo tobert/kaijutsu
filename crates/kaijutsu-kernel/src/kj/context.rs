@@ -801,6 +801,23 @@ impl KjDispatcher {
     /// refuses to run a turn without one) — the `<model>` addendum fields
     /// are simply omitted. Previewing a prompt is exactly the thing you
     /// want to do while a context's model is still unconfigured.
+    ///
+    /// Two divergences from the turn path are known and NOT yet closed
+    /// (2026-08-07 review; tracked in `docs/issues.md`). Both are narrow, but
+    /// the whole value of this verb is fidelity, so they are named rather
+    /// than left for the next reader to discover:
+    ///
+    /// - **Model source.** Both sides call the same `resolve_context_model`,
+    ///   but this reads `provider`/`model` off the KernelDb row while the
+    ///   turn path reads them from the live DriftRouter handle
+    ///   (`llm_stream.rs`). `apply_context_config` writes both together, so
+    ///   they agree in the ordinary case — a preview racing a `kj context
+    ///   set`, or any future path that updates one without the other, can
+    ///   show a `<model>` the turn would not pick.
+    /// - **Staging.** The turn path refuses a `Staging` context outright.
+    ///   This renders the prompt regardless, so a staged context previews a
+    ///   prompt that cannot currently run. `<context state="staging"/>` is
+    ///   present in the output, but nothing says "this would be refused".
     async fn context_prompt(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         // Same !Send guard-scoping constraint as context_info: KernelDb's
         // parking_lot::MutexGuard must not cross an `.await` below.

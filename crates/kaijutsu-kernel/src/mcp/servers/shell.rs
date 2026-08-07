@@ -17,8 +17,11 @@
 //! and can call `shell` exactly when its binding grants `facade:shell` — the
 //! same bit that gates the RPC seam. There is no second capability to keep in
 //! sync, and no rc-script change: every role that already had `facade:shell`
-//! (default/coder/mcp via `facade:*`, director/musician explicitly) gets the
-//! tool; `toolie` (no facade) stays excluded.
+//! (default/coder/mcp via `facade:*`, director explicitly) gets the tool;
+//! `toolie` holds `facade:shell_readonly` and so gets the read-only twin;
+//! `musician` holds neither and is excluded by design — its binding grants
+//! only `drive`, because a small local model plays best with an empty tool
+//! palette (see `assets/defaults/rc/musician/create/S10-binding.kai`).
 
 use std::sync::{Arc, LazyLock, Weak};
 

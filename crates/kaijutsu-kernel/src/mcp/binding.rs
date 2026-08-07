@@ -68,7 +68,7 @@ pub const KNOWN_AUTHORITIES: &[&str] =
 /// native agent "had no shell" regardless of `facade:shell`. The projection
 /// closes that gap WITHOUT forking the policy: gating the tool as an ordinary
 /// `Instance`/`Tool` grant would mean a context with `facade:shell` but no `*`
-/// (e.g. `director`, `musician`) silently loses the model's shell. So the
+/// (e.g. `director`) silently loses the model's shell. So the
 /// binding treats a projected instance as allowed exactly when its backing
 /// facade is allowed. One bit — `facade:shell` — governs both surfaces.
 /// `shell_readonly` is the read-only twin: it projects `builtin.shell_readonly`

@@ -11,4 +11,15 @@
 # into the cached system prompt like S00-stance.kai — see that script's
 # comment for why S25-datetime.kai deliberately does NOT do this).
 primer="$(kj kaish primer)"
+
+# Fail loudly on an empty primer instead of seeding an empty system block.
+# `$(...)` swallows a failing command's exit status into an empty capture, so
+# without this guard a broken `kj kaish primer` produced a zero-length
+# Role::System block, the script still exited 0, and the rc lifecycle recorded
+# an ordinary Trace — a context silently missing its kaish guidance with
+# nothing anywhere saying so. Exiting non-zero makes the lifecycle write an
+# Error block instead (kj/lifecycle.rs), which is the whole point of the
+# create lifecycle being observable.
+test -n "$primer" || exit 1
+
 kj block create --role system --kind text --content "$primer"
