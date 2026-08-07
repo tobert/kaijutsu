@@ -265,6 +265,9 @@ impl McpServerLike for FileToolsServer {
                     },
                     None => tool_ctx.cwd.to_string_lossy().into_owned(),
                 };
+                if let Some(refusal) = refuse_filesystem_root_walk("glob", &base) {
+                    return Ok(from_exec_result(refusal));
+                }
                 let search_root = match glob_path.static_prefix() {
                     Some(prefix) => {
                         let mut root = std::path::PathBuf::from(&base);
@@ -322,6 +325,9 @@ impl McpServerLike for FileToolsServer {
                     },
                     None => tool_ctx.cwd.to_string_lossy().into_owned(),
                 };
+                if let Some(refusal) = refuse_filesystem_root_walk("grep", &search_root) {
+                    return Ok(from_exec_result(refusal));
+                }
                 if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_read(&tool_ctx, &search_root)
                 {
@@ -862,6 +868,35 @@ fn extract_context(content: &str, pos: usize, match_len: usize) -> String {
         .join("\n")
 }
 
+/// Refuse a tree walk rooted at the filesystem root.
+///
+/// `glob`/`grep` without an explicit `path` walk from the caller's cwd, and a
+/// cwd of `/` is never a real working directory — it is the shape a missing
+/// cwd takes by the time it reaches here (`CallContext::cwd`'s contract is
+/// that `None` must be rejected, and every synthesized `ExecContext` that
+/// can't resolve one lands on `/`). Servicing it means descending the entire
+/// filesystem: above any repository, so `.gitignore` never applies and the
+/// walk falls into build-output trees until the 120s tool timeout fires. That
+/// cost a wasted agentic iteration every time an autonomous turn tried to
+/// orient itself (see `docs/issues.md`, the 2026-08-07 cwd entry).
+///
+/// A refusal that names the fix is strictly better than a walk that cannot
+/// finish: the model can retry with a real `path` on the next tool call
+/// instead of burning two minutes discovering the timeout.
+fn refuse_filesystem_root_walk(tool: &str, root: &str) -> Option<ExecResult> {
+    if std::path::Path::new(root) != std::path::Path::new("/") {
+        return None;
+    }
+    Some(ExecResult::failure(
+        1,
+        format!(
+            "{tool}: refusing to walk the filesystem root. This context has no \
+             usable working directory, so a search with no `path` would descend \
+             all of `/`. Pass an explicit `path` (e.g. the repository you mean).",
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +944,71 @@ mod tests {
             Some(ToolContent::Text(s)) => s.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    /// A pathless `glob` from a context with no cwd must refuse, not walk.
+    ///
+    /// `CallContext::test()` carries no cwd — the same shape an autonomous
+    /// turn had before 2026-08-07 — which `to_exec_context` renders as `/`.
+    /// Servicing that walks the entire filesystem and times out after 120s;
+    /// every fresh coder context paid it on its first orientation move.
+    #[tokio::test]
+    async fn glob_without_path_refuses_a_filesystem_root_walk() {
+        let (broker, _cache) = broker_with_file("/tmp/a.rs", "fn main() {}\n").await;
+
+        let res = call(&broker, "glob", serde_json::json!({ "pattern": "**/Cargo.toml" })).await;
+
+        assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
+        let msg = text_of(&res);
+        assert!(
+            msg.contains("refusing to walk the filesystem root"),
+            "refusal must say what it refused: {msg}"
+        );
+        assert!(
+            msg.contains("path"),
+            "refusal must name the fix (pass an explicit path): {msg}"
+        );
+    }
+
+    /// Same guard on `grep` — it reached the walk by a different line.
+    #[tokio::test]
+    async fn grep_without_path_refuses_a_filesystem_root_walk() {
+        let (broker, _cache) = broker_with_file("/tmp/b.rs", "fn main() {}\n").await;
+
+        let res = call(&broker, "grep", serde_json::json!({ "pattern": "fn" })).await;
+
+        assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
+        assert!(
+            text_of(&res).contains("refusing to walk the filesystem root"),
+            "grep must refuse a rootless walk too: {}",
+            text_of(&res)
+        );
+    }
+
+    /// The guard must not over-refuse: an explicit path is let through.
+    /// Without this, "refuse the root" could be satisfied by refusing
+    /// everything.
+    ///
+    /// Asserts only that the *root refusal* doesn't fire — this harness mounts
+    /// a `MemoryBackend` the walker doesn't surface files from (the sibling
+    /// `glob_via_broker` likewise only asserts it didn't error), so a match
+    /// count would be testing the fixture, not the guard.
+    #[tokio::test]
+    async fn glob_with_an_explicit_path_is_not_refused() {
+        let (broker, _cache) = broker_with_file("/tmp/found.rs", "fn main() {}\n").await;
+
+        let res = call(
+            &broker,
+            "glob",
+            serde_json::json!({ "pattern": "*.rs", "path": "/tmp" }),
+        )
+        .await;
+
+        assert!(
+            !text_of(&res).contains("refusing to walk the filesystem root"),
+            "an explicit path must not trip the root guard: {}",
+            text_of(&res)
+        );
     }
 
     #[tokio::test]
@@ -1006,13 +1106,21 @@ mod tests {
             .await
             .unwrap();
 
+        // `CallContext::test()` carries no cwd, so this needs an explicit
+        // `path`: a pathless walk from a cwd-less context is now refused
+        // rather than serviced from `/` (see
+        // `glob_without_path_refuses_a_filesystem_root_walk`). The point of
+        // this test is the broker→tool plumbing, not the walk root.
         let ctx = CallContext::test();
         let result = broker
             .call_tool(
                 KernelCallParams {
                     instance: InstanceId::new(FileToolsServer::INSTANCE),
                     tool: "glob".to_string(),
-                    arguments: serde_json::json!({ "pattern": "**/*.nonexistent" }),
+                    arguments: serde_json::json!({
+                        "pattern": "**/*.nonexistent",
+                        "path": "/tmp",
+                    }),
                 },
                 &ctx,
                 tokio_util::sync::CancellationToken::new(),

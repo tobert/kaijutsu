@@ -582,12 +582,25 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     continue;
                 };
                 // Headless turn: no interactive session, so synthesize the
-                // execution context. cwd is the root — fork copies the parent's
-                // shell config separately; the turn itself doesn't need it.
+                // execution context — but read the context's durable cwd the
+                // same way the interactive paths do. It used to hardcode `/`
+                // on the theory that "the turn itself doesn't need it"; the
+                // turn's file tools use cwd as the *walk root* for a pathless
+                // `glob`/`grep`, so rooting it at `/` sent every autonomous
+                // turn (kj drive, ACP prompts, the musician's OODA loop)
+                // walking the whole filesystem — above any repo, so
+                // .gitignore could not apply and the walk fell into
+                // build-output trees until the 120s tool timeout fired.
+                // A context with no durable cwd still yields `/` here, matching
+                // the other call sites — but that is now a refusal, not a
+                // license: the file tools reject a filesystem-root walk root
+                // instead of servicing it (`servers/file.rs`).
+                let cwd =
+                    context_cwd(kernel, context_id).unwrap_or_else(|| std::path::PathBuf::from("/"));
                 let tool_ctx = kaijutsu_kernel::ExecContext::new(
                     principal_id,
                     context_id,
-                    std::path::PathBuf::from("/"),
+                    cwd,
                     kaijutsu_types::SessionId::new(),
                     kernel.kernel.id(),
                 );
