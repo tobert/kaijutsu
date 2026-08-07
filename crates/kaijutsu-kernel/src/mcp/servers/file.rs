@@ -265,9 +265,6 @@ impl McpServerLike for FileToolsServer {
                     },
                     None => tool_ctx.cwd.to_string_lossy().into_owned(),
                 };
-                if let Some(refusal) = refuse_filesystem_root_walk("glob", &base) {
-                    return Ok(from_exec_result(refusal));
-                }
                 let search_root = match glob_path.static_prefix() {
                     Some(prefix) => {
                         let mut root = std::path::PathBuf::from(&base);
@@ -276,6 +273,18 @@ impl McpServerLike for FileToolsServer {
                     }
                     None => std::path::PathBuf::from(&base),
                 };
+                // Checked on `search_root`, NOT on `base`: `PathBuf::push`
+                // REPLACES the whole path when the pushed component is
+                // absolute, so a pattern whose static prefix starts with `/`
+                // turns a perfectly good base into `/` after this match. A
+                // guard on `base` approves that walk. Same semantic point as
+                // grep's check below — the value actually handed to the
+                // walker.
+                if let Some(refusal) =
+                    refuse_filesystem_root_walk("glob", &search_root.to_string_lossy())
+                {
+                    return Ok(from_exec_result(refusal));
+                }
                 if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_read(&tool_ctx, &search_root.to_string_lossy())
                 {
@@ -884,17 +893,52 @@ fn extract_context(content: &str, pos: usize, match_len: usize) -> String {
 /// finish: the model can retry with a real `path` on the next tool call
 /// instead of burning two minutes discovering the timeout.
 fn refuse_filesystem_root_walk(tool: &str, root: &str) -> Option<ExecResult> {
-    if std::path::Path::new(root) != std::path::Path::new("/") {
+    if !normalizes_to_filesystem_root(root) {
         return None;
     }
     Some(ExecResult::failure(
         1,
         format!(
-            "{tool}: refusing to walk the filesystem root. This context has no \
-             usable working directory, so a search with no `path` would descend \
-             all of `/`. Pass an explicit `path` (e.g. the repository you mean).",
+            "{tool}: refusing to walk the filesystem root ('{root}' resolves to \
+             `/`). Either this context has no usable working directory, or the \
+             path climbs out of one. Pass an explicit `path` under the tree you \
+             mean.",
         ),
     ))
+}
+
+/// Does this path denote the filesystem root once `.` and `..` are folded?
+///
+/// Purely lexical — deliberately NOT `canonicalize()`, which hits the host
+/// filesystem and would both lie about the VFS (paths here may be virtual,
+/// e.g. `/v/docs`) and fail outright on a root that doesn't exist there.
+///
+/// `Path` equality alone is not enough. It compares components, so `//`,
+/// `/.`, `///` already equal `/` — but `..` is NOT resolved by
+/// `Components`, so `/tmp/..` compares unequal to `/` while the walker
+/// happily descends from the root. That gap let a path climb out of its
+/// workspace and reinstate the whole-filesystem walk this guard exists to
+/// stop.
+fn normalizes_to_filesystem_root(path: &str) -> bool {
+    use std::path::Component;
+
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        // Relative paths are resolved against a cwd before reaching here;
+        // a bare relative path can't denote the root on its own.
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for component in p.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            // `..` above the root stays at the root, as the kernel does.
+            Component::ParentDir => depth = depth.saturating_sub(1),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -983,6 +1027,79 @@ mod tests {
             "grep must refuse a rootless walk too: {}",
             text_of(&res)
         );
+    }
+
+    /// A path that CLIMBS OUT of its workspace reaches the root walk the
+    /// guard exists to stop. `Path` equality misses this: `..` is not folded
+    /// by `Components`, so `/tmp/..` compares unequal to `/` while the walker
+    /// descends from the root all the same.
+    #[tokio::test]
+    async fn glob_refuses_a_path_that_climbs_out_to_the_root() {
+        let (broker, _cache) = broker_with_file("/tmp/c.rs", "fn main() {}\n").await;
+
+        let res = call(
+            &broker,
+            "glob",
+            serde_json::json!({ "pattern": "**/*.rs", "path": "/tmp/.." }),
+        )
+        .await;
+
+        assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
+        assert!(
+            text_of(&res).contains("refusing to walk the filesystem root"),
+            "a path resolving to `/` must be refused however it spells it: {}",
+            text_of(&res)
+        );
+    }
+
+    /// An absolute *pattern* must not escape the given `path`.
+    ///
+    /// `PathBuf::push` replaces the whole path when handed an absolute
+    /// component, so if `static_prefix()` ever returned one, the base would
+    /// silently become `/` — which is why the guard sits on `search_root`
+    /// rather than on `base`. Checked against kaish-glob 0.13: it never
+    /// does. `/etc/*.conf` yields `Some("etc")` (leading slash stripped) and
+    /// `/**/*.rs`, `/*`, `/**` all yield `None`. This test pins that
+    /// assumption, so a future kaish-glob that starts returning absolute
+    /// prefixes fails here instead of quietly widening every walk.
+    #[tokio::test]
+    async fn an_absolute_pattern_does_not_escape_the_given_path() {
+        let (broker, _cache) = broker_with_file("/tmp/d.rs", "fn main() {}\n").await;
+
+        let res = call(
+            &broker,
+            "glob",
+            serde_json::json!({ "pattern": "/**/*.rs", "path": "/tmp" }),
+        )
+        .await;
+
+        assert!(
+            !text_of(&res).contains("refusing to walk the filesystem root"),
+            "walk stayed under /tmp, so the root guard must not fire: {}",
+            text_of(&res)
+        );
+    }
+
+    #[test]
+    fn root_normalization_folds_dots_and_parents() {
+        // Component-equality already handles these.
+        for s in ["/", "//", "/.", "/./", "///"] {
+            assert!(normalizes_to_filesystem_root(s), "{s} should be the root");
+        }
+        // These are the ones plain `Path` equality misses.
+        for s in ["/tmp/..", "/a/b/../..", "/a/../"] {
+            assert!(
+                normalizes_to_filesystem_root(s),
+                "{s} climbs back to the root and must be caught"
+            );
+        }
+        // And these must NOT be refused.
+        for s in ["/tmp", "/a/b/..", "/home/atobey/src", "relative/path"] {
+            assert!(
+                !normalizes_to_filesystem_root(s),
+                "{s} is a real directory, not the root"
+            );
+        }
     }
 
     /// The guard must not over-refuse: an explicit path is let through.
