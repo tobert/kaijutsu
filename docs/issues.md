@@ -6,6 +6,55 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kj context info` human and `--json` renders disagree about cwd (2026-08-07)
+
+Human output shows `Cwd: /home/atobey/src/kaijutsu`; `--json` reports
+`shell: null` for the same context. Found while chasing the turn-path cwd bug
+(fixed same day) — the disagreement cost real diagnosis time, because the
+JSON view suggested a context had no cwd when it did. One of the two renders
+is lying; make them share a source.
+
+## Two context-creation paths disagree about stamping the model (2026-08-07, stance tuning)
+
+Found while fixing the coder stance's model dispatch. The RPC create path
+reads the registry defaults and writes them onto the new `ContextRow`
+(`kaijutsu-server/src/rpc.rs:2390-2412`, `provider`/`model` fields) — so a
+context made by the GUI, `register_session`, or the ACP bridge carries a
+stamped model and `kj context info --json` reports `resolved_source:
+"context"`. `kj context create` does not stamp: the row's `model` stays
+`null` and resolution falls through to the registry default
+(`resolved_source: "default"`). Verified live both ways on zorak.
+
+Same divergent-creation-path family as the bug
+`test_rpc_created_context_runs_rc_create` (`e2e_kj_workflow.rs:596`) guards,
+and it has real consequences:
+
+- Anything reading `.model` gets a different answer depending on which door
+  the context came through. That is exactly what broke the stance dispatch.
+- A stamped row is a *snapshot*: change the registry default later and
+  RPC-created contexts keep the old model while kj-created ones follow. One
+  of those is probably wrong, and which one is a design decision nobody has
+  made on purpose.
+- It makes RPC-path tests structurally unable to catch null-model bugs —
+  the toothless-stance-test trap below.
+
+Decide the intent: either both paths stamp (creation freezes the model, and
+`resolved_source` mostly stops mattering) or neither does (the row means
+"override", inheritance stays live). Don't leave it split.
+
+## rc seed assets have no rebuild tracking (2026-08-07)
+
+`assets/defaults/rc/` is embedded via `include_dir!`
+(`kaijutsu-kernel/src/seed_scripts.rs:54`) and `kaijutsu-kernel` has no
+`build.rs`, so nothing emits `cargo:rerun-if-changed` for the seed tree.
+Editing a stance or lifecycle script may not trigger a rebuild, and a test
+run can silently exercise a stale embedded copy. Bit us during stance tuning:
+a mutation test looked green until `strings` on the test binary proved which
+version was actually compiled in. Wants a small `build.rs` walking the asset
+dir. Until then, verify with:
+
+    strings -a target/debug/deps/<test-binary> | grep -o "<a distinctive string>"
+
 ## Conversation block-focus indicator is invisible (2026-08-04, live BRP debug)
 
 The "j/k navigation stuck" mystery from the 08-03 signoff is SOLVED and it
